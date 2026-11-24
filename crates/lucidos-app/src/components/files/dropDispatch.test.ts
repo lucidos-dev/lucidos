@@ -1,10 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { findDropZone, dispatchDrop } from './dropDispatch';
 
-/** Build a minimal element-like object with the surface findDropZone reads.
- *  Stubs `closest` since the test environment has no real DOM — walks the
- *  parent chain and returns the first ancestor whose data-drop-zone matches
- *  one of the values requested by the selector. */
 function makeEl(zone?: 'attach' | 'import' | string): any {
   const el: any = {
     parentElement: null,
@@ -22,7 +18,6 @@ function makeEl(zone?: 'attach' | 'import' | string): any {
   return el;
 }
 
-/** Wire elements into a parent chain — first arg is the innermost (event target). */
 function chain(...nodes: any[]): any {
   for (let i = 0; i < nodes.length - 1; i++) {
     nodes[i].parentElement = nodes[i + 1];
@@ -64,7 +59,6 @@ describe('findDropZone', () => {
   });
 
   it('returns the innermost zone when both attach and import are ancestors', () => {
-    // Inner zone wins over outer — supports nesting (e.g. files panel inside an attach surface).
     const inner = makeEl('attach');
     const outer = makeEl('import');
     expect(findDropZone(chain(makeEl(), inner, outer))?.kind).toBe('attach');

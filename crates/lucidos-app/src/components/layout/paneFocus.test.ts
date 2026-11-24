@@ -9,19 +9,10 @@ import {
   installPaneFocusTracking, handlePaneTab,
 } from './paneFocus';
 
-// jsdom never lays out, so `getClientRects()` is empty on every real element.
-// `visibleFocusables` treats that as "not visible", so stub it per-element to
-// isolate the `inert` exclusion under test.
 function stubVisible(el: HTMLElement): void {
   el.getClientRects = () => [{}] as unknown as DOMRectList;
 }
 
-// A click inside any content-pane iframe (app, preview, PDF plugin, cross-origin
-// URL) moves the host's activeElement to the <iframe> and fires window blur; this
-// pure check decides whether that focus target should move the content-pane
-// focus marker. It
-// keys on tagName + a `.pane-content` ancestor (not `instanceof HTMLIFrameElement`)
-// so it's testable without jsdom, mirroring appFrame.test.ts's stub style.
 describe('isContentPaneIframeFocus', () => {
   const fake = (tagName: string, inContentPane: boolean): Element =>
     ({ tagName, closest: (sel: string) => (sel === '.pane-content' && inContentPane ? {} : null) } as unknown as Element);
@@ -43,10 +34,6 @@ describe('isContentPaneIframeFocus', () => {
   });
 });
 
-// Pure boundary logic for the per-pane Tab trap. The DOM handler relies on a
-// pane being a contiguous subtree, so the browser's default Tab handles the
-// in-between steps and this only decides the wrap at the two ends. Toast reuses
-// it for its own (already-focused) button trap, so its semantics stay fixed.
 describe('trapTargetIndex', () => {
   it('returns null when the pane has no tabbable elements', () => {
     expect(trapTargetIndex(0, -1, false)).toBeNull();
@@ -69,7 +56,6 @@ describe('trapTargetIndex', () => {
   it('does not wrap in-between (browser default keeps focus in the subtree)', () => {
     expect(trapTargetIndex(3, 1, false)).toBeNull();
     expect(trapTargetIndex(3, 1, true)).toBeNull();
-    // forward off a non-last, shift off a non-first
     expect(trapTargetIndex(3, 0, false)).toBeNull();
     expect(trapTargetIndex(3, 2, true)).toBeNull();
   });
@@ -80,9 +66,6 @@ describe('trapTargetIndex', () => {
   });
 });
 
-// Target logic for the focused-pane Tab trap. Unlike trapTargetIndex it MOVES
-// focus into the focused pane when DOM focus is outside it: a pane click sets
-// `focusedPane` signal-only, leaving DOM focus on <body> or another pane.
 describe('paneTabTarget', () => {
   it('falls through (null) when the focused pane has no tabbable elements', () => {
     expect(paneTabTarget(0, -1, false, false)).toBeNull();
@@ -90,18 +73,16 @@ describe('paneTabTarget', () => {
   });
 
   it('moves focus INTO the pane when DOM focus is outside it', () => {
-    // forward Tab enters at the first element, Shift+Tab at the last
     expect(paneTabTarget(3, -1, false, false)).toBe(0);
     expect(paneTabTarget(3, -1, true, false)).toBe(2);
   });
 
   it('wraps at the boundaries when focus is already inside the pane', () => {
-    expect(paneTabTarget(3, 2, false, true)).toBe(0); // forward off last → first
-    expect(paneTabTarget(3, 0, true, true)).toBe(2);  // shift off first → last
+    expect(paneTabTarget(3, 2, false, true)).toBe(0);
+    expect(paneTabTarget(3, 0, true, true)).toBe(2);
   });
 
   it('falls through (null) for in-between steps inside the pane', () => {
-    // the browser's default Tab keeps focus in the contiguous pane subtree
     expect(paneTabTarget(3, 1, false, true)).toBeNull();
     expect(paneTabTarget(3, 1, true, true)).toBeNull();
     expect(paneTabTarget(3, 0, false, true)).toBeNull();
@@ -116,9 +97,6 @@ describe('paneTabTarget', () => {
   });
 });
 
-// Focus can sit inside a pane on an element the trap does not list: the
-// tabindex=-1 pane container a click focused, or a dialog body. Native Tab
-// from there left the pane while the marker stayed behind.
 describe('tabTargetWithin', () => {
   function pane(): { container: HTMLElement; list: HTMLElement[]; mid: HTMLElement } {
     const container = document.createElement('div');
@@ -149,18 +127,12 @@ describe('tabTargetWithin', () => {
   });
 });
 
-// Pure decision behind `reconcilePaneFocus` — keeps real DOM focus in sync with
-// the focused-pane (focusedPane) marker so native scroll keys act on the pane the
-// marker points at. The DOM-touching wrapper (rAF + query + `.focus()`) is
-// covered by browser e2e; this pins the "should we move focus at all" contract.
 describe('shouldReconcilePaneFocus', () => {
   it('pulls focus in when desktop, no overlay, and focus is outside the pane', () => {
     expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: false, focusInsidePane: false })).toBe(true);
   });
 
   it('never steals a click\'s own focus — no-op when focus is already inside the pane', () => {
-    // This is what composes with focusPaneMainControl (lands focus in-pane → this
-    // then no-ops) and never yanks focus off a control clicked inside the pane.
     expect(shouldReconcilePaneFocus({ mobile: false, overlayOpen: false, focusInsidePane: true })).toBe(false);
   });
 
@@ -173,7 +145,6 @@ describe('shouldReconcilePaneFocus', () => {
   });
 
   it('any single blocking condition suppresses the pull-in', () => {
-    // Only the all-clear case moves focus; every other combination is a no-op.
     const combos = [
       { mobile: true, overlayOpen: true, focusInsidePane: true },
       { mobile: true, overlayOpen: false, focusInsidePane: false },
@@ -184,10 +155,6 @@ describe('shouldReconcilePaneFocus', () => {
   });
 });
 
-// Which focusable a navigation landing on a settings row hands focus to. A row
-// whose label carries an explainer puts the info icon BEFORE the control in DOM
-// order, so "the first focusable" is the icon and Enter opens a dialog instead
-// of operating the setting the user searched for.
 describe('navigationFocusTarget', () => {
   const fake = (cls: string) => ({ cls, classList: { contains: (c: string) => c === cls } });
 
@@ -202,8 +169,6 @@ describe('navigationFocusTarget', () => {
   });
 
   it('falls back to the explainer when it is the only focusable', () => {
-    // A section title whose sole focusable IS its icon (Repositories)
-    // should still take focus rather than leaving the landing unfocused.
     const icon = fake('explainer-btn');
     expect(navigationFocusTarget([icon])).toBe(icon);
   });
@@ -213,26 +178,14 @@ describe('navigationFocusTarget', () => {
   });
 });
 
-// The keyboard "surface" each pane hands focus to. Drawer maps to the pane
-// container itself (its list-nav keydown handler lives there); thread/content map
-// to their scroll regions so native Arrow/Page keys scroll the focused pane.
 describe('PANE_FOCUS_REGION', () => {
   it('maps each pane to its scroll/keyboard-nav surface', () => {
-    // Thread is scoped to `.thread-view` so the compose/welcome `.thread-content`
-    // (no `.thread-view` wrapper, never focusable) is excluded — only a real
-    // thread's transcript matches.
     expect(PANE_FOCUS_REGION.thread).toBe('.thread-view .thread-content');
     expect(PANE_FOCUS_REGION.content).toBe('.content-pane-body');
-    // The drawer's tree, never the pane. A child of the live list, so a
-    // leaving drawing's copy never matches.
     expect(PANE_FOCUS_REGION.drawer).toBe('.thread-drawer-list > .thread-drawer-tree');
   });
 });
 
-// The per-pane Tab trap follows the marker, not DOM focus. A drawer row click
-// leaves the marker on the drawer. The thread switch then focuses the thread's
-// live choice card or prompt, and Tab jumped back into the drawer. A
-// programmatic focus into a pane must take the marker with it.
 describe('focusIntoPane', () => {
   afterEach(() => {
     document.body.innerHTML = '';
@@ -279,9 +232,6 @@ describe('focusIntoPane', () => {
   });
 });
 
-// Focus can enter a pane with no pointer and no app helper: a screen reader's
-// cursor, find-in-page, a test's `.focus()`. The marker must follow, or the next
-// Tab pulls focus out of the pane the reader is in.
 describe('installPaneFocusTracking', () => {
   let stop: (() => void) | null = null;
 
@@ -314,8 +264,6 @@ describe('installPaneFocusTracking', () => {
     const { pin, menu } = panes();
     stop = installPaneFocusTracking();
     pin.focus();
-    // `false` hands the step to the browser, which goes on to the next control
-    // in the same pane. Before the fix the trap pulled focus into the thread.
     expect(handlePaneTab(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(false);
     expect(document.activeElement).toBe(pin);
     menu.focus();
@@ -333,8 +281,6 @@ describe('installPaneFocusTracking', () => {
     expect(focusedPane.value).toBe('content');
   });
 
-  // A shortcut can move the marker while focus stays in a field. Coming back
-  // to the window refocuses that field, and must not undo the shortcut.
   it('ignores the refocus a returning window gives the retained element', () => {
     const { pin, menu } = panes();
     stop = installPaneFocusTracking();
@@ -355,11 +301,6 @@ describe('installPaneFocusTracking', () => {
   });
 });
 
-// The per-pane Tab trap's tabbable-elements query. A closed-but-mounted panel
-// (the thread drawer's filter view, `ThreadFilterCover`) marks itself `inert`
-// rather than unmounting, so its buttons stay real DOM. The browser already
-// skips `inert` content on Tab and refuses to focus it, so this query must
-// agree.
 describe('visibleFocusables', () => {
   it('excludes a button inside an inert wrapper', () => {
     const container = document.createElement('div');
@@ -393,8 +334,6 @@ describe('visibleFocusables', () => {
   });
 
   it('counts the container itself when it is a tab stop', () => {
-    // A stop that also holds controls, as a tree with a button inside would.
-    // Without it, Tab bounces on the control beside the stop forever.
     const stop = document.createElement('div');
     stop.tabIndex = 0;
     stubVisible(stop);
@@ -406,7 +345,6 @@ describe('visibleFocusables', () => {
   });
 
   it('skips a container removed from the tab order', () => {
-    // `.pane-thread` / `.pane-content` are tabindex=-1 and never a stop.
     const pane = document.createElement('div');
     pane.tabIndex = -1;
     stubVisible(pane);
@@ -414,8 +352,6 @@ describe('visibleFocusables', () => {
   });
 
   it('excludes a laid-out control under visibility: hidden', () => {
-    // A collapsed pane and the drawer list under the filter panel keep their
-    // boxes but hide by visibility. The browser refuses to focus them.
     const container = document.createElement('div');
     container.style.visibility = 'hidden';
     const button = document.createElement('button');
@@ -443,8 +379,6 @@ describe('visibleFocusables', () => {
   });
 
   it('a real control stays reachable beside an inert closed panel', () => {
-    // Mirrors the thread drawer: one live tabbable control alongside a
-    // closed, inert filter view holding several radio-row buttons.
     const container = document.createElement('div');
     const live = document.createElement('button');
     stubVisible(live);

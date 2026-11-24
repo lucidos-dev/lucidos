@@ -8,14 +8,6 @@ import {
 } from '../../store/actions/preferences';
 import { Explainer } from '../shared/Explainer';
 
-/** Common languages offered up-front; the field is freeText, so any other
- *  language name can still be typed. The value stored is the plain name the
- *  engine echoes back ("Respond in {language}").
- *
- *  A voice call reads the same value twice: the talker is told the name, and
- *  the transcriber is pinned to the ISO-639-1 code it maps to. A name outside
- *  this list still reaches the talker; only the code needs the mapping, which
- *  lives in the engine's `voice/language.rs`. */
 const COMMON_LANGUAGES = [
   'English',
   'Norwegian',
@@ -34,8 +26,6 @@ const COMMON_LANGUAGES = [
   'Korean',
 ];
 
-/** All IANA timezone names from the platform (one source of truth), falling back
- *  to a small common list on the rare engine without `Intl.supportedValuesOf`. */
 function timezoneOptions(current: string): DropdownOption[] {
   let zones: string[];
   try {
@@ -61,17 +51,10 @@ function timezoneOptions(current: string): DropdownOption[] {
       'Australia/Sydney',
     ];
   }
-  // Make sure the saved value is always selectable, even if the platform list
-  // omits it (stale alias, custom zone).
   if (current && !zones.includes(current)) zones = [current, ...zones];
   return zones.map((z) => ({ value: z, label: z }));
 }
 
-/** Language + timezone: global (workspace-wide) preferences, surfaced as their
- *  own Settings category so they're not LLM-only (the agent sets them via
- *  set_preference; this is the human-facing control). They rendered under
- *  Settings → System until 2026-08-05, which buried two of the most
- *  looked-for settings there are under a diagnostics page. */
 export function LocaleSection() {
   const language = currentLanguage();
   const timezone = currentTimezone();

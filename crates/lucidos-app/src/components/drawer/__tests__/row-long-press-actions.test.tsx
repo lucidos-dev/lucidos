@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A mobile drawer row has no ⋯, and a long press opens its actions instead.
- *
- * The trigger is a 31x27px box against the pane's right edge, the hardest place
- * on a phone to reach. Its menu opens in the same corner. So the mobile row
- * drops it and the whole row becomes the target.
- *
- * Rendered rather than poked through props, because the composition IS the
- * thing under test. The hold has to swallow its own paired click. The prefetch
- * has to survive that composition. And the trigger's absence is what publishes
- * the opener the hold calls.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { ThreadRow, ComposingThreadRow } from '../ThreadDrawer';
@@ -35,7 +23,6 @@ import { focusThread } from '../../../store/actions/threads';
 import { loadThreadEvents } from '../../../store/actions/thread-loading';
 import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 const THREAD_ID = 'row-1';
@@ -93,15 +80,11 @@ function overflowTrigger(): HTMLElement | null {
   return host.querySelector<HTMLElement>('button[aria-haspopup="menu"]');
 }
 
-/** The open menu lives in a portal outside `host`, so it is looked up on the
- *  document rather than in the render container. */
 function openMenu(): HTMLElement | null {
   return document.querySelector<HTMLElement>('.thread-overflow-menu');
 }
 
 function pointer(type: string, init: { clientX?: number; clientY?: number } = {}): PointerEvent {
-  // jsdom has no PointerEvent constructor, so a MouseEvent carrying the same
-  // fields stands in. `useLongPress` reads only `button` and `clientX/Y`.
   return new MouseEvent(type, {
     bubbles: true,
     cancelable: true,
@@ -111,16 +94,11 @@ function pointer(type: string, init: { clientX?: number; clientY?: number } = {}
   }) as unknown as PointerEvent;
 }
 
-/** Let Preact commit. It schedules a rerender on a microtask, and fake timers
- *  do not drive those. Without this an assertion right after a state change
- *  reads the previous frame. */
 async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
 
-/** Press, hold past the 450ms threshold, lift. The click the browser pairs
- *  with the lift is dispatched too: swallowing it is the contract. */
 async function hold(target: HTMLElement, moveTo?: { x: number; y: number }): Promise<void> {
   target.dispatchEvent(pointer('pointerdown'));
   if (moveTo) target.dispatchEvent(pointer('pointermove', { clientX: moveTo.x, clientY: moveTo.y }));
@@ -174,7 +152,6 @@ describe('the desktop row keeps its ⋯', () => {
 
   it('is what the keyboard shortcut looks up, inside the row', () => {
     mount(false);
-    // `openHighlightedThreadActions` finds the trigger by exactly this path.
     const found = host.querySelector(`[data-thread-nav="${THREAD_ID}"] button[aria-haspopup="menu"]`);
     expect(found).not.toBeNull();
   });
@@ -219,12 +196,6 @@ describe('the mobile gesture', () => {
     expect(loadThreadEvents).toHaveBeenCalledWith(THREAD_ID);
   });
 
-  // A second hold while the menu is up would re-open it the instant the first
-  // outside press dismissed it. Nothing in this hook stops that, and nothing
-  // needs to: an open overlay inerts the shell behind it, so the row takes no
-  // pointer at all. The exemption that would break it is `data-overlay-anchor`,
-  // and host-opened mode deliberately marks no anchor. Asserting the mechanism,
-  // because jsdom resolves no CSS and cannot show the effect.
   it('exempts nothing from the inert while open, so no second press can arm', async () => {
     mount(true);
     await hold(row());
@@ -241,9 +212,6 @@ describe('the mobile gesture', () => {
   });
 });
 
-// A compose draft row has no pin, so its ⋯ was the actions box's only child.
-// Kept on mobile, that box would be an empty flex item, opening the right
-// column's gap under the chips. So the row drops the box with the button.
 describe('a compose draft row', () => {
   function mountDraft(mobile: boolean): void {
     viewportIsMobile.value = mobile;

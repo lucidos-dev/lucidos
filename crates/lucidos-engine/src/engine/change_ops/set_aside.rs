@@ -8,7 +8,7 @@ const BRING_BACK_UNREADABLE: &str =
 
 /// What an Apply of a set-aside change answers. Every apply path guards on
 /// `pending`, so the user brings the change back first (ADR 0328).
-pub(crate) const SET_ASIDE_APPLY_REFUSAL: &str =
+pub const SET_ASIDE_APPLY_REFUSAL: &str =
     "This change is set aside. Bring it back before applying it.";
 
 impl LucidosEngine {
@@ -18,9 +18,10 @@ impl LucidosEngine {
     /// A user-facing caller asks `change_action_refusal` first. This refuses
     /// only what no caller may do: a change that is not pending, or one an
     /// apply or discard is already working on.
-    pub(crate) async fn set_aside_change(
+    pub async fn set_aside_change(
         &self,
         change_id: Uuid,
+        hold_id: Option<Uuid>,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Held across the read and the emit, so an apply cannot start between.
@@ -28,6 +29,9 @@ impl LucidosEngine {
             .apply_claims
             .try_claim(change_id)
             .ok_or(super::apply_claim::APPLY_IN_PROGRESS_MESSAGE)?;
+        if crate::engine::landing_lane::handoff_started(self.pool(), change_id).await? {
+            return Err(crate::engine::landing_lane::HELD_BY_LANDER.into());
+        }
         let change = self
             .changes()
             .get_by_id(change_id)
@@ -48,11 +52,23 @@ impl LucidosEngine {
                 None => {}
             }
         }
+        let hold_id = match (hold_id, change.thread_id) {
+            (None, Some(thread_id)) => {
+                crate::engine::thread_hold::hold_for_set_aside(
+                    &self.event_bus,
+                    thread_id,
+                    actor.clone(),
+                )
+                .await?
+            }
+            (hold_id, _) => hold_id,
+        };
         emit_change_status(
             &self.event_bus,
             change.thread_id.unwrap_or(change_id),
             crate::engine::thread_events::ThreadEvent::ChangeSetAside {
                 change_id: change_id.to_string(),
+                hold_id,
             },
             actor,
         )
@@ -77,7 +93,7 @@ impl LucidosEngine {
     /// Incomplete work never becomes a pending change (ADR 0400). Such a row
     /// is withdrawn instead, and its branch decided again as its last turn
     /// ended: proposed under a fresh id, or withheld with the real reason.
-    pub(crate) async fn bring_back_change(
+    pub async fn bring_back_change(
         &self,
         change_id: Uuid,
         actor: Option<MessageOrigin>,
@@ -104,7 +120,7 @@ impl LucidosEngine {
                 crate::engine::git_ops::branch_changed_files_checked(repo_root, &change.branch_name)
                     .await
             {
-                log!("[Changes] Bring back of {}: {}", change_id, e);
+                log_legacy!("[Changes] Bring back of {}: {}", change_id, e);
                 return Err(BRING_BACK_UNREADABLE.into());
             }
             let finished = withdraw_for_redecision(
@@ -115,7 +131,15 @@ impl LucidosEngine {
                 actor.clone(),
             )
             .await?;
-            self.redecide_branch_work(thread_id, &change.branch_name, repo_root, actor, finished)
+            self.agent_host()
+                .redecide_branch_work(
+                    self,
+                    thread_id,
+                    &change.branch_name,
+                    repo_root,
+                    actor,
+                    finished,
+                )
                 .await?;
             self.broadcast_changes_updated().await;
             return Ok(());
@@ -155,8 +179,8 @@ pub(crate) async fn withdraw_for_redecision(
     )
     .await?;
     Ok(
-        crate::engine::agent_recovery::last_turn_end(pool, thread_id).await
-            == Some(crate::engine::agent_recovery::TurnEnd::Finished),
+        crate::engine::coding_turn_end::last_turn_end(pool, thread_id).await
+            == Some(crate::engine::coding_turn_end::TurnEnd::Finished),
     )
 }
 

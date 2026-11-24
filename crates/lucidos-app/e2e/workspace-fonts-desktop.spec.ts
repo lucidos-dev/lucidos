@@ -1,16 +1,3 @@
-/**
- * A workspace font, end to end (ADR 0308): installed from Settings, picked with
- * Use, painted in the shell and in an app frame, and loaded from the local
- * engine only.
- *
- * Unit tests pin every rule. Only a browser shows the three halves agree. The
- * install writes what the engine lists. The shell registers the face from
- * `/data`. An opaque-origin app frame loads the same face through its frame
- * capability.
- *
- * Desktop-only because it walks the Settings panel at one width. Chromium is
- * the engine that enforces the CORS rule a frame's font load needs.
- */
 import { readFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -22,7 +9,6 @@ test.use({ viewport: { width: 1280, height: 900 } });
 
 const APP_ID = 'e2e-workspace-font-app';
 
-/** A real font, so the browser parses the face rather than rejecting it. */
 const FONT_BYTES = readFileSync(
   fileURLToPath(new URL('../src/assets/fonts/FiraCode-VF.woff2', import.meta.url)),
 );
@@ -48,8 +34,6 @@ test.describe('a workspace font', () => {
 </body>
 </html>
 `,
-      // The first family of --font-ui is the one the frame resolved. Its faces
-      // are then loaded and reported by status, so a refused face reads 'error'.
       js: `
 lucidos.ui.applyPreferences().then(function () {
   var ui = getComputedStyle(document.documentElement).getPropertyValue('--font-ui');
@@ -108,7 +92,6 @@ lucidos.ui.applyPreferences().then(function () {
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.getByRole('button', { name: 'Use' }).click();
 
-    // The shell paints it: the stack leads with the font, and its face loads.
     await expect
       .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--font-ui')))
       .toContain(`'${family}'`);
@@ -122,13 +105,7 @@ lucidos.ui.applyPreferences().then(function () {
     }, family);
     expect(status).toBe('loaded');
 
-    // An app frame, opaque-origin, paints the same font from the workspace.
-    // Seeded before the shell boots, as `app-frame-loads-fonts` does, so
-    // `loadApps()` restores the app through the real `AppUiInline`. The saved
-    // nav history is the other restore record, and it wins at load: it holds
-    // the Settings view this test opened, so it has to go.
     await page.addInitScript((id) => {
-      // An init script runs in EVERY frame, and the app frame's storage throws.
       if (window.parent !== window) return;
       localStorage.removeItem('lucidos-nav-history');
       localStorage.setItem('app-window-open', id);
@@ -140,7 +117,6 @@ lucidos.ui.applyPreferences().then(function () {
       timeout: 15_000,
     });
 
-    // Every font request went to the page's own origin: nothing third-party.
     const faceRequests = fontRequests.filter((url) => url.includes(`/data/fonts/${slug}/`));
     expect(faceRequests.length, 'the workspace face was requested').toBeGreaterThan(0);
     for (const url of fontRequests) {

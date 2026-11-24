@@ -6,33 +6,9 @@
 //! Plan: `docs/plans/2026-10-21-warn-triggers-on-plugin-knowhow-removal.md`.
 
 use super::config::{TriggerConfig, TriggerRun};
-use serde::{Deserialize, Serialize};
-
-/// A trigger, and the removed paths it relies on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AffectedTrigger {
-    pub trigger_id: String,
-    pub trigger_name: String,
-    pub paths: Vec<AffectedPath>,
-}
-
-/// One removed `data/`-relative path, and why the trigger relies on it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AffectedPath {
-    pub path: String,
-    pub reason: AffectedReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AffectedReason {
-    /// The intent text or the script path names the path.
-    NamedInRun,
-    /// The path is knowhow under the trigger's owning app.
-    OwningApp,
-    /// The path is knowhow under the trigger's own `triggers/<slug>/` folder.
-    TriggerKnowhow,
-}
+pub use crate::engine::thread_events::affected_trigger::{
+    AffectedPath, AffectedReason, AffectedTrigger,
+};
 
 /// Every trigger that relies on one of `removed`, sorted by name. A trigger
 /// owned by `plugin_id` is skipped: that plugin ships its intent and knowhow
@@ -267,6 +243,10 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            program_grants: vec![],
+            folder_grants: vec![],
+            program_denies: vec![],
+            folder_denies: vec![],
             coding_agent_grant: false,
             context_ceiling: None,
             mcp_servers: vec![],

@@ -53,22 +53,35 @@ pub(crate) fn app_is_hidden() -> bool {
 }
 
 /// Record an app-wide hide or unhide.
+#[cfg(any(target_os = "macos", test))]
 fn note_app_hidden(hidden: bool) {
     APP_HIDDEN.store(hidden, Ordering::SeqCst);
 }
 
 /// Must this window's page be running right now?
 ///
-/// Pure, and the one place the three axes are combined. Our own intent covers
-/// the hides the client performs, `app_hidden` covers Cmd-H, and `miniaturized`
+/// Pure, and the one place the axes are combined. Our own intent covers the
+/// hides the client performs, `app_hidden` covers Cmd-H, and `miniaturized`
 /// covers the yellow button. `[NSWindow isVisible]` is deliberately absent: it
 /// is the value under suspicion.
+///
+/// The fourth axis is WebKit's own verdict, which the page reports as
+/// `document.visibilityState`. A covered window is on screen by every axis
+/// above, yet WebKit suspends its page after a few minutes. That silence is
+/// expected, and a reload only wakes the page for seconds. So a page that
+/// reported hidden is left alone, but only while its window is not the key
+/// window. The key window is the one the user is clicking, which is where
+/// ADR 0180 found a wrong "hidden" and must keep recovering.
+/// ADR 0660 has the covered-window incident.
 pub(crate) fn page_should_be_running(
     shown_by_client: bool,
     app_hidden: bool,
     miniaturized: bool,
+    page_reported_hidden: bool,
+    key_window: bool,
 ) -> bool {
-    shown_by_client && !app_hidden && !miniaturized
+    let webkit_suspended_it = page_reported_hidden && !key_window;
+    shown_by_client && !app_hidden && !miniaturized && !webkit_suspended_it
 }
 
 /// Off macOS nothing hides a whole app behind the client's back.
@@ -122,11 +135,24 @@ mod tests {
     #[test]
     fn a_page_runs_only_while_its_window_is_on_screen() {
         // The ordinary case: the client showed it, nothing took it away.
-        assert!(page_should_be_running(true, false, false));
+        assert!(page_should_be_running(true, false, false, false, false));
         // The three ways a window leaves the screen, each on its own.
-        assert!(!page_should_be_running(false, false, false));
-        assert!(!page_should_be_running(true, true, false));
-        assert!(!page_should_be_running(true, false, true));
+        assert!(!page_should_be_running(false, false, false, false, false));
+        assert!(!page_should_be_running(true, true, false, false, false));
+        assert!(!page_should_be_running(true, false, true, false, false));
+    }
+
+    /// The incident: a covered window whose page WebKit suspended.
+    #[test]
+    fn a_covered_window_whose_page_reported_hidden_is_left_alone() {
+        assert!(!page_should_be_running(true, false, false, true, false));
+    }
+
+    /// ADR 0180's frozen-while-clicked recovery must survive: the key window is
+    /// watched whatever its page last reported.
+    #[test]
+    fn the_key_window_is_watched_even_when_its_page_reported_hidden() {
+        assert!(page_should_be_running(true, false, false, true, true));
     }
 
     #[test]

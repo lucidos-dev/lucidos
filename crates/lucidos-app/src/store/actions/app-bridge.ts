@@ -1,15 +1,6 @@
-/**
- * The host half of the app bridge: what the shell does on an isolated app
- * frame's behalf.
- *
- * An app frame runs in its own renderer process so it cannot freeze the shell,
- * and the price is an opaque origin. Its own `fetch` to the engine is
- * CORS-blocked, `EventSource` with it, and storage throws. The SDK sends those
- * over `postMessage` and this answers them.
- *
- * The app half is `packages/lucidos-sdk/src/_bridge.ts`. The reasoning is in
- * `docs/plans/2026-09-19-an-app-frame-cannot-starve-the-shell.md`.
- */
+import { retryTransportRead } from '../../../../../packages/lucidos-sdk/src/_transport';
+import { subscribeAppEvents, updateAppEventTypes, unsubscribeAppEvents, clearAppEventSubscribers, resetAppEventStream, postToFrame } from './app-frame-channel';
+export { askFrame, tellFrame, postToAppFrame, fanOutEventFrame, fanOutEventStreamStatus, frameEventTypes } from './app-frame-channel';
 
 import {
   APP_STORAGE_AREAS,
@@ -30,46 +21,19 @@ import { postClientLog } from '../../utils/clientLog';
 import { deviceIdHeader, readDeviceId } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
 import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
+import { peerClient } from '../../../../../packages/lucidos-sdk/src/_peerScope';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import { rawStorageKey } from '../../utils/workspaceStorage';
 import { focusedThreadId, showToast } from '../store';
 import { BRIDGED_FETCH_SLOTS, FetchLanes, type LanesSnapshot } from './bridgedFetchLanes';
-// The app half of the protocol. Relative, because the barrel does not export
-// the bridge; it has no import-time side effects.
 import {
-  BRIDGE_PUSH_TYPE,
   BRIDGE_REPLY_TYPE,
   BRIDGE_TYPE,
-  HOST_REPLY_TYPE,
-  HOST_REQUEST_TYPE,
   type BridgeOp,
   type WireBody,
   type WireRequest,
 } from '../../../../../packages/lucidos-sdk/src/_bridge';
 
-/**
- * The path this request will actually be sent to, or null if this app may not
- * make it at all.
- *
- * The answer is the engine's. `app_reach.rs` classifies every `/api/v1` route,
- * and a test there fails the build on a route that says nothing. The generated
- * table is what `appMayCall` reads (ADR 0231), and the host keeps no list of
- * its own: two would be one too many.
- *
- * Normalised FIRST, and the caller fetches what came back, so what was checked
- * and what is sent are the same string. Checking the raw path and sending it
- * separately is the whole bug class: the URL parser resolves a dot segment
- * afterwards, and it counts `%2e%2e` as one, so `/data/%2e%2e/credentials`
- * passes a literal `..` scan and lands on `/api/v1/credentials`.
- *
- * One rewrite happens after this, [`stampDeviceScope`], and it may touch a
- * query value only. The pathname it rebuilds from is the one checked here, so
- * the route cannot move. Anything else added between the check and the `fetch`
- * reopens the bug class above.
- *
- * `appId` is the calling app. Nothing reads it yet, and it is threaded through
- * so a per-app grant lands without re-plumbing the bridge.
- */
 export function resolveBridgePath(
   path: string,
   method = 'GET',
@@ -80,27 +44,12 @@ export function resolveBridgePath(
   return appMayCall(method, resolved.pathname, appId) ? resolved.full : null;
 }
 
-/** Whether the bridge may call this path at all. The resolver above is what
- *  the call itself goes through; this is for the tests and for a reader. */
 export function pathIsAllowed(path: string, method = 'GET'): boolean {
   return resolveBridgePath(path, method) !== null;
 }
 
-/** What a frame sends when it means "the device I am running on".
- *  Mirrors `THIS_DEVICE` in `packages/lucidos-sdk/src/preferences.ts`. */
 export const THIS_DEVICE = '@device';
 
-/**
- * Put the real device id where the frame asked for its own.
- *
- * Theme, font and scale are device-scoped, so a preference read with no device
- * gets only the global rows. The frame cannot name the device, because the id
- * is the one thing the isolation keeps from it. So it names itself and the host
- * answers with the id it stamps on the header anyway.
- *
- * Only `/preferences`, which is the only read scoped this way. Widening it to
- * every path would hand the id to whatever an endpoint chooses to echo.
- */
 function stampDeviceScope(path: string): string {
   const url = new URL(path, 'https://app.invalid');
   if (url.pathname !== '/preferences') return path;
@@ -111,11 +60,6 @@ function stampDeviceScope(path: string): string {
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
-/** Headers an app may not set on a bridged call.
- *
- *  `x-lucidos-*` is the engine's own namespace, and the device id inside it is
- *  what `api::actor` resolves the user from. The host stamps the real one after
- *  this, so letting an app supply one would let it name any device it liked. */
 function sanitizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(headers ?? {})) {
@@ -125,8 +69,6 @@ function sanitizeHeaders(headers: Record<string, string> | undefined): Record<st
   return out;
 }
 
-/** Rebuild the body the app flattened. `FormData` cannot cross a structured
- *  clone, so it arrived as its entries. */
 function fromWireBody(body: WireBody): BodyInit | null {
   switch (body?.kind) {
     case 'text': return body.value;
@@ -146,22 +88,12 @@ function headersToRecord(headers: Headers): Record<string, string> {
   return out;
 }
 
-/** The header naming the app a bridged call came from.
- *
- *  Stamped by the host, after [`sanitizeHeaders`] has dropped every
- *  `x-lucidos-*` the app supplied, so an app cannot name another app. The
- *  engine reads it to apply the same route table, which is defence in depth
- *  behind this check rather than the boundary itself (ADR 0231). */
 export const APP_ID_HEADER = 'x-lucidos-app-id';
 
-/** The answer to a call with no `timeoutMs`. */
 const DEFAULT_FETCH_TIMEOUT_MS = 30000;
 
-/** What a click sends. These calls skip the slots: they are rare and short, and
- *  one waiting behind an app's background work is the delay a user feels. */
 const USER_INTENT_PREFIX = '/ui/';
 
-/** The path this call may take, or an error naming why it may not. */
 function admittedPath(wire: WireRequest, appId: string | null): string {
   const method = wire.method || 'GET';
   const resolved = resolveBridgePath(wire.path, method, appId);
@@ -171,7 +103,6 @@ function admittedPath(wire: WireRequest, appId: string | null): string {
   return stampDeviceScope(resolved);
 }
 
-/** Make one engine call for an app, and flatten the answer for the wire. */
 async function sendBridgedFetch(
   wire: WireRequest,
   path: string,
@@ -186,7 +117,7 @@ async function sendBridgedFetch(
   if (registration) await registration;
   if (!restoreAdmissionReady()) await waitForRestoreAdmission();
   checkGeneration();
-  const res = await fetch(`${API}${path}`, {
+  const res = await retryTransportRead(() => fetch(`${API}${path}`, {
     method,
     headers: {
       ...sanitizeHeaders(wire.headers),
@@ -196,7 +127,7 @@ async function sendBridgedFetch(
     },
     body: fromWireBody(wire.body),
     signal: AbortSignal.timeout(timeoutMs),
-  });
+  }), { method }, checkGeneration);
   if (!restoreAdmissionReady()) await waitForRestoreAdmission();
   checkGeneration();
   const body = await res.arrayBuffer();
@@ -212,12 +143,10 @@ async function sendBridgedFetch(
 
 let fetchLanes = new FetchLanes<HTMLIFrameElement>(BRIDGED_FETCH_SLOTS);
 
-/** What the frames' engine calls are doing now. Read-only. */
 export function bridgedFetchSnapshot(): LanesSnapshot {
   return fetchLanes.snapshot();
 }
 
-/** Make one engine call for an app frame, in its turn. */
 function bridgedFetch(
   wire: WireRequest,
   appId: string | null,
@@ -232,184 +161,7 @@ function bridgedFetch(
   );
 }
 
-// ---------------------------------------------------------------------------
-// The event stream, fanned out
-// ---------------------------------------------------------------------------
 
-/** One app frame that asked for the stream: the element it is, and the event
- *  types it listens to. `null` takes every frame, as an SDK that names no
- *  types does. */
-interface SseSubscriber {
-  frame: HTMLIFrameElement;
-  types: ReadonlySet<string> | null;
-}
-
-/** App frames that asked for the stream. The shell holds ONE connection and
- *  relays to these, so ten open apps still cost one upstream. */
-const sseSubscribers = new Map<MessageEventSource, SseSubscriber>();
-
-/** The listened types a frame sent, or `null` when it named none. */
-function listenedTypes(args: unknown): ReadonlySet<string> | null {
-  const types = (args as { types?: unknown } | null)?.types;
-  if (!Array.isArray(types)) return null;
-  return new Set(types.filter((t): t is string => typeof t === 'string'));
-}
-
-/** The event types a frame dispatches to in the SDK: a thread event's own type
- *  and `ThreadEvent`, else the system event's type. Empty when unreadable. */
-export function frameEventTypes(data: string): string[] {
-  let parsed: { type?: unknown; data?: { event?: { type?: unknown } } } | null;
-  try {
-    parsed = JSON.parse(data);
-  } catch {
-    return [];
-  }
-  const outer = parsed?.type;
-  if (typeof outer !== 'string') return [];
-  if (outer !== 'ThreadEvent') return [outer];
-  const inner = parsed?.data?.event?.type;
-  return typeof inner === 'string' ? [inner, outer] : [outer];
-}
-
-/** Whether a subscriber listens to a frame of these types. A `*` listener
- *  takes them all (ADR 0432). */
-function wants(subscriber: SseSubscriber, types: () => readonly string[]): boolean {
-  if (!subscriber.types || subscriber.types.has('*')) return true;
-  return types().some((t) => subscriber.types!.has(t));
-}
-
-/** Whether the shell's stream is up RIGHT NOW, not whether it ever was.
- *
- *  A frame that subscribes to a live stream missed its `open`. So it gets one
- *  at once, as a port joining the shared worker does. Subscribing while the
- *  stream is down gets none: the app would re-read its data over a dead
- *  stream, then again on the real open. */
-let hostStreamOpen = false;
-
-/** Post to one app frame. Its origin is opaque, so `'*'` is the only target
- *  that reaches it; the message goes to that window object and no other. */
-function postToFrame(target: MessageEventSource, message: unknown): void {
-  (target as Window).postMessage(message, '*');
-}
-
-/** Relay one thing to every subscribed frame, dropping any that has gone.
- *
- *  `isConnected` on the element kept at subscribe time, never a fresh DOM
- *  query. This runs once per event-stream frame, and a streaming turn is
- *  thousands of them: a `querySelectorAll` per frame per subscriber would put
- *  work back on the main thread this change exists to protect. */
-function fanOut(payload: unknown, accepts: (subscriber: SseSubscriber) => boolean = () => true): void {
-  for (const [target, subscriber] of [...sseSubscribers]) {
-    if (!subscriber.frame.isConnected) {
-      sseSubscribers.delete(target);
-      continue;
-    }
-    if (accepts(subscriber)) postStreamTo(target, payload);
-  }
-}
-
-function postStreamTo(target: MessageEventSource, payload: unknown): void {
-  postToFrame(target, { type: BRIDGE_PUSH_TYPE, channel: 'sse', data: payload });
-}
-
-/** Push one thing to one app frame, on a named channel.
- *
- *  The fan-out above is for the event stream, where every subscriber gets the
- *  same payload. A renewed frame capability is per frame, so it goes straight
- *  to the element rather than through the subscriber map. */
-export function postToAppFrame(
-  frame: HTMLIFrameElement,
-  channel: string,
-  data: unknown,
-): boolean {
-  const target = frame.contentWindow;
-  if (!target) return false;
-  postToFrame(target, { type: BRIDGE_PUSH_TYPE, channel, data });
-  return true;
-}
-
-/** One event-stream frame, verbatim, to every app that listens to its type.
- *  The frame is parsed at most once, and only when a typed subscriber needs
- *  it: a streaming turn is thousands of frames. */
-export function fanOutEventFrame(data: string): void {
-  if (sseSubscribers.size === 0) return;
-  let types: string[] | null = null;
-  const frameTypes = () => (types ??= frameEventTypes(data));
-  fanOut({ kind: 'frame', data }, (subscriber) => wants(subscriber, frameTypes));
-}
-
-/** The upstream opened or dropped. An app re-reads its data on each open
- *  (`lucidos.sse.onOpen`), since nothing replays what landed in the gap. */
-export function fanOutEventStreamStatus(kind: 'open' | 'error'): void {
-  hostStreamOpen = kind === 'open';
-  if (sseSubscribers.size === 0) return;
-  fanOut({ kind });
-}
-
-// ---------------------------------------------------------------------------
-// The other direction: asking a frame to act
-// ---------------------------------------------------------------------------
-
-let askCounter = 0;
-
-/**
- * Ask one app frame to do something, and wait for its answer.
- *
- * The shell used to reach through `contentWindow` for these: reading
- * `lucidos._capture`, and driving `location.replace` to deliver a fragment. An
- * isolated frame denies both, so it does them for itself.
- *
- * `timeoutMs` bounds the wait, because the frame answering is the very thing
- * that may be wedged. A capture already had a deadline for that reason.
- */
-export function tellFrame(frame: HTMLIFrameElement, op: string, args: unknown): boolean {
-  const target = frame.contentWindow;
-  if (!target) return false;
-  // No id, so the frame owes no answer. A navigation has nothing useful to
-  // report back: whether the document loaded is the frame's `load` event, not
-  // a return value, exactly as `location.replace` never told the caller either.
-  target.postMessage({ type: HOST_REQUEST_TYPE, op, args }, '*');
-  return true;
-}
-
-export function askFrame(
-  frame: HTMLIFrameElement,
-  op: string,
-  args: unknown,
-  timeoutMs: number,
-): Promise<unknown> {
-  const target = frame.contentWindow;
-  if (!target) return Promise.reject(new Error('the app frame has no browsing context'));
-  const id = `host-${++askCounter}`;
-  return new Promise((resolve, reject) => {
-    const settle = (fn: () => void) => {
-      window.removeEventListener('message', onReply);
-      clearTimeout(timer);
-      fn();
-    };
-    const timer = setTimeout(
-      () => settle(() => reject(new Error(`the app did not answer "${op}" in ${timeoutMs}ms`))),
-      timeoutMs,
-    );
-    const onReply = (event: MessageEvent) => {
-      if (event.source !== target) return;
-      const data = event.data as { type?: string; id?: string; ok?: boolean; value?: unknown; error?: string } | null;
-      if (!data || data.type !== HOST_REPLY_TYPE || data.id !== id) return;
-      settle(() => (data.ok
-        ? resolve(data.value)
-        : reject(new Error(data.error || `the app refused "${op}"`))));
-    };
-    window.addEventListener('message', onReply);
-    target.postMessage({ type: HOST_REQUEST_TYPE, id, op, args }, '*');
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Storage, on the app's behalf
-// ---------------------------------------------------------------------------
-
-/** What a frame sent for a storage op. Every field crossed a `postMessage`
- *  from app code, so each is checked before use. */
 interface StorageArgs {
   space?: unknown;
   area?: unknown;
@@ -444,17 +196,12 @@ function browserStore(area: AppStorageArea): Storage {
     const store = area === 'session' ? sessionStorage : localStorage;
     if (store) return store;
   } catch {
-    // Falls through to the refusal: a disabled store is reported, not hidden.
   }
   throw new Error('Browser storage is unavailable here');
 }
 
-/** Where one app's keys in one space sit in the shell's storage, as stored.
- *
- *  Raw, so a walk over `Storage.key(i)` finds them. The workspace override
- *  rewrites every key it writes, and `key(i)` is not wrapped. */
 function storedPrefix(appId: string, space: AppStorageSpace): string {
-  return rawStorageKey(appStoragePrefix(appId, space), WORKSPACE_ID);
+  return rawStorageKey(appStoragePrefix(appId, space), WORKSPACE_ID, peerClient());
 }
 
 function entriesUnder(store: Storage, prefix: string): Array<[string, string]> {
@@ -468,16 +215,6 @@ function entriesUnder(store: Storage, prefix: string): Array<[string, string]> {
   return out;
 }
 
-/**
- * Everything this app has stored, in one answer.
- *
- * One call rather than a read per key, because the SDK's readers are
- * synchronous and `postMessage` is not. The app mirrors this and serves its
- * reads from the mirror, so nothing downstream has to learn to wait.
- *
- * An area the browser keeps disabled primes empty, so the other still answers.
- * A write to it is still refused, by `browserStore`.
- */
 function storagePrime(appId: string): AppStorageSnapshot {
   const snapshot = emptyAppStorageSnapshot();
   for (const area of APP_STORAGE_AREAS) {
@@ -500,8 +237,6 @@ function storageSet(appId: string, args: StorageArgs): null {
   const value = storageString(args, 'value');
   const store = browserStore(area);
   const prefix = storedPrefix(appId, space);
-  // Checked here as well as in the SDK, in both spaces, because the frame is
-  // not trusted and names the space itself.
   const refusal = appStorageRefusal(entriesUnder(store, prefix), key, value, space);
   if (refusal) throw new Error(refusal);
   try {
@@ -528,19 +263,12 @@ function storageClear(appId: string, args: StorageArgs): null {
   return null;
 }
 
-/**
- * Forget everything a deleted app stored on this device, in both spaces and
- * both areas. An app later installed under the same id then starts empty.
- *
- * Only a device with the shell open when the delete lands clears here. Another
- * device clears nothing until it hears of a delete itself (ADR 0372).
- */
 export function clearAppStorage(appId: string): void {
   let prefixes: string[];
   try {
     prefixes = APP_STORAGE_SPACES.map((space) => storedPrefix(appId, space));
   } catch {
-    return; // an id storage cannot scope by never stored anything
+    return;
   }
   for (const area of APP_STORAGE_AREAS) {
     let store: Storage;
@@ -553,13 +281,6 @@ export function clearAppStorage(appId: string): void {
   }
 }
 
-/**
- * Run one storage op for the app this frame belongs to.
- *
- * The app comes from the host's own element, never from the message. A frame
- * with no app has no storage. A failure in the `app` space is the app's data,
- * so the user is told as well as the app.
- */
 function runStorageOp(
   frame: HTMLIFrameElement,
   args: unknown,
@@ -578,26 +299,15 @@ function runStorageOp(
         key: `app-storage:${appId}`,
       });
     } else {
-      // The SDK's own write is a scroll position saved on pagehide, with no
-      // user action behind it and no reply owed. The next save retries it, and
-      // a full store also fails the app's own writes, which toast.
       console.warn(`[app-bridge] app "${appId}" could not keep its scroll position:`, message);
     }
     throw error;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Frame breadcrumbs
-// ---------------------------------------------------------------------------
 
-/** The frame's detail is its own claim and can be any size. The engine answers
- *  400 over 4 KB of UTF-8 and would lose the line, so an oversized detail is
- *  dropped. Counted in bytes, since non-Latin text takes up to 3 per unit. */
 const MAX_BREADCRUMB_DETAIL_BYTES = 2000;
 
-/** Write a frame's breadcrumb to the engine log as `[Client/<category>]`.
- *  The app id comes from the element the host mounted, never from the frame. */
 function logAppBreadcrumb(category: 'app-link' | 'app-fullscreen', args: unknown, appId: string | null): void {
   const { step, ...detail } = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>;
   const fits = new TextEncoder().encode(JSON.stringify(detail)).length <= MAX_BREADCRUMB_DETAIL_BYTES;
@@ -607,13 +317,7 @@ function logAppBreadcrumb(category: 'app-link' | 'app-fullscreen', args: unknown
   });
 }
 
-// ---------------------------------------------------------------------------
-// The router
-// ---------------------------------------------------------------------------
 
-/** `op` is typed by the app half's own list, so an arm naming an op the SDK
- *  does not send fails to compile. The value came off the wire, so the default
- *  arm still answers anything else. */
 async function runOp(
   op: BridgeOp,
   args: unknown,
@@ -621,17 +325,19 @@ async function runOp(
   frame: HTMLIFrameElement,
 ): Promise<unknown> {
   switch (op) {
+    case 'media.poster': {
+      const { mediaPoster } = await import('./app-media-bridge');
+      return mediaPoster(args, frame);
+    }
     case 'fetch': return bridgedFetch(args as WireRequest, appIdForFrame(frame), frame);
     case 'sse.open':
-      sseSubscribers.set(source, { frame, types: listenedTypes(args) });
-      if (hostStreamOpen) postStreamTo(source, { kind: 'open' });
+      subscribeAppEvents(source, frame, args);
       return null;
     case 'sse.types': {
-      const subscriber = sseSubscribers.get(source);
-      if (subscriber) subscriber.types = listenedTypes(args);
+      updateAppEventTypes(source, args);
       return null;
     }
-    case 'sse.close': sseSubscribers.delete(source); return null;
+    case 'sse.close': unsubscribeAppEvents(source); return null;
     case 'storage.prime': return runStorageOp(frame, args, storagePrime);
     case 'storage.set': return runStorageOp(frame, args, storageSet);
     case 'storage.remove': return runStorageOp(frame, args, storageRemove);
@@ -643,17 +349,6 @@ async function runOp(
   }
 }
 
-/**
- * Answer app frames for as long as the shell is up.
- *
- * Two guards run before anything else. The message must carry the bridge's own
- * type, so the host's other frame protocols are untouched. The sender must be a
- * mounted app frame, checked against the live DOM by `contentWindow` identity.
- * An opaque origin cannot forge that, and `event.origin` cannot answer it.
- *
- * Every op is awaited and its outcome posted back. So a failure reaches the app
- * as a rejected SDK call, never as a promise that does not settle.
- */
 export function installAppBridge(): () => void {
   const onMessage = (event: MessageEvent) => {
     const data = event.data as { type?: string; id?: string; op?: string; args?: unknown } | null;
@@ -677,14 +372,12 @@ export function installAppBridge(): () => void {
   window.addEventListener('message', onMessage);
   return () => {
     window.removeEventListener('message', onMessage);
-    sseSubscribers.clear();
+    clearAppEventSubscribers();
   };
 }
 
-/** Test-only: forget every subscriber so module state cannot leak between
- *  cases. Not part of the runtime surface. */
 export function _resetAppBridgeForTesting(): void {
-  sseSubscribers.clear();
+  clearAppEventSubscribers();
   fetchLanes = new FetchLanes(BRIDGED_FETCH_SLOTS);
-  hostStreamOpen = false;
+  resetAppEventStream();
 }

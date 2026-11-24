@@ -1,14 +1,3 @@
-/**
- * The Animation speed slider's scale: the computed, the TS helper, and the two
- * things that would silently undo them.
- *
- * `durationScale` is the reciprocal of `speedMultiplier`, published to CSS as
- * `--duration-scale` (every `--duration-*` token folds it in) and read in TS by
- * `scaledDurationMs`. The second half is the one that rots: a timer that exists
- * to outlive a CSS transition has no compile-time link to the token it mirrors,
- * so scaling the CSS while leaving the timer fixed desyncs the pair at any
- * setting but 1x. The call-site scan at the bottom is that link.
- */
 import { describe, it, expect, afterEach, beforeAll } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -21,8 +10,6 @@ import { animationSpeed, durationScale, scaledDurationMs } from '../store';
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(resolve(here, rel), 'utf8');
 
-/** Every `--duration-scale` write the publishing effect makes, newest last.
- *  The test-setup stub discards them, so record before importing effects. */
 const published: string[] = [];
 
 beforeAll(async () => {
@@ -41,21 +28,17 @@ afterEach(() => {
 
 describe('durationScale', () => {
   it('is 1 at the slider centre', () => {
-    // The untouched-slider case: nobody who never opens the setting may notice
-    // that any of this exists.
     expect(durationScale.value).toBe(1);
   });
 
   it('is the reciprocal of the speed', () => {
-    animationSpeed.value = 10; // 10x faster
+    animationSpeed.value = 10;
     expect(durationScale.value).toBeCloseTo(0.1, 10);
-    animationSpeed.value = -10; // 10x slower
+    animationSpeed.value = -10;
     expect(durationScale.value).toBeCloseTo(10, 10);
   });
 
   it('is published to CSS on every change', () => {
-    // Without this the CSS side is inert: the token default holds and every
-    // transition runs at 1x whatever the slider says.
     animationSpeed.value = -10;
     expect(published[published.length - 1]).toBe('10');
     animationSpeed.value = 10;
@@ -76,10 +59,6 @@ describe('scaledDurationMs', () => {
   });
 });
 
-/** Every timer that exists to outlive a CSS transition, with the expression it
- *  must use. Each keeps its safety slack OUTSIDE the scaled call: slack is a
- *  fixed margin, not animation, so scaling it too would balloon to a second of
- *  dead time at 0.1x and shrink below usefulness at 10x. */
 const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
   {
     file: '../../components/layout/splitHelpers.ts',
@@ -181,10 +160,6 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     expr: /scaledDurationMs\(MODAL_FADE_MS\) \+ MODAL_FADE_SLACK_MS/,
     what: "removes a closed modal's exit drawing once its fade has run",
   },
-  // The only entry whose transition is INLINE rather than a token. The FLIP
-  // writes `transform` and `height` durations onto the element itself, so
-  // nothing in the CSS carries the scale for it. Both come off the same
-  // `scaledDurationMs(PROMPT_FLIP_MS)` this timer does.
   {
     file: '../../components/layout/ThreadPane.tsx',
     expr: /scaledDurationMs\(PROMPT_FLIP_MS\) \+ 100/,

@@ -14,6 +14,7 @@ function setup() {
   const reference = { pageId: 'page', generation: 'old', sourceThreadId: 'source' };
   const store = {
     readRecoveries: vi.fn(async () => [record]),
+    materializeDraft: vi.fn(async (draft: unknown) => draft),
     prepareRecovery: vi.fn(async () => ({ generation: 'current', drafts: [{ sourceThreadId: 'source', threadId: 'copy' }], completed: [] as string[] })),
     completeRecoveryDraft: vi.fn(async () => {}),
   } as unknown as RestoreIntentStore;
@@ -74,4 +75,15 @@ describe('explicit restore source review', () => {
     effects.readLiveOwners.mockImplementation(async () => { revoke(); return null; });
     await expect(readRestoreSourceReview(store, effects)).rejects.toThrow('connection changed');
   });
+});
+
+it('checks the connection lease after loading the selected retained draft', async () => {
+  const { store, effects, reference, revoke } = setup();
+  vi.mocked(store.materializeDraft).mockImplementation(async () => {
+    revoke();
+    return { threadId: 'source', draft: { text: 'original', image_hashes: [], mode: null }, selection: {} };
+  });
+  await expect(copyRestoreSourceForReview(store, 'current', reference, effects)).rejects.toThrow('connection changed');
+  expect(effects.createDraftIfAbsent).not.toHaveBeenCalled();
+  expect(store.completeRecoveryDraft).not.toHaveBeenCalled();
 });

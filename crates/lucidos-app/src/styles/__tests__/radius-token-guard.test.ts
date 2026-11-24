@@ -1,18 +1,3 @@
-/**
- * Every corner in the shell follows the theme's three shape tokens, so a theme
- * can square the whole UI:
- *
- *   - `--radius-control` for buttons, inputs, chips and rows;
- *   - `--radius-surface` for cards, panels, the composer and dialogs;
- *   - `--radius-round` for circles and pills.
- *
- * A component that wants a bigger or smaller corner scales a token with
- * `calc()`. A literal radius is a corner no theme can reach. That is how the
- * composer box stayed round under a theme that set both tokens to 0.
- *
- * Two exemptions stay round in every theme, a square one included: spinners,
- * and the badges on icons. A square count reads as a key cap, not a mark.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -26,11 +11,8 @@ import { cssRules, rulesTargeting, selectorList, styleSheetPaths } from './css-r
 const here: string = dirname(fileURLToPath(import.meta.url));
 const src: string = resolve(here, '../..');
 
-/** Spinners keep a true circle: a rotating square reads as a glitch. */
 const SPINNERS = new Set(['.mini-spinner']);
 
-/** Every badge class. They take ONE pill corner, in badges.css, which no
- *  radius token reaches. */
 const BADGES = [
   '.badge',
   '.drawer-badge',
@@ -41,8 +23,6 @@ const BADGES = [
   '.system-attention-badge',
   '.brand-menu-refresh-badge',
 ];
-/** Modifiers a badge always wears beside a base class above. A corner set
- *  through one of them would beat the shared rule just the same. */
 const BADGE_MODIFIERS = [
   '.brand-badge',
   '.brand-badge-dot',
@@ -53,7 +33,6 @@ const BADGE_SHEET: string = resolve(src, 'styles/badges.css');
 const isBadgeCornerRule = (path: string, selector: string): boolean =>
   path === BADGE_SHEET && selectorList(selector).every(s => BADGES.includes(s));
 
-/** The corners of a radius value, split on top-level spaces and the slash. */
 function corners(value: string): string[] {
   const out: string[] = [];
   let depth = 0;
@@ -72,7 +51,6 @@ function corners(value: string): string[] {
   return out;
 }
 
-/** A corner a theme reaches: zero, inherited, or built on a radius token. */
 const followsTheTheme = (corner: string): boolean =>
   corner === '0' || corner === 'inherit' || /var\(--[a-z-]*radius/.test(corner);
 

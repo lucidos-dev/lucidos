@@ -1,6 +1,8 @@
 use super::*;
+use crate::core::store::integrated::handed_up_branch;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::record_hardened;
+use crate::engine::thread_events::IntegratedBranch;
 use crate::engine::thread_events::{
     ActorMode, EventChannel, EventMeta, ThreadEvent, UnproposedReason,
 };
@@ -14,6 +16,7 @@ async fn start_session(bus: &EventBus, thread_id: Uuid, branch: &str, integrated
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: branch.into(),
@@ -119,6 +122,7 @@ async fn an_integrated_branch_with_its_own_change_needs_the_full_tier() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: Uuid::new_v4().to_string(),
             description: Some("work".into()),
             files: vec!["a.rs".into()],
@@ -154,12 +158,17 @@ async fn an_integrated_branch_with_its_own_change_needs_the_full_tier() {
 /// The `lucidos spawn-thread` request for a coding-agent child of `parent`.
 fn agent_chat_spawn(child: Uuid, parent: Uuid, integrated: bool) -> ThreadQueueRequest {
     ThreadQueueRequest::AgentChat {
+        user_addressing: None,
         depth: 0,
         message: "follow up on the sweep".into(),
         thread_id: child,
         event_id: None,
         image_hashes: vec![],
         device_id: None,
+        app_context: None,
+        file_context: None,
+        url_context: None,
+        conflict_change_id: None,
         model: None,
         reasoning_effort: None,
         provider: None,
@@ -307,7 +316,7 @@ async fn a_child_hands_up_its_branch_only_once_its_work_waits_for_the_parent() {
         .await
         .expect("record the fast marker");
     let withhold = |reason| {
-        crate::engine::change_ops::emit_proposal_withheld(&bus, child, branch, &[], reason)
+        crate::engine::change_ops::emit_proposal_withheld(&bus, child, branch, &[], reason, false)
     };
 
     withhold(UnproposedReason::HardeningMissing).await;

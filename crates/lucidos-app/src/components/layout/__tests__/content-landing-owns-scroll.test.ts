@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A landing on a row owns the content pane's scroll, so the pane's scroll
- *  memory stands down for that open. Otherwise it restores a saved position
- *  over the landing (`e2e/shortcut-search-landing-desktop.spec.ts`). */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createContentLandingClaim } from '../contentLanding';
 import { applyNavFocus, clearNavFocus } from '../../shared/focusMarker';
@@ -45,8 +42,6 @@ describe('the content landing claim', () => {
     expect(claims('files', body)).toBe(false);
   });
 
-  // They wait on data and can linger (a plugin row a filter hides), and the
-  // view must still be placed meanwhile.
   it('ignores a plugin or trigger target still waiting', () => {
     pluginScrollTarget.value = 'hidden-plugin';
     triggerScrollTarget.value = 'some-trigger';
@@ -59,8 +54,6 @@ describe('the content landing claim', () => {
     expect(claims(SHORTCUTS, body)).toBe(true);
   });
 
-  // The dead-link rescue asks again seconds later. A reader who dismissed the
-  // marker without scrolling must not be moved off the row.
   it('holds the claim after the marker is dismissed, for the same visit', () => {
     markRowIn(body);
     expect(claims(SHORTCUTS, body)).toBe(true);

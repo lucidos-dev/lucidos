@@ -62,7 +62,7 @@ describe('buildFolderTree', () => {
       'src/utils/format.ts',
       'README.md',
     ]);
-    expect(tree.files).toHaveLength(1); // README.md at root
+    expect(tree.files).toHaveLength(1);
     expect(tree.children.src.children.api.files).toHaveLength(2);
     expect(tree.children.src.children.utils.files).toHaveLength(1);
   });
@@ -80,7 +80,6 @@ describe('buildFolderTree', () => {
 });
 
 describe('repo store actions', () => {
-  // Dynamic imports to avoid signal initialization order issues
   let repoSource: typeof import('../../../store/store').repoSource;
   let repoFiles: typeof import('../../../store/store').repoFiles;
   let repoDiff: typeof import('../../../store/store').repoDiff;
@@ -103,7 +102,6 @@ describe('repo store actions', () => {
     selectedLines = store.selectedLines;
     toggleRepoFolder = actions.toggleRepoFolder;
 
-    // Reset to defaults
     repoSource.value = null;
     repoFiles.value = { status: 'not-loaded' };
     repoDiff.value = { status: 'not-loaded' };

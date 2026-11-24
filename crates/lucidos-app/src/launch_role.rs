@@ -13,8 +13,37 @@ pub enum LaunchRole {
     Version,
     /// `--service`: the headless launchd role (`desktop::run_service`).
     Service,
+    /// Fresh, bounded packaged smoke service.
+    DisposableService(Vec<OsString>),
+    /// Detached relaunch diagnostics, with no Tauri or client lock.
+    CaptureClientRelaunchLog,
+    /// One outcome from the detached relaunch watcher.
+    RecordClientRelaunch(RelaunchOutcome),
     /// Every other launch: the GUI client.
     Client,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaunchOutcome {
+    PreviousClientStillRunning,
+    ClientObserved,
+    AttemptsExhausted,
+}
+
+impl RelaunchOutcome {
+    const ALL: [Self; 3] = [
+        Self::PreviousClientStillRunning,
+        Self::ClientObserved,
+        Self::AttemptsExhausted,
+    ];
+
+    pub(crate) fn arg(self) -> &'static str {
+        match self {
+            Self::PreviousClientStillRunning => "--record-relaunch-client-still-running",
+            Self::ClientObserved => "--record-relaunch-client-observed",
+            Self::AttemptsExhausted => "--record-relaunch-attempts-exhausted",
+        }
+    }
 }
 
 /// Decide the role from a full argv, executable path included.
@@ -28,6 +57,15 @@ pub fn launch_role(args: impl IntoIterator<Item = OsString>) -> LaunchRole {
     let has = |flag: &str| flags.iter().any(|a| a == OsStr::new(flag));
     if has("--version") || has("-V") {
         LaunchRole::Version
+    } else if has("--disposable-service") || has("--disposable-supervisor") {
+        LaunchRole::DisposableService(flags)
+    } else if has("--capture-client-relaunch-log") {
+        LaunchRole::CaptureClientRelaunchLog
+    } else if let Some(outcome) = RelaunchOutcome::ALL
+        .into_iter()
+        .find(|outcome| has(outcome.arg()))
+    {
+        LaunchRole::RecordClientRelaunch(outcome)
     } else if has("--service") {
         LaunchRole::Service
     } else {
@@ -54,6 +92,44 @@ mod tests {
         ))
         .chain(words.iter().map(OsString::from))
         .collect()
+    }
+
+    #[test]
+    fn disposable_launch_never_enters_the_persistent_service_or_client() {
+        assert!(matches!(
+            launch_role(argv(&["--disposable-service", "/tmp/run", "5300"])),
+            LaunchRole::DisposableService(_)
+        ));
+        assert!(matches!(
+            launch_role(argv(&["--service", "--disposable-service"])),
+            LaunchRole::DisposableService(_)
+        ));
+        assert_eq!(
+            launch_role(argv(&["--disposable-service", "--version"])),
+            LaunchRole::Version
+        );
+    }
+
+    #[test]
+    fn relaunch_capture_is_headless_and_version_still_wins() {
+        assert_eq!(
+            launch_role(argv(&["--capture-client-relaunch-log"])),
+            LaunchRole::CaptureClientRelaunchLog
+        );
+        assert_eq!(
+            launch_role(argv(&["--capture-client-relaunch-log", "--version"])),
+            LaunchRole::Version
+        );
+    }
+
+    #[test]
+    fn each_watcher_outcome_selects_a_headless_role() {
+        for outcome in RelaunchOutcome::ALL {
+            assert_eq!(
+                launch_role(argv(&[outcome.arg()])),
+                LaunchRole::RecordClientRelaunch(outcome)
+            );
+        }
     }
 
     #[test]

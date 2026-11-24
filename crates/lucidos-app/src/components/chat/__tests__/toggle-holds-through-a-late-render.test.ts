@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// Stub HTMLElement before importing the modules that reference it, exactly as
-// the sibling scroll suites do.
 if (typeof (globalThis as any).HTMLElement === 'undefined') {
   (globalThis as any).HTMLElement = class {};
 }
@@ -17,24 +15,6 @@ import { mockStyle } from './scroll-test-helpers';
 import { anchorSpacer } from '../anchorCorrection';
 import { readerGestureForTest, setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
-/**
- * **A turn control holds its control when the render lands after the correction.**
- *
- * Reported on the desktop app: "Show the latest answer only", pressed on the
- * last turn, sent the reader to the bottom of the thread. That turn did not
- * change at all, and every turn above it shrank.
- *
- * Two things lined up, both WebKit's:
- *
- * - The freeze itself moves the control. WebKit drops the scrollbar gutter
- *   under `overflow: hidden`, which rewraps every line, so the synchronous
- *   check read a change and corrected before the render had happened.
- * - The render then shrank the transcript under the reader, and the browser
- *   clamped the offset to the bottom. The re-assert read that clamp as the
- *   reader scrolling away, and stood down.
- *
- * The numbers are the reported thread's, measured in Playwright's WebKit.
- */
 describe('a turn control holds its control through a late render', () => {
   const VIEWPORT = 573;
   const TALL = 6500;
@@ -42,13 +22,8 @@ describe('a turn control holds its control through a late render', () => {
   const ANCHOR_TALL = 4860;
   const ANCHOR_SHORT = 2941;
   const START = 4820;
-  /** Where holding the control puts the reader: the whole shrink was above it. */
-  const HELD = START - (ANCHOR_TALL - ANCHOR_SHORT); // 2901
-  /** When the render commits: after the press's own correction has run, and
-   *  before the first re-assert frame. The async timer advance flushes
-   *  microtasks, so the correction runs where a browser runs it. */
+  const HELD = START - (ANCHOR_TALL - ANCHOR_SHORT);
   const RENDER_AT = 10;
-  /** How far the freeze's gutter reflow moves the control, as measured. */
   const FREEZE_REFLOW = 9;
 
   function makeContainer() {
@@ -60,7 +35,6 @@ describe('a turn control holds its control through a late render', () => {
       clientWidth: 800,
       clientHeight: VIEWPORT,
       offsetHeight: VIEWPORT,
-      /** Every position the container was left at, in order. */
       settled: [] as number[],
       _scrollTop: START,
       _scrollHeight: TALL,
@@ -85,8 +59,6 @@ describe('a turn control holds its control through a late render', () => {
     return el;
   }
 
-  /** The pressed control. While the container is frozen it reads the gutter
-   *  reflow on top of its real offset, as WebKit's layout does. */
   function makeAnchor(container: any) {
     const a: any = {
       isConnected: true,
@@ -101,7 +73,6 @@ describe('a turn control holds its control through a late render', () => {
     return a;
   }
 
-  /** The render the press asks for: every turn above the control shrinks. */
   function render(el: any, anchor: any) {
     anchor.offsetTop = ANCHOR_SHORT;
     el.scrollHeight = SHORT;
@@ -121,8 +92,6 @@ describe('a turn control holds its control through a late render', () => {
   });
 
   it('holds the control for a reader who scrolled to it just before pressing', async () => {
-    // The ordinary way to reach a control. That scroll is still inside the
-    // reader-gesture window when the press lands, and must not end its re-assert.
     const el = makeContainer();
     const anchor = makeAnchor(el);
     setActiveScrollElement(el);
@@ -151,7 +120,6 @@ describe('a turn control holds its control through a late render', () => {
     readerGestureForTest(el);
     await vi.advanceTimersByTimeAsync(1500);
 
-    // Nothing wrote past the reader: the offset is where the render's clamp left it.
     expect(el.scrollTop).toBe(SHORT - VIEWPORT);
   });
 
@@ -166,7 +134,6 @@ describe('a turn control holds its control through a late render', () => {
     });
     await vi.advanceTimersByTimeAsync(1500);
 
-    // The reported bug left the reader on the clamp, at the bottom.
     expect(el.scrollTop).not.toBe(SHORT - VIEWPORT);
     expect(el.scrollTop).toBe(HELD);
     expect(anchor.getBoundingClientRect().top).toBe(before);
@@ -181,8 +148,6 @@ describe('a turn control holds its control through a late render', () => {
     withScrollAnchor(anchor, () => render(el, anchor));
     vi.advanceTimersByTime(1500);
 
-    // The render's own clamp, then the correction, and nothing between. A
-    // correction read in the frozen layout lands 9px off for a frame first.
     expect(el.settled).toEqual([SHORT - VIEWPORT, HELD]);
     expect(anchor.getBoundingClientRect().top).toBe(before);
   });

@@ -1,7 +1,5 @@
 // @vitest-environment jsdom
-// This file renders markdown, and the sanitizer runs on a real DOM.
-// The default `node` environment has none.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -9,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import * as QuestionCardModule from '../QuestionCard';
+import * as questionActions from '../../../store/actions/chat-claude-code';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import {
@@ -45,13 +44,6 @@ describe('OptionIndicator', () => {
   });
 });
 
-// The agent used to author an "Other, I'll type it" option because nothing on
-// a card with options said the two real escapes existed. Naming them is what
-// fixed that, but the card is the wrong surface for it: a guide line under the
-// options sat a few pixels above the textarea it pointed at, and said the same
-// thing that textarea's own placeholder says. The prompt row owns both halves
-// now, one on each control: the textarea's placeholder names typing, the Cancel
-// button's tooltip names Cancel.
 describe('the card carries no hint of its own', () => {
   const SOURCE = readFileSync(
     resolve(dirname(fileURLToPath(import.meta.url)), '../QuestionCard.tsx'),
@@ -63,10 +55,6 @@ describe('the card carries no hint of its own', () => {
     expect(Object.keys(QuestionCardModule).filter(k => /hint/i.test(k))).toEqual([]);
   });
 
-  // "custom answer", not "your answer": the placeholder has to read as a peer of
-  // the card's options rather than as composer chrome. Short and unpunctuated
-  // for the same reason, since a placeholder that wraps to two lines of grey
-  // text at 125% scale in monospace is the first thing the eye skips.
   it('leaves the typing escape to the prompt placeholder, in one short line', () => {
     expect(PLACEHOLDER_ANSWERING).toContain('Type');
     expect(PLACEHOLDER_ANSWERING).toContain('custom answer');
@@ -74,25 +62,16 @@ describe('the card carries no hint of its own', () => {
     expect(PLACEHOLDER_ANSWERING).not.toContain('.');
   });
 
-  // The other half of the pair: what the red button does to a pending question
-  // is spelled out nowhere else, so the tooltip carries it.
   it('leaves the Cancel escape to the prompt row Cancel tooltip', () => {
     expect(ANSWER_CANCEL_TOOLTIP).toContain('Cancel');
     expect(ANSWER_CANCEL_TOOLTIP).toContain('ask something else');
   });
 
-  // Pin the WIRING, not just the wording. While both halves lived in one string
-  // the placeholder assertion covered them together; split across two controls,
-  // a refactor that drops the tooltip leaves the constant (and the assertion
-  // above) intact while the escape goes unnamed on screen. Source-scan for the
-  // same reason as prompt-answer-no-images.test.ts: mounting PromptInput drags
-  // in every chat signal and store.
   it('wires that tooltip onto the lone Cancel in PromptInput', () => {
     const promptSource = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../PromptInput.tsx'),
       'utf8',
     );
-    // Lone Cancel: question card gets the wording, a permission card keeps Stop.
     expect(promptSource).toMatch(
       /data-tooltip=\{answeringQuestionCard\s*\?\s*ANSWER_CANCEL_TOOLTIP\s*:\s*tooltipWithShortcut\('Stop', 'stopThread'\)\}/,
     );
@@ -118,9 +97,6 @@ describe('AnsweredBody — Canceled state', () => {
     expect(text).not.toContain('question-canceled-badge');
   });
 
-  // Nobody chose this outcome, so the card states it rather than rendering a
-  // picked affordance. Reading "Canceled" here would blame the user for
-  // dismissing a question they actually replied past.
   it('renders a plain note for a Superseded answer, never the Cancel affordance', () => {
     const text = vnodeToText(AnsweredBody({
       threadId: 't',
@@ -164,14 +140,7 @@ describe('AnsweredBody — Canceled state', () => {
   });
 });
 
-/** Two halves, both pinned. The CLASS, so the answer keeps the transcript's
- *  shape for the user's own words instead of growing a private surface again.
- *  The ORDER, so the label stays a header above the bubble and cannot slide
- *  back inside it. `styles/chat/response.css` § FreeText says why. */
 describe('AnsweredBody: the custom answer wears the user bubble', () => {
-  // Tolerant of a class added or reordered on the bubble, so only the two
-  // things this pins can fail it: the header comes first, and the answer
-  // still wears `.user-bubble`.
   const LABEL_THEN_BUBBLE =
     /class="question-freetext-label">Your answer<\/span><div class="[^"]*\buser-bubble\b[^"]*">/;
 
@@ -201,8 +170,6 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
     expect(text).toContain('and also this');
   });
 
-  // The user's own words render as markdown, like a message they send.
-  // A pasted fence printed its backticks and lost the code block.
   it('renders the typed answer as markdown, so a fence becomes a code block', () => {
     const host = document.createElement('div');
     render(
@@ -236,17 +203,6 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
   });
 });
 
-/** A DEAD card says so in its class, and the scroll landing reads that straight
- *  off the DOM. `followSentMessage` asks the newest `.question-body` whether it
- *  is still open. A TYPED answer then lands on the card, rather than on the
- *  optimistic row the send inserts and the answer removes again. See
- *  `answerableQuestionId` in `scrollState.ts`.
- *
- *  The ANSWERED class is the load-bearing one, since an answered body KEEPS its
- *  `data-tool-use-id` for `cardTurn` to find. Rename it and a plain follow-up
- *  starts landing on a card nobody can answer, holding the reader at the bottom
- *  until that landing's backstop. The terminated class is belt to that brace: a
- *  terminated body carries no id either. */
 describe('a dead card says so to the scroll landing', () => {
   it('an answered body wears question-body-answered', () => {
     const text = vnodeToText(AnsweredBody({
@@ -287,7 +243,6 @@ describe('TerminatedQuestionBody', () => {
     expect(text).toContain('Chocolate');
     const disabledCount = (text.match(/ disabled/g) ?? []).length;
     expect(disabledCount).toBe(2);
-    // The user never picked — no cancel-picked / selected affordance.
     expect(text).not.toContain('question-cancel-picked');
     expect(text).not.toContain('question-option-selected');
   });
@@ -346,8 +301,6 @@ describe('question text: URL linkification', () => {
   });
 });
 
-// A card carried four findings and the decision in one run-on paragraph,
-// because the question rendered as inline markdown and flattened every block.
 describe('question text: block markdown', () => {
   const QUESTION = [
     'Findings on option A: it is doable.',
@@ -372,8 +325,6 @@ describe('question text: block markdown', () => {
   });
 });
 
-// A coding agent rendered five variants and put each one in its option's
-// `preview`. The card dropped the field, so the user saw no pictures at all.
 describe('an option preview', () => {
   const options = [
     { id: 'opt-0', label: 'D', preview: '![D](artifacts/variant-d.png)' },
@@ -386,7 +337,6 @@ describe('an option preview', () => {
     expect(html).toMatch(/<img[^>]*src="[^"]*\/data\/artifacts\/variant-d\.png"/);
     expect(html).not.toContain('src="artifacts/');
     expect(html).toContain('  Sent  21:30<br>  ^^^^  dim');
-    // One preview box per option that has one: B stays as it was.
     expect(html.match(/question-option-preview/g)).toHaveLength(2);
   };
 
@@ -408,9 +358,6 @@ describe('an option preview', () => {
     render(null, host);
   });
 
-  // A tap on the picture opens the image viewer, through the one global click
-  // handler. Answering on the same tap would send a choice the user was
-  // still looking at.
   it('lets a tap on its picture open the viewer instead of choosing', () => {
     const host = document.createElement('div');
     document.body.append(host);
@@ -431,7 +378,6 @@ describe('an option preview', () => {
     img!.click();
     expect(getMultiSelectedIds('tu-preview-tap')).toEqual([]);
 
-    // Dragging the picture's scrollbar ends in a click on the wrapper itself.
     img!.closest<HTMLElement>('.image-scroll-wrapper')!.click();
     expect(getMultiSelectedIds('tu-preview-tap')).toEqual([]);
 
@@ -443,7 +389,6 @@ describe('an option preview', () => {
     host.remove();
   });
 
-  // Scrolling a picture sideways pressed the whole option in, as if choosing.
   it('does not sink the option while its picture is pressed', () => {
     const css = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../../../styles/chat/response.css'),
@@ -474,9 +419,6 @@ describe('an option preview', () => {
   });
 });
 
-// ADR 0415: an option's widget sits in one box with the option's button, as a
-// sibling, never a descendant. Only the button picks, and a settled card keeps
-// every widget.
 describe('an option with a widget', () => {
   const player = {
     id: 'lucidos-sound-player', name: 'Sound player', description: '', reveal: 'on-load' as const,
@@ -539,8 +481,6 @@ describe('an option with a widget', () => {
   });
 });
 
-// A Claude Code card has no message field, so an agent draws its widget in the
-// question text. That text drew only the embed's empty label slot.
 describe('a widget embed in the question text', () => {
   const tapper = {
     id: 'tap-counter', name: 'Tap counter', description: '', reveal: 'on-load' as const,
@@ -592,4 +532,42 @@ describe('a widget embed in the question text', () => {
       expect(vnodeToText(TerminatedQuestionBody({ threadId: 't', question: named, options, multiSelect: false }))).toContain('Keep');
     }
   });
+});
+
+it.each([
+  { unchecked: [0], expected: ['git'] },
+  { unchecked: [0, 1], expected: [] },
+])('saves only checked review grants after remount ($expected)', async ({ unchecked, expected }) => {
+  const root = document.createElement('div');
+  const props = {
+    threadId: 'trigger-review',
+    toolUseId: 'trigger-review-options',
+    question: 'Choose grants',
+    options: [{ id: 'curl', label: 'curl' }, { id: 'git', label: 'git' }],
+    multiSelect: true,
+    grantSelection: true,
+  };
+  const submit = vi.spyOn(questionActions, 'answerThreadQuestion').mockResolvedValue('sent');
+  try {
+    const mount = () => act(() => render(<QuestionBody {...props} />, root));
+    const toggles = () => [...root.querySelectorAll<HTMLButtonElement>('button[aria-pressed]')];
+    mount();
+    expect(toggles().map(node => node.getAttribute('aria-pressed'))).toEqual(['true', 'true']);
+    for (const index of unchecked) act(() => toggles()[index]!.click());
+    act(() => render(null, root));
+    mount();
+    expect(toggles().map(node => node.getAttribute('aria-pressed'))).toEqual(
+      props.options.map(option => String(expected.includes(option.id))),
+    );
+    const button = [...root.querySelectorAll('button')].find(node => node.textContent === 'Save grants');
+    await act(async () => button!.click());
+    const answer = { kind: 'MultiSelected', option_ids: expected } as const;
+    expect(submit).toHaveBeenCalledExactlyOnceWith(props.threadId, props.toolUseId, answer);
+    act(() => render(<QuestionBody {...props} resolved={answer} />, root));
+    expect([...root.querySelectorAll('.question-option-static.question-option-selected')]
+      .map(node => node.textContent)).toEqual(expected);
+  } finally {
+    act(() => render(null, root));
+    submit.mockRestore();
+  }
 });

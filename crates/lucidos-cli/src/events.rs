@@ -1,6 +1,8 @@
 use serde_json::{Map, Value};
 
-use crate::http::{client as http_client, send_and_print};
+use crate::http::{
+    client as http_client, client_with_timeout as http_client_with_timeout, send_and_print,
+};
 use crate::workspace::{BoxError, Workspace};
 
 pub(crate) fn cmd_emit(
@@ -60,6 +62,7 @@ pub(crate) struct QueryFilters<'a> {
 }
 
 pub(crate) fn cmd_query(ws: &Workspace, filters: QueryFilters<'_>) -> Result<(), BoxError> {
+    print_liveness_header(ws, filters.thread_id);
     let url = format!("{}/api/v1/events/query", ws.base_url());
     let params = build_query_params(&filters);
     let mut req = http_client()?.get(&url);
@@ -78,6 +81,7 @@ pub(crate) struct CountFilters<'a> {
 }
 
 pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(), BoxError> {
+    print_liveness_header(ws, filters.thread_id);
     let url = format!("{}/api/v1/events/count", ws.base_url());
     let params = build_count_params(&filters);
     let mut req = http_client()?.get(&url);
@@ -87,7 +91,88 @@ pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(),
     send_and_print("GET", &url, req)
 }
 
-fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static str, String)> {
+/// Print one thread's liveness on stderr, so stdout stays parseable JSON. A
+/// failed read, or an engine without the route, prints nothing: an absent
+/// header claims nothing.
+fn print_liveness_header(ws: &Workspace, thread_id: Option<&str>) {
+    let Some(thread_id) = thread_id else {
+        return;
+    };
+    let url = format!("{}/api/v1/threads/{}/liveness", ws.base_url(), thread_id);
+    let liveness = http_client_with_timeout(std::time::Duration::from_secs(5))
+        .ok()
+        .and_then(|client| client.get(&url).send().ok())
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.json::<Value>().ok());
+    if let Some(line) = liveness.as_ref().and_then(liveness_header_line) {
+        // User-facing CLI output on stderr, beside the JSON on stdout.
+        eprintln!("{line}");
+    }
+}
+
+/// `# thread: working · running · session 2 (handoff, 9 min) · active 4 s ago`.
+pub(crate) fn liveness_header_line(liveness: &Value) -> Option<String> {
+    let mut parts = vec![
+        liveness.get("state")?.as_str()?.to_string(),
+        liveness.get("status")?.as_str()?.to_string(),
+    ];
+    if let Some(session) = liveness.get("session") {
+        parts.push(format!(
+            "session {} ({}, {})",
+            session.get("ordinal")?.as_u64()?,
+            session.get("continuity")?.as_str()?,
+            age(session.get("age_secs")?.as_i64()?)
+        ));
+    }
+    if liveness.get("handoff").and_then(Value::as_str) == Some("pending") {
+        parts.push("handoff pending".to_string());
+    }
+    if let Some(secs) = liveness
+        .get("last_activity_age_secs")
+        .and_then(Value::as_i64)
+    {
+        parts.push(format!("active {} ago", age(secs)));
+    }
+    if let Some(waits) = liveness["live_event_waits"].as_array() {
+        parts.extend(waits.iter().filter_map(|wait| {
+            let reason = wait["reason"].as_str()?;
+            let seconds = wait["expires_in_secs"].as_i64()?;
+            Some(format!("waiting for {reason:?} ({seconds} s left)"))
+        }));
+    }
+    if let Some(children) = liveness["awaited_children"].as_array() {
+        parts.extend(children.iter().filter_map(|child| {
+            let title = child["title"].as_str()?;
+            Some(format!("awaiting child {title:?}"))
+        }));
+    }
+    let hold = &liveness["hold"];
+    match (hold["by"].as_str(), hold["reason"].as_str()) {
+        (Some("stop"), _) => parts.push("held by Stop".to_string()),
+        (Some("open_card"), _) => parts.push("held by a card waiting for the owner".to_string()),
+        (Some("hold"), Some(reason)) => parts.push(format!("on hold ({reason:?})")),
+        _ => (),
+    }
+    let wake = &liveness["expected_wake"];
+    if let (Some(at), Some(source), Some(reason)) = (
+        wake["at"].as_str(),
+        wake["source"].as_str(),
+        wake["reason"].as_str(),
+    ) {
+        parts.push(format!("expected wake {at} ({source}: {reason:?})"));
+    }
+    Some(format!("# thread: {}", parts.join(" · ")))
+}
+
+fn age(secs: i64) -> String {
+    match secs {
+        ..=59 => format!("{secs} s"),
+        60..=3599 => format!("{} min", secs / 60),
+        _ => format!("{} h", secs / 3600),
+    }
+}
+
+pub(crate) fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static str, String)> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(t) = filters.event_type {
         params.push(("type", t.to_string()));
@@ -108,7 +193,7 @@ fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static str, String)>
 /// test that `--before-event-id` / `--after-event-id` reach the server as
 /// `before_event_id` / `after_event_id` (snake_case — the engine doesn't
 /// accept the kebab form).
-fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)> {
+pub(crate) fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(t) = filters.event_type {
         params.push(("type", t.to_string()));
@@ -137,6 +222,72 @@ fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_header_line_reads_like_the_wire_object() {
+        let liveness = serde_json::json!({
+            "state": "working",
+            "status": "running",
+            "last_activity_age_secs": 4,
+            "session": {"ordinal": 2, "continuity": "handoff", "age_secs": 553},
+            "as_of": "2026-11-13T16:43:15Z",
+        });
+        assert_eq!(
+            liveness_header_line(&liveness).as_deref(),
+            Some("# thread: working · running · session 2 (handoff, 9 min) · active 4 s ago")
+        );
+        let stalled = serde_json::json!({
+            "state": "stalled", "status": "idle", "handoff": "pending",
+            "last_activity_age_secs": 7200, "as_of": "2026-11-13T16:43:15Z",
+        });
+        assert_eq!(
+            liveness_header_line(&stalled).as_deref(),
+            Some("# thread: stalled · idle · handoff pending · active 2 h ago")
+        );
+        assert_eq!(
+            liveness_header_line(&serde_json::json!({"error": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn the_header_line_names_wait_evidence_and_escapes_control_characters() {
+        let liveness = serde_json::json!({
+            "state": "held",
+            "status": "idle",
+            "live_event_waits": [
+                {"reason": "test\r\nresults\u{1b}", "expires_in_secs": 120},
+                {"reason": "missing expiry"}
+            ],
+            "awaited_children": [{"title": "Compile\ncrate"}, {}],
+            "hold": {"by": "hold", "reason": "review first", "root_thread_id": "00000000-0000-4000-8000-000000000000"},
+            "expected_wake": {
+                "at": "2026-11-20T16:00:00Z",
+                "source": "agent",
+                "reason": "suite usually finishes then"
+            },
+        });
+        let line = liveness_header_line(&liveness).unwrap();
+        assert_eq!(
+            line,
+            concat!(
+                "# thread: held · idle",
+                r#" · waiting for "test\r\nresults\u{1b}" (120 s left)"#,
+                r#" · awaiting child "Compile\ncrate""#,
+                r#" · on hold ("review first")"#,
+                r#" · expected wake 2026-11-20T16:00:00Z (agent: "suite usually finishes then")"#,
+            ),
+        );
+        assert!(!line.chars().any(char::is_control));
+        assert_eq!(
+            liveness_header_line(&serde_json::json!({
+                "state": "held", "status": "idle", "hold": {"by": "stop"},
+                "live_event_waits": true, "expected_wake": {},
+            }))
+            .as_deref(),
+            Some("# thread: held · idle · held by Stop"),
+        );
+    }
 
     #[test]
     fn enforce_summary_accepts_existing_string() {

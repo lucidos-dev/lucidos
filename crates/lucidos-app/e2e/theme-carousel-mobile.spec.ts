@@ -1,9 +1,3 @@
-/**
- * Mobile: the theme carousel opens on its left edge and pages one card at a
- * time, the first press centring the third theme. Its chips and chevrons stay
- * inside the settings column and above the pane's edge-swipe strips, so a tap
- * reaches them. The strip scrolls alone, so the page never scrolls sideways.
- */
 import { test, expect } from './fixtures';
 import { assertHealthy, isMobileViewport, navigateToApp, openSettingsView, waitForEventStream, waitForPaneAtRest } from './helpers';
 
@@ -18,7 +12,6 @@ test('the theme carousel fits a phone and pages on a tap', async ({ page }) => {
   const next = page.getByRole('button', { name: 'Next themes' });
   const previous = page.getByRole('button', { name: 'Previous themes' });
   await expect(next).toBeVisible({ timeout: 15_000 });
-  // Opening Settings swipes the panes: measure once the content pane settles.
   await waitForPaneAtRest(page);
 
   const column = await page.locator('.settings-panel').boundingBox();
@@ -31,7 +24,6 @@ test('the theme carousel fits a phone and pages on a tap', async ({ page }) => {
 
   await strip.evaluate(el => { el.scrollLeft = 0; el.dispatchEvent(new Event('scroll')); });
   await expect(previous).toBeDisabled();
-  // Opens with the first card on the strip's left edge, not centred.
   const firstLeft = await strip.evaluate(el => {
     const card = el.querySelector('.theme-card')!.getBoundingClientRect();
     return Math.abs(card.left - el.getBoundingClientRect().left) < 12;
@@ -54,7 +46,6 @@ test('the theme carousel fits a phone and pages on a tap', async ({ page }) => {
   await previous.tap();
   await expect.poll(centred, { message: 'the left chevron did not page back' }).toBe(1);
 
-  // The first chip sits at the edge-swipe strip and still takes a tap.
   const chips = page.locator('.pill-bar-btn');
   await chips.nth(1).tap();
   await expect(chips.nth(1)).toHaveAttribute('aria-pressed', 'true');

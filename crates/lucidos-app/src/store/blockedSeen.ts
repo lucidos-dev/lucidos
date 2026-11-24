@@ -4,18 +4,10 @@ import {
   threadListFetched, threadMap,
 } from './store';
 
-/** One blocked stretch of one thread: its id plus its last agent action.
- *  Every block begins with one (a question, a permission request, a failure),
- *  and a user's follow-up does not move it. */
 function blockKey(id: string, lastAgentAction: string | undefined): string {
   return `${id} ${lastAgentAction ?? ''}`;
 }
 
-/** The next seen set: the blocks seen since each began, plus what `looking`
- *  shows now. `blocked` maps each blocked thread to its block key. A key leaves
- *  the set when its block ends, so blocking again counts as new. `looking` is
- *  what is on screen: every blocked thread while the Blocked group lists, else
- *  the open thread. */
 export function seenBlockedAfter(
   seen: ReadonlySet<string>,
   blocked: ReadonlyMap<string, string>,
@@ -48,7 +40,6 @@ const blockKeys = computed<ReadonlyMap<string, string>>(() => {
 const seenBlockedState = signal<ReadonlySet<string>>(restoreIdSet(SEEN_BLOCKED_KEY));
 
 effect(() => {
-  // Before the list arrives nothing is blocked, so pruning would forget every seen block.
   if (!threadListFetched.value) return;
   const listingBlocked = drawerGrouping.value === 'ongoing' && selectedOngoingGroup.value === 'blocked';
   const next = seenBlockedAfter(seenBlockedState.peek(), blockKeys.value, listingBlocked ? 'all' : focusedThreadId.value);
@@ -57,9 +48,6 @@ effect(() => {
   persistIdSet(SEEN_BLOCKED_KEY, next);
 });
 
-/** A thread is blocked that the user has not seen since it became blocked.
- *  The Blocked tile breathes while this holds. The seen set persists, so a
- *  reload does not start it again. */
 export const hasUnseenBlocked = computed(() => {
   const seen = seenBlockedState.value;
   for (const key of blockKeys.value.values()) if (!seen.has(key)) return true;

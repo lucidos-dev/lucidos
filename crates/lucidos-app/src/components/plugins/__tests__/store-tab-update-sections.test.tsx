@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * An outdated plugin stands out: its Update button is green, and the list
- * groups every outdated plugin under an "Updates available" section on top.
- * With nothing to update, the list draws no section headers at all.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginRowSections, PluginStoreRow, splitOutdated, type PluginSectionId } from '../StoreTab';

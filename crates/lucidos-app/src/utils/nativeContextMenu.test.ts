@@ -59,7 +59,6 @@ describe('installNativeContextMenuPolicy (desktop app)', () => {
   });
 
   describe('the selection WebKit makes on the way in', () => {
-    // A selection whose one rect sits at (10..60, 20..36).
     const fakeSelection = (collapsed: boolean) => {
       const removeAllRanges = vi.fn();
       const sel = {

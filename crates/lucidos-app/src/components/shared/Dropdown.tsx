@@ -14,15 +14,8 @@ import { isTouchLayout, keyboardHolder, returnKeyboard } from './keyboardHandoff
 export interface DropdownOption {
   value: string;
   label: string;
-  /** Non-selectable section header. Renders dimmer + ignores click / keyboard
-   *  select. Use to group options inside a flat list (e.g. the compose
-   *  destination picker grouping coding targets under "Coding agent on…"). */
   disabled?: boolean;
-  /** Optional second line rendered muted under the label in the open menu.
-   *  Not part of the trigger sizing — only labels feed `.dropdown-sizer`. */
   description?: string;
-  /** Error styling for a (usually disabled) row — a failed load must look
-   *  different from an empty group (frontend.md "No Hidden Errors"). */
   danger?: boolean;
 }
 
@@ -33,49 +26,16 @@ interface DropdownProps {
   disabled?: boolean;
   placeholder?: string;
   class?: string;
-  /** Allow typing a custom value not in the options list */
   freeText?: boolean;
-  /** Keyboard selection usually restores focus to the trigger for accessibility.
-   *  Callers that synchronously focus a follow-up input from onChange can opt
-   *  out so the trigger does not steal focus back. */
   restoreFocusOnSelect?: boolean;
-  /** Mark the option matching `value` as the current selection (a subtle dot —
-   *  see `.dropdown-option.active`). Default `true` for dropdowns that reflect a
-   *  persisted current setting. Set `false` where the value is a transient
-   *  "last used" choice that's about to be replaced (the compose destination +
-   *  coding-agent pickers) — there, marking it just competes with the arrow-key
-   *  `.focused` highlight and tells the user nothing useful. */
   markCurrent?: boolean;
-  /** Fired every time the menu opens (click, Enter/Space, arrow key, typeahead,
-   *  or a freeText focus), never on close. For an option list that can go stale
-   *  or fail to load: refresh — or retry — it from the user's own gesture,
-   *  instead of leaving a dead list on screen. Must be cheap and idempotent;
-   *  loaders that single-flight (`loadRepositories`, `loadApps`) are the fit. */
   onOpen?: () => void;
 }
 
-/** Match the option name and description through the shared list filter. */
 export function filterDropdownOptions(options: DropdownOption[], query: string): DropdownOption[] {
   return filterListItems(options, query);
 }
 
-/** Which element must hold focus while the menu is open. Whatever has focus
- *  handles the menu's keystrokes. That is what makes type-to-search work:
- *  `'trigger'` routes a printable key into the typeahead seed, and `'filter'`
- *  owns input once that seed has revealed the box.
- *
- *  The open effect ASSERTS `'trigger'` rather than assuming it. WebKit does not
- *  focus a `<button>` on click (the macOS convention), so a menu opened with
- *  the mouse left focus where it already was. In the Tauri app that is usually
- *  the prompt textarea, where the filter query landed instead of filtering.
- *
- *  On a touch device the trigger never takes focus: a `<button>` holds no
- *  on-screen keyboard. The filter box does, once the keyboard handoff
- *  (`keyboardHandoff.ts`) has shown it.
- *
- *  `null` leaves focus alone: on an unsearched touch menu, and while the panel
- *  is unpositioned, since it is then `visibility: hidden` and unfocusable.
- *  Pure, exported for testing. */
 export function openMenuFocusTarget(opts: {
   freeText: boolean;
   searching: boolean;
@@ -87,24 +47,11 @@ export function openMenuFocusTarget(opts: {
   return opts.touch ? null : 'trigger';
 }
 
-/** Class list for the menu panel. The menu is portaled to `<body>` (see the
- *  `<Overlay portal>` below), which severs every ancestor-scoped rule that used
- *  to reach it through the DOM. Exactly one such context styled the rows: a
- *  dropdown used as a **form field**, whose taller `.form-group` control wants
- *  its options sized to match. That context travels with the panel as its own
- *  class (`.dropdown-menu-field`) instead of being read off an ancestor that is
- *  no longer there. Pure over anything `closest`-capable, so it is testable
- *  without a DOM. */
 export function dropdownMenuClass(trigger: { closest(selector: string): unknown } | null): string {
   const base = trigger?.closest('.form-group') ? 'surface-box dropdown-menu dropdown-menu-field' : 'surface-box dropdown-menu';
   return base + protectedClassFrom(trigger);
 }
 
-/** Walk `options` from `start` in direction `step` (±1), skipping any
- *  `disabled` entries (section headers). Used by ArrowDown/Up + the initial
- *  focus seed so navigation never lands stuck on a header. Returns `start`
- *  if no enabled option exists in the chosen direction — caller's clamp
- *  keeps focus where it was. */
 function nextEnabledIndex(options: DropdownOption[], start: number, step: 1 | -1): number {
   const len = options.length;
   if (len === 0) return -1;
@@ -128,12 +75,6 @@ export function Dropdown({
   markCurrent = true,
   onOpen,
 }: DropdownProps) {
-  // Anchor element when open, null when closed. `useAnchoredPosition` reacts
-  // to anchor changes via its effect deps — no separate `open` flag needed.
-  // The menu uses `position: fixed` (and is portaled to <body>, see the
-  // `<Overlay>` below) so it escapes any `overflow: hidden` ancestor (notably
-  // `.mobile-swipe-pane` on mobile, where an `absolute`-positioned menu was
-  // clipped at the pane edge regardless of placement direction).
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const [draft, setDraft] = useState(value);
@@ -143,8 +84,6 @@ export function Dropdown({
   const menuRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef(value);
   const lastCommittedRef = useRef(value);
-  // The text field the filter box took the keyboard from. Closing hands
-  // focus back to it, so the keyboard stays up for the message being typed.
   const keyboardHolderRef = useRef<HTMLElement | null>(null);
   const selected = options.find((o) => o.value === value);
   const open = anchor !== null;
@@ -157,7 +96,6 @@ export function Dropdown({
   const { query, inputRef: filterRef, searching, setQuery: setFilter } = listFilter;
   const filter = query.value;
 
-  // Sync draft when external value changes (and we're not actively editing)
   useEffect(() => {
     lastCommittedRef.current = value;
     if (!open) {
@@ -183,10 +121,6 @@ export function Dropdown({
 
   useHidePanelWebviewWhile(open);
 
-  // Focus management while open. `openMenuFocusTarget` holds the policy; this
-  // effect applies it. The freeText input keeps its one-frame deferral, since
-  // its own `onFocus` is one of the paths that opens the menu. A close cancels
-  // the frame, or it would pull a Tab's focus back and reopen the menu.
   useEffect(() => {
     if (!open) return;
     const target = openMenuFocusTarget({
@@ -199,8 +133,6 @@ export function Dropdown({
       return () => cancelAnimationFrame(frame);
     }
     const el = target === 'filter' ? filterRef.current : target === 'trigger' ? buttonRef.current : null;
-    // preventScroll: the trigger was just activated, so it is already in view,
-    // and scrolling to it would shift the surface under the open menu.
     if (el && document.activeElement !== el) el.focus({ preventScroll: true });
   }, [open, searching, pos, freeText]);
 
@@ -210,12 +142,9 @@ export function Dropdown({
     el?.scrollIntoView({ block: 'nearest' });
   }, [focusedIndex, open]);
 
-  // Filter before computing keyboard indices so hidden rows cannot be chosen.
   const filterOptions = (query: string) => filterDropdownOptions(options, query);
   const filtered = filterOptions(filter);
 
-  // Returns nothing on purpose: it is the Overlay's `onClose`, which reads a
-  // `false` return as a no-op and then lets the dismissing click through.
   function closeDropdown(): void {
     hideMenu();
     restoreKeyboardHolder();
@@ -233,9 +162,6 @@ export function Dropdown({
     return returnKeyboard(field, menuRef.current);
   }
 
-  /** Commit the focused option (or the typed freeText draft) and close. Returns
-   *  true iff something was selected — Tab uses this and falls back to a plain
-   *  close when there's nothing valid to pick. */
   function selectFocusedAndClose(): boolean {
     if (focusedIndex >= 0 && focusedIndex < filtered.length) {
       const focused = filtered[focusedIndex];
@@ -256,8 +182,6 @@ export function Dropdown({
     return false;
   }
 
-  /** Single door into the open state — every open path goes through here so
-   *  `onOpen` can't be missed by one of them. */
   function showMenu() {
     if (!ref.current) return;
     setAnchor(ref.current);
@@ -270,10 +194,6 @@ export function Dropdown({
     keyboardHolderRef.current = keyboardHolder();
     if (query.value) return;
     const currentIdx = options.findIndex((o) => o.value === value);
-    // Seed at the saved value, or — when missing/stale or pointing at a
-    // disabled row (stale scope that collides with a section header after
-    // a re-group) — the first enabled option. Without the disabled-skip,
-    // focus could land on a header and ArrowDown would silently dead-key.
     if (currentIdx < 0 || options[currentIdx]?.disabled) {
       setFocusedIndex(nextEnabledIndex(options, -1, +1));
     } else {
@@ -288,9 +208,6 @@ export function Dropdown({
       inputRef.current?.blur();
       return;
     }
-    // Tab on an open menu commits the highlighted option and closes — and is
-    // swallowed so it neither tabs focus away nor reaches the global Tab trap.
-    // freeText keeps its native Tab (move on; its onBlur commits the draft).
     if (e.key === 'Tab' && open && !freeText) {
       e.preventDefault();
       e.stopPropagation();
@@ -359,7 +276,6 @@ export function Dropdown({
           disabled={disabled}
           aria-haspopup="listbox"
           aria-expanded={open}
-          // The open effect still focuses the trigger on desktop.
           onMouseDown={keepFocusOnPress}
           onClick={() => {
             if (disabled) return;
@@ -383,14 +299,6 @@ export function Dropdown({
         onClose={closeDropdown}
         anchor={ref.current}
         backdrop={false}
-        // Portaled to <body>, and both halves of that matter. The menu carries
-        // VIEWPORT coordinates, so a `transform`ed ancestor would become its
-        // containing block and resolve them against the wrong origin; and the
-        // pane it opens from is a stacking context (`.mobile-swipe-pane` is
-        // `isolation: isolate` + `translateZ(0)`), which caps every z-index
-        // inside it below the floating header chrome however high the menu
-        // asks to be. Hoisting the panel out of `.app-shell` is what lets the
-        // z-index in `.dropdown-menu` actually out-rank that chrome.
         portal
         panelClass={dropdownMenuClass(anchor)}
         panelRef={menuRef}
@@ -414,9 +322,6 @@ export function Dropdown({
           {filtered.map((o, i) => (
             <div
               key={o.value}
-              // `danger` suppresses the header look (uppercase/letter-spacing)
-              // even when the row is also `disabled` — an error row is prose,
-              // not a section heading.
               class={`dropdown-option${markCurrent && o.value === value ? ' active' : ''}${i === focusedIndex ? ' focused' : ''}${o.disabled && !o.danger ? ' dropdown-option-header' : ''}${o.danger ? ' dropdown-option-danger' : ''}`}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
@@ -426,9 +331,6 @@ export function Dropdown({
                 inputRef.current?.blur();
               }}
             >
-              {/* One DOM shape for every option: label always wrapped, so
-                  per-caller ellipsis/styling rules don't fork on whether a
-                  description is present. */}
               <div class="dropdown-option-label">{o.label}</div>
               {o.description !== undefined && (
                 <div class="dropdown-option-description">{o.description}</div>
@@ -440,35 +342,9 @@ export function Dropdown({
   );
 }
 
-/**
- * A dropdown-shaped loading skeleton, for a control whose value is still in flight.
- *
- * It lives here, beside the real thing, and it wears the trigger's OWN
- * `.dropdown-trigger` box rather than a hand-sized `SkBlock`: padding, border,
- * radius, the flex gap and the font metrics then come from one rule, so the
- * skeleton is the size of the control that replaces it and the row does not jump
- * on settle. A `SkBlock` measured by eye is right only until someone re-pads
- * the trigger.
- *
- * The chevron is drawn as its real glyph for the same reason. Everything about
- * its footprint (`.dropdown-chevron`'s own smaller font size, and the gap the
- * trigger puts before it) is then the trigger's rule rather than a second
- * guess, and the skeleton is not narrower than the control by exactly a chevron.
- * It is the one part shown rather than shimmered: a skeleton is meant to read as
- * the shape of what is coming, and this part of the shape is already known.
- *
- * Only the LABEL is guessed. `w` is the width of the widest label the slot will
- * show, since nothing can know that before the options land.
- *
- * Gate it behind `useDelayedFlag` and wrap it in `<LoadingFade>` like every
- * other skeleton (`.claude/rules/frontend.md`), so a fast load never shows it
- * and a slow one crossfades out instead of snapping.
- */
 export function DropdownSkeleton({ w }: { w: string }) {
   return (
     <SkeletonProvider>
-      {/* A span, not the real <button>: a skeleton must not be focusable or
-          announced, and `.dropdown-skeleton` drops the trigger's hover tell. */}
       <span class="dropdown-trigger dropdown-skeleton" aria-hidden="true">
         <SkText w={w} />
         <DropdownChevron open={false} />

@@ -13,6 +13,7 @@ function setup() {
   };
   const store = {
     readRecoveries: vi.fn(async () => [source]),
+    materializeDraft: vi.fn(async (draft: unknown) => draft),
     prepareRecovery: vi.fn(async () => ({ generation: 'restored', drafts: [{ sourceThreadId: 'archived', threadId: 'fresh' }], completed: [] as string[] })),
     completeRecoveryDraft: vi.fn(async () => {}),
   } as unknown as RestoreIntentStore;
@@ -78,4 +79,12 @@ it('checks the connection lease after querying owner liveness', async () => {
     .toEqual({ status: 'stale', recovered: 0 });
   expect(store.prepareRecovery).not.toHaveBeenCalled();
   expect(effects.createDraftIfAbsent).not.toHaveBeenCalled();
+});
+
+it('checks the connection lease after loading the selected draft attachments', async () => {
+  const { source, store, effects, revoke } = setup();
+  vi.mocked(store.materializeDraft).mockImplementation(async () => { revoke(); return source.intent.drafts[0]; });
+  expect(await recoverRestoreDrafts(store, 'restored', effects)).toEqual({ status: 'stale', recovered: 0 });
+  expect(effects.createDraftIfAbsent).not.toHaveBeenCalled();
+  expect(store.completeRecoveryDraft).not.toHaveBeenCalled();
 });

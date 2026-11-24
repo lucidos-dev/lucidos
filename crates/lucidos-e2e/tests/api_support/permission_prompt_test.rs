@@ -10,7 +10,7 @@
 //!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
 
 use crate::support::{
-    base_url, db_url, register_device, seed_cc_thread_summary, user_client, workspace_path,
+    as_stamped_device, base_url, db_url, register_device, seed_cc_thread_summary, user_client,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 /// Serialize tests that snapshot/modify this workspace's `cc-allowed-tools`
-/// file. Cargo runs integration tests in parallel within a binary, so without
+/// settings. Cargo runs integration tests in parallel within a binary, so without
 /// this lock concurrent snapshot+restore cycles would race and clobber each
 /// other's restore. Acquire at the top of any test that calls
 /// `read_cc_allowed_tools` / `restore_cc_allowed_tools`; hold for the full
@@ -33,20 +33,29 @@ async fn lock_cc_allowed_tools() -> MutexGuard<'static, ()> {
 /// Restores this workspace's `cc-allowed-tools` when it goes out of scope, on
 /// the panicking path as well as the clean one.
 ///
-/// Any test that empties the file needs this. The engine's gate reads the file
-/// on every prompt (ADR 0125), so a test that leaves it emptied has taken the
-/// workspace's real grants away. Drop cannot await, so it writes the snapshot
-/// straight to disk rather than through the settings endpoint. The gate reads
-/// the file fresh, so nothing caches a stale copy.
+/// Any test that empties the list needs this, or it takes the workspace's real
+/// grants away. It restores through the settings endpoint. Drop cannot await,
+/// so the PUT runs on a thread with its own runtime.
 struct CcAllowlistRestore {
     snapshot: String,
 }
 
 impl Drop for CcAllowlistRestore {
     fn drop(&mut self) {
-        let path = workspace_path().join(".lucidos").join("cc-allowed-tools");
-        if let Err(e) = std::fs::write(&path, &self.snapshot) {
-            eprintln!("failed to restore {}: {e}", path.display());
+        let snapshot = std::mem::take(&mut self.snapshot);
+        let restored = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the restore runtime")
+                .block_on(async {
+                    let client = user_client().await;
+                    restore_cc_allowed_tools(&client, &snapshot).await;
+                });
+        })
+        .join();
+        if restored.is_err() {
+            eprintln!("failed to restore the workspace's cc-allowed-tools");
         }
     }
 }
@@ -55,7 +64,7 @@ impl Drop for CcAllowlistRestore {
 /// afterwards whatever happens.
 ///
 /// A card only renders for a request the allowlist does not already cover, and
-/// this workspace's file inherited real grants (bare `Bash`, `Skill`, …). A test
+/// this workspace may already hold grants (bare `Bash`, `Skill`, …). A test
 /// about what a CLICK persists must therefore start from nothing granted. Its
 /// prompt would otherwise be auto-allowed before any card exists.
 async fn empty_cc_allowed_tools(client: &reqwest::Client) -> CcAllowlistRestore {
@@ -287,12 +296,12 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
     let after_first = read_cc_allowed_tools(&client).await;
     assert!(
         line_present(&after_first, &pattern),
-        "after first allow, file must contain {pattern}; got:\n{after_first}"
+        "after first allow, Settings must contain {pattern}; got:\n{after_first}"
     );
     assert_eq!(
         count_line(&after_first, &pattern),
         1,
-        "one click writes one line; file:\n{after_first}"
+        "one click stores one pattern; Settings:\n{after_first}"
     );
 
     // A DIFFERENT skill from the granted plugin: covered, so no card at all.
@@ -354,7 +363,7 @@ async fn permission_prompt_persists_broad_bash_pattern() {
 /// The reported bug: an "Always allow" click bound the NEXT coding-agent
 /// session, not the one it was clicked in, so the same tool carded again
 /// seconds later. The grant reaches Claude Code as `--allowedTools`, frozen at
-/// spawn, and the engine's own gate never read the file.
+/// spawn, and the engine's own gate previously ignored the updated list.
 ///
 /// Clicks narrow on one command, then raises a SECOND prompt for a DIFFERENT
 /// command with the same head. It must answer allowed with no new card.
@@ -491,13 +500,10 @@ async fn permission_prompt_stores_exactly_the_stamped_pattern() {
     }
 }
 
-/// `persist_scope: "broad"` on `Edit` (and Write/NotebookEdit) must NOT write
-/// the file: bare `Edit` in `--allowedTools` is silently ignored by CC's
-/// `acceptEdits` routing for out-of-cwd paths, so persisting it would mislead
-/// the user into thinking the prompt won't recur. Engine refuses at the
-/// `derive_allow_pattern` boundary; UI hides the corresponding button.
+/// Claude Code ignores a bare `Edit` in `--allowedTools` for out-of-cwd
+/// paths. A broad approval therefore leaves the standing grants alone.
 #[tokio::test]
-async fn permission_prompt_broad_persist_for_edit_does_not_write_file() {
+async fn permission_prompt_broad_persist_for_edit_keeps_standing_grants() {
     let _lock = lock_cc_allowed_tools().await;
     let client = user_client().await;
     let pool = PgPool::connect(&db_url())
@@ -523,21 +529,16 @@ async fn permission_prompt_broad_persist_for_edit_does_not_write_file() {
     .await;
 
     let after = read_cc_allowed_tools(&client).await;
-    // snapshot == after is the load-bearing assertion: the engine must leave
-    // the file untouched. A standalone `!line_present(after, "Edit")` would
-    // be wrong because the user's pre-existing file may already contain
-    // `Edit` (from a prior install or manual edit) — what matters is that
-    // *this* call didn't append.
+    // Compare the full list because an earlier Settings edit may include Edit.
     assert_eq!(
         snapshot, after,
         "broad persist on Edit must NOT modify cc-allowed-tools — bare entry is a no-op for acceptEdits-routed tools"
     );
 }
 
-/// Without `persist_scope`, the consent endpoint must not touch the file.
-/// Regression guard for the existing Allow-once behavior.
+/// Allow once leaves standing grants alone.
 #[tokio::test]
-async fn permission_prompt_without_persist_scope_does_not_write_file() {
+async fn permission_prompt_without_persist_scope_keeps_standing_grants() {
     let _lock = lock_cc_allowed_tools().await;
     let client = user_client().await;
     let pool = PgPool::connect(&db_url())
@@ -654,7 +655,7 @@ async fn read_cc_allowed_tools(client: &reqwest::Client) -> String {
     body["contents"].as_str().unwrap_or("").to_string()
 }
 
-/// Restore the settings file to a previously-snapshotted state.
+/// Restore the standing grants from a Settings snapshot.
 async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
     let resp = client
         .put(format!("{}/api/v1/cc-allowed-tools", base_url()))
@@ -688,11 +689,13 @@ async fn agent_allowed_commands_settings_roundtrip() {
         .expect("PUT agent-allowed-commands failed");
     assert!(put.status().is_success(), "PUT must succeed");
 
+    // GET returns the PUT's stored grant lines
+    // under the engine's own header. A comment the PUT carried is not a grant.
     let after = read_agent_allowed_commands(&client).await;
-    assert_eq!(after, body, "GET must return exactly what was PUT");
-    assert!(
-        line_present(&after, &sentinel),
-        "round-tripped file must contain the sentinel pattern; got:\n{after}"
+    assert_eq!(
+        grant_lines(&after),
+        [sentinel.as_str(), "Python"],
+        "GET must return exactly the lines that were PUT; got:\n{after}"
     );
 
     // Restore so the e2e workspace's allowlist is left as we found it.
@@ -726,11 +729,19 @@ fn line_present(contents: &str, pattern: &str) -> bool {
 }
 
 fn count_line(contents: &str, pattern: &str) -> usize {
+    grant_lines(contents)
+        .into_iter()
+        .filter(|l| *l == pattern)
+        .count()
+}
+
+/// Stored patterns without editor comments and blank lines.
+fn grant_lines(contents: &str) -> Vec<&str> {
     contents
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && *l == pattern)
-        .count()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
 }
 
 /// End-to-end: open a permission_prompt, wait for the canonical request event,
@@ -862,13 +873,14 @@ async fn every_allowlist_put_records_the_resulting_grants() {
         let sentinel = sentinel_pattern.replace("{}", &Uuid::new_v4().simple().to_string());
         let body = format!("{header}\n{sentinel}\n");
 
-        let put = client
-            .put(format!("{}/api/v1/{route}", base_url()))
-            .header("x-lucidos-device-id", &device)
-            .json(&json!({ "contents": body }))
-            .send()
-            .await
-            .expect("PUT failed");
+        let put = as_stamped_device(
+            client.put(format!("{}/api/v1/{route}", base_url())),
+            &device,
+        )
+        .json(&json!({ "contents": body }))
+        .send()
+        .await
+        .expect("PUT failed");
         assert!(put.status().is_success(), "PUT /{route} must succeed");
 
         let row: Option<(String, serde_json::Value)> = sqlx::query_as(
@@ -915,16 +927,18 @@ async fn every_allowlist_put_records_the_resulting_grants() {
 #[tokio::test]
 async fn auto_approve_on_an_unknown_server_still_answers() {
     let client = user_client().await;
-    // The per-request header wins over the client's default. So this id needs
-    // registering in its own right, or the gate refuses before the toggle runs.
+    // The per-request header wins over the client's default, and the default's
+    // stamp names another device. So this id needs registering and stamping in
+    // its own right, or the gate refuses before the toggle runs.
     register_device("e2e-auto-approve").await;
-    let resp = client
-        .put(format!("{}/api/v1/mcp/auto-approve", base_url()))
-        .header("x-lucidos-device-id", "e2e-auto-approve")
-        .json(&json!({ "server_id": "no-such-server", "auto_approve": true }))
-        .send()
-        .await
-        .expect("PUT mcp/auto-approve failed");
+    let resp = as_stamped_device(
+        client.put(format!("{}/api/v1/mcp/auto-approve", base_url())),
+        "e2e-auto-approve",
+    )
+    .json(&json!({ "server_id": "no-such-server", "auto_approve": true }))
+    .send()
+    .await
+    .expect("PUT mcp/auto-approve failed");
     assert_eq!(resp.status().as_u16(), 200, "the toggle must answer 200");
 }
 

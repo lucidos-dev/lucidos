@@ -26,8 +26,8 @@ and its `resolvedModel` stay Claude Code's.
 A curated row with `offered: false` is overlay only. It keeps its
 `context_window` for threads already on it, and is never listed or accepted for
 a new spawn. It also drops a discovered row with the same value, so a withdrawn
-model stays withdrawn whatever Claude Code lists. Opus 5 and the Fable rows
-carry it.
+model stays withdrawn whatever Claude Code lists. Opus 5, Fable 5 and Fable 5.1
+carry it. Fable 5.2 is offered, and is the top of the Claude Code ladder.
 
 The `chat_submit` route checks `cc_model` for a new coding-agent thread with the
 same function the tool uses. Both refuse with the same text.
@@ -50,8 +50,9 @@ same function the tool uses. Both refuse with the same text.
   A release that Claude Code omits is offered once its row is added here.
 - Claude Code omits a model for two reasons: it lags a release, or the account
   or provider cannot run it. The merge cannot tell them apart. A curated row the
-  provider cannot run is offered, and a spawn that picks it fails on its first
-  turn, loudly (ADR 0487). Setting `offered: false` removes such a row.
+  provider cannot run is offered. Claude Code runs another model on it rather
+  than failing. ADR 0674 shows that as a step and stops offering the row.
+  Setting `offered: false` removes such a row for every account.
 - A model dropped from both lists is refused for a new spawn. A thread already
   on it keeps running, because a follow-up is not checked.
 - A cross-workspace sender still passes a Claude Code model through unchecked.

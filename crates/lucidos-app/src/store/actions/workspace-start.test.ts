@@ -57,8 +57,6 @@ describe('startThisWorkspace', () => {
     expect(connectionStatus.value).toBe('stopped');
   });
 
-  // The gateway boots in the background after it accepts a start. A boot that
-  // fails there ends `starting` in something other than connected.
   it.each(['stopped', 'disconnected'])('tells the user when starting ends %s', async (end) => {
     mockStartWorkspace.mockResolvedValue(undefined);
     mockCheckConnection.mockImplementation(async () => {

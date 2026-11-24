@@ -33,32 +33,15 @@ function formatTimestamp(iso: string): string {
   return `${formatShortDate(d)} ${formatShortTime(d)}`;
 }
 
-/** Open the thread an entry is bound to. Background entries without a
- *  materialized thread (a queued trigger fire that hasn't spawned one yet) have
- *  no thread_id and aren't navigable. Uses focusThreadOrBootstrap so a thread
- *  outside the loaded window (background work) still opens. Exported for the
- *  unit test. */
 export function openQueueEntryThread(entry: ThreadQueueEntry): void {
   if (!entry.thread_id) return;
   focusThreadOrBootstrap(entry.thread_id);
 }
 
-/** Self-skeletonizing queue row: rendered with no entry inside a
- *  SkeletonProvider (`<ThreadQueueRow />`) it draws itself as a loading
- *  placeholder via the Sk* leaves; with a real entry it renders normally.
- *  `entry` is optional only to support the skeleton call; real call sites pass
- *  it. */
 function ThreadQueueRow({ entry }: { entry?: ThreadQueueEntry }) {
   const sk = useSkeleton();
   const running = entry?.status === 'admitted';
-  // User-initiated entries aren't background queue rows — Run now / Drop act on
-  // the projection, which doesn't hold them. A queued user thread is already
-  // prioritized; cancel it from the chat itself, not here.
   const actionable = !!entry && !running && entry.kind !== 'user-chat';
-  // Prefer the live thread title the user sees in the drawer / header; fall
-  // back to the queued prompt for entries whose thread isn't loaded
-  // (background work) or hasn't been titled yet. Reading threadMap here makes
-  // the row re-render when ThreadTitleGenerated lands.
   const thread = entry?.thread_id ? threadMap.value.get(entry.thread_id) : undefined;
   const title = thread ? threadDisplayTitle(thread) : entry?.summary;
   const navigable = !!entry?.thread_id;
@@ -119,8 +102,6 @@ function ThreadQueueRow({ entry }: { entry?: ThreadQueueEntry }) {
   );
 }
 
-/** Numeric policy fields rendered as labeled inputs, in display order. `min`
- *  is 1 where the engine refuses 0 (`CapacityPolicy::invalid_reason`). */
 const POLICY_FIELDS: Array<{ key: keyof CapacityPolicy & string; label: string; min: 0 | 1 }> = [
   { key: 'max_concurrent_total', label: 'Max concurrent (total)', min: 0 },
   { key: 'reserved_background', label: 'Reserved for background', min: 0 },
@@ -135,18 +116,13 @@ const POLICY_FIELDS: Array<{ key: keyof CapacityPolicy & string; label: string; 
 ];
 
 function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {
-  // Server-backed: untouched the fields render the policy the store holds, so a
-  // `CapacityPolicyChanged` frame repaints them. Touched, they keep the user's
-  // draft. Seeding a `useState` from the entity kept the first snapshot for the
-  // life of the editor. It then read as dirty against a policy nobody had
-  // edited, and offered to save the values that frame had replaced (ADR 0118).
   const [draft, setDraft] = useServerBackedField<CapacityPolicy>(policy, sameJson);
   const [saving, setSaving] = useState(false);
   const dirty = !sameJson(draft, policy);
 
   async function save() {
     setSaving(true);
-    await saveCapacityPolicy(draft); // self-toasts on success/failure, never rejects
+    await saveCapacityPolicy(draft);
     setSaving(false);
   }
 

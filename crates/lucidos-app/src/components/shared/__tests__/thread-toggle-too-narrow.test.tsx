@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The thread-drawer toggle reads what is drawn. A window too narrow for the
- * drawer even alone disables it, and the tooltip says why. The toggle is
- * aria-disabled rather than disabled, which keeps the pointer for its tooltip.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ThreadToggleButton } from '../ThreadToggleButton';
 import { THREAD_LIST_TOO_NARROW } from '../../../store/actions/pane';

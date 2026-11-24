@@ -17,8 +17,6 @@ function pressSearch(): void {
   action!.onClick!({ currentTarget: button } as unknown as MouseEvent);
 }
 
-// focusSearchInput does nothing once the palette is open. So it must run
-// while the palette is still closed, or a tap never raises the keyboard.
 describe('the Search everywhere header action', () => {
   beforeEach(() => {
     openWhenFocused.length = 0;

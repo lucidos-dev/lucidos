@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The action slot's one control (ADR 0573). Alone, it is one button. With a
- * menu, it is a split button on the desktop face. On the compact face it is one round
- * button that opens the menu, face included, on every tap.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -87,7 +82,6 @@ describe('an action with a menu', () => {
     expect(whole.getAttribute('aria-label')).toBe('Apply. More change actions');
     act(() => { whole.click(); });
     expect(o.face.invoke).not.toHaveBeenCalled();
-    // The menu opens upward, so the face sits last, next to the button.
     expect(menuLabels()).toEqual(['Discard', 'Archive', 'Apply']);
     act(() => { document.querySelector<HTMLButtonElement>('.split-button-menu [role="menuitem"]:last-child')!.click(); });
     expect(o.face.invoke).toHaveBeenCalledTimes(1);

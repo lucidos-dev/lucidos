@@ -7,15 +7,11 @@ import { loadResponseStyles } from '../../store/actions/responseStyles';
 import { loadThemeGallery } from '../../store/actions/themes';
 import { loadDevices } from '../../store/actions/devices';
 import { loadPairedDevices } from '../../store/actions/pairedDevices';
-import { loadOperators } from '../../store/actions/operators';
+import { loadGatewayUsers } from '../../store/actions/gatewayUsers';
+import { reloadRemoteGatewayLists } from '../../store/actions/remoteGatewayManage';
 import { loadOAuthAccounts } from '../../store/actions/oauth';
 import { refreshRepositories } from '../../store/actions/repositoriesLoader';
 
-/** The panel refresh for the settings sections that `SettingsView` draws with
- *  a function rather than a component of their own. A section that IS a
- *  component registers its own, and so does any component inside one of these
- *  (the coding-agent binaries, the two allowlist editors). The panel refresh
- *  runs all of them. */
 export const SETTINGS_SECTION_REFRESH: Partial<Record<SettingsSubview, PanelRefreshAction>> = {
   models: () => Promise.all([
     loadPreferences(),
@@ -30,7 +26,12 @@ export const SETTINGS_SECTION_REFRESH: Partial<Record<SettingsSubview, PanelRefr
   devices: () => Promise.all([
     loadDevices(),
     loadPairedDevices(),
-    loadOperators(),
+    loadGatewayUsers(),
+    reloadRemoteGatewayLists(),
+  ]),
+  users: () => Promise.all([
+    loadGatewayUsers(),
+    reloadRemoteGatewayLists(),
   ]),
   accounts: () => Promise.all([
     loadOAuthAccounts(),

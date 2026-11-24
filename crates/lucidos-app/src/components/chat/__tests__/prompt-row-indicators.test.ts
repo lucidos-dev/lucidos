@@ -1,16 +1,3 @@
-/** The two STATUS readouts fold, and a folded one still reports.
- *
- *  Pinning them was the first pass, on the reasoning that a readout inside a
- *  closed menu reports nothing. Measured against the reported row, it removed
- *  one glyph of seven and left the row at its width limit. So it did not answer
- *  the report. They fold now, and each says its state in words on its menu row.
- *  Colour and a pulse do not survive the fold, and words do.
- *
- *  A source scan for the wiring and a unit test for the words. Rendering the
- *  composer pulls in the whole chat surface, which every test beside this one
- *  avoids for the same reason.
- *
- *  Plan: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`. */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -39,7 +26,6 @@ describe('a folded todo indicator says what the glyph could not', () => {
     expect(summary?.menuLabel).toBe('Todo list: 1 of 2 done');
   });
 
-  /** The in-progress item is what the coloured glyph was saying. */
   it('names the item in flight', () => {
     const summary = todoIndicatorSummary([todo('in_progress', 'the migration'), todo('pending')]);
     expect(summary?.menuLabel).toContain('doing the migration');
@@ -50,8 +36,6 @@ describe('a folded todo indicator says what the glyph could not', () => {
       .toBe('Todo list: notes kept');
   });
 
-  /** The row button's accessible name and the menu row's words come from one
-   *  summary, so neither can drift from the other. */
   it('says the same thing to a screen reader as to the menu', () => {
     const summary = todoIndicatorSummary([todo('completed')]);
     expect(summary?.ariaLabel).toBe(`${summary?.menuLabel}. Click to expand.`);
@@ -65,8 +49,6 @@ describe('a folded waiting indicator says what it is waiting for', () => {
     expect(waitingIndicatorSummary([], noChildren)).toBeNull();
   });
 
-  /** A lone subscription reads as its own reason, and the label supplies the
-   *  verb the reason does not. */
   it('names a lone subscription by its reason', () => {
     const waits = [{ reason: 'waiting for the release build' }] as never[];
     expect(waitingIndicatorSummary(waits, noChildren)?.menuLabel)
@@ -86,10 +68,6 @@ describe('a folded waiting indicator says what it is waiting for', () => {
 });
 
 describe('the composer wires both indicators as foldable members', () => {
-  /** `TodoListWritten` is the Lucidos Agent's own event, so a coding-agent
-   *  thread has no list. The WAIT is not backend-specific: both agents arm
-   *  them, and a coding-agent thread sat in Waiting with nowhere to read what
-   *  it watched before the indicator reached it. */
   it('gates the todo action on the backend and the waiting action on nothing', () => {
     expect(prompt).toMatch(
       /const todoAction = promptCodingAgent === null \? todoIndicatorAction\(\) : null;/,
@@ -97,8 +75,6 @@ describe('the composer wires both indicators as foldable members', () => {
     expect(prompt).toMatch(/const waitingAction = waitingIndicatorAction\(\);/);
   });
 
-  /** The row draws todo, then waiting. The WIP preview is a toggle, not a
-   *  readout, so it keeps its own slot. */
   it('puts todo before waiting, and leaves the WIP preview out of them', () => {
     const todoAt = prompt.indexOf('if (todoAction) readouts.push(todoAction);');
     const waitingAt = prompt.indexOf('if (waitingAction) readouts.push(waitingAction);');
@@ -107,17 +83,12 @@ describe('the composer wires both indicators as foldable members', () => {
     expect(prompt).toContain('wipPreview: wipPreviewAction(focusedThread),');
   });
 
-  /** A panel cannot live inside the control that folds away. Both are mounted
-   *  by the composer and portal out of it. */
   it('mounts both panels outside the fold cluster', () => {
     expect(prompt).toMatch(/<TodoPanelSlot \/>/);
     expect(prompt).toMatch(/<WaitingPanelHost \/>/);
     expect(prompt.indexOf('<TodoPanelSlot />')).toBeGreaterThan(prompt.indexOf('<OverflowMenu'));
   });
 
-  /** Two ways a panel's anchor stops being a box worth pointing at. A fold step
-   *  can unmount it. And the ⋯ trigger is exempt from the dismiss of the panel
-   *  it anchors, so re-pressing it would stack one over the other. */
   it('retires the stranded popovers on a fold step and every one on a ⋯ open', () => {
     expect(prompt).toMatch(
       /function closeFoldedPanels\(\): void \{\s*attachMenuOpen\.value = false;\s*closeTodoPanel\(\);\s*closeWaitingPanel\(\);\s*\}/,

@@ -1,5 +1,5 @@
 //! Finding this machine's gateway, for the commands that talk to it rather
-//! than to a workspace engine (`lucidos pair`, `lucidos update-address`).
+//! than to a workspace engine (`lucidos pair`, `lucidos update-channel`).
 //!
 //! They resolve their own target instead of going through `crate::workspace`.
 //! A gateway serves every workspace, so no workspace names it.
@@ -17,26 +17,12 @@ const DEFAULT_PORTS: [u16; 2] = [
 /// Where the gateway's own surface lives, behind the reserved sigil namespace.
 pub(crate) const HEALTH_PATH: &str = "/~/api/v1/health";
 
-/// The loopback client every gateway call uses. A gateway may serve a
-/// self-signed certificate, and a proxy must never see a loopback call.
+/// The loopback client every gateway call uses. It trusts only the loopback
+/// CA and follows no redirect.
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
-    Ok(client_builder().build()?)
-}
-
-/// [`client`] for an identity probe, which never follows a redirect. A
-/// redirect to loopback would otherwise prove this gateway at an origin that
-/// is not its own.
-pub(crate) fn probe_client() -> Result<reqwest::blocking::Client, BoxError> {
-    Ok(client_builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
-}
-
-fn client_builder() -> reqwest::blocking::ClientBuilder {
-    reqwest::blocking::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
+    Ok(lucidos_local_token::client::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(5))
+        .build()?)
 }
 
 /// Ports to probe: the dev override from the environment, then the defaults.
@@ -79,11 +65,9 @@ pub(crate) struct FoundGateway {
 
 /// Every gateway that answers, in probe order.
 ///
-/// The other scheme is tried only after a transport failure. An HTTP refusal
-/// proves a server answered and must not be bypassed. The dev gateway serves
-/// TLS and the packaged one serves plain HTTP. All of
-/// them rather than the first, so a caller that must refuse ambiguity sees the
-/// second one.
+/// Every gateway serves https on loopback, so one probe per port decides.
+/// All of them rather than the first, so a caller that must refuse ambiguity
+/// sees the second one.
 pub(crate) fn find_gateways(
     client: &reqwest::blocking::Client,
     ports: &[u16],
@@ -92,30 +76,19 @@ pub(crate) fn find_gateways(
         client
             .get(format!("{base}{HEALTH_PATH}"))
             .send()
-            .map(|response| response.status().is_success())
-            .map_err(|_| ())
+            .is_ok_and(|response| response.status().is_success())
     })
 }
 
-fn find_gateways_with(
-    ports: &[u16],
-    mut probe: impl FnMut(&str) -> Result<bool, ()>,
-) -> Vec<FoundGateway> {
-    let mut found = Vec::new();
-    for &port in ports {
-        for scheme in ["https", "http"] {
-            let base = format!("{scheme}://127.0.0.1:{port}");
-            match probe(&base) {
-                Ok(true) => {
-                    found.push(FoundGateway { port, base });
-                    break;
-                }
-                Ok(false) => break,
-                Err(()) => continue,
-            }
-        }
-    }
-    found
+fn find_gateways_with(ports: &[u16], mut probe: impl FnMut(&str) -> bool) -> Vec<FoundGateway> {
+    ports
+        .iter()
+        .map(|&port| FoundGateway {
+            port,
+            base: lucidos_local_token::client::origin(port),
+        })
+        .filter(|gateway| probe(&gateway.base))
+        .collect()
 }
 
 /// The gateway the caller named, through `--port` or the dev override, when it
@@ -193,44 +166,18 @@ mod tests {
     const WHY: &str = "Pass --port to name one.";
 
     #[test]
-    fn a_health_refusal_stops_scheme_fallback_but_not_other_ports() {
-        for status in [301, 401, 403, 404, 500, 502, 503, 504] {
-            let mut attempts = Vec::new();
-            let gateways = find_gateways_with(&[5998, 5999], |base| {
-                attempts.push(base.to_owned());
-                Ok(reqwest::StatusCode::from_u16(if base.ends_with(":5998") {
-                    status
-                } else {
-                    200
-                })
-                .unwrap()
-                .is_success())
-            });
-            assert_eq!(
-                attempts,
-                ["https://127.0.0.1:5998", "https://127.0.0.1:5999"]
-            );
-            assert_eq!(gateways.len(), 1);
-            assert_eq!(gateways[0].port, 5999);
-        }
-    }
-
-    #[test]
-    fn only_a_transport_failure_tries_the_other_scheme() {
+    fn every_port_is_probed_once_over_https() {
         let mut attempts = Vec::new();
-        let gateways = find_gateways_with(&[5999], |base| {
+        let gateways = find_gateways_with(&[5998, 5999], |base| {
             attempts.push(base.to_owned());
-            if base.starts_with("https:") {
-                Err(())
-            } else {
-                Ok(true)
-            }
+            base.ends_with(":5999")
         });
         assert_eq!(
             attempts,
-            ["https://127.0.0.1:5999", "http://127.0.0.1:5999"]
+            ["https://127.0.0.1:5998", "https://127.0.0.1:5999"]
         );
-        assert_eq!(gateways[0].base, "http://127.0.0.1:5999");
+        assert_eq!(gateways.len(), 1);
+        assert_eq!(gateways[0].port, 5999);
     }
 
     fn found(ports: &[u16]) -> Vec<FoundGateway> {

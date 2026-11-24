@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Disk usage draws its figures and worktree rows as skeletons while
- *  its two reads are in flight. One delay gate covers both, so the skeletons
- *  arrive in one wave; each slot still clears on its own read. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render, type FunctionComponent } from 'preact';
 import { act } from 'preact/test-utils';
@@ -11,7 +8,6 @@ const answers = new Map<string, (body: unknown) => void>();
 let host: HTMLDivElement;
 let DiskUsagePage: FunctionComponent;
 
-/** Answers one read, then lets the loader's awaits run out. */
 function answer(path: string, body: unknown) {
   return act(async () => {
     answers.get(path)!(body);
@@ -55,7 +51,6 @@ it('draws its labels at once and no skeleton before the gate opens', () => {
 
 it('draws every owed skeleton together once the gate opens', () => {
   act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
-  // The headline, three key rows and the cleanup card's figure.
   expect(bars('.disk-usage-figure')).toBe(5);
   expect(host.querySelector('.loading-fade-skeleton .settings-overview-bar .sk-bar')).not.toBeNull();
   expect(host.querySelectorAll('.loading-fade-skeleton .disk-usage-row')).toHaveLength(3);
@@ -66,7 +61,7 @@ it('clears the worktree slots when the inventory lands, while the summary still 
   act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
   await answer('worktrees', { worktrees: [] });
   const [worktrees, data] = [...host.querySelectorAll('.settings-overview-key-value')];
-  expect(shimmering(worktrees)).toBe(true); // held through the minimum-visible floor
+  expect(shimmering(worktrees)).toBe(true);
   act(() => { vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS); });
   expect(shimmering(worktrees)).toBe(false);
   expect(shimmering(data)).toBe(true);

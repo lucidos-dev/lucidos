@@ -1,19 +1,3 @@
-// A tool call held by a permission card says so, and a refused one says that.
-//
-// Before `'blocked'` and `'denied'` existed, the row for a gated call lied in
-// one of two directions, and which one you got was a race. It opened
-// `'pending'`, so a command waiting on a human shimmered exactly like one that
-// was running. A permission request also parks the thread at
-// `waiting_for_user_answer`, which `isThreadQuiescent` counts as quiescent. The
-// `threadIdle` sweep could therefore finalize the un-run row to a green
-// `'success'`. A denial resolved to `'success'` too.
-//
-// Everything here drives the REAL fold, because the marks are written there:
-// the request is an exchange starter, so the call it gates sits in the previous
-// exchange and only `groupIntoExchanges` holds both ends. Both projections are
-// asserted every time, since they are mirrors.
-//
-// See `docs/plans/2026-08-25-permission-blocked-step-state.md`.
 
 import { describe, it, expect } from 'vitest';
 import {
@@ -36,8 +20,6 @@ function ev(seq: number, e: ThreadEvent): readonly [number, StoredEvent] {
 }
 const thread = (...entries: Array<readonly [number, StoredEvent]>) => new Map(entries);
 
-/** Outcomes of both projections' step rows, keyed by the name each is known
- *  by, so a failure names which mirror drifted. */
 function outcomes(exchange: Exchange, threadIdle = false): Record<string, StepOutcome[]> {
   return {
     exchangeSteps: exchangeSteps(exchange, false, threadIdle).map(s => s.outcome),
@@ -47,22 +29,17 @@ function outcomes(exchange: Exchange, threadIdle = false): Record<string, StepOu
   };
 }
 
-/** Assert both projections give the call rows exactly `expected`. */
 function expectOutcomes(exchange: Exchange, expected: StepOutcome[], threadIdle = false): void {
   for (const [projection, actual] of Object.entries(outcomes(exchange, threadIdle))) {
     expect(actual, projection).toEqual(expected);
   }
 }
 
-/** The step rows of the inline projection, which is the one carrying results. */
 function inlineRows(exchange: Exchange): Extract<ResponseEvent, { type: 'step' }>[] {
   return exchangeResponseEvents(exchange, false, false)
     .filter((e): e is Extract<ResponseEvent, { type: 'step' }> => e.type === 'step');
 }
 
-// The coding-agent lane, Claude Code and Codex alike. The request shares its
-// `tool_use_id` with the call on both backends, so the fold pairs them through
-// `toolCallOwners` across the divider between them.
 
 const ccBash = (seq: number, id: string, command: string) =>
   ev(seq, { type: 'CodingAgentToolCalled', name: 'Bash', args: { command }, tool_use_id: id });
@@ -84,7 +61,6 @@ const PROMPT = 'read the PR report';
 const CMD = 'cd /tmp/report && python3 -c "import json"';
 const DENIAL = "The user doesn't want to proceed with this tool use.";
 
-/** The exchange holding the gated call: the one BEFORE the divider. */
 function callExchange(...entries: Array<readonly [number, StoredEvent]>): Exchange {
   return groupIntoExchanges(thread(
     ev(1, { type: 'MessageReceived', text: PROMPT }),
@@ -99,11 +75,8 @@ describe('a coding-agent call held by a permission card', () => {
     expectOutcomes(callExchange(...upToRequest), ['blocked']);
   });
 
-  // The green-check half of the original bug, and the reason `'blocked'` had to
-  // live outside `'pending'` rather than beside it. Every sweep keys on
-  // `'pending'`, so a held row is exempt from them by construction.
   it('survives the quiescent sweep instead of being finalized to success', () => {
-    expectOutcomes(callExchange(...upToRequest), ['blocked'], /* threadIdle */ true);
+    expectOutcomes(callExchange(...upToRequest), ['blocked'],  true);
   });
 
   it('the card is still its own divider exchange', () => {
@@ -132,9 +105,6 @@ describe('a coding-agent call held by a permission card', () => {
     expectOutcomes(callExchange(...upToRequest, ccResolved(4, 'r1', false)), ['denied']);
   });
 
-  // The refusal comes back to the agent as an ordinary tool result. Pairing by
-  // id used to require the step still be `'pending'`. A denied row therefore
-  // fell through to the walk, and a green check landed on it anyway.
   it('and the refusal that follows does not turn it back into a success', () => {
     const exchange = callExchange(
       ...upToRequest,
@@ -155,8 +125,6 @@ describe('a coding-agent call held by a permission card', () => {
 });
 
 describe('a gated call beside a running one', () => {
-  // The reported shape: one command raises a card while a sibling from the same
-  // assistant message runs. Holding one must not mute the other.
   const parallel = [
     ccBash(2, 'tu-a', CMD),
     ccBash(3, 'tu-b', 'git show HEAD^{commit}'),
@@ -182,10 +150,6 @@ describe('a gated call beside a running one', () => {
   });
 });
 
-// The chat lanes: the Lucidos Agent's command guard and its MCP gate. A chat
-// `ToolCalled` carries no `tool_use_id`, so the fold takes the last call step
-// of the exchange the request interrupted. That is exact, because the chat
-// agentic loop runs one tool at a time.
 
 const chatCall = (seq: number, name: string) =>
   ev(seq, {
@@ -236,7 +200,6 @@ describe('the chat MCP gate holds its call the same way', () => {
     expectOutcomes(exchange, ['denied']);
   });
 
-  // The refusal carries `success: false`, and a denial still reads Denied.
   it('the refusal lands on the refused row rather than an older one', () => {
     const exchange = chatCallExchange(
       ...upToRequest,
@@ -256,11 +219,6 @@ describe('the chat MCP gate holds its call the same way', () => {
 });
 
 describe('a queued follow-up between the call and the card', () => {
-  // `MessageReceived` is an exchange starter, so a follow-up typed while the
-  // agent works makes `current` that uningested MR. It holds no tool call, so
-  // reading the interrupted turn off `current` finds nothing and the held row
-  // keeps shimmering. `chatTurnOwner` reads `lastChatTurnReqId` instead, which
-  // the fold already tracks for the divider redirect's version of this bug.
   const events = thread(
     ev(1, { type: 'MessageReceived', text: 'search slack', _eventId: 'msg-1' } as ThreadEvent),
     chatCall(2, 'mcp__slack__search'),
@@ -321,9 +279,6 @@ describe('a thread with no permission card', () => {
 });
 
 describe('nothing on screen claims the machine is busy while a card is open', () => {
-  // The whole point, checked across BOTH exchanges the card splits the turn
-  // into. `shimmer-invariant.test.ts` asks the complementary question, that a
-  // turn which IS working never loses its only shimmer.
   const events = thread(
     ev(1, { type: 'MessageReceived', text: PROMPT, channel: 'claude_code' } as ThreadEvent),
     ev(2, { type: 'SessionStarted', session_id: 's1', channel: 'claude_code' } as ThreadEvent),
@@ -333,7 +288,6 @@ describe('nothing on screen claims the machine is busy while a card is open', ()
 
   it('neither the held call nor the card shimmers', () => {
     const exchanges = groupIntoExchanges(events);
-    // The thread is parked, which is what makes `threadIdle` true here.
     const threadIdle = true;
     exchanges.forEach((exchange, i) => {
       const isLast = i === exchanges.length - 1;
@@ -356,9 +310,6 @@ describe('nothing on screen claims the machine is busy while a card is open', ()
 });
 
 describe('the incremental fold wakes the exchange it reached back into', () => {
-  // The call's row lives in an exchange the request does not belong to, and
-  // `ChatExchange` is memoized on a captured `revision`. Marking it without the
-  // bump would leave the held row shimmering until something else re-rendered.
   it('bumps the prior exchange revision when the card arrives', () => {
     const state = makeThreadState();
     for (const [seq, event] of [

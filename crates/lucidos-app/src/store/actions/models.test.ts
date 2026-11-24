@@ -51,7 +51,6 @@ function model(
   };
 }
 
-/** A row served by two backends, which is what the Claude seeds ship. */
 function dualRouted(
   id: string,
   label: string,
@@ -65,11 +64,8 @@ function dualRouted(
   };
 }
 
-/** What the engine serves for a `provider = local` row. A third-party
- *  OpenAI-compatible server stops at `high`, since `xhigh` is OpenAI's own. */
 const LOCAL_TIERS = ['none', 'low', 'medium', 'high'];
 
-/** What an adaptive Claude route offers. */
 const ALL_TIERS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 afterEach(() => {
@@ -134,13 +130,9 @@ describe('chatModelOptions', () => {
   it('falls back to the static MODELS list before the registry loads', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(chatModelOptions()).toBe(MODELS);
-    // The fallback includes Fable 5.1 so the picker is never empty pre-load.
     expect(MODELS.some((m) => m.value === 'claude-fable-5-1')).toBe(true);
   });
 
-  // The registry filters on the chat ladder; the fallback cannot, so it must
-  // already BE a current set. A retired model left here is offered for the moment
-  // before `/models` lands, then disappears under the user's cursor.
   it('offers no model a disable migration has retired', () => {
     const retired = [
       'claude-opus-4-8',
@@ -159,10 +151,6 @@ describe('chatModelOptions', () => {
     expect(MODELS.filter((m) => retired.includes(m.value))).toEqual([]);
   });
 
-  // THE REPORTED BUG. Every Claude Opus and Sonnet row was seeded on `vertex`,
-  // and the filter asked about that one provider. A workspace whose only
-  // credential is an Anthropic key therefore got the Fable rows and nothing
-  // else from the Claude family.
   it('offers a dual-routed model when ANY of its backends is configured', () => {
     const opus = dualRouted('claude-opus-5-6', 'Opus 5.6', ['vertex', 'anthropic']);
     chatModels.value = { status: 'loaded', data: [opus] };
@@ -171,17 +159,13 @@ describe('chatModelOptions', () => {
     expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-6', label: 'Opus 5.6' }]);
     expect(resolvedRoute('claude-opus-5-6')?.provider).toBe('anthropic');
 
-    // Vertex is listed first, so a workspace holding both keeps Vertex.
     configuredProviders.value = ['vertex', 'anthropic'];
     expect(resolvedRoute('claude-opus-5-6')?.provider).toBe('vertex');
 
-    // Neither configured: the model leaves the picker, as it always did.
     configuredProviders.value = [];
     expect(chatModelOptions()).toEqual([]);
   });
 
-  // Mirrors the engine's `resolve_route`: the plan route leads a GPT row only so
-  // a signed-in plan wins. A user who set up nothing never chose it.
   it('names the API route of an unconfigured GPT model, not the plan', () => {
     const gpt = dualRouted('gpt-x', 'GPT X', ['chatgpt-plan', 'openai']);
     chatModels.value = { status: 'loaded', data: [gpt] };
@@ -193,9 +177,6 @@ describe('chatModelOptions', () => {
     expect(resolvedRoute('gpt-x')?.provider).toBe('chatgpt-plan');
   });
 
-  // Honoured or refused, never substituted. A model whose PICKED backend is
-  // parked stays listed, because the provider step is the only place the user
-  // can fix it. Hiding the model would be a dead end.
   it('keeps a model listed when its preferred backend is parked', () => {
     const opus = dualRouted(
       'claude-opus-5-6',
@@ -207,13 +188,9 @@ describe('chatModelOptions', () => {
     configuredProviders.value = ['vertex'];
 
     expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-6', label: 'Opus 5.6' }]);
-    // And the picker names the PARKED backend, not the one that happens to be
-    // configured, so what it shows is what the turn will do: refuse.
     expect(resolvedRoute('claude-opus-5-6')?.provider).toBe('anthropic');
   });
 
-  // The refusal is fixable without leaving the picker: the provider step lists
-  // every backend, marks the parked one, and shows it as the one in force.
   it('offers the parked backend in a provider step beside the configured one', () => {
     const opus = dualRouted(
       'claude-opus-5-6',
@@ -235,8 +212,6 @@ describe('chatModelOptions', () => {
     expect(row.providers.map((p) => p.value)).toEqual(['vertex', 'anthropic']);
   });
 
-  // One configured backend is no choice, so an Anthropic-only workspace picks
-  // Opus in two steps, exactly as before routes.
   it('offers no provider step when only one backend is configured', () => {
     chatModels.value = {
       status: 'loaded',
@@ -248,36 +223,29 @@ describe('chatModelOptions', () => {
     expect(row.providers).toEqual([]);
   });
 
-  // A fresh install with no saved preference resolves to the catalog default,
-  // so the picker has to be able to show it.
   it('offers the default chat model', () => {
     expect(MODELS.some((m) => m.value === DEFAULT_CHAT_MODEL)).toBe(true);
   });
 
-  // The newest OpenAI builtin. A seed the fallback list misses is invisible
-  // until `/models` lands, which is exactly when a fresh page is being read.
   it('offers GPT-6 Astra', () => {
     expect(MODELS).toContainEqual({ value: 'gpt-6-astra', label: 'GPT-6 Astra' });
   });
 
-  // Fable 5.1, Opus 5.6 and Sonnet 5.5 run 1M natively, so their `[1m]` twins
-  // retired to the bare rows.
   it('offers no 1M twin of a model that only runs at 1M', () => {
     for (const twin of ['claude-fable-5-1[1m]', 'claude-opus-5-5[1m]', 'claude-sonnet-5-5[1m]']) {
       expect(MODELS.some((m) => m.value === twin)).toBe(false);
     }
   });
 
-  // The newest Anthropic builtin heads the list.
   it('offers Fable 5.2 first and not the retired Fable 5', () => {
     expect(MODELS[0]).toEqual({ value: 'claude-fable-5-2', label: 'Fable 5.2' });
     expect(MODELS).toContainEqual({ value: 'gemini-4-argon', label: 'Gemini 4 Argon' });
+    expect(MODELS).toContainEqual({ value: 'gemini-4-neon', label: 'Gemini 4 Neon' });
     expect(MODELS).toContainEqual({ value: 'gemini-4-carbon', label: 'Gemini 4 Carbon' });
     expect(MODELS.some((m) => m.value.startsWith('claude-fable-5['))).toBe(false);
     expect(MODELS.some((m) => m.value === 'claude-fable-5')).toBe(false);
   });
 
-  // Opus 5 retired to Opus 5.6 (ADR 0418), so only the successor is offered.
   it('offers Opus 5.6 and not the retired Opus 5', () => {
     expect(MODELS).toContainEqual({ value: DEFAULT_CHAT_MODEL, label: 'Opus 5.5' });
     expect(MODELS.some((m) => m.value === 'claude-opus-5' || m.value === 'claude-opus-5[1m]'))
@@ -327,10 +295,6 @@ describe('chatModelOptions', () => {
   });
 });
 
-// The picker's half of the fix. `reasoningLevelsFor` / `clampEffortFor` are the
-// ONLY way a Lucidos Agent surface should ask "what does this model support?",
-// so the engine's answer is used wherever it exists and the id-shape heuristic
-// is reached only when there is none.
 describe('modelReasoningEfforts', () => {
   it('returns the registry answer for a loaded model', () => {
     chatModels.value = {
@@ -354,17 +318,10 @@ describe('modelReasoningEfforts', () => {
       status: 'loaded',
       data: [model('a', 'A', true, 'local', LOCAL_TIERS), model('older', 'Older')],
     };
-    // A saved chat_model naming a model the user has since deleted.
     expect(modelReasoningEfforts('deleted-model')).toBeUndefined();
-    // A row always carries its route's set, so this is never `undefined`. An
-    // EMPTY set falls through to the id-shape heuristic downstream, in
-    // `availableReasoningLevels`, rather than rendering an empty dropdown.
     expect(modelReasoningEfforts('older')).toEqual([]);
   });
 
-  // The set is per ROUTE, because the answer depends on the backend as much as
-  // on the model. Resolution picks the route that will serve, so switching the
-  // preferred provider switches which set the picker offers.
   it('answers for the route that would serve, not the row', () => {
     chatModels.value = {
       status: 'loaded',
@@ -398,8 +355,6 @@ describe('lucidosModelChoices / clampEffortFor', () => {
     expect(row?.reasoningEfforts).toEqual(LOCAL_TIERS);
   });
 
-  // The reported bug, at the layer the user touches: switching to this model
-  // with the account effort at xhigh must land on a tier its server accepts.
   it('snaps xhigh onto the closest tier a local model supports', () => {
     chatModels.value = {
       status: 'loaded',
@@ -411,8 +366,6 @@ describe('lucidosModelChoices / clampEffortFor', () => {
 
   it('offers the whole ladder when the registry cannot answer', () => {
     chatModels.value = { status: 'not-loaded' };
-    // Pre-load the picker stays usable, and the engine snaps the pick onto
-    // what the backend accepts: the client keeps no per-family copy.
     const row = lucidosModelChoices('gpt-5.4').find((c) => c.value === 'gpt-5.4');
     expect(row?.reasoningEfforts).toEqual(EFFORT_LADDER);
     expect(clampEffortFor('max', 'gpt-5.4')).toBe('max');
@@ -446,9 +399,6 @@ describe('parseContextWindow', () => {
   });
 
   it('rejects non-positive and non-integer values rather than dropping them', () => {
-    // Silently dropping a bad value would leave the model on the 200k default
-    // with no sign anything went wrong — the exact failure this field exists
-    // to prevent.
     for (const bad of ['0', '-1', 'abc', '1.5', '1e', '']) {
       if (bad === '') continue;
       expect(parseContextWindow(bad).ok).toBe(false);
@@ -462,7 +412,6 @@ describe('formatContextWindow', () => {
   });
 
   it('abbreviates declared windows to M and k', () => {
-    // A million-token row reads as the marker its id carries, not as 1049k.
     expect(formatContextWindow(1048576)).toBe('context window: 1M');
     expect(formatContextWindow(1000000)).toBe('context window: 1M');
     expect(formatContextWindow(1050000)).toBe('context window: 1.1M');
@@ -471,7 +420,6 @@ describe('formatContextWindow', () => {
   });
 
   it('never prints 1000k, whichever side of a million the value falls', () => {
-    // Rounds up to 1000k, so a threshold on the raw value would print it.
     expect(formatContextWindow(999_999)).toBe('context window: 1M');
     expect(formatContextWindow(999_400)).toBe('context window: 999k');
   });
@@ -483,16 +431,12 @@ describe('displayModelName', () => {
     expect(displayModelName('claude-fable-5')).toBe('Fable 5');
   });
 
-  // `claude-fable-5` is a prefix of `claude-fable-5-1`, so a lookup that was
-  // not an exact match would label a 5.1 exchange as Fable 5.
   it('tells the two Fable generations apart', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName('claude-fable-5-1')).toBe('Fable 5.1');
     expect(displayModelName('claude-fable-5-1[1m]')).toBe('Fable 5.1 (1M)');
   });
 
-  // `claude-opus-5` is a prefix of `claude-opus-5-5`, the same trap the Fable
-  // pair sets.
   it('tells the two Opus 5 generations apart', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(displayModelName(DEFAULT_CHAT_MODEL)).toBe('Opus 5.5');

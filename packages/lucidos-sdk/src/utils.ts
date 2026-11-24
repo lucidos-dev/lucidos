@@ -12,16 +12,13 @@ export const utils = {
     return new Date(iso).toLocaleDateString();
   },
 
-  /** Text position only: it leaves quotes raw, so an attribute takes `escapeHtmlAttr`. */
   escapeHtml(str: string): string {
     const d = document.createElement('div');
     d.textContent = str;
     return d.innerHTML;
   },
 
-  /** Safe inside a single- or double-quoted attribute value, and in text position. */
   escapeHtmlAttr(str: string): string {
-    // Coerces like `escapeHtml`, so plain-JS callers can swap one for the other.
     return String(str ?? '').replace(/[&<>"']/g, (c) => ATTR_ENTITIES[c]);
   },
 

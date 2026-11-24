@@ -15,11 +15,9 @@
 import { hasCoarsePointer } from './viewport';
 
 export interface HealthCounters {
-  /** Live listeners on `document`, `window` and `visualViewport`, by type. */
   listeners: Map<string, number>;
   intervals: number;
   observers: number;
-  /** Every `requestAnimationFrame` call since install. */
   rafCalls: number;
 }
 
@@ -34,8 +32,6 @@ interface Globals {
   observerPrototypes: { observe: (...a: never[]) => void; disconnect: () => void }[];
 }
 
-/** The slice of `FinalizationRegistry` used here. The project's TS lib
- *  predates it. */
 type FinalizationRegistryCtor = new (onCollect: () => void) => {
   register(target: object, held: undefined, token: object): void;
   unregister(token: object): void;
@@ -45,15 +41,12 @@ function captureOf(opts: unknown): boolean {
   return typeof opts === 'boolean' ? opts : !!(opts as { capture?: boolean } | undefined)?.capture;
 }
 
-/** A listener the browser removes by itself is never counted: `once`, or one
- *  bound to an `AbortSignal`. Neither passes through `removeEventListener`. */
 function removesItself(opts: unknown): boolean {
   if (typeof opts !== 'object' || opts === null) return false;
   const o = opts as { once?: boolean; signal?: AbortSignal };
   return !!o.once || !!o.signal;
 }
 
-/** Patch the globals to count what is live. Returns a restore function. */
 export function installHealthCounters(g: Globals): { counters: HealthCounters; restore: () => void } {
   const counters: HealthCounters = { listeners: new Map(), intervals: 0, observers: 0, rafCalls: 0 };
   const bump = (type: string, d: number) => counters.listeners.set(type, (counters.listeners.get(type) ?? 0) + d);
@@ -62,7 +55,6 @@ export function installHealthCounters(g: Globals): { counters: HealthCounters; r
   const add = proto.addEventListener;
   const remove = proto.removeEventListener;
   const registered = new WeakMap<object, Set<string>>();
-  // Keyed per target as well as type and phase, as the browser dedupes.
   const targetIds = new WeakMap<EventTarget, number>();
   let nextTargetId = 0;
   const keyOf = (target: EventTarget, type: string, opts: unknown) => {
@@ -105,7 +97,6 @@ export function installHealthCounters(g: Globals): { counters: HealthCounters; r
   };
 
   const observing = new WeakSet<object>();
-  // An observer collected without a disconnect still leaves the count.
   const Registry = (globalThis as { FinalizationRegistry?: FinalizationRegistryCtor }).FinalizationRegistry;
   const collected = Registry ? new Registry(() => { counters.observers -= 1; }) : null;
   const restores = g.observerPrototypes.map((p) => {
@@ -143,12 +134,10 @@ export function installHealthCounters(g: Globals): { counters: HealthCounters; r
 
 let installed: HealthCounters | null = null;
 
-/** The live counts, or null where nothing was installed (a desktop). */
 export function pageHealthCounters(): HealthCounters | null {
   return installed;
 }
 
-/** Install on a touch device only. Idempotent. */
 export function installPageHealthCounters(): void {
   if (installed || typeof window === 'undefined' || !hasCoarsePointer()) return;
   installed = installHealthCounters({

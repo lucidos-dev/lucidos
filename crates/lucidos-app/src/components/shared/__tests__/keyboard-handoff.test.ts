@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** A touch menu opened mid-typing takes the on-screen keyboard for its filter
- *  box, and hands it back to the field as it closes. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { keyboardHolder, returnKeyboard } from '../keyboardHandoff';
 
@@ -38,8 +36,6 @@ describe('keyboardHolder', () => {
   });
 
   it('names none for a focused control that opens no keyboard', () => {
-    // A checkbox holds focus with no keyboard up. Taking it over would raise
-    // one over the list the user opened to tap.
     mount('input', 'checkbox').focus();
     expect(keyboardHolder()).toBeNull();
   });
@@ -51,8 +47,6 @@ describe('keyboardHolder', () => {
   });
 
   it('names the field in a phone-width window, where no trigger takes focus', () => {
-    // The touch layout leaves the trigger unfocused, so without the handoff a
-    // keystroke would land in the prompt.
     fingerPointer(false);
     vi.stubGlobal('innerWidth', 600);
     const prompt = mount('textarea');
@@ -74,7 +68,6 @@ describe('returnKeyboard', () => {
   });
 
   it('hands focus back when the step that held it left nothing focused', () => {
-    // A tier row replaces the filter box, so focus falls to the body.
     const prompt = mount('textarea');
     expect(returnKeyboard(prompt, mount('div'))).toBe(true);
     expect(document.activeElement).toBe(prompt);

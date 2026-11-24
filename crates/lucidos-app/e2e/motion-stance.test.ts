@@ -2,15 +2,9 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-/** The suite runs on calm motion (`reducedMotion: 'reduce'` in
- *  playwright.config.ts), so a spec that measures motion would pass with
- *  nothing moving. Every spec that reads motion therefore names the motion it
- *  wants in a `test.use`: `'no-preference'` to see real motion, or `'reduce'`
- *  when it only waits motion out. */
 
 const E2E_DIR = __dirname;
 
-/** What reading motion looks like in a spec. */
 const MOTION_READS: { name: string; matches: (src: string) => boolean }[] = [
   { name: 'getAnimations()', matches: src => src.includes('getAnimations(') },
   { name: 'animationName', matches: src => src.includes('animationName') },

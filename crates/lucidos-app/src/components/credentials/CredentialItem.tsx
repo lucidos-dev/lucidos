@@ -25,20 +25,6 @@ function formatAuthType(authType: AuthType): string {
   }
 }
 
-/** How a credential row titles and explains itself.
- *
- *  Two auth types read as ordinary rows without help. An `oauth_client` is the
- *  app registration behind a connected account, not a second account: a user who
- *  had just connected Dropbox saw it sitting next to a stray plain credential of
- *  the same name and could not tell which was which, or what either was for
- *  (2026-08-05). An `email_password` has the same shape.
- *
- *  The title is always the service name, which is now the provider or the
- *  mailbox account with no namespace prefix wrapped around it, and the `note`
- *  says what the row is. Keyed on `authType` rather than on how the name is
- *  spelled, which is the same correction the storage layer made: the type was
- *  always the thing being described, and the prefix was a second copy of it that
- *  could drift. Pure so the labelling is unit-testable without rendering. */
 export function credentialRowLabel(
   serviceName: string,
   authType: AuthType
@@ -77,7 +63,6 @@ const COPY_TARGETS: Record<AuthType, CopyTarget[]> = {
   ],
   email_password: [{ label: 'Password' }],
   secret: [{ label: 'Secret' }],
-  // Never copied or revealed: the engine refuses it with a 403 anyway.
   onepassword_service_account: [],
 };
 
@@ -111,18 +96,12 @@ export function CredentialItem({ credential }: Props) {
       <div class="list-row-info">
         <div class="title list-row-name">{title}</div>
         <div class="list-row-details">
-          {/* One field per base URL the credential covers, since a *credential
-              scope* is a set. `.list-row-details` is a flex row of fields, so
-              its own gap separates them. A `secret` declares none and renders
-              nothing, rather than an empty span the gap would show as a hole. */}
           {credential.base_urls.map((url) => (
             <span class="list-row-url" key={url}>{url}</span>
           ))}
           <span class="list-row-type">{formatAuthType(credential.auth_type)}</span>
           {credential.secret_reference && <span class="list-row-type">1Password reference</span>}
         </div>
-        {/* A sentence, so `.list-row-details-prose` (the bare class is a flex
-            row of FIELDS and would blow holes through it). */}
         {note && <div class="list-row-details list-row-details-prose">{note}</div>}
         <div class="list-row-date">Added {dateStr}</div>
       </div>

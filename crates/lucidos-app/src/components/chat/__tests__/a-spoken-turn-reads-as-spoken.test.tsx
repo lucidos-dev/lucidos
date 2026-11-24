@@ -1,17 +1,3 @@
-/** A call leaves two marks in the transcript, and they say different things.
- *
- *  The bubble mark says the message was SPOKEN. The session bounds cannot say
- *  it: the composer stays live during a call (ADR 0148), so a typed message
- *  sits between the same pair of session events.
- *
- *  The row says what Lucidos said back OUT LOUD, which is never the written
- *  answer beside it: the talker says what an answer means. It is a transcript
- *  marker rather than step mechanics, so no control may hide it. No audio is
- *  kept, so the row is the only record that exists.
- *
- *  Both marks are the call icon alone. Neither may lose its accessible name
- *  with its word, which is what the screen-reader cases here pin.
- */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { SpokenChip, SpokenReply } from '../chat-exchange-parts';
@@ -25,9 +11,6 @@ import type { ResponseEvent } from '../../../store/types';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
-/** The text a node would show. There is no jsdom here, so a child that is a
- *  function component is invoked rather than mounted. Every component this
- *  file reaches is hookless, which is what makes that safe. */
 function vnodeText(n: ComponentChildren): string {
   if (n === null || n === undefined || typeof n === 'boolean') return '';
   if (typeof n === 'string' || typeof n === 'number') return String(n);
@@ -54,12 +37,6 @@ function findByRole(node: ComponentChildren, role: string): AnyVNode | null {
   return findByRole(v.props?.children, role);
 }
 
-/** Is `text` carried by a `.visually-hidden` span, i.e. present for a screen
- *  reader and absent from the page? That is how both call marks keep the word
- *  they no longer print.
- *
- *  Over `vnodeToText`, the shared walker, which surfaces `class` for exactly
- *  this kind of structural assertion. */
 function hasHiddenName(node: ComponentChildren, text: string): boolean {
   return vnodeToText(node).includes(`<span class="visually-hidden">${text}</span>`);
 }
@@ -102,8 +79,6 @@ describe('a spoken message says so', () => {
     expect(typed.status).toBeUndefined();
   });
 
-  // The tint went with the word. A spoken bubble is the same message as a typed
-  // one, so it takes the same surface and the mark carries the whole fact.
   it('takes no surface of its own', () => {
     const spoken = describeInitiator(
       exchangeWith({
@@ -168,8 +143,6 @@ describe('what was said out loud is in the transcript', () => {
   });
 
   it('draws with the steps control OFF', () => {
-    // The caller heard it and no audio is kept, so a default-off control would
-    // record it nowhere. That is the bug the event row already taught us.
     expect(drawsResponseRow(spokenRow(), false)).toBe(true);
   });
 
@@ -189,7 +162,6 @@ describe('a spoken reply is not the written answer', () => {
     const row = SpokenReply({ event: spokenRow({ text: 'Both of them answered.' }) });
     expect(findByRole(row, 'spoken-reply')).not.toBeNull();
     expect(vnodeText(row)).toContain('Both of them answered.');
-    // The word went; the accessible name it carried did not.
     expect(hasHiddenName(row, 'Said aloud')).toBe(true);
   });
 
@@ -200,9 +172,6 @@ describe('a spoken reply is not the written answer', () => {
     expect(vnodeText(whole)).not.toContain('cut off');
   });
 
-  /** A RUN of spoken rows says "this was said aloud" once. Eleven of them
-   *  down one reply carried eleven call marks, which is the marker repeating
-   *  itself rather than telling the reader anything. */
   it('marks the first of a run and no other', () => {
     const reply = (text: string) => ({
       seq: 1,
@@ -219,7 +188,6 @@ describe('a spoken reply is not the written answer', () => {
     const spoken = events.filter(e => e.type === 'spoken_reply');
     expect(spoken.map(e => e.follows === true)).toEqual([false, true, false]);
 
-    // The slot is kept either way, so the bubbles keep one left edge.
     const led = SpokenReply({ event: spokenRow() });
     const inRun = SpokenReply({ event: { ...spokenRow(), follows: true } });
     expect(hasHiddenName(led, 'Said aloud')).toBe(true);
@@ -227,16 +195,6 @@ describe('a spoken reply is not the written answer', () => {
     expect(findByRole(inRun, 'spoken-reply')).not.toBeNull();
   });
 
-  /** **The row claims no liveness, in words or in a mark** (ADR 0197).
-   *
-   *  The live row is retired by the engine's own row, written at the next move
-   *  of the conversation (ADR 0188, ADR 0191). A finished sentence stands here
-   *  until the caller speaks again, so anything saying "still going" is a lie
-   *  for all of it. That was the report: a reply under a Done header, wearing
-   *  the mark.
-   *
-   *  The live row and the landed row therefore render identically, which also
-   *  means the swap between them moves nothing. */
   it('never says it is still being said', () => {
     const drawn = vnodeToText(SpokenReply({ event: spokenRow() }));
     expect(drawn).not.toContain('live-speech-mark');
@@ -245,9 +203,6 @@ describe('a spoken reply is not the written answer', () => {
   });
 });
 
-/** One act, one shape. Which model fielded an utterance is a fact about
- *  Lucidos, not about the reader, so it may not change how their own words
- *  look. `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`. */
 describe('a caller utterance reads the same either way', () => {
   const HTML = '<p>what happened?</p>';
 

@@ -15,25 +15,9 @@ export function DrawerDivider() {
 
     beginPaneResize();
 
-    // Capture panel pane pixel width before drag starts so we can keep it constant
     const splitLayout = contentRow.querySelector('.split-layout') as HTMLElement | null;
     const contentPanePx = splitLayout ? splitLayout.offsetWidth * (1 - drawnSplitRatio.peek()) : 0;
 
-    // CLAMPED drag, both ends (ADR 0056). Narrowing stops at the drawer's own
-    // floor, which is what its header row needs. WIDENING stops too, and that
-    // end is the less obvious one: the drag deliberately holds the content pane
-    // at a constant pixel width, so every pixel the drawer gains comes out of
-    // the THREAD pane, which has a minimum of its own. Without the ceiling a
-    // wide drag squeezed it to nothing.
-    //
-    // Nothing corrects any of this on release, which is also what holds the
-    // collapse-state attributes still through the gesture: the drawer's own
-    // stays put because only its toggle writes it, and the split panes' cannot
-    // flip because `clampSplitRatio` guarantees a ratio strictly inside (0, 1).
-    //
-    // Measured ONCE, like the split divider's bounds: they derive from the root
-    // font size, which a drag cannot change, and each read forces a style
-    // recalc on a per-pointermove path.
     const floor = minDrawerWidth();
     const threadFloor = minThreadPanePx();
     const bounds = splitBounds();
@@ -47,11 +31,6 @@ export function DrawerDivider() {
       );
       threadDrawerWidth.value = newWidth;
 
-      // Keep the content pane at the pixel width it had at grab time: the
-      // remaining space is the split's, and the thread pane takes what the
-      // content pane does not. Routed through the same clamp the split divider
-      // uses, so the two dividers cannot disagree about the panes' floors and
-      // so this path inherits the strictly-inside-(0, 1) guarantee.
       const newSplitWidth = rect.width - newWidth;
       if (newSplitWidth > 0 && contentPanePx > 0) {
         splitRatio.value = clampSplitRatio(newSplitWidth - contentPanePx, newSplitWidth, bounds);

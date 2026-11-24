@@ -21,15 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Per-change failure reason in an Apply All batch. Named-struct wire
-/// format keeps the `failed` field of `ApplyAllBatchCompleted` self-
-/// describing (tuple serialization would emit a positional JSON array
-/// downstream consumers couldn't introspect).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ApplyFailure {
-    pub change_id: Uuid,
-    pub error: String,
-}
+pub use crate::engine::thread_events::apply::ApplyFailure;
 
 /// Lifecycle state of one batch member. `Applied` / `Failed` are terminal:
 /// once set, a second terminal event for the same member is a no-op.
@@ -326,7 +318,7 @@ impl BatchProgress {
 /// one instance on the engine. Concurrent batches are allowed (one per
 /// device, in principle) but in practice the UI starts only one at a time.
 #[derive(Debug, Default)]
-pub(crate) struct ApplyAllRegistry {
+pub struct ApplyAllRegistry {
     inner: HashMap<Uuid, BatchProgress>,
 }
 
@@ -368,7 +360,7 @@ impl ApplyAllRegistry {
 
     /// The running Apply All as the apply toast draws it, or `None` when no
     /// batch runs. Concurrent batches read as one longer run.
-    pub(crate) fn snapshot(&self) -> Option<ApplyAllBatchSnapshot> {
+    pub fn snapshot(&self) -> Option<ApplyAllBatchSnapshot> {
         if self.inner.is_empty() {
             return None;
         }

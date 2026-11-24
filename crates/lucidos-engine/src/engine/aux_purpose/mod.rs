@@ -39,13 +39,13 @@ use crate::llm::LlmProvider;
 
 use crate::engine::event_bus::EventBus;
 use crate::llm::AuxProvider;
+pub(crate) use default::select as select_model;
 pub use default::ModelSource;
-pub(crate) use default::{asks_no_model, recommended, recommended_effort, select as select_model};
-pub(crate) use judge_model::{
-    guarded_turn_refusal, unresolved_judge, unresolved_reason as judge_unresolved,
-};
+pub(crate) use judge_model::unresolved_reason as judge_unresolved;
 use not_served_report::NotServedRecorder;
 pub(crate) use reach::{seed_not_served, Reach};
+pub use {default::asks_no_model, default::recommended, default::recommended_effort};
+pub use {judge_model::guarded_turn_refusal, judge_model::unresolved_judge};
 
 /// The preference pair one auxiliary purpose reads.
 ///
@@ -79,7 +79,7 @@ pub(crate) const SUMMARY_COMPACTION_PREFS: ProviderResolvedPrefs = ProviderResol
 /// the named model runs as it is.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum GenerationStep {
+pub enum GenerationStep {
     /// The named model was retired, and its successor `model` runs.
     Successor { model: String },
     /// Nothing from the named model on is reachable, so the earlier `model`
@@ -115,30 +115,30 @@ impl GenerationStep {
 
 /// A resolved *model selection* for one auxiliary call.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AuxSelection {
+pub struct AuxSelection {
     /// The model every request names. Never empty.
-    pub(crate) model: String,
+    pub model: String,
     /// `None` leaves the tier to the router: the model's *default effort*,
     /// else no effort at all.
-    pub(crate) reasoning: Option<String>,
-    pub(crate) source: ModelSource,
+    pub reasoning: Option<String>,
+    pub source: ModelSource,
     /// Whether a configured provider serves `model`, or a generation of it
     /// the call may move to, and has not answered not-found for it. Only a
     /// stored pick or the chat model can be unreachable, and their calls then
     /// fail naming why.
-    pub(crate) reachable: bool,
+    pub reachable: bool,
     /// What runs instead of `model` within its *lineage*, and why.
-    pub(crate) generation: Option<GenerationStep>,
+    pub generation: Option<GenerationStep>,
     /// Where a default call moves when `model` answers not-found. `None` for a
     /// stored pick or the chat model, which move nowhere (ADR 0403).
     pub(crate) fallback: Option<String>,
     /// The models this purpose would run on ahead of `model`, plus `model`,
     /// whose provider answered not-found within the window.
-    pub(crate) not_served: Vec<String>,
+    pub not_served: Vec<String>,
     /// Whether the purpose sends images, so `model` must read them.
-    pub(crate) needs_vision: bool,
+    pub needs_vision: bool,
     /// Whether `model` reads images, by its row's *vision flag*.
-    pub(crate) vision: bool,
+    pub vision: bool,
 }
 
 impl AuxSelection {
@@ -147,7 +147,7 @@ impl AuxSelection {
     /// A purpose that sends images refuses a model that cannot read them,
     /// before anything is spent. A stored pick is named as the user's choice;
     /// an unset one means no recommended model that can is reachable.
-    pub(crate) fn refusal(&self) -> Option<String> {
+    pub fn refusal(&self) -> Option<String> {
         if !self.needs_vision || self.vision {
             return None;
         }
@@ -194,7 +194,7 @@ pub(crate) enum AuxModelSource {
     CallerChosen,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AuxModelSource {
     /// The pair, for a test that only handles the settable case.
     pub(crate) fn prefs(self) -> Option<AuxModelPrefs> {
@@ -276,6 +276,11 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
         ContextPurpose::ExpectedWakeDecision => AuxModelPrefs {
             model: &prefs::MODEL_EXPECTED_WAKE_DECISION,
             reasoning: Some(&prefs::REASONING_EXPECTED_WAKE_DECISION),
+            needs_vision: false,
+        },
+        ContextPurpose::PermissionAnswer => AuxModelPrefs {
+            model: &prefs::MODEL_PERMISSION_ANSWER,
+            reasoning: Some(&prefs::REASONING_PERMISSION_ANSWER),
             needs_vision: false,
         },
         ContextPurpose::QueryClassification => AuxModelPrefs {
@@ -425,7 +430,7 @@ fn task_effort(
 }
 
 /// The purposes Settings shows a background model row for, in its order.
-pub(crate) const BACKGROUND_ROWS: &[ContextPurpose] = &[
+pub const BACKGROUND_ROWS: &[ContextPurpose] = &[
     ContextPurpose::Title,
     ContextPurpose::ChangeSummary,
     ContextPurpose::ImageDescribe,
@@ -438,10 +443,11 @@ pub(crate) const BACKGROUND_ROWS: &[ContextPurpose] = &[
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
     ContextPurpose::ExpectedWakeDecision,
+    ContextPurpose::PermissionAnswer,
 ];
 
 /// The model preference key `purpose` reads, which names its Settings row.
-pub(crate) fn model_key(purpose: ContextPurpose) -> Option<&'static str> {
+pub fn model_key(purpose: ContextPurpose) -> Option<&'static str> {
     match model_source(purpose) {
         AuxModelSource::Preferences(pair) => Some(pair.model.key()),
         AuxModelSource::ProviderResolved => Some(SUMMARY_COMPACTION_PREFS.model.key()),
@@ -472,11 +478,11 @@ pub(crate) fn model_key(purpose: ContextPurpose) -> Option<&'static str> {
 /// retries. A server that hangs four times over consumes the deadline, which
 /// is precisely what a deadline is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AuxBudget {
+pub struct AuxBudget {
     /// Cap on the whole call, retries included.
-    pub(crate) deadline: Duration,
+    pub deadline: Duration,
     /// Cap on one HTTP attempt.
-    pub(crate) attempt_timeout: Duration,
+    pub attempt_timeout: Duration,
 }
 
 /// The summariser's budget. It is the only auxiliary call that ships tens of
@@ -532,7 +538,7 @@ const MEMORY_FIND_BUDGET: AuxBudget = AuxBudget {
 /// Exhaustive on purpose, with no wildcard arm. A new variant then fails the
 /// build here until somebody decides how long its call may take. ADR 0107
 /// promised that, and a `_` arm quietly took it back.
-pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
+pub fn budget_for(purpose: ContextPurpose) -> AuxBudget {
     match purpose {
         ContextPurpose::ConversationSummary => SUMMARY_BUDGET,
         ContextPurpose::JudgeTool => JUDGE_TOOL_BUDGET,
@@ -547,7 +553,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::CommandJudge
         | ContextPurpose::ReadDecision
         | ContextPurpose::WakeDecision
-        | ContextPurpose::ExpectedWakeDecision => SHORT_CALL_BUDGET,
+        | ContextPurpose::ExpectedWakeDecision
+        | ContextPurpose::PermissionAnswer => SHORT_CALL_BUDGET,
         // Nine that never ask. None is an auxiliary HTTP call this module
         // times: a turn and the five `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket. Web
@@ -569,7 +576,7 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
 /// what budget, and the router that serves it. Resolved once from a
 /// [`ContextPurpose`], so no call site restates a model id or hardcodes an
 /// effort.
-pub(crate) struct AuxCall {
+pub struct AuxCall {
     selection: AuxSelection,
     budget: AuxBudget,
     router: Arc<dyn LlmProvider>,
@@ -620,8 +627,8 @@ impl AuxCall {
 
     /// A call over `provider` at the purpose's declared defaults, with no
     /// preference read. Tests only: production resolves against the router.
-    #[cfg(test)]
-    pub(crate) fn over(provider: Arc<dyn LlmProvider>, purpose: ContextPurpose) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn over(provider: Arc<dyn LlmProvider>, purpose: ContextPurpose) -> Self {
         let reasoning = model_source(purpose)
             .prefs()
             .and_then(|p| p.reasoning)
@@ -646,7 +653,7 @@ impl AuxCall {
 
     /// The provider every request of this call goes out on: the router, with
     /// the selected model and the purpose's attempt cap pinned.
-    pub(crate) fn provider(&self) -> Arc<dyn LlmProvider> {
+    pub fn provider(&self) -> Arc<dyn LlmProvider> {
         let provider = AuxProvider::new(
             self.router.clone(),
             self.selection.model.clone(),
@@ -659,7 +666,7 @@ impl AuxCall {
         })
     }
 
-    pub(crate) fn selection(&self) -> &AuxSelection {
+    pub fn selection(&self) -> &AuxSelection {
         &self.selection
     }
 
@@ -674,48 +681,21 @@ impl AuxCall {
         }
     }
 
-    pub(crate) fn reasoning(&self) -> Option<&str> {
+    pub fn reasoning(&self) -> Option<&str> {
         self.selection.reasoning.as_deref()
     }
 
-    pub(crate) fn attempt_timeout(&self) -> Duration {
+    pub fn attempt_timeout(&self) -> Duration {
         self.budget.attempt_timeout
     }
 
-    pub(crate) fn deadline(&self) -> Duration {
+    pub fn deadline(&self) -> Duration {
         self.budget.deadline
     }
 }
 
-/// Every purpose the enum has, so a new variant fails the tests below until it
-/// declares what it reads and how long it may take.
 #[cfg(test)]
-pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
-    ContextPurpose::Turn,
-    ContextPurpose::Title,
-    ContextPurpose::ImageDescribe,
-    ContextPurpose::Memory,
-    ContextPurpose::ConversationSummary,
-    ContextPurpose::QueryClassification,
-    ContextPurpose::ImageGen,
-    ContextPurpose::Voice,
-    ContextPurpose::CommandJudge,
-    ContextPurpose::JudgeTool,
-    ContextPurpose::IntentLoop,
-    ContextPurpose::MemoryCorrection,
-    ContextPurpose::ArtifactSummary,
-    ContextPurpose::SideQuestion,
-    ContextPurpose::ChangeSummary,
-    ContextPurpose::SummaryCompaction,
-    ContextPurpose::MemoryFind,
-    ContextPurpose::WebSearch,
-    ContextPurpose::Proxy,
-    ContextPurpose::ReadDecision,
-    ContextPurpose::WakeDecision,
-    ContextPurpose::ExpectedWakeDecision,
-    ContextPurpose::CacheKeepAlive,
-    ContextPurpose::PrefillProbe,
-];
+pub(crate) use crate::engine::thread_events::ALL_PURPOSES;
 
 #[cfg(test)]
 #[path = "resolve_tests.rs"]
@@ -754,11 +734,12 @@ mod tests {
                 | ContextPurpose::ReadDecision
                 | ContextPurpose::WakeDecision
                 | ContextPurpose::ExpectedWakeDecision
+                | ContextPurpose::PermissionAnswer
                 | ContextPurpose::CacheKeepAlive
                 | ContextPurpose::PrefillProbe => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 24);
+        assert_eq!(ALL_PURPOSES.len(), 25);
     }
 
     /// The key an unset handle inherits, if any.

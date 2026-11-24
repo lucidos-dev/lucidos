@@ -10,7 +10,6 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-/** A page with a link and a button, and a clock the guard reads. */
 function setup() {
   const doc: Document = document;
   let now = 1_000;
@@ -30,8 +29,6 @@ function setup() {
     }));
   };
   const click = (target: HTMLElement = link) => {
-    // The page's own handler: reached unless the guard stopped the click. It
-    // cancels the click last, so jsdom does not try to follow the link.
     let reachedPrevented: boolean | null = null;
     const page = (e: Event) => { reachedPrevented = e.defaultPrevented; e.preventDefault(); };
     window.addEventListener('click', page);
@@ -47,7 +44,6 @@ function setup() {
     touch,
     click,
     plain,
-    /** A finger down, dragged by `dx`, then lifted. */
     gesture(dx: number, { heldMs = 50, fingers = 1, on = doc }: { heldMs?: number; fingers?: number; on?: EventTarget } = {}) {
       touch('touchstart', 100, 100, fingers, on);
       now += heldMs / 2;

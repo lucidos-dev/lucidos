@@ -26,8 +26,6 @@ const MODE_OPTIONS: Array<{ mode: BindMode; label: string; hint: string }> = [
   { mode: 'all', label: 'All interfaces', hint: 'LAN + tailnet' },
 ];
 
-/** Human label for the effective inherited gateway bind shown when engines
- *  inherit (read-only here — changed from the workspace picker). */
 function describeBind(value: string): string {
   const { mode, address } = parseBindValue(value);
   if (mode === 'loopback') return 'Loopback only';
@@ -35,9 +33,6 @@ function describeBind(value: string): string {
   return address;
 }
 
-/** The read-only row shown while engines inherit the gateway bind, which is
- *  the default. With no `gatewayBind`, inside a `SkeletonProvider`, it is the
- *  page's loading placeholder. */
 function InheritedBindRow({ gatewayBind }: { gatewayBind?: string }) {
   return (
     <div class="list-rows">
@@ -60,19 +55,6 @@ function InheritedBindRow({ gatewayBind }: { gatewayBind?: string }) {
   );
 }
 
-/**
- * Per-workspace engine Network access (Settings → Access → Network access).
- *
- * Controls THIS workspace's engine bind — the address its API server listens on.
- * The machine-global gateway bind + the "engines inherit gateway bind" toggle
- * live in the workspace picker (they apply before any workspace is selected). So
- * when engines inherit the gateway bind (the default), this pane is read-only and
- * shows the inherited value; the per-workspace control is live only when inherit
- * is turned off in the picker.
- *
- * Binds are set at process start — a change takes effect only after an engine
- * restart (we cannot re-bind a live socket), so the pane says so plainly.
- */
 export function NetworkAccessPage() {
   const [info, setInfo] = useState<Loadable<NetworkConfigResponse>>({ status: 'not-loaded' });
   const [mode, setMode] = useState<BindMode>('loopback');
@@ -93,7 +75,6 @@ export function NetworkAccessPage() {
   }, []);
 
   useEffect(() => { void reload(); }, [reload]);
-  // A re-read resets the fields, so it pauses while they hold an unsaved edit.
   const served = info.status === 'loaded' ? parseBindValue(info.data.engine_bind) : null;
   const editing = served !== null && (served.mode !== mode || served.address !== address);
   usePanelRefresh('network access', editing ? null : reload);
@@ -119,21 +100,10 @@ export function NetworkAccessPage() {
     }
   }, [mode, address, reload]);
 
-  // The section shell and its TITLE render in every state, because the title
-  // carries `data-search-anchor="access:network"` and that anchor is a
-  // navigation target: Search Everywhere jumps here, and `SettingsView`'s scroll
-  // effect does ONE `querySelector` on the commit where the subview mounts, then
-  // clears the target whether it found the element or not. An anchor that only
-  // appears once an async fetch lands is therefore missed on a cold open, and
-  // the user is dropped at the top of the page with no scroll and no marker.
-  // Every other settings anchor renders unconditionally; this one must too.
   const shell = (body: ComponentChildren) => (
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="access:network">
         Network access
-        {/* On the SHELL, not inside the loaded branch: the shell renders
-            unconditionally (see the anchor comment above), so the explanation is
-            readable while the config is still loading or has failed. */}
         <Explainer title="Network access">
           <p>Controls the address this workspace's engine listens on.</p>
           <p>
@@ -149,7 +119,6 @@ export function NetworkAccessPage() {
   if (info.status === 'failed') {
     return shell(<LoadableError noun="network configuration" error={info.error} />);
   }
-  // The shell is unconditional (see above); only the body waits on the read.
   return shell(
     <LoadingFade
       showSkeleton={showLoading}

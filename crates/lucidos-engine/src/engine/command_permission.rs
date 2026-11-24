@@ -26,16 +26,19 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::core::grants::{self, GrantFile};
-use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
-use crate::engine::claude_code::AllowScope;
+use crate::core::grants::GrantFile;
+use crate::engine::card_queue;
+use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionEntry, PermissionState};
 use crate::engine::command_guard::{
-    self, CommandSite, GuardDecision, JudgeInput, JudgedClassification, RiskLane,
+    self, Catastrophe, CommandSite, GuardDecision, JudgeInput, JudgedClassification, RiskLane,
     SideEffectCategory, StaticVerdict, TrustedHeads,
 };
-use crate::engine::command_judge::JudgeVerdict;
+use crate::engine::command_judge::{JudgeVerdict, JUDGE_FAILED_REASON};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::git_ops::CheckpointEffects;
+use crate::engine::permission::standing_deny::{self, CommandKind};
+use crate::engine::permission::tool_grants::{self, AnsweredBy};
+use crate::engine::thread_events::{AllowScope, GrantOffer, OfferWithheld};
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
@@ -96,7 +99,7 @@ async fn guarded_mcp_launch(
     tool_name: &str,
     input: &Value,
 ) -> Option<Result<GuardedMcpLaunch, String>> {
-    let action = crate::engine::tools::dispatch_name(tool_name, input).ok()?;
+    let action = crate::engine::tool_arguments::dispatch_name(tool_name, input).ok()?;
     if action == tn::SETUP_MCP_SERVER {
         let line = match command_guard::mcp_setup_command_line(
             tool_name,
@@ -110,7 +113,7 @@ async fn guarded_mcp_launch(
         // Rendering the line parsed the setup and placed its working
         // directory, so both hold here. Refuse rather than skip the guard.
         let (Ok(setup), Some(cwd)) = (
-            crate::engine::tools::mcp::McpSetupRequest::parse(input),
+            crate::engine::tool_arguments::McpSetupRequest::parse(input),
             spawn_cwd,
         ) else {
             return Some(Err(UNPLACEABLE_MCP_LAUNCH.to_string()));
@@ -206,26 +209,41 @@ pub fn derive_command_allow_pattern(
 /// the coding-agent session lane also uses, so the two cannot drift. Python
 /// takes the coarse `Python` pattern: the python tool has no finer sub-scope.
 /// It covers no secret read, which no grant covers.
+#[cfg(test)]
 pub fn command_is_allowed(
     tool_name: &str,
     command: &str,
     site: CommandSite<'_>,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
+    command_is_allowed_with_paths(
+        tool_name,
+        command,
+        site,
+        &command_guard::SecretPaths::conservative(),
+        allowed,
+    )
+}
+
+fn command_is_allowed_with_paths(
+    tool_name: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    paths: &command_guard::SecretPaths,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
     match tool_name {
-        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
-            command_guard::grant_covers_command("Bash", command, site, &TrustedHeads::NONE, allowed)
-        }
+        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => command_guard::grant_covers_command_with_paths(
+            "Bash",
+            command,
+            site,
+            &TrustedHeads::NONE,
+            paths,
+            allowed,
+        ),
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => {
-            !command_guard::command_reads_secret(command)
-                && command_guard::catastrophic_reason_for_command_at(
-                    command,
-                    match site {
-                        CommandSite::Workspace(root) => Some(root),
-                        CommandSite::TextOnly { root } => root,
-                    },
-                )
-                .is_none()
+            !paths.python(command)
+                && command_guard::tool_catastrophe(tool_name, command, site.root()).is_none()
                 && allowed("Python")
         }
         _ => false,
@@ -233,8 +251,10 @@ pub fn command_is_allowed(
 }
 
 /// Whether a bash or python tool call reads a secret path.
+#[cfg(test)]
 fn tool_call_reads_secret(tool_name: &str, input: &Value) -> bool {
-    command_guard::command_text(tool_name, input).is_some_and(command_guard::command_reads_secret)
+    command_guard::command_text(tool_name, input)
+        .is_some_and(|text| command_guard::tool_text_reads_secret(tool_name, text))
 }
 
 fn bash_narrow_pattern(command: &str) -> Option<String> {
@@ -264,40 +284,109 @@ fn grant_head(tool_name: &str, command: &str, site: CommandSite<'_>) -> Option<S
 }
 
 // ---------------------------------------------------------------------------
-// Persisted allowlist file (`agent-allowed-commands`)
+// Tool grants (`agent-allowed-commands`)
 // ---------------------------------------------------------------------------
 
-/// Record a granted "Always allow" by scope: `Session` into the in-memory
-/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file
-/// ([`GrantFile::AgentCommands`]). No-op for scopes whose pattern doesn't
-/// derive. Mirrors the CC consent endpoint's `record_allow_grant`.
-pub fn record_command_allow_grant(
-    engine: &LucidosEngine,
-    thread_id: Uuid,
+/// The grants a command card offers: each scope's pattern, kept only when
+/// storing it would cover this same command, so no button stores a line that
+/// covers nothing (ADR 0571). A secret read offers none, and says why.
+#[cfg(test)]
+pub fn command_card_offer(tool_name: &str, command: &str, site: CommandSite<'_>) -> GrantOffer {
+    command_card_offer_with_paths(
+        tool_name,
+        command,
+        site,
+        &command_guard::SecretPaths::conservative(),
+    )
+}
+
+fn command_card_offer_with_paths(
     tool_name: &str,
     command: &str,
-    scope: AllowScope,
-) {
-    let site = CommandSite::Workspace(engine.workspace_path());
+    site: CommandSite<'_>,
+    paths: &command_guard::SecretPaths,
+) -> GrantOffer {
     let source = grant_source(tool_name, command, site);
-    let Some(pattern) = derive_command_allow_pattern(tool_name, &source, scope) else {
+    // A deny takes power away, so it is offered even where no allow is.
+    let deny = derive_command_allow_pattern(tool_name, &source, AllowScope::Narrow)
+        .and_then(|line| standing_deny::card_rule(line, command_kind(tool_name)?, command));
+    if paths.tool(tool_name, command) {
+        return GrantOffer {
+            deny,
+            ..GrantOffer::withheld(OfferWithheld::SecretRead)
+        };
+    }
+    if matches!(
+        command_guard::tool_catastrophe(tool_name, command, site.root()),
+        Some(Catastrophe::Unproven(_))
+    ) {
+        return GrantOffer {
+            deny,
+            ..GrantOffer::withheld(OfferWithheld::UnprovenWorkspaceDestruction)
+        };
+    }
+    let offered = |scope| {
+        let pattern = derive_command_allow_pattern(tool_name, &source, scope)?;
+        command_is_allowed_with_paths(tool_name, command, site, paths, |p| p == pattern)
+            .then_some(pattern)
+    };
+    let broad = offered(AllowScope::Broad);
+    GrantOffer {
+        narrow: offered(AllowScope::Narrow).filter(|narrow| Some(narrow) != broad.as_ref()),
+        session: offered(AllowScope::Session),
+        broad,
+        withheld: None,
+        deny,
+    }
+}
+
+/// What a command tool's text is written in. `None` for any other tool.
+fn command_kind(tool_name: &str) -> Option<CommandKind> {
+    match tool_name {
+        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => Some(CommandKind::Shell),
+        tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => Some(CommandKind::Python),
+        _ => None,
+    }
+}
+
+/// The refusal a *standing deny* gives this tool call, if one covers it. The
+/// chat and trigger lanes both read it here, after the floor and before any
+/// allow or the judge.
+async fn standing_deny_refusal(
+    pool: &sqlx::PgPool,
+    tool_name: &str,
+    input: &Value,
+) -> Option<String> {
+    let kind = command_kind(tool_name)?;
+    let command = command_guard::command_text(tool_name, input)?;
+    standing_deny::refusal_for(pool, kind, command).await
+}
+
+/// Record a granted "Always allow" by scope as a *tool grant*: the pattern the
+/// card stamped for it, never a fresh derivation (ADR 0571). `Session` is held
+/// by the thread, `Narrow` / `Broad` stand. A scope the card did not offer
+/// records nothing.
+pub async fn record_command_allow_grant(
+    engine: &LucidosEngine,
+    entry: &PermissionEntry,
+    scope: AllowScope,
+    answered_by: AnsweredBy,
+) {
+    let Some(pattern) = entry.grant_offer.pattern(scope).map(str::to_string) else {
         return;
     };
-    match scope {
-        AllowScope::Session => {
-            let mut pending = engine.pending_command_permission.lock().unwrap();
-            pending.allow_session(thread_id, pattern);
-        }
-        AllowScope::Narrow | AllowScope::Broad => {
-            if let Err(e) = grants::append(&engine.grants_dir(), GrantFile::AgentCommands, &pattern)
-            {
-                crate::log!(
-                    "[CommandGuard] Failed to persist allow pattern {:?}: {}",
-                    pattern,
-                    e
-                );
-            }
-        }
+    if let Err(e) = tool_grants::record_card_allow(
+        &engine.event_bus,
+        GrantFile::AgentCommands,
+        entry.thread_id,
+        &entry.request_id,
+        pattern.clone(),
+        scope,
+        answered_by,
+    )
+    .await
+    {
+        crate::log_legacy!("[CommandGuard] Failed to record allow pattern {pattern:?}: {e}");
     }
 }
 
@@ -338,6 +427,7 @@ fn decision_from_answer(
     match answer {
         Ok(PermissionAnswer::Allowed) => GuardDecision::Proceed,
         Ok(PermissionAnswer::Denied) => GuardDecision::Refuse(denial_refusal()),
+        Ok(PermissionAnswer::Refused(reason)) => GuardDecision::Refuse(reason),
         Ok(PermissionAnswer::Withdrawn(_)) | Err(_) => GuardDecision::Refuse(withdrawn_refusal()),
     }
 }
@@ -374,16 +464,12 @@ fn trigger_block_refusal(
         msg.push_str(&format!("\n\nWhy it was gated: {why}"));
     }
     let remedy = if category.is_grantable() {
-        grantable_remedy(category)
+        TRIGGER_GRANT_REMEDY
     } else {
-        ungrantable_remedy().to_string()
+        ungrantable_remedy(category)
     };
     msg.push_str(&format!("\n\n{remedy}"));
-    // The verbatim command goes LAST, after the one-line summary and the remedy.
-    // A push notification body is this same string, and the OS preview shows only
-    // its first couple of lines: the summary and the remedy are what a glance
-    // should carry, and the raw command (which can contain a token the postgres
-    // scrub below does not know about) stays off the lock screen.
+    // Keep the command in the run transcript and out of the notification.
     if let Some(excerpt) = blocked_command_excerpt(tool_name, input) {
         let fence = code_fence_for(&excerpt);
         msg.push_str(&format!(
@@ -393,22 +479,21 @@ fn trigger_block_refusal(
     msg
 }
 
-/// What to tell the user when a grant can allow a command a trigger tried.
-/// The judge can misjudge a command, so the check comes before the grant: a
-/// grant given for a misjudgement lets every later command of that kind run.
-fn grantable_remedy(category: SideEffectCategory) -> String {
-    format!(
-        "Check what the command does first. If it does not do this, the guard misjudged it: you \
-         need no grant, so run the trigger again. If the trigger really must do this, grant the \
-         \"{label}\" side-effect in the trigger's settings and re-run.",
-        label = category.label(),
-    )
-}
+const TRIGGER_GRANT_REMEDY: &str =
+    "Review the command before granting it. A grant lets this trigger run the program again.";
 
 /// What to tell the user when no grant can allow a command a trigger tried.
-fn ungrantable_remedy() -> &'static str {
-    "No side-effect grant can allow this. Name a credential (CRED_*) in the command to \
-     use a stored secret instead."
+fn ungrantable_remedy(category: SideEffectCategory) -> &'static str {
+    match category {
+        SideEffectCategory::UnprovenWorkspaceDestruction => {
+            "No program grant can allow this. Run the command from a chat turn instead, where \
+             you can allow it once after reviewing it."
+        }
+        _ => {
+            "No program grant can allow this. Name a credential (CRED_*) in the command to \
+             use a stored secret instead."
+        }
+    }
 }
 
 /// A fence long enough that `excerpt` cannot break out of its code block: one
@@ -480,7 +565,7 @@ pub async fn resolve_pending_command_permissions_as_superseded(
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] unresolved-permission query failed for {}: {}",
                 thread_id,
                 e
@@ -509,6 +594,7 @@ pub async fn resolve_pending_command_permissions_as_superseded(
             request_id,
             false,
             Some(SUPERSEDED_REASON.to_string()),
+            None,
             None,
             EventMeta::with_actor(actor.clone()),
             "[CommandGuard] CommandPermissionResolved (superseded)",
@@ -541,7 +627,7 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!("[Recovery] orphan command permission query failed: {}", e);
+            crate::log_legacy!("[Recovery] orphan command permission query failed: {}", e);
             return;
         }
     };
@@ -550,7 +636,7 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
         return;
     }
 
-    crate::log!(
+    crate::log_legacy!(
         "[Recovery] Auto-resolving {} orphan command permission request(s) (chat turn gone after restart)",
         rows.len()
     );
@@ -561,7 +647,8 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
             thread_id,
             request_id,
             false,
-            Some("Chat turn ended before answering — request expired".to_string()),
+            Some(crate::engine::cc_permission::RESTART_CLOSED_REASON.to_string()),
+            None,
             None,
             EventMeta::NONE,
             "[Recovery] CommandPermissionResolved (orphan)",
@@ -588,30 +675,47 @@ pub async fn resolve_command_permission(
     request_id: String,
     allowed: bool,
     persist_scope: Option<AllowScope>,
-    actor: Option<MessageOrigin>,
+    always_deny: bool,
+    answered_by: AnsweredBy,
     log_context: &str,
-) -> bool {
+) -> Result<bool, String> {
     let entry = {
         let mut pending = engine.pending_command_permission.lock().unwrap();
         pending.take(&request_id)
     };
     let Some(entry) = entry else {
-        return false;
+        return Ok(false);
     };
-    // Wake the blocked loop, and every deduped waiter on the same broadcast.
-    let _ = entry.tx.send(PermissionAnswer::from_decision(allowed));
-
-    let reason = if allowed {
-        None
+    let standing_deny = if always_deny {
+        Some(standing_deny::record_card_rule(engine, &entry, &answered_by).await)
     } else {
-        Some(DENIAL_REASON.to_string())
+        None
     };
-    // A scope on a denial grants nothing: the click said no.
-    let persist_scope = persist_scope.filter(|_| allowed);
+    let blocked = if allowed {
+        standing_deny_refusal(&engine.pool, &entry.tool_name, &entry.input).await
+    } else {
+        None
+    };
+    let allowed = allowed && blocked.is_none();
+    let refusal = blocked.clone().or_else(|| {
+        standing_deny
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|line| standing_deny::refusal(line))
+    });
+    let answer = refusal.map_or_else(
+        || PermissionAnswer::from_decision(allowed),
+        PermissionAnswer::Refused,
+    );
+    let _ = entry.tx.send(answer);
+
+    let reason = blocked.or_else(|| (!allowed).then(|| DENIAL_REASON.to_string()));
+    // A scope on a denial grants nothing: the click said no. Nor does one the
+    // card never offered.
+    let persist_scope =
+        persist_scope.filter(|scope| allowed && entry.grant_offer.pattern(*scope).is_some());
     if let Some(scope) = persist_scope {
-        let command =
-            command_guard::command_text(&entry.tool_name, &entry.input).unwrap_or_default();
-        record_command_allow_grant(engine, entry.thread_id, &entry.tool_name, command, scope);
+        record_command_allow_grant(engine, &entry, scope, answered_by.clone()).await;
     }
     emit_command_permission_resolved(
         &engine.event_bus,
@@ -620,11 +724,20 @@ pub async fn resolve_command_permission(
         allowed,
         reason,
         persist_scope,
-        EventMeta::with_actor(actor),
+        standing_deny
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .cloned(),
+        EventMeta::with_actor(answered_by.actor),
         log_context,
     )
     .await;
-    true
+    if let Some(Err(error)) = standing_deny {
+        return Err(format!(
+            "The command was denied. Could not save the standing deny: {error}"
+        ));
+    }
+    Ok(true)
 }
 
 /// Emit a `CommandPermissionResolved` via the bus. Shared by the consent
@@ -638,6 +751,7 @@ pub async fn emit_command_permission_resolved(
     allowed: bool,
     reason: Option<String>,
     persist_scope: Option<AllowScope>,
+    standing_deny: Option<String>,
     meta: EventMeta,
     log_context: &str,
 ) {
@@ -650,6 +764,7 @@ pub async fn emit_command_permission_resolved(
                     allowed,
                     reason,
                     persist_scope,
+                    standing_deny,
                 },
                 meta,
             },
@@ -666,7 +781,7 @@ pub async fn emit_command_permission_resolved(
 /// loop and threaded through each bash/python tool call. The cache memoizes
 /// judge verdicts by [`JudgeInput::cache_key`], so a re-emitted identical
 /// command within one response doesn't re-pay the LLM call. Loop-local — dropped at the end of the response, no GC needed.
-pub(crate) struct CommandGuardCtx<'a> {
+pub struct CommandGuardCtx<'a> {
     /// Enables the judge and reversible checks. The catastrophic floor and secret gate remain on.
     pub enabled: bool,
     /// `command_guard_judge` sub-toggle. `false` → the ambiguous middle uses the
@@ -674,12 +789,6 @@ pub(crate) struct CommandGuardCtx<'a> {
     pub judge_enabled: bool,
     /// Turn-scoped cache: `JudgeInput::cache_key()` → resolved classification.
     pub judge_cache: &'a mut HashMap<String, JudgedClassification>,
-    /// The firing trigger's declared **side-effect grant** (ADR 0002, Phase 5).
-    /// Empty for chat turns (the ask lane never consults it) and for triggers
-    /// that granted nothing. On a trigger, an `IrreversibleDanger` command runs
-    /// only if its [`SideEffectCategory`] is in this set; otherwise the trigger
-    /// fails.
-    pub trigger_grant: &'a [SideEffectCategory],
 }
 
 /// What the guard does once the final [`RiskLane`] is resolved. Pure mapping —
@@ -701,6 +810,34 @@ enum GuardAction {
     FailTrigger(SideEffectCategory),
 }
 
+fn trigger_program_covers(
+    grants: &[crate::triggers::config::TriggerProgramGrant],
+    tool_name: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    paths: &command_guard::SecretPaths,
+) -> bool {
+    command_is_allowed_with_paths(tool_name, command, site, paths, |pattern| {
+        grants
+            .iter()
+            .any(|grant| grant.legacy.is_none() && grant.pattern == pattern)
+    })
+}
+
+pub(crate) fn trigger_program_pattern(
+    tool_name: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    paths: &command_guard::SecretPaths,
+) -> Option<String> {
+    let offer = command_card_offer_with_paths(tool_name, command, site, paths);
+    offer.narrow.or_else(|| {
+        matches!(tool_name, tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND)
+            .then_some(offer.broad)
+            .flatten()
+    })
+}
+
 /// The lane an MCP server setup or start takes for its command's `lane`. A checkpoint
 /// covers one run, but the server runs the command again on every start, with
 /// no checkpoint. So reversible destruction is irreversible here.
@@ -716,13 +853,11 @@ fn mcp_launch_lane(lane: RiskLane) -> RiskLane {
 /// channel-gate rationale (chat turns carry `channel == None`; only triggers
 /// carry `Some(Trigger)`).
 ///
-/// `category` is `Some` only for `IrreversibleDanger`; `grant` is the firing
-/// trigger's declared side-effect grant (empty for chat).
+/// Only an irreversible command has a side-effect category.
 fn action_for_lane(
     lane: RiskLane,
     channel: Option<EventChannel>,
     category: Option<SideEffectCategory>,
-    grant: &[SideEffectCategory],
 ) -> GuardAction {
     match lane {
         RiskLane::Safe => GuardAction::Proceed,
@@ -733,16 +868,7 @@ fn action_for_lane(
         RiskLane::Catastrophic => GuardAction::Refuse,
         RiskLane::IrreversibleDanger => {
             if channel == Some(EventChannel::Trigger) {
-                // Unattended trigger: no human to ask. Run only if the command's
-                // side-effect category is in the trigger's grant; else fail the
-                // trigger (Phase 5). An irreversible command always has a
-                // category — default `Other` if the judge didn't tag one.
-                let cat = category.unwrap_or(SideEffectCategory::Other);
-                if cat.is_grantable() && grant.contains(&cat) {
-                    GuardAction::Proceed
-                } else {
-                    GuardAction::FailTrigger(cat)
-                }
+                GuardAction::FailTrigger(category.unwrap_or(SideEffectCategory::Other))
             } else {
                 GuardAction::Ask
             }
@@ -818,15 +944,34 @@ fn checkpoint_outcome(effects: Result<Option<CheckpointEffects>, String>) -> Che
 fn judged(
     outcome: Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>>,
 ) -> JudgedClassification {
-    let verdict = outcome.unwrap_or_else(|e| {
-        crate::log!("[CommandGuard] judge failed ({}); asking the user", e);
-        JudgeVerdict::judge_failed(e.as_ref())
-    });
+    let verdict = outcome.unwrap_or_else(|e| JudgeVerdict::judge_failed(e.as_ref()));
     JudgedClassification {
         lane: verdict.lane,
         summary: Some(verdict.summary),
         category: verdict.category,
+        judge_reason: Some(verdict.reason),
     }
+}
+
+/// A command-free trace suitable for a log, event or trigger failure. Keep
+/// the static facts separate from the model's answer: neither explains the other.
+fn decision_trace(layer: &str, input: Option<&JudgeInput>, reason: Option<&str>) -> String {
+    let evidence = input.map_or_else(
+        || "static_verdict=settled".to_string(),
+        |input| {
+            format!(
+                "target_outside_workspace={} fast_path_refused={}",
+                input.out_of_workspace, input.fast_path_refused
+            )
+        },
+    );
+    // A provider error can echo the command, so a failure keeps its label only.
+    let reason = match reason {
+        Some(failed) if failed.starts_with(JUDGE_FAILED_REASON) => JUDGE_FAILED_REASON.to_string(),
+        other => crate::core::redact_postgres_secrets(other.unwrap_or("not-called"))
+            .replace(['\n', '\r'], " "),
+    };
+    format!("layer={layer} {evidence} judge={reason}")
 }
 
 /// Where a command checkpoint came from: the thread its card sits on, and the
@@ -879,11 +1024,9 @@ impl LucidosEngine {
     /// - `IrreversibleDanger` on the chat lane → pause and ask (this method
     ///   blocks until the user answers, the turn is canceled, or a restart
     ///   sweep resolves it)
-    /// - `IrreversibleDanger` on a trigger → run if the command's side-effect
-    ///   [`SideEffectCategory`] is in the trigger's grant (`ctx.trigger_grant`),
-    ///   else `FailTrigger` (block + fail the run). Triggers fire unattended, so
-    ///   a runtime prompt would deadlock them — the grant is pre-authorized at
-    ///   trigger-creation time (ADR 0002, Phase 5).
+    /// - `IrreversibleDanger` on a trigger → run if the trigger's grants or
+    ///   this run's once grants cover the invocation, else `FailTrigger`. The
+    ///   run then parks on a card that offers the program grant.
     ///
     /// The agentic loop serves only the Lucidos Agent (chat + triggers), so
     /// `meta.channel` is either `Some(Trigger)` (a scheduled trigger) or `None`
@@ -892,7 +1035,7 @@ impl LucidosEngine {
     /// gate on "is this a trigger?" rather than "is this chat?", so the common
     /// `None` chat case correctly reaches the ask lane.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn command_guard_decision(
+    pub async fn command_guard_decision(
         &self,
         ctx: &mut CommandGuardCtx<'_>,
         tool_name: &str,
@@ -901,6 +1044,7 @@ impl LucidosEngine {
         tool_use_id: &str,
         meta: &EventMeta,
         cancel_token: &CancellationToken,
+        paths: &command_guard::SecretPaths,
     ) -> GuardDecision {
         // An MCP server setup, or a start of a launch line nobody approved,
         // spawns a process. It is classified, asked and granted as the shell
@@ -915,7 +1059,10 @@ impl LucidosEngine {
         )
         .await
         {
-            Some(Err(refusal)) => return GuardDecision::Refuse(refusal),
+            Some(Err(refusal)) => {
+                crate::log_legacy!("[CommandGuard] decision layer=mcp-launch result=refuse");
+                return GuardDecision::Refuse(refusal);
+            }
             launch => launch.and_then(Result::ok),
         };
         let shell_input;
@@ -927,35 +1074,74 @@ impl LucidosEngine {
             }
         };
         // The catastrophic floor is unconditional, including preference-off calls.
-        if matches!(
-            command_guard::static_classify(
-                tool_name,
-                input,
-                CommandSite::Workspace(self.workspace_path())
-            ),
-            StaticVerdict::Settled(RiskLane::Catastrophic)
-        ) {
+        let floor = command_guard::static_classify_with_paths(
+            tool_name,
+            input,
+            CommandSite::Workspace(self.workspace_path()),
+            &TrustedHeads::NONE,
+            paths,
+        );
+        if floor == StaticVerdict::Settled(RiskLane::Catastrophic) {
+            crate::log_legacy!("[CommandGuard] decision layer=floor lane=Catastrophic static_verdict=settled judge=not-called");
             return GuardDecision::Refuse(command_guard::catastrophic_refusal(tool_name, input));
         }
-        // A secret read is gated even with the guard off, since it ships off.
-        if !ctx.enabled && !tool_call_reads_secret(tool_name, input) {
+        // The owner's own rule holds with the guard preference on or off.
+        if let Some(refusal) = standing_deny_refusal(&self.pool, tool_name, input).await {
+            return GuardDecision::Refuse(refusal);
+        }
+        let unproven_floor = floor
+            == StaticVerdict::SettledIrreversible(SideEffectCategory::UnprovenWorkspaceDestruction);
+        if mcp_launch.is_some() && unproven_floor {
+            return GuardDecision::Refuse(
+                concat!(
+                    "Refused by the command guard: the MCP server was not started. ",
+                    "Its launch may delete a Lucidos workspace or its database. ",
+                    "MCP launch approval persists across starts, so Allow once is unavailable."
+                )
+                .to_string(),
+            );
+        }
+        // Without an enforcing sandbox, the text gate holds even with the
+        // guard preference off. So does the workspace floor's ask.
+        if !ctx.enabled
+            && !unproven_floor
+            && !command_guard::command_text(tool_name, input)
+                .is_some_and(|text| paths.gates_tool(tool_name, text))
+        {
+            crate::log_legacy!(
+                "[CommandGuard] decision layer=preference guard_enabled=false judge=not-called"
+            );
             return GuardDecision::Proceed;
         }
         // `None` → the turn was canceled while the judge was running.
-        let Some(JudgedClassification {
+        let Some((classification, mut trace)) = self
+            .resolve_command_lane(ctx, tool_name, input, thread_id, cancel_token, paths, floor)
+            .await
+        else {
+            crate::log_legacy!("[CommandGuard] decision layer=cancellation result=refuse");
+            return GuardDecision::Refuse(canceled_refusal());
+        };
+        let JudgedClassification {
             lane,
             summary,
             category,
-        }) = self
-            .resolve_command_lane(ctx, tool_name, input, thread_id, cancel_token)
-            .await
-        else {
-            return GuardDecision::Refuse(canceled_refusal());
-        };
+            ..
+        } = classification;
         let lane = match mcp_launch {
             Some(_) => mcp_launch_lane(lane),
             None => lane,
         };
+        let action = action_for_lane(lane, meta.channel, category);
+        let (action, trigger_pattern) = match action {
+            GuardAction::FailTrigger(category) => {
+                self.trigger_program_action(category, tool_name, input, paths)
+            }
+            _ => (action, None),
+        };
+        trace.push_str(&format!(
+            " lane={lane:?} category={category:?} action={action:?}"
+        ));
+        crate::log_legacy!("[CommandGuard] decision {}", trace);
         // What the card and a trigger failure say. An allowed MCP server keeps
         // running this command each time it starts, with no further card.
         let gated_summary = match &mcp_launch {
@@ -969,7 +1155,7 @@ impl LucidosEngine {
             None => summary.clone(),
         };
 
-        let decision = match action_for_lane(lane, meta.channel, category, ctx.trigger_grant) {
+        let decision = match action {
             GuardAction::Proceed => GuardDecision::Proceed,
             GuardAction::Checkpoint => {
                 // Snapshot the workspace before the in-workspace destruction so
@@ -985,10 +1171,6 @@ impl LucidosEngine {
                 }
             }
             GuardAction::Refuse => {
-                crate::log!(
-                    "[CommandGuard] Refused catastrophic command from {}",
-                    tool_name
-                );
                 GuardDecision::Refuse(command_guard::catastrophic_refusal(tool_name, input))
             }
             GuardAction::Ask => {
@@ -1000,21 +1182,22 @@ impl LucidosEngine {
                     meta,
                     cancel_token,
                     gated_summary.as_deref(),
+                    &trace,
+                    paths,
+                    unproven_floor,
                 )
                 .await
             }
             GuardAction::FailTrigger(cat) => {
-                crate::log!(
-                    "[CommandGuard] Trigger blocked — {} not in side-effect grant ({})",
-                    cat.reason(),
-                    tool_name
-                );
-                GuardDecision::FailTrigger(trigger_block_refusal(
-                    cat,
-                    tool_name,
-                    input,
-                    gated_summary.as_deref(),
-                ))
+                GuardDecision::FailTrigger(command_guard::TriggerCommandBlocked {
+                    reason: format!(
+                        "{}\nDecision trace: {trace}",
+                        trigger_block_refusal(cat, tool_name, input, gated_summary.as_deref())
+                    ),
+                    pattern: trigger_pattern,
+                    folder: None,
+                    thread_id,
+                })
             }
         };
         // With the guard on, a launch it let through is approved. The start
@@ -1027,11 +1210,11 @@ impl LucidosEngine {
                 &self.event_bus,
                 &launch.server_id,
                 &launch.fingerprint,
-                Some(crate::engine::tools::agent_tool_actor(thread_id)),
+                Some(crate::engine::thread_events::agent_tool_actor(thread_id)),
             )
             .await
             {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] could not record the launch approval for MCP server '{}': {}",
                     launch.server_id,
                     e
@@ -1068,7 +1251,7 @@ impl LucidosEngine {
             crate::engine::git_ops::create_command_checkpoint(self.workspace_path(), &checkpoint_id)
                 .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] checkpoint failed ({}); running the command without an undo point",
                 e
             );
@@ -1100,7 +1283,7 @@ impl LucidosEngine {
     ///
     /// Best-effort throughout, on the same reasoning as the pre image: a git
     /// failure here costs the undo affordance, never the command's result.
-    pub(crate) async fn finalize_command_checkpoint(
+    pub async fn finalize_command_checkpoint(
         &self,
         pending: command_guard::PendingCheckpoint,
         thread_id: Uuid,
@@ -1113,18 +1296,18 @@ impl LucidosEngine {
             Err(e) => Err(e),
         };
         if let Err(e) = &effects {
-            crate::log!("[CommandGuard] checkpoint {} post image failed: {}", id, e);
+            crate::log_legacy!("[CommandGuard] checkpoint {} post image failed: {}", id, e);
         }
         match checkpoint_outcome(effects) {
             CheckpointOutcome::Discard(reason) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] checkpoint {} dropped: {}",
                     id,
                     reason.explain()
                 );
                 crate::engine::git_ops::delete_command_checkpoint_pair(workspace, id).await;
             }
-            CheckpointOutcome::KeepRefsNoCard => crate::log!(
+            CheckpointOutcome::KeepRefsNoCard => crate::log_legacy!(
                 "[CommandGuard] checkpoint {} effects unavailable; refs kept, no card shown",
                 id
             ),
@@ -1216,18 +1399,60 @@ impl LucidosEngine {
         Ok(())
     }
 
+    /// Consult this fire's trigger grants after the standing deny and static floor.
+    fn trigger_program_action(
+        &self,
+        category: SideEffectCategory,
+        tool_name: &str,
+        input: &Value,
+        paths: &command_guard::SecretPaths,
+    ) -> (GuardAction, Option<String>) {
+        use crate::scheduler::user_tasks::{current_trigger_id, TRIGGER_DEFINITION};
+
+        let blocked = GuardAction::FailTrigger(category);
+        let Some(command) =
+            command_guard::command_text(tool_name, input).filter(|_| category.is_grantable())
+        else {
+            return (blocked, None);
+        };
+        let Some((id, digest)) =
+            current_trigger_id().zip(TRIGGER_DEFINITION.try_with(Clone::clone).ok())
+        else {
+            return (blocked, None);
+        };
+        let site = CommandSite::Workspace(self.workspace_path());
+        let configs = self.trigger_configs.read().unwrap();
+        let Some(config) = configs
+            .get(&id)
+            .filter(|config| config.definition_digest() == digest)
+        else {
+            return (blocked, None);
+        };
+        let once = crate::scheduler::user_tasks::run_program_grants();
+        if trigger_program_covers(&config.program_grants, tool_name, command, site, paths)
+            || trigger_program_covers(&once, tool_name, command, site, paths)
+        {
+            return (GuardAction::Proceed, None);
+        }
+        (
+            blocked,
+            trigger_program_pattern(tool_name, command, site, paths),
+        )
+    }
+
     /// Resolve the final [`RiskLane`] (and its side-effect category) for one
     /// tool call: the static fast-path, then — for the ambiguous middle — the
     /// judge or its static fallback. Returns `None` only when the turn is
     /// canceled while the judge is running — the loop then ends as canceled.
     ///
-    /// Since Phase 5 triggers DO reach the judge: the trigger side-effect grant
-    /// can only be enforced once the command's lane + category are known, so the
+    /// Trigger program grants apply once the command's lane and category
+    /// are known, so the
     /// ambiguous middle is classified on the trigger channel too (it was skipped
     /// in Phase 3, when triggers ran everything ambiguous).
     ///
     /// It therefore takes no channel: both channels classify the middle the
     /// same way. Add one back when a routing rule needs it.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_command_lane(
         &self,
         ctx: &mut CommandGuardCtx<'_>,
@@ -1235,37 +1460,63 @@ impl LucidosEngine {
         input: &Value,
         thread_id: Uuid,
         cancel_token: &CancellationToken,
-    ) -> Option<JudgedClassification> {
-        let site = CommandSite::Workspace(self.workspace_path());
-        match command_guard::static_classify(tool_name, input, site) {
+        paths: &command_guard::SecretPaths,
+        verdict: StaticVerdict,
+    ) -> Option<(JudgedClassification, String)> {
+        match verdict {
             // Settled lanes are only ever `Safe` / `Catastrophic` — neither
             // carries a side-effect category.
-            StaticVerdict::Settled(lane) => Some(JudgedClassification {
-                lane,
-                summary: None,
-                category: None,
-            }),
-            StaticVerdict::SettledIrreversible(category) => Some(JudgedClassification {
-                lane: RiskLane::IrreversibleDanger,
-                summary: Some(format!("May perform {}.", category.reason())),
-                category: Some(category),
-            }),
+            StaticVerdict::Settled(lane) => Some((
+                JudgedClassification {
+                    lane,
+                    summary: None,
+                    category: None,
+                    judge_reason: None,
+                },
+                decision_trace("static", None, None),
+            )),
+            StaticVerdict::SettledIrreversible(category) => Some((
+                JudgedClassification {
+                    lane: RiskLane::IrreversibleDanger,
+                    summary: Some(format!("May perform {}.", category.reason())),
+                    category: Some(category),
+                    judge_reason: None,
+                },
+                decision_trace(
+                    if command_guard::command_text(tool_name, input)
+                        .is_some_and(|text| paths.tool(tool_name, text))
+                    {
+                        "static-secret-path"
+                    } else {
+                        "static-side-effect"
+                    },
+                    None,
+                    None,
+                ),
+            )),
             StaticVerdict::NeedsJudge(ji) => {
                 tokio::select! {
                     biased;
                     _ = cancel_token.cancelled() => None,
-                    resolved = self.judge_or_fallback(ctx, ji, thread_id) => Some(resolved),
+                    resolved = self.judge_or_fallback(ctx, ji.clone(), thread_id) => {
+                        let trace = decision_trace(
+                            if ctx.judge_enabled { "judge" } else { "static-fallback" },
+                            Some(&ji), resolved.judge_reason.as_deref(),
+                        );
+                        Some((resolved, trace))
+                    },
                 }
             }
         }
     }
 
     /// Resolve one ambiguous command via the judge, memoized in the per-turn
-    /// cache. With the judge off, the static fallback decides. With it on but
+    /// cache, including the distribution for each decision trace. With the judge
+    /// off, the static fallback decides. With it on but
     /// failing, the command asks: a failure must not weaken the guard.
     ///
     /// `thread_id` is the turn the judge's own spend is recorded against. A
-    /// cache hit spends nothing and records nothing.
+    /// cache hit spends nothing; the caller still records its decision trace.
     async fn judge_or_fallback(
         &self,
         ctx: &mut CommandGuardCtx<'_>,
@@ -1304,31 +1555,35 @@ impl LucidosEngine {
         meta: &EventMeta,
         cancel_token: &CancellationToken,
         summary_override: Option<&str>,
+        trace: &str,
+        paths: &command_guard::SecretPaths,
+        unproven_floor: bool,
     ) -> GuardDecision {
         let command = command_guard::command_text(tool_name, input)
             .unwrap_or_default()
             .to_string();
 
-        // Auto-allow: prior "Allow for this thread" (session) and persisted
-        // "Always allow" (allowlist file) grants are unioned, and EVERY segment
-        // head of the command must be covered (see [`command_is_allowed`]) —
-        // a dangerous trailing segment must not ride into a grant that only
-        // names the harmless leading one.
-        let session_patterns: std::collections::HashSet<String> = {
-            let pending = self.pending_command_permission.lock().unwrap();
-            pending
-                .session_allows
-                .get(&thread_id)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let persisted = grants::patterns(&self.grants_dir(), GrantFile::AgentCommands);
+        // Auto-allow: the thread's own grants and the standing ones are
+        // unioned, and EVERY segment head of the command must be covered (see
+        // [`command_is_allowed`]). A dangerous trailing segment must not ride
+        // into a grant that only names the harmless leading one.
         let site = CommandSite::Workspace(self.workspace_path());
-        if command_is_allowed(tool_name, &command, site, |p| {
-            session_patterns.contains(p) || persisted.iter().any(|x| x == p)
-        }) {
-            return GuardDecision::Proceed;
-        }
+        let offer = if unproven_floor {
+            GrantOffer::withheld(OfferWithheld::UnprovenWorkspaceDestruction)
+        } else {
+            let granted = tool_grants::granted_lines(
+                &self.event_bus,
+                GrantFile::AgentCommands,
+                Some(thread_id),
+            )
+            .await;
+            if command_is_allowed_with_paths(tool_name, &command, site, paths, |p| {
+                granted.contains(p)
+            }) {
+                return GuardDecision::Proceed;
+            }
+            command_card_offer_with_paths(tool_name, &command, site, paths)
+        };
 
         // Register (deduping identical concurrent requests) and emit the card.
         let canonical_input = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
@@ -1340,7 +1595,7 @@ impl LucidosEngine {
                 thread_id,
                 tool_name.to_string(),
                 input.clone(),
-                crate::engine::claude_code::GrantOffer::default(),
+                offer.clone(),
             )
         };
 
@@ -1353,23 +1608,39 @@ impl LucidosEngine {
             // the agentic loop applies to `ToolCalled.args`. The `summary` is a
             // fixed risk phrase with no command text, so it needs no scrub.
             let command_for_event = crate::core::redact_postgres_secrets(&command);
-            self.event_bus
-                .emit_or_log(
-                    BusEvent::Thread {
-                        thread_id,
-                        event: ThreadEvent::CommandPermissionRequested {
-                            request_id: request_id.clone(),
-                            tool_use_id: tool_use_id.to_string(),
-                            tool_name: tool_name.to_string(),
-                            command: command_for_event,
-                            summary,
-                            grant_head: grant_head(tool_name, &command, site),
-                        },
-                        meta: meta.clone(),
-                    },
-                    "[CommandGuard] CommandPermissionRequested",
-                )
-                .await;
+            let request = ThreadEvent::CommandPermissionRequested {
+                request_id: request_id.clone(),
+                tool_use_id: tool_use_id.to_string(),
+                tool_name: tool_name.to_string(),
+                command: command_for_event,
+                summary,
+                grant_head: grant_head(tool_name, &command, site),
+                grant_offer: Some(offer),
+                decision_trace: Some(trace.to_string()),
+            };
+            // Wait for the thread's card slot. A cancel before the card
+            // shows leaves nothing to resolve.
+            let posted = card_queue::post_permission_prompt(
+                &self.event_bus,
+                thread_id,
+                request,
+                meta.clone(),
+                Some(cancel_token),
+            )
+            .await;
+            match posted {
+                Ok(card_queue::PromptPost::Posted) => {}
+                Ok(card_queue::PromptPost::Canceled) => {
+                    self.pending_command_permission
+                        .lock()
+                        .unwrap()
+                        .take(&request_id);
+                    return GuardDecision::Refuse(canceled_refusal());
+                }
+                Err(e) => {
+                    crate::log_legacy!("[CommandGuard] CommandPermissionRequested emit failed: {e}")
+                }
+            }
         }
 
         // Block until the user answers (no timeout — the user is the rate-
@@ -1392,6 +1663,7 @@ impl LucidosEngine {
                             false,
                             Some(CANCELED_REASON.to_string()),
                             None,
+                            None,
                             meta.clone(),
                             "[CommandGuard] CommandPermissionResolved (canceled)",
                         )
@@ -1407,8 +1679,148 @@ impl LucidosEngine {
 }
 
 #[cfg(test)]
+#[path = "command_guard_corpus_tests.rs"]
+mod corpus_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn command_request_ids(engine: &LucidosEngine, thread_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT payload->>'request_id' FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'CommandPermissionRequested' \
+             ORDER BY sequence",
+        )
+        .bind(thread_id.to_string())
+        .fetch_all(engine.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn wait_for_command_requests(engine: &LucidosEngine, thread_id: Uuid, count: usize) {
+        for _ in 0..200 {
+            if command_request_ids(engine, thread_id).await.len() >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the thread never held {count} command permission requests");
+    }
+
+    /// Two parallel command prompts show one card at a time, and both calls
+    /// get an answer.
+    #[tokio::test]
+    async fn parallel_command_prompts_show_one_card_at_a_time() {
+        use crate::test_support::{boot_mock_engine, seed_chat_thread, setup_test_db};
+        let (_pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let thread_id = seed_chat_thread(&engine.event_bus, "run two commands").await;
+        let ask = |command: &'static str| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .ask_command_permission(
+                        tn::RUN_BASH,
+                        &serde_json::json!({ "command": command }),
+                        thread_id,
+                        command,
+                        &EventMeta::NONE,
+                        &CancellationToken::new(),
+                        None,
+                        "test",
+                        &command_guard::SecretPaths::conservative(),
+                        false,
+                    )
+                    .await
+            })
+        };
+        let first = ask("curl -X POST https://example.com -d @a");
+        let second = ask("curl -X POST https://example.com -d @b");
+
+        wait_for_command_requests(&engine, thread_id, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let shown = command_request_ids(&engine, thread_id).await;
+        assert_eq!(shown.len(), 1, "one prompt at a time");
+
+        let allow = |request_id: String| {
+            resolve_command_permission(
+                &engine,
+                request_id,
+                true,
+                None,
+                false,
+                AnsweredBy::tap(None),
+                "test",
+            )
+        };
+        assert_eq!(allow(shown[0].clone()).await, Ok(true));
+        wait_for_command_requests(&engine, thread_id, 2).await;
+        let next = command_request_ids(&engine, thread_id).await[1].clone();
+        assert_eq!(allow(next).await, Ok(true));
+
+        for waiter in [first, second] {
+            let decision = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+                .await
+                .expect("both calls get an answer")
+                .unwrap();
+            assert!(matches!(decision, GuardDecision::Proceed), "{decision:?}");
+        }
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn executing_policy_stamps_workspace_log_grants_and_preserves_the_floor() {
+        use crate::runtime::agent_sandbox::{policy_from, PolicyInputs, SandboxMode};
+        let policy = policy_from(&PolicyInputs {
+            lucidos_home: None,
+            data_dirs: vec!["/srv/gateway".into()],
+            workspaces: vec![],
+        });
+        for mode in [
+            SandboxMode::Enforced,
+            SandboxMode::Inherited,
+            SandboxMode::OwnerOptedOut,
+            SandboxMode::PermittedOutside,
+        ] {
+            let paths = command_guard::SecretPaths::for_policy(&policy, Some(mode));
+            for tool in [
+                tn::RUN_BASH,
+                tn::RUN_BASH_BACKGROUND,
+                tn::RUN_PYTHON,
+                tn::RUN_PYTHON_BACKGROUND,
+            ] {
+                let bash = matches!(tool, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
+                for (path, open) in [
+                    ("/srv/gateway/workspaces/demo/log", true),
+                    ("/srv/gateway//workspaces/./demo/log", true),
+                    ("/srv/gateway/workspaces/demo/../../config/key", false),
+                    ("/srv/gateway/config/key", false),
+                    (".lucidos/private/local-token", false),
+                ] {
+                    let text = if bash {
+                        format!("grep warning {path}")
+                    } else {
+                        format!("print(open('{path}').read())")
+                    };
+                    let expected = open && mode == SandboxMode::Enforced;
+                    let offer = command_card_offer_with_paths(tool, &text, TEXT_ONLY, &paths);
+                    assert_eq!(
+                        offer.session.is_some(),
+                        expected,
+                        "{mode:?}: {tool}: {text}"
+                    );
+                    assert_eq!(
+                        command_is_allowed_with_paths(tool, &text, TEXT_ONLY, &paths, |_| true),
+                        expected
+                    );
+                    if expected && bash {
+                        assert_eq!(offer.narrow.as_deref(), Some("Bash(grep:*)"));
+                    }
+                }
+            }
+        }
+    }
 
     const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
 
@@ -1591,10 +2003,73 @@ mod tests {
             event,
             ThreadEvent::CommandPermissionRequested {
                 grant_head: None,
+                grant_offer: None,
                 ..
             }
         ));
         assert_eq!(serde_json::to_value(&event).unwrap(), old);
+    }
+
+    /// Each button a command card draws stores a line covering that same
+    /// command. So an Always allow is never followed by the same card (I7).
+    #[test]
+    fn a_command_card_offers_only_grants_that_cover_its_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        let offer = |tool: &str, command: &str| command_card_offer(tool, command, site);
+
+        let git = offer(tn::RUN_BASH, "git status");
+        assert_eq!(git.broad.as_deref(), Some("Bash"));
+        assert_eq!(git.narrow.as_deref(), Some("Bash(git:*)"));
+        assert_eq!(git.session.as_deref(), Some("Bash(git:*)"));
+
+        let chained = offer(tn::RUN_BASH, "git status && make deploy");
+        assert_eq!(chained.broad.as_deref(), Some("Bash"));
+        assert_eq!(chained.narrow, None, "Bash(git:*) does not cover `make`");
+        assert_eq!(chained.session, None);
+
+        let python = offer(tn::RUN_PYTHON, "print(1)");
+        assert_eq!(python.broad.as_deref(), Some("Python"));
+        assert_eq!(python.narrow, None, "Python has one line, the broad one");
+
+        for scope in [AllowScope::Broad, AllowScope::Narrow, AllowScope::Session] {
+            for (tool, command) in [(tn::RUN_BASH, "git status"), (tn::RUN_PYTHON, "print(1)")] {
+                if let Some(line) = offer(tool, command).pattern(scope) {
+                    assert!(command_is_allowed(tool, command, site, |p| p == line));
+                }
+            }
+        }
+    }
+
+    /// No grant covers a secret read, so its card offers Allow once and Deny
+    /// only, and names why.
+    #[test]
+    fn a_secret_read_card_offers_no_grant_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        for (tool, command) in [
+            (tn::RUN_BASH, "cat ~/.lucidos/secret-keys/db"),
+            (
+                tn::RUN_PYTHON,
+                "open('/home/u/.lucidos/pg-shared-password')",
+            ),
+        ] {
+            assert_eq!(
+                command_card_offer(tool, command, site),
+                GrantOffer {
+                    deny: Some(
+                        if tool == tn::RUN_BASH {
+                            "Bash(cat:*)"
+                        } else {
+                            "Python"
+                        }
+                        .into()
+                    ),
+                    ..GrantOffer::withheld(OfferWithheld::SecretRead)
+                },
+                "{tool}: {command}"
+            );
+        }
     }
 
     /// Nothing runs after the `cd`, so the grant reads the command as written.
@@ -1792,18 +2267,16 @@ mod tests {
 
     // --- action_for_lane: resolved-lane + channel gate + trigger grant ------
 
-    const NO_GRANT: &[SideEffectCategory] = &[];
-
     #[test]
     fn action_safe_proceeds_reversible_checkpoints_on_every_channel() {
         for ch in [None, Some(EventChannel::Chat), Some(EventChannel::Trigger)] {
             assert_eq!(
-                action_for_lane(RiskLane::Safe, ch, None, NO_GRANT),
+                action_for_lane(RiskLane::Safe, ch, None),
                 GuardAction::Proceed
             );
             // Phase 4: reversible is snapshotted before it runs, on every channel.
             assert_eq!(
-                action_for_lane(RiskLane::ReversibleDanger, ch, None, NO_GRANT),
+                action_for_lane(RiskLane::ReversibleDanger, ch, None),
                 GuardAction::Checkpoint
             );
         }
@@ -1818,12 +2291,7 @@ mod tests {
             RiskLane::IrreversibleDanger
         );
         assert_eq!(
-            action_for_lane(
-                mcp_launch_lane(RiskLane::ReversibleDanger),
-                None,
-                None,
-                NO_GRANT
-            ),
+            action_for_lane(mcp_launch_lane(RiskLane::ReversibleDanger), None, None,),
             GuardAction::Ask
         );
         for lane in [
@@ -1839,90 +2307,41 @@ mod tests {
     fn action_catastrophic_refuses_on_every_channel() {
         for ch in [None, Some(EventChannel::Chat), Some(EventChannel::Trigger)] {
             assert_eq!(
-                action_for_lane(RiskLane::Catastrophic, ch, None, NO_GRANT),
+                action_for_lane(RiskLane::Catastrophic, ch, None),
                 GuardAction::Refuse
             );
         }
     }
 
     #[test]
-    fn action_irreversible_asks_on_chat_regardless_of_grant() {
-        // Regression: an ordinary chat turn carries channel == None (the loop
-        // does not stamp Chat on its per-turn meta). The ask lane MUST still
-        // fire — gating on `== Some(Chat)` would have silently let it run. The
-        // grant is never consulted on chat (the user is asked every time).
-        let cat = Some(SideEffectCategory::Email);
-        let full_grant = &[SideEffectCategory::Email];
-        assert_eq!(
-            action_for_lane(RiskLane::IrreversibleDanger, None, cat, full_grant),
-            GuardAction::Ask
-        );
-        assert_eq!(
-            action_for_lane(
-                RiskLane::IrreversibleDanger,
-                Some(EventChannel::Chat),
-                cat,
-                NO_GRANT
-            ),
-            GuardAction::Ask
-        );
+    fn action_irreversible_asks_on_chat() {
+        for channel in [None, Some(EventChannel::Chat)] {
+            assert_eq!(
+                action_for_lane(
+                    RiskLane::IrreversibleDanger,
+                    channel,
+                    Some(SideEffectCategory::Email)
+                ),
+                GuardAction::Ask
+            );
+        }
     }
 
     #[test]
-    fn action_irreversible_on_trigger_gates_on_grant() {
-        let ch = Some(EventChannel::Trigger);
-        // Granted category → run.
+    fn action_irreversible_on_trigger_requires_a_program_grant() {
+        let channel = Some(EventChannel::Trigger);
+        for category in SideEffectCategory::GRANTABLE
+            .into_iter()
+            .chain([SideEffectCategory::SecretRead])
+        {
+            assert_eq!(
+                action_for_lane(RiskLane::IrreversibleDanger, channel, Some(category)),
+                GuardAction::FailTrigger(category)
+            );
+        }
         assert_eq!(
-            action_for_lane(
-                RiskLane::IrreversibleDanger,
-                ch,
-                Some(SideEffectCategory::Email),
-                &[SideEffectCategory::Email, SideEffectCategory::CloudCli],
-            ),
-            GuardAction::Proceed
-        );
-        // Ungranted category → fail the trigger, carrying the blocked category.
-        assert_eq!(
-            action_for_lane(
-                RiskLane::IrreversibleDanger,
-                ch,
-                Some(SideEffectCategory::ExternalApi),
-                &[SideEffectCategory::Email],
-            ),
-            GuardAction::FailTrigger(SideEffectCategory::ExternalApi)
-        );
-        // No category on an irreversible trigger command → treated as Other,
-        // which an empty grant doesn't cover → fail.
-        assert_eq!(
-            action_for_lane(RiskLane::IrreversibleDanger, ch, None, NO_GRANT),
+            action_for_lane(RiskLane::IrreversibleDanger, channel, None),
             GuardAction::FailTrigger(SideEffectCategory::Other)
-        );
-        // A trigger that explicitly granted Other runs the uncategorized one.
-        assert_eq!(
-            action_for_lane(
-                RiskLane::IrreversibleDanger,
-                ch,
-                Some(SideEffectCategory::Other),
-                &[SideEffectCategory::Other],
-            ),
-            GuardAction::Proceed
-        );
-    }
-
-    #[test]
-    fn a_secret_read_fails_a_trigger_even_when_every_category_is_granted() {
-        let ch = Some(EventChannel::Trigger);
-        let cat = Some(SideEffectCategory::SecretRead);
-        // A grant can never deserialize to `SecretRead`, so this one is
-        // forged to show the lane refuses it on its own.
-        let forged = &[SideEffectCategory::SecretRead, SideEffectCategory::Other];
-        assert_eq!(
-            action_for_lane(RiskLane::IrreversibleDanger, ch, cat, forged),
-            GuardAction::FailTrigger(SideEffectCategory::SecretRead)
-        );
-        assert_eq!(
-            action_for_lane(RiskLane::IrreversibleDanger, None, cat, forged),
-            GuardAction::Ask
         );
     }
 
@@ -1975,44 +2394,49 @@ mod tests {
 
     // --- trigger_block_refusal: the message the user reads out of context ---
 
+    #[test]
+    fn retired_category_invocation_grants_never_authorize_commands() {
+        use crate::triggers::config::{LegacyInvocationGrant, TriggerProgramGrant};
+
+        for category in SideEffectCategory::GRANTABLE {
+            let grant = TriggerProgramGrant {
+                pattern: "Bash(curl:*)".into(),
+                legacy: Some(LegacyInvocationGrant {
+                    fingerprint: "original".into(),
+                    category,
+                }),
+            };
+            assert!(!trigger_program_covers(
+                &[grant],
+                tn::RUN_BASH,
+                "curl -X POST https://example.com",
+                TEXT_ONLY,
+                &command_guard::SecretPaths::conservative(),
+            ));
+        }
+    }
+
     fn bash_input(cmd: &str) -> Value {
         serde_json::json!({ "command": cmd })
     }
 
     #[test]
-    fn a_secret_read_refusal_offers_no_grant() {
-        let msg = trigger_block_refusal(
-            SideEffectCategory::SecretRead,
-            tn::RUN_BASH,
-            &bash_input("cat ~/.lucidos/secret-keys/db"),
-            None,
-        );
-        assert!(msg.contains(ungrantable_remedy()), "{msg}");
-        assert!(!msg.contains(MISJUDGED), "{msg}");
-        assert!(!msg.contains("grant the"), "{msg}");
-    }
-
-    /// The opening of the grantable remedy, which names the misjudgement.
-    const MISJUDGED: &str = "Check what the command does first.";
-
-    /// A block is often a misjudgement, so the remedy names that path first
-    /// and offers the grant only for a real need.
-    #[test]
-    fn a_grantable_refusal_names_the_misjudgement_before_the_grant() {
-        let msg = trigger_block_refusal(
-            SideEffectCategory::OutOfWorkspaceDestruction,
-            tn::RUN_BASH,
-            &bash_input("python3 - <<'E'\nopen('data/x','w')\nE"),
-            Some("Overwrites files outside the workspace."),
-        );
-        let misjudged = msg.find(MISJUDGED).expect("misjudgement line");
-        let grant = msg
-            .find(SideEffectCategory::OutOfWorkspaceDestruction.label())
-            .expect("the grant names its label");
-        assert!(misjudged < grant, "{msg}");
-        assert!(msg.contains("misjudged"), "{msg}");
-        assert!(msg.contains("no grant"), "{msg}");
-        assert!(!msg.contains("To allow it"), "{msg}");
+    fn an_ungrantable_refusal_offers_no_grant() {
+        for (category, command) in [
+            (
+                SideEffectCategory::SecretRead,
+                "cat ~/.lucidos/secret-keys/db",
+            ),
+            (
+                SideEffectCategory::UnprovenWorkspaceDestruction,
+                "make clean",
+            ),
+        ] {
+            let msg = trigger_block_refusal(category, tn::RUN_BASH, &bash_input(command), None);
+            assert!(msg.contains(ungrantable_remedy(category)), "{msg}");
+            assert!(!msg.contains(TRIGGER_GRANT_REMEDY), "{msg}");
+            assert!(!msg.contains("grant the"), "{msg}");
+        }
     }
 
     #[test]
@@ -2034,10 +2458,7 @@ mod tests {
         );
         // Still carries the block verdict and the remedy.
         assert!(msg.contains("was NOT run"), "{msg}");
-        assert!(
-            msg.contains(SideEffectCategory::Other.label()),
-            "the remedy must name the grant to tick: {msg}"
-        );
+        assert!(msg.contains(TRIGGER_GRANT_REMEDY), "{msg}");
     }
 
     #[test]
@@ -2065,18 +2486,16 @@ mod tests {
         );
         assert!(
             msg.len() < 1_000,
-            "a long script must not flood the notification: {} bytes",
+            "a long script must not flood the failure transcript: {} bytes",
             msg.len()
         );
         assert!(msg.contains("..."), "truncation must be visible: {msg}");
-        assert!(msg.contains(SideEffectCategory::Other.label()), "{msg}");
+        assert!(msg.contains(SideEffectCategory::Other.reason()), "{msg}");
     }
 
     #[test]
     fn trigger_block_refusal_puts_the_raw_command_last() {
-        // The push notification body IS this string and the OS preview shows
-        // only its first lines, so the summary and the remedy must precede the
-        // raw command text.
+        // The transcript shows the verdict and remedy before the raw command.
         let msg = trigger_block_refusal(
             SideEffectCategory::ExternalApi,
             tn::RUN_BASH,
@@ -2084,7 +2503,7 @@ mod tests {
             Some("Charges a payment endpoint."),
         );
         let why = msg.find("Why it was gated").expect("summary line");
-        let remedy = msg.find(MISJUDGED).expect("remedy line");
+        let remedy = msg.find(TRIGGER_GRANT_REMEDY).expect("remedy line");
         let tried = msg.find("What it tried").expect("command block");
         assert!(why < remedy && remedy < tried, "{msg}");
     }
@@ -2139,6 +2558,68 @@ mod tests {
         assert!(msg.contains("was NOT run"), "{msg}");
     }
 
+    #[test]
+    fn a_failed_judge_call_leaves_no_provider_text_in_the_trace() {
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            "400 bad request: rm -rf /home/u/private-token".into();
+        let verdict = JudgeVerdict::judge_failed(err.as_ref());
+        let trace = decision_trace("judge", None, Some(&verdict.reason));
+        assert!(
+            trace.ends_with(&format!("judge={JUDGE_FAILED_REASON}")),
+            "{trace}"
+        );
+        assert!(!trace.contains("private-token"), "{trace}");
+    }
+
+    #[test]
+    fn decision_trace_keeps_evidence_and_distribution_without_command_text() {
+        let input = JudgeInput {
+            tool_name: tn::RUN_BASH.to_string(),
+            command: "curl https://example.test/private-token".to_string(),
+            out_of_workspace: true,
+            fast_path_refused: false,
+            script_sources: vec![],
+        };
+        let classification = judged(Ok(JudgeVerdict {
+            lane: RiskLane::Safe,
+            category: None,
+            summary: "Safe".to_string(),
+            reason: "safe 0.90, reversible 0.05, irreversible 0.05".to_string(),
+        }));
+        let trace = decision_trace(
+            "judge",
+            Some(&input),
+            classification.judge_reason.as_deref(),
+        );
+        assert!(trace.contains("layer=judge"));
+        assert!(trace.contains("target_outside_workspace=true"));
+        assert!(trace.contains("fast_path_refused=false"));
+        assert!(trace.contains("safe 0.90"));
+        assert!(!trace.contains("private-token"));
+        let mut cache = HashMap::new();
+        cache.insert(input.cache_key(), classification);
+        let cached = cache.get(&input.cache_key()).unwrap();
+        assert_eq!(
+            decision_trace("judge", Some(&input), cached.judge_reason.as_deref()),
+            trace
+        );
+    }
+
+    #[test]
+    fn decision_trace_survives_permission_event_roundtrip_and_old_events() {
+        let old = serde_json::json!({
+            "type": "CommandPermissionRequested",
+            "request_id": "r", "tool_use_id": "t", "tool_name": "run_bash",
+            "command": "ls", "summary": "s",
+        });
+        let event: ThreadEvent = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), old);
+        let mut traced = old;
+        traced["decision_trace"] = decision_trace("static", None, None).into();
+        let event: ThreadEvent = serde_json::from_value(traced.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), traced);
+    }
+
     /// The judge-on path: a call that never answered asks with its failure on
     /// the card, where it once fell to the static list (I7).
     #[test]
@@ -2146,6 +2627,10 @@ mod tests {
         let c = judged(Err("network down".into()));
         assert_eq!(c.lane, RiskLane::IrreversibleDanger);
         assert_eq!(c.category, Some(SideEffectCategory::Other));
+        assert!(c
+            .judge_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("network down")));
         assert!(
             c.summary
                 .as_deref()
@@ -2163,10 +2648,106 @@ mod tests {
             command: "curl -X POST https://api/charge".to_string(),
             out_of_workspace: false,
             fast_path_refused: false,
+            script_sources: vec![],
         };
         let c = command_guard::fallback_classify(&ji, CommandSite::TextOnly { root: None });
         assert_eq!(c.lane, RiskLane::IrreversibleDanger);
         assert_eq!(c.category, Some(SideEffectCategory::ExternalApi));
+    }
+
+    /// The chat and trigger lanes share one read. A standing deny refuses a
+    /// command a standing allow covers, whatever tool runs it, and the card
+    /// offers the line the narrow allow would store.
+    #[tokio::test]
+    async fn a_standing_deny_beats_a_standing_allow_on_the_agent_lanes() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = crate::test_support::seed_chat_thread(&bus, "post it").await;
+        let root = tempfile::TempDir::new().unwrap();
+        let site = CommandSite::Workspace(root.path());
+        let command = "curl -X POST https://example.com";
+        let offer = command_card_offer(tn::RUN_BASH, command, site);
+        assert_eq!(offer.deny, offer.narrow, "one scope derivation for both");
+        let line = offer.deny.expect("a curl command derives a deny line");
+
+        let by = tool_grants::ChangedBy {
+            source: crate::core::grants::GrantSource::Card,
+            thread_id: Some(thread_id),
+            actor: None,
+        };
+        tool_grants::change_standing(
+            &bus,
+            GrantFile::AgentCommands,
+            tool_grants::StandingChange::Add(std::slice::from_ref(&line)),
+            by,
+        )
+        .await
+        .unwrap();
+        let input = serde_json::json!({ "command": command });
+        assert_eq!(
+            standing_deny_refusal(&pool, tn::RUN_BASH, &input).await,
+            None
+        );
+
+        standing_deny::record(&bus, thread_id, line.clone(), AnsweredBy::tap(None))
+            .await
+            .unwrap();
+        for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+            let refusal = standing_deny_refusal(&pool, tool, &input)
+                .await
+                .unwrap_or_else(|| panic!("{tool} is denied"));
+            assert!(refusal.contains(&line), "{refusal}");
+        }
+        // A Python deny is its own line, and a shell deny leaves Python alone.
+        let code = serde_json::json!({ "code": "print(1)" });
+        assert_eq!(
+            standing_deny_refusal(&pool, tn::RUN_PYTHON, &code).await,
+            None
+        );
+        // Any other tool has no command for a rule to match.
+        assert_eq!(
+            standing_deny_refusal(&pool, tn::SEND_NOTIFICATION, &input).await,
+            None
+        );
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A secret read offers no allow, and still offers the deny.
+    #[test]
+    fn a_secret_read_still_offers_always_deny() {
+        let root = tempfile::TempDir::new().unwrap();
+        let site = CommandSite::Workspace(root.path());
+        let offer = command_card_offer(tn::RUN_BASH, "cat ~/.lucidos/private/pg-password", site);
+        assert_eq!(offer.withheld, Some(OfferWithheld::SecretRead));
+        assert_eq!(offer.narrow, None);
+        assert_eq!(offer.deny.as_deref(), Some("Bash(cat:*)"));
+    }
+
+    /// An unproven floor match offers no allow on either tool, and no grant
+    /// covers it, whatever the grant set holds.
+    #[test]
+    fn an_unproven_floor_match_offers_no_allow() {
+        let root = tempfile::TempDir::new().unwrap();
+        let site = CommandSite::Workspace(root.path());
+        for (tool, text) in [
+            (
+                tn::RUN_BASH,
+                "cat > fixture.rs <<'EOF'\npg_ctl -D /tmp/lucidos_example stop\nEOF\ncargo fmt --all",
+            ),
+            (
+                tn::RUN_PYTHON,
+                "import os\nos.posix_spawn('curl', ['-X', 'POST', 'http://localhost/~/api/v1/control/cleanup/batches'], {})",
+            ),
+        ] {
+            let offer = command_card_offer(tool, text, site);
+            assert_eq!(
+                offer.withheld,
+                Some(OfferWithheld::UnprovenWorkspaceDestruction),
+                "{tool}"
+            );
+            assert_eq!((offer.broad, offer.narrow, offer.session), (None, None, None));
+            assert!(!command_is_allowed(tool, text, site, |_| true), "{tool}");
+        }
     }
 
     /// A setup is approved under the fingerprint the start gate computes for
@@ -2262,6 +2843,47 @@ mod tests {
         assert!(launch_of(true, enable).await.is_none());
         assert!(launch_of(true, start).await.is_none());
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn an_unproven_mcp_launch_cannot_create_a_persistent_approval() {
+        use crate::test_support::{boot_mock_engine, seed_chat_thread, setup_test_db};
+        let (_pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let thread_id = seed_chat_thread(&engine.event_bus, "set up a server").await;
+        let input = serde_json::json!({
+            "action": "setup",
+            "id": "srv",
+            "name": "Server",
+            "command": "fixture-server",
+            "args": ["/~/api/v1/control/trash/empty"]
+        });
+        let mut ctx = CommandGuardCtx {
+            enabled: true,
+            judge_enabled: false,
+            judge_cache: &mut HashMap::new(),
+        };
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.command_guard_decision(
+                &mut ctx,
+                tn::MCP,
+                &input,
+                thread_id,
+                "setup",
+                &EventMeta::NONE,
+                &CancellationToken::new(),
+                &command_guard::SecretPaths::conservative(),
+            ),
+        )
+        .await
+        .expect("an unproven launch must refuse without a card");
+        assert!(
+            matches!(decision, GuardDecision::Refuse(ref reason) if reason.contains("Allow once")),
+            "{decision:?}"
+        );
+        assert!(command_request_ids(&engine, thread_id).await.is_empty());
+        crate::test_support::teardown_test_db(&db).await;
     }
 
     /// Setup now refuses `=` in a command, but an older row may hold one. Its

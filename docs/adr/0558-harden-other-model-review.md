@@ -3,6 +3,10 @@
 - **Status**: Accepted
 - **Date**: 2026-10-23
 
+**Amended by [ADR 0681](0681-other-model-review-proves-it-read-the-patch.md).**
+A verdict counts only with proof the reviewer read the patch. Codex runs on
+`codex exec` against a snapshot, no longer through the companion.
+
 ## Context
 
 ADR 0476 gave every `/harden` iteration one Claude review plus Codex on the

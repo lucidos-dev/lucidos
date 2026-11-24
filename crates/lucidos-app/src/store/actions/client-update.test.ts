@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// CLIENT_BUILD_ID is the build that produced the running code — pin it so each
-// test varies only the served id.
 vi.mock('virtual:build-id', () => ({ CLIENT_BUILD_ID: 'client123' }));
 vi.mock('../../hooks/sw-update', () => ({
   getServedBuildId: vi.fn(),
@@ -9,7 +7,6 @@ vi.mock('../../hooks/sw-update', () => ({
   markSwUpdateDismissed: vi.fn(),
   wasSwUpdateDismissed: vi.fn(() => false),
   noteUpdateBuildId: vi.fn(),
-  // store.ts (imported transitively) pulls this from the same module.
   markEngineVersionDismissed: vi.fn(),
 }));
 
@@ -34,9 +31,6 @@ function reset() {
   updateAvailable.value = false;
   toasts.value = [];
   engineRestarting.value = false;
-  // The refresh dismissal is a global preference, so syncClientUpdateFromBuild
-  // skips until preferences load. Seed loaded so the surface-behavior tests run;
-  // the gated-while-loading case has its own test below.
   preferences.value = { status: 'loaded', data: {} };
 }
 
@@ -46,21 +40,21 @@ describe('syncClientUpdateFromBuild — badge', () => {
   it('clears the badge when the served build matches the running build', async () => {
     updateAvailable.value = true;
     mockGetServedBuildId.mockResolvedValue('client123');
-    await syncClientUpdateFromBuild();
-    expect(updateAvailable.value).toBe(false); // self-correcting: was true, now cleared
+    expect(await syncClientUpdateFromBuild()).toBe(false);
+    expect(updateAvailable.value).toBe(false);
   });
 
   it('lights the badge when the served build is newer than the running build', async () => {
     mockGetServedBuildId.mockResolvedValue('server999');
-    await syncClientUpdateFromBuild();
+    expect(await syncClientUpdateFromBuild()).toBe(true);
     expect(updateAvailable.value).toBe(true);
   });
 
   it('leaves a lit badge untouched when the served build id is indeterminate', async () => {
     updateAvailable.value = true;
-    mockGetServedBuildId.mockResolvedValue(null); // offline / transient
+    mockGetServedBuildId.mockResolvedValue(null);
     await syncClientUpdateFromBuild();
-    expect(updateAvailable.value).toBe(true); // must not mis-clear on a failed check
+    expect(updateAvailable.value).toBe(true);
   });
 
   it('leaves an unlit badge untouched when the served build id is indeterminate', async () => {
@@ -70,16 +64,13 @@ describe('syncClientUpdateFromBuild — badge', () => {
   });
 
   it('skips entirely until preferences load (durable global dismissal not yet known)', async () => {
-    // Before preferences load, the global refresh-dismissal is unknown — surfacing
-    // would flash an already-dismissed toast on cold start. Skip without even
-    // fetching the served build; startClient re-runs this after loadPreferences.
     preferences.value = { status: 'loading' };
     updateAvailable.value = true;
     mockGetServedBuildId.mockResolvedValue('server999');
     await syncClientUpdateFromBuild();
     expect(mockGetServedBuildId).not.toHaveBeenCalled();
     expect(hasUpdateToast()).toBe(false);
-    expect(updateAvailable.value).toBe(true); // left as-is, not mis-cleared
+    expect(updateAvailable.value).toBe(true);
   });
 });
 
@@ -93,7 +84,6 @@ describe('syncClientUpdateFromBuild — badge ⟺ toast (arrival coupled; dismis
     const toast = toasts.value.find((t) => t.key === UPDATE_KEY);
     expect(toast?.message).toBe('New version available — refresh to sync');
     expect(toast?.action?.label).toBe('Refresh');
-    // "Later" is the explicit defer affordance (dismisses; badge stays lit).
     expect(toast?.secondaryAction?.label).toBe('Later');
   });
 
@@ -111,14 +101,11 @@ describe('syncClientUpdateFromBuild — badge ⟺ toast (arrival coupled; dismis
   });
 
   it('keeps the badge lit but suppresses the toast for a build already dismissed', async () => {
-    // Dismiss defers: the toast is gone for THIS build, but the badge stays lit
-    // (still stale) as the persistent refresh affordance — the user can still
-    // refresh from the reload badge.
     mockWasDismissed.mockReturnValue(true);
     mockGetServedBuildId.mockResolvedValue('server999');
     await syncClientUpdateFromBuild();
-    expect(updateAvailable.value).toBe(true); // badge persists
-    expect(hasUpdateToast()).toBe(false); // toast deferred
+    expect(updateAvailable.value).toBe(true);
+    expect(hasUpdateToast()).toBe(false);
   });
 
   it('removes the toast (and clears the badge) when the client is no longer stale', async () => {
@@ -126,7 +113,6 @@ describe('syncClientUpdateFromBuild — badge ⟺ toast (arrival coupled; dismis
     await syncClientUpdateFromBuild();
     expect(hasUpdateToast()).toBe(true);
     expect(updateAvailable.value).toBe(true);
-    // The running build now matches (e.g. a refresh landed) — both clear together.
     mockGetServedBuildId.mockResolvedValue('client123');
     await syncClientUpdateFromBuild();
     expect(hasUpdateToast()).toBe(false);
@@ -138,16 +124,13 @@ describe('syncClientUpdateFromBuild — badge ⟺ toast (arrival coupled; dismis
     await syncClientUpdateFromBuild();
     expect(hasUpdateToast()).toBe(true);
     expect(updateAvailable.value).toBe(true);
-    // User clicks X or "Later" → dismissToast('update-available').
     dismissToast(UPDATE_KEY);
-    expect(hasUpdateToast()).toBe(false); // toast deferred away
-    expect(updateAvailable.value).toBe(true); // badge persists (update from badge)
-    expect(mockMarkDismissed).toHaveBeenCalled(); // build remembered (durable)
+    expect(hasUpdateToast()).toBe(false);
+    expect(updateAvailable.value).toBe(true);
+    expect(mockMarkDismissed).toHaveBeenCalled();
   });
 
   it('surfaces alongside the action-less "Engine restarted" confirmation', async () => {
-    // A restart that also rebuilt the client must still tell the user to refresh;
-    // there is no longer a hasRefreshToast guard to hold it back.
     showToast('Engine restarted', 'success', { autoDismissMs: 5_000 });
     mockGetServedBuildId.mockResolvedValue('server999');
     await syncClientUpdateFromBuild();

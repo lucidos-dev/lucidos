@@ -9,13 +9,15 @@
 //! down, an announcement that does not send: none of them may be the reason a
 //! build does not happen.
 
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use lucidos_build_slot::{
-    host_ncpu, inherited_slot, resolve_class, BuildLimits, BuildSlotPool, SlotClass, SlotState,
-    ENV_CARGO_JOBS, ENV_HELD, ENV_NICE, ENV_PRIORITY,
+    host_ncpu, inherited_slot, resolve_class_with_legacy, BuildLimits, BuildSlotGuard,
+    BuildSlotPool, SlotClass, SlotState, ENV_CARGO_JOBS, ENV_CLASS, ENV_HELD, ENV_LEASE_NICE,
+    ENV_LEGACY_PRIORITY, ENV_NICE,
 };
 
 use crate::workspace::{resolve_from_env, BoxError, Workspace};
@@ -38,6 +40,7 @@ const LABEL_CHARS: usize = 120;
 
 pub(crate) struct BuildSlotArgs {
     pub status: bool,
+    pub lease: bool,
     pub set_capacity: Option<usize>,
     pub max_wait_secs: Option<u64>,
     pub label: Option<String>,
@@ -50,6 +53,9 @@ pub(crate) fn run(args: BuildSlotArgs) -> Result<u8, BoxError> {
     }
     if args.status {
         return cmd_status();
+    }
+    if args.lease {
+        return cmd_lease(args);
     }
     cmd_wrap(args)
 }
@@ -125,35 +131,115 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     }
     let label = default_label(args.label.as_deref(), &args.command);
 
-    // Already inside a wrapped build: run straight through. Without this a
-    // `make test` that wraps, calling a script that also wraps, would wait for
-    // a slot it is already holding.
-    //
-    // It imposes NOTHING either. The outer wrapper already niced this tree and
-    // already divided its cores. Doing it again would halve an inner `make
-    // test`'s share a second time, and stack a nice increment no non-root
-    // process can take back.
     if let Some(index) = inherited_slot() {
-        return spawn_child(&args.command, Some(&index), BuildLimits::NONE);
+        let limits = BuildLimits::nested(std::env::var(ENV_LEASE_NICE).ok().as_deref());
+        lower_own_priority(limits.nice);
+        return spawn_child(&args.command, Some(&index), limits);
     }
 
-    let pool = match BuildSlotPool::open() {
-        Ok(pool) => pool,
+    let Some(pool) = open_pool() else {
+        return spawn_child(&args.command, None, BuildLimits::NONE);
+    };
+    let Some((guard, limits)) = acquire(&pool, &label, args.max_wait_secs, None) else {
+        return Ok(WAIT_TIMEOUT_EXIT);
+    };
+    let index = guard.index().to_string();
+    lower_own_priority(limits.nice);
+    let code = spawn_child(&args.command, Some(&index), limits);
+    release(guard, &label);
+    code
+}
+
+fn cmd_lease(args: BuildSlotArgs) -> Result<u8, BoxError> {
+    let parent = parent_pid();
+    if let Ok(owner) = std::env::var("LUCIDOS_BUILD_SLOT_LEASE_OWNER") {
+        // The launch shell may have died during the wrapper's bootstrap.
+        // Its adopted child must never take a slot on its behalf.
+        if owner.parse::<u32>().ok() != Some(parent) {
+            return Ok(0);
+        }
+    }
+    if inherited_slot().is_some() {
+        println!("unleased");
+        return Ok(0);
+    }
+    let Some(pool) = open_pool() else {
+        println!("unleased");
+        return Ok(0);
+    };
+    let label = default_label(Some(args.label.as_deref().unwrap_or("build lease")), &[]);
+    let Some((guard, limits)) = acquire(&pool, &label, args.max_wait_secs, Some(parent)) else {
+        println!("error");
+        return Ok(WAIT_TIMEOUT_EXIT);
+    };
+    let result = (|| -> io::Result<()> {
+        let jobs = limits
+            .jobs
+            .map_or_else(|| "-".into(), |jobs| jobs.to_string());
+        {
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "granted {} {jobs} {}", guard.index(), limits.nice)?;
+            stdout.flush()?;
+        }
+        wait_for_lease_release(parent)
+    })();
+    release(guard, &label);
+    result?;
+    Ok(0)
+}
+
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    // SAFETY: getppid has no arguments and reads the calling process's state.
+    unsafe { libc::getppid() as u32 }
+}
+
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    0
+}
+
+fn wait_for_lease_release(parent: u32) -> io::Result<()> {
+    // The shell opens the FIFO read-write. Its death may leave inherited
+    // writers open, so stdin alone cannot tell us when to release.
+    let (done, release) = std::sync::mpsc::channel();
+    std::thread::Builder::new().spawn(move || {
+        let mut line = Vec::new();
+        let _ = done.send(io::stdin().lock().read_until(b'\n', &mut line));
+    })?;
+    while parent_pid() == parent {
+        match release.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => return result.map(|_| ()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
+fn open_pool() -> Option<BuildSlotPool> {
+    match BuildSlotPool::open() {
+        Ok(pool) => Some(pool),
         Err(e) => {
             eprintln!("lucidos build-slot: no pool ({e}), running the build unrestricted");
-            return spawn_child(&args.command, None, BuildLimits::NONE);
+            None
         }
-    };
+    }
+}
 
-    let class = resolve_class(std::env::var(ENV_PRIORITY).ok().as_deref());
-    let guard = match pool.try_acquire_as(&label, class) {
-        Some(guard) => guard,
-        None => match wait_for_slot(&pool, &label, class, args.max_wait_secs) {
-            Some(guard) => guard,
-            None => return Ok(WAIT_TIMEOUT_EXIT),
-        },
-    };
-
+fn acquire(
+    pool: &BuildSlotPool,
+    label: &str,
+    max_wait_secs: Option<u64>,
+    lease_parent: Option<u32>,
+) -> Option<(BuildSlotGuard, BuildLimits)> {
+    let class = resolve_class_with_legacy(
+        std::env::var(ENV_CLASS).ok().as_deref(),
+        std::env::var(ENV_LEGACY_PRIORITY).ok().as_deref(),
+    );
+    let guard = pool
+        .try_acquire_as(label, class)
+        .or_else(|| wait_for_slot(pool, label, class, max_wait_secs, lease_parent))?;
     let index = guard.index().to_string();
     // Decided with the slot already in hand, so the share counts this holder.
     let caller_jobs = std::env::var(ENV_CARGO_JOBS).ok();
@@ -168,9 +254,11 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
         "{}",
         describe_limits(&index, pool.capacity().value, &limits)
     );
-    lower_own_priority(limits.nice);
-    let code = spawn_child(&args.command, Some(&index), limits);
+    Some((guard, limits))
+}
 
+fn release(guard: BuildSlotGuard, label: &str) {
+    let index = guard.index().to_string();
     // Free the slot BEFORE announcing, so a waiter woken by the event finds it
     // already available rather than racing the drop.
     drop(guard);
@@ -185,7 +273,6 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
         &format!("A build slot freed up after `{label}`"),
         serde_json::json!({ "label": label, "slot": index }),
     );
-    code
 }
 
 /// The slot label: `--label` when given, else the program's file name alone.
@@ -217,11 +304,13 @@ fn wait_for_slot(
     label: &str,
     class: SlotClass,
     max_wait_secs: Option<u64>,
-) -> Option<lucidos_build_slot::BuildSlotGuard> {
+    lease_parent: Option<u32>,
+) -> Option<BuildSlotGuard> {
     let capacity = pool.capacity().value;
     let turn = match class {
         SlotClass::Priority => "as a priority build, so the next free one is ours",
         SlotClass::Ordinary => "for one",
+        SlotClass::Background => "behind chosen work",
     };
     eprintln!(
         "lucidos build-slot: all {capacity} build slots are busy, waiting {turn}. \
@@ -230,14 +319,24 @@ fn wait_for_slot(
 
     let mut next_progress = PROGRESS_EVERY;
     let mut announced = false;
+    #[cfg(unix)]
+    let mut background_wait = None;
     let max_wait = max_wait_secs.map(Duration::from_secs);
     let guard = pool.acquire(label, max_wait, class, |waited| {
+        if lease_parent.is_some_and(|parent| parent_pid() != parent) {
+            // Still queued. Process exit drops the kernel's waiter locks.
+            std::process::exit(0);
+        }
         // Announced from inside the wait, not before it. `acquire` raises the
         // waiting flag before this first runs. So a holder releasing during
         // the announcement's own round trip already sees a queued build, and
         // emits its release. Announcing first left that window silent.
         if !announced {
             announced = true;
+            #[cfg(unix)]
+            {
+                background_wait = lucidos_build_slot::notify_background_wait();
+            }
             announce(
                 "BuildSlotWaiting",
                 &format!("A build is waiting for one of {capacity} build slots: `{label}`"),
@@ -252,6 +351,8 @@ fn wait_for_slot(
             next_progress = waited + PROGRESS_EVERY;
         }
     });
+    #[cfg(unix)]
+    drop(background_wait);
 
     match guard {
         Some(guard) => {
@@ -342,8 +443,10 @@ fn spawn_child(
     if let Some(index) = slot {
         cmd.env(ENV_HELD, index);
     }
-    // Priority belongs to this acquisition, not to the tree it admits.
-    cmd.env_remove(ENV_PRIORITY);
+    // The class belongs to this acquisition, not to the tree it admits.
+    cmd.env_remove(ENV_LEASE_NICE);
+    cmd.env_remove(ENV_CLASS);
+    cmd.env_remove(ENV_LEGACY_PRIORITY);
     if let Some(jobs) = limits.jobs {
         cmd.env(ENV_CARGO_JOBS, jobs.to_string());
     }
@@ -407,6 +510,24 @@ fn post_event(
 mod tests {
     use super::*;
     use lucidos_build_slot::SlotHolder;
+
+    #[test]
+    fn a_nested_step_under_a_lease_applies_the_lease_nice_once() {
+        assert_eq!(
+            BuildLimits::nested(Some("10")),
+            BuildLimits {
+                nice: 10,
+                jobs: None
+            }
+        );
+        assert_eq!(BuildLimits::nested(Some("-10")), BuildLimits::NONE);
+    }
+
+    #[test]
+    fn a_nested_step_without_a_lease_still_imposes_nothing() {
+        assert_eq!(BuildLimits::nested(None), BuildLimits::NONE);
+        assert_eq!(BuildLimits::nested(Some("invalid")), BuildLimits::NONE);
+    }
 
     #[test]
     fn an_unavailable_engine_does_not_delay_an_announcement() {
@@ -511,6 +632,7 @@ mod tests {
     fn the_wrapper_refuses_an_empty_command() {
         let err = run(BuildSlotArgs {
             status: false,
+            lease: false,
             set_capacity: None,
             max_wait_secs: None,
             label: None,

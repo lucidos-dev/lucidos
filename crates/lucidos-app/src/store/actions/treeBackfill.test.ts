@@ -14,7 +14,6 @@ import {
 import { summaryTreesVersion } from '../store';
 import { repairGapState } from '../eventGap';
 
-// Hoisted by vitest, so the module under test sees the stub.
 const mockGet = vi.fn();
 vi.mock('../../api/client', async (original) => ({
   ...(await original<typeof import('../../api/client')>()),
@@ -51,7 +50,6 @@ describe('the Tree backfill store', () => {
     handleGlobalEvent('TreeBackfillProgressed', { progress: RUNNING.progress });
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: RUNNING });
 
-    // Ready, with the older threads still counted, until the next frame.
     handleGlobalEvent('TreeBackfillCompleted', { total: 10 });
     expect(treeBackfill.value).toEqual({
       status: 'loaded',
@@ -62,15 +60,12 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'off', started: true } });
   });
 
-  /** After the ready flag sets, older threads still fill in: a progress
-   *  frame then keeps the state ready and carries the count. */
   it('reads a progress frame after ready as ready and filling', () => {
     const filling = { ...ZERO, done: 8, total: 10, done_milli: 8_000, ready: true };
     handleGlobalEvent('TreeBackfillProgressed', { progress: filling });
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready', filling } });
   });
 
-  /** A ready state already counting the older threads keeps its count. */
   it('keeps the count when the ready frame lands after a filling frame', () => {
     const filling = { ...ZERO, done: 8, total: 10, done_milli: 8_000, ready: true };
     handleGlobalEvent('TreeBackfillProgressed', { progress: filling });
@@ -78,7 +73,6 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready', filling } });
   });
 
-  /** A snapshot read that started before a frame must not undo it. */
   it('keeps a frame that lands while the snapshot read is open', async () => {
     let resolve: (v: TreeBackfill) => void = () => {};
     mockGet.mockReturnValue(new Promise<TreeBackfill>((r) => { resolve = r; }));
@@ -89,8 +83,6 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready' } });
   });
 
-  /** A gap re-reads while the mount read is still open. The older reply
-   *  can land last, and must not undo the newer one. */
   it('keeps a newer snapshot over an older read that lands after it', async () => {
     let resolveOlder: (v: TreeBackfill) => void = () => {};
     mockGet.mockReturnValueOnce(new Promise<TreeBackfill>((r) => { resolveOlder = r; }));
@@ -102,8 +94,6 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready' } });
   });
 
-  /** The read after Start can overtake frames still in flight on SSE. A
-   *  frame its snapshot already counted must not step the bar back. */
   it('drops a frame the snapshot already counted', async () => {
     const at = (seq: number, done: number) => ({ ...ZERO, done, total: 2, done_milli: done * 1_000, seq });
     mockGet.mockResolvedValue({ state: 'running', progress: at(2, 1) });
@@ -117,8 +107,6 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: at(3, 2) } });
   });
 
-  /** A read that started before the reset can carry a restarted engine's old
-   *  order. It still shows, but it sets no order. */
   it('takes no order from a snapshot read that started before the reset', async () => {
     let resolve: (v: TreeBackfill) => void = () => {};
     mockGet.mockReturnValue(new Promise<TreeBackfill>((r) => { resolve = r; }));
@@ -132,8 +120,6 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: fresh } });
   });
 
-  /** A reconnect can follow an engine restart, whose frames count from one
-   *  again. */
   it('takes a low order again once the order is forgotten', () => {
     handleGlobalEvent('TreeBackfillProgressed', { progress: { ...RUNNING.progress, seq: 40 } });
     forgetTreeBackfillOrder();
@@ -160,7 +146,6 @@ describe('the Tree backfill store', () => {
     expect(backfillPercent({ ...ZERO, done: 3, total: 3, done_milli: 3_000 })).toBe(100);
   });
 
-  /** The long last tree moves the bar while the tree count holds. */
   it('counts the built share of the trees under way', () => {
     const lastTree = { ...ZERO, done: 14, total: 15, done_milli: 14_617, nodes_done: 210, nodes_total: 340 };
     expect(backfillPercent(lastTree)).toBe(97);
@@ -168,20 +153,16 @@ describe('the Tree backfill store', () => {
     expect(backfillDetail({ ...lastTree, nodes_done: 0, nodes_total: 0 })).toBe('14 of 15 trees');
   });
 
-  /** A backfill that ran before resumes without a new confirm. */
   it('reads started from an off state, and from any live one', () => {
     expect(treeBackfillStarted()).toBe(false);
     treeBackfill.value = { status: 'loaded', data: { state: 'off', started: false } };
     expect(treeBackfillStarted()).toBe(false);
     treeBackfill.value = { status: 'loaded', data: { state: 'off', started: true } };
     expect(treeBackfillStarted()).toBe(true);
-    // Leaving Tree mid-build sends no frame, so the store still says running.
     treeBackfill.value = { status: 'loaded', data: RUNNING };
     expect(treeBackfillStarted()).toBe(true);
   });
 
-  /** One progress frame per built node would re-read the browser thousands
-   *  of times in a backfill. */
   it('moves the summary tree browser on completion, reset and delete, never on progress', () => {
     const before = summaryTreesVersion.value;
     handleGlobalEvent('TreeBackfillProgressed', { progress: RUNNING.progress });

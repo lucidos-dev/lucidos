@@ -1,50 +1,9 @@
-/**
- * The desktop content header's title and chevrons hold ONE position, whatever
- * the trailing action cluster contains.
- *
- * The report, 2026-08-13: "we should keep the same position for title/chevrons
- * in content pane header whether the overflow menu icon is present or not."
- * They were the `flex: 1` middle of a 3-zone row, so their position was the
- * midpoint between the hamburger and a cluster that is 1 to 3 icon boxes wide
- * depending on the content view. The ⋯ trigger coming and going was the
- * sharpest case; navigating from a plain view (the bell alone) to Files (an
- * icon and the bell) moved them just as much.
- *
- * The fix is the arrangement every other header row already had: the cluster is
- * a fixed span centred on the row, and the actions are in flow at its trailing
- * edge (`.pane-header-content-title` in styles/panels/shell.css). This spec is
- * the rendered proof, over three views whose clusters differ:
- *
- * | View            | Trailing cluster                    |
- * |-----------------|-------------------------------------|
- * | Settings        | the bell alone                      |
- * | Apps            | search + the bell                   |
- * | An app's UI     | open in tab + find + fullscreen + the bell |
- *
- * The app's UI is the widest cluster: three context actions and the bell, all
- * riding the row while it has room. Its Refresh leads the row beside the
- * hamburger, so the back chevron must clear that too.
- *
- * The mirror case has its own test: two app views whose CLUSTERS are identical
- * and whose TITLES are not, one of them long enough to ellipsize. That is the
- * variable the report named second ("the chevrons still move around for
- * different titles"), and the three views above cannot isolate it, since each
- * of them changes the title and the cluster together.
- *
- * Desktop-only: the mobile row has its own centred cluster and its own spec
- * (mobile-content-title-overlap-all.spec.ts). The arithmetic behind the reserve the
- * box clears is pinned by source scan in
- * src/styles/__tests__/content-header-title-centring.test.ts, which is where a
- * regression at a ui-scale this viewport never renders would show up.
- */
 import { test, expect, type Page } from './fixtures';
 import { createIframeAppFixture, ensureHomeThread } from './db-helpers';
 import { assertHealthy, gotoWithRetry, clickVisibleElement, hideDashboardRail, watchPreferenceReads, openSettingsView } from './helpers';
 
 const APP_ID = 'e2e-desktop-title-position';
 const APP_NAME = 'Trip countdown';
-// The same view type under a title long enough to outgrow --desktop-nav-span
-// (20rem), so it is the ellipsis case rather than merely a wider one.
 const APP_ID_LONG = 'e2e-desktop-title-position-long';
 const APP_NAME_LONG = 'Half Marathon Training Plan and Weekly Readiness Review';
 let fixture: { cleanup: () => void };
@@ -54,31 +13,26 @@ let widgetFixture: { cleanup: () => void };
 test.use({ viewport: { width: 1280, height: 800 } });
 
 interface HeaderMetrics {
-  backX: number;        // the back chevron's left edge
-  forwardX: number;     // the forward chevron's right edge
+  backX: number;
+  forwardX: number;
   boxCentre: number;
   boxRight: number;
   boxWidth: number;
   rowCentre: number;
-  rowWidth: number;     // the box's containing block, which its 100% resolves against
-  navRight: number;     // the leading cluster's inner edge: the hamburger, or Refresh beside it
-  hasRefresh: boolean;  // Refresh leads the row beside the hamburger
-  actionsLeft: number;  // the trailing cluster's inner edge
-  minSpan: number;      // --desktop-nav-min-span, resolved to px
-  sideReserve: number;  // --content-side-reserve, resolved to px
-  span: number;         // --desktop-nav-span, resolved to px
-  spanMax: number;      // --desktop-content-title-span-max, resolved to px
-  unfoldedReserve: number; // --content-unfolded-reserve, resolved to px
-  titleText: string;    // the box's rendered text, ellipsis excluded (it is CSS)
+  rowWidth: number;
+  navRight: number;
+  hasRefresh: boolean;
+  actionsLeft: number;
+  minSpan: number;
+  sideReserve: number;
+  span: number;
+  spanMax: number;
+  unfoldedReserve: number;
+  titleText: string;
   hasOverflow: boolean;
   trailingIcons: number;
 }
 
-/** Measure the desktop content row's centred box against its two clusters.
- *
- *  Scoped to `.desktop-header`: MobileAppHeader renders FIRST and carries
- *  copies of several of these classes, so an unscoped querySelector can return
- *  the hidden mobile one (the 0x0-rect trap in .claude/rules/frontend.md). */
 async function measure(page: Page): Promise<HeaderMetrics | null> {
   return page.evaluate(() => {
     const row = document.querySelector('.desktop-header .content-header-elements') as HTMLElement | null;
@@ -94,10 +48,6 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
     const r = row.getBoundingClientRect();
     const a = actions.getBoundingClientRect();
     if (b.width === 0 || a.width === 0) return null;
-    // The clamp's floor, resolved by the browser rather than restated as a
-    // number here: it is a rem token, so a literal would be right at exactly
-    // one ui-scale. The hidden probe inherits the row's local reserve,
-    // including compact geometry and control insets.
     const resolve = (token: string) => {
       const probe = document.createElement('div');
       probe.style.cssText = `position:absolute;visibility:hidden;width:var(${token})`;
@@ -135,8 +85,6 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
   });
 }
 
-/** Settled = the row is laid out AND the collapse hook has measured it (it runs
- *  in a layout effect, so a read before it lands sees the pre-collapse row). */
 async function settled(page: Page): Promise<HeaderMetrics> {
   let last: HeaderMetrics | null = null;
   await expect.poll(async () => {
@@ -150,7 +98,6 @@ async function settled(page: Page): Promise<HeaderMetrics> {
   return last!;
 }
 
-/** True of every view: the box sits on the row's axis and clears both clusters. */
 function expectCentredAndClear(m: HeaderMetrics, view: string): void {
   expect(
     Math.abs(m.boxCentre - m.rowCentre),
@@ -193,8 +140,6 @@ test.describe('the desktop content title holds its position across views', () =>
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // The rail toggle shows once the thread list carries Home, and a spec
-    // before this one may have truncated the threads, home included.
     ensureHomeThread();
     await hideDashboardRail(page);
   });
@@ -217,6 +162,37 @@ test.describe('the desktop content title holds its position across views', () =>
     expect.soft(await title.evaluate(el => el.scrollWidth <= el.clientWidth), 'widget name fits').toBe(true);
     await expect.soft(title).not.toContainText('(widget)');
     await expect(title).toHaveText(APP_NAME);
+  });
+
+  test('compact overflow holds its leading slot during position-only layout changes', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await page.addInitScript((id) => {
+      localStorage.setItem('app-window-open', id);
+      localStorage.setItem('lucidos-thread-drawer-open', 'true');
+      localStorage.setItem('lucidos-split-ratio', '0.6');
+    }, APP_ID);
+    const preferencesReady = watchPreferenceReads(page);
+    await gotoWithRetry(page, '/');
+    await preferencesReady();
+    await page.evaluate(() => document.documentElement.style.setProperty('--user-ui-scale', '175%'));
+    await settled(page);
+    await expect(page.locator('.desktop-header .content-header-actions')).toHaveAttribute('data-compact');
+    const more = page.locator('.desktop-header .content-header-more');
+    await expect(more).toBeVisible();
+    const shifts = await more.evaluate((el) => {
+      const row = el.closest<HTMLElement>('.content-header-elements')!;
+      const hamburger = row.querySelector('.hamburger-panel')!;
+      const style = getComputedStyle(row);
+      const padding = parseFloat(style.paddingRight);
+      const gap = parseFloat(style.gap);
+      return [padding + 40, padding].map((right) => {
+        row.style.paddingRight = `${right}px`;
+        return el.getBoundingClientRect().left - hamburger.getBoundingClientRect().right - gap;
+      });
+    });
+    for (const shift of shifts) expect(Math.abs(shift), 'overflow stays beside the hamburger').toBeLessThan(1);
+    await more.click();
+    await expect(page.getByRole('menuitem', { name: 'Refresh', exact: true })).toBeVisible();
   });
 
   test('reported 1920 by 1080 at 175% keeps real destinations whole', async ({ page }) => {
@@ -279,25 +255,7 @@ test.describe('the desktop content title holds its position across views', () =>
   });
 
   test('the chevrons land on the same x for a short and a long title', async ({ page }) => {
-    // The report's own wording, 2026-08-13: "the chevrons still move around for
-    // different titles, should stay in one place (as long as header width is
-    // the same)". The case below it holds the TITLE roughly constant and varies
-    // the action cluster; this one is its mirror, and it is the sharper
-    // isolation of the two: both loads are the same view TYPE (an app's UI, so
-    // the same trailing cluster) at the same split, so the title is the only
-    // thing that differs.
-    //
-    // What makes the chevrons immune to it is that the box is a FIXED SPAN with
-    // `space-between`: the title is its one shrinking member, so a title too
-    // long for the span ellipsizes inside it rather than pushing an end out.
-    // A regression here looks like a `width` on the box that reads its content
-    // (`fit-content`, `max-content`, or dropping the clamp for a `max-width`).
     const titled: Partial<Record<'short' | 'long', HeaderMetrics>> = {};
-    // One load first, purely to put the page on the app's origin: the restore
-    // key is written with `evaluate` rather than `addInitScript` so the second
-    // pass can overwrite it, and localStorage is per-origin. The saved nav
-    // history is the other restore record: the first pass folds its app into
-    // it, and it wins at load. Dropping it leaves the seed as the only record.
     await gotoWithRetry(page, '/');
     for (const [label, id] of [['short', APP_ID], ['long', APP_ID_LONG]] as const) {
       await page.evaluate((appId) => {
@@ -309,7 +267,6 @@ test.describe('the desktop content title holds its position across views', () =>
       titled[label] = await settled(page);
     }
 
-    // The titles really did differ, or the comparison below proves nothing.
     expect(
       titled.long!.titleText.length,
       `the long fixture rendered "${titled.long!.titleText}", no longer than the short one`,
@@ -329,9 +286,6 @@ test.describe('the desktop content title holds its position across views', () =>
   });
 
   test('the chevrons land on the same x whatever the trailing cluster holds', async ({ page }) => {
-    // Restore-on-load opens the app in the content pane (the same hook
-    // sdk-iframe-mount uses): panelOverlay = {type:'app-ui'}, whose three
-    // context actions ride the row beside the bell, the widest cluster.
     await page.addInitScript((id) => localStorage.setItem('app-window-open', id), APP_ID);
     await gotoWithRetry(page, '/');
     await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
@@ -341,16 +295,12 @@ test.describe('the desktop content title holds its position across views', () =>
     expect(widest.hasRefresh, 'the app view leads its row with Refresh').toBe(true);
     expectCentredAndClear(widest, 'app UI');
 
-    // Apps: one context action (search) riding the row beside the bell.
     await clickVisibleElement(page, '.hamburger-panel');
     await expect.poll(() => clickVisibleElement(page, '.drawer-item', 'Apps'), { timeout: 10_000 }).toBe(true);
     const oneAction = await settled(page);
     expect(oneAction.hasOverflow, 'one action does not fold: ⋯ would replace it 1:1').toBe(false);
     expectCentredAndClear(oneAction, 'apps');
 
-    // Settings: no context actions at all, so the bell stands alone and the
-    // cluster is a whole icon box narrower than either view above. This is the
-    // pair the report is about, at its widest.
     await clickVisibleElement(page, '.hamburger-panel');
     await expect.poll(() => clickVisibleElement(page, '.drawer-item', 'Settings'), { timeout: 10_000 }).toBe(true);
     const noActions = await settled(page);
@@ -358,7 +308,6 @@ test.describe('the desktop content title holds its position across views', () =>
     expect(noActions.trailingIcons, 'settings: the bell alone').toBe(1);
     expectCentredAndClear(noActions, 'settings');
 
-    // The ask. The clusters really did differ, and the chevrons did not move.
     expect(
       noActions.actionsLeft,
       'the three views produced the same trailing cluster, so this proves nothing',
@@ -376,21 +325,6 @@ test.describe('the desktop content title holds its position across views', () =>
   });
 
   test('the box still clears the cluster with the Canvas pane near its floor', async ({ page }) => {
-    // The narrowest this pane legally gets, where the box has given up the most
-    // width to the two side reserves.
-    //
-    // The pane width is SEEDED, not dragged. `splitRatio` is read straight out
-    // of localStorage with no load-time clamp (store/store.ts), so a ratio IS a
-    // pane width, where a divider drag has to find a live divider and land a
-    // real pointer on it. Every sibling desktop spec seeds it for that reason
-    // (split-resize-desktop, repo-files, header-drawer-toggle-pinned-desktop);
-    // this test hand-rolled the drag instead and it silently moved nothing,
-    // leaving the pane at its 765px default and the assertion below unreached.
-    //
-    // 0.7 of this 1280 viewport leaves the Canvas pane ~381px: above its
-    // MIN_CONTENT_PANE_REM floor (22.5rem = 360px at these projects' 16px
-    // root), so it is a width a drag could also stop at, and the narrowest
-    // regime the clamp has to hold this box clear in.
     await page.addInitScript((id) => {
       localStorage.setItem('lucidos-split-ratio', '0.7');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
@@ -405,7 +339,6 @@ test.describe('the desktop content title holds its position across views', () =>
     );
     expect(paneWidth, 'the seeded ratio did not narrow the Canvas pane').toBeLessThan(400);
     expect(paneWidth, 'the seeded ratio went under the Canvas pane floor').toBeGreaterThan(360);
-    // Compact panes fold every optional action into the leading overflow.
     const compactWidth = Math.min(narrow.span, Math.max(0, narrow.rowWidth - 2 * narrow.sideReserve));
     expect(narrow.boxWidth, 'compact span clears symmetric control reserves').toBeCloseTo(compactWidth, 0);
     expect(narrow.trailingIcons, 'only the bell remains trailing').toBe(1);
@@ -415,11 +348,6 @@ test.describe('the desktop content title holds its position across views', () =>
   });
 
   test('a wide Canvas pane grows the title box, up to its cap', async ({ page }) => {
-    // The ratio seeds the pane width, as in the test above. At 1920px, 0.45
-    // leaves the Canvas pane ~1050px: past the width where the box starts to
-    // grow, short of its cap. 0.3 leaves ~1340px, past the cap. The docked Home
-    // rail toggle widens the unfolded reserve by a box, so the box starts to
-    // grow near a 980px pane.
     await page.setViewportSize({ width: 1920, height: 1000 });
     const atRatio = async (ratio: string): Promise<HeaderMetrics> => {
       await page.evaluate(({ r, id }) => {
@@ -432,7 +360,6 @@ test.describe('the desktop content title holds its position across views', () =>
       await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
       return settled(page);
     };
-    // One load first, to put the page on the app's origin for localStorage.
     await gotoWithRetry(page, '/');
 
     const growing = await atRatio('0.45');

@@ -1,7 +1,8 @@
 //! The surfaces generated from the manifest: the CLI's command module and the
 //! SDK's capability table. A generated command routes through the CLI's own
-//! `http::client()` / `send_and_print`, so it can never re-introduce the
-//! curl/port/gateway-prefix traps that motivated the manifest.
+//! `http::client()` / `permission_request::send_and_report`, so it can never
+//! re-introduce the curl/port/gateway-prefix traps that motivated the
+//! manifest. A route asking for the owner's permission prints the request id.
 
 use crate::{domains, Arg, ArgIn, ArgType, Method, Operation};
 
@@ -62,7 +63,8 @@ pub fn render_cli_module() -> String {
         "// `dispatch_<domain>` that routes through `crate::http` (port/cert/auth handled).\n",
     );
     out.push_str("// Wire each enum into `main.rs`'s `Command` enum + its `run()` match arm.\n\n");
-    out.push_str("use crate::http::{client, send_and_print};\n");
+    out.push_str("use crate::http::client;\n");
+    out.push_str("use crate::permission_request::send_and_report;\n");
     out.push_str("use crate::workspace::{BoxError, Workspace};\n\n");
 
     for d in domains().iter().filter(|d| d.cli) {
@@ -75,11 +77,11 @@ pub fn render_cli_module() -> String {
         for op in &cli_ops {
             out.push_str(&format!("    /// {}\n", op.summary));
             let variant = pascal(op.cli_name);
-            if op.args.is_empty() {
+            if op.caller_args().next().is_none() {
                 out.push_str(&format!("    {},\n", variant));
             } else {
                 out.push_str(&format!("    {} {{\n", variant));
-                for a in op.args {
+                for a in op.caller_args() {
                     out.push_str(&format!("        /// {}\n", a.description));
                     out.push_str(&format!(
                         "        #[arg(long)]\n        {}: {},\n",
@@ -95,20 +97,21 @@ pub fn render_cli_module() -> String {
         // Dispatch fn. The doc comment shows the real (kebab-case) CLI command
         // name (`trigger-groups`), while the fn ident keeps the snake form.
         out.push_str(&format!(
-            "/// Execute a `lucidos {} <op>` command against the parent workspace.\n",
+            "/// Execute a `lucidos {} <op>` command against the parent workspace,\n",
             d.name.replace('_', "-")
         ));
+        out.push_str("/// returning the exit code.\n");
         out.push_str(&format!(
-            "pub fn dispatch_{}(ws: &Workspace, cmd: {}) -> Result<(), BoxError> {{\n",
+            "pub fn dispatch_{}(ws: &Workspace, cmd: {}) -> Result<u8, BoxError> {{\n",
             d.name, enum_name
         ));
         out.push_str("    match cmd {\n");
         for op in &cli_ops {
             let variant = pascal(op.cli_name);
-            let bind = if op.args.is_empty() {
+            let names: Vec<&str> = op.caller_args().map(|a| a.name).collect();
+            let bind = if names.is_empty() {
                 String::new()
             } else {
-                let names: Vec<&str> = op.args.iter().map(|a| a.name).collect();
                 format!(" {{ {} }}", names.join(", "))
             };
             out.push_str(&format!(
@@ -176,10 +179,21 @@ pub fn render_cli_module() -> String {
             };
             // Body — only when there are body args; empty body for non-GET goes
             // through json!({}) so the engine sees a JSON content type.
-            let body_args: Vec<&Arg> = op.args.iter().filter(|a| a.loc == ArgIn::Body).collect();
+            let body_args: Vec<&Arg> = op
+                .args
+                .iter()
+                .filter(|a| matches!(a.loc, ArgIn::Body | ArgIn::FixedBody(_)))
+                .collect();
             let body_clause = if !body_args.is_empty() {
                 out.push_str("            let mut body = serde_json::Map::new();\n");
                 for a in &body_args {
+                    if let ArgIn::FixedBody(literal) = a.loc {
+                        out.push_str(&format!(
+                            "            body.insert(\"{}\".into(), serde_json::json!({literal}));\n",
+                            a.name
+                        ));
+                        continue;
+                    }
                     // The field is snake_case and clap derives a kebab-case
                     // flag from it, so an error naming the field names a flag
                     // clap then refuses. Say what the user typed.
@@ -223,7 +237,7 @@ pub fn render_cli_module() -> String {
                 method_call, query_clause, body_clause
             ));
             out.push_str(&format!(
-                "            send_and_print(\"{}\", &url, req)\n",
+                "            send_and_report(\"{}\", &url, req)\n",
                 op.method.as_str()
             ));
             out.push_str("        }\n");

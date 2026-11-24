@@ -12,7 +12,6 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { LoadableError } from '../shared/LoadableError';
 import { SkeletonProvider, SkText } from '../shared/Skeleton';
 
-/** Build output stays in the paired window, including Tauri and iOS PWAs. */
 export function EngineBuildLogModal() {
   const [output, setOutput] = useState<Loadable<string>>({ status: 'loading' });
   const [attempt, setAttempt] = useState(0);

@@ -271,7 +271,7 @@ async fn stored_memory_module(pool: &PgPool) -> Option<String> {
 /// The migration that keeps a used workspace on Classic when the default
 /// became Tree.
 const KEEP_CLASSIC_MIGRATION: &str = include_str!(
-    "../../../../migrations/20261012130357_keep_classic_memory_for_existing_workspaces.sql"
+    "../../../../../lucidos-core/migrations/20261012130357_keep_classic_memory_for_existing_workspaces.sql"
 );
 
 async fn run_keep_classic_migration(pool: &PgPool) {
@@ -576,4 +576,58 @@ async fn a_positive_coding_agent_preference_adds_the_workspace_view() {
     );
 
     teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn held_delivery_tree_view_keeps_the_prompt_out_of_the_previous_turn() {
+    let (pool, db) = setup_test_db().await;
+    let thread = Uuid::new_v4();
+    let held = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, thread_id, event_type, payload, aggregate, aggregate_id)          VALUES ($1, $2, 'MessageReceived', $3, 'thread', $2::text)",
+    )
+    .bind(held)
+    .bind(thread)
+    .bind(json!({"text": "held prompt", "mode": "human", "queued_for_permission": true}))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = store::load_thread_log_now(
+        &pool,
+        thread,
+        crate::engine::summary_tree::log::ThreadKind::LucidosAgent,
+    )
+    .await
+    .unwrap();
+    assert!(before.entries.is_empty());
+
+    for (kind, payload) in [
+        ("ResponseGenerated", json!({"text": "previous reply"})),
+        (
+            "ChatTurnSettingsResolved",
+            json!({"request_event_id": held, "model": "test"}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO events (id, thread_id, event_type, payload, aggregate, aggregate_id)              VALUES (gen_random_uuid(), $1, $2, $3, 'thread', $1::text)",
+        )
+        .bind(thread)
+        .bind(kind)
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let log = store::load_thread_log_now(
+        &pool,
+        thread,
+        crate::engine::summary_tree::log::ThreadKind::LucidosAgent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(log.entries.len(), 2);
+    assert_eq!(log.entries[0].text, "previous reply");
+    assert_eq!(log.entries[1].text, "held prompt");
+    assert_eq!(log.turns[0].entries, 0..1);
+    teardown_test_db(&db).await;
 }

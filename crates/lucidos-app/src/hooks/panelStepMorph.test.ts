@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { motionPreference } from '../utils/motion';
 import { morphKeyframes, startStepMorph, stepSignature, whenStepSettled, type Box } from './panelStepMorph';
 
-/** jsdom lays nothing out, so each box is stubbed. */
 function boxed<T extends HTMLElement>(el: T, box: Box): T {
   el.getBoundingClientRect = () => ({
     ...box, x: box.left, y: box.top, right: box.left + box.width, bottom: box.top + box.height, toJSON: () => ({}),
@@ -13,7 +12,6 @@ function boxed<T extends HTMLElement>(el: T, box: Box): T {
 
 interface FakeAnimation { cancel: ReturnType<typeof vi.fn>; onfinish: (() => void) | null }
 
-/** Records every `animate` call on `el`, returning animations the test finishes. */
 function recordAnimations(el: HTMLElement): { keyframes: Keyframe[][]; animations: FakeAnimation[] } {
   const keyframes: Keyframe[][] = [];
   const animations: FakeAnimation[] = [];
@@ -26,7 +24,6 @@ function recordAnimations(el: HTMLElement): { keyframes: Keyframe[][]; animation
   return { keyframes, animations };
 }
 
-/** A panel at `to` holding a head and a body, each with its own final size. */
 function panelWithChildren(to: Box) {
   const panel = boxed(document.createElement('div'), to);
   const head = boxed(document.createElement('div'), { ...to, height: 40 });
@@ -105,7 +102,6 @@ describe('startStepMorph', () => {
     expect(onSettled).toHaveBeenCalledTimes(1);
     expect(panel.getAttribute('style') ?? '').toBe('');
     expect(head.getAttribute('style') ?? '').toBe('');
-    // A value the child carried before the morph comes back.
     expect(body.style.height).toBe('5rem');
   });
 
@@ -181,7 +177,6 @@ describe('whenStepSettled', () => {
     expect(fn).not.toHaveBeenCalled();
     box.animations[0].onfinish?.();
     expect(fn).toHaveBeenCalledTimes(1);
-    // The pins are gone by then, so the work measures the box at rest.
     expect(panel.getAttribute('style') ?? '').toBe('');
   });
 

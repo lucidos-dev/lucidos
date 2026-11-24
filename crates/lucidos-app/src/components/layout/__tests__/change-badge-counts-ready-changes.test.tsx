@@ -1,10 +1,3 @@
-/**
- * The Changes badge counts only the changes the reader can act on now.
- *
- * A change whose thread has not settled offers Apply on settle and nothing
- * else, so it owes the reader nothing yet. The menu hamburger leads to the
- * Changes row, so it carries the same count.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { HamburgerButton } from '../ContentNav';
 import { SystemAttentionBadge } from '../../shared/SystemAttentionBadge';
@@ -39,8 +32,6 @@ describe('the actionable change count', () => {
     expect(actionableChangeCount.value).toBe(1);
   });
 
-  // A change the lane holds, or one an apply started, sits in Applying and
-  // owes the reader nothing (ADR 0463).
   it('leaves out a change the lane holds and one an apply started', () => {
     changes.value = {
       status: 'loaded',
@@ -84,8 +75,14 @@ describe('the menu hamburger', () => {
     releaseNoticeView.value = {
       status: 'loaded',
       data: {
-        notices: [{ id: 'n', since: '2.0.0', title: 'Audit', body: 'Run it.', resolved: false, action_deferred: false }],
-        next_id: 'n',
+        releases: [{
+          since: '2.0.0',
+          items: [{ id: 'n', since: '2.0.0', title: 'Audit', summary: 'Review it.', body: 'Run it.', resolved: false }],
+          resolved: false,
+          action_prompt: null,
+        }],
+        owed_through: 'n',
+        action_prompt: null,
       },
     };
     const kids = hamburger().props.children as AnyVNode[];

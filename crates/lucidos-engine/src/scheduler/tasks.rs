@@ -8,7 +8,7 @@
 mod tests {
     #[test]
     fn valid_cron_expressions_parse() {
-        use crate::engine::tools::scheduler::parse_standard_cron;
+        use crate::scheduler::cron_rules::parse_standard_cron;
         // These are the standard 6-field cron expressions used throughout Lucidos.
         let valid = [
             "0 0 8 * * *",    // daily at 08:00
@@ -31,7 +31,7 @@ mod tests {
 
     #[test]
     fn invalid_cron_expression_fails() {
-        use crate::engine::tools::scheduler::parse_standard_cron;
+        use crate::scheduler::cron_rules::parse_standard_cron;
         let invalid = [
             "",             // empty
             "* * *",        // too few fields
@@ -93,7 +93,7 @@ mod tests {
         // Verify that parsed cron schedules produce future occurrences.
         // This is the core of run_task_loop's scheduling — if next() returns
         // None or a past time, the scheduler breaks.
-        let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 0 8 * * *").unwrap();
+        let schedule = crate::scheduler::cron_rules::parse_standard_cron("0 0 8 * * *").unwrap();
         let now = chrono::Utc::now();
         let next = schedule.upcoming(chrono::Utc).next();
         assert!(

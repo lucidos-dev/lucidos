@@ -10,7 +10,20 @@ import tempfile
 import urllib.request
 
 
-def adopt(base, directory, slug, port, token_file, transport=None):
+def loopback_transport(cafile):
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)),
+    )
+
+    def send(req):
+        with opener.open(req, timeout=10) as response:
+            return json.load(response)
+
+    return send
+
+
+def adopt(base, directory, slug, port, token_file, cafile, transport=None):
     directory = Path(directory)
     if directory.name != slug or not slug or any(
         c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -26,10 +39,9 @@ def adopt(base, directory, slug, port, token_file, transport=None):
         headers = {"content-type": "application/json"}
         if Path(token_file).is_file():
             headers["x-lucidos-local-token"] = Path(token_file).read_text().strip()
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
-        )
+        if transport is None:
+            # Trusts only the loopback CA, like scripts/lib/loopback_curl.sh.
+            transport = loopback_transport(cafile)
 
         def request(method, path, body=None):
             req = urllib.request.Request(
@@ -38,10 +50,7 @@ def adopt(base, directory, slug, port, token_file, transport=None):
                 headers=headers,
                 method=method,
             )
-            if transport is not None:
-                return transport(req)
-            with opener.open(req, timeout=10) as response:
-                return json.load(response)
+            return transport(req)
 
         listed = request("GET", "workspaces").get("workspaces")
         if not isinstance(listed, list) or any(
@@ -85,7 +94,7 @@ def adopt(base, directory, slug, port, token_file, transport=None):
 
 if __name__ == "__main__":
     try:
-        adopt(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5])
+        adopt(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6])
     except Exception:
         # HTTP errors and response bodies must never expose the owner token.
         print("ERROR: E2E adoption or owner publication failed; resources retained", file=sys.stderr)

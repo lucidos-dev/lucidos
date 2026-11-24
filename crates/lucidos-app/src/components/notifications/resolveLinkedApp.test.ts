@@ -38,14 +38,10 @@ describe('resolveLinkedApp', () => {
   });
 
   it('does not match by title — title-match fallback is gone', () => {
-    // A notification whose title equals an app name but with no app_id must NOT auto-link.
-    // Previously this would fall back to apps.find(a => a.name === title); that path is removed.
     expect(resolveLinkedApp(undefined, loaded, unread)).toEqual({ kind: 'none' });
   });
 
   it('returns pending when apps are still loading', () => {
-    // Cold-start deep-link / push can open the modal before loadApps() resolves;
-    // suppressing the 'unknown' verdict here prevents a false error flash.
     expect(resolveLinkedApp('morning-dashboard', { status: 'loading' }, unread)).toEqual({ kind: 'pending' });
   });
 
@@ -54,7 +50,6 @@ describe('resolveLinkedApp', () => {
   });
 
   it('returns pending when apps failed to load', () => {
-    // We can't tell stale-id from we-don't-know — withhold the unknown verdict.
     expect(resolveLinkedApp('morning-dashboard', { status: 'failed', error: 'oops' }, unread)).toEqual({ kind: 'pending' });
   });
 

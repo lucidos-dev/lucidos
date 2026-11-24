@@ -2,19 +2,13 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { connectionStatus, toasts, restartRequired, restartGroups, engineStartedAt, engineRestarting, engineRestartNewVersion, activeProgressDialog, updateAvailable } from '../store';
 import { restoreRestartState, syncRestartState, RESTART_LS_KEY, RESTART_IN_FLIGHT_LS_KEY, RESTART_GROUPS_LS_KEY } from '../actions/chat-changes';
 
-// Mock dependencies so checkConnection runs in isolation. Mirrors
-// restart-toast-reconnect.test.ts, but this file deliberately NEVER calls an
-// establishConnection() helper: connection.ts's module-private `hasEverConnected`
-// stays false the whole time (a genuine fresh page load), so the completion test
-// truly exercises the `everOrRestarting` fallback that restored `engineRestarting`
-// unlocks — rather than being masked by a prior connect having set the flag.
 const mockCheckHealth = vi.fn();
 vi.mock('../../api/client', () => ({
   checkHealth: (...args: any[]) => mockCheckHealth(...args),
   API_BASE: 'http://localhost:3000',
   API: 'http://localhost:3000/api/v1',
 }));
-vi.mock('../actions/thread-sync', () => ({
+vi.mock('../actions/thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),
@@ -22,9 +16,6 @@ vi.mock('../actions/thread-sync', () => ({
 vi.mock('../actions/thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
-  // runResumeSync retries every thread carrying `eventsLoadFailed` through
-  // this, so the reference is read on every resume even when nothing is
-  // flagged; the mock proxy throws on an undeclared export.
   loadThreadEvents: vi.fn().mockResolvedValue(undefined),
   clearThreadFetchGuards: vi.fn(),
   markLoadedThreadsStale: vi.fn(),
@@ -52,13 +43,7 @@ function loadedHealth(overrides: Record<string, unknown> = {}) {
 }
 const unreachable = { status: 'failed', error: 'Failed to fetch' };
 
-/** Seed localStorage as if a restart was in flight when the page unloaded, then
- *  reset the signals to fresh-reload defaults and run the startup restore.
- *  `newVersion` mirrors what initiateEngineRestart persisted: whether the
- *  restart delivers a new engine version (→ "Starting new version") or is a
- *  plain respawn (→ "Restarting engine"). */
 function reloadMidRestart(newVersion: boolean): void {
-  // syncRestartState set RESTART_LS_KEY; initiateEngineRestart set the in-flight marker.
   localStorage.setItem(RESTART_LS_KEY, 'true');
   localStorage.setItem(RESTART_IN_FLIGHT_LS_KEY, JSON.stringify({ startedAt: STARTED_AT, newVersion }));
   connectionStatus.value = 'connecting';
@@ -92,13 +77,9 @@ describe('restart progress dialog survives a reload (in-flight marker)', () => {
     const dialog = activeProgressDialog.value;
     expect(dialog.visible).toBe(true);
     expect(dialog.title).toBe(NEW_VERSION_TITLE);
-    // A restart cannot be called back, so the dialog offers no way out of it.
     expect(dialog.cancel).toBeUndefined();
-    // No toast either: the pre-restart "Engine restart required" warning would
-    // nag the user to start a restart already underway.
     expect(toasts.value).toHaveLength(0);
 
-    // State re-armed so checkConnection can detect the completion across the reload.
     expect(engineRestarting.value).toBe(true);
     expect(engineStartedAt.value).toBe(STARTED_AT);
     expect(restartRequired.value).toBe(true);
@@ -114,15 +95,12 @@ describe('restart progress dialog survives a reload (in-flight marker)', () => {
     reloadMidRestart(true);
     expect(engineRestarting.value).toBe(true);
 
-    // Engine comes back with a NEW started_at. hasEverConnected is false (fresh
-    // load); the restored engineRestarting unlocks the completion detection.
     mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
     await checkConnection();
 
     expect(engineRestarting.value).toBe(false);
     expect(activeProgressDialog.value.visible).toBe(false);
     expect(toasts.value.find(t => t.message === 'Engine restarted')).toBeTruthy();
-    // Both markers cleared so a later reload won't restore a stale dialog.
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();
     expect(localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY)).toBeNull();
   });
@@ -131,21 +109,15 @@ describe('restart progress dialog survives a reload (in-flight marker)', () => {
     reloadMidRestart(true);
     expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
 
-    // Old engine killed. A /health failure must NOT close or reword the dialog,
-    // since there is no build to swap phase transition.
     mockCheckHealth.mockResolvedValueOnce(unreachable);
     await checkConnection();
 
     expect(activeProgressDialog.value.visible).toBe(true);
     expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
-    // Still restarting: the flag must NOT clear on a mere disconnect.
     expect(engineRestarting.value).toBe(true);
   });
 
   it('does not hang: even a stale marker self-heals on the next connect', async () => {
-    // The clear was somehow missed: the restart already finished, but the marker
-    // survived. Restore raises the dialog, then the first poll sees a different
-    // started_at and completes. engineRestarting can never hang.
     reloadMidRestart(false);
 
     mockCheckHealth.mockResolvedValueOnce(loadedHealth({ started_at: RESTARTED_AT }));
@@ -156,14 +128,10 @@ describe('restart progress dialog survives a reload (in-flight marker)', () => {
   });
 
   it('a re-sync that flips restartRequired false does NOT close the restored dialog', () => {
-    // After restore, the startup refreshChangesState resolves with the applied
-    // change no longer pending (restart_required=false) and calls
-    // syncRestartState. While engineRestarting is true that must leave the
-    // dialog alone, or a user who reloaded mid-restart watches it vanish.
     reloadMidRestart(true);
     expect(activeProgressDialog.value.title).toBe(NEW_VERSION_TITLE);
 
-    restartRequired.value = false; // backend: applied change dropped out of pending
+    restartRequired.value = false;
     syncRestartState();
 
     expect(activeProgressDialog.value.visible).toBe(true);
@@ -172,10 +140,6 @@ describe('restart progress dialog survives a reload (in-flight marker)', () => {
   });
 
   it('cold start with only a PENDING restart (no in-flight marker) surfaces nothing', () => {
-    // No in-flight marker: a restart is merely pending, not underway. Restore
-    // re-arms restartRequired so the brand badge and the restart confirm dialog
-    // reappear. The engine "New version available → Switch" toast is owned by
-    // the poll (engine-update.ts).
     localStorage.setItem(RESTART_LS_KEY, 'true');
     engineRestarting.value = false;
     toasts.value = [];

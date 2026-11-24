@@ -1,6 +1,3 @@
-/** A teammate's bubble names its sender and aligns left. The reader's own
- *  bubble, and every bubble on a gateway with nobody to tell apart, draws as
- *  before: a bare timestamp and no teammate class. */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { InitiatorPanel } from '../chat-exchange-parts';

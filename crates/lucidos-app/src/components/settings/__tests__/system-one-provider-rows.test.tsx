@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The Cloudflare Workers AI and custom System One rows on Settings →
- * Providers.
- *
- * Both wear the same frame as the TypeSafe row, which its own suite pins. What
- * is theirs is what a save writes: the account in the Cloudflare token's scope,
- * and the custom endpoint's URL and model.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -38,7 +30,6 @@ describe('System One provider rows', () => {
   const button = (text: string) =>
     [...host.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent === text);
 
-  /** Open a never-configured row: the press only reveals the fields. */
   async function reveal(): Promise<void> {
     const input = toggle();
     if (!input) throw new Error('the enable switch is not rendered');
@@ -70,8 +61,6 @@ describe('System One provider rows', () => {
     credentials.value = { status: 'not-loaded' };
   });
 
-  /** The engine reads the account out of the scope URL, so that is where the
-   *  save puts it. */
   it('saves a Cloudflare token scoped to its account', async () => {
     act(() => { render(<CloudflareWorkersAiSettings />, host); });
     await reveal();
@@ -96,8 +85,6 @@ describe('System One provider rows', () => {
     expect(button('Save')!.disabled).toBe(true);
   });
 
-  /** A stored token names its account beside the label, so a user can tell
-   *  which account the judgments go to. */
   it('shows the stored account', () => {
     credentials.value = {
       status: 'loaded',
@@ -129,7 +116,6 @@ describe('System One provider rows', () => {
     expect(savePreference).toHaveBeenCalledWith('system_one_custom_model', 'kev');
   });
 
-  /** The engine posts only to http(s), so the page refuses anything else. */
   it('accepts only an http(s) URL for the custom endpoint', () => {
     expect(customEndpointUrlValid('https://decider.example/v1/systemone')).toBe(true);
     expect(customEndpointUrlValid('http://localhost:8000/systemone')).toBe(true);

@@ -1,16 +1,9 @@
-/**
- * Dynamic bars over an app (ADR 0469). The app's own document scrolls inside
- * its frame, so the SDK reports that scroll and the host moves the bars from
- * it. The app panel glides up with the header and grows into its room. No
- * band opens above or below the app, and the app keeps its own scroll.
- */
 import { test, expect, type Page, type Frame } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import {
   assertHealthy, disableMobileDynamicBars, enableMobileDynamicBars, ensureMobileView, gotoWithRetry,
 } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
 const APP_ID = 'e2e-dynamic-bars-app';
@@ -45,7 +38,6 @@ async function geometry(page: Page): Promise<Geometry> {
   }, FRAME);
 }
 
-/** The app's frame, once its rows have rendered. */
 async function appFrame(page: Page): Promise<Frame> {
   await expect(page.locator(FRAME)).toBeVisible({ timeout: 15_000 });
   const handle = await page.locator(FRAME).elementHandle();
@@ -54,7 +46,6 @@ async function appFrame(page: Page): Promise<Frame> {
   return frame;
 }
 
-/** Scroll the app to each position in turn, a frame apart, as a reader does. */
 async function scrollApp(frame: Frame, tops: number[]) {
   for (const top of tops) {
     await frame.evaluate((y) => new Promise<void>((done) => {
@@ -64,7 +55,6 @@ async function scrollApp(frame: Frame, tops: number[]) {
   }
 }
 
-/** Wait out the glide and the delayed shrink behind it. */
 async function settled(page: Page): Promise<Geometry> {
   let last: Geometry | null = null;
   await expect.poll(async () => {
@@ -120,10 +110,8 @@ test.describe('dynamic bars over an app', () => {
     const away = await settled(page);
     expect(away.away).toBe(true);
     expect(away.headerBottom).toBeLessThanOrEqual(0.5);
-    // No band above the app, and none below it.
     expect(away.frameTop).toBeCloseTo(0, 0);
     expect(away.frameBottom).toBeCloseTo(away.paneBottom, 0);
-    // Observed, never consumed: the app is where the reader scrolled it.
     expect(await frame.evaluate(() => window.scrollY)).toBe(600);
 
     await scrollApp(frame, [560, 500]);

@@ -223,9 +223,6 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
-    // The draft carries its OWN scope (set by the picker via applyDestination /
-    // eager-seeded at creation) — the send resolves that, not the shared
-    // selectedScope. selectedScope is deliberately different to prove it.
     patchComposeSelection(draftId, { scope: { kind: 'external', repoId: 'external-repo-uuid' } });
     selectedScope.value = { kind: 'lucidos' };
 
@@ -233,9 +230,6 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
 
     const body = lastBody();
     expect(body.use_coding_agent).toBe(true);
-    // sendCompose flips composing→active BEFORE delegating, so the chat path
-    // now treats this as a follow-up and reads meta.repoId — which compose
-    // bound from the external scope.
     expect(body.repo_id).toBe('external-repo-uuid');
   });
 
@@ -244,7 +238,6 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
     setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
-    // Draft's own scope override — resolved at send, not the shared selectedScope.
     patchComposeSelection(draftId, { scope: { kind: 'app', appId: 'habit-tracker' } });
     selectedScope.value = { kind: 'lucidos' };
 
@@ -289,10 +282,6 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
   });
 
   it('retrying a draft after rollback with Lucidos scope clears prior repoId binding', async () => {
-    // Simulate rollback state: a CC draft already has meta.repoId from a
-    // previous sendCompose attempt (or some other source). User now picks
-    // the default scope (Lucidos) and resends. The stale binding must NOT
-    // leak into the chat body.
     const draftId = 'rollback-draft';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code', repoId: 'stale-repo-uuid' });
@@ -308,14 +297,6 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
   });
 });
 
-/** The drawer row's context chip must not blink across the promotion. A draft
- *  row names its destination from the draft's own scope
- *  (`composeDraftContextName`); the started row names it from the bound meta
- *  (`threadContextName`). Both are on screen in the same place, one frame
- *  apart, so if the promotion drops a name it already resolved, the chip
- *  vanishes until the engine answers with `cc_repo_name` and then reappears.
- *  Each case asserts the two functions agree, not a literal, so the chip is
- *  pinned to continuity rather than to today's copy. */
 describe('promotion keeps the destination chip the draft was already showing', () => {
   const REPOS = [
     { id: 'external-repo-uuid', name: 'example-repo', path: '/tmp/example-repo' },
@@ -372,8 +353,6 @@ describe('promotion keeps the destination chip the draft was already showing', (
 
     expect(draftChip).toBe('habit-tracker');
     expect(chipAfterSend(draftId)).toBe(draftChip);
-    // The app id names a folder, not a repository. Writing it to repoName would
-    // make the chip right only by accident.
     expect(threadMap.value.get(draftId)!.meta.repoName).toBeUndefined();
   });
 
@@ -382,8 +361,6 @@ describe('promotion keeps the destination chip the draft was already showing', (
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
     setDraft(draftId, { text: 'hi', image_hashes: [], mode: null });
-    // A repo scope left over from an earlier coding pick must not follow a chat
-    // send onto the promoted thread.
     patchComposeSelection(draftId, { scope: { kind: 'external', repoId: 'external-repo-uuid' } });
 
     await sendCompose(draftId, { useCodingAgent: false });
@@ -393,12 +370,6 @@ describe('promotion keeps the destination chip the draft was already showing', (
   });
 });
 
-/** A raw new send mints its own thread id client-side, so the engine has never
- *  seen it. The body must SAY that: an unknown `thread_id` with no create
- *  signal is a 404, not a thread conjured out of whatever the caller sent.
- *  That refusal is what stops a wrong-target write from looking exactly like a
- *  correct one (a message posted at the wrong engine used to materialize the
- *  thread there, so reading it back confirmed the mistake). See ADR 0050. */
 describe('new_thread declares a client-minted thread id', () => {
   it('raw new send sets new_thread', async () => {
     await sendMessage('start something new');

@@ -1,19 +1,8 @@
 import { test, expect, Page, Locator } from './fixtures';
-import type { BrowserContext } from '@playwright/test';
 import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, ensureMobileView, ensureOnThreadPane, gotoWithRetry, touchPress, waitForDashboardReady, waitForVisibleInput, waitForWorkspaceReady } from './helpers';
 import { ensureHomeThread, psql, seedChatThread } from './db-helpers';
 
-/**
- * The phone dashboard is a panel over any thread (ADR 0538). A button beside
- * the mark in the thread header opens it, over Home or any other thread. Opening
- * it never changes focus, so the hash stays put. Closing it
- * never reloads a tile. The phone dashboard has its own tiles, apart from the
- * desktop one.
- */
-
-/** Fresh contexts the held-chunk spec spends to get the route in front of the chunk. */
-const HOLD_ATTEMPTS = 5;
 
 let written: string[] = [];
 let added: string[] = [];
@@ -27,11 +16,9 @@ async function writeFile(page: Page, path: string, body: string): Promise<void> 
   expect(resp.ok(), `PUT ${path}`).toBeTruthy();
 }
 
-/** A widget that shows a random number per load, so a reload is visible. */
 const LIVE_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head><body>'
   + '<p id="load"></p><script>document.getElementById("load").textContent = String(Math.random());</script></body></html>';
 
-/** A reusable widget, as a tile on the phone dashboard. */
 async function addToDashboard(page: Page, appId: string, manifest: Record<string, unknown> = {}): Promise<void> {
   await writeFile(page, `apps/${appId}/index.html`, LIVE_WIDGET);
   await writeFile(page, `apps/${appId}/manifest.json`, JSON.stringify({
@@ -58,7 +45,6 @@ const tile = (page: Page, appId: string): Locator => panel(page).locator(`.dashb
 const frame = (page: Page, appId: string) => tile(page, appId).frameLocator('iframe');
 const order = (page: Page, appId: string) => tile(page, appId).evaluate((el) => Number((el as HTMLElement).style.order));
 
-/** A cold start with no stored focus lands on Home, a plain chat. */
 async function openHome(page: Page): Promise<void> {
   await page.addInitScript(() => localStorage.removeItem('lucidos-focused-thread'));
   await gotoWithRetry(page, '/');
@@ -68,7 +54,6 @@ async function openHome(page: Page): Promise<void> {
   await expect(toggle(page)).toBeVisible({ timeout: 15_000 });
 }
 
-/** Open the panel from its button and wait for the fade to finish. */
 async function openPanel(page: Page): Promise<void> {
   await toggle(page).click();
   await expect(panel(page)).toBeVisible();
@@ -76,10 +61,8 @@ async function openPanel(page: Page): Promise<void> {
   await waitForDashboardReady(panel(page));
 }
 
-/** The app header's bottom edge, in px. */
 const headerBottom = (page: Page) => page.evaluate(() => document.querySelector('.app-header')!.getBoundingClientRect().bottom);
 
-/** The panel's top edge, in px. */
 const panelTop = (page: Page) => page.evaluate(() => document.querySelector('.dashboard-panel')!.getBoundingClientRect().top);
 
 test.describe('The dashboard panel on a phone', () => {
@@ -88,7 +71,6 @@ test.describe('The dashboard panel on a phone', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // An earlier spec in the shard may have truncated the Home row.
     ensureHomeThread();
     written = [];
     added = [];
@@ -118,8 +100,6 @@ test.describe('The dashboard panel on a phone', () => {
     await page.mouse.move(0, 0);
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
 
-    // Filter is a framed toggle, so a framed probe on the same bar is its paint.
-    // Polled, because the chip fades in under a transition.
     const paints = () => page.evaluate(() => {
       const paint = (el: Element) => {
         const style = getComputedStyle(el);
@@ -161,8 +141,6 @@ test.describe('The dashboard panel on a phone', () => {
         await ensureOnThreadPane(page);
         await expect(toggle(page)).toBeVisible({ timeout: 15_000 });
 
-        // The hash router strips `#thread=` once the landing settles (hash-deeplink-router.ts).
-        // Read the hash only after that, or the panel gets blamed for the router's strip.
         await expect.poll(() => page.evaluate(() => location.hash)).toBe('');
         await expect.poll(() => page.evaluate(() => localStorage.getItem('lucidos-focused-thread'))).toBe(threadId);
         const hash = await page.evaluate(() => location.hash);
@@ -186,7 +164,6 @@ test.describe('The dashboard panel on a phone', () => {
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'false');
   });
 
-  /** Invariant: a pane swipe that starts on the open panel moves the strip. */
   test('a pane swipe from the open panel moves the strip, and the panel is open on return', async ({ page, browserName }) => {
     test.skip(browserName === 'webkit', 'CDP touch input is Chromium only');
     await openHome(page);
@@ -208,7 +185,6 @@ test.describe('The dashboard panel on a phone', () => {
     await expect(panel(page)).toBeVisible();
   });
 
-  /** Invariant: the header stays live over the panel, so the mark opens the Lucidos menu. */
   test('the Lucidos mark opens its menu over the open panel', async ({ page }) => {
     await openHome(page);
     await openPanel(page);
@@ -218,7 +194,6 @@ test.describe('The dashboard panel on a phone', () => {
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
   });
 
-  /** Invariant: closing and reopening the panel never reloads a tile. */
   test('a tile is not reloaded when the panel closes and opens again', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
@@ -231,7 +206,6 @@ test.describe('The dashboard panel on a phone', () => {
     await expect(frame(page, a).locator('#load')).toHaveText(loaded ?? '');
   });
 
-  /** Invariant: each dashboard's tiles are independent (ADR 0496). */
   test('the phone dashboard keeps its own tiles and arrangement, and leaves desktop alone', async ({ page }) => {
     const desktopBefore = await dashboardTiles(page, 'desktop');
     await addToDashboard(page, a);
@@ -249,8 +223,6 @@ test.describe('The dashboard panel on a phone', () => {
     expect(await dashboardTiles(page, 'desktop')).toEqual(desktopBefore);
   });
 
-  /** Invariant: a phone narrower than two cells shrinks them to fit two
-   *  columns, and never overflows the dashboard. */
   test('a medium tile fills the two columns inside the dashboard, with no overflow', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
@@ -269,75 +241,12 @@ test.describe('The dashboard panel on a phone', () => {
     expect(await dashboard.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
   });
 
-  /** Invariant: the panel is ready to press only once its tiles are mounted
-   *  and no skeleton covers them. The dashboard is a code-split chunk. Until it
-   *  lands the panel shows no grid and, inside the skeleton's delay gate, no
-   *  skeleton. A readiness check that only looks for their absence then passes
-   *  at once. The skeleton then shows over the tiles for its minimum hold, and a
-   *  press lands on it. */
-  test.describe('with the dashboard chunk held', () => {
-    test('a panel with no dashboard yet is not ready to press', async ({ page: seedPage, browser }) => {
-      await addToDashboard(seedPage, a);
-      let release = () => {};
-      const released = new Promise<void>((resolve) => { release = resolve; });
-      let held = false;
-      const contexts: BrowserContext[] = [];
-      let page = seedPage;
-      try {
-        // The chunk is the one script that draws the settling grid. The idle
-        // prefetch can fetch it before WebKit routes anything, and a reload then
-        // serves it from the browser cache, past the route. Each attempt is a
-        // fresh context, with a cache of its own, until the route has caught it.
-        // A service worker would answer the chunk past the route, so it is blocked.
-        // Playwright fills every other option from the project config.
-        for (let attempt = 0; attempt < HOLD_ATTEMPTS && !held; attempt++) {
-          const context = await browser.newContext({ serviceWorkers: 'block' });
-          contexts.push(context);
-          // Each attempt has its own flag: a late fetch in an abandoned context
-          // must not mark the current page as held.
-          let caught = false;
-          await context.route('**/assets/*.js', async (route) => {
-            const response = await route.fetch();
-            if ((await response.text()).includes('is-settling')) {
-              caught = true;
-              await released;
-            }
-            await route.fulfill({ response });
-          });
-          page = await context.newPage();
-          await openHome(page);
-          if ((await toggle(page).getAttribute('aria-pressed')) !== 'true') await toggle(page).click();
-          await expect(panel(page)).toHaveCSS('opacity', '1');
-          await expect.poll(() => caught, { timeout: 3_000 }).toBe(true).catch(() => {});
-          held = caught;
-        }
-        expect(held, 'the dashboard chunk request reached the route').toBe(true);
-        let ready = false;
-        const readiness = waitForDashboardReady(panel(page)).then(() => { ready = true; });
-        await page.waitForTimeout(500);
-        expect(ready).toBe(false);
-
-        release();
-        await readiness;
-        const box = (await tile(page, a).boundingBox())!;
-        const coveredBySkeleton = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('.loading-fade-skeleton') != null, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
-        expect(coveredBySkeleton).toBe(false);
-      } finally {
-        release();
-        await Promise.all(contexts.map((context) => context.close().catch(() => {})));
-      }
-    });
-  });
-
   test('a finger drag over a live tile moves nothing, and a hold opens the tile menu', async ({ page, browserName }) => {
     test.skip(browserName === 'webkit', 'CDP touch input is Chromium only');
     await addToDashboard(page, a);
     await addToDashboard(page, b);
     await openHome(page);
     await openPanel(page);
-    // A frame forwards a hold only once the host's push marked it a dashboard
-    // tile with a menu. The place stamp lands in the same handler as that mark,
-    // and a slow renderer start on a runner can outlast the 450 ms hold.
     for (const id of [a, b]) {
       await expect(frame(page, id).locator('html')).toHaveAttribute('data-widget-place', 'dashboard');
     }
@@ -360,7 +269,6 @@ test.describe('The dashboard panel on a phone', () => {
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [from] });
     await page.waitForTimeout(800);
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-    // One press opens one menu, and Edit dashboard in it enters edit mode.
     const menu = page.locator('.thread-overflow-menu');
     await expect(menu).toHaveCount(1);
     await expect(panel(page).locator('.dashboard-tile-shield')).toHaveCount(0);

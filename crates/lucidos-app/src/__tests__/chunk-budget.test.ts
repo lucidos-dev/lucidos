@@ -22,14 +22,7 @@ import {
   type Budget,
 } from '../../vite/chunkBudget';
 
-/**
- * The chunk budgets (ADR 0436): the entry chunk and the first-paint set fail a
- * single-shot build, and a lazy chunk only warns. The module under test is
- * build config under `crates/lucidos-app/vite/`, tested from here because
- * Vitest's `include` covers `src/` only.
- */
 
-/** A budget whose numbers the verdict tests can read at a glance. */
 const SIX_HUNDRED: Budget = { name: 'entry', label: 'Entry chunk', kb: 600, fix: 'Move the next thing out.' };
 
 describe('budgetVerdict', () => {
@@ -106,8 +99,6 @@ describe('underDevBuildWatch', () => {
   });
 
   it('stays strict for a variable leaked from another watcher or exported in a shell', () => {
-    // The release, e2e and /harden builds run under `npx`, so their parent is
-    // never the watcher that set the variable, even when they inherit it.
     expect(underDevBuildWatch({ [DEV_BUILD_WATCH_ENV]: '4242' }, 5151)).toBe(false);
     expect(underDevBuildWatch({ [DEV_BUILD_WATCH_ENV]: '1' }, 5151)).toBe(false);
     expect(underDevBuildWatch({ [DEV_BUILD_WATCH_ENV]: 'true' }, 5151)).toBe(false);
@@ -212,7 +203,6 @@ describe('chunkBudget plugin', () => {
     return { errors, warnings, threw };
   }
 
-  /** The files a build within budget emits, once the handler has settled. */
   async function emittedBy(bundle: Record<string, unknown>, report: boolean) {
     const plugin = chunkBudget(false, report) as unknown as Hooks;
     const emitted: { fileName: string; source: string }[] = [];
@@ -226,7 +216,6 @@ describe('chunkBudget plugin', () => {
     return emitted;
   }
 
-  /** An entry, a shell and one lazy chunk, sized in bytes. */
   function app(entry: number, shell: number, lazy = 1000, shared?: number) {
     return bundleOf(
       chunk('assets/index-a.js', entry, { isEntry: true, dynamicImports: ['assets/App-s.js'] }),
@@ -254,7 +243,6 @@ describe('chunkBudget plugin', () => {
   });
 
   it('never judges the shell against the lazy number', () => {
-    // The shell alone is past the lazy limit, which is not its number.
     expect(run(app(ENTRY * 0.5, LAZY * 1.5), false)).toEqual({ errors: [], warnings: [], threw: false });
   });
 
@@ -272,8 +260,6 @@ describe('chunkBudget plugin', () => {
   });
 
   it('counts a chunk the shell imports statically against the first-paint set', () => {
-    // Splitting the shell into a statically imported piece moves no byte off
-    // the first frame, so it must not get it under the budget.
     const shell = FIRST_PAINT * 0.5;
     const result = run(app(ENTRY * 0.8, shell, 1000, FIRST_PAINT - shell), false);
     expect(result.threw).toBe(true);
@@ -346,7 +332,6 @@ describe('chunkBudget plugin', () => {
 });
 
 describe('the docs that restate the numbers', () => {
-  // Raw docs cannot import the constants, so this pins them (ADR 0368).
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
   const read = (path: string) => readFileSync(resolve(root, path), 'utf8');
 

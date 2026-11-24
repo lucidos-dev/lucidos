@@ -284,7 +284,7 @@ fn restore_status(
     if !lucidos_gateway_constants::is_valid_workspace_id(workspace) {
         return Err("snapshot_target_invalid".into());
     }
-    let probe = crate::gateway::probe_client()?;
+    let probe = crate::gateway::client()?;
     let base = crate::gateway::the_gateway(
         &probe,
         port,

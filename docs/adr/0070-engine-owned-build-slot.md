@@ -151,3 +151,37 @@ increment beside it.
 **Two hand-synced copies of the pool logic**, the way ADR 0014 forced on the
 gateway's `build_id.rs`. Rejected in favour of the `lucidos-build-slot` crate,
 since nothing here forbids sharing one.
+
+## Amendment, 2026-11-21: 12 GiB per build with an 8 GiB host reserve
+
+Subtract an 8 GiB reserve from whole host GiB, saturating at zero.
+Divide the remaining GiB by 12 and clamp the count to 1 through 8.
+macOS and Linux use the same formula. The environment variable still
+takes precedence over the capacity file, which takes precedence over RAM.
+
+| Measurement | Peak |
+|---|---:|
+| Linux, largest test-link process | 7.0 GiB |
+| Linux, largest build or clippy process | 4.5 GiB |
+| Linux, quietest host-wide cold build at 8 jobs | 8.4 GiB |
+| macOS, clean host-sum warm test at 18 jobs | 8.9 GiB |
+| macOS, clean host-sum local-release landing | 8.0 GiB |
+
+The budget leaves roughly 3 GiB per build above the observed clean
+host-sum peak. The reserve accounts for the OS and standing services.
+Without it, a 48 GiB host would admit four builds. Four builds at 9 GiB
+leave 12 GiB for standing processes, below the roughly 15 GB observed on
+the swapless test Mac. With the reserve, that host derives three slots.
+
+Other concurrent builds contaminated the Linux host-wide test probes.
+The 8 GiB reserve has limited evidence across hosts. The calculation
+assumes concurrent builds can reach their link peaks simultaneously.
+Hosts with a larger standing footprint can set an explicit capacity.
+
+Raise the reserve or restore the original 16 GiB formula if any of the
+following occur within two weeks of switching. These signals apply to
+hosts using derived capacity.
+
+- A slotted build is OOM-killed.
+- The macOS memory watchdog fires its rescue while the pool is full.
+- A clean measurement of one build's host-sum peak exceeds 11 GiB.

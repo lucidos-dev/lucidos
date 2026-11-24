@@ -1,33 +1,4 @@
-/**
- * "Pair a device" on Settings -> Access: a pairing QR a phone can scan.
- *
- * The gateway answers no device it has not been paired with (ADR 0094), and
- * pairing means an eight-digit code. Typing one off a laptop screen into a
- * phone is the tedious part. So this mints a code and draws a QR for
- * `<reachable-origin>/~/#pair=<secret>`. The phone's camera opens it, the picker
- * loads, and the code is already in the box.
- *
- * **Anyone reading this page is already paired**, which is what makes minting
- * here safe to offer. A paired device holds full authority, so it may enrol
- * another one.
- *
- * A code lasts five minutes and is spent once. When it runs out the section
- * says so, drops the cards, and waits for the button.
- */
 
-// Four things this will not do, each for a reason:
-//
-// - **It never mints a code the reader did not ask for.** It used to replace an
-//   expired code by itself, which read as the page undoing the press the reader
-//   had just made. ADR 0098.
-// - **It never guesses an address.** `pairingOrigin` answers `null` when
-//   nothing reachable was derived, and the section then shows the code alone.
-//   A QR pointing at `127.0.0.1` is worse than no QR.
-// - **It does not name the device.** The phone names itself on the pairing
-//   screen, and that name wins over one minted here.
-// - **It does not hide when the gateway is out of reach.** The shell and its
-//   search anchor render either way, for the reason Other addresses records: an
-//   absent section drops a Search Everywhere hit at the top of the page.
 
 import { useCallback, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
@@ -40,9 +11,8 @@ import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { useCodeCountdown } from './useCodeCountdown';
 import { Dropdown } from '../shared/Dropdown';
-import { isTeamGateway, operatorRows, operators } from '../../store/actions/operators';
+import { isTeamGateway, gatewayUserRows, gatewayUsers } from '../../store/actions/gatewayUsers';
 
-/** A minted code, and the moment it stops working. */
 export interface MintedCode {
   code: string;
   pairUrl: string | null;
@@ -50,36 +20,16 @@ export interface MintedCode {
   expiresAt: number;
 }
 
-/** What the page knows about where to send a new device.
- *
- *  Four states, and `unknown` is not a synonym for `none`. The page must not
- *  claim no address reaches another device when the read that would say so
- *  failed. Same distinction `HostTailnetState` draws, for the same reason.
- *
- *  `resolving` is the one that bites without this type. The reads take a
- *  moment, and clicking inside that window would mint a bare code on a machine
- *  with a perfectly good address. */
 export type PairTarget =
   | { kind: 'resolving' }
   | { kind: 'unknown' }
   | { kind: 'none' }
   | { kind: 'origin'; url: string };
 
-/** Pure: the SVG the gateway rendered, as something an `img` can load.
- *
- *  A `data:` URL rather than inline markup, so the QR goes through the image
- *  path and can run nothing. An SVG loaded by `img` gets no script and no
- *  external fetch, whatever it holds. This one holds only rectangles, which
- *  the gateway's own test pins. Both together are what make a server-rendered
- *  image safe to drop into the page. */
 export function qrImageSrc(svg: string): string {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
-/** Pure: what the idle row says about where a new device will be sent.
- *
- *  Exported so all four states are testable, and so the `unknown` wording
- *  cannot quietly drift back into claiming there is no address. */
 export function targetSentence(target: PairTarget): ComponentChildren {
   switch (target.kind) {
     case 'resolving':
@@ -98,16 +48,6 @@ export function targetSentence(target: PairTarget): ComponentChildren {
   }
 }
 
-/** Pure: the expiry line, which has to keep saying something true.
- *
- *  A code sitting on a screen for ten minutes stops working silently, and a
- *  static "expires in five minutes" is a lie by then. The countdown is the
- *  honest version, and zero is its own state rather than a very small number.
- *
- *  Single use is deliberately NOT said here. It is a property of the code that
- *  nobody has to act on: the reader mints one, hands it over, and it is spent.
- *  Saying it beside a ticking clock made the one line that has to be read every
- *  second twice as long as the fact it carries. */
 export function expiryLabel(left: number): string {
   if (left <= 0) return 'This code has expired';
   if (left < 60) return `Expires in ${left}s`;
@@ -116,13 +56,6 @@ export function expiryLabel(left: number): string {
   return `Expires in ${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
-/**
- * The section itself.
- *
- * `canMint` is whether `/~/…` resolves to the gateway from this page, which is
- * true exactly while we are served under `/<slug>/`. `target` is where a new
- * device should point, in one of the four states above.
- */
 export function PairDeviceSection({
   canMint,
   target,
@@ -132,20 +65,14 @@ export function PairDeviceSection({
 }) {
   const [minted, setMinted] = useState<Loadable<MintedCode>>({ status: 'not-loaded' });
   const origin = target.kind === 'origin' ? target.url : null;
-  // Whose device this will be. Asked only with several people: with one, the
-  // gateway gives the device to its first person.
-  const people = isTeamGateway.value ? operatorRows(operators.value) : null;
-  const [chosenPerson, setChosenPerson] = useState<string | null>(null);
-  const forPerson = people === null ? null : chosenPerson ?? people[0]?.id ?? null;
+  const users = isTeamGateway.value ? gatewayUserRows(gatewayUsers.value) : null;
+  const [chosenUser, setChosenUser] = useState<string | null>(null);
+  const forUser = users === null ? null : chosenUser ?? users[0]?.id ?? null;
 
-  // Mints a code, and every button in the section is wired to it.
   const mint = useCallback(() => {
     setMinted({ status: 'loading' });
-    void mintPairingCode(origin, forPerson).then(
+    void mintPairingCode(origin, forUser).then(
       (body) => {
-        // The clock is read HERE, beside the expiry it is compared against.
-        // Stamping it when the request went out would open the countdown at
-        // however long the round trip took, so "5:02" on a slow one.
         const landed = Date.now();
         setMinted({
           status: 'loaded',
@@ -159,7 +86,7 @@ export function PairDeviceSection({
       },
       (e) => setMinted(toFailed(e)),
     );
-  }, [origin, forPerson]);
+  }, [origin, forUser]);
 
   const left = useCodeCountdown(minted.status === 'loaded' ? minted.data.expiresAt : null);
 
@@ -177,9 +104,6 @@ export function PairDeviceSection({
       );
     }
     if (minted.status !== 'loaded') {
-      // Minting is held until the address is known. Clicking before the reads
-      // land would burn a code and show no QR, on a machine that had a
-      // perfectly good address for one.
       const resolving = target.kind === 'resolving';
       return (
         <div class="list-row">
@@ -190,11 +114,11 @@ export function PairDeviceSection({
             </div>
           </div>
           <div class="list-row-actions">
-            {people !== null && forPerson !== null && (
+            {users !== null && forUser !== null && (
               <Dropdown
-                options={people.map((o) => ({ value: o.id, label: `For ${o.name}` }))}
-                value={forPerson}
-                onChange={setChosenPerson}
+                options={users.map((o) => ({ value: o.id, label: `For ${o.name}` }))}
+                value={forUser}
+                onChange={setChosenUser}
               />
             )}
             <button
@@ -239,11 +163,6 @@ export function PairDeviceSection({
   );
 }
 
-/** One way to use the code: a caption, an optional action, and the thing itself.
- *
- *  `kind` names the card in the DOM, and is closed rather than a bare string so
- *  a typo cannot invent a fourth. The QR and the code each take a rule of their
- *  own; the address card rides the base class alone today. */
 export function PairCard({
   kind,
   label,
@@ -266,12 +185,6 @@ export function PairCard({
   );
 }
 
-/** Copy one of the two things a card can hand over.
- *
- *  Renders nothing where there is no clipboard to copy to. A non-secure context
- *  has none at all. This page is often read over a plain-HTTP LAN address,
- *  where the button would fail on every tap. The digits and the address stay
- *  selectable either way. */
 export function CopyButton({ text, what }: { text: string; what: string }) {
   if (!clipboardAbilities().copy) return null;
   return (
@@ -281,21 +194,6 @@ export function CopyButton({ text, what }: { text: string; what: string }) {
   );
 }
 
-/**
- * A live code, as the three ways to use it.
- *
- * **The QR is the point**, so it is the big card and the two fallbacks stack
- * beside it. They are ALTERNATIVES, not steps, which the captions have to carry:
- * every card after the first opens with "Or", or a row of imperatives reads as a
- * checklist of three things to do.
- *
- * Above them sits what is true of the code itself rather than of one way to
- * spend it: how long it has left, and the button that replaces it.
- *
- * **An expired code shows no cards at all.** Every one of them is an
- * instruction, and there is nothing left for the digits or the QR to do. The
- * line above says so, beside the button that fixes it.
- */
 function MintedBody({
   minted,
   left,
@@ -306,15 +204,8 @@ function MintedBody({
   onAgain: () => void;
 }) {
   const expired = left <= 0;
-  // The QR card, or nothing. Built here so the caption below can ask the CARD
-  // whether it exists, rather than re-deriving it: two conditions could
-  // disagree, and a lone card would then open with "Or".
-  // The address never has to ask. The gateway derives a QR from the pair URL,
-  // so an address on screen means a QR above it.
   const scanCard = minted.qrSvg ? (
     <PairCard kind="qr" label="Scan this">
-      {/* Decorative: the digits and the address beside it say the same thing in
-          text, and nobody scans a QR with a screen reader. */}
       <img class="add-device-qr" src={qrImageSrc(minted.qrSvg)} alt="" />
     </PairCard>
   ) : null;
@@ -344,9 +235,6 @@ function MintedBody({
                   label="Or open this address"
                   action={<CopyButton text={minted.pairUrl} what="pairing address" />}
                 >
-                  {/* Text, never a link. The address is for the OTHER device,
-                      and opening it here would spend a single-use code on a
-                      device that is already paired. */}
                   <div class="add-device-url">{minted.pairUrl}</div>
                 </PairCard>
               )}

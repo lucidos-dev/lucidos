@@ -18,7 +18,9 @@
         }
         history.replaceState(history.state, '', url.href);
         try {
-          var spent = JSON.parse(localStorage.getItem('lucidos.pairing.spentLaunchCodes') || '[]');
+          var peerMeta = document.querySelector('meta[name="lucidos-peer-client"]');
+          function peerKey(name) { return peerMeta ? 'peer:' + peerMeta.getAttribute('content') + ':' + name : name; }
+          var spent = JSON.parse(localStorage.getItem(peerKey('lucidos.pairing.spentLaunchCodes')) || '[]');
           if (Array.isArray(spent) && spent.indexOf((raw || '').trim()) !== -1) window.lucidosPairingLaunch = false;
         } catch (e) { /* unavailable storage still allows the launch to pair */ }
       })();
@@ -163,7 +165,11 @@
           // WITH its params, instead of a bare /<slug>/.
           // `@` stays literal, as `workspaceRouteUrlSegment` keeps it: the
           // gateway reads a remote route `<slug>@<name>` off the raw path.
-          if (slug) location.replace('/' + encodeURIComponent(slug).replace('%40', '@') + '/' + location.search + location.hash);
+          if (slug) {
+            Promise.resolve(window.lucidosRemoteClientReady).then(function () {
+              location.replace('/' + encodeURIComponent(slug).replace('%40', '@') + '/' + location.search + location.hash);
+            }).catch(function () { /* boot reports retirement failure */ });
+          }
         } catch (e) { /* fall through to the normal picker render */ }
       })();
     </script>
@@ -207,7 +213,7 @@
       //   2. A NOTIFICATION TAP (`?notification=…` on the URL). TEMPORARY MEASURE
       //      (docs/temporary-measures.md § "Cross-document notification-tap reload
       //      on iOS"): WebKit gives a push tap no reload-free channel
-      //      (system-knowhow/notifications.md §4.5), so the reload IS the
+      //      (system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md §4.5), so the reload IS the
       //      navigation. Only this trigger goes away when WebKit gives us one.
       //
       // Decided HERE, in <head>, and never in the body. Every body script waits
@@ -241,7 +247,11 @@
           var seg = bootBaseHref.replace(/^\/+|\/+$/g, '');
           return (seg === '' || seg === '~') ? null : seg;
         })();
-        function wsKey(name) { return bootSlug ? 'ws:' + bootSlug + ':' + name : name; }
+        var bootPeer = document.querySelector('meta[name="lucidos-peer-client"]');
+        function wsKey(name) {
+          var key = bootSlug ? 'ws:' + bootSlug + ':' + name : name;
+          return bootPeer ? 'peer:' + bootPeer.getAttribute('content') + ':' + key : key;
+        }
         // Consume the refresh flag FIRST and unconditionally, so it cannot survive
         // a load that then declines to quiet for some other reason. One-shot, so a
         // refresh whose reload never happened can quiet at most ONE later load.
@@ -412,7 +422,7 @@
            fallback and then reflow when the web font swaps, which is visible
            jank on the boot splash. An all-system monospace stack paints
            instantly with no swap. Size in px for the no-rem reason above. */
-        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
         font-size: 15px;
         line-height: 1.4;
         letter-spacing: 0.01em;
@@ -620,6 +630,22 @@
         text-underline-offset: 0.2em;
         pointer-events: auto;
       }
+      /* The one button the packaged desktop's start can need from the user:
+         Trust certificate (src/utils/bootSplash.ts `setBootAction`). Solid
+         white on the brand gradient, so it reads as the thing to press. Same
+         no-rem rule as the rest of the splash. */
+      .boot-splash-action {
+        pointer-events: auto;
+        cursor: pointer;
+        font: inherit;
+        color: #0a4ea8;
+        background: #fff;
+        border: 0;
+        border-radius: 999px;
+        padding: 8px 20px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+      }
+      .boot-splash-action:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
       .boot-splash.boot-splash-stalled { pointer-events: auto; cursor: pointer; }
       /* THE EXIT IS TWO BEATS, and the split is what makes the hand-off read as
          one. Fading the whole splash on one curve (what this did until
@@ -645,7 +671,8 @@
          has started, a click belongs to the app underneath. Two-class
          specificity and declared after the stalled rule, so it wins. */
       .boot-splash.boot-splash-leaving,
-      .boot-splash-leaving .boot-splash-escape { pointer-events: none; }
+      .boot-splash-leaving .boot-splash-escape,
+      .boot-splash-leaving .boot-splash-action { pointer-events: none; }
       /* Beat one, the status. Same specificity as `.boot-splash-status-shown`
          above and later in the file, which is what lets it win. */
       .boot-splash-leaving .boot-splash-status {
@@ -859,7 +886,11 @@
           var seg = slugHref.replace(/^\/+|\/+$/g, '');
           return (seg === '' || seg === '~') ? null : seg;
         })();
-        function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
+        var workspacePeer = document.querySelector('meta[name="lucidos-peer-client"]');
+        function wsKey(name) {
+          var key = workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name;
+          return workspacePeer ? 'peer:' + workspacePeer.getAttribute('content') + ':' + key : key;
+        }
         var recovered = false;
         var handedOver = false;
         // The service worker's bundle caches. Must match SHELL_CACHE in sw.js.
@@ -897,7 +928,7 @@
 
         /* The way out of a workspace this document cannot reach, and the reason
            the engine stamps a gateway port and a workspace id into every shell
-           (api/base_path.rs): built from those two metas plus `location`, so it
+           (core/base_path.rs): built from those two metas plus `location`, so it
            needs no engine, no network and no application bundle. Exactly the
            resources a document served from the service worker's cache against a
            dead origin still has.

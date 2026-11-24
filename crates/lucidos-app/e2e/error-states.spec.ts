@@ -9,7 +9,6 @@ test.describe('Error display states', () => {
   });
 
   test('malformed chat stream request shows error response', async ({ page }) => {
-    // Send a request with missing required fields
     const resp = await apiRequest(page).post('/api/v1/chat/stream', {
       headers: { 'content-type': 'application/json' },
       data: JSON.stringify({ text: '' }),
@@ -44,11 +43,6 @@ test.describe('Error display states', () => {
   });
 
   test('engine-restart-then-recovered turn does NOT show "Response interrupted"', async ({ page }) => {
-    // Regression: when the engine restarts mid-turn, recovery emits
-    // ResponseAborted, then the rerun emits ResponseGenerated for the SAME
-    // request_event_id. The exchange's terminal verdict must be the LATER
-    // success — not the earlier abort. Pre-fix: the badge falsely read
-    // "Response interrupted" / showed the aborted warning marker.
     const threadId = randomUUID();
     const userMsgId = randomUUID();
     const abortedId = randomUUID();
@@ -65,9 +59,6 @@ test.describe('Error display states', () => {
       images: [],
       request_event_id: userMsgId,
     });
-    // exchangeResponseText() pulls visible text from TextStreamed events, not
-    // from the terminal payload — seed a TextStreamed for the rerun output so
-    // the response content actually renders in the DOM.
     const textStreamedPayload = JSON.stringify({
       text: 'final answer after rerun',
       request_event_id: userMsgId,
@@ -95,9 +86,6 @@ test.describe('Error display states', () => {
       const exchange = page.locator('.chat-exchange:visible').first();
       await expect(exchange).toContainText('final answer after rerun', { timeout: 10_000 });
 
-      // A later same-request_event_id ResponseGenerated must supersede the
-      // earlier ResponseAborted: no abort marker, no aborted badge, no
-      // "Response interrupted" copy inside the exchange.
       await expect(exchange.locator('.response-aborted-marker')).toHaveCount(0);
       await expect(exchange.locator('.exchange-status-aborted')).toHaveCount(0);
       await expect(exchange.getByText('Response interrupted')).toHaveCount(0);
@@ -111,12 +99,6 @@ test.describe('Error display states', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Resume-after-restart UI: AbortPanel + ResumePanel + Continue button.
-// Each test seeds a thread directly via psql() (so we don't actually need to
-// crash + restart the engine) and asserts the rendered DOM matches the
-// design.
-// ---------------------------------------------------------------------------
 test.describe('Resume after restart — boundary panels', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -149,9 +131,6 @@ test.describe('Resume after restart — boundary panels', () => {
       }, threadId);
       await navigateToApp(page);
 
-      // The abort boundary opens its own exchange, drawn as a card with no
-      // actor header: only agent output wears one. The card's own button is
-      // Continue.
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);
@@ -175,11 +154,6 @@ test.describe('Resume after restart — boundary panels', () => {
     const t1 = new Date(Date.now() - 2_000).toISOString();
 
     const userPayload = JSON.stringify({ text: 'fix the bug', channel: 'chat' });
-    // Both halves of the switch-teardown fingerprint, because
-    // `isSwitchTeardownAbort` requires both: the `engine_shutdown` cause AND
-    // the device that clicked Switch. A device actor alone is not it, since
-    // `stale_settle` also carries the actor of the user button that exposed the
-    // stuck row, so an actor-only fixture reads as a plain interruption.
     const abortedPayload = JSON.stringify({
       text: '',
       images: [],
@@ -203,17 +177,8 @@ test.describe('Resume after restart — boundary panels', () => {
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);
-      // Device-driven abort (you hit Restart) renders as a card with no actor
-      // header, its cause as the state word; who/what is in the time popover.
       await expect(abortExchange.locator('.initiator-actor')).toHaveCount(0);
       await expect(abortExchange.locator('.event-row[data-kind="boundary"] .event-row-state')).toHaveText('Paused by restart');
-      // And NO Continue button, which is the point of the "paused" wording: the
-      // engine promised to resume this turn itself (ADR 0045), so offering a
-      // Continue would invite the user to run it a second time.
-      // `continuableAbortIndex` withholds it on exactly the fingerprint that
-      // produces the label above, so the two can never contradict each other.
-      // If the boot declines to resume, it emits a fresh `recovery_after_restart`
-      // abort, which does not match, and the button comes back.
       await expect(abortExchange.getByRole('button', { name: 'Continue' })).toHaveCount(0);
     } finally {
       psql([
@@ -224,8 +189,6 @@ test.describe('Resume after restart — boundary panels', () => {
   });
 
   test('Continue button hides after a ContinuationStarted lands', async ({ page }) => {
-    // Same shape as the engine-abort test, but with a trailing ContinuationStarted
-    // — the AbortPanel must render WITHOUT the Continue button.
     const threadId = randomUUID();
     const userMsgId = randomUUID();
     const abortedId = randomUUID();
@@ -258,20 +221,11 @@ test.describe('Resume after restart — boundary panels', () => {
       }, threadId);
       await navigateToApp(page);
 
-      // Three exchanges: original, abort boundary, resume.
       const exchanges = page.locator('.chat-exchange:visible');
       await expect(exchanges).toHaveCount(3, { timeout: 10_000 });
-      // The abort boundary's Continue button must NOT render once a
-      // ContinuationStarted exists later in the thread.
       const abortExchange = exchanges.nth(1);
       await expect(abortExchange.getByRole('button', { name: 'Continue' })).toHaveCount(0);
-      // The resume exchange shows the device-attributed initiator.
-      // The summary text must NOT say "engine restart" — this is a
-      // user-clicked Continue, the engine was never restarted.
       const resumeExchange = exchanges.nth(2);
-      // The resume turn (you clicked Continue) draws no header: a Resumed card
-      // opens its reply. Its state must read "You continued", NOT an engine
-      // restart.
       await expect(resumeExchange.locator('.initiator-panel')).toHaveCount(0);
       const resumeState = resumeExchange.locator('.event-row[data-kind="resume"] .event-row-state');
       await expect(resumeState).toHaveText('You continued');
@@ -304,8 +258,6 @@ test.describe('Resume after restart — boundary panels', () => {
       branch: '',
       actor: { kind: 'device', device_id: 'd-test' },
     });
-    // Engine note text must include 2 bullet-style tool lines so the resume
-    // card's Details count "2 steps".
     const noteText =
       '[Engine note — this is a rerun]\n' +
       'Your previous attempt at this turn was interrupted by an engine restart.\n' +
@@ -349,16 +301,6 @@ test.describe('Resume after restart — boundary panels', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Question-parked threads are PRESERVED across a restart (no abort): the card
-// stays answerable, and NO "Aborted / Restarted / Response interrupted /
-// Continue" boundary appears. This is the inverse of the boundary panels above
-// and the exact user-reported screenshots. The backend guard
-// (`thread_has_unanswered_question` gating every restart-abort path) is proven
-// by the engine integration tests; this seeds the post-restart state that guard
-// now guarantees — a `UserQuestionAsked` with NO trailing `ResponseAborted`,
-// status `waiting_for_user_answer` — and asserts the user-visible contract.
-// ---------------------------------------------------------------------------
 test.describe('Question-parked thread preserved across restart', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -396,16 +338,12 @@ test.describe('Question-parked thread preserved across restart', () => {
       }, threadId);
       await navigateToApp(page);
 
-      // The question card renders ANSWERABLE (live `.question-body`, enabled
-      // options) — NOT the disabled `.question-body-terminated` an abort/overtake
-      // would produce.
       await expect(page.locator('.question-body').first()).toBeVisible({ timeout: 10_000 });
       await expect(page.locator('.question-body-terminated')).toHaveCount(0);
       const approve = page.locator('.question-option', { hasText: 'Approve the image' }).first();
       await expect(approve).toBeVisible();
       await expect(approve).toBeEnabled();
 
-      // No restart/abort boundary anywhere in the thread.
       await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0);
       await expect(page.getByText('Response interrupted')).toHaveCount(0);
       await expect(page.locator('.event-row-state', { hasText: 'Paused by restart' })).toHaveCount(0);

@@ -1,17 +1,3 @@
-/**
- * A field that commits on blur and cancels on Escape must carry
- * `data-escape-self`, and its Escape branch must call `preventDefault`.
- *
- * The central Escape policy (`dispatchEscape` in `hooks/useKeyboardShortcuts.ts`)
- * runs in the capture phase and blurs a focused text input. The blur fires the
- * field's commit before its own Escape handler runs, so Escape saved the edit
- * it was meant to cancel. `data-escape-self` tells the policy to leave the key
- * to the field. The field then spends the key, or `InlineForm` reads it as
- * unspent and closes the form around it.
- *
- * A source scan over every `<input />` whose handlers are written inline.
- * A field with named handlers is not covered.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -33,7 +19,6 @@ function walkTsx(dir: string): string[] {
   return out;
 }
 
-/** Every self-closing `<input …/>` tag in `source`. */
 function fieldTags(source: string): string[] {
   const tags: string[] = [];
   const opener = /<input\b/g;
@@ -46,8 +31,6 @@ function fieldTags(source: string): string[] {
   return tags;
 }
 
-/** Whether a tag commits on blur and handles Escape itself. A blur that
- *  cancels (`cancelEditingUrl`, `setEditingPath(false)`) is harmless. */
 function commitsOnBlurAndCancelsOnEscape(tag: string): boolean {
   const blur = /\bonBlur=\{([^}]*)\}/.exec(tag);
   return blur !== null && /commit|save/i.test(blur[1]) && tag.includes("'Escape'");

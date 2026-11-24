@@ -12,14 +12,9 @@ import {
 } from '../../store/actions/preferences';
 import { technicalLiteracyOptions } from './ResponseStylesSection';
 
-/** The engine's list of *technical literacy* levels.
- *
- *  A level the picker offers but the engine lacks is stored and then ignored,
- *  so the user picks "Developer" and nothing changes. Read the Rust source,
- *  do not restate it, as `responseStyle.mirror.test.ts` does. */
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUST: string = readFileSync(
-  resolve(HERE, '../../../../lucidos-engine/src/core/technical_literacy.rs'),
+  resolve(HERE, '../../../../lucidos-core/src/core/technical_literacy.rs'),
   'utf8',
 );
 
@@ -29,7 +24,6 @@ function rustIds(): string[] {
   return [...match[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
 }
 
-/** One `Self::X => "text"` arm per level, read out of a named Rust fn. */
 function rustCopy(fnName: string): string[] {
   const body = RUST.split(`pub fn ${fnName}(self)`)[1]?.split('\n    }\n')[0];
   if (!body) throw new Error(`${fnName} is not declared in core/technical_literacy.rs`);

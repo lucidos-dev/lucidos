@@ -1,8 +1,3 @@
-/**
- * A ⋯ menu taller than the screen scrolls. The dashboard's Add lists every
- * widget and every app, which on a phone ran off the bottom with no way to
- * reach the rest.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

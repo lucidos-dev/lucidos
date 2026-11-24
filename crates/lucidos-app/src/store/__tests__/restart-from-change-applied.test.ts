@@ -13,12 +13,6 @@ beforeEach(() => {
 });
 
 describe('restart-required state from ChangeApplied requires_restart', () => {
-  // When ChangeApplied SSE arrives with requires_restart=true, the thread-sync
-  // handler sets restartRequired and calls syncRestartState(). Post single-surface
-  // decision, this surfaces NO toast — the engine "New version available → Switch"
-  // toast is owned by the poll (engine-update.ts) once the rebuild is `ready`. The
-  // persisted state (restartRequired + RESTART_LS_KEY) drives the brand badge
-  // + restart confirm dialog and must survive a reload.
 
   it('persists restartRequired and shows no toast', () => {
     restartRequired.value = true;
@@ -33,7 +27,6 @@ describe('restart-required state from ChangeApplied requires_restart', () => {
     syncRestartState();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBe('true');
 
-    // Simulate page reload (signals reset, toasts cleared)
     restartRequired.value = false;
     toasts.value = [];
 
@@ -56,7 +49,6 @@ describe('restart-required state from ChangeApplied requires_restart', () => {
     syncRestartState();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBe('true');
 
-    // restartRequired stays true (OR logic: once set, stays until engine restarts)
     syncRestartState();
     expect(restartRequired.value).toBe(true);
     expect(localStorage.getItem(RESTART_LS_KEY)).toBe('true');
@@ -67,8 +59,6 @@ describe('restart-required state from ChangeApplied requires_restart', () => {
     syncRestartState();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBe('true');
 
-    // Simulate refreshChangesState API response: restart_required=false
-    // (e.g. the change was reverted, or the engine restarted)
     restartRequired.value = false;
     syncRestartState();
     expect(localStorage.getItem(RESTART_LS_KEY)).toBeNull();

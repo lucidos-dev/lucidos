@@ -10,7 +10,6 @@ type Proto = Record<string, unknown>;
 const videoProto = HTMLVideoElement.prototype as unknown as Proto;
 const elementProto = Element.prototype as unknown as Proto;
 
-/** The steps the host was told about, in order. */
 const steps = () => tellHost.mock.calls.map(([, args]) => (args as { step: string }).step);
 const sent = (step: string) => tellHost.mock.calls
   .map(([, args]) => args as Record<string, unknown>)

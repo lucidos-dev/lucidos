@@ -1,16 +1,3 @@
-/**
- * Pressing Connect once must be enough.
- *
- * The engine answers "no OAuth client yet" (or "the one you have cannot drive a
- * flow") with a credential request, so `grantOAuthScope` opens the registration
- * form and returns false. Nothing used to survive that return: saving the
- * credential closed the form, reloaded the list, and stopped. No one told the
- * user to press Connect again, and no one did it for them.
- *
- * A repair carries the id of the row it must update, too. Creating instead would
- * make a second `oauth_client` for one provider, and a name plus an auth type is
- * the credential's identity, so that pair is a duplicate.
- */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const reauthorizeOAuth = vi.fn();
@@ -44,7 +31,6 @@ import { grantOAuthScope, cancelPendingOAuthConnect } from './oauth';
 import { submitRequestedCredential } from './credentials';
 import type { CredentialRequest } from '../types';
 
-/** The engine's answer when the registration is missing or incomplete. */
 function needsCredentials(over: Partial<CredentialRequest> = {}) {
   return {
     success: false,
@@ -75,10 +61,25 @@ describe('a saved registration continues the connection it was blocking', () => 
       '{"client_id":"abc"}',
     );
 
-    // The same provider and the same scopes: a continuation that dropped the
-    // purpose would connect a bare sign-in and send the user back to Backup.
-    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', 'files.content.write');
+    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', 'files.content.write', false);
     expect(openUrlOutsideApp).toHaveBeenCalledWith('https://dropbox.test/authorize?x=1');
+  });
+
+  it('keeps the sign-in request through the registration form', async () => {
+    reauthorizeOAuth.mockResolvedValueOnce(needsCredentials());
+    await grantOAuthScope('dropbox', '', true);
+    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', '', true);
+
+    reauthorizeOAuth.mockResolvedValueOnce(AUTHORIZES);
+    await submitRequestedCredential(
+      { service: 'dropbox' },
+      'dropbox',
+      ['https://api.dropboxapi.test'],
+      'oauth_client',
+      '{"client_id":"abc"}',
+    );
+
+    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', '', true);
   });
 
   it('does not fire twice for one press', async () => {
@@ -97,8 +98,6 @@ describe('a saved registration continues the connection it was blocking', () => 
     await save();
     await save();
 
-    // One queued continuation, consumed once. Re-running would race the
-    // engine's single live authorization and open a second browser tab.
     expect(openUrlOutsideApp).toHaveBeenCalledTimes(1);
   });
 
@@ -120,9 +119,6 @@ describe('a saved registration continues the connection it was blocking', () => 
   });
 
   it('is not consumed by an unrelated credential saved later', async () => {
-    // Navigating away from the form does not dismiss it, so a queued
-    // continuation can outlive the screen that created it. Opening a browser for
-    // a provider the user abandoned is worse than doing nothing.
     reauthorizeOAuth.mockResolvedValueOnce(needsCredentials());
     await grantOAuthScope('dropbox', 'files.content.write');
 
@@ -189,9 +185,6 @@ describe('a repair updates the existing registration', () => {
   });
 });
 
-/* A scope widening reaches the same update path as an OAuth repair, but its
-   credential is an ordinary API one, so every field it does not mean to change
-   has to survive. The auth header is the one that used to be hardcoded. */
 describe('a scope widening keeps everything but the scope', () => {
   const widening: CredentialRequest = {
     service: 'github',
@@ -220,8 +213,6 @@ describe('a scope widening keeps everything but the scope', () => {
     }));
   });
 
-  /* An oauth_client has no meaningful header, and the form never shows the
-     field on a create. Both land here with nothing to pass. */
   it('falls back to Authorization when no header is passed', async () => {
     await submitRequestedCredential(
       widening,

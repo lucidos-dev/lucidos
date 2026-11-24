@@ -9,9 +9,6 @@ describe('previewExt', () => {
     expect(previewExt('artifacts/README.MD')).toBe('md');
   });
 
-  // Not `''`: a dotless name has no extension, and the whole name is what the
-  // fallback returns. Both callers treat an unknown value the same way, so the
-  // distinction never reaches a branch, but the value must not be a surprise.
   it('returns the whole name when there is no dot', () => {
     expect(previewExt('Makefile')).toBe('makefile');
   });
@@ -46,8 +43,6 @@ describe('dataPreviewBody', () => {
     expect(read('artifacts/deck.slides', true)).toBe('source');
   });
 
-  // The toggle is persisted and global, so it is live over a `.rs` file too. It
-  // must not turn one into something else, and least of all an image.
   it('leaves a type with no rendered form alone when the toggle is on', () => {
     expect(read('artifacts/main.rs', true)).toBe('source');
     expect(read('artifacts/photo.png', true)).toBe('image');
@@ -60,8 +55,6 @@ describe('dataPreviewBody', () => {
     expect(read('artifacts/take.mp3')).toBe('audio');
   });
 
-  // SVG is text (XML) but reads as a picture, so it is the one type the toggle
-  // moves between an <img> and the source view.
   it('shows svg as a picture until the Source toggle asks otherwise', () => {
     expect(read('artifacts/diagram.svg')).toBe('image');
     expect(read('artifacts/diagram.svg', true)).toBe('source');
@@ -76,8 +69,6 @@ describe('dataPreviewBody', () => {
     expect(read('artifacts/notes.txt', false, true)).toBe('editor');
   });
 
-  // The Files header offers Edit only for an editable path. The signal is
-  // global, so it can be on when the preview moves to a path that is not.
   it('ignores the editing flag for a file the editor cannot write', () => {
     expect(read('system-knowhow/glossary.md', false, true)).toBe('markdown');
     expect(read('artifacts/photo.png', false, true)).toBe('image');
@@ -97,23 +88,16 @@ describe('repoPreviewBody', () => {
     expect(readRepo('data/rows.csv')).toBe('csv');
   });
 
-  // A blob of the fetched SVG text would share the shell's origin, so "Open
-  // image in new tab" would run its script as the shell. The media path points
-  // the image at the engine URL, which serves it sandboxed.
   it('renders an SVG as an image from the engine URL, and its source on request', () => {
     expect(readRepo('assets/logo.svg')).toBe('image');
     expect(readRepo('assets/logo.svg', true)).toBe('source');
   });
 
-  // Repo HTML is application source under review, not a document. A live
-  // srcDoc render of the app shell shows its boot splash instead of the file.
   it('shows repo HTML as source, never as a live render', () => {
     expect(readRepo('crates/lucidos-app/index.html')).toBe('source');
     expect(readRepo('page.htm')).toBe('source');
   });
 
-  // Unlike the data-file preview, which calls these unsupported: a repo holds
-  // Makefiles, LICENSE files and lockfiles, and all of them are readable text.
   it('shows an unknown or extensionless repo file as source', () => {
     expect(readRepo('Makefile')).toBe('source');
     expect(readRepo('Cargo.lock')).toBe('source');

@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * **A click anywhere on a change row opens its thread, except on a control.**
- * A change of several commits draws a "N commits" fold, and only its toggle
- * keeps its own click. The fold's block spans the row, so a guard on the whole
- * block would leave that line of every multi-commit row dead.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -52,7 +46,6 @@ function makeChange(over: Partial<Change> = {}): Change {
 
 const rows = {
   'a pending row': () => { changes.value = { status: 'loaded', data: [makeChange()] }; },
-  'a set-aside row': () => { setAsideChanges.value = { status: 'loaded', data: [makeChange({ status: 'set_aside' })] }; },
   'an applied row': () => { appliedChanges.value = { status: 'loaded', data: [makeChange({ status: 'applied' })] }; },
 };
 

@@ -2,10 +2,6 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import { focusedPane, splitRatio } from '../../store/store';
 
-// A preview iframe's same-origin `contentDocument`, faked for the node test env
-// (no jsdom): records keydown listeners and lets a test fire a chord at them.
-// KeyboardEvent isn't a global here, so events are the minimal shape the
-// dispatcher reads, with a preventDefault that records defaultPrevented.
 function fakeContentDoc() {
   const handlers: Record<string, { fn: (e: unknown) => void; capture: boolean }[]> = {};
   return {
@@ -13,11 +9,8 @@ function fakeContentDoc() {
       (handlers[type] ??= []).push({ fn, capture: capture === true });
     },
     removeEventListener: () => {},
-    /** test-only: number of listeners registered for a type */
     listenerCount: (type: string) => (handlers[type] ?? []).length,
-    /** test-only: whether all listeners for a type are capture-phase */
     allCapture: (type: string) => (handlers[type] ?? []).every((h) => h.capture),
-    /** test-only: dispatch an event to the registered listeners */
     fire: (type: string, e: unknown) => { for (const h of handlers[type] ?? []) h.fn(e); },
   };
 }
@@ -31,9 +24,9 @@ function chord(over: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boo
 }
 
 beforeEach(() => {
-  (globalThis as { innerWidth: number }).innerWidth = 1024; // desktop
-  focusedPane.value = 'thread'; // stale: focus is in the preview, host didn't see it
-  splitRatio.value = 0.5;       // content pane visible, not maximized
+  (globalThis as { innerWidth: number }).innerWidth = 1024;
+  focusedPane.value = 'thread';
+  splitRatio.value = 0.5;
 });
 
 describe('bridgePreviewIframeShortcuts', () => {
@@ -51,15 +44,15 @@ describe('bridgePreviewIframeShortcuts', () => {
     const e = chord({ key: 'Enter', metaKey: true, shiftKey: true });
     doc.fire('keydown', e);
 
-    expect(e.defaultPrevented).toBe(true);   // Chrome's default (context menu) suppressed
+    expect(e.defaultPrevented).toBe(true);
     expect(focusedPane.value).toBe('content');
-    expect(splitRatio.value).toBe(0);        // content pane group maximized
+    expect(splitRatio.value).toBe(0);
   });
 
   it('attaches once per document — a second bridge call does not stack listeners', () => {
     const doc = fakeContentDoc();
     bridgePreviewIframeShortcuts(iframeWith(doc));
-    bridgePreviewIframeShortcuts(iframeWith(doc)); // same doc, must be a no-op
+    bridgePreviewIframeShortcuts(iframeWith(doc));
     expect(doc.listenerCount('keydown')).toBe(1);
   });
 

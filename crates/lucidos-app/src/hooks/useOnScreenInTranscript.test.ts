@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { watchOnScreen } from './useOnScreenInTranscript';
 import { getActiveScrollElement, setActiveScrollElement } from '../components/chat/scrollState';
 
-/** What each constructed fake observer recorded. */
 interface Armed {
   callback: () => void;
   root: Element | null;
@@ -12,8 +11,6 @@ interface Armed {
 
 let armed: Armed[] = [];
 
-/** Stand in for the browser observer, which this suite has no jsdom to supply.
- *  Faking it is also what makes the root and the teardown assertable. */
 function installObserverFake(): void {
   (globalThis as Record<string, unknown>).IntersectionObserver = class {
     private entry: Armed;
@@ -26,8 +23,6 @@ function installObserverFake(): void {
   };
 }
 
-/** A node measurable at `top`, with no parent to clip it. `unmeasurableBox`
- *  walks `parentElement`, so leaving it undefined ends the walk at once. */
 function node(top: number, height = 20): HTMLElement {
   return {
     getBoundingClientRect: () => ({
@@ -36,7 +31,6 @@ function node(top: number, height = 20): HTMLElement {
   } as unknown as HTMLElement;
 }
 
-/** A transcript band from 0 to 600, inside a window that runs to 800. */
 function scroller(): HTMLElement {
   return node(0, 600);
 }
@@ -45,7 +39,6 @@ describe('watchOnScreen', () => {
   beforeEach(() => {
     armed = [];
     installObserverFake();
-    // No layout engine, so the window band is supplied rather than measured.
     (globalThis as Record<string, unknown>).innerHeight = 800;
     (globalThis as Record<string, unknown>).innerWidth = 1024;
     setActiveScrollElement(null);
@@ -57,8 +50,6 @@ describe('watchOnScreen', () => {
   });
 
   it('reports the verdict once up front, before anything crosses', () => {
-    // A row that never crosses the root gets no further entry, so the caller
-    // would sit on the optimistic default without this first sample.
     const reported: boolean[] = [];
     watchOnScreen(node(2000), (v: boolean) => reported.push(v));
     expect(reported).toEqual([false]);
@@ -93,10 +84,6 @@ describe('watchOnScreen', () => {
     expect(armed[0].disconnects).toBe(1);
   });
 
-  // The notifier and the verdict must measure the same box. `isElementOnScreen`
-  // takes its band from the active scroll element, so the observer roots there
-  // too. Root them differently and a crossing of the verdict's band fires no
-  // callback, which latches the answer at whatever it last was.
   it('roots at the active scroll element, the box the verdict measures', () => {
     const el = node(100);
     setActiveScrollElement(scroller());
@@ -110,8 +97,6 @@ describe('watchOnScreen', () => {
   });
 
   it('reports off screen for a row below the transcript but inside the window', () => {
-    // The crossing a window-rooted observer would miss, and the reason the root
-    // is the scroller. The window band here runs to 800.
     const reported: boolean[] = [];
     setActiveScrollElement(scroller());
     watchOnScreen(node(700), (v: boolean) => reported.push(v));

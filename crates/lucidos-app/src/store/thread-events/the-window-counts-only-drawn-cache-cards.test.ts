@@ -1,6 +1,3 @@
-/** With the Cache cards switch off, the transcript draws no keep-alive card.
- *  The render window clamps by row index, so it must count the same rows the
- *  exchange draws, or the clamp cuts the wrong rows. */
 import { describe, expect, it } from 'vitest';
 import type { Exchange, StoredEvent } from '../thread-events';
 import { drawnResponseEvents, exchangeResponseEvents } from './exchange-render';

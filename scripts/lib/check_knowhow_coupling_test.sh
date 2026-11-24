@@ -253,17 +253,41 @@ class CouplingTests(unittest.TestCase):
         self.commit()
         self.assertIn('overlap', self.run_gate(1))
 
-    def test_duplicate_audit_ids_are_rejected(self):
-        self.put('system-knowhow/workspace-audit/nested/tools.md',
-                 '---\nname: Another audit\nsources: ["src/tools/*"]\n---\nAudit')
+    def test_registry_cannot_claim_an_audit_id(self):
+        registry = self.root / 'docs/knowhow-surfaces.tsv'
+        registry.write_text(registry.read_text()
+                            + 'audit/tools\tsrc/other/*\tsystem-knowhow/tools.md\tClash.\n')
+        self.put('src/other/x.rs', 'other')
         self.commit()
-        self.assertIn('duplicate audit', self.run_gate(1))
+        self.assertIn('invalid or duplicate surface: audit/tools', self.run_gate(1))
+
+    def test_a_section_part_satisfies_its_section(self):
+        self.put('system-knowhow/workspace-audit/tools/checks.md', 'Checks\n')
+        self.git('checkout', '-q', 'main')
+        self.commit()
+        self.git('checkout', '-q', 'change')
+        self.git('merge', '-q', 'main')
+        self.put('src/tools/tool.rs', 'changed')
+        self.put('system-knowhow/tools.md', '# Updated tools')
+        self.put('system-knowhow/workspace-audit/tools/checks.md', 'Checks, reviewed\n')
+        self.commit()
+        self.run_gate(0)
+
+    def test_a_part_cannot_declare_its_own_section_as_a_source(self):
+        self.put('docs/knowhow-surfaces.tsv',
+                 'tools\tsrc/tools/* system-knowhow/workspace-audit/tools/*\tsystem-knowhow/tools.md\tTool contract.\n')
+        self.put('system-knowhow/workspace-audit/tools.md',
+                 '---\nname: Tools audit\nsources: ["src/tools/*", "system-knowhow/workspace-audit/tools/*"]\n---\nAudit\n')
+        self.put('system-knowhow/workspace-audit/tools/checks.md', 'Checks\n')
+        self.commit()
+        self.assertIn('cannot declare itself', self.run_gate(1))
 
     def test_live_mappings_follow_the_chat_tool_owner(self):
         repo = CHECK.parents[1]
         owners = subprocess.check_output(['git', '-C', str(repo), 'grep', '-l', '-F',
                                          'pub(crate) fn chat_tools(', '--',
-                                         'crates/lucidos-engine/src/*.rs']).decode().splitlines()
+                                         'crates/lucidos-engine/src/*.rs',
+                                         'crates/lucidos-agents-api/src/*.rs']).decode().splitlines()
         self.assertEqual(len(owners), 1, owners)
         owner = owners[0]
         self.assertIn('CONTENT TAXONOMY', (repo / owner).read_text())

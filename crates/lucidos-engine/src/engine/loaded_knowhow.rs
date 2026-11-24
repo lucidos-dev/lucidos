@@ -12,7 +12,7 @@
 
 use crate::core::EventRow;
 use crate::engine::LucidosEngine;
-use crate::llm::tool_names::{LOAD_KNOWHOW, UNLOAD_KNOWHOW};
+use crate::llm::tool_names::UNLOAD_KNOWHOW;
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
@@ -20,12 +20,8 @@ use uuid::Uuid;
 /// doc before the doc leaves the block.
 pub const IDLE_TURNS_BEFORE_UNLOAD: usize = 3;
 
-/// The event that ends a finished turn, and so ages every loaded doc. A Stop,
-/// an abort or a failure ends a turn that did not finish, and ages nothing.
-pub(crate) const TURN_FINISHED_EVENT: &str = "ResponseGenerated";
-
-/// The tools whose pairs change the set.
-pub(crate) const KNOWHOW_TOOLS: [&str; 2] = [LOAD_KNOWHOW, UNLOAD_KNOWHOW];
+use crate::engine::thread_events::TURN_FINISHED_EVENT;
+use crate::llm::tool_names::KNOWHOW_TOOLS;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedKnowhow {
@@ -44,13 +40,13 @@ impl LoadedKnowhow {
     /// Whether this turn's block holds the body: it arrived before a turn
     /// finished. A load in an unfinished turn reads as not held, so the agent
     /// gets the body again rather than none.
-    pub(crate) fn body_in_block(&self) -> bool {
+    pub fn body_in_block(&self) -> bool {
         self.turns_since_body > 0
     }
 
     /// Why the doc is still here, for the `[KNOWHOW RETENTION]` block and the
     /// Context viewer row.
-    pub(crate) fn retention_note(&self) -> String {
+    pub fn retention_note(&self) -> String {
         match IDLE_TURNS_BEFORE_UNLOAD.saturating_sub(self.idle_turns) {
             0 => "leaves after this turn unless loaded again".to_string(),
             1 => "stays 1 more turn after this one unless loaded again".to_string(),
@@ -59,10 +55,10 @@ impl LoadedKnowhow {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LoadedKnowhow {
     /// A doc whose body arrived `idle_turns` finished turns ago, unused since.
-    pub(crate) fn loaded_turns_ago(id: &str, body: &str, idle_turns: usize) -> Self {
+    pub fn loaded_turns_ago(id: &str, body: &str, idle_turns: usize) -> Self {
         Self {
             id: id.to_string(),
             body: body.to_string(),
@@ -73,7 +69,7 @@ impl LoadedKnowhow {
 }
 
 /// The `load_knowhow` result for a doc this turn's block already holds.
-pub(crate) fn kept_result(id: &str) -> String {
+pub fn kept_result(id: &str) -> String {
     format!(
         "{KEPT_PREFIX}`{id}` is in the [LOADED KNOWHOW] section of this turn's user message, \
          with its body. This call keeps it for {IDLE_TURNS_BEFORE_UNLOAD} more turns."
@@ -121,7 +117,7 @@ fn step_of(pair: crate::core::store::ResumeToolPair) -> Option<(Uuid, Step)> {
 ///
 /// `events` is the thread's events in order: all of them, or only the
 /// shapes [`crate::core::EventStore::get_thread_knowhow_events`] selects.
-pub(crate) fn loaded_knowhow(events: &[EventRow]) -> Vec<LoadedKnowhow> {
+pub fn loaded_knowhow(events: &[EventRow]) -> Vec<LoadedKnowhow> {
     let mut steps: HashMap<Uuid, Step> =
         crate::core::store::collect_tool_pairs_chronological(events)
             .into_iter()
@@ -165,7 +161,7 @@ pub(crate) fn loaded_knowhow(events: &[EventRow]) -> Vec<LoadedKnowhow> {
 
 impl LucidosEngine {
     /// The thread's loaded knowhow right now, read from its events.
-    pub(crate) async fn thread_loaded_knowhow(
+    pub async fn thread_loaded_knowhow(
         &self,
         thread_id: Uuid,
     ) -> Result<Vec<LoadedKnowhow>, Box<dyn std::error::Error + Send + Sync>> {

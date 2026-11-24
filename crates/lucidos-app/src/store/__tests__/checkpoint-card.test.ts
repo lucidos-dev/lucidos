@@ -3,7 +3,6 @@ import { TS, makeThreadState } from './thread-events-helpers';
 import { exchangeResponseEvents, groupIntoExchanges, type StoredEvent, type ThreadEvent } from '../thread-events';
 import { checkpointUndoScope } from '../../components/chat/chat-exchange-parts';
 
-/** Replay a turn's worth of events and pull out the single checkpoint row. */
 function checkpointRow(events: ThreadEvent[]) {
   const thread = makeThreadState();
   events.forEach((event, i) => {
@@ -34,8 +33,6 @@ describe('checkpoint card rendering', () => {
     expect(row).toMatchObject({ type: 'checkpoint', restores: 3, removes: 1, reverted: false });
   });
 
-  /** Every checkpoint written before 2026-08-06 has no counts, because Undo
-   *  could only restore. Those cards must still render, with their Undo. */
   it('defaults the counts on a checkpoint written before they existed', () => {
     const row = checkpointRow([
       MESSAGE,
@@ -78,9 +75,6 @@ describe('checkpointUndoScope', () => {
     expect(checkpointUndoScope(0, 1)).toBe('Undo will remove 1 file this step created.');
   });
 
-  /** 0/0 is a checkpoint whose counts were never recorded, not one that changed
-   *  nothing: a command that changed nothing git-visible emits no card at all.
-   *  Saying "restore 0 files" there would state a fact the engine never sent. */
   it('says nothing when the counts are unknown', () => {
     expect(checkpointUndoScope(0, 0)).toBeNull();
   });

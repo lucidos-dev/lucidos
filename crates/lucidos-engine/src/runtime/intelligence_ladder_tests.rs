@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::intelligence_rungs::RUNG_ESTIMATES_JSON;
 
 fn everything_offered(_: &str, _: &str) -> bool {
     true
@@ -254,6 +255,8 @@ fn the_rung_estimates_ship_integer_bands_only() {
         "token_band",
         "time_band",
         "on",
+        "pinned",
+        "dominators",
     ];
     fn bands_only(value: &serde_json::Value, path: &str) {
         match value {
@@ -408,7 +411,15 @@ async fn each_surface_s_pairs_that_are_on_form_a_frontier_apart_from_its_shipped
 }
 
 #[test]
-fn the_claude_code_ladder_climbs_haiku_then_sonnet_and_opus_to_opus_max() {
+fn neon_coding_bands_distinguish_measured_and_estimated_efforts() {
+    for effort in ["low", "medium", "high", "xhigh"] {
+        let pair = estimate_of("gemini-4-neon", effort).expect("Neon effort has estimates");
+        assert_eq!(pair.coding_estimated, effort != "xhigh");
+    }
+}
+
+#[test]
+fn the_claude_code_ladder_climbs_haiku_then_sonnet_to_fable_high() {
     let ladder = effective_ladder(LadderSurface::ClaudeCode, None, everything_offered);
     assert_eq!(
         pairs_of(&ladder),
@@ -417,44 +428,47 @@ fn the_claude_code_ladder_climbs_haiku_then_sonnet_and_opus_to_opus_max() {
             "claude-haiku-5-5=medium",
             "claude-haiku-5-5=high",
             "claude-haiku-5-5=xhigh",
-            "claude-sonnet-5-5=medium",
-            "claude-opus-5-5=low",
             "claude-sonnet-5-5=high",
             "claude-opus-5-5=medium",
+            "claude-fable-5-2=low",
             "claude-opus-5-5=high",
+            "claude-fable-5-2=medium",
             "claude-opus-5-5=xhigh",
-            "claude-opus-5-5=max",
+            "claude-fable-5-2=high",
         ]
     );
 }
 
 #[test]
-fn the_codex_ladder_climbs_luna_then_sol_to_sol_xhigh() {
+fn the_codex_ladder_climbs_luna_then_sol_to_astra_xhigh() {
     let ladder = effective_ladder(LadderSurface::Codex, None, everything_offered);
     assert_eq!(
         pairs_of(&ladder),
         [
             "gpt-6-luna=low",
-            "gpt-5.6-luna=medium",
             "gpt-6-luna=medium",
             "gpt-6-luna=high",
             "gpt-6-luna=xhigh",
-            "gpt-6-luna=max",
             "gpt-6.1-sol=low",
+            "gpt-6.2-sol=low",
             "gpt-6.1-sol=medium",
-            "gpt-6.1-sol=xhigh",
+            "gpt-6.2-sol=medium",
+            "gpt-6.2-sol=high",
+            "gpt-6.2-sol=xhigh",
+            "gpt-6.1-sol=max",
+            "gpt-6.2-astra=xhigh",
         ]
     );
 }
 
 #[test]
-fn an_unoffered_intelligence_rung_drops_and_the_rest_keep_their_order() {
+fn removing_an_offer_restores_previously_dominated_pairs() {
     let no_haiku = |model: &str, _: &str| model != "claude-haiku-5-5";
     let ladder = effective_ladder(LadderSurface::ClaudeCode, None, no_haiku);
     assert_eq!(
         pairs_of(&ladder)[..2],
-        ["claude-sonnet-5-5=medium", "claude-opus-5-5=low"],
-        "the shipped ladder is stored, so no rung Haiku beat comes back"
+        ["claude-sonnet-5-5=low", "claude-sonnet-5-5=medium"],
+        "Sonnet low and medium return when Haiku is unavailable"
     );
 }
 
@@ -518,7 +532,7 @@ fn haiku_at(effort: &str) -> IntelligenceRung {
     IntelligenceRung::new("claude-haiku-5-5", effort)
 }
 
-/// Coding bands: haiku low 16, medium 17, high 18, xhigh 20 and sonnet low 20.
+/// Coding bands: Haiku low 8, medium 11, high 14, and Sonnet medium 17.
 #[test]
 fn a_ladder_climbs_when_no_estimated_intelligence_rung_sits_below_the_one_before() {
     let climbs_on = |on: &[IntelligenceRung]| climbs(LadderSurface::ClaudeCode, on);
@@ -531,20 +545,20 @@ fn a_ladder_climbs_when_no_estimated_intelligence_rung_sits_below_the_one_before
     assert!(!climbs_on(&[haiku_at("high"), haiku_at("medium")]));
     assert!(
         !climbs_on(&[
-            IntelligenceRung::new("claude-sonnet-5-5", "low"),
+            IntelligenceRung::new("claude-sonnet-5-5", "medium"),
             haiku_at("high")
         ]),
-        "the coding profile ranks sonnet low above haiku high"
+        "the coding profile ranks Sonnet medium above Haiku high"
     );
 }
 
 #[test]
 fn equal_bands_and_unestimated_intelligence_rungs_never_break_the_climb() {
-    let sonnet_low = IntelligenceRung::new("claude-sonnet-5-5", "low");
+    let sonnet_medium = IntelligenceRung::new("claude-sonnet-5-5", "medium");
     let unestimated = IntelligenceRung::new("my-model", "high");
     for tied in [
-        [haiku_at("xhigh"), sonnet_low.clone()],
-        [sonnet_low.clone(), haiku_at("xhigh")],
+        [haiku_at("max"), sonnet_medium.clone()],
+        [sonnet_medium.clone(), haiku_at("max")],
     ] {
         assert!(climbs(LadderSurface::ClaudeCode, &tied), "{tied:?}");
     }
@@ -566,12 +580,12 @@ fn the_shipped_ladders_climb_on_their_own_profile() {
 
 #[test]
 fn sorting_by_intelligence_is_stable_and_keeps_the_same_intelligence_rungs() {
-    let sonnet_low = IntelligenceRung::new("claude-sonnet-5-5", "low");
+    let sonnet_medium = IntelligenceRung::new("claude-sonnet-5-5", "medium");
     let unestimated = IntelligenceRung::new("my-model", "high");
     let on = vec![
         unestimated.clone(),
-        sonnet_low.clone(),
-        haiku_at("high"),
+        sonnet_medium.clone(),
+        haiku_at("max"),
         haiku_at("xhigh"),
         haiku_at("low"),
     ];
@@ -580,9 +594,9 @@ fn sorting_by_intelligence_is_stable_and_keeps_the_same_intelligence_rungs() {
         pairs_of(&sorted),
         [
             "claude-haiku-5-5=low",
-            "claude-haiku-5-5=high",
-            "claude-sonnet-5-5=low",
             "claude-haiku-5-5=xhigh",
+            "claude-sonnet-5-5=medium",
+            "claude-haiku-5-5=max",
             "my-model=high"
         ],
         "tied rungs keep the owner's order and an unestimated rung comes last"
@@ -598,17 +612,17 @@ fn sorting_by_intelligence_is_stable_and_keeps_the_same_intelligence_rungs() {
 #[test]
 fn the_served_ladder_says_whether_its_intelligence_rungs_climb() {
     assert!(served(LadderSurface::ClaudeCode, None, "medium", 0.0).climbs);
-    let general_order = "claude-sonnet-5-5=low, claude-haiku-5-5=high";
+    let descending_order = "claude-sonnet-5-5=medium, claude-haiku-5-5=high";
     let ladder = served(
         LadderSurface::ClaudeCode,
-        Some(general_order),
+        Some(descending_order),
         "medium",
         0.0,
     );
     assert!(ladder.customised);
     assert!(
         !ladder.climbs,
-        "the coding profile ranks sonnet low above haiku high"
+        "the coding profile ranks Sonnet medium above Haiku high"
     );
 }
 
@@ -660,7 +674,7 @@ fn the_prompt_bar_intelligence_rungs_carry_the_bands_the_ladder_route_serves() {
 }
 
 #[test]
-fn an_override_decides_which_intelligence_rungs_the_prompt_bar_lists() {
+fn the_prompt_bar_lists_the_override_and_the_default_intelligence_rung() {
     let ladder = served(
         LadderSurface::ClaudeCode,
         Some("claude-sonnet-5-5=low,claude-opus-5-5=high"),
@@ -673,7 +687,11 @@ fn an_override_decides_which_intelligence_rungs_the_prompt_bar_lists() {
             .iter()
             .map(|r| format!("{}={}", r.model, r.effort))
             .collect::<Vec<_>>(),
-        ["claude-sonnet-5-5=low", "claude-opus-5-5=high"]
+        [
+            "claude-sonnet-5-5=low",
+            "claude-opus-5-5=medium",
+            "claude-opus-5-5=high",
+        ]
     );
 }
 
@@ -681,7 +699,7 @@ fn an_override_decides_which_intelligence_rungs_the_prompt_bar_lists() {
 fn under_an_override_an_off_pair_follows_the_shipped_pair_before_it() {
     let ladder = served(
         LadderSurface::ClaudeCode,
-        Some("claude-opus-5-5=max, claude-haiku-5-5=low"),
+        Some("claude-fable-5-2=max, claude-haiku-5-5=low, claude-opus-5-5=medium"),
         "medium",
         0.0,
     );
@@ -693,13 +711,17 @@ fn under_an_override_an_off_pair_follows_the_shipped_pair_before_it() {
     assert_eq!(
         order[..4],
         [
-            "claude-opus-5-5=max",
+            "claude-fable-5-2=max",
             "claude-haiku-5-5=low",
             "claude-haiku-5-5=medium off",
             "claude-haiku-5-5=high off",
         ]
     );
-    assert_eq!(order.len(), 15, "{order:?}");
+    assert_eq!(
+        order.len(),
+        LadderSurface::ClaudeCode.shipped_pairs().len(),
+        "{order:?}"
+    );
     assert!(ladder.customised);
 }
 
@@ -713,7 +735,7 @@ fn a_one_million_twin_is_the_same_intelligence_rung_as_its_base_model() {
         base
     );
     assert!(ladder
-        .check_pick(&IntelligenceRung::new("claude-sonnet-5-5[1m]", "medium"))
+        .check_pick(&IntelligenceRung::new("claude-sonnet-5-5[1m]", "high"))
         .is_ok());
 }
 
@@ -724,9 +746,187 @@ fn an_off_intelligence_rung_is_served_but_refused_naming_every_one_that_is_on() 
     assert!(ladder.position_of(&off).is_some());
     let err = ladder.check_pick(&off).unwrap_err();
     assert!(err.contains("claude-sonnet-5-5=max is not a rung"), "{err}");
-    assert!(err.contains("claude-opus-5-5=max"), "{err}");
+    assert!(!err.contains("claude-fable-5-2=max"), "{err}");
+    assert!(err.contains("claude-fable-5-2=high"), "{err}");
     assert!(!err.contains("claude-sonnet-5-5=low"), "{err}");
     assert!(err.contains("lucidos intelligence-ladder"), "{err}");
+}
+
+/// A swapped model stays a rung that is on, so the owner can still pick it.
+/// An agent's pick of it is refused, naming the swap and the other rungs.
+#[test]
+fn an_agent_pick_of_a_refused_model_names_the_swap() {
+    let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let fable = IntelligenceRung::new("claude-fable-5-2", "high");
+    let fable_refused = |agent: CodingAgent, model: &str| {
+        agent == CodingAgent::ClaudeCode && model.starts_with("claude-fable-5-2")
+    };
+    assert_eq!(ladder.check_pick(&fable), Ok(()), "still on the ladder");
+    let err = ladder
+        .check_runnable_pick(&fable, fable_refused)
+        .unwrap_err();
+    assert!(err.contains("swapped claude-fable-5-2"), "{err}");
+    assert!(!err.contains("claude-fable-5-2=high"), "{err}");
+    assert!(err.contains(&opus_at("medium").to_string()), "{err}");
+    assert_eq!(
+        ladder.check_runnable_pick(&opus_at("medium"), fable_refused),
+        Ok(())
+    );
+    let off = IntelligenceRung::new("claude-sonnet-5-5", "max");
+    assert!(ladder
+        .check_runnable_pick(&off, fable_refused)
+        .unwrap_err()
+        .contains("is not a rung"));
+}
+
+/// The swap suggestions are rungs that are on, never the refused model, and
+/// nearest the refused rung first: two above and two below when both sides
+/// have them, the other side filling in at an end of the ladder.
+#[test]
+fn swap_suggestions_are_the_nearest_intelligence_rungs_on_another_model() {
+    let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let on = ladder.pairs();
+    let on_index = |pair: &IntelligenceRung| on.iter().position(|p| p == pair).unwrap();
+    let check = |refused: &IntelligenceRung| {
+        let suggestions = ladder.swap_suggestions(refused, |_| false);
+        assert!(
+            !suggestions.is_empty() && suggestions.len() <= 4,
+            "{suggestions:?}"
+        );
+        let at = ladder.position_of(refused).unwrap();
+        let mut last = 0;
+        for pair in &suggestions {
+            assert!(on.contains(pair), "{pair} is not on the ladder");
+            assert!(!runs_same_model(
+                CodingAgent::ClaudeCode,
+                &pair.model,
+                &refused.model
+            ));
+            let distance = ladder.position_of(pair).unwrap().abs_diff(at);
+            assert!(distance >= last, "{suggestions:?} is not nearest first");
+            last = distance;
+        }
+        suggestions
+    };
+    // The top rung that is on has nothing above it, so all four sit below.
+    let top = on.last().unwrap().clone();
+    let from_top = check(&top);
+    let top_others: Vec<_> = on
+        .iter()
+        .rev()
+        .filter(|p| !runs_same_model(CodingAgent::ClaudeCode, &p.model, &top.model))
+        .take(4)
+        .cloned()
+        .collect();
+    assert_eq!(from_top, top_others);
+    // A middle rung takes the nearest of each side.
+    let middle = opus_at("medium");
+    let around_middle = check(&middle);
+    let middle_at = on_index(&middle);
+    assert!(
+        around_middle.iter().any(|p| on_index(p) > middle_at),
+        "{around_middle:?}"
+    );
+    assert!(
+        around_middle.iter().any(|p| on_index(p) < middle_at),
+        "{around_middle:?}"
+    );
+    // An effort no rung offers sits at the model's lowest rung, not the top.
+    let off_ladder = IntelligenceRung::new("claude-opus-5-5", "no-such-effort");
+    let lowest_opus = ladder
+        .intelligence_rungs
+        .iter()
+        .find(|r| runs_same_model(CodingAgent::ClaudeCode, &r.model, "claude-opus-5-5"))
+        .map(|r| IntelligenceRung::new(&r.model, &r.effort))
+        .unwrap();
+    assert_eq!(
+        ladder.swap_suggestions(&off_ladder, |_| false),
+        ladder.swap_suggestions(&lowest_opus, |_| false)
+    );
+    // A model the backend also refused is never offered.
+    let also = &around_middle[0].model;
+    let without = ladder.swap_suggestions(&middle, |m| m == also);
+    assert!(without.iter().all(|p| &p.model != also), "{without:?}");
+}
+
+#[test]
+fn setting_the_intelligence_rungs_keeps_the_asked_order_and_refuses_a_bad_list() {
+    let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let haiku = IntelligenceRung::new("claude-haiku-5-5", "low");
+    let fable = IntelligenceRung::new("claude-fable-5-2", "high");
+    let asked = [fable.clone(), opus_at("medium"), haiku.clone()];
+    assert_eq!(
+        ladder.intelligence_rungs_set_to(&asked, None),
+        Ok(asked.to_vec())
+    );
+
+    let refusal =
+        |asked: &[IntelligenceRung]| ladder.intelligence_rungs_set_to(asked, None).unwrap_err();
+    assert!(refusal(&[]).contains("at least one"));
+    assert!(refusal(&[opus_at("medium"), opus_at("medium")]).contains("twice"));
+    assert!(refusal(std::slice::from_ref(&haiku)).contains("default rung"));
+    let unknown = IntelligenceRung::new("no-such-model", "low");
+    assert!(refusal(&[opus_at("medium"), unknown]).contains("not offered"));
+}
+
+#[test]
+fn removing_a_model_turns_off_its_intelligence_rungs_but_never_the_default_or_the_last() {
+    let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let default = "claude-opus-5-5";
+    let left = ladder
+        .intelligence_rungs_without("claude-fable-5-2", Some(default))
+        .unwrap();
+    assert!(!left.is_empty());
+    assert!(left
+        .iter()
+        .all(|p| !p.model.starts_with("claude-fable-5-2")));
+    assert_eq!(left, ladder.on_without_model("claude-fable-5-2"));
+
+    let refusal = |model: &str| {
+        ladder
+            .intelligence_rungs_without(model, Some(default))
+            .unwrap_err()
+    };
+    assert!(refusal(default).contains("default rung"));
+    assert!(refusal("no-such-model").contains("No rung that is on"));
+    let only_opus = served(
+        LadderSurface::ClaudeCode,
+        Some("claude-opus-5-5=medium"),
+        "medium",
+        0.0,
+    );
+    let last = only_opus
+        .intelligence_rungs_without(default, Some("claude-haiku-5-5"))
+        .unwrap_err();
+    assert!(last.contains("only model"), "{last}");
+}
+
+/// Chat may store no default rung, and its default selection then names the
+/// default model. Both edits keep a rung that runs it, and a ladder with no
+/// default model protects none.
+#[test]
+fn with_no_default_intelligence_rung_the_default_model_still_stays_on() {
+    let mut ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    ladder.default_intelligence_rung = None;
+    let default = "claude-opus-5-5";
+    let fable = IntelligenceRung::new("claude-fable-5-2", "high");
+
+    let set = ladder
+        .intelligence_rungs_set_to(std::slice::from_ref(&fable), Some(default))
+        .unwrap_err();
+    assert!(set.contains("default model"), "{set}");
+    assert!(ladder
+        .intelligence_rungs_set_to(&[fable.clone(), opus_at("high")], Some(default))
+        .is_ok());
+    let removed = ladder
+        .intelligence_rungs_without(default, Some(default))
+        .unwrap_err();
+    assert!(removed.contains("default rung"), "{removed}");
+
+    assert!(ladder
+        .intelligence_rungs_set_to(std::slice::from_ref(&fable), None)
+        .is_ok());
+    assert!(ladder.intelligence_rungs_without(default, None).is_ok());
 }
 
 #[test]
@@ -791,7 +991,7 @@ fn an_intelligence_band_reads_in_hundredths() {
 fn the_bands_follow_the_reference_intelligence_rung() {
     let at_medium = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
     assert_eq!(cost_label(&at_medium, "claude-opus-5-5", "medium"), "1.0×");
-    assert_eq!(cost_label(&at_medium, "claude-opus-5-5", "max"), "4.5×");
+    assert_eq!(cost_label(&at_medium, "claude-opus-5-5", "max"), "4.0×");
     assert_eq!(cost_label(&at_medium, "claude-haiku-5-5", "low"), "0.02×");
     assert_eq!(
         intelligence_label(&at_medium, "claude-opus-5-5", "medium"),
@@ -799,22 +999,22 @@ fn the_bands_follow_the_reference_intelligence_rung() {
     );
     assert_eq!(
         intelligence_label(&at_medium, "claude-opus-5-5", "max"),
-        "1.12×"
+        "1.21×"
     );
     assert_eq!(
         intelligence_label(&at_medium, "claude-haiku-5-5", "low"),
-        "0.64×"
+        "0.33×"
     );
     let at_high = served(LadderSurface::ClaudeCode, None, "high", 0.0);
     assert_eq!(cost_label(&at_high, "claude-opus-5-5", "high"), "1.0×");
-    assert_eq!(cost_label(&at_high, "claude-opus-5-5", "medium"), "0.8×");
+    assert_eq!(cost_label(&at_high, "claude-opus-5-5", "medium"), "0.7×");
     assert_eq!(
         intelligence_label(&at_high, "claude-opus-5-5", "high"),
         "1.0×"
     );
     assert_eq!(
         intelligence_label(&at_high, "claude-opus-5-5", "medium"),
-        "0.93×"
+        "0.92×"
     );
     assert!(served_intelligence_rung(&at_high, "claude-opus-5-5", "high").is_default);
     assert_eq!(at_high.reference, Some(opus_at("high")));
@@ -845,8 +1045,7 @@ fn covered_coding_scores_keep_their_profile_after_smoothing() {
     );
 }
 
-/// An unmeasured pair keeps its model's measured gap, so Opus xhigh never
-/// reads level with high or past max on the coding profile.
+/// Missing coding measurements use the model gap; the effort envelope permits ties.
 #[test]
 fn the_coding_ladder_keeps_a_models_unmeasured_efforts_rising() {
     let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
@@ -866,9 +1065,16 @@ fn the_coding_ladder_keeps_a_models_unmeasured_efforts_rising() {
         "Opus max reads as xhigh"
     );
     let codex = served(LadderSurface::Codex, None, "medium", 0.0);
-    for model in ["gpt-6-astra", "gpt-5.6-luna"] {
-        assert_efforts_rise(&codex, model, &["low", "medium", "high", "xhigh", "max"]);
-    }
+    assert_efforts_rise(
+        &codex,
+        "gpt-6-luna",
+        &["low", "medium", "high", "xhigh", "max"],
+    );
+    assert_efforts_rise(&codex, "gpt-6-astra", &["low", "medium", "high", "max"]);
+    assert_eq!(
+        intelligence_label(&codex, "gpt-6-astra", "high"),
+        intelligence_label(&codex, "gpt-6-astra", "xhigh")
+    );
 }
 
 fn assert_efforts_rise(ladder: &IntelligenceLadder, model: &str, efforts: &[&str]) {
@@ -914,7 +1120,7 @@ fn a_pair_with_no_estimate_has_no_band() {
 fn the_long_prompt_share_prices_in_only_a_model_with_a_long_tier() {
     let base = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
     let long = served(LadderSurface::ClaudeCode, None, "medium", 0.8);
-    assert_eq!(cost_label(&long, "claude-haiku-5-5", "low"), "0.08×");
+    assert_eq!(cost_label(&long, "claude-haiku-5-5", "low"), "0.07×");
     assert_eq!(cost_label(&long, "claude-haiku-5-5", "max"), "0.6×");
     assert_eq!(cost_label(&long, "claude-sonnet-5-5", "high"), "0.6×");
     assert_eq!(
@@ -1011,6 +1217,45 @@ fn a_registry_tier_claude_code_does_not_take_is_not_pinned() {
             |_| Some("none")
         ),
         (Some("claude-opus-4-8@default".into()), None)
+    );
+}
+
+#[test]
+fn a_swap_to_the_default_model_runs_at_the_default_effort() {
+    // Reported case: Fable 5.2 at low asked, Opus 5.5 served, default
+    // Opus 5.5 at medium. The served model must not keep `low`.
+    assert_eq!(
+        fallback_effort(
+            CodingAgent::ClaudeCode,
+            "claude-opus-5-5",
+            Some(&opus_medium()),
+            |_| Some("high")
+        ),
+        Some("medium".into())
+    );
+}
+
+#[test]
+fn a_swap_to_another_model_runs_at_that_models_default_effort() {
+    let registry = |model: &str| (model == "claude-sonnet-5-5").then_some("high");
+    assert_eq!(
+        fallback_effort(
+            CodingAgent::ClaudeCode,
+            "claude-sonnet-5-5",
+            Some(&opus_medium()),
+            registry
+        ),
+        Some("high".into())
+    );
+}
+
+#[test]
+fn a_swap_with_no_default_implementer_runs_at_the_models_default_effort() {
+    assert_eq!(
+        fallback_effort(CodingAgent::ClaudeCode, "claude-opus-5-5", None, |_| {
+            Some("medium")
+        }),
+        Some("medium".into())
     );
 }
 
@@ -1116,7 +1361,10 @@ async fn the_shipped_codex_default_is_an_intelligence_rung_on_the_shipped_codex_
     let routes = seeded_routes(&pool).await;
     assert_eq!(
         default_implementer(&pool, CodingAgent::Codex).await,
-        Some(sol_medium())
+        Some(DefaultImplementer {
+            model: "gpt-6.2-sol".into(),
+            effort: Some("medium".into())
+        })
     );
     let ladder = load(&pool, &routes, LadderSurface::Codex).await;
     let default = ladder
@@ -1205,7 +1453,9 @@ fn haiku_chat_ladder(route: ProviderKind) -> IntelligenceLadder {
         routes: ModelRoutes {
             registry: haiku_registry(),
             configured: vec![route],
+            provider: None,
         },
+        unavailable_routes: Default::default(),
         labels: HashMap::from([(HAIKU.to_string(), "Haiku 5.5".to_string())]),
     };
     assemble(
@@ -1341,7 +1591,9 @@ fn chat_offers_a_current_model_at_a_tier_one_of_its_routes_takes() {
         routes: ModelRoutes {
             registry: registry.clone(),
             configured: ProviderKind::ALL.to_vec(),
+            provider: None,
         },
+        unavailable_routes: Default::default(),
         labels: HashMap::new(),
     };
     assert!(offer.offers(HAIKU, "xhigh"), "Anthropic takes xhigh");
@@ -1372,7 +1624,7 @@ fn a_chat_refusal_names_the_lucidos_agent_ladder_and_its_surface_flag() {
     );
     assert!(err.contains("--surface chat"), "{err}");
     assert!(ladder
-        .check_pick(&IntelligenceRung::new("claude-opus-5-5[1m]", "xhigh"))
+        .check_pick(&IntelligenceRung::new("claude-opus-5-5[1m]", "medium"))
         .is_ok());
 }
 
@@ -1383,6 +1635,7 @@ async fn seeded_routes(pool: &PgPool) -> ModelRoutes {
     ModelRoutes {
         registry,
         configured: ProviderKind::ALL.to_vec(),
+        provider: None,
     }
 }
 
@@ -1396,7 +1649,7 @@ async fn an_agents_chat_pick_is_bound_to_the_chat_ladder() {
     };
     assert_eq!(check(None, None).await, Ok(()), "no pick is the default");
     assert_eq!(
-        check(Some("claude-opus-5-5[1m]"), Some("xhigh")).await,
+        check(Some("claude-opus-5-5[1m]"), Some("medium")).await,
         Ok(())
     );
     let err = check(Some("claude-sonnet-5-5"), Some("low"))
@@ -1437,6 +1690,37 @@ async fn the_chat_ladder_loads_with_the_account_default_marked() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+#[tokio::test]
+async fn a_chat_default_without_an_estimate_counts_from_the_claude_code_default() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let routes = seeded_routes(&pool).await;
+    let model = "user-added-model";
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), model)
+        .await
+        .unwrap();
+    crate::test_support::seed_preference(
+        &pool,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        &format!("{model}=high"),
+    )
+    .await
+    .unwrap();
+    let ladder = load(&pool, &routes, LadderSurface::Chat).await;
+    assert_eq!(
+        ladder.default_intelligence_rung,
+        Some(IntelligenceRung::new(model, "high"))
+    );
+    let claude_code = default_coding_intelligence_rung(&pool, CodingAgent::ClaudeCode)
+        .await
+        .expect("Claude Code ships a default rung");
+    assert_eq!(ladder.reference, Some(claude_code));
+    assert!(ladder
+        .intelligence_rungs
+        .iter()
+        .any(|r| r.on && r.intelligence.is_some()));
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 /// An operational ladder must never demote a model when its effort increases.
 /// Check the shipped data independently of the generator that writes it.
 #[test]
@@ -1463,4 +1747,472 @@ fn every_models_effort_bands_are_nondecreasing() {
             previous = Some(pair);
         }
     }
+}
+
+#[test]
+fn other_backends_exclude_the_current_and_uninstalled_agents() {
+    let other = |current, installed| other_coding_agents(current, |a| a == installed);
+    assert_eq!(
+        other(CodingAgent::ClaudeCode, CodingAgent::Codex),
+        vec![CodingAgent::Codex]
+    );
+    assert!(other(CodingAgent::ClaudeCode, CodingAgent::ClaudeCode).is_empty());
+    assert!(other_coding_agents(CodingAgent::Codex, |_| false).is_empty());
+}
+
+#[test]
+fn codex_can_count_from_the_claude_code_reference() {
+    let reference = opus_at("medium");
+    let ladder = assemble(
+        LadderSurface::Codex,
+        &CodingAgentOffer(CodingAgent::Codex),
+        None,
+        Some(IntelligenceRung::new("gpt-6.1-sol", "medium")),
+        Some(reference.clone()),
+        Some(share_of(0.0)),
+    );
+    assert_eq!(ladder.reference, Some(reference));
+    assert!(ladder
+        .intelligence_rungs
+        .iter()
+        .filter(|r| r.on)
+        .all(|r| r.cost.is_some() && r.intelligence.is_some()));
+}
+
+#[tokio::test]
+async fn chat_frontier_uses_available_routes_without_rewriting_overrides() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let mut routes = seeded_routes(&pool).await;
+    routes.configured = vec![ProviderKind::Anthropic];
+    let ladder = load(&pool, &routes, LadderSurface::Chat).await;
+    let restored = IntelligenceRung::new(HAIKU, "low");
+    assert!(ladder.pairs().contains(&restored));
+    assert!(check_agent_pick(
+        &pool,
+        &routes,
+        LadderSurface::Chat,
+        Some(HAIKU),
+        Some("low")
+    )
+    .await
+    .is_ok());
+    assert!(ladder
+        .pairs()
+        .iter()
+        .all(|p| p.model.starts_with("claude-")));
+    assert!(ladder
+        .intelligence_rungs
+        .iter()
+        .any(|p| p.model == "gpt-6.2-sol"));
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let value = "gpt-6.2-sol=high, claude-haiku-5-5=low";
+    crate::core::PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::INTELLIGENCE_LADDER_CHAT.key(),
+        value,
+        None,
+    )
+    .await
+    .unwrap();
+    let overridden = load(&pool, &routes, LadderSurface::Chat).await;
+    let default = overridden.default_intelligence_rung.as_ref().unwrap();
+    assert_eq!(overridden.check_pick(default), Ok(()));
+    let saved_order: Vec<_> = overridden
+        .pairs()
+        .into_iter()
+        .filter(|p| p != default)
+        .collect();
+    assert_eq!(
+        pairs_of(&saved_order),
+        ["gpt-6.2-sol=high", "claude-haiku-5-5=low"]
+    );
+    assert_eq!(
+        prefs::INTELLIGENCE_LADDER_CHAT.read(&pool).await.as_deref(),
+        Some(value)
+    );
+    crate::core::PreferenceStore::delete(&pool, &bus, prefs::INTELLIGENCE_LADDER_CHAT.key(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        load(&pool, &routes, LadderSurface::Chat).await.pairs(),
+        ladder.pairs()
+    );
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn availability_uses_the_selected_routes_efforts_and_preserves_catalogue_support() {
+    let mut offer = ChatOffer {
+        routes: ModelRoutes {
+            registry: haiku_registry(),
+            configured: vec![ProviderKind::Vertex, ProviderKind::Anthropic],
+            provider: None,
+        },
+        labels: HashMap::new(),
+        unavailable_routes: Default::default(),
+    };
+    // A user-defined route can send a different wire model with different efforts.
+    offer
+        .routes
+        .registry
+        .write()
+        .unwrap()
+        .get_mut(HAIKU)
+        .unwrap()
+        .routes[0]
+        .wire_id = "gemini-4-carbon".into();
+    assert!(offer.offers(HAIKU, "xhigh"));
+    assert!(
+        !offer.available(HAIKU, "xhigh"),
+        "the selected wire model does not support xhigh"
+    );
+    offer
+        .unavailable_routes
+        .insert((ProviderKind::Vertex, HAIKU.to_string()));
+    assert!(
+        !offer.available(HAIKU, "high"),
+        "the router does not skip a configured route after a model refusal"
+    );
+    offer.routes.configured = vec![ProviderKind::Anthropic];
+    assert!(
+        offer.available(HAIKU, "xhigh"),
+        "Anthropic serves xhigh when selected"
+    );
+    offer
+        .routes
+        .registry
+        .write()
+        .unwrap()
+        .get_mut(HAIKU)
+        .unwrap()
+        .preferred = Some(ProviderKind::Vertex);
+    assert!(
+        !offer.available(HAIKU, "high"),
+        "an unavailable explicit route pin is not substituted"
+    );
+    assert!(offer.offers(HAIKU, "high"));
+}
+
+#[tokio::test]
+async fn every_provider_subset_keeps_only_routes_it_can_serve() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let mut routes = seeded_routes(&pool).await;
+    for kind in ProviderKind::ALL {
+        routes.configured = vec![kind];
+        let offer = ChatOffer::load(&pool, routes.clone()).await;
+        let served = load(&pool, &routes, LadderSurface::Chat).await;
+        assert!(
+            !served.intelligence_rungs.is_empty(),
+            "catalogue stays visible for {kind:?}"
+        );
+        for pair in served.pairs() {
+            assert!(
+                offer.available(&pair.model, &pair.effort),
+                "{kind:?}: {pair}"
+            );
+        }
+    }
+    routes.configured = vec![ProviderKind::Anthropic];
+    // Refusals use the registry identity, even when the provider sends a snapshot alias.
+    routes
+        .registry
+        .write()
+        .unwrap()
+        .get_mut(HAIKU)
+        .unwrap()
+        .routes
+        .iter_mut()
+        .find(|r| r.provider == ProviderKind::Anthropic)
+        .unwrap()
+        .wire_id = format!("{HAIKU}-20261101");
+    let ledger = crate::llm::not_served::NotServedLedger::default();
+    let router = crate::llm::RoutingProvider::new(
+        crate::llm::RoutingBackends {
+            anthropic: Some(std::sync::Arc::new(
+                crate::llm::AnthropicProvider::new(
+                    crate::llm::AnthropicAuth::ApiKey("fixture-key".into()),
+                    HAIKU.into(),
+                )
+                .unwrap(),
+            )),
+            ..Default::default()
+        },
+        routes.registry.clone(),
+        HAIKU.into(),
+    )
+    .observing(ledger.clone());
+    routes.provider = Some(std::sync::Arc::new(router));
+    assert!(load(&pool, &routes, LadderSurface::Chat)
+        .await
+        .pairs()
+        .iter()
+        .any(|p| p.model == HAIKU));
+    ledger.mark(ProviderKind::Anthropic, HAIKU);
+    let refused = load(&pool, &routes, LadderSurface::Chat).await;
+    assert!(!refused.pairs().iter().any(|p| p.model == HAIKU));
+    assert!(refused.intelligence_rungs.iter().any(|p| p.model == HAIKU));
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn vertex_chat_defaults_to_neon_and_respects_availability_and_pins() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let mut routes = seeded_routes(&pool).await;
+    routes.configured = vec![ProviderKind::Vertex];
+    let mut offer = ChatOffer::load(&pool, routes.clone()).await;
+    let neon = IntelligenceRung::new("gemini-4-neon", "high");
+    assert_eq!(
+        default_chat_selection(&pool, &offer)
+            .await
+            .intelligence_rung(),
+        Some(neon.clone())
+    );
+    let ladder = load(&pool, &routes, LadderSurface::Chat).await;
+    assert_eq!(ladder.default_intelligence_rung.as_ref(), Some(&neon));
+    assert_eq!(ladder.check_pick(&neon), Ok(()));
+    offer
+        .unavailable_routes
+        .insert((ProviderKind::Vertex, "gemini-4-neon".into()));
+    assert_eq!(
+        default_chat_selection(&pool, &offer).await.model,
+        "gemini-4-carbon"
+    );
+
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "gemini-4-carbon")
+        .await
+        .unwrap();
+    let offer = ChatOffer::load(&pool, routes).await;
+    assert_eq!(
+        default_chat_selection(&pool, &offer).await.model,
+        "gemini-4-carbon"
+    );
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn automatic_chat_defaults_share_routes_efforts_and_preserve_pins() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let mut routes = seeded_routes(&pool).await;
+    for provider in [
+        ProviderKind::OpenAi,
+        ProviderKind::ChatGptPlan,
+        ProviderKind::OpenRouter,
+    ] {
+        routes.configured = vec![provider];
+        let offer = ChatOffer::load(&pool, routes.clone()).await;
+        let default = default_chat_selection(&pool, &offer).await;
+        assert_eq!(
+            default.intelligence_rung(),
+            Some(IntelligenceRung::new("gpt-6.2-sol", "medium"))
+        );
+        let ladder = load(&pool, &routes, LadderSurface::Chat).await;
+        assert_eq!(
+            ladder.default_intelligence_rung,
+            default.intelligence_rung()
+        );
+        assert_eq!(ladder.reference, default.intelligence_rung());
+        assert!(
+            check_agent_pick(&pool, &routes, LadderSurface::Chat, None, Some("medium"))
+                .await
+                .is_ok()
+        );
+    }
+    crate::test_support::seed_preference(
+        &pool,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        "gpt-6.2-sol=high",
+    )
+    .await
+    .unwrap();
+    let mut offer = ChatOffer::load(&pool, routes.clone()).await;
+    assert_eq!(
+        default_chat_selection(&pool, &offer)
+            .await
+            .effort
+            .as_deref(),
+        Some("high")
+    );
+    for provider in ProviderKind::ALL {
+        offer
+            .unavailable_routes
+            .insert((provider, "gpt-6.2-sol".into()));
+    }
+    assert_eq!(
+        default_chat_selection(&pool, &offer).await.model,
+        "gpt-6.1-sol"
+    );
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "gpt-6.1-sol")
+        .await
+        .unwrap();
+    assert_eq!(
+        default_chat_selection(&pool, &offer).await.model,
+        "gpt-6.1-sol"
+    );
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-5-5")
+        .await
+        .unwrap();
+    assert_eq!(
+        default_chat_selection(&pool, &offer).await.model,
+        "claude-opus-5-5",
+        "an unavailable explicit pin remains authoritative"
+    );
+    assert_eq!(
+        prefs::CHAT_MODEL.stored(&pool).await.as_deref(),
+        Some("claude-opus-5-5")
+    );
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+#[test]
+fn current_openai_default_keeps_the_standard_price_tier() {
+    let table: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../lucidos-core/src/llm/model_prices.json"
+    ))
+    .unwrap();
+    let card = |model: &str| &table["models"][model][0];
+    for field in [
+        "uncached_in",
+        "cache_write",
+        "cache_write_12h",
+        "cache_read",
+        "out",
+    ] {
+        let price = |model| card(model)[field].as_f64().unwrap();
+        assert_eq!(price("gpt-6.2-sol"), price("gpt-6.1-sol"), "{field}");
+        assert!(
+            price("gpt-6-luna") < price("gpt-6.2-sol"),
+            "cheaper tiers stay distinct: {field}"
+        );
+        assert!(
+            price("gpt-6.2-astra") >= 4.0 * price("gpt-6.2-sol"),
+            "Astra remains a premium choice: {field}"
+        );
+    }
+    assert_eq!(prefs::MODEL_CODEX.default_text(), "gpt-6.2-sol");
+}
+
+#[test]
+fn customised_ladders_keep_the_offered_default_on() {
+    let offer = CodingAgentOffer(CodingAgent::Codex);
+    let surface = LadderSurface::Codex;
+    let default = IntelligenceRung::new("gpt-6.2-sol", "medium");
+    let low = IntelligenceRung::new("gpt-6.2-sol", "low");
+    let high = IntelligenceRung::new("gpt-6.2-sol", "high");
+    let cases = [
+        (
+            vec![high.clone(), low.clone()],
+            vec![default.clone(), high.clone(), low.clone()],
+        ),
+        (
+            vec![low.clone(), high.clone()],
+            vec![low.clone(), default.clone(), high.clone()],
+        ),
+        (vec![low.clone()], vec![low.clone(), default.clone()]),
+        (
+            vec![high.clone(), default.clone()],
+            vec![high, default.clone()],
+        ),
+    ];
+    assert!(offer.available(&default.model, &default.effort));
+    for (stored, expected) in cases {
+        let value = pairs_of(&stored).join(", ");
+        let ladder = assemble(
+            surface,
+            &offer,
+            Some(&value),
+            Some(default.clone()),
+            None,
+            None,
+        );
+        assert_eq!(ladder.pairs(), expected);
+        assert_eq!(ladder.check_pick(&default), Ok(()));
+    }
+
+    let unknown = IntelligenceRung::new("unestimated-model", "low");
+    let value = low.to_string();
+    let appended = assemble(
+        surface,
+        &OfferAll,
+        Some(&value),
+        Some(unknown.clone()),
+        None,
+        None,
+    );
+    assert_eq!(appended.pairs(), vec![low.clone(), unknown.clone()]);
+    let unavailable = assemble(surface, &offer, Some(&value), Some(unknown), None, None);
+    assert_eq!(unavailable.pairs(), vec![low]);
+}
+
+#[tokio::test]
+async fn chat_route_checks_overlap_and_each_route_is_checked_once() {
+    struct Routes {
+        both_started: tokio::sync::Barrier,
+        checks: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for Routes {
+        async fn chat(
+            &self,
+            _: Vec<crate::llm::Message>,
+            _: Vec<crate::llm::provider::ToolDefinition>,
+            _: crate::llm::ModelSelection<'_>,
+            _: Option<&str>,
+            _: Option<crate::llm::TokenCallback>,
+            _: crate::llm::metered::CallToken,
+        ) -> Result<crate::llm::provider::LlmResponse, Box<dyn std::error::Error + Send + Sync>>
+        {
+            unreachable!("checking a route never calls the model")
+        }
+
+        async fn route_available(
+            &self,
+            _: ProviderKind,
+            model: &str,
+            _: &str,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.checks.lock().unwrap().push(model.to_string());
+            self.both_started.wait().await;
+            Ok(model == HAIKU)
+        }
+    }
+
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let registry = haiku_registry();
+    let provider_kind = {
+        let mut registry = registry.write().unwrap();
+        let mut row = registry[HAIKU].clone();
+        let duplicate = row.routes[0].clone();
+        let kind = duplicate.provider;
+        row.routes = vec![duplicate.clone(), duplicate];
+        registry.insert("other-model".into(), row);
+        kind
+    };
+    let provider = std::sync::Arc::new(Routes {
+        both_started: tokio::sync::Barrier::new(2),
+        checks: Default::default(),
+    });
+    let offer = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ChatOffer::load(
+            &pool,
+            ModelRoutes {
+                registry,
+                configured: vec![provider_kind],
+                provider: Some(provider.clone()),
+            },
+        ),
+    )
+    .await
+    .expect("both route checks must start before either can finish");
+    let mut checks = provider.checks.lock().unwrap().clone();
+    checks.sort();
+    assert_eq!(checks, [HAIKU, "other-model"]);
+    assert_eq!(
+        offer.unavailable_routes,
+        [(provider_kind, "other-model".into())].into()
+    );
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
 }

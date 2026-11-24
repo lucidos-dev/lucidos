@@ -1,7 +1,3 @@
-/**
- * The theme half of the appearance contract: what every surface does with the
- * resolved maps the engine serves.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -24,6 +20,9 @@ import {
   shadowWithinReach,
 } from './appearance';
 
+import { MAX_VALUE_LENGTH } from './generated/theme-parts';
+import { FONT_CATALOG, WORKSPACE_FONT_FALLBACKS, WORKSPACE_FONT_LIMITS } from './generated/font-catalog';
+
 const here: string = dirname(fileURLToPath(import.meta.url));
 const cases: {
   shadowTokens: string[];
@@ -35,13 +34,24 @@ const cases: {
   validValues: string[];
   invalidValues: string[];
 } = JSON.parse(readFileSync(
-  resolve(here, '../../../crates/lucidos-engine/src/core/themes/theme-validation-cases.json'),
+  resolve(here, '../../../crates/lucidos-core/src/core/themes/theme-validation-cases.json'),
   'utf-8',
 ));
 
 describe('the token gate agrees with the engine', () => {
-  // The engine's `core/themes` tests read the same fixture. If the two sides
-  // disagreed, a theme could save and then never paint.
+  it('accepts every catalog and longest workspace font stack', () => {
+    for (const font of FONT_CATALOG) expect(isValidOverrideValue(font.stack)).toBe(true);
+    for (const fallback of Object.values(WORKSPACE_FONT_FALLBACKS)) {
+      const stack = `'ws-${'a'.repeat(WORKSPACE_FONT_LIMITS.slug)}', ${fallback}`;
+      expect(isValidOverrideValue(stack)).toBe(true);
+    }
+  });
+  it('caps ASCII and astral values by UTF-16 units', () => {
+    for (const value of ['a'.repeat(MAX_VALUE_LENGTH), '😀'.repeat(MAX_VALUE_LENGTH / 2)]) {
+      expect(isValidOverrideValue(value)).toBe(true);
+      expect(isValidOverrideValue(value + 'a')).toBe(false);
+    }
+  });
   it.each(cases.validNames)('accepts the name %s', name => {
     expect(isValidOverrideName(name)).toBe(true);
   });
@@ -86,16 +96,12 @@ describe('parseResolvedTheme', () => {
     expect(theme.fonts).toEqual({ ui: 'geist', mono: 'geist-mono' });
   });
 
-  // The engine refuses these when the theme is written. A cache in storage is
-  // data, so the client drops them too.
   it('drops an unknown id and an inherited key', () => {
     for (const ui of ['comic-sans', 'toString', 42]) {
       expect(parseResolvedTheme(JSON.stringify({ fonts: { ui, mono: ui } })).fonts).toEqual({});
     }
   });
 
-  // ADR 0303: the fonts that once loaded from Google are bundled, so a theme
-  // may name them.
   it('keeps a font that once loaded from Google', () => {
     const theme = parseResolvedTheme(JSON.stringify({ fonts: { ui: 'inter', mono: 'jetbrains-mono' } }));
     expect(theme.fonts).toEqual({ ui: 'inter', mono: 'jetbrains-mono' });
@@ -195,7 +201,6 @@ describe('protected surfaces (ADR 0309)', () => {
       '--part-surface-border-style': 'double',
     }));
     expect(overrides).toEqual({ '--part-surface-border-style': 'double' });
-    // A theme carries them: the resolved map keeps the token.
     const theme = parseResolvedTheme(JSON.stringify({ dark: { '--part-screen-background-image': scanlines }, light: {} }));
     expect(theme.dark['--part-screen-background-image']).toBe(scanlines);
   });

@@ -1,12 +1,3 @@
-/**
- * The appearance contract, pinned by input table.
- *
- * Written BEFORE the four duplicated copies were collapsed into it, asserting
- * what they did at that moment. The refactor's whole promise is that nothing a
- * user sees changes, so these cases are the fixed target the rewritten boot
- * scripts and store have to keep hitting: unset, each theme, each font, a
- * legacy scale value, and garbage in every slot.
- */
 import { describe, it, expect, vi } from 'vitest';
 import { PREF_FONT_FAMILY } from './generated/preference-catalog';
 import {
@@ -85,9 +76,6 @@ describe('theme preference precedence', () => {
   });
 
   it('a missing server value never clobbers a present localStorage value (regression)', () => {
-    // The systemic dark-flash bug: the active device had no server-scoped
-    // theme, so `prefs['theme-mode'] || 'dark'` returned 'dark' and overwrote the
-    // light value the FOUC script had already applied from localStorage.
     expect(resolveThemeModePreference(undefined, 'light', () => 'light')).toBe('light');
   });
 });
@@ -149,7 +137,6 @@ describe('what a repaint paints', () => {
 });
 
 describe('following the OS appearance', () => {
-  /** A page whose OS reads `light` once `osLight` is set, painted dark. */
   function fakePage() {
     const page = { shown: true, osLight: false, applied: 0 };
     const follower = followSystemThemeMode({
@@ -244,18 +231,12 @@ describe('font key resolution', () => {
   });
 
   it('never accepts an INHERITED key as a font', () => {
-    // The key comes out of localStorage, and `'toString' in FONT_STACKS` is
-    // true. Accepting it would write `Object.prototype.toString`'s source text
-    // into --font-ui.
     for (const stored of ['toString', 'constructor', 'valueOf', '__proto__', 'hasOwnProperty']) {
       expect(resolveFontKey(stored, NO_THEME_FONT)).toBe('fira-code');
     }
   });
 
   it('resolves a real pair for every key it can return', () => {
-    // The caller reads BOTH maps with this key. A key outside the map would
-    // take a stack from one and `normal` features from the other, and
-    // `normal` is not "ligatures off".
     for (const stored of ['toString', 'comic-sans', null, 'inter', FOLLOW_THEME]) {
       for (const theme of [NO_THEME_FONT, THEME_GEIST]) {
         const key = resolveFontKey(stored, theme);
@@ -345,9 +326,6 @@ describe('ligature features', () => {
   });
 
   it('never spells the OFF value `normal`', () => {
-    // `liga` and `calt` are default-ON, so `normal` renders identically to `1`
-    // and the whole feature would be inert. This is the assertion that caught a
-    // shipped no-op once already.
     expect(fontFeaturesFor('fira-code').text).not.toBe('normal');
     expect(fontFeaturesFor('fira-code').text).toMatch(/"liga"\s+0/);
   });
@@ -375,11 +353,6 @@ describe('ui scale', () => {
   });
 
   it('answers null for nothing usable, rather than the default', () => {
-    // `null` is what leaves --user-ui-scale UNSET so the stylesheet's own
-    // fallback answers. Writing the default inline looks identical and then
-    // quietly beats any later override of that property.
-    // `toString` is in the list because the legacy map is indexed by a stored
-    // string, so an inherited key must not read as a legacy scale.
     for (const raw of [null, undefined, '', 'huge', 'toString', 'constructor']) {
       expect(parseUiScale(raw)).toBeNull();
     }
@@ -388,7 +361,6 @@ describe('ui scale', () => {
 
 describe('reduced motion', () => {
   it('follows the OS only under `system`', () => {
-    // The whole contract: 3 values x OS on/off.
     expect(resolveReducedMotion('system', true)).toBe(true);
     expect(resolveReducedMotion('system', false)).toBe(false);
     expect(resolveReducedMotion('reduce', true)).toBe(true);
@@ -422,10 +394,7 @@ describe('the animation duration scale', () => {
   });
 
   it('stays above zero, so a transition still ends and still fires its end event', () => {
-    // A 0s transition never starts, so it fires no `transitionend`. Code
-    // that waits on one would then hang on its fallback timer.
     expect(REDUCED_MOTION_DURATION_SCALE).toBeGreaterThan(0);
-    // And short enough that the slowest token (0.5s) ends inside one frame.
     expect(500 * REDUCED_MOTION_DURATION_SCALE).toBeLessThan(16);
   });
 

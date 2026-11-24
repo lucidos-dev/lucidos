@@ -26,7 +26,6 @@ function style(over: Partial<ResponseStyle> & { id: string }): ResponseStyle {
   };
 }
 
-/** What the engine serves a workspace that has changed nothing. */
 const SHIPPED: ResponseStyle[] = [
   style({
     id: STANDARD_ID,
@@ -58,8 +57,6 @@ describe('the response style picker', () => {
     expect(options.map((o) => o.value)).toEqual([STANDARD_ID, 'concise', 'minimal']);
     for (const option of options) {
       expect(option.label.length).toBeGreaterThan(0);
-      // The description is what tells a user what the setting DOES to an
-      // answer. A row without one is a name they have to guess at.
       expect(option.description?.length ?? 0).toBeGreaterThan(0);
     }
   });
@@ -85,8 +82,6 @@ describe('the response style picker', () => {
 
 describe('the stored document', () => {
   it('holds nothing at all while every shipped style is untouched', () => {
-    // The promise behind Reset, and behind a later reword of the shipped text
-    // reaching whoever left it alone: an untouched row is simply absent.
     expect(documentWithout(SHIPPED, 'nothing')).toEqual([]);
   });
 
@@ -113,8 +108,6 @@ describe('the stored document', () => {
       label: 'Board report',
       instruction: '- Two bullets.',
     });
-    // The other override survives. Rebuilding the document from the library is
-    // what guarantees that, where patching the old one could drop it.
     expect(document.map((e) => e.id).sort()).toEqual(['board-report', 'concise']);
     expect(document.find((e) => e.id === 'concise')?.instruction).toBe('- Mine.');
   });
@@ -126,15 +119,11 @@ describe('the stored document', () => {
       ...SHIPPED.slice(2),
       style({ id: 'board-report', label: 'Board report' }),
     ];
-    // Reset a shipped style: the override goes, the user style stays.
     expect(documentWithout(library, 'concise').map((e) => e.id)).toEqual(['board-report']);
-    // Delete a user style: the override stays.
     expect(documentWithout(library, 'board-report').map((e) => e.id)).toEqual(['concise']);
   });
 
   it('never writes an entry for Standard', () => {
-    // The engine refuses one outright. Sending it would turn a save into a
-    // toast, so the client must not build one in the first place.
     const document = documentWithEdit(SHIPPED, {
       id: 'board-report',
       label: 'Board report',
@@ -157,8 +146,6 @@ describe('the stored document', () => {
   });
 
   it('replaces an edited row IN PLACE, so the picker does not reshuffle', () => {
-    // Document order is picker order for a user's own styles. Appending would
-    // move a style to the bottom every time its typo was fixed.
     const library = [
       ...SHIPPED,
       style({ id: 'first', instruction: '- a' }),
@@ -175,9 +162,6 @@ describe('the stored document', () => {
   });
 
   it('refuses an edit that would push the document past the limit', () => {
-    // The Add card is already hidden here, but Edit is not: overriding an
-    // untouched shipped style adds a row the engine would then refuse. The
-    // bound is on the document, so the check has to be too.
     const full = [
       ...SHIPPED,
       ...Array.from({ length: MAX_STYLES }, (_, i) => style({ id: `style-${i}` })),
@@ -188,8 +172,6 @@ describe('the stored document', () => {
 
     const taken = full.filter((s) => s.id !== 'concise').map((s) => s.id);
     expect(describeStyleProblem(draft, taken, nextSize)).toContain(String(MAX_STYLES));
-    // Editing a style that ALREADY has a row does not grow the document, so a
-    // full library must still allow it.
     const own = { id: 'style-0', label: 'Mine', instruction: '- Mine.' };
     const ownSize = documentWithEdit(full, own).length;
     expect(ownSize).toBe(MAX_STYLES);
@@ -221,16 +203,11 @@ describe('what the engine would refuse', () => {
   it('derives a usable id from a typed name', () => {
     expect(nextStyleId('Board report', [])).toBe('board-report');
     expect(nextStyleId('  Terse!!  ', [])).toBe('terse');
-    // NFKD, so an accent keeps its letter. A bare fold gives `caf-report`,
-    // which is not what the engine's `slugify_kebab` would store.
     expect(nextStyleId('Café report', [])).toBe('cafe-report');
     expect([...nextStyleId('x'.repeat(80), [])].length).toBeLessThanOrEqual(MAX_ID_CHARS);
   });
 
   it('gives a name the charset cannot hold a usable id anyway', () => {
-    // Lucidos runs in whatever language `language` names. A Japanese or
-    // Cyrillic name folds to nothing, and leaving Save dead over an id the
-    // form never shows is not an answer.
     for (const label of ['要点だけ', 'Кратко', 'موجز', '###']) {
       const id = nextStyleId(label, []);
       expect(isValidStyleId(id)).toBe(true);
@@ -263,9 +240,6 @@ describe('what the engine would refuse', () => {
   });
 
   it('counts code points, matching the engine, not UTF-16 units', () => {
-    // The engine counts Rust `chars`, which are code points. A bare `.length`
-    // here counts UTF-16 units, so an astral character costs two and Save goes
-    // dead on a paragraph the engine would happily take.
     const wide = '😀'.repeat(MAX_INSTRUCTION_CHARS);
     expect(wide.length).toBe(MAX_INSTRUCTION_CHARS * 2);
     expect(
@@ -279,8 +253,6 @@ describe('what the engine would refuse', () => {
   });
 
   it('lets a shipped style keep its id while its name changes', () => {
-    // Editing Concise must not be refused as a duplicate of itself. Nor may it
-    // save under a new id, which would leave the original in place.
     const taken = SHIPPED.filter((s) => s.id !== 'concise').map((s) => s.id);
     expect(
       describeStyleProblem({ id: 'concise', label: 'Terse', instruction: '- Short.' }, taken),

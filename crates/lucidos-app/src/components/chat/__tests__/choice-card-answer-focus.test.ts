@@ -3,12 +3,8 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { focusedPane } from '../../../store/store';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt } from '../choiceCardNav';
 
-// Answering a card swaps its live choices for the answered body. The focused
-// option unmounts, focus drops to <body>, and the next Tab restarts at the
-// thread title. The answer hands focus to the prompt instead.
 describe('handAnsweredCardFocusToPrompt', () => {
   beforeEach(() => {
-    // A keyboard device: the gate that keeps a phone's keyboard down.
     window.matchMedia = ((q: string) => ({ matches: q === '(hover: hover)' })) as unknown as typeof window.matchMedia;
   });
   afterEach(() => {
@@ -41,8 +37,6 @@ describe('handAnsweredCardFocusToPrompt', () => {
   });
 
   it('leaves focus alone when the card did not hold it', () => {
-    // A tap in Safari answers without focusing the button; the reader's focus
-    // is somewhere of their own choosing.
     threadPane();
     const elsewhere = document.querySelector<HTMLButtonElement>('.thread-drawer button')!;
     elsewhere.focus();

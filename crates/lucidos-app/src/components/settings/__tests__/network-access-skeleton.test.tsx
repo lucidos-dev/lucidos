@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Network access draws the inherited-bind row as its loading
- *  placeholder, under a title that is there from the first frame. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

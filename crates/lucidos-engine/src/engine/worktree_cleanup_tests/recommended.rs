@@ -119,12 +119,15 @@ async fn branch_exists(repo: &Path, branch: &str) -> bool {
 }
 
 #[tokio::test]
-async fn a_finished_worktree_is_removed_with_its_merged_branch() {
+async fn a_finished_worktree_is_removed_and_its_merged_branch_is_kept() {
     let outcome = Scenario::of(Tree::AtMain).run().await;
     assert_eq!(outcome.removed_count, 1);
     assert_eq!(outcome.event_tiers, vec![0]);
     assert!(!outcome.tree_left);
-    assert!(!outcome.branch_left, "a fully merged branch goes with it");
+    assert!(
+        outcome.branch_left,
+        "reclamation keeps a fully merged branch"
+    );
 }
 
 #[tokio::test]

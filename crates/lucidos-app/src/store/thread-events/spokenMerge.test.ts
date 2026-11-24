@@ -2,9 +2,6 @@ import { describe, expect, it } from 'vitest';
 import fixture from '../../generated/spoken-merge-fixture.json';
 import { MERGE_GAP_SECS, isOneUtterance, joinSpoken } from './spokenMerge';
 
-/** The merge rule has two implementations, and a reader must never meet a
- *  bubble the model did not see as one message. The Rust side owns the rule and
- *  generates these cases (`./scripts/codegen.sh`); this replays them. */
 type MergeCase = {
   name: string;
   first: string;

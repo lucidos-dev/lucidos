@@ -1,21 +1,3 @@
-/**
- * The threads Filter's fades, which jsdom cannot run, pinned by a CSS scan.
- * The Grouping button shares the glyph crossfade and its timing.
- *
- * Two timings, on purpose:
- * - THE BUTTON. The glyph and the pressed highlight are button feedback, on
- *   `--duration-fast` like every header icon. Under the Ongoing grouping the
- *   whole button fades out in place, on `--duration-normal`, in a slot that
- *   keeps its box.
- * - THE VIEW. Threads and Filters dip through the pane background on
- *   `--duration-slow`: the shared navigation cover rises, holds while the views
- *   swap, and clears. The pane title switches word at once.
- *
- * One guard is a specific failure: THE RIM. The header paints a resting icon in
- * translucent white. Two translucent shapes stacked mid-crossfade paint their
- * overlap twice, so the funnel's rim flares. The translucency lives on the
- * glyph WRAPPER instead, and the shapes paint opaque.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -32,14 +14,12 @@ const shell = sheet('panels/shell.css');
 const host = sheet('global/host-components.css');
 const drawer = sheet('drawer.css');
 
-/** The one rule with exactly this selector. */
 function rule(rules: CssRule[], selector: string): CssRule {
   const found = rules.filter(r => r.selector === selector);
   expect(found, `expected one rule for ${selector}`).toHaveLength(1);
   return found[0];
 }
 
-/** The one rule whose selector list holds this selector. */
 function ruleListing(rules: CssRule[], selector: string): CssRule {
   const found = rules.filter(r => selectorList(r.selector).includes(selector));
   expect(found, `expected one rule for ${selector}`).toHaveLength(1);
@@ -64,8 +44,6 @@ describe('the button fades on --duration-fast', () => {
 });
 
 describe('the button fades in place under Ongoing, and nothing moves', () => {
-  // A fading control may not leave a ghost where another slides in
-  // (frontend.md, a single control). The slot keeps its box, so none does.
   it('fades its slot and leaves at the end, never changing its box', () => {
     const slot = rule(shell, '.filter-slot');
     expect(slot.props.get('transition')).toBe('opacity var(--duration-normal) ease, visibility var(--duration-normal)');
@@ -87,7 +65,6 @@ describe('the button fades in place under Ongoing, and nothing moves', () => {
   });
 });
 
-/** The one @keyframes block with this name, as its raw body. */
 function keyframes(name: string): string {
   const css = readFileSync(resolve(here, '..', 'global/host-components.css'), 'utf-8');
   const m = css.match(new RegExp(`@keyframes ${name}\\s*\\{([\\s\\S]*?)\\n\\}`));
@@ -99,7 +76,6 @@ describe('the view dips on one timing', () => {
   it('the drawer cover dips on --duration-slow, resting transparent', () => {
     const dip = rule(host, '.nav-cover.nav-cover-dip');
     expect(dip.props.get('animation')).toBe('nav-cover-dip var(--duration-slow) ease-in-out forwards');
-    // A late first frame shows the leaving view, never a flash of background.
     expect(dip.props.get('opacity')).toBe('0');
   });
 
@@ -139,8 +115,6 @@ describe('the view dips on one timing', () => {
 });
 
 describe('the leaving drawing hides whole at the midpoint', () => {
-  // A collapsed count badge sets its own `visibility: visible`, which beats
-  // an inherited `hidden`, so `visibility` alone left the counts on screen.
   const body = () => {
     const css = readFileSync(resolve(here, '..', 'drawer.css'), 'utf-8');
     const m = css.match(/@keyframes thread-view-drawing-leave\s*\{([\s\S]*?)\n\}/);
@@ -170,7 +144,6 @@ describe('the rim is painted once', () => {
   });
 
   it('the muted tone and the wrapper read one alpha', () => {
-    // The header tokens live in the theme blocks, where a theme can reach them.
     const bar = sheet('global/base.css').find(r => r.props.has('--header-fg-muted-alpha'));
     expect(bar, 'no rule declares --header-fg-muted-alpha').toBeDefined();
     expect(bar!.props.get('--header-fg-muted')).toContain('var(--header-fg-muted-alpha)');
@@ -191,10 +164,6 @@ describe('the rim is painted once', () => {
   });
 });
 
-// A fade lifts its element onto a compositing layer for as long as it runs,
-// and a layer snaps to whole pixels. The button sits at a fractional y. So on a
-// real iPhone the glyph can hop as a fade begins and drop back after.
-// Emulators paint without that compositing, so this scan is the guard.
 describe('nothing in the button hops when a fade starts or ends', () => {
   it.each([
     '.app-header .crossfade-glyph',
@@ -225,12 +194,8 @@ describe('the views swap under the cover', () => {
   });
 
   it('nothing in the swap carries a fade of its own: the cover is the one fade', () => {
-    // The rules styling the two views' own boxes, not the rows inside them.
-    // WebKit re-compositing content up from transparent is the iOS paint-loss
-    // shape, so only `visibility` may transition here.
     const swapping = /(\.thread-filter-cover|\.thread-drawer-list)(\[data-open\])?$/;
     const boxes = drawer.filter(r => selectorList(r.selector).some(s => swapping.test(s)));
-    // Guard the guard: the cover, the open cover, the hidden list and the swap.
     expect(boxes.length).toBeGreaterThanOrEqual(4);
     for (const r of boxes) {
       expect(r.props.has('opacity'), r.selector).toBe(false);
@@ -247,9 +212,6 @@ describe('reduced motion', () => {
     return found!;
   };
 
-  // A scaled duration is short, not instant: the transition still waits for
-  // its start, and Chromium held a fade at its old value for a frame under
-  // load. So every button fade is cancelled outright.
   it.each([
     [host, '.crossfade-layer'],
     [shell, '.app-header .crossfade-glyph'],
@@ -272,7 +234,6 @@ describe('reduced motion', () => {
 const hoversOf = (row: string) =>
   drawer.filter(r => selectorList(r.selector).some(s => s.startsWith(`${row}:hover`)));
 
-// A checkbox toggles one setting, so its row paints no hover band.
 it('checkbox rows paint no hover band', () => {
   expect(hoversOf('.thread-filter-option')).toEqual([]);
 });

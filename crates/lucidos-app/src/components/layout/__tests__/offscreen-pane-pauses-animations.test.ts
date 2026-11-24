@@ -7,11 +7,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// A mobile pane that is not the current one pauses its animations. Rendered
-// behaviour is pinned by e2e/offscreen-pane-animations-pause-mobile.spec.ts.
-// That spec sees only the drawer's animations. This suite pins the rule's
-// reach: pseudo-elements, and every selector that sets an `animation`
-// shorthand, which resets the play state.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const swipeSrc = readFileSync(resolve(here, '../MobileSwipeContainer.tsx'), 'utf-8');
@@ -41,8 +36,6 @@ describe('an off-screen pane', () => {
     expect(rule[2]).toMatch(/animation-play-state\s*:\s*paused/);
   });
 
-  // `.system-status-row .status-dot.disconnected { animation: … infinite }`
-  // out-specifies the pause, and its shorthand sets the play state to running.
   it('outranks any selector whose animation shorthand resets the play state', () => {
     const rule = mobileCss.match(/\[data-offscreen\][^{}]*\{([^}]*)\}/);
     expect(rule?.[1]).toMatch(/animation-play-state\s*:\s*paused\s*!important/);

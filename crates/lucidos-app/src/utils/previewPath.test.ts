@@ -28,8 +28,6 @@ describe('previewFileName', () => {
 
 describe('splitPreviewPath', () => {
   it('splits at the last separator and KEEPS the trailing slash on the folders', () => {
-    // The two halves must concatenate back into the path exactly, so a caller
-    // rendering them as adjacent spans never reintroduces the separator itself.
     const { dir, name } = splitPreviewPath('.claude/rules/system-knowhow.md');
     expect(dir).toBe('.claude/rules/');
     expect(name).toBe('system-knowhow.md');
@@ -45,8 +43,6 @@ describe('splitPreviewPath', () => {
   });
 });
 
-// What the packaged desktop client hands to the OS opener. A wrong answer here
-// is an "item not found" dialog, or worse, the wrong file opened silently.
 describe('previewDiskPath', () => {
   const WS = '/home/user/workspaces/dev';
   const REPOS = [{ id: 'repo-1', path: '/home/user/code/example-repo' }];
@@ -61,8 +57,6 @@ describe('previewDiskPath', () => {
       .toBe('/home/user/code/example-repo/src/main.rs');
   });
 
-  // The locator's qualifier names a revision, which the file on disk does not
-  // have. It must not leak into the path.
   it('ignores a ref or a change id on the locator', () => {
     expect(previewDiskPath('repo:repo-1:file#v2.1:src/main.rs', WS, REPOS))
       .toBe('/home/user/code/example-repo/src/main.rs');
@@ -77,22 +71,17 @@ describe('previewDiskPath', () => {
       .toBe('/code/r/main.rs');
   });
 
-  // Each of these would otherwise build a path to a file that is not there.
   it('has no answer while a root is missing', () => {
     expect(previewDiskPath('artifacts/x.html', '', REPOS)).toBeNull();
     expect(previewDiskPath('repo:repo-9:file:main.rs', WS, REPOS)).toBeNull();
     expect(previewDiskPath('repo:repo-1:file:main.rs', WS, [])).toBeNull();
   });
 
-  // system-knowhow ships inside the engine and is served from there, so there
-  // is no such file under the workspace to open.
   it('has no answer for system-knowhow, which is not in the workspace', () => {
     expect(previewDiskPath('system-knowhow/glossary.md', WS, REPOS)).toBeNull();
   });
 });
 
-// What "Copy path" puts on the clipboard: the thing a user pastes into
-// Obsidian, Finder or a terminal.
 describe('previewCopyPath', () => {
   const WS = '/home/user/workspaces/dev';
   const REPOS = [{ id: 'repo-1', path: '/home/user/code/example-repo' }];

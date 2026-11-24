@@ -1,10 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveFileTarget } from './fileTarget';
 
-// fileTarget imports the real `normalizeDataPath` from ./artifacts (the point of
-// this suite is that the resolver runs the genuine locator rules). Its module
-// siblings reach for the API client and the pane/nav actions at import time, so
-// stub those the way artifacts.test.ts does.
 vi.mock('../../api/client', () => ({ listArtifacts: vi.fn(), uploadFile: vi.fn() }));
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
@@ -37,8 +33,6 @@ describe('resolveFileTarget: the locator', () => {
     });
   });
 
-  // A structurally incomplete encoding is NOT a repo path. It degrades to the
-  // artifact rule rather than opening a preview that can only 404.
   it.each(['repo::file:x', 'repo:r1:file:', 'repo:r1:bogus:x'])(
     'treats the malformed encoding %s as a data path',
     (encoded) => {
@@ -66,8 +60,6 @@ describe('resolveFileTarget: the line range', () => {
     expect(resolveFileTarget('artifacts/notes.md', 520, 510).range).toEqual({ start: 510, end: 520 });
   });
 
-  // A citation's line number is the part that goes stale. It must never cost the
-  // reader the file itself: the path still resolves, only the range is dropped.
   it.each([
     ['zero', 0],
     ['negative', -3],
@@ -80,17 +72,11 @@ describe('resolveFileTarget: the line range', () => {
     expect(target.range).toBeNull();
   });
 
-  // The line count isn't known until the content loads, so a past-the-end line is
-  // accepted here and highlights nothing; LineNumberedCode drops the selection
-  // once it can see the file is too short.
   it('accepts a line past the end of the file', () => {
     expect(resolveFileTarget('artifacts/notes.md', 9_000_000).range)
       .toEqual({ start: 9_000_000, end: 9_000_000 });
   });
 
-  // A target that can never show numbered lines must not end up with an
-  // invisible selection: `currentChatContext` would attach it to the next
-  // message as a range naming no code.
   it.each([
     ['a PDF', 'artifacts/report.pdf'],
     ['an image', 'artifacts/chart.png'],
@@ -112,8 +98,6 @@ describe('resolveFileTarget: the line range', () => {
     expect(resolveFileTarget(`repo:${REPO_ID}:file:Makefile`, 5).range).toEqual({ start: 5, end: 5 });
   });
 
-  // The media check reads the extension off the repo-relative path, not off the
-  // encoded locator (whose last segment would otherwise decide it).
   it('reads the extension from inside a repo locator', () => {
     expect(resolveFileTarget(`repo:${REPO_ID}:file:docs/report.pdf`, 5).range).toBeNull();
   });
@@ -127,11 +111,6 @@ describe('resolveFileTarget: the line range', () => {
   });
 });
 
-/** The navigate router and the file preview modal share this resolver so
- *  the modal cannot reach a file, or honour a line, that `navigate('file', …)`
- *  would not. The view input is the ONE thing they differ by, and this is what
- *  pins how far that difference reaches: exactly one line rule, and never the
- *  resolved path. */
 describe('resolveFileTarget: the two views', () => {
   const LOCATORS = [
     'artifacts/notes.md',
@@ -161,10 +140,6 @@ describe('resolveFileTarget: the two views', () => {
     }
   });
 
-  // A caller rendering the FILE is showing the file's own line numbers, so the
-  // citation is honourable there even though the locator names a diff. The
-  // locator itself is untouched, which is how the change id survives to
-  // `RepoFileContent`.
   it('honours a citation into a diff locator for a caller that renders the file', () => {
     const locator = `repo:${REPO_ID}:diff#change-7:src/main.rs`;
     const target = resolveFileTarget(locator, 510, 520, 'file');
@@ -175,8 +150,6 @@ describe('resolveFileTarget: the two views', () => {
     expect(target.range).toEqual({ start: 510, end: 520 });
   });
 
-  // The view moves the DIFF rule and nothing else: a PDF has no source view in
-  // either, so its line is still dropped.
   it('still drops a line the file itself cannot show', () => {
     expect(resolveFileTarget(`repo:${REPO_ID}:diff#change-7:docs/report.pdf`, 5, undefined, 'file').range)
       .toBeNull();

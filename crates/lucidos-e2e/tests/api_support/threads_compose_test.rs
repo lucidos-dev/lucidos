@@ -1101,3 +1101,48 @@ async fn recovered_draft_refuses_a_foreign_restore_generation() {
     assert_eq!((rows, events), (0, 0));
     pool.close().await;
 }
+
+#[tokio::test]
+async fn stale_legacy_selection_preserves_the_pinned_agent_and_accepts_new_text() {
+    let client = user_client().await;
+    let id = Uuid::new_v4();
+    let created = client
+        .post(threads_url())
+        .json(&json!({"id": id, "mode": "lucidos"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    for (text, selection) in [
+        (
+            "original",
+            json!({"codingAgent":"claude-code", "model":"old"}),
+        ),
+        ("new peer text", json!({"model":"new"})),
+    ] {
+        let response = client
+            .put(compose_url(&id))
+            .json(&json!({"text":text, "selection":selection}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    assert_eq!(
+        fetch_compose_selection(&pool, id).await.unwrap(),
+        json!({"codingAgent":"claude-code", "model":"new"})
+    );
+    assert_eq!(fetch_compose_row(&pool, id).await.1, "new peer text");
+    let response = client
+        .put(compose_url(&id))
+        .json(&json!({"text":"new peer text", "selection":{"codingAgent":"codex"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        fetch_compose_selection(&pool, id).await.unwrap(),
+        json!({"codingAgent":"codex"})
+    );
+}

@@ -310,7 +310,7 @@ mod tests {
     /// crate cannot import.
     #[test]
     fn every_state_spells_an_engine_label() {
-        const ENGINE: &str = include_str!("../../lucidos-engine/src/api/internal.rs");
+        const ENGINE: &str = include_str!("../../lucidos-agents-api/src/api/internal.rs");
         let handler = ENGINE
             .split("async fn query_hardened(")
             .nth(1)

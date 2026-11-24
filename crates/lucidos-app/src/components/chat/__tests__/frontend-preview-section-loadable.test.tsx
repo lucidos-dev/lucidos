@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** The frontend preview section names no state it has not read. Unknown, its
- *  button waits dimmed; failed, it says so and still offers Start; loaded, it
- *  offers the action. */
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -70,7 +70,7 @@ fn an_address_the_gateway_refused_stops_the_check() {
 #[test]
 fn the_app_applies_the_rule_itself_and_never_trusts_the_gateway_blindly() {
     let body = status(json!({ "update_address": "http://example.com/latest.json" }));
-    assert!(refusal(Some(&body)).contains(lucidos_update_address::RULE));
+    assert!(refusal(Some(&body)).contains(lucidos_update_channel::RULE));
 }
 
 #[test]
@@ -133,18 +133,36 @@ fn no_shipped_source_overrides_the_updater_key() {
 /// process ends. The manifest names the bundle at `bundle_host`. Returns the
 /// `latest.json` address.
 fn serve_fixture(bundle_host: &str) -> UpdateAddress {
+    serve_fixture_version(bundle_host, "99.0.0")
+}
+
+fn serve_fixture_version(bundle_host: &str, version: &str) -> UpdateAddress {
+    serve_channel_fixture(bundle_host, version, None, None).0
+}
+
+/// Each observed request includes its headers, so Local proves authentication
+/// on both HTTP hops. Redirects can be injected on either hop.
+fn serve_channel_fixture(
+    bundle_host: &str,
+    version: &str,
+    token: Option<&str>,
+    redirect_path: Option<&str>,
+) -> (UpdateAddress, std::sync::mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
     let platform = tauri_plugin_updater::target().expect("a supported platform");
     let manifest = json!({
-        "version": "99.0.0",
+        "version": version,
         "notes": "fixture",
         "platforms": { platform: {
-            "url": format!("http://{bundle_host}:{port}/bundle.tar.gz"),
+            "url": format!("http://{bundle_host}:{port}/~/updates/local/bundle.tar.gz"),
             "signature": FIXTURE_SIGNATURE.trim(),
         }},
     })
     .to_string();
+    let token = token.map(str::to_string);
+    let redirect_path = redirect_path.map(str::to_string);
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -153,10 +171,33 @@ fn serve_fixture(bundle_host: &str) -> UpdateAddress {
             if reader.read_line(&mut request_line).is_err() {
                 continue;
             }
-            while let Ok(n) = reader.read_line(&mut String::new()) {
-                if n <= 2 {
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) <= 2 {
                     break;
                 }
+                headers.push_str(&line);
+            }
+            let _ = tx.send(format!("{request_line}{headers}"));
+            let authorized = token.as_ref().is_none_or(|token| {
+                headers.contains(&format!(
+                    "{}: {token}\r\n",
+                    lucidos_local_token::HEADER_LOCAL_TOKEN
+                ))
+            });
+            if !authorized {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            if redirect_path
+                .as_ref()
+                .is_some_and(|path| request_line.contains(path))
+            {
+                let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
             }
             let body: &[u8] = if request_line.contains("/bundle.tar.gz") {
                 FIXTURE_BUNDLE
@@ -171,16 +212,66 @@ fn serve_fixture(bundle_host: &str) -> UpdateAddress {
             let _ = stream.write_all(body);
         }
     });
-    UpdateAddress::parse(&format!("http://127.0.0.1:{port}/latest.json"))
-        .expect("valid")
-        .expect("set")
+    let address = UpdateAddress::parse(&format!(
+        "http://127.0.0.1:{port}/~/updates/local/latest.json"
+    ))
+    .expect("valid")
+    .expect("set");
+    (address, rx)
+}
+
+#[test]
+fn a_failed_gateway_poll_does_not_block_the_apps_stable_check() {
+    let (endpoint, requests) = serve_channel_fixture("127.0.0.1", "99.0.0", None, None);
+    let body = status(json!({
+        "channel": "stable", "update_address": null,
+        "channel_error": null, "last_error": "Check origin unavailable"
+    }));
+    let source = resolve_update_source(Some(&body)).unwrap();
+    assert_eq!(source, UpdateSource::Published);
+    let app = mock_app_at(Some(FIXTURE_PUBKEY.trim()), Some(&endpoint));
+    let updater = updater_for(app.handle(), &source).unwrap();
+    assert!(tauri::async_runtime::block_on(check_offer(&updater))
+        .unwrap()
+        .is_some());
+    assert!(requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_ok());
+}
+
+#[test]
+fn a_channel_error_stops_the_check_without_falling_back_to_stable() {
+    let body = status(json!({ "channel": "local", "channel_error": "Local feed is broken" }));
+    assert!(refusal(Some(&body)).contains("Local feed is broken"));
+}
+
+#[test]
+fn a_correctly_signed_downgrade_is_refused_against_the_baked_release() {
+    let app = mock_app(Some(FIXTURE_PUBKEY.trim()));
+    // Above the crate's 0.1.0, below every shipped Lucidos release.
+    let source = UpdateSource::Address(serve_fixture_version("127.0.0.1", "0.2.0"));
+    let updater = updater_for(app.handle(), &source).unwrap();
+    let result = tauri::async_runtime::block_on(check_offer(&updater));
+    match result {
+        Err(message) => assert!(message.contains("ahead"), "{message}"),
+        Ok(_) => panic!(
+            "a lower channel must report ahead, never offer a downgrade or report up to date"
+        ),
+    }
 }
 
 /// A mock app whose updater config is the production one, key included.
 /// `pubkey` swaps the key for the positive control only.
 fn mock_app(pubkey: Option<&str>) -> tauri::App<MockRuntime> {
+    mock_app_at(pubkey, None)
+}
+
+fn mock_app_at(pubkey: Option<&str>, endpoint: Option<&UpdateAddress>) -> tauri::App<MockRuntime> {
     let mut context = mock_context(noop_assets());
-    let updater = tauri_conf()["plugins"]["updater"].clone();
+    let mut updater = tauri_conf()["plugins"]["updater"].clone();
+    if let Some(endpoint) = endpoint {
+        updater["endpoints"] = json!([endpoint.as_str()]);
+    }
     context
         .config_mut()
         .plugins
@@ -194,6 +285,147 @@ fn mock_app(pubkey: Option<&str>) -> tauri::App<MockRuntime> {
         .plugin(plugin.build())
         .build(context)
         .expect("mock app")
+}
+
+/// The Local channel trusts the machine's loopback CA, which a test host may
+/// not have, so the fixture hands it a throwaway certificate.
+fn fixture_updater<R: Runtime>(
+    app: &AppHandle<R>,
+    source: &UpdateSource,
+    read_token: impl FnOnce() -> Option<String>,
+) -> Result<ChannelUpdater, String> {
+    updater_with_token(app, source, read_token, || {
+        Ok(include_str!("updater_fixtures/loopback-ca.pem").to_string())
+    })
+}
+
+fn fixture_source(channel: &str, address: &UpdateAddress) -> UpdateSource {
+    resolve_update_source(Some(&status(json!({
+        "channel": channel,
+        "update_address": if channel == "stable" { Value::Null } else { json!(address.as_str()) },
+    }))))
+    .unwrap()
+}
+
+#[test]
+fn every_channel_keeps_the_baked_key_and_authenticates_local_downloads() {
+    for channel in ["stable", "beta", "local", "custom:Test"] {
+        for trusted in [false, true] {
+            let token = (channel == "local").then_some("fixture-local-token");
+            let (address, requests) = serve_channel_fixture("127.0.0.1", "99.0.0", token, None);
+            let app = mock_app_at(trusted.then_some(FIXTURE_PUBKEY.trim()), Some(&address));
+            let updater = fixture_updater(app.handle(), &fixture_source(channel, &address), || {
+                token.map(str::to_string)
+            })
+            .unwrap();
+            let result = tauri::async_runtime::block_on(async {
+                let update = check_offer(&updater).await?.expect("newer fixture");
+                assert_eq!(update.no_proxy, token.is_some(), "{channel}");
+                update
+                    .download(|_, _| {}, || {})
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+            if trusted {
+                assert_eq!(result.unwrap(), FIXTURE_BUNDLE, "{channel}");
+            } else {
+                let error = result.expect_err("foreign key must fail");
+                assert!(
+                    error.to_lowercase().contains("signature"),
+                    "{channel}: {error}"
+                );
+            }
+            for path in ["latest.json", "bundle.tar.gz"] {
+                let request = requests
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(request.contains(path), "{request}");
+                assert_eq!(
+                    request.contains(lucidos_local_token::HEADER_LOCAL_TOKEN),
+                    token.is_some(),
+                    "{channel}: {request}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_channel_refuses_downgrades_and_equal_versions_but_accepts_newer_releases() {
+    for channel in ["stable", "beta", "local", "custom:Test"] {
+        for version in ["0.2.0", crate::LUCIDOS_RELEASE, "99.0.0-rc.1"] {
+            let (address, _) = serve_channel_fixture("127.0.0.1", version, None, None);
+            let app = mock_app_at(Some(FIXTURE_PUBKEY.trim()), Some(&address));
+            let updater = fixture_updater(app.handle(), &fixture_source(channel, &address), || {
+                Some("fixture-local-token".into())
+            })
+            .unwrap();
+            let result = tauri::async_runtime::block_on(check_offer(&updater));
+            match version {
+                "0.2.0" => assert!(result.err().unwrap().contains("ahead"), "{channel}"),
+                "99.0.0-rc.1" => assert!(result.unwrap().is_some(), "{channel}"),
+                _ => assert!(result.unwrap().is_none(), "{channel}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn local_requires_a_token_and_refuses_redirects_on_both_hops() {
+    for path in ["latest.json", "bundle.tar.gz"] {
+        let (address, requests) =
+            serve_channel_fixture("127.0.0.1", "99.0.0", Some("fixture-token"), Some(path));
+        let app = mock_app(Some(FIXTURE_PUBKEY.trim()));
+        let source = fixture_source("local", &address);
+        assert!(fixture_updater(app.handle(), &source, || None).is_err());
+        let updater =
+            fixture_updater(app.handle(), &source, || Some("fixture-token".into())).unwrap();
+        let result = tauri::async_runtime::block_on(async {
+            let update = check_offer(&updater).await?.expect("newer fixture");
+            update
+                .download(|_, _| {}, || {})
+                .await
+                .map_err(|e| e.to_string())
+        });
+        assert!(result.is_err(), "{path} redirect must fail");
+        let expected = if path == "latest.json" { 1 } else { 2 };
+        assert_eq!(
+            requests.try_iter().count(),
+            expected,
+            "no redirected request"
+        );
+    }
+}
+
+#[test]
+fn local_refuses_a_bundle_outside_its_gateway_origin() {
+    let (address, _) = serve_channel_fixture("localhost", "99.0.0", None, None);
+    let app = mock_app(Some(FIXTURE_PUBKEY.trim()));
+    let updater = fixture_updater(app.handle(), &fixture_source("local", &address), || {
+        Some("fixture-token".into())
+    })
+    .unwrap();
+    assert!(tauri::async_runtime::block_on(check_offer(&updater))
+        .err()
+        .unwrap()
+        .contains("Local bundle"));
+}
+
+#[test]
+fn malformed_channels_never_fall_back_or_receive_local_credentials() {
+    for channel in ["beta", "local", "custom:Test", "nightly", "bogus"] {
+        for address in [Value::Null, json!("")] {
+            let body = status(json!({"channel": channel, "update_address": address}));
+            assert!(resolve_update_source(Some(&body)).is_err(), "{body}");
+        }
+    }
+    for address in [
+        "https://example.com/~/updates/local/latest.json",
+        "http://127.0.0.1:1234/latest.json",
+    ] {
+        let body = status(json!({"channel": "local", "update_address": address}));
+        assert!(resolve_update_source(Some(&body)).is_err());
+    }
 }
 
 /// Check and download through the production `updater_for`.
@@ -238,7 +470,7 @@ fn an_offer_naming_a_plain_http_bundle_elsewhere_is_refused() {
     let err = fetch_through_the_address(&mock_app(Some(FIXTURE_PUBKEY.trim())), "example.com")
         .expect_err("a plain-http bundle on another host must be refused");
     assert!(
-        err.starts_with(lucidos_update_address::BUNDLE_RULE),
+        err.starts_with(lucidos_update_channel::BUNDLE_RULE),
         "{err}"
     );
 }

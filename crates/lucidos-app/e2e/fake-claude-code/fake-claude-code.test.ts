@@ -6,23 +6,22 @@ import { createInterface } from 'node:readline';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   FAKE_VERSION, NO_EFFORT, NO_RULE_REPLY, NO_SESSION_CONTEXT_REPLY,
-  failToStartText, replyTo, resolveModel, turnDurationMs,
+  failToStartText, modelBase, replyTo, resolveModel, restrictedModels, restrictionWarning, turnDurationMs,
 } from './claude.mjs';
 import {
-  SCENARIO_FLAGS, SESSION_FLAGS, UNREPLAYED_FLAGS, diffShapes, shapeOf, unknownKinds,
+  SCENARIO_FLAGS, SESSION_FLAGS, UNREPLAYED_FLAGS, diffShapes, incompleteScenario, shapeOf, unknownKinds,
 } from './drift-check.mjs';
 
 const FAKE = join(__dirname, 'claude.mjs');
 
 type Line = Record<string, any>;
 
-// No effort either: a suite run from inside Claude Code inherits its own.
 const { CLAUDE_CODE_EFFORT_LEVEL: _, ...ENV } = process.env;
 const NO_DELAY = { ...ENV, FAKE_CLAUDE_CODE_TURN_MS: '0' };
 
-function runFake(args: string[], inputs: Line[] = []): Line[] {
+function runFake(args: string[], inputs: Line[] = [], env: Record<string, string> = {}): Line[] {
   const input = inputs.map((l) => `${JSON.stringify(l)}\n`).join('');
-  const out = execFileSync(process.execPath, [FAKE, ...args], { input, encoding: 'utf8', env: NO_DELAY });
+  const out = execFileSync(process.execPath, [FAKE, ...args], { input, encoding: 'utf8', env: { ...NO_DELAY, ...env } });
   return out.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
@@ -44,6 +43,13 @@ describe('the fake Claude Code', () => {
     expect(execFileSync(join(dir, 'claude'), ['--version'], { encoding: 'utf8' })).toBe(`${FAKE_VERSION} (Claude Code)\n`);
   });
 
+  it('runs routing CLI probes without returning inherited credentials or raw stderr', () => {
+    const proof = runFake([], [user('Probe routing CLI: {"cli":"/usr/bin/false","args":[]}')],
+      { LUCIDOS_AGENT_ORIGIN_TOKEN: 'fixture-origin-must-stay-private' }).at(-1);
+    expect(JSON.parse(proof?.result)).toEqual({ code: 1, data: null, link: null, liveness: false });
+    expect(JSON.stringify(proof)).not.toContain('fixture-origin-must-stay-private');
+  });
+
   it('answers initialize with the model list and sends no init', () => {
     const lines = runFake([], [control('initialize')]);
     expect(lines).toHaveLength(1);
@@ -58,8 +64,9 @@ describe('the fake Claude Code', () => {
       env: { ...NO_DELAY, LUCIDOS_AGENT_ORIGIN_TOKEN: '' },
     });
     const lines = out.trim().split('\n').map(l => JSON.parse(l));
-    expect(lines.at(-1)?.result).toBe('{"verified":false}');
-    expect(lines.find(l => l.type === 'assistant')?.message.content).toEqual([{ type: 'text', text: '{"verified":false}' }]);
+    const refusal = '{"verified":false,"stage":"env"}';
+    expect(lines.at(-1)?.result).toBe(refusal);
+    expect(lines.find(l => l.type === 'assistant')?.message.content).toEqual([{ type: 'text', text: refusal }]);
   });
 
   it('runs a Say exactly turn: init, replay, the text, then result', () => {
@@ -77,6 +84,37 @@ describe('the fake Claude Code', () => {
     expect(lines.filter((l) => l.type === 'result').map((l) => [l.session_id, l.result])).toEqual([['sid-1', 'a'], ['sid-1', 'b']]);
   });
 
+  describe('with restricted models', () => {
+    const RESTRICTED = { FAKE_CLAUDE_CODE_RESTRICTED_MODELS: 'claude-fable-5-2, claude-x-1' };
+    const turns = [user('Say exactly: "a"'), user('Say exactly: "b"')];
+
+    it('runs the default model in place of a restricted pick, and warns once after init', () => {
+      const lines = runFake(['--model', 'claude-fable-5-2[1m]'], turns, RESTRICTED);
+      expect(lines[0]).toMatchObject({ subtype: 'init', model: resolveModel('default') });
+      expect(lines[1]).toEqual(restrictionWarning('claude-fable-5-2[1m]', resolveModel('default')));
+      expect(lines.filter((l) => l.subtype === 'informational')).toHaveLength(1);
+      expect(lines.filter((l) => l.type === 'assistant').map((l) => l.message.model)).toEqual([resolveModel('default'), resolveModel('default')]);
+    });
+
+    it('runs a model it does not restrict, with no warning', () => {
+      const lines = runFake(['--model', 'haiku'], turns, RESTRICTED);
+      expect(lines[0]).toMatchObject({ subtype: 'init', model: resolveModel('haiku') });
+      expect(lines.some((l) => l.subtype === 'informational')).toBe(false);
+    });
+
+    it('warns on the turn after a set_model to a restricted model', () => {
+      const lines = runFake([], [user('Say exactly: "a"'), control('set_model', { model: 'claude-x-1@pin' }), user('Say exactly: "b"')], RESTRICTED);
+      const warningAt = lines.findIndex((l) => l.subtype === 'informational');
+      expect(warningAt).toBeGreaterThan(lines.findIndex((l) => l.type === 'result'));
+      expect(lines[warningAt].content).toContain('"claude-x-1@pin"');
+    });
+
+    it('reads the list by base id', () => {
+      expect([...restrictedModels(' a[1m], b@x ,,')]).toEqual(['a', 'b']);
+      expect(modelBase('claude-opus-5-5[1m]')).toBe('claude-opus-5-5');
+    });
+  });
+
   it('replays at once but lasts a turn before its result, so a mid-turn poll sees it live', async () => {
     const child = spawn(process.execPath, [FAKE], { env: { ...process.env, FAKE_CLAUDE_CODE_TURN_MS: '400' } });
     const seen: Record<string, number> = {};
@@ -92,7 +130,6 @@ describe('the fake Claude Code', () => {
     child.stdin.write(`${JSON.stringify(control('set_model', { model: 'haiku' }))}\n`);
     await done;
     child.kill();
-    // Relative to the replay, so a slow Node start under load cannot fail it.
     expect(seen.result - seen.replay).toBeGreaterThanOrEqual(350);
     expect(seen.result - seen.control_response).toBeGreaterThanOrEqual(300);
   });
@@ -151,7 +188,6 @@ describe('the fake Claude Code', () => {
     expect(run.stdout).toBe('');
   });
 
-  // A fresh session's first message, shaped like `SessionContext::render`.
   const withSessionContext = (history: string, turn: string) => [
     'SESSION CONTEXT: Lucidos sends this once.',
     'BRANCH: Your worktree is on branch `lucidos-x`.',
@@ -187,6 +223,46 @@ describe('the fake Claude Code', () => {
   });
 });
 
+describe('real drift check scenario completion', () => {
+  const init = { type: 'system', subtype: 'init', session_id: 'session' };
+  const success = { type: 'result', subtype: 'success' };
+  const complete = {
+    probe: [{ type: 'control_response', response: { request_id: 'drift-initialize' } }],
+    first: [init, success],
+    resumed: [init, success],
+  };
+
+  it('accepts a complete run', () => {
+    expect(incompleteScenario(complete)).toBeNull();
+  });
+
+  it('reports a resumed run that errors before init', () => {
+    const resumed = [{ type: 'result', subtype: 'error_during_execution' }];
+    expect(incompleteScenario({ ...complete, resumed })).toEqual({
+      scenario: 'resumed',
+      reason: 'result/error_during_execution before system/init',
+    });
+  });
+
+  it('requires the initialize reply to match the probe request', () => {
+    const probe = [{ type: 'control_response', response: { request_id: 'elsewhere' } }];
+    expect(incompleteScenario({ ...complete, probe })?.scenario).toBe('probe');
+  });
+
+  it('rejects a success result that also reports an error', () => {
+    const resumed = [init, { ...success, is_error: true }];
+    expect(incompleteScenario({ ...complete, resumed })).toEqual({
+      scenario: 'resumed',
+      reason: 'result/success with is_error=true',
+    });
+  });
+
+  it('requires init and a successful result for each user scenario', () => {
+    expect(incompleteScenario({ ...complete, first: [init] })?.scenario).toBe('first');
+    expect(incompleteScenario({ ...complete, resumed: [success] })?.scenario).toBe('resumed');
+  });
+});
+
 describe('the drift check shape diff', () => {
   const fakeTurn = () => runFake(['--model', 'haiku'], [user('Say exactly: "x"')]);
 
@@ -198,6 +274,7 @@ describe('the drift check shape diff', () => {
     const fake = fakeTurn();
     const real = [
       { type: 'system', subtype: 'hook_started' },
+      { type: 'system', subtype: 'commands_changed' },
       ...fake.slice(0, 3),
       { type: 'stream_event', event: { type: 'content_block_delta' } },
       { type: 'assistant', message: { id: 'm', model: 'x', usage: {}, content: [{ type: 'thinking', thinking: '…' }] } },

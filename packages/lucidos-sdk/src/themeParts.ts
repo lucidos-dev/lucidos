@@ -1,15 +1,3 @@
-/**
- * The TypeScript twin of the engine's theme part grammar
- * (`crates/lucidos-engine/src/core/themes/grammar.rs`, ADR 0307).
- *
- * The engine checks every part value in a theme, and every `--part-*` style
- * override at the preference write. Each apply site checks again here, so a
- * value that reached storage some other way still never reaches
- * `setProperty`. `theme-part-cases.json` feeds both sides, so they accept,
- * refuse and canonicalise alike.
- *
- * Pure, like `appearance.ts`: the boot script bundles it.
- */
 import {
   COLOUR_TOKENS,
   FRAME_COLOUR_TOKENS,
@@ -31,7 +19,6 @@ const FRAME_COLOUR_TOKEN_SET = new Set<string>(FRAME_COLOUR_TOKENS);
 const NAMED_COLOUR_SET = new Set<string>(NAMED_COLOURS);
 const COLOUR_FUNCTIONS = ['rgb', 'rgba', 'hsl', 'hsla', 'oklab', 'oklch', 'color-mix', 'var'];
 
-/** `{ ok: canonical }` or `{ error: why }`, the engine's messages word for word. */
 export type PartCheck = { ok: string } | { error: string };
 
 interface Slot {
@@ -39,7 +26,6 @@ interface Slot {
   part: string;
   grammar: PartGrammar;
   insetOnly: boolean;
-  /** The part paints in app frames, which register the frame tokens only. */
   frames: boolean;
 }
 
@@ -49,7 +35,6 @@ function refuse(why: string): never {
   throw new Refusal(why);
 }
 
-/** Check a value for a part token. Unknown tokens are refused. */
 export function checkPartToken(name: string, value: string): PartCheck {
   const spec = Object.prototype.hasOwnProperty.call(PART_TOKENS, name) ? PART_TOKENS[name] : null;
   if (!spec) return { error: 'not a part token. GET /api/v1/themes/parts lists them.' };
@@ -143,8 +128,6 @@ function isAngle(token: string): boolean {
     token.endsWith(unit) && plainNumber(token.slice(0, -unit.length)) !== null);
 }
 
-/** A vertical `repeating-linear-gradient` of faint literal stops: the
- *  engine's `scanlines` grammar. */
 function scanlines(slot: Slot, value: string, maxAlpha: number, maxPeriod: number, maxStops: number): string {
   const call = functionCall(value);
   if (!call) refuse(`${slot.property} takes none or repeating-linear-gradient().`);
@@ -178,7 +161,6 @@ function scanlines(slot: Slot, value: string, maxAlpha: number, maxPeriod: numbe
   return `repeating-linear-gradient(${out.join(', ')})`;
 }
 
-/** A literal colour whose alpha is known, so the cap holds for any input. */
 function scanlineColour(value: string): Colour {
   if (value === 'transparent') return { css: value, alpha: 0 };
   if (value.startsWith('#')) return parseHex(value);
@@ -270,14 +252,10 @@ function length(slot: Slot, token: string, unit: PartUnit): number {
   refuse(`use ${unit} for ${slot.property} lengths.`);
 }
 
-/** Optional sign, digits, optional fraction. No exponent, and at most six
- *  digits either side of the point, where Rust and JavaScript write a number
- *  the same way. */
 function plainNumber(token: string): number | null {
   return /^[+-]?(?:\d{1,6}(?:\.\d{1,6})?|\.\d{1,6})$/.test(token) ? Number(token) : null;
 }
 
-/** The engine's number form: shortest round trip, never `-0`. */
 function num(v: number): string {
   return v === 0 ? '0' : String(v);
 }
@@ -307,7 +285,6 @@ function functionCall(token: string): [string, string] | null {
   return depth === 0 && /^[a-z-]+$/.test(name) ? [name, inner] : null;
 }
 
-/** Split at `sep` outside parentheses, trimming and dropping empty pieces. */
 function splitTopLevel(value: string, sep: (c: string) => boolean): string[] {
   const parts: string[] = [];
   let depth = 0;
@@ -327,7 +304,6 @@ function splitTopLevel(value: string, sep: (c: string) => boolean): string[] {
 
 interface Colour {
   css: string;
-  /** The most alpha the colour can have. A `var()` counts as opaque. */
   alpha: number;
 }
 

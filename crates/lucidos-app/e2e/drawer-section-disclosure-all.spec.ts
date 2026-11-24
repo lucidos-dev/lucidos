@@ -3,10 +3,8 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, openThreadDrawer, assertHealthy } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-/** One animation frame of a section toggle. */
 interface ToggleFrame {
     headerBottom: number;
     nextHeaderTop: number;
@@ -14,13 +12,10 @@ interface ToggleFrame {
     maskTop: number | null;
     ghosts: number;
     viewportBottom: number;
-    /** The collapsed divider under the header: absent, waiting, or drawn. */
     divider: 'none' | 'hidden' | 'visible';
-    /** Bottom edge of the line carried on the rolling block, while it exists. */
     carriedBottom: number | null;
 }
 
-/** Click the Pinned header and record every frame until the motion settles. */
 async function recordToggle(page: import('@playwright/test').Page, threadIds: string[]): Promise<ToggleFrame[]> {
     return page.evaluate(async (threadIds) => {
         const wrap = (id: string) => document.querySelector<HTMLElement>(`[data-flip-id="${id}"]`);
@@ -44,8 +39,6 @@ async function recordToggle(page: import('@playwright/test').Page, threadIds: st
                 viewportBottom: window.innerHeight,
                 carriedBottom: document.querySelector('.drawer-section > .flip-disclosure-hairline')
                     ?.getBoundingClientRect().bottom ?? null,
-                // Read last: a pseudo-element style read can move WebKit's
-                // animations on, and every box above must share one moment.
                 divider: (() => {
                     const after = getComputedStyle(wrap('__section_saved')!, '::after');
                     if (after.content === 'none') return 'none' as const;
@@ -69,8 +62,6 @@ test.describe('Drawer section disclosure', () => {
 
     test('a section\'s threads unroll and roll up under its header, like sub-threads', async ({ page }) => {
         const stamp = Date.now();
-        // Taller than the viewport, so the roll is capped at the screen and
-        // the rows past the cut stay out of the motion.
         const pinnedIds = Array.from({ length: 30 }, () => randomUUID());
         const archivedId = randomUUID();
         const now = new Date().toISOString();
@@ -82,16 +73,10 @@ test.describe('Drawer section disclosure', () => {
 
         await navigateToApp(page);
         await openThreadDrawer(page);
-        // The section's top row: rows far below it sit past the row window.
         const pinnedRow = page.locator('[data-flip-id="__section_saved"] ~ .drawer-section-rows .thread-row').first();
         await expect(pinnedRow).toBeVisible();
-        // The archived row itself may sit past the row window, so the
-        // Archive header stands for it.
         await expect(page.locator('[data-flip-id="__section_archive"]')).toBeVisible();
 
-        // The gap under the moving block, open and shut. The next header must
-        // stay inside that range on every frame. The block's bottom is its rows'
-        // box: rows past the row window are a gap, not a row.
         const nextHeaderGap = () => page.evaluate(() => {
             const header = document.querySelector('[data-flip-id="__section_saved"]')!;
             const rows = header.parentElement!.querySelector('.drawer-section-rows');
@@ -102,25 +87,15 @@ test.describe('Drawer section disclosure', () => {
 
         const collapse = await recordToggle(page, pinnedIds);
         await expect(pinnedRow).toBeHidden();
-        // The section is taller than the screen, so it rolls only one screen:
-        // the next header starts just below the fold, and rows past the cut
-        // get no copy.
         expect(collapse[0].nextHeaderTop).toBeLessThan(collapse[0].viewportBottom + 150);
         expect(Math.max(...collapse.map(f => f.ghosts))).toBeLessThan(pinnedIds.length);
-        // While the rows roll up, a carried line stands in for the divider,
-        // and the divider takes over once it lands.
         for (const f of collapse.filter(f => f.ghosts > 0)) expect(f.divider).toBe('hidden');
         expect(collapse[collapse.length - 1].divider).toBe('visible');
         const shutGap = await nextHeaderGap();
         const expand = await recordToggle(page, pinnedIds);
         await expect(pinnedRow).toBeVisible();
-        // Unrolling, the carried line takes the divider's place and rides down.
         for (const f of expand.filter(f => f.ghosts > 0)) expect(f.divider).toBe('none');
 
-        // Mobile WebKit can read one element's box a frame apart from the
-        // rest, early or late, so a check allows the block's larger step to
-        // either neighbouring frame. Real drift grows past that; a one-frame
-        // read skew does not.
         const slack = (frames: ToggleFrame[], i: number) => {
             const cur = frames[i].blockBottom;
             const step = (other: number | null | undefined) => (other != null && cur != null ? Math.abs(cur - other) : 0);
@@ -129,8 +104,6 @@ test.describe('Drawer section disclosure', () => {
         const tracked = (f: ToggleFrame) =>
             f.ghosts > 0 && f.blockBottom !== null && f.nextHeaderTop < f.viewportBottom;
 
-        // The carried line rides the block's bottom edge and never rises above
-        // the header, where the divider sits.
         for (const frames of [collapse, expand]) {
             expect(frames.some(f => f.carriedBottom !== null)).toBe(true);
             expect(frames[frames.length - 1].carriedBottom).toBeNull();
@@ -144,9 +117,6 @@ test.describe('Drawer section disclosure', () => {
             });
         }
 
-        // The next header never rides over the section header, and while it
-        // is on screen it tracks the bottom of the moving block. Below the
-        // fold there is nothing to see, so no copy exists to measure.
         for (const frames of [collapse, expand]) {
             frames.forEach((f, i) => {
                 expect(f.nextHeaderTop).toBeGreaterThanOrEqual(f.headerBottom - 1);
@@ -176,13 +146,11 @@ test.describe('Drawer section disclosure', () => {
 
         await navigateToApp(page);
         await openThreadDrawer(page);
-        // The sub-thread closes the Pinned section, so its line is indented.
         const child = page.locator(`.thread-row[data-thread-nav="${childId}"]`);
         await expect(child).toBeVisible();
         const lineLeft = (el: Element) => el.getBoundingClientRect().left + parseFloat(getComputedStyle(el, '::after').left);
         const rowLineLeft = await child.evaluate(lineLeft);
 
-        // The carried line's left edge on every frame it exists.
         const recordLefts = () => page.evaluate(async () => {
             document.querySelector<HTMLElement>('[data-flip-id="__section_saved"]')!.click();
             const lefts: number[] = [];
@@ -202,9 +170,6 @@ test.describe('Drawer section disclosure', () => {
         const expand = await recordLefts();
         await expect(child).toBeVisible();
 
-        // The left edge travels one way between the row's indent and the
-        // divider's inset, and finishes on the far end. The first frame read
-        // can land well into the motion, so the path is what gets checked.
         const expectPath = (lefts: number[], from: number, to: number) => {
             expect(lefts.length).toBeGreaterThan(0);
             const sign = Math.sign(to - from);
@@ -231,8 +196,6 @@ test.describe('Drawer section disclosure', () => {
         const badge = header.locator('.section-count-badge');
         const open = header.locator('.section-count-open');
 
-        // One copy of the number shows at a time: the bare, larger one while
-        // open, and the pill's own while shut.
         await expect(header).toHaveAttribute('aria-expanded', 'true');
         await expect(open).toBeVisible();
         await expect(open).toHaveText('2');

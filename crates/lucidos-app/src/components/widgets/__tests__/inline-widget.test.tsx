@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * An inline widget in the transcript (ADRs 0432, 0466): a bare widget box,
- * the box a dashboard tile is. Its frame mounts once on screen and fills the
- * box. Content past the box is clipped under a fade. The widget menu's size
- * row picks another declared size and keeps the frame. A reply's embed and an
- * old `WidgetShown` draw the same one.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
 import { render } from 'preact';
@@ -30,13 +23,11 @@ vi.mock('../../../store/actions/dashboards', async (importOriginal) => ({
   rereadDashboard: () => Promise.resolve(),
 }));
 
-/** A pick lands as the engine's `InlineWidgetSized`, which the card draws. */
 let nextSeq = 1;
 function sizeEventArrives(appId: string, size: string): void {
   const thread = threadMap.value.get(THREAD);
   const events = new Map(thread?.events);
   events.set(nextSeq++, { type: 'InlineWidgetSized', app_id: appId, size } as StoredEvent);
-  // Only `events` is read, so the rest of the thread stays a stub.
   threadMap.value = new Map([[THREAD, { ...thread, events } as never]]);
 }
 const sizeWidgetCards = vi.fn((instance: { appId: string }, _name: string, size: string) => {
@@ -58,7 +49,6 @@ const { WidgetMenuItems } = await import('../widgetMenuChunks');
 const { LONG_PRESS_DELAY_MS } = await import('../../../hooks/useLongPress');
 
 const THREAD = 'thread-1';
-/** A stand-in for the widget box's height, which CSS sets and jsdom cannot read. */
 const BOX_PX = 160;
 
 function readEmptyDashboard(): void {
@@ -72,8 +62,6 @@ function appRead(app: Partial<App> & { id: string }): void {
   }]]);
 }
 
-// jsdom lays nothing out, so the widget box answers as a browser would: as
-// tall as its size. The stub shadows jsdom's own on `Element`.
 beforeEach(() => {
   Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
     configurable: true,
@@ -89,10 +77,8 @@ afterEach(() => {
 let host: HTMLElement;
 
 beforeEach(async () => {
-  // The menu opens once its rows are in memory: load them up front.
   await WidgetMenuItems.preload();
   _resetWidgetHeightsForTesting();
-  // A frame applies a report on the next animation frame. Run it at once.
   vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => { run(performance.now()); return 0; });
   appRead({ id: 'flight-picker', name: 'Flight picker' });
   appRead({ id: 'player', name: 'Sound player', reusable: true });
@@ -109,7 +95,6 @@ afterEach(() => {
   appsById.value = new Map();
   dashboards.value = new Map();
   threadMap.value = new Map();
-  // A case that fails mid-way still hands the next one real timers.
   vi.useRealTimers();
 });
 
@@ -117,7 +102,6 @@ const frames = () => host.querySelectorAll<HTMLIFrameElement>('iframe');
 const box = () => host.querySelector<HTMLElement>('.inline-widget .widget-box')!;
 const fade = () => host.querySelector('.widget-box-fade');
 const card = () => host.querySelector<HTMLElement>('.inline-widget')!;
-// The menu is portalled, so its rows are read from the document.
 const sizeOption = (size: string) => document.querySelector<HTMLButtonElement>(`.thread-overflow-menu [role="radio"][aria-label="${size}"]`)!;
 const menuItem = (label: string) =>
   [...document.querySelectorAll<HTMLButtonElement>('.thread-overflow-menu [role="menuitem"]')].find((b) => b.textContent!.startsWith(label));
@@ -198,8 +182,6 @@ describe('InlineWidget', () => {
     expect(frames()[0], 'the frame stays').toBe(frame);
   });
 
-  /** Invariant: a card too narrow for XL is clamped by CSS and the box keeps
-   *  the true XL width in its scroller. The widget still gets `xl`. */
   it('draws an XL card at four cells, the box holding that width in a scroller', () => {
     appRead({ id: 'flight-picker', name: 'Flight picker', sizes: ['medium', 'large', 'xl'] });
     renderCard();
@@ -231,8 +213,6 @@ describe('InlineWidget', () => {
     expect(addToDashboard).toHaveBeenCalledWith('desktop', { appId: 'flight-picker', params: undefined, label: undefined, size: 'medium' }, 'Flight picker', 'widget');
   });
 
-  // I6 and I7: the card draws the thread's newest pick, as after a reload or
-  // a pick on another device, and adds its tile at that size.
   it('draws the newest size the thread holds, and adds at it', () => {
     appRead({ id: 'flight-picker', name: 'Flight picker', sizes: ['medium', 'large'] });
     readEmptyDashboard();
@@ -255,8 +235,6 @@ describe('InlineWidget', () => {
     expect(box().getAttribute('data-size')).toBe('medium');
   });
 
-  // ADR 0415: the card finds its own instance among two of one widget, puts
-  // its params in the frame, and reads its label.
   it('draws its own instance: params in the frame, the label as its name', () => {
     act(() => {
       render(<InlineWidget threadId={THREAD} appId="player" params={{ clip: 'b.mp3' }} label="Cedar" eventId="s-b" stamped />, host);
@@ -342,10 +320,8 @@ describe('InlineWidget menu', () => {
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
     });
     expect(menuItems().length).toBeGreaterThan(0);
-    // Closed first, so only the card can stop the click that follows.
     act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
     expect(menuItems()).toEqual([]);
-    // The lift's paired click is swallowed before it reaches the box.
     act(() => {
       target.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, button: 0 }));
       target.click();

@@ -5,7 +5,7 @@
 
 /// Cosine similarity threshold for matching wrong_fact against memory candidates
 /// in correct_memory. Entries must exceed this to be considered for deletion.
-pub(crate) const MEMORY_CORRECTION_THRESHOLD: f32 = 0.65;
+pub const MEMORY_CORRECTION_THRESHOLD: f32 = 0.65;
 
 /// Cosine similarity at which extraction treats a new fact as one it already
 /// holds, and skips it.

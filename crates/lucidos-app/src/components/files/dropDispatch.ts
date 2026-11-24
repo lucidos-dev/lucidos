@@ -12,9 +12,6 @@ export interface DropHandlers {
 
 const ZONE_SELECTOR = '[data-drop-zone="attach"], [data-drop-zone="import"]';
 
-/** Find the nearest ancestor of `target` marked as a drop zone. The innermost
- *  match wins, so a files panel nested inside an attach surface still imports
- *  cleanly. Returns the matched element so callers can apply visual feedback. */
 export function findDropZone(target: EventTarget | null): DropZoneMatch | null {
   const el = (target as HTMLElement | null)?.closest?.(ZONE_SELECTOR) as HTMLElement | null;
   if (!el) return null;
@@ -22,9 +19,6 @@ export function findDropZone(target: EventTarget | null): DropZoneMatch | null {
   return { el, kind };
 }
 
-/** Resolve the drop target and invoke the matching handler. Returns the kind
- *  that was dispatched, or null if the drop should be ignored. Caller must
- *  call `preventDefault` on the underlying event. */
 export async function dispatchDrop(
   target: EventTarget | null,
   files: FileList | null | undefined,

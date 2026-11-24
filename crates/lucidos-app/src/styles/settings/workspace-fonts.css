@@ -1,5 +1,3 @@
-/* Settings → Appearance → Workspace fonts: the installed fonts, each named in
-   its own face, and the install form (components/settings/WorkspaceFontsSection.tsx). */
 
 .workspace-font-rows {
     display: flex;
@@ -37,8 +35,6 @@
     padding-bottom: var(--space-sm);
 }
 
-/* The Files row: the pick on the left, the themed button at the row's right
-   edge. The button is a label around a visually hidden file input. */
 .settings-row:has(> .workspace-font-picker) {
     align-items: center;
 }
@@ -47,8 +43,6 @@
     padding-top: 0;
 }
 
-/* Grows into the line beside the label and may shrink below its content. A
-   long file name then truncates and leaves the button on the row. */
 .workspace-font-picker {
     flex: 1 1 8rem;
     min-width: 0;
@@ -58,7 +52,6 @@
     gap: var(--space-sm);
 }
 
-/* The weight hint's muted type, on one line. */
 .workspace-font-picker-status {
     min-width: 0;
     overflow: hidden;
@@ -73,7 +66,6 @@
     white-space: nowrap;
 }
 
-/* The input is 0x0 and transparent, so its own outline would land on nothing. */
 .workspace-font-picker > .settings-option:has(> input:focus-visible) {
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);

@@ -1,13 +1,3 @@
-/**
- * The installed iOS PWA steps forward off a page it reached by going back.
- *
- * Every iOS notification tap loads a new document, so the page the user was on
- * stays one entry back. The left-edge swipe is iOS's back gesture, and the edge
- * guard cannot cover every touch, so a stray swipe lands there. This inline
- * `<head>` script is what sends the user straight back to the live page. It is
- * lifted out of `index.html` and run with stub globals, as the cold-start fast
- * path suite does.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -28,18 +18,14 @@ function bounceSource(): string {
 }
 
 interface Env {
-  /** `navigator.standalone`: true only in a Safari web app (iOS home screen or macOS Dock). */
   standalone?: boolean;
-  /** The navigation entry's `type`, or null for no entry. */
   navType?: string | null;
-  /** `navigation.canGoForward`, or undefined where the Navigation API is missing. */
   canGoForward?: boolean;
 }
 
 interface Run {
   forwards: number;
   flagged: boolean;
-  /** Fire `pageshow`, as a back-forward cache restore or an ordinary show. */
   pageshow: (persisted: boolean) => void;
 }
 
@@ -48,7 +34,6 @@ function run(env: Env): Run {
   const result = { forwards: 0 };
   const listeners: Array<(e: { persisted: boolean }) => void> = [];
   const win: Record<string, unknown> = canGoForward === undefined ? {} : { navigation: { canGoForward } };
-  // The script under test is inline HTML, so only `new Function` can run it.
   // eslint-disable-next-line no-new-func
   new Function('navigator', 'performance', 'history', 'addEventListener', 'window', bounceSource())(
     { standalone },
@@ -94,8 +79,6 @@ describe('iOS PWA history bounce', () => {
   });
 
   it('stays put when there is nowhere forward to go', () => {
-    // A restored session reloads its current entry as a traversal. Flagging it
-    // would stand the picker's redirect down for a hop that never happens.
     const r = run({ navType: 'back_forward', canGoForward: false });
     expect(r.forwards).toBe(0);
     expect(r.flagged).toBe(false);

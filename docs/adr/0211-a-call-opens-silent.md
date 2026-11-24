@@ -1,7 +1,8 @@
 # 0211: A call opens silent: the talker is not heard before the caller's first word
 
 - **Status**: Accepted, and amended by [ADR 0213](0213-one-opener-buys-one-answer.md)
-  and [ADR 0218](0218-a-mute-covers-a-sentence.md)
+  and [ADR 0218](0218-a-mute-covers-a-sentence.md), and
+  [ADR 0666](0666-a-call-opens-listening.md)
 - **Date**: 2026-09-17
 
 > **What 0213 changes.** "Three things open the floor, and none closes it again"

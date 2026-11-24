@@ -5,7 +5,6 @@ describe('pairingCodeFromText', () => {
   it('reads the code out of the URL a QR encodes', () => {
     expect(pairingCodeFromText('https://mac.ts.net/~/?pair=01234567')).toBe('01234567');
     expect(pairingCodeFromText('http://192.168.1.5:5252/~/?pair=47118899')).toBe('47118899');
-    // Trailing whitespace is what a scanner and a clipboard both add.
     expect(pairingCodeFromText('  https://mac.ts.net/~/?pair=01234567\n')).toBe('01234567');
   });
 
@@ -23,9 +22,6 @@ describe('pairingCodeFromText', () => {
   });
 
   it('never mines digits out of text that merely contains some', () => {
-    // The scanner points at whatever is on screen, so it reads other codes,
-    // other links and other people's phone numbers. Each has to be refused so
-    // it keeps looking rather than submitting a wrong code.
     for (const text of [
       '',
       '   ',

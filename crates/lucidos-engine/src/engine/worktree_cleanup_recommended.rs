@@ -32,7 +32,7 @@ enum RecommendedAction {
 ///
 /// Every check runs right before its worktree is touched, and liveness again
 /// after the slow ones. A failure on one worktree is logged and skipped.
-pub(crate) async fn run_recommended_cleanup(
+pub async fn run_recommended_cleanup(
     pool: &PgPool,
     bus: &EventBus,
     workspace_root: &Path,
@@ -43,7 +43,7 @@ pub(crate) async fn run_recommended_cleanup(
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] recommended: cannot read worktrees dir {}: {}",
                 dir.display(),
                 e
@@ -88,7 +88,7 @@ pub(crate) async fn run_recommended_cleanup(
                     let Some(removed) = remove_worktree_and_optionally_delete_branch(
                         &worktree,
                         None,
-                        BranchDisposal::WhenMerged,
+                        BranchDisposal::Keep,
                     )
                     .await
                     else {
@@ -106,7 +106,7 @@ pub(crate) async fn run_recommended_cleanup(
                 }
             };
             outcome.freed_bytes = outcome.freed_bytes.saturating_add(freed_bytes);
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] recommended: tier-{} freed {} bytes for thread {}",
                 tier,
                 freed_bytes,
@@ -156,7 +156,7 @@ async fn recommended_action(
         Ok(false) => {}
         Ok(true) => return None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] recommended: is_saved lookup failed for thread {}: {}; skipping",
                 thread_id,
                 e

@@ -14,18 +14,13 @@ import type { WidgetMenuTarget } from './WidgetMenu';
 import { WidgetMenuItems } from './widgetMenuChunks';
 import { WidgetBox } from './WidgetBox';
 
-/** What an inline widget draws when its widget cannot: in place, never
- *  refused, since a reply cannot be (ADR 0415). */
 export const WIDGET_UNAVAILABLE_TEXT = 'This widget is not available';
 
-/** `reason` as a sentence: the embed parser words its reasons as clauses. */
 function asSentence(reason: string): string {
   const capped = reason.charAt(0).toUpperCase() + reason.slice(1);
   return /[.!?]$/.test(capped) ? capped : `${capped}.`;
 }
 
-/** An inline widget that cannot draw, in the same box. `reason` says why, so
- *  whoever wrote the embed can fix it. */
 export function UnavailableWidget({ appId, stamp, reason }: { appId?: string; stamp?: string; reason?: string }) {
   return (
     <div class="inline-widget inline-widget-gone" data-event-id={stamp} data-inline-widget={appId}>
@@ -35,13 +30,6 @@ export function UnavailableWidget({ appId, stamp, reason }: { appId?: string; st
   );
 }
 
-/** An inline widget's card: its widget box, bare, as a dashboard tile draws
- *  it. A right-click or a long press anywhere on it opens the widget menu,
- *  inside the frame included (`frame` gets `onMenu`). The click a hold pairs
- *  is swallowed in capture, so the widget under the finger does not also take
- *  it. The card is a focus stop, and the menu key or Shift+F10 opens the
- *  menu from the keyboard. `stamp` is the card's deep-link stamp, and `style`
- *  its box geometry. */
 function WidgetCard({ style, stamp, target, frame }: {
   style: Record<string, string>;
   stamp?: string;
@@ -83,25 +71,8 @@ function WidgetCard({ style, stamp, target, frame }: {
   );
 }
 
-/** The size a card holds its room at until its widget is read. */
 const UNREAD_BOX_SIZE: WidgetSize = 'medium';
 
-/** An *inline widget* (ADR 0466): a widget in a turn, drawn as its bare
- *  *widget box*, the same box its dashboard tile draws (ADR 0432). A reply
- *  draws one from its embed, and an old `WidgetShown` still draws one at its
- *  turn. `eventId` is an event of that turn.
- *
- *  The card starts at the widget's default size, and the size row of its menu
- *  picks another of the sizes it declares. A pick writes `InlineWidgetSized`,
- *  and the card draws the newest one the thread holds. It resizes the box and
- *  keeps the frame.
- *
- *  `stamped` is set for an old `WidgetShown`, which is its own deep-link
- *  target (`stampedEventIds`). A reply's widget names its turn's starter,
- *  which the turn root already wears.
- *
- *  `refusal` is a reply embed's check, run once the widget is read. An old
- *  showing was checked when it was written, so it passes none. */
 export function InlineWidget({ threadId, appId, params, label, eventId, stamped = false, refusal = widgetRefusal }: {
   threadId: string;
   appId: string;
@@ -133,7 +104,6 @@ export function InlineWidget({ threadId, appId, params, label, eventId, stamped 
     appId,
     params,
     label,
-    // Blank until the widget is read: a single value, so no skeleton.
     name: label ?? app?.name ?? '',
     reusable: app?.reusable ?? false,
     originPluginId: app?.origin_plugin_id,
@@ -158,7 +128,6 @@ export function InlineWidget({ threadId, appId, params, label, eventId, stamped 
           onMenu={onMenu}
         />
       ) : (
-        // The frame waits on the manifest's `reveal`. The box holds the room.
         <div class="widget-box" data-size={size} />
       ))}
     />

@@ -12,10 +12,6 @@ import {
   renameThreadViaMenu,
 } from './helpers';
 
-/** Desktop rename and the drawer-aware title row. The `-desktop` suffix keeps
- *  these off the mobile projects, where `.thread-view-header` is not drawn.
- *  The title never edits in place. It opens the thread menu, and Rename…
- *  there opens the prompt dialog prefilled with the title. */
 
 async function newThread(page: import('@playwright/test').Page, tag: string): Promise<void> {
   await navigateToApp(page);
@@ -78,8 +74,6 @@ test.describe('Thread title and rename: desktop', () => {
     await newThread(page, 'drawer-open');
     await openThreadDrawer(page);
 
-    // The open thread's drawer row can be scrolled, folded or filtered away,
-    // so the title row, whose title opens the menu, stays on screen.
     await expect(page.locator('.thread-view-header .thread-title')).toBeVisible();
 
     const next = `From the title row ${Date.now()}`;

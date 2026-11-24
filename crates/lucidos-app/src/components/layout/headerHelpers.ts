@@ -27,11 +27,7 @@ function getFormTitle(form: InlineForm): string {
     }
     case 'new-app': return 'New App';
     case 'credential': return form.editing ? 'Edit Credential' : 'Add Credential';
-    // Also the nav-history row's label (via navEntryTitle), so a sent email
-    // reads as the receipt it is rather than a confirmation still pending.
     case 'email-confirm': return form.sentAt ? 'Email Sent' : 'Confirm Email';
-    // Past tense once the panel is a receipt, so the nav-history row says what
-    // happened rather than offering an action that is already resolved.
     case 'plugin-install':
       return `${form.installed ? 'Installed' : 'Install'} ${form.request.plugin_name}`;
     case 'plugin-uninstall':
@@ -43,8 +39,6 @@ function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
-/** An app's name in the Canvas header. Widget details and the origin thread
- *  belong in the full tooltip and history title (ADR 0402). */
 function appTitle(app: App, short: boolean): string {
   if (short || app.kind !== 'widget') return app.name;
   const origin = app.origin_thread_id ? threadMap.value.get(app.origin_thread_id)?.meta.title : undefined;
@@ -52,19 +46,6 @@ function appTitle(app: App, short: boolean): string {
   return `${app.name} (widget from ${origin})`;
 }
 
-/** Title of whatever the content pane is showing, in one of two forms.
- *
- *  `short` is what the header BAR renders, and the rule for it is: a title WE
- *  author says the destination's kind and nothing more, because the bar is the
- *  narrowest surface a title ever appears on. Everything appended to name the
- *  particular instance (which notification, which change a diff belongs to,
- *  which thread is previewing an app) belongs to the full form, which the
- *  title's own tap-tooltip carries and the back/forward history menu renders.
- *  A name we did NOT author (a file, an app, a web page, a thread) has no short
- *  form to author, so the ellipsis stays the net underneath.
- *
- *  Both forms come out of this one function, on purpose: a new destination
- *  cannot land in the full form and go missing from the short one. */
 function contentTitle(short: boolean): string {
   const settingsLabel: (key: SettingsNavKey) => string | undefined =
     short ? settingsSubviewShortLabel : settingsSubviewLabel;
@@ -73,15 +54,11 @@ function contentTitle(short: boolean): string {
   const pageTitle = panelTitle.value;
   const active = activeMenuItem.value;
 
-  // The overlay's own `form`, not the `activeInlineForm` alias computed off it.
-  // Narrowing gives it to us here, where the alias needed a `!` to say the same.
   if (overlay?.type === 'form') return getFormTitle(overlay.form);
   if (overlay?.type === 'app-ui') {
     const wipTid = wipPreviewThreadId.value;
     if (wipTid) {
       const wipTitle = threadMap.value.get(wipTid)?.meta.title;
-      // Which thread is previewing it is instance detail: the bar says the app
-      // is showing work in progress, the tooltip says whose.
       if (wipTitle && wipTitle !== PENDING_TITLE_PLACEHOLDER && !short) {
         return `${overlay.app.name} (WIP by ${wipTitle})`;
       }
@@ -91,9 +68,6 @@ function contentTitle(short: boolean): string {
   }
   if (overlay?.type === 'file-preview') {
     const fileName = previewFileName(overlay.path);
-    // The change a diff belongs to is a sentence, not a title. The bar names the
-    // file; the tooltip is already the description on its own (see AppHeader,
-    // which prefers `getDiffDescription`), so nothing is lost by dropping it.
     const desc = short ? null : getDiffDescription();
     if (desc) return `${fileName}: ${desc}`;
     return fileName;
@@ -110,23 +84,14 @@ function contentTitle(short: boolean): string {
   return MENU_ITEM_LABELS[active] || '';
 }
 
-/** The full title, for every surface with room for it: the tap-tooltip on the
- *  header title, and anything else that wants the destination's real name. */
 export function getContentTitle(): string {
   return contentTitle(false);
 }
 
-/** The title as the header bar renders it: the destination's kind, without the
- *  detail that names the particular instance. See `contentTitle`. */
 export function getContentTitleShort(): string {
   return contentTitle(true);
 }
 
-/** Title for an arbitrary captured `NavEntry` — the rows in the back/forward
- *  long-press history menu. Mirrors `getContentTitle` but reads the entry's own
- *  fields instead of the live signals (so past entries label correctly), and
- *  falls back to the host name for url-preview entries since the live page
- *  <title> isn't captured in history. */
 export function navEntryTitle(entry: NavEntry): string {
   const overlay = entry.overlay;
   if (overlay?.type === 'form') return getFormTitle(overlay.form);
@@ -146,19 +111,9 @@ export function navEntryTitle(entry: NavEntry): string {
   if (!overlay && entry.menuItem === 'settings' && entry.settingsSubview !== 'main') {
     return settingsSubviewLabel(entry.settingsSubview) || 'Settings';
   }
-  // The fallback is not dead. `parseNavEntry` casts a persisted string to
-  // `MenuItem` unchecked, so an old stack can carry a retired menu item this
-  // map has no name for.
   return MENU_ITEM_LABELS[entry.menuItem] || entry.menuItem;
 }
 
-/** Content-pane category for a captured `NavEntry` — drives the icon shown
- *  beside each row in the content back/forward history menu (ContentNav). Mirrors
- *  `navEntryTitle`'s branching, mapping every destination to one of the
- *  Search Everywhere content categories (plus the content-pane-only ones:
- *  `notifications`, `web`). The bare menu items already share their names with
- *  the category icons, so the no-overlay case returns the menu item verbatim;
- *  anything unmapped falls through to the icon's default. */
 export function navEntryCategory(entry: NavEntry): string {
   const overlay = entry.overlay;
   if (overlay?.type === 'form') {
@@ -168,9 +123,6 @@ export function navEntryCategory(entry: NavEntry): string {
       case 'new-app': return 'apps';
       case 'credential':
       case 'email-confirm': return 'settings';
-      // A plugin panel is about a plugin, and `plugins` is both a menu item and
-      // a CategoryIcon key, so the row carries the plugin glyph rather than the
-      // settings cog it used to borrow.
       case 'plugin-install':
       case 'plugin-uninstall': return 'plugins';
     }
@@ -180,9 +132,6 @@ export function navEntryCategory(entry: NavEntry): string {
   if (overlay?.type === 'url-preview') return 'web';
   if (overlay?.type === 'notification-detail') return 'notifications';
   if (overlay?.type === 'plugin-detail') return 'plugins';
-  // No overlay → the active menu item is the destination; its name is also the
-  // category icon's key (files / apps / triggers / settings / changes /
-  // notifications).
   return entry.menuItem;
 }
 

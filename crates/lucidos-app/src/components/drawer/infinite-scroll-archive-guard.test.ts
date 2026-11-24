@@ -1,20 +1,3 @@
-// Pins the Archive infinite-scroll primitives:
-//
-// - `archivePaginationAllowed` — the collapsed-Archive guard. Collapsing Archive
-//   shrinks the list, pulls the sentinel into view, and would otherwise let the
-//   fill loop pull the whole archive into memory for rows the user can't see.
-//   There is NO filter-active bypass anymore: the badge reads a server-sourced
-//   count (`refreshArchivedCount`), so a filter's matches are counted while
-//   collapsed without eager-loading hidden rows. It also gates whether the
-//   sentinel is RENDERED at all. Being a dependency of the observer effect is
-//   what makes an expand mount one and kick the fill loop
-//   (`e2e/drawer-archive-pagination.spec.ts`).
-//
-// - `sentinelInView` — the pure rect overlap the fill loop polls after each page
-//   to decide whether the freshly-loaded rows pushed the sentinel below the fold.
-//   This is the fix for "pagination only advanced on collapse/expand": an
-//   IntersectionObserver fires only on transitions, so a page that doesn't
-//   refill the viewport leaves the sentinel intersecting with no new event.
 
 import { describe, it, expect } from 'vitest';
 import { archivePaginationAllowed, sentinelInView } from './ThreadDrawer';
@@ -41,7 +24,6 @@ describe('sentinelInView', () => {
   const root = { top: 100, bottom: 800 };
 
   it('is true when the sentinel sits inside the viewport (page underfilled)', () => {
-    // Sentinel visible just below the last loaded row → keep loading.
     expect(sentinelInView({ top: 500, bottom: 532 }, root)).toBe(true);
   });
 
@@ -50,7 +32,6 @@ describe('sentinelInView', () => {
   });
 
   it('is false when the sentinel is pushed below the fold (viewport filled)', () => {
-    // Freshly-loaded rows pushed the sentinel out → stop; user scrolls to resume.
     expect(sentinelInView({ top: 900, bottom: 932 }, root)).toBe(false);
   });
 

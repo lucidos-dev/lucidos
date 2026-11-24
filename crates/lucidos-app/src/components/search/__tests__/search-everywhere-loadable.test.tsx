@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** Search Everywhere shows every hit as soon as it has it. Local hits land on
- *  the keystroke and each engine category on its own answer. A slow category
- *  leaves a trailing row saying what is still out. With nothing to show, a
- *  slow search draws result rows past the delay gate, and a failed one says it
- *  failed rather than "No results". */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -11,8 +6,6 @@ import type { SearchResultItem } from '../../../api/client';
 
 type Answer = 'hang' | 'fail' | SearchResultItem[] | Promise<SearchResultItem[]>;
 
-/** Text search answers on its own route. Its hits never come from `answerAll`,
- *  which only decides whether it hangs, fails or finds nothing. */
 type TextAnswer = 'hang' | 'fail' | 'none';
 
 const engine = vi.hoisted(() => ({
@@ -44,9 +37,7 @@ import { ALL_TAB_LIMIT } from '../searchSections';
 import { preferences, searchEverywhereOpen } from '../../../store/store';
 import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
 
-/** Matches nothing the frontend holds, so every row has to come from the engine. */
 const NO_LOCAL_HITS = 'zqxv';
-/** Finds the Search everywhere shortcut in the local settings index. */
 const SHORTCUT_QUERY = 'cmd k';
 const DEBOUNCE_MS = 150;
 const SERVER_CATEGORIES = ['apps', 'files', 'threads', 'triggers', 'changes'];
@@ -161,7 +152,6 @@ describe('hits before everything has loaded', () => {
     await advance(DEBOUNCE_MS);
     expect(rowTitles()).toEqual(['habit-tracker']);
 
-    // The shortcut and the header toggle close through the signal, not close().
     act(() => { searchEverywhereOpen.value = false; });
     engine.answers.apps = 'hang';
     act(() => { searchEverywhereOpen.value = true; });
@@ -203,7 +193,6 @@ describe('hits before everything has loaded', () => {
     press('ArrowDown');
     expect(selectedTitle()).toBe(first);
 
-    // A tie would put Apps above Settings, but Settings is already on screen.
     await act(async () => {
       landApps([hit('apps', 'habit-tracker')]);
       for (let i = 0; i < 5; i++) await Promise.resolve();
@@ -272,7 +261,6 @@ describe('ranking and tab dimming', () => {
     expect(tab('Apps').hasAttribute('aria-label')).toBe(false);
     expect(tab('Triggers').hasAttribute('data-empty')).toBe(true);
     expect(tab('Triggers').getAttribute('aria-label')).toBe('Triggers, no hits');
-    // Still out: not dimmed, so it never reads as empty.
     expect(tab('Threads').hasAttribute('data-empty')).toBe(false);
     expect(tab('Threads').hasAttribute('aria-label')).toBe(false);
   });

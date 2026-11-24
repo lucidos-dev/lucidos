@@ -8,6 +8,7 @@
 #
 #   ./scripts/check-prose.sh                 # vs the merge-base with main
 #   ./scripts/check-prose.sh --base <ref>    # vs another base
+#   ./scripts/check-prose.sh --path <file>   # one repository-relative file
 #
 # Run by `/harden` Phase 4.5 for EVERY diff, including docs-only ones. Docs-only
 # is precisely the diff this rule is about, so the docs-only skip must not apply.
@@ -27,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/prose_scan.sh"
 
 BASE_REF="main"
+SCAN_PATH=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --base)
@@ -35,6 +37,14 @@ while [ $# -gt 0 ]; do
                 exit 1
             }
             BASE_REF="$2"
+            shift 2
+            ;;
+        --path)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --path needs a repository-relative file." >&2
+                exit 1
+            fi
+            SCAN_PATH="$2"
             shift 2
             ;;
         -h | --help)
@@ -58,6 +68,19 @@ if [ -z "$REPO_ROOT" ]; then
     exit 1
 fi
 
+if [ -n "$SCAN_PATH" ]; then
+    case "/$SCAN_PATH/" in
+        //* | */../* | */./*)
+            echo "ERROR: --path needs a repository-relative file without dot components." >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -f "$REPO_ROOT/$SCAN_PATH" ]; then
+        echo "ERROR: --path does not name a regular file: $SCAN_PATH" >&2
+        exit 1
+    fi
+fi
+
 # The merge base, not the base ref itself: a branch cut days ago must be judged
 # on what IT added, never on what main gained in the meantime.
 BASE_COMMIT="$(git -C "$REPO_ROOT" merge-base "$BASE_REF" HEAD 2>/dev/null)"
@@ -67,7 +90,7 @@ if [ -z "$BASE_COMMIT" ]; then
     exit 1
 fi
 
-HITS="$( { prose_scan_diff "$BASE_COMMIT" "$REPO_ROOT" && prose_scan_untracked "$REPO_ROOT"; } )"
+HITS="$( { prose_scan_diff "$BASE_COMMIT" "$REPO_ROOT" "$SCAN_PATH" && prose_scan_untracked "$REPO_ROOT" "$SCAN_PATH"; } )"
 SCAN_RC=$?
 if [ "$SCAN_RC" -ne 0 ]; then
     echo "ERROR: the prose scan failed (status $SCAN_RC), so nothing was verified." >&2

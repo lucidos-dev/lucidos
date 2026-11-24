@@ -252,12 +252,7 @@ async fn hard_pressure_keeps_the_tree_of_a_live_thread() {
 }
 
 #[tokio::test]
-async fn tier_0_deletes_branch_if_fully_merged() {
-    // After Tier 0 was introduced, a fully-merged branch (no commits ahead
-    // of main, clean worktree, no pending change) is removed by Tier 0 long
-    // before Tier 2's 30d window — but the destructive call is shared, so
-    // `branch_deleted=true` semantics still hold. This test pins both:
-    // Tier 0 fires AND deletes the merged branch.
+async fn tier_0_keeps_branch_if_fully_merged() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
@@ -289,12 +284,9 @@ async fn tier_0_deletes_branch_if_fully_merged() {
     );
     let (_, tier, _, branch_deleted) = cleaned[0];
     assert_eq!(tier, 0, "should be reclaimed by Tier 0, not Tier 2");
-    assert!(branch_deleted, "fully-merged branch must be deleted");
-
-    let res = git_cmd(&["rev-parse", "--verify", &branch], &root).await;
-    let exists = matches!(res, Ok(o) if o.status.success());
-    assert!(!exists, "branch {} must no longer exist", branch);
-    let _ = worktree;
+    assert!(!branch_deleted);
+    assert!(branch_exists(&root, &branch).await);
+    assert!(!worktree.exists());
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -559,7 +551,7 @@ async fn archived_thread_worktree_reclaimed_with_ample_disk() {
         cleaned[0].1, 2,
         "the archived removal reports a full removal"
     );
-    assert!(cleaned[0].3, "a fully merged branch goes with the tree");
+    assert!(!cleaned[0].3, "archived removal keeps the branch");
     assert!(!worktree.exists(), "archived worktree dir must be removed");
 
     pool.close().await;
@@ -807,12 +799,54 @@ async fn ample_disk_keeps_artifacts_of_a_thread_with_a_pending_change() {
 
 // ── BranchDisposal ────────────────────────────────────────────────────
 //
-// The reclamation rule and its one sanctioned inversion (ADR 0035 amendment).
-// A worktree built by `add_worktree_for_thread` has a commit of its own, so
-// both cases below start from a branch the worker would keep.
+#[tokio::test]
+async fn keep_preserves_a_fully_merged_branch() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
 
-/// The worker's rule, and the one the other four callers pass. A unique commit
-/// is the user's work, so the tree goes and the branch stays.
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, None, BranchDisposal::Keep)
+            .await
+            .expect("the worktree is removed");
+
+    assert!(!worktree.exists());
+    assert!(!outcome.branch_deleted);
+    assert!(branch_exists(&root, &branch).await);
+}
+
+#[test]
+fn thread_reclamation_uses_keep() {
+    let worker = include_str!("../worktree_cleanup.rs");
+    let recommended = include_str!("../worktree_cleanup_recommended.rs");
+
+    for (source, caller) in [
+        (worker, "try_archived_removal"),
+        (worker, "try_tier_0"),
+        (worker, "try_tier_2"),
+        (recommended, "run_recommended_cleanup"),
+    ] {
+        let (_, body) = source
+            .split_once(&format!("async fn {caller}("))
+            .unwrap_or_else(|| panic!("missing {caller}"));
+        let body = body.split("async fn ").next().unwrap();
+        let (_, call) = body
+            .split_once("remove_worktree_and_optionally_delete_branch(")
+            .unwrap_or_else(|| panic!("{caller} must remove the worktree"));
+        let args = call.split(".await").next().unwrap();
+        assert!(
+            args.contains("BranchDisposal::Keep"),
+            "{caller} must keep the branch"
+        );
+    }
+}
+
+/// Conditional disposal protects unique commits on temporary branches.
 #[tokio::test]
 async fn when_merged_keeps_a_branch_that_holds_commits() {
     use crate::engine::worktree_cleanup::{

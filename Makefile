@@ -1,4 +1,4 @@
-.PHONY: build-local check lint lint-knowhow lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
+.PHONY: build-local check lint lint-static lint-knowhow lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -35,16 +35,27 @@ CLIPPY_FLAGS := --locked $(CLIPPY_SCOPE) --all-targets
 
 # Build locally (for development)
 build-local:
-	cargo build --locked -p lucidos-engine -p lucidos-cli
+	cargo build --locked -p lucidos-engine-bin -p lucidos-cli
 
 # Run all checks
 check: lint
 	cargo check --locked
 
 # Run every linter. THE clean-build lint gate, ordered cheapest first so a
-# finding surfaces immediately instead of after a full clippy pass: shell takes
-# under a second, the fmt check a few seconds, clippy minutes.
-lint: lint-shell lint-eval lint-knowhow lint-fmt lint-rust
+# finding surfaces before a full clippy pass. Shell analysis can be expensive.
+# Two halves: /harden completes lint-static before the Cargo lane, then runs
+# lint-rust in it. lint-static never runs Cargo.
+lint: lint-static
+	@$(MAKE) --no-print-directory lint-rust
+
+# Command-line overrides select components; exported settings retain all checks.
+LINT_STATIC_TARGETS = lint-shell lint-eval lint-knowhow
+lint-static:
+	@result=0; for target in $(LINT_STATIC_TARGETS); do \
+		echo "[lint-static] start $$target"; \
+		$(MAKE) --no-print-directory $$target || result=1; \
+		echo "[lint-static] end $$target"; \
+	done; exit $$result
 
 lint-knowhow:
 	@./scripts/check-knowhow-refs.sh & refs_pid=$$!; \
@@ -86,36 +97,15 @@ lint-fmt:
 		exit 1; \
 	}
 
-# Run clippy linter — TWICE, once per feature configuration, because neither
-# one alone lints the whole tree (see CLIPPY_FLAGS for the shared flags).
-#
-#   --all-features  lucidos-engine gates real code behind `e2e-test-hooks` (the
-#                   e2e workspace builds with it) and `real-embedder-tests`;
-#                   without this pass they are never linted.
-#   default         `e2e-test-hooks` compiles the PRODUCTION push transport OUT.
-#                   `scheduler/push.rs` holds the repo's only production
-#                   `cfg(not(feature …))`: `fan_out_to_web_push` and `send_each`
-#                   (VAPID, the real APNs/FCM send) exist only when the
-#                   feature is OFF. An
-#                   --all-features-only gate is blind to ~100 lines of shipping
-#                   code; verified by planting a `ptr_arg` in that region, which
-#                   --all-features passed and this pass caught.
-#
-# Cargo fingerprints artifacts per feature set, so both stay cached in target/
-# and alternating between them does not thrash — the second pass is near-free
-# once warm.
-# Both passes run inside ONE build slot rather than one each, so a queued lint
-# is admitted once and does not re-queue between them. `lint-shell` and
-# `lint-fmt` stay outside the slot: seconds of work must not wait behind
-# minutes of clippy.
-lint-rust:
+# Clippy checks every feature in one pass. The production push transport
+# compiles alongside the e2e push-log stub, so --all-features lints both.
+# lint-shell and lint-fmt stay outside the slot so they never queue for Clippy.
+lint-rust: lint-fmt
 	@$(BUILD_SLOT) --label "make lint" -- $(MAKE) --no-print-directory lint-rust-clippy
 
-# The clippy pair itself. Reached through `lint-rust`, which is what holds the
-# slot; invoking this target directly deliberately skips it.
+# Reached through lint-rust, which holds the build slot.
 lint-rust-clippy:
 	cargo clippy $(CLIPPY_FLAGS) --all-features -- -D warnings
-	cargo clippy $(CLIPPY_FLAGS) -- -D warnings
 
 # Run ShellCheck over every tracked shell script (discovery + flags live in the
 # script and .shellcheckrc, so a hand-run `shellcheck foo.sh` agrees with this).
@@ -144,7 +134,7 @@ fix:
 fmt:
 	cargo fmt --all
 
-# Run tests. ENGINE_TEST_ARGS reaches test-engine.sh verbatim; the early suite
+# Run tests for all three engine libraries. ENGINE_TEST_ARGS reaches test-engine.sh verbatim; the early suite
 # run of `/harden` passes its driver-module skips through it (ADR 0292).
 test: test-eval test-gateway test-crates
 	./scripts/test-engine.sh $(ENGINE_TEST_ARGS)
@@ -183,13 +173,12 @@ test-eval:
 test-gateway:
 	cargo test --locked -p lucidos-gateway
 
-# The small library crates' own unit tests. Each one's tests are hermetic
-# (a throwaway $HOME, pool or lock dir, no Postgres) and they all finish in
-# about a second. `make lint` compiles them under `--all-targets` and runs none, so
+# The small crates' own unit tests. Each one's tests are hermetic
+# (a throwaway $HOME, pool or lock dir, no Postgres). Most finish in about a
+# second; `lucidos-diagnostic-log`'s trybuild cases compile crates and take
+# longer on a cold cache. `make lint` compiles them under `--all-targets` and runs none, so
 # without this target a broken token check or capability check still passes.
-TEST_CRATES := lucidos-build-slot lucidos-capabilities lucidos-claude-code-managed \
-	lucidos-file-backup-exclusion lucidos-frame-capability lucidos-engine-socket lucidos-gateway-constants lucidos-home \
-	lucidos-installs lucidos-local-token lucidos-owner-lock lucidos-pg-url lucidos-secret-store lucidos-tailscale lucidos-update-address
+TEST_CRATES = $(shell awk '/^lucidos-/ && $$1 != "lucidos-app" && $$1 != "lucidos-cli" && $$1 != "lucidos-e2e" && $$1 != "lucidos-eval" && $$1 != "lucidos-gateway" && (NF == 2 || $$1 == "lucidos-engine-bin") {print $$1}' crates/crate-tiers.tsv)
 test-crates:
 	cargo test --locked $(addprefix -p ,$(TEST_CRATES))
 
@@ -230,4 +219,4 @@ status:
 # Run the engine against a fresh test workspace (for development)
 run-local:
 	rm -rf test-workspace/data test-workspace/.lucidos
-	LUCIDOS_WORKSPACE=./test-workspace cargo run --locked -p lucidos-engine
+	LUCIDOS_WORKSPACE=./test-workspace cargo run --locked -p lucidos-engine-bin

@@ -10,7 +10,9 @@
 
 use std::path::Path;
 
-use lucidos_engine::engine::{AnsweredQuestion, InFlight, PushedNotification, TurnRead};
+use lucidos_agents_api::engine::turn_end::{
+    AnsweredQuestion, InFlight, PushedNotification, TurnRead,
+};
 use lucidos_engine::llm::judgment::JudgmentProvider;
 use serde::Deserialize;
 
@@ -20,7 +22,7 @@ use crate::Fallible;
 pub(crate) const CHECK: Check = Check {
     command: "read-decision",
     name: "read decision",
-    chat_judge: lucidos_engine::engine::read_decision_chat_judge,
+    chat_judge: lucidos_agents_api::engine::turn_end::read_decision_chat_judge,
     missed: "Missed must-read",
     noise: "Noise passed",
 };
@@ -73,6 +75,7 @@ impl LabelledTurn {
             in_flight: InFlight {
                 sub_threads: self.sub_threads,
                 event_waits: self.event_waits,
+                successor_session: false,
             },
             report_wakes_parent: self.report_wakes_parent,
             pushed: self.pushed.clone(),
@@ -95,7 +98,7 @@ impl Labelled for LabelledTurn {
     }
 
     async fn decide(&self, provider: &dyn JudgmentProvider) -> Fallible<Answer> {
-        let d = lucidos_engine::engine::decide_read_for_eval(
+        let d = lucidos_agents_api::engine::turn_end::decide_read_for_eval(
             provider,
             &self.turn()?,
             lucidos_engine::llm::metered::CallToken::for_eval_harness(),

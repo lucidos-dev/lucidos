@@ -5,32 +5,12 @@ import {
   mobileView,
   type ApplyPhase,
 } from '../../store/store';
-import { crossWorkspaceUnreadTotal } from '../../store/actions/app-badge';
+import { notificationsMenuUnreadTotal } from '../../store/actions/app-badge';
 import { liveActivityRows, type ActivityRow } from '../../store/actions/activityRows';
-// One cap for both header counts, so the mark and the menu rows cannot start
-// eliding at different numbers. Each site's own box is its own business; the
-// number at which a count stops being spelled out is shared.
 import { countLabel } from './unreadCountLabel';
 import { HourglassIcon, ReloadIcon } from '../shared/icons';
 import { GlyphBadge } from '../shared/GlyphBadge';
 
-/** Visible state of the brand badge. PURELY VISUAL in every state: a tap on it
- *  is a tap on the mark, which opens the Lucidos menu. The menu's activity
- *  group is where each state is explained and acted on.
- *
- *  - `busy`: a job is in flight, shown as a spinning refresh icon. The jobs are
- *    the activity group's rows (`store/actions/activityRows.ts`): builds, the
- *    embedding-model download, an Expose run, and applies.
- *  - `ready`: a new engine version is ready to switch onto, or a newer client
- *    bundle is available to refresh, shown as a single `!` attention mark. The
- *    menu's Refresh and Restart rows take it.
- *  - `pending`: new code exists in source with no version built behind it,
- *    shown as a quieter dot. The menu's pending row re-opens its toast.
- *  - `none`: nothing to surface, and the badge is not rendered.
- *
- *  Ordered by how much the user can do about it. Busy wins over ready (a
- *  switch/refresh isn't offered until the work lands), and ready wins over
- *  pending (something you can take now beats something that isn't built). */
 export type BrandBadgeState = 'busy' | 'ready' | 'pending' | 'none';
 
 export function brandBadgeState(activityCount: number): BrandBadgeState {
@@ -40,10 +20,6 @@ export function brandBadgeState(activityCount: number): BrandBadgeState {
   return 'none';
 }
 
-/** What the state badge stands for, in the menu's own words, or `undefined`
- *  when it is not drawn. The MARK speaks it in its label, and its tooltip
- *  shows it through {@link brandTooltipRows}: the badge is click-through, so
- *  neither a pointer nor a screen reader ever lands on the badge itself. */
 export function brandBadgeLabel(rows: ActivityRow[]): string | undefined {
   if (rows.length > 0) return rows.map((r) => r.label).join(' · ');
   const notices = brandNotices();
@@ -51,14 +27,11 @@ export function brandBadgeLabel(rows: ActivityRow[]): string | undefined {
   return notices.map((n) => `${n.label} ${n.value}`).join(' · ');
 }
 
-/** One row of the mark's hover tooltip, in the `data-tooltip-rows` shape. */
 export interface BrandTooltipRow {
   label: string;
   value: string;
 }
 
-/** The version notices the state badge stands for while no job runs. Each
- *  reads as one phrase when its label and value are joined with a space. */
 function brandNotices(): BrandTooltipRow[] {
   const notices: BrandTooltipRow[] = [];
   if (engineNewVersionReady()) notices.push({ label: 'New version', value: 'available' });
@@ -72,7 +45,6 @@ function brandNotices(): BrandTooltipRow[] {
   return notices;
 }
 
-/** A single-thread apply's phase, as a tooltip label a thread count reads under. */
 const APPLY_TOOLTIP_LABEL: Record<ApplyPhase | 'applying', string> = {
   merging: 'Merging',
   'resolving-conflict': 'Merge conflicts',
@@ -80,12 +52,6 @@ const APPLY_TOOLTIP_LABEL: Record<ApplyPhase | 'applying', string> = {
   applying: 'Applying',
 };
 
-/** The mark's hover tooltip: what is going on, as counts at a glance.
- *
- *  The menu names every thread, so single-thread applies collapse to one row
- *  per phase. The connection gets a row only while it is degraded, because a
- *  lit mark already says it is fine. That row pairs the state with what
- *  happens next, the short notice. */
 export function brandTooltipRows(
   unreadCount: number,
   rows: ActivityRow[],
@@ -108,36 +74,13 @@ export function brandTooltipRows(
   return out;
 }
 
-/** The unread count in words, or `null` when there is nothing to say.
- *
- *  Lives here with the badge, but is spoken by the MARK: see
- *  {@link UnreadBrandBadge} for why the badge itself is silent. */
 export function unreadBadgeLabel(count: number): string | null {
   if (count <= 0) return null;
   return count === 1 ? '1 unread notification' : `${count} unread notifications`;
 }
 
-/** The unread count on the mark, and the ONLY in-app mirror of the app-icon
- *  badge. Both read `crossWorkspaceUnreadTotal`, so they cannot show different
- *  numbers.
- *
- *  It rides the mark rather than the bell because the bell is not on every
- *  pane: `ContentHeaderActions` owns it, so the thread pane and the threads
- *  drawer carried no count at all. The mark is on all three.
- *
- *  It sits at the mark's BOTTOM-right corner, not the top-right the bell and
- *  the filter button use for a count. The artwork puts its sparkle top-right,
- *  and a resident badge there leaves the brand as three plain squares. The
- *  state badge above covers it only while something is happening.
- *
- *  PURELY VISUAL, and that is why it carries neither a tooltip nor a name. It
- *  is `pointer-events: none` in CSS, so the tap and the hover both belong to
- *  the mark underneath. A `data-tooltip` here could never fire: `useTooltip`
- *  resolves its target by walking UP from the hovered element, and this badge
- *  is never that element. The mark speaks the count instead, through
- *  {@link unreadBadgeLabel} in its label and an Unread row in its tooltip. */
 export function UnreadBrandBadge() {
-  const count = crossWorkspaceUnreadTotal.value;
+  const count = notificationsMenuUnreadTotal.value;
   if (count <= 0) return null;
   return (
     <GlyphBadge class="badge brand-unread-badge" aria-hidden="true">
@@ -146,10 +89,6 @@ export function UnreadBrandBadge() {
   );
 }
 
-/** The brand badge shared by the desktop brand label and the mobile mark.
- *  It spins while a job runs, shows `!` when a switch or refresh is ready,
- *  and a dot when new code is pending. Reads the driving signals in its own
- *  render, so it re-renders in place as they change. */
 export function BrandBadge() {
   const rows = liveActivityRows();
   const state = brandBadgeState(rows.length);
@@ -157,24 +96,17 @@ export function BrandBadge() {
   if (state === 'ready') {
     return <GlyphBadge class="badge brand-badge" aria-hidden="true">!</GlyphBadge>;
   }
-  const pending = state === 'pending';
+  if (state === 'pending') {
+    return <span class="badge brand-badge brand-badge-dot" aria-hidden="true" />;
+  }
   const waiting = rows.every((r) => r.queued);
   return (
-    <GlyphBadge
-      class={`badge brand-badge${pending ? ' brand-badge-dot' : ''}`}
+    <span
+      class="badge brand-badge badge-icon"
       aria-hidden="true"
     >
-      {/* Pending draws no glyph at all: the badge box IS the dot. The `!` is
-          spoken for by `ready`, and a second attention mark beside it would say
-          "act on this" about the one state where there is nothing to act on
-          yet.
-
-          Keyed on the mobile pane: each mobile header has its own badge, and
-          the hidden headers are `display: none`. iOS WebKit can leave a spin
-          frozen on an element that comes back from that, so each swap draws
-          a fresh element whose animation starts anew. */}
-      {!pending && !waiting && <span key={mobileView.value} class="brand-badge-spinner"><ReloadIcon /></span>}
-      {!pending && waiting && <span class="brand-badge-queued"><HourglassIcon /></span>}
-    </GlyphBadge>
+      {!waiting && <span key={mobileView.value} class="brand-badge-spinner"><ReloadIcon /></span>}
+      {waiting && <span class="brand-badge-queued"><HourglassIcon /></span>}
+    </span>
   );
 }

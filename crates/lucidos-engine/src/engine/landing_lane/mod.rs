@@ -7,8 +7,9 @@
 //! *lane thread* resolves on an *integration branch* and lands whole. Later
 //! arrivals that merge cleanly keep landing. While an Apply All press is open
 //! the lane opens no batch, so the press's conflicts resolve in one (ADR
-//! 0480). App changes keep the Apply tiers, and external-repo threads propose
-//! nothing.
+//! 0480). While a batch hardens again after a catch-up, the lane holds clean
+//! arrivals until the batch ends or a cap passes (ADR 0694). App changes keep
+//! the Apply tiers, and external-repo threads propose nothing.
 //!
 //! - `state`: the pure queue, batch and press rules.
 //! - `landing`: landing merges, built without a worktree.
@@ -23,34 +24,31 @@ mod integration;
 mod landing;
 mod lane_thread;
 mod recovery;
+mod remote;
 mod snapshot;
 mod state;
 
 pub(crate) use driver::{settle_restored_lane, LaneMsg, Submission};
 #[cfg(test)]
 pub(crate) use landing::{publish_clean_pass, LandingInput};
-pub(crate) use lane_thread::{
-    lane_batch_of_stale_session, lane_duty_for_run, unanswered_run_end, LaneDuty, LaneThreadEnd,
-    LANE_THREAD_CLOSED,
-};
+pub(crate) use lane_thread::lane_batch_ended;
 pub(crate) use snapshot::LaneSnapshot;
-pub(crate) use state::LaneRemoval;
+pub use state::LaneRemoval;
+pub use {
+    lane_thread::lane_batch_of_stale_session, lane_thread::lane_duty_for_run,
+    lane_thread::unanswered_run_end, lane_thread::LaneDuty, lane_thread::LaneThreadEnd,
+    lane_thread::LANE_THREAD_CLOSED,
+};
 
 use crate::engine::change_ops::ApplyKindContext;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
 
-/// A change in the lane: exactly the commit the lane lands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LaneMember {
-    pub change_id: Uuid,
-    pub snapshot_sha: String,
-}
+pub use crate::engine::thread_events::landing_lane::{LaneHoldRelease, LaneMember};
 
 /// Whether a change lands through the lane. Only Lucidos source in the
 /// engine's own repository does: the lane serves one repository.
-pub(crate) fn takes_landing_lane(
+pub fn takes_landing_lane(
     kind: &ApplyKindContext,
     change_repo_root: &Path,
     lane_repo_root: &Path,
@@ -86,6 +84,7 @@ pub(crate) async fn queued_changes(
         .map(|(change_id, snapshot_sha)| LaneMember {
             change_id,
             snapshot_sha,
+            remote: None,
         })
         .collect())
 }
@@ -119,8 +118,23 @@ pub(crate) async fn lane_held_changes(
     Ok(held.into_iter().map(|(id,)| id).collect())
 }
 
+pub(crate) const HELD_BY_LANDER: &str = "This change is held by the lander.";
+
+pub(crate) async fn handoff_started(pool: &sqlx::PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT event_type FROM events
+         WHERE event_type IN ('ChangeHandoffStarted', 'ChangeUnqueued', 'ChangeApplied')
+           AND payload->>'change_id' = $1
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(latest.as_deref() == Some("ChangeHandoffStarted"))
+}
+
 /// The snapshot `change_id` waits at, when it is queued.
-pub(crate) async fn queued_snapshot(
+pub async fn queued_snapshot(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     change_id: Uuid,

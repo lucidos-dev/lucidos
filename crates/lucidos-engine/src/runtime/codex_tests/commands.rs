@@ -9,6 +9,8 @@ fn test_config(worktree: &Path) -> CodexConfig {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: vec![
             (
@@ -35,9 +37,59 @@ fn collect_args(cmd: &tokio::process::Command) -> Vec<String> {
 }
 
 #[test]
+fn exec_requires_a_codex_release_with_standing_deny_hooks() {
+    assert!(supports_exec_command_hook("0.170.0"));
+    assert!(supports_exec_command_hook("0.171.0"));
+    assert!(!supports_exec_command_hook("0.169.0"));
+    assert!(!supports_exec_command_hook("unknown"));
+}
+
+/// Codex's seatbelt cannot nest inside Lucidos's, so it steps aside while
+/// Lucidos's is on, on both drivers.
+#[test]
+fn codex_runs_its_own_sandbox_only_while_lucidos_runs_none() {
+    let mut config = test_config(Path::new("/tmp/wt"));
+    assert_eq!(codex_sandbox_mode(&config), "workspace-write");
+    config.sandbox = crate::runtime::agent_sandbox::Sandbox::inherited();
+    assert_eq!(codex_sandbox_mode(&config), "danger-full-access");
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]).expect("command");
+    let args = collect_args(&cmd);
+    let at = args
+        .iter()
+        .position(|a| a == "--sandbox")
+        .expect("--sandbox");
+    assert_eq!(args[at + 1], "danger-full-access");
+}
+
+#[test]
+fn codex_writes_its_worktree_its_roots_and_its_home() {
+    let roots = confined_write_roots(
+        Path::new("/ws/.lucidos/worktrees/t1"),
+        &[PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")],
+        codex_home(&[], Some(Path::new("/home/u"))),
+    );
+    assert_eq!(
+        roots,
+        [
+            "/ws/.lucidos/worktrees/t1",
+            "/repo/.git",
+            "/ws/data",
+            "/home/u/.codex"
+        ]
+        .map(PathBuf::from)
+    );
+    let pinned = [("CODEX_HOME".to_string(), "/elsewhere".to_string())];
+    assert_eq!(
+        codex_home(&pinned, Some(Path::new("/home/u"))),
+        Some(PathBuf::from("/elsewhere"))
+    );
+}
+
+#[test]
 fn fresh_turn_command_layout() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &[]).expect("unsandboxed command");
     let args = collect_args(&cmd);
     assert_eq!(args[0], "exec");
     assert!(
@@ -79,12 +131,26 @@ fn fresh_turn_command_layout() {
             .any(|w| w[0] == "-c" && w[1] == "project_doc_max_bytes=65536"),
         "codex's 32KiB default would truncate Lucidos' ~29KiB CLAUDE.md soon"
     );
+    assert!(!args.iter().any(|a| a.starts_with("allow_login_shell")));
+}
+
+/// A login shell's `path_helper` would put `/bin/ps` ahead of the shim.
+#[test]
+fn with_the_ps_shim_codex_runs_no_login_shell() {
+    let mut config = test_config(Path::new("/tmp/wt"));
+    config.login_shell = false;
+    let cmd = build_codex_turn_command(&config, None, None, None, &[]).expect("command");
+    let args = collect_args(&cmd);
+    assert!(args
+        .windows(2)
+        .any(|w| w[0] == "-c" && w[1] == "allow_login_shell=false"));
 }
 
 #[test]
 fn max_effort_is_model_scoped_in_exec_driver() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, Some("gpt-5.6-sol"), Some("max"), None, &[]);
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.6-sol"), Some("max"), None, &[])
+        .expect("unsandboxed command");
     let args = collect_args(&cmd);
     assert!(
         args.windows(2)
@@ -94,7 +160,8 @@ fn max_effort_is_model_scoped_in_exec_driver() {
 
     // Older models reject Max. A stale selection must be omitted so Codex
     // applies its own default instead of failing the whole turn.
-    let cmd = build_codex_turn_command(&config, Some("gpt-5.5"), Some("max"), None, &[]);
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.5"), Some("max"), None, &[])
+        .expect("unsandboxed command");
     let args = collect_args(&cmd);
     assert!(
         !args
@@ -103,7 +170,8 @@ fn max_effort_is_model_scoped_in_exec_driver() {
         "Max must be omitted for pre-5.6 models"
     );
 
-    let cmd = build_codex_turn_command(&config, None, Some("max"), None, &[]);
+    let cmd = build_codex_turn_command(&config, None, Some("max"), None, &[])
+        .expect("unsandboxed command");
     let args = collect_args(&cmd);
     assert!(
         !args
@@ -119,7 +187,8 @@ fn resume_turn_places_global_flags_before_subcommand() {
     // (`error: unexpected argument '--sandbox' found`) — pin the ordering.
     let config = test_config(Path::new("/tmp/wt"));
     let cmd =
-        build_codex_turn_command(&config, Some("gpt-5.5"), Some("high"), Some("sid-123"), &[]);
+        build_codex_turn_command(&config, Some("gpt-5.5"), Some("high"), Some("sid-123"), &[])
+            .expect("unsandboxed command");
     let args = collect_args(&cmd);
     let resume_idx = args.iter().position(|a| a == "resume").expect("resume");
     for flag in ["--json", "--sandbox", "-m", "-c"] {
@@ -144,7 +213,8 @@ fn the_stdin_marker_follows_the_separator() {
     let config = test_config(Path::new("/tmp/wt"));
     let imgs = vec![PathBuf::from("/tmp/a.png")];
     for resume in [None, Some("sid-123")] {
-        let cmd = build_codex_turn_command(&config, None, None, resume, &imgs);
+        let cmd = build_codex_turn_command(&config, None, None, resume, &imgs)
+            .expect("unsandboxed command");
         let args = collect_args(&cmd);
         let n = args.len();
         assert_eq!(
@@ -165,7 +235,8 @@ fn the_stdin_marker_follows_the_separator() {
 #[test]
 fn turn_command_wires_lucidos_mcp_server() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &[]).expect("unsandboxed command");
     let args = collect_args(&cmd);
     for expected in lucidos_mcp_server_config_overrides(&config.env) {
         assert!(
@@ -192,6 +263,38 @@ fn turn_command_wires_lucidos_mcp_server() {
     );
 }
 
+/// The agent sandbox denies the machine-local token file, so the origin token
+/// is the MCP child's only credential. Without it every question 401s. It
+/// travels by name in `env_vars`, never by value in the config or the argv.
+#[test]
+fn mcp_child_gets_the_origin_token_by_name_only() {
+    let mut config = test_config(Path::new("/tmp/wt"));
+    let secret = "origin-token-secret-value";
+    config.env.push((
+        std::ffi::OsString::from(crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN),
+        std::ffi::OsString::from(secret),
+    ));
+    let json = lucidos_mcp_server_config_json(&config.env);
+    assert_eq!(
+        json["env_vars"],
+        serde_json::json!([crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN])
+    );
+    assert!(!json.to_string().contains(secret), "{json}");
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &[]).expect("unsandboxed command");
+    let args = collect_args(&cmd);
+    assert!(
+        args.windows(2).any(|w| w[0] == "-c"
+            && w[1]
+                == format!(
+                    "mcp_servers.lucidos.env_vars=[\"{}\"]",
+                    crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN
+                )),
+        "got {args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(secret)), "got {args:?}");
+}
+
 /// The suppression gate in the engine's run loop and the MCP wire name must
 /// agree — `mcp__<server>__<tool>` derives from the server name (`lucidos`)
 /// and tool name (`ask_user_question`) in the config overrides above. A
@@ -214,10 +317,12 @@ fn ask_user_question_tool_name_matches_server_config() {
 fn model_default_sentinel_is_omitted() {
     // "default" mirrors CC's sentinel — let the user's codex config decide.
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, Some("default"), None, None, &[]);
+    let cmd = build_codex_turn_command(&config, Some("default"), None, None, &[])
+        .expect("unsandboxed command");
     assert!(!collect_args(&cmd).iter().any(|a| a == "-m"));
 
-    let cmd = build_codex_turn_command(&config, Some("gpt-5.4-mini"), None, None, &[]);
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.4-mini"), None, None, &[])
+        .expect("unsandboxed command");
     let args = collect_args(&cmd);
     let m_idx = args.iter().position(|a| a == "-m").expect("-m");
     assert_eq!(args[m_idx + 1], "gpt-5.4-mini");
@@ -226,7 +331,8 @@ fn model_default_sentinel_is_omitted() {
 #[test]
 fn effort_maps_to_model_reasoning_effort_config() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, Some("xhigh"), None, &[]);
+    let cmd = build_codex_turn_command(&config, None, Some("xhigh"), None, &[])
+        .expect("unsandboxed command");
     let args = collect_args(&cmd);
     assert!(
         args.windows(2)
@@ -250,7 +356,8 @@ fn every_sandbox_writable_root_becomes_an_add_dir() {
     //                 That command now PUTs to the engine and needs no root.
     let mut config = test_config(Path::new("/tmp/wt"));
     config.sandbox_writable_roots = vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
-    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &[]).expect("unsandboxed command");
     let args = collect_args(&cmd);
     let dirs: Vec<&String> = args
         .iter()
@@ -270,7 +377,8 @@ fn every_sandbox_writable_root_becomes_an_add_dir() {
 fn no_add_dir_when_there_are_no_writable_roots() {
     let config = test_config(Path::new("/tmp/wt"));
     assert!(config.sandbox_writable_roots.is_empty());
-    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &[]).expect("unsandboxed command");
     assert!(!collect_args(&cmd).iter().any(|a| a == "--add-dir"));
 }
 
@@ -418,7 +526,8 @@ async fn writable_roots_skip_a_missing_data_dir_rather_than_creating_it() {
 fn image_paths_become_i_flags() {
     let config = test_config(Path::new("/tmp/wt"));
     let imgs = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.jpg")];
-    let cmd = build_codex_turn_command(&config, None, None, None, &imgs);
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &imgs).expect("unsandboxed command");
     let args = collect_args(&cmd);
     let i_positions: Vec<usize> = args
         .iter()
@@ -434,7 +543,8 @@ fn image_paths_become_i_flags() {
 #[test]
 fn command_applies_config_env() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(&config, None, None, None, &[]);
+    let cmd =
+        build_codex_turn_command(&config, None, None, None, &[]).expect("unsandboxed command");
     let envs: std::collections::HashMap<_, _> = cmd
         .as_std()
         .get_envs()
@@ -522,7 +632,13 @@ fn each_codex_model_row_carries_the_efforts_it_accepts() {
             .map(|e| e.as_str().expect("tier").to_string())
             .collect()
     };
-    for sixer in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+    for sixer in [
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ] {
         assert!(
             efforts_of(sixer).contains(&"max".to_string()),
             "{sixer} accepts max"
@@ -612,15 +728,15 @@ fn resolve_codex_binary_falls_back_to_bare_name() {
 #[test]
 fn write_image_files_decodes_and_names_by_mime() {
     use base64::Engine as _;
-    let png = crate::api::ChatImage {
+    let png = crate::engine::types::ChatImage {
         base64: base64::engine::general_purpose::STANDARD.encode(b"fakepng"),
         mime_type: "image/png".into(),
     };
-    let jpg = crate::api::ChatImage {
+    let jpg = crate::engine::types::ChatImage {
         base64: base64::engine::general_purpose::STANDARD.encode(b"fakejpg"),
         mime_type: "image/jpeg".into(),
     };
-    let bad = crate::api::ChatImage {
+    let bad = crate::engine::types::ChatImage {
         base64: "!!!not-base64!!!".into(),
         mime_type: "image/png".into(),
     };
@@ -653,6 +769,7 @@ fn the_baked_env_compiles_without_the_shared_sccache_daemon() {
         spawning_event_id: None,
         repo_name: None,
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &[],
         account_pin: None,
         binary_override: None,
@@ -661,8 +778,9 @@ fn the_baked_env_compiles_without_the_shared_sccache_daemon() {
         auto_compact: None,
         keep_alive: false,
         agent_run: AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     };
-    let (env, _) = baked_lucidos_env(&args, None);
+    let (env, _) = baked_lucidos_env(&args, None, &args.sandbox);
     let value_of = |name: &str| {
         env.iter()
             .find(|(key, _)| key == name)

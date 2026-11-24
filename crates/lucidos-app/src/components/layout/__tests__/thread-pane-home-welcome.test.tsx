@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * An empty Home showing the welcome takes the compose layout, with its title
- * at the pane's top (ADR 0411). A Home with a message is an ordinary thread
- * view again. The pane's children are stubbed: this pins which ones it draws.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 

@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Coding agents › Binaries draws one row per agent while the read
- *  is in flight: the names are known, and only what the read decides shimmers. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

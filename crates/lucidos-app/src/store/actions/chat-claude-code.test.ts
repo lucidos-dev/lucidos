@@ -1,10 +1,3 @@
-/**
- * Tests that change state transitions (applied, discarded, reverted) are stored
- * correctly as thread events. Toast notifications for these transitions are
- * handled in handleThreadEvent (thread-sync.ts) by reacting to ChangeApplied,
- * ChangeDiscarded, and ChangeReverted SSE events — regardless of source
- * (Changes panel, CC idle banner, auto-apply, etc.).
- */
 import { describe, it, expect } from 'vitest';
 
 import { handleEvent, type ThreadState } from '../thread-events';

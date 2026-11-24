@@ -1,10 +1,3 @@
-/**
- * A toast card shows the pointer only when a click on it acts.
- *
- * A passive toast does nothing on a click, so a pointer would promise a
- * destination that does not exist. The pointer belongs to `click` and `action`
- * cards only.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

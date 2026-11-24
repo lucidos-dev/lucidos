@@ -1,15 +1,3 @@
-/**
- * An endless animation that repaints must sit on its own compositing layer.
- *
- * Only `transform` and `opacity` animate on the compositor. Any other property
- * (`background-position`, `background`, a colour) repaints every frame, and
- * without a layer of its own it re-rasterizes the whole layer it sits in. In a
- * transcript that is a viewport-sized layer. Under a streaming turn WebKit's GPU
- * process falls behind on those buffers and can grow without bound.
- *
- * `will-change: transform` gives the element a layer, so a frame repaints only
- * the element. It needs an atomic box: an inline span gets no layer from it.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -29,7 +17,6 @@ const sheets = styleSheetPaths(srcRoot).map((path: string) => ({
 
 const COMPOSITED = new Set(['transform', 'translate', 'rotate', 'scale', 'opacity']);
 
-/** Every property each `@keyframes` animates, across all its definitions. */
 function keyframeProps(): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
   for (const { css } of sheets) {

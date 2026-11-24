@@ -11,8 +11,6 @@ import type { FrameSource } from '../../store/actions/frame-swipe-bridge';
 
 const WIDTH = 300;
 
-/** A track that records what the drag asked of it, and refuses a `follow`
- *  that no `grab` began. */
 function fakeTrack() {
   const calls: string[] = [];
   const state = { held: false };
@@ -40,7 +38,6 @@ const pt = (identifier: number, clientX: number, clientY = 100): TouchPoint => (
 const APP = { name: 'app frame' } as unknown as FrameSource;
 const PREVIEW = { name: 'preview frame' } as unknown as FrameSource;
 
-/** Start touch 1 at x=200 and drag it far left, locked and held. */
 function farDrag(s: ReturnType<typeof setup>) {
   s.drag.touchStart(pt(1, 200), [pt(1, 200)], true);
   s.drag.touchMove([pt(1, 180)], true);
@@ -56,7 +53,6 @@ describe('PaneDrag: a host touch', () => {
     expect(s.drag.holding).toBe(false);
   });
 
-  // Defect 9: a tap mid-slide jumped the strip to the slide's end.
   it('leaves the strip alone for a tap or a vertical scroll', () => {
     const s = setup();
     s.drag.touchStart(pt(1, 200), [pt(1, 200)], true);
@@ -67,7 +63,6 @@ describe('PaneDrag: a host touch', () => {
     expect(s.calls).toEqual([]);
   });
 
-  // Defect 1: iOS taking a touch over committed the pane change.
   it('springs back on a cancel, however far it went', () => {
     const s = setup();
     farDrag(s);
@@ -101,11 +96,9 @@ describe('PaneDrag: a host touch', () => {
     expect(s.calls.slice(-1)).toEqual(['rest true']);
   });
 
-  // Defect 4: a refused touch after a lost end drove the strip from the old start.
   it('lets no refused touch move the strip, even after a lost touchend', () => {
     const s = setup();
     farDrag(s);
-    // Touch 1's end never arrived. Touch 2 starts on a sideways scroller.
     s.drag.touchStart(pt(2, 200), [pt(2, 200)], false);
     s.calls.length = 0;
     s.drag.touchMove([pt(2, 20)], true);
@@ -113,7 +106,6 @@ describe('PaneDrag: a host touch', () => {
     expect(s.calls).toEqual([]);
   });
 
-  // Defect 11 shape, for a fullscreen app entered mid-drag.
   it('springs back instead of committing while fullscreen', () => {
     const s = setup({ mayCommit: () => false });
     farDrag(s);
@@ -123,7 +115,6 @@ describe('PaneDrag: a host touch', () => {
   });
 });
 
-// Defects 2 and 3.
 describe('PaneDrag: a second touch', () => {
   it('never hijacks a lead that has locked', () => {
     const s = setup();
@@ -166,7 +157,6 @@ describe('PaneDrag: frames', () => {
     expect(s.calls).toEqual(['grab', 'follow -20', 'follow -150', 'navigate 1', 'rest true']);
   });
 
-  // Defect 7: a release from any frame ended the followed one's drag.
   it('ignores a release and a drag from another frame', () => {
     const s = setup();
     s.drag.frameDrag(APP, -20);
@@ -178,13 +168,11 @@ describe('PaneDrag: frames', () => {
     expect(s.calls).toEqual(['grab', 'follow -20', 'rest true']);
   });
 
-  // Defect 5: a re-stamped preview's release carries the old nonce and is dropped.
   it('springs back when the frame leading goes away', () => {
     const s = setup();
     s.drag.frameDrag(PREVIEW, -120);
     s.drag.frameGone(PREVIEW);
     expect(s.calls).toEqual(['grab', 'follow -120', 'rest true']);
-    // Its new document's first drag is a fresh gesture.
     s.drag.frameDrag(PREVIEW, -10);
     expect(s.calls.slice(-1)).toEqual(['follow -10']);
   });
@@ -200,13 +188,11 @@ describe('PaneDrag: frames', () => {
     expect(s.calls).toEqual(['grab', 'follow -30']);
   });
 
-  // Defect 6: a host touch cleared the frame drag but left its transform.
   it('springs back a frame drag when a host touch starts, even a refused one', () => {
     const s = setup();
     s.drag.frameDrag(APP, -120);
     s.drag.touchStart(pt(1, 100), [pt(1, 100)], false);
     expect(s.calls).toEqual(['grab', 'follow -120', 'rest true']);
-    // The rest of that frame gesture does nothing, and its release clears it.
     s.drag.frameDrag(APP, -200);
     s.drag.frameRelease(APP, 1);
     expect(s.calls).toEqual(['grab', 'follow -120', 'rest true']);
@@ -245,7 +231,6 @@ describe('PaneDrag: frames', () => {
   });
 });
 
-// Defect 8: a navigation mid-drag re-enabled the transition under the finger.
 describe('PaneDrag: an interrupt', () => {
   it('ends a touch drag, and the rest of that gesture does nothing', () => {
     const s = setup();
@@ -285,7 +270,6 @@ describe('isFrameInside', () => {
     expect(isFrameInside(host(PREVIEW, APP), APP)).toBe(true);
   });
 
-  // Defect 10: a frame outside the strip passed the known-app-frame check.
   it('refuses a frame outside it', () => {
     expect(isFrameInside(host(PREVIEW), APP)).toBe(false);
     expect(isFrameInside(null, APP)).toBe(false);
@@ -293,7 +277,6 @@ describe('isFrameInside', () => {
   });
 });
 
-/** A deterministic generator, so a failing sequence replays. */
 function seeded(seed: number) {
   let a = seed >>> 0;
   return () => {
@@ -353,7 +336,6 @@ describe('PaneDrag: random event sequences', () => {
             drag.touchCancel([pt(id, x, y)], listed());
             break;
           case 'lose':
-            // A touch that ended with no event at all.
             down.delete(id);
             break;
           case 'drag':
@@ -376,16 +358,13 @@ describe('PaneDrag: random event sequences', () => {
         }
 
         const made = calls.slice(before);
-        // The track draws a hold exactly while the drag says it holds one.
         expect(state.held, `seed ${seed} step ${step} ${action}`).toBe(drag.holding);
-        // Only a lift commits, and a commit is always followed by a rest.
         const nav = made.findIndex((c) => c.startsWith('navigate'));
         if (nav !== -1) {
           expect(lift, `seed ${seed} step ${step}: ${action} navigated`).toBe(true);
           expect(fullscreen).toBe(false);
           expect(made[nav + 1]).toBe('rest true');
         }
-        // A follow only ever comes from the lead the step belongs to.
         if (made.some((c) => c.startsWith('follow'))) {
           expect(['move', 'drag'], `seed ${seed} step ${step}`).toContain(action);
           if (action === 'move') expect(leadBefore).toBe(`touch ${drag.leadTouch}`);
@@ -393,12 +372,10 @@ describe('PaneDrag: random event sequences', () => {
         commits += made.filter((c) => c.startsWith('navigate')).length;
       }
     }
-    // The sequences reach commits at all, so the checks above are not vacuous.
     expect(commits).toBeGreaterThan(20);
   });
 });
 
-/** A touch event as a browser builds one, with identifiers. */
 function touchEvent(
   type: string,
   touches: TouchPoint[],
@@ -440,7 +417,6 @@ describe('attachPaneDragTouches', () => {
     expect(w.drag.leadTouch).toBe(7);
   });
 
-  // Defect 3: the edge guard read the resting thumb's position.
   it('gates the touch that started, not the oldest one down', () => {
     const w = wire();
     w.surface.dispatchEvent(touchEvent('touchstart', [pt(1, 5)], [pt(1, 5)]));
@@ -467,7 +443,6 @@ describe('attachPaneDragTouches', () => {
 
   function strandedRow() {
     const row = new EventTarget();
-    // Detached: its events reach nothing above it.
     const fire = (e: Event) => {
       Object.defineProperty(e, 'composedPath', { value: () => [row] });
       row.dispatchEvent(e);
@@ -484,7 +459,6 @@ describe('attachPaneDragTouches', () => {
     expect(w.calls).toEqual(['grab', 'follow -142', 'navigate 1', 'rest true']);
   });
 
-  // Defect 2: a second touchstart dropped the first finger's follow.
   it('keeps following a locked lead when a second touch starts', () => {
     const w = wire();
     const { row, fire } = strandedRow();

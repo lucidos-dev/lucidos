@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A skeleton the delay gate let through stays opaque for LOADER_MIN_VISIBLE_MS,
- *  hides its loaded content meanwhile, then fades. A load that outlasts the floor
- *  ends the skeleton at once. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -40,7 +37,7 @@ describe('LoadingFade minimum-visible floor', () => {
   it('keeps the skeleton opaque and the content hidden until the floor elapses', () => {
     show(true);
     act(() => { vi.advanceTimersByTime(30); });
-    show(false); // the load ended 30 ms after the skeleton appeared
+    show(false);
     expect(skeleton()).not.toBeNull();
     expect(isFadingOut()).toBe(false);
     expect(contentHidden()).toBe(true);

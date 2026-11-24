@@ -21,9 +21,6 @@ import { DashboardTile, TileSkeleton } from './DashboardTile';
 import { useDashboardDrag } from './useDashboardDrag';
 import { useDashboardSettled } from './useDashboardSettled';
 
-/** The tiles' DOM order: the order each first appeared in, appended to and
- *  never rearranged. A tile's place is its CSS `order`, because moving an
- *  iframe in the DOM reloads it (ADR 0419). */
 export function stableTileOrder(previous: readonly string[], keys: readonly string[]): string[] {
   const present = new Set(keys);
   const kept = previous.filter((k) => present.has(k));
@@ -31,11 +28,8 @@ export function stableTileOrder(previous: readonly string[], keys: readonly stri
   return [...kept, ...keys.filter((k) => !known.has(k))];
 }
 
-/** The tile sizes the skeleton draws until the tile list has loaded. */
 const SKELETON_SIZES: TileSize[] = ['small', 'small', 'medium', 'medium'];
 
-/** Add: the installed reusable widgets, the picker the thread menu's Add
- *  widget shows too, then the apps. A pick adds a tile to this dashboard. */
 function AddWidget({ dashboard }: { dashboard: DashboardName }) {
   return (
     <OverflowMenu
@@ -47,21 +41,6 @@ function AddWidget({ dashboard }: { dashboard: DashboardName }) {
   );
 }
 
-/** One dashboard (ADR 0496): its own widget tiles, in a grid of square cells.
- *  The desktop rail hosts the `desktop` one, and the phone's dashboard panel
- *  the `phone` one.
- *
- *  `hidden` is a dashboard kept mounted out of sight, as in a hidden rail. Its
- *  tiles hear they are hidden and unload after the off-screen hold, so
- *  showing it again soon finds them as they were.
- *
- *  The grid stays hidden until the dashboard has settled (`useDashboardSettled`),
- *  so its frames load out of sight. A skeleton of the tiles stands in, behind
- *  the delay gate, and the grid then fades in as one.
- *
- *  Edit mode lays a shield over each frame. A drag or Alt plus an arrow moves
- *  a tile. The pill resizes it, and the minus removes it from this dashboard.
- *  Each drop or resize writes one arrangement. Done or Escape leaves. */
 export function Dashboard({ dashboard, hidden = false }: {
   dashboard: DashboardName;
   hidden?: boolean;
@@ -83,7 +62,6 @@ export function Dashboard({ dashboard, hidden = false }: {
   const commit = (tiles: DashboardTileData[]) => void arrangeDashboard(dashboard, tiles);
   const drag = useDashboardDrag({ order: keys, enabled: editing, onDrop: (order) => commit(inOrder(all, order)) });
   useEscapeStep(editing ? () => setEditing(false) : null);
-  // A hidden dashboard cannot be edited, and its Escape step must not outlive it.
   useEffect(() => {
     if (hidden) setEditing(false);
   }, [hidden]);
@@ -92,8 +70,6 @@ export function Dashboard({ dashboard, hidden = false }: {
     if (view.status === 'not-loaded') void rereadDashboard(dashboard);
   }, [view.status, dashboard]);
 
-  // The dashboard's own width, never the window's: on desktop the rail's divider
-  // sets it.
   useLayoutEffect(() => {
     if (!root) return undefined;
     const measure = () => {
@@ -116,8 +92,6 @@ export function Dashboard({ dashboard, hidden = false }: {
   const skeletonSizes = view.status === 'loaded'
     ? drag.shown.flatMap((key) => byKey.get(key)?.size ?? [])
     : SKELETON_SIZES;
-  // On the dashboard, since its head lines up with the grid too. The cell
-  // edge and gap come from `useWidgetCell`, which a thread pane shares.
   const steps = columns * DASHBOARD_STEPS_PER_CELL;
   const geometry = {
     '--dashboard-columns': String(columns),

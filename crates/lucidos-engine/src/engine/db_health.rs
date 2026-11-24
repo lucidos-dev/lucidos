@@ -44,22 +44,9 @@
 //! query that answered counts, so an outage never reads as a wipe.
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
-use sqlx::{Connection, PgConnection, PgPool};
 
 use super::LucidosEngine;
-use crate::core::migration_marker::{self, MigrationTable};
-
-/// How often the background task probes. Matches the frontend's own health poll,
-/// so a recovery surfaces within about one client tick of actually happening.
-const PROBE_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Ceiling on one probe. Comfortably under the frontend's `HEALTH_PROBE_TIMEOUT_MS`
-/// and the gateway's `build_health_client` timeout, though neither waits on this one
-/// (property 1 above). It exists so a wedged connection cannot stall the ticker.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+use crate::core::migration_marker::MigrationTable;
 
 /// Consecutive failed probes before the engine reports its database unreachable.
 /// Two (so ~10s) rather than one: a single timed-out `SELECT 1` under a saturated
@@ -131,7 +118,7 @@ impl DatabaseHealth {
     /// Why a pool probe failed, from what a direct connection then got. A
     /// refusal for too many connections is a full pool too: the database
     /// answered, and has nothing free.
-    fn of_failed_probe(direct_answered: bool, refusal_sqlstate: Option<&str>) -> Self {
+    pub fn of_failed_probe(direct_answered: bool, refusal_sqlstate: Option<&str>) -> Self {
         if direct_answered || refusal_sqlstate == Some(TOO_MANY_CONNECTIONS) {
             Self::PoolExhausted
         } else {
@@ -142,7 +129,7 @@ impl DatabaseHealth {
     /// The verdict after [`apply_probe`] decided reachability. `failure` is why
     /// the latest probe failed. It is always set when the verdict is
     /// unreachable, since one success restores reachability.
-    fn settle(reachable: bool, failure: Option<Self>) -> Self {
+    pub fn settle(reachable: bool, failure: Option<Self>) -> Self {
         match failure {
             Some(kind) if !reachable => kind,
             _ => Self::Reachable,
@@ -177,35 +164,6 @@ impl DatabaseHealthCell {
     }
 }
 
-/// One round trip through the pool, bounded. `None` when the query answered.
-/// Otherwise a direct connection says why it did not, bounded too, so a tick
-/// never lasts much past twice [`PROBE_TIMEOUT`].
-async fn probe_once(pool: &PgPool) -> Option<DatabaseHealth> {
-    let pooled = tokio::time::timeout(PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(pool)).await;
-    if matches!(pooled, Ok(Ok(_))) {
-        return None;
-    }
-    Some(probe_outside_pool(pool).await)
-}
-
-/// Whether the database answers a connection of its own, with the pool's
-/// connect options and one timeout over connect and query together.
-async fn probe_outside_pool(pool: &PgPool) -> DatabaseHealth {
-    let options = pool.connect_options();
-    let attempt = async {
-        let mut conn = PgConnection::connect_with(&options).await?;
-        sqlx::query("SELECT 1").execute(&mut conn).await?;
-        conn.close().await
-    };
-    match tokio::time::timeout(PROBE_TIMEOUT, attempt).await {
-        Ok(Ok(())) => DatabaseHealth::of_failed_probe(true, None),
-        Ok(Err(sqlx::Error::Database(e))) => {
-            DatabaseHealth::of_failed_probe(false, e.code().as_deref())
-        }
-        Ok(Err(_)) | Err(_) => DatabaseHealth::of_failed_probe(false, None),
-    }
-}
-
 impl LucidosEngine {
     /// The last settled verdict on the database. Cheap enough to read per
     /// request: one relaxed atomic load, never a query. Read it once per
@@ -214,180 +172,15 @@ impl LucidosEngine {
         self.database_health.load()
     }
 
-    /// Report the wiped database and stop, when the migration marker agrees
-    /// it is this database. `false` when it does not, and the engine runs on.
-    async fn stop_on_wiped_database(&self) -> bool {
-        let workspace = self.workspace_path();
-        let named = tokio::time::timeout(
-            PROBE_TIMEOUT,
-            migration_marker::marker_names(workspace, &crate::core::database_url(), self.pool()),
-        )
-        .await;
-        if named != Ok(true) {
-            return false;
-        }
-        crate::log!("[DbHealth] The database lost its migration table; stopping");
-        crate::boot_failure::report(&crate::boot_failure::wiped_database_message(workspace)).await;
-        request_own_shutdown();
-        true
+    /// Publish the verdict from the background probe.
+    pub fn set_database_health(&self, health: DatabaseHealth) {
+        self.database_health.store(health);
     }
-
-    /// Start the background reachability probe. Spawned once at boot, alongside
-    /// the other periodic engine tasks in `main.rs`.
-    ///
-    /// Unlike `spawn_served_frontend_sync` this is NOT dev-only: a packaged
-    /// install's bundled Postgres can die too, and the client's degraded surface
-    /// is the same either way (only the remedy sentence differs, which the
-    /// frontend picks from the existing `packaged` flag).
-    pub fn spawn_db_health_probe(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let engine = self.clone();
-        tokio::spawn(async move {
-            let mut failures: u32 = 0;
-            let mut schema_misses: u32 = 0;
-            let mut ticker = tokio::time::interval(PROBE_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                if engine.is_shutting_down() {
-                    return;
-                }
-                let was = engine.database_health.load();
-                let failure = probe_once(engine.pool()).await;
-                let (reachable, next_failures) =
-                    apply_probe(was.is_reachable(), failures, failure.is_none());
-                failures = next_failures;
-                // Only after the pool answered, and bounded like it, so a tick
-                // still never lasts much past twice `PROBE_TIMEOUT`.
-                let table = if failure.is_none() {
-                    tokio::time::timeout(
-                        PROBE_TIMEOUT,
-                        migration_marker::migration_table(engine.pool()),
-                    )
-                    .await
-                    .unwrap_or(MigrationTable::Unknown)
-                } else {
-                    MigrationTable::Unknown
-                };
-                let (misses, wiped) = apply_schema_probe(schema_misses, table);
-                schema_misses = misses;
-                if wiped && engine.stop_on_wiped_database().await {
-                    return;
-                }
-                let now = DatabaseHealth::settle(reachable, failure);
-                if now != was {
-                    engine.database_health.store(now);
-                    match now {
-                        DatabaseHealth::Reachable => {
-                            crate::log!("[DbHealth] Database reachable again")
-                        }
-                        DatabaseHealth::NotAnswering => crate::log!(
-                            "[DbHealth] Database unreachable after {} consecutive failed probes",
-                            failures
-                        ),
-                        DatabaseHealth::PoolExhausted => crate::log!(
-                            "[DbHealth] Database answers, but no pooled connection is free \
-                             after {} consecutive failed probes",
-                            failures
-                        ),
-                    }
-                }
-            }
-        })
-    }
-}
-
-/// Stop through the engine's own graceful path, the SIGUSR1 `main.rs` handles,
-/// so agent sessions and background tasks are torn down too.
-#[cfg(unix)]
-fn request_own_shutdown() {
-    // SAFETY: kill takes no pointers; getpid names this process.
-    unsafe {
-        libc::kill(libc::getpid(), libc::SIGUSR1);
-    }
-}
-
-#[cfg(not(unix))]
-fn request_own_shutdown() {
-    std::process::exit(1);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_probe, apply_schema_probe, DatabaseHealth, DatabaseHealthCell, MigrationTable,
-        FAILURES_BEFORE_UNREACHABLE,
-    };
-
-    #[test]
-    fn one_missing_table_is_not_a_wipe_and_two_in_a_row_are() {
-        assert_eq!(apply_schema_probe(0, MigrationTable::Missing), (1, false));
-        assert_eq!(apply_schema_probe(1, MigrationTable::Missing), (2, true));
-    }
-
-    #[test]
-    fn a_present_table_resets_the_run() {
-        assert_eq!(apply_schema_probe(1, MigrationTable::Present), (0, false));
-        assert_eq!(apply_schema_probe(0, MigrationTable::Missing), (1, false));
-    }
-
-    /// The load-bearing negative case: during a Docker or socket outage the
-    /// query errors, and that must never count toward a wipe (ADR 0037).
-    #[test]
-    fn an_unanswered_probe_leaves_the_run_alone() {
-        assert_eq!(apply_schema_probe(0, MigrationTable::Unknown), (0, false));
-        assert_eq!(apply_schema_probe(1, MigrationTable::Unknown), (1, false));
-        let (misses, wiped) = apply_schema_probe(1, MigrationTable::Unknown);
-        assert_eq!(
-            apply_schema_probe(misses, MigrationTable::Missing),
-            (2, true)
-        );
-        assert!(!wiped);
-    }
-
-    #[test]
-    fn a_direct_connection_that_answers_means_the_pool_is_used_up() {
-        assert_eq!(
-            DatabaseHealth::of_failed_probe(true, None),
-            DatabaseHealth::PoolExhausted
-        );
-        assert_eq!(
-            DatabaseHealth::of_failed_probe(false, Some("53300")),
-            DatabaseHealth::PoolExhausted,
-            "too many connections: the database answered and has nothing free"
-        );
-    }
-
-    #[test]
-    fn a_direct_connection_that_gets_nothing_means_the_database_does_not_answer() {
-        assert_eq!(
-            DatabaseHealth::of_failed_probe(false, None),
-            DatabaseHealth::NotAnswering
-        );
-        assert_eq!(
-            DatabaseHealth::of_failed_probe(false, Some("57P03")),
-            DatabaseHealth::NotAnswering,
-            "any other refusal is the database, not the pool"
-        );
-    }
-
-    #[test]
-    fn the_kind_of_failure_shows_only_once_the_verdict_is_unreachable() {
-        use DatabaseHealth::*;
-        assert_eq!(DatabaseHealth::settle(true, None), Reachable);
-        assert_eq!(
-            DatabaseHealth::settle(true, Some(PoolExhausted)),
-            Reachable,
-            "one failure is not an outage, so it names no kind"
-        );
-        assert_eq!(
-            DatabaseHealth::settle(false, Some(PoolExhausted)),
-            PoolExhausted
-        );
-        assert_eq!(
-            DatabaseHealth::settle(false, Some(NotAnswering)),
-            NotAnswering
-        );
-    }
+    use super::{DatabaseHealth, DatabaseHealthCell};
 
     #[test]
     fn the_cell_round_trips_every_verdict_and_starts_reachable() {
@@ -401,49 +194,5 @@ mod tests {
             cell.store(health);
             assert_eq!(cell.load(), health);
         }
-    }
-
-    #[test]
-    fn a_healthy_probe_reports_reachable_and_clears_the_tally() {
-        assert_eq!(apply_probe(true, 0, true), (true, 0));
-        assert_eq!(apply_probe(true, 1, true), (true, 0));
-    }
-
-    #[test]
-    fn one_failure_is_not_enough_to_claim_an_outage() {
-        // The load-bearing negative case: a single timed-out probe on a saturated
-        // host must not put the whole client into its degraded surface.
-        assert_eq!(apply_probe(true, 0, false), (true, 1));
-    }
-
-    #[test]
-    fn the_second_consecutive_failure_settles_the_verdict() {
-        let (reachable, failures) = apply_probe(true, 1, false);
-        assert!(!reachable, "two consecutive failures is the threshold");
-        assert_eq!(failures, FAILURES_BEFORE_UNREACHABLE);
-    }
-
-    #[test]
-    fn a_single_success_restores_it() {
-        // Asymmetric by design: proof of life needs no hysteresis.
-        assert_eq!(apply_probe(false, 7, true), (true, 0));
-    }
-
-    #[test]
-    fn a_settled_outage_stays_settled_without_re_announcing() {
-        // Already false: further failures keep it false and keep counting, so the
-        // caller's `now != was` guard logs the transition exactly once.
-        let (reachable, failures) = apply_probe(false, 2, false);
-        assert!(!reachable);
-        assert_eq!(failures, 3);
-    }
-
-    #[test]
-    fn a_long_outage_cannot_overflow_the_tally() {
-        // Saturating rather than wrapping: a wrap would take the count back under
-        // the threshold and flip a dead database to "reachable".
-        let (reachable, failures) = apply_probe(false, u32::MAX, false);
-        assert!(!reachable);
-        assert_eq!(failures, u32::MAX);
     }
 }

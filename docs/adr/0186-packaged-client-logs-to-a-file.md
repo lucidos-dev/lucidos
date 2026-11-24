@@ -1,6 +1,6 @@
 # 0186: The packaged client writes its own diagnostics to a file, because LaunchServices discards them
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR 0716 for storage and capture
 - **Date**: 2026-09-15
 
 ## Context

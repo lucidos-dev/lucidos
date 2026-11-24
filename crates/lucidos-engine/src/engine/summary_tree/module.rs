@@ -50,7 +50,7 @@ impl MemoryModule {
         match Self::stored(pool).await {
             Ok(stored) => stored.unwrap_or(Self::Classic),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[SummaryTree] Failed to read the memory module: {}. Staying on Classic",
                     e
                 );
@@ -75,7 +75,7 @@ pub async fn tree_ready(pool: &PgPool) -> bool {
     match super::store::is_ready(pool).await {
         Ok(ready) => ready,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Failed to read the ready flag: {}. Staying on Classic",
                 e
             );
@@ -84,49 +84,7 @@ pub async fn tree_ready(pool: &PgPool) -> bool {
     }
 }
 
-/// How far the backfill has got, in scopes: each in-scope thread plus the
-/// workspace. A scope counts as done once its drain completes.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct BackfillProgress {
-    pub done: usize,
-    /// Zero until the compactor has seeded.
-    pub total: usize,
-    /// `done` in thousandths of a scope, plus the built share of each scope
-    /// under way. One scope can hold hundreds of nodes, so this moves the bar
-    /// within a long one. Only new work in a scope under way lowers it.
-    pub done_milli: u64,
-    /// Nodes built so far in the owed scopes under way: started draining and
-    /// not done.
-    pub nodes_done: u64,
-    /// Nodes those scopes need in all, built or not.
-    pub nodes_total: u64,
-    /// The last drain failed because no background model could be resolved,
-    /// so the backfill cannot move until one is configured.
-    pub waiting_for_model: bool,
-    /// An owed scope's last drain failed for another reason. It goes back
-    /// after [`super::RETRY`], and this holds until it completes.
-    pub retrying: bool,
-    /// The model whose breaker is open: its calls keep failing, so nodes wait
-    /// before the next one. Cleared when the model answers or the user picks
-    /// another.
-    #[serde(default)]
-    pub failing_model: Option<String>,
-    /// The ready flag is set, so turns read the trees while the older
-    /// threads still fill in.
-    pub ready: bool,
-    /// What the backfill episode has spent, when one is open.
-    pub spent_usd: Option<f64>,
-    /// Where it pauses, when its model is priced.
-    pub cap_usd: Option<f64>,
-    /// The cap Continue would set, when the backfill can have one.
-    pub next_cap_usd: Option<f64>,
-    /// The backfill spent its cap and waits for the user. Live work goes on.
-    pub held: bool,
-    /// The order of the frame that announced this count, rising across one
-    /// engine's life. A snapshot carries the last frame's order, so a client
-    /// drops a frame its snapshot already counted.
-    pub seq: u64,
-}
+pub use crate::engine::thread_events::tree_backfill::BackfillProgress;
 
 /// What `GET /api/v1/memory/tree-backfill` serves.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -168,7 +126,7 @@ pub(crate) async fn tree_backfill(
 
 /// Where a memory view is read. Each has its own workspace view size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Surface {
+pub enum Surface {
     Home,
     Chat,
     Trigger,
@@ -189,15 +147,15 @@ impl Surface {
 
 /// The byte budgets of one turn's two views.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ViewBudgets {
-    pub(crate) workspace: usize,
-    pub(crate) thread: usize,
+pub struct ViewBudgets {
+    pub workspace: usize,
+    pub thread: usize,
 }
 
 impl ViewBudgets {
     /// The budgets for `surface`, each capped for `model` when the workspace
     /// names one in `memory_view_model_caps`.
-    pub(crate) async fn resolve(pool: &PgPool, surface: Surface, model: Option<&str>) -> Self {
+    pub async fn resolve(pool: &PgPool, surface: Surface, model: Option<&str>) -> Self {
         let workspace = surface.workspace_view_bytes().read(pool).await as usize;
         let thread = prefs::THREAD_VIEW_BYTES.read(pool).await as usize;
         let caps = prefs::MEMORY_VIEW_MODEL_CAPS.read(pool).await;
@@ -206,7 +164,7 @@ impl ViewBudgets {
 
     /// Cap both views so together they take at most `limit` bytes, half
     /// each. A small model window then shrinks the views, not the turn.
-    pub(crate) fn within(self, limit: usize) -> Self {
+    pub fn within(self, limit: usize) -> Self {
         Self {
             workspace: self.workspace.min(limit / 2),
             thread: self.thread.min(limit / 2),
@@ -242,17 +200,7 @@ fn model_cap(caps: &str, model: &str) -> Option<usize> {
         .map(|(_, bytes)| bytes)
 }
 
-/// Parse `model=bytes, model=bytes`. Blank parses to no caps.
-pub(crate) fn parse_model_caps(value: &str) -> Result<Vec<(String, usize)>, String> {
-    let pairs = prefs::parse_model_pairs(value, "bytes", |raw| {
-        raw.parse::<usize>()
-            .map_err(|_| "has no whole number of bytes".to_string())
-    })?;
-    Ok(pairs
-        .into_iter()
-        .map(|(id, bytes)| (id.to_string(), bytes))
-        .collect())
-}
+use crate::core::prefs::parse_model_caps;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,7 @@
 # 0636: The ChatGPT plan is its own provider kind, signed in as Lucidos itself
 
 - **Status**: Accepted
+- **Amended by**: [0730](0730-chatgpt-plan-web-search.md), adding search through a separate plan backend.
 - **Date**: 2026-11-09
 
 Plan: `docs/plans/2026-11-09-chatgpt-plan-provider.md`.

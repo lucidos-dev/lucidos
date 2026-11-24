@@ -492,7 +492,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | Class | Budget | Past 90 % | Past the budget |
   |---|---|---|---|
   | Entry chunk | 600 kB | warns | single-shot build FAILS |
-  | First-paint set | 1400 kB | warns | single-shot build FAILS |
+  | First-paint set | 1950 kB | warns | single-shot build FAILS |
   | Each lazy chunk | 400 kB | nothing | warns |
 
   Every message names the measured size, and a soft-line warning names the

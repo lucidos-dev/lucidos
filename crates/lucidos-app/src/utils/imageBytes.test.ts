@@ -16,7 +16,6 @@ function bytes(...parts: (number | string)[]): Uint8Array {
   return new Uint8Array(out);
 }
 
-/** Pad to `size` so a signature check with a length floor still sees enough. */
 function padded(head: Uint8Array, size: number): Uint8Array {
   const out = new Uint8Array(size);
   out.set(head.subarray(0, size));
@@ -130,7 +129,6 @@ describe('sniffImageBytes', () => {
   });
 });
 
-/** Sniff and phrase in one step, failing loudly if the bytes were accepted. */
 function rejection(input: Uint8Array, name: string, declared: string): string {
   const verdict = sniffImageBytes(input);
   if (verdict.kind === 'accepted') throw new Error(`expected a rejection, got ${verdict.mime}`);

@@ -1,22 +1,15 @@
-/** Real Settings restore against the private gateway fixture. Only client
- * assets are fulfilled locally; every API request and SSE reaches its engines.
- * Run with E2E_SNAPSHOT_BROWSER=chromium scripts/e2e-api.sh --local -f
- * server::snapshot_roundtrip_tests::isolated_snapshot_cli_roundtrip after a
- * frontend build. The shared browser-suite workspace is never restored. */
 import { chromium, expect } from '@playwright/test';
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const config = JSON.parse(process.env.E2E_SNAPSHOT_BROWSER_CONFIG ?? 'null');
-if (!config?.workspace?.startsWith('snapshot-e2e-') || !config.token || !config.handle) {
+if (!config?.workspace?.startsWith('snapshot-e2e-') || !config.credential || !config.handle) {
   throw new Error('Private snapshot browser fixture required');
 }
 const dist = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
-// The ordinary direct-engine shell uses stamped workspace identity. This also
-// keeps the real SSE worker on its engine origin without inventing pairing.
-const prefix = '/';
-const origin = `http://127.0.0.1:${config.engine_port}`;
+const prefix = `/${config.workspace}/`;
+const origin = `https://127.0.0.1:${config.port}`;
 const shell = (await readFile(join(dist, 'index.html'), 'utf8')).replace('<head>',
   `<head><base href="${prefix}"><meta name="lucidos-workspace-id" content="${config.workspace}"><meta name="lucidos-gateway-port" content="${config.port}">`);
 const browser = await chromium.launch({
@@ -24,14 +17,9 @@ const browser = await chromium.launch({
 });
 const context = await browser.newContext({
   serviceWorkers: 'block', reducedMotion: 'reduce',
-  extraHTTPHeaders: {
-    'x-lucidos-local-token': config.token,
-    'x-lucidos-device-id': config.device,
-  },
+  ignoreHTTPSErrors: true,
 });
-await context.addInitScript(({ device }) => {
-  localStorage.setItem('lucidos-device-id', device);
-}, { device: config.device });
+await context.addCookies([{ name: config.cookie, value: config.credential, url: origin }]);
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
@@ -50,7 +38,7 @@ await page.route(`${origin}/**`, async route => {
   if (path.startsWith(prefix) && file.startsWith(`${dist}${sep}`)) {
     try {
       if ((await stat(file)).isFile()) return route.fulfill({ path: file });
-    } catch { /* Unknown assets still receive the real server's response. */ }
+    } catch {  }
   }
   return route.continue();
 });

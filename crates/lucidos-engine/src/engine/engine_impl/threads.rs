@@ -3,7 +3,7 @@
 //! Part of the `LucidosEngine` inherent impl, split from engine_impl.rs.
 
 use super::super::*;
-use crate::engine::chat::PreEmittedOrigin;
+use crate::engine::PreEmittedOrigin;
 
 /// How long a follow-up waits for the turn ahead of it before that turn is
 /// treated as wedged and evicted. Named so the log line and the doc comment
@@ -16,7 +16,7 @@ const STUCK_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// `VoiceSessionSlot` is one: a task that panicked mid-name would otherwise
 /// hold the slot for the life of the process, and that thread could never be
 /// named again.
-pub(crate) struct NamingSlot {
+pub struct NamingSlot {
     being_named: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     thread_id: uuid::Uuid,
 }
@@ -133,6 +133,42 @@ impl LucidosEngine {
             Some(handle) => handle.inject(prompt),
             None => false,
         }
+    }
+
+    /// Atomically hand over the batch or reserve its re-run.
+    pub fn hand_over_or_admit(
+        &self,
+        thread_id: Uuid,
+        prompts: Vec<InjectedPrompt>,
+    ) -> OrphanAdmission {
+        crate::engine::hand_over_or_admit(
+            &self.active_threads,
+            &self.thread_completion,
+            thread_id,
+            prompts,
+        )
+    }
+
+    /// The engine's entry point to
+    /// [`crate::engine::inject_the_rest_of_a_sentence`].
+    pub fn inject_the_rest_of_a_sentence(
+        &self,
+        thread_id: Uuid,
+        asked_turn: Uuid,
+        prompt: InjectedPrompt,
+    ) -> crate::engine::RestOfSentence {
+        crate::engine::inject_the_rest_of_a_sentence(
+            &self.active_threads,
+            thread_id,
+            asked_turn,
+            prompt,
+        )
+    }
+
+    /// Record that this turn is about to read its history. The engine's entry
+    /// point to [`crate::engine::record_history_read_begun`].
+    pub fn note_history_read_begun(&self, thread_id: Uuid, generation: u64) {
+        crate::engine::record_history_read_begun(&self.active_threads, thread_id, generation);
     }
 
     /// Admit one run on `thread_id`, or refuse because a turn already owns it.
@@ -254,13 +290,38 @@ impl LucidosEngine {
         thread_id: Uuid,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> bool {
+        self.cancel_thread_with_cause(
+            thread_id,
+            actor,
+            crate::engine::thread_events::CancelCause::SupersededByFollowup,
+        )
+    }
+
+    /// Cancel a live Lucidos Agent turn because a Hold reached its thread.
+    /// The turn ends as `CancelCause::Hold`, which leaves no Stop hold.
+    pub fn cancel_thread_for_hold(
+        &self,
+        thread_id: Uuid,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> bool {
+        self.cancel_thread_with_cause(
+            thread_id,
+            actor,
+            crate::engine::thread_events::CancelCause::Hold,
+        )
+    }
+
+    fn cancel_thread_with_cause(
+        &self,
+        thread_id: Uuid,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+        cause: crate::engine::thread_events::CancelCause,
+    ) -> bool {
         if let Some(handle) = self.active_threads.lock().unwrap().get(&thread_id) {
             if actor.is_some() {
                 *handle.cancel_actor.lock().unwrap() = actor;
             }
-            handle
-                .redirect_followup
-                .store(true, std::sync::atomic::Ordering::Release);
+            *handle.cancel_cause.lock().unwrap() = Some(cause);
             handle.token.cancel();
             true
         } else {
@@ -268,20 +329,20 @@ impl LucidosEngine {
         }
     }
 
-    /// Read and clear the redirect flag set by
-    /// [`Self::cancel_thread_for_followup`]. The agentic-loop cancel arms call
-    /// this to pick `SupersededByFollowup` over `UserStop`. Drained on read, so
-    /// a stale flag cannot relabel the next turn on the same thread. The
-    /// `active_threads` analog of `take_session_redirect_followup`.
-    pub fn take_redirect_followup(&self, thread_id: Uuid) -> bool {
+    /// Read and clear the cause [`Self::cancel_thread_for_followup`] or
+    /// [`Self::cancel_thread_for_hold`] set. The agentic-loop cancel arms call
+    /// this to pick it over `UserStop`. Drained on read, so a stale cause
+    /// cannot relabel the next turn on the same thread. The `active_threads`
+    /// analog of `take_session_redirect_cause`.
+    pub fn take_cancel_cause(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<crate::engine::thread_events::CancelCause> {
         self.active_threads
             .lock()
             .unwrap()
             .get(&thread_id)
-            .is_some_and(|h| {
-                h.redirect_followup
-                    .swap(false, std::sync::atomic::Ordering::AcqRel)
-            })
+            .and_then(|h| h.cancel_cause.lock().unwrap().take())
     }
 
     /// Read and clear the pending cancel actor for `thread_id`. Returns
@@ -342,7 +403,7 @@ impl LucidosEngine {
                 return Ok(());
             }
         }
-        if !crate::engine::agent_recovery::thread_turn_after_restore(self.pool(), child_thread_id)
+        if !crate::core::snapshot::boundary::thread_turn_after_restore(self.pool(), child_thread_id)
             .await?
         {
             return Ok(());
@@ -369,7 +430,7 @@ impl LucidosEngine {
             )
             .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Parent {} was awaiting this completion; its event wait carries the \
                  wake, so the fan-in callback stands down (one turn, not two)",
                 parent_thread_id
@@ -387,36 +448,38 @@ impl LucidosEngine {
             child_thread_id,
             thread_events::ActorMode::Agent,
         ));
-        self.process_message_with_steps(
-            &block,
-            None,
-            None,
-            None,
-            None,
-            None, // provider_override
-            None,
-            None,
-            Some(parent_is_coding_agent),
-            None,
-            Some(parent_thread_id),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            thread_events::ActorMode::Agent,
-            None,
-            None,
-            Some(PreEmittedOrigin::EngineReentry(child_completed_event_id)),
-            None,
-            callback_origin,
-            None,
-            crate::engine::FollowUpUrgency::Normal,
-            None,
-        )
-        .await
-        .map(|_| ())
+        self.agent_host()
+            .process_message_with_steps(
+                self,
+                &block,
+                None,
+                None,
+                None,
+                None,
+                None, // provider_override
+                None,
+                None,
+                Some(parent_is_coding_agent),
+                None,
+                Some(parent_thread_id),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                thread_events::ActorMode::Agent,
+                None,
+                None,
+                Some(PreEmittedOrigin::EngineReentry(child_completed_event_id)),
+                None,
+                callback_origin,
+                None,
+                crate::engine::FollowUpUrgency::Normal,
+                None,
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Will one of the parent's own *event waits* carry this
@@ -534,7 +597,7 @@ impl LucidosEngine {
     /// Draining *before* removal (the old order) left a window: a send landing
     /// after the drain but before the guard dropped was acknowledged into a
     /// channel nobody would ever read, then silently dropped on return.
-    pub(crate) fn finalize_turn_and_drain_injections(
+    pub fn finalize_turn_and_drain_injections(
         guard: ThreadGuard,
         injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
     ) -> Vec<InjectedPrompt> {
@@ -554,7 +617,7 @@ impl LucidosEngine {
     /// A poisoned lock takes the slot. A namer panicked mid-flight, and naming
     /// again risks the second title this guard prevents. Refusing would leave
     /// the thread unnameable for the life of the process.
-    pub(crate) fn claim_the_naming_of(&self, thread_id: uuid::Uuid) -> Option<NamingSlot> {
+    pub fn claim_the_naming_of(&self, thread_id: uuid::Uuid) -> Option<NamingSlot> {
         let taken = match self.threads_being_named.lock() {
             Ok(mut naming) => naming.insert(thread_id),
             Err(_) => true,
@@ -563,50 +626,6 @@ impl LucidosEngine {
             being_named: Arc::clone(&self.threads_being_named),
             thread_id,
         })
-    }
-
-    /// Spawn background title generation for a thread (used when pinning).
-    /// Looks up the first message of the thread and generates a title via Flash.
-    pub async fn spawn_title_generation(&self, thread_id: &str) {
-        let tid_uuid = match uuid::Uuid::parse_str(thread_id) {
-            Ok(u) => u,
-            Err(e) => {
-                log!(
-                    "[Title] spawn_title_generation skipped: invalid thread_id {:?}: {}",
-                    thread_id,
-                    e
-                );
-                return;
-            }
-        };
-        let call = chat::title_call(self).await;
-        let event_store = self.event_store.clone();
-        let pool = self.pool.clone();
-        let bus = self.event_bus.clone();
-        let tid = thread_id.to_string();
-        tokio::spawn(async move {
-            let (first_msg, image_desc, image_count) =
-                match event_store.get_thread_first_message(&tid).await {
-                    Ok(Some((msg, desc, count))) => (msg, desc, count),
-                    Ok(None) => return,
-                    Err(e) => {
-                        log!("[Thread] Failed to get first message for title: {}", e);
-                        return;
-                    }
-                };
-
-            chat::emit_generated_title(
-                &pool,
-                &bus,
-                &call,
-                tid_uuid,
-                &first_msg,
-                image_desc.as_deref(),
-                None,
-                image_count,
-            )
-            .await;
-        });
     }
 
     /// Cancel all active threads. `actor` is stamped on every handle's

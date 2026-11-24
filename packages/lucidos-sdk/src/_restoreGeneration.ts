@@ -1,5 +1,3 @@
-/** Page-local provenance for direct SDK calls. Never consult shared storage:
- * another document observing a restore cannot authorize this page's intent. */
 export class RestoreGenerationFence {
   private generation: string | null = null;
   private observed = false;
@@ -18,8 +16,6 @@ export class RestoreGenerationFence {
   }
 
   capture(): { header: string; assertCurrent(): void } {
-    // Starting work before hello binds this document to the original
-    // generation. A later hello must not authorize further old-page intent.
     this.observed = true;
     const generation = this.generation;
     return {
@@ -35,8 +31,6 @@ export class RestoreGenerationFence {
 
 export const directRestoreGeneration = new RestoreGenerationFence();
 
-/** The shell owns a durable admission barrier and a separate event transport.
- * Install its authority without importing shell code into the standalone SDK. */
 export interface DirectRequestGuard {
   readonly header: string;
   assertCurrent(): void;

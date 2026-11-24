@@ -22,7 +22,6 @@ test('composer icons and right-aligned controls stay put when clear draft toggle
     ];
     const controls = [...icons, '.rung-control', '.action-slot'];
     for (const selector of controls) await expect(row.locator(selector)).toBeVisible();
-    // The follow toggle floats over the composer, so it takes no box here.
     await expect(row.locator('[data-role="follow-live-edge"]')).toHaveCount(0);
     const positions = () => Promise.all(controls.map((selector) => row.locator(selector).boundingBox()));
     const empty = await positions();

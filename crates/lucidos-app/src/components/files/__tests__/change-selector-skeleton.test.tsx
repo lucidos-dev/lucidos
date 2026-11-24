@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** The change selector's loading states.
- *
- *  It wears its own trigger box while the list loads. It unmounts when there
- *  is nothing to choose. It appends placeholder rows while a page loads. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

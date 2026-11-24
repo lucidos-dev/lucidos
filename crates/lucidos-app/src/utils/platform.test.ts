@@ -8,7 +8,6 @@ import {
   isWebKitUserAgent,
 } from './platform';
 
-/** Registration user-agents as the engine actually stores them. */
 const UA = {
   iphone:
     'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
@@ -60,17 +59,11 @@ describe('isMobileDeviceUserAgent', () => {
   });
 
   it('is false for the native desktop app, whatever its embedded UA claims', () => {
-    // The WKWebView's own UA is indistinguishable from Safari, so the product
-    // token is the only thing that identifies the desktop client. Gate on it
-    // before the pattern, or a future non-Mac desktop build could read as mobile.
     expect(isMobileDeviceUserAgent(registrationUserAgent(UA.macSafari, true))).toBe(false);
     expect(isMobileDeviceUserAgent(`${UA.iphone} ${DESKTOP_APP_UA_TOKEN}`)).toBe(false);
   });
 
   it('treats a device with no recorded user-agent as not mobile', () => {
-    // `devices.user_agent` is nullable (legacy rows, a registration race). The
-    // callers act ON a true (turning push off elsewhere), so an unknown device
-    // must fall on the do-nothing side.
     expect(isMobileDeviceUserAgent(null)).toBe(false);
     expect(isMobileDeviceUserAgent(undefined)).toBe(false);
     expect(isMobileDeviceUserAgent('')).toBe(false);
@@ -79,9 +72,6 @@ describe('isMobileDeviceUserAgent', () => {
 
 describe('isWebKitUserAgent', () => {
   it('recognizes every WebKit client, the packaged Mac app included', () => {
-    // The desktop app's live `navigator.userAgent` IS the macOS Safari string:
-    // the product token is appended at registration only, so the engine is all
-    // this can key on. That client is the reason the predicate exists.
     expect(isWebKitUserAgent(UA.macSafari)).toBe(true);
     expect(isWebKitUserAgent(UA.iphone)).toBe(true);
     expect(isWebKitUserAgent(UA.ipad)).toBe(true);
@@ -89,14 +79,10 @@ describe('isWebKitUserAgent', () => {
   });
 
   it('recognizes an iOS browser that is WKWebView under another badge', () => {
-    // Every iOS browser is WKWebView, whatever it calls itself, so the Apple
-    // devices are matched before the Chromium tokens are excluded.
     expect(isWebKitUserAgent(UA.iosChrome)).toBe(true);
   });
 
   it('is false for Blink and Gecko', () => {
-    // Blink still says `AppleWebKit`, so excluding the Chromium tokens by name
-    // is what keeps a Chrome reader out of the repaint path entirely.
     expect(isWebKitUserAgent(UA.macChrome)).toBe(false);
     expect(isWebKitUserAgent(UA.macEdge)).toBe(false);
     expect(isWebKitUserAgent(UA.android)).toBe(false);
@@ -119,8 +105,6 @@ describe('describeDeviceUserAgent', () => {
 
 describe('isTauriPreGatewayEntryFor', () => {
   it('is true on the macOS Tauri asset scheme (tauri://localhost)', () => {
-    // The bundled entry before desktop::launch() navigates to the gateway —
-    // where every same-origin API/SW URL throws WebKit's pattern error.
     expect(
       isTauriPreGatewayEntryFor({ isTauri: true, protocol: 'tauri:', hostname: 'localhost' }),
     ).toBe(true);
@@ -139,8 +123,6 @@ describe('isTauriPreGatewayEntryFor', () => {
   });
 
   it('is false in the dev window (an http localhost origin)', () => {
-    // Same origin shape as the gateway — an http localhost origin, not the asset
-    // host — so the guard must not suppress the app in the dev window.
     expect(
       isTauriPreGatewayEntryFor({ isTauri: true, protocol: 'http:', hostname: 'localhost' }),
     ).toBe(false);

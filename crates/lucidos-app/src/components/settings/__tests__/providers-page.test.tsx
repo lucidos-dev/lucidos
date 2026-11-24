@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Settings → Providers owns every provider block, and Settings → Models owns
- * none. Search lands on the page, and an anchor retired with the move still
- * reaches its block.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

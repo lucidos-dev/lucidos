@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-29
+- **Amended by**: [0745: Loopback serves HTTPS from a per-user, name-constrained CA](0745-loopback-serves-tls-from-a-per-user-ca.md), which ends "loopback stays plain"
 
 ## Context
 
@@ -51,6 +52,8 @@ client, no certificate issuer and no hosted service.
 - **Loopback stays plain.** The packaged window, its Tauri capability, the
   raw-socket health checks and the `tailscale serve` target all assume
   `http://127.0.0.1`. Loopback TLS is a separate plan.
+  ADR 0745 ends this: loopback serves a leaf from the per-user loopback CA,
+  and a proxied `tailscale serve` hop keeps plain loopback.
 - **No hosted service.** ADR 0550 stands: a Lucidos-run issuer or relay would
   make every install depend on us.
 

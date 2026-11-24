@@ -33,6 +33,7 @@ fn handle(task_id: &str, deadline: DateTime<Utc>) -> RunningTaskHandle {
         description: None,
         command: "cargo build".to_string(),
         watchdog_deadline: deadline,
+        queued_for_build_slot: false,
         stop_requested: false,
         polled: false,
     }
@@ -260,6 +261,7 @@ fn the_synthetic_tool_use_id_is_namespaced() {
 fn wait_over(on: Vec<EventSubscription>) -> super::super::LiveWait {
     let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid");
     super::super::LiveWait {
+        background_timing: None,
         wait_id: uuid::Uuid::new_v4(),
         thread_id: uuid::Uuid::new_v4(),
         tool_use_id: "toolu_test".to_string(),

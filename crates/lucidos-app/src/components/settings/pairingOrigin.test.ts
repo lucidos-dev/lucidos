@@ -1,17 +1,7 @@
-/**
- * Where a pairing QR points, and the rule it must not fork from.
- *
- * The whole difficulty is that the machine minting a code is usually reading
- * the page over loopback, and a QR aimed at `127.0.0.1` helps nobody. So the
- * QR reuses the derivation the Other addresses Tailscale row already had, and
- * these tests pin the two together rather than testing them apart.
- */
 import { describe, it, expect } from 'vitest';
 import { tailnetOrigin, pairingOrigin, tailnetConnectRows } from './MobileAccessPage';
 import type { TailnetInput } from './MobileAccessPage';
 
-/** A laptop reading the page over loopback, on a machine that is on a tailnet
- *  and listening there. The case the whole feature exists for. */
 const base: TailnetInput = {
   here: { protocol: 'http:', hostname: 'localhost', port: '5252' },
   tailnetIp: '100.64.0.7',
@@ -21,7 +11,6 @@ const base: TailnetInput = {
   bind: 'all',
 };
 
-/** The same machine once the gateway holds a certificate from its tailnet. */
 const SERVED = 'https://mymac.tailnet-name.ts.net:5252';
 
 describe('tailnetOrigin', () => {
@@ -34,15 +23,11 @@ describe('tailnetOrigin', () => {
   });
 
   it('never composes an https origin nobody verified', () => {
-    // The dev gateway serves an mkcert certificate made for an old name and
-    // address. Keeping the reader's scheme made a QR the phone refused.
     const overTls = { ...base, here: { protocol: 'https:', hostname: 'localhost', port: '5251' } };
     expect(tailnetOrigin(overTls)).toBeNull();
   });
 
   it('takes the origin of a verified serve URL, dropping its workspace path', () => {
-    // A pairing link lands on the picker, never on a workspace. The path in the
-    // verified URL is the one part that must not come along.
     const served = { ...base, workspaceServeUrl: 'https://mymac.tailnet-name.ts.net/dev/' };
     expect(tailnetOrigin(served)).toBe('https://mymac.tailnet-name.ts.net');
   });
@@ -62,15 +47,11 @@ describe('tailnetOrigin', () => {
   });
 
   it('survives a serve URL that is not a URL', () => {
-    // The engine only ever sets a verified one, so this is the belt: a garbage
-    // value must yield no origin rather than throwing inside a render.
     expect(tailnetOrigin({ ...base, workspaceServeUrl: 'not a url' })).toBeNull();
   });
 });
 
 describe('tailnetConnectRows agrees with tailnetOrigin', () => {
-  // The invariant the extraction exists for: the address a user copies and the
-  // address a QR encodes name the same host, in every state.
   const cases: Array<[string, TailnetInput]> = [
     ['plain http over the tailnet', base],
     ['no MagicDNS', { ...base, magicDnsName: null }],
@@ -113,10 +94,6 @@ describe('pairingOrigin', () => {
   });
 
   it("keeps this gateway's port, so the code is redeemed where it was minted", () => {
-    // Each gateway keeps its own paired-device store and its own pending
-    // codes, and two run on one machine. An origin that dropped the reader's
-    // port would send the phone to the other gateway, which never saw the
-    // code. The phone would then be told a fresh code had expired.
     const devGateway = {
       ...base,
       here: { protocol: 'http:', hostname: '100.64.0.7', port: '5251' },
@@ -167,9 +144,6 @@ describe('pairingOrigin', () => {
   });
 
   it('answers nothing rather than an address a phone cannot reach', () => {
-    // The bug the whole derivation exists to avoid. Off any tailnet and bound
-    // to loopback, this machine has no address to hand out. A QR aimed at the
-    // reader's own `localhost` would be worse than no QR at all.
     expect(pairingOrigin({ ...base, external: null, tailnetIp: null, bind: 'loopback', lan: null })).toBeNull();
   });
 
@@ -182,7 +156,6 @@ describe('pairingOrigin', () => {
   });
 
   it("points the QR at the gateway's own HTTPS origin whenever it serves one", () => {
-    // The invariant: never an http:// QR from a gateway serving HTTPS there.
     expect(pairingOrigin({ ...base, gatewayHttps: SERVED, external: null, lan })).toBe(SERVED);
     const plainReader = { ...base, here: { protocol: 'http:', hostname: '100.64.0.7', port: '5252' } };
     expect(pairingOrigin({ ...plainReader, gatewayHttps: SERVED, external: null, lan })).toBe(SERVED);
@@ -196,11 +169,8 @@ describe('pairingOrigin', () => {
   });
 
   it("takes the reader's own origin after the tailnet, when it is not loopback", () => {
-    // A phone that reached the gateway over a company VPN address: the page
-    // arrived there, so a second device can open it too.
     const vpnReader = { ...base, here: { protocol: 'http:', hostname: '10.8.0.2', port: '5252' } };
     expect(pairingOrigin({ ...vpnReader, external: null, tailnetIp: null, lan })).toBe('http://10.8.0.2:5252');
-    // The tailnet still comes first.
     expect(pairingOrigin({ ...vpnReader, external: null, lan })).toBe('http://mymac.tailnet-name.ts.net:5252');
   });
 });

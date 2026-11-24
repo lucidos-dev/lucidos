@@ -1,21 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { engineRestarting, toasts, showToast } from '../store';
 
-// While the engine is restarting, in-flight read requests fail as the engine
-// goes down (a GET already past the awaitEngineReady gate, SSE, health poll).
-// showToast suppresses the resulting noise, so the restart's own progress
-// dialog is the only account of it on screen. The central guard is
-// `workspaceUnavailable()` in store.ts. It covers a restart plus the two other
-// windows of the same shape: a committed packaged update, and an unreachable
-// database (see database-unreachable-surface.test.ts).
-//
-// These pin the screenshot regression: the SW "New version available" refresh
-// prompt and the "Failed to fetch changes" error must NOT show during a restart.
-// User-initiated write failures surface elsewhere, e.g. a send's inline
-// ResponseFailed, not via this path.
-//
-// `showWhileUnavailable` survives the restart moving to a dialog: it is the opt
-// out for any status toast raised inside one of those windows.
 
 beforeEach(() => {
   engineRestarting.value = false;
@@ -41,9 +26,6 @@ describe('toast suppression while engine is restarting', () => {
   });
 
   it('suppresses the SW "New version available" refresh prompt while restarting', () => {
-    // Mirrors startClient's onUpdateFound: the post-restart frontend rebuild
-    // activates a new service worker, which would otherwise stack a Refresh
-    // toast on top of the "Restarting engine..." status.
     engineRestarting.value = true;
     showToast('New version available — refresh to sync', 'info', {
       key: 'update-available',
@@ -78,9 +60,6 @@ describe('toast suppression while engine is restarting', () => {
     showToast('Suppressed', 'error');
     expect(toasts.value).toHaveLength(0);
 
-    // connection.ts clears the flag before emitting its toasts.
-    // The real "Engine restarted" toast carries no action (the refresh prompt is
-    // owned solely by the build-id staleness check).
     engineRestarting.value = false;
     showToast('Engine restarted', 'success', { autoDismissMs: 5_000 });
     expect(toasts.value.some(t => t.message === 'Engine restarted')).toBe(true);

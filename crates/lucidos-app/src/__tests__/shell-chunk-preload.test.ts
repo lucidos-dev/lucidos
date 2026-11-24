@@ -1,11 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { shellPreloadHrefs } from '../../vite/shellChunkPreload';
 
-/**
- * The shell chunk's `modulepreload` links (ADR 0288). The module under test is
- * build config under `crates/lucidos-app/vite/`, tested from here because
- * Vitest's `include` covers `src/` only.
- */
 type Chunk = { type: 'chunk'; fileName: string; moduleIds: string[]; imports: string[]; isEntry: boolean };
 
 const chunk = (fileName: string, over: Partial<Chunk> = {}): Chunk => ({

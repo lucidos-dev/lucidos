@@ -7,6 +7,9 @@
 - **Amended by**: [0516](0516-subprocesses-get-only-the-secrets-they-name.md)
   (which secrets a subprocess gets)
 
+- **Amended by**: [0686](0686-agent-role-table-write-allow-list.md).
+  Agent-role writes use a table allow-list outside machine-made workspaces.
+
 ## Context
 
 Agents, scripts and triggers receive `LUCIDOS_DATABASE_URL` (ADR 0481). Until

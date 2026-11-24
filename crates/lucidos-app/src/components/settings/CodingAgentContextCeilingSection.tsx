@@ -1,12 +1,11 @@
+import { PREF_CODING_AGENT_CONTEXT_CEILING } from '@lucidos/preference-catalog';
 import { currentContextCeiling, setContextCeiling } from '../../store/actions/preferences';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 
-const DEFAULT_CEILING = PREFERENCE_CATALOG.coding_agent_context_ceiling.fallback;
 
-/** The values the picker offers. Any other the engine accepts, set through
- *  the CLI or a thread, still shows as the current one. */
+const DEFAULT_CEILING = PREF_CODING_AGENT_CONTEXT_CEILING.fallback;
+
 const OFFERED = ['off', '200k', '300k', '400k', '500k', '30%', '50%'];
 
 function ceilingLabel(value: string): string {
@@ -14,8 +13,6 @@ function ceilingLabel(value: string): string {
   return value.endsWith('%') ? `${value} of the window` : value;
 }
 
-/** The picker's options, with the catalog default marked, and `current` kept
- *  when it is not one the picker offers. Pure, unit tested. */
 export function contextCeilingOptions(current: string): DropdownOption[] {
   const values = OFFERED.includes(current) ? OFFERED : [...OFFERED, current];
   return values.map((value) => ({
@@ -26,12 +23,6 @@ export function contextCeilingOptions(current: string): DropdownOption[] {
   }));
 }
 
-/**
- * Settings → Coding Agents → Context ceiling: the workspace's *context
- * ceiling* (ADR 0629), the size at which a coding-agent session hands off to a
- * fresh session. A thread or trigger may set its own, and a child takes its
- * parent's.
- */
 export function CodingAgentContextCeilingSection() {
   const ceiling = currentContextCeiling();
 

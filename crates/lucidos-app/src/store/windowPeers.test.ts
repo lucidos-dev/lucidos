@@ -41,7 +41,6 @@ describe('the windows of one workspace', () => {
   let stop: () => void;
   let self: Omit<PeerState, 'id' | 'activeAt'>;
 
-  /** Another window, speaking on the same channel. */
   function otherSays(message: unknown): Promise<void> {
     other.postMessage(message);
     return new Promise((resolve) => setTimeout(resolve, 20));

@@ -18,7 +18,6 @@ export async function loadEnvironmentVariables(): Promise<void> {
   }
 }
 
-/** Create a new env var or update an existing one. Returns true on success. */
 export async function submitEnvVar(
   name: string,
   value: string,

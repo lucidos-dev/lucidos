@@ -1,7 +1,3 @@
-/**
- * The quiet retries every send path shares: which failures retry, when, how
- * many times, and what ends a wait early.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../utils/clientLog', () => ({ postClientLog: vi.fn() }));
@@ -13,7 +9,6 @@ import { _resetPageVisitForTesting } from '../../utils/pageVisit';
 
 const dropped = () => new TypeError('Load failed');
 
-/** A window and document the early wake can listen on. */
 function stubPage() {
   const win = new EventTarget();
   const doc = Object.assign(new EventTarget(), { visibilityState: 'visible' });
@@ -115,7 +110,6 @@ describe('withQuietRetries', () => {
     const settled = vi.fn();
     void withQuietRetries(attempt, { path: 'message' }).then(settled);
     await vi.advanceTimersByTimeAsync(0);
-    // The page froze through the wait, so the clock jumps past the deadline.
     vi.setSystemTime(Date.now() + SEND_RETRY_DEADLINE_MS + 1);
     await vi.advanceTimersByTimeAsync(SEND_RETRY_BACKOFF_MS[0]);
     expect(attempt).toHaveBeenCalledTimes(1);

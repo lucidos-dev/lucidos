@@ -1,17 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Every grouping change plays the same transition, whoever made it.
- *
- * The drawer's navigation cover keys on `drawerSwapKey(panelOpen, grouping)`,
- * so a change of either half is one dip. With the panel shut, a grouping
- * change leaves a drawing of the old list over the list. The CSS hides it at
- * the dip's midpoint, as it hides the closing panel.
- *
- * The filter shapes Folders only: switching to Ongoing closes the panel and
- * hides the Filter button. jsdom runs no animations and loads no CSS, so these
- * tests pin the DOM the CSS keys on. The frames are covered by
- * `e2e/drawer-grouping-all.spec.ts`.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -49,7 +36,6 @@ describe('a grouping change', () => {
   const navCovers = () => host.querySelectorAll('.thread-drawer-body > .nav-cover');
   const groupingButton = () => q('.grouping-btn') as HTMLButtonElement;
   const shownGlyph = () => groupingButton().querySelector<HTMLElement>('.crossfade-layer[data-current]')!.dataset.layer;
-  /** Runs every fuse out, so the next change starts a fresh dip. */
   const settle = () => act(() => { vi.advanceTimersByTime(5_000); });
 
   beforeEach(() => {
@@ -113,9 +99,7 @@ describe('a grouping change', () => {
     expect(drawn.className).toBe('thread-view-drawing-list');
     expect(drawn.inert).toBe(true);
     expect(drawn.querySelector('[id], [data-thread-nav], [data-flip-id]')).toBeNull();
-    // The real list already shows the ongoing groups under it.
     expect(q('.thread-drawer-body > .thread-drawer-list .ongoing-grouping')).not.toBeNull();
-    // Painted under the filter cover and the navigation cover.
     expect(drawing!.nextElementSibling!.classList.contains('thread-filter-cover')).toBe(true);
   });
 
@@ -135,7 +119,6 @@ describe('a grouping change', () => {
     const slot = q('.filter-slot')!;
     expect(slot.hasAttribute('data-shown')).toBe(false);
     expect(slot.hasAttribute('inert')).toBe(true);
-    // An open under Ongoing does nothing.
     act(() => { openThreadFilterPanel(); });
     expect(threadFilterPanelOpen.value).toBe(false);
     act(() => { setDrawerGrouping('folders'); });

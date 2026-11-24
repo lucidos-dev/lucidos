@@ -1,22 +1,5 @@
-/**
- * Regression: `getVapidKey` used to call `fetch()` directly, bypassing the
- * shared `json()` helper. That dropped the `x-lucidos-device-id` header and
- * surfaced engine errors as a generic `TypeError("Failed to fetch")` instead
- * of the typed `ApiError` other helpers raise.
- *
- * These tests bind that contract to the network surface: every push action
- * that the SW route exposes goes through `json()` / `mutatingFetch`, both of
- * which set `x-lucidos-device-id`.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// A Vitest run IS a Vite dev-server bundle, so the live `isDevServerBundle()`
-// reports true here and every flow below would short-circuit on the frontend
-// preview's no-service-worker gate. These tests exercise the PRODUCTION path, so
-// the predicate is pinned false; the gate itself is covered by the pure
-// `pushUnsupportedReason` cases at the bottom of this file and by
-// `utils/devServerBundle.test.ts`. `importOriginal` keeps the real message
-// string, which one of those cases asserts on.
 vi.mock('../../utils/devServerBundle', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/devServerBundle')>()),
   isDevServerBundle: () => false,
@@ -24,9 +7,6 @@ vi.mock('../../utils/devServerBundle', async (importOriginal) => ({
 
 const originalFetch = globalThis.fetch;
 
-/** Generate a real 65-byte uncompressed VAPID point (0x04 || X(32) || Y(32))
- *  so `pushManager.subscribe`'s applicationServerKey validation accepts it.
- *  `seed` varies the point so two workspaces can be given distinct keys. */
 function makeVapidKey(seed = 0): string {
   const bytes = new Uint8Array(65);
   bytes[0] = 0x04;
@@ -36,8 +16,6 @@ function makeVapidKey(seed = 0): string {
   return btoa(bin).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-/** The raw bytes a browser reports in `subscription.options.applicationServerKey`
- *  for a subscription created against `key`. */
 function vapidKeyBytes(key: string): ArrayBuffer {
   const bin = atob(key.replace(/-/g, '+').replace(/_/g, '/'));
   const out = new Uint8Array(bin.length);
@@ -45,20 +23,15 @@ function vapidKeyBytes(key: string): ArrayBuffer {
   return out.buffer;
 }
 
-/** Install a `granted`-permission Notification + PushManager stub on globalThis,
- *  matching what the production flow probes for before subscribing. The fake
- *  origin is https://lucidos.test (see beforeEach), so declare the secure
- *  context a real browser would grant it — initPushSubscription's
- *  pushUnsupportedReasonHere() gate checks window.isSecureContext first. */
 function installPermissionStubs() {
   (globalThis as unknown as { Notification: typeof Notification }).Notification = Object.assign(
-    function () { /* stub */ } as unknown as typeof Notification,
+    function () {  } as unknown as typeof Notification,
     {
       permission: 'granted',
       requestPermission: async () => 'granted',
     },
   ) as typeof Notification;
-  (globalThis as unknown as { PushManager: object }).PushManager = function () { /* stub */ };
+  (globalThis as unknown as { PushManager: object }).PushManager = function () {  };
   Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
 }
 
@@ -89,7 +62,6 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
           headers: { 'content-type': 'application/json' },
         });
       }
-      // Push subscribe POST: accept, in the engine's ApiResult shape
       return new Response('{"success":true}', { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
 
@@ -119,10 +91,6 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
     ).toBe('dev-test-vapid');
   });
 
-  /**
-   * The engine answers a refused subscribe with `200 {success: false}`. Read
-   * as a success, the user saw "enabled" for a device that gets no push.
-   */
   it('initPushSubscription reports a subscribe the engine refused', async () => {
     const vapidKey = makeVapidKey();
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -157,14 +125,7 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
     expect(await initPushSubscription()).toBe(false);
   });
 
-  /**
-   * A page relayed by another gateway carries the base `/<slug>@<gateway>/`.
-   * The service worker registers under that outside prefix and the stored
-   * scope names it, so B's pushes tap back through A's origin.
-   */
   it('a relayed page registers and subscribes under its outside prefix', async () => {
-    // The test document is a stub, so stand in the base element the engine
-    // stamps. `basePath` reads it once, at module load.
     const stampedBase = { getAttribute: (name: string) => (name === 'href' ? '/dev@cloud/' : null) };
     const querySelector = vi
       .spyOn(document, 'querySelector')
@@ -200,15 +161,19 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
             return fakeRegistration;
           },
           ready: Promise.resolve(fakeRegistration),
+          getRegistration: async () => undefined,
         },
         configurable: true,
       });
       installPermissionStubs();
 
-      const { initPushSubscription } = await import('./push');
+      const { initPushSubscription, recoverServiceWorker } = await import('./push');
       expect(await initPushSubscription()).toBe(true);
 
-      expect(registrations).toContainEqual({ script: '/dev@cloud/sw.js', scope: '/dev@cloud/' });
+      expect(registrations).toContainEqual({ script: '/~/sw.js?workspace=dev%40cloud', scope: '/dev@cloud/' });
+      await recoverServiceWorker();
+      expect(registrations).toHaveLength(2);
+      expect(registrations[1]).toEqual(registrations[0]);
       const subscribe = seen.find((s) => s.url === '/dev@cloud/api/v1/push/subscribe');
       expect(subscribe, 'the subscribe POST must go under the outside prefix').toBeDefined();
       const payload = JSON.parse(subscribe!.body!) as Record<string, string>;
@@ -218,15 +183,6 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
     }
   });
 
-  /**
-   * Regression guard for the divergence where `devices.push_enabled = true`
-   * yet `push_subscriptions` has no row for the device, so the engine pushes
-   * to no Chrome endpoint and the user sees nothing. Two known causes: the
-   * LLM `enable_push_notifications` tool flips the device flag before the
-   * browser handshake completes, or the browser silently loses its
-   * subscription (cleared site data, SW unregistered). Permission stays
-   * 'granted', so the recovery path is silent.
-   */
   it('refreshPushSubscription self-heals when permission granted but subscription missing', async () => {
     const seen: Array<{ url: string; method: string; body?: string }> = [];
     const vapidKey = makeVapidKey();
@@ -284,14 +240,6 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
   });
 });
 
-/**
- * Regression: a workspace recreated at the same gateway slug mints a fresh
- * VAPID keypair, but the browser keeps its subscription at the unchanged
- * `/<slug>/` service-worker scope. Enabling push then died on the browser's
- * "A subscription with a different applicationServerKey (or gcm_sender_id)
- * already exists" with no way out of the UI, while the background refresh
- * silently re-POSTed a subscription the engine could never sign a push for.
- */
 describe('stale applicationServerKey reconciliation', () => {
   function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
     const x = new Uint8Array(a);
@@ -299,11 +247,6 @@ describe('stale applicationServerKey reconciliation', () => {
     return x.length === y.length && x.every((v, i) => v === y[i]);
   }
 
-  /** A PushManager fake carrying the browser's real contract: `subscribe()`
-   *  rejects with `InvalidStateError` while a subscription created under a
-   *  different applicationServerKey is still present. `existing.key === null`
-   *  models a browser that hides `options.applicationServerKey`; pair it with
-   *  `hiddenKeyMismatch` to make that hidden key a stale one. */
   function makeRegistration(existing?: {
     key: string | null;
     endpoint: string;
@@ -353,7 +296,6 @@ describe('stale applicationServerKey reconciliation', () => {
     return { registration, calls, subscription: () => current };
   }
 
-  /** Serve `vapidKey` from the engine and accept every POST; returns the log. */
   function installFetch(vapidKey: string) {
     const seen: Array<{ url: string; method: string; body?: string }> = [];
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -464,7 +406,6 @@ describe('stale applicationServerKey reconciliation', () => {
         getSubscription: async () => null,
         subscribe: async () => {
           calls.push('subscribe');
-          // What subscribing before the worker is active looks like.
           const err = new Error('Subscription failed - no active Service Worker');
           err.name = 'InvalidStateError';
           throw err;
@@ -483,9 +424,6 @@ describe('stale applicationServerKey reconciliation', () => {
 
   it('subscribes against the active worker, not the registration register() returns', async () => {
     const seen = installFetch(CURRENT_KEY);
-    // A first-ever registration for this scope comes back still 'installing',
-    // and subscribe() rejects against it. `ready` resolves to the one that
-    // owns the active worker.
     const installing = {
       pushManager: {
         getSubscription: async () => null,
@@ -526,10 +464,6 @@ describe('pushUnsupportedReason', () => {
   });
 
   it('the frontend preview wins over every other reason, because it is https already', async () => {
-    // A preview is served over https on localhost, so `secureContext` is true
-    // and the origin advice would be advice the user has already followed. It
-    // registers no service worker by design (utils/devServerBundle.ts), so the
-    // "not supported in this browser" message would blame the wrong thing too.
     const { pushUnsupportedReason } = await import('./push');
     const reason = pushUnsupportedReason({
       ...ALL_OK,
@@ -543,9 +477,6 @@ describe('pushUnsupportedReason', () => {
   });
 
   it('insecure origin wins over missing APIs and names the fix, not the browser', async () => {
-    // Chrome hides navigator.serviceWorker entirely on insecure origins, so
-    // this exact combination is what a packaged install over http://<host>
-    // reports — the message must blame the origin and point at https/localhost.
     const { pushUnsupportedReason } = await import('./push');
     const reason = pushUnsupportedReason({
       secureContext: false,
@@ -568,7 +499,6 @@ describe('pushUnsupportedReason', () => {
       httpsOrigin: 'https://mymac.tailnet-name.ts.net:5252',
     });
     expect(reason).toContain('Open Lucidos at https://mymac.tailnet-name.ts.net:5252');
-    // A secure page needs no address.
     expect(pushUnsupportedReason({ ...ALL_OK, httpsOrigin: 'https://mymac.tailnet-name.ts.net:5252' })).toBeNull();
   });
 

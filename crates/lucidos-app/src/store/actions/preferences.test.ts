@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { preferences, toasts, llmConfigured } from '../store';
-import { applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
+import { preferences, toasts, llmConfigured, selectedCodingAgent, threadMap, lastSuccessfulBackup } from '../store';
+import { makeThreadState } from './threads-test-helpers';
+import { getComposeSelectionOverride, resolveCodingAgent, _resetComposeSelectionsForTesting } from '../composeSelections';
+import { preferencesSlice, currentAgentBrandColours, setAgentBrandColours, applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
 import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, backupIsConfigured, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupBanner, backupBannerIn, backupOverdueHiddenByDismissal, dismissBackupOverdueReminder, BACKUP_OVERDUE_SNOOZE_MS, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
 import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_HEADER_TOP } from '@lucidos/appearance';
@@ -19,27 +21,16 @@ vi.mock('../../utils/platform', () => ({
   isIOS: () => platformMocks.isIOS,
 }));
 
-// The test environment has no DOM to stamp, so the Autocorrect switch is read
-// off the call it makes. `noAutofill.test.ts` covers what the stamp does.
 const setProseAutocorrectMock = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/noAutofill', () => ({ setProseAutocorrect: setProseAutocorrectMock }));
 
-// applyThemeMode tints the native title bar via this when isTauri(); mock it so the
-// web-path tests don't need a Tauri IPC bridge and the Tauri-path test can
-// assert the per-theme color.
 const setTitlebarColorMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
-// The same block signals that the page is about to paint, which is what lets the
-// shell show the window it kept hidden at launch. The real one is one-shot per
-// document (utils/tauri.test.ts pins that); this mock counts every call, which is
-// how the tests below can see it fire on the Tauri path only.
 const windowReadyToShowMock = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/tauri', () => ({
   setTitlebarColor: setTitlebarColorMock,
   windowReadyToShow: windowReadyToShowMock,
 }));
 
-// The test environment has no canvas, so a token resolves to whatever a test
-// says. Null means no stylesheet defines it, which takes the fallback.
 const resolvedTokenHexMock = vi.hoisted(() => vi.fn((_name: string): string | null => null));
 vi.mock('../../utils/cssColor', () => ({ resolvedTokenHex: resolvedTokenHexMock }));
 
@@ -50,12 +41,9 @@ describe('currentThemeMode: localStorage fallback', () => {
   });
 
   it('returns localStorage theme when backend has no theme preference', () => {
-    // User set light mode → saved in localStorage + backend
-    // Backend lost the preference (device_id change, save failure, etc.)
     localStorage.setItem('lucidos-theme-mode', 'light');
     preferences.value = { status: 'loaded', data: { 'font-family': 'monospace' } };
 
-    // currentThemeMode() must respect localStorage, not default to 'dark'
     expect(currentThemeMode()).toBe('light');
   });
 
@@ -63,7 +51,6 @@ describe('currentThemeMode: localStorage fallback', () => {
     localStorage.setItem('lucidos-theme-mode', 'light');
     preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
 
-    // Backend is source of truth when it has a value
     expect(currentThemeMode()).toBe('dark');
   });
 
@@ -108,10 +95,6 @@ describe('currentThemeMode: localStorage fallback', () => {
     expect(currentThemeMode()).toBe('system');
   });
 
-  // The defaults apply where nothing is stored, which is most existing devices:
-  // no first run seeds either row, so a device that never opened Settings picks
-  // them up. A device that DID pick keeps its pick, and the two cases above
-  // ('returns backend theme…', 'skips invalid backend value…') pin that half.
   it('defaults an untouched device to system theme and following the theme', () => {
     preferences.value = { status: 'loaded', data: {} };
 
@@ -127,9 +110,6 @@ describe('currentThemeMode: localStorage fallback', () => {
 });
 
 describe('apply* functions mirror to localStorage for FOUC inline script', () => {
-  // The inline FOUC IIFE in index.html reads these localStorage keys on next
-  // page load. Each apply* mutator must keep its key fresh so the next reload
-  // paints the right value before any stylesheet evaluates.
 
   let inlineProps: Record<string, string>;
   let attrs: Record<string, string>;
@@ -143,10 +123,6 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     localStorage.clear();
     inlineProps = {};
     attrs = {};
-    // A Google-font preference calls ensureFontLoaded, which appends a <link>.
-    // The test-setup document stub has no `head`, so give it one: the font
-    // fetch is orthogonal to what this block asserts, but the fira-code tests
-    // below cannot avoid triggering it.
     originalHead = (document as any).head;
     (document as any).head = { appendChild: () => {} };
     const el = (document as any).documentElement;
@@ -190,7 +166,6 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
   });
 
   it('applyThemeMode sets html.style.background inline so the WebView has a paintable bg before global.css loads', () => {
-    // See preferences.ts:applyThemeMode for why: the iOS PWA cold-restart flash.
     const el = (document as any).documentElement;
     applyThemeMode('dark');
     expect(el.style.background).toBe('#07172e');
@@ -199,9 +174,6 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
   });
 
   it('applyFontFamily writes lucidos-font-family to localStorage', () => {
-    // Use 'monospace' (no Google Font load) — `inter` would trigger
-    // ensureFontLoaded, which calls document.head.appendChild and is
-    // orthogonal to what this test verifies.
     applyFontFamily('monospace');
     expect(localStorage.getItem('lucidos-font-family')).toBe('monospace');
     expect(inlineProps['--font-ui']).toContain('SF Mono');
@@ -227,7 +199,6 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
       preferences.value = { status: 'loaded', data: {} };
       await activateTheme({ ui: 'geist' });
       expect(inlineProps['--font-ui']).toMatch(/^'Geist',/);
-      // The RAW preference is cached, so the boot script resolves the same way.
       expect(localStorage.getItem('lucidos-font-family')).toBe('theme');
     });
 
@@ -253,31 +224,17 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
   });
 
   it('applyFontFamily turns Fira Code ligatures OFF for text with explicit zeros, not `normal`', () => {
-    // `normal` does NOT disable ligatures. `liga` and `calt` are default-ON
-    // features in CSS, so `normal` means "the font's defaults" and renders
-    // BYTE-IDENTICALLY to `"liga" 1, "calt" 1` (established by pixel
-    // comparison in headless Chromium, since the computed value shows no
-    // difference). An earlier attempt at this fix merely stopped setting the
-    // property, which left the defaults in place and changed nothing at all.
     applyFontFamily('fira-code');
     expect(inlineProps['--font-features-text']).toBe('"liga" 0, "calt" 0');
-    // Scope is decided by CSS, so no set-point writes the bare property.
     expect(inlineProps['font-feature-settings']).toBeUndefined();
   });
 
   it('applyFontFamily turns them back ON for code', () => {
-    // Code surfaces inherit the OFF value now, so they must re-enable
-    // explicitly. `normal` would work today (defaults are on) but re-encodes
-    // the exact trap above, so the value is spelled out.
     applyFontFamily('fira-code');
     expect(inlineProps['--font-features-code']).toBe('"liga" 1, "calt" 1');
   });
 
   it('applyFontFamily resolves BOTH properties to normal for every other font', () => {
-    // Switching away from Fira Code must clear both rather than leave a stale
-    // value on <html>. `normal` is right HERE: a non-Fira font wants its own
-    // defaults untouched, and an unconditional `"liga" 0` would also kill the
-    // fi/fl ligatures a proportional font like Inter legitimately wants.
     applyFontFamily('fira-code');
     applyFontFamily('monospace');
     expect(inlineProps['--font-features-text']).toBe('normal');
@@ -299,7 +256,6 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
 
   it('applyUiScale clamps and stores the clamped value', () => {
     applyUiScale(500);
-    // UI_SCALE_MAX = 200
     expect(localStorage.getItem('lucidos-ui-scale')).toBe('200');
   });
 
@@ -320,22 +276,36 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
     vi.restoreAllMocks();
   });
 
+  it('establishes the saved agent on startup before preserving drafts on later refreshes', async () => {
+    const previousThreads = threadMap.value;
+    threadMap.value = new Map([['legacy', makeThreadState('legacy', { meta: { state: 'composing' } })]]);
+    selectedCodingAgent.value = 'claude-code';
+    const read = vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { coding_agent_default: 'codex' } });
+    try {
+      await loadPreferences();
+      expect(resolveCodingAgent('legacy')).toBe('codex');
+      expect(getComposeSelectionOverride('legacy').codingAgent).toBeUndefined();
+      read.mockResolvedValue({ preferences: { coding_agent_default: 'claude-code' } });
+      await loadPreferences();
+      expect(resolveCodingAgent('legacy')).toBe('codex');
+      expect(selectedCodingAgent.value).toBe('claude-code');
+    } finally {
+      threadMap.value = previousThreads;
+      selectedCodingAgent.value = 'claude-code';
+      _resetComposeSelectionsForTesting();
+    }
+  });
+
   it('does not wipe loaded state to "loading" on a refetch', async () => {
-    // First load → goes through 'loading' to 'loaded' as expected.
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
       preferences: { 'theme-mode': 'dark', 'font-family': 'monospace' },
     });
     await loadPreferences();
     expect(preferences.value.status).toBe('loaded');
 
-    // Refetch — should NOT flip back to 'loading'. We assert the value never
-    // becomes 'loading' between the call site and the resolved value swap.
     let observedLoadingDuringRefetch = false;
     const reloadPromise = (async () => {
       const promise = loadPreferences();
-      // Inspect state synchronously after the function starts but before it
-      // resolves. Since `loadPreferences` only flips when status is
-      // 'not-loaded', the synchronous check must still see 'loaded'.
       if ((preferences.value as { status: string }).status === 'loading') {
         observedLoadingDuringRefetch = true;
       }
@@ -348,9 +318,6 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
   });
 
   it('a superseded call resolves only once the newest call has loaded', async () => {
-    // Startup chains work on its own call, and the stream's first open issues
-    // a newer one. The older GET can land first, and its caller must still
-    // find the preferences loaded.
     const replies: Array<(v: { preferences: Record<string, string> }) => void> = [];
     vi.spyOn(apiClient, 'getPreferences').mockImplementation(
       () => new Promise(resolve => { replies.push(resolve); }),
@@ -370,9 +337,44 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
     expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
   });
 
+  it('a call superseded by a snapshot read resolves once the snapshot has applied', async () => {
+    const replies: Array<(v: { preferences: Record<string, string> }) => void> = [];
+    vi.spyOn(apiClient, 'getPreferences').mockImplementation(
+      () => new Promise(resolve => { replies.push(resolve); }),
+    );
+    let statusWhenNarrowResumed: string | null = null;
+    const narrow = loadPreferences().then(() => { statusWhenNarrowResumed = preferences.value.status; });
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    const snapshotRead = preferencesSlice.begin();
+
+    replies[0]({ preferences: { 'theme-mode': 'light' } });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(statusWhenNarrowResumed).toBeNull();
+    expect(preferences.value.status).toBe('loading');
+
+    preferencesSlice.apply({ preferences: { 'theme-mode': 'dark' } }, snapshotRead);
+    await narrow;
+    expect(statusWhenNarrowResumed).toBe('loaded');
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
+  });
+
+  it('a call superseded by a snapshot read resolves when that read fails too', async () => {
+    const replies: Array<(v: { preferences: Record<string, string> }) => void> = [];
+    vi.spyOn(apiClient, 'getPreferences').mockImplementation(
+      () => new Promise(resolve => { replies.push(resolve); }),
+    );
+    const narrow = loadPreferences();
+    await vi.waitFor(() => expect(replies).toHaveLength(1));
+    const snapshotRead = preferencesSlice.begin();
+    replies[0]({ preferences: { 'theme-mode': 'light' } });
+
+    preferencesSlice.fail(new Error('offline'), snapshotRead);
+    await narrow;
+    expect(preferences.value.status).toBe('failed');
+  });
+
   it('still flips to "loading" on the very first call', async () => {
     vi.spyOn(apiClient, 'getPreferences').mockImplementation(async () => {
-      // Capture the synchronous state after invocation.
       return { preferences: { 'theme-mode': 'dark' } };
     });
 
@@ -383,14 +385,6 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
   });
 });
 
-/**
- * `loadPreferences` used to have neither a transient retry nor a re-trigger.
- * A single cancelled startup fetch (an iOS PWA suspend, or the gateway
- * lazy-starting the engine) left it on `failed` for the whole page load.
- * Settings then showed every stored value as its default. Same fix as
- * `loadRepositories` (repositoriesLoader.test.ts): one retry on a transient
- * rejection, a real verdict still surfaces immediately.
- */
 describe('loadPreferences: transient failures retry, real ones surface', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -447,15 +441,6 @@ describe('loadPreferences: transient failures retry, real ones surface', () => {
   });
 });
 
-/**
- * A resume can call `loadPreferences` while an SSE-triggered refetch is
- * still in flight, so two independent GETs can be outstanding at once.
- * Sharing one in-flight promise would be the wrong fix (see the
- * `preferencesLoadSeq` comment in preferences.ts): WebKit can leave a
- * fetch hanging forever across an iOS suspend, and a caller sharing that
- * promise would then be stuck behind it. Each call issues its own fetch
- * instead, and only the newest ISSUED call's outcome is ever applied.
- */
 describe('loadPreferences: a stale response cannot overwrite a fresher one', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -483,8 +468,6 @@ describe('loadPreferences: a stale response cannot overwrite a fresher one', () 
 
     const first = loadPreferences();
     const second = loadPreferences();
-    // The newer call settles FIRST; the older one resolves after it, which
-    // is the exact reordering that would overwrite fresh data unguarded.
     await second;
     resolveOlder({ preferences: { 'theme-mode': 'light' } });
     await first;
@@ -519,10 +502,6 @@ describe('loadPreferences: a stale response cannot overwrite a fresher one', () 
 });
 
 describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia flash)', () => {
-  // Background: iOS WKWebView's matchMedia for prefers-color-scheme returns
-  // wrong synchronous values at random points post-FOUC. Re-applying 'system'
-  // on every PreferencesChanged briefly flipped the page; this guard skips
-  // the re-apply when the stored preference matches what was last applied.
   beforeEach(() => {
     localStorage.clear();
     preferences.value = { status: 'not-loaded' };
@@ -533,8 +512,6 @@ describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia
   });
 
   it('does not rewrite data-theme-mode on a refetch when the theme value matches the previously applied value', async () => {
-    // Pin the "previously applied" value via a direct applyThemeMode so this test
-    // is independent of any state left by earlier tests in the file.
     applyThemeMode('light');
 
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
@@ -564,18 +541,11 @@ describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia
 });
 
 describe("applyThemeMode('system'): following the OS", () => {
-  // Three guards decide whether a re-resolve paints: the preference still
-  // follows the OS, the document is visible, and the value actually changed.
-  // The visibility guard is what makes the media-query listener safe on iOS.
-  // Backgrounding there flips the trait collection twice for the app-switcher
-  // snapshots (rdar://7213631), and each flip reaches the page as a real event.
   let originalMatchMedia: typeof window.matchMedia;
   let originalSetAttribute: unknown;
   let originalGetAttribute: unknown;
   let mqListeners: Array<() => void>;
   let mqLight: boolean;
-  /** Every `data-theme-mode` value written since this case started. The guard being
-   *  tested reads the attribute back, so the stub has to round-trip it. */
   let painted: string[];
   let attrs: Record<string, string>;
 
@@ -583,12 +553,10 @@ describe("applyThemeMode('system'): following the OS", () => {
     (document as { visibilityState: string }).visibilityState = state;
   }
 
-  /** Fire the media query's `change`, as WKWebView does per trait flip. */
   function fireMediaQueryChange(): void {
     for (const fn of [...mqListeners]) fn();
   }
 
-  /** Run past both reads, the settle read and the one confirming it. */
   function settle(): void {
     vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS);
   }
@@ -623,7 +591,6 @@ describe("applyThemeMode('system'): following the OS", () => {
 
   afterEach(() => {
     setVisibility('visible');
-    // Leave no listener behind pointing at this block's mocked media query.
     applyThemeMode('dark');
     (window as any).matchMedia = originalMatchMedia;
     const el = document.documentElement as unknown as Record<string, unknown>;
@@ -638,10 +605,6 @@ describe("applyThemeMode('system'): following the OS", () => {
   });
 
   it('keeps a flip a repaint raced, instead of swapping the query out from under it', () => {
-    // A media query announces only a change made after it exists. A repaint
-    // between the flip and its dispatch, such as the startup theme re-lay,
-    // used to replace the query. The new one was born on the new appearance,
-    // so it announced nothing.
     const queries: Array<{ born: boolean; listeners: Array<() => void> }> = [];
     (window as any).matchMedia = () => {
       const query = { born: mqLight, listeners: [] as Array<() => void> };
@@ -679,9 +642,6 @@ describe("applyThemeMode('system'): following the OS", () => {
   });
 
   it('catches a flip that landed before the page subscribed', async () => {
-    // The boot script paints the OS appearance, and the bundle subscribes later.
-    // A media query announces only changes made after it exists.
-    // A flip in between reaches no listener, so the page would keep the old mode.
     localStorage.setItem('lucidos-theme-mode', 'system');
     attrs['data-theme-mode'] = 'dark';
     mqLight = true;
@@ -707,8 +667,6 @@ describe("applyThemeMode('system'): following the OS", () => {
   });
 
   it('re-reads at settle time rather than trusting the event that woke it', () => {
-    // The snapshot pass flips the trait collection and flips it straight back.
-    // A flip that raced the visibility guard must not survive to paint.
     applyThemeMode('system');
     painted = [];
 
@@ -738,9 +696,6 @@ describe("applyThemeMode('system'): following the OS", () => {
   });
 
   it('paints nothing a brief wake reads, when the page hides before the flip holds', () => {
-    // An iOS wake can last under a second. For that moment the media query
-    // still reports the snapshot pass's light, past the settle read. Painting
-    // it left the page light, and the next return opened on light.
     applyThemeMode('system');
     painted = [];
 
@@ -839,8 +794,6 @@ describe("applyThemeMode('system'): following the OS", () => {
   });
 
   describe('a repaint keeps the painted mode (ADR 0092)', () => {
-    // Startup's first preference load, a theme fetch and a theme file event all
-    // repaint through `applyTheme`. Only the follower may move the mode.
     it('a theme re-lay while hidden paints nothing the OS says', async () => {
       applyThemeMode('system');
       painted = [];
@@ -916,13 +869,9 @@ describe('applyThemeMode: native title-bar tint (Tauri)', () => {
   });
 
   it('tells the shell the page is ready to show, Tauri only', () => {
-    // Nothing is waiting on a hidden window in a browser, and there is no IPC
-    // bridge to carry the signal.
     applyThemeMode('light');
     expect(windowReadyToShowMock).not.toHaveBeenCalled();
 
-    // Under Tauri the theme is now resolved and on the document, which is the
-    // moment a window can come on screen showing a page instead of bare tint.
     platformMocks.isTauri = true;
     applyThemeMode('light');
     expect(windowReadyToShowMock).toHaveBeenCalled();
@@ -930,7 +879,6 @@ describe('applyThemeMode: native title-bar tint (Tauri)', () => {
 });
 
 describe('theme-color: the bar above the page continues the header', () => {
-  // The test document is a stub with no <head>, so the tag is a stand-in.
   let themeColor: string | undefined;
   let querySpy: ReturnType<typeof vi.spyOn>;
 
@@ -1072,7 +1020,6 @@ describe('retireWelcomeAfterUse: the welcome retires itself after enough threads
       thread({ state: 'discarded' }),
       thread({ initiator: 'system' }),
       thread({ parentThreadId: 'parent' }),
-      // Boot makes Home with a user initiator (ADR 0411), so it is excluded by name.
       thread({ home: true }),
     ]);
 
@@ -1089,26 +1036,9 @@ describe('retireWelcomeAfterUse: the welcome retires itself after enough threads
   });
 });
 
-/**
- * The app-shell backup reminder's visibility rule.
- *
- * The property worth pinning is that it needs no endpoint of its own: the
- * engine's GET /backup/schedule reports a `schedule` only when the cron is
- * active AND a provider is set (`api::backup::schedule_response`), and both are
- * ordinary preference rows that GET /preferences already returns. So these
- * predicates are a mirror of an engine rule, and drift between them is the bug
- * to catch. The component-side tests live in
- * `components/layout/__tests__/backup-reminder-banner.test.tsx`.
- *
- * Only the `schedule` field is mirrored. That response's `provider` field is
- * reported whether or not the schedule is active, because a destination does
- * not stop existing when the cron is off, so it is NOT a signal for "is backup
- * on" and this predicate deliberately does not follow it.
- */
 describe('backup reminder: is backup actually on?', () => {
   const T0 = Date.parse('2026-08-04T09:00:00Z');
   const DAY_MS = 24 * 60 * 60 * 1000;
-  /** A workspace with automatic backup switched on. */
   const BACKUP_ON = { backup_schedule: '0 0 3 * * *', backup_provider: 'google_drive' };
 
   beforeEach(() => {
@@ -1119,23 +1049,12 @@ describe('backup reminder: is backup actually on?', () => {
     vi.restoreAllMocks();
   });
 
-  it('mirrors core::backup::is_schedule_active for the cron half', () => {
-    expect(isBackupScheduleActive(undefined)).toBe(false);
-    expect(isBackupScheduleActive('')).toBe(false);
-    expect(isBackupScheduleActive('off')).toBe(false);
-    expect(isBackupScheduleActive('0 0 3 * * *')).toBe(true);
-    expect(isBackupScheduleActive('0 0 */12 * * *')).toBe(true);
-  });
-
-  it('requires BOTH an active cron and a provider', () => {
-    expect(backupIsActive(BACKUP_ON)).toBe(true);
-    expect(backupIsActive({})).toBe(false);
-    // A cron with nowhere to upload to.
-    expect(backupIsActive({ backup_schedule: '0 0 3 * * *' })).toBe(false);
-    // The shape left behind by picking a provider in Settings and never
-    // choosing a schedule, which backs up nothing.
-    expect(backupIsActive({ backup_provider: 'google_drive' })).toBe(false);
-    expect(backupIsActive({ backup_provider: 'google_drive', backup_schedule: 'off' })).toBe(false);
+  it('counts backup as set up once a provider is chosen, whatever the schedule', () => {
+    expect(backupIsConfigured(BACKUP_ON)).toBe(true);
+    expect(backupIsConfigured({})).toBe(false);
+    expect(backupIsConfigured({ backup_schedule: '0 0 3 * * *' })).toBe(false);
+    expect(backupIsConfigured({ backup_provider: 'google_drive', backup_schedule: 'off' })).toBe(true);
+    expect(backupIsConfigured({ backup_provider: 'google_drive' })).toBe(true);
   });
 
   it('an unset dismissal is not a dismissal', () => {
@@ -1157,9 +1076,6 @@ describe('backup reminder: is backup actually on?', () => {
   });
 
   it('an unparseable dismissal fails towards SHOWING the warning', () => {
-    // Garbage can only arrive by hand-writing the preference. This is a
-    // data-loss warning, so an uninterpretable dismissal must not silence it,
-    // and the next dismiss overwrites the garbage with a real instant.
     expect(backupReminderHiddenByDismissal('yesterday', T0)).toBe(false);
     expect(backupReminderNextDismissal('yesterday', T0)).toBe(new Date(T0).toISOString());
   });
@@ -1167,8 +1083,6 @@ describe('backup reminder: is backup actually on?', () => {
   it('records the instant on the first dismissal and forever on the second', () => {
     expect(backupReminderNextDismissal(undefined, T0)).toBe(new Date(T0).toISOString());
     expect(backupReminderNextDismissal('', T0)).toBe(new Date(T0).toISOString());
-    // The banner can only be back on screen because the snooze lapsed, so
-    // dismissing it again is the user saying it a second time.
     const first = new Date(T0).toISOString();
     expect(backupReminderNextDismissal(first, T0 + 31 * DAY_MS)).toBe(BACKUP_REMINDER_FOREVER);
     expect(backupReminderNextDismissal(BACKUP_REMINDER_FOREVER, T0)).toBe(BACKUP_REMINDER_FOREVER);
@@ -1178,23 +1092,93 @@ describe('backup reminder: is backup actually on?', () => {
     expect(backupReminderVisibleIn({}, T0)).toBe(true);
     expect(backupReminderVisibleIn(BACKUP_ON, T0)).toBe(false);
     expect(backupReminderVisibleIn({ ...BACKUP_ON, backup_reminder_dismissed: '' }, T0)).toBe(false);
-    // Switched back off after a dismissal whose snooze has since lapsed.
     expect(backupReminderVisibleIn({ backup_reminder_dismissed: new Date(T0).toISOString() }, T0 + 31 * DAY_MS)).toBe(true);
   });
 
   it('fails closed while preferences are not loaded (no flash for returning users)', () => {
-    // Same reasoning as welcomeSuggestionsDismissed above, and it matters more
-    // on an iOS PWA, where the preferences fetch reruns on every resume.
     for (const state of [
       { status: 'not-loaded' } as const,
       { status: 'loading' } as const,
       { status: 'failed', error: 'network error' } as const,
     ]) {
       preferences.value = state;
-      expect(backupReminderVisible(T0)).toBe(false);
+      expect(backupBanner(T0)).toBeNull();
     }
     preferences.value = { status: 'loaded', data: {} };
-    expect(backupReminderVisible(T0)).toBe(true);
+    expect(backupBanner(T0)).toEqual({ state: 'setup' });
+  });
+
+  describe('the overdue state', () => {
+    const OVERDUE = { status: 'loaded', data: { at: null, stale: true, configured: true, overdue: true, overdue_at: null } } as const;
+    const FRESH = { status: 'loaded', data: { at: null, stale: false, configured: true, overdue: false, overdue_at: null } } as const;
+    const MANUAL_ONLY = { backup_provider: 'google_drive', backup_schedule: 'off' };
+
+    it('shows when a provider is set and the engine says overdue, schedule or not', () => {
+      expect(backupBannerIn(MANUAL_ONLY, OVERDUE, T0)).toEqual({ state: 'overdue', provider: 'google_drive', lastBackupAt: null });
+      expect(backupBannerIn(BACKUP_ON, OVERDUE, T0)?.state).toBe('overdue');
+    });
+
+    it('carries the last backup instant for the sentence', () => {
+      const at = new Date(T0 - 12 * DAY_MS).toISOString();
+      const loaded = { status: 'loaded', data: { at, stale: true, configured: true, overdue: true, overdue_at: null } } as const;
+      expect(backupBannerIn(BACKUP_ON, loaded, T0)).toMatchObject({ lastBackupAt: at });
+    });
+
+    it('stays hidden when the engine says the backup is recent', () => {
+      expect(backupBannerIn(BACKUP_ON, FRESH, T0)).toBeNull();
+    });
+
+    it('appears once an open tab passes overdue_at, with no re-read', () => {
+      const due = new Date(T0 + DAY_MS).toISOString();
+      const read = { status: 'loaded', data: { ...FRESH.data, at: new Date(T0 - 6 * DAY_MS).toISOString(), overdue_at: due } } as const;
+      expect(backupBannerIn(BACKUP_ON, read, T0 + DAY_MS)).toBeNull();
+      expect(backupBannerIn(BACKUP_ON, read, T0 + DAY_MS + 1)?.state).toBe('overdue');
+    });
+
+    it('setup wins, and overdue never shows without a provider', () => {
+      expect(backupBannerIn({}, OVERDUE, T0)).toEqual({ state: 'setup' });
+      const dismissedSetup = { backup_reminder_dismissed: new Date(T0).toISOString() };
+      expect(backupBannerIn(dismissedSetup, OVERDUE, T0)).toBeNull();
+    });
+
+    it('fails closed while the verdict is unloaded or failed', () => {
+      for (const state of [
+        { status: 'not-loaded' } as const,
+        { status: 'loading' } as const,
+        { status: 'failed', error: 'HTTP 500' } as const,
+      ]) {
+        expect(backupBannerIn(BACKUP_ON, state, T0)).toBeNull();
+      }
+    });
+
+    it('a dismissal snoozes it for 7 days, then it returns', () => {
+      const at = new Date(T0).toISOString();
+      const dismissed = { ...BACKUP_ON, backup_overdue_reminder_dismissed: at };
+      expect(backupBannerIn(dismissed, OVERDUE, T0 + 6 * DAY_MS)).toBeNull();
+      expect(backupBannerIn(dismissed, OVERDUE, T0 + BACKUP_OVERDUE_SNOOZE_MS)?.state).toBe('overdue');
+      expect(backupOverdueHiddenByDismissal('yesterday', T0)).toBe(false);
+      expect(backupOverdueHiddenByDismissal('', T0)).toBe(false);
+    });
+
+    it('the setup dismissal does not silence overdue, and the reverse', () => {
+      const setupDismissed = { ...BACKUP_ON, backup_reminder_dismissed: 'forever' };
+      expect(backupBannerIn(setupDismissed, OVERDUE, T0)?.state).toBe('overdue');
+    });
+
+    it('dismissBackupOverdueReminder writes the instant to its own preference', async () => {
+      preferences.value = { status: 'loaded', data: BACKUP_ON };
+      const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+      await dismissBackupOverdueReminder(T0);
+      expect(spy).toHaveBeenCalledWith('backup_overdue_reminder_dismissed', new Date(T0).toISOString(), undefined);
+    });
+
+    it('reads the live signals through backupBanner', () => {
+      preferences.value = { status: 'loaded', data: BACKUP_ON };
+      lastSuccessfulBackup.value = OVERDUE;
+      expect(backupBanner(T0)?.state).toBe('overdue');
+      lastSuccessfulBackup.value = { status: 'not-loaded' };
+      expect(backupBanner(T0)).toBeNull();
+    });
   });
 
   it('dismissBackupReminder writes the instant, then forever', async () => {
@@ -1204,8 +1188,6 @@ describe('backup reminder: is backup actually on?', () => {
     await dismissBackupReminder(T0);
     expect(spy).toHaveBeenCalledWith('backup_reminder_dismissed', new Date(T0).toISOString(), undefined);
 
-    // savePreference updates the local map optimistically, so the second
-    // dismissal reads the first one's value and escalates.
     await dismissBackupReminder(T0 + 31 * DAY_MS);
     expect(spy).toHaveBeenLastCalledWith('backup_reminder_dismissed', BACKUP_REMINDER_FOREVER, undefined);
   });
@@ -1259,16 +1241,6 @@ describe('currentInAppBrowser — experimental in-app browser, off by default', 
   });
 });
 
-/**
- * The surfaces that must agree about the in-app browser being the live URL
- * target: the menu drawer's Browser row (its only entry point) and
- * `restoreState`'s refusal to resurrect a url-preview overlay on reload.
- *
- * The preference half is the one that shipped missing from the row. With the
- * toggle off `openUrl` deliberately routes to the OS opener, so the row rendered
- * for every desktop user and a menu entry labelled "Browser" just launched the
- * system browser on google.com.
- */
 describe('inAppBrowserAvailable: desktop app AND the experimental opt-in', () => {
   beforeEach(() => {
     platformMocks.isTauri = false;
@@ -1298,13 +1270,6 @@ describe('inAppBrowserAvailable: desktop app AND the experimental opt-in', () =>
   });
 });
 
-/**
- * The external-link target is read on the tap itself, inside a code path with
- * no `await` before it (the Web Share branch needs the user activation intact),
- * so every fallback has to be a pure synchronous default rather than a retry.
- * That is what these cases pin: unset, still-loading, and a value the enum
- * doesn't know all resolve to `safari`, the behaviour shipped in dbc7386d.
- */
 describe('currentExternalLinkTarget: safari unless the user chose otherwise', () => {
   beforeEach(() => {
     preferences.value = { status: 'not-loaded' };
@@ -1320,8 +1285,6 @@ describe('currentExternalLinkTarget: safari unless the user chose otherwise', ()
   });
 
   it('defaults to safari while preferences are still loading', () => {
-    // A link tapped during startup must not land in a different mode than the
-    // same link tapped a second later.
     preferences.value = { status: 'loading' };
     expect(currentExternalLinkTarget()).toBe('safari');
   });
@@ -1334,8 +1297,6 @@ describe('currentExternalLinkTarget: safari unless the user chose otherwise', ()
   });
 
   it('degrades an unrecognized stored value to safari, never to no hand-off', () => {
-    // e.g. a value written by a newer build, or a hand-edited row. Falling back
-    // to the working default beats leaving the user trapped in the web view.
     preferences.value = { status: 'loaded', data: { external_link_target: 'chrome' } };
     expect(currentExternalLinkTarget()).toBe('safari');
   });
@@ -1351,13 +1312,6 @@ describe('currentExternalLinkTarget: safari unless the user chose otherwise', ()
   });
 });
 
-/**
- * The Settings row must not render where the choice decides nothing. Every
- * client except an installed iOS PWA opens a new tab (or the desktop OS opener)
- * regardless of the stored value, so a row there would be a control that does
- * nothing, which `.claude/rules/frontend.md` treats as a lie rather than a
- * harmless extra.
- */
 describe('externalLinkTargetConfigurable: the row shows only where it bites', () => {
   beforeEach(() => {
     platformMocks.isIOSPwa = false;
@@ -1380,26 +1334,13 @@ describe('externalLinkTargetConfigurable: the row shows only where it bites', ()
   });
 
   it('does not depend on preferences having loaded', () => {
-    // Platform-only, so the row cannot pop in partway through startup.
     platformMocks.isIOSPwa = true;
     preferences.value = { status: 'loading' };
     expect(externalLinkTargetConfigurable()).toBe(true);
   });
 });
 
-/**
- * An installed iOS PWA suspends tens of times a day, and WebKit aborts every
- * in-flight fetch when it does. `savePreference` applies the value locally
- * first, so the only thing left to go wrong is delivery, and it used to go
- * wrong loudly and permanently: one toast per cancelled write, never retried,
- * leaving the device showing a value the server never received.
- *
- * The contract now: a transient rejection is retried, then parked and flushed
- * on resume, silently; a real engine verdict still speaks up at once; and
- * neither can stack more than one card.
- */
 describe('preference writes survive an iOS PWA suspend', () => {
-  /** What WebKit rejects with when it kills an in-flight fetch. */
   const cancelled = () => new DOMException('Fetch is aborted', 'AbortError');
 
   beforeEach(() => {
@@ -1427,10 +1368,6 @@ describe('preference writes survive an iOS PWA suspend', () => {
   });
 
   it('speaks up when the engine refuses, rather than retrying or parking', async () => {
-    // What the client hands up for a refusal. `PUT /preferences` answers one
-    // with `200 {success: false, error}` rather than a 4xx, and `setPreference`
-    // turns that into this throw. Before it did, every refusal the engine
-    // issued read here as a save that worked.
     const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(
       new Error("'response_styles' holds at most 20 styles (got 21)"),
     );
@@ -1438,13 +1375,9 @@ describe('preference writes survive an iOS PWA suspend', () => {
     await savePreference('response_styles', '[]');
 
     expect(spy).toHaveBeenCalledTimes(1);
-    // No retry: a verdict is not a transient failure.
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].message).toContain('at most 20 styles');
-    // The engine's reason, not an HTTP code in front of it. A refusal arrives
-    // on a 200, so stamping one would read as a success code on an error.
     expect(toasts.value[0].message).not.toContain('200');
-    // Answered, so the key is no longer owed a re-send.
     expect(_pendingPreferenceKeysForTesting()).toEqual([]);
   });
 
@@ -1557,7 +1490,6 @@ describe('a refetch during a write keeps what the user chose', () => {
     toasts.value = [];
   });
 
-  /** A write the engine answers only when the test says so. */
   function heldWrite(): { answer: (outcome: 'accept' | 'refuse') => void } {
     let answer: (outcome: 'accept' | 'refuse') => void = () => {};
     vi.spyOn(apiClient, 'setPreference').mockImplementation(() => new Promise((resolve, reject) => {
@@ -1625,13 +1557,6 @@ describe('a refetch during a write keeps what the user chose', () => {
   });
 });
 
-/**
- * `PUT /preferences?key=<k>` is applied in ARRIVAL order, so two overlapping
- * writes to one key are a lost-update race the local bookkeeping cannot see:
- * an older request landing second puts the stale value on the server while the
- * device shows the newer one. Deliveries are therefore serialized per key, and
- * a write that a newer one has superseded stands down instead of sending.
- */
 describe('concurrent writes to one preference key', () => {
   const cancelled = () => new DOMException('Fetch is aborted', 'AbortError');
 
@@ -1673,8 +1598,6 @@ describe('concurrent writes to one preference key', () => {
       return { success: true };
     });
 
-    // Both requested in the same tick, so the first has not gone out yet when
-    // the second claims the key. Sending it at all would be pure waste.
     await Promise.all([
       savePreference('ui-scale', '112.5', undefined, true),
       savePreference('ui-scale', '150', undefined, true),
@@ -1697,7 +1620,6 @@ describe('concurrent writes to one preference key', () => {
 
     const newer = savePreference('ui-scale', '150', undefined, true);
     await vi.waitFor(() => expect(sent).toContain('150'));
-    // The resume flush queues the parked write behind the newer one.
     const flushed = flushPendingPreferenceWrites();
     acceptNewer();
     await Promise.all([newer, flushed]);
@@ -1714,8 +1636,6 @@ describe('concurrent writes to one preference key', () => {
 
     vi.spyOn(apiClient, 'setPreference').mockImplementation((_k, v) => {
       sent.push(v);
-      // Hold the very first request open so the test can interleave a newer
-      // write while it is genuinely on the wire.
       if (v === '112.5' && !failFirstAttempt) {
         return new Promise<ApiResult>((_resolve, reject) => {
           failFirstAttempt = () => reject(cancelled());
@@ -1731,8 +1651,6 @@ describe('concurrent writes to one preference key', () => {
     failFirstAttempt!();
     await Promise.all([first, second]);
 
-    // The older value went out once and was NOT retried: by then the user had
-    // moved on, and its retry would have landed after the newer write.
     expect(sent.filter(v => v === '112.5')).toHaveLength(1);
     expect(sent.filter(v => v === '150')).toHaveLength(2);
     expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
@@ -1740,13 +1658,10 @@ describe('concurrent writes to one preference key', () => {
 
   it('keeps a newer parked write when an older one is rejected outright', async () => {
     const spy = vi.spyOn(apiClient, 'setPreference');
-    // Older write: two cancels, so it parks.
     spy.mockRejectedValue(cancelled());
     await savePreference('ui-scale', '125', undefined, true);
     expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
 
-    // A LATER rejection for the same key must not evict the parked value: it is
-    // still the user's choice and still owed a re-send.
     spy.mockRejectedValue(new ApiError(500, 'db down'));
     await flushPendingPreferenceWrites();
     expect(toasts.value.some(t => t.message.includes('db down'))).toBe(true);
@@ -1773,12 +1688,6 @@ describe('concurrent writes to one preference key', () => {
   });
 });
 
-/**
- * The two failure banners answer different questions, so draining the queue must
- * retract the "not reaching the engine" one whichever way it drained. A queue
- * emptied by rejections used to leave it on screen insisting nothing was getting
- * through, directly contradicting the rejection card beside it.
- */
 describe('unreachable banner tracks the queue, not just the happy path', () => {
   const cancelled = () => new DOMException('Fetch is aborted', 'AbortError');
   const UNREACHABLE = 'preference-save-unreachable';
@@ -1795,7 +1704,6 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
     toasts.value = [];
   });
 
-  /** Park three writes so the escalation threshold trips. */
   async function stallThreeWrites() {
     const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
     await savePreference('theme-mode', 'light');
@@ -1813,7 +1721,6 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
 
     expect(_pendingPreferenceKeysForTesting()).toEqual([]);
     expect(toasts.value.some(t => t.key === UNREACHABLE)).toBe(false);
-    // The rejection itself still has to be readable.
     expect(toasts.value.some(t => t.message.includes('unknown preference key'))).toBe(true);
   });
 
@@ -1823,12 +1730,10 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
     await savePreference('theme-mode', 'light');
     await savePreference('font-family', 'inter');
 
-    // An answer, even a refusal, breaks the "nothing is getting through" streak.
     spy.mockRejectedValue(new ApiError(400, 'nope'));
     await savePreference('image_model', 'auto');
     toasts.value = toasts.value.filter(t => t.key !== 'preference-save-rejected');
 
-    // So the next single cancel is back to being noise, not the third strike.
     spy.mockRejectedValue(cancelled());
     await savePreference('timezone', 'UTC');
     expect(toasts.value.some(t => t.key === UNREACHABLE)).toBe(false);
@@ -1840,22 +1745,11 @@ describe('unreachable banner tracks the queue, not just the happy path', () => {
 
     await savePreference('theme-mode', 'light');
 
-    // Same array identity: retracting an absent banner must not notify
-    // subscribers, or every preference save re-renders the toast container.
     expect(toasts.value).toBe(before);
   });
 });
 
 
-/**
- * `currentMaxToolCalls` mirrors `PreferenceStore::max_tool_calls` in
- * `core/preferences.rs`. The two must agree, or Settings shows a cap the engine
- * would not honor: the user reads 12 and the loop runs 500.
- *
- * The engine parses with `parse::<usize>()`, which is stricter than JS's
- * `parseInt` in exactly the ways that matter here, so these cases are the
- * contract between them rather than incidental input validation.
- */
 describe('currentMaxToolCalls: mirrors the engine resolution', () => {
   beforeEach(() => {
     preferences.value = { status: 'loaded', data: {} };
@@ -1873,8 +1767,6 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
   it('honors a stored value, including one far above any preset', () => {
     preferences.value = { status: 'loaded', data: { max_tool_calls: '2000' } };
     expect(currentMaxToolCalls()).toBe(2000);
-    // A huge cap within the bound is the user's call. The UI must show what is
-    // actually stored rather than a clamped fiction.
     preferences.value = { status: 'loaded', data: { max_tool_calls: '1000000' } };
     expect(currentMaxToolCalls()).toBe(1_000_000);
   });
@@ -1885,8 +1777,6 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
   });
 
   it('reads a value outside the catalog bounds as unset, as the engine does', () => {
-    // 0 would end the turn before the first LLM call, and "-5" is not a cap at
-    // all. Only a write from outside Settings can store one.
     for (const raw of ['0', '-5', String(MAX_TOOL_CALLS_MAX + 1), '1'.repeat(400)]) {
       preferences.value = { status: 'loaded', data: { max_tool_calls: raw } };
       expect(currentMaxToolCalls(), raw).toBe(MAX_TOOL_CALLS_DEFAULT);
@@ -1907,9 +1797,6 @@ describe('currentMaxToolCalls: mirrors the engine resolution', () => {
   });
 });
 
-/** A background row reads only its own stored keys. Inheritance and the
- *  provider-aware default are resolved once, on the engine, and Settings shows
- *  that answer while a key is unset (`useBackgroundModels`). */
 describe('a stored background selection', () => {
   it('reads null for both halves while unset, whatever the keys it inherits hold', () => {
     preferences.value = {
@@ -1939,7 +1826,6 @@ describe('a stored background selection', () => {
 describe('the memory module', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  /** Unset is "never chosen", and runs what the engine runs while unset. */
   it('runs Classic, with no choice, while unset, unloaded or unknown', () => {
     const states: Loadable<Record<string, string>>[] = [
       { status: 'not-loaded' },
@@ -1976,11 +1862,6 @@ describe('the memory module', () => {
   });
 });
 
-/**
- * The Settings note tells the user what a cap means in wall-clock terms before
- * they pick one: the number is theirs to choose, so it has to be legible.
- * Coarse on purpose.
- */
 describe('estimateTurnDuration', () => {
   it('scales from minutes through hours to days', () => {
     expect(estimateTurnDuration(50)).toBe('13 min');
@@ -1994,12 +1875,6 @@ describe('estimateTurnDuration', () => {
   });
 });
 
-/**
- * The in-app toast switch is the one preference whose pre-load answer is not a
- * harmless default: a toast cannot be taken back, so guessing "on" before the
- * GET returns interrupts exactly the user who turned it off. Hence a
- * device-local mirror, kept honest at both points the value becomes known.
- */
 describe('notification_toasts: the mirror that survives a cold start', () => {
   const KEY = 'lucidos-notification-toasts';
 
@@ -2034,9 +1909,6 @@ describe('notification_toasts: the mirror that survives a cold start', () => {
     expect(currentNotificationToasts()).toBe(true);
   });
 
-  // Driven through `loadPreferences` rather than the cache step directly: a
-  // mirror nothing refreshes is the way this whole fix goes quietly dead, so
-  // the wiring is the part worth pinning.
   it('takes the mirror from what the engine served', async () => {
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
       preferences: { notification_toasts: 'false' },
@@ -2046,8 +1918,6 @@ describe('notification_toasts: the mirror that survives a cold start', () => {
   });
 
   it('clears the mirror when the engine serves no value', async () => {
-    // Unset means the default. A mirror left behind would outlive a reset and
-    // keep silencing toasts for a preference nobody holds any more.
     localStorage.setItem(KEY, 'false');
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
     await loadPreferences();
@@ -2055,18 +1925,12 @@ describe('notification_toasts: the mirror that survives a cold start', () => {
   });
 
   it('writes the mirror on the user pick, before the round trip', () => {
-    // savePreference applies locally first and delivers after, so the mirror
-    // must not wait on the network: the next cold start reads it.
     vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
     void setNotificationToasts(false);
     expect(localStorage.getItem(KEY)).toBe('false');
   });
 });
 
-/**
- * What Enter does in the composer. A send cannot be taken back either, so a
- * user who chose a new line must keep it before preferences load.
- */
 describe('composer_enter_key: Enter-to-send or a new line', () => {
   const KEY = 'lucidos-composer-enter-key';
 
@@ -2128,12 +1992,6 @@ describe('composer_enter_key: Enter-to-send or a new line', () => {
   });
 });
 
-/**
- * The device's Autocorrect switch. iOS autocorrect can keep the tap on Send for
- * itself, so a device that hits it can turn autocorrect off. Unset means on, on
- * every client. The mirror answers before preferences load, because the
- * composer can take focus first and iOS reads the attribute at focus.
- */
 describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
   const KEY = 'lucidos-autocorrect';
 
@@ -2150,8 +2008,6 @@ describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
     vi.restoreAllMocks();
   });
 
-  // The iPhone case is the one that matters: the platform must not pick the
-  // default, or the switch goes back to hiding autocorrect from iOS users.
   it('is on when nothing is stored, on an iPhone and on a desktop alike', () => {
     preferences.value = { status: 'loaded', data: {} };
     platformMocks.isIOS = true;
@@ -2175,8 +2031,6 @@ describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
     expect(currentAutocorrect()).toBe(false);
   });
 
-  // Driven through `loadPreferences`, because a switch nothing applies is how
-  // this fix would go quietly dead.
   it('applies the served value to the stamp and to the mirror', async () => {
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
       preferences: { autocorrect: 'false' },
@@ -2194,8 +2048,6 @@ describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
   });
 
   it('clears the mirror when the engine serves no value', async () => {
-    // Unset means on, and a mirror left behind would keep answering for a
-    // preference nobody holds any more.
     localStorage.setItem(KEY, 'false');
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
     await loadPreferences();
@@ -2205,7 +2057,6 @@ describe('autocorrect: the switch that keeps Send reachable on iOS', () => {
   it('writes this device only, and re-stamps before the round trip', async () => {
     const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
     const saved = setAutocorrect(false);
-    // Applied locally before the network, so the next focus already has it.
     expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(false);
     expect(localStorage.getItem(KEY)).toBe('false');
     await saved;
@@ -2248,7 +2099,6 @@ describe('motion: the device-scoped calm switch', () => {
   });
 
   it('clears the mirror and follows the OS when the engine serves no value', async () => {
-    // A stale mirror would otherwise keep calming a device after a reset.
     localStorage.setItem(KEY, 'reduce');
     motionPreference.value = 'reduce';
     vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
@@ -2323,8 +2173,6 @@ describe('the resident-block sections a call opens with', () => {
     vi.restoreAllMocks();
   });
 
-  /** Nothing stored is the catalog default, which is what the engine falls
-   *  back to for a workspace that never opened this screen. */
   it('reads unset as the sections that ship on', () => {
     for (const section of VOICE_RESIDENT_SECTIONS) {
       expect(voiceSectionEnabled(section.id)).toBe(DEFAULT_VOICE_RESIDENT_SECTIONS.includes(section.id));
@@ -2337,15 +2185,11 @@ describe('the resident-block sections a call opens with', () => {
     expect(voiceSectionEnabled('who-and-where')).toBe(false);
   });
 
-  /** The first toggle-off has to write the OTHER two, not just its own absence:
-   *  an empty value would turn everything off at once. */
   it('turning one off writes the rest', async () => {
     await setVoiceSectionEnabled('this-thread', false);
     expect(stored()).toBe(DEFAULT_VOICE_RESIDENT_SECTIONS.filter((id) => id !== 'this-thread').join(','));
   });
 
-  /** The whole point of an empty value meaning none. Without it the last
-   *  toggle reads as unset and brings all three back. */
   it('turning the last one off stores an empty list', async () => {
     preferences.value = { status: 'loaded', data: { [KEY]: 'this-thread' } };
     await setVoiceSectionEnabled('this-thread', false);
@@ -2353,20 +2197,63 @@ describe('the resident-block sections a call opens with', () => {
     expect(voiceSectionEnabled('this-thread')).toBe(false);
   });
 
-  /** The registry's order, not the order they were clicked in. The engine
-   *  renders in its own order, so two workspaces with the same sections on
-   *  should store the same string. */
   it('writes the registry order however they were toggled', async () => {
     preferences.value = { status: 'loaded', data: { [KEY]: 'workspace-shape' } };
     await setVoiceSectionEnabled('who-and-where', true);
     expect(stored()).toBe('who-and-where,workspace-shape');
   });
 
-  /** A newer engine can define a section this client has never heard of.
-   *  Dropping it on the next toggle would silently turn it off. */
   it('keeps an id the registry does not carry', async () => {
     preferences.value = { status: 'loaded', data: { [KEY]: 'this-thread,from-the-future' } };
     await setVoiceSectionEnabled('who-and-where', true);
     expect(stored()).toBe('who-and-where,this-thread,from-the-future');
+  });
+});
+
+
+describe('agent brand colours', () => {
+  it('keeps a saved Off choice during reload and a failed preference fetch', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    await setAgentBrandColours(false);
+    preferences.value = { status: 'loading' };
+    expect(currentAgentBrandColours()).toBe(false);
+    vi.spyOn(apiClient, 'getPreferences').mockRejectedValue(new Error('offline'));
+    await loadPreferences();
+    expect(currentAgentBrandColours()).toBe(false);
+  });
+
+  it('repaints shared marks when preferences refresh', () => {
+    const stamp = vi.spyOn(document.documentElement, 'setAttribute');
+    preferences.value = { status: 'loaded', data: { 'agent-brand-colours': 'false' } };
+    expect(stamp).toHaveBeenLastCalledWith('data-agent-brand-colours', 'off');
+    preferences.value = { status: 'loaded', data: {} };
+    expect(stamp).toHaveBeenLastCalledWith('data-agent-brand-colours', 'on');
+  });
+
+  it('loads a saved choice and restores the default after reset', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { 'agent-brand-colours': 'false' } });
+    await loadPreferences();
+    expect(currentAgentBrandColours()).toBe(false);
+    vi.mocked(apiClient.getPreferences).mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(currentAgentBrandColours()).toBe(true);
+  });
+
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'loaded', data: {} };
+    _resetPendingPreferenceWritesForTesting();
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('defaults to normal colours', () => {
+    expect(currentAgentBrandColours()).toBe(true);
+  });
+
+  it('persists a device choice through the preference pipeline', async () => {
+    const save = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    await setAgentBrandColours(false);
+    expect(currentAgentBrandColours()).toBe(false);
+    expect(save).toHaveBeenCalledWith('agent-brand-colours', 'false', expect.any(String));
   });
 });

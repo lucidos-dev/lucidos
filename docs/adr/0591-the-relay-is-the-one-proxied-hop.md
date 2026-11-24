@@ -3,6 +3,8 @@
 - **Status**: Accepted
 - **Date**: 2026-10-28
 - **Extends**: [0590](0590-gateway-pairing-is-a-deliberate-grant.md), [0014](0014-multi-workspace-redesign.md)
+- **Amended by**: [0723](0723-trusted-remote-workspace-client.md), which replaces the foreign-frontend/browser-origin trust below. The signed directional data relay remains; B no longer supplies A's privileged frontend. The text below records the original decision.
+- **Amended by**: [0807](0807-trusted-pairing-serves-the-peer-client.md). B's frontend may return at A's origin as an owner's opt-in per pairing, without B's service worker.
 
 ## Context
 

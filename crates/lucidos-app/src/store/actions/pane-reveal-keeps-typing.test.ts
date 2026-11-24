@@ -5,9 +5,6 @@ import { dashboardRailShown } from '../dashboardRail';
 import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from './pane';
 import { drawnSplitRatio, layoutGeometry } from '../../components/layout/drawnLayout';
 
-// An agent opens a file while the reader types in the prompt. The reveal's
-// reconcile never pulls focus off a field being edited. Moving the marker
-// alone would send their next Tab into the content pane instead of to Send.
 describe('revealContentPane while the reader types in another pane', () => {
   afterEach(() => {
     document.body.innerHTML = '';
@@ -30,7 +27,6 @@ describe('revealContentPane while the reader types in another pane', () => {
   });
 
   it('the reader\'s own navigation from the prompt still moves the marker', () => {
-    // A shortcut such as the one that opens Settings: Tab should follow it.
     panes().prompt.focus();
     revealContentPane();
     expect(focusedPane.value).toBe('content');
@@ -44,7 +40,6 @@ describe('revealContentPane while the reader types in another pane', () => {
   });
 
   it('a released hold does not catch the reader\'s later reveal', () => {
-    // An agent navigation that landed no content, such as a thread or a URL.
     panes().prompt.focus();
     holdFocusedPaneWhileTyping();
     releaseTypingHold();
@@ -53,7 +48,6 @@ describe('revealContentPane while the reader types in another pane', () => {
   });
 
   it('an agent navigation never swaps out the pane the reader types in', () => {
-    // The Canvas yielded for room, so showing it would hide the Conversation.
     const floors = { minThreadPx: 400, minContentPx: 300, drawerPx: 300, railPx: 360 };
     const railWasShown = dashboardRailShown.value;
     dashboardRailShown.value = false;

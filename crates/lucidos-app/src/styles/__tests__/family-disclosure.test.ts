@@ -1,15 +1,3 @@
-/**
- * Source scans over the drawer's "Show / Hide N sub-threads" link.
- *
- * The chevron rotates 90 degrees on
- * expand. In the packaged macOS app it then jumped a little to the right once
- * the rotation finished. WebKit drops the compositing layer a transition runs
- * on and repaints the rotated chevron into the row, snapped to a different
- * sub-pixel spot. A permanent layer removes the hand-off.
- *
- * A source scan because nothing this repo drives reproduces it: the box does
- * not move, and Playwright's WebKit paints it steady.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -46,8 +34,6 @@ describe('the sub-thread chevron keeps one layer through its turn', () => {
 });
 
 describe('the sub-thread link stays on one line', () => {
-  // A wide chip squeezed the title column, and the button centred its wrapped
-  // text, leaving "threads" alone under "Hide 2 sub-".
   it('never wraps its label, and the mobile rule does not undo that', () => {
     const rules = cssRules(drawerCss).filter(r => r.selector === '.family-disclosure');
     expect(rules[0].props.get('white-space')).toBe('nowrap');

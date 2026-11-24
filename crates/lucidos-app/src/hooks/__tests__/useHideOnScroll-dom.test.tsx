@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The bars hook against a DOM, where useHideOnScroll.test.ts covers its pure
- * rules. jsdom has no layout, so every height the hook measures is stubbed.
- *
- * A viewport that leaves the phone layout (a tablet's split, a widened window)
- * swaps App to the desktop layout and back. The header that carries the hook
- * outlives the swap, and the mobile tree does not. Bound to the old tree, the
- * keyboard left the new title bar on screen and the down chevron fell onto
- * Send. e2e/dynamic-bars-survive-rotation-mobile.spec.ts drives the real swap.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
@@ -30,7 +20,6 @@ function Header() {
   return <header class="app-header" ref={ref} />;
 }
 
-/** The parts of a mobile thread pane the hook binds. */
 function mountMobileTree(): HTMLElement {
   const wrapper = document.createElement('div');
   wrapper.className = 'mobile-swipe-wrapper';
@@ -66,7 +55,6 @@ beforeEach(() => {
   });
   headerPx = HEADER_PX;
   promptPx = PROMPT_PX;
-  // A phone's width, so the hook's own breakpoint read agrees with the signal.
   Object.defineProperty(window, 'innerWidth', { value: 390, configurable: true });
   preferences.value = { status: 'loaded', data: { mobile_dynamic_bars: 'true' } };
   mobileView.value = 'thread';
@@ -104,7 +92,6 @@ describe('the bars hook across a layout swap', () => {
     viewportIsMobile.value = false;
     document.querySelector('.mobile-swipe-wrapper')!.remove();
     await frames();
-    // The desktop layout gets the header with none of the mobile writes.
     expect(document.documentElement.hasAttribute('data-mobile-dynamic-bars')).toBe(false);
     expect(document.documentElement.style.getPropertyValue('--mobile-header-height')).toBe('');
     viewportIsMobile.value = true;
@@ -122,8 +109,6 @@ describe('the bars hook across a layout swap', () => {
 
 describe('a UI scale applied after mount', () => {
   it('publishes the prompt height in the new rem', async () => {
-    // The prompt's observer can fire before the header's, so it must not
-    // convert with the rem the header last read.
     const observed = new Map<Element, () => void>();
     vi.stubGlobal('ResizeObserver', class {
       constructor(private cb: () => void) {}
@@ -171,7 +156,6 @@ describe('a header that grows while away', () => {
     tree.querySelector('textarea')!.focus();
     await frames();
 
-    // A banner mounts in the header, or the top inset comes back.
     headerPx = 150;
     window.dispatchEvent(new Event('resize'));
     await frames();
@@ -180,7 +164,6 @@ describe('a header that grows while away', () => {
   });
 });
 
-/** A mobile Canvas pane showing an app, plus a widget frame elsewhere. */
 function mountAppPane(): { panel: HTMLElement; frame: HTMLIFrameElement; widget: HTMLIFrameElement } {
   const wrapper = document.createElement('div');
   wrapper.className = 'mobile-swipe-wrapper';

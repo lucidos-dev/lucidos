@@ -1,7 +1,3 @@
-/**
- * The slowness bar's height reservation. `--app-header-bottom` sums every
- * banner's property, so toasts and the drawer start below whichever are up.
- */
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same

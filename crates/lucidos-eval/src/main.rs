@@ -152,7 +152,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         list: bool,
     },
-    /// Classify `eval/command-judge/commands.toml` with each candidate, through
+    /// Classify `eval/command-guard/cases.toml` with each candidate, through
     /// the command guard's own judge, and print the table. Spends real tokens.
     #[command(name = "command-judge")]
     JudgeCheck {
@@ -355,7 +355,7 @@ async fn dispatch() -> Fallible<()> {
         }
         Command::JudgeCheck { models, out } => {
             let set = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../eval/command-judge/commands.toml");
+                .join("../../eval/command-guard/cases.toml");
             command_judge::run(&set, &models, &out).await
         }
         Command::ReadDecisionCheck(args) => {
@@ -618,7 +618,6 @@ async fn seed_repeat(
     sweep: SweepPins,
 ) -> Fallible<()> {
     let pins = seed_pins(window);
-    let tls = workspace::EngineTls::from_env()?;
     let mut digests = Vec::new();
     for arm in arms.iter().copied() {
         let slug = workspace::arm_workspace_name(run_label(), arm, repeat);
@@ -635,7 +634,7 @@ async fn seed_repeat(
         // into the workspace repo as it comes up. Replacing the directory
         // afterwards would leave every fixture file an uncommitted delete.
         workspace::install_fixture_tree(&ws, &paths.fixture_root.join(config::SEED_TREE))?;
-        workspace::migrate_by_booting(&paths.engine_bin, &ws, &url, &tls)?;
+        workspace::migrate_by_booting(&paths.engine_bin, &ws, &url)?;
         workspace::apply_seed_sql(&url, &paths.fixture_root.join("fixtures/seed.sql"), &pins)?;
         let pool = arm_pool(paths, run_label(), arm, repeat).await?;
         workspace::write_arm_preference(&pool, arm, sweep).await?;
@@ -925,7 +924,6 @@ async fn boot_arms(
     engines: &mut Vec<workspace::BootedEngine>,
     endpoints: &mut Vec<(Arm, PathBuf, ArmEndpoint)>,
 ) -> Fallible<()> {
-    let tls = workspace::EngineTls::from_env()?;
     for arm in arms.iter().copied() {
         let ws = workspace::arm_workspace_path(&paths.eval_root, run_label(), arm, repeat);
         let url = workspace::arm_database_url(&paths.pg_base, run_label(), arm, repeat);
@@ -933,7 +931,7 @@ async fn boot_arms(
         // Full `ContextCaptured` bodies, always. A run whose captures are
         // truncated at 8 KB cannot be replayed, and replaying it is half of
         // what the benchmark is for.
-        let engine = workspace::boot_engine(&paths.engine_bin, &ws, &url, port, &tls, true)?;
+        let engine = workspace::boot_engine(&paths.engine_bin, &ws, &url, port, true)?;
         let base_url = engine.base_url.clone();
         engines.push(engine);
         let pool = arm_pool(paths, run_label(), arm, repeat).await?;

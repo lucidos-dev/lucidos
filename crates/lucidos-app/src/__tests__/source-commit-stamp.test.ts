@@ -10,12 +10,6 @@ import { fileURLToPath } from 'node:url';
 import { SOURCE_COMMIT_FILE } from '@lucidos/engine-constants';
 import { readHeadCommit, sourceCommitFile, sourceCommitStamp } from '../../vite/sourceCommitStamp';
 
-/**
- * The build stamps `dist/` with the commit it was built from. The engine reads
- * it to leave out of the switch list what the served client already carries
- * (docs/plans/2026-10-10-the-served-client-names-its-commit.md). Tested from
- * here because Vitest's `include` covers `src/` only.
- */
 const SHA = 'a'.repeat(40);
 
 type Hooks = {

@@ -16,53 +16,32 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Identifier for the coding-agent backend. The engine maps each kind to a
-/// concrete `AgentRuntime` implementation in its agent registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CodingAgent {
-    ClaudeCode,
-    Codex,
-}
+pub use crate::engine::thread_events::CodingAgent;
 
-impl CodingAgent {
-    /// Every backend, in picker order. The LLM tool schemas read their enum
-    /// from here.
-    pub const ALL: [Self; 2] = [Self::ClaudeCode, Self::Codex];
-
-    /// Wire/DB string for this backend — same kebab-case values serde uses
-    /// (`claude-code`, `codex`), so the `thread_summaries.coding_agent`
-    /// column, event payloads, and HTTP request bodies all share one root.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-        }
-    }
-
-    /// The name the user knows this backend by.
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-        }
-    }
-
-    /// Parse a stored backend string. Unknown / legacy NULL-ish values fall
-    /// back to `ClaudeCode` — every thread persisted before the column
-    /// existed was a Claude Code thread.
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "codex" => Self::Codex,
-            _ => Self::ClaudeCode,
-        }
-    }
+/// A Codex usage notification that is not proven to describe this turn's work.
+/// Counts use the same uncached-input convention as `AgentEvent::Usage`.
+#[derive(Debug, Clone)]
+pub struct CodexUsageSnapshot {
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
 }
 
 /// Canonical event emitted by a coding agent. Implementors translate their
 /// CLI's output format into this enum before sending it over `events_rx`.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Still recorded as usage, but never billed from this process's account.
+    UsageRestored { snapshot: CodexUsageSnapshot },
+    /// Neither restored identity nor a current turn is proven. Keep the counts.
+    UsageUnscoped { snapshot: CodexUsageSnapshot },
+    /// Allowlisted evidence from this process, never the engine's own router.
+    BillingObserved {
+        attribution: super::billing_provider::BillingAttribution,
+    },
     /// Initial handshake — session id, model, available commands.
     Init {
         session_id: String,
@@ -71,6 +50,8 @@ pub enum AgentEvent {
         skills: Vec<String>,
         /// The agent CLI's own version, when its handshake names one.
         agent_version: Option<String>,
+        /// This process can accept ordinary follow-ups during an active turn.
+        can_steer: bool,
     },
     /// Streamed assistant text fragment. `opens_block` is true when this text
     /// starts a new content block rather than continuing the open one. The
@@ -145,20 +126,31 @@ pub enum AgentEvent {
     /// (`--replay-user-messages`): mid-turn when it folds the input in at a tool
     /// result, and at the next turn's start otherwise. A local command such as
     /// `/cost` replays too. Codex reports it when the driver starts the turn
-    /// that carries the input.
+    /// that carries the input or accepts its mid-turn steer.
     InputRead { input: uuid::Uuid },
     /// The agent will never take the forwarded input `input`: Codex rejected or
     /// failed the turn that carried it. The turn's `Result` carries the error.
     InputRejected { input: uuid::Uuid },
+    /// A steer failed. The input remains queued; the driver interrupts the
+    /// current turn only when it cannot safely leave the input for its end.
+    SteerFallback { can_steer: bool, interrupting: bool },
     /// Turn-complete marker. The agent is now idle.
     /// `error` is `Some` when the agent reported the turn ended in failure
     /// (CC's `subtype: "error_during_execution"` etc., `is_error: true`) —
     /// the consumer emits `ResponseFailed` instead of `ResponseGenerated` so
     /// the partial response renders as a failed exchange, not a complete one.
+    ///
+    /// `provider_error` is the structured code the provider attached to the
+    /// failure, when it sent one (Codex's `codexErrorInfo`).
+    ///
+    /// `turn_end` is how the turn ended, stored on the idle that follows.
+    /// Claude Code sends `None`.
     Result {
         text: String,
         duration_ms: u64,
         error: Option<String>,
+        provider_error: Option<crate::engine::thread_events::ProviderError>,
+        turn_end: Option<crate::engine::thread_events::TurnEndFacts>,
     },
     /// Token usage of one API call the agent made, exactly once per call. The
     /// consumer records it as a `ContextCaptured`, the same event the main-LLM
@@ -231,8 +223,10 @@ pub struct AgentExitFacts {
 /// User input sent to a running agent.
 #[derive(Debug, Clone)]
 pub struct AgentInput {
+    /// Keep this input queued until idle if steering fails; never interrupt for it.
+    pub defer_on_steer_failure: bool,
     pub text: String,
-    pub images: Vec<crate::api::ChatImage>,
+    pub images: Vec<crate::engine::types::ChatImage>,
     /// The name the agent knows this write by, which a withdraw uses. Fresh
     /// for every write: Claude Code skips a user message whose uuid it has
     /// already seen, so reusing an event id would drop a resent message.
@@ -268,65 +262,7 @@ pub enum ControlRequest {
     Interrupt,
 }
 
-/// The Claude Code profile a thread is bound to: its *account pin*.
-///
-/// Claude Code treats an unset `CLAUDE_CONFIG_DIR` as a different profile from
-/// one set to its default path. The two read different keychain entries and
-/// different `.claude.json` files, so only one of them holds the user's login.
-/// A pinned spawn therefore replays exactly what turn 1 ran with.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AccountPin {
-    /// `CLAUDE_CONFIG_DIR` was unset. `dir` is Claude Code's default,
-    /// `$HOME/.claude`, where the transcripts live.
-    DefaultConfigDir { dir: String },
-    /// `CLAUDE_CONFIG_DIR` was set to `dir`.
-    ExplicitConfigDir { dir: String },
-}
-
-impl AccountPin {
-    /// The pin a thread's first session establishes: the live
-    /// `CLAUDE_CONFIG_DIR` when set, else Claude Code's default dir. `None`
-    /// only when there is neither, which means `$HOME` is unset.
-    pub fn for_first_session(live: Option<String>, default_dir: Option<String>) -> Option<Self> {
-        match live {
-            Some(dir) => Some(Self::ExplicitConfigDir { dir }),
-            None => default_dir.map(|dir| Self::DefaultConfigDir { dir }),
-        }
-    }
-
-    /// Resolve a recorded pin.
-    ///
-    /// `explicit` is `None` on rows written before the engine recorded it.
-    /// Those rows stored `default_dir` for an unset variable too, so that one
-    /// path is ambiguous. It counts as explicit only while the live env still
-    /// sets exactly that path. Any other path can only have come from the
-    /// variable.
-    pub fn from_recorded(
-        dir: String,
-        explicit: Option<bool>,
-        live: Option<&str>,
-        default_dir: Option<&str>,
-    ) -> Self {
-        let explicit = explicit
-            .unwrap_or_else(|| Some(dir.as_str()) != default_dir || live == Some(dir.as_str()));
-        if explicit {
-            Self::ExplicitConfigDir { dir }
-        } else {
-            Self::DefaultConfigDir { dir }
-        }
-    }
-
-    /// Where Claude Code keeps this profile's transcripts.
-    pub fn dir(&self) -> &str {
-        match self {
-            Self::DefaultConfigDir { dir } | Self::ExplicitConfigDir { dir } => dir,
-        }
-    }
-
-    pub fn is_explicit(&self) -> bool {
-        matches!(self, Self::ExplicitConfigDir { .. })
-    }
-}
+pub use crate::llm::coding_agent_models::AccountPin;
 
 /// Parameters for spawning an agent. Borrowed for the duration of `spawn`.
 #[derive(Clone)]
@@ -334,7 +270,7 @@ pub struct SpawnArgs<'a> {
     pub worktree_path: &'a Path,
     /// Which repo the session edits. Decides who owns the lucidos-cli skill
     /// file (see `lucidos_cli::place_lucidos_cli_skill`). Codex ignores it.
-    pub coding_agent_kind: crate::engine::agent_session::CodingAgentKind,
+    pub coding_agent_kind: crate::engine::thread_events::CodingAgentKind,
     /// Forwarded as `LUCIDOS_WORKSPACE` so subprocess tooling (e.g. the
     /// `lucidos` CLI) can resolve back to the right engine.
     pub workspace_path: &'a Path,
@@ -367,14 +303,10 @@ pub struct SpawnArgs<'a> {
     /// target workspace's default repo. Always pass the resolved repo name
     /// when one is known; only legacy/early-startup callers should pass `None`.
     pub repo_name: Option<&'a str>,
-    /// True when this spawn is an interactive session — chat, recovery, or
-    /// external-repo work where the user is at the keyboard. False for
-    /// unattended sessions (conflict-resolution) that run autonomously.
-    ///
-    /// Forwarded as `LUCIDOS_SESSION_KIND=interactive` so the
-    /// `cc-stop-reminder` hook knows whether it can safely block CC with an
-    /// AskUserQuestion redirect (which would hang an unattended session
-    /// waiting for an answer that's not coming).
+    /// True when the Stop hook can redirect a prose question to an owner card.
+    /// False for unattended sessions and integrated sub-threads, whose
+    /// ordinary decisions go to the parent. Forwarded as
+    /// `LUCIDOS_SESSION_KIND=interactive`.
     pub interactive: bool,
     /// User-managed non-secret environment variables (`(NAME, value)` pairs from
     /// `EnvironmentVariableStore::env_pairs`). Applied FIRST in
@@ -384,6 +316,8 @@ pub struct SpawnArgs<'a> {
     /// orchestration (which has the pool); empty for callers that don't inject
     /// (tests, engine-internal spawns with no user env).
     pub user_env_vars: &'a [(String, String)],
+    /// Engine-owned scheduling class, resolved from the repair's durable lineage.
+    pub build_slot_class: lucidos_build_slot::SlotClass,
     /// The thread's *account pin*, replayed on every spawn after turn 1.
     /// `build_command` applies it AFTER `apply_lucidos_env`. So neither a live
     /// user toggle nor the engine's own env can move the thread to another
@@ -424,7 +358,10 @@ pub struct SpawnArgs<'a> {
     pub keep_alive: bool,
     /// The agent run marker the spawn stamps, and what the driver's end does
     /// with the processes carrying it (ADR 0391, 0478).
-    pub(crate) agent_run: super::agent_run_marker::AgentRun,
+    pub agent_run: super::agent_run_marker::AgentRun,
+    /// The OS sandbox the agent process runs in, resolved by the spawn
+    /// orchestration, which holds the pool (ADR 0645).
+    pub sandbox: super::agent_sandbox::Sandbox,
 }
 
 impl SpawnArgs<'_> {
@@ -463,7 +400,7 @@ impl NotesReminderDue {
         use super::claude_code_notes::{notes_visibility, NotesVisibility};
         match (resume_session_id, notes_visibility(model)) {
             (Some(_), NotesVisibility::Hidden) => Self {
-                owed: Some(crate::engine::agent_session::NOTES_HIDDEN_AGAIN_REMINDER),
+                owed: Some(crate::runtime::agent_notes::NOTES_HIDDEN_AGAIN_REMINDER),
                 ..Self::default()
             },
             _ => Self::default(),
@@ -477,7 +414,7 @@ impl NotesReminderDue {
 
     /// The first note arrived. A reset owed now is stale, so this replaces it.
     pub(crate) fn promoted(&mut self) {
-        self.owed = Some(crate::engine::agent_session::NOTES_NOW_SHOWN_REMINDER);
+        self.owed = Some(crate::runtime::agent_notes::NOTES_NOW_SHOWN_REMINDER);
         self.carried = None;
     }
 
@@ -495,9 +432,7 @@ impl NotesReminderDue {
     /// `input` behind the reminder when one is owed and `input` takes a
     /// prefix. A verbatim input, such as a slash command, passes it on.
     pub(crate) fn lead(&mut self, mut input: AgentInput) -> AgentInput {
-        if std::mem::take(&mut self.skip_first_input)
-            || crate::engine::agent_session::forwards_verbatim(&input.text)
-        {
+        if std::mem::take(&mut self.skip_first_input) || forwards_verbatim(&input.text) {
             return input;
         }
         if let Some(reminder) = self.owed.take() {
@@ -535,9 +470,7 @@ impl SessionContextDue {
     /// prefix. The block stays owed until [`Self::delivered`].
     pub(crate) fn led(&self, input: AgentInput) -> AgentInput {
         match &self.0 {
-            Some(block) if !crate::engine::agent_session::forwards_verbatim(&input.text) => {
-                block.lead(input)
-            }
+            Some(block) if !forwards_verbatim(&input.text) => block.lead(input),
             _ => input,
         }
     }
@@ -545,7 +478,7 @@ impl SessionContextDue {
     /// The agent took `input`, as [`Self::led`] shaped it. A verbatim input
     /// carried no block, so the block stays owed.
     pub(crate) fn delivered(&mut self, input: &AgentInput) {
-        if !crate::engine::agent_session::forwards_verbatim(&input.text) {
+        if !forwards_verbatim(&input.text) {
             self.0 = None;
         }
     }
@@ -564,7 +497,7 @@ impl SessionContextDue {
 #[derive(Debug, Clone, Default)]
 pub struct SessionContextBlock {
     pub text: String,
-    pub images: Vec<crate::api::ChatImage>,
+    pub images: Vec<crate::engine::types::ChatImage>,
 }
 
 impl SessionContextBlock {
@@ -648,16 +581,24 @@ pub trait AgentRuntime: Send + Sync {
     ) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Whether the engine forwards `text` exactly as typed, with no note or device
+/// block in front. Claude Code runs a slash command only when the input starts
+/// with `/`, so anything in front turns the command into a model prompt.
+pub fn forwards_verbatim(text: &str) -> bool {
+    text.starts_with('/')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AccountPin, AgentInput, CodingAgent, NotesReminderDue, SessionContextBlock,
         SessionContextDue,
     };
-    use crate::api::ChatImage;
+    use crate::engine::types::ChatImage;
 
     fn input(text: &str) -> AgentInput {
         AgentInput {
+            defer_on_steer_failure: false,
             text: text.into(),
             images: Vec::new(),
             uuid: uuid::Uuid::new_v4(),

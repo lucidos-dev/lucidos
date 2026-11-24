@@ -1,8 +1,8 @@
 #!/bin/bash
 # Tests for the dev window's launch binary in scripts/lib/workspace.sh
 # (ADR 0461): which processes select_dev_windows picks, when
-# publish_dev_window_binary replaces the published file, and when
-# build_or_find_engine builds the window.
+# publish_dev_window_binary replaces the published file, when
+# build_or_find_engine builds the window, and what run_dev_window passes it.
 #
 # Hermetic: the ps seam is replaced for the whole file, so no real process is
 # listed or signalled. The build tests stub every compile, sign and prune step,
@@ -136,7 +136,8 @@ else
 fi
 
 echo "test: bundle metadata describes an accessible dev application"
-if python3 - "$PUB/launch/Lucidos Dev.app/Contents/Info.plist" <<'PYTEST'
+if python3 - "$PUB/launch/Lucidos Dev.app/Contents/Info.plist" \
+    "$SCRIPT_DIR/../../crates/lucidos-app/Info.plist" <<'PYTEST'
 import plistlib
 import sys
 with open(sys.argv[1], "rb") as f:
@@ -146,11 +147,31 @@ assert info["CFBundleName"] == "Lucidos Dev"
 assert info["CFBundleExecutable"] == "lucidos-app"
 assert info["CFBundlePackageType"] == "APPL"
 assert info["NSHighResolutionCapable"] is True
+with open(sys.argv[2], "rb") as f:
+    packaged = plistlib.load(f)
+for key in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription"):
+    assert info[key] == packaged[key], key
 PYTEST
 then
     pass "valid plist with dev identity"
 else
     fail "missing or invalid bundle metadata"
+fi
+
+echo "test: a launch refreshes a stale bundle plist without republishing the binary"
+python3 - "$PUB/launch/Lucidos Dev.app/Contents/Info.plist" <<'PYTEST'
+import plistlib
+import sys
+with open(sys.argv[1], "wb") as f:
+    plistlib.dump({"CFBundleIdentifier": "com.lucidos.dev-launcher"}, f)
+PYTEST
+before="$(inode "$PUBLISHED")"
+write_dev_window_bundle "$PUB/launch"
+if [ "$(inode "$PUBLISHED")" = "$before" ] \
+    && grep -q NSMicrophoneUsageDescription "$PUB/launch/Lucidos Dev.app/Contents/Info.plist"; then
+    pass "usage strings restored, binary untouched"
+else
+    fail "the launch left the stale plist in place"
 fi
 
 echo "test: bundled sibling links resolve to this variant's existing binaries"
@@ -195,9 +216,18 @@ else
     fail "variants share an executable"
 fi
 
+# A sandbox checkout builds the window, so it needs the packaged plist the
+# bundle starts from.
+seed_packaged_plist() { # <checkout>
+    mkdir -p "$1/crates/lucidos-app"
+    cp "$SCRIPT_DIR/../../crates/lucidos-app/Info.plist" "$1/crates/lucidos-app/Info.plist"
+}
+
 test_first_window_build() {
     local PROJECT_DIR="$SANDBOX/first-window"
     mkdir -p "$PROJECT_DIR/target/debug"
+    seed_packaged_plist "$PROJECT_DIR"
+    # shellcheck disable=SC2329 # build_dev_window invokes this stub from the sourced library
     run_dev_window_cargo_build() { printf first > "$PROJECT_DIR/target/debug/lucidos-app"; }
     build_dev_window "$PROJECT_DIR/.launch/debug/plain" &&
         [ "$(cat "$(dev_window_bin "$PROJECT_DIR/.launch/debug/plain")")" = first ]
@@ -212,6 +242,7 @@ fi
 # ── build_or_find_engine builds the window only where one was published ─
 # Runs the real build_or_find_engine with the engine half stubbed, under
 # `set -e` as web-dev.sh runs it. Prints which builds ran.
+# shellcheck disable=SC2329 # the sourced build path invokes these stubs indirectly
 run_build() {
     local checkout="$1" window_rc="$2"
     (
@@ -245,6 +276,7 @@ fi
 echo "test: a checkout with a published window compiles it with the engine, before publishing"
 WITH_WINDOW="$SANDBOX/with-window"
 mkdir -p "$WITH_WINDOW/target/debug" "$WITH_WINDOW/.launch/debug/plain"
+seed_packaged_plist "$WITH_WINDOW"
 WITH_WINDOW_BIN="$(dev_window_bin "$WITH_WINDOW/.launch/debug/plain")"
 printf 'window old' > "$WITH_WINDOW/.launch/debug/plain/lucidos-app"
 out="$(run_build "$WITH_WINDOW" 0)"
@@ -281,14 +313,30 @@ else
     pass "the previous version stays whole"
 fi
 
+# ── dev_window_records_dir ──────────────────────────────────────────────
+# A no-gateway window records no workspace windows, so its first save would
+# empty the gateway window's arrangement if the two shared a dir.
+echo "test: a no-gateway window keeps its records apart from the gateway window's"
+gateway_dir="$(dev_window_records_dir "$SANDBOX/checkout" "")"
+legacy_dir="$(dev_window_records_dir "$SANDBOX/checkout" 1)"
+if [ "$gateway_dir" = "$SANDBOX/checkout/.launch/dev-window" ] &&
+    [ "$legacy_dir" = "$SANDBOX/checkout/.launch/dev-window-no-gateway" ]; then
+    pass "one records dir per launch mode, inside the checkout's .launch"
+else
+    fail "unexpected records dirs: '$gateway_dir' and '$legacy_dir'"
+fi
+
 # ── run_dev_window ──────────────────────────────────────────────────────
-# The stub window logs each start's URL, asks for one relaunch on its first
-# start, then exits with status 3.
+# The stub window logs each start's URL and records dir, asks for one relaunch
+# on its first start, then exits with status 3.
 STUB_WINDOW="$SANDBOX/stub-window"
 STUB_LOG="$SANDBOX/stub-window.log"
+STUB_RECORDS_LOG="$SANDBOX/stub-window-records.log"
+RECORDS_DIR="$SANDBOX/checkout/.launch/dev-window"
 cat > "$STUB_WINDOW" <<EOF
 #!/bin/bash
 echo "\$LUCIDOS_DEV_WINDOW_URL" >> "$STUB_LOG"
+echo "\${LUCIDOS_DEV_WINDOW_RECORDS_DIR:-unset}" >> "$STUB_RECORDS_LOG"
 if [ "\$LUCIDOS_DEV_WINDOW_URL" = "https://localhost:5251/dev/" ]; then
     printf '%s' "https://localhost:5251/dev/threads/a" > "\$LUCIDOS_DEV_WINDOW_RELAUNCH_FILE"
     exit 0
@@ -299,12 +347,20 @@ chmod +x "$STUB_WINDOW"
 
 echo "test: a window that asks for a relaunch is started again as a new process on its page"
 status=0
-run_dev_window "$STUB_WINDOW" "https://localhost:5251/dev/" >/dev/null || status=$?
+run_dev_window "$STUB_WINDOW" "https://localhost:5251/dev/" "$RECORDS_DIR" >/dev/null || status=$?
 starts="$(tr '\n' ' ' < "$STUB_LOG")"
 if [ "$starts" = "https://localhost:5251/dev/ https://localhost:5251/dev/threads/a " ]; then
     pass "relaunched once, on the page the window showed"
 else
     fail "unexpected starts: '$starts'"
+fi
+
+echo "test: every start sees the checkout's window records dir"
+records="$(tr '\n' ' ' < "$STUB_RECORDS_LOG")"
+if [ "$records" = "$RECORDS_DIR $RECORDS_DIR " ]; then
+    pass "the first start and the relaunch both name the records dir"
+else
+    fail "unexpected records dirs: '$records'"
 fi
 
 echo "test: the window's own exit status ends the run"

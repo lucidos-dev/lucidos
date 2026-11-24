@@ -172,7 +172,7 @@ step "Building headless bundle lucidos-$VERSION-$TRIPLE"
 # permission-prompt MCP server, so a headless install that omits it breaks every
 # coding-agent thread on its first tool call.
 step "Building engine + gateway + cli (release)"
-stage_runtime_build_binaries "$REPO_ROOT" lucidos-engine lucidos-gateway lucidos-cli \
+stage_runtime_build_binaries "$REPO_ROOT" lucidos-engine-bin lucidos-gateway lucidos-cli \
     || die "engine + gateway + cli build failed"
 ENGINE_BIN="$REPO_ROOT/target/release/lucidos-engine"
 GATEWAY_BIN="$REPO_ROOT/target/release/lucidos-gateway"

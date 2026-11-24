@@ -1,6 +1,3 @@
-/** A new-chat navigate's `coding_agent` and `folder` picks, against the real
- *  compose store: they land on the NEW draft only, and a value that names
- *  nothing leaves the dropdown at its default and toasts. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 

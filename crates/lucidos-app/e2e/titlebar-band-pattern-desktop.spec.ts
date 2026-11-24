@@ -4,18 +4,6 @@ import { fileURLToPath } from 'node:url';
 import { test, expect, type Page } from './fixtures';
 import { apiRequest, gotoWithRetry, shellDeviceId, waitForVisibleInput } from './helpers';
 
-/**
- * A patterned header fill carries on up through the macOS title-bar band.
- *
- * Setting `--header-gradient` derives `--titlebar-strip-continues`, and the
- * header's fill then paints as one box from the band's top edge.
- *
- * Pinned here: the striped rows keep their period across the join, and the
- * default theme and two built-ins paint exactly as the header's own background
- * did. `mono` sets a flat `--header-gradient`, so it takes the continuing path
- * and must still not move. This spec stamps the build rather than running it
- * (ADR 0016).
- */
 
 test.use({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 });
 
@@ -27,15 +15,10 @@ const fixture = readFileSync(resolve(here, 'themes', 'striped-header.json'), 'ut
 
 const BLACK: Rgb = [0, 0, 0];
 const GREEN: Rgb = [0, 255, 0];
-/** The fixture's period: two black rows, then one green. */
 const stripeAt = (y: number): Rgb => (y % 3 < 2 ? BLACK : GREEN);
-/** Per-channel slack for gradient rasterisation. */
 const EPS = 8;
-/** The themes whose own `--header-gradient` derives the continuing band. */
 const CONTINUES = new Set([STRIPED, 'mono']);
 
-/** The header painting its own fill, with nothing from the band. Injected
- *  over the live sheet, it is the control. */
 const RULES_BEFORE = `
   .titlebar-strip::before { content: none !important; }
   .app-header { background: var(--header-gradient) !important; }
@@ -47,18 +30,12 @@ async function setTheme(page: Page, theme: string): Promise<void> {
   expect(res.ok(), `theme=${theme}`).toBe(true);
 }
 
-/** What the three themes under test, and the starting one, differ in: a theme
- *  sets the page background, the header fill, or both. */
 const readPalette = (page: Page) =>
   page.evaluate(() => {
     const style = getComputedStyle(document.documentElement);
     return ['--bg-primary', '--header-gradient'].map(name => style.getPropertyValue(name).trim()).join('|');
   });
 
-/** Set the theme and wait until it is painted. The band switch cannot prove
- *  that for a theme that leaves it at `0`, which the page already has. So a
- *  theme other than the starting `lucidos` must also move the background. Then
- *  the swap's transition lock must lift. */
 async function applyTheme(page: Page, theme: string): Promise<void> {
   const startPalette = await readPalette(page);
   await setTheme(page, theme);
@@ -79,18 +56,14 @@ async function stampOverlayBuild(page: Page): Promise<void> {
   });
 }
 
-/** Hide everything drawn ON the bar, so only its fill is left to read. */
 async function bareBar(page: Page): Promise<void> {
   await page.addStyleTag({ content: '.app-header * { visibility: hidden !important; }' });
 }
 
-/** The bar's bottom edge: the band plus the header. */
 async function barHeight(page: Page): Promise<number> {
   return page.evaluate(() => Math.round(document.querySelector('.app-header')!.getBoundingClientRect().bottom));
 }
 
-/** One column of the window's top, decoded in the page, since the suite ships
- *  no PNG decoder. */
 async function pixelColumn(page: Page, x: number, height: number): Promise<Rgb[]> {
   const png = await settledShot(page, { x, y: 0, width: 1, height });
   return page.evaluate(async (b64) => {
@@ -113,8 +86,6 @@ const close = (a: Rgb, b: Rgb) => a.every((c, i) => Math.abs(c - b[i]) <= EPS);
 
 type Clip = { x: number; y: number; width: number; height: number };
 
-/** A screenshot once two in a row agree, so a theme's colour transitions have
- *  finished before anything is compared. */
 async function settledShot(page: Page, clip: Clip): Promise<Buffer> {
   let last = await page.screenshot({ clip });
   for (let i = 0; i < 20; i++) {
@@ -126,7 +97,6 @@ async function settledShot(page: Page, clip: Clip): Promise<Buffer> {
   throw new Error('the bar never stopped changing');
 }
 
-/** 'none' for identical pixels, else how many differ, where, and by how much. */
 async function pixelDiff(page: Page, a: Buffer, b: Buffer): Promise<string> {
   return page.evaluate(async ([pa, pb]) => {
     const decode = async (b64: string) => {
@@ -176,8 +146,6 @@ test.describe('the title-bar band continues the header fill', () => {
     const bar = await barHeight(page);
     expect(bar, 'the bar is the 28px band plus the header').toBeGreaterThan(28);
 
-    // The bar's own right edge, not the window's: the dashboard rail holds the
-    // window's right edge, outside the header (ADR 0466).
     const right = await page.evaluate(() => Math.floor(document.querySelector('.app-header')!.getBoundingClientRect().right));
     for (const x of [3, 640, right - 10]) {
       const wrong = (await pixelColumn(page, x, bar))

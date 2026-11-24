@@ -14,9 +14,10 @@
 #                    -f adds one file to the run.
 #   --no-reset       Skip DB reset AND leave the workspace running for the next
 #                    invocation. Use for fast iteration on a single spec.
-#   --webkit         Run mobile tests on WebKit (iOS Safari engine). A local
-#                    filtered run needs it to run mobile-webkit at all.
-#   --no-webkit      Run every browser project EXCEPT mobile-webkit
+#   --webkit         Run only the WebKit projects: desktop-webkit (the macOS
+#                    app's engine) and mobile-webkit (iOS Safari). A local
+#                    filtered run needs it to run either at all.
+#   --no-webkit      Run every browser project EXCEPT the WebKit ones
 #   --ios            Launch iOS Simulator with Safari (requires Xcode)
 #   --               Everything after this is passed to Playwright
 #
@@ -24,20 +25,23 @@
 #   ./scripts/e2e-browser.sh                           # All tests
 #   ./scripts/e2e-browser.sh -h -f chat.spec.ts        # Headed, single file
 #   ./scripts/e2e-browser.sh -- --grep "sends message" # Filter by test name
-#   ./scripts/e2e-browser.sh --webkit                  # WebKit mobile tests
+#   ./scripts/e2e-browser.sh --webkit                  # The two WebKit projects
 #   ./scripts/e2e-browser.sh --no-webkit               # The cheap projects only
 #   ./scripts/e2e-browser.sh --ios                     # iOS Simulator
 #
 # A local filtered run is lean (ADR 0536). It builds a debug engine, which
-# compiles incrementally, and skips mobile-webkit. It takes a free e2e slot
-# rather than the whole lock, so two worktrees can run side by side.
-# `--webkit` or a Playwright `--project` keeps mobile-webkit, on the release
-# engine, and takes every slot.
+# compiles incrementally, and skips the WebKit projects. It takes a free e2e
+# slot rather than the whole lock, so two worktrees can run side by side.
+# `--webkit` or a Playwright `--project` keeps WebKit, on the release engine,
+# and takes every slot.
 #
 # Environment:
 #   LUCIDOS_E2E_WEBKIT_CHUNK    specs per fresh-browser chunk (default 3)
 #   LUCIDOS_E2E_WEBKIT_CHUNKS   run only nav chunks <first>-<last> (or <first>-)
 #   LUCIDOS_E2E_WEBKIT_PHASE    run one phase only: nav, cc, or both (default both)
+#
+# A chunk range or a single phase names mobile-webkit work only, so
+# desktop-webkit stays out of such a run. The closing report says so.
 #
 # mobile-webkit grows the macOS VM compressor by roughly 15 GB. That is squeezed
 # idle memory host-wide rather than anything the run holds, so it is a cost to
@@ -85,6 +89,47 @@ done
 
 if [ -n "$USE_WEBKIT" ] && [ -n "$SKIP_WEBKIT" ]; then
     echo "e2e-browser.sh: --webkit and --no-webkit contradict each other" >&2
+    exit 1
+fi
+
+# Print why a WebKit flag and a pinned Playwright --project contradict each
+# other, or nothing. A pinned project runs alone, so `--webkit` beside a
+# Chromium project would report success with no WebKit test run.
+#   webkit_flag_contradiction <use-webkit> <skip-webkit> <playwright arg>...
+webkit_flag_contradiction() {
+    local use="$1" skip="$2" arg in_project="" pattern known
+    shift 2
+    for arg in "$@"; do
+        # The split form is variadic: every value up to the next option.
+        pattern=""
+        case "$arg" in
+            --project=*) pattern="${arg#--project=}"; in_project="" ;;
+            --project) in_project=1 ;;
+            -*) in_project="" ;;
+            *) [ -z "$in_project" ] || pattern="$arg" ;;
+        esac
+        [ -n "$pattern" ] || continue
+        # Playwright reads the value as a glob and ignores its case, so ask
+        # every project it names.
+        pattern="$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')"
+        for known in $(e2e_browser_projects); do
+            # shellcheck disable=SC2254 # the pattern is a glob on purpose
+            case "$known" in $pattern) ;; *) continue ;; esac
+            if [ -n "$use" ] && ! is_webkit_project "$known"; then
+                echo "--webkit and --project=$pattern contradict each other: $known is not a WebKit project"
+                return 0
+            fi
+            if [ -n "$skip" ] && is_webkit_project "$known"; then
+                echo "--no-webkit and --project=$pattern contradict each other: $known is a WebKit project"
+                return 0
+            fi
+        done
+    done
+}
+
+CONTRADICTION="$(webkit_flag_contradiction "$USE_WEBKIT" "$SKIP_WEBKIT" ${PW_ARGS[@]+"${PW_ARGS[@]}"})"
+if [ -n "$CONTRADICTION" ]; then
+    echo "e2e-browser.sh: $CONTRADICTION" >&2
     exit 1
 fi
 
@@ -193,6 +238,7 @@ finish() {
     report_left_behind_summary
     report_webkit_chunk_range
     report_webkit_phase_selection
+    report_webkit_narrowing_dropped
     report_webkit_excluded "$SKIP_WEBKIT"
     report_e2e_mem_top_deltas
     rm -f "$PW_TALLY_LOG"
@@ -260,13 +306,12 @@ for spec_file in ${TEST_FILES[@]+"${TEST_FILES[@]}"}; do
 done
 [ ${#PW_ARGS[@]} -gt 0 ] && CMD+=("${PW_ARGS[@]}")
 
-# Detect whether the caller already pinned a project (via --webkit or `-- --project=`).
+# Detect whether the caller already pinned a project (via `-- --project=`).
 # If so, run once. Otherwise, loop through every project with a clean DB between
 # each — the workspace DB is not isolated across projects. The same pass notes a
 # caller-pinned --output so set_output_dir never silently overrides it.
 USER_PINNED_PROJECT=""
 USER_PINNED_OUTPUT=""
-[ -n "$USE_WEBKIT" ] && USER_PINNED_PROJECT=1
 for arg in "${PW_ARGS[@]:-}"; do
     case "$arg" in
         --project=*|--project) USER_PINNED_PROJECT=1 ;;
@@ -295,6 +340,7 @@ else
     # invocations, so the second must keep the first's failure traces.
     PW_OUTPUT_ROOT="test-results/full"
     if [ -n "$USE_WEBKIT" ]; then
+        # desktop-webkit's output is cleared below, once it is known to run.
         rm -rf "$PW_OUTPUT_ROOT/mobile-webkit" "$PW_OUTPUT_ROOT"/mobile-webkit-* "$PW_OUTPUT_ROOT/mem-samples.log"
     elif [ -n "$SKIP_WEBKIT" ]; then
         rm -rf "$PW_OUTPUT_ROOT/chromium" "$PW_OUTPUT_ROOT/mobile" "$PW_OUTPUT_ROOT/mem-samples.log"
@@ -408,6 +454,34 @@ webkit_phase_selection() {
 # project, and read once by finish(). A phase-narrowed run must never read as a
 # complete project, exactly as a ranged one must not.
 WEBKIT_PHASE_APPLIED=""
+
+# Whether this run narrows mobile-webkit to a chunk range or to one phase. Each
+# knob is resolved by its own parser, so a value that parser widens back to
+# everything is no narrowing. The chunk count is not known this early. So a
+# range still counts as one when it starts past the last chunk, or when its
+# end reaches it.
+webkit_run_is_narrowed() {
+    local unbounded=999999
+    [ "$(webkit_chunk_range "${LUCIDOS_E2E_WEBKIT_CHUNKS:-}" "$unbounded" 2>/dev/null)" = "1 $unbounded" ] || return 0
+    [ "$(webkit_phase_selection "${LUCIDOS_E2E_WEBKIT_PHASE:-}" 2>/dev/null)" != both ]
+}
+
+# Whether a narrowed run keeps <project>. The narrowing names mobile-webkit
+# work, so every other WebKit project stays out. The cheap projects are not
+# WebKit, and a narrowing never touched them.
+narrowed_run_keeps() {
+    [ "$1" = mobile-webkit ] || ! is_webkit_project "$1"
+}
+
+# The projects a narrowing kept out, space-separated, for the closing report.
+WEBKIT_NARROWING_DROPPED=""
+
+report_webkit_narrowing_dropped() {
+    [ -n "$WEBKIT_NARROWING_DROPPED" ] || return 0
+    echo ""
+    echo "[e2e] $WEBKIT_NARROWING_DROPPED did NOT run: a chunk range or a phase narrows this run to mobile-webkit."
+    echo "[e2e] Coverage is incomplete until an un-narrowed --webkit run."
+}
 
 report_webkit_phase_selection() {
     [ -n "$WEBKIT_PHASE_APPLIED" ] || return 0
@@ -879,23 +953,33 @@ _run_browser_project_body() {
     return "$rc"
 }
 
-if [ -n "$USE_WEBKIT" ] && [ "${#TEST_FILES[@]}" -eq 0 ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
-    # `--webkit` with no filter: route through run_browser_project so a manual
-    # webkit run gets the SAME sharding/phase-split as the nightly full run (and so
-    # the sharding is validatable in isolation). A filtered `--webkit -f X` (or any
-    # `--`/positional arg) still falls through to the single-pass branch below —
-    # run_browser_project's own guard would single-pass it anyway, but keeping it
-    # here avoids appending --project twice.
-    # This is the documented "run it alone, on a cold host" recipe, so it is the
-    # run whose STARTING compressor matters most: it decides how far the project
-    # gets, and no other line records it.
-    echo ""
-    report_host_memory_start
-    webkit_rc=0
-    run_browser_project mobile-webkit || webkit_rc=$?
-    finish "$webkit_rc"
-elif [ -n "$USER_PINNED_PROJECT" ]; then
-    [ -n "$USE_WEBKIT" ] && CMD+=(--project=mobile-webkit)
+# Whether the Playwright arguments after `--` carry a filter the projects must
+# be asked about. An interactive mode is never probed: it would open twice.
+pw_args_filter_projects() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --ui | --ui-* | --debug) return 1 ;;
+        esac
+    done
+    e2e_github_is_filtered -- "$@"
+}
+
+# Whether <project> has a test the caller's filter selects. Playwright's own
+# --list answers, since nothing else can read a --grep. Only a listing whose
+# one error is "No tests found" drops the project. A spec that fails to load
+# reports that too, and the real run must show it.
+project_matches_filter() {
+    local project="$1" listing
+    listing="$("${CMD[@]}" --project="$project" --list 2>&1)" && return 0
+    case "$listing" in
+        *"No tests found"*) ;;
+        *) return 0 ;;
+    esac
+    awk '!/No tests found/ && /Error/ { other = 1 } END { exit !other }' <<<"$listing"
+}
+
+if [ -n "$USER_PINNED_PROJECT" ]; then
     set_output_dir pinned
     # Capture rather than letting `set -e` exit here, so a failing pinned run
     # still gets drained + classified by finish. Through run_playwright, so the
@@ -928,26 +1012,71 @@ else
     # reset recreates the database and restarts the engine on it, on the same
     # binary, since build_e2e_engine_once never recompiles mid-suite. So every
     # project sees a brand-new workspace database, seeds included.
-    # --no-webkit leaves the expensive project for its own run. Dropped from the
-    # list rather than skipped inside it, so the per-project table below reports
-    # what actually ran; report_webkit_excluded says what did not.
+    # --no-webkit leaves the WebKit projects for their own run, and --webkit is
+    # that run. Dropped from the list rather than skipped inside it, so the
+    # per-project table below reports what actually ran; report_webkit_excluded
+    # says what did not. An unfiltered --webkit run is the documented "run it
+    # alone, on a cold host" recipe, and it shards mobile-webkit like a full run.
+    PROJECT_SET=""
+    [ -z "$SKIP_WEBKIT" ] || PROJECT_SET=--no-webkit
+    [ -z "$USE_WEBKIT" ] || PROJECT_SET=--webkit
     PROJECTS=()
     while IFS= read -r project; do
         PROJECTS+=("$project")
     done <<EOF
-$(e2e_browser_projects ${SKIP_WEBKIT:+--no-webkit})
+$(e2e_browser_projects $PROJECT_SET)
 EOF
-    # A targeted spec runs only on the projects that do not testIgnore it.
+    # A narrowed run runs only what its narrowing names. Without this, the
+    # cheap "discharge a nav tail" recipe would run all of desktop-webkit first.
+    if [ "${#TEST_FILES[@]}" -eq 0 ] && [ "${#PW_ARGS[@]}" -eq 0 ] && webkit_run_is_narrowed; then
+        KEPT=()
+        for project in "${PROJECTS[@]}"; do
+            if narrowed_run_keeps "$project"; then
+                KEPT+=("$project")
+            else
+                echo "[e2e] $project does not run: this run is narrowed to part of mobile-webkit."
+                WEBKIT_NARROWING_DROPPED="${WEBKIT_NARROWING_DROPPED:+$WEBKIT_NARROWING_DROPPED }$project"
+            fi
+        done
+        PROJECTS=(${KEPT[@]+"${KEPT[@]}"})
+    fi
+    # A narrowed --webkit run keeps the traces an earlier desktop-webkit
+    # failure left, since it does not run that project again.
+    if [ -n "$USE_WEBKIT" ] && [ "$PW_OUTPUT_ROOT" = test-results/full ] && [ -z "$WEBKIT_NARROWING_DROPPED" ]; then
+        rm -rf "$PW_OUTPUT_ROOT/desktop-webkit"
+    fi
+    # A targeted spec runs only on the projects that select it.
     if [ "${#TEST_FILES[@]}" -gt 0 ]; then
         RUNS_SPEC=()
         for project in "${PROJECTS[@]}"; do
             if project_runs_any_spec "$project" "${TEST_FILES[@]}"; then
                 RUNS_SPEC+=("$project")
             else
-                echo "[e2e] $project ignores ${TEST_FILES[*]} (playwright.config.ts testIgnore), so it does not run."
+                echo "[e2e] $project does not select ${TEST_FILES[*]} (playwright.config.ts), so it does not run."
             fi
         done
+        if [ "${#RUNS_SPEC[@]}" -eq 0 ]; then
+            echo "e2e-browser.sh: no selected project runs ${TEST_FILES[*]}, so nothing ran." >&2
+            finish 1
+        fi
         PROJECTS=("${RUNS_SPEC[@]}")
+    fi
+    # A Playwright filter after `--` may select nothing on one project. That
+    # project would exit "No tests found" and fail a run whose other projects pass.
+    if [ "${#PROJECTS[@]}" -gt 1 ] && pw_args_filter_projects ${PW_ARGS[@]+"${PW_ARGS[@]}"}; then
+        MATCHES_FILTER=()
+        for project in "${PROJECTS[@]}"; do
+            if project_matches_filter "$project"; then
+                MATCHES_FILTER+=("$project")
+            else
+                echo "[e2e] $project has no test matching ${PW_ARGS[*]}, so it does not run."
+            fi
+        done
+        if [ "${#MATCHES_FILTER[@]}" -eq 0 ]; then
+            echo "e2e-browser.sh: no selected project has a test matching ${PW_ARGS[*]}, so nothing ran." >&2
+            finish 1
+        fi
+        PROJECTS=("${MATCHES_FILTER[@]}")
     fi
     PROJECT_RCS=()
     overall_rc=0

@@ -12,12 +12,6 @@ import { markNavigationScroll } from '../chat/scrollState';
 
 type FileEntry = { name: string; path: string };
 
-/** One placeholder tree row mirroring the real `.folder-item` / `.file-item`
- *  node markup (icon box + name) with shimmer leaves, indented like a real node.
- *  The real tree gets its offset from being nested in `.folder-contents`, but the
- *  skeleton's rows are flat siblings — so wrap the row in `depth` such shells to
- *  borrow the same per-level offset rather than restating it as a number here.
- *  Used only inside a SkeletonProvider (via {@link folderTreeSkeletonRow}). */
 function TreeRowSkeleton({ kind, depth }: { kind: 'folder' | 'file'; depth: number }) {
   let row =
     kind === 'folder' ? (
@@ -38,9 +32,6 @@ function TreeRowSkeleton({ kind, depth }: { kind: 'folder' | 'file'; depth: numb
   return row;
 }
 
-/** A representative folder/file shape, cycled by row index so the tree skeleton
- *  shows real nesting (folders + indented files) instead of a flat run of bars —
- *  the tree's true shape is unknown before load, so this stands in for it. */
 const TREE_SKELETON_PATTERN: { kind: 'folder' | 'file'; depth: number }[] = [
   { kind: 'folder', depth: 0 },
   { kind: 'file', depth: 1 },
@@ -50,20 +41,11 @@ const TREE_SKELETON_PATTERN: { kind: 'folder' | 'file'; depth: number }[] = [
   { kind: 'file', depth: 0 },
 ];
 
-/** Row thunk for `<ListSkeletonOf row={folderTreeSkeletonRow} />` — mirrors the
- *  FolderTree / TreeNode layout while artifacts (or the repo file tree) load. */
 export function folderTreeSkeletonRow(i: number) {
   const node = TREE_SKELETON_PATTERN[i % TREE_SKELETON_PATTERN.length];
   return <TreeRowSkeleton kind={node.kind} depth={node.depth} />;
 }
 
-/** Scroll the content pane to the folder `revealFolderInFiles` asked for, then
- *  clear the request. Returns the ref for the tree's root element.
- *
- *  The scroll waits a frame: the pane's scroll memory attaches in a PARENT
- *  effect, which runs after this one and would otherwise reset the pane to the
- *  top over it. The row lands under the pane's `::before` spacer, which is the
- *  room a phone reserves for its fixed header, and is empty on desktop. */
 export function useRevealedFolderScroll() {
   const treeRef = useRef<HTMLDivElement>(null);
   const target = revealedFolder.value;
@@ -100,11 +82,6 @@ export function FolderTree() {
   );
 }
 
-/** Renders one level of the tree. Indentation is NOT computed here: a level's
- *  rows are nested inside the parent's `.folder-contents`, which carries the
- *  single per-level offset (see `components.css`). Reintroducing a per-row
- *  offset on top of that DOM nesting is what made each level indent by the
- *  running total instead of one unit. */
 export function TreeNode({
   node,
   isExpanded,

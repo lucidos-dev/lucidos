@@ -1,22 +1,3 @@
-/**
- * The thread-drawer toggle carries the Blocked badge whenever the thread
- * list itself is off screen, on BOTH layouts:
- *
- *   - Desktop: the drawer is closed, so the threads header's Filter button (the
- *     count's other home) is hidden with it.
- *   - Mobile: the thread list is a separate swipe pane, so the count is
- *     unreachable from the conversation without it.
- *
- * The complementary half matters just as much: with the list visible the toggle
- * must NOT badge, or the same number is claimed twice side by side.
- *
- * These tests invoke the components directly and walk the returned VNode tree
- * without descending into nested function components (ThreadNav, HeaderMark,
- * ...), which use render-time hooks. Both components under test are hook-free at
- * their own level, so direct invocation is safe. The badge's semantics
- * (attention-only, excluding review / running) live in
- * `components/drawer/ongoing-group-rows.test.ts`.
- */
 import type { ComponentChildren } from 'preact';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -64,7 +45,6 @@ function makeThread(id: string, status: ThreadStatus): ThreadState {
   };
 }
 
-/** Seed `threadMap` with `n` threads that each need the user's attention. */
 function seedBlocked(n: number): void {
   const threads: ThreadState[] = [];
   for (let i = 0; i < n; i++) threads.push(makeThread(`t${i}`, 'waiting_for_user_answer'));
@@ -90,7 +70,6 @@ describe('threadListVisible', () => {
   it('follows the drawer flag on desktop and the visible pane on mobile', () => {
     expect(threadListVisible(false, 'thread', true)).toBe(true);
     expect(threadListVisible(false, 'thread', false)).toBe(false);
-    // Mobile ignores the drawer flag entirely: the list is a swipe pane there.
     expect(threadListVisible(true, 'threads', false)).toBe(true);
     expect(threadListVisible(true, 'thread', true)).toBe(false);
     expect(threadListVisible(true, 'content', true)).toBe(false);
@@ -148,7 +127,6 @@ describe('ThreadToggleButton badge', () => {
   });
 });
 
-/** Types of the header row's DIRECT children, in row order. */
 function rowChildTypes(header: AnyVNode): unknown[] {
   const row = findByClass(header, 'mobile-header-row')[0];
   const kids = row.props.children as ComponentChildren;

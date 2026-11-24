@@ -3,14 +3,10 @@ import type { Signal } from '@preact/signals';
 import type { DrawerGrouping } from '../../store/store';
 import { navCoverFuseMs } from '../shared/NavigationCover';
 
-/** A drawing of the list as it looked when its grouping changed. Each dip
- *  takes a new `id`, even when it carries the same `node` over. */
 export type LeavingDrawing = { id: number; node: HTMLElement; scrollTop: number };
 
 let lastDrawingId = 0;
 
-/** Attributes that give a row an identity. The drawing must not answer a row
- *  lookup, a FLIP pass or `aria-activedescendant`. */
 const IDENTITY_ATTRIBUTES = ['id', 'data-thread-nav', 'data-flip-id'];
 
 const DRAWING_CLASS = 'thread-view-drawing';
@@ -20,9 +16,6 @@ function isShowing(el: Element): boolean {
   return getComputedStyle(el).visibility === 'visible';
 }
 
-/** A drawing of `list` as the user sees it, or null when it is not what the
- *  user sees. A drawing already on screen carries itself over instead
- *  (`LeavingViewDrawing`), so a reversal never jumps to the list under it. */
 export function drawLeavingList(list: HTMLElement | null): LeavingDrawing | null {
   if (!list?.firstElementChild || !isShowing(list)) return null;
   const showing = list.parentElement?.querySelector(`:scope > .${DRAWING_CLASS}`);
@@ -33,15 +26,10 @@ export function drawLeavingList(list: HTMLElement | null): LeavingDrawing | null
   for (const el of [node, ...node.querySelectorAll('*')]) {
     for (const name of IDENTITY_ATTRIBUTES) el.removeAttribute(name);
   }
-  // A leaving row is drawn gone. A clone carries no Web Animation, so its
-  // folding copy would sit frozen at the start of its exit.
   for (const layer of node.querySelectorAll('.flip-departure-layer')) layer.remove();
   return { id: ++lastDrawingId, node, scrollTop: list.scrollTop };
 }
 
-/** Draws the list when its grouping changes. It wraps the list's content,
- *  because `getSnapshotBeforeUpdate` runs after render and before the content's
- *  DOM changes: the one moment the leaving view still exists. */
 export class LeavingViewSnapshot extends Component<{
   grouping: DrawerGrouping;
   list: RefObject<HTMLElement>;
@@ -61,22 +49,11 @@ export class LeavingViewSnapshot extends Component<{
   }
 }
 
-/** The leaving list, held over the pane until the dip's midpoint, where the
- *  CSS hides it (drawer.css). It plays the part the closing filter panel plays
- *  on the panel path. A drawing, not a view: its content is `inert` and the
- *  frame `aria-hidden`. The frame itself takes a tap while it shows, so a tap
- *  never reaches the arriving list before the user can see it.
- *
- *  Keyed on the drawing, so each dip mounts a fresh element whose animation
- *  starts with the fresh navigation cover's. A new dip (`swapKey`) that finds it
- *  still showing re-keys it, so it holds until the NEW midpoint. It unmounts on
- *  the cover's own fuse. */
 export class LeavingViewDrawing extends Component<{
   swapKey: string;
   drawing: Signal<LeavingDrawing | null>;
 }> {
   private frame = createRef<HTMLDivElement>();
-  /** The drawing the last render committed a frame for, and the one shown. */
   private rendered: LeavingDrawing | null = null;
   private shown: LeavingDrawing | null = null;
   private fuse: ReturnType<typeof setTimeout> | undefined;
@@ -102,7 +79,6 @@ export class LeavingViewDrawing extends Component<{
     this.props.drawing.value = null;
   }
 
-  /** Puts a newly mounted frame's drawing in it and arms that drawing's fuse. */
   private show(): void {
     const current = this.rendered;
     if (current === this.shown) return;

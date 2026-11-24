@@ -1,12 +1,3 @@
-/**
- * The body of a picker row for a workspace on a remote gateway. It wears the
- * local row's shape: dot, name with a quiet `@gateway` tag, and a host line.
- *
- * A row opens the workspace through this gateway's relay, at `/<slug>@<name>/`.
- * Its ⋯ menu (`actions`) offers no Start, Stop, rename or delete: those belong
- * to the gateway that hosts the workspace. A gateway that did not answer keeps
- * its last rows, greyed and closed, and `UnreachableGatewayNotes` says why.
- */
 
 import type { ComponentChildren } from 'preact';
 import type { ListedWorkspace } from '../../api/client/control';
@@ -25,7 +16,6 @@ interface RemoteWorkspaceRowBodyProps {
   workspace: ListedWorkspace;
   onOpen: (route: string, mode: WorkspaceOpenMode) => void;
   onContextMenu?: (e: MouseEvent) => void;
-  /** The row's ⋯ menu, drawn where a local row draws its actions. */
   actions: ComponentChildren;
 }
 
@@ -33,8 +23,6 @@ export function RemoteWorkspaceRowBody({ view, workspace: w, onOpen, onContextMe
   const route = remoteWorkspaceRoute(view, w);
   const state = workspaceState(w);
   const fault = workspaceFaultNote(w);
-  // Nothing here can restart a remote engine, so an unhealthy row stays shut
-  // rather than dropping the user into a page that cannot connect.
   const openable = remoteWorkspaceOpenable(view, w);
   const open = (mode: WorkspaceOpenMode | null) => {
     if (openable && mode !== null) onOpen(route, mode);
@@ -80,7 +68,6 @@ export function RemoteWorkspaceRowBody({ view, workspace: w, onOpen, onContextMe
   );
 }
 
-/** One line per gateway that did not answer, naming it and saying why. */
 export function UnreachableGatewayNotes({ views }: { views: readonly RemoteGatewayView[] }) {
   const silent = views.filter((view) => view.unreachable !== null);
   if (silent.length === 0) return null;

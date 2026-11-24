@@ -1,7 +1,7 @@
 ---
 name: Workspace audit: prompt footprint
 description: The prompt-footprint audit section. Sections over their ceilings, clipped descriptions, unused apps and widgets, knowhow not loaded by name, and triggers listing an MCP server they never call.
-sources: ["system-knowhow/preferences.md", "crates/lucidos-engine/src/engine/prompt_footprint.rs", "crates/lucidos-engine/src/api/workspace_prompt_footprint.rs", "crates/lucidos-engine/src/core/preference_catalog.rs"]
+sources: ["system-knowhow/preferences.md", "system-knowhow/preferences/*.md", "crates/lucidos-engine/src/engine/prompt_footprint.rs", "crates/lucidos-agents-api/src/api/workspace_prompt_footprint.rs", "crates/lucidos-core/src/core/preference_catalog.rs"]
 ---
 
 # Workspace audit section: prompt-footprint
@@ -33,8 +33,22 @@ The three numbers come from the user's *preference*s:
 `workspace_prompt_footprint_total_ceiling` and
 `workspace_prompt_footprint_unused_days`. The JSON carries the values in force.
 Quote them from there, never from memory.
+Read ceiling preferences from the workspace being audited. The engine-owned
+release notice cursor records which notice items the workspace has answered.
 
 ## Checks
+
+Build-deferral settings control build admission, not footprint ceilings.
+Intelligence ladder settings control which rungs an agent may pick, not footprint ceilings.
+The system prompt footprint includes the held-build reading; use the measured report rather than reconstructing its text.
+
+Background extraction settings, including `reasoning_memory`, do not control this footprint.
+Its forced-Claude thinking exception is documented in `system-knowhow/preferences.md`.
+Use the measured sections and preferences above when automatic chat selection changes with route availability.
+The selected model's context budget governs request packing. Workspace preferences set this audit's footprint ceilings.
+
+
+The landing setting controls which source workspace builds landing batches. Read footprint measurements from the workspace the audit covers.
 
 For each finding, capture: **location** (the section id, then the item id),
 **what's wrong**, **which reference owns the rule**, **suggested fix**.

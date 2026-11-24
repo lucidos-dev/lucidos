@@ -523,10 +523,11 @@ fn the_ledger_survives_garbage_and_forgets_nothing_it_was_told() {
 
 #[cfg(unix)]
 fn fake_claude(dir: &Path, banner: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("claude");
-    std::fs::write(&path, format!("#!/bin/sh\necho '{banner}'\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::runtime::stub_executable::write_stub_executable(
+        &path,
+        &format!("#!/bin/sh\necho '{banner}'\n"),
+    );
     path
 }
 

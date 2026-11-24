@@ -71,8 +71,6 @@ describe('the call URL', () => {
   });
 });
 
-/** The probe must ride the SAME hops the call does, or it answers about a
- *  route nobody dialled. */
 describe('the echo URL', () => {
   it('takes the scheme, host and prefix the call takes', () => {
     const origin = { api: '/dev/api/v1', protocol: 'https:', host: 'host.example:8443' };

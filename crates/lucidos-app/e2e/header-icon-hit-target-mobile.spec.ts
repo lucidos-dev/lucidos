@@ -1,32 +1,15 @@
-/**
- * Every mobile header icon takes a tap that lands above or below its 1.75rem
- * button, upright and in landscape. The button box is what the row's reserves
- * place, so it cannot grow. A transparent `::before` reaches past it instead
- * (styles/mobile.css, `.mobile-header-row .icon-btn.header-icon`). The nav
- * chevrons have their own reach, pinned by nav-chevron-hit-target.
- *
- * Pinned for every visible icon on all three panes, at 100% and 112.5%:
- * - its hit box, found by walking `elementFromPoint` out from its centre,
- *   is the full 2.75rem target tall and its own button wide;
- * - a tap on its own button, centre or edge, still lands on it;
- * - a tap on a chevron's own button lands on the chevron.
- */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, navigateToApp, ensureMobileView } from './helpers';
+import { assertHealthy, navigateToApp, ensureMobileView, watchPreferenceReads } from './helpers';
 
 const PORTRAIT = { width: 393, height: 852 };
 const LANDSCAPE = { width: 852, height: 393 };
-// The emulator zeroes every safe-area inset. A phone upright has the status bar
-// above the header, and in landscape the Dynamic Island at one side.
 const STATUS_BAR_PX = 59;
 const ISLAND_PX = 59;
 
 interface Probe {
   label: string;
   box: { left: number; right: number; top: number; bottom: number };
-  /** How far a tap still reaches the button, out from its centre. */
   reach: { left: number; right: number; up: number; down: number };
-  /** Where taps on the button's own centre and edges land. */
   own: boolean[];
 }
 
@@ -35,7 +18,6 @@ async function probeHeaderIcons(page: Page): Promise<Probe[]> {
     const view = document.querySelector('.app-header')?.getAttribute('data-mobile-view');
     const section = document.querySelector(`.app-header .mobile-${view}-header`);
     if (!section) return [];
-    // The closed search bar stays laid out, but clipped and untappable.
     const buttons = Array.from(section.querySelectorAll<HTMLElement>(
       '.mobile-header-row .icon-btn.header-icon:not(.nav-chevron)',
     )).filter((b) => {
@@ -67,8 +49,6 @@ async function probeHeaderIcons(page: Page): Promise<Probe[]> {
   });
 }
 
-/** For each visible nav chevron on the shown row, whether taps on its own
- *  centre and edges land on it. A neighbour's reach must never cover it. */
 async function chevronOwnTaps(page: Page): Promise<Record<string, boolean[]>> {
   return page.evaluate(() => {
     const view = document.querySelector('.app-header')?.getAttribute('data-mobile-view');
@@ -87,7 +67,6 @@ async function chevronOwnTaps(page: Page): Promise<Record<string, boolean[]>> {
   });
 }
 
-/** Resolve a length to px through a probe, at the current root. */
 async function px(page: Page, value: string): Promise<number> {
   return page.evaluate((v) => {
     const probe = document.createElement('div');
@@ -113,7 +92,6 @@ async function rotate(page: Page, size: { width: number; height: number }): Prom
   await page.waitForFunction(({ width }) => window.innerWidth === width, size);
 }
 
-/** Stamp the insets a real phone reports in this orientation. */
 async function simulateInsets(page: Page, orientation: 'portrait' | 'landscape'): Promise<void> {
   await page.evaluate(({ orientation, top, side }) => {
     const s = document.documentElement.style;
@@ -130,17 +108,12 @@ test.describe('The mobile header icons take a near miss', () => {
   });
 
   test('every icon hit box is the full target tall, upright and in landscape', async ({ page }) => {
+    const preferencesSettled = watchPreferenceReads(page);
     await navigateToApp(page);
-    // The app's own preference load writes the ui-scale. Wait for it, so the
-    // scale set here is the last write rather than one that gets undone.
-    await page.waitForFunction(
-      () => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 },
-    );
+    await preferencesSettled();
 
     for (const view of ['threads', 'thread', 'content'] as const) {
       for (const orientation of ['portrait', 'landscape'] as const) {
-        // `ensureMobileView` reads a narrow viewport as the phone layout, so
-        // the pane is picked upright and kept through the rotation.
         await rotate(page, PORTRAIT);
         await ensureMobileView(page, view);
         await rotate(page, orientation === 'portrait' ? PORTRAIT : LANDSCAPE);
@@ -161,8 +134,6 @@ test.describe('The mobile header icons take a near miss', () => {
               + `at y=${p.box.top.toFixed(1)}, reach ${JSON.stringify(p.reach)}`);
 
             expect(p.own, `${where}: a tap on its own button went elsewhere`).toEqual([true, true, true, true, true]);
-            // Half the target each way, minus the walk's half-px step. In
-            // landscape the row meets the screen top, which bounds the reach up.
             expect(p.reach.down, `${where}: reach below`).toBeGreaterThanOrEqual(target / 2 - 0.5);
             expect(p.reach.up, `${where}: reach above`).toBeGreaterThanOrEqual(Math.min(target / 2, cy) - 0.5);
             const width = p.reach.left + p.reach.right;

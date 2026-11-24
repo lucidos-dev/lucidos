@@ -1,6 +1,3 @@
-/** An `ImageUploaded` from the event stream records the hash the engine
- *  stored, which lands the matching pending image. Plan:
- *  `docs/plans/2026-10-04-image-upload-lands-on-its-event.md`. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import type { ThreadEventRow } from '../../api/threads';

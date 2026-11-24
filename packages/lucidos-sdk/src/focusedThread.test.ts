@@ -7,8 +7,6 @@ const saved: Record<string, unknown> = {};
 let listeners: Array<(event: MessageEvent) => void> = [];
 let parent: { postMessage: ReturnType<typeof vi.fn> };
 
-/** A fresh SDK module graph per case: the bridge installs its listener once
- *  per module instance, on the window present at that moment. */
 async function load() {
   vi.resetModules();
   return import('./focusedThread');
@@ -46,7 +44,6 @@ afterEach(() => {
 });
 
 describe('focusedThread', () => {
-  /** The request the SDK posted, answered as the host would. */
   function hostAnswers(value: unknown): void {
     const [request, target] = parent.postMessage.mock.calls[0];
     expect(request).toMatchObject({ type: BRIDGE_TYPE, op: 'ui.focused-thread' });

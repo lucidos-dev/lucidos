@@ -97,6 +97,9 @@ env var rolls a workspace back to the shipped-and-stable model.
 
 ## Addendum (2026-06-18): mid-turn follow-ups interrupt-and-redirect
 
+Amended by [ADR 0697](0697-codex-steers-mid-turn-followups.md): capable
+app-servers steer ordinary follow-ups; urgent and legacy paths still interrupt.
+
 **Context.** The Codex drivers accept input only at a turn boundary
 (`turn/start` requires no turn in flight; the exec driver is per-turn), so the
 app-server driver queues any `AgentInput` that arrives mid-turn ("No mid-turn

@@ -8,9 +8,6 @@ import {
   type FileSearchResult,
 } from '../fileSearch';
 
-/** Regression: the workspace Files view listed every pending change's files,
- *  badged "C". Selecting one closed the modal and did nothing, because
- *  `openRepoFilePreview` returns silently with no bound repository. */
 describe('openableChangeFiles', () => {
   const files = [{ path: 'src/api.rs' }, { path: 'src/new.rs' }];
 
@@ -156,8 +153,6 @@ describe('filterSearchResults', () => {
   });
 });
 
-/** Regression: the modal rendered every match, about 3,400 rows in a real
- *  workspace, so opening it on a phone took seconds. */
 describe('visibleSearchResults', () => {
   const results: FileSearchResult[] = Array.from({ length: 250 }, (_, i) => ({
     path: `apps/demo/file-${i}.md`,

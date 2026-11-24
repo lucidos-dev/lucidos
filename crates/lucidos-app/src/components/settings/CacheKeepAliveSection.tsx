@@ -10,15 +10,6 @@ import { Disclosure } from '../shared/Disclosure';
 import { Explainer } from '../shared/Explainer';
 import { LoadableToggle } from '../shared/LoadableToggle';
 
-/**
- * Settings → Models → Cache keep-alive: whether the engine pings a waiting
- * Claude Code session or Lucidos Agent thread to keep its prompt cache warm.
- * The Cache cards switch nests under it and shows only while it is on, since
- * the cards never draw while it is off.
- *
- * Both write through `savePreference`, which applies locally before the
- * request and parks a failed delivery for retry.
- */
 export function CacheKeepAliveSection() {
   const loaded = preferences.value.status === 'loaded';
   const on = currentCacheKeepAliveOn();
@@ -93,8 +84,6 @@ export function CacheKeepAliveSection() {
   );
 }
 
-/** Coding Agents' one-line pointer to the setting, which lives on Models since
- *  it covers the Lucidos Agent too (ADR 0556). */
 export function CacheKeepAlivePointer() {
   return (
     <div class="settings-section">

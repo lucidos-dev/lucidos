@@ -17,8 +17,6 @@ vi.mock('../../api/client', async () => {
   };
 });
 
-// Loading effects registers every toast effect, so a test can assert that no
-// progress toast follows the rehydrated signal.
 await import('../effects');
 const { refreshChangesState } = await import('../actions/chat-changes');
 
@@ -43,9 +41,6 @@ beforeEach(() => {
 
 describe('refreshChangesState rehydrates the Apply All batch across reload', () => {
   it('brings back the Apply All row when a batch is live on the engine', async () => {
-    // Page-reload scenario: the optimistic signal reset to false on load and the
-    // ApplyAllBatchStarted SSE is not replayed, but the engine still has the
-    // batch in flight (apply_all_batches row present).
     mockFetchChanges.mockResolvedValueOnce({ ...baseState, apply_all_in_progress: true });
 
     refreshChangesState();
@@ -117,7 +112,6 @@ describe('refreshChangesState rehydrates the Apply All batch across reload', () 
   });
 
   it('drops a phase whose terminal event the page missed', async () => {
-    // A conflict set the phase, then the stream dropped the ChangeApplyFailed.
     applyPhases.value = new Map([['t-9', { phase: 'resolving-conflict', eventId: 'e-9', startedAt: null }]]);
     mockFetchChanges.mockResolvedValueOnce({ ...baseState, apply_all_in_progress: false });
 

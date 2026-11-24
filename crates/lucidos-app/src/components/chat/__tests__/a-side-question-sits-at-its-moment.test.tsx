@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A side question asked during a turn sits at its moment inside that turn:
- *  rows written before it draw above the card, rows written after it below.
- *  See docs/plans/2026-09-28-side-question-sits-inside-its-turn.md. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -1,10 +1,3 @@
-/** The *widget embed* grammar (ADR 0415): `![label](app:<id>?params={...})`
- *  in markdown draws a widget wherever a picture draws.
- *
- *  This is the TypeScript definition; the engine's `engine/widget_embed.rs` is
- *  the Rust one. Both read `widget_embeds.fixture.json`, so an embed the engine
- *  accepts is one this draws, and the reverse. Raw JSON params may hold spaces
- *  and `)`, which a markdown link cannot, so this scans the text itself. */
 
 import { isWidgetParams } from '@lucidos/sdk';
 import { WIDGET_PARAMS_MAX_BYTES } from '@lucidos/engine-constants';
@@ -13,19 +6,14 @@ import type { App } from '../store/types';
 import { canonicalWidgetParams } from './widgetParams';
 
 const OPEN = '](app:';
-/** The embed grammar's params marker. It reads like the frame URL's query
- *  key, but it is markdown syntax the agent writes, and stays its own. */
 const EMBED_PARAMS = '?params=';
 
-/** One embed found in markdown: where it sits, and what it says. */
 export interface EmbedMatch {
   start: number;
   end: number;
-  /** The embed, or why its syntax is broken. */
   embed: { ok: true; value: WidgetEmbed } | { ok: false; reason: string };
 }
 
-/** Every embed in `text`, in order. A broken one is still a match. */
 export function scanWidgetEmbeds(text: string): EmbedMatch[] {
   const code = codeRanges(text);
   const found: EmbedMatch[] = [];
@@ -49,9 +37,6 @@ export function scanWidgetEmbeds(text: string): EmbedMatch[] {
   }
 }
 
-/** The ranges of code in `text`: a run of backticks up to the next run of
- *  the same length, so an inline span and a fenced block alike. An embed in
- *  code is an example, as markdown draws no picture there. */
 function codeRanges(text: string): Array<[number, number]> {
   const runAt = (i: number) => {
     let n = 0;
@@ -88,16 +73,12 @@ function codeRanges(text: string): Array<[number, number]> {
   return ranges;
 }
 
-/** The embed that starts `text`, if one does. The markdown renderer reads an
- *  embed this way, token by token, so one inside code stays code. */
 export function widgetEmbedAtStart(text: string): EmbedMatch | null {
   if (!text.startsWith('![')) return null;
   const open = text.indexOf(OPEN);
   return open < 0 ? null : matchFrom(text, 0, open);
 }
 
-/** The embed spanning `start` (its `![`) and `open` (its `](app:`). The label
- *  between must be one line with no `]` and no other `![`. */
 function matchFrom(text: string, start: number, open: number): EmbedMatch | null {
   const labelText = text.slice(start + 2, open);
   if (labelText.includes(']') || labelText.includes('\n') || labelText.includes('![')) return null;
@@ -118,8 +99,6 @@ type Target =
   | { ok: true; length: number; appId: string; params?: Record<string, unknown> }
   | { ok: false; length: number; reason: string };
 
-/** Parse `<id>[?params=<json>])` after the `app:`, with the length up to and
- *  including the closing `)`. A failure still reports a length. */
 function parseTarget(rest: string): Target {
   const idMatch = /^[A-Za-z0-9._-]*/.exec(rest);
   const appId = idMatch ? idMatch[0] : '';
@@ -172,7 +151,6 @@ function parseTarget(rest: string): Target {
   return { ok: true, length: closeAt + 1, appId, ...(Object.keys(params).length > 0 ? { params } : {}) };
 }
 
-/** The length of the JSON object at the start of `s`, string-aware. */
 function balancedObjectLength(s: string): number | null {
   let depth = 0;
   let inString = false;
@@ -205,8 +183,6 @@ function percentDecode(s: string): string | null {
   }
 }
 
-/** `text` with the matched embeds cut out and the ends trimmed, or `null`
- *  when nothing else is left. */
 export function withoutWidgetEmbeds(text: string, matches: readonly EmbedMatch[]): string | null {
   let out = '';
   let at = 0;
@@ -219,21 +195,14 @@ export function withoutWidgetEmbeds(text: string, matches: readonly EmbedMatch[]
   return trimmed ? trimmed : null;
 }
 
-/** Own keys only: `toString` is not a param a widget declared. */
 function hasOwn(record: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
 }
 
-/** Why this app cannot draw as a widget, or `null` when it can. */
 export function widgetRefusal(app: App): string | null {
   return app.kind === 'widget' ? null : `'${app.id}' is an app, not a widget.`;
 }
 
-/** Why this embed may not draw in this thread, or `null` when it may: a
- *  widget, reusable or made here, given only the params its manifest takes
- *  and every required one. The engine checks an option's embed before the
- *  card (`check_widget_params`), and these reasons read as its do. A reply's
- *  embed has only this check. */
 export function embedRefusal(app: App, embed: WidgetEmbed, threadId: string): string | null {
   const notWidget = widgetRefusal(app);
   if (notWidget) return notWidget;
@@ -242,7 +211,6 @@ export function embedRefusal(app: App, embed: WidgetEmbed, threadId: string): st
   }
   const declared = app.params ?? {};
   const given = embed.params ?? {};
-  // Sorted, as the engine's maps are, so both name the same param.
   const declaredNames = Object.keys(declared).sort();
   const unknown = Object.keys(given).sort().find((name) => !hasOwn(declared, name));
   if (unknown !== undefined) {

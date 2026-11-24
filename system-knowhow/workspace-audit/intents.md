@@ -1,7 +1,7 @@
 ---
 name: Workspace audit: intents
 description: The intents audit section: frontmatter, knowhow ids that resolve, intents shadowed by a same-id knowhow doc, and user-facing tone.
-sources: ["system-knowhow/intent-registry.md", "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs"]
+sources: ["system-knowhow/intent-registry.md", "crates/lucidos-agents-api/src/engine/chat/process/system_prompt.rs"]
 ---
 
 # Workspace audit section: intents
@@ -15,7 +15,21 @@ the report. This file carries its scan, its checks and its fixes.
 No grep decides this section. Its checks read files and events directly,
 so it adds no row to the receipts.
 
+The registry implementation lives in `crates/lucidos-core/src/core/intents.rs`.
+
 ## Checks
+
+Version-build readings in the turn tail describe runtime state, not available intents.
+Use `system-knowhow/glossary/core-terms-15.md` § Build deferral when checking an intent that promises a new version.
+
+- **Thread assessments from old replies.** An intent asking about thread progress must read current liveness before a verdict.
+  See `system-knowhow/glossary/core-terms-10.md` § Thread liveness; earlier replies are history.
+
+Check intents that promise an external file read against the private paths rule in [Agent sandbox](../agent-sandbox.md).
+Only a device in the Lucidos shell can change those lists.
+
+An intent that reads unattended trigger output must name a file read rather than rely on workspace memory.
+See `docs/system-events.md` § Artifact provenance and provider holds.
 
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
@@ -35,3 +49,9 @@ Scope is **every `.md` file the registry reads** (per `system-knowhow/intent-reg
   the renamed id.
 - Reads in user terms, not engineer terms (same test as triggers).
 - **Do not flag** a missing `data/triggers/<slug>/<slug>.md` for a *standalone scheduled trigger*. Its `run.intent` (in the `TriggerCreated` payload) is enough for scheduled firing. An on-disk procedure file is warranted only for dual use: scheduled firing **and** an on-demand run through `load_knowhow`. A pure scheduled orchestrator nothing calls manually is correct as-is.
+
+## Diagnostic evidence
+
+Run `lucidos diagnostic-log query` yourself when debugging an intent.
+See [Agent Sandbox](../agent-sandbox.md) for the access rules.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

@@ -1,10 +1,3 @@
-/**
- * Post-process rendered HTML to linkify artifact paths and bare URLs, and to
- * rewrite deliberate app / nav-panel / artifact anchors into click-routed
- * links. App names are NOT scanned in prose: an app becomes a link only when
- * the LLM writes an explicit markdown link to it. Tracks <a> and <code>
- * nesting to avoid nested anchors and linkifying code content.
- */
 
 import { makeInertBody } from './escapeHtml';
 import { escapeHtmlAttr } from './escapeHtmlAttr';
@@ -16,7 +9,6 @@ const REGEX_ESCAPE = /[.*+?^${}()|[\]\\]/g;
 
 type Match = { start: number; end: number; replacement: string };
 
-/** Order `key` against `text.slice(at, at + len)`, without slicing. */
 function compareKeyToSpan(key: string, text: string, at: number, len: number): number {
   const n = Math.min(key.length, len);
   for (let j = 0; j < n; j++) {
@@ -33,11 +25,6 @@ function sharedPrefixLength(key: string, text: string, at: number, len: number):
   return j;
 }
 
-/** The longest of the sorted `keys` that `text` holds at `at`, or null.
- *
- *  The last key ordered at or before the remaining text is the answer when it
- *  is a prefix of that text. Otherwise only a key no longer than their shared
- *  prefix can match, and it sorts earlier, so the search narrows and repeats. */
 function longestKeyAt(keys: readonly string[], text: string, at: number): string | null {
   let len = text.length - at;
   let end = keys.length;
@@ -59,10 +46,6 @@ function longestKeyAt(keys: readonly string[], text: string, at: number): string
   return null;
 }
 
-/** Collect every known path in `text`, leftmost first and longest at each
- *  start. A sorted lookup rather than one regex alternation over the list:
- *  WebKit scans a thousands-way alternation about twenty times slower than V8,
- *  which froze typing in the desktop app whenever the list changed. */
 function collectKnownPathMatches(
   text: string,
   sortedKeys: readonly string[],
@@ -81,9 +64,6 @@ function collectKnownPathMatches(
   }
 }
 
-/** Resolve overlaps across every candidate, whatever matcher produced it.
- *  Same start: longest wins, matching a single regex alternation over
- *  length-desc alternatives. Earlier non-overlapping match wins overall. */
 function resolveMatches(matches: Match[]): Match[] {
   matches.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
   const filtered: Match[] = [];
@@ -114,27 +94,6 @@ const CLASS_ATTR = /\sclass\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_PATH_ATTR = /\sdata-path\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_LINE_ATTRS = /\sdata-line(?:-end)?\s*=\s*(?:"[^"]*"|'[^']*')/gi;
 
-/** If the opening anchor tag points at a workspace data file, return a
- *  replacement opening tag using `class="artifact-link" data-path="..."`, so
- *  the chat click handler routes through `openFilePreview` instead of letting
- *  the browser navigate to the `/data/*` static mount. Returns null when the
- *  href is not a data file. Visible text and other attributes are preserved.
- *
- *  Two ways to resolve, in this order. The known-paths lookup runs FIRST
- *  because it also canonicalizes, mapping the bare `foo.md` back to
- *  `artifacts/foo.md`, which shape alone cannot do. Then the shape
- *  (`extractDataPathTarget`), for a path the cached artifact list does not
- *  know. That list is a projection refreshed by SSE, so gating a DELIBERATE
- *  markdown link on it concludes "not a file" from a stale cache.
- *
- *  The text-segment linkifier resolves by shape too, via `DATA_PATH_IN_PROSE`,
- *  which adds one guard an anchor does not need: a final segment carrying an
- *  extension.
- *
- *  `href="#"` is forced rather than dropped: iOS Safari treats an `<a>` with
- *  no href as non-interactive, so taps never become `click` events. A `#L`
- *  line reference moves to `data-line` / `data-line-end`, since the forced
- *  href can no longer carry it. */
 function rewriteArtifactAnchor(
   tag: string,
   pathLookup: Map<string, string> | undefined,
@@ -168,16 +127,6 @@ const DATA_SETTINGS_VIEW_ATTR = /\sdata-settings-view\s*=\s*(?:"[^"]*"|'[^']*')/
 const DATA_SETTINGS_FRAGMENT_ATTR = /\sdata-settings-fragment\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
-/** UI panels reachable from a markdown link like `[Notifications](notifications)`.
- *  Every `MenuItem` plus the three bare `navigate_ui` targets that land somewhere
- *  other than a menu row: `dashboard` reveals the dashboard, `app-store` is
- *  the retired alias for Plugins, and `thread-queue` opens a Settings subview.
- *
- *  Held apart from `MenuItem` on purpose. This set answers "is this href a
- *  panel", so it stays a plain string set that `utils/` owns without importing
- *  the store. Hand-written, so `nav-targets-cover-every-panel.test.ts` is what
- *  keeps it honest: a menu item or a bare generated target missing here is a
- *  link the agent writes and the reader cannot open. */
 export const NAV_TARGETS: ReadonlySet<string> = new Set([
   'dashboard',
   'notifications',
@@ -191,97 +140,41 @@ export const NAV_TARGETS: ReadonlySet<string> = new Set([
   'settings',
 ]);
 
-/** Extract a UI-panel target from an href that points at a Lucidos navigation
- *  panel, meaning "open the inbox / apps list / triggers list", NOT "open a
- *  specific app or file inside it".
- *
- *  Accepted with an optional `data/` or `/data/` prefix, trailing slash, query
- *  string or fragment. Rejected: any sub-path (`apps/<id>`), external URLs and
- *  unknown panel names. Sub-paths fall through so the app rewriter and the
- *  artifact rewriter keep claiming their own shapes.
- *
- *  The LLM naturally writes `[Notifications](data/notifications)`, mirroring
- *  the `data/artifacts/<path>` shape it knows produces clickable links. Left
- *  alone the browser hits the engine's `/data/*` static mount and 404s on a
- *  folder that does not exist. */
 export function extractNavTargetFromHref(href: string): string | null {
   let candidate = href;
   if (candidate.startsWith('/data/')) candidate = candidate.slice('/data/'.length);
   else if (candidate.startsWith('data/')) candidate = candidate.slice('data/'.length);
   if (candidate.startsWith('/')) candidate = candidate.slice(1);
-  // Strip query string / fragment so `notifications?refresh=1` matches.
   const queryStart = candidate.search(/[?#]/);
   if (queryStart !== -1) candidate = candidate.slice(0, queryStart);
   if (candidate.endsWith('/')) candidate = candidate.slice(0, -1);
   if (!candidate) return null;
-  // Sub-path → not a panel target. `apps/<id>` belongs to the app rewriter,
-  // `notifications/foo` is meaningless (no such sub-path exists).
   if (candidate.includes('/')) return null;
   return NAV_TARGETS.has(candidate) ? candidate : null;
 }
 
-/** A Settings page, plus the row on it a link named. */
 export interface SettingsHrefTarget {
-  /** A `navigate_ui` `settings_view` id. */
   view: string;
-  /** The row's name without its `#`, or null when the link names the page only.
-   *  The row's anchor is `<view>:<fragment>`. */
   fragment: string | null;
 }
 
-/** Extract the Settings page a `settings:<view>` href names, such as
- *  `[Settings → System → Backup](settings:backup)` in an engine notification.
- *  A fragment names a row on the page: `settings:providers#xai`.
- *
- *  Only the SHAPE is checked here. `handleNavigationRequest` validates the view
- *  and toasts one it cannot render, and SettingsView toasts a row it cannot
- *  find, so a stale name is reported, never swallowed.
- *  Bare `settings` (the Settings home) stays with `extractNavTargetFromHref`. */
 export function extractSettingsTargetFromHref(href: string): SettingsHrefTarget | null {
-  const m = /^settings:([a-z0-9-]+)\/?(?:#([a-z0-9-]+))?$/i.exec(href);
+  const m = /^settings:([a-z0-9-]+)\/?(?:#([a-z0-9:-]+))?$/i.exec(href);
   return m ? { view: m[1], fragment: m[2] ?? null } : null;
 }
 
-/** Does this href carry a URL scheme (`https:`, `mailto:`, `app:`, `file:`)?
- *  The single source of truth for that question across every link router. A
- *  scheme is never claimed as a relative path in one place and left to the
- *  browser in another. Matches ANY scheme rather than a known set: the point
- *  is "not a relative path", and each caller decides what to do with the ones
- *  it owns. */
 export function hasUrlScheme(href: string): boolean {
   return /^[a-z][a-z0-9+.-]*:/i.test(href);
 }
 
-/** The schemes a click may be handed to the browser for. `http` and `https` are
- *  ordinary links; `mailto`, `tel` and `sms` hand off to the OS and are
- *  universally claimed. */
 const BROWSER_NAVIGABLE_SCHEMES: ReadonlySet<string> =
   new Set(['http', 'https', 'mailto', 'tel', 'sms']);
 
-/** Can the browser actually DO something with this href?
- *
- *  Narrower than `hasUrlScheme`, and the difference is the point. A scheme no
- *  handler claims does nothing at all when clicked. A link that does nothing
- *  reads as a broken app rather than a broken link. ADR 0048 makes that
- *  argument about a `lucidos://` deep link, and it holds for an href the agent
- *  invents inside a message: `trigger:<id>` was exactly this, silent for as
- *  long as nothing claimed it.
- *
- *  So this is what the terminal guard tests, rather than "has a scheme". The
- *  app's OWN schemes never reach it: `app:`, `trigger:`, `repo:` and `file:`
- *  are claimed by their extractors first.
- *
- *  A legitimate third-party scheme (`vscode:`, `zoommtg:`) is swallowed by
- *  this, deliberately. Add it here if one turns out to be worth supporting. */
 export function browserHandlesHref(href: string): boolean {
   if (!hasUrlScheme(href)) return false;
   return BROWSER_NAVIGABLE_SCHEMES.has(href.slice(0, href.indexOf(':')).toLowerCase());
 }
 
-/** The trees a bare path in PROSE links into. Narrower than
- *  `DATA_PATH_PREFIXES`, because prose is not a deliberate anchor. A coding
- *  agent writes repo paths such as `scripts/e2e.sh` in passing, and those must
- *  stay plain text rather than become data links that 404. */
 export const PROSE_DATA_PATH_PREFIXES: readonly string[] = [
   'artifacts/',
   'knowhow/',
@@ -290,78 +183,28 @@ export const PROSE_DATA_PATH_PREFIXES: readonly string[] = [
   'system-knowhow/',
 ];
 
-/** A bare data path written in PROSE, recognized by shape. Group 1 is a leading
- *  boundary character the link must not swallow; group 2 is the path.
- *
- *  The agent is INSTRUCTED to write bare full paths, because the chat system
- *  prompt promises one becomes a link. ADR 0038 limited shape resolution to
- *  anchors, which broke that promise for a file the cached list had not caught
- *  up with. It is amended, and the plan it links carries the rationale.
- *
- *  Stricter than `extractDataPathTarget` in one way, since prose is not a
- *  deliberate anchor: the final segment must carry an extension. That keeps a
- *  folder mentioned in passing (`artifacts/marketing`) plain.
- *
- *  Three details carry weight, and `collectProseMatches` adds two more guards
- *  the regex cannot express. The boundary rejects a preceding word character or
- *  `/`, which stops `https://example.com/artifacts/x.md` being carved up
- *  mid-URL. The charset excludes `<>"'&` and whitespace, so an HTML entity
- *  terminates the match. The extension is alphanumeric, so
- *  `see artifacts/notes.md.` links the path and leaves the full stop.
- *
- *  No lookbehind: an older WebKit cannot transpile one. */
 const DATA_PATH_IN_PROSE = new RegExp(
   '(^|[^\\w/])'
   + '(\\/?(?:data\\/)?'
-  // Escaped like every other interpolated path in this file: a future prefix
-  // carrying a regex metacharacter would otherwise change what this matches.
   + `(?:${PROSE_DATA_PATH_PREFIXES.map((p) => p.slice(0, -1).replace(REGEX_ESCAPE, '\\$&')).join('|')})`
   + '(?:\\/[^\\s<>"\'&/]+)*'
   + '\\/[^\\s<>"\'&/]*[^\\s<>"\'&/.]\\.[A-Za-z0-9]+)',
   'g',
 );
 
-/** A character that would CONTINUE the filename past the extension the regex
- *  stopped at. Checked after the match rather than as a trailing `(?!…)`,
- *  because a lookahead sitting after a greedy `+` does not forbid the shape: it
- *  makes the engine give characters back until the lookahead passes. That
- *  turned `artifacts/archive.tar.zst-1` into a link to `archive.tar.zs`, which
- *  is worse than the truncation it was added to prevent.
- *
- *  `?` and `#` are deliberately absent, so `artifacts/report.html?v=2` still
- *  links its base path. */
 const FILENAME_CONTINUES = /[-_~+%]/;
 
 const SCHEME_CHAR = /[A-Za-z0-9+.-]/;
 const SCHEME_FIRST_CHAR = /[A-Za-z]/;
 
-/** Does a URL scheme end at `colonIndex`, as in `file:artifacts/x.pdf`?
- *
- *  The prose boundary accepts `:`, so without this the workspace half of a
- *  scheme URL becomes an artifact link. `hasUrlScheme` owns the question "is
- *  this a relative path", and it would reject the same string as an href. The
- *  prose matcher must not claim what an anchor declines.
- *
- *  Walks back over the scheme's own characters instead of slicing the text
- *  before the match. The slice was O(n) per match, which went quadratic on a
- *  segment whose every boundary is a colon. These runs are disjoint between
- *  matches, so the walk stays linear over the segment. Same grammar as
- *  `hasUrlScheme`: one letter, then letters, digits, `+`, `.` or `-`. */
 function schemeEndsAt(text: string, colonIndex: number): boolean {
   let i = colonIndex - 1;
   while (i >= 0 && SCHEME_CHAR.test(text[i])) i--;
   return i + 1 < colonIndex && SCHEME_FIRST_CHAR.test(text[i + 1]);
 }
 
-/** A bare URL in a text segment. Shared by the URL linkifier and by
- *  `overlapsUrl`, so both agree on where a URL starts and ends. `file://` is
- *  included because marked's autolinker skips it, and the click router hands
- *  it to the OS opener (`extractLocalFileTarget`). The last character is never
- *  sentence punctuation, matching GFM's autolink rule, so `file:///tmp/a.pdf.`
- *  opens `a.pdf`. */
 const URL_IN_TEXT = /(?:https?|file):\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?]/g;
 
-/** Spans of every bare URL in `text`. */
 function urlSpans(text: string): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   URL_IN_TEXT.lastIndex = 0;
@@ -370,35 +213,15 @@ function urlSpans(text: string): Array<[number, number]> {
   return spans;
 }
 
-/** Does a path candidate sit inside a URL?
- *
- *  A workspace-shaped query or fragment value belongs to its URL, not to the
- *  workspace, and `=`, `?` and `#` are all legal prose boundaries. So
- *  `https://x/?next=artifacts/foo.md` offers a candidate the matcher would
- *  otherwise take.
- *
- *  In prose the markdown autolinker has already wrapped the URL, so the anchor
- *  guard covers it. Inside `<code>` it has not, and the URL pass is skipped
- *  there. Without this, the path pass splices an anchor into the middle of a
- *  shell command the reader is meant to copy. */
 function overlapsUrl(spans: Array<[number, number]>, start: number, end: number): boolean {
   return spans.some(([from, to]) => start < to && end > from);
 }
 
-/** The anchor both text matchers emit. `href="#"` is required: see
- *  `rewriteArtifactAnchor`. `text` is the path as WRITTEN, already HTML-escaped
- *  by the markdown render; `path` is the canonical store path to open. */
 function artifactLink(text: string, path: string): string {
   const escapedPath = path.replace(/"/g, '&quot;');
   return `<a href="#" class="artifact-link" data-path="${escapedPath}">${text}</a>`;
 }
 
-/** Collect the prose-shape candidates. The boundary group sits INSIDE the
- *  match and must be excluded from the span the link covers. `render` returns
- *  null to DECLINE a candidate: the regex recognizes a path-shaped token, and
- *  only the resolver can say whether that token names a file. A declined
- *  candidate is dropped before precedence runs, so it cannot mask a real match
- *  beneath it. */
 function collectProseMatches(
   text: string,
   render: (m: string) => string | null,
@@ -409,7 +232,6 @@ function collectProseMatches(
   while ((m = DATA_PATH_IN_PROSE.exec(text)) !== null) {
     const start = m.index + m[1].length;
     const end = start + m[2].length;
-    // Only a `:` boundary can carry a scheme, so nothing else pays for the walk.
     if (m[1] === ':' && schemeEndsAt(text, start - 1)) continue;
     if (FILENAME_CONTINUES.test(text.charAt(end))) continue;
     const replacement = render(m[2]);
@@ -418,26 +240,7 @@ function collectProseMatches(
   }
 }
 
-/** Recognize an href that points at a file under the workspace's `data/` tree,
- *  by SHAPE rather than by membership of the cached artifact list. Returns the
- *  normalized store path (`artifacts/report.html`), or null.
- *
- *  Accepts an optional `data/` / `/data/` prefix or a bare leading `/`, and
- *  strips any query string or fragment. Rejected:
- *    - any URL scheme (`https:`, `app:`, `file:`): real links, or another
- *      extractor's job
- *    - a bare sub-tree name with nothing under it (`artifacts`, `apps`), which
- *      is a directory rather than a file. `apps` / `triggers` are also nav
- *      panel names, so this guard keeps the two from fighting whatever order
- *      the extractors run in.
- *    - anything outside the known sub-trees
- *
- *  Both the render-time rewriter and the click handler use this, so neither
- *  depends on cache warmth. A file written moments ago is not in the cached
- *  list, and a plain relative href navigates the SPA fallback, reloading the
- *  whole workspace. */
 export function extractDataPathTarget(href: string): string | null {
-  // Any URL scheme disqualifies a data path, same test as extractBareAppRef.
   if (hasUrlScheme(href)) return null;
   let candidate = href;
   if (candidate.startsWith('/data/')) candidate = candidate.slice('/data/'.length);
@@ -447,66 +250,30 @@ export function extractDataPathTarget(href: string): string | null {
   if (queryStart !== -1) candidate = candidate.slice(0, queryStart);
   const prefix = DATA_PATH_PREFIXES.find((p) => candidate.startsWith(p));
   if (!prefix) return null;
-  // Nothing under the sub-tree, or a trailing slash: a directory, not a file.
   if (candidate.length === prefix.length || candidate.endsWith('/')) return null;
   return candidate;
 }
 
-/** Recognize an href that names a file under THIS workspace's `data/` tree by
- *  its disk path: `<workspacePath>/data/artifacts/x.png`, bare or as a
- *  `file://` URL. Returns the store path (`artifacts/x.png`), or null.
- *
- *  A coding agent works on the workspace's disk, so it links what it wrote by
- *  disk path. Left to `extractLocalFileTarget`, that link needs an OS opener,
- *  which a browser does not have. The in-app preview opens it on every client.
- *
- *  `workspacePath` comes from `/health` and is empty until that loads, which
- *  answers null. It percent-decodes the href first, since markdown encodes a
- *  destination carrying a space. */
 export function extractWorkspaceDiskDataPath(href: string, workspacePath: string): string | null {
   if (!workspacePath) return null;
   let decoded = href;
-  try { decoded = decodeURI(href); } catch { /* malformed escape: match the raw href */ }
+  try { decoded = decodeURI(href); } catch {  }
   if (/^file:\/\//i.test(decoded)) decoded = decoded.slice('file://'.length);
   const dataRoot = workspaceDataRoot(workspacePath);
   if (!decoded.startsWith(dataRoot)) return null;
   const relative = decoded.slice(dataRoot.length);
-  // A `..` segment can climb out of data/, so the prefix alone proves nothing.
   if (relative.split('/').some((segment) => segment === '.' || segment === '..')) return null;
   return extractDataPathTarget(relative);
 }
 
-/** Recognize an href that points at a REAL local filesystem location the OS
- *  should open directly: a `file://` URL or an absolute POSIX path. The
- *  release flow hands the user a link to a staged `.dmg` living OUTSIDE the
- *  workspace. Clicking it must mount the image via the OS, not route through
- *  the in-app preview or the engine's `/data/*` static mount.
- *
- *  Returns the path or URL to hand to the OS opener. Null for a workspace
- *  route (`/data/...`, `/artifacts/...` and the bare directory form of each),
- *  a relative href, or an external web URL.
- *
- *  This runs LAST in the click handler, after the app / nav / data-path
- *  extractors, so the absolute workspace routes they claim never reach here.
- *  The guards below are the belt to that braces: they keep an absolute data
- *  route out of the OS opener on their own, so reordering the handler cannot
- *  turn `/artifacts/report.pdf` into a disk path. Derived from
- *  `DATA_PATH_PREFIXES`, so a new sub-tree is covered the moment it is added
- *  there. */
 export function extractLocalFileTarget(href: string): string | null {
   if (/^file:\/\//i.test(href)) return href;
-  // Absolute POSIX path. Exclude the workspace's own absolute routes so a
-  // `/data/…` or `/artifacts/…` link is never handed to the OS as a disk path.
   if (href.startsWith('/')) {
     return isWorkspaceAbsoluteRoute(href) ? null : href;
   }
   return null;
 }
 
-/** True when an absolute href addresses the workspace's own `data/` tree
- *  (the `/data/*` static mount, or one of its sub-trees reached without the
- *  `data/` segment) rather than a filesystem location. Matches both the
- *  sub-path form (`/artifacts/x.md`) and the bare directory (`/artifacts`). */
 function isWorkspaceAbsoluteRoute(href: string): boolean {
   if (href === '/data' || href.startsWith('/data/')) return true;
   return DATA_PATH_PREFIXES.some((p) => {
@@ -515,13 +282,6 @@ function isWorkspaceAbsoluteRoute(href: string): boolean {
   });
 }
 
-/** Mirror of `rewriteArtifactAnchor` / `rewriteAppAnchor` for navigation
- *  panels. Returns a replacement opening tag with
- *  `class="nav-link" data-nav-target="<target>"` so the chat click handler
- *  routes through `handleNavigationRequest({ target })`. A `settings:<view>`
- *  href also carries `data-settings-view="<view>"`, and `data-settings-fragment`
- *  when it names a row. Returns null when the href is neither, and the caller
- *  falls through to the next rewriter. */
 function rewriteNavAnchor(tag: string): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
@@ -544,39 +304,12 @@ function rewriteNavAnchor(tag: string): string | null {
   );
 }
 
-/** An app entry point, plus the place inside the app a link named. */
 export interface AppHrefTarget {
   appId: string;
-  /** The href's fragment without its `#`, or null when it carries none. The
-   *  app receives it as `location.hash`. */
   fragment: string | null;
 }
 
-/** Extract a Lucidos app id and its target from an href pointing at an app's
- *  ENTRY POINT. That means "open this app", not "preview a file inside it".
- *  Accepted (with an optional `data/` or `/data/` prefix):
- *    - `apps/<id>`, `apps/<id>/`, `apps/<id>/index.html`
- *    - `app:<id>`, the custom-scheme shorthand, with an optional `/`
- *  Each may carry a fragment, so a link can name a place inside the app:
- *  `[Some report](app:pr-understanding#pr-1645)`. The entry point's query is
- *  dropped, because the engine's WIP-preview rewrite keeps only `thread_id`.
- *  A `?` AFTER the `#` is part of the fragment by URL syntax, not a query, and
- *  reaches the app whole. Rejected: any other sub-path, external URLs, mailto
- *  and lookalike schemes (`apple:`).
- *
- *  Entry points only, because `lucidos.data.list()` returns EVERY file under
- *  `data/`, so the artifact path list always contains `apps/<id>/index.html`.
- *  A permissive extractor would claim sub-files the user wants to preview.
- *
- *  `app:<id>` is accepted because LLMs invent it by analogy to the documented
- *  `thread:<UUID>` scheme, and no OS handler claims the unknown scheme.
- *
- *  Exported because `rewriteAppAnchor`, the chat click handler and the
- *  preview-iframe router all need it. */
 export function extractAppTargetFromHref(href: string): AppHrefTarget | null {
-  // Cut the fragment off first, so every id rule below reads the string it
-  // always read and the fragment survives one shared split. Everything after
-  // the FIRST `#` is the fragment, so a `?` in there is the app's to read.
   const hash = href.indexOf('#');
   const fragment = hash === -1 ? '' : href.slice(hash + 1);
   const appId = extractAppEntryPoint(hash === -1 ? href : href.slice(0, hash));
@@ -584,12 +317,7 @@ export function extractAppTargetFromHref(href: string): AppHrefTarget | null {
   return { appId, fragment: fragment.length === 0 ? null : fragment };
 }
 
-/** The id half of `extractAppTargetFromHref`, over an href whose fragment is
- *  already cut off. Still strips a query, so `app:todo?refresh=1` gives
- *  `todo`. */
 function extractAppEntryPoint(href: string): string | null {
-  // `app:<id>` custom-scheme branch. Match before the path-based normalization
-  // below so the leading-slash strip can't mangle it.
   if (href.startsWith('app:')) {
     const rest = href.slice('app:'.length);
     if (rest.length === 0) return null;
@@ -597,11 +325,11 @@ function extractAppEntryPoint(href: string): string | null {
     const trimmed = queryStart === -1 ? rest : rest.slice(0, queryStart);
     if (trimmed.length === 0) return null;
     const slash = trimmed.indexOf('/');
-    if (slash === -1) return trimmed;                   // `app:<id>`
+    if (slash === -1) return trimmed;
     const appId = trimmed.slice(0, slash);
     const afterSlash = trimmed.slice(slash + 1);
-    if (afterSlash.length === 0) return appId || null;  // `app:<id>/`
-    return null;                                        // `app:<id>/sub` → no meaning
+    if (afterSlash.length === 0) return appId || null;
+    return null;
   }
   let candidate = href;
   if (candidate.startsWith('/data/')) candidate = candidate.slice('/data/'.length);
@@ -614,58 +342,31 @@ function extractAppEntryPoint(href: string): string | null {
   const trimmed = queryStart === -1 ? rest : rest.slice(0, queryStart);
   if (trimmed.length === 0) return null;
   const slash = trimmed.indexOf('/');
-  if (slash === -1) return trimmed;                     // `apps/<id>`
+  if (slash === -1) return trimmed;
   const appId = trimmed.slice(0, slash);
   const afterSlash = trimmed.slice(slash + 1);
-  if (afterSlash.length === 0) return appId || null;    // `apps/<id>/`
-  if (afterSlash === 'index.html') return appId || null;// `apps/<id>/index.html`
-  return null;                                          // sub-file → artifact
+  if (afterSlash.length === 0) return appId || null;
+  if (afterSlash === 'index.html') return appId || null;
+  return null;
 }
 
-/** Extract a trigger id from a `trigger:<id>` href, meaning "show me THIS
- *  trigger" rather than "open the Triggers panel". A trailing `/` is accepted
- *  and a query or fragment stripped, mirroring the `app:<id>` branch above.
- *
- *  The scheme exists because a trigger is the one first-class thing the agent
- *  names in a reply that had no link form: a file has its path, an app has
- *  `app:<id>`, a thread has `thread:<ws>/<uuid>`, and a trigger had only the
- *  panel it lives in. So the agent linked the panel, and when told to link the
- *  trigger it invented exactly this href. Nothing claimed it, and an unclaimed
- *  scheme is handed to a browser that has no handler for it, so the click did
- *  nothing at all. See docs/plans/2026-08-24-a-trigger-is-a-link.md.
- *
- *  `triggers` (the panel) cannot collide: it carries no scheme, so it stays
- *  with `extractNavTargetFromHref`. Nor can `triggers/<slug>`, which is a
- *  workspace path the artifact rewriter owns.
- *
- *  Exported because the anchor rewriter, the chat click handler and the
- *  preview-iframe router all need it. */
 export function extractTriggerIdFromHref(href: string): string | null {
   if (!href.startsWith('trigger:')) return null;
   const rest = href.slice('trigger:'.length);
   const queryStart = rest.search(/[?#]/);
   const trimmed = queryStart === -1 ? rest : rest.slice(0, queryStart);
   const slash = trimmed.indexOf('/');
-  if (slash === -1) return trimmed || null;              // `trigger:<id>`
+  if (slash === -1) return trimmed || null;
   const id = trimmed.slice(0, slash);
-  // `trigger:<id>/` is the same destination; `trigger:<id>/sub` has no meaning.
   return trimmed.slice(slash + 1).length === 0 ? (id || null) : null;
 }
 
-/** A file in a registered repository clone, named by a `repo:` href. The
- *  locator's `repoId` is whatever the link wrote, an id or a repository name,
- *  so a caller resolves it against the registry before opening. */
 export type RepoFileHrefTarget = { locator: RepoLocator } & Partial<LineRef>;
 
-/** A GitHub-style line reference: `#L510`, `#L510-L520` or `#L510-520`. The
- *  only channel an href has for a line. */
 const LINE_FRAGMENT_RE = /#L(\d+)(?:-L?(\d+))?$/;
 
-/** A line citation the way prose writes one, ending a link's label:
- *  `main.rs:510`, `main.rs:510-520`, or with an en dash. */
 const LABEL_LINES_RE = /:(\d+)(?:\s*[-\u2013]\s*(\d+))?$/;
 
-/** The line, and optionally the last line, a link cites. */
 export interface LineRef {
   line: number;
   lineEnd?: number;
@@ -678,29 +379,18 @@ function lineRefFrom(match: RegExpExecArray | null): LineRef | null {
     : { line: Number(match[1]), lineEnd: Number(match[2]) };
 }
 
-/** The line reference ending an href, or null. */
 export function hrefLineRef(href: string): LineRef | null {
   return lineRefFrom(LINE_FRAGMENT_RE.exec(href));
 }
 
-/** The line citation ending a link's visible label, or null. The label is
- *  what the reader clicked, so a link that names lines only there still
- *  lands on them. */
 export function labelLineRef(label: string): LineRef | null {
   return lineRefFrom(LABEL_LINES_RE.exec(label.trim()));
 }
 
-/** Extract a `repo:<repo>:file:<path>` href (or `file#<ref>`, or `diff`),
- *  with an optional trailing line reference split off.
- *
- *  `parseRepoPath` stays the sole predicate for "is this a repo path", so a
- *  malformed encoding returns null and falls to the caller's scheme handling.
- *  The href is percent-decoded first, because markdown encodes a destination
- *  carrying spaces or non-ASCII characters. */
 export function extractRepoFileTargetFromHref(href: string): RepoFileHrefTarget | null {
   if (!href.startsWith('repo:')) return null;
   let decoded = href;
-  try { decoded = decodeURIComponent(href); } catch { /* malformed escape: parse the raw href */ }
+  try { decoded = decodeURIComponent(href); } catch {  }
   const lineMatch = LINE_FRAGMENT_RE.exec(decoded);
   const locator = parseRepoPath(lineMatch ? decoded.slice(0, lineMatch.index) : decoded);
   if (!locator) return null;
@@ -709,25 +399,7 @@ export function extractRepoFileTargetFromHref(href: string): RepoFileHrefTarget 
   return { locator, line: lines.line, lineEnd: lines.lineEnd };
 }
 
-/** Extract a BARE app reference from an href: a single path segment with no
- *  URL scheme and no sub-path, e.g. `habit-tracker` or `Habit Tracker`. The
- *  caller resolves the token against the known app ids and names.
- *
- *  The LLM writes `[Habit Tracker](habit-tracker)` by analogy to
- *  `[Notifications](notifications)`. That href matches none of the strict
- *  shapes. Left alone the browser resolves it against the base href to a
- *  non-existent route, and the SPA fallback reloads the whole workspace.
- *
- *  Returns null when the href carries a URL scheme, has a slash beyond an
- *  optional leading or trailing one, or is empty. A query or fragment is
- *  stripped.
- *
- *  The returned token is percent-DECODED. Markdown encodes a destination
- *  carrying spaces, so `Habit%20Tracker` has to decode back before it can
- *  match the app name. */
 export function extractBareAppRef(href: string): string | null {
-  // Any URL scheme disqualifies a bare ref. `app:<id>` is handled upstream by
-  // extractAppTargetFromHref; `http(s):`, `mailto:`, `tel:`, `file:` are real links.
   if (hasUrlScheme(href)) return null;
   let candidate = href;
   if (candidate.startsWith('/')) candidate = candidate.slice(1);
@@ -735,23 +407,10 @@ export function extractBareAppRef(href: string): string | null {
   if (queryStart !== -1) candidate = candidate.slice(0, queryStart);
   if (candidate.endsWith('/')) candidate = candidate.slice(0, -1);
   if (!candidate) return null;
-  if (candidate.includes('/')) return null; // sub-path → not a bare ref
-  // Decode so a percent-encoded app name (`Habit%20Tracker`) matches the raw
-  // name. A malformed escape throws: keep the raw token rather than dropping
-  // the ref.
+  if (candidate.includes('/')) return null;
   try { return decodeURIComponent(candidate); } catch { return candidate; }
 }
 
-/** Mirror of `rewriteArtifactAnchor` for apps. LLMs naturally write
- *  `[Name](apps/<id>/index.html)`, which renders as a plain relative anchor.
- *  Left alone the browser navigates to the file under the `/data/*` static
- *  mount, showing a file preview rather than the running app. An href whose
- *  `<id>` names no known app is rejected, so an unrelated `apps/...` URL is
- *  left alone.
- *
- *  `data-app-fragment` rides beside the id when the href named a place inside
- *  the app, and is absent otherwise. So the click handler can tell "no target"
- *  from "the empty target", and leaves an open app where the reader put it. */
 function rewriteAppAnchor(tag: string, appIds: Set<string>): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
@@ -769,9 +428,6 @@ function rewriteAppAnchor(tag: string, appIds: Set<string>): string | null {
   );
 }
 
-/** Drop the attributes an app-link rewrite replaces, the stale
- *  `data-app-fragment` included: one already on the incoming tag must not
- *  outlive the href it came from. */
 function stripAppLinkAttrs(tag: string): string {
   return tag
     .replace(HREF_ATTR, '')
@@ -780,19 +436,10 @@ function stripAppLinkAttrs(tag: string): string {
     .replace(DATA_APP_FRAGMENT_ATTR, '');
 }
 
-/** Escape a value for a double-quoted HTML attribute. It comes from an href
- *  the sanitizer already serialized, so `&` arrives encoded and the quote is
- *  the only delimiter left that could break out. */
 function escapeAttr(value: string): string {
   return value.replace(/"/g, '&quot;');
 }
 
-/** Mirror of `rewriteAppAnchor` for triggers. Unlike the app rewriter it does
- *  NOT check the id against a loaded list. `navigateToTrigger` re-fetches the
- *  registry on a cache miss before deciding a trigger is gone. Gating the
- *  rewrite on a cached projection is how a trigger created moments ago renders
- *  as a dead link. Same reasoning as `rewriteArtifactAnchor` resolving by
- *  shape. */
 function rewriteTriggerAnchor(tag: string): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
@@ -823,27 +470,18 @@ function rewriteTriggerAnchor(tag: string): string | null {
  *  `app:<id>` links carrying an id. */
 const BARE_APP_HREF = /^app:?\/?$/i;
 
-/** Plain-text content between an opening `<a>` tag at `openTagIndex` and its
- *  matching `</a>` in the alternating tag/text `segments`. Nested tags are
- *  skipped so `<a href="app"><strong>Site Publisher</strong></a>` still yields
- *  "Site Publisher". */
 function anchorText(segments: string[], openTagIndex: number): string {
   let text = '';
   for (let j = openTagIndex + 1; j < segments.length; j++) {
     if (j % 2 === 1) {
       if (segments[j].toLowerCase() === '</a>') break;
-      continue; // nested tag: skip it, keep gathering text
+      continue;
     }
     text += segments[j];
   }
   return text;
 }
 
-/** Last-resort app-anchor rewriter for bare `app` hrefs (see `BARE_APP_HREF`):
- *  resolve the app from the anchor's visible TEXT instead of its href, since the
- *  href carries no id. Runs only after the strict href-based rewriters decline,
- *  so a real `apps/<id>` / nav / artifact link is never hijacked. Returns null
- *  when the href isn't a bare-app shape or the text names no known app. */
 function rewriteBareAppAnchorByText(
   tag: string,
   linkText: string,
@@ -859,12 +497,6 @@ function rewriteBareAppAnchorByText(
   return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapeAttr(id)}"`);
 }
 
-/** Rewrite a bare app-id/name href (see `extractBareAppRef`) to an app-link.
- *  `appTextToId` maps both forms to the id, so `habit-tracker` and
- *  `Habit Tracker` both resolve. Runs AFTER the strict `apps/<id>`, nav and
- *  artifact rewriters, so a reserved nav panel or a real artifact path always
- *  wins. This only claims an href none of them wanted, and returns null when
- *  the href is not a bare ref, or names no known app. */
 function rewriteAppAnchorByBareRef(tag: string, appTextToId: Map<string, string>): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
@@ -878,11 +510,7 @@ function rewriteAppAnchorByBareRef(tag: string, appTextToId: Map<string, string>
   return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapeAttr(id)}"`);
 }
 
-/** The lookups linkify needs for a given (paths, apps) set. They do not depend
- *  on the html, so they are built once per (paths, apps) and reused across
- *  every block in a render (see `getCompiled`). */
 interface CompiledLinkify {
-  /** Every key of `pathLookup`, in code-unit order for `longestKeyAt`. */
   sortedPathKeys: string[];
   pathLookup: Map<string, string> | undefined;
   appTextToId: Map<string, string> | undefined;
@@ -894,10 +522,6 @@ function buildCompiled(
   apps: { name: string; id: string }[],
 ): CompiledLinkify {
   let sortedPathKeys: string[] = [];
-  // Keyed by every form a path may appear in: the full path, and the bare form
-  // with the `artifacts/` prefix stripped, since LLMs sometimes write those.
-  // Values are always the full store path, so both the text-segment linkifier
-  // and the anchor rewriter hand the click handler a canonical path.
   let pathLookup: Map<string, string> | undefined;
   if (paths.length > 0) {
     pathLookup = new Map();
@@ -907,14 +531,9 @@ function buildCompiled(
         pathLookup.set(p.slice('artifacts/'.length), p);
       }
     }
-    // An empty key would match everywhere and advance nothing.
     sortedPathKeys = [...pathLookup.keys()].filter((key) => key.length > 0).sort();
   }
 
-  // Map each app name AND id to its id so the anchor rewriters can resolve a
-  // deliberate `[X](app:x)` / `[X](habit-tracker)` link the LLM wrote. An app
-  // named in prose is NOT auto-linked: a blind `\b(name)\b` match linkifies
-  // every mention of a generically-named app.
   let appTextToId: Map<string, string> | undefined;
   let appIds: Set<string> | undefined;
   if (apps.length > 0) {
@@ -929,11 +548,6 @@ function buildCompiled(
   return { sortedPathKeys, pathLookup, appTextToId, appIds };
 }
 
-// Build the matchers ONCE per (paths, apps) set instead of once per call. Every
-// exchange in a render passes the SAME array references. So a 1-entry
-// by-reference memo hits for every call after the first, and across renders
-// until the artifact or app list changes. `generation` bumps on each rebuild
-// and folds into the output-cache key below, so a list change invalidates it.
 let cachedPaths: string[] | null = null;
 let cachedApps: { name: string; id: string }[] | null = null;
 let cachedCompiled: CompiledLinkify | null = null;
@@ -948,15 +562,9 @@ function getCompiled(paths: string[], apps: { name: string; id: string }[]): Com
   return cachedCompiled;
 }
 
-// Output LRU cache, mirroring renderMarkdown's. linkify output is a pure
-// function of (html, paths, apps), keyed on `${generation}\0${html}` so a
-// (paths, apps) change invalidates it. A re-render busts the per-exchange memo
-// in ChatExchange and re-linkifies every block, which the O(1) hit keeps cheap.
 const LINKIFY_CACHE_MAX = 400;
 const linkifyCache = new Map<string, string>();
 
-/** Test-only: clear the output cache + compiled memo so module-level state can't
- *  leak between tests. Not part of the runtime surface. */
 export function _resetLinkifyCacheForTesting(): void {
   linkifyCache.clear();
   cachedPaths = null;
@@ -965,12 +573,6 @@ export function _resetLinkifyCacheForTesting(): void {
   generation = 0;
 }
 
-/** Post-process rendered HTML to linkify artifact paths and bare URLs, and to
- *  rewrite deliberate app / nav / artifact anchors. Pure in (html, paths,
- *  apps), and LRU-cached so a re-render with unchanged content is O(1).
- *  `opts.cache: false` opts out, for the live streaming buffer whose html
- *  changes every token. try/finally records elapsed linkify time for the perf
- *  phase split (utils/renderPhaseTimers.ts). */
 export function linkifyPaths(
   html: string,
   paths: string[],
@@ -980,14 +582,11 @@ export function linkifyPaths(
   const start = performance.now();
   try {
     const useCache = opts?.cache !== false;
-    // Build or reuse the patterns first: this may bump `generation`, which the
-    // cache key below has to reflect.
     const compiled = getCompiled(paths, apps);
     const key = useCache ? `${generation}\0${html}` : '';
     if (useCache) {
       const hit = linkifyCache.get(key);
       if (hit !== undefined) {
-        // LRU touch: move to most-recently-used.
         linkifyCache.delete(key);
         linkifyCache.set(key, hit);
         return hit;
@@ -997,7 +596,6 @@ export function linkifyPaths(
     if (useCache) {
       linkifyCache.set(key, out);
       if (linkifyCache.size > LINKIFY_CACHE_MAX) {
-        // Evict the least-recently-used (first key in insertion order).
         const oldest = linkifyCache.keys().next().value;
         if (oldest !== undefined) linkifyCache.delete(oldest);
       }
@@ -1010,25 +608,9 @@ export function linkifyPaths(
 
 const TAG_SPLIT = /(<[^>]+>)/;
 
-/** Stands in for a stashed attribute value. A private-use character, so the
- *  serializer writes it through untouched and no linkifier pattern matches it. */
 const STASH_MARK = '\uE000';
 const STASH_REF = new RegExp(`${STASH_MARK}(\\d+)${STASH_MARK}`, 'g');
 
-/** Rendered HTML as alternating text and tag segments, or null when it cannot
- *  be split safely.
- *
- *  The split reads a tag as `<` up to the next `>`. The serializer writes `>`
- *  raw inside an attribute value, where it ends the tag early. The URL
- *  linkifier then splices an anchor into the value. Its quote closes the value,
- *  and the rest parses as attribute names, such as a live `onmouseover`.
- *
- *  Text never holds a raw `<`, so the first cut always starts at a real tag,
- *  and that segment ends inside an open value. Spotting one proves a cut. Only
- *  such markup pays for a parse.
- *
- *  Null means linkify must return the markup untouched. That markup is already
- *  sanitized, so declining costs links, never safety. */
 function splitTags(html: string): string[] | null {
   const segments = html.split(TAG_SPLIT);
   if (!segments.some(isCutTag)) return segments;
@@ -1042,9 +624,6 @@ function isCutTag(segment: string, index: number): boolean {
   return index % 2 === 1 && endsInsideValue(segment);
 }
 
-/** Does this tag end inside an attribute value? A quote opens a value only
- *  right after `=`, and only the same quote closes it. One pass per segment,
- *  so the whole check stays linear in the markup. */
 function endsInsideValue(tag: string): boolean {
   let open: string | null = null;
   let previous = '';
@@ -1059,13 +638,8 @@ function endsInsideValue(tag: string): boolean {
   return open !== null;
 }
 
-/** Its own inert body, never `renderMarkdown`'s: a shared node would let either
- *  pass read markup the other left behind. */
 let attributeBody: HTMLElement | null | undefined;
 
-/** `html` reserialized with every `<` and `>` inside an attribute value written
- *  as an entity. The browser serializes the tree, and only values holding a
- *  bracket are swapped for a stash mark and put back escaped. */
 function withAttributeBracketsEscaped(html: string): string | null {
   if (html.includes(STASH_MARK)) return null;
   if (attributeBody === undefined) attributeBody = makeInertBody();
@@ -1092,8 +666,6 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
   const segments = splitTags(html);
   if (!segments) return html;
 
-  // Track tag nesting to skip content inside <a> (prevents nested anchors)
-  // and <code> (code content should not be linkified).
   let insideAnchor = 0;
   let insideCode = 0;
 
@@ -1102,41 +674,14 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
       const tag = segments[i].toLowerCase();
       if (tag.startsWith('<a ') || tag === '<a>') {
         insideAnchor++;
-        // Rewriter order: app, then trigger, then nav, then artifact.
-        //
-        // App MUST run before artifact. The artifact rewriter resolves by
-        // SHAPE, so it claims `apps/<id>/index.html` whether or not the path
-        // list is loaded. Only the strict app rewriter running first keeps an
-        // app entry point opening the app rather than a file preview. App
-        // stays strict, so a sub-file like `apps/<id>/scripts/run.sh` falls
-        // through to the artifact rewriter.
-        //
-        // Trigger sits next to app because it is the other scheme-based entity
-        // link. It claims `trigger:` and nothing else, so it can collide with
-        // no neighbour: the `triggers` panel carries no scheme and a
-        // `triggers/<slug>` path is the artifact rewriter's.
-        //
-        // Nav matches only bare panel names with an optional `data/` prefix
-        // and no slash beyond it, so it cannot collide with either neighbour.
-        // Its position between them is for narrative clarity.
         let rewritten: string | null = null;
         if (appIds) rewritten = rewriteAppAnchor(segments[i], appIds);
         if (!rewritten) rewritten = rewriteTriggerAnchor(segments[i]);
         if (!rewritten) rewritten = rewriteNavAnchor(segments[i]);
-        // Unconditional, NOT gated on `pathLookup`: the rewriter also resolves
-        // a data path by shape, which is what a workspace with an empty or
-        // not-yet-loaded artifact list needs.
         if (!rewritten) rewritten = rewriteArtifactAnchor(segments[i], pathLookup);
-        // A bare app-id/name href the strict rewriters and nav declined,
-        // resolved from the HREF against the known app ids and names. Without
-        // this the browser navigates to the relative href and the SPA fallback
-        // reloads the whole workspace.
         if (!rewritten && appTextToId) {
           rewritten = rewriteAppAnchorByBareRef(segments[i], appTextToId);
         }
-        // Last resort: a bare `app` href with no id, resolved from the
-        // anchor's visible text. Covers `[Site Publisher](app)`, which would
-        // otherwise dead-end at `/<slug>/app`.
         if (!rewritten && appTextToId) {
           rewritten = rewriteBareAppAnchorByText(segments[i], anchorText(segments, i), appTextToId);
         }
@@ -1148,17 +693,8 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
       continue;
     }
 
-    // Artifact paths are linkified even inside <code>, since LLMs wrap paths
-    // in backticks. URLs are skipped inside <code>, to avoid mangling code
-    // content. App names are not scanned in text at all.
 
     if (insideAnchor === 0) {
-      // Two matchers, one precedence pass. The cached list runs first because it
-      // also CANONICALIZES, mapping a bare `foo.md` back to `artifacts/foo.md`,
-      // which shape alone cannot do. The shape matcher then claims a full path
-      // the list does not know. One shared `resolveMatches` is what lets a
-      // longer shape span beat a shorter cached one at the same start, e.g.
-      // `artifacts/notes.md.bak` over a cached `artifacts/notes.md`.
       const candidates: Match[] = [];
       if (sortedPathKeys.length > 0) {
         collectKnownPathMatches(segments[i], sortedPathKeys, (m) => artifactLink(m, pathLookup!.get(m)!), candidates);

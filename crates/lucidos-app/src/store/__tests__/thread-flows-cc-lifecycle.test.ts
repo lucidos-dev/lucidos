@@ -6,7 +6,6 @@ beforeEach(resetSeqCounter);
 
 describe('CC thread follow-up: channel detection', () => {
   it('thread with channel=claude_code is detected for CC mode inheritance', () => {
-    // Simulate: CC thread exists with channel='claude_code'
     const map = new Map<string, ThreadState>();
     const ccThread: ThreadState = {
       meta: {
@@ -41,12 +40,9 @@ describe('CC thread follow-up: channel detection', () => {
     };
     map.set('cc-1', ccThread);
 
-    // The frontend's sendMessage checks existingThread?.meta.channel === 'claude_code'
-    // to decide whether to set use_coding_agent: true on follow-up messages
     const existingThread = map.get('cc-1');
     expect(existingThread?.meta.channel).toBe('claude_code');
 
-    // Regular chat thread should NOT trigger CC mode
     const chatThread: ThreadState = {
       meta: {
         id: 'chat-1',
@@ -83,43 +79,31 @@ describe('CC thread follow-up: channel detection', () => {
   });
 
   it('SessionStarted event sets thread channel to claude_code', () => {
-    // Verify the SSE handler sets source correctly when CC starts
     const { map, id } = makeThread();
     const thread = map.get(id)!;
-    expect(thread.meta.channel).toBe('chat'); // initially chat
+    expect(thread.meta.channel).toBe('chat');
 
-    // After SessionStarted, source should be 'claude_code'
-    // (handled by handleThreadEvent in thread-sync.ts)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
       { type: 'SessionStarted', session_id: 's1' },
     ]);
-    // thread-sync.ts sets meta.channel on SessionStarted — verify the thread
-    // recognizes this as a CC thread for future follow-ups
     const exchanges = groupIntoExchanges(map.get(id)!.events);
     expect(exchanges[0].steps.some(s => s.event.type === 'SessionStarted')).toBe(true);
   });
 
   it('follow-up to running CC thread must route via CC channel, not /api/v1/chat/stream', () => {
-    // Regression: sending a follow-up via /api/v1/chat/stream calls register_thread()
-    // which cancels the old token, killing the active Claude Code session.
-    // The frontend should detect running CC threads and route via CC message channel.
     const { map, id } = makeThread();
 
-    // Simulate a CC thread that's actively running (tools being called)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
       { type: 'SessionStarted', session_id: 's1' },
       { type: 'CodingAgentToolCalled', name: 'Grep', args: { pattern: 'foo' } },
     ]);
-    // SessionStarted sets source via thread-sync.ts — simulate that
     map.get(id)!.meta.channel = 'claude_code';
 
-    // Thread status should be 'running' — CC is actively processing (live process)
     const status = map.get(id)!.meta.status;
     expect(status).toBe('running');
 
-    // The frontend routing logic: CC thread + running status → use CC channel
     const thread = map.get(id)!;
     const isCCThread = thread.meta.channel === 'claude_code';
     const hasLiveCCSession = isCCThread && (status === 'running' || status === 'waiting');
@@ -129,7 +113,6 @@ describe('CC thread follow-up: channel detection', () => {
   it('follow-up to ended CC thread spawns new Claude Code session via /api/v1/chat/stream', () => {
     const { map, id } = makeThread();
 
-    // Claude Code session that has ended
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
       { type: 'SessionStarted', session_id: 's1' },
@@ -142,7 +125,6 @@ describe('CC thread follow-up: channel detection', () => {
     const status = map.get(id)!.meta.status;
     expect(status).toBe('idle');
 
-    // Ended CC thread: spawns a new session via /api/v1/chat/stream, not the CC channel
     const thread = map.get(id)!;
     const isCCThread = thread.meta.channel === 'claude_code';
     const hasLiveCCSession = isCCThread && (status === 'running' || status === 'waiting');
@@ -150,12 +132,6 @@ describe('CC thread follow-up: channel detection', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// No duplicate events — each event type should appear at most once per action
-// ---------------------------------------------------------------------------
-// MUST TEST: EventBus migration integration tests
-// These test flows that were migrated from old Event to ThreadEvent via bus.
-// ---------------------------------------------------------------------------
 
 describe('MUST TEST 1: CC change proposal → apply/discard', () => {
   it('ChangeProposed appears as step in exchange with done status', () => {
@@ -174,7 +150,6 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
     expect(exchanges).toHaveLength(1);
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
 
-    // ChangeProposed should be in the exchange steps
     const allEvents = [...map.get(id)!.events.values()];
     const changeProposed = allEvents.find(e => e.type === 'ChangeProposed');
     expect(changeProposed).toBeDefined();
@@ -183,10 +158,6 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
   });
 
   it('ChangeProposed must come before SessionEnded, and the change stays pending until resolved', () => {
-    // Regression: backend emitted SessionEnded before ChangeProposed, causing
-    // the exchange to stay stuck instead of transitioning to done.
-    // After fix, ChangeProposed always precedes SessionEnded.
-    // Thread status is 'waiting' because the change hasn't been applied/discarded yet.
     const { map, id } = makeThread();
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'refactor the code' },
@@ -196,18 +167,15 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
       { type: 'CodingAgentTextStreamed', text: 'Done.' },
       { type: 'ResponseGenerated', text: 'Done.', images: [] },
       { type: 'CodingAgentIdled', has_changes: true },
-      // Correct order: ChangeProposed THEN SessionEnded
       { type: 'ChangeProposed', change_id: 'c-1', description: 'Refactor', files: ['src/main.rs'], requires_restart: false },
       { type: 'SessionEnded' },
     ]);
 
-    // Status is idle; the pending change shows through codingAgentChangeState
     const status = map.get(id)!.meta.status;
     expect(status).toBe('idle');
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // Exchange itself is 'done' (session completed), and the change still awaits resolution
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
   });
 
@@ -223,7 +191,6 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
       { type: 'SessionEnded' },
     ]);
 
-    // Thread status should be idle (SessionEnded is completion)
     expect(map.get(id)!.meta.status).toBe('idle');
 
     const allEvents = [...map.get(id)!.events.values()];
@@ -263,7 +230,6 @@ describe('MUST TEST 2: CC cancel mid-work', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: original CC reply (status canceled), 2: ResponseCanceled boundary panel
     expect(exchanges).toHaveLength(2);
     expect(exchangeStatus(exchanges[0], '', false)).toBe('canceled');
     expect(exchanges[1].userEvent.type).toBe('ResponseCanceled');
@@ -281,11 +247,9 @@ describe('MUST TEST 2: CC cancel mid-work', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: original CC reply (status canceled), 2: ResponseCanceled boundary panel
     expect(exchanges).toHaveLength(2);
     expect(exchangeStatus(exchanges[0], '', false)).toBe('canceled');
     expect(exchanges[1].userEvent.type).toBe('ResponseCanceled');
-    // Response text comes from CodingAgentTextStreamed, not ResponseCanceled
     expect(exchangeResponseText(exchanges[0])).toBe('Starting to work... Almost done.');
   });
 });
@@ -294,14 +258,12 @@ describe('MUST TEST 3: CC follow-up after idle', () => {
   it('follow-up in same thread creates second exchange, first becomes done', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
-      // First exchange: CC works and idles
       { type: 'MessageReceived', text: 'fix the tests' },
       { type: 'SessionStarted', session_id: 'claude-code/20260315' },
       { type: 'CodingAgentToolCalled', name: 'Read', args: {} },
       { type: 'CodingAgentToolResult', name: 'Read', result: 'test code' },
       { type: 'CodingAgentTextStreamed', text: 'Tests fixed.' },
       { type: 'CodingAgentIdled', has_changes: true },
-      // Second exchange: user sends follow-up
       { type: 'MessageReceived', text: 'also fix the linting errors' },
       { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'npm run lint' } },
       { type: 'CodingAgentToolResult', name: 'Bash', result: '0 errors' },
@@ -311,11 +273,8 @@ describe('MUST TEST 3: CC follow-up after idle', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // oldest first
-    // First exchange completed (follow-up from idle = done, not interrupted)
     expect(exchangeUserMessage(exchanges[0])).toBe('fix the tests');
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
-    // Newest exchange (follow-up) is last
     expect(exchangeUserMessage(exchanges[1])).toBe('also fix the linting errors');
     expect(exchangeStatus(exchanges[1], '', true)).toBe('done');
   });
@@ -334,79 +293,57 @@ describe('MUST TEST 3: CC follow-up after idle', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // CodingAgentTextStreamed contributes to response text, not steps
-    // oldest first
     expect(exchangeResponseText(exchanges[0])).toBe('Done first.');
     expect(exchangeResponseText(exchanges[1])).toBe('Done second.');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flow: CC follow-up interrupted by stop button
-// ---------------------------------------------------------------------------
-// When the user sends a follow-up to an idle Claude Code session and then hits stop:
-//   1. CC was idle (CodingAgentIdled) → user sends follow-up (MessageReceived)
-//   2. CC starts working → user hits stop → interrupt sent
-//   3. Backend emits ResponseCanceled (not ResponseGenerated) then CodingAgentIdled
-// Result: the follow-up exchange shows "Canceled", and the thread settles at idle
-// because CC is still alive at a turn boundary (CodingAgentIdled is the last event).
 describe('Flow: CC follow-up stopped by user', () => {
   it('interrupted follow-up exchange shows "Canceled", thread settles at idle', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
-      // First exchange: CC completes work and goes idle
       { type: 'MessageReceived', text: 'Fix the bug', created: '2026-01-01T00:00:00Z' },
       { type: 'SessionStarted', session_id: 'claude-code/test', created: '2026-01-01T00:00:01Z' },
       { type: 'CodingAgentToolCalled', name: 'Read', args: {}, created: '2026-01-01T00:00:02Z' },
       { type: 'CodingAgentTextStreamed', text: 'Fixed.', created: '2026-01-01T00:00:03Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:04Z' },
       { type: 'CodingAgentIdled', has_changes: true, created: '2026-01-01T00:00:05Z' },
-      // Second exchange: user sends follow-up, then hits stop
       { type: 'MessageReceived', text: 'Also fix tests', created: '2026-01-01T00:01:00Z' },
       { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'npm test' }, created: '2026-01-01T00:01:01Z' },
-      // User hits stop → backend emits ResponseCanceled then CodingAgentIdled
       { type: 'ResponseCanceled', created: '2026-01-01T00:01:02Z' },
       { type: 'CodingAgentIdled', has_changes: true, created: '2026-01-01T00:01:03Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: first reply (done), 2: follow-up (canceled), 3: cancel boundary panel
     expect(exchanges).toHaveLength(3);
 
-    // First exchange: completed normally → "Done"
     expect(exchangeUserMessage(exchanges[0])).toBe('Fix the bug');
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
 
-    // Second exchange (follow-up): user hit stop → "Canceled"
     expect(exchangeUserMessage(exchanges[1])).toBe('Also fix tests');
     expect(exchangeStatus(exchanges[1], '', false)).toBe('canceled');
     expect(getLabel(exchanges[1], '', false)).toBe('Canceled');
 
-    // Third exchange: ResponseCanceled boundary panel — 'Response canceled'
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
 
-    // Thread: idle at the turn boundary (last event is CodingAgentIdled)
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 
   it('interrupted follow-up with no work started also shows "Canceled"', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
-      // CC completes and goes idle
       { type: 'MessageReceived', text: 'Build feature', created: '2026-01-01T00:00:00Z' },
       { type: 'SessionStarted', session_id: 'claude-code/test', created: '2026-01-01T00:00:01Z' },
       { type: 'CodingAgentTextStreamed', text: 'Done.', created: '2026-01-01T00:00:02Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:03Z' },
       { type: 'CodingAgentIdled', created: '2026-01-01T00:00:04Z' },
-      // User sends follow-up and immediately hits stop (CC hadn't started working yet)
       { type: 'MessageReceived', text: 'Never mind', created: '2026-01-01T00:01:00Z' },
       { type: 'ResponseCanceled', created: '2026-01-01T00:01:01Z' },
       { type: 'CodingAgentIdled', created: '2026-01-01T00:01:02Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: first reply (done), 2: follow-up (canceled), 3: cancel boundary panel
     expect(exchanges).toHaveLength(3);
     expect(exchangeStatus(exchanges[1], '', false)).toBe('canceled');
     expect(getLabel(exchanges[1], '', false)).toBe('Canceled');
@@ -444,7 +381,6 @@ describe('MUST TEST 4: Scheduled triggers', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
-    // Steps use human-readable description derived from tool name + args
     expect(exchangeSteps(exchanges[0]).some((s: any) => s.description === 'Notify: Report')).toBe(true);
   });
 });
@@ -483,13 +419,10 @@ describe('MUST TEST 5: Recovery sessions', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: recovery exchange, 2: ChangeApplied initiator panel
     expect(exchanges).toHaveLength(2);
     expect(exchanges[1].userEvent.type).toBe('ChangeApplied');
-    // Thread status is idle because SessionEnded is a completion event
     expect(map.get(id)!.meta.status).toBe('idle');
 
-    // No duplicate events
     const allEvents = [...map.get(id)!.events.values()];
     const msgEvents = allEvents.filter(e => e.type === 'MessageReceived');
     expect(msgEvents).toHaveLength(1);
@@ -503,26 +436,20 @@ describe('MUST TEST 5: Recovery sessions', () => {
       { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'git diff' } },
       { type: 'CodingAgentToolResult', name: 'Bash', result: '' },
       { type: 'CodingAgentTextStreamed', text: 'Nothing to clean up.' },
-      // Recovery with no changes auto-ends (cancel.notify_one())
       { type: 'CodingAgentIdled' },
       { type: 'SessionEnded' },
     ]);
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // Thread status is idle (SessionEnded is a completion event)
     expect(map.get(id)!.meta.status).toBe('idle');
     expect(exchangeResponseText(exchanges[0])).toBe('Nothing to clean up.');
   });
 });
 
-// ---------------------------------------------------------------------------
-// CC message should produce ONE thread, not a stub + spawned thread
-// ---------------------------------------------------------------------------
 describe('CC single thread (no duplicate spawn)', () => {
   it('CC message produces one exchange in one thread, not a redirect stub', () => {
     const { map, id } = makeThread();
-    // The correct flow: MessageReceived + SessionStarted + CC work + idle, all in one thread
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'what time is it?' },
       { type: 'SessionStarted', session_id: 'claude-code/20260315' },
@@ -537,7 +464,6 @@ describe('CC single thread (no duplicate spawn)', () => {
     expect(exchangeUserMessage(exchanges[0])).toBe('what time is it?');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
 
-    // Must NOT have a "I've started a new Claude Code thread" redirect response
     const allEvents = [...map.get(id)!.events.values()];
     const responseEvents = allEvents.filter(e => e.type === 'ResponseGenerated');
     const hasRedirect = responseEvents.some(e =>
@@ -547,11 +473,9 @@ describe('CC single thread (no duplicate spawn)', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
 describe('No duplicate events', () => {
   it('Claude Code session has exactly one MessageReceived (no dual-persist)', () => {
     const { map, id } = makeThread();
-    // Simulate a Claude Code session — each event arrives with a unique seq (from DB via bus)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
       { type: 'SessionStarted', session_id: 's1' },
@@ -564,23 +488,18 @@ describe('No duplicate events', () => {
     const thread = map.get(id)!;
     const allEvents = [...thread.events.values()];
 
-    // Exactly one MessageReceived
     const msgEvents = allEvents.filter(e => e.type === 'MessageReceived');
     expect(msgEvents).toHaveLength(1);
 
-    // Exactly one SessionStarted
     const sessionEvents = allEvents.filter(e => e.type === 'SessionStarted');
     expect(sessionEvents).toHaveLength(1);
 
-    // Exactly one CodingAgentIdled
     const idleEvents = allEvents.filter(e => e.type === 'CodingAgentIdled');
     expect(idleEvents).toHaveLength(1);
 
-    // Exactly one ToolCalled
     const toolEvents = allEvents.filter(e => e.type === 'CodingAgentToolCalled');
     expect(toolEvents).toHaveLength(1);
 
-    // Exactly one ToolResult
     const resultEvents = allEvents.filter(e => e.type === 'CodingAgentToolResult');
     expect(resultEvents).toHaveLength(1);
   });
@@ -613,13 +532,11 @@ describe('No duplicate events', () => {
     const exchanges = groupIntoExchanges(map.get(id)!.events);
     expect(exchanges).toHaveLength(1);
 
-    // No duplicate events of any type
     const allEvents = [...map.get(id)!.events.values()];
     const typeCounts = new Map<string, number>();
     for (const e of allEvents) {
       typeCounts.set(e.type, (typeCounts.get(e.type) || 0) + 1);
     }
-    // Each event type should appear exactly once (except TextStreamed which can have multiple chunks)
     for (const [type, count] of typeCounts) {
       if (type !== 'CodingAgentTextStreamed' && type !== 'TextStreamed') {
         expect(count).toBe(1);
@@ -628,9 +545,6 @@ describe('No duplicate events', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flow: Image rendering
-// ---------------------------------------------------------------------------
 describe('Flow: Image rendering', () => {
   it('extracts user image hashes from MessageReceived event', () => {
     const { map, id } = makeThread();
@@ -666,13 +580,9 @@ describe('Flow: Image rendering', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Bug: CC follow-up images not rendered
-// ---------------------------------------------------------------------------
 describe('Bug: CC follow-up images not rendered', () => {
   it('pending CC follow-up includes images in synthetic exchange', () => {
     const { map, id } = makeThread();
-    // Initial Claude Code session events
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix the bug' },
       { type: 'SessionStarted', session_id: 's1' },
@@ -680,7 +590,6 @@ describe('Bug: CC follow-up images not rendered', () => {
       { type: 'CodingAgentIdled' },
     ]);
 
-    // Simulate pending follow-up WITH image hashes (the wire shape post Phase 3b)
     const pendingHashes = ['sha256-of-img1', 'sha256-of-img2'];
     map.get(id)!.pendingUserMessages.push({
       text: 'here is the screenshot',
@@ -689,7 +598,6 @@ describe('Bug: CC follow-up images not rendered', () => {
       image_hashes: pendingHashes,
     });
 
-    // Verify hashes are stored in the pending message data structure
     const pending = map.get(id)!.pendingUserMessages[0];
     expect(pending.image_hashes).toHaveLength(2);
     expect(pending.image_hashes![0]).toBe('sha256-of-img1');
@@ -702,7 +610,6 @@ describe('Bug: CC follow-up images not rendered', () => {
       { type: 'SessionStarted', session_id: 's1' },
       { type: 'CodingAgentTextStreamed', text: 'Done.' },
       { type: 'CodingAgentIdled' },
-      // Follow-up with image hashes (post-Phase-3b event payload shape)
       {
         type: 'MessageReceived',
         text: 'here is the screenshot',
@@ -711,13 +618,8 @@ describe('Bug: CC follow-up images not rendered', () => {
     ]);
 
     const exchanges = groupIntoExchanges(map.get(id)!.events);
-    // The follow-up should be a separate exchange
     const followUp = exchanges[exchanges.length - 1];
     const hashes = exchangeUserImageHashes(followUp);
     expect(hashes).toEqual(['sha256-of-img1']);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Timestamps
-// ---------------------------------------------------------------------------

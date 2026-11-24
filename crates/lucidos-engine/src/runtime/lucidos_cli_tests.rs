@@ -10,65 +10,6 @@ fn write_lucidos_cli_skill_writes_file() {
     assert!(content.starts_with("---"));
 }
 
-/// The two shipped docs that teach `lucidos await-event` to a coding agent:
-/// the skill the engine embeds and writes into every CC worktree, and the
-/// knowhow the workspace LLM loads. Read from the repo so the guards below
-/// cover the source a reader actually edits.
-fn cli_docs() -> [(&'static str, String); 2] {
-    let knowhow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../system-knowhow/lucidos-cli.md");
-    [
-        (
-            ".claude/skills/lucidos-cli/SKILL.md",
-            LUCIDOS_CLI_SKILL.to_string(),
-        ),
-        (
-            "system-knowhow/lucidos-cli.md",
-            std::fs::read_to_string(&knowhow)
-                .unwrap_or_else(|e| panic!("cannot read {}: {e}", knowhow.display())),
-        ),
-    ]
-}
-
-/// A `--relation child` spawn already re-opens the calling thread with the
-/// child's result. So a wait on that completion is a duplicate wake, plus a
-/// second clock that can expire for nothing. The skill shipped an example
-/// pairing the two, and an agent followed it and subscribed twice. The guard
-/// is per fenced block rather than per file: both docs discuss both commands
-/// in prose, and it is the recipe that misleads.
-#[test]
-fn no_cli_doc_recipe_awaits_its_own_child() {
-    for (name, doc) in cli_docs() {
-        for (i, block) in doc.split("```").skip(1).step_by(2).enumerate() {
-            assert!(
-                !(block.contains("--relation child") && block.contains("await-event")),
-                "{name} code block {i} spawns a child and then awaits its completion. \
-                 The child's own callback already re-opens this thread, so the wait \
-                 buys nothing and adds a clock that expires for nothing.\n{block}"
-            );
-        }
-    }
-}
-
-/// The exclusion above reads as redundancy only when the doc also shows the
-/// shapes that ARE legitimate. Otherwise it reads as "a cross-thread wait
-/// might not fire". Both shapes carry a condition, because an unconditioned
-/// `ChildThreadCompleted` matches workspace-wide and would catch your own.
-/// The idle needle opens the JSON brace on purpose: a bare `thread_id` is a
-/// substring of `child_thread_id`, so it would pass on the first shape alone.
-#[test]
-fn cli_docs_name_the_two_legitimate_completion_waits() {
-    for (name, doc) in cli_docs() {
-        for needle in ["\"child_thread_id\"", "CodingAgentIdled", "{\"thread_id\""] {
-            assert!(
-                doc.contains(needle),
-                "{name} must keep naming how to await a completion that is not your \
-                 own child's (missing: {needle:?})"
-            );
-        }
-    }
-}
-
 #[test]
 fn find_lucidos_cli_dir_returns_none_when_no_binary() {
     let tmp = tempfile::tempdir().unwrap();
@@ -175,7 +116,7 @@ fn ensure_workspace_bin_symlink_replaces_stale_target() {
 #[test]
 fn workspace_script_env_vars_always_sets_lucidos_workspace() {
     let ws = tempfile::tempdir().unwrap();
-    let vars = workspace_script_env_vars(ws.path(), None, None);
+    let vars = workspace_script_env_vars(ws.path(), None, None, None);
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
     assert_eq!(
         map.get("LUCIDOS_WORKSPACE").map(String::as_str),
@@ -188,7 +129,7 @@ fn workspace_script_env_vars_always_sets_lucidos_workspace() {
 #[test]
 fn workspace_script_env_vars_skips_path_when_cli_and_pg_unavailable() {
     let ws = tempfile::tempdir().unwrap();
-    let vars = workspace_script_env_vars(ws.path(), None, None);
+    let vars = workspace_script_env_vars(ws.path(), None, None, None);
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
     assert!(
         !map.contains_key("PATH"),
@@ -204,7 +145,7 @@ fn workspace_script_env_vars_prepends_bin_dir_to_path() {
     let cli = tempfile::tempdir().unwrap();
     std::fs::write(cli.path().join(LUCIDOS_BIN_NAME), b"").unwrap();
 
-    let vars = workspace_script_env_vars(ws.path(), Some(cli.path()), None);
+    let vars = workspace_script_env_vars(ws.path(), Some(cli.path()), None, None);
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
 
     let path = map
@@ -219,13 +160,31 @@ fn workspace_script_env_vars_prepends_bin_dir_to_path() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn workspace_script_env_vars_puts_the_ps_shim_after_the_cli_bin_dir() {
+    let ws = tempfile::tempdir().unwrap();
+    let cli = tempfile::tempdir().unwrap();
+    let shim = tempfile::tempdir().unwrap();
+    std::fs::write(cli.path().join(LUCIDOS_BIN_NAME), b"").unwrap();
+
+    let vars = workspace_script_env_vars(ws.path(), Some(cli.path()), Some(shim.path()), None);
+    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+
+    let dirs: Vec<_> = std::env::split_paths(&map["PATH"]).take(2).collect();
+    assert_eq!(
+        dirs,
+        vec![ws.path().join(".lucidos/bin"), shim.path().to_path_buf()]
+    );
+}
+
 #[test]
 fn workspace_script_env_vars_prepends_pg_bin_dir_for_bare_psql() {
     // Packaged builds: psql lives at LUCIDOS_PG_BIN_DIR, not on the launchd PATH.
     // The dir must be prepended so `psql "$LUCIDOS_DATABASE_URL"` resolves.
     let ws = tempfile::tempdir().unwrap();
     let pg = tempfile::tempdir().unwrap();
-    let vars = workspace_script_env_vars(ws.path(), None, Some(pg.path()));
+    let vars = workspace_script_env_vars(ws.path(), None, None, Some(pg.path()));
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
     let path = map.get("PATH").expect("PATH must be set when PG dir given");
     assert!(
@@ -238,7 +197,7 @@ fn workspace_script_env_vars_prepends_pg_bin_dir_for_bare_psql() {
 fn workspace_script_env_vars_ignores_nonexistent_pg_bin_dir() {
     let ws = tempfile::tempdir().unwrap();
     let missing = ws.path().join("does-not-exist");
-    let vars = workspace_script_env_vars(ws.path(), None, Some(&missing));
+    let vars = workspace_script_env_vars(ws.path(), None, None, Some(&missing));
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
     assert!(
         !map.contains_key("PATH"),
@@ -442,4 +401,65 @@ fn file_id_changes_when_a_rename_replaces_the_path() {
     publish_cli(dir.path(), "b");
     assert_ne!(file_id(&path).unwrap(), before);
     assert!(file_id(&dir.path().join("missing")).is_none());
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// The two shipped docs that teach `lucidos await-event` to a coding agent:
+    /// the skill the engine embeds and writes into every CC worktree, and the
+    /// knowhow the workspace LLM loads. Read from the repo so the guards below
+    /// cover the source a reader actually edits.
+    fn cli_docs() -> [(&'static str, String); 2] {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        [
+            (
+                ".claude/skills/lucidos-cli/SKILL.md",
+                LUCIDOS_CLI_SKILL.to_string(),
+            ),
+            (
+                "system-knowhow/lucidos-cli.md",
+                crate::core::knowhow::doc_family_text(&repo, "system-knowhow/lucidos-cli.md"),
+            ),
+        ]
+    }
+
+    /// A `--relation child` spawn already re-opens the calling thread with the
+    /// child's result. So a wait on that completion is a duplicate wake, plus a
+    /// second clock that can expire for nothing. The skill shipped an example
+    /// pairing the two, and an agent followed it and subscribed twice. The guard
+    /// is per fenced block rather than per file: both docs discuss both commands
+    /// in prose, and it is the recipe that misleads.
+    #[test]
+    fn no_cli_doc_recipe_awaits_its_own_child() {
+        for (name, doc) in cli_docs() {
+            for (i, block) in doc.split("```").skip(1).step_by(2).enumerate() {
+                assert!(
+                    !(block.contains("--relation child") && block.contains("await-event")),
+                    "{name} code block {i} spawns a child and then awaits its completion. \
+                 The child's own callback already re-opens this thread, so the wait \
+                 buys nothing and adds a clock that expires for nothing.\n{block}"
+                );
+            }
+        }
+    }
+
+    /// The exclusion above reads as redundancy only when the doc also shows the
+    /// shapes that ARE legitimate. Otherwise it reads as "a cross-thread wait
+    /// might not fire". Both shapes carry a condition, because an unconditioned
+    /// `ChildThreadCompleted` matches workspace-wide and would catch your own.
+    /// The idle needle opens the JSON brace on purpose: a bare `thread_id` is a
+    /// substring of `child_thread_id`, so it would pass on the first shape alone.
+    #[test]
+    fn cli_docs_name_the_two_legitimate_completion_waits() {
+        for (name, doc) in cli_docs() {
+            for needle in ["\"child_thread_id\"", "CodingAgentIdled", "{\"thread_id\""] {
+                assert!(
+                    doc.contains(needle),
+                    "{name} must keep naming how to await a completion that is not your \
+                 own child's (missing: {needle:?})"
+                );
+            }
+        }
+    }
 }

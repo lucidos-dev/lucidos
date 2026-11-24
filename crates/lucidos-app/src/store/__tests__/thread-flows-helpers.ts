@@ -1,6 +1,3 @@
-// Shared scaffolding for the thread-flows integration tests, split across
-// thread-flows-*.test.ts. Pure builders plus the per-test seq counter,
-// which each split file resets in its own beforeEach via resetSeqCounter().
 import { expect } from 'vitest';
 import { exchangeResponseEvents, exchangeStatus, exchangeSteps, groupIntoExchanges, renderOrderViolations, type Exchange, type StoredEvent, type ThreadEvent, type ThreadState } from '../thread-events';
 import { handleEventWithAgg } from './aggregate-test-helper';
@@ -8,11 +5,8 @@ import { statusLabel } from '../exchange-status';
 
 export const TS = '2026-04-17T00:00:00Z';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
-export function makeThread(id = 'thread-1', status: 'idle' | 'running' | 'waiting' = 'idle'): { map: Map<string, ThreadState>; id: string } {
+export function makeThread(id = 'thread-1', status: ThreadState['meta']['status'] = 'idle'): { map: Map<string, ThreadState>; id: string } {
   const thread: ThreadState = {
     meta: {
       id,
@@ -50,8 +44,6 @@ export function makeThread(id = 'thread-1', status: 'idle' | 'running' | 'waitin
 
 let seqCounter = 1;
 
-/** Insert events into the thread's event map, simulating SSE arrival.
- *  Uses ascending seqs so insertion order = sort order. */
 export function insertEvents(
   map: Map<string, ThreadState>,
   threadId: string,
@@ -63,30 +55,20 @@ export function insertEvents(
     const clean = { ...event };
     delete (clean as any).created;
     delete (clean as any).event_id;
-    // Use handleEventWithAgg so a synthesized ThreadAggregate (mirroring
-    // backend update_thread_projection rules) is applied to thread.meta.
     handleEventWithAgg(map, threadId, seqCounter++, clean, created, eventId);
   }
 }
 
-/** Fold, and check the render order on the way through.
- *
- *  **Every flow test pays this.** The rule is `renderOrderViolations`, and a
- *  transcript that reads out of clock order is a defect whatever else the test
- *  was about. Checking here rather than per test is what makes the corpus the
- *  guard: a new flow inherits it. */
 function checkedExchanges(events: Map<number, StoredEvent>): Exchange[] {
   const exchanges = groupIntoExchanges(events);
   expect(renderOrderViolations(exchanges)).toEqual([]);
   return exchanges;
 }
 
-/** Run full pipeline: events map → exchanges (oldest-first) */
 export function getExchanges(map: Map<string, ThreadState>, threadId: string) {
   return checkedExchanges(map.get(threadId)!.events);
 }
 
-/** Get the user-visible status label for an Exchange */
 export function getLabel(ex: Exchange, streamingBuffer = '', isLast = true, hasPriorActive = false, threadIsCC = false): string {
   const status = exchangeStatus(ex, streamingBuffer, isLast, hasPriorActive, threadIsCC);
   const steps = exchangeSteps(ex);
@@ -95,9 +77,6 @@ export function getLabel(ex: Exchange, streamingBuffer = '', isLast = true, hasP
   return statusLabel(status, hasSteps).label;
 }
 
-/** Build exchanges including pending user messages (not yet in DB).
- *  @param useDisplayCreated — use `_displayCreated` instead of `created` for synthetic events
- *    (chat threads need this so sorting falls through to seq comparison). */
 export function getExchangesWithPending(
   map: Map<string, ThreadState>,
   threadId: string,
@@ -123,7 +102,6 @@ export function getExchangesWithPending(
   return checkedExchanges(augmented);
 }
 
-/** Post-increment the shared seq counter (mirrors the old `seqCounter++`). */
 export function nextSeq(): number {
   return seqCounter++;
 }

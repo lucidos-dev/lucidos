@@ -5,7 +5,7 @@ use super::*;
 use crate::core::McpServerStore;
 use crate::engine::event_bus::EventBus;
 use crate::engine::trigger_writes::TriggerRegistryWriter;
-use crate::gateway_operators::Operator;
+use crate::gateway_users::User;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use crate::triggers::TriggerConfig;
 
@@ -15,8 +15,8 @@ fn device(id: &str) -> MessageOrigin {
     }
 }
 
-fn person(id: &str, devices: &[&str]) -> Operator {
-    Operator {
+fn person(id: &str, devices: &[&str]) -> User {
+    User {
         id: id.into(),
         name: id.to_uppercase(),
         emails: vec![],
@@ -25,9 +25,9 @@ fn person(id: &str, devices: &[&str]) -> Operator {
 }
 
 /// Sam holds two devices; Kim holds one.
-fn team() -> OperatorSnapshot {
-    OperatorSnapshot {
-        operators: vec![
+fn team() -> UserSnapshot {
+    UserSnapshot {
+        users: vec![
             person("sam", &["sam-phone", "sam-laptop"]),
             person("kim", &["kim-phone"]),
         ],
@@ -126,40 +126,6 @@ impl Bench {
 }
 
 #[test]
-fn a_change_notifies_everyone_but_its_maker_and_only_on_a_team() {
-    let change = ConfigChange {
-        title: "Repository added",
-        what: "added the repository \"x\"".into(),
-        actor: Some(device("sam-laptop")),
-        undo: None,
-    };
-    let id = Uuid::new_v4();
-    let notice = notice(&change, id, &team()).unwrap();
-    assert_eq!(notice.message, "SAM added the repository \"x\".");
-    assert_eq!(notice.tap, Tap::Modal, "no undo, no Undo tap");
-    assert_eq!(notice.audience, Some(vec!["kim-phone".to_string()]));
-
-    let agent = ConfigChange {
-        actor: Some(crate::engine::tools::agent_tool_actor(Uuid::new_v4())),
-        ..change.clone()
-    };
-    let notice = super::notice(&agent, id, &team()).unwrap();
-    assert_eq!(notice.message, "An agent added the repository \"x\".");
-    assert_eq!(notice.audience, None, "nobody made it, so the team hears");
-
-    let solo = OperatorSnapshot {
-        operators: vec![person("sam", &["sam-laptop"])],
-        relayed: vec![],
-    };
-    assert_eq!(super::notice(&change, id, &solo), None);
-    let nobody = ConfigChange {
-        actor: None,
-        ..change
-    };
-    assert_eq!(super::notice(&nobody, id, &team()), None);
-}
-
-#[test]
 fn a_tool_change_inverts_only_when_one_tool_moved() {
     let a = || "a".to_string();
     let b = || "b".to_string();
@@ -202,6 +168,54 @@ fn an_undo_that_restores_a_coding_agent_grant_is_named() {
         server_id: "s".to_string()
     }
     .needs_the_owner(None));
+}
+
+#[test]
+fn undo_requires_the_owner_to_restore_a_program_grant() {
+    assert_undo_restoring_needs_the_owner(serde_json::json!({
+        "program_grants": [{ "pattern": "Python" }],
+    }));
+}
+
+#[test]
+fn undo_requires_the_owner_to_restore_or_revoke_a_folder_grant() {
+    let (granted, revoked) = assert_undo_restoring_needs_the_owner(serde_json::json!({
+        "folder_grants": [{ "folder": "/outside/reports", "device": 1, "inode": 10 }],
+    }));
+    let revoke = ConfigUndo::WriteTrigger {
+        write: TriggerWrite::Updated,
+        trigger_id: "t1".into(),
+        payload: revoked.to_created_payload(),
+    };
+    assert!(revoke.needs_the_owner(Some(&granted)));
+}
+
+/// Returns the trigger with the grant, then without it.
+fn assert_undo_restoring_needs_the_owner(
+    grant: serde_json::Value,
+) -> (TriggerConfig, TriggerConfig) {
+    let mut config = TriggerConfig::from_created_payload(&serde_json::json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"],
+        "run": { "type": "intent", "intent": "x" },
+    }))
+    .unwrap();
+    let revoked = config.clone();
+    config.apply_update(&grant);
+    let update = ConfigUndo::WriteTrigger {
+        write: TriggerWrite::Updated,
+        trigger_id: "t1".into(),
+        payload: config.to_created_payload(),
+    };
+    let create = ConfigUndo::WriteTrigger {
+        write: TriggerWrite::Created,
+        trigger_id: "t1".into(),
+        payload: config.to_created_payload(),
+    };
+
+    assert!(update.needs_the_owner(Some(&revoked)));
+    assert!(create.needs_the_owner(None));
+    assert!(!update.needs_the_owner(Some(&config)));
+    (config, revoked)
 }
 
 #[tokio::test]

@@ -42,7 +42,7 @@
 #
 # The engine system prompt is the OTHER unconditional surface, and it is gated
 # separately rather than not at all: `PROMPT_FLAVOR_CEILINGS` in
-# crates/lucidos-engine/src/engine/agent_session/prompts.rs ratchets each
+# crates/lucidos-agents-api/src/engine/agent_session/prompts.rs ratchets each
 # assembled prompt per flavor and per backend. It is a Rust test because only
 # Rust can measure the assembled string, which includes per-flavor inline text
 # and the backend tail that `append_backend_rules` adds; a scan of this file's

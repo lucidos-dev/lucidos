@@ -43,10 +43,7 @@ const SEMANTIC_CANDIDATE_LIMIT: usize = 200;
 /// Scale a score by age: `score * (0.5 + 0.5 * exp(-age_days / 14))`. A hit
 /// from today keeps its score and a months-old one keeps half. Items with no
 /// timestamp keep their score.
-pub(crate) fn recency_boost(
-    score: f64,
-    last_activity: Option<chrono::DateTime<chrono::Utc>>,
-) -> f64 {
+pub fn recency_boost(score: f64, last_activity: Option<chrono::DateTime<chrono::Utc>>) -> f64 {
     match last_activity {
         Some(ts) => {
             let age_days = (chrono::Utc::now() - ts).num_seconds() as f64 / 86400.0;
@@ -121,7 +118,7 @@ pub(super) fn combined_score(text: Option<f64>, semantic: Option<f64>) -> f64 {
 /// boost.
 /// Empty/whitespace queries return an empty vec. Used by both
 /// `/api/v1/threads/search` and the SearchEverywhere `/api/v1/search` endpoint.
-pub(crate) async fn combined_thread_search(
+pub async fn combined_thread_search(
     engine: &LucidosEngine,
     query: &str,
     limit: i64,
@@ -137,7 +134,7 @@ pub(crate) async fn combined_thread_search(
         let embedding = match engine.embedder.embed(q).await {
             Ok(e) => e,
             Err(e) => {
-                log!("[Search] embedder failed, degrading to text-only: {}", e);
+                log_legacy!("[Search] embedder failed, degrading to text-only: {}", e);
                 return None;
             }
         };
@@ -152,7 +149,7 @@ pub(crate) async fn combined_thread_search(
         {
             Ok(r) => r,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Search] semantic search failed, degrading to text-only: {}",
                     e
                 );
@@ -173,7 +170,7 @@ pub(crate) async fn combined_thread_search(
         {
             Ok(r) => Some(r),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Search] thread aggregation failed, degrading to text-only: {}",
                     e
                 );

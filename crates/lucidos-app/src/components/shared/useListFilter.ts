@@ -8,8 +8,6 @@ import { isTypeaheadKey } from './typeahead';
 export { filterListItems, listFilterVisible } from '../../utils/listFilter';
 import { listFilterVisible } from '../../utils/listFilter';
 
-/** Shared query and reveal behavior extracted from Dropdown. Focus and row
- *  selection stay with the host, including its keyboard handoff. */
 export function useListFilter({ enabled = true, escape = true, onChange }: {
   enabled?: boolean;
   escape?: boolean;

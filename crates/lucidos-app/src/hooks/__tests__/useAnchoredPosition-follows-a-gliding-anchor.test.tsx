@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * An anchored panel follows an anchor that moved on a transition.
- *
- * The phone's sticky title row glides back in on `translate` when the bars
- * reveal, with no scroll or resize. A widget dropped open from a transcript row
- * measures that title row mid-glide, so the hook re-measures when the anchor's
- * transition ends (ADR 0405).
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';

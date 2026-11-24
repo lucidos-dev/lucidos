@@ -122,12 +122,11 @@ service_log_dir() { printf '%s/logs' "${1%/}"; }
 # runtime. Downloaded once; not per-instance.
 service_runtime_root() { printf '%s/runtime/current' "${1%/}"; }
 
-# service_health_url <port> [scheme] — the gateway health endpoint (behind the
-# sigil namespace, ADR 0014 — a bare /api/v1/health resolves as a workspace
-# slug). Scheme defaults to http (the packaged posture); a TLS-enabled instance
-# (LUCIDOS_TLS_CERT/KEY baked into its service env — the gateway serves https
-# iff both are set) probes https.
-service_health_url() { printf '%s://localhost:%s/~/api/v1/health' "${2:-http}" "$1"; }
+# service_health_url <port> — the gateway health endpoint (behind the sigil
+# namespace, ADR 0014 — a bare /api/v1/health resolves as a workspace slug). It
+# is on the loopback listener, which always serves TLS from the loopback CA, so
+# the caller sources loopback_curl.sh for loopback_origin.
+service_health_url() { printf '%s/~/api/v1/health' "$(loopback_origin "$1")"; }
 
 # ── port candidates (pure) ───────────────────────────────────────────────────
 
@@ -178,7 +177,31 @@ service_is_bind_value() {
 # it is the SAME knob the picker's Settings → Network access edits, so a later
 # UI change keeps working (unlike baking bind env into the unit, which would
 # permanently shadow the file: env > file in the resolution order).
-service_network_toml_path() { printf '%s/.lucidos/network.toml' "${1%/}"; }
+# It is a private entry (ADR 0645): the copy of lucidos_private_entry_in
+# below is byte-identical to scripts/lib/storage_root.sh's, because
+# uninstall.sh fetches this file alone.
+service_network_toml_path() { lucidos_private_entry_in "${1%/}/.lucidos" network.toml; }
+
+lucidos_private_entry_in() {
+    local home="$1" name="$2" legacy
+    local names="network.toml network.toml.lock paired-devices.json webhook-token run secret-keys snapshots gateway local-token hook-socket-token pg-shared-password .local-token.lock .hook-socket-token.lock .pg-shared-password.lock"
+    case " $names " in
+        *" $name "*) ;;
+        *) printf '%s/private/%s\n' "$home" "$name"; return 0 ;;
+    esac
+    if [ -e "$home/$name" ] || [ -L "$home/$name" ]; then
+        printf '%s/%s\n' "$home" "$name"; return 0
+    fi
+    if [ -e "$home/private/$name" ] || [ -L "$home/private/$name" ]; then
+        printf '%s/private/%s\n' "$home" "$name"; return 0
+    fi
+    for legacy in $names; do
+        if [ -e "$home/$legacy" ] || [ -L "$home/$legacy" ]; then
+            printf '%s/%s\n' "$home" "$name"; return 0
+        fi
+    done
+    printf '%s/private/%s\n' "$home" "$name"
+}
 
 # service_network_toml_bind <contents> — extract the current [gateway] bind
 # value ("" when absent). Tolerant single-line parse, used for the
@@ -309,6 +332,11 @@ service_runtime_program() {
     printf '%s/lucidos-gateway\n' "${1%/}"
 }
 
+# service_runtime_cli <runtime-root> — the `lucidos` CLI beside the gateway.
+service_runtime_cli() {
+    printf '%s/lucidos\n' "${1%/}"
+}
+
 # service_runtime_env_pairs <runtime-root> <data> <port> — the canonical
 # NAME=VALUE env the gateway runs with, identical to
 # crates/lucidos-app/src/desktop.rs::spawn_gateway but resolved against the SHARED
@@ -321,7 +349,7 @@ service_runtime_env_pairs() {
     printf 'LUCIDOS_PG_BIN_DIR=%s/postgres/bin\n' "$root"
     printf 'LUCIDOS_PG_LIB_DIR=%s/postgres/lib\n' "$root"
     printf 'LUCIDOS_ENGINE_BIN=%s/lucidos-engine\n' "$root"
-    printf 'LUCIDOS_CLI_BIN=%s/lucidos\n' "$root"
+    printf 'LUCIDOS_CLI_BIN=%s\n' "$(service_runtime_cli "$root")"
     printf 'LUCIDOS_STATIC_DIR=%s/frontend\n' "$root"
     printf 'LUCIDOS_SDK_DIR=%s/sdk\n' "$root"
     printf 'LUCIDOS_SYSTEM_KNOWHOW_DIR=%s/system-knowhow\n' "$root"
@@ -387,11 +415,14 @@ service_launchd_timeout() { printf '%s' "${LUCIDOS_LAUNCHD_TIMEOUT:-30}"; }
 # ── plist / unit templating (pure) ───────────────────────────────────────────
 
 # service_xml_escape <string> — minimal XML escaping for plist values.
+# Bash 5.2 reads an unquoted `&` in a replacement as the matched text, and 3.2
+# keeps a quoted one's quotes inside "${...}". A quoted variable in an unquoted
+# assignment is literal in both.
 service_xml_escape() {
-    local s="$1"
-    s="${s//&/&amp;}"
-    s="${s//</&lt;}"
-    s="${s//>/&gt;}"
+    local s="$1" amp='&amp;' lt='&lt;' gt='&gt;'
+    s=${s//&/"$amp"}
+    s=${s//</"$lt"}
+    s=${s//>/"$gt"}
     printf '%s' "$s"
 }
 
@@ -837,16 +868,16 @@ service_systemd_unload() {
     return 0
 }
 
-# service_health_wait <port> <timeout-secs> [interval-secs] [scheme] — poll the
-# gateway health URL until it answers 200 or the deadline passes. Needs curl.
-# `-k` accepts the self-signed/private-CA certs a TLS-flagged install typically
-# carries (same posture as the dev scripts' `curl -sk`); it is a no-op on http.
+# service_health_wait <port> <timeout-secs> [interval-secs] — poll the
+# gateway health URL until it answers 200 or the deadline passes. Needs curl and
+# loopback_curl.sh. It trusts only the loopback CA, so a squatter on the port
+# never reads as healthy, and the plaintext 301 never reaches curl.
 service_health_wait() {
-    local port="$1" timeout="${2:-120}" interval="${3:-1}" scheme="${4:-http}" url deadline now
-    url="$(service_health_url "$port" "$scheme")"
+    local port="$1" timeout="${2:-120}" interval="${3:-1}" url deadline now
+    url="$(service_health_url "$port")"
     deadline=$(( $(date +%s) + timeout ))
     while :; do
-        if curl -fsSk -o /dev/null --max-time 3 "$url" 2>/dev/null; then
+        if loopback_curl -fsS -o /dev/null --max-time 3 "$url" 2>/dev/null; then
             return 0
         fi
         now="$(date +%s)"
@@ -869,7 +900,7 @@ SERVICE_NETWORK_TOML_LOCK=network.toml.lock
 service_write_network_toml() {
     local path
     path="$(service_network_toml_path "$1")"
-    mkdir -p "$(dirname "$path")" || return 1
+    (umask 077 && mkdir -p "$(dirname "$path")") || return 1
     (
         exec 9>>"$(dirname "$path")/$SERVICE_NETWORK_TOML_LOCK" || exit 1
         if command -v perl >/dev/null 2>&1; then

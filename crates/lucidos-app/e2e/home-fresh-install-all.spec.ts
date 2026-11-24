@@ -2,25 +2,16 @@ import { test, expect, Locator, Page } from './fixtures';
 import { assertHealthy, assertUserMessagesVisible, gotoWithRetry, isMobileViewport, waitForWorkspaceReady } from './helpers';
 import { clearAllThreads, ensureHomeThread, psql, resetWelcomePreference } from './db-helpers';
 
-/** A fresh install starts in Home (ADR 0411). The first screen is Home in the
- *  compose layout: its title at the top, the welcome above a centred prompt.
- *  The setup interview then runs in Home and creates no thread of its own.
- *
- *  `gotoWithRetry`, never `navigateToApp`, which steps off Home for the specs
- *  that start on the compose view. */
 test.describe('A fresh install starts in Home', () => {
   let home: string;
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // A fresh workspace: no thread but Home, which boot made, and a welcome
-    // nobody dismissed. Truncating takes Home with it, so it is put back.
     clearAllThreads();
     home = ensureHomeThread();
     resetWelcomePreference();
   });
 
-  /** Press the way the running device would, as welcome-all.spec.ts explains. */
   async function press(page: Page, button: Locator): Promise<void> {
     if (isMobileViewport(page)) await button.tap();
     else await button.click();
@@ -33,7 +24,6 @@ test.describe('A fresh install starts in Home', () => {
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem('lucidos-focused-thread')), { timeout: 10_000 })
       .toBe(home);
-    // A phone's Home is the same plain chat: title on top, welcome above the prompt.
     await expect(page.locator('.home-welcome-title .thread-title-menu:visible')).toHaveText('Home');
     await expect(page.locator('.thread-pane.compose-empty:visible')).toHaveCount(1);
     await expect(page.locator('.home-pane')).toHaveCount(0);

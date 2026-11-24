@@ -18,9 +18,6 @@ export function ReloadIcon() {
   );
 }
 
-/** One arrow turning back on itself: try the same thing again. The arc ends
- *  in a short line into the arrowhead's corner, so the head stays attached.
- *  Every icon-only retry control draws this glyph (`one-retry-glyph.test.ts`). */
 export function RetryIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -30,9 +27,6 @@ export function RetryIcon() {
   );
 }
 
-// Hourglass: work that is waiting its turn rather than running, the still
-// counterpart of the spinning ReloadIcon on the brand badge. The glass has
-// straight walls under each cap, so at badge size it cannot read as an "X".
 export function HourglassIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -42,7 +36,6 @@ export function HourglassIcon() {
   );
 }
 
-/** The gear: a control that opens a Settings row. */
 export function SettingsIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -79,7 +72,6 @@ export function DownloadIcon() {
   );
 }
 
-/** "Move to top level": an arrow rising to the top line. */
 export function MoveToTopIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -110,9 +102,6 @@ export function InfoIcon() {
   );
 }
 
-/** A solid warning triangle with its "!" cut out, so the mark shows the
- *  surface behind it in every theme. Solid, because an outlined "!" blurs
- *  into its own stroke at text size. */
 export function WarningIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" aria-hidden="true">
@@ -121,9 +110,6 @@ export function WarningIcon({ className }: { className?: string }) {
   );
 }
 
-/** A "↳" whose ink fills its viewBox top to bottom. Its CSS sizes the box in
- *  cap units: the stem starts on the cap line, and the bottom two units hang
- *  below the baseline. A font's own "↳" sits wherever its designer put it. */
 export function ContinuedIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -132,8 +118,6 @@ export function ContinuedIcon({ className }: { className?: string }) {
   );
 }
 
-/** Question mark in a circle. Mirrors InfoIcon's geometry (same circle, same
- *  stroke, same baseline dot) so the two read as one family in a header row. */
 export function HelpIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -152,9 +136,6 @@ export function ClearIcon() {
   );
 }
 
-// The class is not decoration: this glyph paints far less of its viewBox than
-// the icons it sits beside, so the boxes that hold it correct for that by name.
-// See the `.trash-icon` rule in styles/global/host-components.css.
 export function TrashIcon() {
   return (
     <svg class="trash-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -201,8 +182,6 @@ export function BellIcon() {
   );
 }
 
-/** A handset, for the composer's call toggle. It carries both directions:
- *  colour says whether pressing it places a call or ends one. */
 export function CallIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -229,8 +208,6 @@ export function ImageIcon({ className }: { className?: string }) {
   );
 }
 
-/** Clock face for the *waiting indicator* (an event wait's countdown). It sits
- *  beside HelpIcon in the header, so it takes the same ring and joins. */
 export function EventWaitClockIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -240,16 +217,6 @@ export function EventWaitClockIcon({ className }: { className?: string }) {
   );
 }
 
-/** The todo indicator's ONE glyph, for every state it can be in.
- *
- *  A ticked checkbox: two strokes, echoing the ✓ the panel's completed rows
- *  use. Idle, in-progress, waiting and abandoned differ only in COLOR (see
- *  `styles/chat/todo-list.css`), never in shape, so the button keeps saying
- *  "todo list" at a glance.
- *
- *  A denser checklist (two ticked rows plus an open circle) was tried here and
- *  dropped: at the 1.25rem the indicator renders, six strokes crowd into a
- *  smudge, while a box and a tick still read. Keep this glyph sparse. */
 export function TodoListIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -268,7 +235,6 @@ export function CameraIcon({ size = '1rem' }: { size?: string }) {
   );
 }
 
-/** A five-point star: filled marks the default, outlined offers to make it so. */
 export function StarIcon({ filled = false, size = '1rem' }: { filled?: boolean; size?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -277,7 +243,6 @@ export function StarIcon({ filled = false, size = '1rem' }: { filled?: boolean; 
   );
 }
 
-/** Two columns of three dots: the handle a row is dragged by. */
 export function GripIcon({ size = '1rem' }: { size?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -304,28 +269,6 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
   );
 }
 
-/** A horseshoe MAGNET over the LIVE EDGE: the *standing follow*'s toggle, in the
- *  prompt area. It says STAY at the live edge; the chevron beside it says go
- *  there once. NOT `DownloadIcon` (one row up) and NOT `ChevronDownIcon` (the
- *  scroll button's), because an icon-only toggle cannot share a mark.
- *
- *  POLES DOWN, over a line, after both free-floating orientations failed at
- *  this size. A horseshoe is read from its inner void and its two pole bands,
- *  and both close up that small, so the bands are gone.
- *
- *  A DETACHED LINE UNDER AN ARCH IS THE RAINBOW GLYPH, and an open-legged
- *  version of this was reported as one. The shut pole ends tell the two arcs
- *  apart from rainbow bands. Widen the 2-unit gap, or reopen the poles, and
- *  the glyph goes back there.
- *
- *  ON AND OFF BY FILL, like `StandingApplyIcon`. A theme without a hue sets the
- *  accent to the text colour, so colour alone cannot show the state.
- *
- *  INK IS 0.667 OF THE BOX on both axes, the GEOMETRIC extent, stroke
- *  excluded. It floats in a circle under the down chevron, and the composer
- *  row's 0.750 read too heavy there. Keep the poles 4 units over the line's
- *  centre: the 2-unit strokes leave 2 units clear, and less fuses the two.
- *  No inline size either: the chevron stack's CSS sizes the svg. */
 export function FollowLiveEdgeIcon({ armed = false }: { armed?: boolean }) {
   return (
     <svg viewBox="0 0 24 24" fill={armed ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -335,11 +278,6 @@ export function FollowLiveEdgeIcon({ armed = false }: { armed?: boolean }) {
   );
 }
 
-/** A question mark in a circle: the composer's *side question* toggle. On and
- *  off by the button's tone. A bare
- *  question mark read as help, and a speech bubble as a message to send.
- *
- *  No inline size: this renders inside `.icon-btn`, which sizes the svg. */
 export function SideQuestionIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -350,20 +288,6 @@ export function SideQuestionIcon() {
   );
 }
 
-/** A flag planted on the change: apply it once this thread settles. The
- *  *standing apply*'s toggle.
- *
- *  On and off by FILL, the shape `PinIcon` uses. That wants one large closed
- *  path, so the banner is the whole glyph and the pole is a bare stroke.
- *
- *  A flag is a standing instruction left behind: plant it, walk away, and it
- *  is still there when the thread finishes. Three other marks say the wrong
- *  thing. A tick says the apply already happened. A clock says what the
- *  *waiting indicator* beside it says, and both can be lit at once. A bolt is
- *  `TriggerFiredIcon`, whose note records that a bolt cannot be outlined at
- *  this size, so it carries no off state at all.
- *
- *  No inline size: this renders inside `.icon-btn`, which sizes the svg. */
 export function StandingApplyIcon({ armed = false }: { armed?: boolean }) {
   return (
     <svg viewBox="0 0 24 24" fill={armed ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -373,17 +297,6 @@ export function StandingApplyIcon({ armed = false }: { armed?: boolean }) {
   );
 }
 
-/** Two speech bubbles, one tucked behind the other: every message in this
- *  turn, not only the latest. Worn by the response header's full-response
- *  toggle.
- *
- *  The glyph never changes with the toggle: a swapped glyph changes the mark's
- *  size on every click while the body under it moves. The pressed chip says
- *  "on" instead (`.turn-controls` in styles/chat/input-messages.css), as it
- *  does for the steps control beside it.
- *
- *  The back bubble draws only the edge the front one leaves showing, so the
- *  two never cross strokes at the 0.875rem this renders at. */
 export function FullResponseIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -393,21 +306,6 @@ export function FullResponseIcon() {
   );
 }
 
-/** A circled minus to fold this turn, a circled plus to unfold it. Worn by both
- *  turn headers: the third of the response header's controls, the initiator
- *  header's only one. The other two flip a transcript-wide setting; this one
- *  folds THIS turn down to its header.
- *
- *  **It is the one turn control whose glyph changes with its state.** The pair
- *  beside it keeps a fixed glyph and sits on a pressed chip when on (see
- *  `FullResponseIcon`). This one is exempt from that chip (`.turn-controls` in
- *  styles/chat/input-messages.css): a chip meaning FOLDED would invert what it
- *  means on its neighbours. So the glyph carries the state, lit in the accent
- *  while folded, and it names the next click, agreeing with the tooltip.
- *
- *  The circle is the same in both forms, so the flip adds one stroke inside it
- *  and the mark never changes size. `__tests__/turn-controls.test.tsx` pins
- *  that. */
 export function CollapseTurnIcon({ collapsed = false }: { collapsed?: boolean }) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -418,10 +316,6 @@ export function CollapseTurnIcon({ collapsed = false }: { collapsed?: boolean })
   );
 }
 
-/** Step-log glyph: three leader-dot lines, the shape of the tool-by-tool log
- *  the steps toggle reveals. Deliberately not `TodoListIcon`'s ticked box,
- *  which already means the todo list; the two would otherwise sit within a
- *  few rem of each other on the same turn. */
 export function StepLogIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -444,17 +338,6 @@ export function FileIcon({ size = '1rem' }: { size?: string }) {
   );
 }
 
-/** Unified-diff glyph: an added line, a context line, a removed line. Toggle
- *  counterpart to FileIcon.
- *
- *  THREE rows, not two. The `+` and `-` pair sat across the middle third of the
- *  box and read as squat. The report on the composer's Diff button named
- *  exactly that. A hunk is the smallest shape saying "diff" rather than "two
- *  lines", and it fills the box.
- *
- *  The middle row carries no marker on purpose. An unmarked gutter IS what a
- *  context line looks like, and marking all three would say every line
- *  changed. */
 export function DiffIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -467,8 +350,6 @@ export function DiffIcon() {
   );
 }
 
-/** Two columns side by side: the side-by-side diff glyph. Toggle counterpart to
- *  DiffIcon, whose single column is the unified rendering. */
 export function SideBySideColumnsIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -478,8 +359,6 @@ export function SideBySideColumnsIcon() {
   );
 }
 
-/** The glyph that carries a surface's tone: success, info, warning or error.
- *  The frame around it stays neutral, so this is the only place tone shows. */
 export function ToneIcon({ tone }: { tone: ToastType }) {
   switch (tone) {
     case 'success':
@@ -553,14 +432,6 @@ export function BlockedIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// The thread-drawer toggle on desktop: a window with its left column split off,
-// the glyph desktop apps use for a sidebar. Never a stack of lines: the Canvas
-// hamburger is already that, and look-alikes in one bar hide the one you are
-// looking for. Desktop only, because on a phone the toggle opens a whole pane
-// rather than a sidebar (see `ThreadListIcon`).
-//
-// Frame and divider stay one path so their crossing is stroked once. Two
-// elements paint it twice, and a translucent colour shows each overlap as a dot.
 export function SidebarIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -569,8 +440,6 @@ export function SidebarIcon() {
   );
 }
 
-// The dashboard toggle: one medium tile over two small ones. The desktop rail's
-// toggle and the phone's dashboard panel button both draw it.
 export function DashboardIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -581,9 +450,6 @@ export function DashboardIcon() {
   );
 }
 
-// The thread-drawer toggle on a phone: a bulleted list, since it takes the user
-// to the threads pane, which is a list of threads. Filter holds the same corner
-// of that pane, which is why Filter draws a funnel and never lines.
 export function ThreadListIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
@@ -607,13 +473,8 @@ export function MenuIcon() {
   );
 }
 
-// A funnel shape, never a stack of lines. On a phone, Filter takes the corner
-// where the pane beside it has the list-shaped thread-drawer toggle. Lines there
-// read as the way back.
 const FUNNEL_PATH = 'M2 2.5h12L9.5 8.25V14l-3-1.5V8.25z';
 
-// The thread drawer's Filter control, which toggles the thread-type panel
-// (see ThreadFilterPanel).
 export function FilterIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -622,14 +483,9 @@ export function FilterIcon() {
   );
 }
 
-// FUNNEL_PATH as it looks stroked at 1.5 with round joins, traced as one outline.
-// The filled funnel paints this alone: a translucent header colour paints a
-// stroke laid over a fill twice, and the rim comes out brighter than the body.
 const FUNNEL_SILHOUETTE_PATH =
   'M1.409 2.962A.75.75 0 0 1 2 1.75H14a.75.75 0 0 1 .591 1.212L10.25 8.509V14a.75.75 0 0 1-1.085.671l-3-1.5A.75.75 0 0 1 5.75 12.5V8.509z';
 
-// The Filter button while a thread-type selection narrows the list: the same
-// funnel, filled. Outline for off and filled for on is the iOS convention.
 export function FilteredIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="currentColor" stroke="none">
@@ -648,9 +504,6 @@ export function PopOutIcon() {
   );
 }
 
-/** The mirror of {@link PopOutIcon}: the same frame, with the arrow landing
- *  INSIDE it rather than leaving it. "Switch this window", where the pop-out
- *  says "open another one". */
 export function PopInIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -699,9 +552,6 @@ export function CodeIcon() {
   );
 }
 
-/** Soft wrap: three lines of text, the second one turning back on itself. The
- *  return arrow is what says "wrap" rather than "a list", so it keeps its own
- *  head even at the smallest icon size. */
 export function WrapTextIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -713,9 +563,6 @@ export function WrapTextIcon() {
   );
 }
 
-// The OpenAI mark, which stands for Codex wherever the app names it. The
-// fill stays a presentation attribute: the drawer's agent mark repaints it
-// with an author rule, which an inline style would beat.
 export function CodexIcon() {
   return (
     <svg class="codex-icon" viewBox="0 0 24 24" fill="var(--codex-mark, var(--text-primary))" fill-rule="evenodd">
@@ -724,7 +571,6 @@ export function CodexIcon() {
   );
 }
 
-// A crosshair: "find this in the list", for Show in Folders.
 export function LocateIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -750,8 +596,6 @@ export function CheckIcon({ className, size }: { className?: string; size?: stri
   );
 }
 
-/** Ink for each finished step outcome, drawn to fill a 12-unit box so a 1cap
- *  svg spans the text's cap band exactly (see `.step-icon svg`, steps.css). */
 const STEP_OUTCOME_INK: Record<Exclude<StepOutcome, 'pending'>, preact.JSX.Element> = {
   success: <path d="M1 6.5 4.5 10.5 11 1.5" />,
   error: (
@@ -771,8 +615,6 @@ const STEP_OUTCOME_INK: Record<Exclude<StepOutcome, 'pending'>, preact.JSX.Eleme
   denied: <path d="M2 2l8 8M10 2l-8 8" />,
 };
 
-/** The leading mark on an inline step row. A running step has none: its
- *  shimmering description is the live affordance. */
 export function StepOutcomeIcon({ outcome }: { outcome: StepOutcome }) {
   if (outcome === 'pending') return null;
   return (
@@ -802,7 +644,6 @@ export function EyeOffIcon() {
   );
 }
 
-// Drawer "Review" view — an open eye (changes ready to look over / apply).
 export function ReviewIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -812,10 +653,6 @@ export function ReviewIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// Drawer "In flight" view: a jet cruising level, nose right, seen slightly from
-// above so the far wing is shorter than the near one. It labels the view (the
-// threads-header Filter button, the panel's In flight row, the IN FLIGHT section
-// header) and never animates. The per-thread `.mini-spinner` marks running work.
 export function InFlightIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -824,7 +661,6 @@ export function InFlightIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// The Ongoing grouping: an inbox tray, on the threads-header grouping button.
 export function InboxIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -834,9 +670,6 @@ export function InboxIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// The Current section, the live working set: three stacked layers. Worn by its
-// drawer header and by every "Move to Current" action. Never the inbox tray,
-// which belongs to the Ongoing grouping shown in the same header.
 export function CurrentIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -847,9 +680,6 @@ export function CurrentIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// The home thread: a house, wherever a Home entry or a Home row is drawn. One
-// path, with the door cut into the base line: two overlapping strokes paint
-// their shared pixels twice and show as bright spots.
 export function HomeIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -858,7 +688,6 @@ export function HomeIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// Drawer "Archive" section — a lidded storage box.
 export function ArchiveIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -869,7 +698,6 @@ export function ArchiveIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// Compose Send button — an up-arrow inside the round send/cancel morph button.
 export function SendArrowIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -879,7 +707,6 @@ export function SendArrowIcon() {
   );
 }
 
-// Compose Cancel/Stop button — a filled stop-square inside the round morph button.
 export function StopIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
@@ -888,18 +715,6 @@ export function StopIcon() {
   );
 }
 
-// The standard pause glyph: two filled bars. Paints the `paused` thread status
-// (a turn an engine restart interrupted). Same filled family as StopIcon, and
-// deliberately a recognizable transport glyph rather than another colored dot,
-// because "paused" is the one status a universal symbol already says outright.
-//
-// Unlike its neighbours in this file, the viewBox HUGS the bars rather than
-// centring them in a square box, and its consumer sizes it to that same 12:16
-// aspect. Every other occupant of the thread status slot (a 0.4rem dot, the
-// 0.7rem question badge, the spinner) is a shape that fills its box, and the
-// slot is a flex row that left-aligns them, so ink floating in the middle of a
-// square icon box would leave a paused row's glyph visibly indented against
-// every neighbouring row's dot.
 export function PauseIcon() {
   return (
     <svg viewBox="0 0 12 16" fill="currentColor" stroke="none" aria-hidden="true">
@@ -909,9 +724,7 @@ export function PauseIcon() {
   );
 }
 
-// Set aside: the change action in menus. A line icon sized like its menu
-// neighbours, never the status slot's PauseIcon above.
-export function SetAsideIcon() {
+export function HoldIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <circle cx="12" cy="12" r="9" />
@@ -921,10 +734,6 @@ export function SetAsideIcon() {
   );
 }
 
-// Power: the restart control in the Lucidos menu. A power symbol rather than
-// another circular arrow, because the row it sits under is Refresh and the two
-// must not read as the same action twice: one reloads the client, this one
-// stops and starts the workspace's engine.
 export function PowerIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -934,25 +743,6 @@ export function PowerIcon() {
   );
 }
 
-/** The *trigger* actor chip's glyph: a trigger fired and this turn is the
- *  result. Worn by the `TriggerStarted` initiator panel.
- *
- *  Deliberately NOT `EventWaitClockIcon`, the clock a few lines up, and the two
- *  can appear within a screen of each other in one transcript. That one marks an
- *  *event wait*: something that has NOT happened, which will wake the turn when
- *  it does. This marks the opposite, something that already fired. A clock here
- *  would also quietly claim every trigger is scheduled, which is wrong: an event
- *  trigger has no clock in it at all.
- *
- *  FILLED, against this file's outlined default, and the reason is the shape
- *  rather than a preference. A bolt's waist is where its two halves cross, and
- *  an outline puts two strokes through that crossing: at the `--icon-size-sm`
- *  the chip renders (0.875rem, ~14px on a plain desktop root, so 24 units map to
- *  ~0.58px each) the 2-unit stroke is ~1.2px and the daylight left in the waist
- *  is under a device pixel. A solid body has no interior to lose, so it
- *  degrades to a smaller bolt rather than to a blob. The cost is ink: this is
- *  heavier than the outlined marks around it. That is tolerable, because the
- *  chip holds exactly one glyph and nothing competes with it. */
 export function TriggerFiredIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
@@ -961,18 +751,7 @@ export function TriggerFiredIcon() {
   );
 }
 
-/** The *You* actor chip's glyph: this turn was started from one of your
- *  devices. The one origin the chip is allowed to call "You" (see
- *  `actorInitiator`), so it must not resemble `ApiPlugIcon` below, which is
- *  precisely the origin that must never be mistaken for you.
- *
- *  FILLED, for the reason `TriggerFiredIcon` sets out at length and for the same
- *  measured cause: the outlined form's daylight is the gap between the head and
- *  the shoulders, ~2 units, and at chip size that closes into a smudge with a
- *  notch. Solid keeps head and shoulders legible as two masses at any size.
- *  The head sits clear of the cap rather than touching it, so the pair still
- *  reads as a figure and not as a single lump. */
-export function PersonIcon() {
+export function UserIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
       <circle cx="12" cy="7.75" r="4" />
@@ -981,18 +760,6 @@ export function PersonIcon() {
   );
 }
 
-/** The *API caller* actor chip's glyph: an external HTTP caller that did not
- *  self-identify (no device id, no agent-origin token, no known workspace).
- *
- *  A plug, keeping the metaphor `API_CALLER_LABEL`'s own definition reaches for:
- *  an external integration plugging into the API. Outlined rather than filled,
- *  unlike its two neighbours above, and that difference is load-bearing rather
- *  than incidental. The chip exists so an anonymous mutating POST can never be
- *  rendered as "You", so this glyph's whole job is to not be mistaken for
- *  `PersonIcon`: two open prongs over a hollow body against one solid mass is a
- *  difference in weight as well as in shape, legible before either outline is.
- *  The prongs are 6 units apart, three times the daylight a stroke needs at chip
- *  size, so what survives shrinking is exactly the part that distinguishes it. */
 export function ApiPlugIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1004,9 +771,6 @@ export function ApiPlugIcon() {
   );
 }
 
-/** A directory row in the directory picker. Renders at 1.25rem rather than the
- *  chip's 0.875rem, which is what affords a single closed outline here where the
- *  actor chips needed solids. */
 export function FolderIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1015,14 +779,6 @@ export function FolderIcon() {
   );
 }
 
-/** The `..` row in the directory picker: go up to the parent directory.
- *
- *  A folder with an arrow out of it, not a second folder shape. The row is a
- *  BUTTON that moves you, where every row under it names a place, so the arrow
- *  is carrying the only thing that distinguishes them. It affords three marks
- *  only because this slot is 1.25rem; at the chip size used elsewhere in this
- *  file an arrow inside a folder smudges into one blob, so do not reuse this one
- *  in a chip. */
 export function FolderUpIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1033,34 +789,6 @@ export function FolderUpIcon() {
   );
 }
 
-/** THE apps glyph. A package: a box with its lid seam and front edge.
- *
- *  Single definition on purpose, and the single one there is. Three surfaces
- *  mark an app and all three read it from here: Search Everywhere's result rows
- *  and the content-pane back/forward history menu (both via `CategoryIcon`'s
- *  `apps` case, which renders this rather than drawing its own), and the message
- *  route panel's fallback for an app whose manifest declares no icon. A concept
- *  with two glyphs diverges on the next tweak, which is what this replaced: the
- *  category set carried a 2x2 rounded tile grid, one spark short of the Lucidos
- *  mark that appears on every Lucidos Agent chip in the same transcript.
- *
- *  Authored in a 16-unit box at stroke-width 1.5, NOT this file's 24-unit
- *  stroke-2 default, and it carries its own `width`/`height` where most icons
- *  here take theirs from a class. Both come from the category family, whose
- *  glyphs all take exactly those numbers from one shared props spread in
- *  `CategoryIcon`. Matching the stroke keeps it from sitting heavier than the
- *  file, thread and trigger glyphs beside it in a row.
- *
- *  The inline SIZE is load-bearing rather than tidy, and dropping it is a real
- *  bug rather than a style slip. `.search-everywhere-result-icon`, the slot on
- *  every Search Everywhere result row, sizes its own box and has NO RULE for
- *  the `<svg>` inside it. That surface has always sized its glyphs purely from
- *  the attributes that spread put on each `<svg>`. So an unsized `AppsIcon` there falls back to the default replaced
- *  element box and paints an app hit's mark at ~300px. Its other two consumers
- *  hide the fault, because both do size the slot in CSS
- *  (`.nav-history-icon svg`, `.message-route-panel .route-app-icon svg`), and a
- *  CSS rule beats a presentation attribute, so those keep overriding this
- *  default exactly as before. */
 export function AppsIcon({ size = '1rem' }: { size?: string } = {}) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1071,13 +799,6 @@ export function AppsIcon({ size = '1rem' }: { size?: string } = {}) {
   );
 }
 
-// The Lucidos mark: three rounded squares and a four-point spark, the same
-// geometry as `public/favicon.svg` and the installed PWA icon. Kept as paths
-// with no tile behind them. So one copy of the artwork serves both uses: on
-// the brand gradient, or painted flat in a single colour.
-//
-// `fill: currentColor` rather than the favicon's hardcoded white, because a
-// flat variant is exactly the same shape in a different colour.
 export function LucidosMarkIcon() {
   return (
     <svg class="lucidos-mark-icon" viewBox="0 0 100 100" fill="currentColor" stroke="none" aria-hidden="true">
@@ -1091,7 +812,6 @@ export function LucidosMarkIcon() {
   );
 }
 
-/** Open in Canvas: the pane beside the thread, full size. */
 export function OpenInCanvasIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1101,7 +821,6 @@ export function OpenInCanvasIcon() {
   );
 }
 
-/** Make reusable: two arrows going round, offered again in other threads. */
 export function ReuseIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

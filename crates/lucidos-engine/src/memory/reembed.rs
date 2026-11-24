@@ -19,11 +19,11 @@ pub async fn reembed_stale(
 
     let stale_count = index.count_stale_embeddings(&target_model).await?;
     if stale_count == 0 {
-        log!(@Memory, "No stale embeddings to re-process");
+        log_legacy!(@Memory, "No stale embeddings to re-process");
         return Ok(0);
     }
 
-    log!(
+    log_legacy!(
         @Memory,
         "Re-embedding {} stale rows for model '{}'",
         stale_count,
@@ -52,17 +52,17 @@ pub async fn reembed_stale(
                 }
                 Err(e) => {
                     failed += 1;
-                    log!(@Memory, "Re-embed UPDATE failed for row {}: {}", id, e);
+                    log_legacy!(@Memory, "Re-embed UPDATE failed for row {}: {}", id, e);
                 }
             }
         }
 
-        log!(@Memory, "Re-embed progress: {} / {}", updated, stale_count);
+        log_legacy!(@Memory, "Re-embed progress: {} / {}", updated, stale_count);
 
         // Guard against an infinite loop when every row in a batch fails
         // (e.g. dimension mismatch). The same rows would otherwise be re-fetched forever.
         if batch_updated == 0 {
-            log!(@Memory, "Re-embed aborted: no rows in batch could be updated");
+            log_legacy!(@Memory, "Re-embed aborted: no rows in batch could be updated");
             break;
         }
 
@@ -71,14 +71,14 @@ pub async fn reembed_stale(
     }
 
     if failed > 0 {
-        log!(
+        log_legacy!(
             @Memory,
             "Re-embed complete: {} rows updated, {} rows failed",
             updated,
             failed
         );
     } else {
-        log!(@Memory, "Re-embed complete: {} rows updated", updated);
+        log_legacy!(@Memory, "Re-embed complete: {} rows updated", updated);
     }
     Ok(updated)
 }

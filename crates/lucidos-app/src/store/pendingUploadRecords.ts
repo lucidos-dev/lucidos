@@ -1,18 +1,13 @@
-/** The bytes of each pending upload, kept on this device so a page reload does
- *  not lose the image. One IndexedDB database per workspace. The live entries
- *  are in `store/pendingUploads.ts`; a record here outlives its entry while
- *  attached or referenced by an unresolved send.
- *
- *  Plan: `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`. */
 
 import { sourceGeneration, type RestoreSourceOrigin } from '../utils/restoreSourceGeneration';
 import type { UploadSendIntent } from './uploadSendIntents';
 import { signal } from '@preact/signals';
 import { WORKSPACE_ID } from '../utils/basePath';
-import { deviceDatabaseName } from './deviceDatabase';
+import { PENDING_UPLOADS_DATABASE, awaitQueuedWrites, deviceDatabaseName } from './deviceDatabase';
 import { createIndexedDbBackend } from './pendingUploadBackend';
 export { createMemoryPendingUploadBackend } from './pendingUploadBackend';
 import { createMemoryPendingUploadBackend } from './pendingUploadBackend';
+import type { StoredUploadSource } from './pendingUploadSource';
 import { pageOwnerId } from './pageOwner';
 import { showToast } from './store';
 
@@ -21,29 +16,22 @@ export interface PendingUploadRecord extends RestoreSourceOrigin {
   threadId: string;
   name: string;
   mime: string;
-  /** An `ArrayBuffer`, not a `Blob`: older WebKit stored `Blob`s unreliably. */
   bytes: ArrayBuffer;
+  migratedBytes?: true;
   size: number;
   createdAt: number;
-  /** The page load that owns the record. See `liveOwnerIds`. */
   ownerId: string;
-  /** Content hash once landed, while the retained bytes are still needed. */
   landedHash?: string;
 }
 
-/** A send the user pressed while the thread's images were still uploading. */
 export interface QueuedUploadSendRecord extends RestoreSourceOrigin {
   threadId: string;
   intent: UploadSendIntent;
   ownerId: string;
-  /** What it still waits on, and the draft text it would send. A restore
-   *  queues it again only if every image comes back and the draft still reads
-   *  `text`. So it never sends what the user did not see. */
   localIds: string[];
   text: string;
 }
 
-/** What this page last stored for a queued upload send. */
 export type QueuedUploadSendSnapshot = Pick<QueuedUploadSendRecord, 'localIds' | 'text'>;
 
 type UploadPatch = Partial<Pick<PendingUploadRecord, 'landedHash' | 'ownerId'>>;
@@ -52,7 +40,8 @@ export interface PendingUploadBackend {
   putUpload(record: PendingUploadRecord): Promise<void>;
   patchUpload(localId: string, patch: UploadPatch): Promise<void>;
   deleteUpload(localId: string): Promise<void>;
-  listUploadHistory(): Promise<PendingUploadRecord[]>;
+  listUploadHistory(): Promise<StoredUploadSource[]>;
+  readUploadBytes(source: StoredUploadSource): Promise<ArrayBuffer | undefined>;
   listUploads(): Promise<PendingUploadRecord[]>;
   putQueuedUploadSend(record: QueuedUploadSendRecord): Promise<void>;
   deleteQueuedUploadSend(record: QueuedUploadSendRecord): Promise<void>;
@@ -60,26 +49,21 @@ export interface PendingUploadBackend {
   listQueuedUploadSends(): Promise<QueuedUploadSendRecord[]>;
 }
 
-/** The caps that bound one workspace's store. A record past a cap is not
- *  written, and an older one is dropped when the page next starts. */
 export const PENDING_UPLOAD_MAX_RECORDS = 20;
 export const PENDING_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 export const PENDING_UPLOAD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** One database per workspace (`deviceDatabaseName`). */
 export function pendingUploadDbName(workspaceId: string | null): string {
-  return deviceDatabaseName('lucidos-pending-uploads', workspaceId);
+  return deviceDatabaseName(PENDING_UPLOADS_DATABASE, workspaceId);
 }
 
 const DB_NAME = pendingUploadDbName(WORKSPACE_ID);
-/** Every operation fails, so a browser without IndexedDB hears that its
- *  images will not survive a reload. */
 function createUnavailableBackend(): PendingUploadBackend {
   const fail = async (): Promise<never> => {
     throw new Error('this browser has no IndexedDB');
   };
   return {
-    putUpload: fail, patchUpload: fail, deleteUpload: fail, listUploads: fail, listUploadHistory: fail,
+    putUpload: fail, patchUpload: fail, deleteUpload: fail, listUploads: fail, listUploadHistory: fail, readUploadBytes: fail,
     putQueuedUploadSend: fail, deleteQueuedUploadSend: fail, listQueuedUploadSends: fail, listQueuedUploadHistory: fail,
   };
 }
@@ -91,8 +75,6 @@ function store(): PendingUploadBackend {
   return backend;
 }
 
-/** What this page knows of a record it owns, read synchronously by the rules
- *  that decide when a record ends. */
 export interface OwnedRecord {
   localId: string;
   threadId: string;
@@ -101,13 +83,8 @@ export interface OwnedRecord {
 }
 
 const owned = new Map<string, OwnedRecord>();
-// Live bytes outlast pending entries even when IndexedDB or its cap refused
-// them. Explicit reference cleanup below is their lifetime, not upload landing.
 const live = new Map<string, PendingUploadRecord>();
 
-/** A send takes ownership before its draft/card clears and releases only
- * after its accepted, refused or unsent destination is installed. Overlapping
- * sends may reference the same content hash. */
 export const sendingImageHashes = signal<readonly string[]>([]);
 const sending = new Map<symbol, readonly string[]>();
 export function retainSendingImageHashes(hashes: readonly string[] = []): () => void {
@@ -123,12 +100,9 @@ export function retainSendingImageHashes(hashes: readonly string[] = []): () => 
 export function livePendingUploadRecords(): PendingUploadRecord[] {
   return [...live.values()];
 }
-/** What this page last stored for each queued upload send, by thread. */
 const ownedQueuedUploadSendsByThread = new Map<string, QueuedUploadSendRecord>();
-/** Records other open tabs own. They count against the caps all the same. */
 let othersUsage = { count: 0, bytes: 0 };
 
-/** Writes run one at a time, in order, so a delete never overtakes its put. */
 let writes: Promise<void> = Promise.resolve();
 let warned = false;
 
@@ -140,7 +114,6 @@ export function pendingUploadStorageFailureMessage(err: unknown): string {
   return `Images waiting to upload will not survive a page reload: this browser could not save them (${reason}).`;
 }
 
-/** Said once per page. The upload itself carries on in memory either way. */
 function warnOnce(message: string): void {
   if (warned) return;
   warned = true;
@@ -151,8 +124,6 @@ function enqueue(write: () => Promise<void>): void {
   writes = writes.then(write).catch((err) => warnOnce(pendingUploadStorageFailureMessage(err)));
 }
 
-/** Keep a just-attached image's bytes. Returns false, and says why once, when
- *  a cap leaves it out. */
 export function persistPendingUpload(args: {
   localId: string;
   threadId: string;
@@ -178,7 +149,6 @@ export function persistPendingUpload(args: {
   return true;
 }
 
-/** The upload landed as `hash`. Retain bytes while the image is attached. */
 export function markPendingUploadLanded(localId: string, hash: string): void {
   const inMemory = live.get(localId);
   if (inMemory) live.set(localId, { ...inMemory, landedHash: hash });
@@ -188,7 +158,6 @@ export function markPendingUploadLanded(localId: string, hash: string): void {
   enqueue(() => store().patchUpload(localId, { landedHash: hash }));
 }
 
-/** Take over a record, retaining its landed identity only when already attached. */
 export function adoptPendingUploadRecord(record: PendingUploadRecord, retainLanded = false): void {
   const landedHash = retainLanded ? record.landedHash : undefined;
   live.set(record.localId, { ...record, ownerId: pageOwnerId, landedHash });
@@ -206,7 +175,6 @@ export function ownedPendingUploadRecords(): OwnedRecord[] {
   return [...new Map<string, OwnedRecord>([...owned.entries(), ...live.entries()]).values()];
 }
 
-/** Count the records other tabs own against this page's caps. */
 export function notePendingUploadsOwnedElsewhere(records: readonly PendingUploadRecord[]): void {
   othersUsage = {
     count: records.length,
@@ -239,18 +207,28 @@ export function ownedQueuedUploadSends(): ReadonlyMap<string, QueuedUploadSendSn
   return ownedQueuedUploadSendsByThread;
 }
 
-/** Everything stored, after every write this page has queued. A failed read
- *  rejects, so the caller can tell "nothing stored" from "could not look". */
-export async function readPendingUploadStore(includeHistory = false): Promise<{
-  uploads: PendingUploadRecord[];
+export async function readPendingUploadHistory(): Promise<{
+  uploads: StoredUploadSource[];
   queuedUploadSendRecords: QueuedUploadSendRecord[];
 }> {
-  await writes;
-  const [uploads, queuedUploadSendRecords] = await Promise.all([(includeHistory ? store().listUploadHistory() : store().listUploads()), (includeHistory ? store().listQueuedUploadHistory() : store().listQueuedUploadSends())]);
+  await awaitQueuedWrites(writes, DB_NAME);
+  const [uploads, queuedUploadSendRecords] = await Promise.all([store().listUploadHistory(), store().listQueuedUploadHistory()]);
   return { uploads, queuedUploadSendRecords };
 }
 
-/** `null` puts back the backend this runtime would pick on its own. */
+export function readArchivedUploadBytes(source: StoredUploadSource): Promise<ArrayBuffer | undefined> {
+  return store().readUploadBytes(source);
+}
+
+export async function readPendingUploadStore(): Promise<{
+  uploads: PendingUploadRecord[];
+  queuedUploadSendRecords: QueuedUploadSendRecord[];
+}> {
+  await awaitQueuedWrites(writes, DB_NAME);
+  const [uploads, queuedUploadSendRecords] = await Promise.all([store().listUploads(), store().listQueuedUploadSends()]);
+  return { uploads, queuedUploadSendRecords };
+}
+
 export function _resetPendingUploadRecordsForTesting(
   next: PendingUploadBackend | null = createMemoryPendingUploadBackend(),
 ): void {
@@ -265,7 +243,6 @@ export function _resetPendingUploadRecordsForTesting(
   warned = false;
 }
 
-/** Resolves once every queued write has run. */
 export function _pendingUploadWritesSettledForTesting(): Promise<void> {
   return writes;
 }

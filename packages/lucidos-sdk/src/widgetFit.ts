@@ -1,25 +1,12 @@
-/**
- * The *widget fit check*'s measurement, run inside a widget frame.
- *
- * The host's probe pushes a `measure` token with each size. The frame waits for
- * its layout to settle, then reports what the box cuts off. A finding names the
- * edge, the px past it, the element and its text. The engine turns that into a
- * note the agent can act on.
- */
 
-/** How long the DOM and the body's size must hold still to count as settled. */
 export const SETTLE_QUIET_MS = 300;
 
-/** A widget that never holds still is measured at this point anyway. */
 export const SETTLE_CAP_MS = 4000;
 
-/** Findings a report carries per box. `total` still counts every one. */
 export const MAX_FIT_FINDINGS = 8;
 
-/** Characters of text a finding quotes. */
 const QUOTE_CHARS = 60;
 
-/** Layout rounding a fractional box absorbs before anything counts as cut. */
 const SLACK_PX = 1;
 
 export interface Rect {
@@ -33,9 +20,6 @@ export const FIT_EDGES = ['top', 'right', 'bottom', 'left'] as const;
 
 export type FitEdge = (typeof FIT_EDGES)[number];
 
-/** `past-edge`: text past an edge of the box. `clipped`: text an
- *  `overflow: hidden` or `clip` ancestor cuts inside the box. `ellipsis`: text
- *  an ellipsis cuts. `media`: an image, SVG, canvas or video past an edge. */
 export const FIT_KINDS = ['past-edge', 'clipped', 'ellipsis', 'media'] as const;
 
 export type FitKind = (typeof FIT_KINDS)[number];
@@ -43,11 +27,8 @@ export type FitKind = (typeof FIT_KINDS)[number];
 export interface FitFinding {
   kind: FitKind;
   edge: FitEdge;
-  /** Whole CSS pixels past the edge. */
   px: number;
-  /** A short element path, such as `div.row > span`. */
   path: string;
-  /** The first characters of the element's text, or an image's alt text. */
   text: string;
 }
 
@@ -56,7 +37,6 @@ export interface FitResult {
   total: number;
 }
 
-/** Where things are drawn. The real one reads the layout; a test stubs it. */
 export interface FitGeometry {
   box(): { width: number; height: number };
   rect(el: Element): Rect;
@@ -76,8 +56,6 @@ export const domGeometry: FitGeometry = {
 
 const MEDIA = 'img, svg, canvas, video';
 
-/** The edge of `edges` that `inner` runs furthest past `outer`, if any runs
- *  past the slack. */
 function overshoot(inner: Rect, outer: Rect, edges: readonly FitEdge[] = FIT_EDGES): { edge: FitEdge; px: number } | null {
   const past: Array<[FitEdge, number]> = (
     [
@@ -105,7 +83,6 @@ function isBox(el: Element): boolean {
   return el === el.ownerDocument.body || el === el.ownerDocument.documentElement;
 }
 
-/** The element and its parent, short enough to read in a note. */
 function pathOf(el: Element): string {
   const parent = el.parentElement;
   return parent && !isBox(parent) ? `${step(parent)} > ${step(el)}` : step(el);
@@ -117,8 +94,6 @@ function styleOf(el: Element): CSSStyleDeclaration {
 
 const clips = (value: string) => value === 'hidden' || value === 'clip';
 
-/** The edges `el` cuts its content at: those of each axis whose overflow
- *  clips. The other axis may still scroll or show its content. */
 function clippedEdges(el: Element): FitEdge[] {
   const style = styleOf(el);
   return [
@@ -131,8 +106,6 @@ function cutByEllipsis(el: Element): boolean {
   return styleOf(el).getPropertyValue('text-overflow') === 'ellipsis' && el.scrollWidth - el.clientWidth > SLACK_PX;
 }
 
-/** The element and its ancestors below the body, since `<html>` and `<body>`
- *  are the box itself. */
 function ancestorsInBox(el: Element): Element[] {
   const chain: Element[] = [];
   for (let at: Element | null = el; at && !isBox(at); at = at.parentElement) chain.push(at);
@@ -146,8 +119,6 @@ function textNodes(doc: Document): Text[] {
   return nodes;
 }
 
-/** What the box cuts off: ellipsis cuts, then text, then media. Text inside an
- *  element already reported as an ellipsis cut is not reported again. */
 export function measureFit(doc: Document, geometry: FitGeometry = domGeometry): FitResult {
   if (!doc.body) return { findings: [], total: 0 };
   const { width, height } = geometry.box();
@@ -191,9 +162,6 @@ export function measureFit(doc: Document, geometry: FitGeometry = domGeometry): 
   return { findings: found.slice(0, MAX_FIT_FINDINGS), total: found.length };
 }
 
-/** Resolves once the fonts are ready and the DOM and the body's size then hold
- *  still for {@link SETTLE_QUIET_MS}. Never later than {@link SETTLE_CAP_MS}
- *  after the call. */
 export function settle(doc: Document): Promise<void> {
   return new Promise((resolve) => {
     let quiet: ReturnType<typeof setTimeout> | undefined;

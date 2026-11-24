@@ -1,19 +1,5 @@
 // @vitest-environment jsdom
-// The resolver reads a real DOM through `closest`, and `renderMarkdown` runs
-// its output through DOMPurify, which needs one too.
 
-/**
- * An `![alt](src)` image in a chat turn is a picture the reader wants to look
- * at. The transcript caps it at 24rem so a screenshot fits beside its prose.
- * The image popup is the only place it can be read at full size, zoomed.
- * Nothing connected the two: clicking an inline image did nothing at all,
- * while a generated image (`.image-thumbnail`) and a user attachment
- * (`.user-image-thumb`) both opened it.
- *
- * The resolver is delegated from the one global click handler rather than
- * bound per component, because every markdown surface emits the same wrapper:
- * a chat turn, a rendered `.md` preview, a notification body.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
 import { readFileSync } from 'node:fs';
@@ -30,8 +16,6 @@ const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf-8');
 const DIAGRAM = 'https://example.test/diagram.png';
 const CHART = 'https://example.test/chart.png';
 
-/** Mount `html` under a container carrying `containerClass`, and hand back the
- *  images the markdown produced. */
 function mount(containerClass: string, html: string): HTMLImageElement[] {
   document.body.innerHTML = `<div class="${containerClass}">${html}</div>`;
   return [...document.querySelectorAll('img')];
@@ -57,7 +41,6 @@ describe('inlineMarkdownImage', () => {
   });
 
   it('claims an image on a question card, in the question and in an option', () => {
-    // A card showed an agent's mockups, and tapping one did nothing.
     document.body.innerHTML = `
       <div class="question-body">
         <div class="question-text markdown-content">${renderMarkdown(`Which? ![All](${DIAGRAM})`)}</div>
@@ -95,8 +78,6 @@ describe('inline images join the popup nav group', () => {
   });
 
   it('groups a rendered markdown document outside the thread pane', () => {
-    // A `.md` file preview and a notification body have no `.thread-content`
-    // around them, so the markdown block itself is the group.
     const imgs = mount(
       'response-content markdown-content',
       renderMarkdown(`![Diagram](${DIAGRAM})\n\nSome prose.\n\n![Chart](${CHART})`),
@@ -136,9 +117,6 @@ describe('inline images join the popup nav group', () => {
   });
 });
 
-/** The selector exists three times: the resolver, the group collector, and the
- *  `zoom-in` cursor. Drift between them advertises a click that never lands, or
- *  hides one that does. */
 describe('the click and the cursor cover the same images', () => {
   const source = read('../imagePopup.ts');
   const selector = source.match(/const INLINE_MARKDOWN_IMAGE = '([^']+)'/)?.[1];
@@ -149,15 +127,13 @@ describe('the click and the cursor cover the same images', () => {
   });
 
   it('cursors exactly that selector, in the host-only stylesheet', () => {
-    // Host-only: an app iframe gets `.image-scroll-wrapper` from the shared
-    // layer but has no popup, so a zoom cursor there would promise nothing.
     const css = read('../../styles/global/host-components.css');
     expect(css).toContain(`${selector} {\n    cursor: zoom-in;`);
     expect(read('../../styles/global/shared-components.css')).not.toContain('zoom-in');
   });
 
   it('is delegated from the one global click handler', () => {
-    const startup = read('../startup.ts');
+    const startup = read('../globalClick.ts');
     expect(startup).toContain('inlineMarkdownImage(target)');
     expect(startup).toContain('openImagePopupFromGroup(inlineImage.src, inlineImage)');
   });

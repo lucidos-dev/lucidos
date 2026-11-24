@@ -1,39 +1,30 @@
-/**
- * The *System attention badge*: what raises it, what it says, and what it refuses
- * read.
- *
- * The two things it must never do are the interesting half. It must not badge
- * on an unknown answer, which would flash a dot on every cold load. And it must
- * not clear on a DISMISSAL, which would spend the one time the workspace is
- * told.
- *
- * The version below is a fixed synthetic value, deliberately not a real
- * release, so it can never collide with the `RELEASE` file being shipped.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Mocked whole, rather than partially: the real module reads `navigator` at
-// load time and this suite runs without jsdom. Nothing else in the badge's
-// import graph reaches it.
 const platform = vi.hoisted(() => ({ thisDeviceIsMobile: vi.fn(() => false) }));
 vi.mock('../utils/platform', () => platform);
 
 import { systemAttentionBadge, systemAttentionBadgeLabel } from './systemAttentionBadge';
 import { releaseNoticeDismissed } from './releaseNotices';
 import { latestTauriAppVersion, releaseCheck, releaseNoticeView } from './store';
-import type { ReleaseNotice } from '../api/client';
+import type { ReleaseNoticeItem } from '../api/client';
 
-function notice(id: string, resolved: boolean): ReleaseNotice {
-  return { id, since: '2.0.0', title: `Notice ${id}`, body: 'Do the thing.', resolved, action_deferred: false };
+function notice(id: string, resolved: boolean): ReleaseNoticeItem {
+  return { id, since: '2.0.0', title: `Notice ${id}`, body: 'Do the thing.', summary: 'Review it.', resolved };
 }
 
-/** Put `notices` in front of the badge, with the first unresolved one owed. */
-function owe(notices: ReleaseNotice[]): void {
-  const next = notices.find((n) => !n.resolved)?.id ?? null;
-  releaseNoticeView.value = { status: 'loaded', data: { notices, next_id: next } };
+function owe(items: ReleaseNoticeItem[]): void {
+  const owed = items.filter((item) => !item.resolved);
+  const owedThrough = owed[owed.length - 1]?.id ?? null;
+  releaseNoticeView.value = {
+    status: 'loaded',
+    data: {
+      releases: [{ since: '2.0.0', items, resolved: owedThrough === null, action_prompt: null }],
+      owed_through: owedThrough,
+      action_prompt: null,
+    },
+  };
 }
 
-/** An offer from the gateway, the ordinary way an update is announced. */
 function offer(version: string): void {
   releaseCheck.value = {
     enabled: true,
@@ -86,12 +77,10 @@ describe('systemAttentionBadge', () => {
   });
 
   it('answers an owed notice', () => {
-    owe([notice('a', true), notice('b', false)]);
+    owe([notice('a', true), notice('b', false), notice('c', false)]);
     expect(systemAttentionBadge()).toBe('1 thing to do');
   });
 
-  // An unknown answer is not "you owe something". Badging here would draw a dot
-  // on every cold load and clear it a moment later.
   it('badges nothing while the notices are unknown', () => {
     releaseNoticeView.value = { status: 'loading' };
     expect(systemAttentionBadge()).toBe(null);
@@ -99,15 +88,12 @@ describe('systemAttentionBadge', () => {
     expect(systemAttentionBadge()).toBe(null);
   });
 
-  // The badge clears on the INSTALL, and a phone can never run one, so a mark
-  // raised there would never go out.
   it('does not raise the update half on a phone', () => {
     platform.thisDeviceIsMobile.mockReturnValue(true);
     offer('9.9.9');
     expect(systemAttentionBadge()).toBe(null);
   });
 
-  // A notice is answerable from anywhere, so only the update half stands down.
   it('still raises an owed notice on a phone', () => {
     platform.thisDeviceIsMobile.mockReturnValue(true);
     offer('9.9.9');
@@ -115,8 +101,6 @@ describe('systemAttentionBadge', () => {
     expect(systemAttentionBadge()).toBe('1 thing to do');
   });
 
-  // Escape on the modal answers nothing, so the badge must survive it. The one
-  // thing that clears it is the notice being resolved.
   it('stays up when the modal is dismissed unanswered', () => {
     owe([notice('a', false)]);
     releaseNoticeDismissed.value = true;

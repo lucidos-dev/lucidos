@@ -1,9 +1,3 @@
-/**
- * The drawer row's agent mark stands under the title line's last action
- * button. Both end at the row's right edge, so their centres meet only when
- * their boxes are equally wide. Each layout sets one width var on the row, and
- * both boxes read it.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -33,6 +27,11 @@ describe('the drawer row agent mark', () => {
     for (const layout of LAYOUTS) {
       expect(widthOf('.thread-row-actions .icon-btn.header-icon', layout)).toBe(`var(${VAR})`);
     }
+  });
+
+  it('keeps every glyph at the same size when the action column is narrow', () => {
+    const svg = RULES.find(r => r.selector === '.thread-row-agent svg')!;
+    expect(svg.props.get('flex-shrink')).toBe('0');
   });
 
   it('takes its width from the row in every layout', () => {

@@ -6,10 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// Where the rung control sits in the prompt row. It is a pill beside the send
-// button in every state, so every send path is the send button's own. It folds
-// in its place in the row order, after every icon on its left
-// (`prompt-row-controls.test.tsx`).
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource: string = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
@@ -23,7 +19,6 @@ describe('the rung control in the prompt row', () => {
     expect(promptSource).toContain('disabledReason={rungDisabledReason}');
   });
 
-  // `a-model-picker-stays-left-of-the-action.test.tsx` renders the group.
   it('hands the cluster members and the action slot to the right-hand group', () => {
     expect(promptSource).toContain(
       '<PromptActionsRight cluster={members.cluster.map(renderMember)} action={actionSlot} />',

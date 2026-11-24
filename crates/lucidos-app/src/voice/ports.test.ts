@@ -9,7 +9,6 @@ vi.mock('../api/client', async (importOriginal) => {
   return { ...actual, mintCallTicket: (threadId: string) => answer(threadId) };
 });
 
-/** What the reader sees when a mint fails, which is the point of minting. */
 async function refusal(): Promise<string> {
   try {
     await browserPorts.mintCallTicket('thread-1');

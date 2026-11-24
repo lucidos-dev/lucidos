@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { makeOrderSaver, type OrderSaveDeps } from './orderSave';
 
-/** A gateway whose saves answer only when the test says so. */
 function harness() {
   const drawn: (readonly string[])[] = [];
   const sent: (readonly string[])[] = [];

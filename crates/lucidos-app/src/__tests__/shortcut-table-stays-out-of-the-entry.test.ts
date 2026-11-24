@@ -1,13 +1,3 @@
-/**
- * The shortcut table ships in the shell chunk, never the entry. Only drawn UI
- * reads it: the keyboard handler, the tooltips, Settings, and the macOS View
- * menu's accelerators, which `startShell` installs. One static import of
- * `utils/shortcuts.ts` from anything `main.tsx` reaches puts it back on first
- * paint with `keybindings.ts` and the SDK tooltip, about 19 kB.
- *
- * This walks the static import graph from `main.tsx`, as Rollup does for the
- * entry chunk (`staticImportGraph.ts`).
- */
 import { describe, it, expect } from 'vitest';
 import { chainTo, srcPath, staticGraph } from './staticImportGraph';
 

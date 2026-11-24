@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 pub(crate) const USER_PROFILE_ARTIFACT: &str = "user_profile.md";
 
 /// The read-cache for `artifacts/user_profile.md`, owned by the engine.
-pub(crate) struct UserProfileCache {
+pub struct UserProfileCache {
     content: RwLock<String>,
 }
 
@@ -44,10 +44,10 @@ impl UserProfileCache {
     /// This is the definition every other method is measured against, since
     /// "what the engine would serve after a restart" is what a stale cache
     /// disagrees with.
-    pub(crate) fn load_from_workspace(workspace_path: &Path) -> Self {
+    pub fn load_from_workspace(workspace_path: &Path) -> Self {
         let content = read_from_disk(workspace_path);
         if !content.is_empty() {
-            log!("[Memory] Loaded user profile ({} chars)", content.len());
+            log_legacy!("[Memory] Loaded user profile ({} chars)", content.len());
         }
         Self {
             content: RwLock::new(content),
@@ -55,7 +55,7 @@ impl UserProfileCache {
     }
 
     /// The current profile, empty when there is none.
-    pub(crate) async fn snapshot(&self) -> String {
+    pub async fn snapshot(&self) -> String {
         self.content.read().await.clone()
     }
 
@@ -69,7 +69,7 @@ impl UserProfileCache {
     /// transient pool timeout would otherwise carry the refresh out of the
     /// function with it, leaving exactly the stale profile this type exists to
     /// prevent.
-    pub(crate) async fn artifact_written(&self, artifact_path: &str, content: &[u8]) {
+    pub async fn artifact_written(&self, artifact_path: &str, content: &[u8]) {
         if artifact_path != USER_PROFILE_ARTIFACT {
             return;
         }
@@ -86,11 +86,7 @@ impl UserProfileCache {
     /// `run_python` copies its staged output straight into `data/` and commits
     /// the paths afterwards, so the file is the only place the new profile
     /// exists. Reads the same way a restart would.
-    pub(crate) async fn artifact_written_on_disk(
-        &self,
-        workspace_path: &Path,
-        artifact_path: &str,
-    ) {
+    pub async fn artifact_written_on_disk(&self, workspace_path: &Path, artifact_path: &str) {
         if artifact_path != USER_PROFILE_ARTIFACT {
             return;
         }
@@ -99,7 +95,7 @@ impl UserProfileCache {
 
     /// Apply an artifact delete that has LANDED. Deleting the profile clears
     /// the cache, matching the empty profile a restart would load.
-    pub(crate) async fn artifact_deleted(&self, artifact_path: &str) {
+    pub async fn artifact_deleted(&self, artifact_path: &str) {
         if artifact_path != USER_PROFILE_ARTIFACT {
             return;
         }

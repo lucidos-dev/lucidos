@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import fixture from '../../../lucidos-engine/src/engine/widget_embeds.fixture.json';
+import fixture from '../../../lucidos-core/src/engine/widget_embeds.fixture.json';
 import { scanWidgetEmbeds, withoutWidgetEmbeds } from './widgetEmbed';
 
 interface FixtureEmbed {
@@ -15,7 +15,6 @@ interface FixtureCase {
   without_embeds: string | null;
 }
 
-// The engine's `widget_embed.rs` reads this same fixture (ADR 0415).
 describe('the shared widget embed fixture', () => {
   for (const c of fixture as FixtureCase[]) {
     it(`parses ${c.markdown}`, () => {

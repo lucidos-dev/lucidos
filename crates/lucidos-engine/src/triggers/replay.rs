@@ -49,7 +49,7 @@ pub fn replay_trigger_events(events: Vec<TriggerEventRow>) -> HashMap<String, Tr
                     // Dropping it silently makes the trigger vanish from the
                     // panel at boot with nothing anywhere to explain it. The
                     // live applier logs the same failure.
-                    Err(e) => crate::log!(
+                    Err(e) => crate::log_legacy!(
                         "[TriggerReplay] {} payload for {} did not parse: {}",
                         row.event_type,
                         trigger_id,

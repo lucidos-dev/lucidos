@@ -1,0 +1,17 @@
+{
+  "description": "The design's worked example: 2 h 42 min from PlanStarted to Live, 62 minutes of waits, a lead time of 1 h 40 min with 45 minutes of Hardening.",
+  "observed_at": "2026-11-02T12:00:00Z",
+  "events": [
+    {"seq": 1, "at": "2026-11-02T09:00:00Z", "type": "PlanStarted", "thread": "thread-a", "data": {"kind": "implementation"}},
+    {"seq": 2, "at": "2026-11-02T09:12:00Z", "type": "PlanProposed", "thread": "thread-a", "data": {"kind": "implementation"}},
+    {"seq": 3, "at": "2026-11-02T09:20:00Z", "type": "PlanApproved", "thread": "thread-a", "data": {"kind": "implementation", "scope": "implement"}},
+    {"seq": 4, "at": "2026-11-02T09:40:00Z", "type": "UserQuestionAsked", "thread": "thread-a", "data": {"tool_use_id": "question-1"}},
+    {"seq": 5, "at": "2026-11-02T09:50:00Z", "type": "UserQuestionAnswered", "thread": "thread-a", "data": {"tool_use_id": "question-1"}},
+    {"seq": 6, "at": "2026-11-02T10:05:00Z", "type": "HardeningStarted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "full"}},
+    {"seq": 7, "at": "2026-11-02T10:45:00Z", "type": "HardenRunCompleted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "full", "verdict": "pass"}},
+    {"seq": 8, "at": "2026-11-02T10:50:00Z", "type": "ChangeProposed", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": true, "hardened": true, "files": ["crates/example-core/src/lib.rs", "crates/example-app/src/main.rs"]}},
+    {"seq": 9, "at": "2026-11-02T11:30:00Z", "type": "ChangeApplied", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": true, "client_update": false, "post_merge_sha": "1111111111111111111111111111111111111111", "landing_merge_sha": "1111111111111111111111111111111111111111", "commits": ["docs: describe habit streaks", "feat: add habit streaks"]}},
+    {"seq": 10, "at": "2026-11-02T11:38:00Z", "type": "EngineBuildCompleted", "thread": null, "data": {"outcome": "succeeded", "duration_ms": 480000, "built_head": "1111111111111111111111111111111111111111"}},
+    {"seq": 11, "at": "2026-11-02T11:42:00Z", "type": "EngineVersionActivated", "thread": null, "data": {"build_id": "1111111111", "frontend_source_commit": "1111111111111111111111111111111111111111"}}
+  ]
+}

@@ -1,12 +1,3 @@
-/**
- * Tests for toggleFocusedThreadFamily — the action behind the `toggleSubthreads`
- * keyboard shortcut. It collapses/expands the OPEN (focused) thread's own
- * sub-thread family, working from any pane (no drawer-focus gate). It always
- * acts on the focused thread itself — never climbing to a parent — and no-ops
- * when there is no focused thread or it has no sub-threads. Collapse state is
- * the same localStorage-backed `collapsedFamilies` set the disclosure chevron
- * and the ←/→ tree nav write, so we assert via the persisted set.
- */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { toggleFocusedThreadFamily } from './ThreadDrawer';

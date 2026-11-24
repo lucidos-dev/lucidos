@@ -1,7 +1,3 @@
-/** A cache keep-alive resumes a waiting coding agent only to keep its prompt
- *  cache warm. Nothing of that turn renders: the waiting turn stays the last
- *  card, and a real delivery after it opens its own card as usual. The run of
- *  pings leaves one turnless card, which later status events update in place. */
 import { describe, expect, it } from 'vitest';
 import { computeExchanges, groupIntoExchanges, handleEvent, isTurnlessBoundary, type StoredEvent, type ThreadEvent, type ThreadMeta, type ThreadState } from '../thread-events';
 import { awaitedQuestionCard } from './exchange-grouping';
@@ -117,7 +113,6 @@ const notKept = (minute: number) => ({
   status: { state: 'not_kept', reason: 'no_wake_children' },
 }) as unknown as StoredEvent;
 
-/** The waiting turn, then `statuses` in order, one seq each. */
 function withStatuses(...statuses: StoredEvent[]): Map<number, StoredEvent> {
   const events = waitingThenKeptWarm();
   statuses.forEach((status, i) => events.set(8 + i, status));
@@ -276,7 +271,6 @@ describe('the thread aggregate', () => {
   });
 });
 
-/** A coding agent parked on a question card, which the user has yet to answer. */
 function parkedOnAQuestion(): Map<number, StoredEvent> {
   const events = new Map<number, StoredEvent>();
   events.set(1, { type: 'MessageReceived', text: 'run the suite', mode: 'human', created: at(0), _eventId: 'm1', channel: 'claude_code' } as StoredEvent);
@@ -381,7 +375,6 @@ describe('a keep-alive run while the turn waits on a question card', () => {
   });
 });
 
-/** `event` reporting a wait that began at `minute`. */
 function sinceAt(event: StoredEvent, minute: number): StoredEvent {
   const { status } = event as unknown as { status: object };
   return { ...event, status: { ...status, since: at(minute) } } as unknown as StoredEvent;

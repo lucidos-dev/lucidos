@@ -1,18 +1,13 @@
 import { repositories, showToast, encodeRepoPath, type Repository } from '../store';
 import type { RepoFileHrefTarget } from '../../utils/linkifyPaths';
 import { refreshRepositories } from './repositoriesLoader';
-import { handleNavigationRequest } from './navigation-request';
+import { handleNavigationRequest } from './navigation-dispatch';
 
-/** How the repository segment of a `repo:` link resolved against the registry. */
 export type RepositoryMatch =
   | { kind: 'found'; repo: Repository }
   | { kind: 'missing' }
   | { kind: 'ambiguous'; count: number };
 
-/** Resolve the repository segment of a `repo:` link: an id, then an exact
- *  name, then a name in any case. The first tier with a hit decides, so an id
- *  never loses to a same-spelled name. Names are not unique in the registry,
- *  so two hits in one tier are ambiguous rather than a guess. */
 export function matchRepository(repos: readonly Repository[], ref: string): RepositoryMatch {
   const folded = ref.toLowerCase();
   const tiers: ((r: Repository) => boolean)[] = [
@@ -28,11 +23,6 @@ export function matchRepository(repos: readonly Repository[], ref: string): Repo
   return { kind: 'missing' };
 }
 
-/** Match `ref` after re-reading the registry. The cached list lags a
- *  repository registered moments ago, so a miss off the cache alone would
- *  report a live repository as unregistered. The read is a fresh request,
- *  since a load already in flight can predate that registration. A failed
- *  re-read keeps the previous list for every other surface. */
 export async function rereadAndMatch(ref: string): Promise<RepositoryMatch | { kind: 'failed'; error: string }> {
   const snapshot = repositories.value;
   await refreshRepositories();
@@ -42,13 +32,6 @@ export async function rereadAndMatch(ref: string): Promise<RepositoryMatch | { k
   return { kind: 'failed', error: reread.status === 'failed' ? reread.error : 'the list did not load' };
 }
 
-/** Open a `repo:` link, naming its repository by id or by name, with `open`.
- *  That is the Files panel's preview unless the caller passes another opener
- *  (a link in agent prose passes the file preview modal's).
- *
- *  A cache hit opens before the first `await`, inside the click's own task.
- *  An unresolvable repository toasts, naming the file, the repository and the
- *  link's origin. A missing file or ref is the preview's own load error. */
 export async function openRepoFileLink(
   target: RepoFileHrefTarget,
   source?: string,

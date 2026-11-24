@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A confirm's OK button is red only when the caller says the action destroys
- * something. `tsc` requires the variant at every call site, and this test pins
- * what each variant renders.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 

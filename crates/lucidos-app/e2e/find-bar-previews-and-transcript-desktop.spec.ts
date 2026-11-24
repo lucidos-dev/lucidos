@@ -7,16 +7,6 @@ import {
   waitForScrollSettled,
 } from './helpers';
 
-// The find bar over a text preview, an HTML artifact preview and the
-// transcript. The unit floor is `store/actions/find-bar.test.ts`,
-// `store/actions/transcript-find.test.ts` and the preview bridge tests. This
-// is what only a browser can say. Each surface really paints, and the HTML
-// preview really answers over its bridge. A step in the transcript reaches a
-// turn the window had not drawn.
-//
-// `-desktop`, because Mod+F and the pane focus it follows are desktop input.
-// Plans: `docs/plans/2026-10-07-find-in-previews-and-transcript.md` and
-// `docs/plans/2026-10-25-find-all-thread-text.md`.
 
 const NOTES_PATH = 'artifacts/e2e-find-notes.md';
 const REPORT_PATH = 'artifacts/e2e-find-report.html';
@@ -91,8 +81,6 @@ test.describe('the find bar', () => {
   });
 
   test('finds in the whole transcript, and a step reaches a turn not yet drawn', async ({ page }) => {
-    // Forty turns: the transcript draws a tail of about twenty, so turn 2 is
-    // not drawn when the thread opens at its end.
     const threadId = seedChatThread({ turns: 40, needles: [2, 38], title: 'Find bar transcript' });
     await page.addInitScript((tid: string) => localStorage.setItem('lucidos-focused-thread', tid), threadId);
     await disarmFollowSeed(page);
@@ -102,7 +90,6 @@ test.describe('the find bar', () => {
     await expect(transcript).toContainText('Answer 39.', { timeout: 15_000 });
     await expect(transcript).not.toContainText('Answer 2 mentions');
 
-    // Fold turn 38, so its match is neither drawn nor unfolded.
     const turn38 = page.locator('.chat-exchange', { hasText: 'Question 38' }).first();
     await turn38.locator('[data-role="toggle-collapsed"]').click({ force: true });
     await expect(transcript).not.toContainText('Answer 38 mentions');
@@ -110,18 +97,15 @@ test.describe('the find bar', () => {
     await transcript.click();
     await page.keyboard.press('ControlOrMeta+f');
     await expect(findInput(page)).toBeFocused();
-    // The fold and the bar's own roll move the layout. Measure once both rest.
     await waitForScrollSettled(page);
     const before = await transcript.evaluate((el) => el.scrollTop);
     await page.keyboard.type('zebra');
     await expect(status(page)).toHaveText('2 matches');
     expect(await transcript.evaluate((el) => el.scrollTop), 'typing moved the transcript').toBe(before);
 
-    // The first step lands below the reader, on the folded turn, and unfolds it.
     await page.keyboard.press('Enter');
     await expect(status(page)).toHaveText('2 of 2');
     await expect(transcript).toContainText('Answer 38 mentions the zebra.');
-    // The next wraps to turn 2, which the window had to draw.
     await page.keyboard.press('Enter');
     await expect(status(page)).toHaveText('1 of 2');
     await expect(transcript).toContainText('Answer 2 mentions the zebra.');
@@ -153,7 +137,6 @@ test.describe('the find bar', () => {
     await page.keyboard.type('giraffe');
     await expect(status(page)).toHaveText('2 matches');
 
-    // The step row comes first. Stepping to it turns steps on.
     await page.keyboard.press('Enter');
     await expect(status(page)).toHaveText('1 of 2');
     await expect(transcript.locator('.step-description', { hasText: 'giraffe' })).toBeVisible();
@@ -165,7 +148,6 @@ test.describe('the find bar', () => {
       return range?.startContainer.parentElement?.closest('.question-option-desc') ? range.toString() : null;
     })).toBe('giraffe');
 
-    // Closing hands the reader's Steps setting back.
     await page.keyboard.press('Escape');
     await expect(transcript.locator('.step-description', { hasText: 'giraffe' })).toHaveCount(0);
   });

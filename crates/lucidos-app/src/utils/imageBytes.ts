@@ -1,17 +1,4 @@
-/**
- * Magic-byte image sniffing on the client, mirroring the engine.
- *
- * The blob store decides what it accepts by reading the bytes
- * (`sniff_image_mime` in `crates/lucidos-engine/src/core/blobs.rs`), never the
- * MIME a client declares. A composer that gates on the declared type builds a
- * chip for bytes the upload then refuses. This module asks the server's own
- * question on the client, before anything is drawn.
- *
- * The three tables below are pinned to the Rust source by
- * `imageBytes.mirror.test.ts`.
- */
 
-/** Mimes the engine's blob store stores. Mirrors `ALLOWED_IMAGE_MIME_EXT`. */
 export const ALLOWED_IMAGE_MIMES = [
   'image/png',
   'image/jpeg',
@@ -22,13 +9,8 @@ export const ALLOWED_IMAGE_MIMES = [
 
 export type AllowedImageMime = (typeof ALLOWED_IMAGE_MIMES)[number];
 
-/** `ftyp` brands the engine reads as HEIC. */
 export const HEIC_BRANDS = ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'] as const;
 
-/**
- * Formats recognized only to name them in a rejection. Nothing here is
- * accepted; the label is what the user reads instead of an allowlist.
- */
 export const UNSUPPORTED_IMAGE_FORMATS = [
   { id: 'TIFF', label: 'a TIFF image' },
   { id: 'BMP', label: 'a BMP image' },
@@ -40,7 +22,6 @@ export const UNSUPPORTED_IMAGE_FORMATS = [
 
 export type UnsupportedImageId = (typeof UNSUPPORTED_IMAGE_FORMATS)[number]['id'];
 
-/** A verdict that refuses the bytes, and therefore owes the user a reason. */
 export type RejectedImage =
   | { kind: 'empty' }
   | { kind: 'unsupported'; id: UnsupportedImageId | null; label: string | null };
@@ -66,10 +47,6 @@ function asciiAt(bytes: Uint8Array, offset: number, length: number): string {
   return out;
 }
 
-/**
- * The engine's `sniff_image_mime`, byte for byte. Returns null for anything
- * outside the allowlist.
- */
 export function sniffImageMime(bytes: Uint8Array): AllowedImageMime | null {
   if (matches(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png';
   if (matches(bytes, [0xff, 0xd8, 0xff])) return 'image/jpeg';
@@ -84,7 +61,6 @@ export function sniffImageMime(bytes: Uint8Array): AllowedImageMime | null {
   return null;
 }
 
-/** How much of a text file to read when looking for an SVG root element. */
 const SVG_SNIFF_LIMIT = 512;
 
 function looksLikeSvg(bytes: Uint8Array): boolean {
@@ -94,10 +70,6 @@ function looksLikeSvg(bytes: Uint8Array): boolean {
   return start.startsWith('<?xml') && head.includes('<svg');
 }
 
-/**
- * Name a format the engine refuses, so the rejection can say what the bytes
- * really are. Diagnosis only: every id here is still a refusal.
- */
 export function describeUnsupportedImage(bytes: Uint8Array): UnsupportedImageId | null {
   if (matches(bytes, [0x49, 0x49, 0x2a, 0x00]) || matches(bytes, [0x4d, 0x4d, 0x00, 0x2a])) return 'TIFF';
   if (matches(bytes, asciiCodes('BM'))) return 'BMP';
@@ -116,7 +88,6 @@ function labelFor(id: UnsupportedImageId): string {
   return found ? found.label : id;
 }
 
-/** Decide an attachment from its bytes alone, the way the engine does. */
 export function sniffImageBytes(bytes: Uint8Array): ImageVerdict {
   if (bytes.length === 0) return { kind: 'empty' };
   const mime = sniffImageMime(bytes);
@@ -125,10 +96,6 @@ export function sniffImageBytes(bytes: Uint8Array): ImageVerdict {
   return { kind: 'unsupported', id, label: id ? labelFor(id) : null };
 }
 
-/**
- * What the user reads at the moment of the paste. Names this attachment and
- * this format; never recites the allowlist.
- */
 export function imageRejectionMessage(
   verdict: RejectedImage,
   name: string,

@@ -173,8 +173,6 @@ describe('getContentTitle — menu labels', () => {
   });
 
   it('Thread Queue renders its canonical title from the Settings → System subview', () => {
-    // Thread Queue is no longer a top-level menu item — it's a System subpanel,
-    // so its title comes from the settings subview label, not menuLabels.
     activeMenuItem.value = 'settings';
     settingsSubview.value = 'thread-queue';
     expect(getContentTitle()).toBe('Thread Queue');
@@ -199,7 +197,6 @@ describe('getContentTitleShort: the header bar’s form of the title', () => {
     activeMenuItem.value = 'settings';
     settingsSubview.value = 'appearance';
     expect(getContentTitleShort()).toBe('Appearance');
-    // The full name stays available for the tap-tooltip beside it.
     expect(getContentTitle()).toBe('Appearance & Behavior');
   });
 
@@ -210,9 +207,6 @@ describe('getContentTitleShort: the header bar’s form of the title', () => {
   });
 
   it('leaves every other destination exactly as the full title has it', () => {
-    // A name we did not author cannot have a shorthand, so the two forms must
-    // not drift: a branch added to one and missed in the other would render an
-    // empty header bar.
     settingsSubview.value = 'main';
     for (const item of MENU_ITEMS) {
       activeMenuItem.value = item;
@@ -227,9 +221,6 @@ describe('getContentTitleShort: the header bar’s form of the title', () => {
     expect(getContentTitleShort()).toBe('notes.md');
   });
 
-  /** The rule the three cases below share: a title WE author says the
-   *  destination's KIND in the bar, and the detail naming the instance lives in
-   *  the full form, which the tap-tooltip and the history menu render. */
   it('says the kind of thing a notification is, not which one', () => {
     activeMenuItem.value = 'notifications';
     panelOverlay.value = {

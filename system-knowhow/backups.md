@@ -10,7 +10,8 @@ provider. Restoring it recreates the workspace's files and database on a fresh
 machine.
 
 For an in-place copy before risky work on this machine, use
-[workspace snapshots](backups/workspace-snapshots.md). A snapshot replaces the same
+[workspace snapshots](backups/workspace-snapshots.md)
+(`system-knowhow/backups/workspace-snapshots`). A snapshot replaces the same
 workspace through the gateway; an encrypted backup restores into a new workspace.
 Snapshots need the existing key store and do not replace off-machine backups.
 
@@ -110,6 +111,8 @@ account, it shows a red line linking to Settings → Accounts. So:
 A connected account must also carry the scopes the backup uses. The Backup page
 shows a missing scope as its own state (connected but not ready). It offers
 **Grant access**, which re-runs the authorization with the right scopes.
+A manual backup to a provider that is not ready is refused at once: `POST
+/api/v1/backup` answers 409 with reason `provider-not-ready`.
 
 **Both surfaces name the same missing scopes**: the page reads "<provider> is
 missing the `files.metadata.read` permission", and `get_backup_status` lists them

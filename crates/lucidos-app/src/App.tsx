@@ -8,6 +8,8 @@ import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
 import { ConnectionBanner } from './components/layout/ConnectionBanner';
 import { IngressBanner } from './components/layout/IngressBanner';
 import { WebhookRefusalBanner } from './components/layout/WebhookRefusalBanner';
+import { AgentSandboxBanner } from './components/layout/AgentSandboxBanner';
+import { PeerClientBanner } from './components/layout/PeerClientBanner';
 import { SlownessBanner } from './components/layout/SlownessBanner';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
@@ -48,7 +50,6 @@ import { CameraCaptureSlot } from './components/chat/PromptInput';
 import { DashboardRail } from './components/dashboard/DashboardRail';
 import { widgetFitRequests } from './store/widgetFit';
 
-// Re-exported so it ships in the shell chunk, which `main.tsx` runs it from.
 export { startShell } from './shellStartup';
 
 const FileSearchModal = lazyComponent(() => import('./components/files/FileSearchModal').then(m => m.FileSearchModal));
@@ -61,7 +62,7 @@ const ContextViewerModal = lazyComponent(() => import('./components/chat/Context
 const EventConditionPopover = lazyComponent(() => import('./components/chat/EventConditionPopover').then(m => m.EventConditionPopover));
 const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').then(m => m.ScaleModal));
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
-const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
+const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.loadFilePreviewModal()));
 const ReleaseNoticeModal = lazyComponent(() => import('./components/shared/ReleaseNoticeModal').then(m => m.ReleaseNoticeModal));
 const MemoryChoice = lazyComponent(() => import('./components/settings/MemoryChoice').then(m => m.MemoryChoice));
 const WidgetFitCheck = lazyComponent(() => import('./components/widgets/WidgetFitCheck').then(m => m.WidgetFitCheck));
@@ -69,8 +70,6 @@ const ConfirmAndPromptDialogs = lazyComponent(() => import('./components/shared/
 prefetchWhenIdle(ConfirmAndPromptDialogs);
 registerAskDialogChunk(ConfirmAndPromptDialogs);
 
-// Each overlay sits in its own slot so the signal subscription is leaf-scoped:
-// a flip re-renders the slot, not all of App and its descendants.
 function ImagePopupSlot()        { return popupImage.value           ? <ImagePopup />        : null; }
 function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageRoutePanel /> : null; }
 function EngineBuildLogSlot()    { return engineBuildLogOpen.value ? <EngineBuildLogModal /> : null; }
@@ -79,31 +78,18 @@ function CheckpointDiffSlot()    { return checkpointDiffModal.value  ? <Checkpoi
 function ContextViewerSlot()     { return contextViewer.value        ? <ContextViewerModal /> : null; }
 function EventConditionSlot()    { return eventConditionPopover.value ? <EventConditionPopover /> : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
-// It stays open through its own slide-out, so the gate holds until it is gone.
 function DrawerSlot()            { return drawerOpen.value           ? <DrawerChunk />       : null; }
-// Slot-gated for a second reason beyond the leaf-scoped subscription: it keeps
-// the file preview renderers (which the content pane already lazy-loads) out of
-// the initial bundle for every user who never opens an app that previews a file.
 function FilePreviewModalSlot()  { return filePreviewModal.value     ? <FilePreviewModal />  : null; }
-// Most workspaces owe no release notice, so the gate keeps the modal's chunk
-// off every load that will never draw it.
 function ReleaseNoticeSlot()     { return releaseNoticeModalOpen()   ? <ReleaseNoticeModal /> : null; }
-// Asked once per workspace, so the same holds for the memory choice.
 function MemoryChoiceSlot()      { return memoryChoiceOpen()         ? <MemoryChoice />      : null; }
-// A fit check renders only when the engine asks, so no first frame loads it.
 function WidgetFitCheckSlot()    { return widgetFitRequests.value.length > 0 ? <WidgetFitCheck /> : null; }
 
-// FileSearchModal and SearchEverywhere render a hidden shell instead of
-// unmounting when closed (avoids will-change:transform ghost pixels on iOS
-// Safari PWAs). Latch on first open and stay mounted thereafter.
 const fileSearchEverOpen = signal(false);
 const searchEverywhereEverOpen = signal(false);
 effect(() => { if (fileSearchOpen.value) fileSearchEverOpen.value = true; });
 effect(() => { if (searchEverywhereOpen.value) searchEverywhereEverOpen.value = true; });
 
 function FileSearchModalSlot()   { return fileSearchEverOpen.value      ? <FileSearchModal />   : null; }
-// Latched like the two above, so after the first open they behave exactly as
-// an always-mounted dialog does, exit fade included.
 const askDialogEverOpen = signal(false);
 effect(() => { if (confirmState.value.visible || promptState.value.visible) askDialogEverOpen.value = true; });
 function ConfirmAndPromptSlot()  { return askDialogEverOpen.value       ? <ConfirmAndPromptDialogs /> : null; }
@@ -115,40 +101,20 @@ export function App() {
   useScrollLock();
   useKeyboardShortcuts();
 
-  // Mount only the visible layout. Dual-mounting fanned every signal write out
-  // to two ThreadDrawer + ThreadPane + ContentPane subtrees — the inactive one
-  // still ran subscriptions, render, and FLIP layout reads on 100+ rows. Gating
-  // on viewportIsMobile keeps one subtree alive. The signal self-corrects on
-  // real viewport changes (rotation / wake / resize — see utils/viewport.ts), so
-  // a wrong initial read on an iOS PWA cold launch or landscape start re-mounts
-  // into the correct layout instead of stranding a portrait phone in the desktop
-  // split. A genuine breakpoint crossing is rare, so the per-render cost is ~0.
   const mobile = viewportIsMobile.value;
-  // Reclaimed macOS title-bar band: drags the window and double-click-zooms it.
-  // Drag/zoom go through always-allowed app commands (useWindowDragRegion), since
-  // data-tauri-drag-region's window-plugin IPC is denied by our capability ACL.
   const stripRef = useRef<HTMLDivElement>(null);
   useWindowDragRegion(stripRef, { maximize: true });
   return (
     <>
       <div class="app-shell">
-        {/* Reclaimed macOS title-bar band + window drag region. Collapses to 0px
-            (and is inert) off the macOS Tauri build — see .titlebar-strip CSS. */}
         <div ref={stripRef} class="titlebar-strip" />
         <AppHeader />
-        {/* Desktop's app-shell banners: flow siblings that push the panes down.
-            The mobile copies are mounted inside the fixed header instead (see
-            AppHeader), and each renders only under its own viewport.
-            Ordered by reach, widest first. The connection bar says this whole
-            workspace is unreachable; the slowness bar says it is reachable
-            but slow; the ingress bar narrows reach to the public path a sender
-            takes; the refusal bar narrows it again to one hook that is throwing
-            away what does arrive; the reminder below them all is about a risk
-            that will still be there later. */}
         <ConnectionBanner layout="desktop" />
         <SlownessBanner layout="desktop" />
         <IngressBanner layout="desktop" />
         <WebhookRefusalBanner layout="desktop" />
+        <AgentSandboxBanner layout="desktop" />
+        <PeerClientBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />
         <DrawerSlot />
         {mobile ? (
@@ -166,15 +132,6 @@ export function App() {
         <DashboardRail />
       </div>
 
-      {/* Overlays -- rendered outside the split layout.
-
-          The layered group below moves as a unit into a natively fullscreen app
-          panel, because a fullscreen element is painted alone and nothing
-          outside its subtree can be seen at any z-index. Keeping them together
-          is what preserves their z-order. The drop dispatcher (renders null) and
-          the UI blocker (inerts its own siblings, so it must stay a child of the
-          app root) are deliberately outside the layer, and OverlayLayer's doc
-          comment says why. */}
       <OverlayLayer>
         <FileSearchModalSlot />
         <Toast />

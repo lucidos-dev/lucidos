@@ -5,12 +5,6 @@ import { preferences } from './preferences';
 import { triggers } from './triggers';
 import { apps } from './apps';
 
-/** The hand-written SDK facade is NOT generated (it carries rich JSDoc + typed
- *  return shapes the codegen can't express), but it must stay in parity with the
- *  capability manifest. `capabilities.ts` is generated from the manifest
- *  (`capability_manifest::DOMAINS`); this test fails if a domain declared
- *  `sdk = true` gains an operation the SDK facade doesn't expose. Add the
- *  namespace to `FACADES` when a new `sdk = true` domain lands. */
 const FACADES: Record<string, Record<string, unknown>> = {
   notifications: notifications as unknown as Record<string, unknown>,
   preferences: preferences as unknown as Record<string, unknown>,

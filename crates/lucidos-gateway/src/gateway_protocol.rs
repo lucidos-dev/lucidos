@@ -30,13 +30,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, ct_eq};
 use crate::error::ApiError;
-use crate::pairing::{self, PairingChannel, PairingKind, PendingPairings, Redemption};
+use crate::pairing::{
+    self, Minter, OwnerGate, PairingAnswer, PairingChannel, PairingKind, PairingRequest,
+    PendingPairings, Redemption,
+};
 use crate::server::GatewayState;
 use crate::stack::Health;
+use lucidos_gateway_stamp::remote_start::RemoteStartSetting;
+use lucidos_gateway_stamp::WORKSPACE_CALLS_PATH;
 
 /// The protocol version B names in its public health. Bumped only when a call
 /// is ADDED; nothing under [`GATEWAY_API_PREFIX`] is ever removed or changed.
-pub const GATEWAY_PROTOCOL: u32 = 2;
+pub const GATEWAY_PROTOCOL: u32 = 5;
+
+pub const OPERATIONS_PROTOCOL: u32 = 5;
+
+/// The first protocol with the manage hop, [`crate::manage_hop`]. Protocol 3
+/// added workspace calls.
+pub const MANAGE_PROTOCOL: u32 = 4;
 
 pub const ROTATE_PATH: &str = "/rotate";
 
@@ -59,6 +70,9 @@ pub const PAIRING_PATH: &str = "/pairing";
 /// List B's workspaces, relative to [`GATEWAY_API_PREFIX`].
 pub const WORKSPACES_PATH: &str = "/workspaces";
 
+/// Manage B's users and devices, relative to [`GATEWAY_API_PREFIX`].
+pub const MANAGE_PATH: &str = "/manage";
+
 /// Is this path in the gateway-to-gateway namespace?
 pub fn is_gateway_api_path(path: &str) -> bool {
     path.strip_prefix(GATEWAY_API_ROOT)
@@ -80,6 +94,16 @@ pub struct PairedGateway {
     pub last_used_at: Option<String>,
     #[serde(default)]
     pub previous_credential: Option<PreviousCredential>,
+    /// May devices on this gateway manage B's users and devices? Off unless
+    /// B's user turned it on (ADR 0656).
+    #[serde(default)]
+    pub may_manage: bool,
+    /// May agents on this gateway start threads here? Deny unless B's user
+    /// chose otherwise, which an older record therefore reads as (ADR 0725).
+    #[serde(default)]
+    pub remote_starts: RemoteStartSetting,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) return_route: Option<crate::return_access::ReturnRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +130,8 @@ pub fn paired_gateways_path(app_data: &Path) -> PathBuf {
 pub struct AuthenticatedGateway {
     pub pairing_id: String,
     pub label: String,
+    pub may_manage: bool,
+    pub remote_starts: RemoteStartSetting,
 }
 
 /// What one redemption produced.
@@ -116,6 +142,12 @@ pub enum GatewayRedemption {
         credential: String,
     },
     Rejected,
+    /// Waiting for a paired device's Allow. A presents the secret again.
+    /// `started` is true on the redeem that began the wait.
+    AwaitingOwner {
+        started: bool,
+    },
+    Declined,
 }
 
 /// B's paired gateways and its outstanding gateway pairings.
@@ -130,6 +162,8 @@ pub struct PairedGatewayStore {
     writing: Mutex<()>,
     /// Never persisted, like device pairings: a pairing lives five minutes.
     pending: Mutex<PendingPairings>,
+    receipts: Mutex<crate::return_access::Receipts>,
+    operation_nonces: Mutex<std::collections::HashMap<(String, String), u64>>,
 }
 
 impl PairedGatewayStore {
@@ -140,23 +174,33 @@ impl PairedGatewayStore {
             gateways: Mutex::new(gateways),
             writing: Mutex::new(()),
             pending: Mutex::new(PendingPairings::new(PairingKind::Gateway)),
+            receipts: Mutex::default(),
+            operation_nonces: Mutex::default(),
         })
     }
 
-    /// Mint a gateway pairing secret, carrying the label B's user suggested.
-    pub fn mint_secret(&self, label: Option<String>) -> Result<String, String> {
+    /// Mint a gateway pairing secret, carrying the label B's user suggested
+    /// and whether the pairing starts with the manage grant.
+    pub fn mint_secret(
+        &self,
+        label: Option<String>,
+        may_manage: bool,
+        minter: Minter,
+    ) -> Result<String, String> {
         self.pending
             .lock()
             .map_err(|_| "gateway pairing state is unavailable".to_string())?
             .mint(crate::pairing::PairingIntent {
                 label,
-                operator_id: None,
+                user_id: None,
+                may_manage,
+                minter,
             })
             .map(|minted| minted.secret)
             .map_err(|e| format!("could not mint a gateway pairing secret: {e}"))
     }
 
-    /// Redeem `secret` and record a paired gateway.
+    /// Redeem `secret` and record a paired gateway, once `gate` lets it.
     ///
     /// Never throttled: the secret is long enough that no flood can guess it,
     /// so no flood can spend a budget that stands before the right one.
@@ -168,26 +212,28 @@ impl PairedGatewayStore {
         &self,
         secret: &str,
         offered_label: Option<&str>,
+        gate: OwnerGate<'_>,
     ) -> Result<GatewayRedemption, String> {
-        let minted_label = {
+        let offered_label = offered_label.map(str::trim).filter(|s| !s.is_empty());
+        let intent = {
             let mut pending = self
                 .pending
                 .lock()
                 .map_err(|_| "gateway pairing state is unavailable".to_string())?;
-            match pending.redeem(secret, PairingChannel::Public) {
-                Redemption::Redeemed(intent) => intent.label,
+            match pending.redeem(secret, PairingChannel::Public, gate) {
+                Redemption::Redeemed(intent) => intent,
+                Redemption::AwaitingOwner { started } => {
+                    return Ok(GatewayRedemption::AwaitingOwner { started })
+                }
+                Redemption::Declined => return Ok(GatewayRedemption::Declined),
                 Redemption::Rejected | Redemption::LocalOnly | Redemption::Throttled => {
                     return Ok(GatewayRedemption::Rejected)
                 }
             }
         };
-        let label = minted_label
-            .or_else(|| {
-                offered_label
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
+        let label = intent
+            .label
+            .or_else(|| offered_label.map(str::to_string))
             .unwrap_or_else(|| "Paired gateway".to_string());
         let credential =
             auth::mint_credential().map_err(|e| format!("could not mint a credential: {e}"))?;
@@ -200,13 +246,33 @@ impl PairedGatewayStore {
             paired_at: chrono::Utc::now().to_rfc3339(),
             last_used_at: None,
             previous_credential: None,
+            may_manage: intent.may_manage,
+            remote_starts: RemoteStartSetting::default(),
+            return_route: None,
         };
-        crate::log!("[Gateway] paired with a remote gateway: {}", gateway.label);
+        crate::log_legacy!("[Gateway] paired with a remote gateway: {}", gateway.label);
         self.write(|store| store.gateways.push(gateway))?;
         Ok(GatewayRedemption::Paired {
             pairing_id,
             credential,
         })
+    }
+
+    /// The gateway pairings waiting for a paired device's answer.
+    pub fn requests(&self) -> Vec<PairingRequest> {
+        self.pending
+            .lock()
+            .map(|p| p.requests())
+            .unwrap_or_default()
+    }
+
+    /// Answer the waiting request `id`. `false` when none has that id.
+    pub fn answer(&self, id: &str, answer: PairingAnswer) -> Result<bool, String> {
+        Ok(self
+            .pending
+            .lock()
+            .map_err(|_| "gateway pairing state is unavailable".to_string())?
+            .answer(id, answer))
     }
 
     /// The paired gateway whose credential this request carries.
@@ -235,6 +301,8 @@ impl PairedGatewayStore {
             Ok(AuthenticatedGateway {
                 pairing_id: gateway.id.clone(),
                 label: gateway.label.clone(),
+                may_manage: gateway.may_manage,
+                remote_starts: gateway.remote_starts,
             })
         })
     }
@@ -313,6 +381,12 @@ impl PairedGatewayStore {
             .unwrap_or_default()
     }
 
+    pub(crate) fn has_no_incoming_pairings(&self) -> bool {
+        self.gateways
+            .lock()
+            .is_ok_and(|store| store.gateways.is_empty())
+    }
+
     /// Forget a paired gateway. `false` when none had that id. Its next call
     /// is refused, because [`Self::authorize`] reads memory.
     pub fn unpair(&self, id: &str) -> Result<bool, String> {
@@ -323,9 +397,146 @@ impl PairedGatewayStore {
             removed = store.gateways.len() != before;
         })?;
         if removed {
-            crate::log!("[Gateway] unpaired a remote gateway");
+            crate::log_legacy!("[Gateway] unpaired a remote gateway");
         }
         Ok(removed)
+    }
+
+    /// Turn the manage grant on or off. `None` when no pairing had that id.
+    /// The next call reads it, because [`Self::authorize`] reads memory.
+    pub fn set_may_manage(
+        &self,
+        id: &str,
+        may_manage: bool,
+    ) -> Result<Option<PairedGateway>, String> {
+        let mut updated = None;
+        self.write(|store| {
+            if let Some(gateway) = store.gateways.iter_mut().find(|g| g.id == id) {
+                gateway.may_manage = may_manage;
+                updated = Some(gateway.clone());
+            }
+        })?;
+        if let Some(gateway) = &updated {
+            crate::log_legacy!(
+                "[Gateway] {} the manage grant for '{}'",
+                if may_manage {
+                    "turned on"
+                } else {
+                    "turned off"
+                },
+                gateway.label
+            );
+        }
+        Ok(updated)
+    }
+
+    /// Set the remote start setting. `None` when no pairing had that id.
+    /// The next spawn reads it, because dispatch re-runs [`Self::authorize`].
+    pub fn set_remote_starts(
+        &self,
+        id: &str,
+        setting: RemoteStartSetting,
+    ) -> Result<Option<PairedGateway>, String> {
+        let mut updated = None;
+        self.write(|store| {
+            if let Some(gateway) = store.gateways.iter_mut().find(|g| g.id == id) {
+                gateway.remote_starts = setting;
+                updated = Some(gateway.clone());
+            }
+        })?;
+        if let Some(gateway) = &updated {
+            crate::log_legacy!(
+                "[Gateway] set remote starts from '{}' to {}",
+                gateway.label,
+                setting.as_str()
+            );
+        }
+        Ok(updated)
+    }
+
+    pub(crate) fn set_return_route(
+        &self,
+        id: &str,
+        route: Option<crate::return_access::ReturnRoute>,
+    ) -> Result<bool, String> {
+        let mut found = false;
+        self.write(|store| {
+            if let Some(gateway) = store.gateways.iter_mut().find(|g| g.id == id) {
+                gateway.return_route = route;
+                found = true;
+            }
+        })?;
+        Ok(found)
+    }
+
+    pub(crate) fn accept_operation_nonce(
+        &self,
+        workspace: &str,
+        nonce: &str,
+    ) -> Result<(), String> {
+        let now = lucidos_gateway_stamp::now_unix();
+        let mut seen = self
+            .operation_nonces
+            .lock()
+            .map_err(|_| "Operation replay state is unavailable.")?;
+        seen.retain(|_, expires| *expires > now);
+        let key = (workspace.to_owned(), nonce.to_owned());
+        if seen.len() >= 1024 || seen.contains_key(&key) {
+            return Err(
+                "This operation was already accepted, or the pending operation limit was reached."
+                    .into(),
+            );
+        }
+        seen.insert(
+            key,
+            now.saturating_add(2 * lucidos_gateway_stamp::WINDOW_SECS + 1),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn with_return_receipts<T>(
+        &self,
+        pairing: &str,
+        grant: &str,
+        f: impl FnOnce(&mut crate::return_access::Receipts) -> T,
+    ) -> Result<T, String> {
+        self.with_pairing_receipts(pairing, Some(grant), f)
+    }
+
+    pub(crate) fn discard_return_receipt(&self, receipt: &str) {
+        match self.receipts.lock() {
+            Ok(mut receipts) => receipts.forget(receipt),
+            Err(_) => crate::log!("[Gateway] Return receipt cleanup state is unavailable"),
+        }
+    }
+
+    /// Keep the pairing lock through issuance/redemption, so an unpair cannot
+    /// race the receipt's current-pairing check.
+    pub(crate) fn with_pairing_receipts<T>(
+        &self,
+        pairing: &str,
+        grant: Option<&str>,
+        f: impl FnOnce(&mut crate::return_access::Receipts) -> T,
+    ) -> Result<T, String> {
+        let gateways = self
+            .gateways
+            .lock()
+            .map_err(|_| "Gateway pairings are unavailable.")?;
+        if !gateways.gateways.iter().any(|g| {
+            g.id == pairing
+                && grant.is_none_or(|grant| {
+                    g.return_route
+                        .as_ref()
+                        .is_some_and(|route| route.grant_id == grant)
+                })
+        }) {
+            return Err("This return route is no longer registered on a current pairing.".into());
+        }
+        let mut receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| "Return receipts are unavailable.")?;
+        Ok(f(&mut receipts))
     }
 
     fn write(&self, mutate: impl FnOnce(&mut PairedGateways)) -> Result<(), String> {
@@ -351,6 +562,22 @@ pub fn router(state: GatewayState) -> Router<GatewayState> {
     let v1 = Router::new()
         .route(PAIRING_PATH, get(own_pairing).delete(leave))
         .route(WORKSPACES_PATH, get(list_workspaces))
+        .route(
+            "/operation-challenges",
+            post(crate::workspace_operations::challenge),
+        )
+        .route(
+            "/operations",
+            post(crate::workspace_operations::receive_peer),
+        )
+        .route(
+            "/return-route",
+            axum::routing::put(crate::return_access::register_route),
+        )
+        .route(
+            "/return-receipts/:receipt",
+            post(crate::return_access::redeem_receipt),
+        )
         .route(crate::nudge::NUDGE_PATH, post(crate::nudge::receive))
         .route(
             &format!("{}/:slug", crate::relay::RELAY_PATH),
@@ -366,7 +593,26 @@ pub fn router(state: GatewayState) -> Router<GatewayState> {
             &format!("{}/:slug/*rest", crate::relay::RELAY_PATH),
             any(crate::relay::receive),
         )
+        .route(
+            &format!("{WORKSPACE_CALLS_PATH}/:target"),
+            get(crate::workspace_calls::takes_calls_for),
+        )
+        .route(
+            &format!("{WORKSPACE_CALLS_PATH}/:target/chat/stream"),
+            post(crate::workspace_calls::receive),
+        )
+        .route(
+            &format!("{WORKSPACE_CALLS_PATH}/:target/diagnostic-bundles"),
+            post(crate::diagnostic_transport::receive),
+        )
+        .nest(MANAGE_PATH, crate::manage_hop::receiver())
         .route_layer(middleware::from_fn_with_state(state, require_gateway))
+        // A return caller has no credential for us; we authenticate its receipt
+        // by calling the source through our existing outgoing pairing instead.
+        .route(
+            "/return-operation",
+            post(crate::workspace_operations::receive_return),
+        )
         // Pair is the call A makes before it holds a credential. The long secret
         // is the only thing standing here: single use, expiring, and too long
         // for any flood to guess, so nothing here is throttled.
@@ -441,6 +687,9 @@ struct PairRequest {
 /// What A learns by redeeming a secret.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairAnswer {
+    /// Durable destination identity. Absent on older peers, never public health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
     pub pairing_id: String,
     pub credential: String,
     pub gateway_protocol: u32,
@@ -450,13 +699,25 @@ pub struct PairAnswer {
     pub external_address: Option<String>,
 }
 
+/// Redeem a gateway pairing secret. A local process's secret answers 202 until
+/// a paired device allows it, so A presents it again (`crate::pairing_requests`).
 async fn pair(
     State(state): State<GatewayState>,
     Json(body): Json<PairRequest>,
-) -> Result<Json<PairAnswer>, ApiError> {
+) -> Result<Response, ApiError> {
+    let asking_as = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Unnamed gateway");
     let redemption = state
         .paired_gateways()
-        .redeem(&body.code, body.label.as_deref())
+        .redeem(
+            &body.code,
+            body.label.as_deref(),
+            state.owner_gate(asking_as),
+        )
         .map_err(ApiError::internal)?;
     let (pairing_id, credential) = match redemption {
         GatewayRedemption::Paired {
@@ -468,28 +729,47 @@ async fn pair(
                 "that gateway pairing secret is not valid or has expired",
             ))
         }
+        GatewayRedemption::AwaitingOwner { started } => {
+            if started {
+                crate::pairing_requests::signal_engines(
+                    &state,
+                    Some((PairingKind::Gateway, asking_as)),
+                );
+            }
+            return Ok(crate::pairing_requests::awaiting_owner());
+        }
+        GatewayRedemption::Declined => {
+            return Err(ApiError::forbidden(crate::pairing_requests::DECLINED))
+        }
     };
     let external_address = crate::net_config::external_address(state.gateway_port())
         .origin
         .filter(|origin| origin.starts_with("https://"));
     Ok(Json(PairAnswer {
+        gateway_id: Some(state.gateway_id().to_string()),
         pairing_id,
         credential,
         gateway_protocol: GATEWAY_PROTOCOL,
         external_address,
-    }))
+    })
+    .into_response())
 }
 
 #[derive(Serialize)]
 struct OwnPairing {
+    gateway_id: String,
     pairing_id: String,
     label: String,
     gateway_protocol: u32,
 }
 
 /// The caller's own pairing, so A can tell a live grant from a revoked one.
-async fn own_pairing(Extension(gateway): Extension<AuthenticatedGateway>) -> Json<OwnPairing> {
+async fn own_pairing(
+    State(state): State<GatewayState>,
+    Extension(gateway): Extension<AuthenticatedGateway>,
+) -> Json<OwnPairing> {
     Json(OwnPairing {
+        gateway_id: state.gateway_id().to_string(),
         pairing_id: gateway.pairing_id,
         label: gateway.label,
         gateway_protocol: GATEWAY_PROTOCOL,
@@ -542,7 +822,7 @@ async fn leave(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Forget a paired gateway and the people it relayed, so they no longer
+/// Forget a paired gateway and the users it relayed, so they no longer
 /// count. `false` when no pairing had that id. A retry after a failed forget
 /// still forgets, though the pairing itself is already gone.
 fn end_pairing(state: &GatewayState, id: &str) -> Result<bool, ApiError> {
@@ -563,12 +843,21 @@ pub fn management_router() -> Router<GatewayState> {
         .route("/gateway-pairing-code", post(gateway_pairing_code))
         .route("/gateways", get(list_gateways))
         .route("/gateways/:id", axum::routing::delete(unpair_gateway))
+        .route("/gateways/:id/manage", axum::routing::put(set_manage))
+        .route(
+            "/gateways/:id/remote-starts",
+            axum::routing::put(set_remote_starts),
+        )
 }
 
 #[derive(Deserialize, Default)]
 struct GatewayCodeQuery {
     #[serde(default)]
     label: Option<String>,
+    /// Start the pairing with the manage grant on, as `lucidos pair
+    /// --gateway --manage` asks.
+    #[serde(default)]
+    manage: bool,
 }
 
 #[derive(Serialize)]
@@ -580,6 +869,7 @@ struct GatewayCodeBody {
 
 async fn gateway_pairing_code(
     State(state): State<GatewayState>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
     axum::extract::Query(query): axum::extract::Query<GatewayCodeQuery>,
 ) -> Result<Json<GatewayCodeBody>, ApiError> {
     let label = query
@@ -590,7 +880,11 @@ async fn gateway_pairing_code(
         .map(str::to_string);
     let secret = state
         .paired_gateways()
-        .mint_secret(label)
+        .mint_secret(
+            label,
+            query.manage,
+            crate::pairing_requests::minter(device.as_ref()),
+        )
         .map_err(ApiError::internal)?;
     Ok(Json(GatewayCodeBody {
         code: secret,
@@ -598,12 +892,27 @@ async fn gateway_pairing_code(
     }))
 }
 
-#[derive(Serialize)]
-struct GatewayRow {
-    id: String,
-    label: String,
-    paired_at: String,
-    last_used_at: Option<String>,
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayRow {
+    pub id: String,
+    pub label: String,
+    pub paired_at: String,
+    pub last_used_at: Option<String>,
+    pub may_manage: bool,
+    pub remote_starts: RemoteStartSetting,
+}
+
+impl From<PairedGateway> for GatewayRow {
+    fn from(g: PairedGateway) -> Self {
+        Self {
+            id: g.id,
+            label: g.label,
+            paired_at: g.paired_at,
+            last_used_at: g.last_used_at,
+            may_manage: g.may_manage,
+            remote_starts: g.remote_starts,
+        }
+    }
 }
 
 async fn list_gateways(State(state): State<GatewayState>) -> Json<Vec<GatewayRow>> {
@@ -612,14 +921,46 @@ async fn list_gateways(State(state): State<GatewayState>) -> Json<Vec<GatewayRow
             .paired_gateways()
             .list()
             .into_iter()
-            .map(|g| GatewayRow {
-                id: g.id,
-                label: g.label,
-                paired_at: g.paired_at,
-                last_used_at: g.last_used_at,
-            })
+            .map(Into::into)
             .collect(),
     )
+}
+
+#[derive(Deserialize)]
+struct ManageBody {
+    may_manage: bool,
+}
+
+async fn set_manage(
+    State(state): State<GatewayState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<ManageBody>,
+) -> Result<Json<GatewayRow>, ApiError> {
+    state
+        .paired_gateways()
+        .set_may_manage(&id, body.may_manage)
+        .map_err(ApiError::internal)?
+        .map(|g| Json(g.into()))
+        .ok_or_else(|| ApiError::not_found("no paired gateway with that id"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteStartsBody {
+    remote_starts: RemoteStartSetting,
+}
+
+async fn set_remote_starts(
+    State(state): State<GatewayState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<RemoteStartsBody>,
+) -> Result<Json<GatewayRow>, ApiError> {
+    state
+        .paired_gateways()
+        .set_remote_starts(&id, body.remote_starts)
+        .map_err(ApiError::internal)?
+        .map(|g| Json(g.into()))
+        .ok_or_else(|| ApiError::not_found("no paired gateway with that id"))
 }
 
 async fn unpair_gateway(

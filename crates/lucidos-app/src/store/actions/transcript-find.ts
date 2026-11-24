@@ -1,16 +1,3 @@
-/**
- * Find in the transcript: the thread pane's find target.
- *
- * The transcript draws only a tail of the thread, and a folded turn draws
- * nothing (`threadWindow.ts`, `Disclosure`). So the count comes from the
- * thread's data: every text the transcript draws (`transcript-passages.ts`).
- * Typing only counts. A step makes its match drawn: it unfolds what hides it,
- * asks the transcript to render down to it, then highlights the occurrence and
- * scrolls to it.
- *
- * Plans: `docs/plans/2026-10-07-find-in-previews-and-transcript.md` and
- * `docs/plans/2026-10-25-find-all-thread-text.md`.
- */
 
 import {
   MAX_FIND_MATCHES, collectPageText, matchSpans, queryPattern, revealRange, spanToRange, stepIndex,
@@ -29,18 +16,15 @@ import { isElementVisible } from '../../utils/elementVisibility';
 
 import { transcriptRenderRequest } from './transcriptRenderRequest';
 
-/** The thread's drawn turns, in DOM order. */
 function drawnTurns(threadId: string): HTMLElement[] {
   const selector = `.chat-exchange[data-thread-id="${CSS.escape(threadId)}"]`;
   return [...document.querySelectorAll<HTMLElement>(selector)].filter(isElementVisible);
 }
 
-/** Drawn, not on its way out: a closing `Disclosure` keeps its body, inert. */
 function live(roots: Iterable<Element>): Element[] {
   return [...roots].filter((root) => !root.closest('[inert]'));
 }
 
-/** Where a passage can draw: its turn, or for a side question the feed. */
 function containerOf(passage: TranscriptPassage, turns: HTMLElement[]): Element | null {
   if (passage.where.inFeed) return turns[0]?.closest('.thread-feed') ?? null;
   return turns.find((el) => el.dataset.userSeq === String(passage.userSeq)) ?? null;
@@ -71,7 +55,6 @@ function sameRange(a: Range, b: Range): boolean {
     && a.endContainer === b.endContainer && a.endOffset === b.endOffset;
 }
 
-/** The first drawn turn at or below the top of the transcript's scroller. */
 function topTurnSeq(threadId: string): number | null {
   const scroller = document.querySelector<HTMLElement>('.thread-view .thread-content');
   const top = scroller ? scroller.getBoundingClientRect().top : 0;
@@ -81,8 +64,6 @@ function topTurnSeq(threadId: string): number | null {
 
 interface Hit { passage: number; k: number }
 
-/** Where the first step lands: the first match at or below the reader's
- *  place going forward, the last one above it going back. */
 function entryHit(hits: Hit[], passages: TranscriptPassage[], step: 1 | -1, threadId: string): number {
   const seq = topTurnSeq(threadId);
   const at = seq === null ? -1 : passages.findIndex((p) => p.userSeq === seq);
@@ -99,8 +80,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** How long a step waits for its turn to be drawn. A history fold or a long
- *  turn can take a few frames. */
 const DRAW_WAIT_MS = 3000;
 
 async function waitForRoots(threadId: string, passage: TranscriptPassage): Promise<Element[]> {
@@ -116,9 +95,6 @@ function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
-/** Let an unfolding roll finish, so the match is measured where it rests. The
- *  step's own unfold renders and starts its roll a frame later, so the wait
- *  begins there. Otherwise a roll not yet started reads as none. */
 async function rollsSettled(el: Element | null): Promise<void> {
   await nextFrame();
   await nextFrame();
@@ -127,8 +103,6 @@ async function rollsSettled(el: Element | null): Promise<void> {
   await Promise.race([Promise.all(rolls), sleep(1000)]);
 }
 
-/** The reader's saved turn settings the find bar turned on, which `clear`
- *  turns off again. */
 const forcedOn = new Set<typeof detailsExpanded>();
 
 function forceOn(setting: typeof detailsExpanded): void {
@@ -137,8 +111,6 @@ function forceOn(setting: typeof detailsExpanded): void {
   forcedOn.add(setting);
 }
 
-/** Open what hides a passage. Folds the reader owns stay as the step leaves
- *  them; only the saved settings go back on close. */
 function unfold(threadId: string, passage: TranscriptPassage): void {
   const { initiator, details, steps, subAgent, sideQuestion } = passage.unfold;
   expandExchange(threadId, passage.userSeq);
@@ -151,8 +123,6 @@ function unfold(threadId: string, passage: TranscriptPassage): void {
   if (sideQuestion) reopenSideQuestion(sideQuestion);
 }
 
-/** Make a match drawn and bring it into view. Resolves to its range, or null
- *  when the transcript could not draw it or the step was overtaken. */
 async function reveal(
   threadId: string,
   passage: TranscriptPassage,
@@ -162,8 +132,6 @@ async function reveal(
 ): Promise<Range | null> {
   unfold(threadId, passage);
   transcriptRenderRequest.value = { threadId, key: passage.key };
-  // The reader asked for this match, so a streaming turn must not pull them
-  // back to the live edge while it is on screen.
   stopFollowingBottom();
   const roots = await waitForRoots(threadId, passage);
   if (roots.length === 0) return null;
@@ -174,14 +142,10 @@ async function reveal(
   const scroller = roots[0].closest<HTMLElement>('.thread-content');
   if (range) revealRange(range, scroller ? clearBand(scroller) : undefined);
   else roots[0].scrollIntoView({ block: 'center' });
-  // Marked as ours. Unmarked, the transcript reads the step as the reader
-  // scrolling, or as the keyboard moving the page, and undoes it.
   markRevealScroll(scroller);
   return range;
 }
 
-/** The part of the transcript nothing floats over. On the phone the find bar
- *  covers its top, under the header, and the prompt covers its bottom. */
 export function clearBand(scroller: HTMLElement): ClearBand {
   let { top, bottom } = scroller.getBoundingClientRect();
   const bar = scroller.closest('.thread-view')?.querySelector(':scope > .find-bar-slot');
@@ -191,20 +155,15 @@ export function clearBand(scroller: HTMLElement): ClearBand {
   return { top, bottom };
 }
 
-/** The current match's range when it is drawn, without moving anything. */
 function drawnRange(threadId: string, passage: TranscriptPassage, k: number, pattern: RegExp): Range | null {
   const ranges = rangesIn(passageRoots(threadId, passage), pattern);
   return ranges[Math.min(k, ranges.length - 1)] ?? null;
 }
 
-/** One find session over one thread. Module-scoped, because the find store
- *  asks for the target afresh on every run. `texts` is the passages' text
- *  cache (`cachedText`). */
 let session: {
   threadId: string;
   query: string;
   current: number;
-  /** The fetch of the thread's older history, once asked for. */
   history: Promise<boolean> | null;
   texts: Map<string, string>;
 } | null = null;
@@ -219,7 +178,6 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
     forcedOn.clear();
   };
 
-  /** Highlight every counted match the transcript draws, and the current one. */
   function paint(passages: TranscriptPassage[], hits: Hit[], pattern: RegExp, current: Range | null): void {
     const turns = drawnTurns(threadId);
     const matched = [...new Set(hits.map((h) => h.passage))];
@@ -243,11 +201,7 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
       session = { threadId, query: '', current: -1, history: null, texts: new Map() };
     }
     const own = session;
-    // A close or a newer query ends this run: it must not paint or scroll.
     const stillWanted = () => session === own && own.query === query;
-    // The count is the whole thread's, so history not loaded yet is fetched
-    // once. The transcript holds the reader in place while it folds in, so
-    // every run waits for it: a step scrolled during the fold is put back.
     if (!own.history && threadMap.value.get(threadId)?.hasOlderEvents) {
       own.history = ensureWholeThreadLoaded(threadId);
     }

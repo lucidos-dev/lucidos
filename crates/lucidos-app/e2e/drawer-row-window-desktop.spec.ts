@@ -7,16 +7,9 @@ import {
     parkListAt, visibleRows, type SeededCurrent, openSeededList,
 } from './drawer-row-window-probe';
 
-/**
- * Navigation through the drawer's row window, on desktop: keyboard browsing,
- * Show in Folders and Search Everywhere land without a blank frame or a jump
- * (docs/plans/2026-10-11-drawer-row-window.md).
- */
 
 let seeded: SeededCurrent;
 
-/** The highlighted row: wholly inside the list's viewport, and named by the
- *  tree's `aria-activedescendant`. */
 async function highlightState(page: Page) {
     return page.evaluate(() => {
         const tree = document.querySelector('.thread-drawer-tree');
@@ -52,7 +45,6 @@ test.describe('Drawer row window navigation', () => {
         await openSeededList(page, seeded);
         await page.locator('.thread-drawer-tree').focus();
         await startProbe(page);
-        // The Current header, then 150 rows.
         let lastScroll = 0;
         for (let step = 0; step < 151; step++) {
             await page.keyboard.press('ArrowDown');
@@ -61,7 +53,6 @@ test.describe('Drawer row window navigation', () => {
             if (step === 0) continue;
             expect(state.id, `step ${step}`).toBe(seeded.ids[step - 1]);
             expect(state.inView, `step ${step}`).toBe(true);
-            // Down only ever scrolls down: never a jump back.
             expect(state.scrollTop, `step ${step}`).toBeGreaterThanOrEqual(lastScroll);
             lastScroll = state.scrollTop;
         }
@@ -78,7 +69,6 @@ test.describe('Drawer row window navigation', () => {
         expect((await highlightState(page)).id).toBe(seeded.ids[0]);
 
         await parkListAt(page, 1);
-        // The highlighted row is pinned, far above the window.
         expect((await highlightState(page)).activeExists).toBe(true);
         expect(await page.locator(`.thread-drawer-list .thread-row[data-thread-nav="${seeded.ids[0]}"]`).count()).toBe(1);
 
@@ -121,7 +111,6 @@ test.describe('Drawer row window navigation', () => {
         await openSeededList(page, seeded);
         await parkListAt(page, 0.6);
         const topRow = (await visibleRows(page))[0];
-        // Past the scroll memory's save debounce.
         await page.waitForTimeout(1000);
 
         const toggle = page.locator(`.thread-toggle-slot button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`);

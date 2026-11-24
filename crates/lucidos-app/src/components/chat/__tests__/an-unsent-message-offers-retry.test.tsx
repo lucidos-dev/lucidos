@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** A send that got no answer shows as Not sent with a Retry, never as a failed
- *  reply. A real failed reply keeps its own card. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -24,7 +22,6 @@ afterEach(() => {
   unsentMessages.value = new Map();
 });
 
-/** `unsent` draws the client-only pair `showUnsentExchange` writes. */
 function mountFailed(userSeq: number, unsent = userSeq < 0): HTMLElement | null {
   const exchange = {
     ...makeExchange(

@@ -13,18 +13,15 @@ import {
   type StyleOf,
 } from './paneSwipe';
 
-/** The origin the host serves app frames from, as the SDK reads it. */
 const HOST_ORIGIN = 'https://localhost:5251';
 
 describe('SwipeTouch', () => {
   it('starts dx at 0 when crossing the lock threshold (no dead-zone jump)', () => {
-    // Without subtracting LOCK_THRESHOLD on lock, the first frame after the
-    // 8px direction-lock jumps the image by 8px — visible as a "snap".
     const s = new SwipeTouch();
     s.start(0, 0);
-    expect(s.move(7, 0)).toBeNull();          // below threshold, undecided
-    expect(s.move(8, 0)).toBe(0);              // locks at threshold → start from 0
-    expect(s.move(20, 0)).toBe(12);            // 20 - 8 = 12px of visible drag
+    expect(s.move(7, 0)).toBeNull();
+    expect(s.move(8, 0)).toBe(0);
+    expect(s.move(20, 0)).toBe(12);
   });
 
   it('returns null while moving vertically', () => {
@@ -38,7 +35,7 @@ describe('SwipeTouch', () => {
     const s = new SwipeTouch();
     s.start(0, 0);
     s.move(50, 0);
-    expect(s.end(800)).toBe(-1);               // finger right → previous
+    expect(s.end(800)).toBe(-1);
   });
 });
 
@@ -62,7 +59,6 @@ describe('claimsHorizontalPan', () => {
 
 type Node = DragNode & { overflowX?: string; touchAction?: string };
 
-/** A leaf inside a chain of ancestors, innermost first. */
 function chain(...nodes: Array<Omit<Node, 'parentElement'>>): Node {
   let parent: Node | null = null;
   for (const n of [...nodes].reverse()) parent = { ...n, parentElement: parent };
@@ -112,16 +108,12 @@ describe('horizontalDragClaimed', () => {
   });
 });
 
-// The test env has no TouchEvent, so a plain Event carries the fields read.
-// Points are screen coordinates. `frameShift` is how far the host has moved
-// the frame, which moves the client coordinates the frame sees and nothing else.
 function touch(
   type: string,
   points: Array<[number, number]>,
   opts: { target?: DragNode; prevented?: boolean; cancelable?: boolean; frameShift?: number; scripted?: boolean } = {},
 ): Event {
   const e = new Event(type, { cancelable: opts.cancelable ?? true });
-  // A synthetic Event is untrusted; stand in for the user's own touch.
   Object.defineProperty(e, 'isTrusted', { value: !opts.scripted });
   const shift = opts.frameShift ?? 0;
   const touches = points.map(([screenX, screenY]) => ({ screenX, screenY, clientX: screenX - shift, clientY: screenY }));
@@ -166,8 +158,6 @@ describe('trackPaneSwipe', () => {
   });
 
   it('follows the finger while the host moves the frame with it', () => {
-    // The frame rides the pane track, so after the host applies a drag the
-    // frame's own client coordinates lag the finger by that much.
     const t = setup();
     t.start([200, 100]);
     t.surface.dispatchEvent(touch('touchmove', [[150, 100]]));
@@ -308,8 +298,6 @@ describe('trackPaneSwipe', () => {
   });
 
   it('follows a drag whose touched node left the DOM to its release', () => {
-    // An app re-rendering its list drops the row under the finger. The rest of
-    // the touch then fires on that detached row and never reaches the surface.
     const t = setup();
     const row = Object.assign(new EventTarget(), { localName: 'div', parentElement: null });
     t.start([200, 100], row);

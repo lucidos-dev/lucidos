@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A row with hidden archived children shows a "N archived" reveal toggle on
- * the sub-thread line, on its own when there are no live children. A row
- * with no hidden archived children shows no such toggle, even when
- * collapsible. Covers the UI half of
- * slack-20261002-hide-archived-child-threads; the hiding logic itself is
- * `hidden-archived-children.test.ts`.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { ThreadRow, setArchivedRevealed } from '../ThreadDrawer';
@@ -129,8 +121,6 @@ describe('the archived-reveal toggle', () => {
   });
 
   it('renders both controls on one line, with no separator, when live and archived children coexist', () => {
-    // totalChildrenCount counts both; the live chevron's own count subtracts
-    // the hidden ones (see visibleChildrenCount / hidden-archived-children.test.ts).
     threadMap.value = new Map([[THREAD_ID, makeThread(3)]]);
     render(
       <ThreadRow threadId={THREAD_ID} status="idle" enableFamilyToggle hiddenArchivedCount={1} isArchivedRevealed={false} />,
@@ -140,7 +130,6 @@ describe('the archived-reveal toggle', () => {
     const controls = host.querySelector('.thread-row-family-line');
     expect(controls?.querySelector('.family-disclosure')?.textContent).toContain('2 sub-threads');
     expect(controls?.textContent).not.toContain('·');
-    // The switch and its count wrap together as one unit.
     expect(controls?.querySelector('.archived-reveal > .archived-reveal-toggle + .archived-reveal-label')).not.toBeNull();
   });
 
@@ -157,8 +146,6 @@ describe('the archived-reveal toggle', () => {
   });
 
   it('is absent from a non-collapsible context even with hidden archived children', () => {
-    // Mirrors the existing sub-thread toggle's search/drafts carve-out: only
-    // the nested ThreadList passes `enableFamilyToggle`.
     threadMap.value = new Map([[THREAD_ID, makeThread(2)]]);
     render(<ThreadRow threadId={THREAD_ID} status="idle" hiddenArchivedCount={2} isArchivedRevealed={false} />, host);
 

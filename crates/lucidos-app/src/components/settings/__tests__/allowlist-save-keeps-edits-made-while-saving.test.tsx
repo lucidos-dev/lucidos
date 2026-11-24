@@ -1,21 +1,10 @@
 // @vitest-environment jsdom
-/**
- * A save puts back what it saved, and only that. Rows typed or added while
- * the save was in flight are a newer draft, so they must stay on screen and
- * keep the editor dirty.
- *
- * Regression: the save's success branch replaced the rows with its own
- * click-time snapshot. A pattern added during the round trip vanished, the
- * editor read clean, and nothing said anything was lost.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 
 import { AllowlistEditor } from '../AllowlistEditor';
 
-/** Lets pending promises land, then flushes Preact's renders and effects. The
- *  mount load starts in an effect, which Preact defers past a paint. */
 function settled(): Promise<void> {
   return act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -65,6 +54,7 @@ describe('AllowlistEditor save', () => {
         description="what it is for"
         placeholder="Bash(git:*)"
         noun="tool permissions"
+        rememberButton="Always allow"
         load={() => Promise.resolve('# header\nBash(git:*)\n')}
         save={(contents) => { saved.push(contents); return pendingSave.promise; }}
       />,
@@ -79,7 +69,6 @@ describe('AllowlistEditor save', () => {
     buttonSaying('Save').click();
     await settled();
 
-    // Typed while the save is still on the wire.
     buttonSaying('Add pattern').click();
     await settled();
     type(inputs()[2], 'Bash(ls:*)');
@@ -90,7 +79,6 @@ describe('AllowlistEditor save', () => {
 
     expect(saved).toEqual(['# header\nBash(git:*)\nPython\n']);
     expect(inputs().map((i) => i.value)).toEqual(['Bash(git:*)', 'Python', 'Bash(ls:*)']);
-    // The newer draft is unsaved, so Save offers to write it.
     expect(buttonSaying('Save').disabled).toBe(false);
   });
 
@@ -103,6 +91,7 @@ describe('AllowlistEditor save', () => {
         description="what it is for"
         placeholder="Bash(git:*)"
         noun="tool permissions"
+        rememberButton="Always allow"
         load={() => Promise.resolve('Bash(git:*)\n')}
         save={() => pendingSave.promise}
       />,

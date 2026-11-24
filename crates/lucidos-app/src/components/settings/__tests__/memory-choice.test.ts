@@ -1,11 +1,5 @@
 // @vitest-environment jsdom
-/**
- * The memory choice asks a workspace that never chose its memory module. It
- * leads with what Tree costs a month for three ways of using a workspace.
- * Every way out writes the preference: Use Classic and closing write
- * `classic`, and Use Tree writes `tree` once the estimate has loaded.
- */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { BackgroundModels, TreeBackfillEstimate } from '../../../api/types';
 
 const {
@@ -49,7 +43,6 @@ const SOL_LOW = {
   cap_usd: 0,
 };
 
-/** A new workspace: no history, so only the per-turn price says anything. */
 const FRESH: TreeBackfillEstimate = {
   calls: { low: 0, high: 0 },
   usable_secs: { low: 0, high: 0 },
@@ -59,7 +52,6 @@ const FRESH: TreeBackfillEstimate = {
   costs: [{ model: 'gpt-6.1-sol', by_effort: [SOL_LOW] }],
 };
 
-/** A workspace from before, unused until now but with threads to summarize. */
 const WITH_HISTORY: TreeBackfillEstimate = {
   ...FRESH,
   calls: { low: 210_000, high: 260_000 },
@@ -80,6 +72,10 @@ async function mount(host: HTMLElement): Promise<() => void> {
   return () => render(null, host);
 }
 
+beforeAll(async () => {
+  await import('../MemoryChoice');
+}, 30_000);
+
 function button(host: HTMLElement, name: string): HTMLButtonElement {
   const found = [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === name);
   if (!found) throw new Error(`no "${name}" button`);
@@ -90,8 +86,6 @@ function tiles(host: HTMLElement): string[] {
   return [...host.querySelectorAll('[data-role="memory-choice-tile"]')].map((t) => t.textContent ?? '');
 }
 
-/** Preact runs effects after paint, which jsdom only reaches through the
- *  100 ms fallback timer, so a settle waits past it. */
 async function settle(): Promise<void> {
   await new Promise((r) => setTimeout(r, 150));
 }
@@ -160,7 +154,6 @@ describe('the memory choice', () => {
     expect(host.textContent).toContain('About $0.06 a turn.');
   });
 
-  /** A new workspace has nothing to summarize, so $0 figures would mislead. */
   it('shows the one-time summary only for a workspace with history', async () => {
     getTreeBackfillEstimate.mockResolvedValue(FRESH);
     unmount = await mount(host);

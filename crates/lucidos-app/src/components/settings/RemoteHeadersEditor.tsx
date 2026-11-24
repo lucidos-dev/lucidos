@@ -3,7 +3,6 @@ import { Disclosure } from '../shared/Disclosure';
 
 export interface HeaderDraft { name: string; value: string }
 
-/** Preserve values exactly; reject duplicates before turning rows into an object. */
 export function headersFromDraft(rows: HeaderDraft[]): Record<string, string> {
   const headers: Record<string, string> = Object.create(null);
   for (const row of rows) {
@@ -15,7 +14,6 @@ export function headersFromDraft(rows: HeaderDraft[]): Record<string, string> {
   return headers;
 }
 
-/** Shared by Settings and the picker. Saved values are never read back. */
 export function RemoteHeadersEditor({ rows, onChange, disabled = false }: {
   rows: HeaderDraft[];
   onChange: (rows: HeaderDraft[]) => void;

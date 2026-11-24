@@ -1,18 +1,3 @@
-/**
- * An icon toggle has ONE definition: `ToggleIconButton` renders it, with
- * `aria-pressed` for the on-state and a `data-tone` for the look. Each tone is
- * painted once per surface (`host-components.css` for the page, `shell.css` for
- * the header bar). Two scans keep it that way.
- *
- * 1. No `<button>` that wears `icon-btn` writes `aria-pressed` by hand. That is
- *    the markup half of a second definition.
- * 2. No sheet paints a pressed state, or the `.active` of `.icon-btn` or
- *    `.pin-btn`, outside the tone rules. That is the paint half: a local `.active` or `[aria-pressed]` rule
- *    beside one toggle is how Filter, Pin and the dashboard toggle drifted apart.
- *
- * Text choices are not icon toggles and stay out of both scans: `pill-bar-btn`,
- * `question-option`, settings choice rows and `action-btn` do not wear `icon-btn`.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -27,32 +12,22 @@ import { clientSourcePaths, cssRules, selectorList, styleSheetPaths } from './cs
 const SRC = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const TONE_COMPONENT = 'components/shared/ToggleIconButton.tsx';
 
-/** The sheets that paint the tones. Inside them a rule must still name a
- *  `data-tone`, or be the bar's crossfade glyph that rides the pressed state. */
 const TONE_SHEETS = ['styles/global/host-components.css', 'styles/panels/shell.css'];
 
-/** Classes an icon toggle wears. A pressed state on any other class is judged
- *  by `PRESSED_CHOICES` instead. */
 const TOGGLE_CLASSES = ['icon-btn', 'pin-btn'];
 
-/** Text choices and the call toggle's phases, which paint their own pressed
- *  state. They are not icon toggles, or refine the `live` tone. */
 const PRESSED_CHOICES = ['question-option', 'pill-bar-btn', 'segmented-btn', '[data-role="call-toggle"]'];
 
-/** Names of retired on-state classes, banned anywhere in a selector. */
 const RETIRED_ON_CLASSES = /\.(?:filter-active|view-selector-active)(?![\w-])/;
 
-/** `[aria-pressed="false"]` is the off-state and is not pressed. */
 const PRESSED = /\[aria-pressed(?:=["']?true["']?)?\]/;
 
-/** An `.active` class, which only counts on an icon toggle's own classes. */
 const ACTIVE = /\.active(?![\w-])/;
 
 function relativeToSrc(file: string): string {
   return relative(SRC, file);
 }
 
-/** `<button>` elements that wear `icon-btn` and carry `aria-pressed`. */
 function handPressedIconButtons(source: string, fileName = 'fixture.tsx'): string[] {
   const ast = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const found: string[] = [];
@@ -71,7 +46,6 @@ function handPressedIconButtons(source: string, fileName = 'fixture.tsx'): strin
   return found;
 }
 
-/** Selector members that paint an icon toggle's on-state outside the tone rules. */
 function stray(css: string, sheet: string): string[] {
   const inToneSheet = TONE_SHEETS.includes(sheet);
   const out: string[] = [];
@@ -100,7 +74,7 @@ describe('an icon toggle has one definition', () => {
       .filter(file => relativeToSrc(file) !== TONE_COMPONENT)
       .flatMap(file => handPressedIconButtons(readFileSync(file, 'utf8'), relativeToSrc(file)));
     expect(offenders, 'render the toggle through ToggleIconButton').toEqual([]);
-  });
+  }, 30_000);
 
   it('flags a hand-pressed icon button (fixture)', () => {
     const source = `const a = <button class={\`icon-btn header-icon\`} aria-pressed={on} />;

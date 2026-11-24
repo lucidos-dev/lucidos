@@ -34,7 +34,7 @@ pub struct JudgeVerdict {
     pub category: Option<SideEffectCategory>,
     /// One-line card text shown to the user when the lane is `IrreversibleDanger`.
     pub summary: String,
-    /// The distribution behind the verdict, logged and not shown to the user.
+    /// The distribution or failure behind the verdict, carried by the decision trace.
     pub reason: String,
 }
 
@@ -53,6 +53,7 @@ impl JudgeVerdict {
     }
 
     /// The verdict when the judge never answered: ask, and say why on the card.
+    /// The reason starts with [`JUDGE_FAILED_REASON`].
     /// Running the command on the static list instead would weaken the guard
     /// the user turned on, with nothing to show for it.
     pub(crate) fn judge_failed(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Self {
@@ -69,13 +70,16 @@ impl JudgeVerdict {
             summary: format!(
                 "The command judge could not run ({why}), so this command needs your approval."
             ),
-            reason: format!("the judge failed: {err}"),
+            reason: format!("{JUDGE_FAILED_REASON}: {err}"),
         }
     }
 }
 
 /// How much of a judge failure the card quotes. The engine log keeps it all.
 const FAILURE_SUMMARY_CHARS: usize = 120;
+
+/// How a failed judge call's reason starts. The decision trace keeps only this.
+pub(crate) const JUDGE_FAILED_REASON: &str = "the judge failed";
 
 /// Run one judge classification as two typed Choice questions, on any
 /// judgment provider.
@@ -141,6 +145,7 @@ pub async fn classify_for_eval(
         command: command.to_string(),
         out_of_workspace,
         fast_path_refused: false,
+        script_sources: vec![],
     };
     let judgment = ChatJudgmentProvider::new(provider, reasoning)
         .ask(
@@ -239,6 +244,7 @@ mod tests {
             command: cmd.to_string(),
             out_of_workspace: oow,
             fast_path_refused: false,
+            script_sources: vec![],
         }
     }
 

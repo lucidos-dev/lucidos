@@ -62,7 +62,6 @@ describe('modelRequest wire contracts', () => {
 it.each(['openai-responses', 'openai-chat-completions'] as const)('uses route effort verbatim for %s', async protocol => {
   registry(protocol, 'openai');
   const result = await modelRequest({ ...value, reasoning_effort: 'max' }, options);
-  // The offered route caps at high; use the host's shared clamp before wiring.
   if (protocol === 'openai-responses') expect(result.body.reasoning).toEqual({ effort: 'high' });
   else expect(result.body.reasoning_effort).toBe('high');
 });

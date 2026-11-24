@@ -62,8 +62,22 @@ async fn list_returns_seeded_threads_with_full_shape() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let marker = unique_marker("api-threads-list-shape");
 
-    let _idle =
-        seed_summary_row(&pool, &format!("{marker}-idle"), "chat", ThreadStatus::Idle).await;
+    let idle = seed_summary_row(&pool, &format!("{marker}-idle"), "chat", ThreadStatus::Idle).await;
+    sqlx::query(
+        "UPDATE thread_summaries SET live_event_wait_count = 1, \
+         live_event_waits = jsonb_build_array($2::jsonb || \
+             jsonb_build_object('expires_at', now() + interval '1 hour')) \
+         WHERE thread_id = $1",
+    )
+    .bind(idle)
+    .bind(serde_json::json!({
+        "wait_id": uuid::Uuid::new_v4(),
+        "on": [{"event_type": "BackgroundBashCompleted"}],
+        "reason": "the test task",
+    }))
+    .execute(&pool)
+    .await
+    .expect("seed an event wait");
     let _running = seed_summary_row(
         &pool,
         &format!("{marker}-running"),
@@ -113,6 +127,19 @@ async fn list_returns_seeded_threads_with_full_shape() {
     }
     assert_eq!(row["status"].as_str(), Some("running"));
     assert_eq!(row["channel"].as_str(), Some("chat"));
+
+    let idle = ours
+        .iter()
+        .find(|r| r["title"].as_str() == Some(&format!("{marker}-idle")))
+        .expect("idle row must be present");
+    assert_eq!(idle["status"], "idle");
+    assert_eq!(idle["liveness"]["status"], "idle");
+    assert_eq!(idle["liveness"]["state"], "waiting");
+    let waits = idle["liveness"]["live_event_waits"].as_array().unwrap();
+    assert_eq!(waits.len(), 1);
+    assert_eq!(waits[0]["reason"], "the test task");
+    assert_eq!(waits[0]["on"][0]["event_type"], "BackgroundBashCompleted");
+    assert!(waits[0]["expires_in_secs"].as_i64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -246,29 +273,38 @@ async fn count_matches_list_length_under_same_filter() {
     let client = http_client();
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let marker = unique_marker("api-threads-count");
-
-    let _running = seed_summary_row(
+    let parent = seed_summary_row(
+        &pool,
+        &format!("{marker}-parent"),
+        "chat",
+        ThreadStatus::Idle,
+    )
+    .await;
+    let _running = seed_child_row(
         &pool,
         &format!("{marker}-r1"),
-        "chat",
+        parent,
         ThreadStatus::Running,
     )
     .await;
-    let _wait_user = seed_summary_row(
+    let _wait_user = seed_child_row(
         &pool,
         &format!("{marker}-r2"),
-        "claude_code",
+        parent,
         ThreadStatus::WaitingForUserAnswer,
     )
     .await;
-    let _idle = seed_summary_row(&pool, &format!("{marker}-i"), "chat", ThreadStatus::Idle).await;
+    let _idle = seed_child_row(&pool, &format!("{marker}-i"), parent, ThreadStatus::Idle).await;
 
-    // count and list must agree for the same filter set. Run against the
-    // global active filter (no source narrowing) since other tests may also
-    // have active rows — we only assert count >= our seeded count, AND that
-    // count and list lengths agree.
-    let list_url = format!("{}/api/v1/threads/list?active=true&limit=1000", base_url());
-    let count_url = format!("{}/api/v1/threads/count?active=true", base_url());
+    // Scope both reads to our children so parallel tests cannot change the count.
+    let list_url = format!(
+        "{}/api/v1/threads/list?parent={parent}&active=true&limit=1000",
+        base_url()
+    );
+    let count_url = format!(
+        "{}/api/v1/threads/count?parent={parent}&active=true",
+        base_url()
+    );
 
     let list_body: serde_json::Value = client
         .get(&list_url)
@@ -290,16 +326,7 @@ async fn count_matches_list_length_under_same_filter() {
     let list_len = list_body.as_array().expect("list is array").len() as i64;
     let count_val = count_body["count"].as_i64().expect("count is integer");
 
-    // Both views must agree — the count endpoint is just a thinner version
-    // of the same SQL filter. Other parallel tests may push the absolute
-    // number around, but list.len() and count.count must match within the
-    // same instant... we don't get atomicity across two HTTP calls, but the
-    // margin should be tiny. Allow ±5 to absorb parallel test noise.
-    assert!(
-        (list_len - count_val).abs() <= 5,
-        "list length {list_len} and count {count_val} disagree by more than 5 — \
-         filters likely diverge"
-    );
+    assert_eq!(list_len, count_val, "list and count filters must agree");
 
     // Our seeded active rows must be counted.
     let ours = rows_with_title_prefix(&list_body, &marker);

@@ -14,25 +14,7 @@ const styles = (rel: string): string => readFileSync(resolve(here, '..', rel), '
 const mobileCss = styles('mobile.css');
 const drawerCss = styles('drawer.css');
 
-/**
- * Regression: the thread filter panel's top rows rendered behind the fixed
- * mobile header.
- *
- * The mobile header is `position: fixed` over the swipe panes, so a pane's
- * content does not start below it for free: every scroll container a pane
- * shows reserves the header's height itself, through the shared `::before`
- * spacer group in mobile.css. The filter panel shipped missing from that
- * group because it is easy to read as part of the thread list. It is not: it
- * is absolutely positioned OVER the list and scrolls on its own, so it
- * inherits nothing the list reserves.
- *
- * A browser e2e covers the rendered geometry
- * (`e2e/mobile-threads-top-clipping-all.spec.ts`). This scan covers the same
- * contract in the fast suite, which matters because the symptom is invisible
- * on a desktop viewport and the e2e suite is not what runs per change.
- */
 describe('mobile fixed-header spacer', () => {
-  /** The rule carrying the `::before` header spacers, found via the list. */
   const spacerRule = cssRules(mobileCss).find(r =>
     r.selector.includes('.thread-drawer-list::before'),
   );
@@ -43,8 +25,6 @@ describe('mobile fixed-header spacer', () => {
     expect(spacerRule!.props.get('height')).toContain('var(--app-header-bottom)');
   });
 
-  // A view that fills the pane gives the spacer's room back. Otherwise it
-  // overflows by one header height and scrolls its top up behind the header.
   it('a pane-filling view takes the pane height less the spacer', () => {
     const fill = cssRules(mobileCss).find(r =>
       r.selector.includes('.content-pane-body > .content-view-full-bleed.active'),
@@ -54,8 +34,6 @@ describe('mobile fixed-header spacer', () => {
     expect(fill!.props.get('height')).toBe('calc(100% - var(--app-header-bottom))');
   });
 
-  // A column view starts at that height and grows, so its end space follows
-  // its last element rather than the pane's bottom edge.
   it('a column view takes it as a floor, never a fixed height', () => {
     const column = cssRules(mobileCss).find(r =>
       r.selector.trim().endsWith('.content-pane-body > .content-view.active'),
@@ -65,12 +43,6 @@ describe('mobile fixed-header spacer', () => {
     expect(column!.props.has('height')).toBe(false);
   });
 
-  /**
-   * The load-bearing pair. The panel COVERS the list, so whatever clearance
-   * the list needs from the header, the panel needs identically: they occupy
-   * the same place on screen. Asserting them together says why, where two
-   * separate "is X in the group" assertions would just be a list.
-   */
   it('the filter panel reserves it too, since it covers the list', () => {
     for (const subject of ['.thread-drawer-list::before', '.thread-filter-cover::before']) {
       expect(
@@ -81,15 +53,6 @@ describe('mobile fixed-header spacer', () => {
     }
   });
 
-  /**
-   * The premise of the test above. If the panel ever renders INSIDE the list
-   * instead of over it, it would inherit the list's spacer and its own would
-   * become a double gap: this pins the shape the pairing is derived from, so
-   * that change fails here rather than silently making the guard wrong.
-   *
-   * The panel shows in ONE scroll box, its cover, so the `::before` is the
-   * cover's first scrolling child, exactly as in the list it covers.
-   */
   it('the panel really is a cover, not a child of the list', () => {
     const panel = block(drawerCss, '.thread-filter-cover {');
     expect(decl(panel, 'position')).toBe('absolute');

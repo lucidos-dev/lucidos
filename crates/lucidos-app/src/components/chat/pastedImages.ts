@@ -6,11 +6,6 @@ import { composeDrafts, getDraft } from '../../store/composeDrafts';
 import { updateCompose } from '../../store/actions/compose';
 import { safeRevokeObjectUrl } from '../../utils/objectUrl';
 
-/** A confirmed-attached image — the hash points at a blob already on the
- *  engine's disk under `data/blobs/`. The `previewUrl` is what
- *  `<img src=...>` consumes; the browser caches it forever (immutable).
- *  This struct carries no bytes — same shape over the wire as the draft
- *  that holds it. */
 export interface AttachedImage {
   hash: string;
   previewUrl: string;
@@ -18,29 +13,10 @@ export interface AttachedImage {
 
 const EMPTY: AttachedImage[] = [];
 
-/** Hash → in-memory `blob:` URL for images uploaded in this browser session.
- *  Populated by `attachImageToActiveDraft` after a successful upload — the
- *  same `blob:` URL that powered the pending preview is handed off here so
- *  the confirmed image keeps rendering from the in-memory File instead of
- *  swapping to the server preview URL. The HTTP swap looks fine on Chromium
- *  but on iOS Safari PWA the new <img> re-fetches over the network even
- *  when the URL was just preloaded — visible as a brief black flash. The
- *  blob URL is rock-solid (in-memory, no fetch), so keeping it in the
- *  preview eliminates the swap entirely. Falls back to the server preview
- *  URL for hashes that originate elsewhere (rehydrated drafts, cross-device
- *  sync). */
 const sessionBlobUrls = new Map<string, string>();
 
-/** Hashes sent this session — kept in `sessionBlobUrls` past the post-send
- *  draft clear so the message bubble renders in-memory bytes. iOS Safari PWA
- *  does not reliably serve the freshly-uploaded preview URL from cache,
- *  surfacing as a brief black flash. */
 const sentSessionHashes = new Set<string>();
 
-/** Hand off ownership of a `blob:` URL to the session map. First-write
- *  wins so re-uploading the same image (same hash) doesn't trample the URL
- *  the preview is already rendering — the duplicate is revoked here so the
- *  underlying File can be GC'd. */
 export function rememberSessionBlobUrl(hash: string, blobUrlValue: string): void {
   if (sessionBlobUrls.has(hash)) {
     safeRevokeObjectUrl(blobUrlValue);
@@ -56,15 +32,7 @@ function dropSessionBlobUrl(hash: string): void {
   sessionBlobUrls.delete(hash);
 }
 
-/** GC: drop session URLs for hashes that left every draft AND were never
- *  sent. Fires whenever `composeDrafts` mutates. Iteration is bounded by
- *  the number of open drafts × attached images so the per-keystroke cost
- *  is microseconds. */
 effect(() => {
-  // `composeDrafts.value` is the dependency that re-fires this effect; read
-  // it before the early-exit so signals tracking sees it on the empty-map
-  // pass too (otherwise the effect would only re-fire after the FIRST
-  // upload, and would not fire again if every URL was dropped between runs).
   const drafts = composeDrafts.value;
   if (sessionBlobUrls.size === 0) return;
   const referenced = new Set<string>();
@@ -76,14 +44,10 @@ effect(() => {
   }
 });
 
-/** Caller MUST invoke before the draft clear so the GC effect on the next
- *  signal flush sees the sent flag — see `sentSessionHashes`. */
 export function markHashesAsSent(hashes: readonly string[]): void {
   for (const h of hashes) sentSessionHashes.add(h);
 }
 
-/** Returns null for hashes that originate elsewhere (rehydrated drafts,
- *  cross-device sync, post-reload) — caller falls back to the server URL. */
 export function getSessionBlobUrlForHash(hash: string): string | null {
   return sessionBlobUrls.get(hash) ?? null;
 }
@@ -101,16 +65,6 @@ export const attachedImagesForCurrentThread = computed<AttachedImage[]>(() =>
   getAttachedImages(focusedThreadId.value),
 );
 
-/** Append a confirmed hash to the draft. Called from `attachImageToActiveDraft`
- *  on a successful blob upload — the bytes are already on disk; this just
- *  records the reference. Goes through `updateCompose` so the keystroke
- *  debounce + cross-device PUT fires once for the change.
- *
- *  Returns false when the draft already holds the hash, the one case this
- *  refuses. A hash IS the bytes, so the same image twice is two references to
- *  one blob: the strip draws the thumbnail twice, and we send the model the
- *  picture twice and pay for it twice. The caller owes the user a word: a paste
- *  that attaches nothing reads as a dead gesture. */
 export function addAttachedImageHash(threadId: string, hash: string): boolean {
   const current = getDraft(threadId).image_hashes;
   if (current.includes(hash)) return false;

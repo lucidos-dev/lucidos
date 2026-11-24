@@ -1,18 +1,3 @@
-/**
- * The thread-drawer toggle draws what it opens: a sidebar on desktop, a list on mobile.
- *
- * On desktop the header already carries a stack of horizontal lines, the Canvas
- * pane's hamburger. A toggle drawn the same way reads as a second, which is half
- * of why a tester could not find it. On a phone the toggle opens a whole pane of
- * threads, so a sidebar glyph there lies about what it does.
- *
- * Filter draws a funnel, never lines. On a phone it holds the same corner of the
- * threads pane that the list toggle holds on the pane beside it.
- *
- * Invokes the component directly and walks the returned VNode tree, the same way
- * `thread-toggle-blocked-badge.test.tsx` does: the button is hook-free at its
- * own level, and the walk never calls a nested component.
- */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { ThreadToggleButton } from '../ThreadToggleButton';
 import { FilteredIcon, FilterIcon, SidebarIcon, ThreadListIcon } from '../icons';
@@ -49,8 +34,6 @@ describe('the thread-drawer toggle glyph', () => {
   });
 
   it('paints the frame and its divider as ONE shape', () => {
-    // Two elements stroke their crossing twice, and a translucent colour then
-    // shows a bright dot at each end of the divider.
     const glyph = SidebarIcon() as AnyVNode;
     expect(findByType(glyph, 'path')).toHaveLength(1);
     for (const tag of ['rect', 'line', 'polyline', 'circle']) {

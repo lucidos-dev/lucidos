@@ -2,21 +2,11 @@ import { test, expect, type Page } from './fixtures';
 import type { Route } from '@playwright/test';
 import { assertHealthy, navigateToApp, uniqueMessage, userMessageBody, waitForVisibleInput } from './helpers';
 
-/** An image in the composer never looks finished while it uploads. A send
- *  that waits on it says so for as long as it waits. A failed upload keeps
- *  the draft and the image, refuses Send with the reason, and Retry lands it.
- *  Plan: `docs/plans/2026-10-02-image-upload-progress-and-resilience.md`.
- *
- *  Service workers are blocked, as in `answer-over-a-stale-connection-all.spec.ts`.
- *  In WebKit a controlled page sends every request through the worker's own
- *  network session, where `page.route` cannot see it. `sw.js` never handled
- *  this POST, so blocking it changes nothing else. */
 
 test.use({ serviceWorkers: 'block' });
 
 const BLOB_ROUTE = '**/api/v1/threads/*/blobs';
 
-/** A real 1x1 PNG: the composer sniffs the bytes before it draws a chip. */
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64',
@@ -41,7 +31,7 @@ test.describe('Image upload progress in the composer', () => {
     const held = new Promise<void>((resolve) => { release = resolve; });
     await page.route(BLOB_ROUTE, async (route: Route) => {
       await held;
-      await route.continue();
+      await route.fallback();
     });
     await navigateToApp(page);
     const message = uniqueMessage('upload-queued');
@@ -54,7 +44,6 @@ test.describe('Image upload progress in the composer', () => {
 
     await sendButton(page).click();
     await expect(uploadNotice(page)).toHaveText('Sends when the image finishes uploading');
-    // The draft is still there while the send waits.
     await expect(input).toHaveValue(message);
 
     release();
@@ -66,7 +55,7 @@ test.describe('Image upload progress in the composer', () => {
   test('a failed upload keeps the draft and the image, refuses Send, and Retry lands it', async ({ page }) => {
     let refuse = true;
     await page.route(BLOB_ROUTE, async (route: Route) => {
-      if (!refuse) return route.continue();
+      if (!refuse) return route.fallback();
       await route.fulfill({
         status: 500,
         contentType: 'application/json',
@@ -99,14 +88,9 @@ test.describe('Image upload progress in the composer', () => {
   });
 
   test('an upload the engine took lands on its event when the answer never arrives', async ({ page }) => {
-    // The engine stores the image and emits ImageUploaded. Its answer never
-    // reaches the page, as on the phone that reported the stall.
     let uploads = 0;
     await page.route(BLOB_ROUTE, async (route: Route) => {
       uploads += 1;
-      // WebKit hands page.route a multipart body with the file's bytes left
-      // out, so a bare route.fetch() replays an empty upload the engine refuses.
-      // The rebuilt form takes a new boundary, so the old framing headers go.
       const headers = await route.request().allHeaders();
       delete headers['content-type'];
       delete headers['content-length'];
@@ -124,7 +108,6 @@ test.describe('Image upload progress in the composer', () => {
     await attachImage(page);
     await sendButton(page).click();
 
-    // Well inside the 20 s stall deadline that would otherwise re-upload.
     await expect(pendingChip(page)).toHaveCount(0, { timeout: 10_000 });
     await expect(userMessageBody(page).filter({ hasText: message })).toHaveCount(1, { timeout: 15_000 });
     expect(uploads).toBe(1);

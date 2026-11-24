@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::core::AppKind;
+use crate::engine::build_deferral::BuildRequest;
 use crate::engine::change_ops::AppliedMerge;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::git_ops::{consume_harden_marker, consume_plan_marker, git_cmd};
@@ -67,35 +68,35 @@ async fn changes_updated_payload(
             (Ok(p), Ok(s), Ok(a), Ok(r)) => (p, s, a, r),
             (perr, serr, aerr, rerr) => {
                 if let Err(e) = perr {
-                    log!(
+                    log_legacy!(
                         "[Changes] changes_updated_payload: list_pending_for_readers: {}",
                         e
                     );
                 }
                 if let Err(e) = serr {
-                    log!(
+                    log_legacy!(
                         "[Changes] changes_updated_payload: list_set_aside_for_readers: {}",
                         e
                     );
                 }
                 if let Err(e) = aerr {
-                    log!(
+                    log_legacy!(
                         "[Changes] changes_updated_payload: list_recently_applied: {}",
                         e
                     );
                 }
                 if let Err(e) = rerr {
-                    log!(
+                    log_legacy!(
                         "[Changes] changes_updated_payload: requires_restart_since: {}",
                         e
                     );
                 }
-                log!("[Changes] changes_updated_payload: skipping ChangesUpdated emit");
+                log_legacy!("[Changes] changes_updated_payload: skipping ChangesUpdated emit");
                 return None;
             }
         };
     if let Err(e) = crate::core::changes::enrich_thread_titles(pool, &mut applied).await {
-        log!("[Changes] enrich applied titles: {}", e);
+        log_legacy!("[Changes] enrich applied titles: {}", e);
     }
     Some(SystemEvent::ChangesUpdated {
         total_pending: pending.len(),
@@ -113,12 +114,12 @@ impl LucidosEngine {
     /// Broadcast the current changes state (pending/applied/restart) to every
     /// SSE client. The sole `ChangesUpdated` emitter for both the engine's own
     /// call sites and the `/api/v1/changes` handlers.
-    pub(crate) async fn broadcast_changes_updated(&self) {
+    pub async fn broadcast_changes_updated(&self) {
         // A failed read skips the frame, as `changes_updated_payload` does.
         let estimates = match self.apply_estimates.current(self.pool()).await {
             Ok(estimates) => estimates,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] apply estimates: {}; skipping ChangesUpdated emit",
                     e
                 );
@@ -144,7 +145,7 @@ impl LucidosEngine {
     /// Emit `MergeResolutionCleared` for a change whose merge worktree was
     /// just torn down. The projection updates from the event.
     /// `log_tag` is forwarded to `emit_or_log` for failure observability.
-    pub(crate) async fn emit_merge_resolution_cleared(
+    pub async fn emit_merge_resolution_cleared(
         &self,
         thread_id: Uuid,
         change_id: Uuid,
@@ -171,7 +172,7 @@ impl LucidosEngine {
     /// complete" message — used by the two post-hardening gates
     /// (`apply_now_inner` after the in-session run, `spawn_hardening_session`
     /// after the spawned run) to bail out when the marker never landed.
-    pub(crate) async fn emit_apply_failed_unhardened(
+    pub async fn emit_apply_failed_unhardened(
         &self,
         thread_id: Uuid,
         change_id: &str,
@@ -185,6 +186,9 @@ impl LucidosEngine {
                 BusEvent::Thread {
                     thread_id,
                     event: ThreadEvent::ChangeApplyFailed {
+                        pre_merge_sha: None,
+                        post_merge_sha: None,
+                        landing_merge_sha: None,
                         change_id: change_id.to_string(),
                         error: error_msg.to_string(),
                         actor,
@@ -206,12 +210,7 @@ impl LucidosEngine {
 
     /// Emit `ChangeHardened` for a change whose `/harden` marker just
     /// landed on its branch. The projection updates from the event.
-    pub(crate) async fn emit_change_hardened(
-        &self,
-        thread_id: Uuid,
-        change_id: Uuid,
-        log_tag: &str,
-    ) {
+    pub async fn emit_change_hardened(&self, thread_id: Uuid, change_id: Uuid, log_tag: &str) {
         self.event_bus
             .emit_or_log(
                 BusEvent::Thread {
@@ -235,7 +234,7 @@ impl LucidosEngine {
     /// looks it up from `thread_summaries` so the persisted event payload
     /// always carries it.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn emit_change_applied(
+    pub async fn emit_change_applied(
         &self,
         claim: &crate::engine::change_ops::apply_claim::ApplyClaim,
         thread_id: Uuid,
@@ -245,11 +244,90 @@ impl LucidosEngine {
         thread_title: Option<String>,
         actor: Option<MessageOrigin>,
         merge: Option<AppliedMerge>,
-    ) {
+    ) -> Result<BuildRequest, String> {
         let change_id = claim.change_id();
+        let merge = match merge {
+            Some(merge) => Some(merge),
+            None => match self.failed_landing_merge(change_id).await {
+                Ok(merge) => merge,
+                Err(error) => {
+                    let error = format!("The earlier landing could not be checked: {error}. Retry Apply to finish recording it.");
+                    self.emit_apply_failed_with_merge(
+                        thread_id,
+                        change_id,
+                        &error,
+                        actor.clone(),
+                        None,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            },
+        };
         let (pre_merge_sha, post_merge_sha, landing_merge_sha) = match merge {
             Some(m) => (Some(m.pre), Some(m.post), m.landing),
             None => (None, None, None),
+        };
+        // Use the landed trees, not the proposal snapshot or approval marker.
+        // A no-op apply has no landed files, so it cannot claim a plan landing.
+        let content = match (&pre_merge_sha, &post_merge_sha) {
+            (Some(pre), Some(post)) => {
+                let change = match self.changes().get_by_id(change_id).await {
+                    Ok(Some(change)) => change,
+                    result => {
+                        log_legacy!(
+                            "[Changes] Cannot classify applied change {}: {:?}",
+                            change_id,
+                            result
+                        );
+                        let error = "The change merged to main, but its landing could not be recorded. Its pending change could not be read. Retry Apply to finish recording it.".to_string();
+                        self.emit_apply_failed_with_merge(
+                            thread_id,
+                            change_id,
+                            &error,
+                            actor.clone(),
+                            Some(AppliedMerge {
+                                pre: pre.clone(),
+                                post: post.clone(),
+                                landing: landing_merge_sha.clone(),
+                            }),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                let range = format!("{pre}..{post}");
+                match crate::engine::git_ops::changed_files_in_range(
+                    std::path::Path::new(&change.repo_root),
+                    &range,
+                )
+                .await
+                {
+                    Ok(files) => crate::engine::thread_events::ChangeContent::from_files(&files),
+                    Err(error) => {
+                        log_legacy!(
+                            "[Changes] Cannot classify applied change {}: {}",
+                            change_id,
+                            error
+                        );
+                        let error = format!("The change merged to main, but its landing could not be recorded. Git could not read the landed files: {error}. Retry Apply to finish recording it.");
+                        self.emit_apply_failed_with_merge(
+                            thread_id,
+                            change_id,
+                            &error,
+                            actor.clone(),
+                            Some(AppliedMerge {
+                                pre: pre.clone(),
+                                post: post.clone(),
+                                landing: landing_merge_sha.clone(),
+                            }),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+            }
+            _ => crate::engine::thread_events::ChangeContent::Code,
         };
         let thread_title = match thread_title {
             Some(t) => Some(t),
@@ -272,34 +350,52 @@ impl LucidosEngine {
             .emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::ChangeApplied {
+                    content,
                     change_id: change_id.to_string(),
                     requires_restart,
                     client_update,
                     commits,
                     thread_title,
-                    actor,
-                    pre_merge_sha,
-                    post_merge_sha,
-                    landing_merge_sha,
+                    actor: actor.clone(),
+                    pre_merge_sha: pre_merge_sha.clone(),
+                    post_merge_sha: post_merge_sha.clone(),
+                    landing_merge_sha: landing_merge_sha.clone(),
                     path: String::new(),
                 },
                 meta: EventMeta::NONE,
             })
             .await
         {
-            Ok(res) => res.is_some(),
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Err("the event was refused".to_string()),
             Err(e) if e.to_string().contains(CHANGE_APPLIED_ONCE_INDEX) => {
-                log!(
+                log_legacy!(
                     "[Changes] ChangeApplied for {} refused: another engine on this database already recorded it",
                     change_id
                 );
-                false
+                Ok(false)
             }
             Err(e) => {
                 // Same message shape `emit_or_log` produced, so the existing
                 // `[EventBus] [Changes] ChangeApplied emit failed: …` stays greppable.
-                log!("[EventBus] [Changes] ChangeApplied emit failed: {}", e);
-                false
+                log_legacy!("[EventBus] [Changes] ChangeApplied emit failed: {}", e);
+                Err(e.to_string())
+            }
+        };
+        let accepted = match accepted {
+            Ok(accepted) => accepted,
+            Err(cause) => {
+                let error = format!("The landing could not be recorded: {cause}. Retry Apply to finish recording it.");
+                let merge = pre_merge_sha
+                    .zip(post_merge_sha)
+                    .map(|(pre, post)| AppliedMerge {
+                        pre,
+                        post,
+                        landing: landing_merge_sha,
+                    });
+                self.emit_apply_failed_with_merge(thread_id, change_id, &error, actor, merge)
+                    .await;
+                return Err(error);
             }
         };
         // Feed the Apply-All driver. Non-member ids are no-ops; batch
@@ -311,9 +407,11 @@ impl LucidosEngine {
         ));
         if accepted {
             self.clear_gate_markers_of_applied_change(change_id).await;
-            self.post_apply_dev_refresh(thread_id, requires_restart, client_update)
-                .await;
+            return Ok(self
+                .post_apply_dev_refresh(thread_id, requires_restart, client_update)
+                .await);
         }
+        Ok(BuildRequest::None)
     }
 
     /// Clear the harden and plan markers of the branch a change landed from.
@@ -330,7 +428,7 @@ impl LucidosEngine {
             Ok(Some(change)) => change,
             Ok(None) => return,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] marker clear for applied change {} skipped: {}",
                     change_id,
                     e
@@ -363,18 +461,18 @@ impl LucidosEngine {
         thread_id: Uuid,
         requires_restart: bool,
         client_update: bool,
-    ) {
+    ) -> BuildRequest {
         let Some(engine) = self.try_clone_arc() else {
             // `main.rs` installs the self-reference immediately after `Arc::new`,
             // long before the HTTP server binds — so in a real engine this is
             // unreachable and only unit tests take it. Log it anyway: a silently
             // skipped rebuild is precisely the failure this funnel exists to
             // stop, and it must not be invisible if the wiring ever moves.
-            log!(
+            log_legacy!(
                 "[Changes] post-apply refresh skipped for change on thread {} — engine self-reference not installed",
                 thread_id
             );
-            return;
+            return BuildRequest::None;
         };
         // One indexed `thread_summaries` lookup, on a user-initiated action —
         // and it gates BOTH arms, so it can't be skipped for the restart case.
@@ -387,17 +485,20 @@ impl LucidosEngine {
         // log recorded the merge succeeding and then said nothing about whether
         // a rebuild had been asked for.
         let decision = post_apply_refresh(requires_restart, client_update, is_lucidos_source);
-        log!(
+        log_legacy!(
             "[Changes] post-apply refresh: {:?} (requires_restart={}, client_update={})",
             decision,
             requires_restart,
             client_update
         );
         match decision {
-            PostApplyRefresh::RebuildEngine => engine.join_or_start_background_rebuild(),
+            PostApplyRefresh::RebuildEngine => {
+                return engine.automatic_background_rebuild().await.into()
+            }
             PostApplyRefresh::ReSnapshotFrontend => engine.refresh_served_frontend_after_rebuild(),
             PostApplyRefresh::Nothing => {}
         }
+        BuildRequest::None
     }
     /// Scan files touched by an applied change and emit per-entity events
     /// (`AppCreated`/`AppUpdated`/`AppDeleted`,
@@ -426,7 +527,7 @@ impl LucidosEngine {
     /// writes `data/triggers/<id>/...` files cannot make a working trigger
     /// without also emitting the right projection events. That's a deeper
     /// architectural gap to address separately.
-    pub(crate) async fn emit_entity_events_for_change_apply(
+    pub async fn emit_entity_events_for_change_apply(
         &self,
         files: &[String],
         pre_merge_sha: Option<&str>,
@@ -434,6 +535,47 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
         writer_thread_id: Option<Uuid>,
     ) {
+        let origin = match writer_thread_id {
+            Some(id) => crate::core::artifact_writer::ArtifactWriterOrigin::Thread(id),
+            None => crate::core::artifact_writer::ArtifactWriterOrigin::Known(
+                crate::engine::event_bus::ArtifactWriter::Engine,
+            ),
+        };
+        let writes_artifact = files.iter().any(|file| {
+            file.starts_with("data/artifacts/") && self.workspace_path().join(file).exists()
+        });
+        let writer = if !writes_artifact {
+            None
+        } else {
+            match origin.resolve(self.event_bus.pool()).await {
+                Ok(writer) => Some(writer),
+                Err(e) => {
+                    crate::log_legacy!(
+                        "[Changes] Failed to resolve artifact writer for apply: {e}"
+                    );
+                    let message = format!(
+                    "The change applied, but artifact writes could not be recorded because their writer could not be resolved: {e}"
+                );
+                    if let Err(error) = self
+                        .create_notification(
+                            "Artifact history could not be recorded",
+                            &message,
+                            None,
+                            writer_thread_id,
+                            None,
+                            crate::scheduler::notifications::Tap::Modal,
+                            actor.clone(),
+                        )
+                        .await
+                    {
+                        crate::log_legacy!(
+                            "[Changes] Could not announce missing artifact history: {error}"
+                        );
+                    }
+                    None
+                }
+            }
+        };
         let events = compute_entity_events_for_change_apply(
             self.workspace_path(),
             pre_merge_sha,
@@ -441,6 +583,7 @@ impl LucidosEngine {
             files,
             actor,
             writer_thread_id,
+            writer,
         )
         .await;
         for ev in events {
@@ -464,18 +607,55 @@ impl LucidosEngine {
     /// Emit a ChangeApplyFailed event so the frontend knows the apply didn't succeed
     /// and can keep the thread in "waiting" state with the Apply/Discard panel visible.
     /// `actor` carries the same value passed to the originating apply call.
-    pub(crate) async fn emit_apply_failed(
+    pub async fn emit_apply_failed(
         &self,
         thread_id: Uuid,
         change_id: Uuid,
         error: &str,
         actor: Option<MessageOrigin>,
     ) {
+        self.record_apply_failure(thread_id, change_id, error, actor, None)
+            .await;
+        self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
+            change_id,
+            error.to_string(),
+        ));
+    }
+
+    /// A retry can recover a landed range after the initial classification failed.
+    async fn failed_landing_merge(
+        &self,
+        change_id: Uuid,
+    ) -> Result<Option<AppliedMerge>, sqlx::Error> {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT payload->>'pre_merge_sha', payload->>'post_merge_sha', payload->>'landing_merge_sha' \
+             FROM events WHERE event_type = 'ChangeApplyFailed' AND payload->>'change_id' = $1 \
+             AND payload->>'pre_merge_sha' IS NOT NULL AND payload->>'post_merge_sha' IS NOT NULL \
+             ORDER BY sequence DESC LIMIT 1",
+        ).bind(change_id.to_string()).fetch_optional(self.pool()).await?;
+        Ok(row.map(|(pre, post, landing)| AppliedMerge { pre, post, landing }))
+    }
+
+    async fn record_apply_failure(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+        error: &str,
+        actor: Option<MessageOrigin>,
+        merge: Option<AppliedMerge>,
+    ) {
+        let (pre_merge_sha, post_merge_sha, landing_merge_sha) = match merge {
+            Some(merge) => (Some(merge.pre), Some(merge.post), merge.landing),
+            None => (None, None, None),
+        };
         self.event_bus
             .emit_or_log(
                 BusEvent::Thread {
                     thread_id,
                     event: ThreadEvent::ChangeApplyFailed {
+                        pre_merge_sha,
+                        post_merge_sha,
+                        landing_merge_sha,
                         change_id: change_id.to_string(),
                         error: error.to_string(),
                         actor,
@@ -485,6 +665,40 @@ impl LucidosEngine {
                 "[Changes] ChangeApplyFailed",
             )
             .await;
+    }
+
+    async fn emit_apply_failed_with_merge(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+        error: &str,
+        actor: Option<MessageOrigin>,
+        merge: Option<AppliedMerge>,
+    ) {
+        self.record_apply_failure(thread_id, change_id, error, actor, merge)
+            .await;
+        match crate::engine::landing_lane::lane_held_changes(self.pool(), &[change_id]).await {
+            Ok(held) if held.contains(&change_id) => {
+                self.event_bus
+                    .emit_or_log(
+                        BusEvent::Thread {
+                            thread_id,
+                            event: ThreadEvent::ChangeUnqueued {
+                                change_id: change_id.to_string(),
+                                reason: crate::engine::thread_events::UnqueueReason::LandingFailed,
+                            },
+                            meta: EventMeta::NONE,
+                        },
+                        "[Changes] ChangeUnqueued after failed landing",
+                    )
+                    .await;
+            }
+            Err(cause) => log_legacy!(
+                "[Changes] Could not check failed change's lane membership: {}",
+                cause
+            ),
+            _ => {}
+        }
         // Feed the Apply-All driver. Failed members do NOT halt the batch
         // — the driver records the failure and keeps applying the rest.
         self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
@@ -568,7 +782,7 @@ impl LucidosEngine {
     /// Returns the prompt body the caller then ships to CC by whatever
     /// per-tier mechanism applies (live `msg_tx.send`, fresh
     /// `run_direct_agent`, resumed `run_direct_agent`).
-    pub(crate) async fn start_merge_and_get_prompt(
+    pub async fn start_merge_and_get_prompt(
         &self,
         thread_id: Uuid,
         change_id: Uuid,
@@ -586,7 +800,7 @@ impl LucidosEngine {
             crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
                 .await
                 .is_app();
-        crate::engine::agent_session::build_merge_prompt(
+        crate::engine::merge_prompts::build_merge_prompt(
             target_branch,
             body_intro,
             description,
@@ -608,6 +822,7 @@ pub(crate) async fn compute_entity_events_for_change_apply(
     files: &[String],
     actor: Option<MessageOrigin>,
     writer_thread_id: Option<Uuid>,
+    writer: Option<crate::engine::event_bus::ArtifactWriter>,
 ) -> Vec<SystemEvent> {
     let mut app_ids: BTreeSet<String> = BTreeSet::new();
     let mut artifact_paths: BTreeSet<String> = BTreeSet::new();
@@ -669,18 +884,25 @@ pub(crate) async fn compute_entity_events_for_change_apply(
             Some(sha) => git_path_exists_at(workspace_path, sha, &full).await,
             None => false,
         };
+        // A failed provenance lookup must not invent a writer or suppress
+        // app and deletion events, which need no artifact writer.
+        if exists_post && writer.is_none() {
+            continue;
+        }
         let event = match (exists_post, exists_pre) {
             (true, false) => Some(SystemEvent::ArtifactCreated {
                 artifact_path: path.clone(),
                 commit: commit.clone(),
                 source: Some("change_apply".to_string()),
                 writer_thread_id,
+                writer: writer.clone(),
             }),
             (true, true) => Some(SystemEvent::ArtifactUpdated {
                 artifact_path: path.clone(),
                 commit: commit.clone(),
                 source: Some("change_apply".to_string()),
                 writer_thread_id,
+                writer: writer.clone(),
             }),
             (false, true) => Some(SystemEvent::ArtifactDeleted {
                 artifact_path: path.clone(),
@@ -711,7 +933,7 @@ async fn git_path_exists_at(repo_root: &std::path::Path, sha: &str, path: &str) 
             // exit 1 = "missing" (expected); anything else (timeout from the
             // 30s wrapper, repo broken, sha unreadable) is suspicious.
             if o.status.code() != Some(1) {
-                log!(
+                log_legacy!(
                     "[Changes] git cat-file -e {} exited {:?} stderr={}",
                     spec,
                     o.status.code(),
@@ -721,7 +943,7 @@ async fn git_path_exists_at(repo_root: &std::path::Path, sha: &str, path: &str) 
             false
         }
         Err(e) => {
-            log!("[Changes] git cat-file -e {} failed: {}", spec, e);
+            log_legacy!("[Changes] git cat-file -e {} failed: {}", spec, e);
             false
         }
     }
@@ -734,7 +956,7 @@ async fn app_kind_at(repo_root: &std::path::Path, sha: &str, app_id: &str) -> Op
     let out = match git_cmd(&["show", &spec], repo_root).await {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
-            log!(
+            log_legacy!(
                 "[Changes] git show {} exited {:?}: {}",
                 spec,
                 out.status.code(),
@@ -743,7 +965,7 @@ async fn app_kind_at(repo_root: &std::path::Path, sha: &str, app_id: &str) -> Op
             return None;
         }
         Err(e) => {
-            log!("[Changes] git show {} failed: {}", spec, e);
+            log_legacy!("[Changes] git show {} failed: {}", spec, e);
             return None;
         }
     };
@@ -823,6 +1045,233 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[test]
+    fn classification_failure_reports_an_unrecorded_landing_without_claiming_success() {
+        crate::test_support::run_on_engine_runtime(
+            "engine::change_ops::emitters::tests::classification_failure_reports_an_unrecorded_landing_without_claiming_success",
+            classification_failure_case,
+        );
+    }
+
+    async fn classification_failure_case() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (engine, workspace) = crate::test_support::boot_mock_engine(&db).await;
+        let thread = crate::test_support::seed_coding_thread(&engine.event_bus, None).await;
+        for proposed in [false, true] {
+            let change = Uuid::new_v4();
+            if proposed {
+                let event: ThreadEvent = serde_json::from_value(serde_json::json!({
+                    "type": "ChangeProposed", "change_id": change.to_string(),
+                    "files": ["docs/plans/example.md"], "branch_name": "work",
+                    "repo_root": workspace.path().join("missing-repository").to_string_lossy(),
+                }))
+                .unwrap();
+                engine
+                    .event_bus
+                    .emit(BusEvent::Thread {
+                        thread_id: thread,
+                        event,
+                        meta: EventMeta::NONE,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let claim = engine.apply_claims.try_claim(change).unwrap();
+            let error = engine
+                .emit_change_applied(
+                    &claim,
+                    thread,
+                    false,
+                    false,
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(AppliedMerge::new("before", "after")),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains("merged to main"));
+            assert!(error.contains("Retry Apply"));
+            let events: Vec<String> = sqlx::query_scalar(
+                "SELECT event_type FROM events WHERE thread_id = $1 AND payload->>'change_id' = $2 AND event_type IN ('ChangeApplied', 'ChangeApplyFailed') ORDER BY sequence",
+            ).bind(thread).bind(change.to_string()).fetch_all(&pool).await.unwrap();
+            assert_eq!(events, ["ChangeApplyFailed"]);
+            if proposed {
+                assert!(engine
+                    .changes()
+                    .get_by_id(change)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_pending());
+            }
+            assert!(engine.apply_claims.is_held(change));
+            drop(claim);
+            assert!(!engine.apply_claims.is_held(change));
+        }
+        // A restart-style retry has no in-memory merge argument. Keep the
+        // actual landed range on the failure so a plan cannot become code.
+        let staging = workspace.path().join("staging-repository");
+        let restored = workspace.path().join("restored-repository");
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        async fn git(repo: &std::path::Path, args: &[&str]) -> String {
+            let out = git_cmd(args, repo).await.unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+        git(&staging, &["init", "-b", "main"]).await;
+        git(&staging, &["config", "user.name", "Test User"]).await;
+        git(&staging, &["config", "user.email", "test@example.com"]).await;
+        tokio::fs::write(staging.join("README.md"), "Example repository")
+            .await
+            .unwrap();
+        git(&staging, &["add", "."]).await;
+        git(&staging, &["commit", "-m", "docs: initialize repository"]).await;
+        let pre = git(&staging, &["rev-parse", "HEAD"]).await;
+        git(&staging, &["checkout", "-b", "plan"]).await;
+        tokio::fs::create_dir_all(staging.join("docs/plans"))
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("docs/plans/example.md"), "The plan")
+            .await
+            .unwrap();
+        git(&staging, &["add", "."]).await;
+        git(&staging, &["commit", "-m", "docs: add plan"]).await;
+        git(&staging, &["checkout", "main"]).await;
+        git(&staging, &["merge", "--no-ff", "--no-edit", "plan"]).await;
+        let post = git(&staging, &["rev-parse", "HEAD"]).await;
+        let change = Uuid::new_v4();
+        let event: ThreadEvent = serde_json::from_value(serde_json::json!({
+            "type": "ChangeProposed", "change_id": change.to_string(),
+            "files": ["docs/plans/example.md"], "branch_name": "plan",
+            "repo_root": restored.to_string_lossy(),
+        }))
+        .unwrap();
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event,
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event: ThreadEvent::ChangeQueued {
+                    change_id: change.to_string(),
+                    snapshot_sha: post.clone(),
+                },
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        engine
+            .emit_apply_failed(thread, change, "Repository has uncommitted changes", None)
+            .await;
+        assert!(!crate::engine::landing_lane::queued_changes(&pool, thread)
+            .await
+            .unwrap()
+            .is_empty());
+        let claim = engine.apply_claims.try_claim(change).unwrap();
+        assert!(engine
+            .emit_change_applied(
+                &claim,
+                thread,
+                false,
+                false,
+                Vec::new(),
+                None,
+                None,
+                Some(AppliedMerge::landing(&pre, &post)),
+            )
+            .await
+            .is_err());
+        drop(claim);
+        let failure: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE event_type = 'ChangeApplyFailed' AND payload->>'change_id' = $1 ORDER BY sequence DESC LIMIT 1",
+        ).bind(change.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(failure["pre_merge_sha"], pre);
+        assert_eq!(failure["post_merge_sha"], post);
+        assert_eq!(failure["landing_merge_sha"], post);
+        assert!(crate::engine::landing_lane::queued_changes(&pool, thread)
+            .await
+            .unwrap()
+            .is_empty());
+        // An unreadable retry must still fail rather than downgrade to code.
+        let claim = engine.apply_claims.try_claim(change).unwrap();
+        assert!(engine
+            .emit_change_applied(&claim, thread, false, false, Vec::new(), None, None, None,)
+            .await
+            .is_err());
+        tokio::fs::rename(&staging, &restored).await.unwrap();
+        engine
+            .emit_change_applied(&claim, thread, false, false, Vec::new(), None, None, None)
+            .await
+            .unwrap();
+        let applied: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE event_type = 'ChangeApplied' AND payload->>'change_id' = $1",
+        ).bind(change.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(applied["content"], "plan-only");
+        assert_eq!(applied["pre_merge_sha"], pre);
+        assert_eq!(applied["post_merge_sha"], post);
+        assert_eq!(applied["landing_merge_sha"], post);
+        drop(claim);
+        let refused = Uuid::new_v4();
+        let event: ThreadEvent = serde_json::from_value(serde_json::json!({
+            "type": "ChangeProposed", "change_id": refused.to_string(),
+            "files": ["docs/plans/example.md"], "branch_name": "plan",
+            "repo_root": restored.to_string_lossy(),
+        }))
+        .unwrap();
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event,
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        crate::test_support::refuse_event_type(&pool, "ChangeApplied").await;
+        let claim = engine.apply_claims.try_claim(refused).unwrap();
+        let error = engine
+            .emit_change_applied(
+                &claim,
+                thread,
+                false,
+                false,
+                Vec::new(),
+                None,
+                None,
+                Some(AppliedMerge::landing(&pre, &post)),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("landing could not be recorded"));
+        assert!(engine
+            .changes()
+            .get_by_id(refused)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_pending());
+        let failure: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE event_type = 'ChangeApplyFailed' AND payload->>'change_id' = $1 ORDER BY sequence DESC LIMIT 1",
+        ).bind(refused.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(failure["pre_merge_sha"], pre);
+        assert_eq!(failure["post_merge_sha"], post);
+        drop(claim);
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
     /// Every `ChangesUpdated` frame carries the gate the Apply button is
     /// disabled by. The thread-queue executor, standing apply, recovery and
     /// thread archive all reach this emitter. A frame without the gate
@@ -841,6 +1290,7 @@ mod tests {
         bus.emit(BusEvent::Thread {
             thread_id: thread,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: format!("cc-{thread}"),
                 branch: String::new(),
@@ -864,6 +1314,7 @@ mod tests {
         bus.emit(BusEvent::Thread {
             thread_id: thread,
             event: ThreadEvent::ChangeProposed {
+                content: Default::default(),
                 change_id: change.to_string(),
                 description: Some("work".to_string()),
                 files: vec!["a.rs".to_string()],
@@ -933,9 +1384,7 @@ mod tests {
                 .find(emitter)
                 .unwrap_or_else(|| panic!("{emitter} must still exist"));
             let rest = &SRC[start + emitter.len()..];
-            let end = rest
-                .find("\n    pub(crate) async fn ")
-                .expect("another emitter must follow");
+            let end = rest.find("\n    }").expect("the emitter must end");
             assert!(
                 rest[..end].contains(BROADCAST),
                 "{emitter} must broadcast ChangesUpdated, or clients keep a stale Apply button"
@@ -1048,6 +1497,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_writer_preserves_apps_and_deletions_without_inventing_artifact_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        init_repo(ws).await;
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/deleted.md"), "old").unwrap();
+        std::fs::write(ws.join("data/artifacts/updated.md"), "old").unwrap();
+        let pre_sha = commit_all(ws, "Existing artifacts").await;
+        std::fs::remove_file(ws.join("data/artifacts/deleted.md")).unwrap();
+        std::fs::write(ws.join("data/artifacts/created.md"), "new").unwrap();
+        std::fs::write(ws.join("data/artifacts/updated.md"), "new").unwrap();
+        write_app_manifest(ws, "new-app", "New App");
+        let post_sha = commit_all(ws, "Apply mixed change").await;
+        let events = compute_entity_events_for_change_apply(
+            ws,
+            Some(&pre_sha),
+            Some(&post_sha),
+            &[
+                "data/apps/new-app/manifest.json".into(),
+                "data/artifacts/deleted.md".into(),
+                "data/artifacts/created.md".into(),
+                "data/artifacts/updated.md".into(),
+            ],
+            None,
+            Some(Uuid::new_v4()),
+            None,
+        )
+        .await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().any(|event| matches!(event,
+            SystemEvent::AppCreated { app_id, .. } if app_id == "new-app"
+        )));
+        assert!(events.iter().any(|event| matches!(event,
+            SystemEvent::ArtifactDeleted { artifact_path, .. } if artifact_path == "deleted.md"
+        )));
+    }
+
+    #[tokio::test]
     async fn cc_apply_creating_a_new_app_emits_app_created() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
@@ -1067,6 +1554,7 @@ mod tests {
             ],
             None,
             None,
+            Some(crate::engine::event_bus::ArtifactWriter::Thread),
         )
         .await;
 
@@ -1118,6 +1606,7 @@ mod tests {
             &["data/apps/habit-tracker/index.html".to_string()],
             None,
             None,
+            Some(crate::engine::event_bus::ArtifactWriter::Thread),
         )
         .await;
 
@@ -1159,6 +1648,7 @@ mod tests {
             ],
             None,
             None,
+            Some(crate::engine::event_bus::ArtifactWriter::Thread),
         )
         .await;
 
@@ -1201,6 +1691,7 @@ mod tests {
             &["data/apps/fare-grid/manifest.json".to_string()],
             None,
             None,
+            Some(crate::engine::event_bus::ArtifactWriter::Thread),
         )
         .await;
 
@@ -1235,6 +1726,7 @@ mod tests {
             &["data/artifacts/notes.md".to_string()],
             None,
             None,
+            Some(crate::engine::event_bus::ArtifactWriter::Thread),
         )
         .await;
 
@@ -1244,8 +1736,13 @@ mod tests {
                 artifact_path,
                 commit,
                 source,
+                writer,
                 ..
             } => {
+                assert_eq!(
+                    writer.as_ref(),
+                    Some(&crate::engine::event_bus::ArtifactWriter::Thread)
+                );
                 assert_eq!(artifact_path, "notes.md");
                 assert_eq!(commit, &post_sha);
                 assert_eq!(source.as_deref(), Some("change_apply"));
@@ -1276,6 +1773,7 @@ mod tests {
             ],
             None,
             None,
+            Some(crate::engine::event_bus::ArtifactWriter::Thread),
         )
         .await;
 

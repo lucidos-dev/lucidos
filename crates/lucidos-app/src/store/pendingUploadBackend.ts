@@ -1,33 +1,26 @@
-/** Device-local upload storage. No application state or browser startup effects. */
-import { uploadSourceVersion } from './pendingUploadSource';
+import { sameStoredUpload, sameUploadBytes, uploadFileIdentity, uploadSourceVersion,
+  type StoredUploadSource } from './pendingUploadSource';
+import { readUploadPayload, retainUploadBytes, UPLOAD_BYTES } from './uploadByteStore';
 import { queuedRestoreSourceId } from '../utils/restoreAdmission';
-import { openDeviceDatabase } from './deviceDatabase';
+import { BOUNDED, openDeviceDatabase } from './deviceDatabase';
 import type { PendingUploadBackend, PendingUploadRecord, QueuedUploadSendRecord } from './pendingUploadRecords';
 
-const UPLOADS = 'uploads';
+export const PENDING_UPLOADS_STORE = 'uploads';
 const UPLOAD_HISTORY = 'upload-source-history';
 
-// Stable source metadata plus exact byte equality make a repeated write idempotent.
-// Reusing a source identity for different bytes is refused, never overwritten.
-function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
-  const left = new Uint8Array(a), right = new Uint8Array(b);
-  return left.length === right.length && left.every((v, i) => v === right[i]);
-}
-function retainUpload(store: IDBObjectStore, record: PendingUploadRecord): void {
-  const key = uploadSourceVersion(record);
-  const get = store.get(key);
-  get.onsuccess = () => {
-    if (!get.result) store.add(record, key);
-    else if (!sameBytes(get.result.bytes, record.bytes)) store.transaction.abort();
-  };
+function retainUpload(history: IDBObjectStore, record: PendingUploadRecord): void {
+  retainUploadBytes(history.transaction.objectStore(UPLOAD_BYTES), record, false, (source) => {
+    const key = uploadSourceVersion(source);
+    const get = history.get(key);
+    get.onsuccess = () => {
+      if (get.result === undefined) history.add(source, key);
+      else if (!sameStoredUpload(get.result, source)) history.transaction.abort();
+    };
+  });
 }
 
 const QUEUED_UPLOAD_SENDS = 'queued-upload-sends';
 
-/** Active slots are scoped to a page and generation. History holds the intent
- * a restore could strand, so a late write from an obsolete page is journaled at
- * the next hello. A settled or superseded revision leaves history: a delivered
- * send is in the workspace, so the recovery snapshot covers a later restore. */
 function queuedSlot(record: QueuedUploadSendRecord): string {
   return JSON.stringify([record.threadId, record.ownerId, record.sourceGeneration ?? null]);
 }
@@ -37,10 +30,8 @@ function queuedVersion(record: QueuedUploadSendRecord): string {
 const QUEUED_HISTORY = 'queued-source-history';
 
 export function createIndexedDbBackend(name: string): PendingUploadBackend {
-  // Upgrades close both v1 and v2 pages. Their explicit old-version reopen
-  // fails, so they cannot delete bytes outside this retention contract.
   const { transact } = openDeviceDatabase(name, (db, tx) => {
-    if (!db.objectStoreNames.contains(UPLOADS)) db.createObjectStore(UPLOADS, { keyPath: 'localId' });
+    if (!db.objectStoreNames.contains(PENDING_UPLOADS_STORE)) db.createObjectStore(PENDING_UPLOADS_STORE, { keyPath: 'localId' });
     if (!db.objectStoreNames.contains(QUEUED_UPLOAD_SENDS)) db.createObjectStore(QUEUED_UPLOAD_SENDS, { keyPath: 'threadId' });
     if (!db.objectStoreNames.contains(QUEUED_HISTORY)) {
       const history = db.createObjectStore(QUEUED_HISTORY);
@@ -54,17 +45,31 @@ export function createIndexedDbBackend(name: string): PendingUploadBackend {
         cursor.continue();
       };
     }
-    const history = db.createObjectStore(UPLOAD_HISTORY);
-    const uploads = tx.objectStore(UPLOADS).openCursor();
-    uploads.onsuccess = () => {
-      const cursor = uploads.result;
-      if (!cursor) return;
-      retainUpload(history, cursor.value);
-      cursor.continue();
+    const bytes = db.createObjectStore(UPLOAD_BYTES);
+    const hadHistory = db.objectStoreNames.contains(UPLOAD_HISTORY);
+    const history = hadHistory ? tx.objectStore(UPLOAD_HISTORY) : db.createObjectStore(UPLOAD_HISTORY);
+    const legacy = (hadHistory ? history : tx.objectStore(PENDING_UPLOADS_STORE)).openCursor();
+    legacy.onsuccess = () => {
+      const cursor = legacy.result;
+      if (!cursor) {
+        if (hadHistory) {
+          const active = tx.objectStore(PENDING_UPLOADS_STORE).openCursor();
+          active.onsuccess = () => {
+            const entry = active.result;
+            if (!entry) return;
+            entry.update({ ...entry.value, migratedBytes: true });
+            entry.continue();
+          };
+        }
+        return;
+      }
+      retainUploadBytes(bytes, cursor.value, hadHistory, (source) => {
+        history.put(source, hadHistory ? cursor.primaryKey : uploadSourceVersion(source));
+        cursor.continue();
+      });
     };
-  }, 3);
+  }, 4);
 
-  /** Delete every history entry `matches` selects, in the open transaction. */
   function dropHistory<T>(store: IDBObjectStore, range: IDBKeyRange | null, matches: (value: T) => boolean): void {
     const cursor = store.openCursor(range);
     cursor.onsuccess = () => {
@@ -78,13 +83,13 @@ export function createIndexedDbBackend(name: string): PendingUploadBackend {
 
   return {
     putUpload: async (record) => {
-      await transact([UPLOADS, UPLOAD_HISTORY], 'readwrite', (s) => {
+      await transact([PENDING_UPLOADS_STORE, UPLOAD_HISTORY, UPLOAD_BYTES], 'readwrite', (s) => {
         retainUpload(s.transaction.objectStore(UPLOAD_HISTORY), record);
         s.put(record);
       });
     },
     patchUpload: async (localId, patch) => {
-      await transact([UPLOADS, UPLOAD_HISTORY], 'readwrite', (s) => {
+      await transact([PENDING_UPLOADS_STORE, UPLOAD_HISTORY, UPLOAD_BYTES], 'readwrite', (s) => {
         const get = s.get(localId);
         get.onsuccess = () => {
           if (get.result) {
@@ -96,13 +101,38 @@ export function createIndexedDbBackend(name: string): PendingUploadBackend {
       });
     },
     deleteUpload: async (localId) => {
-      await transact([UPLOADS, UPLOAD_HISTORY], 'readwrite', (s) => {
+      await transact([PENDING_UPLOADS_STORE, UPLOAD_HISTORY, UPLOAD_BYTES], 'readwrite', (s) => {
         s.delete(localId);
-        dropHistory<PendingUploadRecord>(s.transaction.objectStore(UPLOAD_HISTORY), null, (r) => r.localId === localId);
+        const bytes = s.transaction.objectStore(UPLOAD_BYTES);
+        const history = s.transaction.objectStore(UPLOAD_HISTORY).openCursor();
+        history.onsuccess = () => {
+          const cursor = history.result;
+          if (!cursor) return;
+          const source = cursor.value as StoredUploadSource;
+          if (source.localId === localId) {
+            cursor.delete();
+            bytes.delete(source.byteKey);
+          }
+          cursor.continue();
+        };
       });
     },
-    listUploadHistory: async () => (await transact<PendingUploadRecord[]>(UPLOAD_HISTORY, 'readonly', (s) => s.getAll())) ?? [],
-    listUploads: async () => (await transact<PendingUploadRecord[]>(UPLOADS, 'readonly', (s) => s.getAll())) ?? [],
+    listUploadHistory: async () => (await transact<StoredUploadSource[]>(UPLOAD_HISTORY, 'readonly', (s) => s.getAll(), BOUNDED)) ?? [],
+    readUploadBytes: async (source) => {
+      let payload: ReturnType<typeof readUploadPayload> | undefined;
+      await transact([UPLOAD_HISTORY, UPLOAD_BYTES], 'readonly', (s) => {
+        const version = s.get(uploadSourceVersion(source));
+        version.onsuccess = () => {
+          if (version.result && sameStoredUpload(version.result, source)) {
+            payload = readUploadPayload(s.transaction.objectStore(UPLOAD_BYTES), source.byteKey);
+          }
+        };
+      }, BOUNDED);
+      if (!payload) return undefined;
+      if (!payload.result) throw new Error('Archived upload bytes are missing');
+      return payload.result.bytes;
+    },
+    listUploads: async () => (await transact<PendingUploadRecord[]>(PENDING_UPLOADS_STORE, 'readonly', (s) => s.getAll(), BOUNDED)) ?? [],
     putQueuedUploadSend: async (record) => {
       await transact(QUEUED_HISTORY, 'readwrite', (s) => {
         const active = s.get(`active:${queuedSlot(record)}`);
@@ -126,21 +156,23 @@ export function createIndexedDbBackend(name: string): PendingUploadBackend {
       });
     },
     listQueuedUploadSends: async () => (await transact<QueuedUploadSendRecord[]>(QUEUED_HISTORY, 'readonly',
-      (s) => s.getAll(IDBKeyRange.bound('active:', 'active;')))) ?? [],
+      (s) => s.getAll(IDBKeyRange.bound('active:', 'active;')), BOUNDED)) ?? [],
     listQueuedUploadHistory: async () => (await transact<QueuedUploadSendRecord[]>(QUEUED_HISTORY, 'readonly',
-      (s) => s.getAll(sourceRange()))) ?? [],
+      (s) => s.getAll(sourceRange()), BOUNDED)) ?? [],
   };
 }
 
-/** In-memory implementation of the same isolation contract, for tests. */
 export function createMemoryPendingUploadBackend(): PendingUploadBackend {
   const uploads = new Map<string, PendingUploadRecord>();
-  const uploadHistory = new Map<string, PendingUploadRecord>();
+  const uploadHistory = new Map<string, StoredUploadSource>();
+  const uploadBytes = new Map<string, ArrayBuffer>();
   function retain(record: PendingUploadRecord): void {
-    const key = uploadSourceVersion(record);
-    const previous = uploadHistory.get(key);
-    if (previous && !sameBytes(previous.bytes, record.bytes)) throw new Error('Upload source bytes changed');
-    uploadHistory.set(key, structuredClone(record));
+    const { bytes, ...metadata } = record;
+    const identity = uploadFileIdentity(record);
+    const previous = uploadBytes.get(identity);
+    if (previous && !sameUploadBytes(previous, bytes)) throw new Error('Upload source bytes changed');
+    if (!previous) uploadBytes.set(identity, bytes.slice(0));
+    uploadHistory.set(uploadSourceVersion(record), structuredClone({ ...metadata, byteKey: [identity, 0] }));
   }
   const queued = new Map<string, QueuedUploadSendRecord>();
   const history = new Map<string, QueuedUploadSendRecord>();
@@ -152,9 +184,20 @@ export function createMemoryPendingUploadBackend(): PendingUploadBackend {
     },
     deleteUpload: async (localId) => {
       uploads.delete(localId);
-      for (const [key, record] of uploadHistory) if (record.localId === localId) uploadHistory.delete(key);
+      for (const [key, record] of uploadHistory) {
+        if (record.localId !== localId) continue;
+        uploadHistory.delete(key);
+        uploadBytes.delete(record.byteKey[0]);
+      }
     },
     listUploadHistory: async () => [...uploadHistory.values()].map((r) => structuredClone(r)),
+    readUploadBytes: async (source) => {
+      const current = uploadHistory.get(uploadSourceVersion(source));
+      if (!current || !sameStoredUpload(current, source)) return undefined;
+      const bytes = uploadBytes.get(source.byteKey[0]);
+      if (!bytes) throw new Error('Archived upload bytes are missing');
+      return bytes.slice(0);
+    },
     listUploads: async () => [...uploads.values()].map((r) => ({ ...r })),
     putQueuedUploadSend: async (record) => {
       const previous = queued.get(queuedSlot(record));

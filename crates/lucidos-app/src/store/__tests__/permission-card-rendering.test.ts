@@ -77,7 +77,6 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
       step(1, { type: 'ToolCalled', name: 'run_bash', description: 'curl …' }),
       commandRequestStep(2, { request_id: 'creq-3' }),
     ]);
-    // threadIsCC = false — the command guard fires on chat threads.
     expect(exchangeStatus(ex, '', true, false, false)).toBe('awaiting-answer');
   });
 
@@ -91,9 +90,6 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
     expect(exchangeStatus(ex, '', true, false, false)).not.toBe('awaiting-answer');
   });
 
-  // The grant resumes the turn: the agent's post-grant reply routes into the
-  // divider (below the card) via reqIdRedirect, so a completed divider owns the
-  // turn's ResponseGenerated and reads 'done' — even at idle.
   it('resolved command-permission divider with its routed reply reads as done', () => {
     const divider: Exchange = {
       userEvent: commandRequestStep(1, { request_id: 'creq-5' }).event,
@@ -104,7 +100,6 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
         step(4, { type: 'ResponseGenerated', text: 'done' }),
       ],
     };
-    // isLast=true, threadIdle=true.
     expect(exchangeStatus(divider, '', true, false, false, true)).toBe('done');
   });
 
@@ -126,26 +121,15 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
     const [msg, divider] = exchanges;
     expect(msg.userEvent.type).toBe('MessageReceived');
     expect(divider.userEvent.type).toBe('CommandPermissionRequested');
-    // The gated tool call + its result stay in the message exchange (the call
-    // was initiated before the card; its result re-routes there by
-    // tool_called_event_id, so the "Running …" step renders merged above the
-    // card). Everything emitted AFTER the grant routes into the divider, so the
-    // reply renders BELOW the permission card — not above it.
     expect(msg.steps.map(s => s.event.type)).toEqual(['ToolCalled', 'ToolResult']);
     expect(divider.steps.map(s => s.event.type)).toEqual([
       'CommandPermissionResolved', 'TextStreamed', 'ResponseGenerated',
     ]);
 
-    // The divider now owns the turn's terminal → reads 'done'; the message
-    // exchange has no terminal of its own → 'interrupted' ("Done ↳").
     expect(exchangeStatus(divider, '', true, false, false, true)).toBe('done');
     expect(exchangeStatus(msg, '', false, false, false, true)).toBe('interrupted');
   });
 
-  // Mirrors the reported screenshot: the agent thinks, runs a gated command,
-  // the card resolves, then it keeps thinking and replies. All post-grant
-  // progress must land in the divider (below the card), never back in the
-  // message exchange (above the card).
   it('keeps post-grant thinking + reply below the card across a python git pull', () => {
     const ev = (type: string, fields: Record<string, unknown> = {}): StoredEvent =>
       ({ type, ...fields }) as StoredEvent;
@@ -161,19 +145,14 @@ describe('exchangeStatus around CommandPermissionRequested (chat command guard)'
       [9, ev('ResponseGenerated', { text: 'Here are the fields …', request_event_id: 'req-1' })],
     ]);
     const [msg, divider] = groupIntoExchanges(events);
-    // Pre-grant thinking + the gated call/result stay above the card.
     expect(msg.steps.map(s => s.event.type)).toEqual([
       'ThoughtStreamed', 'ToolCalled', 'ToolResult',
     ]);
-    // Post-grant thinking + the reply render below the card.
     expect(divider.steps.map(s => s.event.type)).toEqual([
       'CommandPermissionResolved', 'ThoughtStreamed', 'TextStreamed', 'ResponseGenerated',
     ]);
   });
 
-  // A divider holding only the resolution on an idle thread runs nothing, so
-  // it stops spinning. A real crash records an abort event of its own, which
-  // opens its own boundary, so this divider never claims one.
   it('command-permission divider with only the resolution settles done at idle', () => {
     const divider: Exchange = {
       userEvent: commandRequestStep(1, { request_id: 'creq-6' }).event,
@@ -212,7 +191,6 @@ describe('exchangeStatus around McpPermissionRequested (chat MCP gate)', () => {
       step(1, { type: 'ToolCalled', name: 'mcp__slack__channels_list', description: 'channels_list' }),
       mcpRequestStep(2, { request_id: 'mreq-3' }),
     ]);
-    // threadIsCC = false — the MCP gate fires on chat threads.
     expect(exchangeStatus(ex, '', true, false, false)).toBe('awaiting-answer');
   });
 
@@ -226,9 +204,6 @@ describe('exchangeStatus around McpPermissionRequested (chat MCP gate)', () => {
     expect(exchangeStatus(ex, '', true, false, false)).not.toBe('awaiting-answer');
   });
 
-  // The grant resumes the turn: the agent's post-grant reply routes into the
-  // divider (below the card) via reqIdRedirect, so a completed divider owns the
-  // turn's ResponseGenerated and reads 'done'.
   it('resolved MCP-permission divider with its routed reply reads as done', () => {
     const divider: Exchange = {
       userEvent: mcpRequestStep(1, { request_id: 'mreq-5' }).event,
@@ -260,8 +235,6 @@ describe('exchangeStatus around McpPermissionRequested (chat MCP gate)', () => {
     const [msg, divider] = exchanges;
     expect(msg.userEvent.type).toBe('MessageReceived');
     expect(divider.userEvent.type).toBe('McpPermissionRequested');
-    // The gated tool call + its result stay in the message exchange; everything
-    // emitted AFTER the grant routes into the divider (below the card).
     expect(msg.steps.map(s => s.event.type)).toEqual(['ToolCalled', 'ToolResult']);
     expect(divider.steps.map(s => s.event.type)).toEqual([
       'McpPermissionResolved', 'TextStreamed', 'ResponseGenerated',

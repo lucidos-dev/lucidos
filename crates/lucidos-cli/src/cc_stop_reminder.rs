@@ -15,9 +15,8 @@ use serde::Deserialize;
 
 use crate::workspace::BoxError;
 
-/// Env var the engine sets when spawning a CC session that's interactive
-/// (chat / recovery / external-repo). Absent for unattended sessions
-/// (conflict-resolution). Read by `run()` to gate the AskUserQuestion redirect.
+/// Env var the engine sets for sessions that can ask the owner ordinary
+/// questions. Absent for unattended sessions and integrated sub-threads.
 pub(crate) const SESSION_KIND_ENV: &str = "LUCIDOS_SESSION_KIND";
 
 /// Value of [`SESSION_KIND_ENV`] that means "user is at the keyboard, safe
@@ -152,23 +151,23 @@ fn question_sentinel_path(message_uuid: &str) -> PathBuf {
     cc_sentinel_path("question-redirect", message_uuid)
 }
 
+fn redirect_question(session_kind: Option<&str>, input: &str) -> Option<String> {
+    if session_kind != Some(SESSION_KIND_INTERACTIVE) {
+        return None;
+    }
+    let payload = parse_stop_hook_payload(input).ok()?;
+    detect_plaintext_question(Path::new(&payload.transcript_path))
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn run() -> Result<(), BoxError> {
     use std::io::Read;
     let mut stdin_buf = String::new();
     let _ = std::io::stdin().lock().read_to_string(&mut stdin_buf);
 
-    // Only an interactive session can redirect: an unattended one
-    // (conflict resolution) would hang waiting for an answer that never comes.
-    // The engine sets the variable in `runtime/claude_code.rs::build_command`
-    // from `SpawnArgs.interactive`.
-    if std::env::var(SESSION_KIND_ENV).as_deref() != Ok(SESSION_KIND_INTERACTIVE) {
-        return Ok(());
-    }
-    let question_uuid = parse_stop_hook_payload(&stdin_buf).ok().and_then(|p| {
-        detect_plaintext_question(Path::new(&p.transcript_path))
-            .ok()
-            .flatten()
-    });
+    let session_kind = std::env::var(SESSION_KIND_ENV).ok();
+    let question_uuid = redirect_question(session_kind.as_deref(), &stdin_buf);
     let Some(message_uuid) = question_uuid else {
         return Ok(());
     };
@@ -269,6 +268,28 @@ mod tests {
         assert_eq!(
             detect_plaintext_question(&path).unwrap(),
             Some("msg-uuid-1".to_string())
+        );
+    }
+
+    #[test]
+    fn integrated_sub_thread_report_does_not_redirect_to_an_owner_card() {
+        let (_dir, path) = write_transcript(&[serde_json::json!({
+            "type": "assistant",
+            "uuid": "parent-decision",
+            "message": {
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Parent decision: should I use A or B?"}]
+            }
+        })]);
+        let input = serde_json::json!({ "transcript_path": path }).to_string();
+
+        // Integrated sessions omit the interactive marker. The exact same
+        // transcript still redirects when an owner card is available.
+        assert_eq!(redirect_question(None, &input), None);
+        assert_eq!(
+            redirect_question(Some(SESSION_KIND_INTERACTIVE), &input).as_deref(),
+            Some("parent-decision")
         );
     }
 

@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A step opened from a reloaded thread fetches its command and result. Past
- *  the delay gate each draws a skeleton in the shape of its own block, never a
- *  line of "Loading…" text. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

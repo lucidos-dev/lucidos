@@ -6,11 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// The compose Send→Cancel morph wears the action slot's face: an up-arrow for
-// Send and a stop-square while a turn runs, each with its word. A phone shows
-// the icon alone in the round button. This pins the icon swap while keeping
-// the accessibility contract (aria-label) and the e2e selector hooks (class
-// names) intact.
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
@@ -45,8 +40,6 @@ describe('send-cancel-morph renders the slot face', () => {
   });
 
   it('stays blue in the stop/cancel state (no red danger variant)', () => {
-    // The stop button matches the send button's blue .action-btn — it no
-    // longer swaps to the red action-btn-danger while a turn is running.
     expect(findMorphButton()).not.toMatch(/action-btn-danger/);
   });
 

@@ -4,12 +4,6 @@ import { resolve } from 'path';
 import { WORKSPACE } from './db-helpers';
 import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 
-/** The breadcrumb above a file preview, on a phone.
- *
- *  Two promises. The file name never breaks at a hyphen inside it while it fits
- *  on a line. And a folder crumb opens the Files view with that folder's row
- *  just under the fixed header. The target sits between forty sibling folders
- *  on each side, so the scroll can neither skip nor clamp. */
 
 const ROOT = 'artifacts/e2e-breadcrumb';
 const TARGET = `${ROOT}/m-deep`;
@@ -63,7 +57,6 @@ test.describe('the file preview breadcrumb', () => {
 
     const row = page.locator(`.folder-header[data-path="${TARGET}"]:visible`);
     await expect(row).toBeVisible({ timeout: 10_000 });
-    // The pane's ::before spacer is the room the fixed header covers.
     await expect.poll(() => row.evaluate((el) => {
       const pane = el.closest('.content-pane-body') as HTMLElement;
       const headerRoom = parseFloat(getComputedStyle(pane, '::before').height) || 0;

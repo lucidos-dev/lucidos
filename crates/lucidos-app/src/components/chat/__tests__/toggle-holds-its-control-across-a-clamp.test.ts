@@ -6,8 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// Stub HTMLElement before importing the modules that reference it, exactly as
-// the sibling scroll suites do.
 if (typeof (globalThis as any).HTMLElement === 'undefined') {
   (globalThis as any).HTMLElement = class {};
 }
@@ -23,41 +21,16 @@ import { mockStyle } from './scroll-test-helpers';
 import { anchorSpacer } from '../anchorCorrection';
 import { setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
-/**
- * **One press reads only its own two measurements.**
- *
- * Hiding the steps at the end of a thread removes content BELOW the pressed
- * control. With less left under it than the viewport is tall, no offset puts
- * that control back, so the browser clamps and it slides. That is geometry, and
- * no correction undoes it.
- *
- * What the reverse press must NOT do is undo it later. The deficit was once
- * remembered against the pressed element and added back by the next press of
- * it. That threw the pressed control up the screen and left the reader on the
- * live edge, reported as the step toggle scrolling to the bottom. Nothing is
- * carried between presses now (ADR 0147).
- *
- * The numbers are measured, not invented. A seeded six-turn thread in Chromium
- * (crates/lucidos-app e2e, 573px viewport): the answer-only view took the
- * transcript from 2737 to 1915 and the anchored turn's `offsetTop` from 2279 to
- * 1594. The reader sat at 2124, so the correction wanted 1439 against a new
- * maximum of 1342.
- */
 describe('a turn control holds its control across a clamp', () => {
   const VIEWPORT = 573;
   const TALL = 2737;
   const SHORT = 1915;
   const ANCHOR_TALL = 2279;
   const ANCHOR_SHORT = 1594;
-  /** The reader's offset before the first press, as the measurement had it. */
   const START = 2124;
-  /** The most the shrunk transcript can be scrolled to. */
-  const SHORT_MAX = SHORT - VIEWPORT; // 1342
-  /** How far the pressed control travels between the two views. */
-  const DELTA = ANCHOR_TALL - ANCHOR_SHORT; // 685
-  /** Where the reverse press lands: its own delta, from where the clamp left
-   *  the reader. The 97px the clamp ate is not repaid. */
-  const BACK = SHORT_MAX + DELTA; // 2027
+  const SHORT_MAX = SHORT - VIEWPORT;
+  const DELTA = ANCHOR_TALL - ANCHOR_SHORT;
+  const BACK = SHORT_MAX + DELTA;
 
   function makeContainer(scrollTop: number, scrollHeight: number) {
     const listeners = new Set<() => void>();
@@ -82,7 +55,6 @@ describe('a turn control holds its control across a clamp', () => {
       get scrollHeight() { return this._scrollHeight; },
       set scrollHeight(v: number) {
         this._scrollHeight = v;
-        // The browser re-clamps when content shrinks under the reader.
         const max = Math.max(0, v - this.clientHeight);
         if (this._scrollTop > max) this._scrollTop = max;
       },
@@ -92,12 +64,6 @@ describe('a turn control holds its control across a clamp', () => {
     return el;
   }
 
-  /** A pressed control, answering both `offsetTop` and its rect.
-   *
-   *  The correction measures through rects rather than the platform's
-   *  whole-pixel `offsetTop` (see `contentOffsetTop`). Each case MOVES the
-   *  control by assigning `offsetTop`, and the rect follows from it. The
-   *  anchor's spacer sits above every turn, so the rect follows it too. */
   function makeAnchor(container: any, offsetTop: number) {
     const a: any = {
       isConnected: true,
@@ -111,12 +77,10 @@ describe('a turn control holds its control across a clamp', () => {
     return a as unknown as Element;
   }
 
-  /** Where the pressed control sits on screen, which is what a press must hold. */
   function controlTop(anchor: any): number {
     return anchor.getBoundingClientRect().top;
   }
 
-  /** One press: the transcript changes height and the pressed control moves. */
   function press(el: any, anchor: any, nextAnchorTop: number, nextHeight: number) {
     withScrollAnchor(anchor, () => {
       anchor.offsetTop = nextAnchorTop;
@@ -143,15 +107,11 @@ describe('a turn control holds its control across a clamp', () => {
     setActiveScrollElement(el);
 
     press(el, anchor, ANCHOR_SHORT, SHORT);
-    // The correction wanted 1439 and the transcript ends at 1342, so the control
-    // slid down by the 97 the clamp ate. Nothing can hold it there.
     expect(el.scrollTop).toBe(SHORT_MAX);
     const slidTo = controlTop(anchor);
 
     press(el, anchor, ANCHOR_TALL, TALL);
 
-    // The reported bug: this press used to spend the clamp and land on START,
-    // throwing the control up the screen by 97.
     expect(el.scrollTop).toBe(BACK);
     expect(controlTop(anchor)).toBe(slidTo);
   });
@@ -165,9 +125,6 @@ describe('a turn control holds its control across a clamp', () => {
     press(el, anchor, ANCHOR_TALL, TALL);
     expect(el.scrollTop).toBe(BACK);
 
-    // From BACK the reader has the slack the clamp wanted, so the third press
-    // reaches its own target exactly and the fourth returns to it. The drift is
-    // one clamp's worth, once, rather than a credit that keeps being spent.
     press(el, anchor, ANCHOR_SHORT, SHORT);
     expect(el.scrollTop).toBe(SHORT_MAX);
     const held = controlTop(anchor);
@@ -178,8 +135,6 @@ describe('a turn control holds its control across a clamp', () => {
   });
 
   it('moves a press of a DIFFERENT control by its own delta alone', () => {
-    // Each press holds the control it was made on. A press higher up the thread
-    // reads that control's two offsets, and nothing the last press left behind.
     const el = makeContainer(START, TALL);
     const pressedFirst: any = makeAnchor(el, ANCHOR_TALL);
     const pressedNext: any = makeAnchor(el, 900);
@@ -193,9 +148,6 @@ describe('a turn control holds its control across a clamp', () => {
   });
 
   it('holds a FRACTIONAL move exactly, carrying the rest in the spacer', () => {
-    // At a fractional root every height is a fraction. A whole-pixel offset
-    // alone left the control up to half a pixel off. Every line of text then
-    // re-landed on its own device-pixel row (ADR 0286).
     const el = makeContainer(1000, TALL);
     const anchor: any = makeAnchor(el, 1500.25);
     setActiveScrollElement(el);
@@ -207,8 +159,6 @@ describe('a turn control holds its control across a clamp', () => {
     expect(anchorSpacer(el)).toBeLessThan(1);
     expect(controlTop(anchor)).toBeCloseTo(before, 9);
 
-    // The press back reads the spacer as part of its own two measurements, so
-    // it lands exactly too and needs no spacer at all.
     press(el, anchor, 1500.25, TALL);
     expect(el.scrollTop).toBe(1000);
     expect(anchorSpacer(el)).toBe(0);
@@ -228,9 +178,6 @@ describe('a turn control holds its control across a clamp', () => {
   });
 
   it('keeps no cross-press state in the module', () => {
-    // A source scan, because the absence of a mechanism cannot be driven. The
-    // correction is one subtraction of two readings taken across one press. A
-    // stored credit is what turns it back into two presses talking.
     const source = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../CreateThreadView.tsx'),
       'utf8',
@@ -238,8 +185,6 @@ describe('a turn control holds its control across a clamp', () => {
     expect(source).toMatch(
       /return splitAnchorCorrection\(scrollBefore \+ \(offset - anchorSpacer\(container\) - offsetBefore\)\);/,
     );
-    // The re-assert compares whole pixels exactly now, so it must discount the
-    // WebKit repaint nudge's in-flight pixel or it writes against it (ADR 0286).
     expect(source).toMatch(/if \(settledScrollTop\(container\) !== target\.scrollTop\)/);
     for (const symbol of ['anchorDebt', 'carriedAnchorDebt', 'rememberAnchorDebt', 'landingScrollTop']) {
       expect(source, `${symbol} is back in CreateThreadView.tsx`).not.toContain(symbol);

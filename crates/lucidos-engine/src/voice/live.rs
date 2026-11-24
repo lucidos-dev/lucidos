@@ -40,8 +40,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use super::provider::{
     drain_held, wait_until, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession,
 };
-use super::DELEGATION_POLICY;
+use super::{DELEGATION_POLICY, EARLIER_TAG, WORKING_NOTE_TAG};
 use crate::engine::ApiUsage;
+use timing_log::TimingLog;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -246,7 +247,7 @@ fn read_frame(
     match message {
         Some(Ok(Message::Text(text))) => {
             let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                log!("[Voice] The talker sent something that is not JSON");
+                log_legacy!("[Voice] The talker sent something that is not JSON");
                 return (vec![], false);
             };
             if value.get("type").and_then(Value::as_str) == Some(SESSION_CLOSED) {
@@ -256,7 +257,7 @@ fn read_frame(
         }
         Some(Ok(_)) => (vec![], false),
         Some(Err(e)) => {
-            log!("[Voice] The Live socket failed: {}", e);
+            log_legacy!("[Voice] The Live socket failed: {}", e);
             (closing_events(turn), true)
         }
         None => (closing_events(turn), true),
@@ -352,14 +353,37 @@ pub fn session_start(model: &str, opening: &SessionOpening) -> Value {
     })
 }
 
-/// The workspace's persona, plus how a tool-less talker asks for help.
+/// The workspace's persona, plus what a Live talker can only be told in words.
 ///
 /// The seam hands every provider the same instructions, and each one says the
-/// rest in its own way. Realtime says it in the `delegate` tool's description.
-/// Live has no tool to hang it on, so it says it here (see
+/// rest in its own way. Realtime says how to ask for help in the `delegate`
+/// tool's description. Live has no tool to hang it on, so it says it here (see
 /// [`DELEGATION_POLICY`]).
+///
+/// It also says that a `[WORKING]` note is no cue to speak. On two recorded
+/// calls, eight talker lines followed a [`THINKING`] note with no caller words
+/// between, and one claimed a watch that did not exist.
+///
+/// And it keeps the talker out of the caller's pauses, under the provider's
+/// own label. A Live session takes no turn-taking settings, and on one call
+/// the talker said "Good, I'm" and "Yeah!" into a sentence still going.
+///
+/// It opens by saying the caller has not spoken yet. On two recorded calls the
+/// talker opened with a recap, or answered the last call's final line (ADR
+/// 0666). The floor rule stops that by mechanism, and this is the tendency.
 fn instructions_for_a_tool_less_talker(instructions: &str) -> String {
-    format!("{}\n\n{}", instructions, DELEGATION_POLICY)
+    format!(
+        "{}\n\nThis call has just opened, and the caller has not spoken yet. Say \
+         nothing until they do. Give a recap of earlier talk only when they ask \
+         for one.\n\n{}\n\nA note that starts with {} says what you started on. \
+         It is for you alone. It is never a cue to speak, so say nothing when \
+         one arrives. A note that starts with {} is for you alone too: keep it, \
+         and pass it on only if they ask.\n\nBackchannel policy: None. Do not \
+         produce any backchannel interjections while the user is speaking. Keep \
+         listening while they pause to think. An unfinished sentence gets \
+         silence, never a filler and never an answer.",
+        instructions, DELEGATION_POLICY, WORKING_NOTE_TAG, EARLIER_TAG
+    )
 }
 
 /// The frames a session opens its resident block with, in order.
@@ -506,6 +530,45 @@ pub struct TurnState {
     /// said, which is what makes [`talker_went_quiet`] one-shot and never
     /// empty.
     last_words: Option<Instant>,
+    /// Where the talker's current reply began on the session clock. Read only
+    /// while [`Self::last_words`] says a reply is running.
+    reply_began_ms: Option<i64>,
+    /// Where the sentence the talker last asked about ends.
+    asked: AskedSentence,
+    /// Temporary: `docs/temporary-measures.md` § Live output timing log.
+    timing: TimingLog,
+}
+
+/// Maximum continuation window after an ask, on the provider's session clock.
+const ASKED_SENTENCE_GRACE_MS: i64 = 2_000;
+
+/// Where the sentence the talker last asked the doer about ends.
+///
+/// An ask hands over only what was transcribed before it, so the rest of that
+/// sentence reaches us later. This is what tells the rest from a new turn.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AskedSentence {
+    /// No ask, or one whose end cannot be placed. Nothing continues it.
+    #[default]
+    Unplaced,
+    /// Asked, with no spoken reply yet. The session clock still bounds it.
+    Open { by: i64 },
+    /// It ends at the earlier of the reply's start and the clock bound.
+    EndsAt(i64),
+}
+
+impl AskedSentence {
+    /// Whether a piece of the caller's words is the rest of the asked sentence.
+    ///
+    /// An untimed piece cannot be placed against the bound, so it is a new turn.
+    fn continues(self, piece: &Fragment) -> bool {
+        match self {
+            Self::Unplaced => false,
+            Self::Open { by: end } | Self::EndsAt(end) => {
+                piece.start_ms.is_some_and(|started| started < end)
+            }
+        }
+    }
 }
 
 /// Map one Live frame onto zero or more [`VoiceEvent`].
@@ -521,7 +584,10 @@ pub fn map_event(value: &Value, turn: &mut TurnState, now: Instant) -> Vec<Voice
         // talker is speaking, because this provider streams it either way. See
         // [`TurnState::last_words`].
         "session.output_audio.delta" => match decoded_audio(value) {
-            Some(pcm) => vec![VoiceEvent::Audio(pcm)],
+            Some(pcm) => {
+                turn.timing.audio(pcm.len(), now);
+                vec![VoiceEvent::Audio(pcm)]
+            }
             None => vec![],
         },
         "session.output_transcript.delta" => {
@@ -534,11 +600,22 @@ pub fn map_event(value: &Value, turn: &mut TurnState, now: Instant) -> Vec<Voice
             let mut events = if text.trim().is_empty() {
                 vec![]
             } else {
-                turn.last_words = Some(now);
+                turn.timing.worded_delta(value, now);
+                let started = started_at(value);
+                if turn.last_words.replace(now).is_none() {
+                    turn.reply_began_ms = started;
+                }
                 // The caller's turn ends where this word STARTED, on the
                 // provider's own clock. Anything they said after that point is
                 // them talking over the reply, and belongs to the next turn.
-                caller_finished(turn, started_at(value))
+                let finished = caller_finished(turn, started);
+                // The first word can shorten the asked sentence's existing bound.
+                if let AskedSentence::Open { by } = turn.asked {
+                    turn.asked = started.map_or(AskedSentence::Unplaced, |start| {
+                        AskedSentence::EndsAt(start.min(by))
+                    });
+                }
+                finished
             };
             turn.talker_words.push_str(text);
             events.push(VoiceEvent::TalkerTranscript {
@@ -591,7 +668,7 @@ fn error_events(value: &Value) -> Vec<VoiceEvent> {
         .and_then(Value::as_str);
     match refused {
         Some(id) => {
-            log!("[Voice] The talker refused {}: {}", id, message);
+            log_legacy!("[Voice] The talker refused {}: {}", id, message);
             vec![]
         }
         None => vec![VoiceEvent::Failed { message }],
@@ -609,20 +686,35 @@ fn error_events(value: &Value) -> Vec<VoiceEvent> {
 /// words says the talker spoke their sentence. ADR 0200 has the trace.
 fn delegation(value: &Value, turn: &mut TurnState) -> Vec<VoiceEvent> {
     let Some(id) = value.pointer("/delegation/id").and_then(Value::as_str) else {
-        log!("[Voice] A delegation arrived with no id, so it cannot be answered");
+        log_legacy!("[Voice] A delegation arrived with no id, so it cannot be answered");
         return vec![];
     };
+    // A second ask before any word places nothing about the first one. What
+    // is held is this ask's sentence.
+    if matches!(turn.asked, AskedSentence::Open { .. }) {
+        turn.asked = AskedSentence::Unplaced;
+    }
     // Asking for help is the talker's own judgment that the caller finished,
     // and this frame says where on the clock that was.
-    let spoken = what_the_caller_said(turn, offset_of(value));
-    log!(
+    let mut events = caller_finished(turn, offset_of(value));
+    log_legacy!(
         "[Voice] The talker asked for the doer on: {}",
-        super::clip(&spoken, super::READ_ALOUD_CHARS)
+        match events.last() {
+            Some(VoiceEvent::UserTurnEnded { transcript }) =>
+                super::clip(transcript, super::READ_ALOUD_CHARS),
+            _ => String::new(),
+        }
     );
-    let mut events = Vec::new();
-    if !spoken.is_empty() {
-        events.push(VoiceEvent::UserTurnEnded { transcript: spoken });
-    }
+    // The first reply word can shorten the window, but never extend it.
+    turn.asked = match (offset_of(value), turn.last_words, turn.reply_began_ms) {
+        (Some(offset), None, _) => AskedSentence::Open {
+            by: offset.saturating_add(ASKED_SENTENCE_GRACE_MS),
+        },
+        (Some(offset), Some(_), Some(began)) => {
+            AskedSentence::EndsAt(began.min(offset.saturating_add(ASKED_SENTENCE_GRACE_MS)))
+        }
+        _ => AskedSentence::Unplaced,
+    };
     events.push(VoiceEvent::DelegationRequested {
         tool_call_id: id.to_string(),
         reason: String::new(),
@@ -693,36 +785,40 @@ fn closing_events(turn: &mut TurnState) -> Vec<VoiceEvent> {
 /// answer empties it, and the next delta re-opens a turn. The plan is
 /// `docs/plans/2026-09-14-one-thing-the-caller-said-is-one-row.md`.
 ///
-/// **A piece transcribed after its own boundary is still lost to the next
-/// turn**, and `before_ms` does not close that. Input transcription is
-/// asynchronous, so the tail of a sentence can land after the talker has
-/// answered it. Waiting for it here is what does not work: `call.rs` reads any
-/// finished utterance as a MOVE of the conversation, so a late one cuts the
-/// reply's own row in half (ADR 0188). Closing it means changing where that
-/// move is, which is its own design. ADR 0198 records the reasoning.
+/// **A piece transcribed after its own boundary is not waited for.** Input
+/// transcription is asynchronous, so the tail of a sentence can land after the
+/// talker has answered it. Waiting here does not work: a late cut splits the
+/// reply's own row (ADR 0188, ADR 0198).
+///
+/// **The rest of an asked sentence comes first, as a continuation.** The ask
+/// went out on the words held at the time, so the turn it started is running
+/// short of these. [`AskedSentence`] places them on the clock.
 fn caller_finished(turn: &mut TurnState, before_ms: Option<i64>) -> Vec<VoiceEvent> {
-    let spoken = what_the_caller_said(turn, before_ms);
-    if spoken.is_empty() {
-        return vec![];
+    let taken = what_the_caller_said(turn, before_ms);
+    let (rest_of_the_ask, new_turn): (Vec<_>, Vec<_>) = taken
+        .into_iter()
+        .partition(|piece| turn.asked.continues(piece));
+    let mut events = Vec::new();
+    let continued = joined(rest_of_the_ask);
+    if !continued.is_empty() {
+        events.push(VoiceEvent::UserTurnContinued {
+            transcript: continued,
+        });
     }
-    vec![VoiceEvent::UserTurnEnded { transcript: spoken }]
+    let spoken = joined(new_turn);
+    if !spoken.is_empty() {
+        events.push(VoiceEvent::UserTurnEnded { transcript: spoken });
+    }
+    events
 }
 
 /// Take the caller's words up to `before_ms`, leaving anything later held.
 ///
 /// `None` takes the lot, which is what a frame with no timing and the closing
 /// socket both want.
-///
-/// Sorted by the clock before joining, because arrival order is not timeline
-/// order. Concatenated raw after that: a delta carries its own spacing, and one
-/// can split a word in two.
-///
-/// **Sorted only when EVERY piece is timed.** An untimed one sorts ahead of all
-/// the rest, so one arriving mid-sentence would move to the front of it. With
-/// nothing to place it by, arrival order is the better guess for the lot.
-fn what_the_caller_said(turn: &mut TurnState, before_ms: Option<i64>) -> String {
+fn what_the_caller_said(turn: &mut TurnState, before_ms: Option<i64>) -> Vec<Fragment> {
     let mut held = turn.caller_words.lock().expect("caller words");
-    let mut theirs: Vec<Fragment> = match before_ms {
+    match before_ms {
         None => std::mem::take(&mut *held),
         Some(at) => {
             let (theirs, later) = held
@@ -731,12 +827,23 @@ fn what_the_caller_said(turn: &mut TurnState, before_ms: Option<i64>) -> String 
             *held = later;
             theirs
         }
-    };
-    drop(held);
-    if theirs.iter().all(|piece| piece.start_ms.is_some()) {
-        theirs.sort_by_key(|piece| piece.start_ms);
     }
-    theirs
+}
+
+/// Join pieces of the caller's words into what they said.
+///
+/// Sorted by the clock before joining, because arrival order is not timeline
+/// order. Concatenated raw after that: a delta carries its own spacing, and one
+/// can split a word in two.
+///
+/// **Sorted only when EVERY piece is timed.** An untimed one sorts ahead of all
+/// the rest, so one arriving mid-sentence would move to the front of it. With
+/// nothing to place it by, arrival order is the better guess for the lot.
+fn joined(mut pieces: Vec<Fragment>) -> String {
+    if pieces.iter().all(|piece| piece.start_ms.is_some()) {
+        pieces.sort_by_key(|piece| piece.start_ms);
+    }
+    pieces
         .iter()
         .map(|piece| piece.text.as_str())
         .collect::<String>()
@@ -788,6 +895,9 @@ async fn await_session_started(reader: &mut Reader) -> Result<(), BoxError> {
         }
     }
 }
+
+#[path = "live_timing_log.rs"]
+mod timing_log;
 
 #[cfg(test)]
 #[path = "live_tests.rs"]

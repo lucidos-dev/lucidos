@@ -1,7 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Stub the two history stacks so the test observes only which one the dispatcher
-// routes to — not their (store/DOM-heavy) internals.
 vi.mock('./navigation', () => ({ navBack: vi.fn(), navForward: vi.fn() }));
 vi.mock('./thread-navigation', () => ({ threadNavBack: vi.fn(), threadNavForward: vi.fn() }));
 

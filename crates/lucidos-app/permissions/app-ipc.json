@@ -27,6 +27,7 @@
           "dismiss_native_notification",
           "nudge_dock_badge",
           "get_native_window_active",
+          "get_native_window_shown",
           "focus_calling_window",
           "take_pending_native_taps",
           "check_app_update",
@@ -48,7 +49,19 @@
           "get_or_create_device_id",
           "previous_device_id",
           "remember_device_id",
-          "mint_pairing_code"
+          "mint_pairing_code",
+          "take_outbox_handoff",
+          "acknowledge_outbox_handoff",
+          "trust_loopback_ca"
+        ]
+      }
+    },
+    {
+      "identifier": "allow-outbox-handoff-store",
+      "description": "The one command the window's old http origin may call: keep that origin's outbox for the https page to import (src/outbox_handoff.rs, ADR 0745). Granted only by desktop::handoff_capability, on `http://localhost:<port>` in the `main` webview, so the hand-off page can reach nothing else. The https page takes and acknowledges the payload through `allow-app-ipc`.",
+      "commands": {
+        "allow": [
+          "store_outbox_handoff"
         ]
       }
     },

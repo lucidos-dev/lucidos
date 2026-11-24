@@ -6,8 +6,6 @@ import { showConfirm, showToast } from '../store';
 
 const TITLE = 'Undo change';
 
-/** Undo a config change on a user tap, after a confirmation. The engine
- * writes the inverse as the tapping device, and refuses one that moved on. */
 export async function confirmConfigUndo(tap: Extract<Tap, { kind: 'undo-config-change' }>): Promise<void> {
   if (!(await showConfirm(
     'Undo this config change? A deleted credential comes back without its value, so someone must enter it again.',

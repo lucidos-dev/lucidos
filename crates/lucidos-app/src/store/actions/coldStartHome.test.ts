@@ -1,7 +1,3 @@
-/**
- * A cold start with no stored focus opens Home, and a returning user keeps
- * their last thread (ADR 0411).
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./threads', () => ({ focusThread: vi.fn(), focusThreadOrBootstrap: vi.fn() }));

@@ -12,16 +12,18 @@
 #   4. Only the seed-cache job saves a cache, by save-if or actions/cache/save.
 #   5. Every artifact lives one day, except what a later run reuses: an
 #      engine and its manifest live seven days, target/ state two.
-#   6. mobile-webkit runs on macOS: the macos job runs on macos-15 and takes
+#   6. The WebKit projects run on macOS: the macos job runs on macos-15 and takes
 #      the plan's macOS matrix.
 #   7. No other workflow triggers on e2e/**.
 #   8. The plan job runs only on an e2e/** push, and seed-cache only on main.
 #      Every other job needs the plan job, so only a run's request starts it.
-#      The engine job also runs only when the plan asks for it.
+#      The suites job also runs only when the plan asks for it.
 #   9. Every action is pinned by a full commit sha.
 #  10. A test job runs only after its build job succeeded or was skipped. Its
 #      steps unpack or assemble an engine for those two results alone, so any
 #      other result (cancelled, failed) leaves it without an engine.
+#  11. The linux and macos jobs are named "e2e <matrix id>". A main check reads
+#      that prefix as its tests starting (E2E_GITHUB_TEST_JOB_PREFIX).
 #
 # Tested by scripts/lib/check_e2e_workflow_test.sh.
 #
@@ -126,8 +128,11 @@ for name, body in all_jobs.items():
     if not needs or not re.search(r"(:\s*|[\[,]\s*)plan\s*($|[\],])", needs[0]):
         errors.append(f"job {name} does not need the plan job, so it could run on a push to main")
 
-if "engine" in all_jobs and "needs.plan.outputs.has_engine == 'true'" not in job_if("engine"):
-    errors.append("the engine job must run only when the plan asks for it (has_engine)")
+if "suites" in all_jobs and "needs.plan.outputs.has_suites == 'true'" not in job_if("suites"):
+    errors.append("the suites job must run only when the plan asks for it (has_suites)")
+
+if "confinement" in all_jobs and "needs.plan.outputs.has_confinement == 'true'" not in job_if("confinement"):
+    errors.append("the confinement job must run only when the plan asks for it (has_confinement)")
 
 for l in code:
     m = re.search(r"uses:\s*(\S+)", l)
@@ -138,6 +143,10 @@ for test_job, build_job in (("linux", "build-linux"), ("macos", "build-macos")):
     want = f"(needs.{build_job}.result == 'success' || needs.{build_job}.result == 'skipped')"
     if want not in job_if(test_job):
         errors.append(f"the {test_job} job must not run after a cancelled or failed build: gate it on {want}")
+
+for test_job in ("linux", "macos"):
+    if "    name: e2e ${{ matrix.id }}" not in all_jobs.get(test_job, []):
+        errors.append(f"the {test_job} job must be named 'e2e ${{{{ matrix.id }}}}': a main check reads the prefix as its tests starting")
 
 mac = all_jobs.get("macos", [])
 if "    runs-on: macos-15" not in mac or not any("fromJSON(needs.plan.outputs.macos)" in l for l in mac):

@@ -13,7 +13,6 @@ function box(scrollTop: number, scrollHeight = 2000, clientHeight = 600): Scroll
   return { scrollTop, scrollHeight, clientHeight };
 }
 
-/** The origin the host serves app frames from, as the SDK reads it. */
 const HOST_ORIGIN = 'https://localhost:5251';
 
 describe('clampedTop', () => {
@@ -65,7 +64,6 @@ describe('createScrollTracker', () => {
     const tracker = createScrollTracker();
     const el = box(1400);
     tracker.scrolled(el, false);
-    // The frame grew, so its bottom came down to meet the old position.
     el.clientHeight = 650;
     el.scrollTop = 1350;
     expect(tracker.scrolled(el, false).delta).toBe(0);

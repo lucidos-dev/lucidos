@@ -216,6 +216,21 @@ export const PREF_REASONING_EXPECTED_WAKE_DECISION = {
   fallback: "none",
 } as const;
 
+export const PREF_MODEL_PERMISSION_ANSWER = {
+  key: "model_permission_answer",
+  scope: "global",
+  type: "text",
+  fallback: "claude-haiku-5-5",
+} as const;
+
+export const PREF_REASONING_PERMISSION_ANSWER = {
+  key: "reasoning_permission_answer",
+  scope: "global",
+  type: "enum",
+  values: ["none", "low", "medium", "high", "xhigh", "max"],
+  fallback: "none",
+} as const;
+
 export const PREF_MODEL_MEMORY = {
   key: "model_memory",
   scope: "global",
@@ -326,6 +341,22 @@ export const PREF_FOLLOW_MAIN_INTERVAL_MINUTES = {
   min: 1,
   max: 60,
   fallback: "3",
+} as const;
+
+export const PREF_FOLLOW_MAIN_BUILD = {
+  key: "follow_main_build",
+  scope: "global",
+  type: "enum",
+  values: ["auto", "on-switch"],
+  fallback: "auto",
+} as const;
+
+export const PREF_DEFER_VERSION_BUILDS = {
+  key: "defer_version_builds",
+  scope: "global",
+  type: "enum",
+  values: ["never", "while-coding"],
+  fallback: "never",
 } as const;
 
 export const PREF_DRIVER_TIMEOUT_HOURS = {
@@ -554,6 +585,22 @@ export const PREF_CODING_AGENT_CONTEXT_CEILING = {
   fallback: "300k",
 } as const;
 
+export const PREF_LANDING_SETTING = {
+  key: "landing_setting",
+  scope: "global",
+  type: "enum",
+  values: ["here", "another-host"],
+  fallback: "here",
+} as const;
+
+export const PREF_MAIN_CHECK_SETTING = {
+  key: "main_check_setting",
+  scope: "global",
+  type: "enum",
+  values: ["here", "another-host", "off"],
+  fallback: null,
+} as const;
+
 export const PREF_MODEL_CLAUDE_CODE = {
   key: "model_claude_code",
   scope: "global",
@@ -573,7 +620,7 @@ export const PREF_MODEL_CODEX = {
   key: "model_codex",
   scope: "global",
   type: "coding-agent-model",
-  fallback: "gpt-6.1-sol",
+  fallback: "gpt-6.2-sol",
 } as const;
 
 export const PREF_REASONING_CODEX = {
@@ -612,6 +659,13 @@ export const PREF_LONG_PROMPT_SHARE = {
   min: 0,
   max: 100,
   fallback: null,
+} as const;
+
+export const PREF_AGENT_BRAND_COLOURS = {
+  key: "agent-brand-colours",
+  scope: "device",
+  type: "flag",
+  fallback: "true",
 } as const;
 
 export const PREF_THEME_MODE = {
@@ -733,6 +787,13 @@ export const PREF_BACKUP_REMINDER_DISMISSED = {
   fallback: null,
 } as const;
 
+export const PREF_BACKUP_OVERDUE_REMINDER_DISMISSED = {
+  key: "backup_overdue_reminder_dismissed",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
 export const PREF_COMMAND_GUARD = {
   key: "command_guard",
   scope: "global",
@@ -749,6 +810,13 @@ export const PREF_COMMAND_GUARD_JUDGE = {
 
 export const PREF_CODING_AGENT_AUTO_ANSWER = {
   key: "coding_agent_auto_answer",
+  scope: "global",
+  type: "flag",
+  fallback: "false",
+} as const;
+
+export const PREF_AGENTS_UNSANDBOXED = {
+  key: "agents_unsandboxed",
   scope: "global",
   type: "flag",
   fallback: "false",
@@ -806,6 +874,13 @@ export const PREF_JUDGMENT_WAKE_DECISION = {
 
 export const PREF_JUDGMENT_EXPECTED_WAKE_DECISION = {
   key: "judgment_expected_wake_decision",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
+export const PREF_JUDGMENT_PERMISSION_ANSWER = {
+  key: "judgment_permission_answer",
   scope: "global",
   type: "text",
   fallback: null,
@@ -1015,6 +1090,8 @@ export const PREFERENCE_CATALOG = {
   "reasoning_wake_decision": PREF_REASONING_WAKE_DECISION,
   "model_expected_wake_decision": PREF_MODEL_EXPECTED_WAKE_DECISION,
   "reasoning_expected_wake_decision": PREF_REASONING_EXPECTED_WAKE_DECISION,
+  "model_permission_answer": PREF_MODEL_PERMISSION_ANSWER,
+  "reasoning_permission_answer": PREF_REASONING_PERMISSION_ANSWER,
   "model_memory": PREF_MODEL_MEMORY,
   "reasoning_memory": PREF_REASONING_MEMORY,
   "model_query_classification": PREF_MODEL_QUERY_CLASSIFICATION,
@@ -1030,6 +1107,8 @@ export const PREFERENCE_CATALOG = {
   "opencode_free_enabled": PREF_OPENCODE_FREE_ENABLED,
   "proxy_timeout_secs": PREF_PROXY_TIMEOUT_SECS,
   "follow_main_interval_minutes": PREF_FOLLOW_MAIN_INTERVAL_MINUTES,
+  "follow_main_build": PREF_FOLLOW_MAIN_BUILD,
+  "defer_version_builds": PREF_DEFER_VERSION_BUILDS,
   "driver_timeout_hours": PREF_DRIVER_TIMEOUT_HOURS,
   "notifications_filter": PREF_NOTIFICATIONS_FILTER,
   "notification_toasts": PREF_NOTIFICATION_TOASTS,
@@ -1058,6 +1137,8 @@ export const PREFERENCE_CATALOG = {
   "coding_agent_auto_compact_trial": PREF_CODING_AGENT_AUTO_COMPACT_TRIAL,
   "cache_keep_alive_mode": PREF_CACHE_KEEP_ALIVE_MODE,
   "coding_agent_context_ceiling": PREF_CODING_AGENT_CONTEXT_CEILING,
+  "landing_setting": PREF_LANDING_SETTING,
+  "main_check_setting": PREF_MAIN_CHECK_SETTING,
   "model_claude_code": PREF_MODEL_CLAUDE_CODE,
   "reasoning_claude_code": PREF_REASONING_CLAUDE_CODE,
   "model_codex": PREF_MODEL_CODEX,
@@ -1066,6 +1147,7 @@ export const PREFERENCE_CATALOG = {
   "intelligence_ladder_claude_code": PREF_INTELLIGENCE_LADDER_CLAUDE_CODE,
   "intelligence_ladder_codex": PREF_INTELLIGENCE_LADDER_CODEX,
   "long_prompt_share": PREF_LONG_PROMPT_SHARE,
+  "agent-brand-colours": PREF_AGENT_BRAND_COLOURS,
   "theme-mode": PREF_THEME_MODE,
   "font-family": PREF_FONT_FAMILY,
   "ui-scale": PREF_UI_SCALE,
@@ -1081,9 +1163,11 @@ export const PREFERENCE_CATALOG = {
   "snapshot_retention": PREF_SNAPSHOT_RETENTION,
   "snapshot_recovery_retention": PREF_SNAPSHOT_RECOVERY_RETENTION,
   "backup_reminder_dismissed": PREF_BACKUP_REMINDER_DISMISSED,
+  "backup_overdue_reminder_dismissed": PREF_BACKUP_OVERDUE_REMINDER_DISMISSED,
   "command_guard": PREF_COMMAND_GUARD,
   "command_guard_judge": PREF_COMMAND_GUARD_JUDGE,
   "coding_agent_auto_answer": PREF_CODING_AGENT_AUTO_ANSWER,
+  "agents_unsandboxed": PREF_AGENTS_UNSANDBOXED,
   "model_command_judge": PREF_MODEL_COMMAND_JUDGE,
   "reasoning_command_judge": PREF_REASONING_COMMAND_JUDGE,
   "judgment_command_guard": PREF_JUDGMENT_COMMAND_GUARD,
@@ -1092,6 +1176,7 @@ export const PREFERENCE_CATALOG = {
   "judgment_read_decision": PREF_JUDGMENT_READ_DECISION,
   "judgment_wake_decision": PREF_JUDGMENT_WAKE_DECISION,
   "judgment_expected_wake_decision": PREF_JUDGMENT_EXPECTED_WAKE_DECISION,
+  "judgment_permission_answer": PREF_JUDGMENT_PERMISSION_ANSWER,
   "max_tool_calls": PREF_MAX_TOOL_CALLS,
   "capture_context": PREF_CAPTURE_CONTEXT,
   "cache_cards": PREF_CACHE_CARDS,

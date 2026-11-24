@@ -1,5 +1,5 @@
 //! Network bind resolution for the gateway + read/write of the machine-global
-//! `~/.lucidos/network.toml`.
+//! `network.toml`, a private entry (`lucidos_home::private_entry`).
 //!
 //! The gateway is the network-facing process, so its bind is **machine-global**
 //! (it binds before any workspace is selected). Resolution precedence (highest
@@ -8,7 +8,7 @@
 //!   1. `LUCIDOS_GATEWAY_BIND_ADDR` parses to an `IpAddr` → bind exactly that.
 //!      Set but unparseable → log a warning, ignore it, continue.
 //!   2. `LUCIDOS_GATEWAY_BIND_ALL` truthy → all interfaces (`[::]`, dual-stack).
-//!   3. `~/.lucidos/network.toml` `[gateway] bind` → `"loopback"|"all"|<IP>`
+//!   3. `network.toml` `[gateway] bind` → `"loopback"|"all"|<IP>`
 //!      (invalid IP → warn + loopback).
 //!   4. loopback (the safe default — the gateway fronts every workspace API and
 //!      its own destructive control plane, so a default launch is never exposed).
@@ -18,13 +18,14 @@
 //! and resolving the *external address* stored beside the bind (ADR 0550).
 //! The per-workspace engine half — `[engine] inherit` and each engine's own
 //! `network_bind` preference — is resolved in
-//! `crates/lucidos-engine/src/net_config.rs`. The **bind resolution** in the two
+//! `crates/lucidos-core/src/net_config.rs`. The **bind resolution** in the two
 //! `net_config` modules is deliberately duplicated rather than shared: the
 //! gateway has no dependency on `lucidos-engine` (ADR 0014 §1). Their
 //! **Tailscale** half is not duplicated any more, because keeping two copies in
 //! step is precisely what failed; it lives in the `lucidos-tailscale` crate,
 //! which is small enough for the gateway to depend on.
 
+use lucidos_home::private::{NETWORK_TOML, NETWORK_TOML_LOCK};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -41,7 +42,7 @@ pub enum BindChoice {
     Address(IpAddr),
 }
 
-/// The machine-global `~/.lucidos/network.toml`, parsed with safe defaults.
+/// The machine-global `network.toml`, parsed with safe defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkToml {
     /// `[gateway] bind` — `loopback` | `all` | `<IP>`. `None` = unset → loopback.
@@ -90,9 +91,9 @@ fn default_true() -> bool {
     true
 }
 
-/// `~/.lucidos/network.toml`. `None` only when `HOME` is unset.
+/// The private entry `network.toml`. `None` only when `HOME` is unset.
 pub fn network_toml_path() -> Option<PathBuf> {
-    Some(lucidos_home::path()?.join("network.toml"))
+    lucidos_home::private_entry(NETWORK_TOML)
 }
 
 /// Does the machine-global config file exist? Used by the dev launch path /
@@ -115,7 +116,7 @@ fn read_network_toml_at(path: &Path) -> NetworkToml {
         Ok(contents) => parse_network_toml(&contents),
         Err(e) => {
             if let Some(warning) = read_failure_warning(path, &e) {
-                crate::log!("{warning}");
+                crate::log_legacy!("{warning}");
             }
             NetworkToml::default()
         }
@@ -150,8 +151,8 @@ pub fn parse_network_toml(contents: &str) -> NetworkToml {
                 .collect(),
         },
         Err(e) => {
-            crate::log!(
-                "[NetConfig] malformed ~/.lucidos/network.toml ({e}); using safe defaults (loopback)"
+            crate::log_legacy!(
+                "[NetConfig] malformed network.toml ({e}); using safe defaults (loopback)"
             );
             NetworkToml::default()
         }
@@ -204,15 +205,13 @@ pub fn render_network_toml(net: &NetworkToml) -> String {
     )
 }
 
-/// The lock every `network.toml` writer holds across its read-modify-write.
-/// `service_write_network_toml` in `scripts/lib/service.sh` takes it too.
-pub const NETWORK_TOML_LOCK: &str = "network.toml.lock";
-
-/// Change `network.toml` in place, asserting the Lucidos home as a storage
-/// root first. Values are assumed already validated by [`validate_bind_input`]
+/// Change `network.toml` in place, asserting its directory as a storage root
+/// first. Values are assumed already validated by [`validate_bind_input`]
 /// and [`valid_external_address`].
 pub fn update_network_toml(change: impl FnOnce(&mut NetworkToml)) -> std::io::Result<()> {
-    update_network_toml_in(&lucidos_home::ensure()?, change)
+    let path = lucidos_home::ensure_private_entry(NETWORK_TOML)?;
+    let dir = path.parent().expect("a private entry has a parent");
+    update_network_toml_in(dir, change)
 }
 
 /// Two gateways share the file, so the read, the change and the write happen
@@ -228,7 +227,7 @@ fn update_network_toml_in(
         .append(true)
         .open(dir.join(NETWORK_TOML_LOCK))?;
     lock.lock_exclusive()?;
-    let path = dir.join("network.toml");
+    let path = dir.join(NETWORK_TOML);
     let mut net = read_network_toml_at(&path);
     change(&mut net);
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -291,14 +290,18 @@ pub fn valid_external_address(raw: &str) -> Result<String, String> {
 /// the origin is refused.
 fn parse_external_entry(port: &str, origin: &toml::Value) -> Option<(u16, String)> {
     let Ok(port) = port.parse::<u16>() else {
-        crate::log!("[NetConfig] ignoring external address key '{port}': not a gateway port");
+        crate::log_legacy!(
+            "[NetConfig] ignoring external address key '{port}': not a gateway port"
+        );
         return None;
     };
     let Some(origin) = origin.as_str() else {
-        crate::log!("[NetConfig] ignoring the external address for port {port}: not a string");
+        crate::log_legacy!(
+            "[NetConfig] ignoring the external address for port {port}: not a string"
+        );
         return None;
     };
-    let origin = external_address_or_warn(origin, "~/.lucidos/network.toml")?;
+    let origin = external_address_or_warn(origin, "network.toml")?;
     Some((port, origin))
 }
 
@@ -309,7 +312,9 @@ fn external_address_or_warn(raw: &str, source: &str) -> Option<String> {
         return None;
     }
     valid_external_address(raw)
-        .map_err(|why| crate::log!("[NetConfig] ignoring the external address in {source}: {why}"))
+        .map_err(|why| {
+            crate::log_legacy!("[NetConfig] ignoring the external address in {source}: {why}")
+        })
         .ok()
 }
 
@@ -319,7 +324,7 @@ fn external_address_or_warn(raw: &str, source: &str) -> Option<String> {
 pub enum ExternalAddressSource {
     /// Nothing sets one.
     Unset,
-    /// `~/.lucidos/network.toml`, which Settings and the CLI write.
+    /// `network.toml`, which Settings and the CLI write.
     File,
     /// [`EXTERNAL_ADDRESS_ENV`], which locks every writer out.
     Env,
@@ -381,7 +386,7 @@ pub fn parse_bind_value(value: &str) -> BindChoice {
         _ => match value.trim().parse::<IpAddr>() {
             Ok(ip) => BindChoice::Address(ip),
             Err(_) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[NetConfig] invalid bind address '{value}' — falling back to loopback only"
                 );
                 BindChoice::Loopback
@@ -457,7 +462,7 @@ pub fn resolve_gateway_bind(
         if !trimmed.is_empty() {
             match trimmed.parse::<IpAddr>() {
                 Ok(ip) => return BindChoice::Address(ip),
-                Err(_) => crate::log!(
+                Err(_) => crate::log_legacy!(
                     "[NetConfig] invalid LUCIDOS_GATEWAY_BIND_ADDR '{trimmed}' — ignoring, falling back"
                 ),
             }
@@ -575,7 +580,9 @@ pub fn side_port(
             Ok(0) => None,
             Ok(port) => Some(port),
             Err(_) => {
-                crate::log!("[Gateway] {var} '{raw}' is not a port, so that listener stays off");
+                crate::log_legacy!(
+                    "[Gateway] {var} '{raw}' is not a port, so that listener stays off"
+                );
                 None
             }
         },
@@ -592,7 +599,7 @@ pub fn side_port(
 pub fn side_bind_addr(var: &str, configured: Option<&str>, port: u16) -> SocketAddr {
     let ip = match configured.map(str::trim) {
         Some(raw) if !raw.is_empty() => raw.parse::<IpAddr>().unwrap_or_else(|_| {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] {var} '{raw}' is not an IP address, so that listener stays on loopback"
             );
             IpAddr::V4(Ipv4Addr::LOCALHOST)

@@ -2,24 +2,9 @@ import type { BackgroundModel, GenerationStep, RecommendedSelection } from '../.
 import { lucidosModelChoices, readsImages } from '../../store/actions/models';
 import type { ModelChoice } from '../../store/modelSelection';
 
-/** The heading over a background row's recommended models. */
 export const RECOMMENDED_SECTION = 'Recommended';
-/** The heading over every other model the row offers. */
 export const OTHER_MODELS_SECTION = 'Other models';
 
-/** The models one background row offers: every model the chat picker offers,
- *  the row's recommended ones first under their own heading, best first.
- *
- *  The engine sends `recommended` (`GET /api/v1/models/background`), so the
- *  list and the default it resolves from are one definition. A recommended
- *  model no configured provider serves is not offered, like any other. Where
- *  the engine names a recommended tier, the model carries it for the badge.
- *
- *  No provider step: a background task stores no backend, and the router picks
- *  the model's route, so a provider pick here would be dropped.
- *
- *  A task that sends images offers only models that read them. The stored
- *  pick stays listed either way, so the row still shows what is set. */
 export function backgroundModelChoices(
   recommended: readonly RecommendedSelection[],
   current: string | null,
@@ -44,8 +29,6 @@ export function backgroundModelChoices(
   ];
 }
 
-/** What a background row says under its label about the model in force, or
- *  `null` when there is nothing to say. */
 export function backgroundRowCaveat(
   resolved: BackgroundModel | null,
   error: string | null,
@@ -72,8 +55,6 @@ export function backgroundRowCaveat(
   return caveats.length > 0 ? caveats.join('. ') : null;
 }
 
-/** The recommended models a default passed over, unless the generation
- *  caveat already names the one refused model. */
 function movedPastCaveat(resolved: BackgroundModel | null): string | null {
   const passed = (resolved?.not_served ?? []).filter(
     (model) => !(resolved?.generation?.kind === 'predecessor' && model === resolved.model),
@@ -83,7 +64,6 @@ function movedPastCaveat(resolved: BackgroundModel | null): string | null {
     : null;
 }
 
-/** What runs instead of `named`, said plainly. */
 function generationCaveat(named: string, step: GenerationStep): string {
   switch (step.kind) {
     case 'successor':

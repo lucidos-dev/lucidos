@@ -20,8 +20,6 @@ describe('lucidosVersionLabel', () => {
   });
 
   it('names the destination while the release is unknown, rather than blanking', () => {
-    // `lucidosRelease` is null until /health answers, and on any engine that
-    // answers without one. The row must keep its shape either way.
     expect(lucidosVersionLabel(null, false)).toBe('System');
     expect(lucidosVersionLabel(null, true)).toBe('System');
   });
@@ -39,27 +37,12 @@ describe('lucidosVersionTooltip', () => {
   });
 
   it('says nothing at all with no release to name', () => {
-    // An `aria-label` replaces the visible text as the accessible name, so an
-    // invented sentence here would make the row unaddressable by the word the
-    // user can see on it.
     expect(lucidosVersionTooltip(null, false)).toBeUndefined();
     expect(lucidosVersionTooltip(null, true)).toBeUndefined();
   });
 });
 
 describe('the Lucidos menu identity row', () => {
-  /**
-   * The row shows the PRODUCT's version, not this device's copy of it.
-   *
-   * It has already been the other thing twice: the engine's CalVer (which is the
-   * workspace binary, not Lucidos), then `clientVersionLabel()` (which answers
-   * "dev" on a Vite dev server, a hex build id on a built web client, and the
-   * shell's app version inside Tauri, so one install names itself three ways).
-   * Both readings are honest about something, and neither answers "what am I
-   * running?". A source-scan, matching the `clientVersionSource` precedent: the
-   * assertion is about which SOURCE the row reads, which a render test could
-   * only observe indirectly.
-   */
   const source = readFileSync(BRAND_MENU_ROWS, 'utf-8');
 
   it('reads the umbrella release and its dirty flag', () => {

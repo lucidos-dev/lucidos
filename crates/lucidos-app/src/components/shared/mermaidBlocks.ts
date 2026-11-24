@@ -4,8 +4,6 @@ import { generateUuid } from '../../utils/uuid';
 import { resolvedTokenHex } from '../../utils/cssColor';
 import '../../styles/chat/mermaid.css';
 
-/** Enhance only genuine renderer-owned code blocks in completed replies.
- * Keep the original pre/code and Copy button, including its delegated handler. */
 export function enhanceMermaidBlocks(host: HTMLElement): () => void {
     const cleanups: (() => void)[] = [];
     for (const block of host.querySelectorAll<HTMLElement>('.code-block-wrapper[data-copy-code]')) {
@@ -86,7 +84,6 @@ export function enhanceMermaidBlocks(host: HTMLElement): () => void {
           notice.hidden = true;
         }
         if (typeof height === 'number' && Number.isFinite(height)) {
-          // Browser geometry, not a design size; cap huge graphs to a scrollable frame.
           frame.style.height = `${Math.max(100, Math.min(2000, height))}px`;
         }
       };

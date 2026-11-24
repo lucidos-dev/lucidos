@@ -48,7 +48,7 @@ pub(crate) fn is_safe_subpath(parent: &Path, child: &Path) -> bool {
 
 /// Free and total space on a volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DiskReading {
+pub struct DiskReading {
     pub free_bytes: u64,
     pub total_bytes: u64,
 }
@@ -57,7 +57,7 @@ pub(crate) struct DiskReading {
 /// puts a small, empty volume under pressure. So each level is the smaller of
 /// its cap and a share of the volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DiskThresholds {
+pub struct DiskThresholds {
     pub soft_bytes: u64,
     pub hard_bytes: u64,
 }
@@ -72,7 +72,7 @@ impl DiskThresholds {
     }
 
     /// The levels for one reading. With no reading, the caps.
-    pub(crate) fn for_reading(
+    pub fn for_reading(
         reading: Option<DiskReading>,
         soft_cap_bytes: u64,
         hard_cap_bytes: u64,
@@ -105,7 +105,7 @@ pub(crate) fn disk_reading(path: &Path) -> Option<DiskReading> {
 
 /// Reading of the volume hosting the workspace's worktrees. Falls back to
 /// the workspace root when the worktrees dir is missing: both share a volume.
-pub(crate) fn volume_reading(worktrees_dir: &Path, workspace_root: &Path) -> Option<DiskReading> {
+pub fn volume_reading(worktrees_dir: &Path, workspace_root: &Path) -> Option<DiskReading> {
     disk_reading(worktrees_dir).or_else(|| disk_reading(workspace_root))
 }
 
@@ -215,7 +215,7 @@ pub(crate) fn directory_age(path: &Path) -> Option<Duration> {
 /// Sum file sizes under `path` recursively, on the blocking pool. A worktree
 /// can hold tens of GB, and a walk on an async worker stalls every task queued
 /// behind it. Returns 0 if the path doesn't exist or the walk task fails.
-pub(crate) async fn directory_size_bytes(path: &Path) -> u64 {
+pub async fn directory_size_bytes(path: &Path) -> u64 {
     measure_on_blocking_pool(path, walk_directory_size_bytes).await
 }
 
@@ -225,7 +225,7 @@ pub(super) async fn measure_on_blocking_pool(path: &Path, walk: fn(&Path) -> u64
     match tokio::task::spawn_blocking(move || walk(&walk_path)).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] size walk of {} failed: {}",
                 path.display(),
                 e
@@ -308,7 +308,7 @@ pub(crate) async fn is_finished_worktree(
         Ok(pending) if pending.is_empty() => {}
         Ok(_) => return false,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] pending_for_thread({}) failed: {}; not finished",
                 thread_id,
                 e
@@ -394,7 +394,7 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
         Ok(Some(true)) => return true,
         Ok(_) => {}
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] children lookup failed for thread {}: {}; keeping worktree",
                 thread_id,
                 e
@@ -423,7 +423,7 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
         Ok(Some(event_type)) => event_type == "ChildThreadCompleted",
         Ok(None) => false,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] latest-event lookup failed for thread {}: {}; keeping worktree",
                 thread_id,
                 e
@@ -443,7 +443,7 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
 /// Returns `None` when the worktree path isn't a recognized git repo (e.g.
 /// the user manually deleted `.git/worktrees/<name>` so the worktree is now
 /// stranded). Tier 2 callers fall back to a `remove_dir_all` in that case.
-pub(crate) async fn resolve_repo_root_from_worktree(worktree: &Path) -> Option<PathBuf> {
+pub async fn resolve_repo_root_from_worktree(worktree: &Path) -> Option<PathBuf> {
     let common = crate::engine::git_ops::git_common_dir(worktree)
         .await
         .ok()?;
@@ -468,7 +468,7 @@ pub(crate) async fn resolve_repo_root_from_worktree(worktree: &Path) -> Option<P
 /// is on) are resolved against the worktree dir before the existence check —
 /// mirroring [`resolve_repo_root_from_worktree`] — so a working relative link
 /// is not a false positive.
-pub(crate) fn worktree_git_admin_missing(worktree: &Path) -> bool {
+pub fn worktree_git_admin_missing(worktree: &Path) -> bool {
     let dotgit = worktree.join(".git");
     // Only a regular file carries the `gitdir:` link. A directory is a real
     // repo; a symlink is not a shape git produces for worktrees — both mean
@@ -504,13 +504,13 @@ pub(crate) fn worktree_git_admin_missing(worktree: &Path) -> bool {
 /// and is preserved; only never-committed edits in the detached working copy
 /// are lost. Returns bytes freed, or `None` if the guard rejected the path or
 /// the removal failed.
-pub(crate) async fn remove_stranded_worktree(
+pub async fn remove_stranded_worktree(
     worktrees_dir: &Path,
     worktree: &Path,
     pre_size: u64,
 ) -> Option<u64> {
     if !is_safe_subpath(worktrees_dir, worktree) {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] refusing stranded removal outside worktrees dir: {}",
             worktree.display()
         );
@@ -519,7 +519,7 @@ pub(crate) async fn remove_stranded_worktree(
     match tokio::fs::remove_dir_all(worktree).await {
         Ok(()) => Some(pre_size),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] stranded remove_dir_all failed for {}: {}",
                 worktree.display(),
                 e
@@ -535,7 +535,7 @@ pub(crate) async fn remove_stranded_worktree(
 /// tree, a filter such as git-crypt failed, a spawn error, a timeout) counts as
 /// dirty: we don't silently nuke a tree we could not describe. The question
 /// itself lives in [`worktree_dirtiness`], shared with the session-end path.
-pub(crate) async fn is_worktree_dirty(worktree: &Path) -> bool {
+pub async fn is_worktree_dirty(worktree: &Path) -> bool {
     crate::engine::git_ops::worktree_dirtiness(worktree)
         .await
         .or_unknown(true)
@@ -544,14 +544,13 @@ pub(crate) async fn is_worktree_dirty(worktree: &Path) -> bool {
 /// What [`remove_worktree_and_optionally_delete_branch`] does with the branch
 /// the worktree was on.
 ///
-/// The default is [`Self::WhenMerged`], and it is the rule for RECLAMATION: the
-/// worker is taking spent disk back, and a unique commit is the user's work.
-/// Keeping the branch costs a ref and keeps the work findable.
-///
-/// [`Self::Always`] inverts that, and exactly one caller may (ADR 0035
-/// amendment, ADR 0192).
+/// Thread-worktree reclamation uses [`Self::Keep`] to preserve session resumption.
+/// [`Self::WhenMerged`] applies when a disposable branch may be removed.
+/// [`Self::Always`] is reserved for thread deletion and closed landing batches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BranchDisposal {
+pub enum BranchDisposal {
+    /// Keep the branch so the coding-agent session can resume.
+    Keep,
     /// Delete the branch only when it holds no unique commits.
     WhenMerged,
     /// Delete the branch whatever it holds. Two callers pass this. A thread
@@ -564,7 +563,7 @@ pub(crate) enum BranchDisposal {
 }
 
 /// Outcome of [`remove_worktree_and_optionally_delete_branch`].
-pub(crate) struct RemoveWorktreeOutcome {
+pub struct RemoveWorktreeOutcome {
     /// Bytes reclaimed from the on-disk worktree (best-effort directory size
     /// captured before removal). Zero when the moved-aside tree could not be
     /// deleted yet.
@@ -589,7 +588,7 @@ pub(crate) struct RemoveWorktreeOutcome {
 ///
 /// A directory that holds tracked files is source, whatever its name, and is
 /// skipped. Returns the bytes freed, or `None` if there was nothing to prune.
-pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
+pub async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
     let mut freed: u64 = 0;
     let mut pruned: Vec<&'static str> = Vec::new();
     for sub in prunable_artifact_dirs(worktree).await {
@@ -601,7 +600,7 @@ pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
                 pruned.push(sub);
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] prune failed for {}: {}",
                     target.display(),
                     e
@@ -612,7 +611,7 @@ pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
     if pruned.is_empty() {
         None
     } else {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] pruned build artifacts in {}: {:?} ({} bytes)",
             worktree.display(),
             pruned,
@@ -633,14 +632,14 @@ pub(crate) async fn prunable_artifact_dirs(worktree: &Path) -> Vec<&'static str>
             continue;
         }
         if !is_safe_subpath(worktree, &target) {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] refusing prune of suspicious path {}",
                 target.display()
             );
             continue;
         }
         if holds_tracked_files(worktree, sub).await {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] not pruning {}: it holds tracked files, or git could not say",
                 target.display()
             );
@@ -679,7 +678,7 @@ pub(crate) async fn move_worktree_aside(worktree: &Path, repo_root: &Path) -> Op
         return None;
     }
     if let Err(e) = tokio::fs::rename(worktree, &aside).await {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] could not move {} aside: {}",
             worktree.display(),
             e
@@ -697,7 +696,7 @@ pub(crate) async fn remove_reclaiming_dir(dir: &Path) -> bool {
         Ok(()) => true,
         Err(_) if !dir.exists() => true,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] remove_dir_all failed for {}: {}; the next pass retries",
                 dir.display(),
                 e
@@ -728,7 +727,7 @@ pub(crate) async fn remove_reclaiming_dir(dir: &Path) -> bool {
 /// Returns `None`, with the tree untouched, when the repo root cannot be
 /// resolved or the tree cannot be moved aside. The caller decides whether that
 /// is a hard error.
-pub(crate) async fn remove_worktree_and_optionally_delete_branch(
+pub async fn remove_worktree_and_optionally_delete_branch(
     worktree: &Path,
     pre_size: Option<u64>,
     disposal: BranchDisposal,
@@ -739,7 +738,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
     let repo_root = match resolve_repo_root_from_worktree(worktree).await {
         Some(p) => p,
         None => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] cannot resolve repo root from worktree {}",
                 worktree.display()
             );
@@ -754,15 +753,13 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
 
     let aside = move_worktree_aside(worktree, &repo_root).await?;
 
-    // Branch deletion (Phase 10.3). `WhenMerged` is the reclamation rule, and
-    // `has_branch_commits` returns true on error, so a branch is kept whenever
-    // git could not answer. `Always` is the owner's delete and takes the branch
-    // without asking, which is the one place that inversion is correct.
-    //
-    // Cleanup never deletes the repo's default branch. An agent can check it
-    // out in its own worktree, and it always reads as merged into itself.
+    // The default branch can be checked out in an agent worktree and reads
+    // as merged into itself. Preserve it even when branch disposal is requested.
     let mut branch_deleted = false;
-    if let Some(branch_name) = branch.as_deref() {
+    if let Some(branch_name) = branch
+        .as_deref()
+        .filter(|_| disposal != BranchDisposal::Keep)
+    {
         let kept_because =
             if branch_name == crate::engine::git_ops::default_local_branch(&repo_root).await {
                 Some("it is the repo's default branch")
@@ -774,7 +771,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
                 None
             };
         if let Some(reason) = kept_because {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] preserving branch {}: {}",
                 branch_name,
                 reason
@@ -783,18 +780,18 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
             match git_cmd(&["branch", "-D", branch_name], &repo_root).await {
                 Ok(o) if o.status.success() => {
                     branch_deleted = true;
-                    log!(
+                    log_legacy!(
                         "[WorktreeCleanup] deleted branch {} ({:?})",
                         branch_name,
                         disposal
                     );
                 }
-                Ok(o) => log!(
+                Ok(o) => log_legacy!(
                     "[WorktreeCleanup] git branch -D {} failed: {}",
                     branch_name,
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[WorktreeCleanup] git branch -D {} errored: {}",
                     branch_name,
                     e
@@ -845,7 +842,7 @@ pub struct WorktreeInventoryRow {
 ///
 /// Skips legacy random-suffix worktrees and orphaned directories whose short
 /// id doesn't resolve to a thread — same rules as the cleanup worker.
-pub(crate) async fn inventory_worktrees(
+pub async fn inventory_worktrees(
     pool: &sqlx::PgPool,
     workspace_root: &Path,
     active_threads: &dyn ActiveThreads,
@@ -855,7 +852,7 @@ pub(crate) async fn inventory_worktrees(
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] cannot read worktrees dir {}: {}",
                 dir.display(),
                 e
@@ -915,7 +912,7 @@ async fn inventory_row(
         active_threads.is_active(thread_id),
     );
     let size = size.unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] size walk of {} failed: {}",
             path.display(),
             e
@@ -981,7 +978,7 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] cannot resolve thread for short id {}: {}. \
                  Treating as unknown, never as an orphan",
                 short,
@@ -994,7 +991,7 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
         0 => ShortThreadLookup::NotFound,
         1 => ShortThreadLookup::Found(rows[0].0),
         _ => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] short id {} matches more than one thread, skipping",
                 short
             );

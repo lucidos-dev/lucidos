@@ -1,17 +1,3 @@
-/**
- * An app or widget picture has one renderer, and the apps glyph one drawing.
- *
- * Every surface naming an app or widget draws its app icon through `AppIcon`
- * (ADR 0414, invariant I3). The manifest's `icon` is a path, so a surface
- * rendering it as text, or drawing a generic glyph instead, is the bug. The
- * surface half is a source scan: a rendered check sees only the surfaces it
- * mounts, and a new reader of `icon` would slip past it.
- *
- * The apps glyph (`AppsIcon`) still marks the apps CATEGORY: the menu drawer's
- * Apps row and a search hit for the Apps page. `CategoryIcon` must delegate
- * to it rather than re-inline a second drawing, which a rendered comparison
- * cannot express: two hand-written copies of one path render identically.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -24,7 +10,6 @@ import { appsList } from '../../../store/store';
 
 const source = (rel: string): string => readFileSync(new URL(rel, import.meta.url), 'utf8');
 
-/** Every surface that names an app or widget (ADR 0414 § Decision). */
 const APP_SURFACES = [
   '../../apps/AppCard.tsx',
   '../../apps/ReusableWidgetsSection.tsx',
@@ -37,9 +22,6 @@ const APP_SURFACES = [
   '../../chat/MessageRoutePanel.tsx',
 ];
 
-/** How an `icon` field may appear on a surface: handed to `AppIcon`, or
- *  carried to the line that does. `appInfo.icon` is the `AppIcon` node
- *  `resolveAppInfo` built, not the raw field. */
 const ALLOWED_ICON_READS = [
   /icon=\{[\w$?.]+\.icon\}/,
   /appIcon: [\w$?.]+\.icon\b/,
@@ -75,8 +57,6 @@ describe('the apps glyph has one definition', () => {
   });
 
   it('CategoryIcon draws no apps shape of its own', () => {
-    // The arm runs from `case 'apps':` to the next `case`, and must contain no
-    // geometry: a `<rect>`/`<path>`/`<circle>` here is a second copy of the mark.
     const arm = source('../CategoryIcon.tsx').split("case 'apps':")[1]?.split('case ')[0] ?? '';
     expect(arm, "expected a `case 'apps':` arm").not.toBe('');
     expect(arm).not.toMatch(/<(rect|path|circle|polyline|polygon|line)\b/);
@@ -84,8 +64,6 @@ describe('the apps glyph has one definition', () => {
   });
 
   it('AppsIcon sizes itself, because one of its slots has no CSS to size it', () => {
-    // `.search-everywhere-result-icon` carries no rule anywhere in styles/.
-    // That surface sizes its glyphs from the `width`/`height` attributes.
     const svg = AppsIcon() as VNode<Record<string, unknown>>;
     expect(svg.props.width).toBe('1rem');
     expect(svg.props.height).toBe('1rem');

@@ -7,22 +7,12 @@
  *  Both probes are diagnostics, registered in `docs/temporary-measures.md` § 1,
  *  and this goes when the last of them does. */
 
-/** The state that separates a layout fault from an event fault. Carried in
- *  every report, because the reporter is a phone with a screenshot.
- *
- *  `keyboardActive` is the `data-keyboard-active` flag on `<html>`. A whole
- *  block of `styles/mobile.css` inerts the header, the title row, the
- *  edge-swipe zones and the transcript's children off it, and re-enables
- *  `.prompt-area`. A flag out of step with the keyboard would read exactly like
- *  the bug being chased. */
 export interface ProbeViewport {
   vvHeight: number;
   vvOffsetTop: number;
   innerHeight: number;
   appHeight: string;
   keyboardActive: boolean;
-  /** `window.scrollY`. A LAYOUT viewport scrolled under a fixed shell is the
-   *  textbook form of this bug on iOS, and no report has carried the number. */
   pageScrollY: number;
 }
 

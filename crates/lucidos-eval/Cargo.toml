@@ -23,13 +23,14 @@ fixture-gen = ["dep:fastembed"]
 # The gateway's control plane authenticates a local caller by a token in a mode
 # 0600 file. This crate owns that path and that header name for every sender, so
 # the harness takes it rather than hand-copying the pair a fifth time.
-lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-local-token = { path = "../lucidos-local-token", features = ["client"] }
 lucidos-pg-url = { path = "../lucidos-pg-url" }
 # The judge calls a model through the engine's provider layer, so it reaches
 # every provider the engine reaches. This does not make the eval a test: the
 # lint above forbids test TARGETS, and says nothing about a dependency.
 # `scripts/eval-context-mode.sh` already builds the engine in the same cargo
 # invocation, so the cost here is a link step.
+lucidos-agents-api = { path = "../lucidos-agents-api" }
 lucidos-engine = { path = "../lucidos-engine" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

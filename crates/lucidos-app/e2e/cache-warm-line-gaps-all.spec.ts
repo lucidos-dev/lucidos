@@ -1,15 +1,3 @@
-/**
- * The cache-warm line is a card between the last turn and the composer. The
- * space above it, from the last turn's visible edge, equals the space below
- * it, to the composer box, at phone and desktop width.
- *
- * The card has no top padding. The last turn's bottom padding is the gap
- * above, and the transcript's bottom padding is the gap below. Either one
- * drifting breaks the equality, which is what this measures.
- *
- * The engine's answer is stubbed: the line needs a warm cache, and a real one
- * needs a real model call inside the cache's lifetime.
- */
 import { test, expect, Page } from './fixtures';
 import { apiRequest, assertHealthy, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
 import { psql } from './db-helpers';
@@ -22,13 +10,10 @@ const WARMTH: CacheWarmth = {
   ttl: { lifetime: '5m', evidence: 'reported' },
 };
 
-// The service worker answers GETs under /api/v1 itself, so `page.route` never sees them.
 test.use({ serviceWorkers: 'block' });
 
-/** A window short enough that one reply overflows the transcript. */
 const SHORT_WINDOW_PX = 420;
 
-/** The gap, in px, within which "equal" holds. */
 const TOLERANCE_PX = 1;
 
 interface Gaps {
@@ -63,10 +48,6 @@ async function measureGaps(page: Page): Promise<Gaps | null> {
     const scroller = lastVisible(document.querySelectorAll('.thread-content'));
     const promptArea = lastVisible(document.querySelectorAll('.prompt-area'));
     if (!card || !edgeOwner || !box || !scroller || !promptArea) return null;
-    // A settled scroller ends at the composer's top edge, or at its bottom edge
-    // where dynamic bars overlay the composer on the transcript. A resize
-    // settles in two layout steps, and between them the scroller ends a pixel
-    // short, which skews the gap below.
     const promptRect = promptArea.getBoundingClientRect();
     const overlaid = getComputedStyle(promptArea).position === 'absolute';
     const settledBottom = overlaid ? promptRect.bottom : promptRect.top;
@@ -83,7 +64,6 @@ async function measureGaps(page: Page): Promise<Gaps | null> {
 test.describe('the cache-warm line gaps', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // The cache cards are off by default, and draw only while the keep-alive is on.
     for (const [key, value] of [['cache_keep_alive_mode', 'on'], ['cache_cards', 'true']]) {
       const res = await apiRequest(page).put(`/api/v1/preferences?key=${key}`, { data: { value } });
       expect(res.ok(), `${key}=${value}`).toBe(true);
@@ -101,14 +81,9 @@ test.describe('the cache-warm line gaps', () => {
     await waitForResponse(page);
 
     await expect(page.locator('[data-role="cache-warm"]:visible')).toBeVisible({ timeout: 15_000 });
-    // Short content leaves the composer far below the card. A short window
-    // makes the transcript scroll, and the card ends it.
     const { width } = page.viewportSize()!;
     await page.setViewportSize({ width, height: SHORT_WINDOW_PX });
     await expect.poll(() => scrollTranscriptToEnd(page), { timeout: 10_000 }).toBe(true);
-    // null until the resize has settled (see measureGaps). The poll keeps the
-    // settled measurement: a second call after it can land between two layout
-    // steps and return null again.
     let gaps: Gaps | null = null;
     await expect
       .poll(async () => (gaps = await measureGaps(page)), { timeout: 10_000 })

@@ -36,7 +36,7 @@ use crate::llm::provider::ToolDefinition;
 /// into `response.tool_calls` as a synthesized `ToolCall`) and the assistant
 /// text with the `<invoke>` block (plus surrounding whitespace) stripped.
 #[derive(Debug, Clone)]
-pub(crate) struct DetectedToolCall {
+pub struct DetectedToolCall {
     /// The invoked tool name (guaranteed to be one of the offered tools).
     pub name: String,
     /// `<parameter name="K">V</parameter>` children parsed into a JSON object.
@@ -64,10 +64,7 @@ const CALLS_CLOSE: &str = "</function_calls>";
 ///   one offered tool's schema (guards against incidental prose).
 ///
 /// Otherwise returns `None` and the caller falls back to normal handling.
-pub(crate) fn detect_inline_tool_call(
-    text: &str,
-    tools: &[ToolDefinition],
-) -> Option<DetectedToolCall> {
+pub fn detect_inline_tool_call(text: &str, tools: &[ToolDefinition]) -> Option<DetectedToolCall> {
     text.match_indices(INVOKE_CLOSE)
         .map(|(close_at, _)| close_at)
         .filter(|close_at| !inside_fence(text, *close_at))
@@ -234,7 +231,7 @@ fn parse_parameters(body: &str) -> serde_json::Value {
 /// Once `true`, the callback stops emitting `CumulativeTextUpdated` /
 /// `TextStreamed` deltas for the rest of the turn, and the post-response
 /// repair path takes over.
-pub(crate) fn buffer_contains_inline_tool_call(buf: &str) -> bool {
+pub fn buffer_contains_inline_tool_call(buf: &str) -> bool {
     ["<invoke name=", "<parameter name=", PARAM_CLOSE]
         .iter()
         .flat_map(|tag| buf.match_indices(tag))

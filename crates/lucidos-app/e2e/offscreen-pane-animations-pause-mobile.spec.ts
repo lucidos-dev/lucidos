@@ -4,16 +4,9 @@ import { randomUUID } from 'crypto';
 import { assertHealthy, ensureMobileView, navigateToApp } from './helpers';
 import { psql } from './db-helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-// Every mobile pane stays mounted, and an infinite animation in one off screen
-// still restyles and repaints it on every frame. On an iPhone, that work shares
-// the main thread with typing. The drawer's running shimmer and spinners
-// stalled composer keystrokes by over a second. So a pane that is not the
-// current one holds its animations paused.
 
-/** A running thread, so the drawer draws its running shimmer and spinner. */
 function seedRunningThread(): string {
   const threadId = randomUUID();
   const now = new Date().toISOString();
@@ -24,7 +17,6 @@ function seedRunningThread(): string {
   return threadId;
 }
 
-/** The play state of every animation inside the threads drawer's pane. */
 function drawerPaneAnimationStates(page: Page): Promise<string[]> {
   return page.evaluate(() => {
     const pane = document.querySelector('.mobile-threads-pane')?.closest('.mobile-swipe-pane');
@@ -55,18 +47,15 @@ test.describe('A mobile pane off screen', () => {
     threadId = seedRunningThread();
     await navigateToApp(page);
 
-    // On the drawer, its running animations play.
     await ensureMobileView(page, 'threads');
     await expect.poll(() => drawerPaneAnimationStates(page), { timeout: 10_000 }).toContain('running');
 
-    // Off screen, every one of them holds still.
     await ensureMobileView(page, 'thread');
     await expect.poll(async () => {
       const states = await drawerPaneAnimationStates(page);
       return states.length > 0 && states.every((s) => s === 'paused');
     }, { timeout: 5_000 }).toBe(true);
 
-    // Back on the drawer, they play again.
     await ensureMobileView(page, 'threads');
     await expect.poll(async () => {
       const states = await drawerPaneAnimationStates(page);

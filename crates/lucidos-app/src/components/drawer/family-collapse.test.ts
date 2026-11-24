@@ -1,13 +1,3 @@
-/**
- * Tests for hasCollapsedAncestor — the predicate that decides whether a thread
- * should be hidden because one of its ancestors is in the collapsedFamilies
- * set. Pairs with nestByParent: after nesting produces the flat depth-annotated
- * list, this filter walks each row's parent chain and drops rows whose ancestor
- * was collapsed by the user. Each parent-with-children has its own independent
- * chevron, so the collapse state composes — collapsing A hides B and C;
- * re-expanding A preserves B's own collapse state because B's filter check is
- * independent of A's chevron.
- */
 
 import { describe, it, expect } from 'vitest';
 import { hasCollapsedAncestor, computeFamilyGraph } from './ThreadDrawer';
@@ -72,7 +62,6 @@ describe('hasCollapsedAncestor', () => {
         const leaf = makeThread('leaf', 'mid');
         const graph = computeFamilyGraph([root, mid, leaf]);
 
-        // Collapsing the root hides the whole subtree, including grandchildren.
         expect(hasCollapsedAncestor('leaf', new Set(['root']), graph)).toBe(true);
     });
 
@@ -83,8 +72,6 @@ describe('hasCollapsedAncestor', () => {
         const siblingOfMid = makeThread('sibling', 'root');
         const graph = computeFamilyGraph([root, mid, leaf, siblingOfMid]);
 
-        // Collapsing `mid` hides `leaf` (its child) but leaves `sibling` (mid's
-        // peer) visible. Each parent has an independent chevron.
         expect(hasCollapsedAncestor('leaf', new Set(['mid']), graph)).toBe(true);
         expect(hasCollapsedAncestor('sibling', new Set(['mid']), graph)).toBe(false);
         expect(hasCollapsedAncestor('mid', new Set(['mid']), graph)).toBe(false);
@@ -95,7 +82,6 @@ describe('hasCollapsedAncestor', () => {
         const child = makeThread('child', 'root');
         const graph = computeFamilyGraph([root, child]);
 
-        // The parent row stays visible; its chevron lets the user re-expand.
         expect(hasCollapsedAncestor('root', new Set(['root']), graph)).toBe(false);
     });
 
@@ -107,8 +93,6 @@ describe('hasCollapsedAncestor', () => {
     });
 
     it('returns false when the thread is not in the graph (paginated out / unknown)', () => {
-        // Defensive: a render between batches may briefly hand us an id whose
-        // thread is no longer in the graph. Don't blow up — just don't hide.
         const root = makeThread('root');
         const graph = computeFamilyGraph([root]);
 
@@ -116,8 +100,6 @@ describe('hasCollapsedAncestor', () => {
     });
 
     it('returns false on a parent cycle when nothing in the cycle is collapsed', () => {
-        // Data corruption: a → b → a. Walking the parent chain must terminate
-        // and return false rather than looping forever.
         const a = makeThread('a', 'b');
         const b = makeThread('b', 'a');
         const graph = computeFamilyGraph([a, b]);
@@ -127,8 +109,6 @@ describe('hasCollapsedAncestor', () => {
     });
 
     it('returns true on a parent cycle when a cycle member is collapsed', () => {
-        // Same cycle, but `a` is collapsed. `b`'s parent chain hits `a` on
-        // the first hop and the predicate returns true.
         const a = makeThread('a', 'b');
         const b = makeThread('b', 'a');
         const graph = computeFamilyGraph([a, b]);

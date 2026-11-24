@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Access › The machine running Lucidos: the HTTPS row.
- *
- *  Every TLS state renders a true sentence, and no HTTPS always says why:
- *  plain HTTP with no stated reason is the failure this row stops. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

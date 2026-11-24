@@ -1,17 +1,20 @@
 //! This engine's background engine build (dev): when one starts, what a
 //! second request does to it, and when it builds once more.
 //!
-//! Two entry points, by who asks:
+//! Entry points, by who asks:
 //!
-//! - [`join_or_start`], for an Apply and for self-heal. A build in flight is
+//! - [`automatic`], for Apply, follow main and self-heal. Coding activity can
+//!   hold a request before it starts. A build in flight is
 //!   left alone and marked joined. When it finishes behind HEAD, the same task
 //!   builds once more. A burst of Applies so costs at most one follow-up, and
 //!   no compile is thrown away.
+//! - [`join_or_start`], the explicit Build now override, joins or starts immediately.
 //! - [`restart`], for the explicit `POST /api/v1/engine/rebuild`. It aborts the
 //!   build in flight and starts over: the user's escape from a hung build.
 //!
 //! Generic over [`BuildHost`], so the rules run in tests without cargo.
 
+pub(crate) use super::build_deferral::BuildDeferral;
 use crate::engine::engine_version::BuildState;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -27,6 +30,9 @@ pub(crate) trait BuildHost: Send + Sync + 'static {
     async fn run_build(&self, previous_failure: Option<&str>, generation: u64) -> FinishedBuild;
     /// Whether `finished` already reflects HEAD, so a join needs no follow-up.
     async fn covers_head(&self, finished: &FinishedBuild) -> bool;
+    async fn automatic_deferral(&self) -> BuildDeferral;
+    /// Recheck coverage when a held request resumes: a peer may have built it.
+    async fn deferred_build_needed(&self) -> bool;
 }
 
 /// One completed build: the state it settles to, and the HEAD it started at.
@@ -81,12 +87,79 @@ pub(crate) fn join_or_start<H: BuildHost>(host: &Arc<H>) {
     let mut slot = host.background_build().slot.lock().unwrap();
     if slot.running() {
         slot.joined = true;
-        crate::log!(
+        crate::log_legacy!(
             "[Rebuild] joined the engine build in flight; it builds once more if HEAD has moved past it"
         );
         return;
     }
     start(host, &mut slot, None);
+}
+
+/// Automatic requests share one hold; explicit requests bypass admission.
+pub(crate) async fn automatic<H: BuildHost>(host: &Arc<H>) -> BuildDeferral {
+    let deferral = host.automatic_deferral().await;
+    automatic_with_deferral(host, deferral).await
+}
+
+/// Use one admission result for both self-heal accounting and the request.
+pub(crate) async fn automatic_with_deferral<H: BuildHost>(
+    host: &Arc<H>,
+    deferral: BuildDeferral,
+) -> BuildDeferral {
+    let changed = {
+        let mut slot = host.background_build().slot.lock().unwrap();
+        if slot.running() {
+            slot.joined = true;
+            return BuildDeferral::Admit;
+        }
+        match &deferral {
+            BuildDeferral::Admit => {
+                start(host, &mut slot, None);
+                None
+            }
+            BuildDeferral::Defer(_) => {
+                let state = host.build_state().with_deferral();
+                let changed = host.build_state().deferred().is_none();
+                host.set_build_state(state.clone());
+                changed.then_some(state)
+            }
+        }
+    };
+    if let Some(state) = changed {
+        host.emit_build_state_changed(&state).await;
+    }
+    deferral
+}
+
+pub(crate) async fn start_deferred_build_if_admitted<H: BuildHost>(host: &Arc<H>) {
+    if host.build_state().deferred().is_none() {
+        return;
+    }
+    let deferral = host.automatic_deferral().await;
+    if !matches!(deferral, BuildDeferral::Admit) {
+        return;
+    }
+    let needed = host.deferred_build_needed().await;
+    let changed = {
+        let mut slot = host.background_build().slot.lock().unwrap();
+        if slot.running() || host.build_state().deferred().is_none() {
+            return;
+        }
+        if needed {
+            start(host, &mut slot, None);
+            None
+        } else {
+            let state = match host.build_state() {
+                BuildState::Ready { built_head, .. } => BuildState::ready_from(built_head),
+                _ => BuildState::Idle,
+            };
+            host.set_build_state(state.clone());
+            Some(state)
+        }
+    };
+    if let Some(state) = changed {
+        host.emit_build_state_changed(&state).await;
+    }
 }
 
 /// Abort the build in flight, killing its process group, and start over.
@@ -95,7 +168,7 @@ pub(crate) fn restart<H: BuildHost>(host: &Arc<H>) {
     let superseded = slot.task.take().filter(|t| !t.is_finished());
     if let Some(old) = &superseded {
         old.abort();
-        crate::log!("[Rebuild] restarting the engine build in flight on request");
+        crate::log_legacy!("[Rebuild] restarting the engine build in flight on request");
     }
     start(host, &mut slot, superseded);
 }
@@ -128,8 +201,8 @@ async fn drive<H: BuildHost>(
     mut previous_failure: Option<String>,
 ) {
     // Push `building` over SSE so a connected client shows the spinner
-    // immediately. The version-status poll alone misses this transient
-    // window, since iOS suspends the timer on a backgrounded PWA.
+    // immediately. A version-status read can miss this transient window;
+    // the stream also invalidates the snapshot for the next read.
     host.emit_build_state_changed(&building).await;
     // HAND THE BUILD LOCK OVER, do not race it. `abort()` only REQUESTS
     // cancellation, so the restarted task drops its `flock` guard strictly
@@ -146,10 +219,10 @@ async fn drive<H: BuildHost>(
             .run_build(previous_failure.as_deref(), generation)
             .await;
         match settle(&host, generation, &finished).await {
-            Settled::Done => break finished.state,
+            Settled::Done => break host.build_state(),
             Settled::Restarted => return,
             Settled::BuildAgain => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Rebuild] HEAD moved past the engine build an Apply joined; building once more"
                 );
                 previous_failure = finished.state.failure().map(|f| f.summary.clone());
@@ -187,6 +260,16 @@ async fn settle<H: BuildHost>(host: &Arc<H>, generation: u64, finished: &Finishe
         // The check takes a git call, and a join may land during it. Looping
         // back to the slot catches that join before retiring.
         if !host.covers_head(finished).await {
+            let deferral = host.automatic_deferral().await;
+            let mut slot = host.background_build().slot.lock().unwrap();
+            if slot.generation != generation {
+                return Settled::Restarted;
+            }
+            if matches!(deferral, BuildDeferral::Defer(_)) {
+                slot.task = None;
+                host.set_build_state(finished.state.clone().with_deferral());
+                return Settled::Done;
+            }
             return Settled::BuildAgain;
         }
     }

@@ -1,14 +1,3 @@
-/**
- * Both titles, and the push that carries the native one to the shell.
- *
- * The bug this replaced was a macOS Window menu listing "Lucidos" twice for two
- * workspaces. So the cases here are the ones that were wrong: two names, and a
- * window with no name at all.
- *
- * `isTauri` is mocked rather than faked through the environment, matching
- * `workspaceWindow.test.ts`: it reads the real `window` and a test that poked it
- * would be asserting on this machine.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const platform = vi.hoisted(() => ({ isTauri: false }));
@@ -24,7 +13,6 @@ const {
   resetWindowTitlePush,
 } = await import('./windowTitle');
 
-/** Drain the microtask queue, so a push waiting behind the chain has run. */
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 beforeEach(() => {
@@ -81,9 +69,6 @@ describe('the push', () => {
     expect(setWindowTitle).toHaveBeenCalledTimes(2);
   });
 
-  // Two names land on an ordinary load: the engine's own, then the gateway
-  // label. Run concurrently they could resolve out of order, and the window
-  // would keep the older one with nothing left to correct it.
   it('applies the newer name last however slow the first push is', async () => {
     platform.isTauri = true;
     let releaseFirst = () => {};
@@ -109,8 +94,6 @@ describe('the push', () => {
     warn.mockRestore();
   });
 
-  // A push that never landed must not count as landed, or the de-duplication
-  // pins the window at a name the shell refused.
   it('retries the same name after a rejected push', async () => {
     platform.isTauri = true;
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

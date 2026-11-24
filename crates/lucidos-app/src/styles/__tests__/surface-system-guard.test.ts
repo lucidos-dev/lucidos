@@ -1,10 +1,3 @@
-/**
- * The surface system's three rules, as source scans: one scrim token for the
- * surfaces that block, tokens for every surface's corner and shadow, and one
- * close affordance (the X in the head). A browser can render any of these
- * wrong without a test noticing, so this test pins them in the source.
- * See docs/plans/2026-09-26-one-surface-system.md.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -33,9 +26,7 @@ const css = {
   search: read('../../components/search/SearchEverywhere.css'),
 };
 
-/** The first top-level rule for `selector`, so a nested or mobile override
- *  with the same name cannot stand in for the base rule. */
-const rule = (sheet: string, selector: string): string => block(sheet, `\n${selector} {`);
+const rule = (sheet: string, selector: string): string => block(`\n${sheet}`, `\n${selector} {`);
 
 describe('only a surface that blocks dims the app, and all of them alike', () => {
   it('draws every blocking scrim from the one token', () => {
@@ -96,9 +87,6 @@ describe('menus wear the shared box instead of a copy of it', () => {
     }
   });
 
-  // A menu takes the box alone, so its rows keep their own line height and its
-  // buttons their own size. A body-only popover takes the whole surface, since
-  // its text sits on the surface inset.
   it.each([
     ['../../components/layout/HeaderMark.tsx', 'surface-box', 'brand-menu'],
     ['../../components/shared/OverflowMenu.tsx', 'surface-box', 'thread-overflow-menu'],
@@ -124,7 +112,6 @@ describe('menus wear the shared box instead of a copy of it', () => {
 });
 
 describe('a head icon costs the body no width', () => {
-  // The icon belongs to the head row, so only the line beside it pays its width.
   it('keys no body inset on the head having an icon', () => {
     expect(css.surface).not.toMatch(/\.surface-head:has\(\.surface-icon\)\s*\+\s*\.surface-body/);
   });
@@ -141,9 +128,6 @@ describe('a head icon costs the body no width', () => {
 });
 
 describe('a wrapped title keeps its first line where a short one sits', () => {
-  // The head's own padding is only the floor. A single line is centred by the
-  // head's height, and a title that wraps outgrows it. The title pads itself so
-  // its first line stays off the frame either way.
   it('derives the title padding from the head height, not the head padding', () => {
     expect(decl(rule(css.surface, '.surface-head'), 'min-height')).toBe('var(--surface-head-height)');
     expect(decl(rule(css.surface, '.surface-title'), 'padding-block'))
@@ -164,8 +148,6 @@ describe('every surface insets its text by one token', () => {
     expect(decl(rule(sheet, selector), prop)).toBe(value);
   });
 
-  // A rule that pads a surface's body to line up with the head is the drift
-  // this token exists to prevent: it stops matching the day the inset moves.
   it('never re-pads a body to the head by hand', () => {
     expect(css.steps).not.toMatch(/\+\s*\.step-detail-body\s*\{[^}]*padding/);
   });
@@ -190,8 +172,6 @@ describe('the header palettes are one shape, over their own pane', () => {
     expect(decl(rule(css.content, '.file-search-modal'), 'max-width')).toMatch(/^min\(var\(--header-surface-width\),/);
   });
 
-  // Both rules share one specificity, so the one LATER in the sheet wins. The
-  // last rule setting a property is what a phone renders.
   it('widens Search everywhere past the menu on desktop, but not on a phone', () => {
     const modal = rulesTargeting(css.search, 'search-everywhere-modal').filter(r => r.props.has('max-width'));
     const desktop = modal.filter(r => r.atRules === '');
@@ -234,8 +214,6 @@ describe('a surface closes from the X in its head, never from a text button', ()
     expect(source).toContain('<SurfaceHead');
   });
 
-  // The tooltip repeats the accessible name, so a pointer user learns what the
-  // X closes before pressing it. Every X in the app carries one or none does.
   it.each([
     '../../components/shared/Surface.tsx',
     '../../components/shared/Toast.tsx',
@@ -244,8 +222,6 @@ describe('a surface closes from the X in its head, never from a text button', ()
     '../../components/layout/BackupReminderBanner.tsx',
     '../../components/layout/SlownessBanner.tsx',
   ])('%s gives its close X a tooltip matching its name', (path) => {
-    // One entry per button, cut at its closing tag. An attribute can hold `>`
-    // (an arrow function in a ref), so a `[^>]*` match stops too early.
     const buttons = read(path).split('<button').slice(1)
       .map((chunk: string) => chunk.split('</button>')[0])
       .filter((chunk: string) => /\b(?:surface-close|toast-close)\b/.test(chunk));

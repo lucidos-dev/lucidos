@@ -245,7 +245,7 @@ impl LucidosEngine {
     /// Non-blocking; never holds the registry lock.
     pub(crate) fn notify_apply_all(&self, msg: ApplyAllDriveMsg) {
         if let Err(e) = self.apply_all_drive_tx.send(msg) {
-            log!(
+            log_legacy!(
                 "[ApplyAll] notify channel closed — dropping {:?}; recovery on \
                  restart will resume from the persisted ApplyAllBatchStarted",
                 e.0,
@@ -261,16 +261,16 @@ impl LucidosEngine {
     pub fn start_apply_all_driver(self: &std::sync::Arc<Self>) {
         let rx = crate::engine::APPLY_ALL_DRIVE_RX.with(|cell| cell.borrow_mut().take());
         let Some(mut rx) = rx else {
-            log!("[ApplyAll] driver receiver missing — listener not started");
+            log_legacy!("[ApplyAll] driver receiver missing — listener not started");
             return;
         };
         let engine = self.clone();
         tokio::spawn(async move {
-            log!("[ApplyAll] driver task started");
+            log_legacy!("[ApplyAll] driver task started");
             while let Some(msg) = rx.recv().await {
                 engine.advance_apply_all_batch(msg).await;
             }
-            log!("[ApplyAll] driver task exiting — channel closed");
+            log_legacy!("[ApplyAll] driver task exiting — channel closed");
         });
     }
 
@@ -284,7 +284,7 @@ impl LucidosEngine {
     /// Both surfaces call this: the HTTP handler and the agent's
     /// `apply_as_they_settle`. Neither owns the rule, which is what stops the
     /// tool quietly becoming a second Apply All with no batch behind it.
-    pub(crate) async fn run_apply_all(
+    pub async fn run_apply_all(
         self: &std::sync::Arc<Self>,
         actor: Option<MessageOrigin>,
         keep_going: bool,
@@ -409,12 +409,12 @@ impl LucidosEngine {
         let engine = self.clone();
         tokio::spawn(async move {
             if let Some(reason) = engine.batch_member_refusal(change_id).await {
-                log!("[ApplyAll] not applying batch member {change_id}: {reason}");
+                log_legacy!("[ApplyAll] not applying batch member {change_id}: {reason}");
                 engine.notify_apply_all(ApplyAllDriveMsg::Failed(change_id, reason.to_string()));
                 return;
             }
             if let Err(e) = engine.apply_batch_member(change_id, actor).await {
-                log!("[ApplyAll] apply_change({change_id}) returned Err: {e}");
+                log_legacy!("[ApplyAll] apply_change({change_id}) returned Err: {e}");
             }
         });
     }
@@ -433,7 +433,7 @@ impl LucidosEngine {
         let thread_unsettled = match unsettled {
             Ok(ids) => change.thread_id.is_some_and(|tid| ids.contains(&tid)),
             Err(e) => {
-                log!("[ApplyAll] settle check for batch member {change_id} failed: {e}");
+                log_legacy!("[ApplyAll] settle check for batch member {change_id} failed: {e}");
                 return Some(MEMBER_SETTLE_UNKNOWN);
             }
         };
@@ -491,7 +491,7 @@ impl LucidosEngine {
         .execute(self.pool())
         .await
         {
-            log!(
+            log_legacy!(
                 "[ApplyAll] failed to persist batch {} membership: {}",
                 batch_id,
                 e
@@ -501,7 +501,7 @@ impl LucidosEngine {
         progress.start_next();
         self.open_lane_press(batch_id);
         reg.insert(progress);
-        log!("[ApplyAll] batch {} seeded", batch_id);
+        log_legacy!("[ApplyAll] batch {} seeded", batch_id);
         Some((batch_id, change_ids))
     }
 
@@ -517,7 +517,7 @@ impl LucidosEngine {
             .execute(self.pool())
             .await
         {
-            log!("[ApplyAll] failed to delete batch {} row: {}", batch_id, e);
+            log_legacy!("[ApplyAll] failed to delete batch {} row: {}", batch_id, e);
         }
     }
 
@@ -538,7 +538,7 @@ impl LucidosEngine {
     /// the interrupt processes still lands and emits `ChangeApplied`, which the
     /// now-removed batch ignores); queued members are left untouched as pending.
     /// Returns the number of batches canceled (0 = nothing was running).
-    pub(crate) async fn cancel_apply_all_batches(&self, actor: Option<MessageOrigin>) -> usize {
+    pub async fn cancel_apply_all_batches(&self, actor: Option<MessageOrigin>) -> usize {
         // Snapshot pending members and remove the batches under ONE lock so the
         // driver can't spawn a new member's apply between the snapshot and the
         // removal. `get_by_id` / `interrupt_agent` run after the lock is dropped.
@@ -586,14 +586,16 @@ impl LucidosEngine {
                         // Gated on a live session, so the settle fallback is
                         // unreachable from here and its variant is moot.
                         if let Err(e) = self
+                            .agent_host()
                             .interrupt_agent(
+                                self,
                                 Some(thread_id),
                                 actor.clone(),
-                                crate::engine::claude_code::SettleTerminal::StuckProjection,
+                                crate::engine::agent_host::SettleTerminal::StuckProjection,
                             )
                             .await
                         {
-                            log!(
+                            log_legacy!(
                                 "[ApplyAll] cancel: interrupt_agent({}) failed: {}",
                                 thread_id,
                                 e
@@ -605,7 +607,7 @@ impl LucidosEngine {
         }
         let count = finals.len();
         for final_state in finals {
-            log!(
+            log_legacy!(
                 "[ApplyAll] batch {} canceled — applied={}, canceled/failed={}",
                 final_state.batch_id(),
                 final_state.applied_ids().len(),
@@ -653,14 +655,14 @@ impl LucidosEngine {
         let rows = match recoverable_batches(self.pool(), &self.event_bus).await {
             Ok(r) => r,
             Err(e) => {
-                log!("[ApplyAll] recovery query failed: {}", e);
+                log_legacy!("[ApplyAll] recovery query failed: {}", e);
                 return;
             }
         };
         if rows.is_empty() {
             return;
         }
-        log!(
+        log_legacy!(
             "[ApplyAll] recovering {} unfinished batch(es) from previous process",
             rows.len()
         );
@@ -676,7 +678,7 @@ impl LucidosEngine {
                     Ok(Some(c)) => Some(c.status()),
                     Ok(None) => None, // row gone → treat as terminal
                     Err(e) => {
-                        log!(
+                        log_legacy!(
                             "[ApplyAll] recovery: changes lookup for {} failed: {} — \
                              treating as pending (will re-drive)",
                             change_id,
@@ -697,7 +699,7 @@ impl LucidosEngine {
             }
 
             if progress.is_complete() {
-                log!(
+                log_legacy!(
                     "[ApplyAll] recovered batch {} already resolved — emitting ApplyAllBatchCompleted",
                     batch_id
                 );
@@ -728,7 +730,7 @@ impl LucidosEngine {
                         // An unknown lane never authorizes an apply, and parking
                         // every member would hang the batch. The batch stays
                         // persisted, so the next boot recovers it.
-                        log!(
+                        log_legacy!(
                             "[ApplyAll] recovery: lane lookup for batch {} failed: {} — \
                              leaving the batch for the next boot",
                             batch_id,
@@ -747,7 +749,7 @@ impl LucidosEngine {
             let next = progress.start_next();
             self.apply_all_batches.lock().await.insert(progress);
             if let Some(change_id) = next {
-                log!(
+                log_legacy!(
                     "[ApplyAll] recovery: driving pending member {} of batch {}",
                     change_id,
                     batch_id
@@ -776,7 +778,7 @@ impl LucidosEngine {
         };
         let decision = decide_recovered_drive(session_running, resume_queued, resolution_open);
         let resolving = owner_is_resolving(&decision, resolution_open)?;
-        log!(
+        log_legacy!(
             "[ApplyAll] recovery: batch {} member {}: {:?} (resolving: {}), waiting for its \
              terminal event",
             batch_id,
@@ -814,7 +816,7 @@ impl LucidosEngine {
                 // then emits `ChangeApplyFailed` for the same change_id.
                 // Acting on it could start a second apply.
                 Advance::Duplicate => {
-                    log!(
+                    log_legacy!(
                         "[ApplyAll] nothing changed for {} in batch {}, skipping advance",
                         change_id,
                         batch_id,
@@ -847,7 +849,7 @@ impl LucidosEngine {
                 applied,
                 failed,
             } => {
-                log!(
+                log_legacy!(
                     "[ApplyAll] batch {} complete — applied={}, failed={}",
                     batch_id,
                     applied.len(),
@@ -866,7 +868,7 @@ impl LucidosEngine {
                 self.persist_batch_removed(batch_id).await;
             }
             NextStep::Start { next_change, actor } => {
-                log!(
+                log_legacy!(
                     "[ApplyAll] starting batch member {} (after {})",
                     next_change,
                     change_id
@@ -882,7 +884,7 @@ impl LucidosEngine {
 }
 
 /// What one Apply All press did, for the surface that made it.
-pub(crate) enum ApplyAllOutcome {
+pub enum ApplyAllOutcome {
     /// A batch started, and its first member has already been applied.
     Started {
         batch_id: Uuid,

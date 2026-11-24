@@ -3,19 +3,6 @@ import { exchangeResponseEvents } from './exchange-render';
 import type { Exchange } from './exchange';
 import type { ResponseEvent } from '../types';
 
-/** A row arrives with its heavy fields already gone.
- *
- *  The engine strips `CodingAgentToolCalled.args` and
- *  `CodingAgentToolResult.result`, because they were the bulk of a coding-agent
- *  thread's transfer and nothing renders them inline. The snapshot and the live
- *  stream strip alike (`ThreadEvent::strip_tool_call_args`). A full row still
- *  reaches the fold from `include_context`.
- *
- *  So the fold has to serve two shapes of the same event, and this pins what
- *  each owes. A stripped row must read identically in the transcript and must
- *  carry the address the step-detail modal fetches by. A full row must carry
- *  the values themselves and no marker, so the modal never fetches what it
- *  already holds. */
 
 const TS = '2026-08-30T09:00:00Z';
 
@@ -35,7 +22,6 @@ function stepsOf(steps: Exchange['steps']): Extract<ResponseEvent, { type: 'step
     .filter((e): e is Extract<ResponseEvent, { type: 'step' }> => e.type === 'step');
 }
 
-/** The same call, with its args (`include_context`) and stripped. */
 const fullCall = () => ev({
   type: 'CodingAgentToolCalled',
   name: 'Edit',
@@ -70,9 +56,6 @@ const strippedResult = () => ev({
 
 describe('a stripped coding-agent tool call', () => {
   it('renders the label a full one renders', () => {
-    // The strip fills `description` before dropping `args`, so the two rows
-    // reach the fold carrying the same label. That equality is the whole
-    // safety of the strip: the label is the only thing the transcript draws.
     const [full] = stepsOf([fullCall()]);
     const [stripped] = stepsOf([strippedCall()]);
     expect(stripped.description).toBe(full.description);
@@ -83,7 +66,6 @@ describe('a stripped coding-agent tool call', () => {
     const [step] = stepsOf([strippedCall()]);
     expect(step.args_stripped).toBe(true);
     expect(step.call_event_id).toBe('evt-call');
-    // Nothing to show inline: the modal loads the un-elided command instead.
     expect(step.full).toBeUndefined();
   });
 
@@ -91,14 +73,11 @@ describe('a stripped coding-agent tool call', () => {
     const [step] = stepsOf([fullCall()]);
     expect(step.args_stripped).toBeUndefined();
     expect(step.full).toBe('/a/styles/shell.css');
-    // Still addressed, so a modal opened on it can re-fetch if it ever needs to.
     expect(step.call_event_id).toBe('evt-call');
   });
 });
 
 describe('a stripped chat tool call', () => {
-  // Every live chat call arrives this way, so the modal must know its channel
-  // to format the args it fetches back through the chat describer.
   it('stamps the marker, the address and the chat channel', () => {
     const [step] = stepsOf([ev({
       type: 'ToolCalled',
@@ -132,9 +111,6 @@ describe('a stripped coding-agent tool result', () => {
   });
 
   it('addresses the step it settles by fallback, not only by tool_use_id', () => {
-    // The pairing normally goes by `tool_use_id`. A result carrying none
-    // settles the last pending step instead, and that path has to stamp the
-    // same two fields. Otherwise the modal opens on a row it cannot fetch.
     const unpaired = ev({
       type: 'CodingAgentToolResult',
       name: 'Edit',

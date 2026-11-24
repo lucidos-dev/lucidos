@@ -1,17 +1,4 @@
-/**
- * `handleOAuthAccountConnected`: what happens the moment an authorization the
- * user completed in a BROWSER lands back in the engine.
- *
- * The scoping is the whole point and is what these tests exist to pin, and it
- * has two levels. The engine stamps the flow's initiating device onto
- * `OAuthAccountConnected` (see `prepare_oauth_flow`), and only that device is
- * told: an account connected from a phone must not yank a desktop window
- * forward, and an engine-internal reconnect (no actor) belongs to nobody. The
- * WINDOW fronting is narrower still, because a device id is per-app and every
- * window of the desktop app shares it: only the page that opened the
- * authorization URL fronts itself.
- */
-import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { oauthAccounts, panelOverlay, toasts } from '../store';
 
 const THIS_DEVICE = 'device-aaa';
@@ -52,10 +39,14 @@ vi.mock('./artifacts', () => ({ openUrlOutsideApp }));
 
 const {
   handleOAuthAccountConnected,
+  presentOAuthAccountConnected,
   openOAuthAuthorizationUrl,
   oauthAuthFlow,
   grantOAuthScope,
 } = await import('./oauth');
+
+const submitInteractiveRequest = vi.fn((request, _id?: string) => presentOAuthAccountConnected(request.payload));
+vi.mock('../interactiveDeliveryService', () => ({ submitInteractiveRequest: (...args: Parameters<typeof submitInteractiveRequest>) => submitInteractiveRequest(...args) }));
 
 const AUTH_URL = 'https://www.dropbox.com/oauth2/authorize?client_id=k8f2m9qxz1abc4d';
 
@@ -81,9 +72,6 @@ describe('handleOAuthAccountConnected', () => {
     completeOAuth.mockClear();
   });
 
-  // The device-scoped half must not eat the accounts reload, which every device
-  // needs. Guarded on `loaded` so a page that never opened Settings doesn't
-  // fetch a list nothing is rendering.
   it('reloads the accounts list for any device, but only when it is loaded', () => {
     handleOAuthAccountConnected(connected(OTHER_DEVICE));
     expect(listOAuthAccounts).not.toHaveBeenCalled();
@@ -102,11 +90,6 @@ describe('handleOAuthAccountConnected', () => {
     expect(toasts.value[0].message).toContain('me@example.com');
   });
 
-  // The engine keeps ONE live callback flow (`core::oauth ACTIVE_CALLBACK_FLOW`),
-  // so a second Connect supersedes the first and the window holding the dead one
-  // is still carrying a marker. It must not ride the survivor's completion
-  // forward. The marker is still cleared for every page, so a dead flow cannot
-  // later be read as one nobody reported.
   it('does not front a window whose own flow was superseded by another provider', () => {
     openOAuthAuthorizationUrl('https://accounts.google.com/o/oauth2/auth', 'google');
 
@@ -115,26 +98,18 @@ describe('handleOAuthAccountConnected', () => {
     expect(oauthAuthFlow.value).toBeNull();
   });
 
-  // The agent path (`NavigationRequested`) carries no provider, so its marker
-  // cannot be matched and any completion counts as this page's.
   it('fronts a flow opened without a provider on any completion', () => {
     openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(THIS_DEVICE));
     expect(focusCallingWindow).toHaveBeenCalledTimes(1);
   });
 
-  // The regression that put a second Lucidos window on screen when an
-  // authorization landed. Every window of the desktop app reports the same
-  // device id, so the device gate above cannot tell them apart. The page that
-  // called `openOAuthAuthorizationUrl` is the one that may come forward.
   it('does not front a window that never opened an authorization page', () => {
     handleOAuthAccountConnected(connected(THIS_DEVICE));
     expect(focusCallingWindow).not.toHaveBeenCalled();
-    // A lone window is the last-touched one, so it still shows the toast.
     expect(toasts.value).toHaveLength(1);
   });
 
-  // The regression the device actor exists to prevent.
   it('leaves a device that did not start the flow alone', () => {
     openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(OTHER_DEVICE));
@@ -142,7 +117,6 @@ describe('handleOAuthAccountConnected', () => {
     expect(toasts.value).toHaveLength(0);
   });
 
-  // An engine-internal reconnect has no initiating device, so nobody is fronted.
   it('does nothing device-scoped when the event carries no actor', () => {
     openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(null));
@@ -155,20 +129,14 @@ describe('handleOAuthAccountConnected', () => {
     openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(THIS_DEVICE));
     expect(focusCallingWindow).not.toHaveBeenCalled();
-    // The toast still fires: a browser user wants to know it landed.
     expect(toasts.value).toHaveLength(1);
   });
 
-  // A provider with no userinfo endpoint (Dropbox, before the POST support)
-  // reports no email. The toast must not render "connected (null)".
   it('omits the email when the provider did not report one', () => {
     handleOAuthAccountConnected(connected(THIS_DEVICE, null));
     expect(toasts.value[0].message).toBe('dropbox connected');
   });
 
-  // The reported bug. The authorization page was routed into the experimental
-  // in-app browser, which providers refuse to run a sign-in flow inside. It now
-  // always leaves the app, so there is no panel of ours to close afterwards.
   describe('the authorization page leaves the app', () => {
     it('hands the URL to the outside-the-app opener, never the in-app panel', () => {
       openOAuthAuthorizationUrl(AUTH_URL);
@@ -181,8 +149,6 @@ describe('handleOAuthAccountConnected', () => {
       expect(oauthAuthFlow.value).toEqual({ provider: 'dropbox' });
     });
 
-    // Whatever the panel shows is the user's own business now: an authorization
-    // never puts anything there, so nothing lands that is ours to take away.
     it('leaves whatever the panel is showing alone', () => {
       openOAuthAuthorizationUrl(AUTH_URL);
       panelOverlay.value = { type: 'url-preview', url: 'https://example.com/other' };
@@ -196,60 +162,16 @@ describe('handleOAuthAccountConnected', () => {
   });
 });
 
-/**
- * A user who CLICKED Connect must get feedback. `handleOAuthAccountConnected`
- * normally owns the success toast (it knows the email and also fronts the
- * window), but it is device-scoped and silent when the actor isn't this device
- * or the SSE never arrived. Without a fallback the button would just stop
- * spinning, which is what the first cut of this change shipped.
- */
-describe('the OAuth toast across windows', () => {
-  let other: BroadcastChannel;
-  let stop: () => void;
-
-  async function otherAuthorizes(provider: string | null): Promise<void> {
-    const { windowId } = await import('../../utils/windowStorage');
-    other.postMessage({
-      type: 'state',
-      state: {
-        id: `${windowId()}-other`, focusedThreadId: null, appId: null,
-        authorizing: { provider }, activeAt: Date.now() + 1000,
-      },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-
-  beforeEach(async () => {
+describe('the OAuth delivery boundary', () => {
+  it('queues identity and keeps focus independent of toast acceptance', () => {
     oauthAuthFlow.value = null;
     toasts.value = [];
-    const { installWindowPeers } = await import('../windowPeers');
-    const { WORKSPACE_ID } = await import('../../utils/basePath');
-    other = new BroadcastChannel(`lucidos-window-peers:${WORKSPACE_ID ?? ''}`);
-    stop = installWindowPeers(() => ({
-      focusedThreadId: null,
-      appId: null,
-      authorizing: oauthAuthFlow.peek() && { provider: oauthAuthFlow.peek()!.provider },
-    }));
-  });
-  afterEach(() => {
-    stop();
-    other.close();
-  });
-
-  // Two windows waiting on the same provider: one toast, in the last-touched.
-  it('toasts once when two windows authorize the same provider', async () => {
+    submitInteractiveRequest.mockImplementationOnce(() => {});
     openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
-    await otherAuthorizes('dropbox');
-    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    handleOAuthAccountConnected(connected(THIS_DEVICE), 'connected-event');
+    expect(submitInteractiveRequest).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'oauth-connected' }), 'connected-event');
+    expect(focusCallingWindow).toHaveBeenCalled();
     expect(toasts.value).toHaveLength(0);
-  });
-
-  // The window waiting on THIS provider wins over one waiting on another.
-  it('toasts in the window authorizing this provider', async () => {
-    openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
-    await otherAuthorizes('google');
-    handleOAuthAccountConnected(connected(THIS_DEVICE));
-    expect(toasts.value).toHaveLength(1);
   });
 });
 
@@ -270,9 +192,6 @@ describe('grantOAuthScope success feedback', () => {
     expect(toasts.value.map((t) => t.message)).toEqual(['dropbox connected']);
   });
 
-  // The normal case: the SSE lands first (the engine emits inside its own write
-  // path, before the result the complete call awaits), so the richer toast has
-  // already fired and this must not stack a second, plainer one on top.
   it('stays quiet when the connected-event already reported it', async () => {
     completeOAuth.mockImplementation(async () => {
       handleOAuthAccountConnected(connected(THIS_DEVICE));

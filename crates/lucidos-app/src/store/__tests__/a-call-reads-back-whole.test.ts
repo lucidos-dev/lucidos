@@ -1,24 +1,3 @@
-/** Every turn of a call reaches the transcript.
- *
- *  The call replayed here is the one in
- *  `docs/plans/2026-08-30-the-talker-sees-the-open-question.md`. Nine spoken
- *  turns happened and two rendered, and three independent gates each dropped
- *  their own share.
- *
- *  A resolved question divider suppressed its whole body, and on a voice
- *  thread that body is the call: the divider is an exchange boundary, so every
- *  spoken turn said while the card sat open folds in as its steps. The
- *  caller's own words had no render case at all. And a greeting said before
- *  anything started a turn landed with no exchange to go in.
- *
- *  No audio is kept, so a dropped spoken turn is gone rather than merely
- *  unrendered. That is what makes each of the three a real loss.
- *
- *  ORDER is asserted as tightly as completeness, and the same replay is what
- *  catches a reorder. A caller's utterance is a boundary now, so the divider's
- *  re-anchor has later exchanges to jump over. See
- *  `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
- */
 import { describe, it, expect } from 'vitest';
 import { ev, heard, put, said } from './call-fixtures';
 import {
@@ -32,7 +11,6 @@ import {
 
 const MSG = 'msg-1';
 
-/** The whole call, in the order the engine wrote it. */
 function theCall(): Map<number, StoredEvent> {
   return new Map([
     ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
@@ -79,7 +57,6 @@ function theCall(): Map<number, StoredEvent> {
   ]);
 }
 
-/** Every spoken line the call produced, in order. */
 const SPOKEN = [
   'Hi there. How can I help?',
   'I can check that for you.',
@@ -95,9 +72,6 @@ describe('a call reads back whole', () => {
     const exchanges = groupIntoExchanges(theCall());
     const drawn: string[] = [];
     for (const exchange of exchanges) {
-      // A caller's utterance always opens a boundary, and a greeting opens one
-      // when there is no turn to land in. Both draw their words in the
-      // initiator panel. Every reply Lucidos gave is a step.
       const starter = exchange.userEvent as { type: string; text?: string };
       if (starter.type === 'SpokenReplyGenerated' || starter.type === 'SpokenMessageReceived') {
         drawn.push(starter.text ?? '');
@@ -122,10 +96,6 @@ describe('a call reads back whole', () => {
     ]);
   });
 
-  /** The divider owns the turn's continuation, so a resolution normally moves
-   *  it to the end of the timeline. It may not move past what the caller said
-   *  in the meantime: the card holds spoken rows of its own, and they were said
-   *  first. Moving it would print them after two later utterances. */
   it('leaves the resolved divider above the utterances that followed it', () => {
     const types = groupIntoExchanges(theCall()).map(e => e.userEvent.type);
     expect(types).toEqual([
@@ -137,10 +107,6 @@ describe('a call reads back whole', () => {
     ]);
   });
 
-  /** The same guard, over the OTHER half of an utterance. A caller's words are
-   *  a `MessageReceived` when the talker delegated them. The reader sees the
-   *  same bubble either way, so the card may not move below one of those
-   *  either. Same call, with the two talker-only utterances delegated. */
   it('holds the divider above a DELEGATED utterance too', () => {
     const events = theCall();
     events.delete(12);
@@ -181,15 +147,10 @@ describe('a call reads back whole', () => {
     const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked');
     if (!divider) throw new Error('the question opened no divider');
 
-    // Resolved without an answer, which is what normally hides the body.
     expect(questionDividerResolution(divider)).toBe('canceled');
-    // And five spoken rows sat in that body, so it renders anyway.
     expect(dividerBodyIsSuppressed(divider, exchangeResponseEvents(divider))).toBe(false);
   });
 
-  /** The other panel that suppresses its own body. A change banner is a
-   *  boundary, so a greeting said while one sat at the bottom folds in here.
-   *  Suppressed, the line is gone rather than hidden: no audio is kept. */
   it('keeps a change banner drawing a call that landed under it', () => {
     for (const banner of ['ChangeApplied', 'ChangeApplyFailed'] as const) {
       const events = new Map([

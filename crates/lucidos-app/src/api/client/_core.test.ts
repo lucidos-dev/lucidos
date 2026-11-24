@@ -3,12 +3,6 @@ import { json, mutatingFetch, API, isTransientFetchError, retryTransient, throwI
 import { trackDeviceRegistration } from '../../utils/deviceRegistration';
 import { engineRestarting } from '../../store/store';
 
-// While the engine restarts (Switch to new version) every connection is dropped, so a
-// GET fired in that window hits a dead socket and surfaces as
-// `TypeError: Load failed` — which the page behind the "Restarting engine…"
-// overlay paints as a spurious "Failed to load…" error. `_core` holds GET reads
-// until the restart completes; these tests pin that gate, plus its two
-// exemptions (the health probe and mutations).
 
 const originalFetch = globalThis.fetch;
 
@@ -39,13 +33,11 @@ describe('read gate during engine restart', () => {
     let settled = false;
     const p = json(`${API}/changes`).then(() => { settled = true; });
 
-    // Let microtasks drain — the read must NOT touch the network mid-restart.
     await Promise.resolve();
     await Promise.resolve();
     expect(mockFetch).not.toHaveBeenCalled();
     expect(settled).toBe(false);
 
-    // Watchdog flips the flag on reconnect; the queued read now runs.
     engineRestarting.value = false;
     await p;
     expect(mockFetch).toHaveBeenCalledTimes(1);
@@ -71,14 +63,7 @@ describe('read gate during engine restart', () => {
   });
 });
 
-/** WebKit (iOS Safari, the packaged WKWebView) rejects an aborted fetch with its
- *  own `AbortError: Fetch is aborted` instead of the signal's `reason`, so our
- *  fired deadline arrives looking exactly like a page-lifecycle cancel. That is
- *  how a timed-out repositories read painted "Failed to load repositories /
- *  Fetch is aborted" in the packaged app. `_core` re-stamps it as the
- *  `TimeoutError` Chrome and Firefox already deliver. */
 describe('client-side deadline normalization', () => {
-  /** Rejects the way WebKit does the moment the composed signal aborts. */
   function abortingFetch() {
     return vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       const fail = () => reject(new DOMException('Fetch is aborted', 'AbortError'));
@@ -100,7 +85,6 @@ describe('client-side deadline normalization', () => {
     globalThis.fetch = abortingFetch() as unknown as typeof fetch;
     const controller = new AbortController();
     const p = json(`${API}/threads/search`, { signal: controller.signal });
-    // Let awaitEngineReady + the fetch call drain before cancelling.
     await Promise.resolve();
     await Promise.resolve();
     controller.abort();
@@ -108,27 +92,10 @@ describe('client-side deadline normalization', () => {
   });
 });
 
-/**
- * An error body is a payload, and a payload is not a message.
- *
- * The regression (iOS Safari at 390pt): a compose PUT reached the workspace
- * gateway while the engine was away, so the gateway answered its 503 boot
- * splash, an 8 KB HTML page. `throwIfNotOk` put that page into `ApiError.reason`
- * verbatim. The toast rendered it as a bold line over a bulleted list of the
- * page's own `<meta>` tags, covering the transcript.
- *
- * The whole contract is here, because the shapes only differ by body: JSON keeps
- * its field, markup is discarded, plain text is reduced to one clamped line.
- * Reasoning about them apart is how "surface the body, it might be a panic"
- * became "surface the body, it might be a web page".
- */
 describe('a failed response never surfaces its body', () => {
   beforeEach(() => { engineRestarting.value = false; });
   afterEach(() => { globalThis.fetch = originalFetch; vi.restoreAllMocks(); });
 
-  /** What `crates/lucidos-gateway/src/proxy.rs::starting_page` actually sends,
-   *  down to the marker header the boot splash is identified by. Truncated: the
-   *  real page inlines the whole splash stylesheet. */
   function bootSplash(): Response {
     const html = [
       '<!doctype html><html><head>',
@@ -147,7 +114,6 @@ describe('a failed response never surfaces its body', () => {
     });
   }
 
-  /** The rejection `throwIfNotOk` throws for this response. */
   async function reject(res: Response): Promise<ApiError> {
     return throwIfNotOk(res).then(
       () => { throw new Error('throwIfNotOk resolved on a failed response'); },
@@ -161,26 +127,19 @@ describe('a failed response never surfaces its body', () => {
     expect(err.reason).toBe('Lucidos is restarting');
     expect(err.message).not.toMatch(/[<>]/);
     expect(err.message.length).toBeLessThan(60);
-    // Nothing to read fields off, so nothing is kept: holding the text is how
-    // it reached the screen.
     expect(err.body).toBeUndefined();
     expect(err.bootSplash).toBe(true);
   });
 
   it('discards an UNMARKED HTML holding page too', async () => {
-    // A reverse proxy or a captive portal in front of the gateway sends its own
-    // page and knows nothing about our marker.
     const err = await reject(new Response('<html><body><h1>502 Bad Gateway</h1></body></html>', {
       status: 502,
-      // Explicit because a constructed Response carries no reason phrase, where
-      // an HTTP/1.1 answer does. The HTTP/2 case (always `''`) is below.
       statusText: 'Bad Gateway',
       headers: { 'Content-Type': 'text/html' },
     }));
 
     expect(err.message).not.toMatch(/[<>]/);
     expect(err.reason).toBe('Bad Gateway');
-    // Only a 503 holding page means "not serving yet". A 502 is a real failure.
     expect(err.bootSplash).toBe(false);
   });
 
@@ -195,7 +154,6 @@ describe('a failed response never surfaces its body', () => {
   });
 
   it('keeps a JSON body whole, so a caller can format its own card', async () => {
-    // The archive endpoint's 409 carries `blocking`, which the caller lists.
     const body = { reason: 'thread has running children', blocking: ['a', 'b'] };
     const err = await reject(new Response(JSON.stringify(body), { status: 409 }));
 
@@ -211,8 +169,6 @@ describe('a failed response never surfaces its body', () => {
 
     expect(err.reason).toBe('No extraction provider available');
     expect(err.message).not.toContain('\n');
-    // The ENGINE answered, so this is a verdict the user is owed, not a
-    // holding page.
     expect(err.bootSplash).toBe(false);
   });
 
@@ -227,19 +183,12 @@ describe('a failed response never surfaces its body', () => {
   });
 
   it('names the status when the body is empty and statusText is too', async () => {
-    // HTTP/2 carries no reason phrase, so `res.statusText` is always `''` there.
-    // A bare "Compose sync failed: 409" tells the user nothing.
     const err = await reject(new Response(null, { status: 409, statusText: '' }));
 
     expect(err.reason).toBe('HTTP 409');
   });
 
   it('leaves a body read that FAILED transiently alone', async () => {
-    // Reading the body is a second chance to fail, and not every failure is
-    // about the content: the deadline is still armed while the stream runs, and
-    // a dropped tunnel rejects mid-body. Re-stamping those as unreadable JSON
-    // would make a radio handoff a verdict, and the park and retry paths read
-    // exactly that classification.
     for (const rejection of [
       new DOMException('Fetch is aborted', 'AbortError'),
       new TypeError('Load failed'),
@@ -259,9 +208,6 @@ describe('a failed response never surfaces its body', () => {
   });
 
   it('does not quote an OK body that is not JSON either', async () => {
-    // A captive portal or a tunnel interstitial answers 200 with its login
-    // page, so `throwIfNotOk` waves it through and `res.json()` is what fails.
-    // V8 puts the payload's first characters in the `SyntaxError` it throws.
     globalThis.fetch = vi.fn().mockResolvedValue(new Response(
       '<!doctype html><html><head><title>Sign in</title></head></html>',
       { status: 200, headers: { 'Content-Type': 'text/html' } },
@@ -286,10 +232,6 @@ describe('isTransientFetchError / retryTransient', () => {
   });
 
   it('classifies the gateway boot splash as transient: it is no verdict at all', () => {
-    // The gateway answered for an engine it could not reach, so the request
-    // never got to the thing that decides. Every caller that parks or retries
-    // reads this predicate, and a compose draft that takes the verdict branch
-    // instead is dropped from the re-send queue.
     expect(isTransientFetchError(new ApiError(503, 'Lucidos is restarting', undefined, true))).toBe(true);
   });
 
@@ -300,8 +242,6 @@ describe('isTransientFetchError / retryTransient', () => {
   });
 
   it('does NOT classify a 503 the ENGINE sent as transient', () => {
-    // "The embedding model is still loading" is an answer the user is owed.
-    // Silencing it leaves a rebuild button doing nothing, with no reason given.
     const jsonBody = new ApiError(503, 'embedder not ready', { error: 'embedder not ready' });
     expect(isTransientFetchError(jsonBody)).toBe(false);
     expect(isTransientFetchError(new ApiError(503, 'No extraction provider available'))).toBe(false);
@@ -328,8 +268,6 @@ describe('isTransientFetchError / retryTransient', () => {
   });
 });
 
-// Every mutation the app sends goes through these two. So this is where a
-// mutation waits for the device registration it needs (ADR 0169).
 describe('a mutation waits for a pending device registration', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
   let finishRegistration: () => void;
@@ -366,8 +304,6 @@ describe('a mutation waits for a pending device registration', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  // The send path dispatches a lone send inside the caller's turn, so a
-  // settled registration must cost a mutation not even a microtask.
   it('sends a mutation at once when registration has settled', async () => {
     finishRegistration();
     await Promise.resolve();
@@ -380,5 +316,27 @@ describe('a mutation waits for a pending device registration', () => {
   it('lets a read through without waiting', async () => {
     await json(`${API}/threads/list`);
     expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('API read transport retry', () => {
+  afterEach(() => { globalThis.fetch = originalFetch; });
+  it('retries a transport failure through json', async () => {
+    const request = vi.fn().mockRejectedValueOnce(new TypeError('Load failed')).mockResolvedValueOnce(okJson());
+    globalThis.fetch = request;
+    await expect(json(API + '/threads/list')).resolves.toEqual({ ok: true });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+  it('does not retry the latency health probe', async () => {
+    const request = vi.fn().mockRejectedValue(new TypeError('Load failed'));
+    globalThis.fetch = request;
+    await expect(json(API + '/health')).rejects.toThrow('Load failed');
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  it('does not retry body parsing', async () => {
+    const request = vi.fn().mockResolvedValue(new Response('bad JSON'));
+    globalThis.fetch = request;
+    await expect(json(API + '/threads/list')).rejects.toThrow();
+    expect(request).toHaveBeenCalledTimes(1);
   });
 });

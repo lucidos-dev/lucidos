@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { describeEngineTool } from '../tool-descriptions';
 
-// The read decision (ADR 0417) runs on every turn, so its no must read
-// quietly. A yes still says it asks the user to read the reply.
 describe('describeEngineTool: request_read', () => {
   it('labels a no quietly', () => {
     expect(describeEngineTool('request_read', { read: false })).toBe('No read needed');

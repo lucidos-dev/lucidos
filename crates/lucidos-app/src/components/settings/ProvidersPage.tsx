@@ -1,4 +1,7 @@
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+import { PREF_VERTEX_REGION } from '@lucidos/preference-catalog';
+import { loadSpendCapHolds, spendCapHolds } from '../../store/actions/spendCapHolds';
+import { LoadableError } from '../shared/LoadableError';
+
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { loadChatGptPlanStatus } from '../../store/actions/chatgptPlan';
 import { loadClaudeGatewayStatus } from '../../store/actions/claudeGateway';
@@ -38,17 +41,12 @@ const VERTEX_REGIONS = [
   { value: 'asia-east1', label: 'asia-east1 (Taiwan)' },
 ];
 
-/** The Vertex provider block. Unlike the other providers it has no credential
- *  to enter: it authenticates via ambient GCP Application Default Credentials
- *  (`gcloud auth application-default login`), so its only knob is the region. */
 function VertexProviderSettings() {
   return (
     <ProviderBlock
       id="vertex"
       label="Vertex AI"
       anchor={providerAnchor('vertex')}
-      // No credential to keep: Vertex is configured on the machine, by gcloud.
-      // So its off state promises nothing about a stored key.
       hasStoredConfig={false}
       explainer={
         <>
@@ -70,7 +68,7 @@ function VertexProviderSettings() {
           options={VERTEX_REGIONS}
           value={currentVertexRegion()}
           freeText
-          placeholder={`e.g. ${PREFERENCE_CATALOG.vertex_region.fallback}`}
+          placeholder={`e.g. ${PREF_VERTEX_REGION.fallback}`}
           onChange={setVertexRegion}
         />
       </div>
@@ -78,13 +76,10 @@ function VertexProviderSettings() {
   );
 }
 
-/** Settings → Providers: where every backend is set up, in two sections. The
- *  model providers serve the registry's models. System One providers answer
- *  typed judgments and serve none of them. */
 export function ProvidersPage() {
-  // Subscribe to preference changes, which hold each provider's switch.
   preferences.value;
   usePanelRefresh('providers settings', () => Promise.all([
+    loadSpendCapHolds(),
     loadPreferences(),
     loadCredentials(),
     loadClaudeGatewayStatus(),
@@ -95,6 +90,7 @@ export function ProvidersPage() {
     <>
       <div class="settings-section">
         <div class="settings-section-title">Model providers</div>
+        {spendCapHolds.value.status === 'failed' && <LoadableError noun="spend-cap holds" error={spendCapHolds.value.error} onRetry={() => void loadSpendCapHolds()} />}
         <VertexProviderSettings />
         <AnthropicProviderSettings />
         <OpenAiProviderSettings />

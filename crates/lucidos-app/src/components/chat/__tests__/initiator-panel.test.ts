@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { describeInitiator } from '../ChatExchange';
+import { actorInitiator, describeInitiator } from '../ChatExchange';
+import { renderOriginSection, renderChannelSection, technicalDetailRows } from '../MessageRoutePanel';
 import { ENGINE_LABEL, LUCIDOS_AGENT_LABEL, SYSTEM_LABEL, type Exchange } from '../../../store/thread-events';
 import type { ComponentChildren, VNode } from 'preact';
 import { vnodeToText } from './vnodeToText';
@@ -10,9 +11,6 @@ function exchangeWith(userEvent: Exchange['userEvent']): Exchange {
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
 
-// Every initiator panel follows the same shape: `label` is WHO performed the
-// action, `summary` is WHAT was done. The route popover shows both, and a
-// turn the agent did not write draws them as a card rather than a header.
 describe('describeInitiator — label is WHO, summary is WHAT', () => {
   it('human-mode MessageReceived: label "You", no summary, user variant', () => {
     const ex = exchangeWith({
@@ -28,11 +26,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('agent-mode MessageReceived (parent_thread origin): label is "Lucidos Agent", summary names the sending thread, lucidos variant', () => {
-    // Parent thread's LLM kicked off this child via run_thread — the Lucidos
-    // agent (not the engine itself) is the initiator, so the WHO label must be
-    // "Lucidos Agent" and the panel accent must be the agent's violet.
-    // The engine label/variant stays for engine-internal triggers
-    // (ContinuationStarted, MissingHardeningDetected, scheduler with no human, …).
     const ex = exchangeWith({
       type: 'MessageReceived',
       text: '[Child thread completed] ...',
@@ -86,9 +79,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('API-originated MessageReceived (human mode): chip is "API caller", summary "API message"', () => {
-    // "You" is reserved for `kind: device`. An anonymous HTTP caller never
-    // impersonates the user in the timeline — the chip renders "API caller"
-    // and the popover discloses the user-agent for forensics.
     const ex = exchangeWith({
       type: 'MessageReceived',
       text: 'curl request',
@@ -102,9 +92,65 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
+  it('unattested MessageReceived (human mode): never "You", even with a claimed device', () => {
+    const ex = exchangeWith({
+      type: 'MessageReceived',
+      text: 'typed device',
+      mode: 'human',
+      channel: 'chat',
+      origin: { kind: 'unattested_caller', mode: 'human', claimed_device_id: 'owner-phone' },
+    });
+    const desc = describeInitiator(ex, '<p>typed device</p>', [], 'tid');
+    expect(desc.label).toBe('A program that named a device');
+    expect(desc.summary).toBe('Message from a program that named a device');
+    expect(desc.variant).toBe('system');
+  });
+
+  it('unattested caller with the local token: the chip names a local program', () => {
+    const userEvent: Exchange['userEvent'] = {
+      type: 'MessageReceived',
+      text: 'from a terminal',
+      mode: 'engine',
+      channel: 'chat',
+      origin: { kind: 'unattested_caller', mode: 'engine', claimed_local_token: true, user_agent: 'lucidos-cli' },
+    };
+    const desc = describeInitiator(exchangeWith(userEvent), '<p>from a terminal</p>', [], 'tid');
+    expect(desc.label).toBe('A program on this computer');
+    expect(technicalDetailRows(userEvent, userEvent.origin)).toEqual([
+      ['Event type', 'MessageReceived'],
+      ['Claimed credential', 'Machine-local token'],
+      ['Client', 'lucidos-cli'],
+    ]);
+  });
+
+  it('a call from another workspace: its claim or its verdict is in the technical details', () => {
+    const unstamped: Exchange['userEvent'] = {
+      type: 'MessageReceived',
+      text: 'spawn',
+      mode: 'agent',
+      channel: 'chat',
+      origin: { kind: 'unattested_caller', mode: 'agent', claimed_workspace: 'work2' },
+    };
+    expect(technicalDetailRows(unstamped, unstamped.origin)).toEqual([
+      ['Event type', 'MessageReceived'],
+      ['Claimed workspace', 'work2'],
+    ]);
+    const refused: Exchange['userEvent'] = {
+      ...unstamped,
+      origin: {
+        kind: 'workspace',
+        workspace: 'work2',
+        mode: 'agent',
+        verdict: { kind: 'refused', reason: 'No grant.' },
+      },
+    };
+    expect(technicalDetailRows(refused, refused.origin)).toEqual([
+      ['Event type', 'MessageReceived'],
+      ['Its gate said', 'Refused: No grant.'],
+    ]);
+  });
+
   it('ContinuationStarted (no actor): label falls back to engine, summary "Resumed after engine restart"', () => {
-    // Legacy DB rows / auto-resume case carry no actor; chip falls back to the
-    // Lucidos-mark Engine chip.
     const ex = exchangeWith({ type: 'ContinuationStarted' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
@@ -113,8 +159,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ContinuationStarted (device actor): iconless action label "Continued the response" (ResponseCanceled style)', () => {
-    // You clicked Continue — rendered like the cancel boundary: no icon, the
-    // action IS the label, no separate summary; attribution is in the popover.
     const ex = exchangeWith({
       type: 'ContinuationStarted',
       actor: { kind: 'device', device_id: 'd-1' },
@@ -127,12 +171,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ContinuationStarted (auto_recovery_after_hang): NOT labeled an engine restart', () => {
-    // A hung subprocess OR a stray signal-kill (e.g. another workspace's
-    // `cargo check` build-lock kill landing on this CC subprocess) auto-resumes
-    // with reason=auto_recovery_after_hang — nothing restarted, so it must not
-    // claim "Resumed after engine restart" (the wording that made a user think
-    // restarting an unrelated workspace had restarted theirs). The reason wins
-    // over the actor.
     const ex = exchangeWith({
       type: 'ContinuationStarted',
       reason: 'auto_recovery_after_hang',
@@ -144,8 +182,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ResponseAborted (system actor): chip is "System", summary "Response interrupted"', () => {
-    // The host system killed the underlying process (engine shutdown,
-    // safety-net catch, OS signal). Engine just marked it on recovery.
     const ex = exchangeWith({
       type: 'ResponseAborted',
       actor: { kind: 'system' },
@@ -157,8 +193,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ResponseAborted (legacy engine actor): falls back to "Lucidos Engine"', () => {
-    // Historical DB rows pre-System variant carry `Engine{OrphanRecovery}`.
-    // The frontend keeps the old label — we don't migrate old rows.
     const ex = exchangeWith({
       type: 'ResponseAborted',
       actor: { kind: 'engine', reason: { kind: 'orphan_recovery' } },
@@ -170,12 +204,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ResponseAborted (switch teardown): iconless action label "Paused by restart" (ResponseCanceled style)', () => {
-    // /api/v1/restart → abort_in_flight_for_restart pre-emits `engine_shutdown`
-    // with the device actor that hit Restart. BOTH halves are the fingerprint
-    // (`isSwitchTeardownAbort`), so the fixture carries both. Rendered like the
-    // cancel boundary: no icon, the action ("Paused by restart") IS the label, no
-    // separate summary. The wording matches the `paused` thread status the same
-    // abort leaves.
     const ex = exchangeWith({
       type: 'ResponseAborted',
       cause: 'engine_shutdown',
@@ -188,15 +216,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 
   it('ResponseAborted (device actor, no cause): reads as an interruption, not a pause', () => {
-    // A device actor ALONE is not the switch fingerprint, so this legacy row
-    // (persisted before `cause` existed) reads "Response interrupted". The
-    // wording on those old transcript rows is a deliberate cost of keeping the
-    // frontend fingerprint identical to the backend's: `SWITCH_TEARDOWN_ABORT_SQL`
-    // requires `cause = 'engine_shutdown'` too, so a legacy row is not a switch on
-    // either side. Making only the frontend lenient is what would drift.
-    //
-    // Still the iconless action style: the branch keys on the device actor, and
-    // whatever the cause, a device-attributed abort IS something the user did.
     const ex = exchangeWith({
       type: 'ResponseAborted',
       actor: { kind: 'device', device_id: 'd-1' },
@@ -206,11 +225,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.label).toBe('Response interrupted');
   });
 
-  /** The user's **Stop waiting**, in the same iconless boundary style as the
-   *  cancel below it and for the same reason: a person did something to this
-   *  thread, and the action IS the header. The header names what was stopped,
-   *  because once the clock indicator drops the wait this line is the only
-   *  place the subscription is named at all. */
   it('EventWaitCanceled (user stop): iconless action label naming what was stopped', () => {
     const ex = exchangeWith({
       type: 'EventWaitCanceled',
@@ -223,22 +237,15 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.icon).toBeNull();
     expect(desc.label).toBe("Stopped waiting for tonight's E2E suite to pass");
     expect(desc.summary).toBeUndefined();
-    // The chip stays clickable: the popover is where the device that pressed
-    // the button is disclosed, off this event's own `actor`.
     expect(desc.actorClickable).not.toBe(false);
   });
 
-  /** A pre-2026-08-07 row carries no reason, so the line says the one thing it
-   *  knows rather than trailing an empty colon. */
   it('EventWaitCanceled (user stop, legacy row): names no subscription it cannot name', () => {
     const ex = exchangeWith({ type: 'EventWaitCanceled', wait_id: 'w1', cause: 'user_stop' });
     expect(describeInitiator(ex, '', [], 'tid').label).toBe('Stopped waiting for an event');
   });
 
   it('ResponseCanceled: no chip — "Response canceled" IS the header label, no summary, no icon', () => {
-    // The cancel boundary drops the actor chip: the label is the header text and
-    // clicking it opens the Initiator info popover. icon is null so ActorChipBody
-    // skips the glyph span. Holds whether or not an actor was plumbed through.
     const ex = exchangeWith({ type: 'ResponseCanceled' });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.label).toBe('Response canceled');
@@ -282,18 +289,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
-  /** An event delivery is the ONE injection whose text is not its content:
-   *  the prose is the model's prompt and carries the matched payload as
-   *  pretty-printed JSON, which is a screen of raw JSON in a transcript. When
-   *  the resolved delivery is in hand, the event row in the body names the event
-   *  instead.
-   *
-   *  **No panel summary line**, because that row already names the event that
-   *  arrived. Carrying one printed the same words twice, once as plain prose in
-   *  the header and once in the card underneath (reported 2026-08-10). Same as
-   *  `TriggerStarted` and `ChildThreadCompleted` above, whose rows own their
-   *  prefixes too. An injection with no resolved delivery is NOT this case and
-   *  keeps its prose summary, covered by the test below. */
   it('PromptInjected (event delivery): the row names the event, the header stays quiet', () => {
     const ex = exchangeWith({
       type: 'PromptInjected',
@@ -307,10 +302,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.summary).toBeUndefined();
     const body = desc.details as { type?: { name?: string }; props?: Record<string, unknown> };
     expect(body?.type?.name).toBe('EventDeliveryBody');
-    // Each field lands on its own prop. They were three trailing
-    // `string | undefined` positionals until 2026-08-10, and adding one in the
-    // middle re-bound the payload to it with no type error and no failing
-    // assertion; one object argument makes that unrepresentable.
     expect(body?.props).toMatchObject({
       eventType: 'CodingAgentIdled',
       eventId: 'evt-src-1',
@@ -318,9 +309,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     });
   });
 
-  /** The link can dangle: the delivery sits in an earlier exchange, so a long
-   *  thread can load the anchor without it. Falling back to the prose is the
-   *  honest thing to show when the structured half is not in hand. */
   it('PromptInjected (delivery not loaded): falls back to the prose body', () => {
     const ex = exchangeWith({
       type: 'PromptInjected',
@@ -332,9 +320,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.details).toBeDefined();
   });
 
-  /** The reported card: a wait that timed out read "Auto-prompt sent", with
-   *  nothing to say where the words came from. An older row carries no origin,
-   *  so its frozen opening sentence identifies it. */
   it('PromptInjected (timed-out wait, older row): summary "Wait timed out"', () => {
     const ex = exchangeWith({
       type: 'PromptInjected',
@@ -356,9 +341,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.summary).toBe('Wait timed out');
   });
 
-  // Regression: a child→parent callback emits PromptInjected with
-  // origin = ThreadLink { direction: 'child', mode: 'agent' }. The chip must
-  // render "Lucidos Agent", not "Lucidos Engine".
   it('PromptInjected (child callback): label is Lucidos Agent', () => {
     const ex = exchangeWith({
       type: 'PromptInjected',
@@ -371,8 +353,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('lucidos');
   });
 
-  // Change lifecycle events: label is the actor (who did it). The change event row in
-  // the body says the action, so the panel draws no summary line.
   it('ChangeApplied (engine actor): label is engine, change event row', () => {
     const ex = exchangeWith({
       type: 'ChangeApplied',
@@ -441,11 +421,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.accent).toBe('change-failed');
   });
 
-  /** No panel summary line: the event row in the body reads "Trigger fired:
-   *  morning-summary", so a header saying "Trigger fired" above it would state
-   *  the same thing twice. Same shape as `ChildThreadCompleted` below, whose row
-   *  has owned its own prefix all along. The popover's Origin row is unaffected:
-   *  it renders the trigger through `renderTriggerOrigin`, not through this. */
   it('TriggerStarted: label is engine, no panel summary line (the event row owns the prefix)', () => {
     const ex = exchangeWith({
       type: 'TriggerStarted',
@@ -496,9 +471,6 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   });
 });
 
-// User-driven control turns render in the "Response canceled" style: no icon,
-// the action AS the label, attribution in the popover. Only the device-owner
-// case is affected — engine/system-driven variants keep their chip.
 describe('describeInitiator — user control turns render iconless (ResponseCanceled style)', () => {
   it('PromptInjected (device origin): iconless label names it as your message, injected body kept', () => {
     const ex = exchangeWith({
@@ -520,7 +492,6 @@ describe('describeInitiator — user control turns render iconless (ResponseCanc
   });
 
   it('engine/system-driven abort + auto-resume KEEP their chip (icon present)', () => {
-    // Not user actions — the iconless treatment must NOT apply.
     const resume = describeInitiator(exchangeWith({ type: 'ContinuationStarted' }), '', [], 'tid');
     expect(resume.icon).not.toBeNull();
     expect(resume.label).toBe(ENGINE_LABEL);
@@ -531,8 +502,6 @@ describe('describeInitiator — user control turns render iconless (ResponseCanc
   });
 });
 
-// Recursively flatten a vnode tree to its visible text — the divider header
-// `status` is a `<span>` vnode (label + optional glyph), not a bare string.
 function textOf(node: ComponentChildren): string {
   if (node == null || node === false || node === true) return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -561,15 +530,9 @@ const sysAbort = (seq: number): Exchange['steps'][number] => ({
   event: { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' } } as Exchange['userEvent'],
 });
 
-// Regression: a question/permission divider whose turn ended WITHOUT the user
-// answering must not claim the user "Canceled" it. A system abort (engine
-// restart recovery) — like every other unanswered-terminal cause — reads as
-// "Unanswered" / "Unresolved"; only an explicit user cancel reads "Canceled".
-// The turn's actual terminal cause (Aborted ⚠ / Error ✕) is carried by the
-// response panel + the abort boundary, not the divider header.
 describe('describeInitiator — divider header reflects the QUESTION, not the turn', () => {
   it('system-aborted unanswered question reads "Unanswered", never "Canceled"', () => {
-    const desc = describeInitiator(askedDivider([sysAbort(1)]), '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
+    const desc = describeInitiator(askedDivider([sysAbort(1)]), '', [], 'tid',  true,  true);
     expect(textOf(desc.status)).toContain('Unanswered');
     expect(textOf(desc.status)).not.toContain('Canceled');
   });
@@ -577,7 +540,7 @@ describe('describeInitiator — divider header reflects the QUESTION, not the tu
   it('agent-overtaken unanswered question reads "Unanswered" (terminated, no answer)', () => {
     const ex = askedDivider();
     ex.questionOvertaken = true;
-    const desc = describeInitiator(ex, '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
+    const desc = describeInitiator(ex, '', [], 'tid',  true,  true);
     expect(textOf(desc.status)).toContain('Unanswered');
     expect(textOf(desc.status)).not.toContain('Canceled');
   });
@@ -585,7 +548,7 @@ describe('describeInitiator — divider header reflects the QUESTION, not the tu
   it('user-canceled question still reads "Canceled ✕"', () => {
     const desc = describeInitiator(
       askedDivider([{ seq: 1, event: { type: 'UserQuestionAnswered', tool_use_id: 'tu_div', answer: { kind: 'Canceled' } } as Exchange['userEvent'] }]),
-      '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true,
+      '', [], 'tid',  true,  true,
     );
     expect(textOf(desc.status)).toContain('Canceled');
     expect(classOf(desc.status)).toContain('exchange-status-canceled');
@@ -597,14 +560,14 @@ describe('describeInitiator — divider header reflects the QUESTION, not the tu
         { seq: 1, event: { type: 'UserQuestionAnswered', tool_use_id: 'tu_div', answer: { kind: 'Selected', option_id: 'opt-0' } } as Exchange['userEvent'] },
         sysAbort(2),
       ]),
-      '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true,
+      '', [], 'tid',  true,  true,
     );
     expect(textOf(desc.status)).toContain('Answered');
     expect(textOf(desc.status)).not.toContain('Unanswered');
   });
 
   it('pending (live) question reads "Needs your answer"', () => {
-    const desc = describeInitiator(askedDivider(), '', [], 'tid', /*responseTerminated*/ false, /*threadIsCC*/ true);
+    const desc = describeInitiator(askedDivider(), '', [], 'tid',  false,  true);
     expect(vnodeToText(desc.status)).toContain('Needs your answer');
   });
 
@@ -621,8 +584,40 @@ describe('describeInitiator — divider header reflects the QUESTION, not the tu
       userSeq: 0,
       steps: [sysAbort(1)],
     };
-    const desc = describeInitiator(ex, '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
+    const desc = describeInitiator(ex, '', [], 'tid',  true,  true);
     expect(textOf(desc.status)).toContain('Unresolved');
     expect(textOf(desc.status)).not.toContain('Canceled');
+  });
+});
+
+describe('unsigned caller disclosure', () => {
+  it('names the workspace claim outside Technical details and offers pairing', () => {
+    const origin = { kind: 'unattested_caller' as const, mode: 'agent' as const, claimed_workspace: 'studio' };
+    const exchange = exchangeWith({ type: 'MessageReceived', text: 'hello', channel: 'chat', mode: 'agent', origin });
+    const desc = describeInitiator(exchange, '<p>hello</p>', [], 'tid');
+    expect(desc.label).toBe('Workspace "studio"');
+    expect(desc.summary).toBe('Message from workspace "studio", by its own account');
+    expect(actorInitiator(origin).icon).toBeNull();
+    const channel = vnodeToText(renderChannelSection(origin));
+    expect(channel).toContain('Sent from');
+    expect(channel).toContain('Workspace "studio", by its own account');
+    const section = renderOriginSection(exchange, undefined, () => undefined);
+    const children = (section.props.children as ComponentChildren[]).filter(child =>
+      !child || typeof child !== 'object' || Array.isArray(child)
+      || (child as AnyVNode).props?.class !== 'route-technical');
+    const body = vnodeToText(children);
+    expect(body).toContain('How Lucidos can check it');
+    expect(body).toContain('Pair a gateway in Settings');
+    expect(body).toContain('If the workspaces use separate gateways, pair them first.');
+    expect(body).toContain('calls sent by a thread through its gateway');
+    expect(body).not.toMatch(/unattested|not verified|unconfirmed/i);
+  });
+
+  it('keeps unknown callers unknown and device names explicitly claimed', () => {
+    expect(actorInitiator({ kind: 'unattested_caller' }).label).toBe('An unknown caller');
+    expect(vnodeToText(renderChannelSection({ kind: 'unattested_caller', claimed_local_token: true })))
+      .toContain('A program on this computer');
+    expect(actorInitiator({ kind: 'unattested_caller', claimed_device_id: 'typed-id' }).label)
+      .toContain('A program that named');
   });
 });

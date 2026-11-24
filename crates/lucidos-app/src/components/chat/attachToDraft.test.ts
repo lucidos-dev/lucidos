@@ -1,13 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Override Node's URL.createObjectURL/revokeObjectURL — the real ones require a
-// Blob instance, but our test uses a plain `File`-shaped object.
 (globalThis as any).URL.createObjectURL = () => 'blob:fake';
 (globalThis as any).URL.revokeObjectURL = () => {};
 
-// Real `updateCompose` writes through to the real draft signal — exactly what
-// the bug needs to expose. We only stub the two thread-bootstrap helpers so
-// the test doesn't need a server-side thread row.
 vi.mock('../../store/actions/compose', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../store/actions/compose')>();
   return {
@@ -39,8 +34,6 @@ import { awaitThreadStarted } from '../../store/actions/compose';
 import { removeAttachedImage, _resetSessionBlobUrlsForTesting } from './pastedImages';
 
 function makeFakeFile(name: string, type: string): File {
-  // `attachImageToActiveDraft` snapshots the bytes via `arrayBuffer()` before
-  // uploading (see the Universal Clipboard fix), so the fake must expose it.
   return {
     name,
     type,
@@ -136,7 +129,6 @@ describe('attachDroppedFilesToDraft', () => {
     expect(confirm).toHaveBeenCalledOnce();
     expect(confirm.mock.calls[0][0]).toContain('report.pdf');
     expect(importFiles).toHaveBeenCalledWith([pdf]);
-    // No warning toast — the confirm dialog replaces it.
     expect(toasts.value).toEqual([]);
   });
 
@@ -255,12 +247,6 @@ describe('attachDroppedFilesToDraft', () => {
   });
 });
 
-/** Cancelling an upload while it is still in flight (clicking the X on the
- *  pending preview) must NOT later add the hash to the draft when the upload
- *  eventually completes. The pending entry's removal IS the user's "cancel"
- *  signal — the in-flight POST resolves regardless, and without a guard the
- *  batched commit re-attaches the image as a confirmed hash. The user sees
- *  the image disappear and pop back a moment later. */
 describe('attachImageToActiveDraft respects cancellation mid-upload', () => {
   beforeEach(() => {
     _resetPendingUploadsForTesting();
@@ -282,39 +268,24 @@ describe('attachImageToActiveDraft respects cancellation mid-upload', () => {
     const file = makeFakeFile('photo.png', 'image/png');
     const attachPromise = attachImageToActiveDraft(file);
 
-    // The request leaves once the bytes are read and hashed, capturing
-    // `resolveUpload`.
     await vi.waitFor(() => expect(uploadThreadBlob).toHaveBeenCalledTimes(1));
 
-    // Pending preview is rendered; user sees the image.
     const pendingForThread = pendingUploads.value.get('t-1') ?? [];
     expect(pendingForThread).toHaveLength(1);
     const localId = pendingForThread[0].localId;
 
-    // User clicks X on the still-uploading preview to cancel.
     removePendingUpload('t-1', localId);
     expect(pendingUploads.value.get('t-1')).toBeUndefined();
     expect(getDraft('t-1').image_hashes).toEqual([]);
 
-    // Upload completes server-side anyway — the request was already in flight.
     resolveUpload({ hash: 'sha256-of-photo', mime: 'image/png', byte_size: 1 });
     await attachPromise;
 
-    // The image must stay gone. Before the fix, the draft picks up the hash
-    // and the strip re-renders the image as a confirmed attachment.
     expect(getDraft('t-1').image_hashes).toEqual([]);
     expect(pendingUploads.value.get('t-1')).toBeUndefined();
   });
 });
 
-/** Regression: an image pasted from the system clipboard (notably macOS
- *  Universal Clipboard — copied on an iPhone, pasted on the Mac) is a File
- *  backed by a promised pasteboard resource, readable only during the
- *  synchronous paste-event turn. The old code read its bytes lazily — inside
- *  `uploadThreadBlob`'s FormData serialization, AFTER `await awaitThreadStarted`
- *  — by which point the backing was released and the upload `fetch` threw
- *  `TypeError: Failed to fetch`. The fix snapshots the bytes into an in-memory
- *  File up front, before that await. */
 describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-start gap', () => {
   beforeEach(() => {
     _resetPendingUploadsForTesting();
@@ -326,14 +297,10 @@ describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-s
   afterEach(() => {
     _resetPendingUploadsForTesting();
     _resetComposeDraftsForTesting();
-    // Restore the module-mock default (immediate resolve) for other suites.
     vi.mocked(awaitThreadStarted).mockImplementation(async () => {});
   });
 
   it('reads the source bytes before thread creation completes and uploads an in-memory copy', async () => {
-    // Hold thread creation open so we can observe that the byte read already
-    // happened while the pasteboard-backed File was still valid — the window
-    // during which the old code had NOT yet touched the bytes.
     let startThread!: () => void;
     vi.mocked(awaitThreadStarted).mockImplementation(
       () => new Promise<void>((resolve) => { startThread = () => resolve(); }),
@@ -355,22 +322,15 @@ describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-s
 
     const attachPromise = attachImageToActiveDraft(source);
 
-    // Let the arrayBuffer snapshot microtask settle. Thread creation is still
-    // pending (startThread not called), so the upload has NOT fired yet — but
-    // the bytes are already captured. This is the crux of the fix: the read
-    // does not wait for the async thread-start gap.
     await new Promise((r) => setTimeout(r, 0));
     expect(reads, 'source bytes must be snapshotted before the thread-start gap').toBe(1);
     expect(uploadThreadBlob).not.toHaveBeenCalled();
 
-    // Now let thread creation finish; the upload runs with the snapshot.
     startThread();
     await attachPromise;
 
     expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
     expect(uploaded).not.toBeNull();
-    // The uploaded File is a fresh in-memory copy, never the clipboard-backed
-    // source object.
     expect(uploaded!.file).not.toBe(source);
     const uploadedBytes = new Uint8Array(await uploaded!.file.arrayBuffer());
     expect(Array.from(uploadedBytes)).toEqual(Array.from(bytes));
@@ -382,7 +342,6 @@ describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-s
     const source = {
       name: 'stale.jpg',
       type: 'image/jpeg',
-      // A pasteboard resource already released before we could read it.
       arrayBuffer: async () => { throw new TypeError('Failed to fetch'); },
     } as unknown as File;
 
@@ -396,13 +355,7 @@ describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-s
   });
 });
 
-/** Regression: a macOS Chrome paste of a screenshot declared `image/png` and
- *  handed over ZERO bytes. The composer gated on the declared type, so it drew
- *  a chip with a broken thumbnail. The real reason arrived seconds later as an
- *  upload toast. The gate now reads the bytes the way the engine does, before
- *  the chip exists. */
 describe('attachImageToActiveDraft refuses bytes the server would refuse', () => {
-  /** A source whose declared type is a lie the old gate believed. */
   function sourceOf(name: string, type: string, ...content: number[]): File {
     return {
       name,
@@ -428,7 +381,6 @@ describe('attachImageToActiveDraft refuses bytes the server would refuse', () =>
     (globalThis as any).URL.createObjectURL = () => 'blob:fake';
   });
 
-  /** No chip, no preview URL, no upload, and one toast naming this paste. */
   function expectRefused(fragment: string) {
     expect(objectUrls, 'a refused image must not get a preview URL').toBe(0);
     expect(pendingUploads.value.get('t-1'), 'a refused image must not draw a chip').toBeUndefined();
@@ -465,8 +417,6 @@ describe('attachImageToActiveDraft refuses bytes the server would refuse', () =>
       return { hash: 'sha-real-png', mime: file.type, byte_size: file.size };
     });
 
-    // Declared `application/octet-stream`, but the bytes are a PNG. The server
-    // would store it, so the composer must not refuse it.
     await attachImageToActiveDraft(
       sourceOf('shot', 'application/octet-stream',
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
@@ -479,17 +429,7 @@ describe('attachImageToActiveDraft refuses bytes the server would refuse', () =>
   });
 });
 
-/** Regression: one paste put the same screenshot in the message twice. A blob
- *  address IS the bytes, so a draft holding one hash twice is two references to
- *  one image: the strip drew two identical thumbnails, and we sent the model
- *  the picture twice.
- *
- *  A second attach can come from a repeated Cmd+V, a drop of a file already
- *  pasted, or the picker. Whichever it was, the draft holds each blob once. And
- *  a paste that attaches nothing owes the user a word, or it reads as a dead
- *  gesture. */
 describe('a draft holds each image once', () => {
-  /** Both attaches upload the same bytes, so the server answers one hash. */
   const HASH = 'sha256-of-the-screenshot';
 
   function pngSource(name: string): File {
@@ -534,8 +474,6 @@ describe('a draft holds each image once', () => {
   });
 
   it('holds one hash when both pastes land together', async () => {
-    // The double-fire shape: neither attach can see the other's hash, because
-    // both uploads are in flight when the first commits.
     await Promise.all([
       attachImageToActiveDraft(pngSource('shot.png')),
       attachImageToActiveDraft(pngSource('shot.png')),

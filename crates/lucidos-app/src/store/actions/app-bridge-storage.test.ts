@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * App storage, on the host side of the bridge.
- *
- * The host is the boundary: it decides which app a frame is from its own
- * element, and an app frame cannot name another app. The workspace namespacing
- * is installed for real here, because the gateway topology is where the prime
- * used to come back empty.
- */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { APP_STORAGE_QUOTA, APP_STORAGE_VALUE_MAX, SDK_STORAGE_QUOTA } from '@lucidos/sdk';
 import { installWorkspaceStorage } from '../../utils/workspaceStorage';
@@ -25,9 +17,6 @@ const { clearAppStorage, installAppBridge, _resetAppBridgeForTesting } = await i
 
 type Reply = { ok: boolean; value?: unknown; error?: string };
 
-/** A store whose methods live on its prototype, as the browser's do. The suite's
- *  shared stub keeps them on the instance, where the workspace override cannot
- *  reach, so the namespacing this file is about would never run. */
 class PrototypeStorage {
   readonly entries = new Map<string, string>();
   getItem(key: string): string | null { return this.entries.get(key) ?? null; }
@@ -61,8 +50,6 @@ function mountFrame(src: string): HTMLIFrameElement {
   return frame;
 }
 
-/** Send one bridge op as `frame` and wait for the host's reply. jsdom cannot
- *  set `event.source` through `postMessage`, so the event is built by hand. */
 function ask(frame: HTMLIFrameElement, op: string, args: unknown): Promise<Reply> {
   const win = frame.contentWindow as Window;
   const id = `t-${++counter}`;
@@ -100,8 +87,6 @@ afterEach(() => {
 describe('app storage is scoped per app by the host', () => {
   it('primes what an app wrote, behind the workspace namespace', async () => {
     expect((await set(habit, 'room', 'kitchen')).ok).toBe(true);
-    // The override namespaces the write, and the prime has to find it there.
-    // The literal pins the stored key layout: changing it orphans saved values.
     expect([...local.entries.keys()]).toEqual(['ws:myws:appbridge:habit-tracker:app:room']);
 
     const prime = await ask(habit, 'storage.prime', {});
@@ -126,7 +111,6 @@ describe('app storage is scoped per app by the host', () => {
   });
 
   it('cannot reach another app through the key itself', async () => {
-    // A key is only ever a suffix under the caller's own prefix.
     await set(demo, '../habit-tracker:app:room', 'forged');
     await set(demo, 'appbridge:habit-tracker:app:room', 'forged');
     const habitPrime = (await ask(habit, 'storage.prime', {})).value as any;
@@ -221,10 +205,8 @@ describe('app storage limits and failures', () => {
     const half = 'x'.repeat(APP_STORAGE_VALUE_MAX - 10);
     expect((await set(habit, 'a', half)).ok).toBe(true);
     expect((await set(habit, 'b', half)).ok).toBe(true);
-    // Two halves fit; a third key of any size takes it past the quota.
     expect(APP_STORAGE_QUOTA).toBeLessThan(3 * half.length);
     expect((await set(habit, 'c', half)).ok).toBe(false);
-    // Another app has its own quota.
     expect((await set(demo, 'c', half)).ok).toBe(true);
   });
 

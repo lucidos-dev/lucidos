@@ -69,16 +69,11 @@ describe('resolveThreadActions', () => {
     expect(actions[1]).toMatchObject({ category: 'save', label: '✓ Pinned' });
   });
 
-  // A pinned thread always sits in the inbox (ADR 0312). So a settled one is
-  // offered Archive, and the user is never left with Unpin alone.
   it('a pinned, settled coding-agent thread with no change offers Archive beside Unpin', () => {
     setThread(makeThreadState('t1', { meta: { channel: 'claude_code', section: 'inbox', status: 'idle', saved: true } }));
     expect(kinds(resolveThreadActions('t1'))).toEqual(['archive', 'unsave']);
   });
 
-  // ADR 0395: a coding agent parked on an event wait with an unproposed diff
-  // holds its proposal. That work outranks Archive the way a proposed change
-  // did, so the thread keeps only the standing apply and the pin.
   it('a parked coding-agent thread with held work is not offered Archive', () => {
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'unproposed', reason: null }, liveEventWaitCount: 1 },
@@ -100,39 +95,25 @@ describe('resolveThreadActions', () => {
     expect(kinds(resolveThreadActions('t1'))).toContain('archive');
   });
 
-  it('CC thread with a pending change → Discard (close) + Apply (primary) + Set aside + Pin', () => {
+  it('CC thread with a pending change → Discard (close) + Apply (primary) + Hold + Pin', () => {
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     const actions = resolveThreadActions('t1');
-    expect(kinds(actions)).toEqual(['discard', 'apply', 'set_aside', 'save']);
+    expect(kinds(actions)).toEqual(['discard', 'apply', 'hold', 'save']);
     expect(actions.find((a) => a.kind === 'apply')).toMatchObject({ category: 'primary', label: 'Apply' });
     expect(actions.find((a) => a.kind === 'discard')).toMatchObject({ category: 'close', label: 'Discard' });
-    expect(actions.find((a) => a.kind === 'set_aside')).toMatchObject({ category: 'close', label: 'Set aside' });
+    expect(actions.find((a) => a.kind === 'hold')).toMatchObject({ category: 'close', label: 'Hold…' });
   });
 
-  // Set aside acts on one change by id. A proposal flag can land before the
-  // pending list, and then Apply and Discard show but Set aside waits.
-  it('offers no Set aside until the pending list names the change', () => {
-    setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
-    }));
-    changes.value = { status: 'loaded', data: [] };
-    expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'save']);
-  });
-
-  // A delegating parent: idle apart from a running sub-thread. The child
-  // writes its own worktree, so the parent's own change is resolvable (ADR
-  // 0249). A live event wait still withholds both, and offers the standing
-  // apply in their place: the wait ends by itself (ADR 0266).
   it('a running sub-thread does not withhold Apply or Discard; an event wait swaps them for the standing apply', () => {
     const parent = makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, activeChildrenCount: 2 },
     });
     setThread(parent);
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
-    expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'set_aside', 'save']);
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'hold', 'save']);
 
     setThread(makeThreadState('t1', {
       meta: { ...parent.meta, liveEventWaitCount: 1 },
@@ -140,8 +121,6 @@ describe('resolveThreadActions', () => {
     expect(kinds(resolveThreadActions('t1'))).toEqual(['apply_when_settled', 'save']);
   });
 
-  // The compact action slot shows the icon alone, and the tooltip layer drops
-  // a tooltip that repeats the label. So each action needs a description.
   it('every close and change action describes itself beyond its label', () => {
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
@@ -163,16 +142,11 @@ describe('resolveThreadActions', () => {
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1', { requires_restart: true })] };
     const apply = resolveThreadActions('t1').find((a) => a.kind === 'apply');
-    // Apply is always non-disruptive now — the "Apply & Restart" dual label
-    // stays retired. requiresRestart surfaces as a compact "Apply*" marker plus
-    // the tooltip (the new engine version builds in the background; the user
-    // switches to it separately).
     expect(apply?.label).toBe('Apply*');
     expect(apply?.tooltip).toContain('new engine version');
   });
 
   it('external-repo CC swaps the change layer for Archive', () => {
-    // External-repo: the thread reads proposed but has no pending changes row.
     setThread(makeThreadState('t1', {
       meta: {
         channel: 'claude_code',
@@ -186,14 +160,6 @@ describe('resolveThreadActions', () => {
     expect(kinds(actions)).toEqual(['archive', 'save']);
   });
 
-  // The standing apply is an Apply the owner presses early, so it belongs
-  // wherever Apply does. Lucidos never merges into an external repo, and such a
-  // thread proposes nothing, so the flag offered to apply a change that could
-  // never exist.
-  //
-  // Both statuses matter: those are the two the core offers the action in. Both
-  // facts matter too: `codingAgentKind` is what a live thread carries, and the
-  // legacy bool is what an old row carries instead.
   describe('the standing apply is withheld where Lucidos never applies', () => {
     const externalFacts: [string, Partial<ThreadMeta>][] = [
       ['by coding-agent kind', { codingAgentKind: 'external' }],
@@ -217,7 +183,6 @@ describe('resolveThreadActions', () => {
       });
     }
 
-    // An app thread merges into the workspace git, so Lucidos does apply it.
     it('still offers it on an app thread, which Lucidos does apply', () => {
       setThread(makeThreadState('t1', {
         meta: {
@@ -230,8 +195,6 @@ describe('resolveThreadActions', () => {
       expect(kinds(resolveThreadActions('t1'))).toContain('apply_when_settled');
     });
 
-    // The regression: `getCodingAgentWaitingInfo` returns null for a running
-    // thread, so a carve-out reading it could never fire where the flag lives.
     it('withholds it before the thread has ever proposed anything', () => {
       setThread(makeThreadState('t1', {
         meta: {
@@ -263,8 +226,6 @@ describe('resolveThreadActions', () => {
   });
 
   it('composing draft does not offer the save toggle', () => {
-    // A composing draft is excluded from every drawer section (including Pinned),
-    // so saving it would set is_saved but leave the row in the compose surface.
     setThread(makeThreadState('t1', {
       meta: { state: 'composing', section: 'inbox', status: 'idle', composeText: 'half a thought' },
     }));
@@ -272,6 +233,11 @@ describe('resolveThreadActions', () => {
     expect(kinds(actions)).toEqual(['discard_draft', 'archive']);
     expect(kinds(actions)).not.toContain('save');
     expect(kinds(actions)).not.toContain('unsave');
+  });
+
+  it('leaves Hold to the thread menu on an idle thread with no change', () => {
+    setThread(makeThreadState('t1', { meta: { channel: 'claude_code', section: 'inbox', status: 'idle' } }));
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['archive', 'save']);
   });
 
   it('returns [] for an unknown thread', () => {
@@ -287,9 +253,9 @@ describe('resolveChangeMenuActions', () => {
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
   }
 
-  it('lists Apply, then Set aside, then Discard for a pending change, and nothing else', () => {
+  it('lists Apply, then Hold, then Discard for a pending change, and nothing else', () => {
     proposedCcThread();
-    expect(kinds(resolveChangeMenuActions('t1'))).toEqual(['apply', 'set_aside', 'discard']);
+    expect(kinds(resolveChangeMenuActions('t1'))).toEqual(['apply', 'hold', 'discard']);
   });
 
   it('offers the standing apply while an event wait withholds Apply', () => {
@@ -373,8 +339,6 @@ describe('runCloseCascade no-op gates', () => {
   });
 
   it('no-ops while a layer is still resolving in-flight', async () => {
-    // A thread with a pending change would normally open the change choice, but
-    // an in-flight apply must gate the cascade to a no-op (async bridge).
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
@@ -406,8 +370,6 @@ describe('runCloseCascade no-op gates', () => {
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     focusedThreadId.value = 't1';
 
-    // showConfirm's promise resolves on user interaction; we only assert the
-    // dialog opened with the three-way choice, then dismiss it.
     void runCloseCascade();
     await Promise.resolve();
     expect(confirmState.value.visible).toBe(true);
@@ -447,16 +409,12 @@ describe('discardDraft (confirm lives on the action)', () => {
       expect(await p).toBe(true);
       expect(getDraft('t1').text).toBe('');
     } finally {
-      // updateCompose schedules a debounced sync PUT; drop it so the real
-      // timer can't fire fetch after the test.
       vi.clearAllTimers();
       vi.useRealTimers();
     }
   });
 
   it('the discard_draft action routes through the same confirm as the cascade', async () => {
-    // The close-cascade shortcut drives this TaggedAction's invoke (the 'draft'
-    // close layer) — so the confirm lives on the action, not on any one caller.
     setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle', composeText: 'half a thought' } }));
     const action = resolveThreadActions('t1').find((a) => a.kind === 'discard_draft');
     void action?.invoke();

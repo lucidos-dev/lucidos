@@ -1,18 +1,3 @@
-/**
- * Tests for the optimistic "answering" flag and `isRenderedThreadIdle`.
- *
- * Bug: after the user answers a pending question, the agent's resume can land
- * its first events while the client's `meta.status` still reads
- * `waiting_for_user_answer` (the `running` aggregate hadn't arrived yet). That
- * status is quiescent, so the lifted `threadIdle` prop was true and the
- * answered question-divider flashed "Aborted ⚠" via the stale-detector in
- * exchange-render.ts — even though the response completed normally.
- *
- * Fix: `answerThreadQuestion` stamps the thread in `answeringThreadIds`, and
- * `isRenderedThreadIdle` (the source for `threadIdle`) treats the thread as
- * NON-idle while that flag — or a pending follow-up — is in flight, bridging
- * the answer→resume gap until the real status leaves `waiting_for_user_answer`.
- */
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   isRenderedThreadIdle,
@@ -80,8 +65,6 @@ describe('isRenderedThreadIdle', () => {
     const thread = makeThread('t1', 'waiting_for_user_answer');
     expect(isRenderedThreadIdle(thread)).toBe(true);
     markThreadAnswering('t1');
-    // The answer→resume gap: raw status still quiescent, but the optimistic
-    // flag forces "not idle" so the divider can't flash "Aborted".
     expect(isRenderedThreadIdle(thread)).toBe(false);
   });
 
@@ -113,18 +96,15 @@ describe('markThreadAnswering / clearThreadAnswering', () => {
 
   it('add then remove toggles membership and is idempotent', () => {
     markThreadAnswering('t1');
-    markThreadAnswering('t1'); // idempotent — no duplicate / no throw
+    markThreadAnswering('t1');
     expect(answeringThreadIds.value.has('t1')).toBe(true);
     clearThreadAnswering('t1');
     expect(answeringThreadIds.value.has('t1')).toBe(false);
-    clearThreadAnswering('t1'); // idempotent on a missing id
+    clearThreadAnswering('t1');
     expect(answeringThreadIds.value.has('t1')).toBe(false);
   });
 });
 
-/** The transcript follow's liveness: a scroll turns the follow off only while
- *  this is true, and parks it otherwise (ADR 0064, the user's instruction).
- *  So every quiet status must read false, not just the two quiescent ones. */
 describe('isThreadStreaming', () => {
   afterEach(() => {
     answeringThreadIds.value = new Set();

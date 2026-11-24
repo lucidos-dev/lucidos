@@ -3,10 +3,6 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, assertHealthy } from './helpers';
 import { psql } from './db-helpers';
 
-/** Insert a parent thread carrying a single ChildThreadCompleted exchange.
- *  We seed the typed event directly (rather than spawning a real child) so
- *  the test stays fast and deterministic: the rendering of the row from the
- *  typed event is what we want to assert, not the LLM-driven spawn flow. */
 function seedParentWithChildCompletion(opts: {
   status: 'success' | 'failure' | 'no_changes' | 'canceled';
   title?: string | null;
@@ -25,13 +21,10 @@ function seedParentWithChildCompletion(opts: {
 
   psql(
     [
-      // Parent thread row.
       `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
         `VALUES ('${parentId}', 'E2E child-completion row', 'chat', '${now}', 2, false, true, 'idle', 'inbox', false, 0, 'none', false)`,
-      // Original parent prompt, giving the thread something to render before the row.
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
         `VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"spawn a sidequest","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${parentId}', '${parentId}')`,
-      // Typed ChildThreadCompleted: the head of the new exchange and the source for the row.
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
         `VALUES ('${childCompletedEventId}', 'ChildThreadCompleted', ` +
         `'{"child_thread_id":"${childId}","status":"${opts.status}","summary":"${summary}","pending_change_ids":${pendingArr}${titleField}}'::jsonb, ` +
@@ -49,11 +42,6 @@ async function openParent(page: Page, parentId: string): Promise<void> {
   await navigateToApp(page);
 }
 
-/** The child callback's event row. One of the four kinds that share
- *  `EventRow`, told apart by `data-role` (see `components/chat/EventRow.tsx`).
- *
- *  Both desktop SplitLayout and mobile MobileSwipeContainer render the chat
- *  tree concurrently; only one is visible at a time. */
 function childRow(page: Page) {
   return page.locator('.event-row[data-role="child-completion"]:visible').first();
 }
@@ -91,8 +79,6 @@ test.describe('Child-completion row', () => {
     await expect(row).toHaveAttribute('data-kind', 'child');
     await expect(row).toHaveAttribute('data-state', 'success');
 
-    // The row owns its own prefix, so the surrounding panel adds no summary
-    // line that would print the same words twice.
     const panel = page.locator('.initiator-panel:visible:has(.event-row[data-role="child-completion"])').first();
     await expect(panel.locator('.initiator-summary')).toHaveCount(0);
 
@@ -183,8 +169,6 @@ test.describe('Child-completion row', () => {
     await openParent(page, parentId);
     const row = childRow(page);
     await expect(row).toBeVisible({ timeout: 10_000 });
-    // The turn wears no actor header, and its time is plain text rather than
-    // the route-popover trigger: the title link is the way to the child.
     const panel = page.locator('.initiator-panel:visible:has(.event-row[data-role="child-completion"])').first();
     await expect(panel.locator('.initiator-actor')).toHaveCount(0);
     await expect(panel.locator('.initiator-timestamp-button')).toHaveCount(0);

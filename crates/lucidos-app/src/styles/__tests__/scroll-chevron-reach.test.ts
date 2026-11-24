@@ -1,11 +1,3 @@
-/**
- * On touch the floating scroll chevrons take a tap that lands near their
- * circle. The circle is drawn and placed, so it keeps its size; a transparent
- * `::before` reaches past it instead. Without it, a near miss lands on the step
- * row's context counter underneath and opens the context viewer.
- *
- * e2e/scroll-chevron-hit-target-mobile.spec.ts measures the painted result.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -27,15 +19,15 @@ const TOUCH = '@media (pointer: coarse)';
 const REACH = '.scroll-to-top::before, .scroll-to-bottom::before, .follow-toggle::before';
 const SURFACE = '.scroll-to-top, .scroll-to-bottom, .follow-toggle';
 const CHEVRONS = '.scroll-to-top, .scroll-to-bottom';
+const SIDE_BY_SIDE = '.thread-pane:has(.scroll-to-bottom.visible) .follow-toggle';
+const SIDE_BY_SIDE_REACH = `${SIDE_BY_SIDE}::before`;
 
-/** The one rule in `css` with this selector at this at-rule scope. */
 function rule(css: string, selector: string, atRules = ''): Map<string, string> {
   const found = cssRules(css).filter(r => r.selector === selector && r.atRules === atRules);
   expect(found.length, `expected exactly one \`${selector}\` at "${atRules}"`).toBe(1);
   return found[0].props;
 }
 
-/** A plain `<n>rem` value, in rem. */
 function rem(value: string | undefined): number {
   expect(value).toMatch(/^[\d.]+rem$/);
   return parseFloat(value!);
@@ -46,10 +38,8 @@ const reach = (): number => rem(touchRoot().get('--scroll-chevron-reach'));
 
 describe('the scroll chevrons reach past their circle on touch', () => {
   it('make a target of at least 44px, plus a margin, at the 16px root', () => {
-    // The circle is the mobile header's icon box on touch.
     expect(touchRoot().get('--scroll-chevron-size')).toBe('var(--mobile-header-icon-box)');
     const box = rem(rule(mobileCss, ':root').get('--mobile-header-icon-box'));
-    // `inset` counts from the padding box, so the border comes off each side.
     const border = /^(\d+)px /.exec(rule(chevronCss, SURFACE).get('border') ?? '')?.[1];
     expect(border, 'the circle\'s border is no longer a px width').toBeDefined();
     expect((box + 2 * reach()) * 16 - 2 * Number(border)).toBeGreaterThan(44);
@@ -61,15 +51,12 @@ describe('the scroll chevrons reach past their circle on touch', () => {
     expect(before.get('position'), 'absolute, so it moves neither the circle nor the glyph').toBe('absolute');
     expect(before.get('inset')).toBe('calc(-1 * var(--scroll-chevron-reach))');
     expect(before.has('background'), 'the reach is never painted').toBe(false);
-    // Besides it, only the two trims where the stacked pair face each other.
     expect(cssRules(chevronCss).filter(r => r.selector.includes('::before') && /scroll-to-|follow-toggle/.test(r.selector))
       .map(r => r.selector))
-      .toEqual([REACH, '.scroll-to-bottom::before', '.follow-toggle::before']);
+      .toEqual([REACH, '.scroll-to-bottom::before', SIDE_BY_SIDE_REACH]);
   });
 
   it('takes no tap while its chevron is hidden', () => {
-    // The overlay inherits `pointer-events` from its button. A value of its
-    // own would keep a faded chevron catching taps meant for the counters.
     expect(rule(chevronCss, REACH, TOUCH).has('pointer-events')).toBe(false);
     expect(rule(chevronCss, SURFACE).has('pointer-events'), 'the follow toggle always takes taps').toBe(false);
     expect(rule(chevronCss, CHEVRONS).get('pointer-events')).toBe('none');
@@ -78,8 +65,6 @@ describe('the scroll chevrons reach past their circle on touch', () => {
   });
 
   it('paints, and hit-tests, above the transcript', () => {
-    // The chevrons are siblings of `.thread-content`, which is z-index 2 on
-    // mobile. The overlay rides the button's own layer, so it has no z-index.
     expect(rule(chevronCss, REACH, TOUCH).has('z-index')).toBe(false);
     expect(rule(chevronCss, SURFACE).get('z-index')).toBe('calc(var(--z-float) + 1)');
     const zFloat = Number(rule(baseCss, ':root').get('--z-float'));
@@ -88,8 +73,6 @@ describe('the scroll chevrons reach past their circle on touch', () => {
   });
 
   it('stops at the gap each button keeps to the chrome beside it', () => {
-    // The up chevron sits a gap below the title bar and the follow toggle a gap
-    // above the composer. A longer reach would take their taps.
     expect(rule(chevronCss, '.follow-toggle').get('bottom')).toBe('calc(100% + var(--scroll-chevron-inset))');
     const composerGap = rem(rule(baseCss, ':root').get('--scroll-chevron-inset'));
     const upTop = rule(mobileCss, '.mobile-swipe-pane .scroll-to-top', '@media (--phone-layout)').get('top') ?? '';
@@ -99,12 +82,26 @@ describe('the scroll chevrons reach past their circle on touch', () => {
   });
 
   it('meets, never overlaps, between the down chevron and the follow toggle', () => {
-    // The chevron stands one stack gap over the toggle. Each reaches half of it.
-    expect(rule(chevronCss, '.scroll-to-bottom').get('bottom'))
-      .toBe('calc(var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap))');
-    expect(touchRoot().get('--scroll-chevron-stack-gap')).toBe('var(--scroll-chevron-reach)');
-    const half = 'calc(-0.5 * var(--scroll-chevron-stack-gap))';
-    expect(rule(chevronCss, '.scroll-to-bottom::before', TOUCH).get('bottom')).toBe(half);
-    expect(rule(chevronCss, '.follow-toggle::before', TOUCH).get('top')).toBe(half);
+    expect(rule(chevronCss, '.scroll-to-bottom').get('bottom')).toBe('var(--scroll-chevron-inset)');
+    expect(rule(chevronCss, SIDE_BY_SIDE).get('transform'))
+      .toBe('translateX(calc(-1 * (var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap))))');
+    expect(rule(chevronCss, SURFACE).get('border')).toMatch(/^1px /);
+    const half = 'calc(-0.5 * var(--scroll-chevron-stack-gap) - 1px)';
+    expect(rule(chevronCss, '.scroll-to-bottom::before', TOUCH).get('left')).toBe(half);
+    expect(rule(chevronCss, SIDE_BY_SIDE_REACH, TOUCH).get('right')).toBe(half);
+  });
+
+  it('keeps each of the pair 44px wide, its far side making up the facing half gap', () => {
+    const far = 'calc(-1 * var(--scroll-chevron-pair-far-reach))';
+    expect(rule(chevronCss, '.scroll-to-bottom::before', TOUCH).get('right')).toBe(far);
+    expect(rule(chevronCss, SIDE_BY_SIDE_REACH, TOUCH).get('left')).toBe(far);
+    expect(touchRoot().get('--scroll-chevron-pair-far-reach')?.replace(/\s+/g, ' '))
+      .toBe('calc( 1.5 * var(--scroll-chevron-reach) - var(--scroll-chevron-stack-gap) / 2)');
+    const gap = rem(rule(baseCss, ':root').get('--scroll-chevron-stack-gap'));
+    const box = rem(rule(mobileCss, ':root').get('--mobile-header-icon-box'));
+    const border = Number(/^(\d+)px /.exec(rule(chevronCss, SURFACE).get('border') ?? '')?.[1]);
+    expect((box + gap / 2 + (1.5 * reach() - gap / 2)) * 16 - 2 * border).toBeGreaterThanOrEqual(44);
+    const rightInset = rem(/^calc\(([\d.]+rem) \+/.exec(rule(chevronCss, SURFACE).get('right') ?? '')?.[1]);
+    expect(1.5 * reach() - gap / 2).toBeLessThan(rightInset);
   });
 });

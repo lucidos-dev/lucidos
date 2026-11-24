@@ -4,12 +4,9 @@
 //! Two phases run a whole coding-agent session, so they alone are worth an
 //! estimate: a hardening and a conflict resolution. A plain merge takes seconds.
 
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 /// How far back a run can count.
 const WINDOW_DAYS: i32 = 90;
@@ -23,19 +20,7 @@ const MAX_RUN_SECS: f64 = 4.0 * 3_600.0;
 /// How long a computed estimate is served before a background refresh.
 const FRESH_FOR: Duration = Duration::from_secs(600);
 
-/// The typical duration of one phase, and how many runs it rests on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PhaseEstimate {
-    pub typical_secs: u64,
-    pub runs: usize,
-}
-
-/// One estimate per slow phase. `None` where too few runs exist.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplyEstimates {
-    pub hardening: Option<PhaseEstimate>,
-    pub resolving_conflict: Option<PhaseEstimate>,
-}
+pub use crate::engine::thread_events::apply::{ApplyEstimates, PhaseEstimate};
 
 /// One completed phase run.
 #[derive(Debug, Clone, Copy)]
@@ -76,12 +61,10 @@ pub(crate) fn estimate(runs: &[PhaseRun]) -> Option<PhaseEstimate> {
     })
 }
 
-/// The event that opens a hardening. It carries no change id, so a hardening
-/// is timed per thread.
-const HARDENING_START: &str = "MissingHardeningDetected";
-/// The events that end a hardening, the first counting as success.
-const HARDENING_ENDS: &str =
-    "'ChangeHardened','ChangeApplied','ChangeApplyFailed','ChangeDiscarded','MissingHardeningDetected','MergeConflictDetected'";
+#[cfg(test)]
+use crate::core::changes::open_hardening_starts;
+use crate::core::changes::{HARDENING_ENDS, HARDENING_START};
+
 /// The events that end a conflict resolution, the first counting as success.
 /// A second `MergeConflictDetected` restarts the resolution.
 const CONFLICT_ENDS: &str =
@@ -140,38 +123,9 @@ pub(crate) async fn compute(pool: &PgPool) -> sqlx::Result<ApplyEstimates> {
     })
 }
 
-/// When each thread's open hardening began: its latest hardening-related
-/// event is the start, with no end after it. One batch query.
-pub(crate) async fn open_hardening_starts(
-    pool: &PgPool,
-    thread_ids: &[Uuid],
-) -> sqlx::Result<HashMap<Uuid, chrono::DateTime<chrono::Utc>>> {
-    if thread_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let ids: Vec<String> = thread_ids.iter().map(Uuid::to_string).collect();
-    let rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(&format!(
-        "SELECT aggregate_id, created FROM ( \
-             SELECT DISTINCT ON (aggregate_id) aggregate_id, event_type, created \
-             FROM events \
-             WHERE aggregate_id = ANY($1) \
-               AND event_type IN ('{HARDENING_START}', {HARDENING_ENDS}) \
-             ORDER BY aggregate_id, sequence DESC \
-         ) latest \
-         WHERE event_type = '{HARDENING_START}'"
-    ))
-    .bind(&ids)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(id, at)| Uuid::parse_str(&id).ok().map(|id| (id, at)))
-        .collect())
-}
-
 /// The last computed estimates, served stale while a refresh runs.
 #[derive(Default)]
-pub(crate) struct ApplyEstimateCache {
+pub struct ApplyEstimateCache {
     state: Mutex<CacheState>,
 }
 
@@ -186,7 +140,7 @@ impl ApplyEstimateCache {
     /// inline and a failure goes to the caller. After that a stale value is
     /// served as it is and refreshed in the background, so a changes broadcast
     /// never waits on the history query.
-    pub(crate) async fn current(self: &Arc<Self>, pool: &PgPool) -> sqlx::Result<ApplyEstimates> {
+    pub async fn current(self: &Arc<Self>, pool: &PgPool) -> sqlx::Result<ApplyEstimates> {
         let served = {
             let mut state = self.state.lock().expect("estimate cache");
             let served = state.computed.map(|(value, _)| value);
@@ -219,7 +173,7 @@ impl ApplyEstimateCache {
         state.refreshing = false;
         match computed {
             Ok(value) => state.computed = Some((value, Instant::now())),
-            Err(e) => log!("[ApplyEstimate] refreshing phase estimates failed: {}", e),
+            Err(e) => log_legacy!("[ApplyEstimate] refreshing phase estimates failed: {}", e),
         }
     }
 }

@@ -45,35 +45,26 @@ describe('compose destination final selection focus', () => {
 
     expect(deps.apply).not.toHaveBeenCalled();
     expect(deps.focusPrompt).not.toHaveBeenCalled();
-    // Repositories share the Coding Agents page with the binaries that run
-    // them, so the jump names the page AND the section it wants inside it.
-    // ONE call: openSettingsSubview lands the menu item too, so the jump leaves
-    // a single nav-history entry rather than a phantom Settings home behind it.
     expect(deps.openSettingsSubview).toHaveBeenCalledOnce();
     expect(deps.openSettingsSubview).toHaveBeenCalledWith('coding-agents');
     expect(deps.scrollToSetting).toHaveBeenCalledWith('coding-agents:repositories');
   });
 
-  it('writes the coding agent to the focused draft, never a global, and focuses the prompt', () => {
-    const deps = { patchSelection: vi.fn(), focusPrompt: vi.fn() };
+  it('remembers the coding agent for the focused draft and focuses the prompt', () => {
+    const deps = { selectAgent: vi.fn(), focusPrompt: vi.fn() };
 
     handleComposeCodingAgentSelection('thread-1', 'codex', deps);
 
-    // Per-draft: only this draft's backend changes; the account default is left
-    // to Settings (draft-only).
-    expect(deps.patchSelection).toHaveBeenCalledWith('thread-1', { codingAgent: 'codex' });
+    expect(deps.selectAgent).toHaveBeenCalledWith('thread-1', 'codex');
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
   });
 
-  it('with no focused draft, writes the PENDING slot (null), never a global', () => {
-    const deps = { patchSelection: vi.fn(), focusPrompt: vi.fn() };
+  it('remembers the coding agent with no focused draft', () => {
+    const deps = { selectAgent: vi.fn(), focusPrompt: vi.fn() };
 
     handleComposeCodingAgentSelection(null, 'claude-code', deps);
 
-    // patchComposeSelection(null, …) routes to the pending slot — a fresh-compose
-    // pick must NOT write `coding_agent_default` (every override-less draft reads
-    // it, so that would leak the pick to all drafts).
-    expect(deps.patchSelection).toHaveBeenCalledWith(null, { codingAgent: 'claude-code' });
+    expect(deps.selectAgent).toHaveBeenCalledWith(null, 'claude-code');
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
   });
 
@@ -85,9 +76,6 @@ describe('compose destination final selection focus', () => {
   });
 
   it('does not mark the last-used option in the compose destination or coding-agent pickers', () => {
-    // The trigger already shows the current value; marking it inside the open
-    // list would only compete with the arrow-key focus row (see Dropdown
-    // `markCurrent`). Both compose pickers must opt out.
     const composeDropdowns = composeRowSource.match(/<Dropdown[\s\S]*?\/>/g) ?? [];
     expect(composeDropdowns[0]).toMatch(/class="compose-destination-picker"[\s\S]*markCurrent=\{false\}/);
     expect(composeDropdowns[1]).toMatch(/class="compose-coding-agent-chip"[\s\S]*markCurrent=\{false\}/);

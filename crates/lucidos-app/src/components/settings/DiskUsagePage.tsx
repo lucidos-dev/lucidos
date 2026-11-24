@@ -1,3 +1,4 @@
+import { retryTransportRead } from '../../api/client/_core';
 import type { ComponentChildren } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
@@ -24,14 +25,11 @@ export interface WorktreeRow {
   thread_title: string | null;
   worktree_path: string;
   size_bytes: number;
-  /** The part of `size_bytes` a build-artifact strip would free. */
   artifact_bytes: number;
   last_activity: string | null;
   is_dirty: boolean;
   is_saved: boolean;
-  /** A coding agent or background task is working in the tree right now. */
   is_active: boolean;
-  /** Nothing in the tree is lost by removing it. */
   is_finished: boolean;
 }
 
@@ -51,16 +49,13 @@ interface DiskSummary {
 const inventory = signal<Loadable<WorktreeRow[]>>({ status: 'not-loaded' });
 const summary = signal<Loadable<DiskSummary>>({ status: 'not-loaded' });
 
-// Both loaders keep a loaded value on screen while they re-read. They run again
-// after every cleanup, and blanking would unmount the page under the user.
 async function loadSummary(): Promise<void> {
   setLoadingIfFresh(summary);
   try {
-    const res = await fetch(`${API}/disk-usage/summary`);
+    const res = await retryTransportRead(() => fetch(`${API}/disk-usage/summary`));
     await throwIfNotOk(res);
     const data = (await res.json()) as DiskSummary;
     summary.value = { status: 'loaded', data };
-    // Keep a known count; only a pass the engine no longer runs drops the cue.
     if (!data.recommended_cleanup_running) recommendedCleanupProgress.value = null;
     else recommendedCleanupProgress.value ??= { done: 0, total: 0 };
   } catch (e) {
@@ -71,14 +66,13 @@ async function loadSummary(): Promise<void> {
 async function loadInventory(): Promise<void> {
   setLoadingIfFresh(inventory);
   try {
-    const res = await fetch(`${API}/disk-usage/worktrees`);
+    const res = await retryTransportRead(() => fetch(`${API}/disk-usage/worktrees`));
     await throwIfNotOk(res);
     const body = (await res.json()) as InventoryResponse;
     inventory.value = { status: 'loaded', data: body.worktrees };
   } catch (e) {
     inventory.value = toFailed(e);
   }
-  // Re-fetch summary so free disk + percentages stay in sync after cleanup.
   await loadSummary();
 }
 
@@ -88,7 +82,6 @@ interface CleanupResult {
   branch_deleted: boolean;
 }
 
-/** Run one cleanup tier. Every refusal throws with the engine's reason. */
 export async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<CleanupResult> {
   const res = await mutatingFetch(
     `${API}/disk-usage/worktrees/${threadId}/cleanup`,
@@ -102,8 +95,6 @@ export async function runCleanup(threadId: string, tier: 1 | 2 | 3): Promise<Cle
   return res.json();
 }
 
-/** Tier 2, or `null` when the engine refuses it with a 409, so the caller can
- *  offer the force of tier 3. */
 export async function removeUnlessDirty(threadId: string): Promise<CleanupResult | null> {
   try {
     return await runCleanup(threadId, 2);
@@ -113,9 +104,6 @@ export async function removeUnlessDirty(threadId: string): Promise<CleanupResult
   }
 }
 
-/** Starts the recommended cleanup over every worktree. The engine decides, per
- *  tree, what is safe at the moment it acts, and reports the outcome over SSE
- *  as `RecommendedCleanupCompleted` or `RecommendedCleanupFailed`. */
 export async function startRecommendedCleanup(): Promise<void> {
   const res = await mutatingFetch(`${API}/disk-usage/cleanup`, {
     method: 'POST',
@@ -131,9 +119,6 @@ export interface RecommendedCleanupEstimate {
   bytes: number;
 }
 
-/** What the recommended cleanup would free, by the inventory's figures: a
- *  finished tree whole, every other one its build artifacts. Live and pinned
- *  trees are skipped, as the engine skips them. */
 export function estimateRecommendedCleanup(rows: WorktreeRow[]): RecommendedCleanupEstimate {
   const estimate = { removeCount: 0, cleanCount: 0, bytes: 0 };
   for (const row of rows) {
@@ -149,7 +134,6 @@ export function estimateRecommendedCleanup(rows: WorktreeRow[]): RecommendedClea
   return estimate;
 }
 
-/** One sentence naming what the recommended cleanup touches. */
 export function describeEstimate({ removeCount, cleanCount }: RecommendedCleanupEstimate): string {
   const parts = [
     removeCount > 0 && `removes ${countOf(removeCount, 'finished worktree')}`,
@@ -175,7 +159,6 @@ function pressureLabelFor(sum: DiskSummary | null): PressureLabel | null {
   return null;
 }
 
-// Palette cycled per worktree segment; matches the swatch on each row below.
 const SEGMENT_PALETTE = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5'] as const;
 
 function paletteClass(idx: number): string {
@@ -193,8 +176,6 @@ function Segment({ cls, bytes, label }: { cls: string; bytes: number; label: str
   );
 }
 
-/** The volume's breakdown as one bar. Inside a `SkeletonProvider` it draws the
- *  bar's own box with a shimmer across it. */
 function DiskUsageBar({
   rows = [],
   freeBytes = 0,
@@ -234,7 +215,6 @@ function skeletonBar(w: string) {
   return <SkeletonProvider><SkText w={w} /></SkeletonProvider>;
 }
 
-/** A figure that shimmers while its read is pending. */
 function Figure({
   skeleton,
   w = '4rem',
@@ -251,7 +231,6 @@ function Figure({
   );
 }
 
-/** One line of the key under the bar: a swatch, what it is, how much. */
 function KeyRow({
   swatch,
   label,
@@ -278,14 +257,12 @@ function KeyRow({
   );
 }
 
-/** The running line under the "Free up space" card. */
 export function cleanupProgressLine({ done, total }: { done: number; total: number }): string {
   return total > 0
     ? `Cleanup in progress: ${done} of ${countOf(total, 'worktree')}`
     : 'Cleanup in progress';
 }
 
-/** The "Free up space" card. With no `rows` its figure shimmers. */
 function RecommendedCleanupCard({
   rows,
   skeleton,
@@ -340,7 +317,6 @@ function RecommendedCleanupCard({
           {busy ? 'Freeing…' : `Free ${formatBytes(estimate.bytes)}`}
         </button>
       )}
-      {/* Drawn like the Backup page's running state: a line, then the bar. */}
       <Disclosure open={busy} class="disk-usage-reclaim-progress">
         {progress && (
           <>
@@ -361,8 +337,6 @@ function StatusBadge({ row }: { row: WorktreeRow }) {
   return <span class="label" data-tooltip="No uncommitted changes">Clean</span>;
 }
 
-/** One worktree. With no `row`, inside a `SkeletonProvider`, it draws itself
- *  as the loading placeholder. */
 function WorktreeRowView({
   row,
   totalBytes = 0,
@@ -397,7 +371,7 @@ function WorktreeRowView({
   async function handleRemove() {
     if (!row) return;
     if (!(await showConfirm(
-      `Remove worktree for "${title}"? Its on-disk files (including any build artifacts) will be deleted. Branch is kept if it has unmerged commits.`,
+      `Remove worktree for "${title}"? Its on-disk files (including any build artifacts) will be deleted. The branch will be kept.`,
       'Remove',
       { variant: 'danger' },
     ))) {
@@ -407,7 +381,6 @@ function WorktreeRowView({
     try {
       let result = await removeUnlessDirty(row.thread_id);
       if (!result) {
-        // Dirty worktree — confirm again, then force via Tier 3
         if (!(await showConfirm(
           `"${title}" has uncommitted changes in its worktree. Force-remove anyway? Uncommitted edits will be lost.`,
           'Force remove',
@@ -417,7 +390,7 @@ function WorktreeRowView({
         }
         result = await runCleanup(row.thread_id, 3);
       }
-      showToast(`Removed worktree (freed ${formatBytes(result.freed_bytes)}${result.branch_deleted ? '; branch deleted' : ''})`, 'success');
+      showToast(`Removed worktree (freed ${formatBytes(result.freed_bytes)})`, 'success');
       onCleanup();
     } catch (e) {
       showToast(`Remove failed: ${errorDetail(e)}`, 'error');
@@ -436,8 +409,6 @@ function WorktreeRowView({
   return (
     <div class="list-row disk-usage-row">
       <div class="list-row-info">
-        {/* The swatch sits INSIDE the button. A button is an atomic inline, so
-            beside it the whole title would drop below the swatch on a wrap. */}
         <div class="title list-row-name">
           {row ? (
             <button type="button" class="accent-link" onClick={() => focusThreadOrBootstrap(row.thread_id)}>
@@ -445,9 +416,6 @@ function WorktreeRowView({
             </button>
           ) : <>{swatch}<SkText w="10rem" /></>}
         </div>
-        {/* Four FIELDS, separated by `.list-row-details`' own 0.75rem flex gap.
-            No manual "·" glue: each dot would be its own anonymous flex item
-            and pick the gap up on both sides, double-spacing the row. */}
         {row ? (
           <div class="list-row-details">
             <span data-tooltip={row.worktree_path}>{formatBytes(row.size_bytes)}</span>
@@ -473,8 +441,6 @@ function WorktreeRowView({
   );
 }
 
-/** Whether opening the page owes a read. A failed read counts: the signals are
- *  module-level, so a one-off failure would otherwise stick until a reload. */
 export function diskUsageLoadOwed(loadable: Loadable<unknown>): boolean {
   return loadable.status === 'not-loaded' || loadable.status === 'failed';
 }
@@ -488,17 +454,12 @@ export function DiskUsagePage() {
   const summaryLoadable = summary.value;
   const inventoryPending = isPending(loadable);
   const summaryPending = isPending(summaryLoadable);
-  // One gate for both reads, so their skeletons arrive in one wave. Each slot
-  // still clears on its own read.
   const gate = useDelayedFlag(inventoryPending || summaryPending);
 
-  // The summary is read on every open, since a pass that ended while the page
-  // was closed leaves the running cue stale. `loadInventory` reads it too.
   useEffect(() => {
     if (diskUsageLoadOwed(loadable)) void loadInventory();
     else void loadSummary();
   }, []);
-  // Re-reads the worktrees, then the summary, keeping both on screen meanwhile.
   usePanelRefresh('disk usage', loadInventory);
   useVersionedRefresh(diskUsageVersion.value, false, () => void loadInventory());
 
@@ -522,7 +483,6 @@ export function DiskUsagePage() {
     ? Math.max(0, diskTotalBytes - freeBytes - totalBytes - (workspaceDataBytes ?? 0))
     : null;
   const pressureLabel = pressureLabelFor(sum);
-  // A settled summary with no figure reads as a dash; a pending one is empty.
   const dash = summaryPending ? null : '–';
   const summarySkeleton = gate && summaryPending;
   const inventorySkeleton = gate && inventoryPending;
@@ -570,8 +530,8 @@ export function DiskUsagePage() {
               <Explainer title="Worktrees">
                 <p>Per-thread worktrees Lucidos creates for coding-agent sessions.</p>
                 <p>
-                  Clean build artifacts to reclaim space, or remove a worktree entirely
-                  when you no longer need its branch.
+                  Clean build artifacts to reclaim space, or remove the entire worktree.
+                  Both actions keep the branch.
                 </p>
               </Explainer>
             }
@@ -606,8 +566,6 @@ export function DiskUsagePage() {
       <div class="settings-section">
         <div class="settings-section-title">Worktrees</div>
         {rows?.length === 0 && <p class="settings-section-desc">No worktrees on disk</p>}
-        {/* Unmounts WITH its content once an empty list settles, so no empty
-            fade box is left behind. */}
         {(inventoryPending || (rows?.length ?? 0) > 0) && (
           <LoadingFade
             showSkeleton={inventorySkeleton}

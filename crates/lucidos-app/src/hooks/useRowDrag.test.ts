@@ -5,7 +5,6 @@ import { act } from 'preact/test-utils';
 import { LONG_PRESS_DELAY_MS } from './useLongPress';
 import { makeRowDrag, rowUnder, useRowDrag, type RowDragCallbacks } from './useRowDrag';
 
-/** A stand-in for `document` that records listeners and replays events. */
 function fakeSurface() {
   const listeners = new Map<string, Set<(e: unknown) => void>>();
   return {

@@ -1,23 +1,12 @@
 import { includeDeletedFilterOptions } from './store';
 
-/** What every filter-option list has in common: a pickable entity that may have
- *  been deleted while its threads live on. `triggerFilterOptions`,
- *  `repoFilterOptions` and `appFilterOptions` all widen this. */
 export type DeletableOption = {
   id: string;
   label: string;
   deleted: boolean;
-  /** ISO timestamp of the last thread bound to it. Set on deleted entries, so
-   *  the group can be ordered most-recent first. */
   lastActivity?: string;
 };
 
-/** The options to SHOW: deleted entries are dropped unless the user opts in,
- *  except a selected one, which always stays so its filter can be cleared.
- *
- *  Sorted live-first, then deleted most-recent-first (the eye lands on the one
- *  they were most likely running last), then by label. Shared because all three
- *  lists want exactly this and had three copies of it. */
 export function visibleFilterOptions<T extends DeletableOption>(
   all: readonly T[],
   selected: Set<string>,

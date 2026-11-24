@@ -1,5 +1,3 @@
-// A refused archive or delete is told in the thread menu's words (ADR 0378),
-// whether the engine's 409 or the delete preflight said it.
 
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../../api/client';
@@ -10,7 +8,6 @@ const refusal = (body: Record<string, unknown>) => new ApiError(409, 'conflict',
 
 describe('BLOCKER_REASON', () => {
   it('words every blocker the engine can name, as a sentence', () => {
-    // A slug with no words would toast an empty card.
     const held: Blocker[] = [
       'home',
       ...OWN_BLOCKER_PRIORITY,

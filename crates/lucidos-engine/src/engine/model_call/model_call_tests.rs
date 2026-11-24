@@ -287,6 +287,7 @@ fn turn_row(model: &str) -> impl FnOnce(TurnReport) -> ThreadEvent + '_ {
         stable_prefix_fingerprint: report.stable_prefix_fingerprint,
         ttft_ms: report.detail.ttft_ms,
         request_id: report.detail.request_id,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }
@@ -450,15 +451,6 @@ async fn an_unfinished_turn_row_still_records_the_call_time() {
 
 // --- the lock -------------------------------------------------------------
 
-/// Every engine source a check judges, minus the provider layer and the
-/// crate's test doubles.
-fn engine_sources() -> Vec<(String, String)> {
-    crate::test_support::source_scan::production_sources()
-        .into_iter()
-        .filter(|(path, _)| !path.starts_with("llm/") && path != "test_support.rs")
-        .collect()
-}
-
 /// **Each billable provider method takes a `CallToken`.** That is what makes
 /// a model call outside `llm::metered` fail to compile. A new billable
 /// trait, or a method that drops the token, fails here first.
@@ -466,22 +458,22 @@ fn engine_sources() -> Vec<(String, String)> {
 fn every_billable_provider_method_takes_a_call_token() {
     let traits = [
         (
-            include_str!("../../llm/provider.rs"),
+            include_str!("../../../../lucidos-core/src/llm/provider.rs"),
             "pub trait LlmProvider",
             "async fn chat(",
         ),
         (
-            include_str!("../../llm/judgment/mod.rs"),
+            include_str!("../../../../lucidos-core/src/llm/judgment/mod.rs"),
             "pub trait JudgmentProvider",
             "async fn ask(",
         ),
         (
-            include_str!("../../llm/image.rs"),
+            include_str!("../../../../lucidos-core/src/llm/image.rs"),
             "pub trait ImageProvider",
             "async fn generate(",
         ),
         (
-            include_str!("../../llm/web_search/mod.rs"),
+            include_str!("../../../../lucidos-core/src/llm/web_search/mod.rs"),
             "pub trait WebSearchProvider",
             "async fn search(",
         ),
@@ -499,42 +491,6 @@ fn every_billable_provider_method_takes_a_call_token() {
              without the model call service recording it"
         );
     }
-}
-
-/// The eval constructor is the one token outside this module, and only
-/// `lucidos-eval` may use it.
-#[test]
-fn no_engine_source_mints_the_eval_token() {
-    let minting: Vec<String> = engine_sources()
-        .into_iter()
-        .filter(|(_, body)| body.contains("for_eval_harness"))
-        .map(|(path, _)| path)
-        .collect();
-    assert!(
-        minting.is_empty(),
-        "engine sources mint the eval token, so their calls record nothing: {minting:?}"
-    );
-}
-
-/// What keeps embedding outside the service honest.
-///
-/// Embedding costs nothing because it runs in-process on fastembed. A remote
-/// embedder would be billable spend with no purpose and no row, so it fails
-/// here first and the decision gets made deliberately.
-#[test]
-fn the_only_embedders_run_in_process() {
-    let found: Vec<String> = engine_sources()
-        .into_iter()
-        .filter(|(_, body)| body.contains("impl EmbeddingProvider for"))
-        .map(|(path, _)| path)
-        .collect();
-    assert_eq!(
-        found,
-        vec!["memory/embedder_slot.rs", "memory/fastembed.rs"],
-        "an embedding provider was added or moved. One calling a remote \
-         endpoint spends real tokens, so it needs a ContextPurpose and a \
-         CallToken on its method"
-    );
 }
 
 // --- deadlines and the other call kinds -------------------------------------
@@ -674,6 +630,60 @@ async fn a_failed_call_records_facts_and_never_a_capture() {
     teardown_test_db(&db).await;
 }
 
+#[tokio::test]
+async fn a_route_resolution_failure_still_records_the_failed_call() {
+    struct Unresolved;
+    #[async_trait::async_trait]
+    impl LlmProvider for Unresolved {
+        fn default_model(&self) -> &str {
+            "unconfigured-model"
+        }
+
+        fn resolved_provider_kind(
+            &self,
+            _: &ModelSelection<'_>,
+        ) -> Result<Option<crate::llm::ProviderKind>, BoxError> {
+            Err("No provider configured for requested model".into())
+        }
+
+        async fn chat(
+            &self,
+            _: Vec<Message>,
+            _: Vec<ToolDefinition>,
+            selection: ModelSelection<'_>,
+            _: Option<&str>,
+            _: Option<TokenCallback>,
+            _: metered::CallToken,
+        ) -> Result<LlmResponse, BoxError> {
+            self.resolved_provider_kind(&selection)?;
+            unreachable!("the route cannot resolve")
+        }
+    }
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let error = AuxCapture::new(&bus, thread, ContextPurpose::Title)
+        .chat(
+            &Unresolved,
+            ask("title"),
+            vec![],
+            ModelSelection::model("unconfigured-model"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("No provider configured"));
+    let rows = failure_rows(&pool, thread).await;
+    assert_eq!(rows.len(), 1, "route failures retain their failure record");
+    assert_eq!(rows[0]["model"], "unconfigured-model");
+    assert_eq!(rows[0]["purpose"], "title");
+    assert_eq!(rows[0]["attempts"], 0);
+    assert_eq!(capture_count(&pool, thread).await, 0);
+    teardown_test_db(&db).await;
+}
+
 /// A call that runs past its deadline fails as a timeout, which no send
 /// attempt sees.
 #[tokio::test]
@@ -810,6 +820,7 @@ impl crate::llm::web_search::WebSearchProvider for Answering {
                 ..Default::default()
             }),
             model: "search-model".to_string(),
+            provider: Some(crate::runtime::billing_provider::BillingProvider::Vertex),
         })
     }
 
@@ -836,7 +847,82 @@ async fn a_web_search_records_the_backend_that_answered() {
     let rows = aux_captures(&pool, thread, "web_search").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["model"], "search-model");
+    assert_eq!(rows[0]["provider"], "vertex");
     assert_eq!(rows[0]["usage"]["input_tokens"], 70);
+    teardown_test_db(&db).await;
+}
+
+/// The failed backend leaves transport facts which the fallback must not inherit.
+struct FailedSearch;
+
+#[async_trait::async_trait]
+impl crate::llm::web_search::WebSearchProvider for FailedSearch {
+    async fn search(
+        &self,
+        _: &str,
+        _: usize,
+        _: crate::llm::metered::CallToken,
+    ) -> Result<crate::llm::web_search::WebSearchResult, BoxError> {
+        crate::llm::call_trace::routed_to(crate::llm::ProviderKind::Vertex);
+        crate::llm::call_trace::attempt_began();
+        crate::llm::call_trace::response_received(503, Some("failed-request"));
+        Err("unavailable".into())
+    }
+    fn id(&self) -> &'static str {
+        "failed"
+    }
+}
+
+struct SearchFallback(Option<crate::runtime::billing_provider::BillingProvider>);
+
+#[async_trait::async_trait]
+impl crate::llm::web_search::WebSearchProvider for SearchFallback {
+    async fn search(
+        &self,
+        query: &str,
+        max: usize,
+        call: crate::llm::metered::CallToken,
+    ) -> Result<crate::llm::web_search::WebSearchResult, BoxError> {
+        let mut result = Answering.search(query, max, call).await?;
+        result.provider = self.0;
+        Ok(result)
+    }
+    fn id(&self) -> &'static str {
+        "fallback"
+    }
+}
+
+#[tokio::test]
+async fn a_web_search_fallback_keeps_only_its_own_billing_evidence() {
+    use crate::runtime::billing_provider::BillingProvider;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    for provider in [
+        Some(BillingProvider::Anthropic),
+        Some(BillingProvider::AnthropicSubscription),
+        Some(BillingProvider::Openai),
+        None,
+    ] {
+        let thread = Uuid::new_v4();
+        let chain = WebSearchChain::new(vec![
+            std::sync::Arc::new(FailedSearch),
+            std::sync::Arc::new(SearchFallback(provider)),
+        ]);
+        let text = AuxCapture::new(&bus, thread, ContextPurpose::WebSearch)
+            .search(&chain, "query", 5)
+            .await
+            .unwrap();
+        assert_eq!(text, "found it");
+        let rows = aux_captures(&pool, thread, "web_search").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["provider"],
+            serde_json::json!(provider.map(|p| p.id()))
+        );
+        assert!(rows[0]["request_id"].is_null());
+        assert_eq!(rows[0]["usage"]["input_tokens"], 70);
+        assert_eq!(rows[0]["model"], "search-model");
+    }
     teardown_test_db(&db).await;
 }
 
@@ -898,4 +984,244 @@ async fn a_web_search_records_its_time() {
     let rows = aux_captures(&pool, thread, "web_search").await;
     assert!(rows[0]["duration_ms"].is_u64(), "row: {}", rows[0]);
     teardown_test_db(&db).await;
+}
+
+/// A held auxiliary call sends nothing; a turn can probe and reopen it.
+#[tokio::test]
+async fn provider_spend_cap_holds_gate_auxiliary_calls_and_allow_turn_probes() {
+    use crate::llm::{spend_cap::SpendCapReached, ProviderKind};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Provider {
+        kind: ProviderKind,
+        refuse: AtomicBool,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Provider {
+        fn resolved_provider_kind(
+            &self,
+            _: &ModelSelection<'_>,
+        ) -> Result<Option<ProviderKind>, BoxError> {
+            Ok(Some(self.kind))
+        }
+        fn default_model(&self) -> &str {
+            "fixture-model"
+        }
+        async fn chat(
+            &self,
+            messages: Vec<Message>,
+            tools: Vec<ToolDefinition>,
+            selection: ModelSelection<'_>,
+            system: Option<&str>,
+            tokens: Option<TokenCallback>,
+            call: metered::CallToken,
+        ) -> Result<LlmResponse, BoxError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(SpendCapReached {
+                    provider: self.kind,
+                    resets_at: None,
+                    message: "spent".into(),
+                }
+                .into());
+            }
+            ScriptedProvider::new("fixture-model", vec!["answer"])
+                .chat(messages, tools, selection, system, tokens, call)
+                .await
+        }
+    }
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let aux = AuxCapture::new(&bus, thread, ContextPurpose::Title);
+    let held = Provider {
+        kind: ProviderKind::ClaudeGateway,
+        refuse: AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    };
+    let other = Provider {
+        kind: ProviderKind::OpenAi,
+        refuse: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+    };
+    for _ in 0..2 {
+        let error = aux
+            .chat(
+                &held,
+                ask("title"),
+                vec![],
+                ModelSelection::model("fixture-model"),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<SpendCapReached>());
+    }
+    assert_eq!(held.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(spend_cap::status(&bus).await.len(), 1);
+    aux.chat(
+        &other,
+        ask("title"),
+        vec![],
+        ModelSelection::model("fixture-model"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(other.calls.load(Ordering::SeqCst), 1);
+    assert!(turn_chat(
+        &bus,
+        thread,
+        EventMeta::NONE,
+        0,
+        &held,
+        ask("probe"),
+        vec![],
+        ModelSelection::model("fixture-model"),
+        None,
+        None
+    )
+    .await
+    .is_err());
+    assert_eq!(held.calls.load(Ordering::SeqCst), 2);
+    held.refuse.store(false, Ordering::SeqCst);
+    turn_chat(
+        &bus,
+        thread,
+        EventMeta::NONE,
+        0,
+        &held,
+        ask("probe"),
+        vec![],
+        ModelSelection::model("fixture-model"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(spend_cap::status(&bus).await.is_empty());
+    aux.chat(
+        &held,
+        ask("title"),
+        vec![],
+        ModelSelection::model("fixture-model"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(held.calls.load(Ordering::SeqCst), 4);
+    let changes: Vec<String> = sqlx::query_scalar("SELECT event_type FROM events WHERE event_type IN ('ModelSpendCapReached', 'ModelSpendCapHoldEnded') ORDER BY sequence")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(changes, ["ModelSpendCapReached", "ModelSpendCapHoldEnded"]);
+
+    spend_cap::failed(
+        &bus,
+        &SpendCapReached {
+            provider: held.kind,
+            resets_at: None,
+            message: "spent".into(),
+        },
+    )
+    .await;
+    spend_cap::clear(
+        &bus,
+        held.kind,
+        crate::engine::thread_events::MessageOrigin::Device {
+            device_id: "test-device".into(),
+        },
+    )
+    .await;
+    assert!(spend_cap::status(&bus).await.is_empty());
+    let cleared: serde_json::Value = sqlx::query_scalar("SELECT payload->'data' FROM events WHERE event_type = 'ModelSpendCapHoldEnded' ORDER BY sequence DESC LIMIT 1")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cleared["cause"], "cleared");
+    assert_eq!(cleared["actor"]["device_id"], "test-device");
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_provider_hold_announces_its_reset_without_another_call_or_status_read() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _callbacks) = EventBus::new(pool.clone());
+    let mut events = bus.subscribe();
+    spend_cap::failed(
+        &bus,
+        &crate::llm::spend_cap::SpendCapReached {
+            provider: crate::llm::ProviderKind::OpenAi,
+            resets_at: Some(chrono::Utc::now() + chrono::Duration::milliseconds(150)),
+            message: "spent".into(),
+        },
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if let BusEvent::System(
+                crate::engine::event_bus::SystemEvent::ModelSpendCapHoldEnded { cause, .. },
+            ) = event.typed
+            {
+                assert_eq!(cause, crate::llm::spend_cap::SpendCapHoldEndCause::Reset);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the expiry timer announces without a read");
+    assert!(bus
+        .spend_cap_holds()
+        .lock()
+        .await
+        .refusal(crate::llm::ProviderKind::OpenAi)
+        .is_none());
+    teardown_test_db(&db).await;
+}
+
+mod guard_tests {
+    /// Every engine source a check judges, minus the provider layer and the
+    /// crate's test doubles.
+    fn engine_sources() -> Vec<(String, String)> {
+        crate::test_support::source_scan::production_sources()
+            .into_iter()
+            .filter(|(path, _)| !path.starts_with("llm/") && path != "test_support.rs")
+            .collect()
+    }
+
+    /// The eval constructor is the one token outside this module, and only
+    /// `lucidos-eval` may use it.
+    #[test]
+    fn no_engine_source_mints_the_eval_token() {
+        let minting: Vec<String> = engine_sources()
+            .into_iter()
+            .filter(|(_, body)| body.contains("for_eval_harness"))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            minting.is_empty(),
+            "engine sources mint the eval token, so their calls record nothing: {minting:?}"
+        );
+    }
+
+    /// What keeps embedding outside the service honest.
+    ///
+    /// Embedding costs nothing because it runs in-process on fastembed. A remote
+    /// embedder would be billable spend with no purpose and no row, so it fails
+    /// here first and the decision gets made deliberately.
+    #[test]
+    fn the_only_embedders_run_in_process() {
+        let found: Vec<String> = engine_sources()
+            .into_iter()
+            .filter(|(_, body)| body.contains("impl EmbeddingProvider for"))
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            found,
+            vec!["memory/embedder_slot.rs", "memory/fastembed.rs"],
+            "an embedding provider was added or moved. One calling a remote \
+         endpoint spends real tokens, so it needs a ContextPurpose and a \
+         CallToken on its method"
+        );
+    }
 }

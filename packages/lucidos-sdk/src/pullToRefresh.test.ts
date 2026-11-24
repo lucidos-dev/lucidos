@@ -13,7 +13,6 @@ import {
   type ScrollNode,
 } from './pullToRefresh';
 
-/** The origin the host serves app frames from, as the SDK reads it. */
 const HOST_ORIGIN = 'https://localhost:5251';
 
 describe('pullTravel', () => {
@@ -97,7 +96,6 @@ describe('scrolledAbove', () => {
   });
 });
 
-// The test env has no TouchEvent, so a plain Event carries the fields read.
 function touch(type: string, points: Array<[number, number]>, opts: { target?: ScrollNode; prevented?: boolean } = {}): Event {
   const e = new Event(type);
   Object.defineProperty(e, 'touches', { value: points.map(([clientX, clientY]) => ({ clientX, clientY })) });
@@ -148,7 +146,6 @@ describe('trackPullToRefresh', () => {
   });
 
   it('arms when a scroll up reaches the top, measuring from that point', () => {
-    // The unreliable pull: a scroll up that runs into the top and carries on.
     const t = setup();
     const target = chain(0, 300);
     const scroller = target.parentElement!;

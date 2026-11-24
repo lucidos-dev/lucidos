@@ -28,29 +28,29 @@ fn meta_content(html: &str, name: &str) -> Option<String> {
 /// the gateway does not list it at `engine_port`, since the harness attaches an
 /// identity only when it does.
 async fn listed_name(gateway_port: &str, workspace_id: &str, engine_port: u16) -> String {
-    let client = local_process_client();
-    for scheme in ["https", "http"] {
-        let url = format!("{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces");
-        let Ok(resp) = client.get(&url).send().await else {
-            continue;
-        };
-        let listing: serde_json::Value = resp.json().await.expect("listing is JSON");
-        let row = listing["workspaces"]
-            .as_array()
-            .expect("listing carries a workspaces array")
-            .iter()
-            .find(|w| w["id"] == workspace_id)
-            .unwrap_or_else(|| panic!("gateway does not list '{workspace_id}': {listing}"));
-        assert_eq!(
-            row["port"], engine_port,
-            "the harness attached this gateway, so it lists us at our port: {row}"
-        );
-        return row["name"]
-            .as_str()
-            .expect("row carries a name")
-            .to_string();
-    }
-    panic!("gateway on :{gateway_port} unreachable on either scheme");
+    let origin = lucidos_local_token::client::origin(gateway_port);
+    let listing: serde_json::Value = local_process_client()
+        .get(format!("{origin}/~/api/v1/control/workspaces"))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("gateway on :{gateway_port} unreachable: {e}"))
+        .json()
+        .await
+        .expect("listing is JSON");
+    let row = listing["workspaces"]
+        .as_array()
+        .expect("listing carries a workspaces array")
+        .iter()
+        .find(|w| w["id"] == workspace_id)
+        .unwrap_or_else(|| panic!("gateway does not list '{workspace_id}': {listing}"));
+    assert_eq!(
+        row["port"], engine_port,
+        "the harness attached this gateway, so it lists us at our port: {row}"
+    );
+    row["name"]
+        .as_str()
+        .expect("row carries a name")
+        .to_string()
 }
 
 #[tokio::test]

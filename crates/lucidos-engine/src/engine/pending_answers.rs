@@ -20,7 +20,7 @@ pub type PendingAnswers<T> = Mutex<HashMap<String, PendingAnswer<T>>>;
 
 /// Why an answer was not taken.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum AnswerRefusal {
+pub enum AnswerRefusal {
     /// No request waits under this id: it timed out, or was already answered.
     Unknown,
     /// The request waits for another device. It stays open for that one.
@@ -28,7 +28,7 @@ pub(crate) enum AnswerRefusal {
 }
 
 /// Start waiting under `request_id` for `target`'s answer, or any page's.
-pub(crate) fn await_answer<T>(
+pub fn await_answer<T>(
     pending: &PendingAnswers<T>,
     request_id: &str,
     target: Option<&str>,
@@ -45,13 +45,13 @@ pub(crate) fn await_answer<T>(
 }
 
 /// Stop waiting under `request_id`: a timeout, or a request never sent.
-pub(crate) fn forget_answer<T>(pending: &PendingAnswers<T>, request_id: &str) {
+pub fn forget_answer<T>(pending: &PendingAnswers<T>, request_id: &str) {
     pending.lock().unwrap().remove(request_id);
 }
 
 /// Hand `answer` to the request `request_id` waits on, if `answering` is the
 /// device it waits for.
-pub(crate) fn resolve_answer<T>(
+pub fn resolve_answer<T>(
     pending: &PendingAnswers<T>,
     request_id: &str,
     answering: Option<&str>,
@@ -70,6 +70,9 @@ pub(crate) fn resolve_answer<T>(
     let _ = request.remove().tx.send(answer);
     Ok(())
 }
+
+/// The captures waiting for an answer, by request id.
+pub type PendingCaptures = PendingAnswers<crate::engine::CaptureResult>;
 
 #[cfg(test)]
 mod tests {

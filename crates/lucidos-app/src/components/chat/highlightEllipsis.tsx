@@ -1,10 +1,5 @@
 import type { ComponentChildren } from 'preact';
 
-/** Rust `describe_tool` appends a trailing "..." as an in-progress aesthetic
- *  that survives onto completed tool calls and reads as real truncation
- *  (especially in the step detail modal where users expect the full string).
- *  Wrap it — and any middle "…" from `middle_truncate` — so the cut point is
- *  visually distinct from surrounding identifier text. */
 export function highlightEllipsis(text: string): ComponentChildren {
   if (!text.includes('…') && !text.endsWith('...')) return text;
 

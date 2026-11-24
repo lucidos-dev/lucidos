@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
 import { exchangeResponseEvents, groupIntoExchanges, type StoredEvent, type ThreadEvent } from '../thread-events';
 
-/** Replay events into one thread and return its exchanges' response rows. */
 function rows(events: ThreadEvent[]) {
   const thread = makeThreadState();
   events.forEach((event, i) => {
@@ -16,7 +15,6 @@ const MESSAGE = { type: 'MessageReceived', text: 'compare the fares' } as unknow
 const SHOWN = { type: 'WidgetShown', app_id: 'fare-grid' } as unknown as ThreadEvent;
 const PINNED = { type: 'WidgetPinned', app_id: 'fare-grid' } as unknown as ThreadEvent;
 const UNPINNED = { type: 'WidgetUnpinned', app_id: 'fare-grid' } as unknown as ThreadEvent;
-// Legacy rows: the snapshot serves the pre-rename names raw.
 const RESTORED = { type: 'WidgetRestored', app_id: 'fare-grid' } as unknown as ThreadEvent;
 const HIDDEN = { type: 'WidgetHidden', app_id: 'fare-grid' } as unknown as ThreadEvent;
 

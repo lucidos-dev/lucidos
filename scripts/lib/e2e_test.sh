@@ -22,6 +22,90 @@ source "$SCRIPT_DIR/e2e.sh"
 # shellcheck source=scripts/lib/flock_test_support.sh
 source "$SCRIPT_DIR/flock_test_support.sh"
 
+# ── the e2e root ──────────────────────────────────────────────────────
+test_a_run_reads_only_the_e2e_roots_secrets_and_cluster() {
+    echo "test: a run's secrets, cluster and database URL all come from the e2e root"
+    local home got
+    home="$(mktemp -d /tmp/e2e-root-test.XXXXXX)"
+    mkdir -p "$home/.lucidos/private"
+    echo live-secret >"$home/.lucidos/private/pg-shared-password"
+    got="$(
+        export HOME="$home" WORKSPACE="$E2E_WORKSPACE"
+        unset LUCIDOS_E2E_ROOT LUCIDOS_PRIVATE_DIR LUCIDOS_SHARED_PG_CONTAINER LUCIDOS_E2E_PG_PORT
+        # shellcheck source=/dev/null # the same lib, re-read under this HOME
+        source "$SCRIPT_DIR/e2e.sh" >/dev/null 2>&1
+        PG_PORT="$(e2e_pg_port)"
+        echo "private=$LUCIDOS_PRIVATE_DIR"
+        echo "container=$(shared_pg_container)"
+        echo "url=$(workspace_database_url)"
+    )"
+    local private="$home/.lucidos/e2e-root/private" password
+    password="$(cat "$private/pg-shared-password" 2>/dev/null)"
+    case "$got" in
+        *"private=$private"*) pass "LUCIDOS_PRIVATE_DIR is the e2e root's" ;;
+        *) fail "private dir: $got" ;;
+    esac
+    case "$got" in
+        *"container=lucidos-pg-e2e"*) pass "the cluster is lucidos-pg-e2e" ;;
+        *) fail "container: $got" ;;
+    esac
+    if [ -z "$password" ]; then
+        fail "nothing was minted under the e2e root"
+    fi
+    case "$got" in
+        *live-secret*) fail "the URL carries the live cluster's password" ;;
+        *"url=postgres://lucidos:$password@localhost:5511/"*)
+            pass "the URL names port 5511 and the e2e root's minted password" ;;
+        *) fail "url: $got" ;;
+    esac
+    rm -rf "$home"
+}
+
+test_a_root_too_long_for_the_socket_is_refused() {
+    echo "test: an e2e root whose socket path would not fit is refused, naming the override"
+    local long out rc=0
+    long="/tmp/$(printf 'x%.0s' $(seq 1 90))"
+    out="$(LUCIDOS_E2E_ROOT="$long" bash -c 'source "$1/e2e_root.sh"; e2e_root_fits_socket' _ "$SCRIPT_DIR" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q LUCIDOS_E2E_ROOT; then
+        pass "refused, naming LUCIDOS_E2E_ROOT"
+    else
+        fail "rc=$rc out=$out"
+    fi
+    long="/tmp/$(printf '\303\251%.0s' $(seq 1 45))"
+    if LC_ALL=en_US.UTF-8 LUCIDOS_E2E_ROOT="$long" \
+        bash -c 'source "$1/e2e_root.sh"; e2e_root_fits_socket' _ "$SCRIPT_DIR" 2>/dev/null; then
+        fail "a root that fits in characters but not in bytes was accepted"
+    else
+        pass "a multibyte root is measured in bytes"
+    fi
+    if LUCIDOS_E2E_ROOT=/tmp/e2e bash -c 'source "$1/e2e_root.sh"; e2e_root_fits_socket' _ "$SCRIPT_DIR"; then
+        pass "a short root is accepted"
+    else
+        fail "a short root was refused"
+    fi
+}
+
+test_an_unwritable_root_is_refused() {
+    echo "test: an e2e root this process cannot write is refused, naming --github"
+    local parent out rc=0
+    parent="$(mktemp -d)"
+    chmod 500 "$parent"
+    out="$(LUCIDOS_E2E_ROOT="$parent/root" bash -c 'source "$1/e2e_root.sh"; e2e_root_writable' _ "$SCRIPT_DIR" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q -- --github; then
+        pass "refused, naming --github"
+    else
+        fail "rc=$rc out=$out"
+    fi
+    chmod 700 "$parent"
+    if LUCIDOS_E2E_ROOT="$parent/root" bash -c 'source "$1/e2e_root.sh"; e2e_root_writable' _ "$SCRIPT_DIR" \
+        && [ -z "$(ls -A "$parent/root")" ]; then
+        pass "a writable root is accepted, and the probe leaves nothing behind"
+    else
+        fail "a writable root was refused or kept its probe"
+    fi
+    rm -rf "$parent"
+}
+
 # ── prune_orphan_worktree_dirs ────────────────────────────────────────
 test_the_debug_switch_reads_zero_as_off() {
     echo "test: LUCIDOS_E2E_DEBUG=1 picks the debug engine, and 0 or unset the release one"
@@ -718,13 +802,15 @@ test_ensure_workspace_running_builds_the_frontend_before_the_engine() {
         build_e2e_engine_once() { echo "build"; }
         ensure_frontend_built() { echo "frontend"; }
         attach_e2e_gateway() { echo "gateway"; }
+        mint_e2e_stamp_key() { echo "stamp"; }
         start_engine() { echo "engine"; }
         curl() { if [[ "$*" == *health* ]]; then return 1; fi; echo "<!DOCTYPE html>"; }
-        ensure_workspace_running 2>/dev/null | grep -E '^(build|frontend|gateway|engine)$' | tr '\n' ' '
+        ensure_workspace_running 2>/dev/null | grep -E '^(build|frontend|gateway|stamp|engine)$' | tr '\n' ' '
     )"
 
-    if [ "$order" = "build frontend gateway engine " ]; then
-        pass "the generated files, the build and the gateway identity land before the boot"
+    # The stamp key names the gateway's slug, so it is minted after the gateway.
+    if [ "$order" = "build frontend gateway stamp engine " ]; then
+        pass "the generated files, the build, the gateway identity and the key land before the boot"
     else
         fail "order was '$order': the frontend builds without its generated files, or the engine boots on a stale dist/"
     fi
@@ -738,6 +824,7 @@ test_a_cached_engine_is_reused_without_cargo() {
         cache="$SANDBOX/cache-hit"
         mkdir -p "$cache"
         engine_cache_find() { echo "$cache"; }
+        # shellcheck disable=SC2329 # a regressed reuse path would call it
         engine_cache_store() { echo "store"; }
         publish_launch_binaries() { echo "publish $1"; }
         build_or_find_engine() { echo "find BUILD=${BUILD:-}"; }
@@ -760,15 +847,19 @@ test_a_cache_miss_builds_and_files_the_build() {
     out="$(
         unset LUCIDOS_E2E_ENGINE_BUILT
         engine_cache_find() { :; }
-        engine_cache_store() { echo "store $2"; }
+        # shellcheck disable=SC2329 # called through ENGINE_BUILD_AFTER
+        engine_cache_store() { echo "store $1 $2"; }
         publish_launch_binaries() { echo "publish"; }
-        build_or_find_engine() { echo "find BUILD=${BUILD:-}"; }
+        build_or_find_engine() {
+            echo "find BUILD=${BUILD:-}"
+            LAUNCH_SOURCE_DIR="$SANDBOX/tree" LAUNCH_UPLIFT_DIR="$SANDBOX/tree/target/local-release" "$ENGINE_BUILD_AFTER"
+        }
         generate_build_outputs() { echo "codegen$REUSED_CODEGEN_BIN"; }
         RELEASE=1 ENGINE_CARGO_PROFILE="" build_e2e_engine_once
         echo "built=${LUCIDOS_E2E_ENGINE_BUILT:-}"
     )"
     local want
-    want="find BUILD=1"$'\n'"store $PROJECT_DIR/target/release"$'\n'"codegen"$'\n'"built=1"
+    want="find BUILD=1"$'\n'"store $SANDBOX/tree $SANDBOX/tree/target/local-release"$'\n'"codegen"$'\n'"built=1"
     if [ "$out" = "$want" ]; then
         pass "a miss builds, files the release build and renders with the fresh codegen"
     else
@@ -953,9 +1044,19 @@ test_browser_projects_match_the_playwright_config() {
         fail "shell lists '$ours', playwright.config.ts defines '$theirs'"
     fi
     if [ "$(e2e_browser_projects --no-webkit | paste -sd, -)" = "chromium,mobile" ]; then
-        pass "--no-webkit drops mobile-webkit"
+        pass "--no-webkit drops the WebKit projects"
     else
         fail "--no-webkit kept the wrong set: $(e2e_browser_projects --no-webkit | paste -sd, -)"
+    fi
+    if [ "$(e2e_browser_projects --webkit | paste -sd, -)" = "$(e2e_webkit_projects | paste -sd, -)" ]; then
+        pass "--webkit keeps only the WebKit projects"
+    else
+        fail "--webkit kept the wrong set: $(e2e_browser_projects --webkit | paste -sd, -)"
+    fi
+    if [ "$(e2e_browser_projects | tail -1)" = mobile-webkit ]; then
+        pass "mobile-webkit still runs last"
+    else
+        fail "the last project is $(e2e_browser_projects | tail -1)"
     fi
 }
 
@@ -966,9 +1067,13 @@ test_lock_projects_follow_the_arguments() {
         got="$(e2e_browser_lock_projects "$@")"
         if [ "$got" = "$EXPECT" ]; then pass "$WHY → $got"; else fail "$WHY: expected '$EXPECT', got '$got'"; fi
     }
-    EXPECT="chromium,mobile,mobile-webkit" WHY="no flags" _check_lock_projects "" "" ""
+    EXPECT="chromium,mobile,desktop-webkit,mobile-webkit" WHY="no flags" _check_lock_projects "" "" ""
     EXPECT="chromium,mobile" WHY="--no-webkit" _check_lock_projects "" 1 ""
-    EXPECT="mobile-webkit" WHY="--webkit" _check_lock_projects 1 "" ""
+    EXPECT="desktop-webkit,mobile-webkit" WHY="--webkit" _check_lock_projects 1 "" ""
+    EXPECT="desktop-webkit,mobile-webkit" WHY="--webkit names both, whatever the filter" \
+        _check_lock_projects 1 "" "composer-row-fit-mobile.spec.ts"
+    EXPECT="chromium,mobile,desktop-webkit,mobile-webkit" WHY="-f on a listed -all spec" \
+        _check_lock_projects "" "" "scroll-memory-all.spec.ts"
     EXPECT="mobile" WHY="--project=mobile" _check_lock_projects "" "" "" --project=mobile --grep x
     EXPECT="chromium,mobile" WHY="--project twice, split form" \
         _check_lock_projects "" "" "" --project chromium --project mobile
@@ -1298,6 +1403,23 @@ test_tree_assert_waits_out_a_late_commit() {
     fi
 }
 
+test_tree_status_takes_no_index_lock() {
+    echo "test: e2e_workspace_tree_status never takes the index lock a concurrent commit needs"
+    local E2E_WORKSPACE shim="$SANDBOX/git-shim" log="$SANDBOX/git-shim.log" real
+    E2E_WORKSPACE="$(new_tree_repo nolock)"
+    real="$(command -v git)"
+    mkdir -p "$shim"
+    printf '#!/bin/sh\necho "$*" >> "%s"\nexec "%s" "$@"\n' "$log" "$real" > "$shim/git"
+    chmod +x "$shim/git"
+    : > "$log"
+    PATH="$shim:$PATH" e2e_workspace_tree_status >/dev/null
+    if grep -q -- '--no-optional-locks status' "$log"; then
+        pass "status runs with --no-optional-locks"
+    else
+        fail "status may take index.lock: $(cat "$log")"
+    fi
+}
+
 test_tree_assert_refuses_an_unreadable_tree() {
     echo "test: assert_e2e_workspace_tree_clean treats an unreadable tree as a failure"
     local E2E_WORKSPACE="$SANDBOX/tree-not-a-repo" rc=0
@@ -1496,6 +1618,7 @@ test_tree_assert_fails_on_a_left_behind_file
 test_tree_assert_fails_on_an_uncommitted_delete
 test_tree_assert_does_not_blame_a_run_for_its_start
 test_tree_assert_waits_out_a_late_commit
+test_tree_status_takes_no_index_lock
 test_tree_assert_refuses_an_unreadable_tree
 
 test_tree_reset_keeps_only_lucidos
@@ -1505,6 +1628,9 @@ test_the_fresh_reset_runs_between_the_engine_stop_and_the_boot
 test_the_e2e_database_alone_skips_the_commit_flush
 test_only_the_start_of_a_run_asks_for_a_fresh_workspace
 test_the_debug_switch_reads_zero_as_off
+test_a_run_reads_only_the_e2e_roots_secrets_and_cluster
+test_a_root_too_long_for_the_socket_is_refused
+test_an_unwritable_root_is_refused
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

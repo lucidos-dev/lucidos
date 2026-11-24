@@ -10,9 +10,10 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::agent_recovery::park_ending_event_types_sql;
-use super::successor::{MAIN_SESSION_CAPTURE, MAX_HANDOFF_HOPS};
 use super::thread_events::ThreadEvent;
+use crate::engine::handoff_state::MAX_HANDOFF_HOPS;
+use crate::engine::question_park_sql::closes_question_sql;
+use crate::engine::session_capture_sql::MAIN_SESSION_CAPTURE;
 
 /// Fewer samples than this, and a median widens or falls back.
 const MIN_SAMPLES: usize = 3;
@@ -54,7 +55,7 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
                AND q.event_type = 'UserQuestionAsked' \
                AND NOT EXISTS (SELECT 1 FROM events p WHERE {p_before} \
                      AND p.sequence > q.sequence \
-                     AND (p.event_type IN ({park_ending}) OR {own_result}))) \
+                     AND {closes})) \
          AND NOT EXISTS (SELECT 1 FROM events w WHERE {w_before} \
                AND w.event_type = 'EventWaitStarted' \
                AND NOT EXISTS (SELECT 1 FROM events r WHERE {r_before} \
@@ -76,8 +77,7 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
         t_before = before_idle("t"),
         q_before = before_idle("q"),
         p_before = before_idle("p"),
-        park_ending = park_ending_event_types_sql(),
-        own_result = ThreadEvent::question_own_result_sql("q", "p"),
+        closes = closes_question_sql("q", "p"),
         w_before = before_idle("w"),
         r_before = before_idle("r"),
         m_before = before_idle("m"),
@@ -85,7 +85,7 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
         h_before = before_idle("h"),
         ho_before = before_idle("ho"),
         ss_before = before_idle("ss"),
-        ho_ended = crate::engine::successor::ends_handoff_sql("ss", "ho"),
+        ho_ended = crate::engine::handoff_sql::ends_handoff_sql("ss", "ho"),
     )
 }
 

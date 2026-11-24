@@ -1,9 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Mirror device-presence.test.ts: jsdom isn't loaded; inject minimal globals
-// so the module's event-listener wiring doesn't blow up. We capture every
-// registered listener by event type so individual tests can fire
-// `visibilitychange` / `focus` / `pageshow` / `hashchange` synthetically.
 type DomListener = (ev?: unknown) => void;
 const documentListeners = new Map<string, Set<DomListener>>();
 const windowListeners = new Map<string, Set<DomListener>>();
@@ -47,12 +43,6 @@ Object.defineProperty(document, 'visibilityState', {
   listener: DomListener,
 ) => unbind(windowListeners, type, listener)) as unknown as typeof unbind;
 
-// Vitest runs in Node (no jsdom). Fake window.location / window.history with
-// just enough surface for the router: `hash` / `pathname` / `search` /
-// `href` reads and `history.replaceState` writes. Crucially, replaceState
-// updates the URL but does NOT fire hashchange — that's exactly the iOS PWA
-// resume scenario (Safari updated the URL while JS was suspended; the paired
-// hashchange never reached the page).
 const currentUrl = { value: 'http://localhost/' };
 function parsed() {
   return new URL(currentUrl.value);
@@ -77,10 +67,7 @@ Object.defineProperty(window, 'history', {
 function setUrl(href: string) {
   currentUrl.value = href;
 }
-// URL constructor needs polyfilling? It's available in Node natively.
 
-// Mock the two dispatchers the router calls. Replaces the real focus/dispatch
-// side-effect chain with vi.fn so the test owns assertion of "did it fire?".
 type Outcome = { kind: 'focused' } | { kind: 'not-found' } | { kind: 'failed'; error: unknown };
 const focusThreadOrBootstrapResult = vi.fn<(id: string) => Promise<Outcome>>();
 const dispatchDeepLink = vi.fn();
@@ -90,16 +77,23 @@ const switchMenuItem = vi.fn();
 vi.mock('./threads', () => ({
   focusThreadOrBootstrapResult: (...args: [string]) => focusThreadOrBootstrapResult(...args),
 }));
-// Partial, for the reason the store mock below is: the router's siblings pull
-// other exports of this module in transitively.
 vi.mock('./menu', async () => {
   const actual = await vi.importActual<typeof import('./menu')>('./menu');
   return { ...actual, switchMenuItem: (...args: unknown[]) => switchMenuItem(...args) };
 });
 vi.mock('./in-app-notification-toast', () => ({ dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args) }));
-// Partial store mock: only the toast is stubbed. A narrow stub would break the
-// modules that pull other store exports in transitively (wipPreview reads
-// `wipPreviewThreadId` at import time).
+const INSTALLED_APP = 'habit-tracker';
+const openAppById = vi.fn((id: string, _source?: string, _fragment?: string) =>
+  Promise.resolve(id === INSTALLED_APP));
+vi.mock('./apps', async () => {
+  const actual = await vi.importActual<typeof import('./apps')>('./apps');
+  return { ...actual, openAppById: (...args: [string, string?, string?]) => openAppById(...args) };
+});
+const replaceNavState = vi.fn();
+vi.mock('./navigation', async () => {
+  const actual = await vi.importActual<typeof import('./navigation')>('./navigation');
+  return { ...actual, replaceNavState: () => replaceNavState() };
+});
 vi.mock('../store', async () => {
   const actual = await vi.importActual<typeof import('../store')>('../store');
   return { ...actual, showToast: (...args: unknown[]) => showToast(...args) };
@@ -108,8 +102,9 @@ vi.mock('../store', async () => {
 const { handleHashLocation, setupHashDeeplinkRouting, _resetThreadHashLandingForTesting } =
   await import('./hash-deeplink-router');
 const { landingHash } = await import('../../utils/workspaceLanding');
+const { appLandingHash } = await import('./appHash');
+const { appPseudoFullscreen, focusedThreadId, threadsLoaded, wipPreviewThreadId } = await import('../store');
 
-/** Let queued microtasks (the landing's awaits) run to completion. */
 const flush = () => new Promise<void>(resolve => { setTimeout(resolve, 0); });
 
 const NOTIF_ID = '5d8c4d96-8df1-4243-a43d-35449f689bda';
@@ -123,10 +118,6 @@ function buildNavigateHash(): string {
   return `#notification=${NOTIF_ID}&thread=${THREAD_ID}&event=${EVENT_ID}&tap=${tap}`;
 }
 
-/** The QUERY (cross-document) form of the same deep link. iOS Safari's
- *  declarative push navigates an already-open PWA window to this URL (a hash-
- *  only change would just focus the window without navigating), so the page
- *  lands on it via a real load/resume and must route off the query string. */
 function buildNavigateQuery(): string {
   const tap = encodeURIComponent(
     JSON.stringify({ kind: 'navigate', to: { target: 'thread', id: THREAD_ID, event_id: EVENT_ID } }),
@@ -141,6 +132,11 @@ describe('hash-deeplink-router', () => {
     dispatchDeepLink.mockClear();
     showToast.mockClear();
     switchMenuItem.mockClear();
+    openAppById.mockClear();
+    replaceNavState.mockClear();
+    appPseudoFullscreen.value = false;
+    wipPreviewThreadId.value = null;
+    focusedThreadId.value = null;
     documentListeners.clear();
     windowListeners.clear();
     visibilityValue = 'visible';
@@ -148,8 +144,6 @@ describe('hash-deeplink-router', () => {
     _resetThreadHashLandingForTesting();
   });
 
-  // The third hash channel, written by `utils/workspaceLanding.ts` when a
-  // Lucidos-menu notifications row points at another workspace.
   describe('the bare #notifications landing channel', () => {
     it('lands on the notifications view and consumes the hash', () => {
       setUrl('http://localhost/dev/#notifications');
@@ -157,7 +151,6 @@ describe('hash-deeplink-router', () => {
       expect(switchMenuItem).toHaveBeenCalledWith('notifications');
       expect(currentUrl.value, 'the consumed hash must be stripped')
         .toBe('http://localhost/dev/');
-      // Not a deep link: there is no notification id to open.
       expect(dispatchDeepLink).not.toHaveBeenCalled();
     });
 
@@ -168,9 +161,6 @@ describe('hash-deeplink-router', () => {
       expect(switchMenuItem).toHaveBeenCalledTimes(1);
     });
 
-    // The router's pattern is written out, so that its anchoring is readable
-    // where the prefix collision above is explained. This is what keeps it
-    // matching what the opener actually writes.
     it('matches the fragment the opener composes', () => {
       setUrl(`http://localhost/dev/${landingHash('notifications')}`);
       handleHashLocation();
@@ -178,9 +168,6 @@ describe('hash-deeplink-router', () => {
     });
 
     it('does NOT swallow the push-tap channel, whose key it is a prefix of', () => {
-      // `notification` is a prefix of `notifications`. A loose match sends an
-      // iOS push tap to the inbox list, instead of to the notification it was
-      // raised for. That is why the pattern is anchored.
       setUrl(`http://localhost/${buildNavigateHash()}`);
       handleHashLocation();
       expect(switchMenuItem).not.toHaveBeenCalled();
@@ -201,6 +188,63 @@ describe('hash-deeplink-router', () => {
     });
   });
 
+  describe('the #app= popout landing channel', () => {
+    it('opens the installed app in pseudo-fullscreen and consumes the hash', async () => {
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledWith(INSTALLED_APP, 'a popout link', undefined);
+      expect(appPseudoFullscreen.value).toBe(true);
+      expect(currentUrl.value, 'the consumed hash must be stripped')
+        .toBe('http://localhost/dev@peer/');
+    });
+
+    it('shows the live app, even when the seeded history restored a WIP preview', async () => {
+      focusedThreadId.value = 'thread-7';
+      threadsLoaded.value = false;
+      wipPreviewThreadId.value = 'thread-7';
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      await flush();
+      expect(wipPreviewThreadId.value).toBeNull();
+      expect(replaceNavState, 'the history row must match the live app').toHaveBeenCalledTimes(1);
+    });
+
+    it('carries the app fragment through, escapes and all', async () => {
+      const fragment = 'week=3&view=list';
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP, fragment })}`);
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledWith(INSTALLED_APP, 'a popout link', fragment);
+    });
+
+    it('opens nothing and stays in the normal layout for an unknown id', async () => {
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: 'not-installed' })}`);
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledWith('not-installed', 'a popout link', undefined);
+      expect(appPseudoFullscreen.value).toBe(false);
+      expect(currentUrl.value).toBe('http://localhost/dev@peer/');
+    });
+
+    it('does not re-fire on a resume once consumed', async () => {
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledTimes(1);
+    });
+
+    it('swallows none of the other channels', () => {
+      for (const hash of ['#notifications', `#thread=${THREAD_ID}`, buildNavigateHash(), '#apps', '#application=x']) {
+        setUrl(`http://localhost/${hash}`);
+        _resetThreadHashLandingForTesting();
+        handleHashLocation();
+      }
+      expect(openAppById).not.toHaveBeenCalled();
+    });
+  });
+
   describe('handleHashLocation', () => {
     it('s4_5_handle_hash_location_dispatches_notification_navigate_target', () => {
       setUrl(`http://localhost/${buildNavigateHash()}`);
@@ -213,10 +257,6 @@ describe('hash-deeplink-router', () => {
     });
 
     it('s4_5_handle_hash_location_dispatches_query_url_for_ios_declarative_reload', () => {
-      // iOS Safari declarative push navigates the PWA window to the QUERY
-      // navigate URL (cross-document, so an already-open window actually
-      // navigates instead of just focusing). After the load/resume the router
-      // must read the deep link from the query string, not just the hash.
       setUrl(`http://localhost/${buildNavigateQuery()}`);
       handleHashLocation();
       expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
@@ -224,7 +264,6 @@ describe('hash-deeplink-router', () => {
       expect(target.notification).toBe(NOTIF_ID);
       expect(target.thread).toBe(THREAD_ID);
       expect(target.event).toBe(EVENT_ID);
-      // Consumed query params are stripped so a refresh doesn't re-fire.
       expect(window.location.search).toBe('');
     });
 
@@ -233,7 +272,6 @@ describe('hash-deeplink-router', () => {
       handleHashLocation();
       expect(window.location.hash).toBe('');
       handleHashLocation();
-      // Still only one call total — second invocation found no deep-link.
       expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
     });
 
@@ -252,17 +290,10 @@ describe('hash-deeplink-router', () => {
       handleHashLocation();
       expect(dispatchDeepLink).not.toHaveBeenCalled();
       expect(focusThreadOrBootstrapResult).not.toHaveBeenCalled();
-      // Unrecognized anchor is preserved — only deep-link params are stripped.
       expect(window.location.hash).toBe('#some-other-anchor');
     });
   });
 
-  // The cross-workspace landing: `openThreadInWorkspace` sends the user to
-  // `<peer>/#thread=<uuid>`, and the gateway lazy-starts a stopped peer engine on
-  // that proxy hit. The shell therefore boots while the engine is still coming up,
-  // so the first bootstrap can lose the race. Before this suite the router stripped
-  // the hash BEFORE dispatching, which turned that lost race into a permanently
-  // lost deep link (the "first click reloads, second click navigates" report).
   describe('bare #thread= landing durability', () => {
     it('keeps the hash while a failed bootstrap is retried, and strips it on success', async () => {
       vi.useFakeTimers();
@@ -275,7 +306,6 @@ describe('hash-deeplink-router', () => {
         setUrl(`http://localhost/#thread=${THREAD_ID}`);
         handleHashLocation();
 
-        // First attempt has failed: the hash MUST still be there to retry from.
         await vi.advanceTimersByTimeAsync(0);
         expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
         expect(window.location.hash).toBe(`#thread=${THREAD_ID}`);
@@ -294,7 +324,6 @@ describe('hash-deeplink-router', () => {
       setUrl(`http://localhost/#thread=${THREAD_ID}`);
       handleHashLocation();
       await flush();
-      // A verdict from the engine, not a race: one attempt, no backoff.
       expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
       expect(window.location.hash).toBe('');
       expect(showToast).toHaveBeenCalledTimes(1);
@@ -313,7 +342,6 @@ describe('hash-deeplink-router', () => {
         handleHashLocation();
 
         await vi.advanceTimersByTimeAsync(60_000);
-        // Bounded: the retry budget is exhausted rather than looping forever.
         expect(focusThreadOrBootstrapResult.mock.calls.length).toBeLessThan(20);
         expect(window.location.hash).toBe('');
         expect(showToast).toHaveBeenCalledTimes(1);
@@ -335,8 +363,6 @@ describe('hash-deeplink-router', () => {
         await vi.advanceTimersByTimeAsync(0);
         expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
 
-        // The hash still being in the URL is exactly what makes every resume
-        // event (visibilitychange / focus / pageshow) re-enter here.
         handleHashLocation();
         handleHashLocation();
         expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
@@ -348,16 +374,8 @@ describe('hash-deeplink-router', () => {
 
   describe('setupHashDeeplinkRouting (iOS PWA resume — the regression)', () => {
     it('s4_5_setup_routing_runs_handle_hash_location_on_visibilitychange_visible_for_ios_pwa_resume', () => {
-      // The iOS PWA scenario: Safari handled the declarative push tap and
-      // updated the PWA URL while the JS was suspended. When the page resumes,
-      // hashchange does NOT fire (the event paired with the URL update was
-      // delivered to a frozen runloop). Without this resume wiring, the
-      // dispatcher never runs and the push tap silently no-ops.
       const teardown = setupHashDeeplinkRouting();
       try {
-        // Simulate Safari setting the URL hash silently (no hashchange).
-        // history.replaceState is the documented way to mutate the URL
-        // without firing hashchange — same shape as iOS Safari's behavior.
         setUrl(`http://localhost/${buildNavigateHash()}`);
         expect(dispatchDeepLink).not.toHaveBeenCalled();
 
@@ -376,10 +394,6 @@ describe('hash-deeplink-router', () => {
         setUrl(`http://localhost/${buildNavigateHash()}`);
         visibilityValue = 'hidden';
         fire(documentListeners, 'visibilitychange');
-        // Defense-in-depth: same gate applies to focus + pageshow when the
-        // document is technically still hidden (e.g. DevTools focus, programmatic
-        // focus on a background tab). Without this the deep link would dispatch
-        // against a tab the user can't see and the hash would be stripped silently.
         fire(windowListeners, 'focus');
         fire(windowListeners, 'pageshow');
         expect(dispatchDeepLink).not.toHaveBeenCalled();
@@ -433,11 +447,6 @@ describe('hash-deeplink-router', () => {
     });
 
     it('s4_5_setup_routing_teardown_clears_cold_start_timer', () => {
-      // Fake timers so we can advance past the cold-start dispatch without
-      // a real wall-clock wait. Without this assertion, a regression that
-      // drops `clearTimeout(coldStartTimer)` from teardown would still pass
-      // the listener-removal test above — the timer would fire on the next
-      // macrotask (outside the synchronous test body) and silently dispatch.
       vi.useFakeTimers();
       try {
         const teardown = setupHashDeeplinkRouting();

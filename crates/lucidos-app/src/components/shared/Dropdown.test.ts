@@ -36,7 +36,6 @@ describe('filterDropdownOptions (type-to-search)', () => {
 });
 
 describe('dropdownMenuClass (the portaled menu carries its own context)', () => {
-  /** A trigger whose `closest` matches exactly the given selectors. */
   const trigger = (...matches: string[]) => ({
     closest: (selector: string) => (matches.includes(selector) ? {} : null),
   });
@@ -46,8 +45,6 @@ describe('dropdownMenuClass (the portaled menu carries its own context)', () => 
   });
 
   it('adds the field class for a trigger inside a .form-group', () => {
-    // The menu is portaled to <body>, so `.form-group .dropdown-option` can no
-    // longer reach it through the DOM: the context has to ride on the panel.
     expect(dropdownMenuClass(trigger('.form-group'))).toBe('surface-box dropdown-menu dropdown-menu-field');
   });
 
@@ -63,15 +60,9 @@ describe('dropdownMenuClass (the portaled menu carries its own context)', () => 
 
 describe('dropdownPanelStyle (the panel is measured before it is placed)', () => {
   it('carries the trigger width BEFORE a position exists, so the measurement is honest', () => {
-    // The panel is portaled to <body>, where the stylesheet's `min-width: 100%`
-    // resolves against the initial containing block. Without an inline
-    // minWidth the first measurement reports a viewport-wide menu and the
-    // computed `left` strands at the viewport margin instead of the trigger.
     const style = dropdownPanelStyle(180, null);
     expect(style.minWidth).toBe('180px');
     expect(style.visibility).toBe('hidden');
-    // Fixed + zeroed offsets keep the hidden box in the viewport rather than
-    // 100vh down the document (the stylesheet's `top: calc(100% + 0.25rem)`).
     expect(style.position).toBe('fixed');
     expect(style.top).toBe('0px');
     expect(style.left).toBe('0px');
@@ -99,9 +90,6 @@ describe('openMenuFocusTarget (who owns keystrokes while the menu is open)', () 
     openMenuFocusTarget({ freeText: false, searching: false, positioned: true, touch: false, ...over });
 
   it('holds focus on the trigger while the menu is open and unsearched', () => {
-    // The trigger's own keydown handler is what seeds the typeahead, so it has
-    // to hold focus however the menu opened. WebKit does not focus a <button>
-    // on click, so a mouse-opened menu left the keystrokes in the prompt.
     expect(target()).toBe('trigger');
   });
 

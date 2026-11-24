@@ -35,26 +35,10 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::LucidosEngine;
 use crate::runtime::CodingAgent;
 
-/// Ceiling on `timeout_secs`. There is no unbounded wait: a wait that outlives
-/// every reason anyone had for it is indistinguishable from a stalled thread.
-pub(crate) const MAX_TIMEOUT_SECS: i64 = 24 * 60 * 60;
-
-/// How many counted waits a thread may start inside
-/// [`RECENT_SUBSCRIPTION_WINDOW_SECS`] with no human action in between (S8).
-/// [`recent_subscriptions`] says which waits count. Mirrors
-/// `max_event_trigger_depth` in intent: the events still persist, the fan-out
-/// just stops.
-///
-/// Twenty, not ten: a thread's own background tasks still count, and a thread
-/// working through short ones reached ten in an hour. A hot loop re-arms in
-/// seconds, so it reaches twenty within a minute or two anyway (ADR 0280).
-pub(crate) const MAX_RECENT_SUBSCRIPTIONS: i64 = 20;
-
-/// The rolling window [`MAX_RECENT_SUBSCRIPTIONS`] counts over. The cap bounds a
-/// loop, and every loop it names re-arms within seconds. A serial workflow of
-/// half-hour waits does not. A lifetime count cannot tell the two apart, so it
-/// starved every thread with no human in it (ADR 0265).
-pub(crate) const RECENT_SUBSCRIPTION_WINDOW_SECS: i64 = 60 * 60;
+pub use crate::core::event_subscription::limits::MAX_TIMEOUT_SECS;
+pub(crate) use crate::core::event_subscription::limits::{
+    MAX_RECENT_SUBSCRIPTIONS, RECENT_SUBSCRIPTION_WINDOW_SECS,
+};
 
 /// How many waits one thread may hold at once (S6b).
 ///
@@ -89,7 +73,7 @@ pub(crate) const RECENT_SUBSCRIPTION_WINDOW_SECS: i64 = 60 * 60;
 /// matching cost, which is workspace-wide: the dispatcher matches every live
 /// wait in the workspace against every event, and nothing bounds how many
 /// threads there are.
-pub(crate) const MAX_LIVE_WAITS_PER_THREAD: usize = 25;
+pub const MAX_LIVE_WAITS_PER_THREAD: usize = 25;
 
 /// How far back registration looks for a match that landed while the model was
 /// still working towards this call (the **arming lookback**, see
@@ -121,7 +105,7 @@ pub(crate) const ARMING_LOOKBACK_MAX_REPORTED: usize = 3;
 /// carries on: `await_event` registers a subscription and returns, it does not
 /// end the turn. The delivery arrives later, normally as its own turn, so
 /// nothing is left dangling here.
-pub(crate) enum AwaitEventOutcome {
+pub enum AwaitEventOutcome {
     /// The wait is registered.
     Registered(String),
     /// Nothing was registered.
@@ -130,7 +114,7 @@ pub(crate) enum AwaitEventOutcome {
 
 impl LucidosEngine {
     /// Validate an `await_event` call, and register the wait if it passes.
-    pub(crate) async fn register_event_wait(
+    pub async fn register_event_wait(
         &self,
         thread_id: Uuid,
         tool_use_id: &str,
@@ -235,7 +219,9 @@ impl LucidosEngine {
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await
-        .inspect_err(|e| crate::log!("[EventWait] Agent read failed for thread {thread_id}: {e}"))
+        .inspect_err(|e| {
+            crate::log_legacy!("[EventWait] Agent read failed for thread {thread_id}: {e}")
+        })
         .ok()?;
         match row? {
             (false, _) => Some(WaitAgent::Lucidos),
@@ -333,7 +319,7 @@ impl LucidosEngine {
                 // A cap that cannot be evaluated must not silently become no
                 // cap: an unreadable event store is exactly when a runaway
                 // loop would do the most damage.
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Subscription-count read failed for thread {thread_id}: {e}"
                 );
                 Some(format!(
@@ -369,7 +355,7 @@ impl LucidosEngine {
                     // Not an empty set: without the exclusion the lookback would
                     // re-report an event this thread was already handed, so an
                     // unreadable exclusion means no report at all.
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventWait] Lookback delivered-set read failed for thread {}: {e}",
                         wait.thread_id
                     );
@@ -389,7 +375,7 @@ impl LucidosEngine {
             Ok(found) if found.is_empty() => None,
             Ok(found) => Some(found),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Lookback scan failed for thread {}: {e}",
                     wait.thread_id
                 );
@@ -418,7 +404,7 @@ pub(super) async fn read_watermark(
     thread_id: Uuid,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     Ok(committed_event_horizon(pool).await.inspect_err(|e| {
-        crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
+        crate::log_legacy!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
     })?)
 }
 
@@ -455,6 +441,7 @@ pub(super) fn build_wait_at(
         reason: reason.to_string(),
         armed_at,
         expires_at: armed_at + Duration::seconds(timeout_secs),
+        background_timing: None,
         watermark,
     }
 }
@@ -476,19 +463,20 @@ pub(super) async fn persist_wait(
             reason: wait.reason.clone(),
             armed_at: wait.armed_at,
             expires_at: wait.expires_at,
+            background_timing: wait.background_timing,
             watermark: wait.watermark,
         },
         meta: EventMeta::NONE,
     })
     .await
     .inspect_err(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] EventWaitStarted emit failed for thread {}: {e}",
             wait.thread_id
         );
     })?;
 
-    crate::log!(
+    crate::log_legacy!(
         "[EventWait] Thread {} subscribed to {:?} for {}s (wait {})",
         wait.thread_id,
         wait.on.iter().map(|s| &s.event_type).collect::<Vec<_>>(),

@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** The full-response and steps toggles roll their rows, like the fold does.
- *
- *  A roll needs its row to survive the toggle. So a row that stays drawn must
- *  stay the same DOM node, and a hidden row goes through its `<Disclosure>`.
- *  A remounted row cannot roll. See docs/plans/2026-09-27-turn-toggles-roll.md.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -66,6 +60,28 @@ const chunk = (text: string) =>
   Array.from(host.querySelectorAll('.response-chunk')).find(c => c.textContent?.includes(text));
 
 describe('the turn toggles', () => {
+  it('combines full response and steps independently through their controls', () => {
+    const click = (role: string) => act(() => {
+      host.querySelector<HTMLButtonElement>(`[data-role="${role}"]`)!.click();
+    });
+    const check = (details: boolean, steps: boolean) => {
+      expect(detailsExpanded.value).toBe(details);
+      expect(stepsExpanded.value).toBe(steps);
+      expect(!!chunk('First part.')).toBe(details);
+      expect(chunk('Final answer.')).toBeDefined();
+      expect(!!host.querySelector('.inline-step')).toBe(details && steps);
+    };
+    check(true, true);
+    click('toggle-steps');
+    check(true, false);
+    click('toggle-details');
+    check(false, false);
+    click('toggle-steps');
+    check(false, true);
+    click('toggle-details');
+    check(true, true);
+  });
+
   it('draws each chunk and the step run inside a Disclosure', () => {
     expect(chunk('First part.')?.closest('.response-content > .disclosure')).not.toBeNull();
     expect(host.querySelector('.response-content > .disclosure .inline-step')).not.toBeNull();
@@ -82,7 +98,6 @@ describe('the turn toggles', () => {
   });
 
   it('marks hidden steps with a hairline row of their own, which rolls', () => {
-    // The hairline rolls in its own Disclosure, so the gap never jumps.
     expect(host.querySelector('.response-elision')).toBeNull();
     act(() => { stepsExpanded.value = false; });
     expect(host.querySelector('.response-content > .disclosure .response-elision')).not.toBeNull();
@@ -101,7 +116,6 @@ describe('the turn toggles', () => {
   });
 });
 
-/** Two runs of steps between three chunks, so the head clamp moves a run. */
 const TWO_RUNS: Exchange = {
   ...TURN,
   userSeq: 2,
@@ -147,7 +161,6 @@ describe('the head clamp', () => {
   });
 });
 
-/** A turn of steps and nothing else. Hiding steps leaves it no body at all. */
 const STEPS_ONLY: Exchange = {
   ...TURN,
   userSeq: 3,
@@ -162,14 +175,11 @@ describe('a turn of steps alone', () => {
   const realRect = HTMLElement.prototype.getBoundingClientRect;
 
   beforeEach(() => {
-    // jsdom has no Web Animations and lays nothing out. Without both, every
-    // Disclosure snaps shut, and a snap is what this case must not do.
     (HTMLElement.prototype as unknown as { animate: unknown }).animate = () => ({
       cancel: () => {},
       finished: new Promise(() => {}),
     });
     HTMLElement.prototype.getBoundingClientRect = () => ({ top: 10, bottom: 50, height: 40 }) as DOMRect;
-    // A fresh mount, not a re-render of the turn the file-level setup drew.
     act(() => { render(null, host); });
     act(() => {
       render(
@@ -199,7 +209,6 @@ describe('a turn of steps alone', () => {
     const step = host.querySelector('.inline-step');
     expect(step).not.toBeNull();
     act(() => { stepsExpanded.value = false; });
-    // Mid-roll: the same row is still drawn, inside a body that takes no input.
     expect(host.querySelector('.inline-step')).toBe(step);
     expect(step!.closest('.response-panel > .disclosure.is-rolling')).not.toBeNull();
   });

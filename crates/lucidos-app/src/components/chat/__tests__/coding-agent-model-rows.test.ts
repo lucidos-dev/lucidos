@@ -6,8 +6,6 @@ const row = (value: string, resolved_model?: string, description = ''): CodingAg
   value, label: value, description, resolved_model,
 });
 
-/** The picker as the engine serves it: sorted, and Opus 5.5 folded to the
- *  `opus` alias although Claude Code also lists `claude-opus-5-5[1m]`. */
 const served = [
   row('default', 'claude-opus-5-5[1m]'),
   row('claude-fable-5-1', 'claude-fable-5-1'),

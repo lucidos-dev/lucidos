@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-05
+- **Amended by**: [0726](0726-remote-app-popout-opens-the-shell.md) (a remote workspace's popout opens the shell)
 
 ## Context
 

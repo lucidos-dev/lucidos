@@ -80,6 +80,40 @@ Load it with `load_knowhow` before you start a release.
 Nothing else routes to a reference. It stays loadable by full id forever, but if no doc
 names it, nothing can find it.
 
+## Size: at most 24 KB per file
+
+**Keep every knowhow file at or under 24 KB (24,576 bytes).** A coding agent
+reads knowhow through a shell, and Claude Code keeps about 30 KB of one
+command's output. Codex keeps less. Past the cap, the agent sees the start of
+the doc and never its end, and it does not know what it missed.
+
+**Split a doc that outgrows the cap into an index plus parts**, using the
+reference folder above:
+
+```
+data/knowhow/
+  billing-api.md              ← the index, listed
+  billing-api/
+    endpoints.md              ← a part
+    error-codes.md            ← a part
+```
+
+- **The index keeps the essentials**: what the doc is for, the rules every
+  reader needs, and a `## Parts` section.
+- **A table works for parts described by section.** Name each part by full id
+  and say what it covers, so the reader can load the part it needs.
+- **For docs that grow by entry, use a `###` heading per part with its full
+  id.** Name the sections it covers on one line. Then list each entry as a
+  separate top-level bullet in part order, as in `system-knowhow/glossary`.
+- **Each part carries its own frontmatter** and a line pointing back at the
+  index.
+- **Split at `##` headings**, and keep a section whole where you can.
+
+Lucidos warns when a write puts a knowhow file over the cap. The write still
+lands. The workspace audit (`system-knowhow/workspace-audit/knowhow`) lists
+every oversized doc, and `lucidos knowhow read` notes one before its body. The
+large shipped docs follow this shape, such as `system-knowhow/js-sdk`.
+
 ## Lifecycle: loaded while in use
 
 When the engine LLM calls `load_knowhow` on a doc, the body comes back as the tool result. From the next turn on, it rides in the `[LOADED KNOWHOW]` block of the user message instead. The block is built once per turn and never changes inside one, so a doc loaded mid-turn joins it on the next turn. How many turns each doc has left rides in a separate `[KNOWHOW RETENTION]` block, so the doc bodies stay byte-identical from turn to turn.
@@ -149,12 +183,12 @@ Avoid:
 A recipe that calls an external HTTP API the workspace holds a credential for uses the engine proxy. Never raw `curl -H "Authorization: Bearer $CRED_..."` or pasted-in headers. The proxy injects the auth header server-side. The credential never appears in script source, args, env vars, log lines, or the LLM tool transcript. Surfaces by consumer:
 
 - **LLM running a trigger or agent step**: the `proxy_request` tool, calling the `data/config/apis.json` entry by name.
-- **Script (bash / Python) invoked by an intent or trigger**: the `lucidos proxy <name> ...` CLI (see `system-knowhow/lucidos-cli.md` § `lucidos proxy`).
-- **App UI inside an iframe**: `lucidos.proxy(name).fetch(path, init)` (see `system-knowhow/js-sdk.md` § `lucidos.proxy`).
+- **Script (bash / Python) invoked by an intent or trigger**: the `lucidos proxy <name> ...` CLI (see `system-knowhow/lucidos-cli/subcommands-13.md` § `lucidos proxy`).
+- **App UI inside an iframe**: `lucidos.proxy(name).fetch(path, init)` (see `system-knowhow/js-sdk/lucidos-media.md` § `lucidos.proxy`).
 
-Configure the backend once in `data/config/apis.json` (schema in `system-knowhow/best-practices.md` § `config/`). Knowhow then names it instead of restating credentials.
+Configure the backend once in `data/config/apis.json` (schema in `system-knowhow/best-practices/workspace-layout.md` § `config/`). Knowhow then names it instead of restating credentials.
 
-**A model provider needs no entry at all.** Every model provider the engine holds auth for is a *builtin provider proxy*: `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The ChatGPT plan has none. They are not in `apis.json`, and a recipe never asks for their key. Each default base already includes `/v1`, so a recipe writes `lucidos proxy openai /models`, never `/v1/models`. See `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
+**A model provider needs no entry at all.** Every model provider the engine holds auth for is a *builtin provider proxy*: `anthropic`, `claude-gateway`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. The ChatGPT plan has none. They are not in `apis.json`, and a recipe never asks for their key. Each default base already includes `/v1`, so a recipe writes `lucidos proxy openai /models`, never `/v1/models`. See `system-knowhow/lucidos-cli/subcommands-13.md` § `lucidos proxy`.
 
 ## Writing knowhow during execution
 

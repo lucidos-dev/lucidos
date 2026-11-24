@@ -1,11 +1,16 @@
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+pub(crate) use crate::core::repository_lock::MainLocks;
+#[cfg(test)]
+pub(crate) use crate::core::repository_lock::WORKSPACE_REPO_MUTEX;
+pub use crate::core::repository_lock::{lock_workspace_repo, WorkspaceRepoLock, MAIN_LOCKS};
+
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 mod branch_name;
 mod checkpoint;
 mod commits;
-mod conflict_probe;
 mod harden_marker;
 mod merge;
 mod origin;
@@ -14,276 +19,83 @@ mod plan_marker;
 mod restart_detection;
 mod worktree;
 
+pub use branch_name::LUCIDOS_BRANCH_PREFIX;
 pub(crate) use branch_name::*;
 pub(crate) use checkpoint::*;
 pub(crate) use commits::*;
-pub(crate) use conflict_probe::*;
+pub use harden_marker::record_hardened;
 pub(crate) use harden_marker::*;
 pub(crate) use merge::*;
 pub(crate) use origin::*;
-pub(crate) use plan_approval::PlanApprovalError;
+pub use origin::{FollowOutcome, LandingOrder};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use plan_approval::user_approved_plan;
+pub use plan_approval::PlanApprovalError;
 pub(crate) use plan_marker::*;
 pub(crate) use restart_detection::*;
 pub(crate) use worktree::*;
+pub use {
+    branch_name::allocate_coding_agent_branch, branch_name::branch_name_is_taken,
+    branch_name::is_coding_agent_branch, branch_name::is_lane_branch, branch_name::lane_branch,
+    branch_name::BranchScope,
+};
+pub use {
+    checkpoint::checkpoint_pair_available, checkpoint::command_checkpoint_ref,
+    checkpoint::command_post_image_ref,
+};
+pub use {
+    commits::auto_commit_preserving_marker, commits::auto_commit_safe_files_if_dirty,
+    commits::branch_changed_files, commits::branch_changed_files_checked, commits::branch_head_sha,
+    commits::commit_worktree_or_err, commits::commits_in_range, commits::current_head_sha,
+    commits::describe_branch_changes, commits::git_commit_no_edit, commits::has_branch_commits,
+    commits::has_unmerged_authored_commits, commits::local_branch_exists,
+    commits::main_history_touches_files, commits::proposal_files_for_branch,
+    commits::root_commit_sha, commits::sole_branch_containing, commits::worktree_dirty_files,
+};
+pub use {
+    harden_marker::consume_harden_marker, harden_marker::has_full_harden_marker,
+    harden_marker::HardenMarker, harden_marker::HardenMarkerState, harden_marker::HardenTier,
+};
+pub use {
+    merge::catchup_and_ff_to_main, merge::default_diff_base, merge::default_local_branch,
+    merge::ff_merge_to_main, merge::push_main_in_background, merge::resolution_merged_main,
+    merge::resolve_worktree_base,
+};
+pub(crate) use {
+    plan_approval::approves as plan_approves, plan_approval::proposed_plan_binding,
+    plan_approval::user_approved_plan_for, plan_approval::user_picked_plan_variant,
+    plan_approval::ApprovalTarget, plan_approval::HumanInput, plan_approval::PlanBinding,
+};
+pub use {
+    plan_marker::carry_child_planned, plan_marker::carry_planned,
+    plan_marker::lands_plan_files_only, plan_marker::record_planned_with_kind,
+    plan_marker::tracked_branch_elsewhere, plan_marker::validate_plan_files,
+    plan_marker::PlanMarkerKind, plan_marker::PlanMarkerState, plan_marker::PlanMarkerWrite,
+};
+pub use {plan_marker::is_plan_file, plan_marker::record_planned};
+pub use {
+    restart_detection::files_have_client_update, restart_detection::files_require_restart,
+    restart_detection::is_external_repo_path,
+};
+pub use {
+    worktree::add_paths_to_worktree_exclude, worktree::cleanup_failed_spawn,
+    worktree::clear_stranded_worktree_dir, worktree::create_sparse_app_worktree,
+    worktree::create_sparse_app_worktree_from, worktree::find_worktree_for_branch,
+    worktree::install_coding_agent_diff_hook, worktree::is_live_worktree_at,
+    worktree::main_worktree, worktree::worktree_add, worktree::worktree_current_branch,
+    worktree::worktrees_dir, worktree::WorktreeLookup,
+};
+pub use {worktree::parse_worktree_list, worktree::short_thread_id};
 
-/// Canonical absolute repo root, as the DB key of a per-branch marker.
-///
-/// Resolves symlinks, so the git hook and the engine produce the same row. The
-/// hook derives its path from `git rev-parse --git-common-dir`, which can
-/// answer relatively or through a symlink. An unresolved path would key a
-/// second row nothing reads.
-///
-/// One definition for all three readers of those tables: the harden marker, the
-/// plan marker, and the sweep a thread delete runs over both. It lived twice,
-/// once per marker module, and a third copy in `api::threads::delete` would
-/// have keyed its DELETEs on a path the writers never wrote.
-pub(crate) fn canonical_repo_root(repo_root: &Path) -> String {
-    repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf())
-        .to_string_lossy()
-        .to_string()
-}
-
-/// How long a single git invocation may run before the engine gives up on it.
-/// Generous, because it is a ceiling on a saturated host, not a latency target:
-/// while the e2e suite runs, ordinary `rev-parse` calls have been observed
-/// taking tens of seconds.
-pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The git binary the engine launches, resolved once per process.
-///
-/// On macOS `/usr/bin/git` is the `xcrun` shim, which launches the real git as
-/// a second process. Every launch costs tens of milliseconds there, so the shim
-/// doubles the price of each call. The shim's git names its exec path, whose
-/// `git` is the binary behind it.
-///
-/// Lazy, so it resolves after `core::user_path::augment_process_path` has set
-/// the PATH it reads.
-pub(crate) async fn git_program() -> &'static Path {
-    static PROGRAM: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
-    PROGRAM
-        .get_or_init(|| async {
-            let path_git = std::env::var_os("PATH").and_then(|path| {
-                std::env::split_paths(&path)
-                    .map(|dir| dir.join("git"))
-                    .find(|git| git.is_file())
-            });
-            if !is_xcrun_git_shim(path_git.as_deref(), cfg!(target_os = "macos")) {
-                return PathBuf::from("git");
-            }
-            let probe = tokio::process::Command::new("git")
-                .arg("--exec-path")
-                .output();
-            let exec_path = match tokio::time::timeout(GIT_TIMEOUT, probe).await {
-                Ok(Ok(o)) if o.status.success() => Some(o.stdout),
-                _ => None,
-            };
-            git_program_from_exec_path(exec_path.as_deref())
-        })
-        .await
-}
-
-/// Only the `xcrun` shim is bypassed. Another `git` on PATH may be a wrapper
-/// that injects config, credentials or auditing. Launching the binary behind
-/// it would skip all of that.
-fn is_xcrun_git_shim(path_git: Option<&Path>, macos: bool) -> bool {
-    macos && path_git == Some(Path::new("/usr/bin/git"))
-}
-
-/// `<exec-path>/git` when `git --exec-path` answered with a directory holding
-/// one, else bare `git`. A failed probe costs the shortcut, never a git call.
-fn git_program_from_exec_path(stdout: Option<&[u8]>) -> PathBuf {
-    let dir = stdout.map(|s| String::from_utf8_lossy(s).trim().to_string());
-    match dir.filter(|d| !d.is_empty()) {
-        Some(dir) if Path::new(&dir).join("git").is_file() => Path::new(&dir).join("git"),
-        _ => PathBuf::from("git"),
-    }
-}
-
-/// Run a git command with the [`GIT_TIMEOUT`] ceiling. Always prepends
-/// `-c core.quotepath=false` so non-ASCII paths come back as raw UTF-8 instead
-/// of git's default `"...\NNN..."` form — every caller treats output as a path.
-pub(crate) async fn git_cmd(args: &[&str], dir: &Path) -> Result<std::process::Output, String> {
-    git_cmd_env(args, dir, &[]).await
-}
-
-/// Run a git command that is expected to DO something, folding a non-zero exit
-/// into the same `Err` a spawn failure or the [`GIT_TIMEOUT`] produces.
-///
-/// [`git_cmd`] returning `Ok` says only that git ran, not that it did the
-/// thing. A caller who just needs "did it work, and if not why" otherwise
-/// writes that three-arm match out at every site. Use this for a mutating
-/// call. For a yes/no *question* reach for [`git_answer`] instead, which keeps
-/// "no" and "could not ask" apart.
-pub(crate) async fn git_ran_ok(args: &[&str], dir: &Path) -> Result<(), String> {
-    match git_cmd(args, dir).await {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => Err(e),
-    }
-}
-
-/// The repo's shared `.git` directory, as an absolute path. Asked from a linked
-/// worktree, it names the main checkout's `.git`. A failed spawn, the timeout,
-/// a non-zero exit and an empty answer are all `Err`, never a guessed path.
-pub(crate) async fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
-    let out = git_cmd(&["rev-parse", "--git-common-dir"], dir).await?;
-    if !out.status.success() {
-        return Err(format!(
-            "git rev-parse --git-common-dir failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return Err("git rev-parse --git-common-dir returned nothing".to_string());
-    }
-    // Git may answer relative to `dir`. Joining an absolute answer returns it.
-    Ok(dir.join(raw))
-}
-
-/// The repo's main working tree, asked from any worktree of it. Git lists it
-/// first in `git worktree list`, which holds for a submodule too. A bare repo
-/// has none. Nor does a `--separate-git-dir` clone asked from a linked
-/// worktree: git records no path for it and names the git dir instead. Both
-/// are `Err`, like every failure to ask.
-pub(crate) async fn git_main_worktree(dir: &Path) -> Result<PathBuf, String> {
-    let out = git_cmd(&["worktree", "list", "--porcelain"], dir).await?;
-    if !out.status.success() {
-        return Err(format!(
-            "git worktree list failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut first = stdout.lines().take_while(|line| !line.is_empty());
-    let path = first
-        .next()
-        .and_then(|line| line.strip_prefix("worktree "))
-        .ok_or("git worktree list named no worktree")?;
-    if first.any(|line| line == "bare") {
-        return Err("the repo is bare, so it has no main working tree".to_string());
-    }
-    let main = PathBuf::from(path);
-    let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok();
-    if same(&main, &git_common_dir(dir).await?) {
-        return Err("git records no main working tree for this repo".to_string());
-    }
-    Ok(main)
-}
-
-/// The author and committer env for a commit Lucidos itself makes, so it
-/// works when the repo has no user.name/email in its config. The engine
-/// commits artifacts through git2 with a per-commit signature, not config.
-pub(crate) fn lucidos_identity_env() -> Vec<(&'static str, &'static OsStr)> {
-    vec![
-        ("GIT_AUTHOR_NAME", OsStr::new("Lucidos")),
-        ("GIT_AUTHOR_EMAIL", OsStr::new("lucidos@localhost")),
-        ("GIT_COMMITTER_NAME", OsStr::new("Lucidos")),
-        ("GIT_COMMITTER_EMAIL", OsStr::new("lucidos@localhost")),
-    ]
-}
-
-/// Like [`git_cmd`] but with extra environment variables. Used by the command
-/// checkpoint helpers, which set `GIT_INDEX_FILE` to a throwaway index so a
-/// snapshot/restore never disturbs the repo's real index or working tree.
-pub(crate) async fn git_cmd_env(
-    args: &[&str],
-    dir: &Path,
-    envs: &[(&str, &OsStr)],
-) -> Result<std::process::Output, String> {
-    git_cmd_env_timeout(args, dir, envs, GIT_TIMEOUT).await
-}
-
-/// [`git_cmd_env`] with an explicit ceiling. Tests use it to force the expiry
-/// branch. Production callers get [`GIT_TIMEOUT`], unless the command moves a
-/// whole repository's history, like a restore fetching `origin`.
-pub(crate) async fn git_cmd_env_timeout(
-    args: &[&str],
-    dir: &Path,
-    envs: &[(&str, &OsStr)],
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    git_cmd_spawn(args, dir, envs, timeout, false).await
-}
-
-/// [`git_cmd`] for a command the engine may SIGKILL the moment it stops
-/// waiting. Opt-in, because leaving a timed-out process alone is the right
-/// default. Killing a half-written `commit` or `merge` strands a lock file over
-/// a command that would have finished.
-///
-/// The opposite case is the pair [`worktree::WORKTREE_ADMIN_MUTEX`] guards.
-/// Both write `$GIT_DIR/worktrees/<id>`, and a timeout releases that guard
-/// while the process writes on. Whichever spawn holds the guard next then
-/// races the one that gave up. Neither destroys anything pre-existing when
-/// killed: a prune is idempotent, and an add owns only what this attempt is
-/// creating.
-pub(crate) async fn git_cmd_kill_on_timeout(
-    args: &[&str],
-    dir: &Path,
-) -> Result<std::process::Output, String> {
-    git_cmd_spawn(args, dir, &[], GIT_TIMEOUT, true).await
-}
-
-/// Run `program`, falling back to PATH's `git` when `program` is gone.
-///
-/// The resolved binary can vanish under a running engine: a Homebrew upgrade
-/// deletes the versioned keg its exec path named, while PATH's `git` follows
-/// the upgrade.
-async fn run_git(
-    program: &Path,
-    args: &[&str],
-    dir: &Path,
-    envs: &[(&str, &OsStr)],
-    kill_on_drop: bool,
-) -> std::io::Result<std::process::Output> {
-    let output = |program: &Path| {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args).current_dir(dir).kill_on_drop(kill_on_drop);
-        // `git status` refreshes a stale index under `index.lock`. That lock
-        // makes a concurrent `git add` or `git commit` in the same worktree
-        // die. Mandatory locks are unaffected. `git diff` ignores this
-        // setting, so a probe uses the plumbing `diff-files` instead.
-        cmd.env("GIT_OPTIONAL_LOCKS", "0");
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        async move { cmd.output().await }
-    };
-    match output(program).await {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && program != Path::new("git") => {
-            output(Path::new("git")).await
-        }
-        result => result,
-    }
-}
-
-/// The one place a git command is spawned, through [`run_git`]. The only other
-/// launch is [`git_program`]'s one-time probe, which finds the binary this runs.
-/// `kill_on_timeout` decides whether giving up on the wait also kills the process.
-async fn git_cmd_spawn(
-    args: &[&str],
-    dir: &Path,
-    envs: &[(&str, &OsStr)],
-    timeout: Duration,
-    kill_on_timeout: bool,
-) -> Result<std::process::Output, String> {
-    let mut full_args: Vec<&str> = Vec::with_capacity(args.len() + 2);
-    full_args.push("-c");
-    full_args.push("core.quotepath=false");
-    full_args.extend_from_slice(args);
-    let run = run_git(git_program().await, &full_args, dir, envs, kill_on_timeout);
-    match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("git {} failed: {}", args.join(" "), e)),
-        Err(_) => Err(format!(
-            "git {} timed out after {}s",
-            args.join(" "),
-            timeout.as_secs()
-        )),
-    }
-}
+pub use crate::core::git::{
+    canonical_repo_root, git_cmd, git_cmd_env, git_ran_ok, predict_merge_into_main, probe_merge,
+    MergeProbe,
+};
+pub(crate) use crate::core::git::{
+    git_cmd_env_timeout, git_cmd_kill_on_timeout, git_common_dir, git_main_worktree,
+    lucidos_identity_env, GIT_TIMEOUT,
+};
 
 /// Answer to a yes/no question the engine asks git.
 ///
@@ -301,7 +113,7 @@ async fn git_cmd_spawn(
 /// authorizes a destructive or discarding action** (see the failure-path
 /// cleanup rule in `.claude/rules/rust.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GitAnswer {
+pub enum GitAnswer {
     /// git ran and said yes (exit 0, or the caller's predicate held).
     Yes,
     /// git ran and said no (non-zero exit, or the caller's predicate failed).
@@ -312,7 +124,7 @@ pub(crate) enum GitAnswer {
 
 impl GitAnswer {
     /// Collapse to a bool, naming the value `Unknown` takes.
-    pub(crate) fn or_unknown(self, on_unknown: bool) -> bool {
+    pub fn or_unknown(self, on_unknown: bool) -> bool {
         match self {
             GitAnswer::Yes => true,
             GitAnswer::No => false,
@@ -322,7 +134,7 @@ impl GitAnswer {
 
     /// True when git could not be asked. Use to log the distinction, or to
     /// refuse an action outright rather than pick a fallback.
-    pub(crate) fn is_unknown(self) -> bool {
+    pub fn is_unknown(self) -> bool {
         matches!(self, GitAnswer::Unknown)
     }
 }
@@ -330,7 +142,7 @@ impl GitAnswer {
 /// Ask git a yes/no question, keeping "could not ask" separate from "no":
 /// exit 0 is [`GitAnswer::Yes`], a non-zero exit is [`GitAnswer::No`], and a
 /// spawn failure or timeout is [`GitAnswer::Unknown`].
-pub(crate) async fn git_answer(args: &[&str], dir: &Path) -> GitAnswer {
+pub async fn git_answer(args: &[&str], dir: &Path) -> GitAnswer {
     git_answer_with(args, dir, |_| true).await
 }
 
@@ -338,7 +150,7 @@ pub(crate) async fn git_answer(args: &[&str], dir: &Path) -> GitAnswer {
 /// output rather than by exit status alone. A non-zero exit is still `No`, so
 /// this is for commands whose failure genuinely means "no" (`rev-parse` on a
 /// path in no repository, say).
-pub(crate) async fn git_answer_with(
+pub async fn git_answer_with(
     args: &[&str],
     dir: &Path,
     predicate: impl FnOnce(&std::process::Output) -> bool,
@@ -360,7 +172,7 @@ pub(crate) async fn git_answer_with(
 /// git-crypt does on a locked repo), which says nothing about whether there is
 /// uncommitted work. Reading that as "not dirty" would let a caller conclude
 /// there is nothing to lose.
-pub(crate) async fn git_answer_when_ok(
+pub async fn git_answer_when_ok(
     args: &[&str],
     dir: &Path,
     predicate: impl FnOnce(&std::process::Output) -> bool,
@@ -376,7 +188,7 @@ pub(crate) async fn git_answer_when_ok(
 
 /// Whether `dir` holds unmerged paths. A non-zero exit means "not a work
 /// tree", never "no conflicts", so it is `Unknown`.
-pub(crate) async fn has_unmerged_paths(dir: &Path) -> GitAnswer {
+pub async fn has_unmerged_paths(dir: &Path) -> GitAnswer {
     git_answer_when_ok(&UNMERGED_PATHS_ARGS, dir, |o| !o.stdout.is_empty()).await
 }
 
@@ -405,7 +217,7 @@ fn classify_git_answer(
         }
         Ok(o) => {
             if on_nonzero.is_unknown() {
-                log!(
+                log_legacy!(
                     "[Git] `git {}` failed in {}: {}. Treating as unknown, never as a no",
                     args.join(" "),
                     dir.display(),
@@ -415,7 +227,7 @@ fn classify_git_answer(
             on_nonzero
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Git] cannot answer `git {}` in {}: {}. Treating as unknown, never as a no",
                 args.join(" "),
                 dir.display(),
@@ -424,34 +236,6 @@ fn classify_git_answer(
             GitAnswer::Unknown
         }
     }
-}
-
-/// The workspace repo lock. Every in-engine writer of the workspace repo holds
-/// it across its whole read, file change and commit. A merge holds it across
-/// catch-up, sha read, ref move and the repo-root tree sync.
-///
-/// Two windows close only because both sides take it. A targeted data write
-/// saves a file, then commits it, and a `checkout -f main` between the two
-/// rewrites the file to its old bytes. A `commit_all_dirty` snapshot between
-/// `update-ref` and the tree sync stages the old tree over the new head, which
-/// commits every merged file as deleted.
-///
-/// Take it through [`lock_workspace_repo`], whose [`WorkspaceRepoLock`] every
-/// commit helper requires. tokio's mutex is not re-entrant, so no holder may
-/// call a function that takes it itself: an `AppManager` write, a merge, or
-/// `commit_all_dirty`. Lock order: [`merge::MERGE_MUTEX`] first, then this.
-pub(crate) static WORKSPACE_REPO_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Proof that the holder owns the workspace repo lock. Only `git_ops` can mint
-/// one, so a write that takes `&WorkspaceRepoLock` cannot run without the lock.
-/// The guard is `'static` and `Send`, so it can move into a `spawn_blocking`
-/// closure. It is then released when the blocking work really ends.
-pub(crate) struct WorkspaceRepoLock {
-    _guard: tokio::sync::MutexGuard<'static, ()>,
-}
-
-pub(crate) async fn lock_workspace_repo() -> WorkspaceRepoLock {
-    MAIN_LOCKS.lock_repo().await
 }
 
 /// Retry budget for a git lock-file collision. A lock is held for one write
@@ -525,10 +309,6 @@ mod answer_tests;
 mod origin_tests;
 
 #[cfg(test)]
-#[path = "../git_ops_tests/program.rs"]
-mod program_tests;
-
-#[cfg(test)]
 #[path = "../git_ops_tests/app_worktree.rs"]
 mod app_worktree_tests;
 
@@ -567,3 +347,7 @@ mod worktree_validity_tests;
 #[cfg(test)]
 #[path = "../git_ops_tests/commits.rs"]
 mod commits_tests;
+
+#[cfg(test)]
+#[path = "../git_ops_tests/git_index.rs"]
+mod git_index_tests;

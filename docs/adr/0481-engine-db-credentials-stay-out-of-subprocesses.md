@@ -9,6 +9,12 @@
   `LUCIDOS_DATABASE_URL` now signs in as the workspace's agent role, which
   cannot read a secret column or reach another database.
 
+- **Amended by**: [0686](0686-agent-role-table-write-allow-list.md).
+  Agent-role writes use a table allow-list outside machine-made workspaces.
+
+- **Amended by**: [0760](0760-agent-role-writes-no-table.md).
+  The agent role writes no table outside machine-made workspaces.
+
 ## Context
 
 A user on the macOS DMG lost every thread and preference. A trigger's coding

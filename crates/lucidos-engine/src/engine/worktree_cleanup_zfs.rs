@@ -94,7 +94,7 @@ pub(crate) fn volume_size_bytes(path: &Path, os_total_bytes: u64) -> u64 {
                 let entry = map.entry(key.clone()).or_default();
                 match cli_size {
                     Some(size) => entry.cli_size = Some(size),
-                    None if entry.fetched.is_none() => log!(
+                    None if entry.fetched.is_none() => log_legacy!(
                         "[WorktreeCleanup] ZFS size unknown for {}: the largest OS total applies",
                         key.display()
                     ),

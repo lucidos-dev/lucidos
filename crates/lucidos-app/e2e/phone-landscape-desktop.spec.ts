@@ -1,8 +1,6 @@
 import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp } from './helpers';
 
-/** Only a finger makes a short viewport a phone in landscape (ADR 0342). A
- *  short desktop window has a fine pointer and keeps the desktop split. */
 
 test('a short desktop window keeps the desktop split', async ({ page }) => {
   await assertHealthy(page);

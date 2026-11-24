@@ -1,23 +1,3 @@
-/**
- * A surface that is not a control paints no focus ring.
- *
- * Two ways one of these boxes takes focus. `ProgressDialog` focuses its own
- * body, so a modal with no Cancel keeps the keyboard. Chrome promotes the
- * scroll boxes to Tab stops, which it does to any overflowing scroller holding
- * no focusable child. Either way the box ends up `:focus-visible` and wears the
- * browser's ring around a block of text. The report was the restart dialog,
- * framed while the user typed.
- *
- * Each box states its own Tab contract, because hiding a ring alone would
- * leave a stop nothing announces. The scroll boxes declare `tabIndex={-1}`, so the
- * promotion never happens and only a click can focus them. The file preview
- * goes the other way: nothing traps Tab there, so it declares a named region
- * and wears our own ring.
- *
- * A source scan, because the trigger needs a real keyboard AND an overflowing
- * box. Chromium promotes the scroller and WebKit does not, so no single e2e
- * project sees them all.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,45 +11,33 @@ import { rulesTargeting, selectorList, styleSheetPaths } from './css-rule-helper
 const here: string = dirname(fileURLToPath(import.meta.url));
 const STYLES_ROOT: string = resolve(here, '..');
 
-/** Every sheet, read once. Each surface below scans all of them, so reading per
- *  surface would re-read the tree five times over. */
 const SHEETS: Array<{ file: string; css: string }> = styleSheetPaths(STYLES_ROOT).map(
   (path: string) => ({ file: relative(STYLES_ROOT, path), css: readFileSync(path, 'utf8') }),
 );
 
-/** The boxes that hold focus without being something the user presses. Add a
- *  class here when a new one appears, together with its suppression. */
 const SURFACES = [
-  'progress-dialog-body', // the restart dialog's body, focused for containment
-  'confirm-details',      // the confirm dialog's detail list
-  'dialog-body',          // the scrolling body of every centred dialog
-  'step-detail-body',     // the scrolling body of the step-detail family
-  'explainer-body',       // the explainer popover's scrolling copy
-  'event-condition-popover-body', // the condition popover's scrolling JSON
-  'toast-heading',        // a toast's title, or its untitled message, a scroll box on its own
-  'toast-text',           // a toast's message under its title, the main scroll box
+  'progress-dialog',
+  'confirm-details',
+  'dialog-body',
+  'step-detail-body',
+  'explainer-body',
+  'event-condition-popover-body',
+  'toast-heading',
+  'toast-text',
 ] as const;
 
-/** Both pseudo-classes, because they are not interchangeable here. Chrome only
- *  paints for `:focus-visible`, and a suppression written for `:focus` alone
- *  loses to a later `:focus-visible` rule on specificity. */
 const STATES = [':focus', ':focus-visible'] as const;
 
-/** The shorthand and the one longhand that paints. A ring restored as
- *  `outline-style` would slip past a scan reading only the shorthand. */
 const OUTLINE_PROPS = ['outline', 'outline-style'] as const;
 
 interface OutlineDecl { state: string; prop: string; value: string; file: string }
 
-/** Every outline declaration any rule makes on `surface` in a focus state. */
 function outlinesInFocus(surface: string): OutlineDecl[] {
   const found: OutlineDecl[] = [];
   for (const { file, css } of SHEETS) {
     for (const rule of rulesTargeting(css, surface)) {
       const members = selectorList(rule.selector);
       for (const state of STATES) {
-        // `:focus-visible` and `:focus-within` both start with `.x:focus`, so a
-        // plain prefix test would file either under `:focus`.
         const hit = members.some(
           one => one.includes(`.${surface}${state}`) && !one.includes(`.${surface}${state}-`),
         );
@@ -112,27 +80,18 @@ describe('non-control surfaces paint no focus ring', () => {
   }
 });
 
-/** The boxes whose surface owns a Tab cycle that cannot name them. Chrome's
- *  promotion only ever added a stop nobody reaches on purpose. The overlay Tab
- *  rule wraps at the confirm dialog's two buttons and steps between them in between;
- *  `handleToastKeyDown` cycles a toast's buttons and links. */
 const TAB_EXCLUDED: ReadonlyArray<readonly [cls: string, source: string]> = [
   ['confirm-details', 'components/shared/ConfirmDialog.tsx'],
   ['toast-heading', 'components/shared/Toast.tsx'],
   ['toast-text', 'components/shared/Toast.tsx'],
 ];
 
-/** The one that goes the other way. Nothing traps Tab in the file preview
- *  modal, so a keyboard user does reach the body and scrolls a long preview
- *  with it. It declares the stop rather than leaning on Chrome, which promotes
- *  only while the preview holds no link. */
 const DECLARED_REGIONS: ReadonlyArray<readonly [cls: string, source: string]> = [
   ['file-preview-modal-body', 'components/files/FilePreviewModal.tsx'],
 ];
 
 const SRC_ROOT: string = resolve(here, '..', '..');
 
-/** The opening tag of the element rendering `class="<cls>"`. */
 function openingTag(cls: string, source: string): string {
   const src: string = readFileSync(resolve(SRC_ROOT, source), 'utf8');
   const tag = src.match(new RegExp(`<[a-z]+[^>]*\\sclass="${cls}"[^>]*>`));

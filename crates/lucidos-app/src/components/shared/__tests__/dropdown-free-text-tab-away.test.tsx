@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** Tab away from an open free-text dropdown must leave focus where Tab put it.
- *
- *  The open menu defers focusing its input by one frame. A frame still pending
- *  when Tab closed the menu pulled focus back into the input, whose focus
- *  handler reopened the menu: Tab looked dead and the menu stayed up. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -1,15 +1,5 @@
-/**
- * The drawer grouping and the Ongoing grouping's selected group survive a
- * reload, per device. `store.ts` restores both from localStorage at init.
- * Their one writer each (`setDrawerGrouping`, `setSelectedOngoingGroup`)
- * writes them back. The grouping's key is cleared for Folders, so a pristine
- * state restores pristine. An unknown stored value restores the default:
- * Folders, and Blocked.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// The stored keys are a contract with every device's localStorage, so the
-// test pins them as literals rather than reading them from the store.
 const GROUPING_KEY = 'lucidos-drawer-grouping';
 const SELECTED_GROUP_KEY = 'lucidos-drawer-selected-ongoing-group';
 
@@ -41,9 +31,7 @@ describe('drawer grouping persistence', () => {
 
   it.each([
     ['an unknown value', 'sections', 'running'],
-    // The grouping was once called Status, and it once had an Idle group.
     ['a retired value', 'status', 'idle'],
-    // Blocked was once called Needs attention, stored as `attention`.
     ['the old Blocked name', 'sections', 'attention'],
   ])('restores the defaults from %s', async (_what, grouping, group) => {
     localStorage.setItem(GROUPING_KEY, grouping);

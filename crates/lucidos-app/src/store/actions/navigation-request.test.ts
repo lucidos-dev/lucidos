@@ -2,11 +2,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
 import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest, focusedThreadId, settingsLinkedFragment } from '../store';
 
-// Spy on showToast but keep the rest of the store real — navigation-request.ts
-// reads the nav lists + settingsSubviewLabel at module load to build its
-// renderable-view set, so those must be the genuine values. `vi.hoisted` is
-// required because the static `import … from '../store'` above resolves the
-// mocked module before plain consts initialize (TDZ).
 const { showToast, setPluginsInstalledOnly } = vi.hoisted(() => ({
   showToast: vi.fn(),
   setPluginsInstalledOnly: vi.fn(),
@@ -16,15 +11,12 @@ vi.mock('../store', async (importActual) => {
   return { ...actual, showToast, setPluginsInstalledOnly };
 });
 
-// Stub every action module handleNavigationRequest dispatches into.
 const openSettingsSubview = vi.fn();
 const switchMenuItem = vi.fn();
 const setActiveMenu = vi.fn();
 vi.mock('./menu', () => ({ openSettingsSubview, switchMenuItem, setActiveMenu }));
 
 const openAppById = vi.fn();
-// The `new-chat` branch leaves a fullscreen app panel on a split layout, so the
-// contract sweep below reaches this even though it never opens an app.
 const exitAppFullscreen = vi.fn(() => false);
 const refreshApps = vi.fn(async () => {});
 vi.mock('./apps', () => ({ openAppById, exitAppFullscreen, refreshApps }));
@@ -59,14 +51,9 @@ vi.mock('./compose', () => ({ ensureFocusedComposeThread, updateCompose, applyDe
 const focusPromptNow = vi.fn();
 vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
 
-// Mirrors the real predicate (`parseRepoPath(path) !== null` → handled here):
-// the router's only job is to hand a repo-encoded path to this action and fall
-// back to openFilePreview when it declines. Its own repo-binding behavior is
-// covered in repositories-nav.test.ts.
 const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
 vi.mock('./repositories', () => ({ openEncodedRepoFilePreview }));
 
-// What `openRepoFileLink` re-reads when its cached list cannot match a name.
 const { refreshRepositories } = vi.hoisted(() => ({ refreshRepositories: vi.fn(async () => {}) }));
 vi.mock('./repositoriesLoader', () => ({ refreshRepositories }));
 
@@ -85,11 +72,6 @@ describe('handleNavigationRequest — settings sub-sections', () => {
   });
 
   it('lands a sub-section in ONE nav push, with no Settings-home entry first', () => {
-    // The reported bug: the Backup failure notification's "Open settings"
-    // landed on Settings → System → Backup correctly, but pairing
-    // switchMenuItem('settings') with openSettingsSubview pushed the Settings
-    // home list as its own history entry, so Back went there instead of back to
-    // the notification. openSettingsSubview lands both, so the pairing is gone.
     handleNavigationRequest({ target: 'settings', settings_view: 'backup' });
     expect(openSettingsSubview).toHaveBeenCalledWith('backup');
     expect(switchMenuItem).not.toHaveBeenCalled();
@@ -121,18 +103,12 @@ describe('handleNavigationRequest — settings sub-sections', () => {
   });
 
   it('lands the Thread Queue subpanel in ONE nav push too', () => {
-    // Same pairing, same fix: `thread-queue` is a NavigateTarget of its own that
-    // the frontend reinterprets as the Settings → System subpanel.
     handleNavigationRequest({ target: 'thread-queue' });
     expect(openSettingsSubview).toHaveBeenCalledWith('thread-queue');
     expect(switchMenuItem).not.toHaveBeenCalled();
   });
 
   it('aliases a retired settings_view onto the category that absorbed it', () => {
-    // A stored notification's deep link, or an app compiled against an older
-    // SDK `SettingsViewTarget`, can still name `repositories` / `mobile-access`
-    // / `network-access` / `links` / `experimental`. Those must land where the
-    // setting moved, not toast "Unknown settings section".
     for (const [sent, expected] of [
       ['repositories', 'coding-agents'],
       ['mobile-access', 'access'],
@@ -149,9 +125,6 @@ describe('handleNavigationRequest — settings sub-sections', () => {
   });
 
   it('still reports a settings_view that is neither live nor retired', () => {
-    // The alias must not swallow a typo: the sender can be told, and a silent
-    // land-on-home would hide a real integration bug. The toast names what the
-    // CALLER sent, so they can see which value was wrong.
     handleNavigationRequest({ target: 'settings', settings_view: 'not-a-section' });
     expect(openSettingsSubview).not.toHaveBeenCalled();
     expect(showToast).toHaveBeenCalledWith('Unknown settings section: "not-a-section"', 'error');
@@ -166,7 +139,7 @@ describe('handleNavigationRequest — settings sub-sections', () => {
 
   it('fails loud on an unknown settings_view instead of blanking the panel', () => {
     handleNavigationRequest({ target: 'settings', settings_view: 'does-not-exist' });
-    expect(switchMenuItem).toHaveBeenCalledWith('settings'); // still showed Settings
+    expect(switchMenuItem).toHaveBeenCalledWith('settings');
     expect(openSettingsSubview).not.toHaveBeenCalled();
     expect(showToast).toHaveBeenCalledWith(
       expect.stringContaining('Unknown settings section'),
@@ -179,7 +152,6 @@ describe('handleNavigationRequest — new-chat destination prefill', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/repos/example-repo' }] };
-    // The mocked ensureFocusedComposeThread focuses nothing, so stand in for it.
     focusedThreadId.value = 'new-thread-id';
   });
 
@@ -281,24 +253,19 @@ describe('handleNavigationRequest — file target', () => {
 
   it('routes a repo-encoded path to the repo preview, intact', () => {
     handleNavigationRequest({ target: 'file', file_path: ENCODED });
-    // The encoded path is handed over verbatim — ContentPane parses it and
-    // mounts RepoFilePreview instead of the /data/* preview.
     expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(ENCODED);
     expect(openFilePreview).not.toHaveBeenCalled();
   });
 
-  // A navigate stored before the engine resolved names, such as a notification
-  // tap, can still name its repository. Opened as written, the viewer read the
-  // name as a uuid and failed with "UUID parsing failed".
   describe('a repository named by its name', () => {
     afterEach(() => {
       repositories.value = { status: 'not-loaded' };
     });
 
-    it('opens the file under the repository id, line and all', () => {
+    it('opens the file under the repository id, line and all', async () => {
       repositories.value = { status: 'loaded', data: [{ id: REPO_ID, name: 'example-repo', path: '/src/example' }] };
       handleNavigationRequest({ target: 'file', file_path: 'repo:example-repo:file#main:docs/x.md', line: 7 });
-      expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(`repo:${REPO_ID}:file#main:docs/x.md`);
+      await vi.waitFor(() => expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(`repo:${REPO_ID}:file#main:docs/x.md`));
       expect(openEncodedRepoFilePreview).not.toHaveBeenCalledWith(expect.stringContaining('example-repo'));
       expect(selectedLines.value).toEqual({ start: 7, end: 7 });
     });
@@ -332,8 +299,6 @@ describe('handleNavigationRequest — file target', () => {
     expect(showToast).toHaveBeenCalledWith('Navigation target missing file_path', 'error');
   });
 
-  // The off-focus jump offer ("Thread X wants to open …") labels the
-  // destination — it must read as the file, not as the encoding.
   it('describes a repo-encoded destination by its repo-relative path', () => {
     expect(describeNavTarget({ target: 'file', file_path: ENCODED }))
       .toBe('file "src/main/resources/transforms/x.jslt"');
@@ -355,10 +320,6 @@ describe('handleNavigationRequest — file target', () => {
   });
 });
 
-// A cited line: select it, scroll to it, and show the source view so there is
-// something to highlight. Set AFTER the open, because both openers clear
-// `selectedLines` (so a previous file's range can't leak) and openFilePreview
-// resets `filePreviewSource`.
 describe('handleNavigationRequest: file target at a line', () => {
   const ENCODED = 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:src/main.rs';
 
@@ -383,7 +344,6 @@ describe('handleNavigationRequest: file target at a line', () => {
 
     expect(openFilePreview).toHaveBeenCalledWith('artifacts/notes.md');
     expect(selectedLines.value).toEqual({ start: 10, end: 20 });
-    // The scroll lands on the first line of the range, not the last.
     expect(lineScrollTarget.value).toEqual({ path: 'artifacts/notes.md', line: 10 });
     expect(filePreviewSource.value).toBe(true);
   });
@@ -397,8 +357,6 @@ describe('handleNavigationRequest: file target at a line', () => {
     expect(filePreviewSource.value).toBe(false);
   });
 
-  // A citation's line number is the part that goes stale. It must never cost
-  // the reader the file itself, and must never raise an error at them.
   it.each([
     ['zero', 0],
     ['negative', -3],
@@ -415,9 +373,6 @@ describe('handleNavigationRequest: file target at a line', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  // The line count isn't known until the content loads, so a past-the-end line
-  // is accepted here and highlights nothing; LineNumberedCode drops the
-  // selection once it can see the file is too short.
   it('accepts a line past the end of the file without complaint', () => {
     handleNavigationRequest({ target: 'file', file_path: 'artifacts/notes.md', line: 9_000_000 });
 
@@ -426,9 +381,6 @@ describe('handleNavigationRequest: file target at a line', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  // A target that can never show numbered lines must not end up with an
-  // invisible selection: `currentChatContext` would attach it to the next
-  // message as a range naming no code.
   it.each([
     ['a PDF', 'artifacts/report.pdf'],
     ['an image', 'artifacts/chart.png'],
@@ -464,9 +416,6 @@ describe('handleNavigationRequest: file target at a line', () => {
   });
 });
 
-// The reported bug: a notification tap could not name a place inside the app it
-// opened. A radar notification about one item landed on a board sorted by score.
-// Chat links and file-preview links already carried a fragment.
 describe('handleNavigationRequest: app target at a fragment', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -486,15 +435,12 @@ describe('handleNavigationRequest: app target at a fragment', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  // Absent is not empty: `openApp` leaves an already-open app where the reader
-  // put it only when it gets nothing, so `''` here would move them.
   it('passes undefined when the navigate names no place inside the app', () => {
     handleNavigationRequest({ target: 'app', app_id: 'habit-tracker' });
 
     expect(openAppById).toHaveBeenCalledWith('habit-tracker', undefined, undefined);
   });
 
-  // `app-ui` is the historical alias, still carried by stored notification rows.
   it('carries the fragment through the app-ui alias too', () => {
     handleNavigationRequest({
       target: 'app-ui',
@@ -512,8 +458,6 @@ describe('handleNavigationRequest: app target at a fragment', () => {
     expect(showToast).toHaveBeenCalledWith('Navigation target missing app_id', 'error');
   });
 
-  // The off-focus jump offer is keyed per source thread, so a second navigate
-  // replaces the first. Two destinations in one app must not read identically.
   it('names the fragment in the jump offer, the way the file case names a line', () => {
     expect(
       describeNavTarget({ target: 'app', app_id: 'habit-tracker', fragment: 'habit-hydration' }),
@@ -524,10 +468,6 @@ describe('handleNavigationRequest: app target at a fragment', () => {
   });
 });
 
-// A notification tap is the ordinary way into this branch, and the reader is
-// often inside an app when it arrives. A fullscreen app panel is the whole
-// viewport. The thread the tap navigates to therefore lands behind it, and the
-// tap reads as having done nothing.
 describe('handleNavigationRequest: thread target', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -541,10 +481,6 @@ describe('handleNavigationRequest: thread target', () => {
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-1', { targetEventId: 'e-7' });
   });
 
-  // Only fullscreen goes. The split gives the conversation its own pane beside
-  // the content one, so closing the app would cost the reader what they were
-  // working in. It would reveal something that was never hidden. Same
-  // distinction the `new-chat` branch draws.
   it('keeps the app the reader had open', () => {
     const overlay = { type: 'app-ui' as const, app: { id: 'habit-tracker', name: 'Habit Tracker' } };
     panelOverlay.value = overlay as never;
@@ -564,10 +500,6 @@ describe('handleNavigationRequest: thread target', () => {
   });
 });
 
-// The reported bug arrived on this branch. The engine's `connect_oauth_account`
-// emits an `OAuthAuthorizationRequested` carrying `purpose: 'oauth'`. The desktop app had
-// the experimental in-app browser on, so the sign-in page was mounted in the
-// url-preview panel and rendered nothing.
 describe('handleNavigationRequest: url target', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -586,8 +518,6 @@ describe('handleNavigationRequest: url target', () => {
     expect(openUrl).not.toHaveBeenCalled();
   });
 
-  // An ordinary link out of an email still follows the user's preferences, the
-  // in-app browser included. Only a sign-in page is forced out of the app.
   it('sends an ordinary url to openUrl, with the source that asked', () => {
     handleNavigationRequest(
       { target: 'url', url: 'https://example.com/report' },
@@ -607,8 +537,6 @@ describe('handleNavigationRequest: url target', () => {
   });
 });
 
-// Codegen cross-checks — the generated contract (from the engine `navigate_ui`
-// tool) must stay a subset of what the frontend can actually render / handle.
 describe('navigate_ui contract is fully consumable by the frontend', () => {
   const renderable = new Set<string>(SETTINGS_SUBVIEW_ITEMS.map((i) => i.key));
 
@@ -621,9 +549,6 @@ describe('navigate_ui contract is fully consumable by the frontend', () => {
   it('every advertised navigate target is handled (no "unknown target")', () => {
     for (const target of NAVIGATE_TARGETS) {
       vi.clearAllMocks();
-      // Kitchen-sink payload so each branch finds the field it needs and never
-      // toasts a missing-field error either — we only care that no branch falls
-      // through to the default "Unknown navigation target" case.
       handleNavigationRequest({
         target,
         app_id: 'a',

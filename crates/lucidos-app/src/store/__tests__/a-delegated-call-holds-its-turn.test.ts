@@ -1,22 +1,8 @@
-/** A delegated call, in the shape the engine writes.
- *
- *  The caller's words are a `SpokenMessageReceived` and the talker's
- *  `WorkDelegated` starts the turn (ADR 0201). No `MessageReceived` is written,
- *  so every reader that told a delegated utterance apart by that type is
- *  reading a row the engine no longer emits.
- *
- *  That is what this file pins. The client's other call fixtures still build
- *  the OLD shape on purpose: those rows are in the store and must keep
- *  rendering. What none of them covered is the new one.
- *
- *  Plan: `docs/plans/2026-09-16-the-clock-is-the-only-order.md`.
- */
 import { describe, expect, it } from 'vitest';
 import { ev, heard, put, said } from './call-fixtures';
 import { exchangeStatus, groupIntoExchanges } from '../thread-events';
 import type { Exchange, StoredEvent } from '../thread-events';
 
-/** The `WorkDelegated` row, which is the turn's anchor. */
 const DELEGATION = 'wd-1';
 
 function aDelegatedCall(): Map<number, StoredEvent> {
@@ -33,7 +19,6 @@ function aDelegatedCall(): Map<number, StoredEvent> {
   ]);
 }
 
-/** The card the caller's words opened, which is where the turn shows. */
 function theCard(exchanges: Exchange[]): Exchange {
   const card = exchanges.find(e => e.userEvent.type === 'SpokenMessageReceived');
   expect(card).toBeDefined();
@@ -58,9 +43,6 @@ describe('a delegated call', () => {
     expect(theCard(groupIntoExchanges(aDelegatedCall())).tookTheTurn).toBe(true);
   });
 
-  /** The turn's events carry the `WorkDelegated` id as their anchor, and no
-   *  exchange wears that id. Without the fold's redirect they would fall
-   *  through to whatever happens to be open. */
   it('files the doer work under it, by the anchor the turn carries', () => {
     const events = aDelegatedCall();
     put(events, 20, { type: 'MemoryRecalled', results: 3, queries: ['codebase'], request_event_id: DELEGATION });
@@ -74,9 +56,6 @@ describe('a delegated call', () => {
     ]);
   });
 
-  /** The loop acknowledges a message it picked up mid-turn with a
-   *  `PromptInjected` naming the anchor. Unabsorbed it opens a boundary of
-   *  its own, and the reader meets their own sentence twice. */
   it('absorbs the acknowledgement rather than drawing the words twice', () => {
     const events = aDelegatedCall();
     put(events, 20, {
@@ -93,9 +72,6 @@ describe('a delegated call', () => {
     expect(stepTypes(theCard(exchanges))).toEqual(['WorkDelegated', 'PromptInjected']);
   });
 
-  /** The talker stalls while the doer works, routinely before the doer has
-   *  woken. Read as the answer, the card settles Done seconds in and flips
-   *  back to Working when the first step lands. */
   it('is not settled by the talker stalling for the doer', () => {
     const events = aDelegatedCall();
     put(events, 20, {
@@ -108,17 +84,8 @@ describe('a delegated call', () => {
     expect(exchangeStatus(card, '', true, false, false, true)).toBe('streaming');
   });
 
-  /** The talker stalls before it asks, which is the ordinary Live shape.
-   *
-   *  That stall is its own turn, so its row lands in the caller's card BEFORE
-   *  the delegation does (ADR 0201). A guard asking for an empty card missed
-   *  every call shaped like this, and the card then settled Done while the
-   *  doer worked.
-   */
   it('holds the turn when the talker stalled before asking', () => {
     const events = aDelegatedCall();
-    // Said at :05, between the utterance and the delegation at :04... so the
-    // delegation is re-stamped later to keep the real order.
     events.delete(4);
     put(events, 5, {
       type: 'SpokenReplyGenerated',
@@ -135,7 +102,6 @@ describe('a delegated call', () => {
     put(events, 20, { type: 'ToolCalled', name: 'run_bash', args: {}, request_event_id: DELEGATION });
     const card = theCard(groupIntoExchanges(events));
     expect(card.tookTheTurn).toBe(true);
-    // And the doer's work still files under it, by the anchor it carries.
     expect(stepTypes(card)).toEqual([
       'SpokenReplyGenerated',
       'WorkDelegated',
@@ -143,12 +109,6 @@ describe('a delegated call', () => {
     ]);
   });
 
-  /** A row order from before ADR 0201, which is still in the store.
-   *
-   *  There the delegation came FIRST and the `MessageReceived` after it was
-   *  the turn's starter. Marking whatever the delegation happened to follow
-   *  gave a greeting a turn it never held, and a finished old call then read
-   *  Aborted: the regression `a-finished-call-is-not-aborted` exists for. */
   it('leaves a legacy row order alone', () => {
     const exchanges = groupIntoExchanges(new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
@@ -166,8 +126,6 @@ describe('a delegated call', () => {
     expect(exchanges.map(e => e.tookTheTurn)).toEqual([undefined, undefined]);
   });
 
-  /** The same, with an utterance the talker had already handled above it. The
-   *  delegation lands on that card and must not mark it either. */
   it('leaves a legacy order alone under an earlier utterance', () => {
     const exchanges = groupIntoExchanges(new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
@@ -185,8 +143,6 @@ describe('a delegated call', () => {
     expect(exchanges.map(e => e.tookTheTurn)).toEqual([undefined, undefined]);
   });
 
-  /** A hangup settles the CALL, never the work. The doer's answer outlives the
-   *  line, so while the doer still runs, the card stays live. */
   it('is not settled by the caller ringing off either', () => {
     const events = aDelegatedCall();
     put(events, 20, {
@@ -197,6 +153,6 @@ describe('a delegated call', () => {
     });
     put(events, 30, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 30 });
     const card = theCard(groupIntoExchanges(events));
-    expect(exchangeStatus(card, '', true, false, false, /* threadIdle */ false)).not.toBe('done');
+    expect(exchangeStatus(card, '', true, false, false,  false)).not.toBe('done');
   });
 });

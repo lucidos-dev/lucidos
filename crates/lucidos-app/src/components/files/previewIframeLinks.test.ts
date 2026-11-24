@@ -8,8 +8,6 @@ const mocks = vi.hoisted(() => ({
   openThreadAcrossWorkspaces: vi.fn(),
   handleNavigationRequest: vi.fn(),
   showToast: vi.fn(),
-  // Mutable stand-in for basePath's load-time `WORKSPACE_ID` const, read via a
-  // getter so the module under test sees the current value at call time.
   workspaceId: 'myws' as string | null,
 }));
 
@@ -29,8 +27,6 @@ vi.mock('../../store/store', async () => {
   const actual = await vi.importActual<typeof import('../../store/store')>('../../store/store');
   return { ...actual, showToast: mocks.showToast };
 });
-// Partial: other modules pulled in transitively read BASE_PATH / API off the
-// same module, so only WORKSPACE_ID is overridden.
 vi.mock('../../utils/basePath', async () => {
   const actual = await vi.importActual<typeof import('../../utils/basePath')>('../../utils/basePath');
   return {
@@ -66,15 +62,9 @@ const ctx = (over: Partial<Parameters<typeof classifyPreviewLink>[1]> = {}) => (
   ...over,
 });
 
-// ---------------------------------------------------------------------------
-// classifyPreviewLink: the routing table
-// ---------------------------------------------------------------------------
 
 describe('classifyPreviewLink', () => {
   it('claims a bare in-page anchor as a fragment scroll (the reported bug)', () => {
-    // A generated report's table of contents. In an `about:srcdoc` document this
-    // resolves against the HOST page URL, so unclaimed it loads the whole app
-    // shell into the content pane.
     expect(classifyPreviewLink('#the-three-pinned-values-old-new', ctx())).toEqual({
       kind: 'fragment',
       id: 'the-three-pinned-values-old-new',
@@ -126,9 +116,6 @@ describe('classifyPreviewLink', () => {
     });
   });
 
-  // Passed on as a bare name, `dev` would mean the remote gateway's dev on a
-  // page inside one. The URL's path names this gateway's own, so the route
-  // travels as it is.
   it('keeps a local route local from inside a remote workspace', () => {
     const remote = ctx({ hostPath: '/notes@cloud/', workspaceId: 'notes@cloud' });
     expect(classifyPreviewLink(`https://localhost:5251/dev/#thread=${TID}`, remote)).toEqual({
@@ -173,8 +160,6 @@ describe('classifyPreviewLink', () => {
   });
 
   it('carries an app fragment through to the action', () => {
-    // A published report citing one item inside a shared app. Without the
-    // fragment the citation opens the app on whatever the reader saw last.
     expect(classifyPreviewLink('app:pr-understanding#pr-1645', ctx())).toEqual({
       kind: 'app',
       appId: 'pr-understanding',
@@ -183,7 +168,6 @@ describe('classifyPreviewLink', () => {
   });
 
   it('keeps an in-page anchor an in-page anchor, not an app fragment', () => {
-    // `#x` names a place in THIS document. The app arm must never see it.
     expect(classifyPreviewLink('#pr-1645', ctx())).toEqual({
       kind: 'fragment',
       id: 'pr-1645',
@@ -198,8 +182,6 @@ describe('classifyPreviewLink', () => {
   });
 
   it('routes a trigger href', () => {
-    // `trigger:` is a scheme. Without its own arm the scheme bail-out below
-    // hands it to the browser, and a report citing a trigger dead-ends.
     expect(classifyPreviewLink('trigger:3f9b21c4-0a7e', ctx())).toEqual({
       kind: 'trigger',
       triggerId: '3f9b21c4-0a7e',
@@ -244,10 +226,6 @@ describe('classifyPreviewLink', () => {
     ['/apps/todo/styles.css', 'apps/todo/styles.css'],
     ['/data/artifacts/report.pdf', 'artifacts/report.pdf'],
   ])('previews the absolute workspace route %s instead of OS-opening it', (href, path) => {
-    // `extractLocalFileTarget` guards every `data/` sub-tree, not just `/data`
-    // and `/apps`, so a root-relative link inside a previewed document reaches
-    // the file branch below it. Before that widening, `/artifacts/report.pdf`
-    // was handed to the OS opener as a disk path that does not exist.
     expect(classifyPreviewLink(href, ctx())).toEqual({ kind: 'file', path });
   });
 
@@ -275,9 +253,6 @@ describe('classifyPreviewLink', () => {
     expect(classifyPreviewLink('   ', ctx())).toBeNull();
   });
 
-  // `repo:` is a URL scheme, so before this arm the guard above handed a repo
-  // citation back to the browser and the link dead-ended. That is why a report
-  // citing repo code had to be published as an app rather than as an artifact.
   describe('a repo-encoded citation', () => {
     const ENCODED = 'repo:repo-1:file:src/main.rs';
 
@@ -308,10 +283,6 @@ describe('classifyPreviewLink', () => {
         .toEqual({ kind: 'repo-file', locator: parseRepoPath(weird), line: 7, lineEnd: undefined });
     });
 
-    // Two `#` in one href, and they mean different things: the one inside the
-    // mode segment names the revision, the trailing one names the line. The
-    // line suffix is `$`-anchored and stripped before `parseRepoPath` is asked,
-    // so the two never compete.
     it('carries a named ref and a cited range together', () => {
       const atRef = 'repo:repo-1:file#origin/main:src/main.rs';
       expect(classifyPreviewLink(`${atRef}#L10-L20`, ctx()))
@@ -323,9 +294,6 @@ describe('classifyPreviewLink', () => {
       expect(classifyPreviewLink(atRef, ctx())).toEqual({ kind: 'repo-file', locator: parseRepoPath(atRef) });
     });
 
-    // parseRepoPath stays the single predicate: a structurally incomplete
-    // encoding is not a repo path, so the href falls through to the existing
-    // scheme guard and the browser keeps it, exactly as before.
     it.each([
       'repo::file:src/main.rs',
       'repo:repo-1:file:',
@@ -336,9 +304,6 @@ describe('classifyPreviewLink', () => {
       expect(classifyPreviewLink(href, ctx())).toBeNull();
     });
 
-    // Only `#L<n>` is a line reference. Anything else stays part of the path,
-    // which then 404s in the preview: the same choice the data-path branch
-    // makes, and better than letting the iframe navigate to the app shell.
     it('does not read a non-line fragment as a line', () => {
       expect(classifyPreviewLink(`${ENCODED}#section`, ctx())).toEqual({
         kind: 'repo-file',
@@ -416,8 +381,6 @@ describe('classifyPreviewLink with a repo-flavored context', () => {
   });
 
   it('anchors a root-relative href at the checkout, never the OS filesystem', () => {
-    // Without a repoLocator, a leading `/` is an absolute OS path
-    // (`extractLocalFileTarget`). A repo preview means something else by it.
     expect(classifyPreviewLink('/README.md', repoCtx())).toEqual({
       kind: 'file',
       path: encodeRepoPath({ ...repoLocator, path: 'README.md' }),
@@ -449,8 +412,6 @@ describe('classifyPreviewLink with a repo-flavored context', () => {
     expect(classifyPreviewLink('#section', repoCtx())).toEqual({ kind: 'fragment', id: 'section' });
   });
 
-  // A `file://` URL is unambiguous in any context, unlike a bare leading `/`:
-  // it must keep going to the OS opener even when previewing a repo file.
   it('still hands a file:// URL to the OS opener', () => {
     expect(classifyPreviewLink('file:///Users/me/notes.txt', repoCtx())).toEqual({
       kind: 'local-file', target: 'file:///Users/me/notes.txt',
@@ -458,13 +419,7 @@ describe('classifyPreviewLink with a repo-flavored context', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Markdown preview clicks (rendered in the host document)
-// ---------------------------------------------------------------------------
 
-/** A click whose target resolves to an anchor with `href`. `href: null` models a
- *  click that hit no anchor at all; `attrs` adds the `data-thread-*` pair the
- *  markdown renderer stamps on a resolved thread link, or a `download` flag. */
 function clickOn(
   href: string | null,
   attrs: Record<string, string> = {},
@@ -494,7 +449,6 @@ function clickOn(
   return e;
 }
 
-/** A rendered markdown document holding elements with these ids or names. */
 function renderedDocument(elements: { id?: string; name?: string }[]) {
   const nodes = elements.map((el) => ({
     id: el.id ?? '',
@@ -514,9 +468,6 @@ function clickInMarkdown(
   return e;
 }
 
-// A markdown artifact renders into the HOST document. So its relative links
-// resolve against the engine-stamped `<base href="/<slug>/">`, and would reload
-// the whole workspace through the SPA fallback.
 describe('markdown preview links (rendered in the host document)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -539,14 +490,14 @@ describe('markdown preview links (rendered in the host document)', () => {
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('other-ws', TID);
   });
 
-  it('routes a repo citation through the navigate router, lines and all', () => {
+  it('routes a repo citation through the navigate router, lines and all', async () => {
     repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
     const e = clickInMarkdown('repo:repo-1:file:src/main.rs#L510-L520');
     expect(e.defaultPrevented).toBe(true);
-    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
       { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
       { source: 'a file preview' },
-    );
+    ));
   });
 
   it('resolves a repo citation that names its repository', () => {
@@ -559,8 +510,6 @@ describe('markdown preview links (rendered in the host document)', () => {
   });
 
   it('prefers a resolved thread link\'s data attributes over its slug-bearing href', () => {
-    // The href carries the workspace SLUG; `data-thread-workspace` carries the
-    // NAME the ref was written with, which is what the router compares against.
     const e = clickInMarkdown(`https://localhost:5251/my-workspace/#thread=${TID}`, 'artifacts/x.md', {
       attrs: { 'data-thread-id': TID, 'data-thread-workspace': 'My Workspace' },
     });
@@ -568,9 +517,6 @@ describe('markdown preview links (rendered in the host document)', () => {
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('My Workspace', TID);
   });
 
-  // The host page's hash belongs to the deep-link router. A heading id carries
-  // a prefix, so it cannot shadow one of the shell's own ids. So the preview
-  // scrolls itself rather than letting the browser follow `#x`.
   describe('in-page fragments', () => {
     const SLUG = 'auth-tier-compatibility-api-key-vs-subscription--oauth';
 
@@ -656,15 +602,11 @@ describe('markdown preview links (rendered in the host document)', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// <base> stamping
-// ---------------------------------------------------------------------------
 
 describe('documentDeclaresBase', () => {
   it('detects an artifact that sets its own base, and only that', () => {
     expect(documentDeclaresBase('<html><head><base href="https://x/"></head></html>')).toBe(true);
     expect(documentDeclaresBase('<html><head><title>t</title></head></html>')).toBe(false);
-    // A `<basefont>` is not a `<base>`, and neither is prose about one.
     expect(documentDeclaresBase('<p>set a base href in the head</p>')).toBe(false);
   });
 });
@@ -718,14 +660,9 @@ describe('withPreviewBase', () => {
   });
 });
 
-// The sizing stamp makes an HTML artifact grow with the shell around it. It
-// also gives unsized text the chat prose step (ADR 0319). It shares
-// `injectAtHeadStart` with the base stamp, so the placement cases below are the
-// same four, asserted through the other caller.
 describe('withPreviewSizing', () => {
   const DOC = '<!DOCTYPE html><html><head><title>T</title></head><body>x</body></html>';
   const BODY = ':where(body){font-size:0.75rem}';
-  /** Everything after the zoom: the body default, then the find highlights. */
   const AFTER_ZOOM = BODY + PREVIEW_FIND_RULES;
 
   it('stamps zoom and the body default as the first thing in <head>', () => {
@@ -736,25 +673,19 @@ describe('withPreviewSizing', () => {
     expect(withPreviewSizing(DOC, 112.5)).toContain('zoom:112.5%');
   });
 
-  // Zero specificity, so any rule the artifact writes on `body` still wins.
   it('gives the body default no specificity to outrank an author rule', () => {
     expect(withPreviewSizing(DOC, 125)).toContain(BODY);
     expect(withPreviewSizing(DOC, 125)).not.toMatch(/(^|[^(])body\s*\{/);
   });
 
-  // A root font-size would move every rem in an artifact that already follows
-  // the type scale, shrinking it a second time.
   it('never sets a font-size on the root', () => {
     expect(withPreviewSizing(DOC, 125)).not.toMatch(/(:root|html)\s*\{[^}]*font-size/);
   });
 
-  // The default scale stamps no zoom, so 100% zooms nothing. The body default
-  // does not depend on the scale and still applies.
   it('stamps no zoom at 100%', () => {
     expect(withPreviewSizing(DOC, 100)).toBe(DOC.replace('<head>', `<head><style>${AFTER_ZOOM}</style>`));
   });
 
-  // An unreadable preference must never cost the reader the document.
   it('stamps no zoom for a value that is not a usable scale', () => {
     for (const bad of [NaN, Infinity, 0, -50]) {
       expect(withPreviewSizing(DOC, bad)).not.toContain('zoom');
@@ -775,15 +706,11 @@ describe('withPreviewSizing', () => {
     expect(withPreviewSizing('<p>x</p>', 125)).toBe(`<style>:root{zoom:125%}${AFTER_ZOOM}</style><p>x</p>`);
   });
 
-  // The two stamps compose the way the preview composes them, and the base has
-  // to come first: it governs relative URLs the rest of the head may carry.
   it('leaves the base first when both are stamped', () => {
     const out = withPreviewBase(withPreviewSizing(DOC, 125), 'https://h/ws/data/artifacts/');
     expect(out).toContain('<head><base href="https://h/ws/data/artifacts/"><style>:root{zoom:125%}');
   });
 
-  // The bridge asks `documentDeclaresBase` about the ORIGINAL artifact, so a
-  // sized document with its own base must still route links against it.
   it('does not disturb an artifact that declares its own base', () => {
     const html = '<html><head><base href="https://elsewhere/"></head></html>';
     const sized = withPreviewSizing(html, 125);

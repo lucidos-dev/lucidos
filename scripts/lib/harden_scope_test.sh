@@ -90,6 +90,22 @@ OFF=$(git rev-parse HEAD) && g checkout -q feature
 expect_has "sha off HEAD's history" "FULL hardened commit is not in HEAD's history" "$(scope "$OFF")"
 expect_has "HEAD is the hardened commit" "FULL no commit since the last hardening" "$(scope "$H")"
 
+echo "a clean overlapping lane catch-up"
+new_repo lane-overlap
+g branch -m lane/test
+g checkout -q main
+commit_file shared.txt $'line1\nline2\nmain3' "main: edit shared"
+commit_file a.txt changed "main: edit a"
+g checkout -q lane/test
+g merge --no-ff -m "Catch up with main" main
+expect_eq "suite scope covers overlap only" "shared.txt" "$(scope --lane-suite-paths "$H")"
+commit_file branch.txt later "lane: edit after catch-up"
+if scope --lane-suite-paths "$H" >/dev/null; then
+    fail "a subsequent edit must widen suites"
+else
+    pass "a subsequent edit widens suites"
+fi
+
 echo "a clean merge"
 new_repo clean
 g checkout -q main && commit_file a.txt a2 "main: edit a" && g checkout -q feature
@@ -119,6 +135,24 @@ expect_lacks "no overlap on main's file" "overlap a.txt" "$OUT"
 RESOLUTION=$(git show --remerge-diff --format= "$M")
 expect_has "resolution diff shows the resolved line" "+feature1 main1" "$RESOLUTION"
 expect_has "resolution diff shows the clean-file edit" "+evil" "$RESOLUTION"
+
+echo "overlap paths whose order depends on the locale"
+new_repo collation
+g checkout -q main
+for f in a-b.txt a_b.txt B.txt; do printf 'main\n' > "$f"; done
+g add a-b.txt a_b.txt B.txt && g commit -m "main: collation files"
+g checkout -q feature
+for f in a-b.txt a_b.txt B.txt; do printf 'feature\n' > "$f"; done
+g add a-b.txt a_b.txt B.txt && g commit -m "feature: collation files"
+H=$(git rev-parse HEAD)
+g merge -q --no-edit main
+for f in a-b.txt a_b.txt B.txt; do printf 'both\n' > "$f"; done
+g add a-b.txt a_b.txt B.txt && g commit --no-edit
+OUT=$(scope "$H")
+expect_lacks "sort and comm agree on order" "not in sorted order" "$OUT"
+for f in a-b.txt a_b.txt B.txt; do
+    expect_has "overlap on $f" "overlap $f" "$OUT"
+done
 
 echo "two merges"
 new_repo two

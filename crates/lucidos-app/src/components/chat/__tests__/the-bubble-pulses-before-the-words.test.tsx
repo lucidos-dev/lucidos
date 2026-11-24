@@ -1,14 +1,3 @@
-/** What the caller's bubble holds before their words exist.
- *
- *  No engine event backs this row. So nothing downstream can be relied on to
- *  treat it sensibly by accident. Three promises: it is the ordinary
- *  right-aligned user bubble, it says something to a screen reader, and no
- *  panel is drawn under it.
- *
- *  The third is read off `liveRowDrawsNoPanel`, the decision itself, rather
- *  than off the source line that consumes it. One source scan is left, and it
- *  only checks that `showResponsePanel` still consults that decision at all.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,8 +20,6 @@ const voiceCallCss: string = readFileSync(
 );
 const partsSource: string = readFileSync(resolve(here, '../chat-exchange-parts.tsx'), 'utf-8');
 
-/** The row exactly as `computeExchanges` appends it: a `MessageReceived` with
- *  no text, marked as the one nothing wrote. */
 const theRow: Exchange = {
   userEvent: {
     type: 'MessageReceived',
@@ -58,9 +45,6 @@ describe('the caller mid-sentence', () => {
     expect(vnodeToText(initiator.status)).toContain('Spoken');
   });
 
-  /** An animation says nothing to a screen reader, and a bubble with no name
-   *  reads as empty. The phrase is the one the call toggle's status region
-   *  speaks, so the two cannot drift apart. */
   it('says what it is doing, for a reader who cannot see the pulse', () => {
     const initiator = describeInitiator(theRow, '', [], 'tid');
     const body = vnodeToText(initiator.details);
@@ -83,16 +67,6 @@ describe('nothing is drawn under it', () => {
     expect(line).toContain('!isLiveRow');
   });
 
-  /** And the exclusion lifts the moment the FINAL words are there. The engine
-   *  is then holding them while the talker decides. Something IS in flight,
-   *  and the reader is owed the shimmer under their own turn (ADR 0174).
-   *
-   *  A partial does not lift it. The caller is still speaking, so nothing is
-   *  in flight behind the bubble yet.
-   *
-   *  Read off the RENDERED decision rather than off the source line. A token
-   *  scan passes on any code containing the token and fails on a reformat, so
-   *  it measures the spelling instead of the behaviour. */
   it('draws a panel for the final words and none for a partial', () => {
     expect(liveRowDrawsNoPanel({ ...theRow.userEvent, text: 'the tests' } as StoredEvent)).toBe(false);
     expect(liveRowDrawsNoPanel({
@@ -103,8 +77,6 @@ describe('nothing is drawn under it', () => {
     expect(liveRowDrawsNoPanel(theRow.userEvent)).toBe(true);
   });
 
-  /** The talker's own live row takes the same exclusion. The words moving in
-   *  it are the activity, so a status badge below would be a second one. */
   it('excludes the talker\'s live row too', () => {
     expect(liveRowDrawsNoPanel({
       type: 'SpokenReplyGenerated',
@@ -117,8 +89,6 @@ describe('nothing is drawn under it', () => {
   });
 });
 
-/** The same row, once the provider has ended the turn. It is the caller's own
- *  message now, and takes the bubble a spoken message takes. */
 describe('the caller\'s words, before the engine has written them down', () => {
   const spoken: Exchange = {
     ...theRow,
@@ -137,38 +107,25 @@ describe('the caller\'s words, before the engine has written them down', () => {
     expect(initiator.variant).toBe('user');
   });
 
-  /** Nothing is in flight behind a sentence the caller has finished. The
-   *  engine holds it until the conversation moves, which is a whole reply
-   *  long. A Requesting shimmer over it says something untrue for all of that.
-   *  Whatever the words do start arrives as its own exchange. */
   it('reads as settled once the caller has finished saying it', () => {
-    expect(exchangeStatus(spoken, '', true, false, false, /* threadIdle */ true, false))
+    expect(exchangeStatus(spoken, '', true, false, false,  true, false))
       .toBe('done');
   });
 
-  /** The pulse is the other half, and it still shimmers: they are mid-word,
-   *  so the reader really is waiting on the rest of the sentence. */
   it('still reads as pending while the caller is speaking', () => {
-    expect(exchangeStatus(theRow, '', true, false, false, /* threadIdle */ true, false))
+    expect(exchangeStatus(theRow, '', true, false, false,  true, false))
       .toBe('pending');
   });
 
-  /** A partial is words the provider may still revise, so it is the pulse's
-   *  half rather than the finished sentence's. */
   it('still reads as pending on a partial', () => {
     const partial: Exchange = {
       ...theRow,
       userEvent: { ...theRow.userEvent, text: 'fix the blank', _livePartial: true } as StoredEvent,
     };
-    expect(exchangeStatus(partial, '', true, false, false, /* threadIdle */ true, false))
+    expect(exchangeStatus(partial, '', true, false, false,  true, false))
       .toBe('pending');
   });
 
-  /** The row is `memo`d on a content fingerprint, and its identity does not
-   *  move when the words arrive: same event id, same seq, no steps, no
-   *  revision. So the fingerprint has to carry the text, or the swap is
-   *  swallowed and the pulse keeps drawing over words the reader could read.
-   *  That is the whole reported bug, arriving one layer down. */
   it('re-renders when the pulse becomes the words', () => {
     const props = (exchange: Exchange) => ({
       exchange,
@@ -181,9 +138,6 @@ describe('the caller\'s words, before the engine has written them down', () => {
   });
 });
 
-/** The reported freeze. The talker's live row is a STEP, so the fingerprint's
- *  step count and its last seq both hold across every word the row gains. The
- *  bubble stopped at `You're looking` while the mark kept moving beside it. */
 describe('the talker\'s bubble while it is being said', () => {
   const props = (exchange: Exchange) => ({
     exchange,
@@ -193,8 +147,6 @@ describe('the talker\'s bubble while it is being said', () => {
     streamingBuffer: '',
   } as unknown as Parameters<typeof chatExchangePropsEqual>[0]);
 
-  /** One doer turn holding the talker's live row, exactly as
-   *  `withLiveCallRows` builds it. */
   const turn = (liveReplyText: string): Exchange => ({
     userEvent: {
       type: 'MessageReceived',
@@ -223,8 +175,6 @@ describe('the talker\'s bubble while it is being said', () => {
     expect(chatExchangePropsEqual(before, after)).toBe(false);
   });
 
-  /** And the memo still earns its keep: a recompute that changed nothing must
-   *  not re-render every sibling on every event. */
   it('still swallows a recompute that changed nothing', () => {
     const same = () => props(turn("You're looking"));
     expect(chatExchangePropsEqual(same(), same())).toBe(true);
@@ -238,9 +188,6 @@ describe('the mark', () => {
     );
   });
 
-  /** An indefinite animation is an activity indicator rather than a
-   *  transition, so it keeps a literal duration and never a `--duration-*`
-   *  token. See `.claude/rules/frontend-css.md`. */
   it('runs on a literal duration, outside the animation-speed scale', () => {
     expect(voiceCallCss).toContain('animation: live-speech-pulse 1s ease-in-out infinite');
     expect(voiceCallCss).not.toContain('live-speech-pulse var(--duration');
@@ -249,9 +196,6 @@ describe('the mark', () => {
   const body = (exchange: Exchange, html = '') =>
     vnodeToText(describeInitiator(exchange, html, [], 'tid').details);
 
-  /** The caller's bubble means one thing by it through both of its shapes: the
-   *  words are still arriving, and the provider has not settled them. Two
-   *  shapes for one meaning is what the caret was. */
   it('is the one mark, before their first word and after it', () => {
     const partial: Exchange = {
       ...theRow,
@@ -261,11 +205,6 @@ describe('the mark', () => {
     expect(body(partial)).toContain('live-speech-mark');
   });
 
-  /** **The talker's row draws no mark, live or landed** (ADR 0197). Its live
-   *  row is retired by the engine's own, written at the next move of the
-   *  conversation (ADR 0188, ADR 0191). So the mark would stand over a
-   *  finished sentence until the caller spoke again, which is what was
-   *  reported. Gating it on the call phase blinks it instead. */
   it('is never drawn on the talker\'s reply', () => {
     const reply: Exchange = {
       userEvent: {
@@ -283,8 +222,6 @@ describe('the mark', () => {
     expect(body(reply)).not.toContain('live-speech-mark');
   });
 
-  /** The caret it replaced is gone from both layers, so nothing can draw the
-   *  old shape by reaching for a class that still styles. */
   it('leaves no caret behind', () => {
     expect(voiceCallCss).not.toContain('live-caret');
     expect(partsSource).not.toContain('live-caret');

@@ -1,38 +1,38 @@
 use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-use MessageAudience::{Agent, PeopleOnly};
+use MessageAudience::{Agent, UserOnly};
 use PauseChange::{Pause, Resume};
 
-/// Every combination of (people mentioned, agent mentioned, paused, question
+/// Every combination of (users mentioned, agent mentioned, paused, question
 /// open).
 #[test]
 fn every_mention_and_pause_combination_has_one_route() {
     let table = [
-        // people, agent, paused => pause change, audience
+        // users, agent, paused => pause change, audience
         ((false, false, false), (None, Agent)),
-        ((false, false, true), (None, PeopleOnly)),
-        ((true, false, false), (Some(Pause), PeopleOnly)),
-        ((true, false, true), (None, PeopleOnly)),
+        ((false, false, true), (None, UserOnly)),
+        ((true, false, false), (Some(Pause), UserOnly)),
+        ((true, false, true), (None, UserOnly)),
         ((false, true, false), (None, Agent)),
         ((false, true, true), (Some(Resume), Agent)),
         ((true, true, false), (None, Agent)),
         ((true, true, true), (Some(Resume), Agent)),
     ];
-    for ((people, agent, paused), (pause_change, audience)) in table {
+    for ((users, agent, paused), (pause_change, audience)) in table {
         // An open card changes only the untagged message on a paused thread.
         for question_open in [false, true] {
-            let audience = match (people, agent, paused, question_open) {
+            let audience = match (users, agent, paused, question_open) {
                 (false, false, true, true) => Agent,
                 _ => audience,
             };
             assert_eq!(
-                people_message_route(people, agent, paused, question_open),
-                PeopleMessageRoute {
+                user_only_message_route(users, agent, paused, question_open),
+                UserOnlyMessageRoute {
                     pause_change,
                     audience
                 },
-                "people={people} agent={agent} paused={paused} question_open={question_open}"
+                "users={users} agent={agent} paused={paused} question_open={question_open}"
             );
         }
     }

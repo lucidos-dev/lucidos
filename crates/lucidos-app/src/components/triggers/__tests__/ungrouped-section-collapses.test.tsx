@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-// The Ungrouped section collapses like a real group. Its heading only renders
-// beside real groups. With none left, a saved collapse must not hide rows that
-// no heading can reopen.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { TriggersView } from '../TriggersView';

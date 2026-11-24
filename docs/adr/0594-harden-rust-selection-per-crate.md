@@ -26,7 +26,7 @@ Plan: `docs/plans/2026-10-28-harden-rust-selection-per-crate.md`.
 3. **The `rust` suite splits.** The suites are `lint`, `crates`, `gateway`,
    `cli`, `app-lib`, `eval`, `engine` and `engine-filtered`. They run in that
    order in the one cargo lane. `lint` runs clippy on the reached set through
-   `CLIPPY_SCOPE`, and both feature passes still run.
+   `CLIPPY_SCOPE` in a single `--all-features` pass.
 4. **These select every crate:** `Cargo.lock`, the root `Cargo.toml`,
    `.cargo/**`, `rust-toolchain.toml`, `clippy.toml`, `Makefile`,
    `crates/vendor/**`, a Rust path no crate owns, and a missing or failed
@@ -50,9 +50,11 @@ Reach on the real tree:
 | a `lucidos-home` source file | 12 crates |
 | `Cargo.lock` | every crate |
 
-Both clippy passes stay, because only the default pass lints the production
-push transport in `lucidos-engine`. Every fail-safe selector runs more, never
-less, so a graph the script cannot read costs time and never coverage.
+The production push transport now compiles alongside the e2e push-log stub.
+A planted lint in the production transport verified that the all-features
+pass checks it. The single pass cut the Mac edit benchmark from 89.62 s to
+42.56 s.
+An unreadable graph still selects every crate to preserve lint coverage.
 
 ## Consequences
 
@@ -69,7 +71,7 @@ less, so a graph the script cannot read costs time and never coverage.
 
 - **A hand-kept crate table in the script.** It drifts when a crate or edge is
   added, and a stale row silently under-selects. Rejected for the graph.
-- **Scope clippy to one feature pass.** It saves time but leaves the production
-  push transport unlinted. Rejected.
+- **Drop the default pass while gating out the production transport.**
+  Rejected because this would leave the transport unlinted.
 - **Keep one `rust` suite and only trim its tests.** The clippy cost stays, and
   the retry and early-run records stay coarse. Rejected.

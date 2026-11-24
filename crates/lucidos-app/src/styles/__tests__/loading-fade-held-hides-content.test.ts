@@ -1,9 +1,3 @@
-/**
- * While LoadingFade holds its skeleton through the minimum-visible floor, the
- * loaded content must not draw beside it. The wrapper carries `loading-fade-held`
- * and this rule hides the content wrapper, keeping its layout so the cell does not
- * resize when the floor lifts.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

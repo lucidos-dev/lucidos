@@ -6,7 +6,6 @@ import { writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 
-/** Create a pending change (no thread, just changes table + git branch). */
 function createTestChange(suffix: string): { id: string; branch: string; file: string } {
   const branch = `e2e-test/change-${suffix}`;
   const file = `e2e-test-${suffix}.txt`;
@@ -20,10 +19,6 @@ function createTestChange(suffix: string): { id: string; branch: string; file: s
 
   psql([
     `INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened) VALUES ('${id}', '${randomUUID()}', '${branch}', '${WORKSPACE}', 'E2E test change ${suffix}', 1, ARRAY['${file}'], false, true)`,
-    // The Apply floor (Lucidos-source changes) requires a Planned marker. A
-    // real CC session sets it; this direct seed mirrors that, keyed on the
-    // canonical repo_root the engine looks the marker up by. cleanupCCThread
-    // deletes the row by branch_name on teardown.
     `INSERT INTO planned_branches (repo_root, branch_name, state, head_sha) VALUES ('${WORKSPACE_CANONICAL}', '${branch}', 'acknowledged_simple', 'seeded') ON CONFLICT (repo_root, branch_name) DO NOTHING`,
   ].join(';\n'));
 
@@ -50,11 +45,9 @@ test.describe('Apply and discard changes', () => {
       expect(body.message).toBeTruthy();
       expect(body.error).toBeUndefined();
 
-      // Verify the file now exists on main
       const fileExists = execSync(`test -f "${resolve(WORKSPACE, change.file)}" && echo "yes" || echo "no"`, { encoding: 'utf-8' }).trim();
       expect(fileExists).toBe('yes');
 
-      // Verify git status is clean
       const status = git(['status', '--porcelain']);
       const dirtyLines = status.split('\n').filter(l => l.trim() && !l.startsWith('??'));
       expect(dirtyLines).toHaveLength(0);
@@ -75,11 +68,9 @@ test.describe('Apply and discard changes', () => {
       const body = await resp.json();
       expect(body.message).toContain('discarded');
 
-      // Verify the file does NOT exist on main
       const fileExists = execSync(`test -f "${resolve(WORKSPACE, change.file)}" && echo "yes" || echo "no"`, { encoding: 'utf-8' }).trim();
       expect(fileExists).toBe('no');
 
-      // Verify the change is no longer in the pending list
       const changesResp = await page.request.get('/api/v1/changes');
       expect(changesResp.ok()).toBeTruthy();
       const changesBody = await changesResp.json();
@@ -95,7 +86,6 @@ test.describe('Apply and discard changes', () => {
     const change = createTestChange(suffix);
 
     try {
-      // Verify our test change appears in pending list
       const changesResp = await page.request.get('/api/v1/changes');
       const changesBody = await changesResp.json();
       const pending = changesBody.pending as Array<{ id: string; description: string }>;
@@ -103,11 +93,9 @@ test.describe('Apply and discard changes', () => {
       expect(ourChange).toBeDefined();
       expect(ourChange!.description).toContain(suffix);
 
-      // Apply via API
       const applyResp = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`);
       expect(applyResp.ok()).toBeTruthy();
 
-      // Verify it moved to applied list
       const afterResp = await page.request.get('/api/v1/changes');
       const afterBody = await afterResp.json();
       const afterPending = afterBody.pending as Array<{ id: string }>;
@@ -131,7 +119,6 @@ test.describe('Apply and discard changes', () => {
       const body = await resp.json();
       expect(body.message).toContain('discarded');
 
-      // Verify no pending changes remain for our test changes
       const changesResp = await page.request.get('/api/v1/changes');
       const changesBody = await changesResp.json();
       const pending = changesBody.pending as Array<{ id: string }>;
@@ -148,15 +135,12 @@ test.describe('Apply and discard changes', () => {
     const change = createTestChange(suffix);
 
     try {
-      // Apply first time
       const resp1 = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`);
       expect(resp1.ok()).toBeTruthy();
 
-      // Apply second time — should either succeed idempotently or return error
       const resp2 = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`, {
         failOnStatusCode: false,
       });
-      // The API may return 200 (idempotent) or 400 (already applied) — both are valid
       expect(resp2.status()).toBeLessThan(500);
       const body2 = await resp2.json();
       expect(body2.message).toBeTruthy();

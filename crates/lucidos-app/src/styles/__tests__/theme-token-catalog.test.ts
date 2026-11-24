@@ -1,18 +1,3 @@
-/**
- * The theme token catalog lists every token a theme can tune, and says what each
- * one is by default.
- *
- * The catalog (`core/themes/theme-tokens.json` in the engine) is what a
- * theme-building plugin reads from `GET /api/v1/themes/tokens`. It is only
- * honest while it matches the stylesheet, so this pins the two together:
- *
- *   - every custom property in the dark and light blocks is in the catalog;
- *   - every catalog default is the value `base.css` gives in that mode;
- *   - a token the catalog says reaches app frames is defined for them.
- *
- * The header block has its own guard: its base tokens live on `<html>`, where a
- * theme's inline value reaches them, never on `.pane-header`.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -29,7 +14,7 @@ const read = (path: string): string => readFileSync(resolve(repo, path), 'utf-8'
 
 const baseCss = read('crates/lucidos-app/src/styles/global/base.css');
 const shellCss = read('crates/lucidos-app/src/styles/panels/shell.css');
-const iframeCss = read('crates/lucidos-engine/src/api/sdk_iframe.css');
+const iframeCss = read('crates/lucidos-agents-api/src/api/sdk_iframe.css');
 
 interface CatalogToken {
   name: string;
@@ -45,9 +30,8 @@ interface Catalog {
   groups: { id: string }[];
   tokens: CatalogToken[];
 }
-const catalog: Catalog = JSON.parse(read('crates/lucidos-engine/src/core/themes/theme-tokens.json'));
+const catalog: Catalog = JSON.parse(read('crates/lucidos-core/src/core/themes/theme-tokens.json'));
 
-/** Custom properties a selector's top-level rule declares, last one winning. */
 function tokensOf(css: string, selector: string): Map<string, string> {
   const rules = cssRules(css).filter(r => r.selector === selector && r.atRules === '');
   expect(rules.length, `no top-level ${selector} rule`).toBeGreaterThan(0);
@@ -59,8 +43,6 @@ function tokensOf(css: string, selector: string): Map<string, string> {
 }
 
 const root = tokensOf(baseCss, ':root');
-// The dark block's selector is `html, html[data-theme-mode="dark"]`, so it applies
-// under the light theme too. Light therefore falls back to it before `:root`.
 const dark = tokensOf(baseCss, 'html, html[data-theme-mode="dark"]');
 const light = tokensOf(baseCss, 'html[data-theme-mode="light"]');
 
@@ -79,8 +61,6 @@ describe('the theme token catalog', () => {
   });
 
   it('lists every token the theme blocks declare', () => {
-    // The protected palette is the engine's to derive, never a theme's to set
-    // (ADR 0309), so it stays out of the catalog.
     const declared = new Set(
       [...dark.keys(), ...light.keys()].filter(name => !name.startsWith('--protected-')),
     );

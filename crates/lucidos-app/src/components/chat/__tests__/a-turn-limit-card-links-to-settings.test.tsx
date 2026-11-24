@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** The turn-limit card renders markdown. So its Settings link is a link, not
- *  `[Settings](settings)` in plain text. Its heading names the limit that
- *  fired (plan invariant 8). */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

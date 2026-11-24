@@ -10,28 +10,17 @@ import { pickerFocusTarget, pickerKeyAction, pickerShowsFilter } from '../shared
 import { isTypeaheadKey } from '../shared/typeahead';
 import { filterRungRows } from './rungRows';
 
-/** A rung's backends, the preferred-provider step a host opens after the rung
- *  is picked. `current` is the backend in force for that model. */
 export interface RungProviderStep {
   label: string;
   options: ControlOption[];
   current: string | null;
 }
 
-/** The panel's scrollTop that puts the row's middle on the panel's middle. */
 export function centredScrollTop(panel: HTMLElement, row: HTMLElement): number {
   const offset = row.getBoundingClientRect().top - panel.getBoundingClientRect().top;
   return Math.max(0, panel.scrollTop + offset - (panel.clientHeight - row.offsetHeight) / 2);
 }
 
-/** The rung list: one tap picks a whole rung. A rung whose model has a real
- *  choice of backend opens the preferred-provider step instead, last, as the
- *  model picker does.
- *
- *  The host owns what a pick means, including the ladder link row. It hands
- *  over the rows from `rungListRows`, and the value that wears the checkmark.
- *
- *  Typing filters the rungs, exactly as the model picker filters models. */
 export function RungPicker({
   label,
   rows,
@@ -46,24 +35,16 @@ export function RungPicker({
   rows: readonly ControlOption[];
   current: string;
   disabled?: boolean;
-  /** A way out of the list, for a host that opened it from a list of its own. */
   back?: { label: string; onBack: () => void };
-  /** The text field that held the on-screen keyboard as the host opened. A
-   *  finger's keyboard goes back to it, so the prompt never loses focus. */
   keyboardHolder?: HTMLElement | null;
-  /** The backends a rung opens, or `null` when it commits at once. */
   providerStep?: (value: string) => RungProviderStep | null;
-  /** The rung, plus the backend when the provider step chose one. */
   onPick: (value: string, provider?: string) => void;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const filter = useSignal('');
-  // Latches on the first printable keystroke, as the model picker's does.
   const searching = useSignal(false);
-  // Open on the rung in force.
   const highlight = useSignal(selectedOptionIndex(rows, current));
-  /** The rung whose backends are showing, or `null` on the rung list. */
   const openRung = useSignal<string | null>(null);
   const step = openRung.value === null ? null : providerStep?.(openRung.value) ?? null;
   const visible = filterRungRows(rows, filter.value);
@@ -82,10 +63,6 @@ export function RungPicker({
     return target === 'list' ? listRef.current : null;
   }, [openRung.value, searching.value]);
 
-  // The list opens with the rung in force mid-panel, so its neighbours show on
-  // both sides. After that the keyboard only nudges the row into view. The
-  // centring writes the panel's own scrollTop: `scrollIntoView` would also pan
-  // the page, which moves the prompt bar under an on-screen keyboard.
   const placed = useRef(false);
   useEffect(() => {
     const row = listRef.current?.querySelector<HTMLElement>('.control-item-active');
@@ -104,7 +81,6 @@ export function RungPicker({
     openRung.value = null;
   }
 
-  // Escape steps back from the backends before it closes the list.
   useEscapeStep(step ? backToRungs : back?.onBack ?? null);
 
   function choose(option: ControlOption) {
@@ -124,8 +100,6 @@ export function RungPicker({
   function handleKeyDown(e: KeyboardEvent) {
     const action = pickerKeyAction(e.key);
     if (action === null) {
-      // A printable key reaching the LIST reveals the box and types into it.
-      // Keys typed INTO the box bubble through here too, and it owns those.
       if (step || isTextInput(e.target) || !isTypeaheadKey(e)) return;
       e.preventDefault();
       e.stopPropagation();

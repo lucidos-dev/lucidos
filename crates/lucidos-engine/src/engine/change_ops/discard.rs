@@ -27,7 +27,7 @@ pub(crate) async fn settle_discarded_branch(
         // user works. It is never a thread's tree, so a reset there would wipe
         // their uncommitted and untracked files.
         WorktreeLookup::Found(wt_path) if !is_linked_worktree(&wt_path) => {
-            log!(
+            log_legacy!(
                 "[Changes] Discarded change {}: branch {} is checked out in {}, which is not a \
                  linked worktree; leaving that checkout and the branch alone",
                 change_id,
@@ -37,7 +37,7 @@ pub(crate) async fn settle_discarded_branch(
         }
         WorktreeLookup::Found(wt_path) => {
             reset_worktree_to_main_after_discard(&wt_path).await?;
-            log!(
+            log_legacy!(
                 "[Changes] Discarded change {}: reset worktree {} on branch {} to main; branch preserved",
                 change_id,
                 wt_path.display(),
@@ -45,7 +45,7 @@ pub(crate) async fn settle_discarded_branch(
             );
         }
         WorktreeLookup::Unknown => {
-            log!(
+            log_legacy!(
                 "[Changes] Discarded change {}: git worktree list gave no answer for branch {}; \
                  leaving the branch ref alone rather than moving it on a guess",
                 change_id,
@@ -72,7 +72,7 @@ pub(crate) async fn settle_discarded_branch(
                 )
                 .into());
             }
-            log!(
+            log_legacy!(
                 "[Changes] Discarded change {}: no worktree on branch {}; reset branch ref to main, branch preserved",
                 change_id,
                 branch_name
@@ -103,11 +103,13 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
     ) {
         // Before the loop, so a thread with no change yet still loses its tasks.
-        self.abandon_background_tasks(thread_id, "Discard").await;
+        self.agent_host()
+            .abandon_background_tasks(self, thread_id, "Discard")
+            .await;
         let pending = match self.changes().open_for_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] discard_open_changes_for_thread({}): open_for_thread: {}; \
                      skipping discard (open changes remain in DB)",
                     thread_id,
@@ -118,7 +120,7 @@ impl LucidosEngine {
         };
         for change in &pending {
             if let Err(e) = self.discard_change(change.id, actor.clone()).await {
-                log!(
+                log_legacy!(
                     "[Changes] Failed to discard change {} for thread {}: {}",
                     change.id,
                     thread_id,
@@ -149,7 +151,7 @@ impl LucidosEngine {
         let pending = match self.changes().open_for_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] discard_open_changes_for_thread_except({}): open_for_thread: {}; \
                      skipping reconcile (stale open changes remain in DB)",
                     thread_id,
@@ -162,7 +164,7 @@ impl LucidosEngine {
             if keep(change) {
                 continue;
             }
-            log!(
+            log_legacy!(
                 "[Changes] Reconcile: discarding stale open change {} (branch {}) for thread {}: \
                  thread already has a newer change",
                 change.id,
@@ -170,7 +172,7 @@ impl LucidosEngine {
                 thread_id
             );
             if let Err(e) = self.discard_change_quietly(change.id, actor.clone()).await {
-                log!(
+                log_legacy!(
                     "[Changes] Reconcile: failed to discard stale change {} for thread {}: {}",
                     change.id,
                     thread_id,
@@ -185,7 +187,7 @@ impl LucidosEngine {
     /// `propose_change` is the primary guard (it prevents a second pending change
     /// from ever coexisting); this catches a pre-existing orphan that predates
     /// that guard or reached the thread via a path that bypassed it.
-    pub(crate) async fn discard_orphaned_pending_siblings(
+    pub async fn discard_orphaned_pending_siblings(
         &self,
         thread_id: Uuid,
         keep_change_id: Uuid,
@@ -213,6 +215,9 @@ impl LucidosEngine {
             .apply_claims
             .try_claim(change_id)
             .ok_or(super::apply_claim::APPLY_IN_PROGRESS_MESSAGE)?;
+        if crate::engine::landing_lane::handoff_started(self.pool(), change_id).await? {
+            return Err(crate::engine::landing_lane::HELD_BY_LANDER.into());
+        }
         let thread_id = self
             .changes()
             .get_by_id(change_id)
@@ -220,7 +225,9 @@ impl LucidosEngine {
             .and_then(|change| change.thread_id);
         if let Some(thread_id) = thread_id {
             // Still running in the worktree the discard is about to reset.
-            self.abandon_background_tasks(thread_id, "Discard").await;
+            self.agent_host()
+                .abandon_background_tasks(self, thread_id, "Discard")
+                .await;
         }
         self.discard_claimed(&claim, actor).await?;
         if let Some(thread_id) = thread_id {
@@ -266,6 +273,9 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let change_id = claim.change_id();
+        if crate::engine::landing_lane::handoff_started(self.pool(), change_id).await? {
+            return Err(crate::engine::landing_lane::HELD_BY_LANDER.into());
+        }
         let change = self
             .changes()
             .get_by_id(change_id)
@@ -301,7 +311,7 @@ impl LucidosEngine {
             })
             .await
             .map_err(|e| {
-                log!(
+                log_legacy!(
                     "[Changes] ChangeDiscarded emit failed for {}: {}. Leaving the branch intact.",
                     change_id,
                     e
@@ -336,7 +346,7 @@ impl LucidosEngine {
             .other_open_for_branch(&change.branch_name, change_id)
             .await
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[Changes] discard_change: other_open_for_branch({}, {}): {}; \
                      keeping branch defensively",
                     change.branch_name,
@@ -346,7 +356,7 @@ impl LucidosEngine {
                 true
             });
         if others {
-            log!(
+            log_legacy!(
                 "[Changes] Discarded change {} but kept branch {} and worktree: other open changes reference it",
                 change_id,
                 change.branch_name
@@ -410,7 +420,7 @@ impl LucidosEngine {
 
         match result {
             Ok(()) => {
-                log!(
+                log_legacy!(
                     "[Changes] Reverted change {} (branch {})",
                     change_id,
                     change.branch_name

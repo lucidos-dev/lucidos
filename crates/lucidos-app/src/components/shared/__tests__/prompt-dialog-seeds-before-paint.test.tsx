@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The prompt's field holds its default value from the moment it draws. Text
- * typed into it once it shows is never overwritten by a late seed, so OK
- * submits what the user typed. The Rename dialog is the caller.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -14,7 +9,6 @@ import { _resetOverlayStackForTesting } from '../../../store/overlayStack';
 
 const field = () => document.querySelector<HTMLInputElement>('.confirm-dialog:not([inert]) .prompt-input');
 
-/** Lets the signal re-render commit, but no timer or frame callback run. */
 async function drawn(): Promise<HTMLInputElement> {
   for (let i = 0; i < 20 && !field(); i++) await Promise.resolve();
   const el = field();

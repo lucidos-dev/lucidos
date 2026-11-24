@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm::tool_names::LOAD_KNOWHOW;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 
@@ -305,6 +306,7 @@ mod persisted {
     use crate::core::EventStore;
     use crate::engine::event_bus::EventBus;
     use crate::engine::thread_events::{ActorMode, ThreadEvent};
+    use crate::llm::tool_names::LOAD_KNOWHOW;
     use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 
     fn message() -> ThreadEvent {

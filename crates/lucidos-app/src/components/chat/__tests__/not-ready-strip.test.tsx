@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The strip above the prompt box that says why a thread's work is not ready
- * (ADR 0400). It shows only for unproposed work a turn end withheld, on a
- * resting coding-agent thread, and only a turn that did not finish gets
- * Continue. Nothing in it is a disabled control (ADR 0168).
- */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -63,8 +57,6 @@ describe('notReadyReason', () => {
     expect(notReadyReason(codingAgentThread(withheld, { liveEventWaitCount: 1 }))).toBeNull();
   });
 
-  // The reader typed while a question was open, then canceled it. The turn
-  // ends unfinished, and the agent starts the queued message a moment later.
   describe('while the agent holds a message it has not read', () => {
     const withheld: CodingAgentChangeState = { kind: 'unproposed', reason: 'turn_incomplete' };
     const message = (text: string, id: string) =>

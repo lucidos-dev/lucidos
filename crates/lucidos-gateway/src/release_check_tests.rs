@@ -123,6 +123,7 @@ fn the_url_carries_exactly_three_parameters() {
 #[test]
 fn the_user_agent_carries_the_version_and_nothing_else() {
     assert_eq!(user_agent("0.33.0"), "lucidos-gateway/0.33.0");
+    assert_eq!(user_agent("9.2.0-rc.10"), "lucidos-gateway/9.2.0-rc.10");
     // The whole value, so a field smuggled in beside the version fails here.
     // ADR 0108 allows the version because the query string already carries it,
     // and allows nothing further.
@@ -197,19 +198,35 @@ fn a_soft_404_is_an_error_never_up_to_date() {
     assert!(parse_response(r#"{"version":"0.29"#).is_err());
 }
 
-#[test]
-fn version_is_newer_compares_numerically_and_refuses_junk() {
-    assert!(version_is_newer("1.3.0", "1.2.0"));
-    assert!(version_is_newer("1.2.1", "1.2.0"));
-    assert!(version_is_newer("2.0", "1.99.99"));
-    assert!(!version_is_newer("1.2.0", "1.2.0"));
-    assert!(!version_is_newer("1.2.0", "1.3.0"));
-    // Padding: a shorter version equals one with trailing zeros.
-    assert!(!version_is_newer("1.2", "1.2.0"));
-    assert!(version_is_newer("1.2.1", "1.2"));
-    // An unreadable version offers nothing, rather than offering everything.
-    assert!(!version_is_newer("unknown", "1.2.0"));
-    assert!(!version_is_newer("1.3.0", "unknown"));
+#[tokio::test]
+async fn checks_offer_only_upgrades_in_semver_precedence() {
+    for (current, offered, upgrade) in [
+        (
+            "9.2.0-nightly.20261116.2",
+            "9.2.0-nightly.20261116.10",
+            true,
+        ),
+        ("9.2.0-nightly.20261116.1", "9.2.0", true),
+        ("9.2.0-nightly.20261116.1", "9.1.0", false),
+        ("9.2.0", "9.2.0-beta.1", false),
+        ("9.2.0+a", "9.2.0+z", false),
+        ("unknown", "9.2.0", false),
+        ("9.2.0", "unknown", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({"version": offered}).to_string();
+        let origin = origin_serving(http_ok(&body), Duration::ZERO).await;
+        let mut check =
+            ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
+        check.current_version = current;
+        let snapshot = check.refresh(false).await;
+        assert_eq!(
+            snapshot["latest"].is_object(),
+            upgrade,
+            "{current} -> {offered}"
+        );
+        assert_eq!(snapshot["last_error"].is_null(), offered != "unknown");
+    }
 }
 
 // ── The preference file ─────────────────────────────────────────────────────
@@ -222,17 +239,24 @@ fn only_enabled(enabled: bool) -> UpdatesToml {
 }
 
 fn with_address(address: &str) -> UpdatesToml {
+    if address.is_empty() {
+        return UpdatesToml::default();
+    }
     UpdatesToml {
-        update_address: address.to_string(),
+        channel: "custom:Custom address".into(),
+        custom: vec![CustomSlot {
+            name: "Custom address".into(),
+            url: address.into(),
+        }],
         ..UpdatesToml::default()
     }
 }
 
 #[test]
-fn a_missing_or_malformed_preference_defaults_to_enabled() {
+fn missing_preferences_default_and_malformed_preferences_fail_closed() {
     assert_eq!(parse_updates_toml(""), UpdatesToml::default());
-    assert_eq!(parse_updates_toml("garbage = = ="), UpdatesToml::default());
-    assert_eq!(parse_updates_toml("[release_check"), UpdatesToml::default());
+    assert!(parse_updates_toml("garbage = = =").address().is_err());
+    assert!(parse_updates_toml("[release_check").address().is_err());
     assert_eq!(read_updates_toml(None), UpdatesToml::default());
     // The check is functional rather than telemetry, so it is on by default and
     // no click stands in front of it (ADR 0139).
@@ -266,10 +290,6 @@ fn render_then_parse_round_trips() {
         only_enabled(false),
         only_enabled(true),
         with_address("http://127.0.0.1:5173/api/v1/data/artifacts/releases/rc/latest.json"),
-        UpdatesToml {
-            enabled: false,
-            update_address: r#"https://example.com/a "quoted" \ path"#.to_string(),
-        },
         // A refused value survives a rewrite, so it stays visible until fixed.
         with_address("http://example.com/latest.json"),
     ] {
@@ -304,7 +324,7 @@ fn the_update_address_is_read_raw_and_judged_by_the_shared_rule() {
 
     // A hand-edited bad value is kept and refused, never dropped to default.
     let bad = parse_updates_toml("[release_check]\nupdate_address = \"http://example.com/x\"\n");
-    assert_eq!(bad.update_address, "http://example.com/x");
+    assert_eq!(bad.custom[0].url, "http://example.com/x");
     assert!(bad.address().is_err());
 
     // A value of the wrong type keeps the rest of the file, and is refused.
@@ -326,11 +346,12 @@ fn a_write_keeps_the_field_it_does_not_name() {
     check.update_config(Some(false), None).unwrap();
     let cfg = read_updates_toml(Some(&config));
     assert!(!cfg.enabled);
-    assert_eq!(cfg.update_address, "https://example.com/latest.json");
+    assert_eq!(cfg.custom[0].url, "https://example.com/latest.json");
 
     check.update_config(Some(true), None).unwrap();
     check.update_config(None, Some("")).unwrap();
-    assert_eq!(read_updates_toml(Some(&config)), only_enabled(true));
+    assert_eq!(read_updates_toml(Some(&config)).channel, "stable");
+    assert_eq!(read_updates_toml(Some(&config)).custom.len(), 1);
 }
 
 #[test]
@@ -350,16 +371,6 @@ fn a_refused_address_writes_nothing() {
         assert!(matches!(err, ConfigWriteError::InvalidAddress(_)), "{bad}");
     }
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
-}
-
-#[test]
-fn a_set_address_is_logged_at_startup() {
-    assert_eq!(update_address_log_line(&UpdatesToml::default()), None);
-    let set = update_address_log_line(&with_address("https://example.com/latest.json")).unwrap();
-    assert!(set.contains("https://example.com/latest.json"), "{set}");
-    assert!(set.contains("not the published release"), "{set}");
-    let refused = update_address_log_line(&with_address("http://example.com/x")).unwrap();
-    assert!(refused.contains("refused"), "{refused}");
 }
 
 #[test]
@@ -667,6 +678,8 @@ async fn a_failed_poll_is_recorded_and_a_later_success_clears_it() {
         snapshot["last_error"].is_string(),
         "a soft 404 must be reportable, got {snapshot}"
     );
+    assert_eq!(snapshot["channel_error"], Value::Null);
+    assert_eq!(snapshot["update_address_error"], Value::Null);
 
     let good = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
     let check = ReleaseCheck::with_origin(&dep, &good.url, Duration::from_millis(1));
@@ -791,11 +804,7 @@ fn set_address(dep: &Deployment, address: &str) {
 async fn a_set_address_is_fetched_as_a_plain_latest_json() {
     let dir = tempfile::tempdir().unwrap();
     let default = origin_serving(http_ok(r#"{"version":"98.0.0"}"#), Duration::ZERO).await;
-    let rc = origin_serving(
-        http_ok(r#"{"version":"99.0.0","notes":"rc","platforms":{}}"#),
-        Duration::ZERO,
-    )
-    .await;
+    let rc = origin_serving(http_ok(&channel_feed("99.0.0")), Duration::ZERO).await;
     let dep = deployment_in(dir.path(), true);
     let address = rc
         .url
@@ -848,7 +857,7 @@ async fn a_refused_address_fails_closed_and_sends_nothing() {
     assert_eq!(origin.requests(), 1, "no request under a refused address");
     assert!(snapshot["update_address_error"].is_string(), "{snapshot}");
     assert_eq!(snapshot["last_error"], snapshot["update_address_error"]);
-    assert_eq!(snapshot["update_address"], "http://example.com/latest.json");
+    assert_eq!(snapshot["update_address"], Value::Null);
     // The default origin's earlier answer is not offered either.
     assert_eq!(snapshot["latest"], Value::Null);
     assert_eq!(snapshot["checked_at"], Value::Null);
@@ -858,7 +867,7 @@ async fn a_refused_address_fails_closed_and_sends_nothing() {
 async fn a_changed_address_is_polled_at_once_and_hides_the_old_answer() {
     let dir = tempfile::tempdir().unwrap();
     let default = origin_serving(http_ok(r#"{"version":"98.0.0"}"#), Duration::ZERO).await;
-    let rc = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let rc = origin_serving(http_ok(&channel_feed("99.0.0")), Duration::ZERO).await;
     let dep = deployment_in(dir.path(), true);
     let check = ReleaseCheck::with_origin(&dep, &default.url, POLL_INTERVAL);
     assert_eq!(check.refresh(false).await["latest"]["version"], "98.0.0");
@@ -881,7 +890,7 @@ async fn a_changed_address_is_polled_at_once_and_hides_the_old_answer() {
 #[tokio::test]
 async fn a_failed_poll_of_a_new_address_drops_the_old_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let rc = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let rc = origin_serving(http_ok(&channel_feed("99.0.0")), Duration::ZERO).await;
     let down = origin_serving(
         "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             .to_string(),
@@ -918,4 +927,336 @@ async fn the_relayed_version_never_comes_from_another_address() {
         None,
         "a refused address offers nothing"
     );
+}
+
+#[test]
+fn legacy_address_migrates_to_a_selected_custom_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep = deployment_in(dir.path(), true);
+    std::fs::write(
+        dep.config_path.as_ref().unwrap(),
+        "[release_check]\nenabled = false\nupdate_address = \"https://example.com/latest.json\"\n",
+    )
+    .unwrap();
+    let check = ReleaseCheck::new(&dep);
+    let snapshot = check.snapshot();
+    assert_eq!(snapshot["channel"], "custom:Custom address");
+    assert_eq!(snapshot["custom"][0]["name"], "Custom address");
+    check.update_config(Some(true), None).unwrap();
+    let saved = std::fs::read_to_string(dep.config_path.unwrap()).unwrap();
+    assert!(!saved.contains("update_address ="));
+}
+
+#[tokio::test]
+async fn a_custom_feed_without_this_platform_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = origin_serving(
+        http_ok(r#"{"version":"99.0.0","platforms":{}}"#),
+        Duration::ZERO,
+    )
+    .await;
+    let dep = deployment_in(dir.path(), true);
+    set_address(&dep, &origin.url);
+    let snapshot = ReleaseCheck::new(&dep).refresh(true).await;
+    assert!(snapshot["last_error"].is_string(), "{snapshot}");
+    assert_eq!(snapshot["channel_error"], Value::Null);
+    assert_eq!(snapshot["latest"], Value::Null);
+}
+
+fn channel_feed(version: &str) -> String {
+    let os = if std::env::consts::OS == "macos" {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let key = format!("{os}-{}", std::env::consts::ARCH);
+    json!({"version":version,"platforms":{key:{"url":"https://example.com/Lucidos.tar.gz","signature":"signed"}}}).to_string()
+}
+
+#[test]
+fn channel_slots_survive_switches_and_rejected_writes_are_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep = deployment_in(dir.path(), true);
+    let mut check = ReleaseCheck::new(&dep);
+    check.desktop_app_present = || false;
+    for name in ["One", "Two"] {
+        check
+            .update_channels(
+                None,
+                None,
+                Some(&CustomSlot {
+                    name: name.into(),
+                    url: "https://example.com/latest.json".into(),
+                }),
+                None,
+            )
+            .unwrap();
+    }
+    check
+        .update_channels(None, Some("custom:One"), None, None)
+        .unwrap();
+    check.update_config(Some(false), None).unwrap();
+    check
+        .update_channels(None, Some("stable"), None, None)
+        .unwrap();
+    assert_eq!(check.config().custom.len(), 2);
+    assert!(!check.config().enabled);
+    let path = dep.config_path.unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    for bad in ["beta", "local", "nightly", "unknown", "custom:Missing"] {
+        assert!(check
+            .update_channels(Some(true), Some(bad), None, Some("One"))
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    check
+        .update_channels(None, Some("custom:One"), None, None)
+        .unwrap();
+    assert!(check
+        .update_channels(None, None, None, Some("One"))
+        .is_err());
+    check
+        .update_channels(None, Some("stable"), None, Some("One"))
+        .unwrap();
+    assert_eq!(check.config().custom.len(), 1);
+}
+
+#[test]
+fn channel_writes_validate_the_machine_without_changing_this_gateways_updater() {
+    for desktop in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dep = deployment_in(dir.path(), false);
+        let mut check = ReleaseCheck::new(&dep);
+        check.desktop_app_present = if desktop { || true } else { || false };
+        // Even a dev gateway can save a pick for the desktop app.
+        check.set_local_origin("https://127.0.0.1:12345".into());
+        for channel in ["beta", "local"] {
+            assert_eq!(
+                check
+                    .update_channels(None, Some(channel), None, None)
+                    .is_ok(),
+                desktop,
+                "{channel}, desktop={desktop}"
+            );
+            assert!(check.address(&check.config()).is_err() || !desktop);
+        }
+        for channel in ["nightly", "unknown", "custom:Missing"] {
+            let before = check.config();
+            assert!(check
+                .update_channels(None, Some(channel), None, None)
+                .is_err());
+            assert_eq!(check.config(), before);
+        }
+        check
+            .update_channels(None, Some("stable"), None, None)
+            .unwrap();
+        check
+            .update_channels(
+                None,
+                Some("custom:Preview"),
+                Some(&CustomSlot {
+                    name: "Preview".into(),
+                    url: "https://example.com/latest.json".into(),
+                }),
+                None,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn packaged_channels_and_headless_channels_have_explanations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dep = deployment_in(dir.path(), true);
+    dep.exe = Some(
+        dir.path()
+            .join("Lucidos.app/Contents/Resources/lucidos-gateway"),
+    );
+    let check = ReleaseCheck::new(&dep);
+    check.set_local_origin("https://127.0.0.1:12345".into());
+    for channel in ["stable", "beta", "local"] {
+        check
+            .update_channels(None, Some(channel), None, None)
+            .unwrap();
+        assert_eq!(check.snapshot()["channel"], channel);
+        if channel == "beta" {
+            assert_eq!(
+                check.snapshot()["update_address"],
+                lucidos_update_channel::BETA_FEED_URL
+            );
+        }
+    }
+    assert!(check
+        .update_channels(None, Some("nightly"), None, None)
+        .is_err());
+    assert_eq!(
+        check.snapshot()["update_address"],
+        "https://127.0.0.1:12345/~/updates/local/latest.json"
+    );
+}
+
+#[tokio::test]
+async fn an_older_channel_version_reports_ahead_without_an_offer() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep = deployment_in(dir.path(), true);
+    let origin = origin_serving(http_ok(&channel_feed("0.0.1")), Duration::ZERO).await;
+    set_address(&dep, &origin.url);
+    let check = ReleaseCheck::new(&dep);
+    let snapshot = check.refresh(true).await;
+    assert_eq!(snapshot["channel_version"], "0.0.1");
+    assert_eq!(snapshot["ahead_of_channel"], true);
+    assert_eq!(snapshot["latest"], Value::Null);
+    assert_eq!(snapshot["channel_error"], Value::Null);
+}
+
+#[test]
+fn bad_channel_feeds_are_errors() {
+    assert!(parse_feed(
+        &channel_feed("unknown"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+    .is_err());
+    for body in [
+        "<html>",
+        "{",
+        r#"{"version":"99.0.0"}"#,
+        r#"{"version":"99.0.0","platforms":{"darwin-aarch64":{"url":"http://example.com/bundle","signature":"signed"}}}"#,
+        r#"{"version":"99.0.0","platforms":{"darwin-aarch64":{"url":"https://example.com/bundle"}}}"#,
+    ] {
+        assert!(parse_feed(body, "macos", "aarch64").is_err(), "{body}");
+    }
+}
+
+#[test]
+fn local_availability_requires_a_usable_staged_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dep = deployment_in(dir.path(), true);
+    dep.exe = Some(
+        dir.path()
+            .join("Lucidos.app/Contents/Resources/lucidos-gateway"),
+    );
+    let check = ReleaseCheck::new(&dep);
+    let available = || {
+        let snapshot = check.snapshot();
+        snapshot["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["channel"] == "local")
+            .unwrap()["available"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(!available(), "Local has no bound origin or staging");
+    check.set_local_origin("https://127.0.0.1:9".into());
+    assert!(!available(), "Local has no staged feed");
+    let local = check.local_channel_dir().unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    let feed = json!({"version":"99.0.0","platforms":{"darwin-aarch64":{
+        "url":"Lucidos.tar.gz","signature":"signed"
+    }}});
+    std::fs::write(local.join("latest.json"), feed.to_string()).unwrap();
+    assert!(!available(), "Local feed has no bundle");
+    std::fs::write(local.join("Lucidos.tar.gz"), b"bundle").unwrap();
+    assert!(available(), "Local feed and bundle are usable");
+    check
+        .update_channels(None, Some("local"), None, None)
+        .unwrap();
+    std::fs::write(local.join("latest.json"), "broken").unwrap();
+    assert!(!available(), "broken Local feed is unavailable");
+    assert_eq!(check.snapshot()["channel"], "local");
+}
+
+#[tokio::test]
+async fn local_checks_read_disk_and_broken_staging_never_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dep = deployment_in(dir.path(), true);
+    dep.exe = Some(
+        dir.path()
+            .join("Lucidos.app/Contents/Resources/lucidos-gateway"),
+    );
+    let origin = origin_serving(http_ok(r#"{"version":"98.0.0"}"#), Duration::ZERO).await;
+    let mut check = ReleaseCheck::with_origin(&dep, &origin.url, POLL_INTERVAL);
+    check.target = Some(("macos", "aarch64"));
+    check.set_local_origin("https://127.0.0.1:9".into());
+    check
+        .update_channels(None, Some("local"), None, None)
+        .unwrap();
+    let local = check.local_channel_dir().unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join("Lucidos.tar.gz"), b"bundle").unwrap();
+    let feed = json!({"version":"99.0.0","platforms":{"darwin-aarch64":{
+        "url":"Lucidos.tar.gz","signature":"signed"
+    }}});
+    std::fs::write(local.join("latest.json"), feed.to_string()).unwrap();
+    let snapshot = check.refresh(true).await;
+    assert_eq!(snapshot["channel_version"], "99.0.0");
+    assert_eq!(snapshot["latest"]["version"], "99.0.0");
+    std::fs::remove_file(local.join("Lucidos.tar.gz")).unwrap();
+    check.state.lock().unwrap().last_attempt = None;
+    let snapshot = check.refresh(true).await;
+    assert!(snapshot["last_error"].is_string(), "{snapshot}");
+    assert_eq!(snapshot["channel_error"], Value::Null);
+    assert_eq!(snapshot["latest"], Value::Null);
+    assert_eq!(snapshot["checked_at"], Value::Null);
+    assert_eq!(origin.requests(), 0);
+}
+
+#[test]
+fn independent_gateway_writers_preserve_each_others_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep = deployment_in(dir.path(), true);
+    let first = ReleaseCheck::new(&dep);
+    let second = ReleaseCheck::new(&dep);
+    let jobs: Vec<_> = [first, second]
+        .into_iter()
+        .enumerate()
+        .map(|(i, check)| {
+            std::thread::spawn(move || {
+                for n in 0..10 {
+                    check
+                        .update_channels(
+                            None,
+                            None,
+                            Some(&CustomSlot {
+                                name: format!("Slot {i}-{n}"),
+                                url: "https://example.com/latest.json".into(),
+                            }),
+                            None,
+                        )
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for job in jobs {
+        job.join().unwrap();
+    }
+    assert_eq!(
+        read_updates_toml(dep.config_path.as_deref()).custom.len(),
+        20
+    );
+}
+
+#[test]
+fn local_is_offered_on_the_https_loopback_origin() {
+    // Every gateway's loopback serves TLS from the loopback CA, operator TLS
+    // or not, so the origin's scheme is never a reason to refuse Local.
+    let dir = tempfile::tempdir().unwrap();
+    let mut dep = deployment_in(dir.path(), true);
+    dep.exe = Some(
+        dir.path()
+            .join("Lucidos.app/Contents/Resources/lucidos-gateway"),
+    );
+    let check = ReleaseCheck::new(&dep);
+    check.set_local_origin(lucidos_local_token::client::origin(12345));
+    check
+        .update_channels(None, Some("local"), None, None)
+        .unwrap();
+    assert_eq!(
+        check.snapshot()["update_address"],
+        "https://127.0.0.1:12345/~/updates/local/latest.json"
+    );
+    assert_eq!(check.snapshot()["channel_error"], Value::Null);
 }

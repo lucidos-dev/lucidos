@@ -15,8 +15,6 @@ const status = (partial: Partial<AgentBinaryStatus>): AgentBinaryStatus => ({
 
 describe('binaryStatusLine', () => {
   it('names the resolution source without repeating the path', () => {
-    // The path is shown once, in the input below the line. A row that printed
-    // it in both places wrapped the long string twice on a phone.
     expect(
       binaryStatusLine(status({ source: 'override', valid: true, path: '/x/claude' }), 'claude'),
     ).toBe('Configured');
@@ -30,10 +28,6 @@ describe('binaryStatusLine', () => {
   });
 
   it('surfaces the spawn error for an invalid override', () => {
-    // The engine's validation message names the preference, and the UI must
-    // show it verbatim rather than a generic line (no-hidden-errors). This is
-    // the one case that keeps a path in the line, because the path is what is
-    // wrong.
     const line = binaryStatusLine(
       status({
         source: 'override',
@@ -55,8 +49,6 @@ describe('binaryVersionLabel', () => {
   });
 
   it('renders nothing when no version is known', () => {
-    // An unknown version is an absence, never "unknown" or "v?". The engine
-    // omits the field when the probe found nothing recognizable.
     expect(binaryVersionLabel(status({ source: 'detected', valid: true }))).toBe('');
     expect(binaryVersionLabel(status({}))).toBe('');
   });

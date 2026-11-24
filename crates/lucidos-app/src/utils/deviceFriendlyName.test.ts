@@ -39,10 +39,6 @@ describe('deviceName', () => {
   });
 });
 
-/** "device-109371a3" names nothing a person recognises. So a device nobody
- *  named is called by its browser and machine, with the short id so two alike
- *  stay apart. The engine's `user_agent_device_label` is
- *  the same rule. */
 describe('the user-agent fallback', () => {
   const chrome = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
     + '(KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36';

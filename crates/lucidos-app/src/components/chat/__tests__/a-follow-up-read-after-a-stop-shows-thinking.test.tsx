@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** A follow-up read once the reader canceled a question card shows a Thinking
- *  row while the agent works on it. Reported: the transcript showed nothing
- *  under the follow-up, and only the title spinner said the agent was working.
- *  The fold half is pinned in
- *  `store/__tests__/an-unread-coding-agent-message-waits-in-the-queue.test.ts`.
- */
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

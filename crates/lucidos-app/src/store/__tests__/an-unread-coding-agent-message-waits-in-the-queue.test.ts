@@ -1,9 +1,3 @@
-/**
- * A message sent to a coding agent mid-turn waits in the queue until the agent
- * reads it. The turn that is running keeps its own steps, and the message takes
- * the steps after the read. See
- * docs/plans/2026-09-24-unread-coding-agent-messages-queue.md.
- */
 import { describe, it, expect } from 'vitest';
 import {
   computeExchanges,
@@ -64,8 +58,6 @@ describe('an unread coding-agent message', () => {
     expect(second.awaitingRead).toBeUndefined();
   });
 
-  // The engine hands the message over at once, and the prompt it records then
-  // carries the RUNNING turn's anchor. It is not a step of that turn.
   describe('when the prompt handing it over is recorded mid-turn', () => {
     const called = { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'wait' }, tool_use_id: 't1', channel: 'claude_code' };
     const result = { type: 'CodingAgentToolResult', name: '', result: 'done', tool_use_id: 't1', channel: 'claude_code' };
@@ -105,8 +97,6 @@ describe('an unread coding-agent message', () => {
     });
   });
 
-  // A long turn's own read sits pages back, so the loaded window holds none.
-  // The prompt naming the message is proof enough that reads get reported.
   it.each([
     ['in one load', false],
     ['as each event arrives', true],
@@ -238,9 +228,6 @@ describe('an unread coding-agent message', () => {
     expect(pending.awaitingRead).toBe(true);
   });
 
-  // The reader typed a reply while the question was open, then pressed Cancel
-  // before the agent took it. The card must not jump below the reply, which
-  // would leave the reply above a tall card and out of view.
   it('stays below a question card canceled while it waited', () => {
     const asked = {
       type: 'UserQuestionAsked',
@@ -279,7 +266,6 @@ describe('an unread coding-agent message', () => {
 });
 
 describe('a withdrawn coding-agent message', () => {
-  // The session records the tombstone once Claude Code drops the message.
   it('leaves the transcript on every device', () => {
     const thread = makeOptimisticThreadState({
       id: 't1',
@@ -300,9 +286,6 @@ describe('a withdrawn coding-agent message', () => {
       .toEqual(['start']);
   });
 
-  // Edit withdraws the message and the user resends it. A Stop then ends the
-  // turn, and the agent reads the resent copy. The withdrawn copy must stay
-  // gone: neither the read nor the idle turn may take it out of the queue.
   it.each([
     ['in one load', false],
     ['as each event arrives', true],
@@ -337,11 +320,6 @@ describe('a withdrawn coding-agent message', () => {
   });
 });
 
-// Reported: the reader typed a follow-up under an open question card, then
-// pressed Cancel. The engine settled the stopped turn with a withheld proposal,
-// an idle and a settings row, then the agent read the follow-up. That
-// bookkeeping took the follow-up out of the queue, so the old turn's idle
-// closed the new one. It read Done with no Thinking row while the agent worked.
 describe('a follow-up read after the turn it waited behind is settled', () => {
   const asked = {
     type: 'UserQuestionAsked',
@@ -391,4 +369,14 @@ describe('a follow-up read after the turn it waited behind is settled', () => {
     expect(exchangeSteps(followUp, true).map(s => [s.description, s.outcome]))
       .toEqual([['Thinking', 'pending']]);
   });
+});
+
+it('keeps a message queued behind a permission card without a prior read receipt', () => {
+  const permission = { type: 'CodingAgentPermissionRequest', request_id: 'permission', channel: 'claude_code' };
+  const queued = { ...message('after permission'), queued_for_permission: true };
+  const rows = [ev(1, permission), ev(2, queued, 'm2')];
+  const exchanges = groupIntoExchanges(new Map(rows));
+  expect(queuedFollowupRun(exchanges, true, true).queuedOrder).toEqual([1]);
+  const released = groupIntoExchanges(new Map([...rows, ev(3, read('m2'))]));
+  expect(queuedFollowupRun(released, true, true).queuedOrder).toEqual([]);
 });

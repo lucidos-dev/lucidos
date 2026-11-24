@@ -37,7 +37,7 @@ struct Holder {
 /// Holds one change for one apply, including the merge session or recovery
 /// task it hands off to. Dropping it lets the change go on every exit: an
 /// error, a panic, a dropped request future.
-pub(crate) struct ApplyClaim {
+pub struct ApplyClaim {
     claims: Arc<ApplyClaims>,
     change_id: Uuid,
     generation: u64,
@@ -73,7 +73,7 @@ impl ApplyClaims {
     /// Set what a release the lane waits on calls, once, at lane start.
     pub(crate) fn on_lane_wait_release(&self, release: impl Fn(Uuid) + Send + Sync + 'static) {
         if self.lane_wait_release.set(Box::new(release)).is_err() {
-            log!("[ApplyClaim] the lane's release callback was already set");
+            log_legacy!("[ApplyClaim] the lane's release callback was already set");
         }
     }
 
@@ -115,12 +115,12 @@ impl ApplyClaims {
 }
 
 impl ApplyClaim {
-    pub(crate) fn change_id(&self) -> Uuid {
+    pub fn change_id(&self) -> Uuid {
         self.change_id
     }
 
     /// Whether this claim still holds its change, or a continuation took it.
-    pub(crate) fn is_current(&self) -> bool {
+    pub fn is_current(&self) -> bool {
         self.claims
             .held()
             .get(&self.change_id)
@@ -129,7 +129,7 @@ impl ApplyClaim {
 
     /// Tie the claim to the merge session that carries it. Once that session
     /// hands its duty off (`flag` set), the continuation may take the claim.
-    pub(crate) fn carried_by_session(&self, flag: Arc<AtomicBool>) {
+    pub fn carried_by_session(&self, flag: Arc<AtomicBool>) {
         if let Some(holder) = self
             .claims
             .held()
@@ -167,7 +167,7 @@ impl crate::engine::LucidosEngine {
     /// Claim a change found by an earlier read, then read it again under the
     /// claim. `None` when another apply holds it or it is no longer pending:
     /// that apply, or whatever resolved the change, announces the outcome.
-    pub(crate) async fn claim_pending_change(
+    pub async fn claim_pending_change(
         &self,
         change_id: Uuid,
     ) -> Result<Option<ApplyClaim>, Box<dyn std::error::Error + Send + Sync>> {
@@ -184,7 +184,7 @@ impl crate::engine::LucidosEngine {
 }
 
 /// What an apply refused by a held claim tells its caller.
-pub(crate) const APPLY_IN_PROGRESS_MESSAGE: &str =
+pub const APPLY_IN_PROGRESS_MESSAGE: &str =
     "This change is already being applied. Its outcome arrives when that apply finishes.";
 
 #[cfg(test)]

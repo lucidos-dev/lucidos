@@ -23,8 +23,6 @@ describe('triggerFilterOptions', () => {
     historicalTriggers.value = { status: 'not-loaded' };
     threadMap.value = new Map();
     selectedTriggerIds.value = new Set();
-    // These cases assert deleted-entry labeling/sorting, which is independent
-    // of the include-deleted toggle — opt in so deleted rows are listed.
     includeDeletedFilterOptions.value = true;
   });
 
@@ -34,8 +32,6 @@ describe('triggerFilterOptions', () => {
     map.set('t1', makeTriggerThread('t1', 'live-1', 'Live One'));
     threadMap.value = map;
 
-    // Without the registry we cannot tell live from deleted — refuse to render
-    // children rather than mis-label every live trigger as "(deleted)".
     expect(triggerFilterOptions.value).toEqual([]);
   });
 
@@ -121,8 +117,6 @@ describe('triggerFilterOptions', () => {
   });
 
   it('always includes selected ids even if no loaded thread references them', () => {
-    // Restored from localStorage on a fresh load — without this the filter
-    // applies silently and the user sees an empty list with no checkbox to clear.
     triggers.value = { status: 'loaded', data: [makeTrigger({ id: 'live-1', name: 'Live One' })] };
     threadMap.value = new Map();
     selectedTriggerIds.value = new Set(['live-1', 'gone-1']);
@@ -159,9 +153,6 @@ describe('triggerFilterOptions', () => {
   });
 
   it('keeps same-named live and deleted entries as separate options (no merging)', () => {
-    // Delete-and-recreate produces a live trigger and a deleted entry that
-    // share a name. They stay distinct in the list — the deleted one's
-    // `(until <date>)` suffix lets the user tell them apart in the dropdown.
     triggers.value = {
       status: 'loaded',
       data: [makeTrigger({ id: 'new-uuid', name: 'Nightly Build' })],

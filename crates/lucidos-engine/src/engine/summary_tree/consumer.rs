@@ -12,10 +12,6 @@
 
 use std::sync::Arc;
 
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
-
 use super::compactor::{CompactionModel, Compactor, CompactorDeps};
 use super::compactor_models::compactor_route;
 use super::log::{ENTRY_EVENT_TYPES, TURN_END_EVENT_TYPES};
@@ -24,7 +20,7 @@ use super::spend::StartEstimate;
 use super::store;
 use super::SummaryScope;
 use crate::engine::aux_purpose::SUMMARY_COMPACTION_PREFS;
-use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
+use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::{ContextPurpose, LucidosEngine};
 use crate::scheduler::notifications::SettingsPage;
@@ -36,18 +32,18 @@ use crate::scheduler::notifications::SettingsPage;
 pub fn spawn(engine: Arc<LucidosEngine>) {
     // Subscribe before reading the preference, so a change landing in between
     // is not missed.
-    let rx = engine.event_bus.subscribe();
+    let (rx, replay) = LagReplay::subscribe(&engine.event_bus, ReplayScope::Workspace, None);
     tokio::spawn(async move {
         let mut running = None;
         if tree_chosen(engine.pool()).await {
             running = Some(start(&engine, None));
         }
-        listen(rx, &engine, running).await;
+        listen(rx, &engine, running, replay).await;
     });
 }
 
 fn start(engine: &Arc<LucidosEngine>, starter: Option<MessageOrigin>) -> Arc<Compactor> {
-    log!("[SummaryTree] The workspace is on the Tree memory module, starting the compactor");
+    log_legacy!("[SummaryTree] The workspace is on the Tree memory module, starting the compactor");
     let compactor = Compactor::new(
         engine.pool().clone(),
         engine.event_bus.clone(),
@@ -85,78 +81,78 @@ fn switch_actor(emitted: &EmittedEvent) -> Option<MessageOrigin> {
 }
 
 async fn listen(
-    rx: tokio::sync::broadcast::Receiver<EmittedEvent>,
+    mut rx: tokio::sync::broadcast::Receiver<EmittedEvent>,
     engine: &Arc<LucidosEngine>,
     mut running: Option<Arc<Compactor>>,
+    mut replay: LagReplay,
 ) {
-    let stream = BroadcastStream::new(rx);
-    tokio::pin!(stream);
-    // A lag must not end the loop: the missed events stay in the table.
-    while let Some(result) = stream.next().await {
-        let emitted = match result {
-            Ok(e) => e,
-            // The missed events may have dirtied any scope, or switched the
-            // module, so look again.
-            Err(BroadcastStreamRecvError::Lagged(n)) => {
-                log!("[SummaryTree] Broadcast lagged by {} events; re-seeding", n);
-                let tree = tree_chosen(engine.pool()).await;
-                running = switch(engine, running, tree, None).await;
-                if let Some(compactor) = &running {
-                    compactor.forget_workspace();
-                    if let Err(e) = compactor.seed().await {
-                        log!("[SummaryTree] Could not re-seed after the lag: {}", e);
-                    }
-                }
+    // Hold announcements are durable too: replay a lag rather than dropping
+    // the one event that owns the provider's notification.
+    while let Some(frames) = replay.read(rx.recv().await, engine.pool()).await {
+        for emitted in frames {
+            if let Some(module) = switched_to(&emitted) {
+                let tree = module == MemoryModule::Tree;
+                running = switch(engine, running, tree, switch_actor(&emitted)).await;
                 continue;
             }
-        };
-        if let Some(module) = switched_to(&emitted) {
-            let tree = module == MemoryModule::Tree;
-            running = switch(engine, running, tree, switch_actor(&emitted)).await;
-            continue;
-        }
-        let Some(compactor) = &running else {
-            continue;
-        };
-        if emitted.seq.is_none() {
-            continue;
-        }
-        match &emitted.typed {
-            BusEvent::Thread {
-                thread_id, event, ..
-            } => {
-                let event_type = event.event_type();
-                let ends_turn = TURN_END_EVENT_TYPES.contains(&event_type);
-                if ends_turn || ENTRY_EVENT_TYPES.contains(&event_type) {
-                    compactor.mark_dirty(SummaryScope::Thread(*thread_id), true);
-                }
-                if ends_turn {
-                    compactor.mark_dirty(SummaryScope::Workspace, true);
-                }
-            }
-            BusEvent::System(
-                SystemEvent::ArtifactCreated { .. }
-                | SystemEvent::ArtifactUpdated { .. }
-                | SystemEvent::ArtifactImported { .. },
-            ) => compactor.mark_dirty(SummaryScope::Workspace, true),
-            BusEvent::System(SystemEvent::ThreadsDeleted { thread_ids, .. }) => {
-                compactor.forget_threads(thread_ids)
-            }
-            BusEvent::System(SystemEvent::PreferencesChanged { key, .. })
-                if is_compactor_model_pref(key) =>
+            if let BusEvent::System(SystemEvent::ModelSpendCapReached {
+                provider,
+                resets_at,
+                ..
+            }) = &emitted.typed
             {
-                compactor.model_changed().await
+                notify_spend_cap(engine, provider, *resets_at).await;
             }
-            BusEvent::System(SystemEvent::TreeBackfillCapRaised { .. }) => {
-                compactor.cap_raised().await
+            let Some(compactor) = &running else {
+                continue;
+            };
+            if emitted.seq.is_none() {
+                continue;
             }
-            BusEvent::System(SystemEvent::TreeBackfillCapReached { spent_usd, cap_usd }) => {
-                notify_cap_reached(engine, *spent_usd, *cap_usd).await
+            match &emitted.typed {
+                BusEvent::Thread {
+                    thread_id, event, ..
+                } => {
+                    let event_type = event.event_type();
+                    let ends_turn = TURN_END_EVENT_TYPES.contains(&event_type);
+                    if ends_turn
+                        || ENTRY_EVENT_TYPES.contains(&event_type)
+                        || crate::engine::consumption_claim::HELD_MESSAGE_RECEIPT_TYPES
+                            .contains(&event_type)
+                    {
+                        compactor.mark_dirty(SummaryScope::Thread(*thread_id), true);
+                    }
+                    if ends_turn {
+                        compactor.mark_dirty(SummaryScope::Workspace, true);
+                    }
+                }
+                BusEvent::System(
+                    SystemEvent::ArtifactCreated { .. }
+                    | SystemEvent::ArtifactUpdated { .. }
+                    | SystemEvent::ArtifactImported { .. },
+                ) => compactor.mark_dirty(SummaryScope::Workspace, true),
+                BusEvent::System(SystemEvent::ThreadsDeleted { thread_ids, .. }) => {
+                    compactor.forget_threads(thread_ids)
+                }
+                BusEvent::System(SystemEvent::PreferencesChanged { key, .. })
+                    if is_compactor_model_pref(key) =>
+                {
+                    compactor.model_changed().await
+                }
+                BusEvent::System(SystemEvent::ModelSpendCapHoldEnded { .. }) => {
+                    compactor.spend_cap_hold_ended().await;
+                }
+                BusEvent::System(SystemEvent::TreeBackfillCapRaised { .. }) => {
+                    compactor.cap_raised().await
+                }
+                BusEvent::System(SystemEvent::TreeBackfillCapReached { spent_usd, cap_usd }) => {
+                    notify_cap_reached(engine, *spent_usd, *cap_usd).await
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-    log!("[SummaryTree] Compactor event stream ended");
+    log_legacy!("[SummaryTree] Compactor event stream ended");
 }
 
 /// Start, pause or resume the compactor to match the module. One compactor
@@ -171,7 +167,7 @@ async fn switch(
         (None, true) => Some(start(engine, starter)),
         (Some(compactor), true) => {
             if compactor.is_paused() {
-                log!("[SummaryTree] The workspace is back on the Tree memory module, resuming the compactor");
+                log_legacy!("[SummaryTree] The workspace is back on the Tree memory module, resuming the compactor");
                 compactor.set_starter(starter);
                 compactor.resume().await;
             }
@@ -179,7 +175,7 @@ async fn switch(
         }
         (running, false) => {
             if let Some(compactor) = running.as_ref().filter(|c| !c.is_paused()) {
-                log!("[SummaryTree] The workspace left the Tree memory module, pausing the compactor");
+                log_legacy!("[SummaryTree] The workspace left the Tree memory module, pausing the compactor");
                 compactor.pause();
             }
             clear_ready_flag(engine.pool(), &engine.event_bus).await;
@@ -202,7 +198,7 @@ pub(super) async fn clear_ready_flag(
             .await
         }
         Ok(false) => {}
-        Err(e) => log!("[SummaryTree] Could not clear the ready flag: {}", e),
+        Err(e) => log_legacy!("[SummaryTree] Could not clear the ready flag: {}", e),
     }
 }
 
@@ -227,7 +223,7 @@ async fn notify_cap_reached(engine: &LucidosEngine, spent_usd: f64, cap_usd: f64
         )
         .await
     {
-        log!(
+        log_legacy!(
             "[SummaryTree] Could not notify that the backfill cap was reached: {}",
             e
         );
@@ -255,7 +251,7 @@ async fn notify_model_down(engine: &LucidosEngine, model: &str) {
         )
         .await
     {
-        log!(
+        log_legacy!(
             "[SummaryTree] Could not notify that {} is not answering: {}",
             model,
             e
@@ -318,7 +314,7 @@ impl CompactorDeps for EngineDeps {
         {
             Ok(content) => Some(content),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[SummaryTree] Could not read {} at {}, so its leaf names the write only: {}",
                     path,
                     commit,
@@ -327,5 +323,45 @@ impl CompactorDeps for EngineDeps {
                 None
             }
         }
+    }
+}
+
+async fn notify_spend_cap(
+    engine: &LucidosEngine,
+    provider: &str,
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let page = SettingsPage::PROVIDERS;
+    let reset = match resets_at {
+        Some(reset) => {
+            let tz = engine
+                .user_timezone()
+                .await
+                .parse::<chrono_tz::Tz>()
+                .unwrap_or(chrono_tz::UTC);
+            format!(
+                "Resets at {}.",
+                reset.with_timezone(&tz).format("%Y-%m-%d %H:%M")
+            )
+        }
+        None => "The provider did not supply a reset time.".into(),
+    };
+    let message = format!("{provider} reached its spend cap. {reset} Background calls wait. Use Try now after raising the cap under {}.", page.link());
+    if let Err(error) = engine
+        .create_notification(
+            "Provider spend cap reached",
+            &message,
+            None,
+            None,
+            None,
+            page.tap(),
+            None,
+        )
+        .await
+    {
+        log_legacy!(
+            "[SummaryTree] Could not announce provider spend cap: {}",
+            error
+        );
     }
 }

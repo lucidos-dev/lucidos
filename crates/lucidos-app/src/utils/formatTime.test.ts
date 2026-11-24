@@ -2,9 +2,6 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { formatAgoPhrase, formatDateTime, formatDurationPhrase, formatMessageTimestamp } from './formatTime';
 import { preferences } from '../store/store';
 
-/** Every drawer row renders a created-at stamp, and a landed archive page
- *  re-renders every row. Building an `Intl` formatter costs about 100µs, so a
- *  formatter per call makes each page cost grow with the rows loaded. */
 describe('formatMessageTimestamp', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -14,7 +11,6 @@ describe('formatMessageTimestamp', () => {
   it('reuses its formatters across calls', () => {
     preferences.value = { status: 'loaded', data: { timezone: 'Europe/Oslo' } };
     formatMessageTimestamp('2026-05-05T09:02:09Z');
-    // `toLocale*String` builds a formatter internally, out of the spy's sight.
     const construct = vi.spyOn(Intl, 'DateTimeFormat');
     const localeTime = vi.spyOn(Date.prototype, 'toLocaleTimeString');
     const localeDate = vi.spyOn(Date.prototype, 'toLocaleDateString');
@@ -25,8 +21,6 @@ describe('formatMessageTimestamp', () => {
   });
 
   it('reads "Invalid Date" for a malformed stamp rather than throwing', () => {
-    // `toLocaleString` returned this string, while a cached formatter's
-    // `format` throws, which would take down the row rendering the stamp.
     expect(formatMessageTimestamp('not a date')).toBe('Invalid Date Invalid Date');
     expect(formatDateTime(new Date(Number.NaN))).toBe('Invalid Date');
   });
@@ -39,8 +33,6 @@ describe('formatMessageTimestamp', () => {
   });
 });
 
-/** This one reads inside a clause, so the words and the singular matter more
- *  than the boundaries do. */
 describe('formatAgoPhrase', () => {
   const now = new Date('2026-08-27T12:00:00Z');
   const before = (ms: number) => new Date(now.getTime() - ms);
@@ -60,14 +52,10 @@ describe('formatAgoPhrase', () => {
   });
 
   it('reads a stamp from the future as just now', () => {
-    // Two clocks, so this is reachable. "-2 minutes ago" is worse than a stamp
-    // that has simply rounded to the present.
     expect(formatAgoPhrase(new Date(now.getTime() + 120_000), now)).toBe('just now');
   });
 });
 
-/** A span rather than a point, and it takes seconds because a caller reads what
- *  the server measured. */
 describe('formatDurationPhrase', () => {
   it('spells out each unit and drops the plural at one', () => {
     expect(formatDurationPhrase(180)).toBe('3 minutes');
@@ -79,8 +67,6 @@ describe('formatDurationPhrase', () => {
   });
 
   it('says "under a minute" rather than counting seconds', () => {
-    // It is read once, inside a clause. A second count there is precision the
-    // reader has no use for.
     expect(formatDurationPhrase(0)).toBe('under a minute');
     expect(formatDurationPhrase(59)).toBe('under a minute');
   });

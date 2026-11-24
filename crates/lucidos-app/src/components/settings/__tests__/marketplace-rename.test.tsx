@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Settings → Marketplaces renames a row in place, and leaves its URL alone.
- *
- * The URL is the marketplace's identity: the engine keys the registry entry on
- * a hash of it, so a rename has to re-post the stored URL verbatim. Post a
- * different one and the upsert lands on a new id, leaving the old row behind.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -68,8 +61,6 @@ function press(el: HTMLElement, key: string): void {
   el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
 }
 
-/** Let Preact flush. A real user types into a rendered field, so each step here
- *  waits for the render the step before it asked for. */
 async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
@@ -127,8 +118,6 @@ describe('renaming a marketplace', () => {
     expect(mockAddPluginMarketplace).not.toHaveBeenCalled();
   });
 
-  // ADR 0118: an idle field holds no copy, so a rename from another device
-  // repaints it. Seeded once at mount it would offer the stale name back.
   it('follows a frame that renames the marketplace elsewhere', async () => {
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf('Renamed elsewhere') };
 

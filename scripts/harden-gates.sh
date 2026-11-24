@@ -23,6 +23,11 @@ LOGS="$ROOT/.lucidos/harden-gates"
 # One "<name> <command>" line per gate, in harden.md's order.
 GATES='em-dash ./scripts/check-em-dashes.sh
 prose ./scripts/check-prose.sh
+comments ./scripts/check-comments.sh
+crate-tiers ./scripts/check-crate-tiers.sh && ./scripts/lib/check_crate_tiers_test.sh
+crate-size ./scripts/check-crate-size.sh && ./scripts/lib/check_crate_size_test.sh
+crate-graph ./scripts/check-crate-graph.sh && ./scripts/lib/check_crate_graph_test.sh
+codegen-inputs ./scripts/check-codegen-inputs.sh
 adr ./scripts/check-adrs.sh
 context-budget ./scripts/check-context-budget.sh
 prompt-mirror ./scripts/check-prompt-mirror.sh
@@ -30,14 +35,21 @@ build-script-paths ./scripts/check-build-script-paths.sh
 e2e-workflow ./scripts/check-e2e-workflow.sh
 mirror-push-gate ./scripts/mirror-push-gate.sh
 mirror-pushers ./scripts/check-mirror-pushers.sh
-knowhow make lint-knowhow
+knowhow-refs ./scripts/check-knowhow-refs.sh
+retired-terms ./scripts/check-retired-terms.sh
+audit-scans ./scripts/check-audit-scans.sh
 knowhow-coupling ./scripts/check-knowhow-coupling.sh
 knowhow-coupling-fixtures ./scripts/lib/check_knowhow_coupling_test.sh
 audit-fixtures ./scripts/lib/check_audit_scans_test.sh
-knowhow-fixtures ./scripts/lib/check_knowhow_refs_test.sh && ./scripts/lib/check_knowhow_generated_test.sh
+knowhow-refs-fixtures ./scripts/lib/check_knowhow_refs_test.sh
+knowhow-generated-fixtures ./scripts/lib/check_knowhow_generated_test.sh
 default-flows ./scripts/check-default-flows.sh
+workspace-client-contract ./scripts/check-workspace-client-contract.sh && ./scripts/lib/check_workspace_client_contract_test.sh
 retired-terms-fixtures ./scripts/lib/check_retired_terms_test.sh
-hooks-registered ./scripts/lib/hooks_registered_test.sh'
+hooks-registered ./scripts/lib/hooks_registered_test.sh
+stage-rules node --test scripts/scoreboard/*.test.mjs
+comment-strip ./scripts/comment-strip/run-tests.sh
+eval-comments-harness ./scripts/eval-comments/run-tests.sh'
 
 case "${1:-}" in
     "") ;;
@@ -53,8 +65,29 @@ esac
 
 rm -rf "$LOGS"
 mkdir -p "$LOGS"
+# Conditional checks use the branch diff, including working-tree edits
+# during the final gate pass. Discovery failure is its own collected failure.
+if base=$(git -C "$ROOT" merge-base main HEAD 2> "$LOGS/change-discovery-input.log") \
+    && changed=$(git -C "$ROOT" diff --no-renames --name-only "$base" -- 2>> "$LOGS/change-discovery-input.log") \
+    && untracked=$(git -C "$ROOT" ls-files -o --exclude-standard 2>> "$LOGS/change-discovery-input.log"); then
+    if printf '%s\n' "$changed" "$untracked" | grep -E '^scripts/recover-billing[^/]*\.py$' > /dev/null; then
+        GATES="$GATES
+recover-billing python3 scripts/recover-billing_test.py"
+    fi
+else
+    GATES="$GATES
+change-discovery cat .lucidos/harden-gates/change-discovery-input.log; echo 'ERROR: cannot discover changed paths' >&2; false"
+fi
 while read -r name cmd; do
+    # Installing the mirror hook mutates the file inspected by mirror-pushers.
+    # Retain both results even when installation fails.
+    if [ "$name" = mirror-pushers ]; then
+        wait "$mirror_install_pid"
+    fi
     ( (cd "$ROOT" && bash -c "$cmd") > "$LOGS/$name.log" 2>&1; echo $? > "$LOGS/$name.exit" ) &
+    if [ "$name" = mirror-push-gate ]; then
+        mirror_install_pid=$!
+    fi
 done <<EOF
 $GATES
 EOF

@@ -1,10 +1,3 @@
-/**
- * One ask at a time, for an ask whose answer can go stale while it runs.
- *
- * A plain call joins the ask in flight. A `fresh` call needs an answer begun
- * after it. So one more ask runs once the current one ends, and the call
- * waits for that one too.
- */
 export function singleFlight(ask: () => Promise<void>): (fresh?: boolean) => Promise<void> {
   let inFlight: Promise<void> | null = null;
   let again = false;

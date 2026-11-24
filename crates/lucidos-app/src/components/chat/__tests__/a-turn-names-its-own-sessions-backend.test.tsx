@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** A turn's header names the backend of the session that turn ran in. A
- *  handoff may switch backend (ADR 0560), and the thread's own backend is its
- *  newest session's. Reading that one relabelled every earlier turn, so a
- *  Claude Code to Codex handoff left no record of the switch.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -58,7 +53,6 @@ function sessionStarted(seq: number, codingAgent: CodingAgent, continuity: Sessi
 
 const HANDOFF: SessionContinuity = { kind: 'handoff', opening: 'narrative', message: 'Carry on.' } as SessionContinuity;
 
-/** A finished turn, opening a session first when `session` is given. */
 function turn(seq: number, session?: ReturnType<typeof sessionStarted>): Exchange {
   return {
     userEvent: { type: 'MessageReceived', text: `ask ${seq}`, created: TS, channel: 'claude_code', _eventId: `u-${seq}` } as StoredEvent,
@@ -123,14 +117,11 @@ describe('a turn header names its own session backend', () => {
     expect(headers()).toEqual(['Claude', 'Claude', 'Codex']);
   });
 
-  // An older page that is not loaded yet holds the first session. A resume or
-  // a fresh session keeps the backend, so the turns above it share its own.
   it('carries a resumed session backend up to the turns above it', () => {
     draw([turn(1), turn(2, sessionStarted(2.1, 'codex', { kind: 'resumed' }))], 'codex');
     expect(headers()).toEqual(['Codex', 'Codex']);
   });
 
-  // A handoff can switch backend, so nothing loaded says what ran above it.
   it('falls back to the thread backend above a handoff whose session is not loaded', () => {
     draw([turn(1), turn(2, sessionStarted(2.1, 'claude-code', HANDOFF))], 'codex');
     expect(headers()).toEqual(['Codex', 'Claude']);

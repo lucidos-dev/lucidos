@@ -1,12 +1,3 @@
-/**
- * The navigation the frame now does for itself.
- *
- * These cases came from `crates/lucidos-app/src/components/apps/iframeNav.test.ts`
- * unchanged in substance. The host used to drive `contentWindow.location`, an
- * isolated frame denies that, and the arithmetic moved into the frame's realm
- * with the code. The bug they guard did not move: a pushed history entry is
- * replayed by the iOS edge-swipe-back gesture (WebKit #9166).
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { installHostOps } from './hostOps';
 import { _resetHostServingForTesting } from './_bridge';
@@ -18,8 +9,6 @@ const saved: Record<string, unknown> = {};
 let listener: ((event: MessageEvent) => void) | null = null;
 let loc: { href: string; origin: string; replace: ReturnType<typeof vi.fn>; hash?: string };
 
-/** Install a frame whose live URL can drift, the way a real app moves itself
- *  with `history.replaceState`, and capture the SDK's message listener. */
 function setFrame(hash = '', query = '') {
   loc = {
     href: `${APP_DOC}${query}${hash}`,
@@ -33,17 +22,11 @@ function setFrame(hash = '', query = '') {
       if (type === 'message') listener = fn;
     },
   };
-  // `defineProperty`, because a plain assignment to `globalThis.location` is
-  // silently dropped where the property is not writable.
   Object.defineProperty(globalThis, 'location', { value: loc, configurable: true, writable: true });
   installHostOps();
   return parent;
 }
 
-/** Deliver a host request, as `askFrame` / `tellFrame` would.
- *
- *  Awaited, because the SDK dispatches a handler on a microtask so a throwing
- *  one becomes a rejected reply rather than an exception in the listener. */
 async function hostSays(op: string, args: unknown, id?: string) {
   const event = {
     data: { type: 'lucidos:bridge:host', id, op, args },
@@ -59,8 +42,6 @@ beforeEach(() => {
   saved.window = (globalThis as any).window;
   saved.location = Object.getOwnPropertyDescriptor(globalThis, 'location');
   listener = null;
-  // The SDK installs its listener once per realm. That is right at runtime, and
-  // it would leave every case after the first with no listener at all.
   _resetHostServingForTesting();
 });
 
@@ -75,8 +56,6 @@ afterEach(() => {
 
 describe('navigate', () => {
   it('is not an op, so even the host cannot send the frame to a URL', async () => {
-    // Whatever window frames the app is its parent. An op taking a whole URL
-    // would let a foreign page run a `javascript:` URL in the app's origin.
     const parent = setFrame();
     await hostSays('navigate', { url: '/app/notes-app/' }, 'host-1');
 
@@ -90,9 +69,6 @@ describe('navigate', () => {
 
 describe('hash', () => {
   it('moves to the fragment without changing the document', async () => {
-    // Same document means a fragment navigation: the app is not reloaded and
-    // `hashchange` fires. It also means no `load`, which is why the host raises
-    // no cover for it.
     setFrame();
     await hostSays('hash', { fragment: 'pr-1645' });
 
@@ -112,9 +88,6 @@ describe('hash', () => {
   });
 
   it('moves a frame whose live hash has DRIFTED back onto the target', async () => {
-    // The same link clicked twice. PR Understanding reflects its selection back
-    // with `history.replaceState`. By the second click the frame sits on a
-    // different report than the one the link names.
     setFrame('#pr-1700');
     await hostSays('hash', { fragment: 'pr-1645' });
 
@@ -136,7 +109,6 @@ describe('hash', () => {
   });
 
   it('does nothing when the frame is already on that fragment', async () => {
-    // Idempotence is what lets both delivery sites write without fighting.
     setFrame('#pr-1645');
     await hostSays('hash', { fragment: 'pr-1645' });
 

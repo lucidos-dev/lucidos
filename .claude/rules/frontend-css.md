@@ -2,16 +2,17 @@
 paths:
   - "crates/lucidos-app/src/**/*.css"
   - "crates/lucidos-app/src/**/*.tsx"
-  - "crates/lucidos-engine/src/api/sdk_iframe.css"
-  - "crates/lucidos-engine/src/api/sdk_iframe_shapes.css"
-  - "crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css"
+  - "crates/lucidos-agents-api/src/api/sdk_iframe.css"
+  - "crates/lucidos-agents-api/src/api/sdk_iframe_shapes.css"
+  - "crates/lucidos-agents-api/src/api/sdk_iframe_control_theme_parts.css"
 ---
 
 # Frontend CSS & Component Conventions
 
 This half of the frontend rules carries the design tokens, the three-file component split and the class contract. `frontend.md` carries the TypeScript and state contract. Reasons and scars: [`docs/frontend-css-conventions.md`](../../docs/frontend-css-conventions.md).
 
-Scoped to `.css` **and** `.tsx` on purpose: a component applies these classes from TSX. A plain `.ts` edit gets only `frontend.md`.
+Reading CSS or TSX loads this rule. TSX components apply the classes.
+Plain TS loads only `frontend.md`.
 
 ## CSS & Component Rules
 
@@ -48,7 +49,7 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
 - **An icon toggle renders through `ToggleIconButton`** (`aria-pressed`, a `tone`). A new look is a new tone, never a local rule (`toggle-icon-single-source.test.ts`).
 - **Tab title**: `(count) Lucidos`.
 - **No system dialogs**: use `showToast(msg, type)` and `await showConfirm(msg, okLabel, { variant })`. `variant` is required: `'danger'` only for an action that loses something for good, else `'default'`.
-- **A dialog message is ONE string, and a blank line is a paragraph.** Render it through `<DialogMessage message={…} />` (`components/shared/DialogMessage.tsx`). Never hand-roll a `<p class="confirm-message">` or use `white-space: pre-line`. A change to the paragraph rule updates `system-knowhow/js-sdk.md` § Confirmation dialogs and § Prompts in the same commit.
+- **A dialog message is ONE string, and a blank line is a paragraph.** Render it through `<DialogMessage message={…} />` (`components/shared/DialogMessage.tsx`). Never hand-roll a `<p class="confirm-message">` or use `white-space: pre-line`. Change the paragraph rule and `system-knowhow/js-sdk/lucidos-ui-ui-control-2.md` § Confirmation dialogs and § Prompts together.
 - **No native tooltips**: use `data-tooltip="text"`. Host and apps share `installTooltips()` (`packages/lucidos-sdk/src/tooltip.ts`).
 - **A tap paints no background.** Wrap every `:hover` rule in `@media (hover: hover)` or scope it under `body:not(.is-touch)`. No `:active` fill (a scale is fine). Never restate the tap-highlight reset in `base.css`. A cursor class set on `mouseenter` takes the same gate. Pinned by `touch-paints-no-press.test.ts`.
 - **No left-accent stripe on a card, callout, banner or notice, strictly forbidden.** That covers a coloured `border-left`, and a faux bar via `::before` or an inset `box-shadow`. Use bold text, a raised `--bg-tertiary` surface, spacing or an inline icon.

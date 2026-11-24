@@ -59,7 +59,6 @@ export function SnapshotSection() {
   async function restore(entry: Snapshot) {
     const checkGeneration = requestGenerationGuard();
     const workspace = WORKSPACE_ID ?? document.querySelector<HTMLMetaElement>('meta[name="lucidos-workspace-id"]')?.content;
-    // No gateway identity means a bare engine, which the restore endpoint refuses.
     if (!workspace) throw new Error('Restoring needs the Lucidos gateway, and this engine runs without one');
     const target = parseWorkspaceRoute(workspace);
     if (!target || target.slug !== entry.workspace_id) throw new Error('Open this snapshot in its workspace before restoring');

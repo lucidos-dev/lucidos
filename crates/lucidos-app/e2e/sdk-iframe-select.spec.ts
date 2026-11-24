@@ -91,7 +91,7 @@ start();
     await trigger.focus();
     await page.keyboard.press('ArrowDown');
     await expect(root).toHaveAttribute('data-state', 'open');
-    await page.keyboard.press('ArrowDown'); // banana → cherry
+    await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
     await expect(root).toHaveAttribute('data-state', 'closed');
     await expect(trigger.locator('.lucidos-select-label')).toHaveText('Cherry');

@@ -1,3 +1,4 @@
+import { retryTransportRead } from './_transport';
 import { apiUrl } from './_fetch';
 import {
   callHost,
@@ -10,46 +11,10 @@ import {
 } from './_bridge';
 import { PROXY_CLIENT_WAIT_SECS } from './generated/engine-constants';
 
-/**
- * Generic API proxy. Configure backends in `data/config/apis.json`:
- *
- * ```json
- * {
- *   "sonos":   { "base_url": "http://localhost:5005" },
- *   "comfort": { "base_url": "https://accsmart.panasonic.com",
- *                "auth": { "type": "bearer", "credential": "comfort-cloud" } }
- * }
- * ```
- *
- * Then from an app:
- *
- * ```ts
- * lucidos.proxy('sonos').fetch('/living-room/play');
- * lucidos.proxy('comfort').fetch('/api/v1/devices', { method: 'POST', body });
- * ```
- *
- * The engine forwards the request to the configured backend and injects the
- * configured auth header from the credential store. It strips
- * Cookie/Origin/Referer/Host, so the upstream never sees the engine's browser
- * session. It strips every `x-lucidos-*` header and the two `x-forwarded-*`
- * ones the gateway owns with them, so no Lucidos credential travels either.
- * The credential value never reaches the iframe. On the way back it passes
- * only allowlisted upstream headers, so no `Set-Cookie` or policy header from
- * the upstream lands on the Lucidos origin.
- */
 export interface ProxyClient {
-  /** Make a request to the configured backend. Returns the raw `Response`
-   *  so the caller can decide how to read the body (`.json()`, `.text()`,
-   *  `.blob()`, …). */
   fetch(path: string, init?: RequestInit): Promise<Response>;
 }
 
-/** How long the host will wait on a proxied upstream before giving up.
- *
- *  The engine owns the real limit: `proxy_timeout_secs`, or an entry's
- *  `timeout_secs`, under a cap on the whole call. This wait sits above that
- *  cap, so it never cuts first. It exists so a hung backend cannot leave a
- *  pending entry for the life of the frame. */
 const PROXY_TIMEOUT_MS = PROXY_CLIENT_WAIT_SECS * 1000;
 
 export function proxy(name: string): ProxyClient {
@@ -58,10 +23,7 @@ export function proxy(name: string): ProxyClient {
     async fetch(path: string, init?: RequestInit): Promise<Response> {
       const normalizedPath = path.startsWith('/') ? path : `/${path}`;
       const suffix = `/proxy/${safeName}${normalizedPath}`;
-      if (!isBridged()) return fetch(apiUrl(suffix), init);
-      // An isolated frame's own `fetch` is CORS-blocked, so the host makes the
-      // call. The raw `Response` is rebuilt on this side, so a caller still
-      // picks its own way to read the body.
+      if (!isBridged()) return retryTransportRead(() => fetch(apiUrl(suffix), init), init);
       const wire: WireRequest = {
         path: suffix,
         method: init?.method ?? 'GET',

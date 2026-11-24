@@ -1,12 +1,3 @@
-/**
- * Without compose-clear on the active-thread send path, the textarea's
- * useEffect resyncs el.value from the draft signal after submit and the
- * cleared draft reappears (the clear-X stays visible, the row lingers in the
- * Drafts panel) — even though the message was already delivered. The bug
- * surfaced most visibly when a user typed a free-text answer to an
- * AskUserQuestion: the answer rendered as "YOUR ANSWER" in the exchange but the
- * same text persisted as a Draft below.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.hoisted(() => {
@@ -23,13 +14,13 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-import { seedSuggestion, startFreshDraft, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
+import { seedSuggestion, startFreshDraft, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, selectComposeCodingAgent, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 import { acceptComposeReport, composeEditSeq, isComposeIntentPending, knownComposeEpoch, _resetComposeSyncForTesting } from '../composeSync';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, confirmState, effectiveThreadStatus, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
-import { promptCaretToEndSeq } from '../../components/chat/promptValueSync';
-import { patchComposeSelection, getComposeSelectionOverride, resolveCodingAgent, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
+import { connectionStatus, preferences, selectedCodingAgent, confirmState, effectiveThreadStatus, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { promptCaretRequest } from '../../components/chat/promptValueSync';
+import { applyCodingAgentDefault, patchComposeSelection, getComposeSelectionOverride, resolveCodingAgent, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -43,23 +34,21 @@ import type { ThreadMeta, ThreadState } from '../thread-events';
 import { _resetComposeDraftsForTesting, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { retryUnsentMessage } from './chat';
 import { upsertThread } from './thread-loading';
+import { handleThreadEvent } from './thread-sync';
+import { composeViewActive } from '../store';
 import { unsentMessages } from '../unsentMessages';
 import type { ThreadSummary } from '../../api/threads';
 
 const originalFetch = globalThis.fetch;
 
-// A discard holds a row intent (ADR 0437), which must not outlive its case.
 afterEach(() => _resetRowIntentsForTesting());
 
-/** A peer's *compose report* for the thread, at the next revision. */
 let peerRevision = 1000;
 function peerReport(threadId: string, text: string): void {
   peerRevision += 1;
   acceptComposeReport(threadId, { revision: peerRevision, epoch: null, text, imageHashes: [], mode: null, selection: null });
 }
 
-/** What the engine answers an accepted chat POST. A bodiless 200 fails to
- *  parse, so it would test a refused send instead. */
 const chatAccepted = () => new Response(JSON.stringify({ event_id: 'e-1' }), { status: 200 });
 
 interface MakeThreadOpts extends Partial<ThreadMeta> {
@@ -116,7 +105,6 @@ function makeActiveThread(overrides: MakeThreadOpts = {}): ThreadState {
   return makeThread({ state: 'active', ...overrides });
 }
 
-/** The row of a thread the engine still has composing, holding `composeText`. */
 function staleComposingSummary(threadId: string, composeText: string): ThreadSummary {
   return {
     thread_id: threadId,
@@ -178,8 +166,6 @@ describe('sendFollowup clears the active-thread draft', () => {
 
     const sendPromise = sendFollowup('t-1', 'my answer', undefined, {});
 
-    // sendMessage is in flight; the draft must already be cleared so the
-    // textarea's useEffect doesn't re-render the typed text as a Draft.
     const draft = getDraft('t-1');
     expect(draft.text).toBe('');
     expect(draft.image_hashes).toEqual([]);
@@ -238,7 +224,6 @@ describe('prefillCompose: seeded-prompt drop-in', () => {
 
     expect(id).toBe('t-1');
     expect(getDraft('t-1').text).toBe('Build me an app that tracks my reading list.');
-    // The thread stays composing — prefill is not a send.
     expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
     const chatCall = mockFetch.mock.calls.find(([url]) =>
       typeof url === 'string' && url.endsWith('/chat/stream'));
@@ -254,7 +239,6 @@ describe('prefillCompose: seeded-prompt drop-in', () => {
     prefillCompose('a fresh starter prompt');
 
     expect(getDraft('t-1').text).toBe('a fresh starter prompt');
-    // Stale attachments must not ride along with the unrelated starter.
     expect(getDraft('t-1').image_hashes).toEqual([]);
   });
 });
@@ -284,36 +268,28 @@ describe('seedSuggestion: seeding the compose input on the user\'s behalf', () =
   });
 
   it('no draft in progress: drops the text in and asks nothing', async () => {
-    const seqBefore = promptCaretToEndSeq.value;
+    const seqBefore = promptCaretRequest.value.seq;
 
     const seeded = seedSuggestion('Build me an app that tracks my reading list.');
 
-    // Nothing is ever asked now: an occupied composer is stepped off rather
-    // than overwritten, so there is no decision left to put to the reader.
     expect(confirmState.value.visible).toBe(false);
     const id = focusedThreadId.value!;
     expect(id).toBeTruthy();
     expect(seeded).toBe(id);
     expect(getDraft(id).text).toBe('Build me an app that tracks my reading list.');
-    // A REPLACEMENT end-snaps the caret. Restoring the old offset would drop
-    // the user inside a sentence they did not write.
-    expect(promptCaretToEndSeq.value).toBe(seqBefore + 1);
-    // Not sent — prefill is not a send.
+    expect(promptCaretRequest.value.seq).toBe(seqBefore + 1);
     const chatCall = mockFetch.mock.calls.find(([url]) =>
       typeof url === 'string' && url.endsWith('/chat/stream'));
     expect(chatCall, 'seedSuggestion must not POST a chat message').toBeUndefined();
   });
 
   it('sets the destination to the Lucidos Agent (chat channel)', async () => {
-    // Start on the coding-agent channel with a coding-agent composing draft.
     inputMode.value = { type: 'coding_agent' };
     const map = new Map<string, ThreadState>();
     map.set('cc-1', makeThread({ id: 'cc-1', state: 'composing', channel: 'claude_code', composeMode: 'claude_code' }));
     threadMap.value = map;
     focusedThreadId.value = 'cc-1';
 
-    // An EMPTY draft is reused: there is nothing to protect, and a second
-    // empty row would be litter in the drawer.
     const seeded = seedSuggestion('Tell me how to set up Lucidos for mobile access.');
 
     expect(seeded).toBe('cc-1');
@@ -322,9 +298,6 @@ describe('seedSuggestion: seeding the compose input on the user\'s behalf', () =
     expect(getDraft('cc-1').text).toBe('Tell me how to set up Lucidos for mobile access.');
   });
 
-  /** The reported loss, and the reason the confirm existed. A seeded sentence
-   *  is sent straight away, so it has no use for the reader's composer: it
-   *  takes a fresh one and leaves their work alone. */
   it('draft in progress: seeds a NEW draft and leaves the old one whole', () => {
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea', composeImages: ['iVBORfake'] }));
@@ -337,13 +310,10 @@ describe('seedSuggestion: seeding the compose input on the user\'s behalf', () =
     expect(seeded).not.toBe('t-1');
     expect(focusedThreadId.value).toBe(seeded);
     expect(getDraft(seeded).text).toBe('Where can I download apps?');
-    // Their text AND their attachments survive untouched.
     expect(getDraft('t-1').text).toBe('my own idea');
     expect(getDraft('t-1').image_hashes).toEqual(['iVBORfake']);
   });
 
-  /** The fresh draft is a chat draft, wherever the one stepped off was aimed.
-   *  A suggested sentence is conversational. */
   it('aims the new draft at the Lucidos Agent', () => {
     inputMode.value = { type: 'coding_agent' };
     const map = new Map<string, ThreadState>();
@@ -359,9 +329,6 @@ describe('seedSuggestion: seeding the compose input on the user\'s behalf', () =
   });
 });
 
-/** The Successor card's Start fresh. The typed request leaves the big thread
- *  for a fresh draft on the same target. It stays unsent, so the user can pick
- *  the model and reasoning first. */
 describe('startFreshDraft', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -474,11 +441,6 @@ describe('startFreshDraft', () => {
   });
 });
 
-/** A composing (new) draft with no text and no images is not a draft —
- *  it's a ghost row in the drawer with the placeholder title "Empty draft".
- *  The user clearing the input is a discard signal: collapse the row entirely.
- *  Active threads keep their compose fields cleared but stay visible (the
- *  conversation still exists). */
 describe('updateCompose discards empty composing drafts', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -532,7 +494,6 @@ describe('updateCompose discards empty composing drafts', () => {
   });
 
   it('does NOT discard active threads when their follow-up draft is cleared', () => {
-    // The conversation continues to exist; only the unsent follow-up is empty.
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeActiveThread({ composeText: 'follow-up' }));
     threadMap.value = map;
@@ -567,13 +528,6 @@ describe('updateCompose discards empty composing drafts', () => {
     expect(focusedThreadId.value).toBe('t-2');
   });
 
-  /** Regression: clicking the actor toggle (Lucidos/Claude) on an empty
-   *  focused composing thread used to trigger the auto-discard, which then
-   *  reset inputMode back to lucidos via discardCompose's session-stickiness
-   *  guard. Net effect: user clicks Claude, toggle snaps back to Lucidos,
-   *  user has to click 2-3 times before CC actually sticks. Mode-only patches
-   *  are a "I'm preparing to type, in this channel" signal — NOT a content
-   *  clear — so they must not trigger the ghost-row cleanup. */
   it('does NOT auto-discard a mode-only patch on an empty composing draft (regression: actor-toggle-bounces-back-to-lucidos)', () => {
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeThread({ state: 'composing', composeText: '', composeImages: [], composeMode: null }));
@@ -586,15 +540,10 @@ describe('updateCompose discards empty composing drafts', () => {
     expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
     expect(focusedThreadId.value).toBe('t-1');
     expect(getDraft('t-1').mode).toBe('claude_code');
-    // The discardCompose path would have reset this to {type:'do'} as a
-    // session-stickiness guard — proving auto-discard fired.
     expect(inputMode.value).toEqual({ type: 'coding_agent' });
   });
 
   it('still auto-discards when text is cleared in the same patch that sets a mode', () => {
-    // User typed something, then in one combined update both cleared the text
-    // AND switched mode (unlikely from the UI but defensible at the API layer).
-    // The text clear is a real discard signal; the mode side ride-along loses.
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeThread({ state: 'composing', composeText: 'hello', composeMode: 'lucidos' }));
     threadMap.value = map;
@@ -651,9 +600,6 @@ describe('draft threads land in the navigation history', () => {
   });
 
   it('does not push when typing into an already-focused thread', () => {
-    // Already-focused threads (a follow-up draft on an active conversation,
-    // or a thread the user just opened) are already in the nav stack via
-    // focusThread; ensureFocusedComposeThread must be idempotent here.
     pushThreadNavState({ type: 'thread', id: 'active' });
     focusedThreadId.value = 'active';
     const before = _threadNavStateForTesting();
@@ -683,10 +629,6 @@ describe('draft threads land in the navigation history', () => {
   });
 
   it('Back after Compose+type+Discard returns to the originally focused thread', async () => {
-    // Regression: cursor lands on X after the draft is removed, but
-    // focusedThreadId is null (the user is in the compose pane). Plain
-    // "decrement cursor" then skips X — the user lands on the entry before X
-    // even though they expected to return to X.
     focusThread('Y');
     focusThread('X');
     expect(focusedThreadId.value).toBe('X');
@@ -722,9 +664,6 @@ describe('draft threads land in the navigation history', () => {
   });
 
   it('Back after Compose without typing also returns to the focused thread', () => {
-    // Same root cause as the discard case: focusedThreadId is null while the
-    // cursor still points at the thread the user just left. The first Back
-    // press must land on it instead of skipping past it.
     focusThread('Y');
     focusThread('X');
 
@@ -740,9 +679,6 @@ describe('draft threads land in the navigation history', () => {
   });
 
   it('drops the nav entry when startComposeIfNeeded POST fails', async () => {
-    // rollbackOptimistic deletes the failed thread from threadMap; without the
-    // matching nav cleanup, Forward would later restore an id whose events
-    // 404 because no map entry exists.
     pushThreadNavState({ type: 'thread', id: 'prior-thread' });
     mockFetch.mockRejectedValueOnce(new Error('network down'));
 
@@ -759,9 +695,6 @@ describe('draft threads land in the navigation history', () => {
   });
 
   it('clearing draft text auto-discards it AND drops it from the nav stack', () => {
-    // updateCompose's empty-content branch routes through discardCompose,
-    // so the nav cleanup must travel that path too — otherwise every "type
-    // then erase" cycle leaves a phantom entry in the stack.
     pushThreadNavState({ type: 'thread', id: 'prior-thread' });
     const draftId = ensureFocusedComposeThread();
     threadMap.value = new Map(threadMap.value).set(draftId, makeThread({
@@ -781,9 +714,6 @@ describe('draft threads land in the navigation history', () => {
 });
 
 describe('compose mutations leave updatedAt alone', () => {
-  // Without this guard a keystroke jumps the thread to the top of saved /
-  // archive (sorted by updatedAt) and the row's timestamp creeps forward
-  // even though no message was sent.
   beforeEach(() => {
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeActiveThread({ updatedAt: '2026-05-01T00:00:00.000Z' }));
@@ -809,9 +739,6 @@ describe('compose mutations leave updatedAt alone', () => {
   });
 });
 
-/** Draft mutations must not invalidate threadMap. ChatExchange subscribes
- *  to threadMap and runs marked.parse per render, so a per-keystroke
- *  threadMap write would re-parse every exchange in the thread. */
 describe('updateCompose does not mutate threadMap (perf isolation)', () => {
   beforeEach(() => {
     const map = new Map<string, ThreadState>();
@@ -848,12 +775,6 @@ describe('updateCompose does not mutate threadMap (perf isolation)', () => {
   });
 });
 
-/** Compose drafts are allocated client-side and live as `composing` rows
- *  server-side. The thread id never appears in the URL — it lives only on the
- *  focusedThreadId signal and (via setFocusedThread) FOCUSED_THREAD_KEY in
- *  localStorage. Without the localStorage write, reloading mid-draft loses
- *  the id and the next keystroke allocates a fresh UUID, orphaning the
- *  server-side compose row from the previous session. */
 describe('ensureFocusedComposeThread persists focusedThreadId across reload', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -883,14 +804,10 @@ describe('ensureFocusedComposeThread persists focusedThreadId across reload', ()
   });
 
   it('eager-seeds the new draft\'s OWN scope from the last-used seed (selectedScope)', () => {
-    // The new draft must carry its own scope because resolveScope no longer falls
-    // back to selectedScope for a real draft (the no-leak guard). So a fresh draft
-    // still shows the last-used target — via its own stored override, not the seed.
     selectedScope.value = { kind: 'app', appId: 'last-used-app' };
     const id = ensureFocusedComposeThread();
     expect(getComposeSelectionOverride(id).scope).toEqual({ kind: 'app', appId: 'last-used-app' });
     expect(resolveScope(id)).toEqual({ kind: 'app', appId: 'last-used-app' });
-    // Changing the seed afterwards must NOT retroactively move this draft.
     selectedScope.value = { kind: 'lucidos' };
     expect(resolveScope(id)).toEqual({ kind: 'app', appId: 'last-used-app' });
   });
@@ -922,8 +839,6 @@ describe('ensureFocusedComposeThread persists focusedThreadId across reload', ()
   });
 
   it('does NOT touch localStorage when called with a thread already focused', () => {
-    // Already-focused threads went through focusThread / setFocusedThread,
-    // which already wrote the id; ensureFocusedComposeThread is a no-op.
     focusThread('existing');
     expect(localStorage.getItem(FOCUSED_THREAD_KEY)).toBe('existing');
 
@@ -933,11 +848,6 @@ describe('ensureFocusedComposeThread persists focusedThreadId across reload', ()
   });
 });
 
-/** Race regression: ensureFocusedComposeThread fires POST /threads as
- *  fire-and-forget. The compose PUT is debounced ~250ms. On a slow link the
- *  POST hasn't landed when the debounce fires, so the PUT 404s with
- *  "thread not found" and the user sees one error toast per typing burst.
- *  pushNow must await the in-flight thread-start before issuing the PUT. */
 describe('compose PUT waits for the thread-start POST to land (slow-network race)', () => {
   beforeEach(() => {
     connectionStatus.value = 'connected';
@@ -983,12 +893,9 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
     const isComposePut = (s: { method: string; url: string }) =>
       s.method === 'PUT' && s.url.endsWith('/compose');
 
-    // Simulate first keystroke: allocate the thread + schedule the PUT.
     const id = ensureFocusedComposeThread();
     updateCompose(id, { text: 'D' });
 
-    // Walk past the 250ms debounce window. The buggy version fires the PUT
-    // here while POST /threads is still in flight → server 404 → toast.
     await vi.advanceTimersByTimeAsync(300);
 
     expect(
@@ -996,7 +903,6 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
       'compose PUT must NOT fire while POST /threads is still in flight',
     ).toEqual([]);
 
-    // Resolve POST /threads; the queued PUT should fire now.
     resolveCreate!(new Response(null, { status: 201 }));
     await vi.runAllTimersAsync();
 
@@ -1005,9 +911,6 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
   });
 
   it('forgets the draft\'s pending edit and suppresses a duplicate toast when POST /threads rejects', async () => {
-    // ensureFocusedComposeThread already toasts "Failed to start compose"
-    // when its POST rejects. The rolled-back row must take its pending edit
-    // with it, and pushNow must not toast a second "Compose sync failed".
     let rejectCreate: ((err: Error) => void) | null = null;
     const mockFetch = vi.fn((url: string, init?: RequestInit) => {
       const method = (init?.method ?? 'GET').toUpperCase();
@@ -1034,11 +937,6 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
   });
 
   it('skips PUT when discardCompose runs while POST /threads is still in flight', async () => {
-    // Pre-fix, the await widened the discard race: discardCompose flips state
-    // to 'discarded' (thread stays in threadMap), pushNow's `if (!thread)`
-    // doesn't catch it, so when POST resolves the PUT fires against a
-    // discarded thread → backend 410 → toast "Compose sync failed: thread
-    // discarded". The post-await guard must reject discarded state too.
     const seen: Array<{ method: string; url: string }> = [];
     let resolveCreate: ((r: Response) => void) | null = null;
     const mockFetch = vi.fn((url: string, init?: RequestInit) => {
@@ -1056,8 +954,6 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
 
     await vi.advanceTimersByTimeAsync(300);
 
-    // User discards before POST resolves. discardCompose flips state to
-    // 'discarded' and DELETEs server-side; the in-flight pushNow must skip.
     void discardCompose(id);
 
     resolveCreate!(new Response(null, { status: 201 }));
@@ -1071,11 +967,6 @@ describe('compose PUT waits for the thread-start POST to land (slow-network race
   });
 });
 
-/** The user-visible contract: picking Claude (or Lucidos) sticks. send /
- *  discard MUST NOT reset inputMode — the next fresh compose has to start on
- *  whichever channel the user last picked, both visually (toggle display) and
- *  functionally (send routing). Cross-reload persistence is covered by
- *  `store/inputMode-default.test.ts`. */
 describe('inputMode is sticky across compose sessions (toggle remembers last pick)', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -1144,10 +1035,6 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
   });
 });
 
-/** A CC reasoning-effort (or model) pick made in the compose view is a
- *  PER-DRAFT intent: it lives on THIS draft's override (`composeSelections`),
- *  applies to exactly the thread its send spawns, and is cleared afterward, so
- *  it can't ride onto another draft or the next new thread. */
 describe('CC compose pick is per-draft (no cross-thread leak)', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
   let chatBodies: Array<{ use_coding_agent?: boolean; reasoning_effort?: string; cc_model?: string }>;
@@ -1157,7 +1044,7 @@ describe('CC compose pick is per-draft (no cross-thread leak)', () => {
     mockFetch = vi.fn((url: string, init?: RequestInit) => {
       const method = (init?.method ?? 'GET').toUpperCase();
       if (typeof url === 'string' && url.endsWith('/chat/stream') && method === 'POST') {
-        try { chatBodies.push(JSON.parse(init!.body as string)); } catch { /* ignore */ }
+        try { chatBodies.push(JSON.parse(init!.body as string)); } catch {  }
         return Promise.resolve(new Response(JSON.stringify({ event_id: 'evt' }), {
           status: 200, headers: { 'Content-Type': 'application/json' },
         }));
@@ -1193,8 +1080,8 @@ describe('CC compose pick is per-draft (no cross-thread leak)', () => {
     await sendCompose('cc-1', { useCodingAgent: true });
 
     expect(chatBodies).toHaveLength(1);
-    expect(chatBodies[0].reasoning_effort).toBe('max'); // the pick reached the spawn
-    expect(getComposeSelectionOverride('cc-1').ccReasoningEffort).toBeUndefined(); // ...and was consumed
+    expect(chatBodies[0].reasoning_effort).toBe('max');
+    expect(getComposeSelectionOverride('cc-1').ccReasoningEffort).toBeUndefined();
   });
 
   it('does NOT leak the pick onto the next new draft', async () => {
@@ -1203,15 +1090,14 @@ describe('CC compose pick is per-draft (no cross-thread leak)', () => {
     patchComposeSelection('cc-A', { ccReasoningEffort: 'max' });
     await sendCompose('cc-A', { useCodingAgent: true });
 
-    // Brand-new compose; the user did NOT pick an effort this time.
     threadMap.value = new Map(threadMap.value).set('cc-B', composingCcThread('cc-B', 'second'));
     focusedThreadId.value = 'cc-B';
     await sendCompose('cc-B', { useCodingAgent: true });
 
     const ccBodies = chatBodies.filter((b) => b.use_coding_agent);
     expect(ccBodies).toHaveLength(2);
-    expect(ccBodies[0].reasoning_effort).toBe('max');     // first draft honored its pick
-    expect(ccBodies[1].reasoning_effort).toBeUndefined();  // second falls through to the default
+    expect(ccBodies[0].reasoning_effort).toBe('max');
+    expect(ccBodies[1].reasoning_effort).toBeUndefined();
   });
 
   it('carries a draft model pick into the spawn and clears it (symmetry with effort)', async () => {
@@ -1226,12 +1112,6 @@ describe('CC compose pick is per-draft (no cross-thread leak)', () => {
   });
 });
 
-/** A *pending intent* means the server has not seen this device's latest
- *  compose intent. No compose report replaces the draft while it is set. It must therefore stay set until the LAST scheduled
- *  write settles, not the first: an edit made while a PUT is in flight schedules
- *  a fresh debounce, and a PUT slower than the debounce can overlap the next one
- *  outright. Releasing on the earlier one's completion advertised "settled" with
- *  a newer write still pending. */
 describe('a pending intent covers the LAST pending write, not the first', () => {
   let resolveFirstPut: (() => void) | null = null;
 
@@ -1262,36 +1142,18 @@ describe('a pending intent covers the LAST pending write, not the first', () => 
 
   it('stays set when a keystroke re-arms the debounce while the first PUT is in flight', async () => {
     updateCompose('t-1', { text: 'first' });
-    await vi.advanceTimersByTimeAsync(300);       // debounce fires → PUT in flight
+    await vi.advanceTimersByTimeAsync(300);
     expect(isComposeIntentPending('t-1')).toBe(true);
 
-    updateCompose('t-1', { text: 'first and more' });  // re-arms the debounce
+    updateCompose('t-1', { text: 'first and more' });
     resolveFirstPut?.();
-    await vi.advanceTimersByTimeAsync(0);         // the FIRST PUT settles
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(isComposeIntentPending('t-1')).toBe(true);
   });
 });
 
-/**
- * Compose drafts: type locally, deliver durably.
- *
- * A draft lives ONLY in the `composeDrafts` signal, so the server is its
- * storage and the debounced PUT is the only thing that gets it there. On an
- * installed iOS PWA that PUT fails constantly for reasons that say nothing
- * about the request (WebKit aborts in-flight fetches when it suspends the page;
- * the tunnel to the engine drops on any radio change) and the page is then
- * evicted, taking the only copy of the text with it. The reported symptom was
- * three stacked "Compose sync failed: Load failed" cards during one four-minute
- * outage, with nothing re-sending the draft afterwards.
- *
- * Mirrors the pending-preference-write suite in `preferences.test.ts`.
- */
 describe('undelivered compose drafts are parked and re-sent', () => {
-  /** Rejects the way a suspended page / dropped tunnel does: no answer, so
-   *  `isTransientFetchError` is true and a re-send is owed. A `TimeoutError`
-   *  (not a transport `TypeError`) so `mutatingFetchIdempotent`'s own single
-   *  retry stays out of the way and each push is exactly one attempt. */
   function noAnswer(): DOMException {
     return new DOMException('Request timed out after 10000ms', 'TimeoutError');
   }
@@ -1349,15 +1211,10 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     const errors = toasts.value.filter((t) => t.type === 'error');
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/not reaching the engine/i);
-    // The reported symptom was a stack of identical cards: the key is what
-    // collapses them, and an error toast has no auto-dismiss to hide the bug.
     expect(errors[0].key).toBeTruthy();
   });
 
   it('surfaces a REFUSAL immediately, without parking it', async () => {
-    // The engine answered. No retry can change that and the user is owed the
-    // reason, so this keeps today's behaviour (a 410 on a discarded thread, a
-    // 409 on an archived one) rather than being swallowed into the queue.
     mockFetch.mockResolvedValue(new Response(JSON.stringify({ error: 'thread discarded' }), { status: 410 }));
 
     updateCompose('t-1', { text: 'against a dead thread' });
@@ -1380,10 +1237,6 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
   });
 
-  /** The gateway's 503 holding page, as `proxy.rs::starting_page` sends it.
-   *  Served for EVERY proxied request whose upstream connect fails, this PUT
-   *  included, so a mid-session restart answers a compose write with a whole
-   *  HTML document. Truncated: the real page inlines the splash stylesheet. */
   function bootSplash(): Response {
     const html = [
       '<!doctype html><html><head>',
@@ -1403,25 +1256,17 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     });
   }
 
-  // The reported card, end to end: a real `fetch` answer through the real
-  // `throwIfNotOk`, the real failure handler, and the real `showToast`.
   it('treats the gateway boot splash as no answer, so the draft is owed a re-send', async () => {
     mockFetch.mockResolvedValue(bootSplash());
 
     updateCompose('t-1', { text: 'typed while the engine was restarting' });
     await vi.runAllTimersAsync();
 
-    // The engine never saw the write, so this is not a verdict and the user is
-    // owed nothing but the re-send. Before the fix it toasted the HTML page AND
-    // dropped the thread from the queue, which lost the write silently.
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
     expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
   });
 
   it('never puts an HTML body into the card, however the page arrived', async () => {
-    // A 502 from something in front of the gateway IS a verdict, so it toasts.
-    // What it must not do is toast the page. The reported card ran the body
-    // through the section parser: a bold line, then one bullet per `<meta>`.
     mockFetch.mockResolvedValue(new Response(
       '<!doctype html>\n<html><head>\n<meta http-equiv="refresh" content="2">\n</head></html>',
       { status: 502, statusText: 'Bad Gateway', headers: { 'Content-Type': 'text/html' } },
@@ -1445,15 +1290,12 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
     const before = composePuts(mockFetch).length;
 
-    // The link is back.
     mockFetch.mockResolvedValue(new Response(null, { status: 204 }));
     flushUndeliveredComposeDrafts();
     await vi.runAllTimersAsync();
 
     const sent = composePuts(mockFetch);
     expect(sent.length).toBe(before + 1);
-    // The park holds a thread id, not a snapshot, so the re-send carries the
-    // draft as it stands now rather than whichever keystroke happened to fail.
     expect(JSON.parse(String((sent[sent.length - 1][1] as RequestInit).body)).text).toBe('abc');
     expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
@@ -1468,7 +1310,6 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     await vi.runAllTimersAsync();
     expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
 
-    // Drained: a later flush must be a no-op, not a stray PUT on every resume.
     _resetUndeliveredComposeDraftsForTesting();
     const before = composePuts(mockFetch).length;
     flushUndeliveredComposeDrafts();
@@ -1514,9 +1355,6 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     await sendCompose('t-1', {});
 
     expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
-    // The send owes exactly one further write, the cleared draft, and it must
-    // be the last word on this thread's compose state. What must NOT happen is
-    // the flush re-posting the text that was just sent.
     const before = composePuts(mockFetch).length;
     flushUndeliveredComposeDrafts();
     await vi.runAllTimersAsync();
@@ -1526,10 +1364,6 @@ describe('undelivered compose drafts are parked and re-sent', () => {
   });
 });
 
-/** The park must not outlive the thread it belongs to. `pushNow` early-returns
- *  for a thread that is gone (its POST /threads failed and the optimistic entry
- *  rolled back) or already discarded, so it never settles and the entry would
- *  sit in the queue forever, holding the unreachable card up behind it. */
 describe('flushUndeliveredComposeDrafts drops what is no longer owed', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -1576,26 +1410,6 @@ describe('flushUndeliveredComposeDrafts drops what is no longer owed', () => {
   });
 });
 
-/**
- * Compose writes for one thread are SERIALIZED.
- *
- * A draft lives only in the `composeDrafts` signal, so the debounced PUT is the
- * only thing that persists it, and the engine keeps whichever write it applies
- * LAST. Overlapping writes can be applied in either order: on a stalled link a
- * PUT far slower than the 250ms debounce is still running when the next one
- * goes out, and the older text can win.
- *
- * On 2026-08-06 that shipped as a message that was both sent and still sitting
- * in the composer, holding an OLDER revision of the sent text: the pre-send
- * draft PUT landed after the message cleared compose, and the reconnect resync
- * staged the resurrected draft back into the box.
- *
- * So at most one write is in flight per thread, and a newer intent raised while
- * one runs is issued afterwards, reading the draft as it stands then. This
- * replaces the older `latestComposePushSeq` guard, which made an out-of-order
- * ANSWER harmless without stopping the out-of-order WRITE. Serializing removes
- * the overlap instead of tolerating it, so that guard is gone.
- */
 describe('compose writes for a thread are serialized', () => {
   let resolvers: Array<{ resolve: (r: Response) => void; reject: (e: unknown) => void; body: string }>;
   let mockFetch: ReturnType<typeof vi.fn>;
@@ -1613,8 +1427,6 @@ describe('compose writes for a thread are serialized', () => {
     _resetUndeliveredComposeDraftsForTesting();
     toasts.value = [];
     resolvers = [];
-    // Every compose PUT hangs until the test resolves it by hand, which is how
-    // a stalled link is modelled here.
     mockFetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
       resolvers.push({ resolve, reject, body: String(init?.body ?? '') });
     }));
@@ -1635,13 +1447,13 @@ describe('compose writes for a thread are serialized', () => {
 
   it('starts no second write while one is still in flight', async () => {
     updateCompose('t-1', { text: 'abc' });
-    await vi.advanceTimersByTimeAsync(300);        // the write for 'abc' goes out
+    await vi.advanceTimersByTimeAsync(300);
     expect(resolvers).toHaveLength(1);
 
     updateCompose('t-1', { text: 'abcd' });
-    await vi.advanceTimersByTimeAsync(300);        // its debounce elapses...
+    await vi.advanceTimersByTimeAsync(300);
 
-    expect(resolvers).toHaveLength(1);             // ...but nothing overlaps it
+    expect(resolvers).toHaveLength(1);
     expect(isComposeIntentPending('t-1')).toBe(true);
   });
 
@@ -1656,9 +1468,6 @@ describe('compose writes for a thread are serialized', () => {
     resolvers[0].resolve(new Response(null, { status: 204 }));
     await vi.runAllTimersAsync();
 
-    // Two writes total: the one that was in flight, then ONE catching up on
-    // everything typed while it ran. Both intents coalesced, and the write that
-    // went out read the draft at issue time.
     expect(composePuts()).toEqual(['abc', 'abcde']);
   });
 
@@ -1668,7 +1477,6 @@ describe('compose writes for a thread are serialized', () => {
     updateCompose('t-1', { text: 'You can have both from us' });
     await vi.advanceTimersByTimeAsync(300);
 
-    // The first write finally lands, long after the second was typed.
     resolvers[0].resolve(new Response(null, { status: 204 }));
     await vi.runAllTimersAsync();
     resolvers[1]?.resolve(new Response(null, { status: 204 }));
@@ -1682,13 +1490,11 @@ describe('compose writes for a thread are serialized', () => {
     updateCompose('t-1', { text: 'abc' });
     await vi.advanceTimersByTimeAsync(300);
     updateCompose('t-1', { text: 'abcd' });
-    await vi.advanceTimersByTimeAsync(300);       // queued behind the in-flight one
+    await vi.advanceTimersByTimeAsync(300);
 
     resolvers[0].resolve(new Response(null, { status: 204 }));
-    await vi.advanceTimersByTimeAsync(0);         // the FIRST write settles
+    await vi.advanceTimersByTimeAsync(0);
 
-    // A queued write is still owed, so every inbound clobber guard must keep
-    // yielding: the engine has NOT seen our latest intent yet.
     expect(isComposeIntentPending('t-1')).toBe(true);
 
     resolvers[1].resolve(new Response(null, { status: 204 }));
@@ -1697,14 +1503,10 @@ describe('compose writes for a thread are serialized', () => {
   });
 
   it('the tab-close flush carries a write queued behind an in-flight one', async () => {
-    // Serialization added a second place an unsent intent can live: a debounce
-    // that fired while a write was running leaves no timer, only a queued
-    // intent. A flush that looked at timers alone would drop exactly the text
-    // this change is about, since a draft lives nowhere but this page.
     updateCompose('t-1', { text: 'hello' });
-    await vi.advanceTimersByTimeAsync(300);        // 'hello' dispatched, hanging
+    await vi.advanceTimersByTimeAsync(300);
     updateCompose('t-1', { text: 'hello world' });
-    await vi.advanceTimersByTimeAsync(300);        // queued, no timer left
+    await vi.advanceTimersByTimeAsync(300);
 
     window.dispatchEvent(new Event('pagehide'));
 
@@ -1716,11 +1518,9 @@ describe('compose writes for a thread are serialized', () => {
     expect(new Headers((keepalive?.[1] as RequestInit).headers).get('x-lucidos-restore-generation')).toBe('none');
   });
 
-  // Every stream drop closes admission until the next hello. A tab closed in
-  // that gap must still flush: the engine fences a stale generation itself.
   it('the tab-close flush still goes out while restore admission is closed', async () => {
     const { installRestoreAdmission } = await import('../../utils/restoreAdmission');
-    installRestoreAdmission({ ready: () => false, wait: () => new Promise(() => {}) });
+    installRestoreAdmission({ ready: () => false, phase: () => 'awaiting-hello', wait: () => new Promise(() => {}) });
     try {
       updateCompose('t-1', { text: 'typed during a reconnect' });
       window.dispatchEvent(new Event('pagehide'));
@@ -1729,7 +1529,7 @@ describe('compose writes for a thread are serialized', () => {
         .map(([, init]) => JSON.parse(String((init as RequestInit).body)).text as string);
       expect(flushed).toEqual(['typed during a reconnect']);
     } finally {
-      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+      installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     }
   });
 
@@ -1746,24 +1546,12 @@ describe('compose writes for a thread are serialized', () => {
     resolvers[1].resolve(new Response(null, { status: 204 }));
     await vi.runAllTimersAsync();
 
-    // The queued write carried the text the user can see, and it landed, so
-    // nothing is owed any more.
     expect(composePuts()).toEqual(['abc', 'abcd']);
     expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
   });
 });
 
-/**
- * The write fence, from the client's side.
- *
- * A `412` means a submission consumed the thread's compose slot after this
- * write was composed, so the engine dropped it and handed back the current
- * *compose epoch*. That is not a refusal the user can act on: the text is still
- * theirs and still unsent, so the client adopts the epoch and re-issues in
- * silence. Treating it as an ordinary rejection would toast a stack of
- * "Compose sync failed" cards and abandon the draft.
- */
 describe('a stale-epoch refusal resyncs instead of failing', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -1810,12 +1598,63 @@ describe('a stale-epoch refusal resyncs instead of failing', () => {
 
     const bodies = composeBodies();
     expect(bodies).toHaveLength(2);
-    expect(bodies[0].compose_epoch).toBeUndefined();      // nothing heard yet
-    expect(bodies[1].compose_epoch).toBe(7);              // adopted from the 412
+    expect(bodies[0].compose_epoch).toBeUndefined();
+    expect(bodies[1].compose_epoch).toBe(7);
     expect(bodies[1].text).toBe('typed while behind a submission');
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
     expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
     expect(knownComposeEpoch('t-1')).toBe(7);
+  });
+
+  it('retries a stale PUT with exact restoration additions after missed SSE', async () => {
+    _resetComposeSyncForTesting();
+    acceptComposeReport('t-1', { revision: 1, epoch: 1, text: 'saved', imageHashes: ['old'], mode: null, selection: null });
+    let calls = 0;
+    mockFetch = vi.fn(() => Promise.resolve(++calls === 1
+      ? new Response(JSON.stringify({ summary_version: 3, compose_epoch: 2,
+        text: 'committed before Stop\n\nqueued', image_hashes: ['server', 'queued'],
+        restorations: [{ epoch: 2, text: 'queued', image_hashes: ['queued'] }] }), { status: 412 })
+      : new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    updateCompose('t-1', { text: 'local replacement', image_hashes: ['local'] });
+    await vi.runAllTimersAsync();
+    expect(composeBodies()[1]).toMatchObject({ text: 'local replacement\n\nqueued', image_hashes: ['local', 'queued'], compose_epoch: 2 });
+    expect(isComposeIntentPending('t-1')).toBe(false);
+  });
+
+  it('a reconnect summary rebases additions into a pending local draft', async () => {
+    _resetComposeSyncForTesting();
+    acceptComposeReport('t-1', { revision: 1, epoch: 1, text: 'saved', imageHashes: [], mode: null, selection: null });
+    mockFetch = vi.fn(() => Promise.resolve(new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    updateCompose('t-1', { text: 'local replacement' });
+    const map = new Map(threadMap.value);
+    upsertThread(map, { ...staleComposingSummary('t-1', 'saved\n\nqueued'), state: 'active',
+      summary_version: 3, compose_epoch: 2,
+      compose_restorations: [{ epoch: 2, text: 'queued', image_hashes: [] }] }, false);
+    threadMap.value = map;
+    expect(getDraft('t-1').text).toBe('local replacement\n\nqueued');
+    await vi.runAllTimersAsync();
+    expect(composeBodies().slice(-1)[0].text).toBe('local replacement\n\nqueued');
+  });
+
+  it('sends rebased content after an older successful PUT acknowledgement', async () => {
+    _resetComposeSyncForTesting();
+    acceptComposeReport('t-1', { revision: 1, epoch: 1, text: 'saved', imageHashes: [], mode: null, selection: null });
+    let answer!: (response: Response) => void;
+    mockFetch = vi.fn().mockImplementationOnce(() => new Promise<Response>(resolve => { answer = resolve; }))
+      .mockImplementation(() => Promise.resolve(new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    updateCompose('t-1', { text: 'committed edit' });
+    await vi.advanceTimersByTimeAsync(300);
+    acceptComposeReport('t-1', { revision: 3, epoch: 2, text: 'committed edit\n\nqueued', imageHashes: [], mode: null, selection: null,
+      restorations: [{ epoch: 2, text: 'queued', image_hashes: [] }] });
+    answer(new Response(JSON.stringify({ summary_version: 2, compose_epoch: 1, text: 'committed edit', image_hashes: [] })));
+    await vi.runAllTimersAsync();
+    expect(composeBodies()).toHaveLength(2);
+    expect(composeBodies()[1]).toMatchObject({ text: 'committed edit\n\nqueued', compose_epoch: 2 });
+    expect(getDraft('t-1').text).toBe('committed edit\n\nqueued');
+    expect(isComposeIntentPending('t-1')).toBe(false);
   });
 
   it('parks the draft rather than spinning when the slot keeps being consumed', async () => {
@@ -1828,25 +1667,12 @@ describe('a stale-epoch refusal resyncs instead of failing', () => {
     updateCompose('t-1', { text: 'racing a busy peer' });
     await vi.runAllTimersAsync();
 
-    // Bounded: the first attempt plus its two retries, then parked for the next
-    // resume flush rather than looping against a peer that keeps submitting.
     expect(composeBodies()).toHaveLength(3);
     expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
   });
 });
 
-/**
- * Every send ends with a compose write carrying the CLEARED draft.
- *
- * Serialization puts that write after every earlier one, so it is the last
- * thing the engine applies for the thread and a pre-send draft cannot be the
- * resting state. Both send paths owe it, which is the whole reason they share
- * one helper: `sendFollowup` had it (via its `updateCompose('')`) and
- * `sendCompose` did not, and `sendCompose` is the first-send path where the
- * user types and sends in one gesture, so its write is the one most likely to
- * still be in flight.
- */
 describe('a send leaves the engine holding an empty draft', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -1892,8 +1718,6 @@ describe('a send leaves the engine holding an empty draft', () => {
     expect(texts[texts.length - 1]).toBe('');
   });
 
-  /** Once the write the send owes is answered, nothing of the send stays
-   *  pending, so the next draft typed on another device shows here. */
   it('after a send settles, a peer\'s newer draft applies here', async () => {
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'from the phone' })]]);
 
@@ -1917,10 +1741,6 @@ describe('a send leaves the engine holding an empty draft', () => {
   });
 
   it('does not carry the draft dropdown picks back onto the sent thread', async () => {
-    // The `MessageReceived` projection sets `compose_selection = NULL` on send.
-    // A trailing clear that still carried the draft's picks would COALESCE them
-    // straight back onto the row, so the write is scheduled only after
-    // `clearComposeSelection` has consumed them.
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
     patchComposeSelection('t-1', { model: 'claude-sonnet-5' });
 
@@ -1939,23 +1759,16 @@ describe('a send leaves the engine holding an empty draft', () => {
     threadMap.value = new Map([['t-1', makeActiveThread({ id: 't-1', composeText: 'a follow-up' })]]);
 
     await sendFollowup('t-1', 'a follow-up');
-    updateCompose('t-1', { text: 'and one more thing' });   // inside the debounce
+    updateCompose('t-1', { text: 'and one more thing' });
     await vi.runAllTimersAsync();
 
-    // The write re-reads the draft when it fires, so the two intents coalesce
-    // into one write carrying what the user can actually see.
     const texts = composePutTexts();
     expect(texts[texts.length - 1]).toBe('and one more thing');
   });
 
-  /** The unsent message is kept on this device, so the engine's draft holds
-   *  what the composer shows. The picks stay until a send is accepted, so a
-   *  refused Retry can still roll the draft back with them. */
   it('an unsent first send clears the engine draft but keeps its picks until a retry is accepted', async () => {
     let chatAnswers = false;
     let revision = 0;
-    // The engine holds the picks a PUT stated, until the accepted send's
-    // consumption clears them.
     let storedSelection: unknown = null;
     mockFetch.mockImplementation((url: string, init?: RequestInit) => {
       if (String(url).endsWith('/chat/stream')) {
@@ -1994,10 +1807,6 @@ describe('a send leaves the engine holding an empty draft', () => {
     expect(getComposeSelectionOverride('t-1').model).toBeUndefined();
   });
 
-  /** The engine still holds the last draft write from typing, a prefix of the
-   *  message, because it never saw the send. A resync (an iOS wake) reads that
-   *  row. The thread must stay sent, the composer empty, and the accepted Retry
-   *  must leave no draft behind. */
   it('a resync while a first send sits unsent does not restage the pre-send draft', async () => {
     let chatAnswers = false;
     mockFetch.mockImplementation((url: string) => {
@@ -2053,17 +1862,11 @@ describe('a send leaves the engine holding an empty draft', () => {
     expect(threadMap.value.get('t-1')!.meta.state).toBe('composing');
     expect(getDraft('t-1').text).toBe('the draft');
     expect(getComposeSelectionOverride('t-1').model).toBe('claude-sonnet-5');
-    // Back in the local draft, so the engine stores it once, not twice.
     expect(lastComposePutText()).toBe('the draft');
   });
 
 });
 
-/**
- * A chat POST the engine refuses (a 500, a 409, the boot splash's 503) drops
- * the optimistic row. The typed text then has to go back into the draft,
- * because nothing else on screen holds it.
- */
 describe('a send the engine refuses keeps the typed text', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -2111,7 +1914,6 @@ describe('a send the engine refuses keeps the typed text', () => {
 
   it('sendCompose stores the restored text when Send beat the draft write', async () => {
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing' })]]);
-    // Typed and sent inside the debounce, so the send cancels this write.
     updateCompose('t-1', { text: 'typed then sent' });
 
     await sendCompose('t-1', {}).catch(() => {});
@@ -2126,7 +1928,6 @@ describe('a send the engine refuses keeps the typed text', () => {
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
 
     const send = sendCompose('t-1', {}).catch(() => {});
-    // The composer is usable while the send is in flight.
     updateCompose('t-1', { text: 'typed meanwhile' });
     await send;
     await vi.runAllTimersAsync();
@@ -2139,14 +1940,13 @@ describe('a send the engine refuses keeps the typed text', () => {
     threadMap.value = new Map([['t-1', makeThread({ id: 't-1', state: 'composing', composeText: 'the draft' })]]);
 
     const send = sendCompose('t-1', {}).catch(() => {});
-    // A stray space or newline: the draft counts it as empty, the box does not.
     updateCompose('t-1', { text: ' ' });
-    const seqBefore = promptCaretToEndSeq.value;
+    const seqBefore = promptCaretRequest.value.seq;
     await send;
     await vi.runAllTimersAsync();
 
     expect(getDraft('t-1').text).toBe('the draft');
-    expect(promptCaretToEndSeq.value).toBe(seqBefore + 1);
+    expect(promptCaretRequest.value.seq).toBe(seqBefore + 1);
   });
 
   it('sendFollowup puts the text back into the draft', async () => {
@@ -2172,17 +1972,6 @@ describe('a send the engine refuses keeps the typed text', () => {
   });
 });
 
-/**
- * `sendCompose` must not race `POST /threads`.
- *
- * `ensureFocusedComposeThread` fires the thread creation WITHOUT awaiting it and
- * parks the promise in `pendingThreadStarts`; the draft PUT awaits that promise
- * inside `pushNow`. Typing hid the gap for every pre-existing caller, because a
- * human needs far longer to reach Send than a POST needs to settle. The setup
- * interview composes and sends in one gesture and `sendCompose` cancels the
- * pending PUT on its way through, so nothing was left waiting on the row and the
- * chat POST could reach the backend before the thread existed.
- */
 describe('sendCompose waits for the thread row before the chat POST', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
   let releaseThreadStart: ((value: Response) => void) | null;
@@ -2193,7 +1982,6 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
   beforeEach(() => {
     releaseThreadStart = null;
     mockFetch = vi.fn().mockImplementation((url: unknown, init?: RequestInit) => {
-      // Hold POST /threads open so the race window is wide instead of timing-dependent.
       if (typeof url === 'string' && url.endsWith('/threads') && init?.method === 'POST') {
         return new Promise<Response>((resolve) => { releaseThreadStart = resolve; });
       }
@@ -2210,9 +1998,6 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     connectionStatus.value = 'disconnected';
     focusedThreadId.value = null;
     threadMap.value = new Map();
-    // Resolving a confirm does not close it: the dialog component owns that, and
-    // no component is mounted here. Left standing, it reads as an open confirm to
-    // every later test in the file.
     confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
     focusedPane.value = 'thread';
     _resetComposeDraftsForTesting();
@@ -2222,8 +2007,6 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
 
   it('holds the chat POST until POST /threads settles, then sends it', async () => {
     const started = startSetupInterview();
-    // Let every already-resolved microtask drain. The chat POST must still be
-    // unsent: the thread row does not exist server-side yet.
     await Promise.resolve();
     await Promise.resolve();
     expect(chatCalls(), 'chat POST fired before the thread row existed').toHaveLength(0);
@@ -2233,8 +2016,6 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     expect(chatCalls(), 'chat POST never fired after the thread row landed').toHaveLength(1);
   });
 
-  // Without the row the thread read as idle: the composer dropped its Stop
-  // flag and offered Archive on a send that was still in flight.
   it('shows the send as in flight while POST /threads is held', async () => {
     const started = startSetupInterview();
     await Promise.resolve();
@@ -2242,6 +2023,17 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     const thread = threadMap.value.get(focusedThreadId.value!)!;
     expect(thread.pendingUserMessages, 'no optimistic row while the thread starts').toHaveLength(1);
     expect(effectiveThreadStatus(thread)).toBe('running');
+
+    handleThreadEvent({
+      thread_id: thread.meta.id, seq: 1, created: '2026-01-01T00:00:00Z',
+      event: { type: 'ThreadStarted' },
+      aggregate: {
+        ...thread.meta, threadId: thread.meta.id, state: 'composing',
+        summaryVersion: 1, lastActivity: '', isSaved: false,
+      },
+    });
+    expect(thread.meta.state).toBe('active');
+    expect(composeViewActive.value).toBe(false);
 
     releaseThreadStart!(new Response(null, { status: 200 }));
     await expect(started).resolves.toBe(true);
@@ -2257,11 +2049,19 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     expect(toasts.value.filter((t) => t.type === 'error').length).toBeGreaterThan(0);
   });
 
-  // A seeded send starts a conversation, so it lands on a thread and must
-  // surface the thread pane. Its callers sit in the content pane (a release
-  // notice, a notification's Discuss), where the thread would otherwise be
-  // invisible. `sendCompose` passes an explicit thread id, so `sendMessage`'s
-  // raw-new reveal never runs.
+  it('restores compose view when the first message is refused after thread creation', async () => {
+    const started = startSetupInterview();
+    const id = focusedThreadId.value!;
+    expect(composeViewActive.value).toBe(false);
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ error: 'Send refused' }), { status: 403 }));
+    releaseThreadStart!(new Response(null, { status: 200 }));
+
+    await expect(started).resolves.toBe(false);
+    expect(threadMap.value.get(id)!.meta.state).toBe('composing');
+    expect(composeViewActive.value).toBe(true);
+    expect(getDraft(id).text.length).toBeGreaterThan(0);
+  });
+
   it('surfaces the thread pane, before the send rather than after it', async () => {
     focusedPane.value = 'content';
     const started = startSetupInterview();
@@ -2275,8 +2075,6 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
   });
 
   it('sends from a new draft, leaving a draft in progress untouched', async () => {
-    // Nothing is asked and nothing is overwritten. The send lands on a thread
-    // of its own, and the reader's work is still where they left it.
     const map = new Map<string, ThreadState>();
     map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea' }));
     threadMap.value = map;
@@ -2293,21 +2091,6 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
   });
 });
 
-/**
- * A starter suggestion composes a NEW message, so it belongs in a draft, never
- * appended to a thread that has already been sent.
- *
- * `ensureFocusedComposeThread` returns the focused id whatever its state, which
- * is right for typing (an active thread's composer writes a follow-up draft onto
- * that thread) and wrong here. The setup interview's header button is a
- * permanent control, so it can be tapped with any thread focused, and it aimed
- * the interview at whatever the user was looking at: on a coding-agent thread
- * the engine's continuity lock rejected the send ("Failed to send message: 409",
- * the 2026-08-05 iOS PWA report) and the rollback left the thread rendering as a
- * Lucidos Agent thread; on a chat thread the interview landed silently in an
- * unrelated conversation. `navigation-request`'s `new-chat` branch already drops
- * focus for exactly this reason.
- */
 describe('a suggestion never lands on an already-sent thread', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -2376,26 +2159,12 @@ describe('a suggestion never lands on an already-sent thread', () => {
 
     seedSuggestion('summarize my week');
 
-    // A follow-up being typed into an OPEN thread was never at risk: the
-    // suggestion goes somewhere else entirely. It is pinned here because
-    // `dropNonComposingFocus` is what steers it there, and a change to that
-    // would take the follow-up with it.
     expect(confirmState.value.visible).toBe(false);
     expect(getDraft('cc-1').text).toBe('and also rename the button');
     expect(getDraft('cc-1').image_hashes).toEqual(['h1']);
   });
 });
 
-/**
- * A compose write carries a `mode` only when the mode CHANGES.
- *
- * `POST /threads` already stores the channel, and the endpoint COALESCEs, so a
- * keystroke re-sending the same value changes nothing server-side. It did have
- * one effect. A write composed before a send and landing after it was read as
- * an attempt to change a sent thread's channel. The user got a "Compose sync
- * failed" card for typing. See
- * `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`.
- */
 describe('a compose write states the mode only when it changes', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -2455,11 +2224,8 @@ describe('a compose write states the mode only when it changes', () => {
   it('re-states a mode the engine never acknowledged', async () => {
     const id = ensureFocusedComposeThread();
     await vi.runAllTimersAsync();
-    // The draft's seeded picks wrote once already; only the toggle counts here.
     mockFetch.mockClear();
 
-    // The toggle's write is dropped in transit, so nothing proves the engine
-    // stored it. A mode we only ever failed to deliver must keep going out.
     let dropComposeWrites = true;
     mockFetch.mockImplementation((url: string, init?: RequestInit) => {
       const isComposePut = String(url).endsWith('/compose') && (init?.method ?? '') === 'PUT';
@@ -2474,17 +2240,11 @@ describe('a compose write states the mode only when it changes', () => {
     updateCompose(id, { text: 'still owed' });
     await vi.runAllTimersAsync();
 
-    // Every attempt states the mode, the landing one included. The count is
-    // left alone: `mutatingFetchIdempotent` retries a dropped write once, and
-    // that is its business rather than this rule's.
     expect(composeModes()).not.toEqual([]);
     expect(composeModes().every((m) => m === 'claude_code')).toBe(true);
   });
 });
 
-/** A draft's backend pick binds to the thread its send spawns, and only that
- *  thread. The model's row remembers the pick too, but that is the picker's
- *  write, not the draft's: a draft that picked nothing sends nothing. */
 describe('a compose backend pick is per-draft', () => {
   let chatBodies: Array<{ provider?: string; model?: string }>;
 
@@ -2534,16 +2294,7 @@ describe('a compose backend pick is per-draft', () => {
   });
 });
 
-/**
- * A first keystroke or a pasted image into a fresh draft fires `POST /threads`.
- * An engine that does not answer has said nothing about the draft. So the
- * draft, its row and its focus stay, and whoever needs the row next re-sends
- * the start. Only a refusal rolls back. Plan:
- * `docs/plans/2026-10-02-image-upload-progress-and-resilience.md`.
- */
 describe('a thread start that gets no answer keeps the draft', () => {
-  /** No answer, one attempt: a `TimeoutError` skips `mutatingFetchIdempotent`'s
-   *  own transport retry. */
   const noAnswer = () => new DOMException('signal timed out', 'TimeoutError');
   const isStart = (url: unknown, init?: RequestInit) =>
     String(url).endsWith('/threads') && init?.method === 'POST';
@@ -2679,5 +2430,94 @@ describe('a thread start that gets no answer keeps the draft', () => {
     expect(threadMap.value.has(id)).toBe(false);
     expect(isThreadStartPending(id)).toBe(false);
     expect(mockFetch.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE')).toBe(false);
+  });
+});
+
+
+describe('remembered composer coding agent', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetComposeSelectionsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    focusedThreadId.value = null;
+    selectedCodingAgent.value = 'claude-code';
+    preferences.value = { status: 'loaded', data: {} };
+    threadMap.value = new Map([
+      ['legacy', makeThread({ id: 'legacy', state: 'composing' })],
+      ['explicit', makeThread({ id: 'explicit', state: 'composing' })],
+      ['started', makeThread({ id: 'started', codingAgent: 'claude-code' })],
+    ]);
+    patchComposeSelection('explicit', { codingAgent: 'codex' });
+    globalThis.fetch = vi.fn(async () => new Response('{}', { status: 200 }));
+  });
+
+  afterEach(() => {
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    selectedCodingAgent.value = 'claude-code';
+  });
+
+  it('remembers the picked agent while preserving implicit and explicit existing drafts', async () => {
+    await selectComposeCodingAgent(null, 'codex');
+    expect(selectedCodingAgent.value).toBe('codex');
+    expect(preferences.value).toMatchObject({ data: { coding_agent_default: 'codex' } });
+    expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/preferences'), expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ value: 'codex' }),
+    }));
+    expect(resolveCodingAgent('legacy')).toBe('claude-code');
+    expect(resolveCodingAgent('explicit')).toBe('codex');
+    expect(threadMap.value.get('started')?.meta.codingAgent).toBe('claude-code');
+    const id = ensureFocusedComposeThread();
+    expect(getComposeSelectionOverride(id).codingAgent).toBe('codex');
+    _resetComposeSelectionsForTesting();
+    expect(resolveCodingAgent(null)).toBe('codex');
+  });
+
+  it('preserves the inherited agent when a peer preference refresh arrives during an edit', () => {
+    updateCompose('legacy', { text: 'new peer text' });
+    applyCodingAgentDefault('codex');
+    expect(resolveCodingAgent('legacy')).toBe('claude-code');
+    expect(resolveCodingAgent('explicit')).toBe('codex');
+    expect(resolveCodingAgent(null)).toBe('codex');
+    expect(isComposeIntentPending('legacy')).toBe(true);
+  });
+
+  it('does not send content writes for unrelated drafts when remembering a pick', async () => {
+    await selectComposeCodingAgent(null, 'codex');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes('/compose'))).toBe(false);
+  });
+
+  it('accepts a server agent pin during startup without replacing pending text', () => {
+    preferences.value = { status: 'loading' };
+    updateCompose('legacy', { text: 'new peer text' });
+    acceptComposeReport('legacy', {
+      revision: 2, epoch: 0, text: 'older server text', imageHashes: [], mode: 'claude_code',
+      selection: { codingAgent: 'codex' },
+    });
+    expect(resolveCodingAgent('legacy')).toBe('codex');
+    expect(getDraft('legacy')?.text).toBe('new peer text');
+    patchComposeSelection('legacy', { codingAgent: 'claude-code' });
+    acceptComposeReport('legacy', {
+      revision: 3, epoch: 0, text: 'older server text', imageHashes: [], mode: 'claude_code',
+      selection: { codingAgent: 'codex' },
+    });
+    expect(resolveCodingAgent('legacy')).toBe('claude-code');
+  });
+
+  it('does not persist the boot fallback before the saved preference is known', () => {
+    preferences.value = { status: 'loading' };
+    const id = ensureFocusedComposeThread();
+    expect(getComposeSelectionOverride(id).codingAgent).toBeUndefined();
+    selectedCodingAgent.value = 'codex';
+    expect(resolveCodingAgent(id)).toBe('codex');
+  });
+
+  it('updates the focused draft as well as the next composer', async () => {
+    await selectComposeCodingAgent('legacy', 'codex');
+    expect(resolveCodingAgent('legacy')).toBe('codex');
+    expect(selectedCodingAgent.value).toBe('codex');
   });
 });

@@ -15,11 +15,6 @@ interface Props {
   trigger: TriggerInfo;
 }
 
-/** Self-skeletonizing trigger row: rendered with no trigger inside a
- *  SkeletonProvider (`<TriggerItem />`) it draws itself as a loading placeholder
- *  via the Sk* leaves (title + status/type/run chips + a last-run line); with a
- *  real trigger it renders normally. The prop is optional only to support the
- *  skeleton call; real call sites pass it. */
 export function TriggerItem({ trigger }: Partial<Props>) {
   const sk = useSkeleton();
   const lastRunDate = trigger?.last_run ? new Date(trigger.last_run) : null;
@@ -30,17 +25,7 @@ export function TriggerItem({ trigger }: Partial<Props>) {
     .map(iso => new Date(iso))
     .map(d => `${formatShortDate(d)} ${formatShortTime(d)}`)
     .join(', ');
-  // Mirrors the two server-side refusals, so the row never offers a button
-  // that is guaranteed to error: an off-schedule run needs a cron schedule (an
-  // event-only trigger has to have its event emitted instead) and an unpaused
-  // trigger. Labelled "Run once", not "Run now": the Thread Queue panel's Run
-  // now force-admits an already-queued entry, a different operation.
   const canRunOnce = !!trigger && !trigger.paused && triggerType !== 'event';
-  // Only for a trigger that pins its own model. Show the registry's human label,
-  // falling back to the raw id when the row is gone (disabled or deleted after
-  // the trigger was saved): routing still resolves it, so the row must still
-  // name it. Both derived together and only when there IS a model, so the
-  // tooltip can't be built around a null label.
   const pinnedModel = trigger?.model
     ? (() => {
         const label = chatModelOptions().find(o => o.value === trigger.model)?.label ?? trigger.model;
@@ -56,8 +41,6 @@ export function TriggerItem({ trigger }: Partial<Props>) {
   return (
     <div
       class={`list-row trigger-row${sk ? '' : ' clickable'}${trigger?.paused ? ' trigger-disabled' : ''}`}
-      // The anchor a trigger deep link scrolls to, mirroring `data-plugin-id`
-      // on a plugin row. Absent on the skeleton, which names no trigger.
       data-trigger-id={trigger?.id}
       onClick={sk ? undefined : () => { if (trigger) openEditTrigger(trigger.id); }}
     >
@@ -92,10 +75,6 @@ export function TriggerItem({ trigger }: Partial<Props>) {
               from {trigger.plugin_id}
             </span>
           )}
-          {/* Only when the trigger pins its own model. A trigger on the account
-              default earns no chip: that is the common case, and a chip on every
-              row would say nothing. A pinned effort alone is too small a detail
-              for the row, so it stays in the form. */}
           {pinnedModel && (
             <span class="label" data-tooltip={pinnedModel.tooltip}>
               {pinnedModel.label}
@@ -112,9 +91,6 @@ export function TriggerItem({ trigger }: Partial<Props>) {
             ))}
           </ul>
         )}
-        {/* The cheapest way to make a wrong schedule visible before it costs
-            anything: a "monthly" trigger listing three dates a year apart gives
-            itself away at a glance. */}
         {nextRunsStr && (
           <div class="trigger-next-runs">Next {nextRunsStr}</div>
         )}

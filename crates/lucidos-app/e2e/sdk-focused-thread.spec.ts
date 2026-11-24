@@ -3,14 +3,6 @@ import { test, expect, type Page } from './fixtures';
 import { apiRequest, assertHealthy, clickThreadRow, navigateToApp, newThread, openThreadDrawer } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
 
-/**
- * `lucidos.ui.focusedThread()` and `onFocusedThreadChange()` from a tile on
- * the desktop dashboard, beside another thread. The tile's widget came from
- * Home, so the value must follow the thread pane and never name Home.
- *
- * The widget re-reads the getter on every push, so each step checks both the
- * bridge answer and the push.
- */
 
 const WIDGET_HTML = `<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head><body>
 <p>read <output id="read">none</output></p>
@@ -31,6 +23,11 @@ const WIDGET_HTML = `<!doctype html><html><head><script src="/api/v1/sdk.js"></s
   });
   read();
 </script></body></html>`;
+
+const THREAD_LIST = /\/api\/v1\/threads(\?.*)?$/;
+const APP_DOCUMENT = (url: URL) => url.pathname === '/';
+const SLOW_LIST_MS = 3_000;
+const SLOW_RELOAD_MS = 5_000;
 
 let written: string[] = [];
 let seededThreads: string[] = [];
@@ -56,13 +53,25 @@ function event(type: string, threadId: string, payload: string, now: string): st
     + `VALUES ('${randomUUID()}', '${type}', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`;
 }
 
+test.use({ serviceWorkers: 'block' });
+
 test.describe('The focused thread in the SDK', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     written = [];
     seededThreads = [];
     appId = `e2e-focused-thread-${randomUUID().slice(0, 8)}`;
-    await page.goto('/');
+    ensureHomeThread();
+    let documents = 0;
+    await page.route(THREAD_LIST, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, SLOW_LIST_MS));
+      await route.continue();
+    });
+    await page.route(APP_DOCUMENT, async (route) => {
+      if (documents++ > 0) await new Promise((resolve) => setTimeout(resolve, SLOW_RELOAD_MS));
+      await route.continue();
+    });
+    await navigateToApp(page);
   });
 
   test.afterEach(async ({ page }) => {
@@ -90,7 +99,6 @@ test.describe('The focused thread in the SDK', () => {
     const added = await apiRequest(page).post('/api/v1/widgets/dashboard-add', { data: { app_id: appId, dashboard: 'desktop' } });
     expect(added.ok(), `add ${appId}: ${await added.text()}`).toBeTruthy();
 
-    // Thread A open, with Home's widget on the dashboard in the rail beside it.
     await page.evaluate((tid) => localStorage.setItem('lucidos-focused-thread', tid), threadA);
     await navigateToApp(page);
 

@@ -19,7 +19,6 @@ function isAnchor(node: ComponentChildren): node is VNode<AnchorProps> {
   );
 }
 
-/** Normalize the result to an array so string and array returns test uniformly. */
 function toArray(result: ComponentChildren): ComponentChildren[] {
   return Array.isArray(result) ? result : [result];
 }
@@ -43,8 +42,6 @@ describe('linkifyText', () => {
   });
 
   it('wears the shared link appearance and no click handler of its own', () => {
-    // `onGlobalClick` routes the click through `openUrl`, and a handler here
-    // that stopped propagation would keep it off that funnel.
     const anchor = toArray(linkifyText('go https://example.com')).find(isAnchor);
     expect(anchor?.props.class).toBe('accent-link');
     expect(anchor?.props.onClick).toBeUndefined();
@@ -54,7 +51,6 @@ describe('linkifyText', () => {
     const parts = toArray(linkifyText('See https://example.com/page.'));
     const anchor = parts.find(isAnchor);
     expect(anchor?.props.href).toBe('https://example.com/page');
-    // The period is preserved as trailing plain text.
     expect(parts[parts.length - 1]).toBe('.');
   });
 

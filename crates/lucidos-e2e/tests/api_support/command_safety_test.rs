@@ -2,10 +2,8 @@
 //! 0002). Two contracts are exercised over real HTTP against the booted e2e
 //! workspace:
 //!
-//! 1. The trigger **side-effect grant** (Phase 5) round-trips through
-//!    `POST/PUT/GET /api/v1/triggers` as a typed `SideEffectCategory` set, and an
-//!    unknown category is rejected at the serde boundary. An app frame may not
-//!    widen it. The coding-agent grant round-trips beside it.
+//! 1. Trigger create and update refuse new category grants. The coding-agent
+//!    grant still round-trips independently.
 //! 2. The command-checkpoint **undo** and **diff** endpoints (Phase 4) fail
 //!    closed on an unknown or malformed checkpoint id.
 //! 3. The guard itself, end to end (Phase 4 and the 2026-08-06 addendum): a
@@ -17,9 +15,58 @@
 //! checkpoint from the event store directly. The third turns the guard on for
 //! its own duration and puts it back.
 
-use crate::support::{base_url, unique_marker, user_client};
+use crate::support::{base_url, local_process_client, unique_marker, user_client};
 use lucidos_engine::core::prefs;
 use serde_json::json;
+
+#[tokio::test]
+async fn standing_deny_settings_control_the_live_hook_check() {
+    let owner = user_client().await;
+    let settings = format!("{}/api/v1/agent-denied-commands", base_url());
+    let check = format!("{}/api/v1/internal/command-deny-check", base_url());
+    let program = unique_marker("e2e-denied");
+    let rule = format!("Bash({program}:*)");
+    let original: serde_json::Value = owner
+        .get(&settings)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let original = original["contents"].as_str().unwrap();
+    let command = json!({"command": format!("'{program}' --help")});
+    let set = owner
+        .put(&settings)
+        .json(&json!({"contents": format!("{original}\n{rule}")}))
+        .send()
+        .await
+        .unwrap();
+    let refused = local_process_client()
+        .put(&settings)
+        .json(&json!({"contents": original}))
+        .send()
+        .await
+        .unwrap();
+    let blocked = owner.post(&check).json(&command).send().await.unwrap();
+    let restore = owner
+        .put(&settings)
+        .json(&json!({"contents": original}))
+        .send()
+        .await
+        .unwrap();
+    let cleared = owner.post(&check).json(&command).send().await.unwrap();
+
+    assert_eq!(set.status().as_u16(), 204);
+    assert_eq!(refused.status().as_u16(), 403);
+    assert_eq!(restore.status().as_u16(), 204);
+    let refusal: String = blocked.error_for_status().unwrap().json().await.unwrap();
+    assert!(refusal.contains(&rule), "{refusal}");
+    let refusal: Option<String> = cleared.error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(refusal, None);
+}
 
 /// Ensure a timezone preference exists so `create_trigger` doesn't have to fall
 /// back to its UTC default. The `set_preference` handler reads the key from the
@@ -55,22 +102,6 @@ async fn create_trigger_with_grant(client: &reqwest::Client, name: &str, grant: 
     assert_eq!(
         res["success"], true,
         "Trigger create must succeed: {:?}",
-        res
-    );
-}
-
-/// Replace the side-effect grant of an existing trigger.
-async fn update_trigger_grant(client: &reqwest::Client, trigger_id: &str, grant: &[&str]) {
-    let resp = client
-        .put(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
-        .json(&json!({ "side_effect_grant": grant }))
-        .send()
-        .await
-        .expect("PUT /triggers failed");
-    let res: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    assert_eq!(
-        res["success"], true,
-        "Trigger update must succeed: {:?}",
         res
     );
 }
@@ -142,26 +173,45 @@ async fn poll_trigger_grant(
     }
 }
 
-/// Create → GET → update (replace) → update (clear) round-trip of the typed
-/// side-effect grant set.
+/// Even the workspace owner uses a program permission card for new grants.
 #[tokio::test]
-async fn trigger_side_effect_grant_round_trips() {
+async fn trigger_create_and_update_refuse_new_category_grants() {
     let client = user_client().await;
     set_timezone_utc(&client).await;
     let name = unique_marker("e2e-grant");
+    let response: serde_json::Value = client
+        .post(format!("{}/api/v1/triggers", base_url()))
+        .json(&json!({
+            "name": name,
+            "run": { "type": "intent", "intent": "noop" },
+            "cron_expressions": ["0 0 8 * * *"],
+            "side_effect_grant": ["email"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["success"], false, "{response}");
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("Category grants are retired"));
 
-    // Create with two categories; GET must round-trip them.
-    create_trigger_with_grant(&client, &name, &["email", "external_api"]).await;
-    let trigger_id = poll_trigger_grant(&client, &name, &["email", "external_api"]).await;
-
-    // Replace with a different single category.
-    update_trigger_grant(&client, &trigger_id, &["cloud_cli"]).await;
-    poll_trigger_grant(&client, &name, &["cloud_cli"]).await;
-
-    // Clear it: an empty array drops the grant entirely.
-    update_trigger_grant(&client, &trigger_id, &[]).await;
+    create_trigger_with_grant(&client, &name, &[]).await;
+    let trigger_id = poll_trigger_grant(&client, &name, &[]).await;
+    let response: serde_json::Value = client
+        .put(format!("{}/api/v1/triggers?id={trigger_id}", base_url()))
+        .json(&json!({ "side_effect_grant": ["email"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["success"], false, "{response}");
     poll_trigger_grant(&client, &name, &[]).await;
-
     delete_trigger(&client, &trigger_id).await;
 }
 
@@ -204,7 +254,6 @@ async fn an_app_frame_cannot_widen_a_side_effect_grant() {
         }),
     )
     .await;
-    assert_eq!(refused["success"], false, "{refused:?}");
     assert!(
         refused["error"]
             .as_str()
@@ -212,8 +261,8 @@ async fn an_app_frame_cannot_widen_a_side_effect_grant() {
         "{refused:?}"
     );
 
-    create_trigger_with_grant(&client, &name, &["email", "cloud_cli"]).await;
-    let trigger_id = poll_trigger_grant(&client, &name, &["cloud_cli", "email"]).await;
+    create_trigger_with_grant(&client, &name, &[]).await;
+    let trigger_id = poll_trigger_grant(&client, &name, &[]).await;
     let query = format!("?id={trigger_id}");
 
     let widened = app_frame_trigger_write(
@@ -229,11 +278,11 @@ async fn an_app_frame_cannot_widen_a_side_effect_grant() {
         &client,
         reqwest::Method::PUT,
         &query,
-        json!({ "side_effect_grant": ["email"] }),
+        json!({ "side_effect_grant": [] }),
     )
     .await;
     assert_eq!(narrowed["success"], true, "{narrowed:?}");
-    poll_trigger_grant(&client, &name, &["email"]).await;
+    poll_trigger_grant(&client, &name, &[]).await;
 
     delete_trigger(&client, &trigger_id).await;
 }
@@ -357,8 +406,8 @@ async fn trigger_update_rejects_unknown_side_effect_category() {
     let name = unique_marker("e2e-bad-update");
 
     // A real trigger to target.
-    create_trigger_with_grant(&client, &name, &["email"]).await;
-    let trigger_id = poll_trigger_grant(&client, &name, &["email"]).await;
+    create_trigger_with_grant(&client, &name, &[]).await;
+    let trigger_id = poll_trigger_grant(&client, &name, &[]).await;
 
     let resp = client
         .put(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
@@ -373,7 +422,7 @@ async fn trigger_update_rejects_unknown_side_effect_category() {
     );
 
     // The bad update must not have mutated the stored grant.
-    poll_trigger_grant(&client, &name, &["email"]).await;
+    poll_trigger_grant(&client, &name, &[]).await;
     delete_trigger(&client, &trigger_id).await;
 }
 
@@ -753,6 +802,15 @@ async fn an_mcp_server_setup_asks_before_it_spawns_anything() {
         mcp_server_rows(&pool, &server_id).await,
         0,
         "nothing may register before an answer"
+    );
+    let trace = card["decision_trace"]
+        .as_str()
+        .expect("the card carries its guard trace");
+    assert!(trace.contains("layer=static-secret-path"), "{trace}");
+    assert!(trace.contains("lane=IrreversibleDanger"), "{trace}");
+    assert!(
+        !trace.contains(&secret_file),
+        "the trace carries no command text"
     );
     let command = card["command"].as_str().unwrap_or_default();
     assert!(

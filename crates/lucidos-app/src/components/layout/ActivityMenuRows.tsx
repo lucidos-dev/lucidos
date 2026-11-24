@@ -1,25 +1,13 @@
-/**
- * The *activity group*: the Lucidos menu's rows for work in flight, one per
- * job. A tap unfolds the job's detail under its row, the way the Workspaces
- * row unfolds its list, and the menu stays open. It is what the spinning badge
- * on the mark advertises, and the one place progress is told: no apply, build
- * or download raises a progress toast.
- *
- * The same split as `NotificationsMenuRows.tsx` beside it.
- * `activityMenuGroup` is PURE, so every branch is testable through
- * `vnodeToText` with no DOM. `ActivityMenuGroup` is the hook-bearing wrapper
- * that reads the signals, holds which rows are open, and ticks the counters.
- */
 
 import { Fragment, type VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { engineBuildDetail, engineVersionPending } from '../../store/store';
+import { engineBuildDetail, engineVersionPending, engineBuildDeferred, engineVersionReady } from '../../store/store';
 import { liveActivityRows, type ActivityBody, type ActivityRow, type ApplyThread } from '../../store/actions/activityRows';
 import { activityAction, buildTimerIsLive } from '../../store/actions/backgroundActivity';
 import { openApplyPhase } from '../../store/actions/applyProgress';
 import { cancelApplyAllBatch } from '../../store/actions/chat-changes';
-import { LANE_PLACE_LABEL } from '../../store/actions/landingLane';
-import { cancelLaneBatch, closeMainCheck, removeFromLandingLane } from '../../store/actions/laneControls';
+import { LANE_PLACE_LABEL, LANE_WAITING_FOR_LANDER_LABEL } from '../../store/actions/landingLane';
+import { fixMainNow, cancelLaneBatch, closeMainCheck, removeFromLandingLane } from '../../store/actions/laneControls';
 import {
   LANE_GATHERING_LABEL,
   LANE_WAITING_FOR_ORIGIN_LABEL,
@@ -30,7 +18,7 @@ import {
   type MainCheckLine,
 } from '../../store/actions/landingLaneRow';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
-import { openEngineVersionToast, showEngineBuildLog } from '../../store/actions/engine-update';
+import { openEngineVersionToast, showEngineBuildLog, triggerRebuild } from '../../store/actions/engine-update';
 import { focusPane } from '../../store/actions/pane';
 import {
   describedItems,
@@ -39,26 +27,25 @@ import {
   pendingCommitsHeadline,
   type BackgroundActivity,
 } from '../../store/backgroundActivity';
-import type { PendingCommits } from '../../api/client';
+import { formatElapsed } from '../../utils/elapsed';
+import type { DeferredBuild, PendingCommits } from '../../api/client';
 import type { StepProgress } from '../../store/types';
 import { ChevronDownIcon, ChevronRightIcon, HourglassIcon } from '../shared/icons';
 import { Disclosure } from '../shared/Disclosure';
 import { progressFillWidth } from '../shared/progressBar';
 
-/** How often an open menu re-reads the clock while a job counts its time. */
 const TICK_MS = 1000;
 
-/** New source waiting for a build. Not in flight, so it has no spinner. */
 export type PendingCode = 'none' | 'pending';
 
 export interface ActivityGroupProps {
   rows: ActivityRow[];
   pending: PendingCode;
-  /** The keys of the rows unfolded now. */
+  deferred?: DeferredBuild | null;
+  versionReady?: boolean;
+  onBuildNow?: () => void;
   open: ReadonlySet<string>;
-  /** What the engine build brings, or `null` when git could not say. */
   commits: PendingCommits | null;
-  /** What the landing lane's row unfolds to. */
   lane: LaneView;
   onToggle: (key: string) => void;
   onOpenThread: (thread: ApplyThread) => void;
@@ -69,11 +56,11 @@ export interface ActivityGroupProps {
   onCancelLaneBatch: (batchId: string) => void;
   onOpenFixThread: (threadId: string) => void;
   onCloseMainCheck: (checkId: string) => void;
+  onFixMain?: () => void;
   onOpenPending: () => void;
   onShowBuildLog: () => void;
 }
 
-/** The pending row reopens the toast offering Rebuild. */
 export function pendingLabel(): string {
   return 'New code pending';
 }
@@ -93,9 +80,6 @@ function progressBar(progress: number | StepProgress): VNode {
   );
 }
 
-/** What the build brings, grouped the way the new-version confirm groups it,
- *  from the same shared wording. `null` and zero both say nothing: an unknown
- *  count must not read as "0 commits" while a build runs. */
 function commitsBody(commits: PendingCommits | null): VNode | null {
   if (!commits || commits.total === 0 || commits.groups.length === 0) return null;
   return (
@@ -127,8 +111,6 @@ function backgroundBody(activity: BackgroundActivity, props: ActivityGroupProps)
   const secondary = activity.kind === 'engine-build'
     ? { label: 'Show build log', onClick: props.onShowBuildLog }
     : activityAction(activity.secondaryAction);
-  // A build names what it brings when git can count it, and otherwise says
-  // what follows it.
   const counted = activity.kind === 'engine-build' ? commitsBody(commits) : null;
   const text = counted ?? (activity.note ? note(activity.note) : null);
   return (
@@ -152,7 +134,6 @@ function backgroundBody(activity: BackgroundActivity, props: ActivityGroupProps)
   );
 }
 
-/** A thread as a link: what is happening on one line, its title under it. */
 function linkRow(phase: string, title: string, onClick: () => void): VNode {
   return (
     <button
@@ -169,13 +150,10 @@ function linkRow(phase: string, title: string, onClick: () => void): VNode {
   );
 }
 
-/** The thread an apply is on, as a link to the event its phase started at. */
 function threadLink(thread: ApplyThread, onOpenThread: (thread: ApplyThread) => void): VNode {
   return linkRow(thread.phase, thread.title, () => onOpenThread(thread));
 }
 
-/** The main check's line: passing, running with its run, or red with its
- *  fix thread and Close. */
 function mainCheckStatus(line: MainCheckLine, props: ActivityGroupProps): VNode {
   switch (line.kind) {
     case 'passing':
@@ -197,16 +175,26 @@ function mainCheckStatus(line: MainCheckLine, props: ActivityGroupProps): VNode 
         <div key="main-check" class="brand-menu-activity-position" data-role="main-check">Main check: running</div>
       );
     case 'red': {
-      const phase = `Main red: ${line.summary}`;
+      const phase = `${line.flakyOnly ? 'Main flaky' : 'Main red'}: ${line.summary}`;
       const fix = line.fixThread;
       return (
         <div key="main-check" class="brand-menu-activity-entry" data-role="main-check">
           {fix
             ? linkRow(phase, fix.title, () => props.onOpenFixThread(fix.threadId))
             : <div class="brand-menu-activity-position">{phase}</div>}
-          {!line.closing && (
-            /* Closes the red for good. The fix thread stays an ordinary
-               thread, and what landed meanwhile starts the next check. */
+          {line.repair && (
+            <div class="brand-menu-activity-position">
+              {line.repair.state === 'running' ? 'Repair running'
+                : line.repair.state === 'waiting' ? `Repair waits for ${line.repair.waiting_on.join(', ') || 'idle capacity'}`
+                : 'No repair scheduled'}
+            </div>
+          )}
+          {line.repair && line.repair.state !== 'running' && (
+            <button type="button" role="menuitem" class="action-btn action-btn-secondary" onClick={props.onFixMain}>
+              Fix now
+            </button>
+          )}
+          {!line.closing && !line.flakyOnly && (
             <button
               type="button"
               role="menuitem"
@@ -222,9 +210,6 @@ function mainCheckStatus(line: MainCheckLine, props: ActivityGroupProps): VNode 
   }
 }
 
-/** The lane's status lines, in order: the open batch's step on its lane
- *  thread, how many changes wait for the next batch, or that the lane gathers
- *  an Apply All press, then why origin holds the lane, then the main check. */
 function laneStatusLines(body: LaneView, props: ActivityGroupProps): VNode[] {
   const lines: VNode[] = [];
   const { batch } = body;
@@ -256,24 +241,39 @@ function laneStatusLines(body: LaneView, props: ActivityGroupProps): VNode[] {
       </div>,
     );
   }
+  if (body.multipleLanders) {
+    lines.push(
+      <div key="multiple-landers" class="brand-menu-activity-position">
+        Multiple landers detected. Set one workspace to Here and the others to Another host in Settings → Coding Agents.
+      </div>,
+    );
+  }
   if (body.mainCheck) lines.push(mainCheckStatus(body.mainCheck, props));
   return lines;
 }
 
-/** A member of the open batch: it leaves only with its batch. */
+function laneEntryRow(phase: string, entry: LaneEntry, props: ActivityGroupProps): VNode {
+  if (!entry.remote) return linkRow(phase, entry.title, () => props.onOpenLaneEntry(entry));
+  return (
+    <div class="brand-menu-activity-link">
+      <span class="brand-menu-activity-phase">{phase}</span>
+      <span class="brand-menu-activity-thread">{entry.title}</span>
+    </div>
+  );
+}
+
 function laneMember(entry: LaneEntry, props: ActivityGroupProps): VNode {
   return (
     <Fragment key={entry.changeId}>
-      {linkRow(LANE_PLACE_LABEL['in-batch'], entry.title, () => props.onOpenLaneEntry(entry))}
+      {laneEntryRow(LANE_PLACE_LABEL['in-batch'], entry, props)}
     </Fragment>
   );
 }
 
-/** A waiting change, with Remove at its trailing edge. */
-function laneWaiting(entry: LaneEntry, props: ActivityGroupProps): VNode {
+function laneWaiting(entry: LaneEntry, props: ActivityGroupProps, waitingForLander: boolean): VNode {
   return (
     <div key={entry.changeId} class="brand-menu-activity-entry" data-role="lane-waiting">
-      {linkRow(LANE_PLACE_LABEL.waiting, entry.title, () => props.onOpenLaneEntry(entry))}
+      {laneEntryRow(waitingForLander ? LANE_WAITING_FOR_LANDER_LABEL : LANE_PLACE_LABEL.waiting, entry, props)}
       <button
         type="button"
         role="menuitem"
@@ -293,11 +293,9 @@ function landingLaneBody(body: LaneView, props: ActivityGroupProps): VNode {
     <>
       {laneStatusLines(body, props)}
       {batch?.members.map((entry) => laneMember(entry, props))}
-      {body.waiting.map((entry) => laneWaiting(entry, props))}
+      {body.waiting.map((entry) => laneWaiting(entry, props, !!body.waitingForLander))}
       {batch && !body.canceling && (
         <div class="brand-menu-activity-actions">
-          {/* Fails the whole batch and stops its lane thread. Every member
-              stays pending, and nothing queues it again until Apply. */}
           <button
             type="button"
             role="menuitem"
@@ -331,8 +329,6 @@ function activityBody(body: ActivityBody, props: ActivityGroupProps): VNode {
           {body.thread && threadLink(body.thread, props.onOpenThread)}
           {!body.canceling && (
             <div class="brand-menu-activity-actions">
-              {/* Stops the whole batch: it aborts the in-flight hardening or
-                  merge and leaves the rest pending. */}
               <button type="button" role="menuitem" class="action-btn action-btn-danger" onClick={props.onCancelApplyAll}>
                 Cancel
               </button>
@@ -373,16 +369,34 @@ function activityRow(row: ActivityRow, props: ActivityGroupProps): VNode {
   );
 }
 
-/** The group, or nothing at all when nothing runs and nothing is pending. The
- *  separator comes from here, under the rows, so an idle menu draws neither. */
 export function activityMenuGroup(props: ActivityGroupProps) {
   const { rows, pending, onOpenPending } = props;
-  if (rows.length === 0 && pending === 'none') return null;
+  if (rows.length === 0 && pending === 'none' && !props.deferred) return null;
   return (
     <>
       <div class="brand-menu-activity-group" role="group" aria-label="Activity">
         {rows.map((row) => activityRow(row, props))}
-        {pending !== 'none' && (
+        {props.deferred && (
+          <div key="deferred-build" class="brand-menu-activity-entry">
+            <div class="brand-menu-item brand-menu-activity-row">
+              <span class="brand-menu-activity-mark" aria-hidden="true"><HourglassIcon /></span>
+              <span class="brand-menu-activity-label">{props.versionReady ? 'Newer version waits' : 'New version waits'}</span>
+            </div>
+            <div class="brand-menu-activity-position">
+              {props.deferred.coding_threads} coding {props.deferred.coding_threads === 1 ? 'thread' : 'threads'} active · {formatElapsed(props.deferred.deferred_ms)}
+            </div>
+            {props.deferred.threads.map((thread) => (
+              <button key={thread.id} type="button" role="menuitem" class="brand-menu-activity-link"
+                data-role="deferred-thread" onClick={() => props.onOpenFixThread(thread.id)}>
+                {thread.title}{thread.state === 'waiting_for_user_answer' ? ' (waits for your answer)' : ''}
+              </button>
+            ))}
+            <div class="brand-menu-activity-position">It builds by itself when they finish.</div>
+            <button type="button" role="menuitem" class="brand-menu-activity-link"
+              data-role="build-now" onClick={props.onBuildNow}>Build now</button>
+          </div>
+        )}
+        {pending !== 'none' && !props.deferred && (
           <button
             key="pending-code"
             type="button"
@@ -401,15 +415,12 @@ export function activityMenuGroup(props: ActivityGroupProps) {
   );
 }
 
-/** The group as the signals stand, inside the menu's `<Overlay>`. The open
- *  rows and the ticker live only while the menu is open. */
 export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
   const [now, setNow] = useState(() => Date.now());
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
   const rows = liveActivityRows(now);
-  // A build counts seconds, and an apply's phase counts minutes. The lane
-  // row counts no time.
-  const ticking = buildTimerIsLive()
+  const deferred = engineBuildDeferred.value;
+  const ticking = buildTimerIsLive() || deferred !== null
     || rows.some((row) => row.body.kind === 'apply-all' || row.body.kind === 'apply-thread');
   useEffect(() => {
     if (!ticking) return;
@@ -420,7 +431,6 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
   const pending: PendingCode = !engineVersionPending.value
     ? 'none'
     : 'pending';
-  // A fix thread or lane thread may be archived, so the page never loaded it.
   const openThread = (threadId: string) => {
     onClose();
     focusThreadOrBootstrap(threadId);
@@ -429,6 +439,9 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
   return activityMenuGroup({
     rows,
     pending,
+    deferred: deferred ? { ...deferred, deferred_ms: deferred.deferred_ms + Math.max(0, now - deferred.anchoredAt) } : null,
+    versionReady: engineVersionReady.value,
+    onBuildNow: () => { onClose(); void triggerRebuild('join'); },
     open,
     commits: engineBuildDetail.value?.pendingCommits ?? null,
     lane: liveLandingLaneView(),
@@ -452,14 +465,12 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
     onCancelLaneBatch: (batchId) => void cancelLaneBatch(batchId),
     onOpenFixThread: openThread,
     onCloseMainCheck: (checkId) => void closeMainCheck(checkId),
+    onFixMain: () => void fixMainNow(),
     onOpenPending: () => {
       onClose();
-      // `showToast` freezes a new toast over the pane focused at that moment.
-      // The mark lives in the thread pane, so the toast lands there too.
       focusPane('thread');
       openEngineVersionToast();
     },
-    // The menu paints above the modal band, so it closes before the log opens.
     onShowBuildLog: () => {
       onClose();
       showEngineBuildLog();

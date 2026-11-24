@@ -5,26 +5,10 @@ import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { focusedThread, isComposeContext } from './PromptRowControls';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
 
-/** What the toggle shows for the focused thread.
- *
- *  Compose has no transcript for `followingLiveEdge` to describe. So there it
- *  shows the FOLLOW SEED, which the thread this compose becomes starts with.
- *  Everywhere else the live flag shows, so the button never sits lit over an
- *  unfollowed transcript. */
 function followShown(): boolean {
   return isComposeContext(focusedThread()) ? followLiveEdgeSeed.value : followingLiveEdge.value;
 }
 
-/** The follow toggle. It floats over the composer's top edge, in the down
- *  chevron's slot, and never moves.
- *
- *  **It RENDERS the follow rather than owning it.** `followingLiveEdge` is
- *  read-only, and the reader's own scroll writes it too. So the button goes off
- *  by itself when they scroll away from a live reply.
- *
- *  It sits by the composer, so it can be armed BEFORE a send, compose view
- *  included. A new thread is where a reader most wants carrying through the
- *  answer. ADR 0064 says why the down chevron cannot hold both jobs. */
 export function FollowLiveEdgeToggle() {
   const on = followShown();
   return (
@@ -48,8 +32,6 @@ export function FollowLiveEdgeToggle() {
   );
 }
 
-/** The follow shortcut. It makes the press the toggle would make, so the two
- *  never disagree about what they light. */
 export function toggleFollowLiveEdge(): void {
   setFollowLiveEdge(!followShown());
 }

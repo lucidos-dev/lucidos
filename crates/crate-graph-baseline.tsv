@@ -1,0 +1,36 @@
+# Workspace dependency depth in edges and the transitive dependents of each crate
+depth	6
+lucidos-agent-sandbox	lucidos-agents-api,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks
+lucidos-agents-api	lucidos-e2e,lucidos-engine-bin,lucidos-eval
+lucidos-app	
+lucidos-build-slot	lucidos-agents-api,lucidos-cli,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks
+lucidos-capabilities	lucidos-agents-api,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks
+lucidos-claude-code-managed	lucidos-agents-api,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks
+lucidos-cli	
+lucidos-core	lucidos-agents-api,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks
+lucidos-diagnostic-log	lucidos-agents-api,lucidos-app,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-diagnostic-log-macros	lucidos-agents-api,lucidos-app,lucidos-core,lucidos-diagnostic-log,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-e2e	
+lucidos-engine	lucidos-agents-api,lucidos-e2e,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks
+lucidos-engine-bin	
+lucidos-engine-boot	lucidos-engine-bin
+lucidos-engine-socket	lucidos-agents-api,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-eval	
+lucidos-event-hooks	lucidos-engine-bin
+lucidos-file-backup-exclusion	lucidos-agents-api,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway,lucidos-secret-store
+lucidos-frame-capability	lucidos-agents-api,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-gateway	
+lucidos-gateway-constants	lucidos-agents-api,lucidos-app,lucidos-cli,lucidos-core,lucidos-diagnostic-log,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-gateway-stamp	lucidos-agents-api,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-gateway-tls	lucidos-gateway
+lucidos-home	lucidos-agents-api,lucidos-app,lucidos-build-slot,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-engine-socket,lucidos-eval,lucidos-event-hooks,lucidos-frame-capability,lucidos-gateway,lucidos-gateway-stamp,lucidos-gateway-tls,lucidos-installs,lucidos-local-token,lucidos-loopback-ca,lucidos-secret-store
+lucidos-installs	lucidos-agents-api,lucidos-app,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-local-token	lucidos-agents-api,lucidos-app,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-engine-socket,lucidos-eval,lucidos-event-hooks,lucidos-frame-capability,lucidos-gateway,lucidos-gateway-stamp,lucidos-gateway-tls,lucidos-loopback-ca
+lucidos-loopback-ca	lucidos-app,lucidos-cli,lucidos-gateway
+lucidos-owner-lock	lucidos-agents-api,lucidos-app,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-pg-url	lucidos-agents-api,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-secret-store	lucidos-agents-api,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-shell-env	lucidos-gateway
+lucidos-tailscale	lucidos-agents-api,lucidos-app,lucidos-cli,lucidos-core,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway,lucidos-gateway-tls
+lucidos-update-channel	lucidos-agents-api,lucidos-app,lucidos-cli,lucidos-e2e,lucidos-engine,lucidos-engine-bin,lucidos-engine-boot,lucidos-eval,lucidos-event-hooks,lucidos-gateway
+lucidos-wire-codegen	lucidos-engine-bin,lucidos-engine-boot

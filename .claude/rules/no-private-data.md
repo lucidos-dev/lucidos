@@ -6,9 +6,13 @@
 
 ## The public-release boundary
 
-Lucidos publishes to the public mirror `github.com/lucidos-dev/lucidos`. The release sanitizes **only two things**: it drops `docs/plans/**` and the release scripts, and it swaps `WORKSPACES.md` for a generic stub. **Everything else ships verbatim**, including all of `crates/**` *with its test fixtures*, `system-knowhow/`, `docs/**`, `scripts/**`, `.claude/**`, and the root docs.
+Lucidos publishes to the public mirror `github.com/lucidos-dev/lucidos`.
+The release drops `docs/plans/**`, release machinery and `release-blockers.tsv`,
+and replaces `WORKSPACES.md` with a generic stub.
+`RELEASE_TREE_EXCLUDE_PATHS` is the authoritative exclusion list.
+Everything else ships verbatim, including test fixtures, comments and knowhow.
 
-So treat every file outside `docs/plans/**` and `WORKSPACES.md` as **public**. Test fixtures and code comments are shipping code; the rule applies to them exactly as to prose.
+Treat other files as public. Use generic placeholders in shipping content.
 
 ## Prohibited (use a generic placeholder instead)
 

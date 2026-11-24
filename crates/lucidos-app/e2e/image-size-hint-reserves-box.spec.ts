@@ -2,24 +2,12 @@ import { test, expect } from './fixtures';
 import type { Page } from '@playwright/test';
 import { navigateToApp, assertHealthy } from './helpers';
 
-/**
- * A picture with an image size hint holds its loaded box before its bytes
- * arrive. So a question card or reply does not grow when the picture lands.
- *
- * This is a layout property, so only a browser can see it. The markup matches
- * what `renderMarkdown` emits for `![alt](x.png#WxH)`, pinned in
- * src/utils/markdownEngine.test.ts. It is injected into real surface hosts so
- * the live app cascade applies, as markdown-table-columns-all.spec.ts does.
- */
 
-/** Small, taller than the 24rem cap, and wider than the pane. */
 const SIZES: Array<[number, number]> = [[200, 100], [400, 1200], [3000, 300]];
 
-/** Two pane widths and two UI scales (root font sizes; '' is the default). */
 const HOST_WIDTHS = [360, 900];
 const ROOT_FONT_SIZES = ['', '22px'];
 
-/** A route that never answers, so a picture pointed at it stays unloaded. */
 const PENDING = '/__never__/pending.png';
 
 const SURFACES = ['response-content markdown-content', 'question-body'];
@@ -27,9 +15,6 @@ const SURFACES = ['response-content markdown-content', 'question-body'];
 interface Box { w: number; h: number }
 interface Measured { label: string; before: Box; after: Box; unhinted: Box }
 
-/** Mounts a hinted picture of each size against the pending route, measures
- *  it, then loads the real bytes into it and into an unhinted copy.
- *  `swapHint` gives each picture a wrong hint on purpose. */
 function measure(page: Page, hostClass: string, swapHint: boolean): Promise<Measured[]> {
   return page.evaluate(async ({ sizes, widths, fonts, pending, hostClass, swapHint }) => {
     const picture = async (w: number, h: number) => {
@@ -108,8 +93,6 @@ test.describe('Image size hint', () => {
 
     test(`a wrong hint never stretches the loaded picture in .${name}`, async ({ page }) => {
       for (const r of await measure(page, surface, true)) {
-        // Once loaded, the picture's own ratio sets the height for the width
-        // the hint gave it, never above the cap an unhinted copy shows.
         const ownRatioHeight = Math.round(r.after.w * r.unhinted.h / r.unhinted.w);
         expect(r.after.h, `${r.label} keeps its own ratio`).toBeLessThanOrEqual(
           Math.max(ownRatioHeight, r.unhinted.h) + 1,

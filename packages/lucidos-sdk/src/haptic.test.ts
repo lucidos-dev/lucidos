@@ -19,8 +19,6 @@ describe('hapticTick', () => {
     }
   });
 
-  // An open overlay reads a click with no pointerdown behind it as an outside
-  // click and closes. The tick's clicks must never reach a page listener.
   it('toggles the switch without any page click listener seeing it', () => {
     const seen = vi.fn();
     document.addEventListener('click', seen, true);

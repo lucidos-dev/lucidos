@@ -6,9 +6,6 @@ const getPreferencesMock = vi.fn(async (..._args: unknown[]) => ({
 }));
 const listModelsMock = vi.fn(async () => ({ models: [] as ModelInfo[] }));
 
-// Spreads the real module first: `loadPreferences` also calls
-// `retryTransient`, and a mock that omitted it would silently throw
-// inside the try/catch, masking every assertion below as "stayed at default".
 vi.mock('../../../api/client', async (importActual) => ({
   ...(await importActual<typeof import('../../../api/client')>()),
   setPreference: (key: string, value: string, deviceId?: string) =>
@@ -24,9 +21,6 @@ import { DEFAULT_CHAT_MODEL } from '../../../store/models';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import type { ModelInfo } from '../../../api/types';
 
-/** A `provider = local` registry row as the engine serves it: the tiers come
- *  from `llm::reasoning::supported_efforts`, which stops local servers at
- *  `high` because `xhigh` is OpenAI-proprietary. */
 const LOCAL_MODEL: ModelInfo = {
   id: 'muse-glimmer:30b-mlx',
   label: 'Muse Glimmer 30B (local)',
@@ -48,7 +42,6 @@ const LOCAL_MODEL: ModelInfo = {
   created_at: '2026-01-01T00:00:00Z',
 };
 
-/** A registry row whose provider documents a default effort. */
 const OPUS_55: ModelInfo = {
   ...LOCAL_MODEL,
   id: 'claude-opus-5-6',

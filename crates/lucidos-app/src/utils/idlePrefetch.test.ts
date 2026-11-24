@@ -1,10 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-/**
- * Idle prefetch (ADR 0288). A surface that only opens on demand loads after
- * the boot splash lifts. So the first frame never waits for it, and its first
- * open never waits for the network.
- */
 describe('idle prefetch', () => {
   beforeEach(() => {
     vi.resetModules();

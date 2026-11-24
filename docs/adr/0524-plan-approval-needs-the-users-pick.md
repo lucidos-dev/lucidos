@@ -30,6 +30,12 @@ The plan summary also moves onto the card. A message that also calls a tool
 never reaches the user, so the card's question carries the summary and a
 re-ask carries what changed.
 
+**Amended by ADR 0664.** A pick that a confirmed *batch* made counts as the
+user's pick, for the plan text the batch showed. The batch item binds the
+marker's `planned_at` and the committed plan's digest. If the committed text
+changes, the approval answers 409 with reason `plan-changed`, and a re-mark
+needs a new yes as before.
+
 ## Rationale
 
 The evidence is already in `events`. The owner-approval gate (ADR 0387) set the

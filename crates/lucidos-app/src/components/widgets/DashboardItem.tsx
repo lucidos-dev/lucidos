@@ -9,15 +9,11 @@ import { widgetInstanceKey, type WidgetParams } from '../../utils/widgetParams';
 import type { DashboardTileRef } from '../../api/client/widgets';
 import type { WidgetSize } from '../../store/types';
 
-/** One widget instance: what a dashboard tile names, and what a menu calls it. */
 export interface WidgetInstance {
   appId: string;
   params?: WidgetParams;
-  /** The instance's label, which a pin or a tile records. */
   label?: string;
-  /** What the menu calls it: the label, else the widget's name. */
   name: string;
-  /** Its card's size, which Add to dashboard starts the tile at. */
   size?: WidgetSize;
 }
 
@@ -51,8 +47,6 @@ export function tileRef({ appId, params, label, size }: WidgetInstance): Dashboa
   return { appId, params, label, size };
 }
 
-/** The dashboard this layout shows, read, and whether it holds `tile`. Until
- *  the read lands `held` is false. */
 function useDashboardHolding(tile: WidgetInstance) {
   const dashboard = currentDashboard();
   const view = dashboardFor(dashboard);
@@ -64,11 +58,6 @@ function useDashboardHolding(tile: WidgetInstance) {
   return { dashboard, view, held };
 }
 
-/** Add to dashboard, offered in every thread, Home included, and on an app's
- *  row. It targets the dashboard this layout shows, and turns into Remove from
- *  dashboard once that dashboard holds the instance (ADR 0496). Until the
- *  dashboard is read, the row draws at once but stays inert, so it never
- *  offers the wrong action. `noun` names the tile in a failure toast. */
 export function DashboardItem({ tile, noun, run }: { tile: WidgetInstance; noun: 'widget' | 'app'; run: Run }) {
   const { dashboard, view, held } = useDashboardHolding(tile);
   if (held) {

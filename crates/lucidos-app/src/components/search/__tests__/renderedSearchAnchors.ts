@@ -1,14 +1,3 @@
-/**
- * Every Settings search anchor the components render, read from source.
- *
- * Shared by the two guards that tie Settings to Search everywhere: every
- * search entry lands on a rendered anchor, and every rendered anchor has a
- * search entry. One scan for both, so the two directions cannot disagree.
- *
- * A literal anchor is read straight off the markup. An anchor built at runtime
- * cannot be, so each such expression needs a row in `DYNAMIC_ANCHORS` saying
- * where its values come from. A new expression with no row fails the guard.
- */
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
 // @ts-expect-error: same
@@ -24,19 +13,13 @@ import { SHORTCUT_DEFS, shortcutSearchAnchor } from '../../../utils/shortcuts';
 const COMPONENTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 type DynamicAnchor =
-  /** A prop. Its callers pass the anchor, and the scan reads it there. */
   | { kind: 'forwarded' }
-  /** Built from a list. These are every value it can take. */
   | { kind: 'expands'; anchors: () => string[] }
-  /** Not a Settings row, so it needs no search entry. */
   | { kind: 'not-a-setting'; why: string };
 
-/** The providers drawn by `SystemOneProviderFrame`. A chat provider's System
- *  One row lives in that provider's own block. */
 const systemOneFrameAnchors = () =>
   Object.values(SYSTEM_ONE_PROVIDERS).filter((p) => !p.chatProvider).map((p) => p.anchor);
 
-/** Keyed by `<path under components/> <expression>`. */
 const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
   'settings/AllowlistEditor.tsx props.anchor': { kind: 'forwarded' },
   'settings/ModelSelectionRow.tsx anchor': { kind: 'forwarded' },
@@ -90,7 +73,6 @@ const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
 
 let sources: Array<{ path: string; src: string }> | null = null;
 
-/** Every non-test `.tsx` under `components/`, keyed by its path there. */
 function componentSources(): Array<{ path: string; src: string }> {
   if (sources) return sources;
   const found: Array<{ path: string; src: string }> = [];
@@ -108,8 +90,6 @@ function componentSources(): Array<{ path: string; src: string }> {
   return (sources = found);
 }
 
-/** A `providerAnchor('vertex')` call with literal arguments: as readable as a
- *  literal anchor, so it needs no `DYNAMIC_ANCHORS` row. */
 const LITERAL_PROVIDER_ANCHOR = /^providerAnchor\('([^']+)'(?:, '([^']+)')?\)$/;
 
 function literalProviderAnchor(expression: string): string | null {
@@ -117,8 +97,6 @@ function literalProviderAnchor(expression: string): string | null {
   return m ? providerAnchor(m[1], m[2]) : null;
 }
 
-/** `data-search-anchor={…}` anywhere, plus an `anchor={…}` prop in Settings,
- *  where the row components that render the attribute take it. */
 function dynamicExpressions(): string[] {
   const keys: string[] = [];
   for (const { path, src } of componentSources()) {
@@ -133,13 +111,9 @@ function dynamicExpressions(): string[] {
   return [...new Set(keys)];
 }
 
-/** Every anchor a Settings row can render. */
 export function renderedSearchAnchors(): Set<string> {
   const anchors = new Set<string>();
   for (const { src } of componentSources()) {
-    // `data-search-anchor="…"`, and any `*anchor="…"` prop a row component
-    // turns into the attribute for its caller. A `${…}` value is a selector
-    // inside a template string, not markup.
     for (const m of src.matchAll(/\b[\w-]*[Aa]nchor="([^"$]+)"/g)) anchors.add(m[1]);
     for (const m of src.matchAll(/\b[\w-]*[Aa]nchor=\{([^}]*)\}/g)) {
       const anchor = literalProviderAnchor(m[1].trim());
@@ -152,12 +126,10 @@ export function renderedSearchAnchors(): Set<string> {
   return anchors;
 }
 
-/** Runtime-built anchor expressions with no `DYNAMIC_ANCHORS` row. */
 export function unclassifiedDynamicAnchors(): string[] {
   return dynamicExpressions().filter((key) => !(key in DYNAMIC_ANCHORS));
 }
 
-/** `DYNAMIC_ANCHORS` rows whose expression no longer appears in source. */
 export function staleDynamicAnchorRows(): string[] {
   const live = new Set(dynamicExpressions());
   return Object.keys(DYNAMIC_ANCHORS).filter((key) => !live.has(key));

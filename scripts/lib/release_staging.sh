@@ -355,3 +355,65 @@ release_staging_assert_commit() {
     fi
     return 0
 }
+
+# Copy the manifest-selected updater into owned scratch, verifying copied bytes.
+# One manifest snapshot binds identity, selection and hashes before publication.
+release_staging_copy_updater() {
+    python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+
+staging, scratch, version, commit = sys.argv[1:]
+try:
+    with open(Path(staging) / "manifest.json", encoding="utf-8") as source:
+        manifest = json.load(source)
+    if manifest.get("version") != version or manifest.get("platform_key") != "darwin-aarch64":
+        raise ValueError("updater staging version or platform mismatch")
+    if commit and manifest.get("source_commit") != commit:
+        raise ValueError("updater staging source commit mismatch")
+    entries = manifest.get("artifacts")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("manifest lists no artifacts")
+    hashes = {}
+    for entry in entries:
+        name, digest = entry["name"], entry["sha256"]
+        if (not isinstance(name, str) or not name or name in (".", "..")
+                or "/" in name or "\\" in name or any(ord(c) < 32 for c in name)
+                or name in hashes):
+            raise ValueError("unsafe or duplicate manifest artifact name")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid manifest artifact hash")
+        hashes[name] = digest
+    bundles = [name for name in hashes if name.endswith(".app.tar.gz")]
+    if len(bundles) != 1 or bundles[0] + ".sig" not in hashes:
+        raise ValueError("manifest must list exactly one updater and its signature")
+    bundle = bundles[0]
+    directory = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in (bundle, bundle + ".sig"):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError("updater artifact must be a regular file")
+                target = Path(scratch) / name
+                with target.open("xb") as destination:
+                    shutil.copyfileobj(source, destination)
+            digest = hashlib.sha256()
+            with target.open("rb") as copied:
+                for chunk in iter(lambda: copied.read(1 << 20), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != hashes[name]:
+                raise ValueError("copied updater checksum mismatch: " + name)
+    finally:
+        os.close(directory)
+    print(Path(scratch) / bundle)
+except (OSError, ValueError, KeyError, TypeError) as error:
+    sys.exit("ERROR: " + str(error))
+PY
+}

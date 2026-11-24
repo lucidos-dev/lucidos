@@ -17,7 +17,6 @@ import { AppSearchBar } from './AppSearchBar';
 import { ReusableWidgetsSection } from './ReusableWidgetsSection';
 import { loadReusableWidgets } from '../../store/actions/widgets';
 
-/** The apps list and the reusable widgets under it. */
 function refreshAppsPanel(): Promise<unknown> {
   return Promise.all([
     refreshApps(),

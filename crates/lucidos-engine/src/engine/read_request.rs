@@ -12,18 +12,18 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::engine::chat::agent_archive::agent_thread_actor;
 use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::agent_thread_actor;
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
-use crate::gateway_operators::Reader;
+use crate::gateway_users::Reader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-pub(crate) use crate::llm::tools::READ_ARG;
+pub use crate::llm::tools::READ_ARG;
 
 /// The yes or no every agent turn ends with, about its reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadDecision {
+pub enum ReadDecision {
     /// The reply is worth reading: a *read request*.
     Requested,
     /// The reply needs no reading.
@@ -31,7 +31,7 @@ pub(crate) enum ReadDecision {
 }
 
 impl ReadDecision {
-    pub(crate) fn from_read(read: bool) -> Self {
+    pub fn from_read(read: bool) -> Self {
         if read {
             Self::Requested
         } else {
@@ -41,7 +41,7 @@ impl ReadDecision {
 
     /// Read `request_read`'s arguments. A missing or non-boolean `read` is
     /// an error the model reads back, never a default.
-    pub(crate) fn from_tool_args(args: &serde_json::Value) -> Result<Self, String> {
+    pub fn from_tool_args(args: &serde_json::Value) -> Result<Self, String> {
         args[READ_ARG]
             .as_bool()
             .map(Self::from_read)
@@ -61,7 +61,7 @@ impl ReadDecision {
     }
 
     /// What the agent reads back after deciding, from the tool and the CLI.
-    pub(crate) fn ack(self) -> &'static str {
+    pub fn ack(self) -> &'static str {
         match self {
             Self::Requested => {
                 "Recorded. Once this turn ends, the thread is listed under \
@@ -78,7 +78,7 @@ impl ReadDecision {
 
 /// Record `thread_id`'s own agent's read decision. The `request_read` tool's
 /// actor: the agent thread itself.
-pub(crate) async fn record_agent_read_decision(
+pub async fn record_agent_read_decision(
     bus: &EventBus,
     thread_id: Uuid,
     decision: ReadDecision,
@@ -94,7 +94,7 @@ pub(crate) async fn record_agent_read_decision(
 
 /// Record a read decision on `thread_id`, by `actor`. `None` is the engine
 /// deciding, when the turn-end gate forced the decision itself.
-pub(crate) async fn record_read_decision(
+pub async fn record_read_decision(
     bus: &EventBus,
     thread_id: Uuid,
     decision: ReadDecision,
@@ -111,7 +111,7 @@ pub(crate) async fn record_read_decision(
 
 /// What a sighting found.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReplySeen {
+pub enum ReplySeen {
     /// A request was pending, and `ThreadReplySeen` now clears it.
     Cleared,
     /// No request was pending, so nothing was recorded.
@@ -127,9 +127,9 @@ pub(crate) enum ReplySeen {
 /// of the thread's `seen_version`. Records nothing when no request is pending
 /// for them, so a second device seeing the same reply adds no event.
 ///
-/// The team's sighting clears the request. A person's, on a team gateway,
-/// clears it for that person only (ADR 0623).
-pub(crate) async fn record_reply_seen(
+/// The team's sighting clears the request. A user's, on a team gateway,
+/// clears it for that user only (ADR 0623).
+pub async fn record_reply_seen(
     pool: &PgPool,
     bus: &EventBus,
     thread_id: Uuid,
@@ -154,7 +154,7 @@ pub(crate) async fn record_reply_seen(
                     thread_id,
                     event: ThreadEvent::ThreadReplySeen {
                         seen_version,
-                        personal: matches!(reader, Reader::Person { .. }),
+                        personal: matches!(reader, Reader::User { .. }),
                     },
                     meta: EventMeta::with_actor(Some(actor)),
                 })

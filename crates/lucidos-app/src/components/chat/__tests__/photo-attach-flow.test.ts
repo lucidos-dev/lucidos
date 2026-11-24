@@ -1,18 +1,3 @@
-/**
- * End-to-end behaviour test: tapping the photo button → picker dismisses with
- * a selected file → handleFileSelect runs → image uploads to the blob endpoint
- * → hash lands in the draft → preview strip renders the blob URL.
- *
- * The previous regression test (photo-attach-ios-pwa.test.ts) only static-
- * checked CSS class names on the file input. It failed to catch the actual
- * data-flow bug, so this test exercises the chain that the iOS PWA hits.
- *
- * Phase 4 changed the data flow: the attach path no longer base64-encodes
- * client-side; it POSTs the raw bytes to `/api/v1/threads/:id/blobs` and
- * stores the returned sha256 hash in `draft.image_hashes`. The preview
- * strip reads from `attachedImagesForCurrentThread` which renders
- * `<img src="/api/v1/blobs/<hash>/preview">` (downscaled JPEG).
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { connectionStatus, focusedThreadId, threadMap } from '../../../store/store';
 import type { ThreadMeta, ThreadState } from '../../../store/thread-events';
@@ -78,10 +63,6 @@ describe('photo attach reaches the draft preview', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    // The blob endpoint is the only fetch the attach path makes; the chat
-    // POST is a separate flow exercised elsewhere.
-    // A fresh Response per call: a body can be read once, and the thread
-    // start reads its own.
     mockFetch = vi.fn(() => Promise.resolve(
       new Response(JSON.stringify({ hash: 'fake-hash-abc123', mime: 'image/jpeg', byte_size: 3 }), {
         status: 200,
@@ -123,12 +104,8 @@ describe('photo attach reaches the draft preview', () => {
     const stripImages = attachedImagesForCurrentThread.value;
     expect(stripImages).toHaveLength(1);
     expect(stripImages[0].hash).toBe('fake-hash-abc123');
-    // Preview keeps the in-memory blob: URL across the upload swap so the
-    // <img> never re-fetches over the network — see no-server-url-swap test
-    // below for the bug this prevents.
     expect(stripImages[0].previewUrl).toBe('blob:fake-preview-url');
     expect(getDraft('t-active').image_hashes).toEqual(['fake-hash-abc123']);
-    // Pending entry was cleaned up after upload succeeded.
     expect(pendingUploads.value.get('t-active')).toBeUndefined();
   });
 
@@ -149,13 +126,6 @@ describe('photo attach reaches the draft preview', () => {
   });
 
   it('does not POST the blob until POST /threads resolves (compose race)', async () => {
-    // Race regression: ensureFocusedComposeThread kicks off
-    // POST /api/v1/threads as fire-and-forget. Pasting an image is the only
-    // attach path that issues a state-changing request synchronously (text
-    // PUTs are debounced ~250ms), so without an explicit await between the
-    // create POST and the blob POST, the blob endpoint queries
-    // thread_summaries before the row exists and returns 404 with toast
-    // "Image upload failed: thread not found".
     expect(focusedThreadId.value).toBeNull();
 
     const seen: Array<{ method: string; url: string }> = [];
@@ -181,10 +151,6 @@ describe('photo attach reaches the draft preview', () => {
 
     const attachP = attachImageToActiveDraft(fakeFile());
 
-    // One macrotask is enough: the buggy version fires the blob POST
-    // synchronously inside attachImageToActiveDraft (no awaits between
-    // ensureFocusedComposeThread and uploadThreadBlob), so `seen` would
-    // contain it before any setTimeout callback runs.
     await new Promise((r) => setTimeout(r, 0));
 
     expect(
@@ -201,23 +167,9 @@ describe('photo attach reaches the draft preview', () => {
   });
 
   it('does not swap the preview to the server URL after upload (no cold-fetch black flash)', async () => {
-    // Regression: the preview strip used to mount <img src="blob:...">
-    // while uploading, then on success swap to <img src="/api/v1/blobs/<hash>">.
-    // The two render entries use different keys (`pending-<localId>` vs
-    // `hash-<hash>`), so Preact unmounts the blob:URL element and mounts a
-    // fresh server-URL one. An earlier fix tried to warm the browser cache
-    // with `new Image().src = serverUrl` before the swap — but iOS Safari
-    // PWA does not reliably populate the HTTP cache from detached Image
-    // preloads, so the new <img> still re-fetched over the network and
-    // rendered empty (visible as a black flash). The current fix keeps the
-    // in-memory blob: URL alive for the session and uses it as the preview
-    // URL for the confirmed image. No HTTP swap, no flash, regardless of
-    // whether the preload would have hit the cache.
     focusedThreadId.value = 't-active';
     threadMap.value = new Map([['t-active', makeActiveThread()]]);
 
-    // Spy on Image() to assert NO preload is attempted — the old bug was
-    // hiding behind an unreliable warm-the-cache step that we no longer need.
     let imagesConstructed = 0;
     class SpyImage {
       onload: (() => void) | null = null;
@@ -230,17 +182,11 @@ describe('photo attach reaches the draft preview', () => {
     try {
       await attachImageToActiveDraft(fakeFile());
 
-      // The pending entry is gone — the upload promoted to a confirmed image.
       expect(pendingUploads.value.get('t-active')).toBeUndefined();
       const stripImages = attachedImagesForCurrentThread.value;
       expect(stripImages).toHaveLength(1);
-      // Critical: the preview URL must be the in-memory blob URL, NOT the
-      // server URL. The swap from pending div to confirmed div still happens
-      // (different keys), but both <img> elements share the same blob URL
-      // src so the browser displays the in-memory bitmap with no fetch.
       expect(stripImages[0].previewUrl).toBe('blob:fake-preview-url');
       expect(getDraft('t-active').image_hashes).toEqual(['fake-hash-abc123']);
-      // No preload attempt — we eliminated that code path.
       expect(imagesConstructed).toBe(0);
     } finally {
       if (originalImage === undefined) {
@@ -271,7 +217,6 @@ describe('photo attach reaches the draft preview', () => {
     await attachImageToActiveDraft(fakeFile());
     expect(getSessionBlobUrlForHash('fake-hash-abc123')).toBe('blob:fake-preview-url');
 
-    // Mirror the order sendCompose / sendFollowup use: mark, then clear.
     markHashesAsSent(['fake-hash-abc123']);
     clearDraft('t-active');
 
@@ -291,9 +236,7 @@ describe('photo attach reaches the draft preview', () => {
 
     await attachImageToActiveDraft(fakeFile());
 
-    // Draft hashes must NOT include a half-uploaded blob.
     expect(getDraft('t-active').image_hashes).toEqual([]);
-    // Pending entry remains so the user can retry / dismiss.
     const pending = pendingUploads.value.get('t-active');
     expect(pending).toHaveLength(1);
     expect(pending![0].state).toEqual({ kind: 'failed', reason: 'unsupported mime', retryable: false });

@@ -7,24 +7,22 @@
 //! undo is a config change of its own. A credential's value is never in an
 //! event, so Undo restores a deleted credential's metadata only.
 
-use std::sync::Arc;
-
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::core::credentials::{AuthType, CredentialMetadata, CredentialStore};
 use crate::core::repositories::RepositoryStore;
-use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope, SystemEvent};
+use crate::engine::event_bus::SystemEvent;
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::trigger_writes::{TriggerWrite, PREVIOUS_KEY};
 use crate::engine::LucidosEngine;
-use crate::gateway_operators::OperatorSnapshot;
+use crate::gateway_users::UserSnapshot;
 use crate::scheduler::notifications::Tap;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The events that record a config change.
-pub(crate) const CONFIG_CHANGE_EVENTS: [&str; 14] = [
+pub const CONFIG_CHANGE_EVENTS: [&str; 14] = [
     "RepositoryAdded",
     "RepositoryRemoved",
     "TriggerCreated",
@@ -43,7 +41,7 @@ pub(crate) const CONFIG_CHANGE_EVENTS: [&str; 14] = [
 
 /// What undoing one config change writes.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ConfigUndo {
+pub enum ConfigUndo {
     RemoveRepository {
         repo_id: Uuid,
     },
@@ -82,8 +80,9 @@ pub(crate) enum ConfigUndo {
 
 impl ConfigUndo {
     /// Whether only the owner may apply this undo: it would widen a trigger's
-    /// grants, or rewrite the work of a granted one.
-    pub(crate) fn needs_the_owner(&self, current: Option<&crate::triggers::TriggerConfig>) -> bool {
+    /// grants, revoke a folder grant, change a deny, or rewrite the work of a
+    /// granted one.
+    pub fn needs_the_owner(&self, current: Option<&crate::triggers::TriggerConfig>) -> bool {
         let ConfigUndo::WriteTrigger { write, payload, .. } = self else {
             return false;
         };
@@ -97,11 +96,20 @@ impl ConfigUndo {
                         payload.get("side_effect_grant"),
                     )
                     .is_empty()
+                    || !crate::triggers::config::parse_program_grants(payload).is_empty()
+                    || payload
+                        .get("folder_grants")
+                        .and_then(Value::as_array)
+                        .is_some_and(|grants| !grants.is_empty())
             }
             Some(current) => {
                 let mut next = current.clone();
                 next.apply_update(payload);
-                current.widens_a_grant(&next) || current.unowned_edit_clears_grants(&next)
+                current.widens_a_grant(&next)
+                    || next.folder_grants != current.folder_grants
+                    || next.program_denies != current.program_denies
+                    || next.folder_denies != current.folder_denies
+                    || current.unowned_edit_clears_grants(&next)
             }
         }
     }
@@ -109,9 +117,9 @@ impl ConfigUndo {
 
 /// One config change, read from its stored event.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ConfigChange {
+pub struct ConfigChange {
     pub title: &'static str,
-    /// What changed, without the person: `added the repository "x"`.
+    /// What changed, without the user: `added the repository "x"`.
     pub what: String,
     pub actor: Option<MessageOrigin>,
     pub undo: Option<ConfigUndo>,
@@ -120,7 +128,7 @@ pub(crate) struct ConfigChange {
 /// The config change an event records, from its type and stored payload.
 /// `None` for any other event, and for a change nobody asked for: an
 /// identity collapse, or a one-shot trigger deleting itself.
-pub(crate) fn change_of(event_type: &str, payload: &Value) -> Option<ConfigChange> {
+pub fn change_of(event_type: &str, payload: &Value) -> Option<ConfigChange> {
     if event_type.starts_with("Trigger") {
         return trigger_change(event_type, payload);
     }
@@ -353,9 +361,9 @@ fn trigger_change(event_type: &str, payload: &Value) -> Option<ConfigChange> {
 }
 
 /// Who made a change, as a notification names them.
-fn who(actor: &MessageOrigin, snapshot: &OperatorSnapshot) -> String {
-    match snapshot.operator_of_origin(actor) {
-        Some(person) => person.name,
+fn who(actor: &MessageOrigin, snapshot: &UserSnapshot) -> String {
+    match snapshot.user_of_origin(actor) {
+        Some(user) => user.name,
         None if actor.mode() == ActorMode::Agent => "An agent".to_string(),
         None => "Someone".to_string(),
     }
@@ -363,30 +371,30 @@ fn who(actor: &MessageOrigin, snapshot: &OperatorSnapshot) -> String {
 
 /// The notification a change posts.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ConfigNotice {
+pub struct ConfigNotice {
     pub title: String,
     pub message: String,
     pub tap: Tap,
     /// Everyone's devices but the maker's. `None` is the whole team, for a
-    /// change no operator made.
+    /// change no user made.
     pub audience: Option<Vec<String>>,
 }
 
 /// The notification a change posts. `None` off a team gateway, for a change
 /// nobody made, and when nobody but its maker holds a device.
-pub(crate) fn notice(
+pub fn notice(
     change: &ConfigChange,
     event_id: Uuid,
-    snapshot: &OperatorSnapshot,
+    snapshot: &UserSnapshot,
 ) -> Option<ConfigNotice> {
-    if snapshot.person_count() < 2 {
+    if snapshot.user_count() < 2 {
         return None;
     }
     let actor = change.actor.as_ref()?;
-    let audience = match snapshot.operator_of_origin(actor) {
+    let audience = match snapshot.user_of_origin(actor) {
         Some(maker) => {
             let others: std::collections::BTreeSet<String> = snapshot
-                .person_ids()
+                .user_ids()
                 .into_iter()
                 .filter(|id| *id != maker.id)
                 .flat_map(|id| snapshot.devices_of(id))
@@ -410,65 +418,9 @@ pub(crate) fn notice(
     })
 }
 
-/// Post a notification for every config change somebody makes, for as long
-/// as the bus runs.
-pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
-    let (mut rx, mut replay) = LagReplay::subscribe(
-        &engine.event_bus,
-        ReplayScope::Workspace,
-        Some(CONFIG_CHANGE_EVENTS.to_vec()),
-    );
-    tokio::spawn(async move {
-        while let Some(frames) = replay.read(rx.recv().await, engine.pool()).await {
-            for frame in frames {
-                if let Err(e) = announce(&engine, &frame).await {
-                    log!(
-                        "[ConfigChange] Cannot post a config change notification: {}",
-                        e
-                    );
-                }
-            }
-        }
-        log!("[ConfigChange] Config change stream ended");
-    })
-}
-
-async fn announce(engine: &LucidosEngine, frame: &EmittedEvent) -> Result<(), BoxError> {
-    let (BusEvent::System(event), Some(_)) = (&frame.typed, frame.seq) else {
-        return Ok(());
-    };
-    let Some(change) = change_of(event.event_type(), &event.to_payload()) else {
-        return Ok(());
-    };
-    let Some(notice) = notice(
-        &change,
-        frame.event_id,
-        &crate::gateway_operators::current(),
-    ) else {
-        return Ok(());
-    };
-    engine
-        .event_bus
-        .emit(BusEvent::System(SystemEvent::NotificationCreated {
-            id: Uuid::new_v4().to_string(),
-            title: notice.title,
-            message: notice.message,
-            task_id: None,
-            app_id: None,
-            thread_id: None,
-            event_id: None,
-            tap: notice.tap,
-            actor: None,
-            audience: notice.audience,
-            push_group: None,
-        }))
-        .await?;
-    Ok(())
-}
-
 /// The config change a stored event records, by its id. `None` when no event
 /// has the id or it records no config change.
-pub(crate) async fn stored_change(
+pub async fn stored_change(
     pool: &sqlx::PgPool,
     event_id: Uuid,
 ) -> Result<Option<ConfigChange>, sqlx::Error> {
@@ -553,7 +505,7 @@ fn trigger_write_applies(
 }
 
 /// What an undo writes through: the stores a config change came from.
-pub(crate) struct UndoTargets<'a> {
+pub struct UndoTargets<'a> {
     pub pool: &'a sqlx::PgPool,
     pub bus: &'a crate::engine::event_bus::EventBus,
     pub triggers: crate::engine::trigger_writes::TriggerRegistryWriter<'a>,
@@ -561,7 +513,7 @@ pub(crate) struct UndoTargets<'a> {
 }
 
 impl LucidosEngine {
-    pub(crate) fn undo_targets(&self) -> UndoTargets<'_> {
+    pub fn undo_targets(&self) -> UndoTargets<'_> {
         UndoTargets {
             pool: self.pool(),
             bus: &self.event_bus,
@@ -575,7 +527,7 @@ impl LucidosEngine {
 /// `Ok(false)` when the config has moved on and the inverse no longer
 /// applies: a later change touched the same thing, or it is already gone, or
 /// already back.
-pub(crate) async fn apply_undo(
+pub async fn apply_undo(
     targets: &UndoTargets<'_>,
     event_id: Uuid,
     undo: ConfigUndo,

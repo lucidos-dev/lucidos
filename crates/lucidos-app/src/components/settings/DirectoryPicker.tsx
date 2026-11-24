@@ -14,8 +14,6 @@ interface DirectoryPickerProps {
   onCancel: () => void;
 }
 
-/** One directory. With no `name`, inside a `SkeletonProvider`, it is the
- *  list's loading placeholder. */
 function DirRow({ name, up = false, selected = false, onClick, onMouseEnter }: {
   name?: string;
   up?: boolean;
@@ -38,8 +36,6 @@ function DirRow({ name, up = false, selected = false, onClick, onMouseEnter }: {
   );
 }
 
-/** Inner children of `.dir-picker-list`. Branches on all four Loadable states
- *  so loading and failed are visually distinct from loaded-empty. */
 export function directoryPickerBody({
   data,
   showLoading,
@@ -110,8 +106,6 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const showLoading = useDelayedLoading(data);
 
   useEffect(() => {
-    // Fast breadcrumb clicks overlap reads. A superseded reply must not land,
-    // or Select would return a directory the user already left.
     let cancelled = false;
     setData({ status: 'loading' });
     setSelectedIndex(-1);
@@ -152,9 +146,6 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const joinPath = (parent: string, child: string) => parent === '/' ? '/' + child : parent + '/' + child;
 
   return (
-    // A centered modal, so it takes `<Overlay>`'s own `.modal-overlay`
-    // container. `.dir-picker` places nothing itself, so a wrapper of its own
-    // would leave the panel unscrimmed and in flow.
     <Overlay open onClose={onCancel} panelClass="surface surface-raised dir-picker" panelRole="dialog" ariaModal>
       <SurfaceHead title="Select Directory" onClose={onCancel} closeLabel="Close directory picker" />
 

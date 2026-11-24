@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A coding agent that exited on its own fails the turn with a card. The card
- *  quotes the CLI, says why Lucidos did not retry, and offers Try again. A
- *  failure with no `agent_exit` keeps the old card. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

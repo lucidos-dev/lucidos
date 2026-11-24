@@ -1,14 +1,3 @@
-/**
- * *Ghost focus*: a keyboard field holds focus while the iOS keyboard is down.
- * The iOS photo picker leaves the composer that way, and so does a focus()
- * made outside a gesture. Everything that reads focus as "the user is typing"
- * then holds: the header and title row stay away and pane swipes are refused.
- * A tap on the transcript does not end it, since iOS keeps focus on a tap that
- * lands on nothing focusable.
- *
- * The mobile shell blurs the field on the next touch elsewhere when this pure
- * decision says the focus is ghost.
- */
 import { describe, it, expect } from 'vitest';
 import { isGhostFocus, KEYBOARD_RISE_GRACE_MS } from '../MobileSwipeContainer';
 

@@ -2,12 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { marketplaceCatalog, marketplaceScanning } from '../store';
 import { ApiError } from '../../api/client/_core';
 import type { MarketplaceCatalog } from '../types';
+import { beginSliceRead, settleSliceRead } from '../bootstrapSliceLoads';
 
-// Mock the API client barrel. `fetchPluginCatalog` is the slow catalog scan
-// (clones every registered marketplace repo) that the bug surfaces on; the rest
-// are pulled in by plugin-marketplaces.ts at import time. `isTransportError`
-// keeps the REAL transport-error classifier so the retry path is exercised
-// honestly rather than against a stub that always says "transient".
 const mockFetchPluginCatalog = vi.fn();
 const mockAddPluginMarketplace = vi.fn();
 const mockRemovePluginMarketplace = vi.fn();
@@ -25,6 +21,7 @@ import {
   addPluginMarketplaceAction,
   loadPluginCatalog,
   pluginCatalogScanned,
+  pluginCatalogSlice,
   refreshPluginCatalog,
   refreshPluginCatalogAfterMutation,
   removePluginMarketplaceAction,
@@ -32,8 +29,6 @@ import {
   resyncPluginCatalog,
 } from './plugin-marketplaces';
 
-/** A catalog response the way the engine sends it. Typed, so a new wire field
- *  fails here instead of arriving as `undefined` in every test at once. */
 function catalogOf(over: Partial<MarketplaceCatalog> = {}): MarketplaceCatalog {
   return {
     marketplaces: [],
@@ -48,9 +43,6 @@ function catalogOf(over: Partial<MarketplaceCatalog> = {}): MarketplaceCatalog {
 
 const emptyCatalog = catalogOf();
 
-/** A catalog fetch the test releases by hand. `scanning` is the engine's own
- *  answer, which is what drives the panel's cue: the client no longer decides
- *  it (see `loadPluginCatalog`). */
 function deferredCatalog(
   marketplaces: Array<{ id: string; name: string; source: string }>,
   scanning = false,
@@ -77,8 +69,6 @@ describe('loadPluginCatalog self-heal', () => {
   });
 
   it('retries a transient transport error (iOS PWA "Load failed") and self-heals to loaded', async () => {
-    // Two stale-connection blips, then the connection re-establishes — exactly
-    // what the user sees when they navigate away and back and the panel loads.
     mockFetchPluginCatalog
       .mockRejectedValueOnce(new TypeError('Load failed'))
       .mockRejectedValueOnce(new TypeError('Load failed'))
@@ -111,8 +101,22 @@ describe('loadPluginCatalog self-heal', () => {
     await done;
 
     expect(marketplaceCatalog.value.status).toBe('failed');
-    // 1 initial attempt + the bounded retries.
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe('a bootstrap snapshot of the catalog', () => {
+  it('never overwrites a narrow catalog read that started after it', async () => {
+    marketplaceCatalog.value = { status: 'not-loaded' };
+    const start = beginSliceRead('plugin_catalog');
+    const ctx = pluginCatalogSlice.begin();
+    const newer = catalogOf({ scanned_at: '2026-09-22T11:00:00Z' });
+    mockFetchPluginCatalog.mockReset().mockResolvedValueOnce(newer);
+    await loadPluginCatalog(true);
+
+    await settleSliceRead('plugin_catalog', start, pluginCatalogSlice, ctx, { body: emptyCatalog });
+
+    expect(marketplaceCatalog.value).toEqual({ status: 'loaded', data: newer });
   });
 });
 
@@ -127,9 +131,6 @@ describe('catalog refresh coalescing', () => {
     vi.useRealTimers();
   });
 
-  // The Store tab tells "no plugins" from "not scanned yet" off this flag, and
-  // the engine is what knows: the scan runs on its scheduler, so a scan nobody
-  // here started still has to raise the cue. Every fetch carries the answer.
   it('takes the scanning flag from the engine, not from its own fetch', async () => {
     const first = deferredCatalog([], true);
     const trailing = deferredCatalog([], false);
@@ -144,7 +145,6 @@ describe('catalog refresh coalescing', () => {
     await vi.runAllTimersAsync();
     await firstRefresh;
 
-    // The engine said a scan was still running, so the cue stays up.
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(2);
     expect(marketplaceScanning.value).toBe(true);
 
@@ -154,11 +154,6 @@ describe('catalog refresh coalescing', () => {
     expect(marketplaceScanning.value).toBe(false);
   });
 
-  // The reported bug's exact shape. The agent registered a marketplace and
-  // renamed it seconds later; a catalog scan git-clones every marketplace and
-  // takes seconds, so the rename's SSE refresh lands mid-scan. Merely joining
-  // the in-flight scan would settle the panel on the pre-rename registry that
-  // scan had already read, with nothing left to correct it.
   it('re-scans after the in-flight one when a mutation refresh arrives mid-scan', async () => {
     const before = deferredCatalog([
       { id: 'm1', name: 'lucidos plugins', source: 'https://github.com/example-org/example-repo' },
@@ -171,9 +166,7 @@ describe('catalog refresh coalescing', () => {
         ],
       }));
 
-    // Registration event: scan starts and reads the pre-rename registry.
     const first = refreshPluginCatalogAfterMutation();
-    // Rename event, while that scan is still cloning.
     const second = refreshPluginCatalogAfterMutation();
 
     before.release();
@@ -188,7 +181,6 @@ describe('catalog refresh coalescing', () => {
     });
   });
 
-  // Many events mid-scan collapse into ONE follow-up, not one scan per event.
   it('collapses a burst of mid-scan mutation refreshes into a single trailing scan', async () => {
     const gate = deferredCatalog([]);
     mockFetchPluginCatalog
@@ -208,9 +200,6 @@ describe('catalog refresh coalescing', () => {
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(2);
   });
 
-  // The case the in-flight sharing exists for. Neither a plain reader (the
-  // AppsView prime-load) nor a panel-open re-scan knows of a mutation to be
-  // fresher than, so neither may add a second clone-everything pass.
   it('does not queue a trailing scan for a reader or a plain re-scan', async () => {
     const gate = deferredCatalog([]);
     mockFetchPluginCatalog
@@ -228,8 +217,6 @@ describe('catalog refresh coalescing', () => {
 
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(1);
   });
-  // An awaiter must see the data it waited for. Settling when the in-flight
-  // read ends hands it the pre-mutation catalog that read already held.
   it('settles a mid-scan mutation refresh only once its trailing read lands', async () => {
     const before = deferredCatalog([]);
     const trailing = deferredCatalog([{ id: 'm1', name: 'Fresh', source: 'https://github.com/example-org/example-repo' }]);
@@ -254,10 +241,6 @@ describe('catalog refresh coalescing', () => {
   });
 });
 
-// The reported freeze: the Add form stayed disabled with the URL still in it,
-// and the new row absent, for as long as a clone-everything scan took. The
-// registry write is already committed when the response returns, and the
-// response carries the whole list, so neither has to wait for a scan.
 describe('a marketplace mutation shows its own result', () => {
   const NEW_MARKETPLACE = {
     id: 'example-repo-1a2b3c4d',
@@ -300,9 +283,6 @@ describe('a marketplace mutation shows its own result', () => {
     };
   }
 
-  // A scan left unresolved would outlive its test: the in-flight handle is
-  // module state, so the next test's refresh would join it instead of starting
-  // one. Every gate opened here is released when the test ends.
   const openScans: Array<() => void> = [];
   function scanStillCloning() {
     const gate = deferredCatalog([]);
@@ -332,7 +312,6 @@ describe('a marketplace mutation shows its own result', () => {
       created: true,
       commit: 'abc123',
     });
-    // Never released: the scan is still cloning when the assertions run.
     mockFetchPluginCatalog.mockImplementation(scanStillCloning());
 
     let registered: boolean | undefined;
@@ -346,12 +325,6 @@ describe('a marketplace mutation shows its own result', () => {
     });
   });
 
-  // The registered marketplace is listed with no plugins under it yet. So the
-  // Store tab must know a scan is running before it says "No plugins found".
-  //
-  // The engine stamps the scan as queued inside the registration itself, before
-  // it spawns the scanning task, so the refetch below cannot outrun it. That is
-  // what makes a server-owned flag safe here (`note_scan_queued`).
   it('reports a scan running from the registration until its catalog lands', async () => {
     loadedWith([OTHER_MARKETPLACE]);
     mockAddPluginMarketplace.mockResolvedValue({
@@ -372,8 +345,6 @@ describe('a marketplace mutation shows its own result', () => {
 
     expect(marketplaceScanning.value).toBe(true);
 
-    // The scan lands and the panel re-reads, which is the SSE arm's job in the
-    // real app and a plain refresh here.
     void refreshPluginCatalog();
     settled.release();
     await vi.runAllTimersAsync();
@@ -408,16 +379,12 @@ describe('a marketplace mutation shows its own result', () => {
     });
   });
 
-  // A scan that read the registry BEFORE the write must not land: its list has
-  // no new marketplace in it, so the row the user just added would blink out
-  // until the trailing scan restored it.
   it('discards a scan that predates the registration', async () => {
     loadedWith([OTHER_MARKETPLACE]);
     const stale = deferredCatalog([OTHER_MARKETPLACE]);
     mockFetchPluginCatalog
       .mockImplementationOnce(stale.scan)
       .mockResolvedValue(catalogOf({ marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE] }));
-    // The Plugins panel's own re-scan, already cloning when the user hits Add.
     void refreshPluginCatalog();
 
     mockAddPluginMarketplace.mockResolvedValue({
@@ -440,10 +407,6 @@ describe('a marketplace mutation shows its own result', () => {
     expect(seen.every((ids) => ids.includes(NEW_MARKETPLACE.id))).toBe(true);
   });
 
-  // Re-registering a source under a new name is a rename, and the id is a hash
-  // of the source, so the id survives it. An expectation keyed on ids alone
-  // would accept a scan carrying the OLD name, which is the stale-name bug
-  // `refreshPluginCatalogAfterMutation` exists for.
   it('discards a scan carrying the pre-rename name', async () => {
     const renamed = { ...OTHER_MARKETPLACE, name: 'Renamed plugins' };
     loadedWith([OTHER_MARKETPLACE]);
@@ -473,17 +436,12 @@ describe('a marketplace mutation shows its own result', () => {
     expect(seen.every((names) => names.includes('Renamed plugins'))).toBe(true);
   });
 
-  // The engine writes the registry before it announces, so the scan our own
-  // SSE frame starts already reads the new one. Queueing a trailing scan
-  // beside it would clone every registered repo a second time for nothing.
   it('joins a scan that already reflects the registration', async () => {
     loadedWith([OTHER_MARKETPLACE]);
     const current = deferredCatalog([NEW_MARKETPLACE, OTHER_MARKETPLACE]);
     mockFetchPluginCatalog
       .mockImplementationOnce(current.scan)
       .mockResolvedValue(catalogOf({ marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE] }));
-    // The SSE frame this device's own registration produced, answered before
-    // the POST resolved.
     void refreshPluginCatalogAfterMutation();
 
     mockAddPluginMarketplace.mockResolvedValue({
@@ -504,8 +462,6 @@ describe('a marketplace mutation shows its own result', () => {
     });
   });
 
-  // Synthesising a loaded catalog with no plugins would swap the Store tab's
-  // skeleton for an empty state the scan then contradicts.
   it('does not fabricate a catalog when none has loaded yet', async () => {
     mockAddPluginMarketplace.mockResolvedValue({
       marketplace: NEW_MARKETPLACE,
@@ -522,8 +478,6 @@ describe('a marketplace mutation shows its own result', () => {
   });
 });
 
-// A scan runs on the engine's scheduler, so `PluginCatalogScanned` is how every
-// client learns one ended, whoever started it.
 describe('a scan landing', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -535,7 +489,6 @@ describe('a scan landing', () => {
     vi.useRealTimers();
   });
 
-  // A failed scan ends too. Leaving the cue up would claim data is coming.
   it('lowers the updating cue and re-reads an open catalog', async () => {
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf({ scanned_at: '2026-09-22T09:00:00Z' }) };
     pluginCatalogScanned();
@@ -544,7 +497,6 @@ describe('a scan landing', () => {
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(1);
   });
 
-  // A device that never opened the panel is not made to fetch a catalog.
   it('does not re-read a catalog nobody loaded', async () => {
     marketplaceCatalog.value = { status: 'not-loaded' };
     pluginCatalogScanned();
@@ -553,8 +505,6 @@ describe('a scan landing', () => {
     expect(mockFetchPluginCatalog).not.toHaveBeenCalled();
   });
 
-  // The reported bug: a pull re-read the cached catalog, so the list never
-  // moved. A refresh asks for a scan.
   it('refreshes by asking for a scan, and settles once its result is on screen', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf({ scanned_at: '2026-09-22T09:00:00Z' }) };
@@ -573,8 +523,6 @@ describe('a scan landing', () => {
     expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
   });
 
-  // SSE replays neither scan frame, so a phone that slept through the scan
-  // never hears it land. The next read after the request carries its result.
   it('settles a refresh from a later read when the scan frame never arrives', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
@@ -596,9 +544,6 @@ describe('a scan landing', () => {
     expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
   });
 
-  // A scan already running can land while the request is in flight. Its
-  // frame cannot say whether the requested scan has run, so a read after the
-  // response decides: still scanning keeps the refresh waiting.
   it('does not settle on a scan that landed while the request was in flight', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
@@ -620,8 +565,6 @@ describe('a scan landing', () => {
     expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
   });
 
-  // SSE and HTTP arrive in no fixed order, so a frame after the response can
-  // still be an earlier scan's. Only a read that finds no scan running settles.
   it('does not settle on a frame whose re-read still finds a scan running', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
@@ -641,8 +584,6 @@ describe('a scan landing', () => {
     expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
   });
 
-  // The failed catalog is the visible end. Pending on, the refresh would
-  // block every later pull on this panel.
   it('settles on a read after the request that fails', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };

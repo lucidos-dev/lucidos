@@ -92,6 +92,9 @@ RELEASE_FINGERPRINT_PATHS=(
 RELEASE_FINGERPRINT_RECIPE_PATHS=(
     scripts/build-dmg.sh
     scripts/lib/stage_runtime.sh
+    scripts/lib/dmg_layout.py
+    scripts/lib/dmg_volume.sh
+    scripts/lib/release_dmg.sh
 )
 
 # release_build_fingerprint_compute <repo-root> [<commit-ish>] — print the

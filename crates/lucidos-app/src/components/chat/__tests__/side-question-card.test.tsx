@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** The side-question card (ADR 0320): the question, then a delayed
- *  "Thinking", the answer as markdown, or the error. It says the answer is not
- *  part of the conversation. Dismissed, it folds to a row that reopens. It
- *  stays where it was asked, and later turns draw below it. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type VNode } from 'preact';
 import { act } from 'preact/test-utils';
@@ -27,7 +23,6 @@ import type { StoredEvent } from '../../../store/thread-events/thread-event-type
 
 let host: HTMLDivElement;
 
-/** The feed as ThreadView draws it, for a thread with no turns yet. */
 function Feed() {
   return <>{placeSideQuestions([], [], sideQuestionsFor('t1'), false)}</>;
 }
@@ -68,8 +63,6 @@ it('renders the answer as markdown, with the not-recorded note', () => {
   expect(card.textContent).toContain(SIDE_QUESTION_NOTE);
 });
 
-// The question is the user's own words, so it renders as markdown like a
-// message they send. A pasted fence printed its backticks.
 it('renders the question as markdown, so a fence becomes a code block', () => {
   show([{ ...asked, id: 'a', question: 'why?\n\n```\nfn main() {}\n```', status: 'pending' }]);
   const question = host.querySelector('.side-question-question')!;
@@ -77,8 +70,6 @@ it('renders the question as markdown, so a fence becomes a code block', () => {
   expect(question.textContent).not.toContain('```');
 });
 
-// The card sits outside the turn body, so it carries the link router itself.
-// Without it the webview followed a `repo:` link to macOS, which refused it.
 it('opens a repo link in the answer in the app, never the OS', () => {
   show([{ ...asked, id: 'a', question: 'where?', status: 'answered', answer: 'In [main](repo:lucidos:file:src/main.rs).' }]);
   const anchor = host.querySelector('.markdown-content a')!;
@@ -103,9 +94,9 @@ it('says Thinking only after a delay while pending, shimmering like the live ste
 });
 
 it('shows a failure as an alert', () => {
-  show([{ ...asked, id: 'a', question: 'q', status: 'failed', error: 'Side questions are not available in Codex threads.' }]);
+  show([{ ...asked, id: 'a', question: 'q', status: 'failed', error: 'Update Codex to use ephemeral side-question forks.' }]);
   const alert = host.querySelector('[role="alert"]')!;
-  expect(alert.textContent).toBe('Side questions are not available in Codex threads.');
+  expect(alert.textContent).toBe('Update Codex to use ephemeral side-question forks.');
 });
 
 it('offers Retry on a failure only, and turns the card back to Thinking in place', () => {

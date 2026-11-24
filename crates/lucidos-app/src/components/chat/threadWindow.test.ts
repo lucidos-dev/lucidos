@@ -43,37 +43,21 @@ import {
 } from './threadWindow';
 import { SCROLLABLE_SLACK_PX, transcriptScrolls } from './transcriptScrolls';
 
-/** `n` exchanges each costing `cost` steps. */
 const flat = (n: number, cost: number): number[] => Array.from({ length: n }, () => cost);
 
-/** The reported thread's real turn sizes, one entry per exchange, oldest first.
- *  653 events over 19 exchanges, all of which rendered on open under the old
- *  turn-counting window. See
- *  docs/plans/2026-08-26-the-transcript-window-counts-steps-not-turns.md. */
 const REPORTED_THREAD = [23, 80, 10, 52, 47, 7, 12, 53, 11, 60, 32, 32, 53, 23, 11, 0, 36, 17, 34]
     .map(steps => steps + 1);
 
-/** Two more reported threads' real turn sizes, oldest first, read out of the
- *  workspace event log. Both are coding-agent threads ending on a small
- *  `ChangeApplied` boundary behind a huge working turn, which is the shape
- *  `fillAction` exists for. */
 const ARCHIVED_THREAD = [357, 1, 115, 0, 0, 2, 0, 288, 7].map(steps => steps + 1);
 const SKELETON_THREAD = [177, 1, 323, 1].map(steps => steps + 1);
 
-/** A viewport the rendered slice is measured against. */
 const view = (scrollHeight: number, clientHeight = 800) => ({ scrollHeight, clientHeight });
 
-/** The edge a trailing-exchange count implies, with nothing clamped inside the
- *  floor turn. Lets the cases below stay written in the unit they are about. */
 const edgeOf = (total: number, renderCount: number): WindowEdge =>
     ({ exchange: computeRenderFromIndex(total, renderCount), rowsHidden: 0 });
 
-/** `n` rows, every one drawn: the default view, steps and details on. */
 const allDrawn = (n: number): boolean[] => Array.from({ length: n }, () => true);
 
-/** A `rowsAt` over a fixed list of row counts, every row drawn, so a case can
- *  say how big each turn is without folding anything. Turns not listed have no
- *  rows. */
 const rowsFrom = (rows: readonly number[]) => (index: number) => allDrawn(rows[index] ?? 0);
 
 describe('thread render windowing', () => {
@@ -118,8 +102,6 @@ describe('thread render windowing', () => {
 
     describe('seedRenderCount', () => {
         it('holds an ordinary chat at the exchange cap, unchanged', () => {
-            // 4 steps a turn: 40 turns would cost 160, so the budget never binds
-            // and the cap decides. Exactly the window this thread had before.
             expect(seedRenderCount(flat(100, 4))).toBe(INITIAL_WINDOW);
         });
 
@@ -134,13 +116,10 @@ describe('thread render windowing', () => {
             const steps = REPORTED_THREAD.slice(REPORTED_THREAD.length - seeded)
                 .reduce((a, c) => a + c, 0);
             expect(steps).toBeLessThanOrEqual(STEP_BUDGET);
-            // Everything above the seeded tail is still reachable by scrolling up.
             expect(edgeHasMoreAbove(edgeOf(REPORTED_THREAD.length, seeded))).toBe(true);
         });
 
         it('renders one exchange even when it alone blows the budget', () => {
-            // Without the floor the transcript would be empty, which emptyReason
-            // reads as `corrupt`.
             expect(seedRenderCount([5, STEP_BUDGET * 3])).toBe(1);
         });
 
@@ -155,9 +134,6 @@ describe('thread render windowing', () => {
         });
 
         it('waits for the load, so a fragment cannot pin the window', () => {
-            // A pending message or an early SSE event puts one exchange on screen
-            // before the snapshot lands. The write happens once, so seeding here
-            // would leave the full history in a one-exchange window.
             expect(canSeedRenderWindow(state({}))).toBe(false);
         });
 
@@ -184,11 +160,9 @@ describe('thread render windowing', () => {
 
     describe('expandRenderCount', () => {
         it('grows by one budget of older exchanges', () => {
-            // 40 steps a turn: four fit in a 160 budget.
             expect(expandRenderCount(flat(100, 40), 20)).toBe(24);
         });
         it('grows an ordinary chat by WINDOW_STEP, unchanged', () => {
-            // 4 steps a turn: the budget clears 32, so the cap decides.
             expect(expandRenderCount(flat(1000, 4), 20)).toBe(20 + WINDOW_STEP);
         });
         it('caps at the total so it stabilizes once all is shown', () => {
@@ -204,7 +178,6 @@ describe('thread render windowing', () => {
     });
 
     describe('fillAction', () => {
-        /** A thread served whole: nothing older is coming. */
         const whole = (v: ReturnType<typeof view>, edge: WindowEdge) => fillAction(v, edge, false);
 
         it('asks nothing once the whole thread is rendered', () => {
@@ -223,9 +196,6 @@ describe('thread render windowing', () => {
             expect(transcriptScrolls(view(800 + SCROLLABLE_SLACK_PX))).toBe(false);
         });
 
-        /** The reported stick. Every turn this client held was already
-         *  rendered, so nothing was left to grow. Meanwhile 662 events sat on
-         *  the server, behind a scroll event a short transcript never fires. */
         it('pages when the window is out of loaded turns and the server has more', () => {
             expect(fillAction(view(120), WHOLE_THREAD, true)).toBe('page');
         });
@@ -248,17 +218,12 @@ describe('thread render windowing', () => {
                 const seeded = seedRenderCount(costs);
                 expect(whole(view(200), edgeOf(costs.length, seeded))).toBe('grow');
                 const filled = expandRenderCount(costs, seeded);
-                // One round takes the working turn behind the boundary, which
-                // is the biggest turn in either thread.
                 expect(filled).toBe(2);
                 expect(whole(view(4000), edgeOf(costs.length, filled))).toBe('none');
             }
         });
 
         it('charges no round that drew nothing, so the loop ends at the top', () => {
-            // Every turn blows the budget alone and draws no row. Charging those
-            // rounds stopped the loop at the cap with the pane still empty. Each
-            // one moved the edge up, so the thread's own top ends the loop.
             const costs = flat(200, STEP_BUDGET * 2);
             const silent = () => [false, false];
             let edge = seedWindowEdge(costs, silent);
@@ -276,19 +241,11 @@ describe('thread render windowing', () => {
             expect(edge).toEqual(WHOLE_THREAD);
         });
 
-        /** The page arm answers from the SERVER's watermark, so it keeps saying
-         *  `'page'` while a page draws no height. Nothing here can end that,
-         *  which is exactly why `MAX_FILL_BACKFILLS` exists in the caller. A
-         *  loop written against this function alone would only ever prove its
-         *  own counter, so the cap is asserted where it lives. */
         it('never ends a loop of pages by itself', () => {
             expect(fillAction(view(0), WHOLE_THREAD, true)).toBe('page');
             expect(MAX_FILL_BACKFILLS).toBeGreaterThan(0);
             const threadView = readFileSync(
                 resolve(dirname(fileURLToPath(import.meta.url)), 'ThreadView.tsx'), 'utf-8');
-            // BOTH halves, for both kinds. A guard over a ledger nothing charges
-            // allows every round for ever, and every suite stays green while
-            // the fill pages without bound.
             for (const kind of ['page', 'grow']) {
                 expect(threadView).toContain(`if (!fillRoundAllowed(ledger, '${kind}')) return;`);
                 expect(threadView).toContain(`chargeFillRound(ledger, '${kind}', reading)`);
@@ -301,22 +258,11 @@ describe('thread render windowing', () => {
         });
     });
 
-    /** A deep link's floor is a NAVIGATION's claim, and it used to outlive the
-     *  visit that made it. One reported thread paid 4,069 rendered rows on every
-     *  open afterwards, against the 37 its window would have drawn. */
     describe('reseedOnReopen', () => {
-        /** Even when a deep link opens it: the link claims its own turn after
-         *  the re-seed. A chevron's render-all kept here drew the thread whole. */
         it('drops a claim the last visit left behind', () => {
             expect(reseedOnReopen('claimed')).toBe(true);
         });
 
-        /** The reader grew this one by scrolling, so it describes where they
-         *  are. Re-seeding would make them walk back up on every return.
-         *
-         *  That holds for a window grown all the way to the first turn. Its
-         *  edge equals `WHOLE_THREAD` by value. Read as a claim, the thread
-         *  would open on the newest turns and jump when the walk arrives. */
         it('keeps a window the reader grew, even one reaching the first turn', () => {
             expect(reseedOnReopen('grown')).toBe(false);
         });
@@ -328,18 +274,13 @@ describe('thread render windowing', () => {
 
     describe('scrollToTopNeedsRenderAll', () => {
         it('requires render-all while older exchanges sit above the window', () => {
-            // A long thread opens windowed to the tail — scroll-to-top must render
-            // the whole thread first, or it stalls partway (the "needed N clicks" bug).
             expect(scrollToTopNeedsRenderAll(edgeOf(100, INITIAL_WINDOW))).toBe(true);
-            // One scroll-up expansion isn't enough on a long thread, still windowed.
             expect(scrollToTopNeedsRenderAll(edgeOf(100, INITIAL_WINDOW + WINDOW_STEP))).toBe(true);
         });
 
         it('skips render-all once the full thread is already rendered', () => {
-            // Short thread fits in the initial window — scroll straight to top.
             expect(scrollToTopNeedsRenderAll(edgeOf(INITIAL_WINDOW, INITIAL_WINDOW))).toBe(false);
             expect(scrollToTopNeedsRenderAll(edgeOf(5, INITIAL_WINDOW))).toBe(false);
-            // Already expanded to everything (deep-link render-all / a prior top jump).
             expect(scrollToTopNeedsRenderAll(edgeOf(1000, Infinity))).toBe(false);
         });
     });
@@ -350,7 +291,6 @@ describe('thread render windowing', () => {
         let count = seedRenderCount(costs);
         let from = computeRenderFromIndex(total, count);
         expect(from).toBe(75);
-        // Scroll up repeatedly until nothing remains above.
         let guard = 0;
         while (edgeHasMoreAbove(edgeOf(total, count)) && guard++ < 100) {
             count = expandRenderCount(costs, count);
@@ -394,17 +334,11 @@ describe('thread render windowing', () => {
         });
     });
 
-    /* The window's promise is about POSITION. `renderCountByThread` held a SIZE,
-     * so appending a turn slid the window forward and dropped the oldest one out
-     * of the DOM. `fillAction` grew it back only while the transcript was
-     * too short to scroll, which a 375px pane leaves behind in two turns. */
     describe('a turn appended after the seed', () => {
         it('never pushes an already-rendered turn out of the window', () => {
             const costs = flat(2, 3);
             const floor = computeRenderFromIndex(costs.length, seedRenderCount(costs));
             expect(floor).toBe(0);
-            // The reader sends a third and a fourth. The edge is what is held, so
-            // every turn they have seen stays rendered.
             for (const total of [3, 4]) {
                 expect(computeRenderFromIndex(total, renderCountFromFloor(total, floor))).toBe(0);
             }
@@ -414,29 +348,15 @@ describe('thread render windowing', () => {
             const costs = flat(95, 4);
             const floor = computeRenderFromIndex(costs.length, seedRenderCount(costs));
             expect(floor).toBe(75);
-            // Twenty turns later the reader can still scroll back to turn 76.
             const grown = costs.length + 20;
             expect(computeRenderFromIndex(grown, renderCountFromFloor(grown, floor))).toBe(75);
         });
     });
 });
 
-// ---------------------------------------------------------------------------
-// WALKING UP TO THE TURN THE READER PARKED ON.
-//
-// A saved *reading position* names a turn (`hooks/useScrollMemory.ts`), because
-// this window decides the transcript's height afresh on every reload. The
-// restore cannot place the reader until that turn is rendered, so ThreadView
-// grows the window until it is.
-//
-// One budgeted round per commit, never a seed that jumps. The jump would render
-// every turn in between in one synchronous pass, which is the blocking render
-// windowing exists to prevent (ADR 0081).
-// ---------------------------------------------------------------------------
 describe('reaching the anchored turn', () => {
     describe('edgeReachesRow over an exchange-only edge', () => {
         it('is true for a turn inside the window, false for one above it', () => {
-            // 100 turns, the newest 20 rendered: the window starts at index 80.
             expect(edgeReachesRow(edgeOf(100, 20), 80, 0)).toBe(true);
             expect(edgeReachesRow(edgeOf(100, 20), 99, 0)).toBe(true);
             expect(edgeReachesRow(edgeOf(100, 20), 79, 0)).toBe(false);
@@ -450,8 +370,6 @@ describe('reaching the anchored turn', () => {
         });
 
         it('says no for a record naming a turn this thread has not got', () => {
-            // `findIndex` answers -1. Acting on it would walk the window to the
-            // very top of a thread the reader never asked to see.
             expect(edgeMustReachRow(edgeOf(100, 20), -1, 0)).toBe(false);
         });
 
@@ -465,23 +383,19 @@ describe('reaching the anchored turn', () => {
     });
 
     it('walks to the turn one budgeted round at a time, and stops there', () => {
-        // The reported thread's shape, read as the walk ThreadView drives: each
-        // commit spends exactly one `expandRenderCount`, and the loop ends the
-        // moment the turn is in the window. It must not overshoot to the top.
         const costs = flat(95, 4);
         const target = 20;
         let count = seedRenderCount(costs);
         const rounds: number[] = [];
         while (edgeMustReachRow(edgeOf(costs.length, count), target, 0)) {
             const next = expandRenderCount(costs, count);
-            expect(next).toBeGreaterThan(count); // every round takes something
-            expect(next - count).toBeLessThanOrEqual(WINDOW_STEP); // and never a jump
+            expect(next).toBeGreaterThan(count);
+            expect(next - count).toBeLessThanOrEqual(WINDOW_STEP);
             rounds.push(next - count);
             count = next;
         }
-        expect(rounds.length).toBeGreaterThan(1); // a real walk, not one hop
+        expect(rounds.length).toBeGreaterThan(1);
         expect(edgeReachesRow(edgeOf(costs.length, count), target, 0)).toBe(true);
-        // Stopped AT the turn rather than continuing to the top of the thread.
         expect(computeRenderFromIndex(costs.length, count)).toBeGreaterThan(0);
     });
 
@@ -492,22 +406,14 @@ describe('reaching the anchored turn', () => {
         while (edgeMustReachRow(edgeOf(costs.length, count), 0, 0)) {
             count = expandRenderCount(costs, count);
             rounds++;
-            expect(rounds).toBeLessThan(costs.length + 1); // no unbounded walk
+            expect(rounds).toBeLessThan(costs.length + 1);
         }
         expect(computeRenderFromIndex(costs.length, count)).toBe(0);
     });
 });
 
-/** The row dimension: what the exchange budget above could never bound.
- *
- *  The reported coding-agent thread holds five turns costing 1, 65, 684, 425
- *  and 1 steps against a `STEP_BUDGET` of 160. Every real turn blows the whole
- *  budget alone. So "at least one exchange" was the only rule that ever fired,
- *  and the window rendered a turn of everything. */
 describe('clamping the floor turn', () => {
-    /** The reported thread's turn sizes, oldest first, in raw events. */
     const VOICE_LOOP = [1, 65, 684, 425, 1].map(steps => steps + 1);
-    /** The same turns as rows drawn, roughly half their raw events. */
     const VOICE_LOOP_ROWS = [0, 64, 683, 424, 0];
     const voiceRows = rowsFrom(VOICE_LOOP_ROWS);
 
@@ -522,8 +428,6 @@ describe('clamping the floor turn', () => {
         });
 
         it('always leaves a row, whatever the budget says', () => {
-            // The floor `countWithinBudget` keeps one level up: a turn admitted
-            // to the window draws something, or the transcript reads as empty.
             expect(seedRowsHidden(allDrawn(500), 0)).toBe(499);
             expect(seedRowsHidden(allDrawn(1), 0)).toBe(0);
             expect(seedRowsHidden([])).toBe(0);
@@ -533,17 +437,11 @@ describe('clamping the floor turn', () => {
     describe('seedWindowEdge', () => {
         it('opens the reported thread on a bounded slice of one turn', () => {
             const edge = seedWindowEdge(VOICE_LOOP, voiceRows);
-            // The step budget takes only the trailing boundary turn, which
-            // draws nothing, so the seed alone still shows an empty pane. What
-            // matters is that it is an EDGE the fill can grow from.
             expect(edge.exchange).toBe(4);
             expect(edge.rowsHidden).toBe(0);
         });
 
         it('clamps a floor turn that is bigger than the row budget', () => {
-            // One turn, larger than the whole step budget. The exchange rule's
-            // "always take at least one" admits it, and the row rule is what
-            // then stops it drawing 880 rows on the open.
             const edge = seedWindowEdge([900], rowsFrom([880]));
             expect(edge.exchange).toBe(0);
             expect(edge.rowsHidden).toBe(880 - ROW_BUDGET);
@@ -562,7 +460,6 @@ describe('clamping the floor turn', () => {
             const edge = { exchange: 3, rowsHidden: 0 };
             const next = expandWindowEdge(edge, VOICE_LOOP, voiceRows);
             expect(next.exchange).toBe(2);
-            // And clamps THAT turn in its own turn: 683 rows do not all draw.
             expect(next.rowsHidden).toBe(683 - ROW_BUDGET);
         });
 
@@ -578,26 +475,22 @@ describe('clamping the floor turn', () => {
             while (edgeHasMoreAbove(edge)) {
                 const before = edge;
                 edge = expandWindowEdge(edge, VOICE_LOOP, voiceRows);
-                expect(edge).not.toEqual(before); // every round takes something
-                // No round may hand the reader an unbounded turn.
+                expect(edge).not.toEqual(before);
                 const uncovered = before.exchange === edge.exchange
                     ? before.rowsHidden - edge.rowsHidden
                     : voiceRows(edge.exchange).length - edge.rowsHidden;
                 drawn.push(uncovered);
                 expect(uncovered).toBeLessThanOrEqual(ROW_BUDGET);
                 rounds++;
-                expect(rounds).toBeLessThan(200); // no unbounded walk
+                expect(rounds).toBeLessThan(200);
             }
             expect(edge).toEqual(WHOLE_THREAD);
-            // The old window did this in ONE round of 1175 rows.
             expect(Math.max(...drawn)).toBeLessThanOrEqual(ROW_BUDGET);
         });
     });
 
     describe('reaching a reading position', () => {
         it('does not call a half-drawn turn reached', () => {
-            // ADR 0152 restores by the turn's own top edge, so a clamped head
-            // means the restore has nothing to measure from.
             expect(edgeReachesRow({ exchange: 2, rowsHidden: 40 }, 2, 0)).toBe(false);
             expect(edgeReachesRow({ exchange: 2, rowsHidden: 0 }, 2, 0)).toBe(true);
             expect(edgeReachesRow({ exchange: 2, rowsHidden: 40 }, 3, 0)).toBe(true);
@@ -630,8 +523,6 @@ describe('clamping the floor turn', () => {
 
     describe('edgeHasMoreAbove', () => {
         it('counts a clamped floor turn, not only older turns', () => {
-            // The up chevron and the fill both read this. A turn whose head is
-            // off screen is exactly as unreachable as a turn that is.
             expect(edgeHasMoreAbove({ exchange: 0, rowsHidden: 40 })).toBe(true);
             expect(edgeHasMoreAbove({ exchange: 1, rowsHidden: 0 })).toBe(true);
             expect(edgeHasMoreAbove(WHOLE_THREAD)).toBe(false);
@@ -643,8 +534,6 @@ describe('clamping the floor turn', () => {
         });
     });
 
-    /** A deep link used to render the whole thread. A 255-turn thread drew
-     *  about 29,000 nodes that way, and iOS killed the page. */
     describe('deepLinkEdge', () => {
         const edge = { exchange: 200, rowsHidden: 0 };
 
@@ -661,14 +550,10 @@ describe('clamping the floor turn', () => {
             expect(deepLinkEdge({ exchange: 200, rowsHidden: 40 }, 200)).toEqual({ exchange: 200, rowsHidden: 0 });
         });
 
-        /** History is still paging toward the target, or holds no turn for
-         *  it. Every stamp a link resolves comes from a turn, so drawing more
-         *  could not help it land (ADR 0631). */
         it('keeps the window for a target no loaded turn holds', () => {
             expect(deepLinkEdge(edge, -1)).toBe(edge);
         });
 
-        /** No turn on screen may leave the DOM when the floor moves. */
         it('never moves the floor down', () => {
             for (let target = 0; target < 260; target++) {
                 const next = deepLinkEdge({ exchange: 150, rowsHidden: 7 }, target);
@@ -723,15 +608,7 @@ describe('readingChaseAction: a reading position the loaded pages do not hold', 
     });
 });
 
-/** The row budget counts rows the reader's view DRAWS.
- *
- *  The reported turn: 748 text events, 45 with prose, and runs of 352 and 206
- *  tool calls between two lines of prose. With steps hidden, each call and the
- *  blank text before it draw nothing. Counted as rows, they filled the seed and
- *  every fill round, and the reader got a header over an empty body. */
 describe('budgeting by the rows the view draws', () => {
-    /** A coding-agent turn as its rows: each run is one prose chunk, then that
-     *  many tool calls, each preceded by the blank text the agent writes. */
     const turn = (runs: readonly number[], showSteps: boolean): boolean[] => runs.flatMap(calls => [
         true,
         ...Array.from({ length: calls }, () => [false, showSteps]).flat(),
@@ -741,8 +618,6 @@ describe('budgeting by the rows the view draws', () => {
     const onlyTurn = () => hiddenSteps;
 
     it('reaches a steps-hidden turn\'s prose in bounded rounds', () => {
-        // The seed stops at the ceiling, deep inside the 352-call run. Each
-        // round the fill takes after it is uncharged, since it draws nothing.
         let edge = seedWindowEdge([hiddenSteps.length], onlyTurn);
         let rounds = 0;
         while (drawnRowsInWindow(edge, 1, onlyTurn) === 0) {
@@ -755,7 +630,6 @@ describe('budgeting by the rows the view draws', () => {
     });
 
     it('used to open on nothing, which is the report', () => {
-        // The old unit: the last ROW_BUDGET rows, all inside the 352-call run.
         const oldHidden = hiddenSteps.length - ROW_BUDGET;
         expect(drawnRowsInWindow({ exchange: 0, rowsHidden: oldHidden }, 1, onlyTurn)).toBe(0);
     });
@@ -791,8 +665,6 @@ describe('budgeting by the rows the view draws', () => {
     });
 
     it('bounds what showing steps can make draw at once', () => {
-        // The edge is not re-seeded on the toggle, so the rows it uncovered
-        // while steps were hidden all draw the moment they are shown.
         const edge = seedWindowEdge([hiddenSteps.length], onlyTurn);
         const shown = () => hiddenSteps.map(() => true);
         expect(drawnRowsInWindow(edge, 1, shown)).toBeLessThanOrEqual(ROW_CEILING);
@@ -812,8 +684,6 @@ describe('budgeting by the rows the view draws', () => {
     });
 });
 
-/** A fill round that drew nothing is not charged. The caps bound rounds that
- *  DREW, and a refund always follows progress, so the loop still ends. */
 describe('the fill ledger', () => {
     const at = (drawn: number, floor = Infinity) => ({ drawn, floor });
 
@@ -850,8 +720,6 @@ describe('the fill ledger', () => {
     });
 
     it('keeps a page charged when only the live turn grew', () => {
-        // The live turn streams in at the NEWEST end. The floor holds still,
-        // so a failed page on a live thread is not mistaken for progress.
         let ledger = chargeFillRound(EMPTY_FILL_LEDGER, 'page', at(0, 5_000));
         ledger = settleFillLedger(ledger, at(0, 5_000));
         expect(ledger.page).toBe(1);
@@ -863,7 +731,6 @@ describe('the fill ledger', () => {
         while (fillRoundAllowed(ledger, 'page')) {
             ledger = chargeFillRound(ledger, 'page', at(0, 5_000));
             asks++;
-            // A failed read folds nothing in: no progress, no refund.
             ledger = settleFillLedger(ledger, at(0, 5_000));
             expect(asks).toBeLessThanOrEqual(MAX_FILL_BACKFILLS);
         }
@@ -871,8 +738,6 @@ describe('the fill ledger', () => {
     });
 
     it('pages through silent history to the first page that draws, past the cap', () => {
-        // Ten silent pages, then one with prose: the shape of a long run of
-        // tool calls a reader with steps hidden opens in the middle of.
         let ledger: FillLedger = EMPTY_FILL_LEDGER;
         let floor = 10_000;
         let drawn = 0;

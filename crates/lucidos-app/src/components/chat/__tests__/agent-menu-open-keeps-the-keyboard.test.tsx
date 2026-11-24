@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** Opening an agent menu in the prompt bar must never drop the keyboard.
- *
- *  On iOS, a blurred prompt drops the keyboard. The shell then grows under a
- *  panel placed for the shrunk viewport, and the panel jumps. With the keyboard
- *  up, the menu's filter box takes it over, and closing hands it back. */
 import { beforeAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -17,7 +12,6 @@ const { CodingAgentControlMenu, menuTakesFocus } = await import('../CodingAgentC
 const { RungControl } = await import('../RungControl');
 const { controlMenuParts } = await import('../controlMenuParts');
 
-// The menus' panel parts are code-split. Warm them, so a press opens at once.
 beforeAll(() => controlMenuParts.preload());
 
 let host: HTMLDivElement;
@@ -108,8 +102,6 @@ describe('the rung list under a finger', () => {
     act(() => { trigger.click(); });
     await frame();
     expect(document.querySelector('.control-option')).not.toBeNull();
-    // The filter box takes the keyboard straight from the prompt, as the
-    // model picker's does, so it never drops.
     expect(document.activeElement).toBe(document.querySelector('.control-filter'));
 
     act(() => { trigger.click(); });

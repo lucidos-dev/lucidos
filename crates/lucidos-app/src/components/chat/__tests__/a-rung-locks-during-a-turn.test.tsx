@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A started coding-agent thread keeps its rung while a turn runs (ADR 0542).
- * The pill still opens its list, explains the lock and records nothing.
- * Once the thread is idle a pick records again.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';

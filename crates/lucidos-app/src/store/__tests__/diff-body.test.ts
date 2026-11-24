@@ -20,10 +20,6 @@ describe('shouldRenderMarkdownDiff', () => {
   });
 
   it('renders for an external-repo Claude Code session that has only a branch ref', () => {
-    // viewThreadCcDiff() leaves repoSelectedChangeId null because external-repo
-    // Claude Code sessions never produce a Lucidos `Change` row: they only have
-    // the worktree branch in repoPending. Before the fix, this returned false and
-    // the .md diff fell back to the unified DiffView instead of RenderedDiff.
     expect(shouldRenderMarkdownDiff({
       ext: 'md', fileStatus: 'modified', activeChangeId: null, gitRef: 'claude-code/2026-04-29', filePreviewSourceOn: false,
     })).toBe(true);
@@ -72,9 +68,6 @@ describe('shouldShowWholeFile', () => {
   });
 });
 
-/** Which body the diff preview shows. Derived once so the header (which offers
- *  "Side by side" only for the raw hunks) and the body cannot disagree about
- *  what is on screen. */
 describe('diffBodyKind', () => {
   function preview(file: DiffFile, changeId = 'change-1'): void {
     repoDiff.value = { status: 'loaded', data: { files: [file] } };
@@ -120,16 +113,12 @@ describe('diffBodyKind', () => {
     expect(diffBodyKind.value).toBe('rendered-markdown');
   });
 
-  // The Source toggle is how a reader asks for the raw diff of a markdown file,
-  // and that IS the hunks, so side by side becomes available there.
   it('falls back to the hunks for markdown when Source is on', () => {
     preview(modified('docs/guide.md'));
     filePreviewSource.value = true;
     expect(diffBodyKind.value).toBe('hunks');
   });
 
-  // An external-repo coding-agent session produces no Change row, so the ref is
-  // all there is to fetch the post-change body with.
   it('renders markdown off the pending branch when there is no change id', () => {
     repoDiff.value = { status: 'loaded', data: { files: [modified('docs/guide.md')] } };
     panelOverlay.value = {
@@ -142,8 +131,6 @@ describe('diffBodyKind', () => {
   });
 });
 
-/** Null means "not showing a diff", which is what the header keys off to hide
- *  every diff-only control. Each of these is a distinct way to get there. */
 describe('diffBodyKind is null when there is no diff on screen', () => {
   beforeEach(() => {
     panelOverlay.value = null;
@@ -188,9 +175,6 @@ describe('diffBodyKind is null when there is no diff on screen', () => {
   });
 });
 
-/** What the header keys the "Side by side" toggle off. Both halves matter: the
- *  toggle must not appear over a body it would do nothing to, nor on a surface
- *  with no room for two columns. */
 describe('sideBySideDiffAvailable', () => {
   beforeEach(() => {
     panelOverlay.value = {

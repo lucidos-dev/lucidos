@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** The memory inspector draws its stats strip and entry rows as skeletons
- *  under one delay gate. A memory's source shimmers in its own code block
- *  while it loads, never a "Loading..." button label. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render, type FunctionComponent } from 'preact';
 import { act } from 'preact/test-utils';

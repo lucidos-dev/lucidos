@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Every collapsible drawer header leads with the chevron, and its turn follows
- * the header's `aria-expanded` (styles/section-header.css turns it on that
- * attribute). jsdom loads no CSS, so this pins the DOM the CSS keys on.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

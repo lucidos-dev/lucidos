@@ -1,16 +1,3 @@
-/**
- * Tests for the loader-delay logic shared by useDelayedLoading, useDelayedFlag,
- * and DelayedSpinner-style loaders. Drives the extracted pure effect
- * (delayedFlagEffect) directly with fake timers — no DOM needed (same style as
- * useAnchoredPopover.test.ts).
- *
- * Regression: opening a thread flashed the loading spinner for the few ms
- * until loadThreadEvents resolved — the spinner rendered immediately instead
- * of waiting the standard SPINNER_DELAY_MS like every other loader. The
- * mapping from thread state to the loading branch (emptyReason) is pinned in
- * components/chat/__tests__/prompt-animation-gate.test.ts; this file pins the
- * delay behavior itself.
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   delayedFlagEffect,
@@ -50,7 +37,7 @@ describe('delayedFlagEffect', () => {
     const h = harness();
     const cleanup = delayedFlagEffect(true, h.setShow, SPINNER_DELAY_MS);
     vi.advanceTimersByTime(150);
-    cleanup?.(); // load finished → effect re-runs with active=false
+    cleanup?.();
     delayedFlagEffect(false, h.setShow, SPINNER_DELAY_MS);
     vi.advanceTimersByTime(1000);
     expect(h.show).toBe(false);
@@ -63,7 +50,6 @@ describe('delayedFlagEffect', () => {
     expect(h.show).toBe(true);
     delayedFlagEffect(false, h.setShow, SPINNER_DELAY_MS);
     expect(h.show).toBe(false);
-    // The first timer already fired; the inactive branch must not add one.
     expect(vi.getTimerCount()).toBe(0);
   });
 });
@@ -96,7 +82,7 @@ describe('lingeringFlagEffect', () => {
     const h = harness();
     const cleanup = lingeringFlagEffect(false, h.setLingering, 350);
     vi.advanceTimersByTime(150);
-    cleanup?.(); // active flipped back → effect re-runs with active=true
+    cleanup?.();
     lingeringFlagEffect(true, h.setLingering, 350);
     vi.advanceTimersByTime(1000);
     expect(h.lingering).toBe(true);
@@ -128,7 +114,7 @@ describe('minimumVisibleFlagEffect', () => {
   it('keeps holding after active drops until the floor elapses, measured from the rise', () => {
     const h = harness();
     h.run(true);
-    vi.advanceTimersByTime(40); // load ends 40 ms after the skeleton appeared
+    vi.advanceTimersByTime(40);
     h.run(false);
     vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS - 40 - 1);
     expect(h.held).toBe(true);

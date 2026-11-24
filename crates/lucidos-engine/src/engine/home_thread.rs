@@ -18,9 +18,7 @@ use uuid::Uuid;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-/// What the home thread is called when it is created. The user may rename it,
-/// and nothing else does.
-pub const HOME_THREAD_TITLE: &str = "Home";
+pub use crate::engine::thread_events::HOME_THREAD_TITLE;
 
 /// The home thread's id, or `None` before one exists.
 pub async fn home_thread_id(pool: &sqlx::PgPool) -> Result<Option<Uuid>, sqlx::Error> {
@@ -42,9 +40,9 @@ pub async fn is_home_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool
 /// Whether `parent_id`, spawning a child, is the home thread, for the child's
 /// default *wake mode*. An unreadable row reads as no, so the child defaults to
 /// `wake`: every doubt wakes (ADR 0451).
-pub(crate) async fn spawner_is_home(pool: &sqlx::PgPool, parent_id: Uuid) -> bool {
+pub async fn spawner_is_home(pool: &sqlx::PgPool, parent_id: Uuid) -> bool {
     is_home_thread(pool, parent_id).await.unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[FanOut] Home check for {} failed, so its child wakes it: {}",
             parent_id,
             e
@@ -75,7 +73,7 @@ pub async fn ensure_home_thread(
         .await;
     match (emitted, home_thread_id(pool).await?) {
         (Ok(_), _) => {
-            crate::log!("[HomeThread] Created the home thread {}", thread_id);
+            crate::log_legacy!("[HomeThread] Created the home thread {}", thread_id);
             Ok(thread_id)
         }
         (Err(_), Some(winner)) => Ok(winner),

@@ -14,6 +14,7 @@
 //! the child dies without a turn terminal).
 
 use super::agent_runtime::AgentEvent;
+use crate::engine::thread_events::{ProviderError, TurnEndFacts, TurnEndStatus};
 
 /// One decoded line of `codex exec --json` output.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,12 +31,14 @@ pub(super) enum CodexLine {
     },
     TurnFailed {
         message: String,
+        provider_error: Option<ProviderError>,
     },
     /// Top-level `error` event. May be transient ("Reconnecting… 1/5") —
     /// the tracker records it but only the driver decides whether it ends
     /// the turn (it does only when the process dies without a terminal).
     StreamError {
         message: String,
+        provider_error: Option<ProviderError>,
     },
     Item {
         phase: ItemPhase,
@@ -167,9 +170,11 @@ pub(super) fn parse_codex_line(line: &str) -> CodexLine {
                 .map(|e| str_field(e, "message"))
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "turn failed".to_string()),
+            provider_error: val.get("error").and_then(ProviderError::from_codex_error),
         },
         "error" => CodexLine::StreamError {
             message: str_field(&val, "message"),
+            provider_error: ProviderError::from_codex_error(&val),
         },
         "item.started" | "item.updated" | "item.completed" => {
             let phase = match event_type {
@@ -267,6 +272,8 @@ pub(super) struct TurnTracker {
     /// Last in-stream error message — the driver uses it to synthesize a
     /// failed `Result` when the process dies without a turn terminal.
     pub last_error: Option<String>,
+    /// The provider's code for [`Self::last_error`], when it sent one.
+    pub last_provider_error: Option<ProviderError>,
     /// True once `turn.completed` / `turn.failed` was seen for the current
     /// turn — tells the driver the child's exit is a clean turn boundary.
     pub turn_terminal_seen: bool,
@@ -295,6 +302,7 @@ impl TurnTracker {
         self.turn_effort = effort;
         self.agent_texts.clear();
         self.last_error = None;
+        self.last_provider_error = None;
         self.turn_terminal_seen = false;
         self.open_tool_ids.clear();
     }
@@ -341,6 +349,7 @@ impl TurnTracker {
                     slash_commands: Vec::new(),
                     skills: Vec::new(),
                     agent_version: None,
+                    can_steer: false,
                 }]
             }
             CodexLine::TurnStarted => Vec::new(),
@@ -376,24 +385,35 @@ impl TurnTracker {
                     text: self.turn_text(),
                     duration_ms: turn_duration_ms,
                     error: None,
+                    provider_error: None,
+                    turn_end: Some(TurnEndFacts::of_status(TurnEndStatus::Completed)),
                 });
                 events
             }
-            CodexLine::TurnFailed { message } => {
+            CodexLine::TurnFailed {
+                message,
+                provider_error,
+            } => {
                 self.turn_terminal_seen = true;
                 let mut events = self.close_open_tools();
                 events.push(AgentEvent::Result {
                     text: self.turn_text(),
                     duration_ms: turn_duration_ms,
                     error: Some(message),
+                    provider_error: provider_error.or_else(|| self.last_provider_error.take()),
+                    turn_end: Some(TurnEndFacts::of_status(TurnEndStatus::Failed)),
                 });
                 events
             }
-            CodexLine::StreamError { message } => {
+            CodexLine::StreamError {
+                message,
+                provider_error,
+            } => {
                 // Possibly transient (reconnects) — record, don't terminate.
                 // The driver promotes it to a failed Result only when the
                 // process exits without a turn terminal.
                 self.last_error = Some(message);
+                self.last_provider_error = provider_error;
                 Vec::new()
             }
             CodexLine::Item { phase, id, kind } => self.map_item(phase, id, kind),
@@ -562,10 +582,11 @@ impl TurnTracker {
             }
             ItemKind::Error { message } => {
                 self.last_error = Some(message);
+                self.last_provider_error = None;
                 Vec::new()
             }
             ItemKind::Unknown { item_type } => {
-                crate::log!("[Codex] Unrecognized item type: {}", item_type);
+                crate::log_legacy!("[Codex] Unrecognized item type: {}", item_type);
                 Vec::new()
             }
         }

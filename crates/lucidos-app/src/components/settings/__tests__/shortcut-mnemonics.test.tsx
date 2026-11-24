@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** Settings → Keyboard shortcuts shows how to remember each default chord.
- *
- *  A mnemonic explains the DEFAULT binding. Once the user rebinds a shortcut,
- *  "L for Live" beside their own chord would teach the wrong key, so it goes.
- *
- *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

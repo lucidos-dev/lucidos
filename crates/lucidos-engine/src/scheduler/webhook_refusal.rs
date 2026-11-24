@@ -24,13 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Deserialize;
 use sqlx::PgPool;
 
-use crate::api::SharedEngine;
 use crate::core::webhook_refusal::{
     decide, judge, recovered_secs, refusing_secs, Decision, Declared, RefusalCause, RefusalVerdict,
     Resolution,
 };
 use crate::core::{Webhook, WebhookStore};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::types::SharedEngine;
 
 /// Every 15 minutes, on the ingress check's own cadence.
 ///
@@ -60,14 +60,14 @@ impl Drop for CheckGuard {
 /// One refusal check, registered on [`WEBHOOK_REFUSAL_CRON`].
 pub(crate) async fn run_webhook_refusal_check(engine: SharedEngine, pool: PgPool) {
     let Some(_guard) = CheckGuard::try_acquire() else {
-        log!("[WebhookRefusal] Skipping run; the previous cycle is still going");
+        log_legacy!("[WebhookRefusal] Skipping run; the previous cycle is still going");
         return;
     };
     if engine.is_shutting_down() {
         return;
     }
     if let Err(e) = run_cycle(&engine, &pool).await {
-        log!("[WebhookRefusal] The cycle could not run: {e}");
+        log_legacy!("[WebhookRefusal] The cycle could not run: {e}");
     }
 }
 
@@ -83,7 +83,7 @@ async fn run_cycle(
     let hooks = WebhookStore::list(pool).await?;
     let declared = declared_refusals(pool).await?;
     for event in plan(&hooks, &declared) {
-        log!("[WebhookRefusal] {}", cycle_line(&event));
+        log_legacy!("[WebhookRefusal] {}", cycle_line(&event));
         engine
             .event_bus
             .emit_or_log(
@@ -215,7 +215,7 @@ fn cycle_line(event: &SystemEvent) -> String {
 /// nobody and is not carried here. What survives is what a retraction needs to
 /// pair itself with the declaration it retracts.
 #[derive(Debug, Clone)]
-pub(crate) struct StandingRefusal {
+pub struct StandingRefusal {
     pub webhook_name: String,
     pub declared: Declared,
     /// How long the run has been going by now, in seconds.
@@ -254,7 +254,7 @@ struct RefusedPayload {
 /// Postgres computes the row's age, per ADR 0053, and it is added to the age
 /// the payload already carried. The same clock measured both halves, and
 /// neither is a host reading.
-pub(crate) async fn declared_refusals(
+pub async fn declared_refusals(
     pool: &PgPool,
 ) -> Result<HashMap<String, StandingRefusal>, sqlx::Error> {
     type Row = (String, String, Option<serde_json::Value>, i64);

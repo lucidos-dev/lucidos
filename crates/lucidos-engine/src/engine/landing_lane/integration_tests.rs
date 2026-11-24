@@ -92,6 +92,7 @@ fn member(n: u8, snapshot: &str) -> LaneMember {
     LaneMember {
         change_id: Uuid::from_bytes([n; 16]),
         snapshot_sha: snapshot.to_string(),
+        remote: None,
     }
 }
 
@@ -138,10 +139,15 @@ async fn a_conflicted_batch_lands_as_one_landing_merge_per_member() {
         .await
         .expect("a complete integration branch");
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
     )
     .await
     .unwrap();
@@ -202,6 +208,7 @@ async fn a_pass_through_lands_mid_resolution_and_the_batch_catches_up() {
     let pass = fx.member("p", "d.txt", "pass\n").await;
     let members = [member(1, &s1)];
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
@@ -223,15 +230,42 @@ async fn a_pass_through_lands_mid_resolution_and_the_batch_catches_up() {
         .await
         .unwrap();
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        landed,
+        IntegrationLanding::NeedsHardening { caught_up: true }
+    );
+    assert_eq!(
+        git(&fx.repo, &["rev-parse", "main"]).await,
+        pass_merge.merge_sha
+    );
+    let certification = IntegrationCertification {
+        head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+    };
+    let landed = land_integration(
+        &[],
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+        &certification,
+        None,
     )
     .await
     .unwrap();
     let IntegrationLanding::Landed { pre, post } = landed else {
-        panic!("a clean catch-up lands: {landed:?}");
+        panic!("the hardened catch-up lands: {landed:?}");
     };
     assert_eq!(
         pre, pass_merge.merge_sha,
@@ -268,6 +302,7 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
 
     let pass = fx.member("p", "e.txt", "pass\n").await;
     publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
@@ -291,10 +326,15 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
         .unwrap();
     let head_before = git(&lane.path, &["rev-parse", "HEAD"]).await;
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
     )
     .await
     .unwrap();
@@ -331,10 +371,15 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
         .await
         .unwrap();
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
     )
     .await
     .unwrap();
@@ -434,7 +479,7 @@ async fn the_lane_worktree_opens_once_and_goes_with_its_branch() {
     assert_eq!(
         read(
             &lane.path,
-            crate::engine::claude_code::WORKTREE_WORKSPACE_MARKER
+            crate::engine::worktree_artifacts::WORKTREE_WORKSPACE_MARKER
         ),
         fx.workspace.to_string_lossy(),
         "tagged for orphan recovery"
@@ -587,20 +632,6 @@ async fn main_before_the_last_move_comes_from_the_reflog() {
     assert_eq!(main_before_last_move(&fx.repo).await, Some(before));
 }
 
-/// No Lucidos-source change can fail because `main` moved: the lane never
-/// produces the concurrent-main error the app path uses for that.
-#[test]
-fn the_lane_never_reports_a_concurrent_main_conflict() {
-    use crate::test_support::source_scan::production_sources;
-    let marker = "CONCURRENT_MAIN_CONFLICT";
-    let lane_files: Vec<String> = production_sources()
-        .into_iter()
-        .filter(|(rel, source)| rel.starts_with("engine/landing_lane/") && source.contains(marker))
-        .map(|(rel, _)| rel)
-        .collect();
-    assert!(lane_files.is_empty(), "{lane_files:?}");
-}
-
 impl Fixture {
     /// Give the repo a bare `origin` holding its `main`, and a second clone
     /// that plays another gateway. Returns `(origin, other)`.
@@ -657,10 +688,35 @@ async fn a_batch_catches_up_with_origin_and_pushes_before_main_moves() {
     let theirs = other_pushes(&other, "d.txt", "other\n").await;
 
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        landed,
+        IntegrationLanding::NeedsHardening { caught_up: true }
+    );
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, base);
+    assert_eq!(git(&origin, &["rev-parse", "main"]).await, theirs);
+    let certification = IntegrationCertification {
+        head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+    };
+    let landed = land_integration(
+        &[],
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+        &certification,
+        None,
     )
     .await
     .unwrap();
@@ -689,10 +745,15 @@ async fn an_outside_push_that_conflicts_goes_back_to_the_lane_thread() {
     let theirs = other_pushes(&other, "a.txt", "other\n").await;
 
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
     )
     .await
     .unwrap();
@@ -720,10 +781,15 @@ async fn an_unreachable_origin_keeps_the_batch_waiting() {
     .await;
 
     let landed = land_integration(
+        &[],
         MainLocks::private_for_test(),
         &fx.repo,
         &LandingOrder::OriginFirst,
         &lane.path,
+        &IntegrationCertification {
+            head: Some(git(&lane.path, &["rev-parse", "HEAD"]).await),
+        },
+        None,
     )
     .await
     .unwrap();
@@ -733,4 +799,194 @@ async fn an_unreachable_origin_keeps_the_batch_waiting() {
     );
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, base);
     assert_eq!(git(&origin, &["rev-parse", "main"]).await, base);
+}
+
+/// A complete merge graph does not certify that the resolver hardened it.
+#[tokio::test]
+async fn an_unhardened_integration_never_moves_main() {
+    let fx = fixture().await;
+    let snapshot = fx.member("source", "a.txt", "source\n").await;
+    fx.main_writes(&["a.txt"], "main\n").await;
+    let (lane, base) = fx.lane().await;
+    land_conflicting(&lane.path, &snapshot, "source", "a.txt", "resolved\n").await;
+    verify_integration(&lane.path, &base, &[member(1, &snapshot)])
+        .await
+        .unwrap();
+    use crate::engine::git_ops::{record_hardened, HardenTier};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let head = git(&lane.path, &["rev-parse", "HEAD"]).await;
+    for marker in [
+        None,
+        Some((&head, HardenTier::Fast)),
+        Some((&base, HardenTier::Full)),
+    ] {
+        if let Some((sha, tier)) = marker {
+            record_hardened(&pool, &fx.repo, &lane.branch, sha, tier)
+                .await
+                .unwrap();
+        }
+        let certification = IntegrationCertification::load(&pool, &fx.repo, &lane.branch).await;
+        let outcome = land_integration(
+            &[],
+            MainLocks::private_for_test(),
+            &fx.repo,
+            &LandingOrder::LocalFirst,
+            &lane.path,
+            &certification,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            IntegrationLanding::NeedsHardening { caught_up: false }
+        );
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, base);
+    }
+    record_hardened(&pool, &fx.repo, &lane.branch, &head, HardenTier::Full)
+        .await
+        .unwrap();
+    let certification = IntegrationCertification::load(&pool, &fx.repo, &lane.branch).await;
+    let outcome = land_integration(
+        &[],
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::LocalFirst,
+        &lane.path,
+        &certification,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, IntegrationLanding::Landed { .. }));
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, head);
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn disjoint_catch_up_carries_and_announces_full_certificate() {
+    assert_catch_up_certificate(true, false).await;
+}
+
+#[tokio::test]
+async fn overlapping_catch_up_requires_hardening() {
+    assert_catch_up_certificate(true, true).await;
+}
+
+#[tokio::test]
+async fn uncovered_catch_up_requires_hardening() {
+    assert_catch_up_certificate(false, false).await;
+}
+
+async fn assert_catch_up_certificate(covered: bool, overlapping: bool) {
+    use crate::engine::event_bus::EventBus;
+    use crate::engine::git_ops::{harden_marker, record_hardened, HardenMarker, HardenTier};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    let fx = fixture().await;
+    fx.main_writes(&["a.txt"], "first\nmiddle\nlast\n").await;
+    let snapshot = fx.member("source", "a.txt", "source\nmiddle\nlast\n").await;
+    let (lane, base) = fx.lane().await;
+    git(
+        &lane.path,
+        &["merge", "--no-ff", &snapshot, "-m", "Land: source"],
+    )
+    .await;
+    let merges = verify_integration(&lane.path, &base, &[member(1, &snapshot)])
+        .await
+        .unwrap();
+    let before = git(&lane.path, &["rev-parse", "HEAD"]).await;
+    let main = if overlapping {
+        fx.main_writes(&["a.txt"], "first\nmiddle\nmain\n").await
+    } else {
+        fx.main_writes(&["b.txt"], "main\n").await
+    };
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _callbacks) = EventBus::new(pool.clone());
+    record_hardened(&pool, &fx.repo, &lane.branch, &before, HardenTier::Full)
+        .await
+        .unwrap();
+    let certification = IntegrationCertification::load(&pool, &fx.repo, &lane.branch).await;
+    let outcome = land_integration(
+        &[],
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::LocalFirst,
+        &lane.path,
+        &certification,
+        covered.then_some(CertificateCarry {
+            bus: &bus,
+            batch_id: Uuid::new_v4(),
+            branch: &lane.branch,
+            merges: &merges,
+        }),
+    )
+    .await
+    .unwrap();
+
+    if !covered || overlapping {
+        assert_eq!(
+            outcome,
+            IntegrationLanding::NeedsHardening { caught_up: true }
+        );
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, main);
+        assert_eq!(
+            harden_marker(&pool, &fx.repo, &lane.branch).await,
+            HardenMarker::Recorded {
+                head_sha: before,
+                fresh: false,
+                tier: HardenTier::Full
+            },
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'HardenCertificateCarried'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+        teardown_test_db(&db).await;
+        return;
+    }
+
+    let IntegrationLanding::Landed { post, .. } = outcome else {
+        panic!("expected to land the disjoint catch-up, got {outcome:?}");
+    };
+    assert_eq!(
+        harden_marker(&pool, &fx.repo, &lane.branch).await,
+        HardenMarker::Recorded {
+            head_sha: post.clone(),
+            fresh: true,
+            tier: HardenTier::Full
+        },
+    );
+    let heads: (String, String) = sqlx::query_as(
+        "SELECT payload->'data'->>'from_sha', payload->'data'->>'to_sha' FROM events
+         WHERE event_type = 'HardenCertificateCarried'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(heads, (before, post));
+    teardown_test_db(&db).await;
+}
+
+mod guard_tests {
+    /// No Lucidos-source change can fail because `main` moved: the lane never
+    /// produces the concurrent-main error the app path uses for that.
+    #[test]
+    fn the_lane_never_reports_a_concurrent_main_conflict() {
+        use crate::test_support::source_scan::production_sources;
+        let marker = "CONCURRENT_MAIN_CONFLICT";
+        let lane_files: Vec<String> = production_sources()
+            .into_iter()
+            .filter(|(rel, source)| {
+                rel.starts_with("engine/landing_lane/") && source.contains(marker)
+            })
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(lane_files.is_empty(), "{lane_files:?}");
+    }
 }

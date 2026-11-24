@@ -69,7 +69,9 @@ A shared workspace raises five questions:
      an email re-attributes every role.
    - A notification records its audience as device ids on its event: the
      work item's driver and watchers, or the people a notice names. A
-     gateway that knows fewer than two people always reaches everyone.
+     gateway that knows fewer than two people ordinarily reaches everyone.
+     Recovery of an admitted team message retains person scoping after
+     membership shrinks; it never broadens that message to everyone (ADR 0649).
    - Taking over a work item, by Take or by answering its gate, tells the
      person who drove it. Archiving the root tells its driver and watchers.
 7. **The team views are a *factory app*.** A Lucidos app shows work items with

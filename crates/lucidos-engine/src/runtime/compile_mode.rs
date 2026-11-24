@@ -214,7 +214,7 @@ fn start_seed(worktree: &Path, seed: &Seed) {
     }
     if let Some(parent) = log.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            crate::log!("[CompileMode] cannot create {}: {e}", parent.display());
+            crate::log_legacy!("[CompileMode] cannot create {}: {e}", parent.display());
             return;
         }
     }
@@ -233,12 +233,12 @@ fn start_seed(worktree: &Path, seed: &Seed) {
         .stderr(std::process::Stdio::null())
         .status();
     match spawned {
-        Ok(_) => crate::log!(
+        Ok(_) => crate::log_legacy!(
             "[CompileMode] seeding prebuilt OpenSSL {} (log: {})",
             seed.version,
             log.display()
         ),
-        Err(e) => crate::log!("[CompileMode] could not start the OpenSSL seed: {e}"),
+        Err(e) => crate::log_legacy!("[CompileMode] could not start the OpenSSL seed: {e}"),
     }
 }
 
@@ -260,7 +260,7 @@ pub(crate) fn env_for_worktree(
         let written = std::fs::create_dir_all(&target)
             .and_then(|()| std::fs::write(target.join(PIN_FILE), pin));
         if let Err(e) = written {
-            crate::log!("[CompileMode] cannot pin {}: {e}", target.display());
+            crate::log_legacy!("[CompileMode] cannot pin {}: {e}", target.display());
         }
     }
     if let Some(seed) = &resolution.seed {

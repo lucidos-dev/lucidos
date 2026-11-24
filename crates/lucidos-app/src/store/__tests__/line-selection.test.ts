@@ -1,10 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { normalizeLineRange, consumeLineScrollTarget, lineScrollTarget } from '../store';
 
-// `line` / `line_end` arrive from outside the app (an app iframe's
-// lucidos.ui.navigate, an LLM navigate_ui, an <a href> inside a previewed
-// artifact), so anything that isn't a positive whole number must be refused
-// rather than turned into a row index.
 describe('normalizeLineRange', () => {
   it('turns a lone line into a single-line range', () => {
     expect(normalizeLineRange(510)).toEqual({ start: 510, end: 510 });
@@ -44,9 +40,6 @@ describe('normalizeLineRange', () => {
     expect(normalizeLineRange(10, 'abc')).toEqual({ start: 10, end: 10 });
   });
 
-  // A range past the end of the file is deliberately NOT rejected here: the
-  // line count isn't known until the content loads, and a stale citation must
-  // still open its file.
   it('accepts a range the file may be too short for', () => {
     expect(normalizeLineRange(9_000_000)).toEqual({ start: 9_000_000, end: 9_000_000 });
   });
@@ -64,7 +57,6 @@ describe('consumeLineScrollTarget', () => {
     expect(lineScrollTarget.value).toBeNull();
   });
 
-  // One-shot: a re-render must not re-scroll a user who has since scrolled away.
   it('hands the target over once and clears it', () => {
     lineScrollTarget.value = { path: PATH, line: 510 };
 

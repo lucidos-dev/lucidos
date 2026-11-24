@@ -3,7 +3,7 @@
 //! check / event-driven registration) live here too so the parent
 //! `SchedulerManager` only has to forward to them.
 
-use crate::api::SharedEngine;
+use crate::engine::types::SharedEngine;
 use crate::triggers::TriggerConfig;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -73,10 +73,10 @@ fn spawn_task_runner(
 
         match result {
             Ok(reason) => {
-                log!("[Scheduler] Task '{}' exited: {}", task_name, reason);
+                log_legacy!("[Scheduler] Task '{}' exited: {}", task_name, reason);
             }
             Err(e) => {
-                log!("[Scheduler] Task '{}' crashed: {}", task_name, e);
+                log_legacy!("[Scheduler] Task '{}' crashed: {}", task_name, e);
             }
         }
     });
@@ -93,12 +93,12 @@ async fn run_task_loop(
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     cancel_token: CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::engine::tools::scheduler::next_occurrence_multi;
+    use crate::scheduler::cron_rules::next_occurrence_multi;
     // Parse all cron expressions (translate standard dow to cron-crate convention)
     let schedules: Vec<cron::Schedule> = cron_expressions
         .iter()
         .map(|expr| {
-            crate::engine::tools::scheduler::parse_standard_cron(expr).map_err(|e| {
+            crate::scheduler::cron_rules::parse_standard_cron(expr).map_err(|e| {
                 format!(
                     "Invalid cron expression '{}' for task {}: {}",
                     expr, task_name, e
@@ -113,7 +113,7 @@ async fn run_task_loop(
 
     // Parse timezone
     let tz: chrono_tz::Tz = timezone.parse().unwrap_or_else(|_| {
-        log!(
+        log_legacy!(
             "[Scheduler] Invalid timezone '{}' for task {}, using UTC",
             timezone,
             task_name
@@ -155,7 +155,7 @@ async fn run_task_loop(
         if next_utc > now_utc {
             let wait_secs = (next_utc - now_utc).num_seconds();
             if wait_secs > 3600 {
-                log!(
+                log_legacy!(
                     "[Scheduler] Task '{}' waiting until {} ({:.1} hours)",
                     task_name,
                     next.format("%Y-%m-%d %H:%M:%S %Z"),
@@ -201,7 +201,7 @@ async fn run_task_loop(
         let actual_now = chrono::Utc::now();
         let delay = actual_now - next_utc;
         if delay > chrono::Duration::minutes(MISSED_TASK_GRACE_MINUTES) {
-            log!("[Scheduler] Task '{}' woke up {} minutes late (scheduled {}, actual {}), skipping this occurrence",
+            log_legacy!("[Scheduler] Task '{}' woke up {} minutes late (scheduled {}, actual {}), skipping this occurrence",
                 task_name,
                 delay.num_minutes(),
                 next.format("%H:%M:%S"),
@@ -223,7 +223,7 @@ async fn run_task_loop(
 
         // Log execution timing
         if delay.num_seconds() > 5 {
-            log!(
+            log_legacy!(
                 "[Scheduler] Task '{}' executing {}s after scheduled time",
                 task_name,
                 delay.num_seconds()
@@ -271,7 +271,7 @@ async fn fire_scheduled_slot(
         )
         .await;
     if !outcome.admitted {
-        log!(
+        log_legacy!(
             "[Scheduler] Task '{}' queued at position {} (system at capacity)",
             task_name,
             outcome.position
@@ -287,7 +287,7 @@ async fn fire_scheduled_slot(
                 .drop_entry(outcome.entry_id, "trigger cancelled", None)
                 .await
             {
-                log!(
+                log_legacy!(
                     "[Scheduler] Runner for task '{}' stopped; admitted run left alone (entry already running or gone): {}",
                     task_name,
                     e
@@ -441,7 +441,7 @@ async fn settle_missed_slots(
         (None, Some(config)) => config,
         (refusal, _) => {
             let reason = refusal.map_or(FireRefusal::Deleted.as_str(), FireRefusal::as_str);
-            log!(
+            log_legacy!(
                 "[Scheduler] Task '{}' leaves its missed slots alone: {}",
                 task_name,
                 reason
@@ -453,7 +453,7 @@ async fn settle_missed_slots(
     let floors = match load_slot_floors(engine.pool(), trigger_id, config.last_run).await {
         Ok(floors) => floors,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] Task '{}' missed-slot history unavailable: {}",
                 task_name,
                 e
@@ -466,7 +466,7 @@ async fn settle_missed_slots(
     match plan_missed_slots(schedules, tz, floors.floor(missed_after, now), now, grace) {
         SlotPlan::Nothing => Ok(()),
         SlotPlan::Report(slots) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] Task '{}' skipped {} slot(s) from {} to {}",
                 task_name,
                 slots.count,
@@ -476,7 +476,7 @@ async fn settle_missed_slots(
             match report_skipped_slots(&engine.event_bus, trigger_id, &config.name, tz, slots).await
             {
                 Ok(notice) => notice.send_push(engine),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[Scheduler] Task '{}' skipped-slot report failed: {}",
                     task_name,
                     e
@@ -518,7 +518,7 @@ async fn catch_up_missed_slot(
             let history =
                 crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
             if let Err(e) = &history {
-                log!(
+                log_legacy!(
                     "[Scheduler] Task '{}' run-history lookup failed: {}",
                     task_name,
                     e
@@ -532,7 +532,7 @@ async fn catch_up_missed_slot(
         }
     };
     if let Some(reason) = skip {
-        log!(
+        log_legacy!(
             "[Scheduler] Task '{}' missed at {}, not executing: {}",
             task_name,
             missed.format("%H:%M:%S"),
@@ -541,7 +541,7 @@ async fn catch_up_missed_slot(
         return Ok(());
     }
 
-    log!(
+    log_legacy!(
         "[Scheduler] Task '{}' missed at {} ({}s ago), executing now",
         task_name,
         missed.format("%H:%M:%S"),
@@ -561,7 +561,7 @@ async fn catch_up_missed_slot(
         )
         .await;
     if outcome.completion.await.is_err() {
-        log!(
+        log_legacy!(
             "[Scheduler] Task '{}' grace-period completion channel dropped",
             task_name
         );
@@ -618,7 +618,7 @@ pub(super) async fn handle_trigger_event(
             if let Some(config) = config.as_ref() {
                 if !config.paused && !config.schedule.is_empty() {
                     register_and_track(config, tracked_tasks, engine, trigger_configs).await;
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Scheduler] Registered new trigger: {} ({})",
                         config.name,
                         trigger_id
@@ -632,7 +632,7 @@ pub(super) async fn handle_trigger_event(
                 if !config.paused && !config.schedule.is_empty() {
                     register_and_track(config, tracked_tasks, engine, trigger_configs).await;
                 }
-                crate::log!("[Scheduler] Updated trigger: {}", trigger_id);
+                crate::log_legacy!("[Scheduler] Updated trigger: {}", trigger_id);
                 // An update can unpause — queued fires for this trigger may
                 // be eligible again.
                 engine.thread_queue.drain().await;
@@ -642,14 +642,14 @@ pub(super) async fn handle_trigger_event(
             // Unconditional: the chokepoint may already have removed the
             // registry entry, but the cron job is still armed until we say so.
             cancel_tracked_task(tracked_tasks, task_uuid).await;
-            crate::log!("[Scheduler] Deleted trigger: {}", trigger_id);
+            crate::log_legacy!("[Scheduler] Deleted trigger: {}", trigger_id);
         }
         "TriggerEnabled" => {
             if let Some(config) = config.as_ref() {
                 if !config.schedule.is_empty() {
                     register_and_track(config, tracked_tasks, engine, trigger_configs).await;
                 }
-                crate::log!("[Scheduler] Resumed trigger: {}", trigger_id);
+                crate::log_legacy!("[Scheduler] Resumed trigger: {}", trigger_id);
                 // Resume unblocks the trigger's queued fires — drain so they
                 // admit without waiting for the periodic sweep.
                 engine.thread_queue.drain().await;
@@ -659,7 +659,7 @@ pub(super) async fn handle_trigger_event(
             // Unconditional for the same reason as delete: disarming the job is
             // this function's job whether or not the flag was already flipped.
             cancel_tracked_task(tracked_tasks, task_uuid).await;
-            crate::log!("[Scheduler] Paused trigger: {}", trigger_id);
+            crate::log_legacy!("[Scheduler] Paused trigger: {}", trigger_id);
         }
         _ => {}
     }
@@ -754,14 +754,14 @@ pub(super) async fn rearm_after_lag(
         }
         register_and_track(config, tracked_tasks, engine, trigger_configs).await;
         repaired += 1;
-        crate::log!(
+        crate::log_legacy!(
             "[Scheduler] Lag repair: {:?} trigger '{}' ({})",
             repair,
             config.name,
             config.id
         );
     }
-    crate::log!(
+    crate::log_legacy!(
         "[Scheduler] Lag repair checked {} trigger(s), re-armed {}",
         configs.len(),
         repaired
@@ -893,7 +893,7 @@ async fn report_depth_cap(
             ))
             .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[Scheduler] Failed to emit depth-cap notification for '{}': {}",
                 config.name,
                 e
@@ -952,7 +952,7 @@ pub(super) async fn fire_matching_triggers(
     let ceiling = engine.thread_queue.policy().await.max_event_trigger_depth;
     match event_trigger_skip_reason(engine.is_shutting_down(), depth, ceiling) {
         Some(EventTriggerSkip::ShuttingDown) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Scheduler] Engine shutting down, not firing triggers for event '{}'",
                 event_type
             );
@@ -966,7 +966,7 @@ pub(super) async fn fire_matching_triggers(
             if stopped.is_empty() {
                 return;
             }
-            crate::log!(
+            crate::log_legacy!(
                 "[Scheduler] Event '{}' at depth {}: skipping {} trigger(s) to prevent recursion",
                 event_type,
                 depth,
@@ -990,7 +990,7 @@ pub(super) async fn fire_matching_triggers(
         return;
     }
 
-    crate::log!(
+    crate::log_legacy!(
         "[Scheduler] Event '{}' matched {} trigger(s)",
         event_type,
         matching.len()
@@ -1019,7 +1019,7 @@ pub(super) async fn fire_matching_triggers(
             )
             .await;
         if !outcome.admitted {
-            crate::log!(
+            crate::log_legacy!(
                 "[Scheduler] Event trigger '{}' queued at position {} (system at capacity)",
                 config.name,
                 outcome.position
@@ -1104,7 +1104,7 @@ pub(super) async fn check_task_health_and_restart(
             };
             match finished_runner_action(config) {
                 FinishedRunner::Restart => {
-                    log!(
+                    log_legacy!(
                         "[Scheduler] Task '{}' crashed or exited unexpectedly, will restart",
                         task_info.task_name
                     );
@@ -1117,7 +1117,7 @@ pub(super) async fn check_task_health_and_restart(
                     ));
                 }
                 FinishedRunner::Drop(problem) => {
-                    log!(
+                    log_legacy!(
                         "[Scheduler] Task '{}' exited because its schedule can never fire: {}. Not restarting it; fix the cron to re-arm it.",
                         task_info.task_name,
                         problem
@@ -1172,7 +1172,7 @@ pub(super) async fn check_task_health_and_restart(
             );
         }
 
-        log!("[Scheduler] Restarted task '{}'", task_name);
+        log_legacy!("[Scheduler] Restarted task '{}'", task_name);
     }
 }
 
@@ -1180,7 +1180,7 @@ pub(super) async fn check_task_health_and_restart(
 /// `restored_at`, so no slot fires between the restore and the assertion.
 /// The restore floor drops that slot; the catch-up grace keeps `permits_slot`
 /// as the backstop should the floor regress.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn pre_restore_hourly_cron(restored_at: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::Timelike;
     format!(
@@ -1190,8 +1190,8 @@ fn pre_restore_hourly_cron(restored_at: chrono::DateTime<chrono::Utc>) -> String
 }
 
 /// Run the production catch-up choke point against a pre-restore slot.
-#[cfg(test)]
-pub(crate) async fn assert_snapshot_catch_up_excluded(engine: &SharedEngine) {
+#[cfg(feature = "test-support")]
+pub async fn assert_snapshot_catch_up_excluded(engine: &SharedEngine) {
     let id = "snapshot-combined-cron";
     let restored_at = crate::core::snapshot::boundary::read(engine.pool())
         .await
@@ -1205,7 +1205,7 @@ pub(crate) async fn assert_snapshot_catch_up_excluded(engine: &SharedEngine) {
     }))
     .unwrap();
     let configs = Arc::new(std::sync::RwLock::new(HashMap::from([(id.into(), config)])));
-    let schedule = crate::engine::tools::scheduler::parse_standard_cron(&expression).unwrap();
+    let schedule = crate::scheduler::cron_rules::parse_standard_cron(&expression).unwrap();
     settle_missed_slots(
         None,
         &[schedule],
@@ -1232,7 +1232,7 @@ mod tests {
         expression: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> chrono::DateTime<chrono::Utc> {
-        let schedule = crate::engine::tools::scheduler::parse_standard_cron(expression).unwrap();
+        let schedule = crate::scheduler::cron_rules::parse_standard_cron(expression).unwrap();
         schedule
             .after(&(now - chrono::Duration::hours(2)))
             .take_while(|slot| *slot <= now)
@@ -1974,10 +1974,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::engine::thread_queue::ThreadQueueExecutor for ParkedRunExecutor {
-        async fn execute(&self, _entry: crate::engine::thread_queue::ExecutableEntry) {
+        async fn execute(
+            &self,
+            _entry: crate::engine::thread_queue::ExecutableEntry,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let _ = self.entered.send(());
             self.gate.acquire().await.expect("gate open").forget();
             let _ = self.finished.send(());
+            Ok(())
         }
     }
 

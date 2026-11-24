@@ -6,20 +6,7 @@ import {
 import { Explainer } from '../shared/Explainer';
 import { providerAnchor } from '../../store/modelProviders';
 
-/** Turn the keyless OpenCode Free tier on or off (Settings →
- *  Providers). There is no key field: the relay serves these models
- *  anonymously, and the engine sends no Authorization header at all. Stored as
- *  the `opencode_free_enabled` preference, which the engine's provider
- *  subscriber watches, so the switch takes effect with no restart.
- *
- *  The privacy line renders beside the toggle rather than behind the Explainer.
- *  Turning this on sends prompts to a third party, so the terms belong where
- *  the decision is made.
- *
- *  Renders only the provider block; the enclosing "Providers"
- *  `settings-section` is owned by `SettingsView`. */
 export function OpenCodeFreeSettings() {
-  // Subscribe to the preference signal.
   preferences.value;
   const enabled = currentOpenCodeFreeEnabled();
 

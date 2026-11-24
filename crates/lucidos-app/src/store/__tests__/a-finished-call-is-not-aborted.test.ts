@@ -1,15 +1,3 @@
-/** A call that ended reads "Done", not "Aborted". A call still waiting on an
- *  answer reads "Requesting", not silence.
- *
- *  A call is not a turn (ADR 0148), so an exchange holding only spoken rows
- *  never gets a terminator, and nothing reads "Aborted" without an abort
- *  event (`aborted-needs-an-abort.test.ts`).
- *
- *  The other half is the wait itself. An utterance whose doer has not woken
- *  holds no steps, and a stepless exchange on an idle thread read as finished.
- *  So no panel drew, and nothing said an answer was coming. See
- *  `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
- */
 import { describe, it, expect } from 'vitest';
 import { ev, heard, put, said } from './call-fixtures';
 import { statusLabel } from '../exchange-status';
@@ -17,14 +5,11 @@ import { exchangeStatus, groupIntoExchanges, type StoredEvent } from '../thread-
 
 const MSG = 'msg-1';
 
-/** The last exchange of a thread, which is the one the detector judges. */
 function lastExchange(events: Map<number, StoredEvent>) {
   const exchanges = groupIntoExchanges(events);
   return exchanges[exchanges.length - 1];
 }
 
-/** The reported call, in the order the engine writes it now: the caller's
- *  words, then the reply to them. */
 function theCall(): Map<number, StoredEvent> {
   return new Map([
     ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
@@ -59,17 +44,11 @@ describe('a finished call is not aborted', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
   });
 
-  // A thread's status is about its TURN, and this exchange holds none, so the
-  // status is not about it. A doer working, or one that failed an hour ago,
-  // says nothing about whether the caller is still owed an answer.
   it('settles whatever a turn elsewhere on the thread is doing', () => {
     const exchange = lastExchange(theCall());
     expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('done');
   });
 
-  // Voice never moves the thread's status, so `threadIdle` is true for the
-  // whole of a talker-only call. Without the session's own end as the signal,
-  // the very first spoken row would declare the live call finished.
   it('reads as live until the caller rings off', () => {
     const events = theCall();
     events.delete(7);
@@ -84,8 +63,6 @@ describe('a finished call is not aborted', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('streaming');
   });
 
-  // Nothing is pending once the caller has heard back, so the shimmer stops
-  // there rather than running to the end of the call.
   it('settles as soon as the talker answers', () => {
     const events = theCall();
     events.delete(7);
@@ -95,16 +72,9 @@ describe('a finished call is not aborted', () => {
   });
 });
 
-/** The gap between an utterance landing and an answer arriving. The reader is
- *  owed a progress affordance for all of it. It must not claim the doer is
- *  running before the doer has woken. */
 describe('a call in progress says so', () => {
   const REQUESTING = { label: 'Requesting', className: 'working' };
 
-  /** A caller's question the talker delegated, with the doer still asleep. Its
-   *  only step is the delegation marker. */
-  /** A delegated utterance in the shape the engine writes: the caller's own
-   *  words, then the talker's `WorkDelegated` starting the turn (ADR 0201). */
   function delegatedAndWaiting(): Map<number, StoredEvent> {
     return new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
@@ -124,10 +94,6 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('streaming');
   });
 
-  // The talker stalls truthfully while it waits, and that stall is the FIRST
-  // thing said on this path. Read as the answer it re-creates the silence: the
-  // exchange settles "Done" seconds in, then flips back to Working when the
-  // doer's first step lands.
   it('is not settled by the talker stalling for the doer', () => {
     const events = delegatedAndWaiting();
     put(events, 5, {
@@ -150,18 +116,12 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('streaming');
   });
 
-  // The label is what may overclaim, and this is the assertion that stops it.
-  // A call-only exchange draws no step rows, so the ladder's `hasSteps` arm is
-  // never taken and "Working" is unreachable before the doer wakes.
   it('says "Requesting" and never "Working" before the doer wakes', () => {
     const exchange = lastExchange(delegatedAndWaiting());
     const status = exchangeStatus(exchange, '', true, false, false, true);
-    expect(statusLabel(status, /* hasSteps */ false)).toEqual(REQUESTING);
+    expect(statusLabel(status,  false)).toEqual(REQUESTING);
   });
 
-  // Ringing off settles the call, not the question. A delegated one is
-  // answered by the doer, and that answer outlives the call, so it stays live
-  // while the thread runs the doer's turn.
   it('does not let a hangup settle a question the doer never answered', () => {
     const events = delegatedAndWaiting();
     put(events, 5, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12 });
@@ -169,8 +129,6 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('pending');
   });
 
-  // Once the thread settles, nothing runs for it. No abort event is in the
-  // log, so it settles as done rather than claiming an abort.
   it('settles an unanswered delegated question once the thread idles', () => {
     const events = delegatedAndWaiting();
     put(events, 5, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12 });
@@ -178,9 +136,6 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
   });
 
-  // The same on a busy thread, which is where a delegated utterance still
-  // needs the thread's status: it IS a turn, so it queues behind another one
-  // and the ordinary machinery owns its verdict.
   it('leaves a delegated utterance to the ordinary machinery while the thread works', () => {
     const events = delegatedAndWaiting();
     put(events, 5, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12 });
@@ -188,8 +143,6 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, false)).not.toBe('done');
   });
 
-  // The talker-only half of the same rule. Nobody else was asked, so ringing
-  // off IS the end of it.
   it('lets a hangup settle an utterance the talker held', () => {
     const events = new Map([
       ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
@@ -200,8 +153,6 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('done');
   });
 
-  // A typed thread must be untouched: an empty exchange on an idle thread is
-  // finished, and only a call makes it a wait.
   it('leaves a stepless typed message finished', () => {
     const events = new Map([
       ev(1, { type: 'MessageReceived', text: 'do the thing', mode: 'human', _eventId: MSG }),
@@ -214,23 +165,10 @@ describe('a call in progress says so', () => {
     const events = delegatedAndWaiting();
     put(events, 5, { type: 'ToolCalled', name: 'list_files', args: {}, request_event_id: MSG });
     const exchange = lastExchange(events);
-    // Not the call arm any more: a real step landed, so the ordinary machinery
-    // owns the verdict.
     expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('streaming');
   });
 });
 
-/** The reported thread. A delegated turn failed, the caller asked for it
- *  again, and rang off before the talker could answer.
- *
- *  Voice moves nothing on the thread's status (ADR 0148), so it stays `failed`
- *  from the doer's own turn, and no later event can clear it. `threadIdle` is
- *  therefore false for good. The caller's last words hold no turn, so nothing
- *  will ever terminate them either.
- *
- *  Gated on the thread's status, the call arm never ran, and the last thing
- *  said shimmered "Requesting" for as long as the thread existed.
- */
 describe('a call that rang off after a failed turn settles', () => {
   function theReportedThread(): Map<number, StoredEvent> {
     return new Map([
@@ -258,11 +196,9 @@ describe('a call that rang off after a failed turn settles', () => {
   it('never shows the reported "Requesting" label', () => {
     const exchange = lastExchange(theReportedThread());
     const status = exchangeStatus(exchange, '', true, false, false, false);
-    expect(statusLabel(status, /* hasSteps */ false).label).not.toBe('Requesting');
+    expect(statusLabel(status,  false).label).not.toBe('Requesting');
   });
 
-  // The failed turn keeps its own verdict. Settling the call must not reach
-  // back and hide why the caller asked again.
   it('leaves the failed doer turn reading as an error', () => {
     const exchanges = groupIntoExchanges(theReportedThread());
     const doer = exchanges.find(e => e.userEvent.type === 'MessageReceived');

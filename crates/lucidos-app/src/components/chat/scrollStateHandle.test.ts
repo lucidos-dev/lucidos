@@ -4,7 +4,6 @@ import type * as ScrollStateModule from './scrollState';
 
 type Handle = typeof import('./scrollStateHandle');
 
-/** A stand-in scrollState that records every call it receives, in order. */
 function recordingScrollState(): { module: typeof ScrollStateModule; calls: string[] } {
   const calls: string[] = [];
   const module = {
@@ -57,7 +56,6 @@ describe('scrollStateHandle', () => {
     const { module, calls } = recordingScrollState();
     handle.provideScrollState(module);
     handle.stopFollowingBottom();
-    // Read before any microtask: the focus retire must land before the focus moves.
     expect(calls).toEqual(['stopFollowingBottom']);
   });
 

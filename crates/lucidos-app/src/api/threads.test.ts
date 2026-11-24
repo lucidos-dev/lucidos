@@ -1,12 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { searchThreads, fetchOlderThreads } from './threads';
 
-// Regression guard for `harden-frontend-api-threads-bare-fetch-no-timeout`.
-// Before the fix, `searchThreads` and `fetchOlderThreads` used bare `fetch()`
-// directly, bypassing the `json()` helper. That meant no 10s `AbortSignal`
-// timeout, no `x-lucidos-device-id` header, and `throwIfNotOk`'s JSON-body
-// `{error}` parsing was applied by hand without the cross-cutting pipeline.
-// Routing both through `json()` reinstates all three.
 
 const originalFetch = globalThis.fetch;
 
@@ -21,8 +15,6 @@ describe('searchThreads goes through the json() helper', () => {
       }),
     );
     globalThis.fetch = mockFetch as unknown as typeof fetch;
-    // json() reads the device id off localStorage to stamp the header. The
-    // jsdom shim is in place, so just seed a known id.
     localStorage.setItem('lucidos-device-id', 'device-abc');
   });
 
@@ -48,8 +40,6 @@ describe('searchThreads goes through the json() helper', () => {
   });
 
   it('composes the caller-supplied signal with the timeout signal', async () => {
-    // The json() helper uses AbortSignal.any to OR the caller signal with the
-    // timeout signal. Aborting the caller signal must still abort the fetch.
     const controller = new AbortController();
     await searchThreads('hello', controller.signal);
     const [, init] = mockFetch.mock.calls[0];
@@ -57,7 +47,6 @@ describe('searchThreads goes through the json() helper', () => {
     expect(signal).toBeDefined();
     expect(signal.aborted).toBe(false);
     controller.abort();
-    // The composed signal must reflect the caller's abort.
     expect(signal.aborted).toBe(true);
   });
 

@@ -1,8 +1,3 @@
-/**
- * Pong aggregation is what keeps the engine's `expected_pong_count` honest once
- * many documents sit behind one connection. The engine waits for one pong per
- * open SSE stream, so the worker owes it exactly one, merged across its ports.
- */
 import { describe, it, expect } from 'vitest';
 import { aggregatePongAnswers, PONG_COLLECT_MS } from './protocol';
 import type { PongAnswer } from '../eventStream';
@@ -22,8 +17,6 @@ describe('aggregatePongAnswers', () => {
   });
 
   it('lets one document that showed the toast speak for the connection', () => {
-    // A hidden tab answering after the visible one must not outvote it, or
-    // the engine pushes on top of a toast already on screen.
     const merged = aggregatePongAnswers([
       answer({ outcome: 'not_shown' }),
       answer({ outcome: 'shown' }),
@@ -52,8 +45,6 @@ describe('aggregatePongAnswers', () => {
 
 describe('PONG_COLLECT_MS', () => {
   it('stays well inside the engine deadline it must beat', () => {
-    // `DEADLINE_MS` in crates/lucidos-engine/src/scheduler/push.rs. An
-    // aggregated pong arriving after it informs no decision at all.
     const ENGINE_DEADLINE_MS = 2000;
     expect(PONG_COLLECT_MS).toBeLessThan(ENGINE_DEADLINE_MS / 2);
   });

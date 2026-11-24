@@ -1,5 +1,6 @@
 import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { DEVICE_DATABASE_STALL_MS, DeviceDatabaseStalledError } from './deviceDatabase';
 
 import {
   adoptUnsentMessageRecord,
@@ -97,6 +98,24 @@ describe('the unsent message store', () => {
     expect(liveUnsentMessageRecords().map((r) => r.eventId)).toEqual(['e-2']);
     const warnings = toasts.value.filter((t) => t.type === 'warning').map((t) => t.message);
     expect(warnings).toEqual([unsentMessageStorageFailureMessage(new Error('QuotaExceededError'))]);
+  });
+
+  it('fails a read stuck behind a stalled write within the bound, and keeps the write', async () => {
+    vi.useFakeTimers();
+    try {
+      const backend = createMemoryUnsentMessageBackend();
+      let land!: () => void;
+      _resetUnsentMessageRecordsForTesting({ ...backend,
+        put: (record) => new Promise<void>((resolve) => { land = () => { void backend.put(record).then(resolve); }; }) });
+      persistSendingMessage(sending('e-1'));
+      const read = expect(readUnsentMessageStore()).rejects.toBeInstanceOf(DeviceDatabaseStalledError);
+      await vi.advanceTimersByTimeAsync(DEVICE_DATABASE_STALL_MS);
+      await read;
+      land();
+      expect((await readUnsentMessageStore()).map((r) => r.eventId)).toEqual(['e-1']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

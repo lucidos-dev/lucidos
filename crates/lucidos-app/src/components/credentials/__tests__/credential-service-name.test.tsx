@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The Service Name a user typed survives every re-render of the form.
- *
- * The field was a controlled input with no input handler. Any state change
- * (adding a host, typing a base URL) re-rendered it and restored the empty
- * initial value, so the name vanished mid-edit.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -82,8 +75,6 @@ describe('the credential form keeps the typed service name', () => {
     expect(serviceField().value).toBe('Example API');
   });
 
-  // A typed field no longer follows its default, so a request replacing the
-  // open form must remount it. Otherwise the save lands under the typed name.
   it('shows the service of a request that replaces a half-filled form', async () => {
     typeInto(serviceField(), 'Example API');
     await settle();

@@ -1,18 +1,3 @@
-/**
- * The thread review loop: one PNG per kind of turn a thread can draw. A change
- * to turn headers, cards or rows can then be LOOKED AT before it is applied.
- *
- *   THREAD_SHOTS=1 ./scripts/e2e-browser.sh --no-webkit -f thread-shots-all.spec.ts
- *
- * It seeds two threads straight into the events table, a Lucidos Agent thread
- * and a Claude Code thread, each holding one turn per scene below. The app
- * then renders them through the real store and the real stylesheet, so a shot
- * is what a reader sees, not a mock.
- *
- * The PNGs land in `test-results/thread-shots/<project>/`, with a
- * `scenes.json` naming each one. Skipped unless `THREAD_SHOTS=1`: it asserts
- * nothing, like header-shots and theme-shots.
- */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { BrowserContext } from '@playwright/test';
@@ -26,7 +11,6 @@ const ROOT = 'test-results/thread-shots';
 
 type SeedEvent = [type: string, payload: Record<string, unknown>];
 
-/** One turn to shoot: the events that make it, and what the gallery says. */
 interface Scene {
   slug: string;
   title: string;
@@ -37,7 +21,6 @@ interface Scene {
 interface SeededThread {
   threadId: string;
   title: string;
-  /** `eventIds` is every event the scene seeded, so the shot can find each turn it opened. */
   scenes: Array<Scene & { anchorId: string; eventIds: string[] }>;
 }
 
@@ -46,11 +29,9 @@ interface GalleryEntry {
   title: string;
   trigger: string;
   thread: string;
-  /** Set on a header crop: which header system drew it. */
   header?: string;
 }
 
-/** Every header system a turn can draw, by the class of its row. */
 const HEADER_KINDS: Array<[kind: string, selector: string]> = [
   ['initiator', '.initiator-header'],
   ['response', '.response-header'],
@@ -81,8 +62,6 @@ function human(text: string, channel: string): SeedEvent {
   return ['MessageReceived', { text, mode: 'human', origin: YOU, actor: YOU, device_id: HARNESS_DEVICE_ID, channel }];
 }
 
-/** A chat tool call and its result. `_id` pins the call's event id, which the
- *  result names so the store pairs them. */
 function chatTool(name: string, description: string, result: string): SeedEvent[] {
   const callId = randomUUID();
   return [
@@ -91,8 +70,6 @@ function chatTool(name: string, description: string, result: string): SeedEvent[
   ];
 }
 
-/** A reply as the engine writes one: streamed text, then the closing event.
- *  The transcript draws the streamed text; the closing event only ends the turn. */
 function chatReply(text: string): SeedEvent[] {
   return [['TextStreamed', { text }], ['ResponseGenerated', { text, model: 'claude-opus-5-5' }]];
 }
@@ -253,8 +230,6 @@ function chatScenes(): Scene[] {
   ];
 }
 
-/** The change the Claude Code thread applies. It gets a real `changes` row,
- *  because the card fetches its description and commits by id. */
 function seedAppliedChange(changeId: string, threadId: string): void {
   psql('INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened, thread_id, status, commits) ' +
     `VALUES ('${changeId}', '${randomUUID()}', 'dark-mode-toggle', '/home/user/example-repo', 'Add a dark-mode toggle to Appearance', 2, ` +
@@ -371,9 +346,6 @@ function ccScenes(changeId: string): Scene[] {
   ];
 }
 
-/** Insert one thread and its scenes, one second apart so timestamps read like
- *  a real conversation. Each scene's first event id is the `data-event-id` its
- *  `.chat-exchange` carries. */
 function seedThread(opts: { title: string; source: 'chat' | 'claude_code'; scenes: Scene[] }): SeededThread {
   const threadId = randomUUID();
   const start = Date.now() - 3_600_000;
@@ -402,22 +374,17 @@ function seedThread(opts: { title: string; source: 'chat' | 'claude_code'; scene
 }
 
 async function openThread(page: Page, threadId: string): Promise<void> {
-  // Dark mode, which is what the gallery's reader runs.
   await page.addInitScript((tid: string) => {
     localStorage.setItem('lucidos-focused-thread', tid);
     localStorage.setItem('lucidos-theme-mode', 'dark');
   }, threadId);
   await disarmFollowSeed(page);
   await navigateToApp(page);
-  // The boot splash is an opaque overlay that fades once the app paints. A
-  // shot taken under it is a picture of the splash.
   await expect.poll(() => page.locator('.boot-splash').count(), { timeout: 30_000 }).toBe(0);
   await expect(page.locator('.chat-exchange').first()).toBeVisible({ timeout: 30_000 });
   await renderWholeTranscript(page);
 }
 
-/** One picture of every turn a scene opened. An abort or a cancel opens a turn of
- *  its own under the reply it ended, so a scene can span several. */
 async function shotTurns(page: Page, path: string, eventIds: string[]): Promise<void> {
   const box = await page.evaluate((ids: string[]) => {
     const turns = [...document.querySelectorAll<HTMLElement>('.chat-exchange')]
@@ -432,8 +399,6 @@ async function shotTurns(page: Page, path: string, eventIds: string[]): Promise<
   if (box) await page.screenshot({ path, clip: box, animations: 'disabled', caret: 'hide' });
 }
 
-/** Shoot one thread on a page of its own, so exactly one init script picks
- *  the focused thread: Playwright leaves the order of several undefined. */
 async function shootThread(context: BrowserContext, dir: string, prefix: string, seeded: SeededThread): Promise<GalleryEntry[]> {
   const page = await context.newPage();
   try {
@@ -443,8 +408,6 @@ async function shootThread(context: BrowserContext, dir: string, prefix: string,
   }
 }
 
-/** The whole pane, its frame (app header, title bar, composer), every scene on
- *  its own, then the surfaces a thread opens over itself. */
 async function shootPage(page: Page, dir: string, prefix: string, seeded: SeededThread): Promise<GalleryEntry[]> {
   const written: GalleryEntry[] = [];
   const mobile = isMobileViewport(page);
@@ -467,7 +430,6 @@ async function shootPage(page: Page, dir: string, prefix: string, seeded: Seeded
     'Thread title bar', mobile ? 'MobileThreadTitleBar' : 'ThreadView .thread-view-header');
   await shot(`${prefix}-03-composer.png`, '.prompt-area', 'Composer', 'PromptInput + PromptRowControls');
 
-  // A tall viewport, so a long turn fits one element shot whole.
   const size = page.viewportSize();
   if (size) await page.setViewportSize({ width: size.width, height: 2400 });
   for (const [i, scene] of seeded.scenes.entries()) {
@@ -485,7 +447,6 @@ async function shootPage(page: Page, dir: string, prefix: string, seeded: Seeded
   }
   if (size) await page.setViewportSize(size);
 
-  // The surfaces a thread opens over itself, each with its own head.
   const popover = async (file: string, opener: string, panel: string, title: string, trigger: string) => {
     const open = page.locator(opener).filter({ visible: true }).first();
     if (await open.count() === 0) return;

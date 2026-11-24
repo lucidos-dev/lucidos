@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The Autocorrect switch inside an app frame (ADR 0262). The host's stamp never
- * reaches this document. The SDK's stamp is what stands between an app's notes
- * field and the dead tap on the Save below it.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   _resetAutocorrectStampForTesting, applyAutocorrectPreference, initialAutocorrect,
@@ -17,7 +12,6 @@ function stubAgent(userAgent: string): void {
   vi.stubGlobal('navigator', { userAgent, platform: 'x', maxTouchPoints: 0 });
 }
 
-/** Let the MutationObserver deliver, as it does before any user input. */
 const observed = () => new Promise<void>((resolve) => queueMicrotask(resolve));
 
 function mount(html: string): HTMLElement {

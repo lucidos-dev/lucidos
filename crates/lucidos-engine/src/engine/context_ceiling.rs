@@ -6,150 +6,20 @@
 //! `ContextCeilingSet` event, the HTTP route and the CLI. The wire form is
 //! `off`, a size such as `300k`, or a window share such as `30%`.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::handoff_estimate::{HANDOFF_FLOOR_TOKENS, OFFER_DECLINE_HOLD_TOKENS};
-use super::successor::SessionReading;
-use super::turn_end::CeilingFacts;
+#[cfg(test)]
+use super::handoff_estimate::HANDOFF_FLOOR_TOKENS;
+use super::handoff_estimate::OFFER_DECLINE_HOLD_TOKENS;
+use super::turn_requirements::CeilingFacts;
+use crate::engine::handoff_state::SessionReading;
 
-/// The share of the recorded window no ceiling goes above, in percent.
-const WINDOW_CAP_PERCENT: u64 = 75;
-
-/// A session's context reading past its effective ceiling, as
-/// `ContextCeilingReached` records it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CeilingCrossing {
-    pub context_tokens: u64,
-    /// The effective ceiling, in tokens.
-    pub ceiling: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window: Option<u64>,
-}
-
-/// The largest size a ceiling names, in thousands of tokens.
-const MAX_THOUSANDS: u64 = 100_000;
+pub use crate::engine::thread_events::{CeilingCrossing, CeilingSource, ContextCeiling};
 
 /// What the route answers an agent that tries to raise a ceiling.
 pub const RAISE_NEEDS_A_PERSON: &str = "ceiling-raise-needs-a-person";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextCeiling {
-    /// No ceiling: the session grows until its backend compacts.
-    Off,
-    /// A size in tokens.
-    Tokens(u64),
-    /// A share of the session's recorded window, in percent.
-    WindowShare(u8),
-}
-
-impl ContextCeiling {
-    const OFF: &'static str = "off";
-
-    /// Parse the text form: `off`, `<N>k`, or `<P>%`.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        let raw = raw.trim();
-        let refused = || {
-            format!(
-                "a context ceiling is \"off\", a size such as \"300k\", or a window share \
-                 such as \"30%\" (got {raw:?})"
-            )
-        };
-        if raw == Self::OFF {
-            return Ok(Self::Off);
-        }
-        if let Some(share) = raw.strip_suffix('%') {
-            return share
-                .parse::<u8>()
-                .ok()
-                .filter(|p| (1..=100).contains(p))
-                .map(Self::WindowShare)
-                .ok_or_else(refused);
-        }
-        raw.strip_suffix('k')
-            .and_then(|n| n.parse::<u64>().ok())
-            .filter(|n| (1..=MAX_THOUSANDS).contains(n))
-            .map(|n| Self::Tokens(n * 1_000))
-            .ok_or_else(refused)
-    }
-
-    /// The ceiling in tokens for a session whose newest capture records
-    /// `window`. `None` when it never fires: `off`, or a share with no window.
-    pub fn effective(self, window: Option<u64>) -> Option<u64> {
-        let window = window.filter(|w| *w > 0);
-        let value = match self {
-            Self::Off => return None,
-            Self::Tokens(n) => n,
-            Self::WindowShare(p) => window? * u64::from(p) / 100,
-        };
-        let capped = match window {
-            Some(w) => value.min(w * WINDOW_CAP_PERCENT / 100),
-            None => value,
-        };
-        Some(capped.max(HANDOFF_FLOOR_TOKENS))
-    }
-
-    /// The crossing `reading` makes of this ceiling, if it tops it. An unknown
-    /// reading never does, and neither does a ceiling with no effective size.
-    pub(crate) fn crossed_by(self, reading: SessionReading) -> Option<CeilingCrossing> {
-        let context_tokens = reading.tokens?;
-        let ceiling = self.effective(reading.window)?;
-        (context_tokens > ceiling).then_some(CeilingCrossing {
-            context_tokens,
-            ceiling,
-            window: reading.window,
-        })
-    }
-
-    /// Whether `self` lets a session grow past where `from` stops it. A
-    /// comparison the window cannot settle reads as a raise, since an unknown
-    /// never authorizes.
-    pub fn raises(self, from: Self, window: Option<u64>) -> bool {
-        match (self, from) {
-            (_, Self::Off) => false,
-            (Self::Off, _) => true,
-            (Self::Tokens(a), Self::Tokens(b)) => a > b,
-            (Self::WindowShare(a), Self::WindowShare(b)) => a > b,
-            _ => match (self.effective(window), from.effective(window)) {
-                (Some(a), Some(b)) => a > b,
-                _ => true,
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for ContextCeiling {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Off => f.write_str(Self::OFF),
-            Self::Tokens(n) => write!(f, "{}k", n / 1_000),
-            Self::WindowShare(p) => write!(f, "{p}%"),
-        }
-    }
-}
-
-impl Serialize for ContextCeiling {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for ContextCeiling {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Where a thread's `ContextCeilingSet` came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CeilingSource {
-    /// Set on the thread itself, by a person or an agent.
-    Thread,
-    /// Copied from the trigger that fired the thread.
-    Trigger,
-}
 
 /// The longest parent chain [`thread_ceiling`] walks.
 const MAX_ANCESTRY_HOPS: i32 = 16;
@@ -308,7 +178,7 @@ async fn refuse_agent(
                 .to_string(),
         }));
     }
-    let window = super::successor::session_reading(pool, thread_id)
+    let window = crate::engine::handoff_state::session_reading(pool, thread_id)
         .await?
         .window;
     let current = ceiling_of(pool, thread_id).await?;
@@ -324,50 +194,78 @@ async fn refuse_agent(
     Ok(None)
 }
 
-/// The ceiling facts of `thread_id`'s current session, read at an ordinary
-/// clean turn end after its `CodingAgentIdled`. `unread_input` says the agent
-/// holds an input it has not read. Only this session's cards count, so a card
-/// an older session left unanswered never holds the ceiling off. A thread a
-/// handoff refuses, such as an integrated sub-thread, is never due.
+/// Delivery facts for this session's durable crossing.
 pub(crate) async fn ceiling_facts(
     pool: &PgPool,
     thread_id: Uuid,
     unread_input: bool,
 ) -> Result<CeilingFacts, sqlx::Error> {
-    let reading = super::successor::session_reading(pool, thread_id).await?;
-    let ceiling = ceiling_of(pool, thread_id).await?;
-    let (reached, turns, card_open, handoff_pending): (bool, i64, bool, bool) =
-        sqlx::query_as(&format!(
-            "SELECT EXISTS (SELECT 1 FROM events \
-                     WHERE thread_id = $1 AND event_type = 'ContextCeilingReached' AND {scope}), \
-                    (SELECT count(*) FROM events \
-                     WHERE thread_id = $1 AND event_type = 'CodingAgentIdled' AND {scope} \
-                       AND payload->>'reason' IS DISTINCT FROM $2), \
-                    EXISTS (SELECT 1 FROM events q \
-                     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' \
-                       AND {question_scope} \
-                       AND NOT EXISTS (SELECT 1 FROM events a \
-                            WHERE a.thread_id = $1 AND a.event_type = 'UserQuestionAnswered' \
-                              AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id')), \
-                    {pending}",
-            scope = super::session_scope::in_current_session_sql("$1", "sequence"),
-            question_scope = super::session_scope::in_current_session_sql("$1", "q.sequence"),
-            pending = super::successor::pending_handoff_sql("$1"),
-        ))
-        .bind(thread_id)
-        .bind(super::thread_events::KEEP_ALIVE_IDLE_REASON)
-        .fetch_one(pool)
-        .await?;
-    let blocked = super::successor::handoff_block(pool, thread_id)
+    let (card_open, handoff_pending): (bool, bool) = sqlx::query_as(&format!(
+        "SELECT EXISTS (SELECT 1 FROM events q \
+           WHERE q.thread_id = $1 AND q.event_type IN ('UserQuestionAsked', 'CodingAgentPermissionRequest') \
+             AND {scope} \
+             AND NOT EXISTS (SELECT 1 FROM events a \
+               WHERE a.thread_id = $1 AND ((q.event_type = 'UserQuestionAsked' AND a.event_type = 'UserQuestionAnswered' \
+                 AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id') \
+                 OR (q.event_type = 'CodingAgentPermissionRequest' AND a.event_type = 'CodingAgentPermissionResolved' \
+                 AND a.payload->>'request_id' = q.payload->>'request_id')))), {pending}",
+        scope = super::session_scope::in_current_session_sql("$1", "q.sequence"),
+        pending = crate::engine::handoff_sql::pending_handoff_sql("$1"),
+    ))
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await?;
+    let blocked = crate::engine::handoff_state::handoff_block(pool, thread_id)
         .await?
         .is_some();
     Ok(CeilingFacts {
-        reading,
-        ceiling,
-        reached,
-        first_turn: turns < 2,
+        owed: past_ceiling(pool, thread_id).await?,
         busy: unread_input || card_open || handoff_pending || blocked,
     })
+}
+
+/// Record the first crossing after a main-session capture. Delivery waits separately.
+/// The caller serializes captures within the session and excludes restored usage.
+pub async fn record_capture_crossing(
+    bus: &super::event_bus::EventBus,
+    thread_id: Uuid,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pool = bus.pool();
+    let (reached, opening): (bool, Option<serde_json::Value>) = sqlx::query_as(&format!(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE thread_id = $1 \
+           AND event_type = 'ContextCeilingReached' AND {scope}), \
+         (SELECT payload FROM events WHERE thread_id = $1 AND {capture} \
+           ORDER BY sequence LIMIT 1)",
+        scope = super::session_scope::in_current_session_sql("$1", "sequence"),
+        capture = crate::engine::session_capture_sql::current_session_capture_sql("$1"),
+    ))
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await?;
+    if reached {
+        return Ok(());
+    }
+    let ceiling = ceiling_of(pool, thread_id).await?;
+    let opening = opening
+        .map(|p| SessionReading {
+            tokens: p["usage"]["input_tokens"].as_u64(),
+            window: p["context_window"].as_u64(),
+        })
+        .unwrap_or_default();
+    if ceiling.crossed_by(opening).is_some() {
+        return Ok(());
+    }
+    if let Some(crossing) =
+        ceiling.crossed_by(crate::engine::handoff_state::session_reading(pool, thread_id).await?)
+    {
+        if crate::engine::handoff_state::handoff_block(pool, thread_id)
+            .await?
+            .is_none()
+        {
+            record_ceiling_reached(bus, thread_id, crossing).await?;
+        }
+    }
+    Ok(())
 }
 
 /// The crossing `thread_id`'s current session recorded, while the session is
@@ -375,7 +273,7 @@ pub(crate) async fn ceiling_facts(
 /// below the crossing, so a raise the session has outgrown still binds. Only a
 /// person raises a ceiling, so `None` after a recorded crossing means a person
 /// raised it above the session's size.
-pub(crate) async fn past_ceiling(
+pub async fn past_ceiling(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<Option<CeilingCrossing>, sqlx::Error> {
@@ -392,7 +290,7 @@ pub(crate) async fn past_ceiling(
     else {
         return Ok(None);
     };
-    let reading = super::successor::session_reading(pool, thread_id).await?;
+    let reading = crate::engine::handoff_state::session_reading(pool, thread_id).await?;
     let size = reading
         .tokens
         .map_or(reached.context_tokens, |t| t.max(reached.context_tokens));
@@ -400,6 +298,33 @@ pub(crate) async fn past_ceiling(
         .await?
         .effective(reading.window.or(reached.window));
     Ok(ceiling.is_some_and(|c| size > c).then_some(reached))
+}
+
+/// Whether the latest ceiling re-entry reached this session before its turn ended.
+/// Missing evidence never authorizes starting a successor without input.
+pub async fn reentry_cut_turn_short(pool: &PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "WITH crossing AS ( \
+           SELECT sequence FROM events WHERE thread_id = $1 \
+             AND event_type = 'ContextCeilingReached' AND {scope} \
+           ORDER BY sequence DESC LIMIT 1), \
+         anchor AS ( \
+           SELECT e.sequence FROM events e, crossing c \
+            WHERE e.thread_id = $1 AND e.sequence > c.sequence \
+              AND e.event_type = 'PromptInjected' \
+              AND e.payload->'origin'->>'kind' = 'engine' \
+              AND e.payload->'origin'->'reason'->>'kind' = 'context_ceiling' \
+            ORDER BY e.sequence DESC LIMIT 1) \
+         SELECT EXISTS (SELECT 1 FROM crossing c, anchor a WHERE NOT EXISTS ( \
+           SELECT 1 FROM events e WHERE e.thread_id = $1 \
+             AND e.sequence > c.sequence AND e.sequence < a.sequence \
+             AND e.event_type = ANY($2)))",
+        scope = super::session_scope::in_current_session_sql("$1", "sequence"),
+    ))
+    .bind(thread_id)
+    .bind(super::summary_tree::log::TURN_END_EVENT_TYPES)
+    .fetch_one(pool)
+    .await
 }
 
 /// Whether a *handoff checkpoint* run on `thread_id` hands off for its context
@@ -410,7 +335,7 @@ pub(crate) async fn checkpoint_past_ceiling(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    if super::successor::handoff_block(pool, thread_id)
+    if crate::engine::handoff_state::handoff_block(pool, thread_id)
         .await?
         .is_some()
     {
@@ -419,7 +344,7 @@ pub(crate) async fn checkpoint_past_ceiling(
     if past_ceiling(pool, thread_id).await?.is_some() {
         return Ok(true);
     }
-    let reading = super::successor::session_reading(pool, thread_id).await?;
+    let reading = crate::engine::handoff_state::session_reading(pool, thread_id).await?;
     Ok(ceiling_of(pool, thread_id)
         .await?
         .crossed_by(reading)
@@ -432,17 +357,19 @@ pub(crate) async fn checkpoint_past_ceiling(
 pub(crate) async fn record_ceiling_brief(
     bus: &super::event_bus::EventBus,
     thread_id: Uuid,
-    implementer: super::successor::Implementer,
-    running: &super::successor::StillRunning,
+    implementer: crate::engine::Implementer,
+    running: &crate::engine::handoff_state::StillRunning,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    use super::successor::{handoff_brief, last_applied_summary, BriefCause, NewHandoff};
     use super::thread_events::{EngineReason, EventMeta, HandoffCause, HandoffOpening};
+    use crate::engine::handoff_state::{
+        handoff_brief, last_applied_summary, BriefCause, NewHandoff,
+    };
 
     let pool = bus.pool();
     let Some(crossing) = past_ceiling(pool, thread_id).await? else {
         return Ok(false);
     };
-    if super::successor::handoff_block(pool, thread_id)
+    if crate::engine::handoff_state::handoff_block(pool, thread_id)
         .await?
         .is_some()
     {
@@ -467,14 +394,14 @@ pub(crate) async fn record_ceiling_brief(
         crossing: Some(crossing),
     };
     let origin = super::thread_events::MessageOrigin::engine(EngineReason::ContextCeiling);
-    let record = super::successor::record_handoff(
+    let record = crate::engine::handoff_state::record_handoff(
         bus,
         thread_id,
         handoff,
         EventMeta::with_actor(Some(origin)),
     )
     .await?;
-    Ok(record == super::successor::HandoffRecord::Recorded)
+    Ok(record == crate::engine::handoff_state::HandoffRecord::Recorded)
 }
 
 /// A ceiling handoff waiting for the thread's next input, as the composer card
@@ -503,17 +430,17 @@ fn return_ceiling(size: u64, window: Option<u64>) -> Option<u64> {
 /// `thread_id`'s pending handoff, when it is a ceiling handoff that waits for
 /// the next input. The size is the session's newest reading, never below the
 /// crossing.
-pub(crate) async fn pending_ceiling_handoff(
+pub async fn pending_ceiling_handoff(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<Option<CeilingHandoff>, sqlx::Error> {
-    let Some(handoff) = super::successor::pending_handoff(pool, thread_id).await? else {
+    let Some(handoff) = super::pending_handoff::pending_handoff(pool, thread_id).await? else {
         return Ok(None);
     };
     let Some(crossing) = handoff.crossing.filter(|_| !handoff.starts_unprompted()) else {
         return Ok(None);
     };
-    let reading = super::successor::session_reading(pool, thread_id).await?;
+    let reading = crate::engine::handoff_state::session_reading(pool, thread_id).await?;
     let size = reading
         .tokens
         .map_or(crossing.context_tokens, |t| t.max(crossing.context_tokens));
@@ -545,7 +472,7 @@ pub enum Withdrawal {
 /// that still stands.
 ///
 /// A run claims the thread before it reads the pending handoff under
-/// [`super::successor::lock_handoff`]. So a run that holds the thread here may
+/// [`crate::engine::handoff_state::lock_handoff`]. So a run that holds the thread here may
 /// already be starting the successor, and the withdraw refuses.
 pub async fn withdraw_ceiling_handoff(
     bus: &super::event_bus::EventBus,
@@ -561,7 +488,7 @@ pub async fn withdraw_ceiling_handoff(
         return Ok(Withdrawal::NeedsAPerson);
     }
     let pool = bus.pool();
-    let claim = super::successor::lock_handoff(pool, thread_id).await?;
+    let claim = crate::engine::handoff_state::lock_handoff(pool, thread_id).await?;
     let Some(pending) = pending_ceiling_handoff(pool, thread_id).await? else {
         return Ok(Withdrawal::NoCeilingHandoff);
     };
@@ -569,7 +496,7 @@ pub async fn withdraw_ceiling_handoff(
         .lock()
         .await
         .get(&thread_id)
-        .is_some_and(super::agent_session::spawn_claim::holds_thread);
+        .is_some_and(crate::engine::session_claim::holds_thread);
     if held {
         return Ok(Withdrawal::Starting);
     }
@@ -609,12 +536,12 @@ impl super::LucidosEngine {
     /// Record the brief handoff `thread_id` owes for its context ceiling, if
     /// it owes one ([`record_ceiling_brief`]). Runs where a ceiling re-entry
     /// turn ends, and where a real spawn claims the thread after a restart.
-    pub(crate) async fn settle_owed_ceiling_handoff(&self, thread_id: Uuid) {
+    pub async fn settle_owed_ceiling_handoff(&self, thread_id: Uuid) {
         match past_ceiling(self.pool(), thread_id).await {
             Ok(Some(_)) => {}
             Ok(None) => return,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ContextCeiling] Could not read whether {} is past its ceiling: {}",
                     thread_id,
                     e
@@ -625,23 +552,23 @@ impl super::LucidosEngine {
         let (model, reasoning_effort) = match self.cc_thread_runs_on(thread_id).await {
             Ok(pair) => pair,
             Err(e) => {
-                log!("[ContextCeiling] Implementer of {}: {}", thread_id, e);
+                log_legacy!("[ContextCeiling] Implementer of {}: {}", thread_id, e);
                 return;
             }
         };
-        let implementer = super::successor::Implementer {
+        let implementer = crate::engine::Implementer {
             coding_agent: self.thread_coding_agent(thread_id).await,
             model,
             reasoning_effort,
         };
         let running = self.still_running(thread_id).await;
         match record_ceiling_brief(&self.event_bus, thread_id, implementer, &running).await {
-            Ok(true) => log!(
+            Ok(true) => log_legacy!(
                 "[ContextCeiling] Thread {} hands off from a brief: its re-entry wrote no narrative",
                 thread_id
             ),
             Ok(false) => {}
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[ContextCeiling] Could not record the brief handoff of {}: {}",
                 thread_id,
                 e
@@ -650,9 +577,8 @@ impl super::LucidosEngine {
     }
 }
 
-/// The crossing an ordinary clean turn end of `thread_id` makes due, from
-/// [`ceiling_facts`]. A failed read sends nothing.
-pub(crate) async fn ceiling_crossing(
+/// The recorded crossing due for delivery. A failed read sends nothing.
+pub async fn ceiling_crossing(
     pool: &PgPool,
     thread_id: Uuid,
     unread_input: bool,
@@ -660,7 +586,7 @@ pub(crate) async fn ceiling_crossing(
     match ceiling_facts(pool, thread_id, unread_input).await {
         Ok(facts) => facts.crossing(),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[ContextCeiling] Could not read the ceiling facts of {}: {}",
                 thread_id,
                 e
@@ -670,26 +596,86 @@ pub(crate) async fn ceiling_crossing(
     }
 }
 
-/// Record `ContextCeilingReached`, then the *ceiling re-entry*'s anchor, and
-/// return the re-entry for the run to put at the head of its channel. The
-/// crossing comes first, so a session that dies before reading the re-entry
-/// still owes its handoff. The `PromptInjected` anchor starts its exchange.
-pub(crate) async fn record_ceiling_reentry(
+/// A later hold invalidates an approval still waiting for a safe boundary.
+pub async fn recheck_ceiling_approval(
+    bus: &super::event_bus::EventBus,
+    thread_id: Uuid,
+    approved: &mut Option<super::AgentUserInput>,
+) {
+    if approved.is_some() && super::thread_hold::thread_is_held(bus.pool(), thread_id).await {
+        *approved = None;
+    }
+}
+
+/// Prepare a safe steer. A refusal to steer leaves the debt for the turn end.
+pub async fn ceiling_steer(
+    bus: &super::event_bus::EventBus,
+    thread_id: Uuid,
+    unread: bool,
+    can_steer: bool,
+    ledger: &mut super::turn_requirements::ReentryLedger,
+    approved: &mut Option<super::AgentUserInput>,
+) -> Result<Option<super::AgentUserInput>, Box<dyn std::error::Error + Send + Sync>> {
+    recheck_ceiling_approval(bus, thread_id, approved).await;
+    if !can_steer {
+        return Ok(None);
+    }
+    let crossing = ceiling_crossing(bus.pool(), thread_id, unread).await;
+    let gate = super::turn_requirements::TurnEndState::at_session_idle(
+        true,
+        false,
+        super::turn_requirements::SessionFacts {
+            head: None,
+            held: None,
+            approved_plan_unstarted: false,
+        },
+        crossing,
+    );
+    let Some(due) = ledger.take_due(&gate) else {
+        return Ok(None);
+    };
+    if approved.is_none() && !super::thread_hold::may_start_turn(bus.pool(), thread_id).await {
+        ledger.forget(due);
+        return Ok(None);
+    }
+    if let Some(input) = approved.take() {
+        return Ok(Some(input));
+    }
+    match record_ceiling_reentry(bus, thread_id, crossing.expect("ceiling-only gate")).await {
+        Ok(input) => Ok(Some(input)),
+        Err(e) => {
+            ledger.forget(due);
+            Err(e)
+        }
+    }
+}
+
+/// Record the re-entry anchor after the durable crossing, then return its input.
+pub async fn record_ceiling_reentry(
     bus: &super::event_bus::EventBus,
     thread_id: Uuid,
     crossing: CeilingCrossing,
 ) -> Result<super::AgentUserInput, Box<dyn std::error::Error + Send + Sync>> {
-    use super::event_bus::BusEvent;
-    use super::thread_events::{
-        ActorMode, EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
-    };
+    ceiling_reentry_input(bus, thread_id, crossing).await
+}
 
-    let origin = MessageOrigin::engine(EngineReason::ContextCeiling);
-    let meta = EventMeta {
+fn ceiling_meta() -> super::thread_events::EventMeta {
+    use super::thread_events::{EngineReason, EventChannel, EventMeta, MessageOrigin};
+    EventMeta {
         channel: Some(EventChannel::ClaudeCode),
-        actor: Some(origin.clone()),
+        actor: Some(MessageOrigin::engine(EngineReason::ContextCeiling)),
         ..EventMeta::NONE
-    };
+    }
+}
+
+/// Record that the session crossed its ceiling, so it owes a handoff.
+pub async fn record_ceiling_reached(
+    bus: &super::event_bus::EventBus,
+    thread_id: Uuid,
+    crossing: CeilingCrossing,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use super::event_bus::BusEvent;
+    use super::thread_events::ThreadEvent;
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ContextCeilingReached {
@@ -697,21 +683,33 @@ pub(crate) async fn record_ceiling_reentry(
             ceiling: crossing.ceiling,
             window: crossing.window,
         },
-        meta: meta.clone(),
+        meta: ceiling_meta(),
     })
     .await?;
-    let text = super::agent_session::ceiling_reentry_prompt(crossing);
+    Ok(())
+}
+
+/// The ceiling re-entry for a live session. Its `PromptInjected` anchor
+/// starts its exchange.
+pub(crate) async fn ceiling_reentry_input(
+    bus: &super::event_bus::EventBus,
+    thread_id: Uuid,
+    crossing: CeilingCrossing,
+) -> Result<super::AgentUserInput, Box<dyn std::error::Error + Send + Sync>> {
+    use super::event_bus::BusEvent;
+    use super::thread_events::{ActorMode, EngineReason, MessageOrigin, ThreadEvent};
+    let text = ceiling_reentry_prompt(crossing);
     let anchor = bus
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::PromptInjected {
                 text: text.clone(),
                 mode: ActorMode::Engine,
-                origin: Some(origin),
+                origin: Some(MessageOrigin::engine(EngineReason::ContextCeiling)),
                 injected_message_id: None,
                 delivered_event_id: None,
             },
-            meta,
+            meta: ceiling_meta(),
         })
         .await?;
     Ok(super::AgentUserInput {
@@ -726,7 +724,7 @@ pub(crate) async fn record_ceiling_reentry(
 impl super::LucidosEngine {
     /// Copy the firing trigger's ceiling onto its thread, through
     /// [`copy_trigger_ceiling`].
-    pub(crate) async fn copy_trigger_ceiling(&self, thread_id: Uuid, trigger_id: &str) {
+    pub async fn copy_trigger_ceiling(&self, thread_id: Uuid, trigger_id: &str) {
         let ceiling = self
             .trigger_configs
             .read()
@@ -734,7 +732,7 @@ impl super::LucidosEngine {
             .and_then(|m| m.get(trigger_id).and_then(|c| c.context_ceiling));
         if let Some(ceiling) = ceiling {
             if let Err(e) = copy_trigger_ceiling(&self.event_bus, thread_id, ceiling).await {
-                log!(
+                log_legacy!(
                     "[ContextCeiling] Could not copy {}'s ceiling: {}",
                     trigger_id,
                     e
@@ -772,6 +770,25 @@ pub(crate) async fn copy_trigger_ceiling(
     })
     .await?;
     Ok(())
+}
+
+/// The *ceiling re-entry*: what a session past its *context ceiling* is told
+/// at its next safe boundary (ADR 0629).
+pub fn ceiling_reentry_prompt(crossing: crate::engine::context_ceiling::CeilingCrossing) -> String {
+    let thousands = |tokens: u64| tokens.div_ceil(1_000);
+    let sections = crate::engine::handoff_state::NARRATIVE_SECTIONS.join(", ");
+    format!(
+        "CONTEXT CEILING: This session's context holds {}k tokens, past this thread's context \
+         ceiling of {}k. Hand off to a fresh session now, and do no more work on the task.\n\n\
+         Stop the step you are on at a safe point. Leave running background tasks alone; \
+         the successor inherits them.\n\n\
+         1. Commit any finished work.\n\
+         2. Write a handoff narrative to a file. Give it these markdown headings: {sections}.\n\
+         3. Run `lucidos successor start --narrative <file>`, then end your turn.\n\n\
+         Ask no question in this turn. The fresh session reads your narrative first.",
+        thousands(crossing.context_tokens),
+        thousands(crossing.ceiling),
+    )
 }
 
 #[cfg(test)]
@@ -1148,47 +1165,136 @@ mod tests {
             insert(pool, thread_id, "CodingAgentIdled", idle).await;
         }
 
-        /// I2: the session's second ordinary turn end past the ceiling is due.
-        /// A keep-alive idle is no turn, and a recorded crossing ends it.
         #[tokio::test]
-        async fn ceiling_facts_count_turns_and_the_recorded_crossing() {
+        async fn a_successor_that_grows_past_the_ceiling_in_its_opening_turn_hands_off() {
             let (pool, db) = setup_test_db().await;
             let (bus, _rx) = EventBus::new(pool.clone());
             let thread = seed_coding_thread(&bus, None).await;
-            turn_at(&pool, thread, 400_000, None).await;
-            let first = ceiling_facts(&pool, thread, false).await.unwrap();
-            assert!(first.first_turn, "the opening turn never hands off");
-            assert_eq!(first.crossing(), None);
+            for tokens in [60_000, 299_000, 301_000] {
+                insert(
+                    &pool,
+                    thread,
+                    "ContextCaptured",
+                    serde_json::json!({
+                        "usage": {"input_tokens": tokens},
+                        "context_window": 1_000_000,
+                    }),
+                )
+                .await;
+                record_capture_crossing(&bus, thread).await.unwrap();
+            }
+            let facts = ceiling_facts(&pool, thread, false).await.unwrap();
+            assert_eq!(facts.crossing().map(|c| c.context_tokens), Some(301_000));
+            teardown_test_db(&db).await;
+        }
 
-            let keep_alive = crate::engine::thread_events::KEEP_ALIVE_IDLE_REASON;
-            turn_at(&pool, thread, 400_000, Some(keep_alive)).await;
-            assert!(
-                ceiling_facts(&pool, thread, false)
-                    .await
-                    .unwrap()
-                    .first_turn,
-                "a keep-alive beat is no turn"
-            );
+        #[tokio::test]
+        async fn hardening_thread_shape_records_at_the_first_capture_past_the_ceiling() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread = seed_coding_thread(&bus, None).await;
+            for tokens in [60_000, 299_000, 301_000, 365_000, 385_000, 474_000, 654_000] {
+                insert(
+                    &pool,
+                    thread,
+                    "ContextCaptured",
+                    serde_json::json!({
+                        "usage": {"input_tokens": tokens}, "context_window": 1_000_000,
+                    }),
+                )
+                .await;
+                record_capture_crossing(&bus, thread).await.unwrap();
+            }
+            let crossings: Vec<serde_json::Value> = sqlx::query_scalar(
+                "SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ContextCeilingReached'"
+            ).bind(thread).fetch_all(&pool).await.unwrap();
+            assert_eq!(crossings.len(), 1);
+            assert_eq!(crossings[0]["context_tokens"], 301_000);
+            assert!(ceiling_crossing(&pool, thread, false).await.is_some());
+            assert!(ceiling_crossing(&pool, thread, true).await.is_none());
+            teardown_test_db(&db).await;
+        }
 
-            turn_at(&pool, thread, 410_000, None).await;
-            let second = ceiling_facts(&pool, thread, false).await.unwrap();
-            assert_eq!(second.reading.tokens, Some(410_000));
-            assert_eq!(second.crossing().map(|c| c.ceiling), Some(300_000));
-            assert_eq!(
-                ceiling_facts(&pool, thread, true).await.unwrap().crossing(),
-                None,
-                "an unread input holds it off"
-            );
+        #[tokio::test]
+        async fn a_session_whose_first_capture_tops_the_ceiling_never_fires() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread = seed_coding_thread(&bus, None).await;
+            for tokens in [301_000, 350_000, 654_000] {
+                turn_at(&pool, thread, tokens, None).await;
+                record_capture_crossing(&bus, thread).await.unwrap();
+                assert_eq!(past_ceiling(&pool, thread).await.unwrap(), None);
+                assert_eq!(ceiling_crossing(&pool, thread, false).await, None);
+            }
+            teardown_test_db(&db).await;
+        }
 
+        #[tokio::test]
+        async fn a_crossing_on_the_first_turn_after_a_shutdown_resume_hands_off() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread = seed_coding_thread(&bus, None).await;
+            turn_at(&pool, thread, 60_000, None).await;
             insert(
                 &pool,
                 thread,
-                "ContextCeilingReached",
-                serde_json::json!({"context_tokens": 410_000, "ceiling": 300_000}),
+                "SessionStarted",
+                serde_json::json!({
+                    "coding_agent": "claude-code", "session_id": "resumed", "branch": "b",
+                    "continuity": {"kind": "resumed"},
+                }),
             )
             .await;
-            assert!(ceiling_facts(&pool, thread, false).await.unwrap().reached);
+            insert(
+                &pool,
+                thread,
+                "ContextCaptured",
+                serde_json::json!({
+                    "usage": {"input_tokens": 301_000}, "context_window": 1_000_000,
+                }),
+            )
+            .await;
+            record_capture_crossing(&bus, thread).await.unwrap();
+            assert_eq!(
+                ceiling_crossing(&pool, thread, false)
+                    .await
+                    .unwrap()
+                    .context_tokens,
+                301_000
+            );
+            teardown_test_db(&db).await;
+        }
 
+        #[tokio::test]
+        async fn a_crossing_on_the_first_turn_after_a_stop_hands_off() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread = seed_coding_thread(&bus, None).await;
+            turn_at(&pool, thread, 60_000, None).await;
+            insert(
+                &pool,
+                thread,
+                "ResponseCanceled",
+                serde_json::json!({"cause": "user_stop"}),
+            )
+            .await;
+            insert(
+                &pool,
+                thread,
+                "ContextCaptured",
+                serde_json::json!({
+                    "usage": {"input_tokens": 301_000}, "context_window": 1_000_000,
+                }),
+            )
+            .await;
+            record_capture_crossing(&bus, thread).await.unwrap();
+            assert_eq!(
+                ceiling_crossing(&pool, thread, false)
+                    .await
+                    .unwrap()
+                    .context_tokens,
+                301_000
+            );
             teardown_test_db(&db).await;
         }
 
@@ -1222,9 +1328,14 @@ mod tests {
             .await;
             turn_at(&pool, thread, 60_000, None).await;
             let fresh = ceiling_facts(&pool, thread, false).await.unwrap();
-            assert!(!fresh.reached);
-            assert!(fresh.first_turn);
-            assert_eq!(fresh.reading.tokens, Some(60_000));
+            assert_eq!(fresh.owed, None);
+            assert_eq!(
+                crate::engine::handoff_state::session_reading(&pool, thread)
+                    .await
+                    .unwrap()
+                    .tokens,
+                Some(60_000)
+            );
 
             teardown_test_db(&db).await;
         }
@@ -1265,6 +1376,191 @@ mod tests {
             teardown_test_db(&db).await;
         }
 
+        #[tokio::test]
+        async fn context_ceiling_steer_rechecks_unread_cards_permissions_and_driver() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread = seed_coding_thread(&bus, None).await;
+            turn_at(&pool, thread, 100_000, None).await;
+            turn_at(&pool, thread, 310_000, None).await;
+            record_capture_crossing(&bus, thread).await.unwrap();
+            let mut ledger = crate::engine::turn_requirements::ReentryLedger::default();
+            assert!(
+                ceiling_steer(&bus, thread, true, true, &mut ledger, &mut None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                ceiling_steer(&bus, thread, false, false, &mut ledger, &mut None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            insert(
+                &pool,
+                thread,
+                "UserQuestionAsked",
+                serde_json::json!({"tool_use_id":"q","question":"Pick"}),
+            )
+            .await;
+            assert!(
+                ceiling_steer(&bus, thread, false, true, &mut ledger, &mut None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            insert(
+                &pool,
+                thread,
+                "UserQuestionAnswered",
+                serde_json::json!({"tool_use_id":"q"}),
+            )
+            .await;
+            insert(
+                &pool,
+                thread,
+                "CodingAgentPermissionRequest",
+                serde_json::json!({"request_id":"p"}),
+            )
+            .await;
+            assert!(
+                ceiling_steer(&bus, thread, false, true, &mut ledger, &mut None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            insert(
+                &pool,
+                thread,
+                "CodingAgentPermissionResolved",
+                serde_json::json!({"request_id":"p"}),
+            )
+            .await;
+            let input = ceiling_steer(&bus, thread, false, true, &mut ledger, &mut None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(input.kind, crate::engine::AgentInputKind::CeilingReentry);
+            assert!(input.text.contains("safe point"));
+            assert!(input.text.contains("successor inherits"));
+            assert!(
+                ceiling_steer(&bus, thread, false, true, &mut ledger, &mut None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let gate = crate::engine::turn_requirements::TurnEndState::at_session_idle(
+                true,
+                false,
+                crate::engine::turn_requirements::SessionFacts {
+                    head: None,
+                    held: None,
+                    approved_plan_unstarted: false,
+                },
+                past_ceiling(&pool, thread).await.unwrap(),
+            );
+            assert!(
+                ledger.take_due(&gate).is_none(),
+                "turn end cannot send a second prompt"
+            );
+            let handoffs: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'SessionHandedOff'")
+                .bind(thread).fetch_one(&pool).await.unwrap();
+            assert_eq!(handoffs, 0, "a deferral must not write a premature brief");
+            assert!(brief(&bus, thread).await);
+            let handoff = crate::engine::pending_handoff::pending_handoff(&pool, thread)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                handoff.message.contains("the full e2e suite"),
+                "the mid-turn path retains running work"
+            );
+            teardown_test_db(&db).await;
+        }
+
+        /// A hold keeps the ceiling steer from starting work, and drops an
+        /// approval that waited for a safe boundary. It raises no card.
+        #[tokio::test]
+        async fn a_hold_withholds_the_ceiling_steer() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread = seed_coding_thread(&bus, None).await;
+            turn_at(&pool, thread, 100_000, None).await;
+            turn_at(&pool, thread, 310_000, None).await;
+            record_capture_crossing(&bus, thread).await.unwrap();
+            let crossing = past_ceiling(&pool, thread).await.unwrap().unwrap();
+            let mut approved = Some(ceiling_reentry_input(&bus, thread, crossing).await.unwrap());
+            crate::test_support::seed_hold(&bus, thread).await;
+            let mut ledger = crate::engine::turn_requirements::ReentryLedger::default();
+            assert!(
+                ceiling_steer(&bus, thread, false, true, &mut ledger, &mut approved)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(approved.is_none(), "the hold drops the waiting approval");
+            let cards: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM events WHERE thread_id = $1 \
+                 AND event_type IN ('UserQuestionAsked', 'UserQuestionQueued')",
+            )
+            .bind(thread)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(cards, 0, "a hold raises no card");
+            teardown_test_db(&db).await;
+        }
+
+        #[tokio::test]
+        async fn ceiling_reentry_distinguishes_interrupted_and_finished_turns() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            for end in [None, Some("ResponseGenerated"), Some("CodingAgentIdled")] {
+                let thread = seed_coding_thread(&bus, None).await;
+                assert!(!reentry_cut_turn_short(&pool, thread).await.unwrap());
+                let crossing = CeilingCrossing {
+                    context_tokens: 335_000,
+                    ceiling: 300_000,
+                    window: Some(1_000_000),
+                };
+                record_ceiling_reached(&bus, thread, crossing)
+                    .await
+                    .unwrap();
+                assert!(!reentry_cut_turn_short(&pool, thread).await.unwrap());
+                if let Some(end) = end {
+                    insert(&pool, thread, end, serde_json::json!({})).await;
+                }
+                record_ceiling_reentry(&bus, thread, crossing)
+                    .await
+                    .unwrap();
+                let cut = reentry_cut_turn_short(&pool, thread).await.unwrap();
+                assert_eq!(cut, end.is_none());
+                let (_, starts) =
+                    crate::engine::handoff_state::cause_and_start(true, false, false, true, cut);
+                assert_eq!(
+                    starts,
+                    if cut {
+                        crate::engine::thread_events::SessionStart::AfterThisTurn
+                    } else {
+                        crate::engine::thread_events::SessionStart::OnNextInput
+                    }
+                );
+                // The narrative turn ending later does not change the delivery.
+                insert(&pool, thread, "CodingAgentIdled", serde_json::json!({})).await;
+                assert_eq!(reentry_cut_turn_short(&pool, thread).await.unwrap(), cut);
+                insert(
+                    &pool,
+                    thread,
+                    "SessionStarted",
+                    serde_json::json!({"continuity": {"kind": "fresh"}}),
+                )
+                .await;
+                assert!(!reentry_cut_turn_short(&pool, thread).await.unwrap());
+            }
+            teardown_test_db(&db).await;
+        }
+
         /// The crossing is recorded before the re-entry, so a session that
         /// dies unread still owes its handoff. The re-entry is the engine's,
         /// and names the six narrative sections.
@@ -1278,6 +1574,9 @@ mod tests {
                 ceiling: 300_000,
                 window: Some(1_000_000),
             };
+            record_ceiling_reached(&bus, thread, crossing)
+                .await
+                .unwrap();
             let input = record_ceiling_reentry(&bus, thread, crossing)
                 .await
                 .unwrap();
@@ -1307,7 +1606,7 @@ mod tests {
             assert!(!input.kind.writes_prompt_sent());
             assert!(input.text.contains("335k") && input.text.contains("300k"));
             assert!(input.text.contains("lucidos successor start --narrative"));
-            for section in crate::engine::successor::NARRATIVE_SECTIONS {
+            for section in crate::engine::handoff_state::NARRATIVE_SECTIONS {
                 assert!(input.text.contains(section), "{section}");
             }
 
@@ -1353,8 +1652,8 @@ mod tests {
             thread
         }
 
-        fn implementer() -> crate::engine::successor::Implementer {
-            crate::engine::successor::Implementer {
+        fn implementer() -> crate::engine::Implementer {
+            crate::engine::Implementer {
                 coding_agent: crate::runtime::CodingAgent::Codex,
                 model: Some("gpt-5.5".to_string()),
                 reasoning_effort: None,
@@ -1362,7 +1661,7 @@ mod tests {
         }
 
         async fn brief(bus: &EventBus, thread: Uuid) -> bool {
-            let running = crate::engine::successor::StillRunning {
+            let running = crate::engine::handoff_state::StillRunning {
                 tasks: vec!["the full e2e suite (`task-1`)".to_string()],
                 ..Default::default()
             };
@@ -1412,7 +1711,7 @@ mod tests {
             assert!(brief(&bus, thread).await);
             assert!(!brief(&bus, thread).await, "one handoff per session");
 
-            let handoff = crate::engine::successor::pending_handoff(&pool, thread)
+            let handoff = crate::engine::pending_handoff::pending_handoff(&pool, thread)
                 .await
                 .unwrap()
                 .expect("the brief handoff is pending");
@@ -1456,6 +1755,20 @@ mod tests {
             .await;
             assert!(brief(&bus, thread).await, "the Stop withdrew the narrative");
 
+            let archived = past_the_ceiling(&pool, &bus).await;
+            sqlx::query(
+                "UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1",
+            )
+            .bind(archived)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(!brief(&bus, archived).await);
+            assert!(
+                ceiling_facts(&pool, archived, false).await.unwrap().busy,
+                "an archived thread never gets the re-entry"
+            );
+
             let integrated = past_the_ceiling(&pool, &bus).await;
             sqlx::query(
                 "UPDATE thread_summaries SET coding_agent_integrated = true WHERE thread_id = $1",
@@ -1464,10 +1777,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-            assert!(!brief(&bus, integrated).await);
             assert!(
-                ceiling_facts(&pool, integrated, false).await.unwrap().busy,
-                "an integrated sub-thread never gets the re-entry"
+                brief(&bus, integrated).await,
+                "an integrated sub-thread hands off like any other"
             );
 
             teardown_test_db(&db).await;
@@ -1541,6 +1853,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+            assert!(
+                verdict(reached).await.unwrap().past_ceiling,
+                "an integrated sub-thread hands off like any other"
+            );
+            sqlx::query(
+                "UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1",
+            )
+            .bind(reached)
+            .execute(&pool)
+            .await
+            .unwrap();
             assert!(!verdict(reached).await.unwrap().past_ceiling);
 
             teardown_test_db(&db).await;
@@ -1582,7 +1905,7 @@ mod tests {
                 Withdrawal::Withdrawn(500_000)
             );
             assert_eq!(
-                crate::engine::successor::pending_handoff(&pool, thread)
+                crate::engine::pending_handoff::pending_handoff(&pool, thread)
                     .await
                     .unwrap(),
                 None
@@ -1611,7 +1934,7 @@ mod tests {
                 ]
             );
             assert_eq!(
-                crate::engine::successor::latest_offer_decline(&pool, thread)
+                crate::engine::handoff_state::latest_offer_decline(&pool, thread)
                     .await
                     .unwrap(),
                 Some(400_000),
@@ -1624,7 +1947,7 @@ mod tests {
             assert!(!brief(&bus, thread).await, "a raised session owes no brief");
             // A ceiling handoff read past the ceiling before the return
             // re-reads it under the lock.
-            let stale = crate::engine::successor::NewHandoff {
+            let stale = crate::engine::handoff_state::NewHandoff {
                 opening: HandoffOpening::Brief,
                 message: "brief".into(),
                 checkpoint: None,
@@ -1636,10 +1959,10 @@ mod tests {
                 crossing: None,
             };
             assert_eq!(
-                crate::engine::successor::record_handoff(&bus, thread, stale, EventMeta::NONE)
+                crate::engine::handoff_state::record_handoff(&bus, thread, stale, EventMeta::NONE)
                     .await
                     .unwrap(),
-                crate::engine::successor::HandoffRecord::CeilingLifted
+                crate::engine::handoff_state::HandoffRecord::CeilingLifted
             );
 
             teardown_test_db(&db).await;
@@ -1657,7 +1980,7 @@ mod tests {
                 withdraw(&bus, CeilingSetter::Agent(Some(thread)), thread).await,
                 Withdrawal::NeedsAPerson
             );
-            assert!(crate::engine::successor::handoff_pending(&pool, thread).await);
+            assert!(crate::engine::pending_handoff::handoff_pending(&pool, thread).await);
 
             let plain = seed_coding_thread(&bus, None).await;
             insert(
@@ -1682,7 +2005,7 @@ mod tests {
         /// successor, so the withdraw refuses and the handoff stands.
         #[tokio::test]
         async fn withdraw_refuses_once_a_run_holds_the_thread() {
-            use crate::engine::agent_session::spawn_claim::{claim_thread_for, ClaimFor};
+            use crate::engine::session_claim::{claim_thread_for, ClaimFor};
             let (pool, db) = setup_test_db().await;
             let (bus, _rx) = EventBus::new(pool.clone());
             let thread = past_the_ceiling(&pool, &bus).await;
@@ -1705,7 +2028,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(outcome, Withdrawal::Starting);
-            assert!(crate::engine::successor::handoff_pending(&pool, thread).await);
+            assert!(crate::engine::pending_handoff::handoff_pending(&pool, thread).await);
 
             teardown_test_db(&db).await;
         }
@@ -1735,7 +2058,7 @@ mod tests {
                 withdraw(&bus, CeilingSetter::Person, thread).await,
                 Withdrawal::CannotRaise
             );
-            assert!(crate::engine::successor::handoff_pending(&pool, thread).await);
+            assert!(crate::engine::pending_handoff::handoff_pending(&pool, thread).await);
 
             teardown_test_db(&db).await;
         }

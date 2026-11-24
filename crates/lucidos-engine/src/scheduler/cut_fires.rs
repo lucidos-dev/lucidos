@@ -1,12 +1,12 @@
 //! Boot reporting for trigger fires interrupted by an engine restart.
 
-use crate::api::SharedEngine;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     ActorMode, EventMeta, FireRetry, MessageOrigin, RetryOf, RetrySkipReason, ThreadEvent,
     HUMAN_MESSAGE_SQL,
 };
 use crate::engine::thread_queue::{ThreadQueue, ThreadQueueRequest};
+use crate::engine::types::SharedEngine;
 use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
 use crate::scheduler::user_tasks::{emit_trigger_notification, TriggerNotification};
 use crate::triggers::{TriggerConfig, TriggerRunStatus};
@@ -78,7 +78,7 @@ async fn find_cut_fires(pool: &PgPool) -> Result<Vec<CutFire>, Error> {
         .replace("{human_message}", HUMAN_MESSAGE_SQL)
         .replace(
             "{parked}",
-            &crate::engine::agent_recovery::unanswered_question_exists_sql("ts.thread_id::text"),
+            &crate::engine::question_park_sql::unanswered_question_exists_sql("ts.thread_id::text"),
         );
     let rows = sqlx::query_as::<_, Candidate>(&sql)
         .bind(BOOT_REPORT_LOOKBACK_SECS as f64)
@@ -118,13 +118,13 @@ async fn find_cut_fires(pool: &PgPool) -> Result<Vec<CutFire>, Error> {
                 });
             }
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                log!(
+                log_legacy!(
                     "[CutFires] Cannot read fire on thread {}: {}",
                     row.thread_id,
                     error
                 );
             }
-            _ => log!(
+            _ => log_legacy!(
                 "[CutFires] Skipping thread {}: no unresumed restart abort",
                 row.thread_id
             ),
@@ -138,7 +138,7 @@ pub(super) async fn settle_cut_trigger_fires(engine: &SharedEngine, pool: &PgPoo
     let fires = match find_cut_fires(pool).await {
         Ok(fires) => fires,
         Err(error) => {
-            log!(
+            log_legacy!(
                 "[CutFires] Could not find interrupted trigger fires: {}",
                 error
             );
@@ -154,7 +154,7 @@ pub(super) async fn settle_cut_trigger_fires(engine: &SharedEngine, pool: &PgPoo
                 .get(&fire.trigger_id)
                 .cloned();
             let retry = prepare_retry(pool, &engine.thread_queue, config.as_ref(), &fire).await?;
-            log!(
+            log_legacy!(
                 "[CutFires] Retry decision for thread {}: {:?}",
                 fire.thread_id,
                 retry
@@ -173,11 +173,11 @@ pub(super) async fn settle_cut_trigger_fires(engine: &SharedEngine, pool: &PgPoo
         }
         .await;
         match result {
-            Ok(()) => log!(
+            Ok(()) => log_legacy!(
                 "[CutFires] Reported interrupted fire on thread {}",
                 fire.thread_id
             ),
-            Err(error) => log!(
+            Err(error) => log_legacy!(
                 "[CutFires] Could not report thread {}: {}",
                 fire.thread_id,
                 error
@@ -232,15 +232,13 @@ fn next_slot(
     let schedules = config
         .schedule
         .iter()
-        .map(|s| crate::engine::tools::scheduler::parse_standard_cron(s).map_err(Error::from))
+        .map(|s| crate::scheduler::cron_rules::parse_standard_cron(s).map_err(Error::from))
         .collect::<Result<Vec<_>, _>>()?;
     let timezone = config.timezone.parse::<chrono_tz::Tz>()?;
     Ok(
-        crate::engine::tools::scheduler::next_occurrences_after(
-            &schedules, timezone, started_at, 1,
-        )
-        .first()
-        .map(|time| time.with_timezone(&Utc)),
+        crate::scheduler::cron_rules::next_occurrences_after(&schedules, timezone, started_at, 1)
+            .first()
+            .map(|time| time.with_timezone(&Utc)),
     )
 }
 
@@ -265,7 +263,7 @@ async fn rebuild_request(
     let request: ThreadQueueRequest = match serde_json::from_value(payload) {
         Ok(request) => request,
         Err(error) => {
-            log!(
+            log_legacy!(
                 "[CutFires] Cannot rebuild request on thread {}: {}",
                 fire.thread_id,
                 error
@@ -460,6 +458,6 @@ async fn report_cut_fire(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "cut_fires_tests.rs"]
-pub(crate) mod tests;
+pub mod tests;

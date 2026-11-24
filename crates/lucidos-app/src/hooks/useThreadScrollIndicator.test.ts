@@ -7,45 +7,24 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 vi.mock('../components/chat/scrollState', () => ({
-  isNavigationScroll: () => false,
+  classifyScroll: () => ({ navigation: false }),
 }));
 
 import { INDICATOR_HIDE_DELAY_MS } from './useThreadScrollIndicator';
-// `atRules` is what lets these tests assert WHERE a rule applies, which is the
-// whole point here: the suppression and the replacement have to share one gate.
 import { cssRules, rulesTargeting, styleSheetPaths } from '../styles/__tests__/css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = resolve(here, '..');
 const read = (rel: string) => readFileSync(resolve(src, rel), 'utf8');
 
-/** Comments out of the TypeScript source, so the scans below read CODE and not
- *  the prose explaining it. The hook documents the very patterns it bans, so an
- *  unstripped scan matches its own rationale. (The CSS needs no equivalent:
- *  postcss parses comments into their own nodes.) */
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
 }
 
-// Source scans rather than behavioral tests, for the same reason
-// useHideOnScroll.test.ts uses them: this suite has no DOM, and the regressions
-// below are about WHICH property and WHICH element get written, not about a
-// value the pure geometry helper already covers
-// (components/chat/__tests__/scroll-indicator-geometry.test.ts).
 const hookCode = stripComments(read('hooks/useThreadScrollIndicator.ts'));
 
 describe('the per-scroll path stays composited', () => {
-  // A layout write in the scroll path dirties layout, so the very next scroll
-  // event's scrollTop read forces a synchronous style+layout flush of the
-  // largest DOM in the app. That is the jank useHideOnScroll.ts already paid for
-  // once (moving --mobile-header-offset off `top` and onto `transform`); this
-  // indicator must not reintroduce it by animating `height` or `top`.
   it('writes only composited or paint-only properties as inline styles', () => {
-    // `transform` and `opacity` are composited. `borderRadius` is paint-only: it
-    // changes the painted shape of a box without moving or resizing anything, so
-    // it cannot dirty layout either. It is written per frame to undo `scaleY`'s
-    // distortion of the thumb's caps (see counterScaledRadiusPx). Anything not on
-    // this list needs the same argument made for it before being added.
     const written = new Set(
       [...hookCode.matchAll(/\.style\.([A-Za-z][A-Za-z0-9]*)\s*=/g)].map(m => m[1]),
     );
@@ -59,8 +38,6 @@ describe('the per-scroll path stays composited', () => {
   });
 
   it('never writes a custom property, on the document root or anywhere else', () => {
-    // Custom properties inherit, so a scroll-frequency write on documentElement
-    // invalidates style for every node in the document.
     expect(hookCode).not.toMatch(/setProperty\s*\(/);
     expect(hookCode).not.toMatch(/documentElement/);
   });
@@ -68,9 +45,6 @@ describe('the per-scroll path stays composited', () => {
 
 describe('the fade is a post-motion linger, not a scroll budget', () => {
   it('is long enough to bridge the gaps between momentum frames', () => {
-    // Restarted by every real movement, so it only ever runs to completion after
-    // the scroller has actually stopped. It must still comfortably exceed the
-    // spacing between late momentum frames, which stretches as a fling decays.
     expect(INDICATOR_HIDE_DELAY_MS).toBeGreaterThan(500);
   });
 
@@ -79,31 +53,17 @@ describe('the fade is a post-motion linger, not a scroll budget', () => {
   });
 
   it('does not depend on the touch window, which no longer bounds visibility', () => {
-    // The original bug: keep-alive was gated on isUserScrolling(), so the
-    // indicator could only survive USER_SCROLL_WINDOW_MS + the delay past the
-    // finger lifting, and a longer fling outlived it. Keep-alive now tracks
-    // motion, so the two constants are independent. Pinned so a future edit
-    // cannot quietly re-couple them.
     expect(hookCode).not.toMatch(/USER_SCROLL_WINDOW_MS/);
   });
 });
 
 describe('the thumb box is measured with the right API for each axis', () => {
-  // The two are not interchangeable, and swapping either one fails silently.
   it('reads the bar width at sub-pixel precision, never through offsetWidth', () => {
-    // offsetWidth rounds to a whole pixel. A rem-authored width rarely lands on
-    // one, and rounding UP makes the two corner radii on an edge sum to more
-    // than the width, at which point CSS scales EVERY radius down by the
-    // overflow ratio, vertical ones included. That silently defeats the
-    // counter-scale and the caps stop being semicircles.
     expect(hookCode).not.toMatch(/offsetWidth/);
     expect(hookCode).toMatch(/getBoundingClientRect\(\)\.width/);
   });
 
   it('reads the scale base through offsetHeight, which the transform does not touch', () => {
-    // getBoundingClientRect reports the TRANSFORMED box, so using it for the
-    // base would feed the already-scaled height back in and compound the scale
-    // frame over frame.
     expect(hookCode).toMatch(/offsetHeight/);
     expect(hookCode).not.toMatch(/getBoundingClientRect\(\)\.height/);
   });
@@ -111,23 +71,12 @@ describe('the thumb box is measured with the right API for each axis', () => {
 
 describe('the visibility rule lives in one testable place', () => {
   it('routes every scroll event through nextIndicatorVisibility', () => {
-    // Re-deriving the rule inline is how it went wrong the first time: the
-    // summon signal (touch) got reused as the keep-alive signal (motion). The
-    // pure function is where that distinction is stated and covered
-    // (components/chat/__tests__/scroll-indicator-geometry.test.ts).
     expect(hookCode).toMatch(/nextIndicatorVisibility\(/);
-    // No inline `if (isUserScrolling())` branch deciding visibility.
     expect(hookCode).not.toMatch(/if\s*\(\s*isUserScrolling\(\)\s*\)/);
   });
 });
 
 describe('the native indicator is only suppressed where a replacement is drawn', () => {
-  // Suppressing WebKit's overlay indicator on a scroller with nothing in its
-  // place would leave that surface with no scroll feedback at all. The CSS is
-  // therefore scoped to `.has-scroll-indicator`, and anything that opts in must
-  // render the replacement.
-  // Raw, not stripped: postcss parses comments into their own nodes, so the
-  // declaration scan below never sees the prose that explains it.
   const mobileCss = read('styles/mobile.css');
 
   it('scopes every transcript scrollbar suppression to a wrap that carries the replacement', () => {
@@ -138,11 +87,6 @@ describe('the native indicator is only suppressed where a replacement is drawn',
   });
 
   it('suppresses the native scrollbar only for the input class the replacement serves', () => {
-    // The replacement is summoned by isUserScrolling(), which keys off
-    // `touchmove` and so says nothing about a wheel or an arrow key. Gating the
-    // suppression on viewport WIDTH alone would strip the native scrollbar from
-    // a narrow window driven by a mouse and never summon the replacement, which
-    // leaves that user with no scroll feedback at all.
     for (const rule of transcriptSuppressions()) {
       expect(rule.atRules).toMatch(/hover:\s*none/);
       expect(rule.atRules).toMatch(/pointer:\s*coarse/);
@@ -162,7 +106,6 @@ describe('the native indicator is only suppressed where a replacement is drawn',
     }
   });
 
-  /** The rules that strip the transcript's native scrollbar. */
   function transcriptSuppressions() {
     return cssRules(mobileCss).filter(
       r =>
@@ -181,10 +124,6 @@ describe('the native indicator is only suppressed where a replacement is drawn',
 });
 
 describe('the parked thumb tracks the chrome above the transcript', () => {
-  // At the top of a thread the thumb sits at the track's top, so this inset is
-  // what the reader judges the indicator by. Both heights above it are live:
-  // the title bar grows when a title wraps to a second line, and a literal here
-  // would leave the parked thumb inside the bar.
   const mobileCss = read('styles/mobile.css');
 
   it('derives the track top from the header and title bar heights', () => {
@@ -199,7 +138,6 @@ describe('the parked thumb tracks the chrome above the transcript', () => {
   });
 });
 
-/** Every `.tsx` under `src`, excluding test files. */
 function tsxFiles(dir: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -215,7 +153,6 @@ function tsxFiles(dir: string): string[] {
 }
 
 describe('desktop keeps the native scrollbar (ADR 0258)', () => {
-  // Only the touch gate draws our own indicator.
   const rules = styleSheetPaths(resolve(src, 'styles')).flatMap(f => cssRules(readFileSync(f, 'utf8')));
 
   it('never hides the transcript\'s native thumb', () => {

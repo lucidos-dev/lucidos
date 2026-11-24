@@ -12,19 +12,9 @@ import {
   MAX_STYLES,
 } from './responseStyle';
 
-/** The engine's own copy of the *style library* bounds.
- *
- *  The client refuses a style the engine would refuse, so the two gates must
- *  hold the same numbers. Client-side they only decide whether Save is enabled.
- *  The engine's are what bind. Drift either way is invisible without this.
- *  Raise the engine's and Save stays dead on a paragraph it would take. Lower
- *  it and the client offers a save that comes back as a toast.
- *
- *  Same shape as `utils/imageBytes.mirror.test.ts` and
- *  `voice/frames.mirror.test.ts`: read the Rust source, do not restate it. */
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUST: string = readFileSync(
-  resolve(HERE, '../../../../lucidos-engine/src/core/response_style.rs'),
+  resolve(HERE, '../../../../lucidos-core/src/core/response_style.rs'),
   'utf8',
 );
 
@@ -36,8 +26,6 @@ function rustUsize(name: string): number {
 
 describe('the style-library bounds mirror the engine', () => {
   it('reads a Rust source that actually declares them', () => {
-    // Guards the regex itself: a rename would otherwise make every assertion
-    // below throw a confusing "not declared" instead of naming the drift.
     expect(RUST).toContain('pub const MAX_ID_CHARS');
   });
 

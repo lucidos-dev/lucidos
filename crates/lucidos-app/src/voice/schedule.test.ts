@@ -10,16 +10,8 @@ import {
 
 const CHUNK = 0.04;
 
-/** Where a call's clock starts, for the first chunk that has no cursor yet. */
 const OPENED_AT = 10;
 
-/**
- * Run more chunks through, arriving at the pace a person hears them.
- *
- * A talker streaming audio in real time holds the queue at exactly the
- * cushion's depth and never deeper. That is the Live shape, and it is what
- * makes the cushion the whole jitter buffer.
- */
 function atTalkingPace(state: Playback, chunks: number): Playback {
   let carried = state;
   for (let i = 0; i < chunks; i++) {
@@ -29,7 +21,6 @@ function atTalkingPace(state: Playback, chunks: number): Playback {
   return carried;
 }
 
-/** When the next chunk lands, given a stream stalled for `stall` seconds. */
 function stalledBy(state: Playback, stall: number): number {
   return state.cursor - state.lead + stall;
 }
@@ -73,8 +64,6 @@ describe('placing a chunk of talker audio', () => {
   });
 
   it('holds a thinned queue together rather than re-leading it', () => {
-    // Audio still queued is played, whatever is left of the cushion. Pushing
-    // it out to a full lead would open the very hole the lead guards against.
     const worn = { ...PLAYBACK_START, cursor: 10.05, lead: 0.5 };
 
     const placed = placeChunk(worn, OPENED_AT, CHUNK);
@@ -82,8 +71,6 @@ describe('placing a chunk of talker audio', () => {
     expect(placed.startAt).toBe(worn.cursor);
   });
 
-  /** The defect the reported call was. The cushion was 80 ms, and the engine
-   *  stalls for longer than that whenever it writes a row. */
   it('absorbs a stall shorter than the cushion', () => {
     const state = atTalkingPace(PLAYBACK_START, 5);
 
@@ -94,8 +81,6 @@ describe('placing a chunk of talker audio', () => {
   });
 
   it('opens a hole on the same stall with the cushion this replaced', () => {
-    // The old constant, so the case above is pinned as a fix rather than as
-    // arithmetic that happens to pass.
     const thin = atTalkingPace({ ...PLAYBACK_START, lead: 0.08 }, 5);
 
     const placed = placeChunk(thin, stalledBy(thin, 0.15), CHUNK);
@@ -107,8 +92,6 @@ describe('placing a chunk of talker audio', () => {
 
 describe('a queue that ran dry', () => {
   it('counts the hole, and the whole of the silence in it', () => {
-    // The chunk was 0.3s late and then took a 0.5s lead. The caller sat
-    // through both, so reporting the lateness alone understates the hole.
     const dry = { ...PLAYBACK_START, cursor: OPENED_AT };
 
     const placed = placeChunk(dry, 10.3, CHUNK);
@@ -127,8 +110,6 @@ describe('a queue that ran dry', () => {
   });
 
   it('absorbs the next stall of the same size, having grown for the first', () => {
-    // The whole point of growing. One hole is a hole. The same hole on every
-    // reply for two minutes is what a caller calls crackling.
     const grown = placeChunk({ ...PLAYBACK_START, cursor: OPENED_AT }, 10.3, CHUNK).playback;
     const settled = atTalkingPace(grown, 5);
 
@@ -155,8 +136,6 @@ describe('a queue that ran dry', () => {
   });
 
   it('reads a long silence as the talker stopping, not as a hole', () => {
-    // A reply that ended. The Realtime talker leaves one at every turn
-    // boundary. Learning from those would cap the cushion on a clean call.
     const between = { ...PLAYBACK_START, cursor: OPENED_AT };
 
     const placed = placeChunk(between, 14, CHUNK);
@@ -188,8 +167,6 @@ describe('starting playback over', () => {
   });
 
   it('counts no hole for the chunk that follows a cut', () => {
-    // The caller cut the talker off, so the silence after it is theirs. Read
-    // as a hole, every barge-in would grow the cushion for nothing.
     const cut = restartPlayback(atTalkingPace(PLAYBACK_START, 5));
 
     const placed = placeChunk(cut, 11, CHUNK);

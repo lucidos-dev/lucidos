@@ -12,24 +12,16 @@ import { BackgroundModelRow } from './BackgroundModelRow';
 import type { BackgroundRows } from './useBackgroundModels';
 import { formatCount, formatDuration, formatUsdCentral, usd } from './treeBackfillFormat';
 
-/** The Tree estimate, priced for the compactor model and tier the workspace
- *  would run. Both surfaces that start Tree read it: the Start Tree dialog
- *  and the memory choice. */
 export interface TreeEstimateRead {
   loadable: Loadable<TreeBackfillEstimate>;
-  /** The delay-gated loading flag for the estimate itself. */
   showLoading: boolean;
   retry: () => void;
   estimate: TreeBackfillEstimate | null;
   model: string;
   effort: string | null;
-  /** The estimate, once the model it is for is known too. */
   priced: TreeBackfillEstimate | null;
-  /** The chosen model's row at the chosen tier, `null` while unpriced. */
   cost: EffortCost | null;
-  /** A cost waits on both reads: the estimate, and which model it is for. */
   costLoading: boolean;
-  /** Set once both reads landed and the model has no price. */
   unpriced: string | null;
 }
 
@@ -58,8 +50,6 @@ export function useTreeEstimate(background: BackgroundRows): TreeEstimateRead {
   };
 }
 
-/** One estimate figure. Its label draws at once; the value waits on the read,
- *  behind a delay-gated shimmer. */
 export function EstimateItem({ label, value, loading }: {
   label: string;
   value: ComponentChildren | null;
@@ -75,9 +65,6 @@ export function EstimateItem({ label, value, loading }: {
   );
 }
 
-/** The tier the engine recommends for `model`, while `effort` runs at another
- *  one, else `null`. A tier the model cannot run counts as the one it snaps to,
- *  which is what the picker shows. */
 function offRecommendedTier(
   background: BackgroundRows,
   model: string,
@@ -90,7 +77,6 @@ function offRecommendedTier(
   return recommended !== null && recommended !== runsAt ? recommended : null;
 }
 
-/** Names the recommended tier while another is picked, and switches to it. */
 function UseRecommendedTier({ model, tier }: { model: string; tier: string }) {
   const label = LUCIDOS_TIER_VOCABULARY.find((t) => t.value === tier)?.label ?? tier;
   return (
@@ -113,8 +99,6 @@ function UseRecommendedTier({ model, tier }: { model: string; tier: string }) {
 
 const COMPACTOR_MODEL = 'Compactor model';
 
-/** The compactor model row, and the recommended tier while another is picked.
- *  A `label` heads a panel the picker sits in, and the picker keeps its name. */
 export function CompactorModelRow({ background, read, label = COMPACTOR_MODEL }: {
   background: BackgroundRows;
   read: TreeEstimateRead;
@@ -135,7 +119,6 @@ export function CompactorModelRow({ background, read, label = COMPACTOR_MODEL }:
   );
 }
 
-/** Why the estimate could not be read, with a retry. */
 export function EstimateFailed({ read }: { read: TreeEstimateRead }) {
   if (read.loadable.status !== 'failed') return null;
   return (
@@ -146,11 +129,8 @@ export function EstimateFailed({ read }: { read: TreeEstimateRead }) {
   );
 }
 
-/** What the one-time summary of this workspace costs and how long it takes,
- *  then what a day costs after it. */
 export function BackfillFigures({ read }: { read: TreeEstimateRead }) {
   const { estimate, priced, cost, unpriced, showLoading, costLoading } = read;
-  // The chosen tier's own call time, when the estimate prices it.
   const times = cost ?? estimate;
   return (
     <dl class="memory-tree-estimate" data-role="tree-estimate" data-state={read.loadable.status}>

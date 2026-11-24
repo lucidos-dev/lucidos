@@ -1,10 +1,3 @@
-/** The call shortcut presses what the composer's call toggle presses.
- *
- *  It asks the toggle's own spec for its gate, so it cannot press a hidden
- *  toggle. The follow shortcut is pinned beside its button, in
- *  `follow-toggle.test.tsx`.
- *
- *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../../store/voice', () => ({ pressCallToggle: vi.fn() }));
@@ -31,7 +24,6 @@ describe('the call shortcut', () => {
     expect(pressCallToggle).toHaveBeenCalledTimes(1);
   });
 
-  /** Voice sessions live in the home thread alone (ADR 0362). */
   it('does nothing on any other Lucidos Agent thread', () => {
     focus(makeThreadState('t1'));
     pressCallToggleIfShown();

@@ -1,13 +1,3 @@
-/**
- * A reply the caller cuts off stops by fading, never by being chopped.
- *
- * `stop()` on its own truncates the waveform wherever it happens to be. A step
- * to zero is broadband, so the caller hears a click whatever was playing, and
- * they hear one on every barge-in. Somebody who talks over the talker a lot
- * therefore hears a call full of clicks.
- *
- * Driven through fakes, because there is no Web Audio here at all.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { CallPorts } from '../ports';
 
@@ -17,19 +7,15 @@ vi.mock('../captureWorklet', async (importOriginal) => ({
 }));
 
 const NOTHING = (): void => undefined;
-/** One chunk of talker audio: two samples, which is all the fakes read. */
 const A_LITTLE_AUDIO = new ArrayBuffer(4);
 
-/** What a gain node was told to do, in the order it was told. */
 interface GainLog {
   ramps: { to: number; at: number }[];
   holds: { to: number; at: number }[];
   cancels: number;
 }
 
-/** When each source was told to stop, or undefined while it is still due. */
 let stops: (number | undefined)[] = [];
-/** Only the gains something automated, which is the speaker and nothing else. */
 let gains: GainLog[] = [];
 let context: FakeAudioContext;
 
@@ -63,8 +49,6 @@ class FakeAudioContext {
   }
 
   createGain(): unknown {
-    // The capture graph builds one of these too, for the silent sink. Only a
-    // gain something automates ever lands in the log below.
     const log: GainLog = { ramps: [], holds: [], cancels: 0 };
     const seen = (): void => {
       if (!gains.includes(log)) gains.push(log);
@@ -127,7 +111,6 @@ describe('cutting a reply off', () => {
     vi.stubGlobal('AudioContext', FakeAudioContext);
     vi.stubGlobal('AudioWorkletNode', FakeWorkletNode);
     vi.stubGlobal('navigator', { mediaDevices: { getUserMedia } });
-    // `primed` is module state, so each case needs its own copy of the module.
     vi.resetModules();
     ({ browserPorts: ports } = await import('../ports'));
   });
@@ -144,7 +127,6 @@ describe('cutting a reply off', () => {
 
     device.stopPlayback();
 
-    // One gain for the whole call, so one ramp covers every queued chunk.
     expect(gains).toHaveLength(1);
     expect(gains[0].cancels).toBe(1);
     expect(gains[0].ramps).toEqual([{ to: 0, at: expect.any(Number) }]);
@@ -159,15 +141,11 @@ describe('cutting a reply off', () => {
 
     device.stopPlayback();
 
-    // A bare `stop()` takes no argument, and that is exactly the chop. The
-    // stop has to wait for the ramp, or the fade never gets to sound.
     const silent = gains[0].ramps[0].at;
     expect(stops).toEqual([silent, silent]);
   });
 
   it('puts the speaker back to full as the fade lands', async () => {
-    // The stream carries on after a cut, so a speaker left at zero would play
-    // the rest of the call silently.
     const device = await ports.openAudio(NOTHING, null);
     device.play(A_LITTLE_AUDIO);
     context.currentTime = 5;
@@ -179,8 +157,6 @@ describe('cutting a reply off', () => {
   });
 
   it('fades well inside the lead the next chunk will take', async () => {
-    // Audio arriving after a cut starts a lead ahead of now. A fade longer
-    // than that lead would still be sounding under it.
     const { PLAYBACK_LEAD_SECONDS } = await import('../schedule');
     const device = await ports.openAudio(NOTHING, null);
     device.play(A_LITTLE_AUDIO);
@@ -192,8 +168,6 @@ describe('cutting a reply off', () => {
   });
 
   it('forgets a cut chunk rather than waiting on an ended it may never get', async () => {
-    // A chunk cut before it ever sounded is promised no `ended` event. Left in
-    // the queue it would be re-stopped by every later cut, for the whole call.
     const device = await ports.openAudio(NOTHING, null);
     device.play(A_LITTLE_AUDIO);
     context.currentTime = 5;

@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The plugin detail page and the row that opens it (ADR 0414, Phase 4).
- */
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render } from 'preact';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -198,7 +195,6 @@ describe('the plugin detail page view key', () => {
   });
 });
 
-/** Invariant I7: the README cannot inject markup or reach a remote host. */
 describe('the plugin README', () => {
   it('drops script, event handlers and remote elements', () => {
     const html = renderPluginReadme([
@@ -216,7 +212,6 @@ describe('the plugin README', () => {
     expect(doc.querySelector('script, img, iframe, input')).toBeNull();
     expect(doc.querySelector('[style], [background], [src]')).toBeNull();
     expect(html).not.toContain('onerror');
-    // The authored input shows as text, so only a live attribute counts.
     const attributeValues = Array.from(doc.querySelectorAll('*'))
       .flatMap((el) => Array.from(el.attributes, (attr) => attr.value));
     expect(attributeValues.join(' ')).not.toContain('tracker.example');
@@ -228,8 +223,6 @@ describe('the plugin README', () => {
   });
 });
 
-/** Invariants I6 and I13: media reaches the DOM as `<img>` and `<video>` only,
- *  and the page mounts no frame, so no plugin code runs before install. */
 describe('the plugin detail page source', () => {
   const page = source('../PluginDetailPage.tsx');
 

@@ -1,13 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { clampToastText, ERROR_MAX_CHARS, TOAST_MAX_CHARS } from './toastMessage';
 
-/**
- * A toast is a summary, so its title and message are bounded before they are
- * stored.
- *
- * An error is flattened as well as clamped: it is one sentence, so a response
- * body put into one can never grow into a page.
- */
 describe('clampToastText', () => {
   it('leaves an ordinary message untouched', () => {
     expect(clampToastText('Backup complete', 'success')).toBe('Backup complete');
@@ -32,16 +25,12 @@ describe('clampToastText', () => {
   });
 
   it('bounds every other kind too, for the payloads nobody sized', () => {
-    // An app reaches `showToast` through the frame bridge with whatever string
-    // it likes, and its type is its own choice.
     const out = clampToastText('x'.repeat(50_000), 'info');
     expect(out.length).toBeLessThanOrEqual(TOAST_MAX_CHARS);
     expect(out.endsWith('…')).toBe(true);
   });
 
   it('never cuts a code point in half', () => {
-    // Sliced by UTF-16 unit this ends in a lone surrogate, which paints as the
-    // replacement glyph.
     const out = clampToastText('🙂'.repeat(300), 'error');
     expect([...out].every((c) => c === '🙂' || c === '…')).toBe(true);
   });

@@ -89,7 +89,7 @@ impl WorkspaceOrderStore {
     /// gateway: an order is a preference, and the next save replaces the file.
     pub fn load(path: PathBuf) -> Self {
         let order = WorkspaceOrder::load(&path).unwrap_or_else(|e| {
-            crate::log!("[Gateway] workspace order unreadable, starting empty: {e}");
+            crate::log_legacy!("[Gateway] workspace order unreadable, starting empty: {e}");
             WorkspaceOrder::default()
         });
         Self {

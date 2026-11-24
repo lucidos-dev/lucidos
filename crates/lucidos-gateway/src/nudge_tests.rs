@@ -2,8 +2,8 @@ use super::*;
 use crate::auth;
 use crate::gateway_protocol::HEADER_GATEWAY_CREDENTIAL;
 use crate::relay::tests::{paired, Paired};
-use crate::remote_gateways::tests::{localhost_cert, serve_https};
 use axum::http::HeaderMap;
+use lucidos_local_token::test_support::serve_https;
 use tower::ServiceExt as _;
 
 fn engine_nudges(p: &Paired) -> Vec<String> {
@@ -78,13 +78,11 @@ async fn the_nudge_is_one_way() {
 #[tokio::test]
 async fn an_older_gateway_without_the_nudge_is_skipped_quietly() {
     let p = paired().await;
-    let cert = localhost_cert();
-    let port = serve_https(axum::Router::new(), &cert).await;
-    p.a.peer_connection()
-        .trust_for_test(cert.cert.pem().as_bytes());
+    let port = serve_https(axum::Router::new()).port();
     p.a.remote_gateways().remove("cloud").unwrap();
     p.a.remote_gateways()
         .add(RemoteGateway {
+            gateway_id: None,
             name: "older".to_string(),
             address: format!("https://localhost:{port}"),
             pairing_id: p.pairing_id.clone(),
@@ -93,6 +91,8 @@ async fn an_older_gateway_without_the_nudge_is_skipped_quietly() {
             gateway_protocol: 1,
             added_at: "2020-01-01T00:00:00Z".to_string(),
             rotation: Default::default(),
+            return_access: None,
+            trusted_pairing: false,
         })
         .unwrap();
     let answers = nudge_remote_gateways(&p.a).await;

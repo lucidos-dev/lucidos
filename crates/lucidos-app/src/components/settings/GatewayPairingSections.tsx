@@ -1,35 +1,33 @@
-/**
- * Gateway pairing on Settings → Access (ADR 0590): two sections.
- *
- * - **Pair a gateway** is this gateway as B. It mints a gateway pairing secret,
- *   and lists the gateways that may open this one's workspaces, with Unpair.
- * - **Remote gateways** is this gateway as A. It lists the gateways it has
- *   paired with, with Remove, and takes the address, secret and short name of a
- *   new one.
- *
- * Both live on the gateway's own surface, so off the gateway they render their
- * shell and say what to run instead, like "Pair a device".
- */
 
 import { headersFromDraft, type HeaderDraft, RemoteHeadersEditor } from './RemoteHeadersEditor';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import {
   listPairedGateways,
   listRemoteGateways,
+  listRemoteWorkspaces,
   mintGatewayPairingCode,
   removeRemoteGateway,
+  repairRemoteGateway,
   updateRemoteGatewayHeaders,
   rotateRemoteGateway,
+  setPairedGatewayMayManage,
+  setPairedGatewayRemoteStarts,
+  setRemoteGatewayReturnAccess,
+  setRemoteGatewayTrustedPairing,
   unpairGateway,
   type PairedGateway,
   type RemoteGateway,
+  type RemoteGatewayListing,
+  type RemoteStartSetting,
 } from '../../api/client/control';
+import { untilOwnerAllows } from '../../api/client/awaitingOwner';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { showConfirm, showToast } from '../../store/store';
 import { loadingIfFresh, toFailed, type Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { Disclosure } from '../shared/Disclosure';
+import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -37,6 +35,7 @@ import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { CopyButton, PairCard, expiryLabel, type PairTarget } from './PairDeviceSection';
 import { timeAgo } from './pairedDevices';
 import {
+  AWAITING_OWNER_NOTE,
   EMPTY_REMOTE_GATEWAY_DRAFT,
   HTTPS_ONLY_NOTE,
   TRUST_NOTE,
@@ -47,19 +46,13 @@ import {
 } from './remoteGatewayForm';
 import { useCodeCountdown } from './useCodeCountdown';
 
-/** Pure: the https address another gateway should pair with, or `null`.
- *
- *  Only an `https` pairing origin qualifies, because gateways pair over https
- *  only. A plain-http one would be refused on the other side. */
 export function gatewayPairingAddress(target: PairTarget): string | null {
   return target.kind === 'origin' && target.url.startsWith('https://') ? target.url : null;
 }
 
-/** A list read this section owns, with its refresh. */
-function useGatewayList<T>(
+function useGatewayRead<T>(
   available: boolean,
   read: () => Promise<T[]>,
-  name: string,
 ): [Loadable<T[]>, () => Promise<unknown>] {
   const [list, setList] = useState<Loadable<T[]>>({ status: 'not-loaded' });
   const reload = useCallback((): Promise<unknown> => {
@@ -71,19 +64,26 @@ function useGatewayList<T>(
     );
   }, [available, read]);
   useEffect(() => { void reload(); }, [reload]);
+  return [list, reload];
+}
+
+function useGatewayList<T>(
+  available: boolean,
+  read: () => Promise<T[]>,
+  name: string,
+): [Loadable<T[]>, () => Promise<unknown>] {
+  const [list, reload] = useGatewayRead(available, read);
   usePanelRefresh(name, reload);
   return [list, reload];
 }
 
-/** One row of either list: a name, a line under it, one action. With no
- *  props, inside a skeleton, it is the loading placeholder. */
 function GatewayRow({
   title,
   detail,
   action,
 }: {
   title?: string;
-  detail?: string;
+  detail?: preact.ComponentChildren;
   action?: preact.ComponentChildren;
 }) {
   return (
@@ -101,7 +101,6 @@ function GatewayRow({
   );
 }
 
-/** A list under a delay-gated skeleton, its failure, or its rows. */
 function GatewayList<T>({
   list,
   noun,
@@ -129,13 +128,25 @@ function GatewayList<T>({
   );
 }
 
-/** A minted gateway pairing secret and when it stops working. */
+export const REMOTE_START_OPTIONS: (DropdownOption & { value: RemoteStartSetting })[] = [
+  { value: 'allow', label: 'Starts allowed' },
+  { value: 'ask', label: 'Starts ask me' },
+  { value: 'deny', label: 'Starts refused' },
+];
+
+export function remoteStartsDetail(setting: RemoteStartSetting): string {
+  switch (setting) {
+    case 'allow': return 'its agents may start threads here';
+    case 'ask': return 'its agents ask you before a thread starts here';
+    case 'deny': return 'its agents may not start threads here';
+  }
+}
+
 interface MintedGatewayCode {
   code: string;
   expiresAt: number;
 }
 
-/** "Pair a gateway": this gateway lets another one in. */
 export function PairGatewaySection({
   available,
   target,
@@ -176,6 +187,34 @@ export function PairGatewaySection({
     } catch (e) {
       showToast(`Couldn't unpair ${gateway.label}: ${errorDetail(e)}`, 'error');
     }
+  };
+
+  const setManage = async (gateway: PairedGateway, mayManage: boolean) => {
+    if (mayManage) {
+      const ok = await showConfirm(
+        `Every device paired with ${gateway.label} can then list, revoke and reassign this gateway's `
+          + 'devices, and add, rename and remove its users.\n\n'
+          + 'Pairing codes, gateway pairings and the rest of Settings stay on this gateway.',
+        'Allow',
+        { title: `Let ${gateway.label} manage users and devices?`, variant: 'default' },
+      );
+      if (!ok) return;
+    }
+    try {
+      await setPairedGatewayMayManage(gateway.id, mayManage);
+    } catch (e) {
+      showToast(`Couldn't change what ${gateway.label} may manage: ${errorDetail(e)}`, 'error');
+    }
+    await reload();
+  };
+
+  const setRemoteStarts = async (gateway: PairedGateway, setting: RemoteStartSetting) => {
+    try {
+      await setPairedGatewayRemoteStarts(gateway.id, setting);
+    } catch (e) {
+      showToast(`Couldn't change remote starts from ${gateway.label}: ${errorDetail(e)}`, 'error');
+    }
+    await reload();
   };
 
   function codeBody() {
@@ -261,6 +300,10 @@ export function PairGatewaySection({
             It is one-way: this gateway gains nothing on the other one. Unpair ends it on
             the other gateway's next request.
           </p>
+          <p>
+            Each pairing also sets whether its agents may start threads here. Ask parks
+            each new thread on a card until you allow it.
+          </p>
         </Explainer>
       </div>
       {available ? (
@@ -274,11 +317,35 @@ export function PairGatewaySection({
               <GatewayRow
                 key={gateway.id}
                 title={gateway.label}
-                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · can open this gateway's workspaces`}
+                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · ${gateway.may_manage ? "can open this gateway's workspaces and manage its users and devices" : "can open this gateway's workspaces"} · ${remoteStartsDetail(gateway.remote_starts)}`}
                 action={
-                  <button class="action-btn action-btn-danger" onClick={() => void unpair(gateway)}>
-                    Unpair
-                  </button>
+                  <>
+                    <Dropdown
+                      options={REMOTE_START_OPTIONS}
+                      value={gateway.remote_starts}
+                      onChange={(value) => void setRemoteStarts(gateway, value as RemoteStartSetting)}
+                    />
+                    <label
+                      class="toggle-switch"
+                      data-tooltip={`Let devices on ${gateway.label} manage users and devices`}
+                    >
+                      <input
+                        type="checkbox"
+                        aria-label={`Let devices on ${gateway.label} manage users and devices`}
+                        checked={gateway.may_manage}
+                        onChange={(e) => {
+                          const input = e.currentTarget as HTMLInputElement;
+                          const wanted = input.checked;
+                          input.checked = gateway.may_manage;
+                          void setManage(gateway, wanted);
+                        }}
+                      />
+                      <span class="toggle-slider" />
+                    </label>
+                    <button class="action-btn action-btn-danger" onClick={() => void unpair(gateway)}>
+                      Unpair
+                    </button>
+                  </>
                 }
               />
             )}
@@ -295,11 +362,129 @@ export function PairGatewaySection({
   );
 }
 
-/** Editing replaces the complete header set; values are write-only. */
-function RemoteHeaderSettings({ gateway, reload }: { gateway: RemoteGateway; reload: () => Promise<unknown> }) {
+export type RemoteGatewayState =
+  | { kind: 'unknown' }
+  | { kind: 'reachable' }
+  | { kind: 'revoked' }
+  | { kind: 'unreachable'; reason: string };
+
+export function remoteGatewayState(
+  listings: Loadable<RemoteGatewayListing[]>,
+  gateway: RemoteGateway,
+): RemoteGatewayState {
+  if (listings.status !== 'loaded') return { kind: 'unknown' };
+  const listing = listings.data.find((l) =>
+    l.gateway === gateway.name && (l.pairing_id === undefined || l.pairing_id === gateway.pairing_id));
+  if (!listing) return { kind: 'unknown' };
+  if (listing.state === 'reachable') return { kind: 'reachable' };
+  return listing.reason_kind === 'revoked' ? { kind: 'revoked' } : { kind: 'unreachable', reason: listing.reason };
+}
+
+const STATE_WORDS: Record<'revoked' | 'unreachable', string> = {
+  revoked: 'Access revoked',
+  unreachable: 'Not reachable',
+};
+
+function RemoteGatewayDetail({ gateway, state }: { gateway: RemoteGateway; state: RemoteGatewayState }) {
+  const added = `${gateway.address} · added ${timeAgo(gateway.added_at, Date.now())}`;
+  if (state.kind !== 'revoked' && state.kind !== 'unreachable') return <>{added}</>;
+  return (
+    <>
+      <span class={`remote-gateway-state remote-gateway-state-${state.kind}`}>{STATE_WORDS[state.kind]}</span>
+      {` · ${added}`}
+    </>
+  );
+}
+
+function RepairRemoteGateway({ gateway, reload }: { gateway: RemoteGateway; reload: () => Promise<unknown> }) {
+  const [code, setCode] = useState('');
+  const [pairing, setPairing] = useState(false);
+  const [awaitingOwner, setAwaitingOwner] = useState(false);
+  const label = `New gateway pairing secret from ${gateway.name}`;
+  const repair = async () => {
+    if (!code.trim() || pairing) return;
+    setPairing(true);
+    try {
+      const renewed = await untilOwnerAllows(
+        () => repairRemoteGateway(gateway.name, code.trim()),
+        () => setAwaitingOwner(true),
+      );
+      setCode('');
+      showToast(renewed.return_access_warning ?? `Paired again with ${gateway.name}`,
+        renewed.return_access_warning ? 'warning' : 'success');
+      await reload();
+    } catch (e) {
+      showToast(`Couldn't pair again with ${gateway.name}: ${errorDetail(e)}`, 'error');
+    } finally {
+      setPairing(false);
+      setAwaitingOwner(false);
+    }
+  };
+  return (
+    <div>
+      <div class="settings-row-note" role="status">
+        {gateway.name} unpaired this gateway, so its workspaces no longer open here. On {gateway.name},
+        open Settings → Access → Pair a gateway and paste the new secret here. The short name, headers
+        and agent return access stay.
+      </div>
+      <div class="settings-row update-address-row">
+        <div class="update-address-controls">
+          <input
+            class="settings-text-input update-address-input"
+            value={code}
+            placeholder="lgp_…"
+            aria-label={label}
+            spellcheck={false}
+            disabled={pairing}
+            onInput={(e) => setCode((e.currentTarget as HTMLInputElement).value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void repair(); }}
+          />
+          <button class="action-btn action-btn-confirm" disabled={!code.trim() || pairing} onClick={() => void repair()}>
+            {awaitingOwner ? 'Waiting…' : pairing ? 'Pairing…' : 'Re-pair'}
+          </button>
+        </div>
+      </div>
+      <Disclosure open={awaitingOwner}>
+        <div class="settings-row-note" role="status">{AWAITING_OWNER_NOTE}</div>
+      </Disclosure>
+    </div>
+  );
+}
+
+function RemoteGatewaySettings({ gateway, reload }: { gateway: RemoteGateway; reload: () => Promise<unknown> }) {
   const [editing, setEditing] = useState(false);
   const [rows, setRows] = useState<HeaderDraft[]>([]);
   const [saving, setSaving] = useState(false);
+  const returnLabel = `Allow agents on ${gateway.name} to read and start threads through this gateway`;
+  const setReturnAccess = async (enabled: boolean) => {
+    setSaving(true);
+    try {
+      const updated = await setRemoteGatewayReturnAccess(gateway.name, enabled);
+      showToast(updated.return_access_warning ?? `Agent return access ${enabled ? 'enabled' : 'disabled'} for ${gateway.name}`,
+        updated.return_access_warning ? 'warning' : 'success');
+    } catch (e) {
+      showToast(`Couldn't change agent return access for ${gateway.name}: ${errorDetail(e)}`, 'error');
+    } finally {
+      await reload();
+      setSaving(false);
+    }
+  };
+  const trustedLabel = `Use ${gateway.name}'s own app for its workspaces`;
+  const setTrustedPairing = async (enabled: boolean) => {
+    if (enabled && !await showConfirm(
+      `${gateway.name}'s app will run here with this gateway's access, on every device that opens its workspaces through this gateway.\n\nTurn this on only if you own ${gateway.name}.`,
+      'Trust', { variant: 'default' })) return;
+    setSaving(true);
+    try {
+      await setRemoteGatewayTrustedPairing(gateway.name, enabled);
+      showToast(`${gateway.name}'s own app ${enabled ? 'enabled' : 'disabled'}`, 'success');
+    } catch (e) {
+      showToast(`Couldn't change trusted pairing for ${gateway.name}: ${errorDetail(e)}`, 'error');
+    } finally {
+      await reload();
+      setSaving(false);
+    }
+  };
   const rotate = async () => {
     setSaving(true);
     try {
@@ -324,6 +509,41 @@ function RemoteHeaderSettings({ gateway, reload }: { gateway: RemoteGateway; rel
     } finally { setSaving(false); }
   };
   return <div>
+    <div class="settings-row">
+      <span class="settings-row-label">{returnLabel}</span>
+      <label class="toggle-switch" data-tooltip={returnLabel}>
+        <input type="checkbox" aria-label={returnLabel} checked={gateway.return_access ?? false}
+          disabled={saving || gateway.return_access === undefined}
+          onChange={(e) => {
+            const input = e.currentTarget as HTMLInputElement;
+            const wanted = input.checked;
+            input.checked = gateway.return_access ?? false;
+            void setReturnAccess(wanted);
+          }} />
+        <span class="toggle-slider" />
+      </label>
+    </div>
+    {gateway.return_access === undefined && <div class="settings-row-note">Update this gateway to manage agent return access.</div>}
+    <div class="settings-row">
+      <span class="settings-row-label">
+        {trustedLabel}
+        <Explainer title="Trusted pairing">
+          Off: this gateway's app opens {gateway.name}'s workspaces. On: {gateway.name} serves its own app, so you
+          get its version and features. Its code then runs with this gateway's access. Turn it on only for a gateway you own.
+        </Explainer>
+      </span>
+      <label class="toggle-switch" data-tooltip={trustedLabel}>
+        <input type="checkbox" aria-label={trustedLabel} checked={gateway.trusted_pairing ?? false}
+          disabled={saving || gateway.trusted_pairing === undefined}
+          onChange={(e) => {
+            const input = e.currentTarget as HTMLInputElement;
+            const wanted = input.checked;
+            input.checked = gateway.trusted_pairing ?? false;
+            void setTrustedPairing(wanted);
+          }} />
+        <span class="toggle-slider" />
+      </label>
+    </div>
     <div class="settings-row-note">{gateway.last_rotated_at ? `Credential rotated ${timeAgo(gateway.last_rotated_at, Date.now())}` : 'Credential rotates automatically every 30 days'}</div>
     {gateway.rotation_error && <div class="settings-row-note" role="status">{gateway.rotation_error} · Retries automatically.</div>}
     {!gateway.rotation_error && gateway.gateway_protocol < 2 && <div class="settings-row-note">Update the remote gateway to support credential rotation.</div>}
@@ -338,15 +558,17 @@ function RemoteHeaderSettings({ gateway, reload }: { gateway: RemoteGateway; rel
   </div>;
 }
 
-/** "Remote gateways": this gateway opens another one's workspaces. */
 export function RemoteGatewaysSection({ available }: { available: boolean }) {
-  const [remotes, reload] = useGatewayList<RemoteGateway>(
-    available,
-    listRemoteGateways,
-    'remote gateways',
+  const [remotes, reloadRemotes] = useGatewayRead<RemoteGateway>(available, listRemoteGateways);
+  const [listings, reloadListings] = useGatewayRead<RemoteGatewayListing>(available, listRemoteWorkspaces);
+  const reload = useCallback(
+    () => Promise.all([reloadRemotes(), reloadListings()]),
+    [reloadRemotes, reloadListings],
   );
+  usePanelRefresh('remote gateways', reload);
   const [draft, setDraft] = useState<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
   const [pairing, setPairing] = useState(false);
+  const [awaitingOwner, setAwaitingOwner] = useState(false);
   const blocker = remoteGatewayBlocker(draft);
   const edit = (patch: Partial<RemoteGatewayDraft>) => setDraft((d) => ({ ...d, ...patch }));
 
@@ -354,7 +576,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
     if (blocker !== null || pairing) return;
     setPairing(true);
     try {
-      const added = await submitRemoteGateway(draft);
+      const added = await submitRemoteGateway(draft, () => setAwaitingOwner(true));
       setDraft(EMPTY_REMOTE_GATEWAY_DRAFT);
       showToast(`Paired with ${added.name}`, 'success');
       await reload();
@@ -362,6 +584,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
       showToast(`Couldn't pair with that gateway: ${errorDetail(e)}`, 'error');
     } finally {
       setPairing(false);
+      setAwaitingOwner(false);
     }
   };
 
@@ -374,7 +597,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
     if (!ok) return;
     try {
       const removed = await removeRemoteGateway(gateway.name);
-      if (!removed.remote_forgot) {
+      if (!removed.remote_forgot && remoteGatewayState(listings, gateway).kind !== 'revoked') {
         showToast(
           `Removed ${gateway.name} here, but it did not answer: ${removed.detail ?? 'no reason given'}. Unpair this gateway there too.`,
           'warning',
@@ -428,6 +651,11 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
           </p>
         </Explainer>
       </div>
+      <div class="settings-section-desc">
+        These gateways let this one open their workspaces. They cannot open yours,
+        and their agents reach back here only where you turn that on. Each one can
+        revoke your access by unpairing this gateway on its own Access page.
+      </div>
       {available ? (
         <>
           <div class="list-rows">
@@ -435,39 +663,56 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
               list={remotes}
               noun="remote gateways"
               empty="No remote gateways yet."
-              row={(gateway) => (
-                <div key={gateway.name}>
-                  <GatewayRow
-                    title={gateway.name}
-                    detail={`${gateway.address} · added ${timeAgo(gateway.added_at, Date.now())}`}
-                    action={
-                      <button class="action-btn action-btn-danger" onClick={() => void remove(gateway)}>
-                        Remove
-                      </button>
-                    }
-                  />
-                  <RemoteHeaderSettings gateway={gateway} reload={reload} />
-                </div>
-              )}
+              row={(gateway) => {
+                const state = remoteGatewayState(listings, gateway);
+                return (
+                  <div key={gateway.name}>
+                    <GatewayRow
+                      title={gateway.name}
+                      detail={<RemoteGatewayDetail gateway={gateway} state={state} />}
+                      action={
+                        <button class="action-btn action-btn-danger" onClick={() => void remove(gateway)}>
+                          Remove
+                        </button>
+                      }
+                    />
+                    <Disclosure open={state.kind === 'unreachable'}>
+                      {state.kind === 'unreachable' && <div class="settings-row-note" role="status">{state.reason}</div>}
+                    </Disclosure>
+                    <Disclosure open={state.kind === 'revoked'}>
+                      <RepairRemoteGateway gateway={gateway} reload={reload} />
+                    </Disclosure>
+                    <Disclosure open={state.kind !== 'revoked'}>
+                      <RemoteGatewaySettings gateway={gateway} reload={reload} />
+                    </Disclosure>
+                  </div>
+                );
+              }}
             />
           </div>
+          {listings.status === 'failed' && (
+            <LoadableError noun="whether remote gateways still answer" error={listings.error} />
+          )}
           <div class="settings-row-note" data-role="remote-gateway-trust">{TRUST_NOTE}</div>
-          {field('Address', 'address', 'https://lucidos.example.com')}
-          <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
+          {field('Short name', 'name', 'cloud')}
           {field('Gateway pairing secret', 'code', 'lgp_…')}
+          <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
           {field(
-            'Short name',
-            'name',
-            'cloud',
+            'Address',
+            'address',
+            'https://lucidos.example.com',
             <button
               class="action-btn action-btn-confirm"
               disabled={blocker !== null || pairing}
               onClick={() => void pair()}
             >
-              {pairing ? 'Pairing…' : 'Pair'}
+              {awaitingOwner ? 'Waiting…' : pairing ? 'Pairing…' : 'Pair'}
             </button>,
           )}
           {blocker?.kind === 'plain-http' && <div class="settings-row-note">{HTTPS_ONLY_NOTE}</div>}
+          <Disclosure open={awaitingOwner}>
+            <div class="settings-row-note" role="status">{AWAITING_OWNER_NOTE}</div>
+          </Disclosure>
         </>
       ) : (
         <div class="settings-section-desc">

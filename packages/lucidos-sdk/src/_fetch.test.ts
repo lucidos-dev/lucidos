@@ -2,18 +2,9 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { request, restampDeadline, SdkError } from './_fetch';
 import { HEADER_DEVICE_ID } from './generated/engine-constants';
 
-/** WebKit (iOS Safari, the packaged WKWebView) rejects an aborted fetch with its
- *  own `AbortError: Fetch is aborted` instead of the signal's `reason`, so a
- *  fired deadline arrives looking exactly like a page-lifecycle cancel. Anything
- *  formatting the error then reports "request cancelled" for what was really a
- *  timeout, which is how a suspended iOS PWA's preference write got mislabeled.
- *  `_fetch` re-stamps it as the `TimeoutError` Chrome and Firefox already
- *  deliver. Mirrors `api/client/_core.test.ts` § "client-side deadline
- *  normalization", the host-side copy of the same rule. */
 
 const originalFetch = globalThis.fetch;
 
-/** Rejects the way WebKit does the moment the composed signal aborts. */
 function abortingFetch() {
   return vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
     const fail = () => reject(new DOMException('Fetch is aborted', 'AbortError'));
@@ -59,23 +50,10 @@ describe('restampDeadline', () => {
   });
 });
 
-/** The workspace address is the whole reason `apiUrl` is public: an app that
- *  builds an engine URL by hand gets a 404 that a `catch` turns into silence.
- *  Both derivations are locked here because they are what the SDK reads INSTEAD
- *  of the two shapes an author reaches for (a relative path against
- *  `document.baseURI`, or a root-absolute `/api/v1/…`). See
- *  `system-knowhow/js-sdk.md` § lucidos.apiUrl.
- *
- *  What the address is FOR narrowed with ADR 0227. An app frame loads a
- *  subresource from it and cannot `fetch` it, so these cases pin the derivation
- *  rather than a working call. */
 describe('apiUrl workspace-address derivation', () => {
   const originalQuerySelector = globalThis.document.querySelector;
   const originalLocation = (globalThis as unknown as { location?: unknown }).location;
 
-  /** Re-import `_fetch` so its load-time `computeBaseUrl()` reads the DOM we
-   *  just installed. The base is resolved once per module instance, so a fresh
-   *  instance per case is the only way to exercise both branches. */
   async function apiUrlUnder(
     base: string | null,
     pathname: string,
@@ -109,10 +87,6 @@ describe('apiUrl workspace-address derivation', () => {
   });
 
   it('never lets a frame capability ride an API call', async () => {
-    // Behind a gateway the engine stamps the frame's base with a pass to its
-    // own files (ADR 0238). That pass reaches `/data/` and `/app/<id>/` and
-    // nothing else, so an `/api/v1` URL carrying one would simply 401. The
-    // prefix is everything before the segment.
     const pass = '6a0b~habit-tracker~00ff';
     const apiUrl = await apiUrlUnder(
       `/dev/~cap/${pass}/app/habit-tracker/`,
@@ -129,9 +103,6 @@ describe('rawFetch deadline + caller signal', () => {
       .rejects.toMatchObject({ name: 'TimeoutError' });
   });
 
-  // Regression: `rawFetch` used to set `signal: controller.signal` on the spread
-  // init, which silently DROPPED a caller-supplied signal, so the caller's abort
-  // did nothing at all.
   it('honours a caller-supplied signal and keeps its abort an AbortError', async () => {
     globalThis.fetch = abortingFetch() as unknown as typeof fetch;
     const controller = new AbortController();
@@ -153,13 +124,7 @@ describe('rawFetch deadline + caller signal', () => {
   });
 });
 
-/** Three app routes reached the engine with no identity at all, so the engine
- *  recorded them as the owner on no evidence: Publish, Blog preview and Trigger
- *  update. They arrive through this facade rather than the host app's own
- *  device-stamped client, so stamping here covers every SDK caller at once.
- *  See ADR 0169. */
 describe('device attribution', () => {
-  /** The header the facade sent, or undefined. */
   async function headerOn(deviceId: string | null): Promise<string | undefined> {
     if (deviceId === null) localStorage.removeItem('lucidos-device-id');
     else localStorage.setItem('lucidos-device-id', deviceId);
@@ -236,5 +201,15 @@ describe('direct SDK generation fencing', () => {
     await expect(pending).rejects.toThrow(/restored/i);
     await expect(sdk.request('/preferences', { method: 'POST' })).rejects.toThrow(/restored/i);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('direct SDK read transport recovery', () => {
+  it('retries a failed GET once', async () => {
+    const fetcher = vi.fn().mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce(new Response('{"ok":true}'));
+    globalThis.fetch = fetcher;
+    await expect(request('/threads/list')).resolves.toEqual({ ok: true });
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 });

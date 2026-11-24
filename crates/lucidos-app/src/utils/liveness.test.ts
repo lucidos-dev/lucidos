@@ -42,7 +42,6 @@ describe('classifyStartup', () => {
   });
 
   it('returns bg_resume for longer iOS-PWA dead windows without clean close', () => {
-    // 60s is past the crash-gap threshold but well under the cold threshold.
     expect(
       classifyStartup({ ...base, deadMs: 60_000, cleanClose: false, isIOSPwa: true }),
     ).toBe('bg_resume');

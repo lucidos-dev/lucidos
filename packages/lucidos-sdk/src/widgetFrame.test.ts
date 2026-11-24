@@ -10,7 +10,6 @@ vi.mock('./_bridge', () => ({
   },
 }));
 
-// Each test settles the frame by hand, and says what the box cuts off.
 const fit = vi.hoisted(() => ({
   settled: [] as Array<() => void>,
   measure: (): unknown => ({ findings: [], total: 0 }),
@@ -24,6 +23,7 @@ vi.mock('./widgetFit', () => ({
 import {
   LONG_PRESS_DELAY_MS,
   PRESS_MOVE_TOLERANCE_PX,
+  WIDGET_RESOURCES_MESSAGE_TYPE,
   WIDGET_CHANNEL,
   WIDGET_CONTENT_SIZE_MESSAGE_TYPE,
   WIDGET_FIT_MESSAGE_TYPE,
@@ -58,6 +58,7 @@ describe('installWidgetFrame', () => {
   const posted: unknown[] = [];
   const parent = { postMessage: (message: unknown) => posted.push(message) };
   const mark = (data: unknown) => pushHandlers.get(WIDGET_CHANNEL)?.(data);
+  const sizes = () => posted.filter(m => (m as { type?: string }).type === WIDGET_CONTENT_SIZE_MESSAGE_TYPE);
   const menus = () => posted.filter((m) => (m as { type?: string }).type === WIDGET_MENU_MESSAGE_TYPE);
 
   beforeEach(() => {
@@ -81,14 +82,15 @@ describe('installWidgetFrame', () => {
     installWidgetFrame();
     expect(posted).toEqual([]);
     mark({});
-    expect(posted).toEqual([{ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 }]);
+    expect(posted).toContainEqual({ type: WIDGET_RESOURCES_MESSAGE_TYPE, videoLoaded: 0, videoPixels: 0, images: 0, imagePixels: 0 });
+    expect(sizes()).toEqual([{ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 }]);
   });
 
   it('every mark reports, so the host hears the size in a new place', () => {
     installWidgetFrame();
     mark({ place: 'option' });
     mark({ place: 'option' });
-    expect(posted).toEqual([
+    expect(sizes()).toEqual([
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 },
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 },
     ]);
@@ -98,7 +100,7 @@ describe('installWidgetFrame', () => {
     installWidgetFrame();
     mark({ place: 'inline', size: 'medium' });
     mark({ place: 'inline', size: 'large' });
-    expect(posted).toEqual([
+    expect(sizes()).toEqual([
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200, size: 'medium' },
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200, size: 'large' },
     ]);
@@ -285,7 +287,6 @@ describe('installWidgetFrame', () => {
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS - 1);
       expect(menus()).toHaveLength(0);
       vi.advanceTimersByTime(1);
-      // The lift's click is still to come, and the host's menu must spend it.
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
       window.dispatchEvent(finger('pointerup'));
       expect(menus()).toHaveLength(1);
@@ -329,8 +330,6 @@ describe('installWidgetFrame', () => {
       installWidgetFrame();
       mark({ place: 'dashboard', size: 'small', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
-      // iOS shows its own selection or link menu while the finger rests, so the
-      // press itself must turn them off. jsdom drops the callout property.
       for (const property of ['user-select', '-webkit-user-select']) {
         expect(root.style.getPropertyValue(property)).toBe('none');
       }
@@ -385,7 +384,6 @@ describe('installWidgetFrame', () => {
       document.body.dispatchEvent(finger('pointerdown'));
       longPressMenu();
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
-      // The finger is still down, so its lift may still bring a click.
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
     });
 
@@ -401,7 +399,6 @@ describe('installWidgetFrame', () => {
       installWidgetFrame();
       mark({ place: 'dashboard', size: 'small', menu: true });
       const at = (type: string, timeStamp: number) => Object.defineProperty(finger(type), 'timeStamp', { value: timeStamp });
-      // Both events reach a frame that was busy for the whole press, so no timer ran.
       document.body.dispatchEvent(at('pointerdown', 1000));
       window.dispatchEvent(at('pointerup', 1000 + LONG_PRESS_DELAY_MS));
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
@@ -443,7 +440,6 @@ describe('installWidgetFrame', () => {
 
   describe('a right-click in a widget frame', () => {
     const at = { x: 40, y: 24 };
-    /** A secondary-button press, then the menu event, both on `target`. */
     const rightClick = (target: Element, init: MouseEventInit = {}) => {
       target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 2, clientX: at.x, clientY: at.y, ...init }));
       const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: at.x, clientY: at.y, ...init });

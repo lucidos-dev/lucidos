@@ -1,15 +1,3 @@
-/**
- * The menu drawer keeps the same gap on both sides of its rows on desktop.
- *
- * Two parts make the gaps equal. The panel hugs its widest row, so the row's
- * right padding is the gap after the widest label or badge. And the row's left
- * padding floor matches its right padding, so the gap before the icon is the
- * same. A width floor on the panel breaks the first part: a short menu then
- * leaves extra room after the labels.
- *
- * The phone layout overrides the left padding on purpose, so this pins only
- * the base rule.
- */
 import { describe, it, expect } from 'vitest';
 import postcss from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

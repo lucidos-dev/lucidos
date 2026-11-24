@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * `<Disclosure>`: the thread drawer's roll for any block in normal flow.
- * Plan: `docs/plans/2026-09-26-one-disclosure-roll.md`.
- *
- * jsdom has no Web Animations, so `Element.animate` is stubbed. Each stub
- * records its keyframes and timing, and a test finishes it by hand.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { useLayoutEffect } from 'preact/hooks';
@@ -48,11 +41,8 @@ function stubAnimate() {
   };
 }
 
-/** Where the box sits in the viewport. On screen unless a test moves it. */
 let boxTop = 0;
 
-/** jsdom lays nothing out, so the body reports a fixed height and the box a
- *  place in the viewport. `offsetHeight` rounds, as a browser's does. */
 function stubLayout() {
   Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
     configurable: true,
@@ -104,8 +94,6 @@ afterEach(() => {
 
 describe('Disclosure', () => {
   it('starts every roll of one commit only after all of them have read the layout', async () => {
-    // A transcript-wide toggle rolls many rows in one commit. A start between
-    // two reads makes the second read lay the whole page out again.
     const log: string[] = [];
     const animate = HTMLElement.prototype.animate;
     HTMLElement.prototype.animate = function (this: HTMLElement, ...args: Parameters<typeof animate>) {
@@ -129,8 +117,6 @@ describe('Disclosure', () => {
   });
 
   it('measures once the commit has settled, after the scroll anchor corrects', async () => {
-    // In the commit, rows opening above push this box below the fold. The
-    // anchor's correction, queued ahead of the roll, brings it back on screen.
     function Anchor({ tick }: { tick: number }) {
       useLayoutEffect(() => {
         if (tick > 0) queueMicrotask(() => { boxTop = 0; });
@@ -150,8 +136,6 @@ describe('Disclosure', () => {
   });
 
   it('snaps a roll nobody can see', async () => {
-    // The turn toggles roll every turn in the transcript at once. Off screen,
-    // a roll is work with nothing to show for it.
     await show(false);
     boxTop = window.innerHeight + 10;
     await show(true);
@@ -186,8 +170,6 @@ describe('Disclosure', () => {
   });
 
   it('lands at the fractional height the content lays out at', async () => {
-    // A roll to a rounded height snaps by the rounding as it lands, and every
-    // row above the pressed control adds its own snap.
     bodyHeight = 120.4;
     await show(false);
     await show(true);
@@ -241,8 +223,6 @@ describe('Disclosure', () => {
   });
 
   it('rolls out what it last showed open, even when the closing render empties it', async () => {
-    // A folded turn stops computing its rows in the same render that folds it.
-    // Rolling out the emptied body would measure 0px and snap.
     await show(true);
     await act(() => {
       render(<Disclosure open={false}>{null}</Disclosure>, host);
@@ -298,7 +278,6 @@ describe('Disclosure', () => {
   });
 
   it('rolls in on its first render when asked to appear', async () => {
-    // A row that arrives in a live list rolls in like a block being opened.
     await act(() => {
       render(<Disclosure open appear><div class="row">a</div></Disclosure>, host);
     });

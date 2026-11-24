@@ -6,16 +6,10 @@ import {
 } from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-/** More exchanges than one page of events holds (`THREAD_EVENTS_PAGE_SIZE` is
- *  400 events, two per exchange here). So the thread opens on its newest page,
- *  which already holds the question, and the link fetches nothing behind it. */
 const EXCHANGES = 260;
 
-/** A long thread waiting on a question, which is its last turn. Returns the
- *  thread and the `UserQuestionAsked` a question notification points at. */
 function seedLongQuestionThread(): { threadId: string; questionId: string } {
   const threadId = randomUUID();
   const questionId = randomUUID();
@@ -57,10 +51,6 @@ test.describe('A question notification into a long, unloaded thread', () => {
   });
 
   test('lands on the question and stays there without drawing the older history', async ({ page }) => {
-    // The link lands and the ride glides to the question at the live edge. The
-    // link claims only the question's turn (ADR 0631), so the window draws a
-    // slice of the thread. A render-all drew every turn, and got the iOS page
-    // killed on a thread this long.
     await assertHealthy(page);
     clearNotifications();
     const seeded = seedLongQuestionThread();
@@ -81,9 +71,6 @@ test.describe('A question notification into a long, unloaded thread', () => {
     await ensureMobileView(page, 'thread');
     await waitForVisibleElement(page, `[data-event-id="${seeded.questionId}"]`, 20_000);
 
-    // Where the question sits inside the transcript's viewport, once every
-    // glide has had time to end. Polled, so it passes as soon as it settles
-    // there, and a reader stranded above it fails.
     const questionState = () => page.evaluate((eid) => {
       const scroller = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
         .find((el) => el.getBoundingClientRect().height > 0);
@@ -110,12 +97,9 @@ test.describe('A question notification into a long, unloaded thread', () => {
       lastState = state;
       return state.inView;
     };
-    // Playwright reads a poll's message once, as a string, so the last
-    // state rides on a rethrow instead.
     await expect.poll(questionInView, { timeout: 5_000 }).toBe(true).catch((error: Error) => {
       throw new Error(`question not in view, last state: ${JSON.stringify(lastState)}\n\n${error.message}`);
     });
-    // And it stays: nothing later carries the reader off it.
     await page.waitForTimeout(1500);
     expect(await questionInView(), `question left view, state: ${JSON.stringify(lastState)}`).toBe(true);
     expect(await countExchanges(page), 'the link drew the whole thread').toBeLessThan(EXCHANGES / 2);

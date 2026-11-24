@@ -8,8 +8,6 @@ const focusedThreadIdSignal = { value: null as string | null };
 vi.mock('../../utils/pageActive', () => ({ isPageActive: isPageActiveMock }));
 vi.mock('../../utils/viewport', () => ({ isInViewport: isInViewportMock }));
 vi.mock('../store', async () => {
-  // Pull in the rest of the store so the toast module's other imports
-  // (showToast, dismissToast, toasts) still resolve.
   const actual = await vi.importActual<typeof import('../store')>('../store');
   return { ...actual, focusedThreadId: focusedThreadIdSignal };
 });
@@ -35,9 +33,6 @@ beforeEach(() => {
   focusedThreadIdSignal.value = null;
 });
 
-// §5.1 — every matrix row in system-knowhow/notifications.md §4. Row IDs
-// match the spec section labels so a failing test points at the broken
-// row.
 
 describe('§4 in-app surface matrix', () => {
   test('s4_row1_focused_event_in_viewport_classifies_as_auto_read', async () => {
@@ -68,9 +63,6 @@ describe('§4 in-app surface matrix', () => {
   });
 
   test('s4_row4_hidden_classifies_as_shell_not_active_regardless_of_focus_or_viewport', async () => {
-    // Even when focused on the source thread and the event is "in viewport"
-    // (hidden tab could still report bbox), an inactive page never gets a
-    // toast and never auto-marks-read.
     isPageActiveMock.mockReturnValue(false);
     isInViewportMock.mockReturnValue(true);
     focusedThreadIdSignal.value = 't-1';
@@ -79,8 +71,6 @@ describe('§4 in-app surface matrix', () => {
   });
 
   test('s4_null_event_id_with_focused_thread_falls_through_to_toast', async () => {
-    // Spec §2: Row 1 requires non-null event_id. Same-thread notification
-    // without one drops into Row 2 (toast + badge).
     isPageActiveMock.mockReturnValue(true);
     isInViewportMock.mockReturnValue(true);
     focusedThreadIdSignal.value = 't-1';
@@ -100,7 +90,6 @@ describe('§4 in-app surface matrix', () => {
   });
 
   test('s4_null_thread_with_event_id_falls_through_to_toast', async () => {
-    // No thread to focus → Row 1's "on source thread" predicate fails.
     isPageActiveMock.mockReturnValue(true);
     isInViewportMock.mockReturnValue(true);
     focusedThreadIdSignal.value = 't-1';
@@ -112,10 +101,6 @@ describe('§4 in-app surface matrix', () => {
 });
 
 describe('isShellActive', () => {
-  // Only the SHELL can show a toast. An app filling the screen means the user
-  // is looking at the app, so the OS surface wins. That also makes a fullscreen
-  // app agree with a popped-out app window, which has always taken the push
-  // and looks identical to the user.
 
   test('an ordinary visible shell is active', async () => {
     const { isShellActive } = await importModule();
@@ -134,8 +119,6 @@ describe('isShellActive', () => {
   });
 
   test('pseudo-fullscreen makes the shell inactive too', async () => {
-    // The iOS path is a CSS overlay rather than the Fullscreen API, so it sets
-    // a different signal. Both mean the same thing to the user.
     const { isShellActive } = await importModule();
     expect(isShellActive(true, false, true)).toBe(false);
   });

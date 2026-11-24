@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** A typed answer the engine has not confirmed shows on the card it answers.
- *  While it sends, the header reads "Sending" and, past the delay gate, the
- *  "Your answer" label spins. When its POST got no answer, the card goes live
- *  again and the answer shows "Not sent" with a retry icon. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type ComponentChildren } from 'preact';
 import { act } from 'preact/test-utils';
@@ -136,7 +132,6 @@ describe('a typed answer that was not sent', () => {
   });
 
   it('is replaced on every way this device answers a card', () => {
-    // A multi-select submit lives in PromptInput, outside this component.
     const src = (name: string): string => readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', name), 'utf8');
     expect(src('QuestionCard.tsx')).toContain('discardUnsentAnswers(threadId, toolUseId)');
     expect(src('PromptInput.tsx')).toContain('discardUnsentAnswers(focused, pendingMultiQ.toolUseId)');

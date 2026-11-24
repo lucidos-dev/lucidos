@@ -1,6 +1,7 @@
 use crate::support::{base_url, http_client};
 
-const PAYLOAD: &str = r#"{"category":"test","message":"e2e-routing","data":{"x":1}}"#;
+const PAYLOAD: &str =
+    r#"{"category":"error","code":"uncaught","message":"e2e-routing","data":{"x":1}}"#;
 
 /// Regression: every HTTP route now lives under `/api/v1/` (see the
 /// "API URL Conventions" section of `.claude/rules/rust.md`). The
@@ -37,4 +38,18 @@ async fn client_log_resolves_at_api_v1_internal_not_api_internal() {
         404,
         "POST /api/internal/client-log must NOT resolve — every route now lives under /api/v1/"
     );
+}
+
+#[tokio::test]
+async fn client_log_batch_refuses_oversized_codes() {
+    let response = http_client()
+        .post(format!("{}/api/v1/internal/client-logs", base_url()))
+        .json(&serde_json::json!([
+            {"category": "error", "code": "uncaught", "message": "private message"},
+            {"category": "error", "code": "x".repeat(257), "message": "private message"}
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
 }

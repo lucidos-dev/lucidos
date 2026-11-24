@@ -1,8 +1,3 @@
-/**
- * A message sent to the Lucidos Agent reads "Sent" until the loop takes it,
- * then "Read", the same label a coding-agent thread shows. The loop takes a
- * message by starting its turn, or by injecting it into a running one.
- */
 import { describe, it, expect } from 'vitest';
 import { groupIntoExchanges, messageReadTimestamp, queuedFollowupRun, readMarkers, type StoredEvent, type ThreadEvent } from '../thread-events';
 
@@ -39,7 +34,6 @@ describe('the read marker on a chat thread', () => {
   });
 
   it('keeps a queued follow-up at Queued while the running turn writes its to-do list', () => {
-    // `TodoListWritten` carries no request id, so nothing routes it by turn.
     const exchanges = groupIntoExchanges(new Map([
       ev(1, { type: 'MessageReceived', text: 'start' }, 'm1'),
       ev(2, { type: 'ToolCalled', tool_name: 'todo_write', args: {}, request_event_id: 'm1' } as unknown as ThreadEvent, 't1'),

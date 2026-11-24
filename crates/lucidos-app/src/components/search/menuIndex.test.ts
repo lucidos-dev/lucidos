@@ -11,7 +11,6 @@ describe('menu search: every page is findable', () => {
   });
 
   it('lists every page for an empty query, in MENU_ITEMS order', () => {
-    // The Menu tab opens on this, so it doubles as "where can I go".
     expect(getMenuSearchResults('', 50).map(r => r.id)).toEqual([...MENU_ITEMS]);
   });
 
@@ -58,8 +57,6 @@ describe('findMenuSearchEntry', () => {
   });
 
   it('resolves nothing for a retired id, so a stale recents row is dropped', () => {
-    // `validateRecents` reads this: recents are persisted verbatim, so an id a
-    // later build no longer knows would close the palette and go nowhere.
     expect(findMenuSearchEntry('pinned')).toBeUndefined();
   });
 });

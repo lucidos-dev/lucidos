@@ -1,23 +1,6 @@
-/**
- * A toast is an optional TITLE over a MESSAGE, and each is mounted in its own
- * box. Which box a piece lands in is the layout.
- *
- * The title goes in `.toast-heading`, outside the scroll box, so a scroll to
- * the end of the message still shows what the toast is about. The message goes
- * in `.toast-text`, which reserves no gutter and so draws its scrollbar in the
- * card's right rail. With no title, the message itself is the heading. The
- * geometry is pinned by `styles/__tests__/toast-height-cap.test.ts` and
- * `e2e/toast-scroll-shape.spec.ts`. What is pinned HERE is the split.
- *
- * The icon, the actions row and the close X stay OUTSIDE both boxes. For the
- * icon that keeps the rotating spinner clear of a scroll container. For the
- * other two it keeps them reachable under the height cap.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { INLINE_MESSAGE_MAX_CHARS, ToastList } from '../Toast';
 import { toasts, showToast } from '../../../store/store';
-// Shared vnode walkers. They live under layout/__tests__ because that is where
-// they were first needed, and nothing about them is layout-specific.
 import { findByClass, textOf } from '../../layout/__tests__/vnodeWalk';
 
 const TITLE = '12 commits come with the new version';
@@ -28,7 +11,6 @@ const TEXT = [
   '• gateway: the pairing screen owns its own boot',
 ].join('\n');
 
-/** Whether the reader has text selected. The card tap stands down while they do. */
 let selecting = false;
 
 beforeEach(() => {
@@ -37,8 +19,6 @@ beforeEach(() => {
   Object.assign(window, { getSelection: () => ({ isCollapsed: !selecting, anchorNode: {} }) });
 });
 
-/** A click whose target is (or is not) inside a link or a button. Enough of an
- *  event for the card handler, which asks its target one question. */
 function clickOn(inControl: boolean) {
   return {
     target: { closest: (sel: string) => (inControl && sel.includes('a[href]') ? {} : null) },
@@ -46,7 +26,6 @@ function clickOn(inControl: boolean) {
   };
 }
 
-/** The card element of the first toast. */
 function card() {
   return findByClass(ToastList(), 'toast')[0];
 }
@@ -62,8 +41,6 @@ describe('a toast is a title that stays over a message that scrolls', () => {
 
     const text = findByClass(tree, 'toast-text');
     expect(text).toHaveLength(1);
-    // The message arrives whole: its blank line and bullets are text, not
-    // structure, so nothing is split out of it.
     expect(textOf(text[0])).toBe(TEXT);
   });
 
@@ -87,10 +64,7 @@ describe('a toast is a title that stays over a message that scrolls', () => {
     const heading = findByClass(tree, 'toast-heading');
     expect(heading).toHaveLength(1);
     expect(textOf(heading[0])).toBe(TEXT);
-    // Its newlines make no title: an untitled toast is never bold.
     expect(findByClass(tree, 'toast-title')).toHaveLength(0);
-    // Nothing is left for a second box, and an empty one would still take the
-    // column's gap. The heading scrolls on its own instead.
     expect(findByClass(tree, 'toast-text')).toHaveLength(0);
   });
 
@@ -118,9 +92,6 @@ describe('a toast is a title that stays over a message that scrolls', () => {
     showToast(TEXT, 'info', { title: TITLE, onClick: () => clicked.push('hit') });
     const c = card();
 
-    // The card holds the icon, the padding and both boxes, so a tap anywhere on
-    // it acts. It is no role="button" itself, which would hide the X from a
-    // screen reader. A hidden real button stands in for the keyboard.
     expect(c.props['data-toast-tap']).toBe('click');
     expect(c.props.role).toBeUndefined();
     const key = findByClass(ToastList(), 'toast-tap-control');
@@ -131,8 +102,6 @@ describe('a toast is a title that stays over a message that scrolls', () => {
   });
 
   it('stands down for a link or a button, each its own destination', () => {
-    // The anchor carries no handler (see `linkifyText`), so the toast's action
-    // is the only thing that could eat the click and leave the URL unopened.
     const clicked: string[] = [];
     showToast('Read https://example.com/notes', 'info', { onClick: () => clicked.push('hit') });
 
@@ -167,9 +136,7 @@ describe('a toast is a title that stays over a message that scrolls', () => {
     const tree = ToastList();
 
     expect(findByClass(tree, 'toast-actions')).toHaveLength(0);
-    // The keyboard still reaches it, under the action's own label.
     expect(textOf(findByClass(tree, 'toast-tap-control')[0])).toBe('Open');
-    // The X stays, so Escape and a defer still have a way out.
     expect(findByClass(tree, 'toast-close')).toHaveLength(1);
     (card().props.onClick as (e: unknown) => void)(clickOn(false));
     expect(clicked).toEqual(['open']);
@@ -187,7 +154,7 @@ describe('a toast is a title that stays over a message that scrolls', () => {
     expect(c.props.onClick).toBeUndefined();
   });
 
-  it('leaves a passive info toast up on a tap, with no keyboard control', () => {
+  it('leaves a passive info toast up on a tap, with no card tap control', () => {
     showToast('Copied', 'info', { key: 'copied' });
     const c = card();
 
@@ -198,8 +165,6 @@ describe('a toast is a title that stays over a message that scrolls', () => {
   });
 });
 
-/** A long headline in the one-line row is squeezed into a narrow column, with
- *  its scroll box mid-card beside the action. So only a short one gets the row. */
 describe('Toast layout: one line only for a short headline', () => {
   const OPEN = { label: 'Open', onClick: () => {} };
 

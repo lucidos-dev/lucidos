@@ -8,6 +8,7 @@ vi.mock('../../utils/basePath', () => ({
   parseWorkspaceRoute: () => ({ slug: 'demo', gateway: 'remote' }),
 }));
 vi.mock('../../api/client/_core', () => ({
+  API: '/demo/api/v1',
   ApiError: class extends Error {
     constructor(readonly httpCode: number, readonly reason: string, readonly body?: unknown, readonly bootSplash = false) {
       super(reason);
@@ -55,8 +56,6 @@ describe('Undo restore confirmation', () => {
     expect(m.fetch).not.toHaveBeenCalled();
     expect(m.toast).toHaveBeenCalled();
   });
-  // Only a request that may have started a restore says its delivery is
-  // unknown. A refusal the engine answered names its reason instead.
   it.each([
     [new TypeError('Failed to fetch'), true],
     [new ApiError(500, 'snapshot_restore_delivery_unknown'), true],

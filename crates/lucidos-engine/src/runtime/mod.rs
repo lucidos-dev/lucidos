@@ -1,23 +1,38 @@
-pub(crate) mod agent_run_marker;
+pub mod agent_notes;
+pub mod agent_run_marker;
 pub mod agent_runtime;
+pub use crate::core::agent_sandbox;
+pub use crate::engine::thread_events::billing_provider;
 pub mod browser;
 mod browser_consent;
-pub mod cc_model_discovery;
+pub use crate::llm::cc_model_discovery;
 pub mod chat_ladder;
+mod chat_ladder_policy;
 pub mod claude_code;
 pub mod claude_code_notes;
 pub mod codex;
 mod codex_app_server;
 mod codex_app_server_parse;
 mod codex_parse;
+pub mod codex_side_question;
 pub(crate) mod compile_mode;
 pub mod intelligence_ladder;
+mod intelligence_ladder_policy;
 pub mod lucidos_cli;
 pub mod python;
-pub(crate) mod spawn_env;
+pub mod spawn_env;
 pub(crate) mod startup_instructions;
+#[cfg(test)]
+pub(crate) mod stub_executable;
+pub(crate) use crate::core::temp_dirs;
 
-use std::sync::Arc;
+#[cfg(test)]
+use crate::llm::coding_agent_models::{
+    curated_coding_agent_model_options, effort_within_row_tiers, offered_row,
+    validate_model_against,
+};
+#[cfg(test)]
+use crate::llm::intelligence_rungs::strip_version_pin;
 
 pub use agent_runtime::{
     AccountPin, AgentEvent, AgentExitFacts, AgentInput, AgentPermissionRequest, AgentRuntime,
@@ -37,280 +52,10 @@ pub use claude_code::{
 pub use codex::{CodexRuntime, CODEX_ASK_USER_QUESTION_TOOL};
 pub use python::PythonRuntime;
 
-/// The `/model` picker entries for one backend. Same data the frontend picker
-/// renders, reached without the caller having to know which module owns it.
-/// Claude Code's are its discovered rows once it has answered, then the offered
-/// curated rows it did not list.
-pub fn coding_agent_model_options(agent: CodingAgent) -> Arc<[claude_code::CcMenuOption]> {
-    match agent {
-        CodingAgent::ClaudeCode => claude_code::cc_model_options(),
-        CodingAgent::Codex => CODEX_MODEL_OPTIONS.clone(),
-    }
-}
-
-static CODEX_MODEL_OPTIONS: std::sync::LazyLock<Arc<[claude_code::CcMenuOption]>> =
-    std::sync::LazyLock::new(|| codex::codex_model_options().into());
-
-/// Every hand-kept row for one backend, offered or not: the source of the
-/// offered rows Claude Code did not list, and the overlay that declares
-/// context windows.
-fn curated_coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::CcMenuOption] {
-    match agent {
-        CodingAgent::ClaudeCode => claude_code::curated_cc_model_options(),
-        CodingAgent::Codex => codex::codex_model_options(),
-    }
-}
-
-/// The context window a coding-agent session runs `model` under, when the
-/// backend's own window differs from what the model registry infers.
-///
-/// `None` means nothing is declared, and the caller falls back to
-/// `context_window_for`. That fallback is right for the engine's own calls and
-/// wrong for these: it answers 200k for most bare `claude-` ids, because LUCIDOS
-/// gates 1M mode on its own `[1m]` suffix. Claude Code does not. A Sonnet 5
-/// session runs 1M whatever we spell, so a capture rendered a real 240k prompt
-/// as "203k / 200k (100%)" before this existed.
-///
-/// The windows are declared on the curated rows, which stay the overlay after
-/// discovery. An alias is never followed to the model it runs: a legacy id
-/// folds onto its alias (`normalize_cc_model_id`), so the alias's current model
-/// says nothing about the session that reported it.
-///
-/// The lookup ignores a `@default` version pin. The curated file writes it on two
-/// rows (`claude-opus-5@default`), and the agent strips it when it echoes the
-/// model back. It deliberately does NOT ignore `[1m]`, which keeps a 1M row
-/// distinct from its bare sibling. [`likely_intended_model`] documents the same
-/// rule.
-pub fn coding_agent_context_window(agent: CodingAgent, model: &str) -> Option<usize> {
-    let target = strip_version_pin(model);
-    curated_coding_agent_model_options(agent)
-        .iter()
-        .find(|o| strip_version_pin(&o.value) == target)
-        .and_then(|o| o.context_window)
-}
-
-/// The `/effort` picker entries for one backend.
-pub fn coding_agent_reasoning_effort_options(
-    agent: CodingAgent,
-) -> &'static [claude_code::CcMenuOption] {
-    match agent {
-        CodingAgent::ClaudeCode => claude_code::cc_reasoning_effort_options(),
-        CodingAgent::Codex => codex::codex_reasoning_effort_options(),
-    }
-}
-
-/// Validate a caller-supplied model id against the backend that will run it.
-///
-/// REFUSES an unknown id rather than falling back to the default, and that is
-/// the whole point of the function. A silent fallback is what shipped before:
-/// `run_coding_agent` advertised a `model` argument, no layer read it, and every
-/// session ran on the settings default while the tool result said success. The
-/// caller then reported a model choice it had not made. An id the backend does
-/// not offer is a caller mistake, and a mistake the caller can SEE is worth more
-/// than a session that quietly runs on the wrong model.
-///
-/// The vocabulary is the backend's own picker list, so this cannot drift from
-/// what the user can pick in the UI. A row is named by its value or by the
-/// concrete model it runs (see [`offered_row`]).
-///
-/// When the rejected id is not offered but is a close spelling of one that
-/// is, `likely_intended_model` names it before the full list. A caller can
-/// paste the LUCIDOS CHAT id `claude-opus-5-5@default[1m]` by mistake. Claude
-/// Code spells that same model `claude-opus-5-5[1m]`.
-pub fn validate_coding_agent_model(
-    agent: CodingAgent,
-    model: Option<&str>,
-) -> Result<Option<String>, String> {
-    validate_model_against(agent, model, &coding_agent_model_options(agent))
-}
-
-fn validate_model_against(
-    agent: CodingAgent,
-    model: Option<&str>,
-    options: &[claude_code::CcMenuOption],
-) -> Result<Option<String>, String> {
-    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
-        return Ok(None);
-    };
-    if offered_row(options, model).is_some() {
-        return Ok(Some(model.to_string()));
-    }
-    let offered = options
-        .iter()
-        .map(describe_row)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let hint = likely_intended_model(model, options)
-        .map(|likely| format!(", which spells that model '{likely}'"))
-        .unwrap_or_default();
-    Err(format!(
-        "model '{model}' is not offered by {}{hint}. Choose one of: {offered}",
-        agent.as_str(),
-    ))
-}
-
-/// The picker row a caller's `model` names: the row with that value, else the
-/// first row that runs that concrete model.
-///
-/// The second arm is what a caller copying a thread's model needs. The picker
-/// sends `sonnet`, Claude Code reports `claude-sonnet-5[1m]` at Init, and the
-/// thread records that. The recorded id names a model the picker offers, so it
-/// must pass. Several rows can run one model (`default` and `opus` often do), and
-/// then the first one answers.
-fn offered_row<'a>(
-    options: &'a [claude_code::CcMenuOption],
-    model: &str,
-) -> Option<&'a claude_code::CcMenuOption> {
-    options.iter().find(|o| o.value == model).or_else(|| {
-        options
-            .iter()
-            .find(|o| o.resolved_model.as_deref() == Some(model))
-    })
-}
-
-/// One row as a refusal lists it: the value, and the model it runs when that
-/// differs, so the caller sees the same pairing the picker shows.
-fn describe_row(option: &claude_code::CcMenuOption) -> String {
-    match option.resolved_model.as_deref() {
-        Some(runs) if runs != option.value => format!("{} (runs {runs})", option.value),
-        _ => option.value.clone(),
-    }
-}
-
-/// The single offered id that is a close misspelling of a rejected `model`,
-/// or `None` when no exactly-one candidate is close enough to name.
-///
-/// Checked two ways, one at a time. First with a `@default` version pin
-/// removed, the LUCIDOS CHAT picker's own decoration. Then with a trailing
-/// `[1m]` context-window suffix removed.
-///
-/// Never both at once. Claude Code's own list pins `@default` on one row,
-/// `claude-opus-5@default`. It pins `[1m]` on a different row for the same
-/// model, `claude-opus-5[1m]`. Stripping both would collapse those two ids
-/// into one stem and turn a clean match into a guess.
-fn likely_intended_model<'a>(
-    model: &str,
-    options: &'a [claude_code::CcMenuOption],
-) -> Option<&'a str> {
-    unique_match_after(model, options, strip_version_pin).or_else(|| {
-        unique_match_after(model, options, |id| {
-            id.strip_suffix("[1m]").unwrap_or(id).to_string()
-        })
-    })
-}
-
-/// A model id without the `@default` version pin the Claude Code picker writes
-/// on some rows. Shared by the two callers that must see through it, so they
-/// cannot disagree about what the decoration means.
-fn strip_version_pin(id: &str) -> String {
-    id.replace("@default", "")
-}
-
-/// The one offered id whose value equals `strip(model)` once `strip` is
-/// applied to it too. `None` when zero or more than one candidate ties.
-fn unique_match_after<'a>(
-    model: &str,
-    options: &'a [claude_code::CcMenuOption],
-    strip: impl Fn(&str) -> String,
-) -> Option<&'a str> {
-    let target = strip(model);
-    let mut matches = options.iter().filter(|o| strip(&o.value) == target);
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first.value.as_str())
-}
-
-/// Validate a caller-supplied reasoning effort against the backend AND the
-/// model that will run it. Refuses an out-of-vocabulary tier for the same
-/// reason [`validate_coding_agent_model`] refuses an unknown model.
-///
-/// The model half exists because Codex declares some tiers per model, and its
-/// driver DROPS a tier the model does not offer rather than failing: an
-/// unsupported value kills the turn outright. The session still records the
-/// tier that was asked for, so the picker would show one the turn never ran at.
-/// Refusing the caller here is what keeps the two honest.
-///
-/// **An absent model is refused for such a tier, not waved through.** The
-/// driver tests the restriction against the model in the request. So a
-/// restricted tier with no model is dropped before the backend is consulted,
-/// whatever its own config would have picked.
-///
-/// `validate_codex_effort` stays as the driver's last-resort guard. A
-/// mid-session `set_reasoning_effort` and a resumed thread both reach it
-/// without passing here.
-pub fn validate_coding_agent_effort(
-    agent: CodingAgent,
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
-        return Ok(None);
-    };
-    let options = coding_agent_reasoning_effort_options(agent);
-    // An absent model and the `default` sentinel both mean "the backend's own
-    // config picks", and neither can match a name in `supported_models`.
-    let model = model.map(str::trim).unwrap_or("");
-    // A discovered row names its own tiers, and the picker offers exactly
-    // those. Refusing anything else keeps the spawn and the picker in step.
-    let row_tiers = offered_row(&coding_agent_model_options(agent), model)
-        .and_then(|o| o.reasoning_efforts.clone());
-    if let Some(tiers) = row_tiers {
-        return effort_within_row_tiers(agent, model, effort, &tiers);
-    }
-    if claude_code::efforts_for_model(model, options)
-        .iter()
-        .any(|o| o == effort)
-    {
-        return Ok(Some(effort.to_string()));
-    }
-    let Some(row) = options.iter().find(|o| o.value == effort) else {
-        let offered = options
-            .iter()
-            .map(|o| o.value.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "reasoning_effort '{}' is not offered by {}. Choose one of: {}",
-            effort,
-            agent.as_str(),
-            offered
-        ));
-    };
-    // A row with no `supported_models` was already admitted above, so reaching
-    // here means the tier names its models. Accept rather than render a refusal
-    // with an empty list, which would be the one message a caller cannot act on.
-    let Some(runs_on) = row.supported_models.as_ref() else {
-        return Ok(Some(effort.to_string()));
-    };
-    Err(format!(
-        "reasoning_effort '{}' runs only on these {} models: {}. Pass one as `model`; \
-         on any other the backend drops the tier and runs at its own default.",
-        effort,
-        agent.as_str(),
-        runs_on.join(", ")
-    ))
-}
-
-/// Accept `effort` only if `tiers`, the model row's own list, names it.
-fn effort_within_row_tiers(
-    agent: CodingAgent,
-    model: &str,
-    effort: &str,
-    tiers: &[String],
-) -> Result<Option<String>, String> {
-    if tiers.iter().any(|t| t == effort) {
-        return Ok(Some(effort.to_string()));
-    }
-    let offered = if tiers.is_empty() {
-        "none".to_string()
-    } else {
-        tiers.join(", ")
-    };
-    Err(format!(
-        "reasoning_effort '{effort}' is not offered for model '{model}' by {}. \
-         It offers: {offered}",
-        agent.as_str()
-    ))
-}
+pub use crate::llm::coding_agent_models::{
+    coding_agent_context_window, coding_agent_model_options, coding_agent_reasoning_effort_options,
+    validate_coding_agent_effort, validate_coding_agent_model,
+};
 
 /// True for every wire tool name that raises a Lucidos QuestionCard.
 ///
@@ -358,7 +103,7 @@ pub const USER_QUESTION_TOOLS: [&str; 3] = [
 /// `desktop.rs::spawn_gateway` and `service.sh::service_runtime_env_pairs`).
 /// Dev / e2e leave it unset. Used to fail fast on a missing bundled runtime
 /// dependency in packaged while keeping dev's tolerant degrade-with-log path.
-pub(crate) fn is_packaged() -> bool {
+pub fn is_packaged() -> bool {
     std::env::var_os("LUCIDOS_PACKAGED").is_some_and(|v| v == "1")
 }
 
@@ -388,6 +133,24 @@ pub struct AgentBinaryStatus {
     /// field is present exactly when we actually know a version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// Installed coding agents, using the same binary-path preferences as spawning.
+pub async fn installed_coding_agents(pool: &sqlx::PgPool) -> Vec<CodingAgent> {
+    let claude = crate::core::prefs::CODING_AGENT_CLAUDE_PATH
+        .read(pool)
+        .await;
+    let codex = crate::core::prefs::CODING_AGENT_CODEX_PATH.read(pool).await;
+    [CodingAgent::ClaudeCode, CodingAgent::Codex]
+        .into_iter()
+        .filter(|agent| {
+            let path = match agent {
+                CodingAgent::ClaudeCode => claude.as_deref(),
+                CodingAgent::Codex => codex.as_deref(),
+            };
+            detect_agent_binary(*agent, path).valid
+        })
+        .collect()
 }
 
 /// Compute the effective CLI binary resolution for `agent`, mirroring exactly
@@ -546,9 +309,23 @@ pub(crate) async fn probe_agent_version(
     binary: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Option<String> {
+    probe_agent_version_command(
+        agent,
+        binary,
+        timeout,
+        &mut tokio::process::Command::new(binary),
+    )
+    .await
+}
+
+async fn probe_agent_version_command(
+    agent: CodingAgent,
+    binary: &std::path::Path,
+    timeout: std::time::Duration,
+    cmd: &mut tokio::process::Command,
+) -> Option<String> {
     let label = agent.as_str();
     let shown = binary.display();
-    let mut cmd = tokio::process::Command::new(binary);
     cmd.arg("--version")
         // stdin is the one stdio tokio does NOT set for us, so closing it here
         // is load-bearing: a binary that isn't the CLI we think it is would
@@ -560,7 +337,7 @@ pub(crate) async fn probe_agent_version(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            crate::log!("[AgentBinary] {label}: `{shown} --version` failed to run: {e}");
+            crate::log_legacy!("[AgentBinary] {label}: `{shown} --version` failed to run: {e}");
             return None;
         }
     };
@@ -582,19 +359,23 @@ pub(crate) async fn probe_agent_version(
     let (stdout, stderr, waited) = match collected {
         Ok(collected) => collected,
         Err(_) => {
-            crate::log!("[AgentBinary] {label}: `{shown} --version` timed out after {timeout:?}");
+            crate::log_legacy!(
+                "[AgentBinary] {label}: `{shown} --version` timed out after {timeout:?}"
+            );
             return None;
         }
     };
     let status = match waited {
         Ok(status) => status,
         Err(e) => {
-            crate::log!("[AgentBinary] {label}: waiting for `{shown} --version` failed: {e}");
+            crate::log_legacy!(
+                "[AgentBinary] {label}: waiting for `{shown} --version` failed: {e}"
+            );
             return None;
         }
     };
     if !status.success() {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentBinary] {label}: `{shown} --version` exited {status}: {}",
             log_excerpt(&stderr, VERSION_PROBE_LOG_EXCERPT)
         );
@@ -602,7 +383,7 @@ pub(crate) async fn probe_agent_version(
     }
     let parsed = parse_agent_version(&stdout);
     if parsed.is_none() {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentBinary] {label}: `{shown} --version` printed no recognizable version: '{}'",
             log_excerpt(&stdout, VERSION_PROBE_LOG_EXCERPT)
         );
@@ -635,7 +416,7 @@ async fn read_capped(
     };
     let mut kept = Vec::new();
     if let Err(e) = (&mut pipe).take(limit).read_to_end(&mut kept).await {
-        crate::log!("[AgentBinary] {context} read failed: {e}");
+        crate::log_legacy!("[AgentBinary] {context} read failed: {e}");
         return String::from_utf8_lossy(&kept).into_owned();
     }
     let mut sink = [0u8; 4096];
@@ -644,7 +425,7 @@ async fn read_capped(
             Ok(0) => break,
             Ok(_) => continue,
             Err(e) => {
-                crate::log!("[AgentBinary] {context} drain failed: {e}");
+                crate::log_legacy!("[AgentBinary] {context} drain failed: {e}");
                 break;
             }
         }
@@ -794,13 +575,7 @@ mod tests {
 
     fn fake_binary(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake binary");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake binary");
-        }
+        stub_executable::write_stub_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 
@@ -1260,7 +1035,7 @@ mod tests {
     }
 
     /// The incident list with the overlay-only ids Claude Code can still list,
-    /// as it did before Fable and Opus 5 left the offered set.
+    /// as it did before Fable 5, Fable 5.1 and Opus 5 left the offered set.
     fn picker_listing_withdrawn_models() -> Vec<claude_code::CcMenuOption> {
         let mut rows = incident_picker();
         let template = rows[0].clone();
@@ -1294,6 +1069,7 @@ mod tests {
                 "claude-opus-5-5",
                 "claude-opus-5-5[1m]",
                 "claude-sonnet-5-5",
+                "claude-fable-5-2",
             ] {
                 assert_eq!(
                     validate_model_against(CodingAgent::ClaudeCode, Some(id), &options),
@@ -1535,3 +1311,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod agent_sandbox_boundary_tests;
+
+#[cfg(test)]
+mod plan_ladder_tests;

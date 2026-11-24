@@ -1,19 +1,7 @@
-/**
- * What the FOUC script actually writes onto `<html>`, driven end to end.
- *
- * This is the test the two hand-copied boot scripts never had. They were only
- * ever checked by scanning their source for literals, which is why the pair
- * could drift in behaviour while both scans passed. One program can be run
- * instead, against a fake document, so these cases pin the RESULT.
- *
- * They are also the refactor's evidence: the promise was that nothing a user
- * sees changes, and every case below states what the previous scripts did.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { applyAppearanceBoot, type BootOptions } from './appearanceBoot';
 import { configure } from '../_fetch';
 
-/** The options each embed site passes (`host.ts`, `iframe.ts`). */
 const SHELL: BootOptions = {
   styleReset: true,
   durationScale: true,
@@ -25,7 +13,6 @@ const IFRAME: BootOptions = {
 
 interface Recorded {
   props: Record<string, string>;
-  /** setProperty call order, which is what the "overrides last" rule is about. */
   order: string[];
   attrs: Record<string, string>;
   background: string;
@@ -35,28 +22,15 @@ let rec: Recorded;
 let store: Record<string, string>;
 const saved: Record<string, unknown> = {};
 
-/**
- * Install a fake document / localStorage / matchMedia / location, and the SDK
- * base path the storage namespacing derives its slug from.
- *
- * `baseUrl` is set explicitly rather than derived from the fake DOM because
- * `_fetch.ts` resolves it once at MODULE load, before any of this runs. What
- * that derivation reads (the shell's `<base href>`, or the path before `/app/`
- * for an iframe) is `_fetch`'s own, unchanged by this script, and exercised for
- * real by `e2e/sdk-iframe-theme-all.spec.ts` in a browser.
- */
 function setEnv(opts: {
   baseUrl?: string;
   pathname?: string;
   search?: string;
   prefersLight?: boolean;
-  /** The OS reduced-motion switch. */
   osReduces?: boolean;
-  /** The two OS signals `system` theme effects follow. */
   osReducesTransparency?: boolean;
   osMoreContrast?: boolean;
   stored?: Record<string, string>;
-  /** What the engine resolved and prepended, for an isolated app frame. */
   served?: Record<string, string>;
 }) {
   configure({ baseUrl: opts.baseUrl ?? '/myws' });
@@ -75,6 +49,7 @@ function setEnv(opts: {
   };
 
   (globalThis as any).document = {
+    querySelector: () => null,
     documentElement: {
       style,
       setAttribute: (k: string, v: string) => { rec.attrs[k] = v; },
@@ -111,12 +86,6 @@ afterEach(() => {
   delete (globalThis as any).__lucidosPrefs;
 });
 
-/**
- * An isolated app frame reads none of the shell's storage, so the engine
- * prepends the values to `sdk-prefs.js` and this script reads them from there.
- * The shell is seeded with nothing and takes the storage path above, which
- * every other case in this file already covers.
- */
 describe('an isolated app frame, served its values', () => {
   it('paints the served appearance with nothing in storage', () => {
     setEnv({
@@ -131,8 +100,6 @@ describe('an isolated app frame, served its values', () => {
   });
 
   it('the served value beats a stale stored one', () => {
-    // The precedence `appearance.ts` documents for the live re-apply, applied
-    // to first paint so the two cannot disagree for a frame.
     setEnv({
       served: { 'theme-mode': 'light' },
       stored: { 'ws:myws:lucidos-theme-mode': 'dark' },
@@ -184,7 +151,6 @@ describe('a device with nothing stored', () => {
     expect(rec.props['--font-ui']).toContain("'Fira Code'");
     expect(rec.props['--font-features-text']).toBe('"liga" 0, "calt" 0');
     expect(rec.props['--font-features-code']).toBe('"liga" 1, "calt" 1');
-    // Nothing stored means the stylesheet's own fallback answers.
     expect(rec.props['--user-ui-scale']).toBeUndefined();
   });
 
@@ -213,15 +179,11 @@ describe('stored values win', () => {
     applyAppearanceBoot(SHELL);
 
     expect(rec.props['--font-ui']).toContain("'Inter'");
-    // `normal` for a font that ships no programming ligatures, so its own
-    // `fi`/`fl` ligatures are left alone.
     expect(rec.props['--font-features-text']).toBe('normal');
     expect(rec.props['--font-features-code']).toBe('normal');
   });
 
   it('an unrecognised font falls back to the default STACK and its features together', () => {
-    // The pairing is the point: a stack from one map with `normal` from the
-    // other would put Fira Code's ligatures back on prose.
     setEnv({ stored: { 'ws:myws:lucidos-font-family': 'comic-sans' } });
     applyAppearanceBoot(SHELL);
 
@@ -245,10 +207,6 @@ describe('stored values win', () => {
 });
 
 describe('workspace scoping', () => {
-  // The shell and its app iframes must read the SAME keys, or a value the shell
-  // wrote never matches the iframe's read and every app FOUCs. The namespacing
-  // itself is `_storage.ts`'s; what these pin is that the boot script goes
-  // through it rather than reading raw keys.
   it('reads the per-workspace keys the shell writes', () => {
     setEnv({ baseUrl: '/myws', stored: { 'ws:myws:lucidos-theme-mode': 'light' } });
     applyAppearanceBoot(SHELL);
@@ -258,7 +216,6 @@ describe('workspace scoping', () => {
   it('does not read the unscoped key inside a workspace', () => {
     setEnv({ baseUrl: '/myws', stored: { 'lucidos-theme-mode': 'light' } });
     applyAppearanceBoot(SHELL);
-    // The unscoped value belongs to no workspace, so it must not be picked up.
     expect(rec.attrs['data-theme-mode']).toBe('dark');
   });
 
@@ -355,8 +312,6 @@ describe('the theme', () => {
   });
 });
 
-// The pre-paint half of "theme suggests, user wins". The first frame must
-// already be the font the live apply will settle on, or it flashes.
 describe('the font a theme suggests', () => {
   const GEIST_THEME = JSON.stringify({ dark: {}, light: {}, fonts: { ui: 'geist' } });
 
@@ -402,7 +357,6 @@ describe('the font a theme suggests', () => {
     expect(rec.props['--font-ui']).toContain("'Fira Code'");
   });
 
-  // ADR 0303: Inter is bundled now, so a theme may suggest it.
   it('a theme may suggest a font that once loaded from Google', () => {
     const theme = JSON.stringify({ dark: {}, light: {}, fonts: { ui: 'inter' } });
     setEnv({ stored: { 'ws:myws:lucidos-theme-resolved': theme } });
@@ -426,8 +380,6 @@ describe('the style remote', () => {
     setEnv({ stored: { 'ws:myws:lucidos-style-overrides': OVERRIDES } });
     applyAppearanceBoot(SHELL);
 
-    // The override of --bg-primary is the honest check: it must be the value
-    // that survives, and its write must come after the theme's.
     expect(rec.props['--bg-primary']).toBe('#123456');
     expect(rec.order.lastIndexOf('--bg-primary')).toBeGreaterThan(rec.order.indexOf('--font-ui'));
   });
@@ -436,7 +388,6 @@ describe('the style remote', () => {
     setEnv({ stored: { 'ws:myws:lucidos-style-overrides': '{oh no' } });
     applyAppearanceBoot(SHELL);
 
-    // Everything else still landed.
     expect(rec.attrs['data-theme-mode']).toBe('dark');
     expect(rec.props['--font-ui']).toBeTruthy();
   });
@@ -453,9 +404,6 @@ describe('the style remote', () => {
   });
 
   it('?style-reset does NOT clear it from an iframe', () => {
-    // The shell removes the key before an iframe loads, so there is nothing
-    // left for that realm to clear, and an app URL that happened to carry the
-    // parameter must not wipe the user's map.
     setEnv({
       pathname: '/myws/app/habit-tracker/',
       search: '?style-reset',

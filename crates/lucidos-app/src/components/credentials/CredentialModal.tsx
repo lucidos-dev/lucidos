@@ -48,14 +48,6 @@ import { inlineFormKey } from '../layout/contentViewKey';
 import { linkifyText } from '../shared/linkifyText';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 
-/** The credential prompt the engine sent, with its URLs made clickable.
- *
- *  A prompt names the page where the token is created, so that URL is the one
- *  thing on the card to act on.
- *
- *  Linkified rather than rendered as markdown: the prompt is agent-written, and
- *  `linkifyText` interprets no HTML. Hook-free and exported so its test can
- *  call it, since the form around it holds hooks. */
 export function CredentialInstructions({ text }: { text: string }) {
   return <blockquote class="credential-instructions">{linkifyText(text)}</blockquote>;
 }
@@ -78,20 +70,8 @@ export function CredentialModal() {
   const form = activeInlineForm.value;
   if (form?.type !== 'credential') return null;
 
-  // Editing pre-loads the stored secret (+ email settings) so the uncontrolled
-  // inputs initialise from real values; a plain create needs no async load.
-  // Keyed by the credential: switching edit targets remounts the loader, so a
-  // stale `data` from the previous credential can never seed the next form.
   if (form.editing) return <CredentialStoredLoader key={form.editing} credentialId={form.editing} />;
 
-  // A request naming a row targets one that already exists (an OAuth repair, or
-  // a scope widening), so it loads the stored secret too. Saving rebuilds the
-  // whole `auth_value` from the form, so a form seeded only with the request's
-  // `client_id` would drop every other stored field on save. A confidential
-  // client would silently lose its `client_secret` and fail the token exchange.
-  // A provider the registry does not know would lose its endpoints and
-  // redirect override too. The stored values win; the request fills only what
-  // is genuinely missing (see `initialAuthUrl`).
   const targetedRow = form.request?.existing_credential_id;
   if (targetedRow) {
     return (
@@ -103,8 +83,6 @@ export function CredentialModal() {
     );
   }
 
-  // Keyed so a new request remounts the form. Its fields seed once, from their
-  // initial values, and would otherwise keep the previous request's service.
   return (
     <CredentialFormInner
       key={inlineFormKey(form)}
@@ -122,30 +100,8 @@ interface EditData {
   emailInfo: EmailAccountInfo | null;
 }
 
-/** The fields every stored credential's form opens with. Only the secret's
- *  own label depends on the type, so it shimmers. */
 const CREDENTIAL_FORM_FIELDS = [{ label: 'Service Name' }, { label: 'Base URLs' }, { label: 'Auth Type' }, {}];
 
-/** Loads a credential's stored secret (+ email settings), then renders the form
- *  pre-filled. The secret is fetched via the same endpoint the copy buttons use,
- *  so this is no new exposure.
- *
- *  Serves the form's three "this row already exists" entry points, which differ
- *  only in what happens on save. An **edit** the user opened updates the row and
- *  stops. A **repair** was opened by the engine refusing to start an
- *  authorization, and a **scope widening** by the engine being asked for a host
- *  the row does not reach. Both of those carry the `request`, so saving
- *  continues whatever was blocked (`submitRequestedCredential`, routed to update
- *  by `existing_credential_id`).
- *
- *  Passing `request` is what tells an edit from the other two. Both of them
- *  leave `editing` unset on purpose, so the form applies the stricter create
- *  rules: the endpoints a repair reopened for are genuinely required.
- *
- *  `credentialId` is the row's `id`, not its service name: a name no longer
- *  identifies one row (an `oauth_client` registration may share it with an API
- *  key), and the form can change `auth_type`, so even name-plus-type could not
- *  name it. The service name for display comes off the resolved row instead. */
 function CredentialStoredLoader({
   credentialId,
   request,
@@ -155,7 +111,6 @@ function CredentialStoredLoader({
 }) {
   const credLoadable = credentials.value;
   const [data, setData] = useState<Loadable<EditData>>({ status: 'not-loaded' });
-  // Bumped by Retry, to run the secret read again after a failure.
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
@@ -169,7 +124,6 @@ function CredentialStoredLoader({
   useEffect(() => {
     if (credLoadable.status !== 'loaded') return;
     if (!existingCred) {
-      // No id in the message: it names nothing the user can look up.
       setData({ status: 'failed', error: 'Credential not found' });
       return;
     }
@@ -191,11 +145,8 @@ function CredentialStoredLoader({
     return () => {
       cancelled = true;
     };
-    // existingCred identity changes only with the credentials list / editing key.
   }, [credLoadable.status, credentialId, existingCred?.auth_type, attempt]);
 
-  // Delay the spinner so a fast secret fetch never flashes it. The failed
-  // branches below render first.
   const showLoading = useDelayedFlag(
     credLoadable.status !== 'loaded' || data.status !== 'loaded' || !existingCred,
   );
@@ -253,11 +204,8 @@ function CredentialFormInner({
   initialFields,
   emailInfo,
 }: CredentialFormInnerProps) {
-  // `editing` is an id, so the name shown comes off the resolved row.
   const initialService = existingCred?.service_name || request?.service || '';
   const initialBaseUrls = initialScopeRows(request?.base_urls, existingCred?.base_urls);
-  /** The hosts a widening ADDS, so the form says what the Save grants. The
-   *  seeded rows cannot: they hold the stored hosts too. */
   const addingBaseUrls = request?.adding_base_urls ?? [];
   const initialAuthType = existingCred?.auth_type || request?.auth_type || 'api_key';
   const initialAuthHeader = existingCred?.auth_header || 'Authorization';
@@ -266,11 +214,7 @@ function CredentialFormInner({
 
   const instructions = request?.prompt || null;
   const oauthDefaults = request?.defaults;
-  // True when the agent pre-filled at least one endpoint from the oauth-providers
-  // knowhow. Drives whether the endpoint section is collapsed + the label copy.
   const hasPrefilledEndpoints = !!(oauthDefaults?.auth_url || oauthDefaults?.token_url);
-  // On edit, the OAuth endpoints come from the stored secret; on a request they
-  // come from the agent-supplied defaults.
   const initialAuthUrl = initialFields.authUrl || oauthDefaults?.auth_url || '';
   const initialTokenUrl = initialFields.tokenUrl || oauthDefaults?.token_url || '';
   const initialUserinfoUrl = initialFields.userinfoUrl || oauthDefaults?.userinfo_url || '';
@@ -279,62 +223,29 @@ function CredentialFormInner({
   const initialAuthorizeParams =
     initialFields.authorizeParams || oauthDefaults?.authorize_params || '';
   const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
-  /** Controlled, so the one-click add can append this page's own URI. */
   const [webRedirectUris, setWebRedirectUris] = useState(initialFields.webRedirectUris);
-  /** This page's web redirect URI, offered only over https: a provider refuses
-   *  a plain-http web redirect. */
   const thisPageWebUri =
     window.location.protocol === 'https:' ? webRedirectUriFor(window.location.origin) : '';
   const thisPageListed = webRedirectUriLines(webRedirectUris).includes(thisPageWebUri);
 
   const [selectedAuthType, setSelectedAuthType] = useState<AuthType>(initialAuthType);
-  /** The Base URLs field, one row per host. State rather than ref writes,
-   *  because the inputs are controlled and every re-render would otherwise
-   *  restore `initialBaseUrls`. */
   const [baseUrls, setBaseUrls] = useState<string[]>(initialBaseUrls);
 
-  // The *OAuth provider registry*, for the console help and the derived-provider
-  // picker. Absent or failed degrades to no help and no picker, which is the
-  // form exactly as it was before the registry existed.
   const registryLoadable = knownOAuthProviders.value;
   const knownProviders =
     registryLoadable.status === 'loaded' ? registryLoadable.data.providers : [];
   const redirectUri =
     registryLoadable.status === 'loaded' ? registryLoadable.data.default_redirect_uri : '';
   const registryRow = rowForService(knownProviders, initialService);
-  /** What the repair notice compares the engine's `missing` list against: the
-   *  values the form is actually showing, which for a known provider are the
-   *  registry's rather than the broken row's. */
   const repairNotice = describeMissingFields(request?.missing, {
     client_id: initialFields.clientId,
     auth_url: initialAuthUrl,
     token_url: initialTokenUrl,
   });
-  /** A repair that reopened the form FOR the endpoints shows them, prefilled or
-   *  not. Collapsing them is what made the autofill look like it never ran: the
-   *  notice named two fields as the whole reason the form is on screen, and both
-   *  sat behind a shut disclosure carrying the word "pre-filled". */
   const repairNamedEndpoints = !!request?.missing?.some(
     (m) => m === 'auth_url' || m === 'token_url',
   );
-  /** Which known provider a derived name was told to run on. Empty until picked.
-   *
-   *  Declared BEFORE `expectsSecret`, which reads it. That read happens inside a
-   *  `.find` callback, so TypeScript's used-before-declaration check does not
-   *  see it (the reference is in a function body, and the compiler cannot know
-   *  when one runs) while `.find` in fact invokes it synchronously: the wrong
-   *  order threw a temporal-dead-zone `ReferenceError` on every render of this
-   *  form, and neither `tsc` nor the suite caught it because nothing mounts the
-   *  modal. */
   const [basedOn, setBasedOn] = useState('');
-  /** The provider whose console this registration is actually made in.
-   *
-   *  For a derived name that is the BASE provider the user picked, not the
-   *  service name: the app is registered with the base provider, so its console
-   *  link, redirect URI, client type and permissions are the ones that apply.
-   *  Keying the help off the service name alone left a derived connection with
-   *  no console link and no URI to copy, at exactly the moment the user is
-   *  standing in that console needing both. */
   const helpRow = registryRow ?? knownProviders.find((p) => p.id === basedOn);
   const expectsSecret = secretIsExpected(helpRow);
 
@@ -342,11 +253,6 @@ function CredentialFormInner({
     if (registryLoadable.status === 'not-loaded') void loadKnownOAuthProviders();
   }, [registryLoadable.status]);
 
-  /** Fill the endpoint fields from a base provider's row.
-   *
-   *  Writes through the refs rather than through state because the endpoint
-   *  inputs are uncontrolled (they hold `defaultValue`), so re-rendering would
-   *  not move them. */
   function applyBaseProvider(id: string) {
     setBasedOn(id);
     const row = knownProviders.find((p) => p.id === id);
@@ -378,7 +284,6 @@ function CredentialFormInner({
   const [userinfoMethod, setUserinfoMethod] = useState<string>(initialUserinfoMethod);
   const authorizeParamsRef = useRef<HTMLInputElement>(null);
   const redirectUriRef = useRef<HTMLInputElement>(null);
-  // Email server settings
   const emailAddressRef = useRef<HTMLInputElement>(null);
   const imapHostRef = useRef<HTMLInputElement>(null);
   const imapPortRef = useRef<HTMLInputElement>(null);
@@ -401,8 +306,6 @@ function CredentialFormInner({
   const isOAuthClient = selectedAuthType === 'oauth_client';
   const isSecret = selectedAuthType === 'secret';
   const isSingleValue = !isEmailPassword && !isPassword && !isOAuthClient;
-  // Email server settings only make sense when editing an existing account;
-  // the create/request flow just collects the password.
   const showEmailSettings = isEmailPassword && !!editing;
 
   function getAuthLabel(authType: string): string {
@@ -427,7 +330,6 @@ function CredentialFormInner({
     }
   }
 
-  /** Collect the secret field values from the inputs into a CredentialFields. */
   function collectFields(): CredentialFields {
     return {
       value: valueRef.current?.value || '',
@@ -448,25 +350,16 @@ function CredentialFormInner({
   async function handleSubmit(e: Event) {
     e.preventDefault();
     const service = serviceRef.current?.value.trim() || '';
-    // A `secret` renders no scope field at all, and is sent nowhere.
     const scopes = selectedAuthType === 'secret' ? [] : submittedScopes(baseUrls);
-    // Checked on the SET, not per input. `required` on the first row instead
-    // blocks a form whose first host was cleared and whose second was filled.
     if (selectedAuthType !== 'secret' && scopes.length === 0) {
       showToast('Add at least one base URL, or pick the Secret auth type.', 'error');
       return;
     }
     const authType = selectedAuthType;
     const fields = collectFields();
-    // Custom env var name is offered for every type except email_password.
     const envVarName = isEmailPassword ? undefined : envVarNameRef.current?.value.trim() || undefined;
 
     if (authType === 'oauth_client') {
-      // Genuinely enforced now, and it says which field. The old rule was a PAIR
-      // check that both-blank passed, so a client with no endpoints saved fine
-      // and failed on the next Connect with "Missing auth_url in OAuth
-      // credentials". A blank client SECRET is still fine: it is how a public
-      // client is expressed (PKCE), not an omission.
       const refusal = oauthClientSubmitError(fields, !!editing);
       if (refusal) {
         showToast(refusal, 'error');
@@ -498,9 +391,6 @@ function CredentialFormInner({
       }
 
       const body: UpdateCredentialBody = {
-        // The form is authoritative, with no fallback to the stored set. A
-        // fallback makes the empty scope unsaveable, so removing every host
-        // silently restored the ones the user just deleted.
         base_urls: scopes,
         auth_type: authType,
         auth_header: authHeaderRef.current?.value.trim() || initialAuthHeader,
@@ -510,13 +400,6 @@ function CredentialFormInner({
       };
       await submitCredentialEdit(editing, body);
     } else if (request) {
-      // A credential the ENGINE asked for. Routed apart from a plain create for
-      // two reasons: a repair carries the id of the row it must update (creating
-      // would make a second OAuth Client for one provider), and a save here has
-      // an authorization waiting behind it that must now continue.
-      // The Advanced block holding the auth-header input renders only while
-      // EDITING, and a request never is. So this resolves to the stored value
-      // on a widening, and to the default on a create.
       await submitRequestedCredential(
         request,
         service,
@@ -548,9 +431,6 @@ function CredentialFormInner({
                 required
               />
             </div>
-            {/* A `secret` is sent nowhere, so it has no base URL. Hiding the
-                field is what lets it stay `required` for every type that does
-                need one. */}
             {!isSecret && (
             <div class="form-group">
               <FieldLabel
@@ -568,19 +448,12 @@ function CredentialFormInner({
                     key.
                   </p>
               </FieldLabel>
-              {/* What the Save actually grants. The rows below hold the stored
-                  hosts too, so they cannot say which ones are new, and a
-                  widening costs the user no secret: reading this IS the
-                  consent. */}
               {addingBaseUrls.length > 0 && (
                 <p class="credential-scope-notice">
                   Adding {addingBaseUrls.join(', ')} to the hosts this credential
                   may be sent to.
                 </p>
               )}
-              {/* These inputs are CONTROLLED, so write every edit through
-                  state. A bare `value=` with no handler is reverted by the next
-                  re-render, and picking an Auth Type or a base provider is one. */}
               <div class="credential-scope-rows">
               {baseUrls.map((value, index) => (
                 <div class="removable-input-row" key={index}>
@@ -594,9 +467,6 @@ function CredentialFormInner({
                     }
                     placeholder="e.g. https://api.github.com"
                   />
-                  {/* Hidden on the sole row, where it can only clear the field
-                      rather than remove it. `handleSubmit` owns the "at least
-                      one host" rule. */}
                   {baseUrls.length > 1 && (
                     <button
                       type="button"
@@ -705,15 +575,8 @@ function CredentialFormInner({
               Saving this grants no access. Access is granted only when you connect
               an account and approve it on the provider's consent screen.
             </p>
-            {/* The one step this form cannot do for the user: the Client ID
-                only exists once an app is registered with the provider, and the
-                redirect URI has to be entered there character for character.
-                Everything shown comes from the registry, so it stays true as
-                providers change and the agent reads the same rows. */}
             {helpRow && (
               <div class="credential-console-help">
-                {/* Shared with the two re-authorization surfaces, so the link
-                    reads the same wherever the registry's console appears. */}
                 <ConsoleLink row={helpRow} />
                 {helpRow.setup_hint && <p>{helpRow.setup_hint}</p>}
                 {helpRow.permissions_hint && <p>{helpRow.permissions_hint}</p>}
@@ -730,11 +593,6 @@ function CredentialFormInner({
                 )}
               </div>
             )}
-            {/* A name the registry does not know is a derived provider: a second,
-                narrowly-scoped connection under its own name, running on a known
-                provider's endpoints. Asking which one beats guessing from the
-                spelling, and beats making the user paste four URLs they could
-                have had for free. */}
             {!registryRow && !editing && knownProviders.length > 0 && (
               <div class="form-group">
                 <FieldLabel
@@ -770,13 +628,6 @@ function CredentialFormInner({
                 required={!editing}
               />
             </div>
-            {/* Advisory, from the registry: the engine still derives the real
-                client type from whether a secret was saved. But "leave it
-                blank" is wrong advice for a provider that only issues
-                confidential clients, and both mismatches (a secret sent by a
-                public client, a secret-less redemption by a confidential one)
-                are refused by the provider late, looking nothing like their
-                cause. */}
             <SecretField
               label={
                 <FieldLabel

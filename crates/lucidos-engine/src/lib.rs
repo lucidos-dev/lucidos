@@ -1,100 +1,60 @@
-//! Lucidos Engine - the core runtime behind a workspace
-//!
-//! This crate provides the core functionality for Lucidos including:
-//! - Event sourcing with PostgreSQL
-//! - Artifact management with Git
-//! - Memory indexing with vector search
-//! - LLM integration with tool calling
-//! - Python runtime execution
+//! Workspace orchestration and the compatibility facade for engine libraries.
 
-/// The Providers page as copy names it: the one definition for engine strings.
-/// A macro, not a `const`, so `concat!` can take it in `const` strings and
-/// `match` arms. The frontend's twin is `PROVIDERS_SETTINGS_PATH`.
-macro_rules! providers_settings {
-    () => {
-        "Settings → Providers"
-    };
-}
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 
-/// Timestamped log with auto-derived module label.
-/// - `log!("message")` → auto module from `module_path!()`
-/// - `log!(@Push, "message")` → explicit label override
-#[macro_export]
-macro_rules! log {
-    (@$label:ident, $($arg:tt)*) => {
-        println!("{} [pid:{}] [{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            std::process::id(),
-            stringify!($label),
-            format_args!($($arg)*))
-    };
-    ($($arg:tt)*) => {
-        println!("{} [pid:{}] [{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            std::process::id(),
-            $crate::module_label(module_path!()),
-            format_args!($($arg)*))
-    };
-}
+#[macro_use]
+extern crate lucidos_core;
 
-pub fn module_label(path: &str) -> &str {
-    let segment = match path.rfind("::") {
-        Some(i) => &path[i + 2..],
-        None => path,
-    };
-    match segment {
-        "api" => "API",
-        "engine" => "Engine",
-        "pinned_apps" => "Apps",
-        "store" => "Store",
-        "events" => "Events",
-        "artifacts" => "Artifacts",
-        "credentials" => "Credentials",
-        "devices" => "Devices",
-        "preferences" => "Preferences",
-        "changes" => "Changes",
-        "scheduler" | "persistence" | "tasks" | "user_tasks" | "config" | "triggers"
-        | "condition" => "Scheduler",
-        "push" | "notifications" => "Push",
-        "memory" | "extractor" | "pgvector" | "fastembed" | "provider" => "Memory",
-        "vertex" | "openai" => "LLM",
-        "mcp" | "mcp_servers" | "client" => "MCP",
-        "browser" | "browser_consent" => "Browser",
-        "chat" | "agentic_loop" => "Engine",
-        "context" | "document" | "types" => "Engine",
-        "claude_code" => "Engine",
-        "files" | "http" | "import" | "python" | "web" => "Engine",
-        "email" => "Engine",
-        "populate_memory" => "Populate",
-        "lucidos_engine" => "Engine",
-        _ => segment,
-    }
-}
+pub use lucidos_core::{
+    log, log_legacy, log_line, log_stamp, module_label, providers_settings, restore_floor_sql,
+    typed_log_line,
+};
 
-pub mod api;
-pub mod boot_failure;
-pub mod boot_report;
-pub mod capability_manifest;
-pub mod codegen;
-pub mod core;
+pub mod app_reach_policy;
+pub use lucidos_core::boot_failure;
+pub use lucidos_core::boot_report;
+pub use lucidos_core::capability_manifest;
+#[doc(hidden)]
+pub mod codegen_inputs;
+pub use lucidos_core::core;
+pub use lucidos_core::diagnostic_bundles;
+pub use lucidos_core::diagnostic_log;
 pub mod engine;
-pub mod gateway_auth;
-pub mod gateway_operators;
+pub use lucidos_core::engine::{proxy_auth_layer, proxy_token_cache};
+pub use lucidos_core::engine_runtime;
+#[cfg(any(test, feature = "test-support"))]
+mod engine_test_support;
+pub use lucidos_core::gateway_auth;
+pub use lucidos_core::gateway_users;
+#[cfg(test)]
+mod guard_tests;
+pub use lucidos_core::internal_faults;
 pub mod landing_gateway;
-pub mod llm;
+pub use lucidos_core::llm;
 pub mod mcp;
 pub mod memory;
 #[cfg(test)]
 mod migration_tests;
-pub mod net_config;
-pub mod paths;
-pub mod preflight;
+pub use lucidos_core::net_config;
+pub use lucidos_core::paths;
 #[cfg(test)]
 mod rung_vocabulary_tests;
 pub mod runtime;
 pub mod scheduler;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    #[cfg(test)]
+    pub use crate::engine_test_support::boot_mock_engine;
+    pub use crate::engine_test_support::{boot_mock_engine_with_host, Fixed384Embedder};
+    pub use lucidos_core::test_support::*;
+
+    #[cfg(test)]
+    pub async fn setup_test_db() -> (sqlx::PgPool, String) {
+        crate::core::secret_store::key_store::install_test_key_store();
+        lucidos_core::test_support::setup_test_db().await
+    }
+}
 pub mod triggers;
 pub mod voice;
 
@@ -102,13 +62,13 @@ pub use engine::LucidosEngine;
 
 /// The `--wasm-selftest` entry point, reachable from the `lucidos-engine`
 /// binary. Re-exported as an item because its module is `pub(crate)`.
-pub use api::proxy_wasm_signer::jit_selftest;
+pub use engine::proxy_wasm_signer::jit_selftest;
 
 /// Hidden re-exports of crate-internal items exercised by the wasmtime
 /// integration tests in `tests/proxy_wasm_engine.rs`.
 ///
 /// **Why this exists.** Those tests originally lived in `#[cfg(test)]`
-/// `mod tests` blocks inside `api/proxy_wasm_*.rs` and friends. Each
+/// `mod tests` blocks inside `engine/proxy_wasm_*.rs` and friends. Each
 /// test created a `wasmtime::Engine` (and a `Module`/`Store`), all of
 /// which `MAP_JIT`-`mmap` JIT memory and exchange Mach messages with
 /// the kernel under macOS. The parallel `cargo test -p lucidos-engine
@@ -125,17 +85,13 @@ pub use api::proxy_wasm_signer::jit_selftest;
 /// of a `pub(crate)` module is rejected (E0365).
 #[doc(hidden)]
 pub mod __wasm_test_internals {
-    pub use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
-    pub use crate::api::proxy_pipeline_builder::{build_pipeline, PipelineBuildContext};
-    pub use crate::api::proxy_pipeline_config::{
-        CredentialHandleConfig, LayerConfig, PipelineConfig, StaticKind,
-    };
-    pub use crate::api::proxy_token_cache::ProxyTokenCache;
-    pub use crate::api::proxy_wasm_host::{
+    pub use crate::engine::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
+    pub use crate::engine::proxy_token_cache::ProxyTokenCache;
+    pub use crate::engine::proxy_wasm_host::{
         register_host_imports, HostState, LogBudget, LOG_BYTES_PER_INVOCATION,
         LOG_LINES_PER_INVOCATION,
     };
-    pub use crate::api::proxy_wasm_signer::{
+    pub use crate::engine::proxy_wasm_signer::{
         build_wasmtime_engine, load_wasm_modules, BodyMode, CompiledModule, CredentialHandle,
         SecretResolver, SignInput, SignInputBody, SignOutput, SignerLimits, WasmManifest,
         WasmSignerLayer, CAP_READ_PRIOR_HEADERS, CAP_REPLACE_BODY, WITHHELD_HEADER_VALUE,
@@ -146,7 +102,7 @@ pub mod __wasm_test_internals {
 
     /// In-memory `SecretResolver` for tests. Returns the mapped bytes for a
     /// known credential id, or a descriptive error otherwise. Shared by
-    /// `crates/lucidos-engine/tests/proxy_wasm_engine.rs` and
+    /// `crates/lucidos-agents-api/tests/proxy_wasm_engine.rs` and
     /// `crates/lucidos-e2e/tests/wasm_signers.rs` so both speak the same
     /// mock semantics.
     pub struct MapResolver(pub HashMap<String, Vec<u8>>);
@@ -162,44 +118,55 @@ pub mod __wasm_test_internals {
     }
 }
 
-/// Lucidos umbrella release version (e.g. "0.7"), distinct from per-crate
-/// Cargo.toml semvers. Sourced from the repo-root `RELEASE` file at compile
-/// time. `trim_ascii_end()` strips the trailing newline at const time.
-pub const LUCIDOS_RELEASE: &str = {
-    let raw = include_str!("../../../RELEASE").as_bytes();
-    let trimmed = raw.trim_ascii_end();
-    // SAFETY: input is ASCII (digits + '.' + whitespace); trim_ascii_end keeps
-    // it valid UTF-8.
-    match std::str::from_utf8(trimmed) {
-        Ok(s) => s,
-        Err(_) => panic!("RELEASE file must be valid UTF-8"),
+/// Identity of the running executable, captured once before engine startup.
+pub struct BuildIdentity {
+    /// Git short SHA, with a dirty diff hash when the engine source differs.
+    pub id: &'static str,
+    /// Umbrella Lucidos release from the repository's RELEASE file.
+    pub release: &'static str,
+    /// Whether the build's commit is newer than the last RELEASE bump.
+    pub release_dirty: bool,
+    /// CalVer generated in the engine library's VERSION file.
+    pub engine_version: &'static str,
+}
+
+static BUILD_IDENTITY: std::sync::OnceLock<BuildIdentity> = std::sync::OnceLock::new();
+
+impl BuildIdentity {
+    /// Called by the engine executable before handling CLI probes or serving requests.
+    pub fn install(self) {
+        assert!(
+            BUILD_IDENTITY.set(self).is_ok(),
+            "engine build identity already installed"
+        );
     }
+}
+
+const UNSTAMPED_BUILD: BuildIdentity = BuildIdentity {
+    id: "",
+    release: "",
+    release_dirty: false,
+    engine_version: "",
 };
 
-/// True when this build was made from a commit *after* the one that last
-/// bumped RELEASE — i.e. the running code is past the published v<RELEASE>
-/// snapshot. Set by build.rs from `git log -- RELEASE`. Defaults to false
-/// when git is unavailable (shipped install, missing history).
-pub const LUCIDOS_RELEASE_DIRTY: bool = match option_env!("LUCIDOS_RELEASE_DIRTY") {
-    // `==` on `&str` isn't const-stable, so byte-compare the literal "true".
-    Some(s) => {
-        let b = s.as_bytes();
-        b.len() == 4 && b[0] == b't' && b[1] == b'r' && b[2] == b'u' && b[3] == b'e'
+/// Read the identity installed by the executable at startup.
+pub fn build_identity() -> &'static BuildIdentity {
+    if let Some(identity) = BUILD_IDENTITY.get() {
+        return identity;
     }
-    None => false,
-};
-
-/// Deterministic-per-source id of this engine binary, baked by `build.rs` (git
-/// short SHA + a hash of any uncommitted engine-source diff; a source-tree hash
-/// when git is unavailable). Mirrors the gateway's `GATEWAY_BUILD_ID`. A running
-/// engine compares this against the on-disk binary's `--build-id` to tell whether
-/// a newer version has been built — the dev "new version available" signal (see
-/// `docs/plans/2026-07-01-new-engine-version-switch-flow.md`). `option_env!` so a
-/// build that somehow skipped the stamp still compiles (empty → never "newer").
-pub const ENGINE_BUILD_ID: &str = match option_env!("ENGINE_BUILD_ID") {
-    Some(s) => s,
-    None => "",
-};
+    // Release-dependent unit tests get the repository RELEASE, compiled into
+    // the test build only, so the shipped library stays unstamped.
+    #[cfg(test)]
+    {
+        static TEST_BUILD: BuildIdentity = BuildIdentity {
+            release: include_str!("../../../RELEASE").trim_ascii_end(),
+            ..UNSTAMPED_BUILD
+        };
+        &TEST_BUILD
+    }
+    #[cfg(not(test))]
+    &UNSTAMPED_BUILD
+}
 
 #[cfg(test)]
 pub(crate) mod test_util {
@@ -259,7 +226,7 @@ pub(crate) mod test_util {
         match outcome {
             SharedEmbedder::Ready(provider) => Some(provider),
             SharedEmbedder::FetchUnavailable(msg) => {
-                eprintln!(
+                crate::log_legacy!(
                     "[real-embedder-tests] SKIP: MultilingualE5Small model unavailable \
                      (huggingface.co fetch failed): {msg}"
                 );

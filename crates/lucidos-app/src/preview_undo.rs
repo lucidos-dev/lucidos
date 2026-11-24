@@ -10,7 +10,7 @@
 //! 1. A local key monitor hands Cmd+Z and Shift+Cmd+Z to the focused preview as
 //!    a plain `keyDown:`, before the menu can match them. The page receives a
 //!    trusted keydown.
-//! 2. [`NATIVE_UNDO_FALLBACK_JS`] runs native undo or redo when no page handler
+//! 2. `NATIVE_UNDO_FALLBACK_JS` runs native undo or redo when no page handler
 //!    claimed that keydown, so a plain text field still undoes.
 //!
 //! Only previews are affected: the monitor forwards solely to a webview
@@ -28,6 +28,7 @@ use std::sync::Mutex;
 /// Runs in every frame, because an editor such as Google Docs takes its keys in
 /// an iframe and keydown does not cross frames. The check waits a task so it
 /// reads `defaultPrevented` after every page handler has run.
+#[cfg(target_os = "macos")]
 pub(crate) const NATIVE_UNDO_FALLBACK_JS: &str = r#"(function(){
     window.addEventListener('keydown',function(e){
         if(!e.isTrusted||!e.metaKey||e.ctrlKey||e.altKey||e.key.toLowerCase()!=='z') return;
@@ -42,6 +43,7 @@ pub(crate) const NATIVE_UNDO_FALLBACK_JS: &str = r#"(function(){
 /// `key` is AppKit's `charactersIgnoringModifiers`, which keeps Shift, so Redo
 /// arrives as `Z`. The letter follows the keyboard layout, as the menu's own
 /// key-equivalent match does.
+#[cfg(any(target_os = "macos", test))]
 fn is_undo_or_redo(key: &str, command: bool, control: bool, option: bool) -> bool {
     command && !control && !option && key.eq_ignore_ascii_case("z")
 }

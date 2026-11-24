@@ -1,8 +1,3 @@
-/**
- * A disabled back / forward chevron shows its tooltip and no hover wash, in
- * every pane. Reported: the thread pane's disabled chevron showed both, while
- * the content pane's showed neither.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -30,8 +25,6 @@ describe('a disabled nav chevron keeps its tooltip', () => {
     const rules = cssRules(hostCss).filter(r => /\.nav-chevron:disabled$/.test(r.selector));
     expect(rules.length).toBe(1);
     expect(rules[0].props.get('pointer-events')).toBe('auto');
-    // An inert regime sets `none` on an ancestor. A value on the element wins
-    // over it, so an ungated rule keeps the chevron live behind a menu.
     for (const state of ['data-keyboard-active', 'data-overlay-open']) {
       expect(rules[0].selector).toContain(`:not([${state}])`);
     }

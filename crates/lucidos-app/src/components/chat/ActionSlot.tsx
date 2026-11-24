@@ -2,31 +2,22 @@ import type { ComponentChildren } from 'preact';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
 import { PROTECTED_SURFACE } from '../shared/protectedSurface';
 
-/** A slot action's colour. */
 export type SlotTone = 'confirm' | 'danger' | 'neutral';
 
-/** One action the action slot can carry, as its face or as a row of its menu. */
 export interface SlotAction {
   key: string;
-  /** The face's word, short enough for the fixed pill. */
   label: string;
-  /** The full name, when the word alone says less than it should. */
   ariaLabel?: string;
   tooltip: string;
   tone: SlotTone;
   icon: () => ComponentChildren;
-  /** What a press does. A busy action has none: it shows a spinner, disabled. */
   invoke: (() => void) | null;
-  /** Tappable but held back: it reads disabled, and a press says why. */
   heldBack?: boolean;
 }
 
-/** The one control in the action slot, where Send stands: a face, and every
- *  other action in its menu. */
 export interface SlotOccupant {
   face: SlotAction;
   menu: SlotAction[];
-  /** The accessible name of the part that opens the menu. */
   menuLabel: string;
 }
 
@@ -40,9 +31,6 @@ function classOf(action: SlotAction): string {
   return `${TONE_CLASS[action.tone]}${action.heldBack ? ' action-btn-blocked' : ''}`;
 }
 
-/** The face's icon and word. The icon holds one spot at the left and the word
- *  centres on the whole button (`.action-slot` in host-components.css). The
- *  compact faces show the icon alone, and the word stays the accessible name. */
 export function SlotFace({ icon, label, busy = false }: { icon: () => ComponentChildren; label: string; busy?: boolean }) {
   return (
     <>
@@ -83,9 +71,6 @@ function menuItem(action: SlotAction): SplitButtonMenuItem {
   };
 }
 
-/** The action slot's occupant. Alone, it is one button. With a menu, it is a
- *  split button on the desktop face. On the compact face it is one round button
- *  that opens the menu, face included, on every tap, so no tap acts at once. */
 export function ActionSlot({ occupant, compact }: { occupant: SlotOccupant; compact: boolean }) {
   const { face, menu } = occupant;
   if (menu.length === 0) return <SlotButton action={face} />;

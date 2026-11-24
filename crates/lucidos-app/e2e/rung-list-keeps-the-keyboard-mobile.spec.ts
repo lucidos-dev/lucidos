@@ -2,11 +2,6 @@ import type { Locator } from '@playwright/test';
 import { test, expect } from './fixtures';
 import { navigateToApp, assertHealthy, waitForVisibleInput } from './helpers';
 
-// Opened under a finger mid-message, the rung list's filter box takes the
-// on-screen keyboard straight from the prompt, and closing hands it back
-// (`keyboardHandoff.ts`). The keyboard never drops. The Lucidos Agent's list
-// stands in for both agent kinds: the coding-agent list is the same picker,
-// and the unit tests cover it.
 test.describe('A touch rung list keeps the on-screen keyboard up', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);

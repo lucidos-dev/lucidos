@@ -22,7 +22,7 @@ describe('renderPhaseTimers', () => {
   });
 
   it('per-operation cost is the delta against a baseline', () => {
-    addMarkdownParseMs(100); // unrelated prior work
+    addMarkdownParseMs(100);
     const base = currentPerfBaseline();
     addMarkdownParseMs(7);
     addLinkifyMs(2);

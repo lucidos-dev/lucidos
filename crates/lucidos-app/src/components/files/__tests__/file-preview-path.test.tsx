@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The two surfaces that show a file's PATH rather than its name, and the one
- * that deliberately still shows a name.
- *
- * The breadcrumb and the changed-files row render into the DOM. The tree row
- * is hook-free, so it is invoked as a plain function and flattened.
- */
 import { describe, it, expect, vi } from 'vitest';
 import { render } from 'preact';
 import type { DiffFile } from '../../../store/store';
@@ -87,8 +80,6 @@ describe('the changed-files list vs the file tree', () => {
   });
 
   it('leaves a tree row on the ellipsising `file-name` box, since it holds a bare name', () => {
-    // The distinction is the point: `.file-path` overrides `.file-name`'s
-    // nowrap, and applying it to the tree would wrap names that already fit.
     const out = vnodeToText(
       <TreeNode
         node={{ name: '', path: '', children: {}, files: [{ name: 'workspace-audit.md', path: 'system-knowhow/workspace-audit.md' }] }}

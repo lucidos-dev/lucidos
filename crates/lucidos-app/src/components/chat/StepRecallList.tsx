@@ -4,8 +4,6 @@ import { openFilePreview } from '../../store/actions/artifacts';
 import { formatShortDateWithYear } from '../../utils/formatTime';
 import type { MemorySource, StepRecall } from '../../store/types';
 
-/** Close the step detail and go where a recalled memory came from. Both paths
- *  land or say why: `showEventWhereItLives` toasts an event it cannot reach. */
 export function openRecalledSource(source: MemorySource): void {
   stepDetailModal.value = null;
   if (source.type === 'event') void showEventWhereItLives(source.id);
@@ -16,8 +14,6 @@ function sourceLabel(source: MemorySource): string {
   return source.type === 'event' ? 'Open the conversation' : `Open ${source.path}`;
 }
 
-/** The memories a pre-turn recall put in front of the model, each a link to
- *  its source, then the queries that found them. */
 export function StepRecallList({ recall }: { recall: StepRecall }) {
   return (
     <>

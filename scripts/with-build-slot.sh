@@ -10,6 +10,11 @@
 #
 # Usage:
 #   scripts/with-build-slot.sh [--label "<text>"] -- <command> [args...]
+#   scripts/with-build-slot.sh [--label "<text>"] --lease
+#
+# A launch build takes a lease for its full body. The broker reports the
+# grant to the build shell and keeps the slot while each wrapped step runs.
+# Each step applies the lease's nice increment to its own process tree.
 #
 # The SLOT fails open, always. A plain `git clone` has no `lucidos` binary, and
 # `make lint` must still work there, so a missing broker means the command runs
@@ -43,13 +48,24 @@ if [ "${1:-}" = "--label" ]; then
     LABEL="${2:-}"
     shift 2
 fi
+LEASE=""
+LOG_FD=1
+if [ "${1:-}" = "--lease" ]; then
+    LEASE=1
+    LOG_FD=2
+    shift
+fi
 if [ "${1:-}" = "--" ]; then
     shift
 fi
 
-if [ $# -eq 0 ]; then
+if [ -z "$LEASE" ] && [ $# -eq 0 ]; then
     echo "with-build-slot.sh: nothing to run" >&2
     echo "usage: scripts/with-build-slot.sh [--label \"<text>\"] -- <command> [args...]" >&2
+    exit 2
+fi
+if [ -n "$LEASE" ] && [ $# -ne 0 ]; then
+    echo "with-build-slot.sh: --lease takes no command" >&2
     exit 2
 fi
 
@@ -117,21 +133,36 @@ _resolve_broker() {
     return 1
 }
 
-"$SCRIPT_DIR/build-memory-gate.sh" --label "${LABEL:-$1}" || exit $?
-LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$(date +%s)"
-export LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT
+if [ -z "${LUCIDOS_BUILD_SLOT_HELD:-}" ] || [ -z "${LUCIDOS_BUILD_SLOT_LEASE_NICE:-}" ]; then
+    "$SCRIPT_DIR/build-memory-gate.sh" --label "${LABEL:-${1:-build lease}}" >&"$LOG_FD" || {
+        rc=$?
+        if [ -n "$LEASE" ]; then printf 'refused %s\n' "$rc"; fi
+        exit "$rc"
+    }
+    LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$(date +%s)"
+    export LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT
+fi
 
 # A subshell tested with `||`, so nothing in the prune can stop the build.
 if [ -r "$SCRIPT_DIR/lib/stale_incremental.sh" ]; then
     (
         # shellcheck source=scripts/lib/stale_incremental.sh
         source "$SCRIPT_DIR/lib/stale_incremental.sh" && prune_stale_incremental "$PROJECT_DIR"
-    ) || echo "with-build-slot.sh: the stale incremental prune failed, building anyway" >&2
+    ) >&"$LOG_FD" || echo "with-build-slot.sh: the stale incremental prune failed, building anyway" >&2
 fi
 
 if ! BROKER="$(_resolve_broker)"; then
     echo "with-build-slot.sh: no \`lucidos\` that knows \`build-slot\`, running the build unrestricted" >&2
+    if [ -n "$LEASE" ]; then echo unleased; exit 0; fi
     exec "$@"
+fi
+
+if [ -n "$LEASE" ]; then
+    if [[ "$("$BROKER" build-slot --help 2>/dev/null)" != *"--lease"* ]]; then
+        echo unleased
+        exit 0
+    fi
+    exec "$BROKER" build-slot --label "${LABEL:-build lease}" --lease
 fi
 
 if [ -n "$LABEL" ]; then

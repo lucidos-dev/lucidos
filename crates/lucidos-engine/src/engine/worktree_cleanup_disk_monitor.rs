@@ -129,7 +129,7 @@ impl DiskMonitor {
     /// never overlap, and a stalled emit holds one check for at most
     /// [`ALERT_EMIT_TIMEOUT`].
     async fn run_loop(mut self) {
-        log!(
+        log_legacy!(
             "[DiskMonitor] starting (interval={:?}, soft_cap={} bytes, rearm_margin={} bytes)",
             DISK_MONITOR_INTERVAL,
             self.soft_cap_bytes,
@@ -169,7 +169,7 @@ impl DiskMonitor {
             return;
         };
         if fresh.free_bytes >= self.thresholds(fresh).soft_bytes {
-            log!(
+            log_legacy!(
                 "[DiskMonitor] free disk recovered to {:.1} GB before the alert went out, not sending it",
                 fresh.free_bytes as f64 / BYTES_PER_GB,
             );
@@ -213,7 +213,7 @@ impl DiskMonitor {
         match tokio::task::spawn_blocking(move || worktree_footprint_bytes(&root)).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                log!("[DiskMonitor] footprint walk task failed: {}", e);
+                log_legacy!("[DiskMonitor] footprint walk task failed: {}", e);
                 0
             }
         }
@@ -230,7 +230,7 @@ impl DiskMonitor {
         );
         match tokio::time::timeout(self.emit_timeout, self.bus.emit(event)).await {
             Ok(Ok(_)) => {
-                log!(
+                log_legacy!(
                     "[DiskMonitor] free disk below soft threshold ({:.1} GB free, Lucidos {:.1} GB), disk-low NotificationCreated recorded",
                     free_gb,
                     lucidos_gb,
@@ -238,7 +238,7 @@ impl DiskMonitor {
                 true
             }
             Ok(Err(e)) => {
-                log!(
+                log_legacy!(
                     "[DiskMonitor] free disk is {:.1} GB, but the disk-low notification could not be recorded: {}. Retrying next tick with a fresh reading",
                     free_gb,
                     e,
@@ -246,7 +246,7 @@ impl DiskMonitor {
                 false
             }
             Err(_) => {
-                log!(
+                log_legacy!(
                     "[DiskMonitor] free disk is {:.1} GB, but recording the disk-low notification took over {:?}. Retrying next tick with a fresh reading",
                     free_gb,
                     self.emit_timeout,

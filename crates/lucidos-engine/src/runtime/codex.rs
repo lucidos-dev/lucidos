@@ -38,36 +38,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// `Result.error` for a turn Codex interrupted without a Lucidos request.
+pub const UNREQUESTED_INTERRUPT_ERROR: &str =
+    "Codex interrupted this turn. Lucidos did not ask for it. The work is incomplete.";
+
 use super::agent_runtime::{
     AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
     InputWithdrawal, RunningAgent, SpawnArgs, WithdrawRequest,
 };
-use super::claude_code::{format_exit_status, CcMenuOption, GROUP_TEARDOWN_GRACE};
+use super::agent_sandbox::SandboxedCommand;
+use super::claude_code::{format_exit_status, GROUP_TEARDOWN_GRACE};
 use super::codex_parse::{parse_codex_line, TurnTracker};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
 use super::spawn_env::{apply_lucidos_env, command_secret_values, AgentSandbox, StderrTail};
+use crate::engine::thread_events::{TurnEndFacts, TurnEndStatus};
 
-#[derive(Debug, serde::Deserialize)]
-struct CodexMenuOptionsFile {
-    models: Vec<CcMenuOption>,
-    reasoning_efforts: Vec<CcMenuOption>,
-}
-
-const CODEX_MENU_OPTIONS_JSON: &str = include_str!("codex_menu_options.json");
-
-static CODEX_MENU_OPTIONS: std::sync::LazyLock<CodexMenuOptionsFile> =
-    std::sync::LazyLock::new(|| {
-        serde_json::from_str(CODEX_MENU_OPTIONS_JSON)
-            .expect("codex_menu_options.json is malformed — see runtime/codex_menu_options.json")
-    });
-
-pub fn codex_model_options() -> &'static [CcMenuOption] {
-    &CODEX_MENU_OPTIONS.models
-}
-
-pub fn codex_reasoning_effort_options() -> &'static [CcMenuOption] {
-    &CODEX_MENU_OPTIONS.reasoning_efforts
-}
+pub use crate::llm::coding_agent_models::{codex_model_options, codex_reasoning_effort_options};
 
 /// Reasoning-summary mode both Codex drivers request. Codex's default
 /// (`auto`) resolves to NO summaries over the app-server/exec protocols —
@@ -111,7 +97,7 @@ pub(super) fn validate_codex_effort<'a>(
     if supported {
         Some(e)
     } else {
-        log!(
+        log_legacy!(
             "[Codex] dropping unsupported reasoning effort '{}' for model '{}' — codex default applies",
             e,
             model.unwrap_or("default/unknown"),
@@ -162,6 +148,12 @@ pub(super) struct CodexConfig {
     /// is there. Deliberately a closed, explicit list — every entry is a hole
     /// in the sandbox and needs a reason.
     pub(super) sandbox_writable_roots: Vec<PathBuf>,
+    /// The OS sandbox every Codex child runs in: Lucidos's own. The exec
+    /// protocol also confines writes to [`confined_write_roots`].
+    pub(super) sandbox: super::agent_sandbox::Sandbox,
+    /// False while the `ps` shim is on PATH. A macOS login shell runs
+    /// `path_helper`, which moves `/bin` ahead of the shim.
+    pub(super) login_shell: bool,
     /// Pre-built env (Lucidos contract) applied to every spawned child.
     pub(super) env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     /// Vars the contract removes from every child, so it cannot inherit them.
@@ -225,7 +217,7 @@ impl AgentRuntime for CodexRuntime {
                     (expected LUCIDOS_CLI_BIN or a sibling `lucidos` binary)"
                     .into());
             }
-            crate::log!(
+            crate::log_legacy!(
                 "[Codex] lucidos CLI binary not found near current_exe — \
                  spawned Codex sessions won't have the `lucidos` command on PATH \
                  (build with `cargo build -p lucidos-cli`)"
@@ -235,8 +227,22 @@ impl AgentRuntime for CodexRuntime {
 
         let sandbox_writable_roots =
             sandbox_writable_roots(args.worktree_path, args.workspace_path).await;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let protocol =
+            codex_protocol_from_env(std::env::var("LUCIDOS_CODEX_PROTOCOL").ok().as_deref());
+        let sandbox = match protocol {
+            // Each command and outside write raises a card, as for Claude Code.
+            CodexProtocol::AppServer => args.sandbox.clone(),
+            // No card channel, so the allowlist is the only write guard.
+            CodexProtocol::Exec => args.sandbox.writes_only_under(&confined_write_roots(
+                args.worktree_path,
+                &sandbox_writable_roots,
+                codex_home(args.user_env_vars, home.as_deref()),
+            )),
+        };
 
-        let (env, env_removed) = baked_lucidos_env(&args, cli_dir);
+        let (env, env_removed) = baked_lucidos_env(&args, cli_dir, &sandbox);
+        let login_shell = sandbox.ps_shim_dir(args.workspace_path, cli_dir).is_none();
         let agent_run = args.agent_run.clone();
 
         // A user-configured `codex` path must point at a real executable —
@@ -249,7 +255,6 @@ impl AgentRuntime for CodexRuntime {
                 crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
             )?;
         }
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         let config = CodexConfig {
             codex_bin: resolve_codex_binary(home.as_deref(), args.binary_override.map(Path::new)),
             worktree_path: args.worktree_path.to_path_buf(),
@@ -258,9 +263,15 @@ impl AgentRuntime for CodexRuntime {
             model: args.model.map(str::to_string),
             reasoning_effort: args.reasoning_effort.map(str::to_string),
             sandbox_writable_roots,
+            sandbox,
+            login_shell,
             env,
             env_removed,
         };
+
+        if protocol == CodexProtocol::Exec {
+            require_exec_command_hook(&config).await?;
+        }
 
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
@@ -268,8 +279,6 @@ impl AgentRuntime for CodexRuntime {
         let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel::<WithdrawRequest>();
 
         let resume_session_id = args.resume_session_id.map(str::to_string);
-        let protocol =
-            codex_protocol_from_env(std::env::var("LUCIDOS_CODEX_PROTOCOL").ok().as_deref());
         let permission_rx = match protocol {
             CodexProtocol::AppServer => {
                 let (permission_tx, permission_rx) = mpsc::unbounded_channel();
@@ -374,7 +383,7 @@ async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBu
     //   * resolves symlinks, which the macOS seatbelt matches on (`/var` →
     //     `/private/var` is the classic one).
     match std::fs::canonicalize(&data_dir).ok().filter(|d| d.is_dir()) {
-        Some(dir) if grants_more_than_the_data_tree(&dir, workspace) => crate::log!(
+        Some(dir) if grants_more_than_the_data_tree(&dir, workspace) => crate::log_legacy!(
             "[Codex] {} resolves to {}, which contains the workspace — refusing \
              to grant it; the sandbox will block direct writes into the parent \
              workspace's data/ tree (`lucidos data path --mkdir`, editor writes \
@@ -384,7 +393,7 @@ async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBu
             dir.display()
         ),
         Some(dir) => roots.push(dir),
-        None => crate::log!(
+        None => crate::log_legacy!(
             "[Codex] {} is not a reachable directory — the sandbox will block \
              direct writes into the parent workspace's data/ tree \
              (`lucidos data path --mkdir`, editor writes to a resolved data \
@@ -395,37 +404,59 @@ async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBu
     roots
 }
 
+/// Where Lucidos's sandbox lets an exec-protocol Codex process write: the
+/// worktree, the roots [`sandbox_writable_roots`] grants, and Codex's own home.
+/// The sandbox wraps the whole process, so Codex must still reach its sessions
+/// and logs.
+fn confined_write_roots(
+    worktree: &Path,
+    writable_roots: &[PathBuf],
+    codex_home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots = vec![worktree.to_path_buf()];
+    roots.extend(writable_roots.iter().cloned());
+    roots.extend(codex_home);
+    roots
+}
+
+/// Codex's home: `CODEX_HOME` from the user's variables or the engine's
+/// environment, else `~/.codex`.
+fn codex_home(user_env_vars: &[(String, String)], home: Option<&Path>) -> Option<PathBuf> {
+    const VAR: &str = "CODEX_HOME";
+    user_env_vars
+        .iter()
+        .find(|(key, _)| key == VAR)
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| std::env::var_os(VAR).map(PathBuf::from))
+        .or_else(|| home.map(|home| home.join(".codex")))
+}
+
+/// Codex's own `--sandbox` mode. Neither its macOS seatbelt nor its Linux
+/// bubblewrap can run inside Lucidos's sandbox (ADR 0645), so it is on only
+/// while Lucidos's is off.
+pub(super) fn codex_sandbox_mode(config: &CodexConfig) -> &'static str {
+    if config.sandbox.is_active() {
+        "danger-full-access"
+    } else {
+        "workspace-write"
+    }
+}
+
+/// The app-server approval policy. With Codex's own sandbox off, `untrusted`
+/// asks for every command and file change, so each raises a card as a Claude
+/// Code `Bash` call does. With it on, `on-request` asks only to escape it.
+pub(super) fn codex_approval_policy(config: &CodexConfig) -> &'static str {
+    if config.sandbox.is_active() {
+        "untrusted"
+    } else {
+        "on-request"
+    }
+}
+
 /// Does this resolved `data/` path reach past the data tree, into the engine's
 /// own state or a sibling's?
 ///
-/// Resolving symlinks is what the sandbox needs (see `sandbox_writable_roots`),
-/// but it also means a `data` symlink decides what the hole covers. Relocating
-/// the tree (`data -> /Volumes/ext/lucidos-data`) is legitimate and stays
-/// allowed. Two shapes are not, and both grant `.lucidos/` runtime state or a
-/// sibling thread's worktree:
-///   * **up**, to the workspace root or an ancestor (`data -> .`, `data -> /`);
-///   * **in**, to the engine's own [`GRANTS_DIR`] (`data -> .lucidos/…`).
-///
-/// Cheaper to make impossible than to document as a footgun. Named for what it
-/// answers rather than for the first of the two, which is what it used to be.
-///
-/// Shared with Claude Code's `cc_settings::widened_directories`, which grants
-/// the same tree through a different mechanism. Both back ends must agree on
-/// which `data` layouts are supported, or a relocated tree works under one and
-/// cards under the other.
-pub(crate) fn grants_more_than_the_data_tree(resolved_data: &Path, workspace: &Path) -> bool {
-    let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    if workspace.starts_with(resolved_data) {
-        return true;
-    }
-    let runtime_dir = crate::core::grants::grants_dir(&workspace);
-    match std::fs::canonicalize(&runtime_dir) {
-        Ok(resolved_runtime) => resolved_data.starts_with(&resolved_runtime),
-        // No runtime dir yet means nothing to reach into. Fall back to the
-        // unresolved path so a probe failure still refuses the obvious shape.
-        Err(_) => resolved_data.starts_with(&runtime_dir),
-    }
-}
+pub(crate) use crate::core::grants::grants_more_than_the_data_tree;
 
 /// The worktree's shared `.git` directory. `None` (log + degrade) when git
 /// fails: Codex still runs, but the sandbox blocks its own `git commit`. The
@@ -436,7 +467,7 @@ async fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
         // Never degrade the sandbox silently: without this line the user sees
         // in-agent `git commit` blocked with nothing in the log saying why.
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Codex] {} in {}: sandbox will block in-agent git commits",
                 e,
                 worktree.display()
@@ -444,6 +475,48 @@ async fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
             None
         }
     }
+}
+
+pub(super) const COMMAND_DENY_HOOK: &str = r#"lucidos command-deny-hook || {
+    printf '%s\n' 'Command guard did not authorize this call.' >&2
+    exit 2
+}"#;
+
+/// The legacy exec protocol has no hook discovery request. Require a CLI
+/// release with shell PreToolUse hooks and session-scoped hook trust.
+async fn require_exec_command_hook(config: &CodexConfig) -> std::io::Result<()> {
+    let binary = Path::new(&config.codex_bin);
+    let mut command = config.sandbox.command(binary)?;
+    command.current_dir(&config.worktree_path);
+    let supported = super::probe_agent_version_command(
+        CodingAgent::Codex,
+        binary,
+        std::time::Duration::from_secs(5),
+        &mut command,
+    )
+    .await
+    .as_deref()
+    .is_some_and(supports_exec_command_hook);
+    if supported {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "Codex exec requires version 0.170.0 or later for standing denies. Update Codex or use the app-server protocol.",
+        ))
+    }
+}
+
+fn supports_exec_command_hook(version: &str) -> bool {
+    semver::Version::parse(version).is_ok_and(|version| version >= semver::Version::new(0, 170, 0))
+}
+
+pub(super) fn command_deny_hooks() -> serde_json::Value {
+    super::codex_side_question::trusted_pre_tool_hook(
+        "Bash",
+        serde_json::json!({
+            "type": "command", "command": COMMAND_DENY_HOOK, "async": false, "timeout": 10,
+        }),
+    )
 }
 
 /// Build one per-turn `codex exec` command. Pure over its inputs so the unit
@@ -458,12 +531,21 @@ fn build_codex_turn_command(
     effort: Option<&str>,
     resume_session_id: Option<&str>,
     image_paths: &[PathBuf],
-) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(&config.codex_bin);
+) -> std::io::Result<SandboxedCommand> {
+    let mut cmd = config.sandbox.command(&config.codex_bin)?;
     cmd.arg("exec").arg("--json");
-    // Worktree-scoped writes, like CC's acceptEdits-in-cwd. Network stays on:
-    // coding tasks need cargo/npm fetches, same as a CC session would run.
-    cmd.arg("--sandbox").arg("workspace-write");
+    let hooks = command_deny_hooks();
+    let key = super::codex_side_question::GUARD_KEY;
+    let hash = &hooks["state"][key]["trusted_hash"];
+    let hook_command = serde_json::Value::from(COMMAND_DENY_HOOK);
+    cmd.arg("-c").arg("features.hooks=true");
+    cmd.arg("-c").arg(format!(
+        "hooks={{ PreToolUse = [{{ matcher = \"Bash\", hooks = [{{ type = \"command\", command = {hook_command}, async = false, timeout = 10 }}] }}], state = {{ \"{key}\" = {{ enabled = true, trusted_hash = {hash} }} }} }}"
+    ));
+    // Worktree-scoped writes, like CC's acceptEdits-in-cwd, from whichever
+    // sandbox is on. Network stays on: coding tasks need cargo/npm fetches,
+    // same as a CC session would run.
+    cmd.arg("--sandbox").arg(codex_sandbox_mode(config));
     cmd.arg("-c")
         .arg("sandbox_workspace_write.network_access=true");
     // Reasoning summaries + CLAUDE.md project-doc fallback — see the
@@ -479,6 +561,9 @@ fn build_codex_turn_command(
     cmd.arg("-c").arg(format!(
         "project_doc_max_bytes={CODEX_PROJECT_DOC_MAX_BYTES}"
     ));
+    if !config.login_shell {
+        cmd.arg("-c").arg("allow_login_shell=false");
+    }
     for flag in lucidos_mcp_server_config_overrides(&config.env) {
         cmd.arg("-c").arg(flag);
     }
@@ -513,7 +598,7 @@ fn build_codex_turn_command(
     for (k, v) in &config.env {
         cmd.env(k, v);
     }
-    cmd
+    Ok(cmd)
 }
 
 /// `-c key=value` overrides wiring the lucidos MCP server into the exec
@@ -543,17 +628,22 @@ pub(super) fn lucidos_mcp_server_config_overrides(
 }
 
 /// Bake the Lucidos env contract once; each per-turn child re-applies it. Codex
-/// runs under an OS sandbox, so its compile env skips the shared sccache daemon.
-fn baked_lucidos_env(
+/// writes only under its own roots, whichever sandbox confines it, so its
+/// compile env skips the agents' sccache daemons (ADR 0567).
+pub(super) fn baked_lucidos_env(
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
+    sandbox: &super::agent_sandbox::Sandbox,
 ) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
     let mut probe = tokio::process::Command::new("true");
     apply_lucidos_env(
         &mut probe,
         args,
         cli_dir,
-        AgentSandbox::OsSandboxed,
+        match sandbox.compile_cache() {
+            AgentSandbox::Unsandboxed => AgentSandbox::WritesConfined,
+            confined => confined,
+        },
         "Codex",
     );
     let mut env = Vec::new();
@@ -597,6 +687,9 @@ pub const CODEX_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos__ask_user_question"
 ///   Codex does not inherit the app-server/exec process env into stdio MCP
 ///   children, so without this the server exits before `initialize` and the
 ///   model sees no `ask_user_question` tool.
+/// - `env_vars` forwards the origin token by name from Codex's own env, so
+///   the secret stays out of the config and the `-c` argv. It is the child's
+///   only credential: the agent sandbox denies the local token file.
 /// - `command` is the bare binary name: `apply_lucidos_env` prepends the
 ///   bundled CLI dir to `PATH`, which codex itself uses to find the command.
 ///   The dir resolves via `LUCIDOS_CLI_BIN` in a packaged build (the staged
@@ -617,6 +710,10 @@ pub(super) fn lucidos_mcp_server_config_json(
         obj.insert("env".to_string(), serde_json::Value::Object(mcp_env));
     }
     obj.insert(
+        "env_vars".to_string(),
+        serde_json::json!([crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN]),
+    );
+    obj.insert(
         "enabled_tools".to_string(),
         serde_json::json!(["ask_user_question"]),
     );
@@ -636,6 +733,7 @@ pub(super) fn lucidos_mcp_server_config_json(
 }
 
 const LUCIDOS_MCP_CHILD_ENV_KEYS: &[&str] = &[
+    "LUCIDOS_BUILD_SLOT_CLASS",
     "LUCIDOS_WORKSPACE",
     "LUCIDOS_THREAD_ID",
     "LUCIDOS_API_BASE_URL",
@@ -697,7 +795,7 @@ pub(super) fn codex_protocol_from_env(value: Option<&str>) -> CodexProtocol {
         Some("exec") => CodexProtocol::Exec,
         Some("app-server") | None => CodexProtocol::AppServer,
         Some(other) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Codex] Unknown LUCIDOS_CODEX_PROTOCOL={:?} — defaulting to app-server",
                 other
             );
@@ -723,12 +821,12 @@ fn compose_first_turn_prompt(system_prompt: Option<&str>, user_text: &str) -> St
 /// A task, so a prompt bigger than the pipe buffer never stalls the turn loop.
 fn send_prompt_on_stdin(stdin: Option<tokio::process::ChildStdin>, prompt: String) {
     let Some(mut stdin) = stdin else {
-        log!("[Codex] the turn has no stdin to send its prompt on");
+        log_legacy!("[Codex] the turn has no stdin to send its prompt on");
         return;
     };
     tokio::spawn(async move {
         if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-            log!("[Codex] failed to send the turn's prompt on stdin: {}", e);
+            log_legacy!("[Codex] failed to send the turn's prompt on stdin: {}", e);
         }
     });
 }
@@ -737,7 +835,7 @@ fn send_prompt_on_stdin(stdin: Option<tokio::process::ChildStdin>, prompt: Strin
 /// inputs on app-server). Returns the paths plus guards that delete the
 /// files on drop (kept alive until the turn ends).
 pub(super) fn write_image_files(
-    images: &[crate::api::ChatImage],
+    images: &[crate::engine::types::ChatImage],
 ) -> (Vec<PathBuf>, Vec<tempfile::TempPath>) {
     let mut paths = Vec::new();
     let mut guards = Vec::new();
@@ -752,7 +850,7 @@ pub(super) fn write_image_files(
         let bytes = match base64::engine::general_purpose::STANDARD.decode(&img.base64) {
             Ok(b) => b,
             Err(e) => {
-                crate::log!("[Codex] dropping undecodable pasted image: {}", e);
+                crate::log_legacy!("[Codex] dropping undecodable pasted image: {}", e);
                 continue;
             }
         };
@@ -763,12 +861,12 @@ pub(super) fn write_image_files(
         {
             Ok(f) => f,
             Err(e) => {
-                crate::log!("[Codex] failed to create temp image file: {}", e);
+                crate::log_legacy!("[Codex] failed to create temp image file: {}", e);
                 continue;
             }
         };
         if let Err(e) = std::fs::write(file.path(), &bytes) {
-            crate::log!("[Codex] failed to write temp image file: {}", e);
+            crate::log_legacy!("[Codex] failed to write temp image file: {}", e);
             continue;
         }
         let path = file.path().to_path_buf();
@@ -852,7 +950,7 @@ async fn driver_task(
                     answer_withdraw(&mut queue, &mut input_rx, withdraw);
                 }
                 _ = cancel.cancelled() => {
-                    log!("[Codex] cancellation signalled while idle — ending session");
+                    log_legacy!("[Codex] cancellation signalled while idle — ending session");
                     break 'session;
                 }
             }
@@ -925,6 +1023,11 @@ async fn run_turn(
     queue: &mut VecDeque<AgentInput>,
     cancel: &CancellationToken,
 ) -> TurnOutcome {
+    // Exec starts another process for every turn. Its JSON stream exposes no
+    // effective auth mode; never borrow a previous process's billing evidence.
+    let _ = events_tx.send(AgentEvent::BillingObserved {
+        attribution: super::billing_provider::BillingAttribution::default(),
+    });
     // The same validated effort goes to the command and to the `Usage`.
     let turn_effort =
         validate_codex_effort(config.model.as_deref(), config.reasoning_effort.as_deref())
@@ -950,23 +1053,28 @@ async fn run_turn(
         text
     };
 
-    let mut cmd = build_codex_turn_command(
+    let spawned = build_codex_turn_command(
         config,
         config.model.as_deref(),
         turn_effort.as_deref(),
         resume_sid.as_deref(),
         &image_paths,
-    );
-    let secrets = command_secret_values(&cmd);
-    let mut child = match super::spawn_env::spawn_below_engine(&mut cmd) {
-        Ok(c) => c,
+    )
+    .and_then(|mut cmd| {
+        let secrets = command_secret_values(&cmd);
+        super::spawn_env::spawn_below_engine(&mut cmd).map(|child| (child, secrets))
+    });
+    let (mut child, secrets) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
-            log!("[Codex] failed to spawn codex CLI: {}", e);
+            log_legacy!("[Codex] failed to spawn codex CLI: {}", e);
             let _ = events_tx.send(AgentEvent::InputRejected { input: input.uuid });
             let _ = events_tx.send(AgentEvent::Result {
                 text: String::new(),
                 duration_ms: 0,
                 error: Some(format!("Failed to start Codex: {e}")),
+                provider_error: None,
+                turn_end: Some(TurnEndFacts::of_status(TurnEndStatus::Failed)),
             });
             return TurnOutcome::Continue;
         }
@@ -1003,7 +1111,7 @@ async fn run_turn(
                         }
                     }
                     Err(e) => {
-                        log!("[Codex] stdout read error: {}", e);
+                        log_legacy!("[Codex] stdout read error: {}", e);
                         break 'turn;
                     }
                 }
@@ -1026,7 +1134,7 @@ async fn run_turn(
             req = control_rx.recv() => {
                 match req {
                     Some(ControlRequest::Interrupt) => {
-                        log!("[Codex] interrupt — killing in-flight codex turn (pid={:?})", child_pid);
+                        log_legacy!("[Codex] interrupt — killing in-flight codex turn (pid={:?})", child_pid);
                         interrupted = true;
                         break 'turn;
                     }
@@ -1037,7 +1145,7 @@ async fn run_turn(
                 }
             }
             _ = cancel.cancelled() => {
-                log!("[Codex] cancellation signalled — killing codex turn");
+                log_legacy!("[Codex] cancellation signalled — killing codex turn");
                 shutdown = true;
                 break 'turn;
             }
@@ -1092,9 +1200,9 @@ async fn run_turn(
 
     let stderr_tail = stderr.finish().await;
     if !stderr_tail.is_empty() {
-        log!("[Codex] codex stderr: {}", stderr_tail);
+        log_legacy!("[Codex] codex stderr: {}", stderr_tail);
     }
-    log!(
+    log_legacy!(
         "[Codex] turn child exited (pid={} status={})",
         child_pid
             .map(|p| p.to_string())
@@ -1121,6 +1229,8 @@ async fn run_turn(
             text: tracker.turn_text(),
             duration_ms: turn_start.elapsed().as_millis() as u64,
             error: None,
+            provider_error: None,
+            turn_end: Some(TurnEndFacts::of_status(TurnEndStatus::Interrupted)),
         });
         return TurnOutcome::Continue;
     }
@@ -1145,6 +1255,8 @@ async fn run_turn(
             text: tracker.turn_text(),
             duration_ms: turn_start.elapsed().as_millis() as u64,
             error: Some(reason),
+            provider_error: tracker.last_provider_error.clone(),
+            turn_end: Some(TurnEndFacts::of_status(TurnEndStatus::Synthesized)),
         });
     }
     TurnOutcome::Continue

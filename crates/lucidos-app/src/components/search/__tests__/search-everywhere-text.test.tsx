@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** Text search in Search Everywhere (ADR 0383). A line shows with its match
- *  marked, after every name section on the All tab. The Text tab lists every
- *  line, and Enter opens the file at that line. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -45,7 +42,6 @@ import { SERVER_DEBOUNCE_MS, SearchEverywhere, TEXT_TAB_WINDOW } from '../Search
 import { preferences, searchEverywhereOpen } from '../../../store/store';
 import { RECENTS_KEY } from '../../../store/actions/entityReferences';
 
-/** Matches nothing in the local Settings and Menu indexes. */
 const QUERY = 'zqxv needle';
 
 let host: HTMLDivElement;
@@ -219,7 +215,6 @@ describe('the Text tab', () => {
     press('ArrowDown');
     expect(scrolled).toHaveBeenCalledTimes(1);
 
-    // Scrolled to within a screen of the end: scrollHeight - scrollTop - clientHeight < clientHeight.
     const list = results() as HTMLElement;
     Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 1000 });
     Object.defineProperty(list, 'clientHeight', { configurable: true, value: 300 });

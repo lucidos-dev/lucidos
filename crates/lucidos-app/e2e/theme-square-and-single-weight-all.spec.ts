@@ -7,20 +7,11 @@ import {
   waitForVisibleInput,
 } from './helpers';
 
-// Two theme fixes in a real browser, on desktop Chromium and mobile WebKit:
-//
-//   - a theme with all three radius tokens at 0 squares every corner, and the
-//     default theme keeps its round ones;
-//   - VT323 renders at Fira Code's x-height with its line box centred on the
-//     glyphs, paints bold with its own strokes, and shows bold as
-//     --text-strong.
 
 const SQUARE = 'e2e-square-phosphor';
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = readFileSync(resolve(here, 'themes', 'square-phosphor.json'), 'utf-8');
 
-/** The thread pane with its composer, a line of bold prose and a few chips.
- *  It brings the scroll buttons too, which the new-thread view never mounts. */
 async function openScene(page: Page): Promise<void> {
   await gotoWithRetry(page, '/');
   await expect(page.locator('.boot-splash')).toHaveCount(0, { timeout: 30_000 });
@@ -59,7 +50,6 @@ async function openScene(page: Page): Promise<void> {
 const radius = (page: Page, selector: string) =>
   page.locator(selector).first().evaluate(el => getComputedStyle(el).borderTopLeftRadius);
 
-/** The corners the phone screenshots showed round under a square theme. */
 const CORNERS = ['.prompt-box', '.send-cancel-morph', '.scroll-to-top', '#sq-pill', '#sq-button'];
 
 test.describe('square corners and single-weight fonts', () => {
@@ -107,7 +97,6 @@ test.describe('square corners and single-weight fonts', () => {
     });
     expect(m.vt.xHeight / m.fira.xHeight).toBeGreaterThan(0.97);
     expect(m.vt.xHeight / m.fira.xHeight).toBeLessThan(1.03);
-    // The caret spans the font box, so its centre sits on the ink's centre.
     const boxCentre = (m.vt.boxTop - m.vt.boxBottom) / 2;
     const inkCentre = (m.vt.inkTop - m.vt.inkBottom) / 2;
     expect(Math.abs(boxCentre - inkCentre), JSON.stringify(m.vt)).toBeLessThan(2);
@@ -134,7 +123,6 @@ test.describe('square corners and single-weight fonts', () => {
     expect(pixels.bold === pixels.regular, 'bold paints the regular outlines').toBe(true);
 
     const colours = await page.evaluate(() => {
-      // Any CSS colour, read back as a painted pixel's brightness.
       const brightness = (colour: string) => {
         const ctx = document.createElement('canvas').getContext('2d')!;
         ctx.fillStyle = colour;
@@ -157,7 +145,6 @@ test.describe('square corners and single-weight fonts', () => {
       return out;
     });
     expect(colours.strong).toBe(colours.textStrong);
-    // A dark page, so bold steps up toward white, in either theme.
     expect(colours.strongBrightness, JSON.stringify(colours)).toBeGreaterThan(colours.proseBrightness);
   });
 

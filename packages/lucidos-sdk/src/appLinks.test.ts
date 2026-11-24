@@ -9,7 +9,6 @@ vi.mock('./index', () => ({ lucidos: { ui: { openExternal, toast } } }));
 const tellHost = vi.hoisted(() => vi.fn());
 vi.mock('./_bridge', () => ({ isBridged: () => false, tellHost, onHostPush: () => () => {} }));
 
-/** The steps the frame told the host, in order. */
 function traced(): string[] {
   return tellHost.mock.calls.map((call) => (call[1] as { step: string }).step);
 }
@@ -19,8 +18,6 @@ import { adoptHostExternalLinks } from './externalLinks';
 
 installAppLinkRouting();
 
-/** Click a link and report whether the frame's router took it: cancelled
- *  before the page's own default could navigate the frame. */
 function click(href: string): boolean {
   document.body.innerHTML = `<a href="${href}"><b id="t">x</b></a>`;
   const e = new MouseEvent('click', { bubbles: true, cancelable: true });
@@ -78,7 +75,6 @@ describe('installAppLinkRouting', () => {
   });
 
   describe('when the host route rejects', () => {
-    /** Click a web link whose host route fails, and let the catch run. */
     async function clickFailing(href: string): Promise<void> {
       openExternal.mockImplementation(() => Promise.reject(new Error('engine down')));
       vi.spyOn(console, 'warn').mockImplementation(() => {});

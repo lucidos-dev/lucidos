@@ -1,19 +1,3 @@
-/**
- * `setDevicePushEnabled` is the one switch behind both push rows (Settings →
- * Devices, and Appearance & Behavior → Notifications), plus the convenience it
- * carries: having turned push on for the phone in your hand, it offers to turn
- * it off on your OTHER phones, so one notification stops buzzing three devices.
- *
- * The offer is the part with teeth, because saying yes mutates devices the user
- * is not holding. These tests pin all four of its edges: it fires only from a
- * mobile device, only about mobile ones, only when there is something to
- * silence, and it changes nothing on cancel.
- *
- * Wired against the real `devices.ts` with a fake server behind
- * `api/client`, rather than mocking the store actions: the thing worth pinning
- * is which devices actually get a `setDevicePush(id, false)`, and a mocked
- * action would only prove the call was forwarded.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeviceInfo } from '../../api/types';
 
@@ -23,12 +7,6 @@ const listDevices = vi.fn();
 const showToast = vi.fn();
 const showConfirm = vi.fn();
 
-// A Vitest run IS a Vite dev-server bundle, so the live `isDevServerBundle()`
-// reports true and `initPushSubscription` would short-circuit on the frontend
-// preview's no-service-worker gate before reaching anything below. Same pin as
-// `push.test.ts`: these tests exercise the PRODUCTION path, and the gate itself
-// is covered by `utils/devServerBundle.test.ts` and the pure
-// `pushUnsupportedReason` cases.
 vi.mock('../../utils/devServerBundle', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/devServerBundle')>()),
   isDevServerBundle: () => false,
@@ -76,9 +54,6 @@ function makeDevice(id: string, userAgent: string, pushEnabled: boolean): Device
   };
 }
 
-/** A fake engine holding the device list, so `setDevicePush` writes are visible
- *  to the `loadDevices()` refetch that follows them. That refetch is what the
- *  offer reads to decide whether there is anything left to silence. */
 function installFakeServer(initial: DeviceInfo[]) {
   const rows = initial.map((d) => ({ ...d }));
   setDevicePush.mockImplementation(async (id: string, enabled: boolean) => {
@@ -91,9 +66,6 @@ function installFakeServer(initial: DeviceInfo[]) {
   return rows;
 }
 
-/** The browser side of enabling push: a granted permission and a service worker
- *  that hands back a subscription. `initPushSubscription` must clear all of this
- *  before the device flag is ever written. */
 function installBrowserPushStubs(permission: NotificationPermission = 'granted') {
   const registration = {
     pushManager: {
@@ -108,26 +80,18 @@ function installBrowserPushStubs(permission: NotificationPermission = 'granted')
     configurable: true,
   });
   (globalThis as unknown as { Notification: typeof Notification }).Notification = Object.assign(
-    function () { /* stub */ } as unknown as typeof Notification,
+    function () {  } as unknown as typeof Notification,
     { permission, requestPermission: async () => permission },
   ) as typeof Notification;
-  (globalThis as unknown as { PushManager: object }).PushManager = function () { /* stub */ };
+  (globalThis as unknown as { PushManager: object }).PushManager = function () {  };
   Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
 }
 
-/** `platform.ts` reads the user-agent once at module load, so this has to be set
- *  before the `await import('./push')` in each test (`vi.resetModules()` in
- *  `beforeEach` is what makes the re-read happen).
- *
- *  Standalone rides along because `initPushSubscription` refuses a non-installed
- *  iOS page outright ("add Lucidos to your home screen first"), which is a real
- *  guard but not the one under test here: the device is an installed PWA. */
 function setUserAgent(ua: string) {
   Object.defineProperty(globalThis.navigator, 'userAgent', { value: ua, configurable: true });
   Object.defineProperty(globalThis.navigator, 'standalone', { value: true, configurable: true });
 }
 
-/** Every device `setDevicePush` was told to switch OFF. */
 function switchedOff(): string[] {
   return setDevicePush.mock.calls.filter((c) => c[1] === false).map((c) => c[0] as string);
 }
@@ -141,9 +105,6 @@ describe('setDevicePushEnabled', () => {
     showConfirm.mockReset();
     showConfirm.mockResolvedValue(false);
     localStorage.setItem('lucidos-device-id', THIS_DEVICE);
-    // The suite runs on the node environment with hand-rolled browser stubs
-    // (`src/test-setup.ts`), so there is no `window.location` to read the
-    // service-worker scope origin from until one is declared.
     Object.defineProperty(window, 'location', {
       value: { origin: 'https://lucidos.test' },
       configurable: true,
@@ -170,7 +131,6 @@ describe('setDevicePushEnabled', () => {
     await setDevicePushEnabled(THIS_DEVICE, true);
 
     expect(showConfirm).toHaveBeenCalledTimes(1);
-    // The laptop is a complementary surface, not a duplicate: it keeps its push.
     expect(switchedOff().sort()).toEqual(['dev-old-phone', 'dev-tablet']);
     expect(rows.find((d) => d.id === 'dev-laptop')!.push_enabled).toBe(true);
     expect(rows.find((d) => d.id === THIS_DEVICE)!.push_enabled).toBe(true);
@@ -178,9 +138,6 @@ describe('setDevicePushEnabled', () => {
   });
 
   it('reloads only after every disable has settled, so a partial failure cannot be read mid-batch', async () => {
-    // With `Promise.all`, the first rejection resumes the caller while the other
-    // writes are still in flight, and the reload then reconciles a device back
-    // to "on" that goes off a moment later.
     const rows = installFakeServer([
       makeDevice(THIS_DEVICE, UA.iphone, false),
       makeDevice('dev-fails', UA.iphone, true),
@@ -201,8 +158,6 @@ describe('setDevicePushEnabled', () => {
     const { setDevicePushEnabled } = await import('./push');
     const { devices } = await import('./devices');
     const pending = setDevicePushEnabled(THIS_DEVICE, true);
-    // Let the fast failure land, then release the straggler. If the reload ran
-    // on the rejection it has already happened, with dev-slow still on.
     await Promise.resolve();
     releaseSlow();
     await pending;
@@ -234,10 +189,6 @@ describe('setDevicePushEnabled', () => {
   });
 
   it('does not offer to silence the others when this device failed to switch on', async () => {
-    // `toggleDevicePush` swallows a failed write into a toast and returns
-    // normally, so nothing downstream can tell the enable did not land. Without
-    // the confirmed-on check, the offer still fires, and confirming it leaves
-    // the user with no device getting a push at all.
     installFakeServer([
       makeDevice(THIS_DEVICE, UA.iphone, false),
       makeDevice('dev-old-phone', UA.iphone, true),
@@ -304,8 +255,6 @@ describe('setDevicePushEnabled', () => {
   });
 
   it('writes no device flag at all when the browser refuses permission', async () => {
-    // The flag alone would leave the engine pushing to an endpoint that does not
-    // exist, and the row would claim an "on" the OS will never honour.
     installBrowserPushStubs('denied');
     installFakeServer([makeDevice(THIS_DEVICE, UA.iphone, false)]);
 
@@ -317,9 +266,6 @@ describe('setDevicePushEnabled', () => {
   });
 
   it('does not offer when push is turned on for a device other than this one', async () => {
-    // Enabling for another device cannot actually work (only that browser can
-    // subscribe itself), but the offer is about the device in the user's hand
-    // and must not fire for another id whatever the caller passes.
     installFakeServer([
       makeDevice(THIS_DEVICE, UA.iphone, false),
       makeDevice('dev-old-phone', UA.iphone, true),

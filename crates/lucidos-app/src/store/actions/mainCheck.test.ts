@@ -19,6 +19,13 @@ describe('the main check frames, as pure steps', () => {
     expect(mainCheckAfter(passed, 'MainCheckRunLinked', link)).toEqual(passed);
   });
 
+  it('a superseded check keeps running until the next start replaces it', () => {
+    const superseded = mainCheckAfter(RUNNING, 'MainCheckSuperseded', { check_id: 'k-1', to_sha: 'ccc' });
+    expect(superseded).toEqual(RUNNING);
+    expect(mainCheckAfter(superseded, 'MainCheckStarted', { check_id: 'k-2', from_sha: 'aaa', to_sha: 'ccc' }))
+      .toEqual({ state: 'running', check_id: 'k-2', from_sha: 'aaa', to_sha: 'ccc' });
+  });
+
   it('a pass keeps the range it cleared', () => {
     expect(mainCheckAfter(RUNNING, 'MainCheckPassed', { check_id: 'k-1' }))
       .toEqual({ state: 'passed', check_id: 'k-1', from_sha: 'aaa', to_sha: 'bbb' });
@@ -74,5 +81,24 @@ describe('setMainCheckFromServer', () => {
     mainCheck.value = RUNNING;
     setMainCheckFromServer(undefined);
     expect(mainCheck.value).toEqual(IDLE_MAIN_CHECK);
+  });
+});
+
+describe('repair-aware snapshots', () => {
+  const waiting: MainCheck = {
+    state: 'red', check_id: 'failed-check', summary: 'Failed: api.',
+    repair: { state: 'waiting', fix_thread_id: 'repair-owner', waiting_on: ['queued work'] },
+  };
+  it('keeps red and its owner while a newer check starts', () => {
+    expect(mainCheckAfter(waiting, 'MainCheckStarted', { check_id: 'new-check' })).toBe(waiting);
+    expect(mainCheckAfter(waiting, 'MainCheckFailed', {
+      check_id: 'new-check', superseded_by_fix: 'repair-owner',
+    })).toBe(waiting);
+  });
+  it('marks only the matching repair running', () => {
+    const started = { check_id: 'new-check', fix_thread_id: 'repair-owner', started_by: 'auto' };
+    expect(mainCheckAfter(waiting, 'MainCheckRepairStarted', started).repair)
+      .toEqual({ state: 'running', fix_thread_id: 'repair-owner', started_by: 'auto', waiting_on: [] });
+    expect(mainCheckAfter(waiting, 'MainCheckRepairStarted', { ...started, fix_thread_id: 'other' })).toBe(waiting);
   });
 });

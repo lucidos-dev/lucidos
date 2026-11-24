@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-const isTauri = vi.fn(() => true);
+const isTauri = vi.hoisted(() => {
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = { invoke: () => Promise.resolve() };
+  return vi.fn(() => true);
+});
 vi.mock('../../utils/platform', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/platform')>()),
   isTauri: () => isTauri(),

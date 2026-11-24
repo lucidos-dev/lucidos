@@ -3,10 +3,8 @@ import { getDraft } from '../store/composeDrafts';
 
 const MAX_LEN = 40;
 
-/** What a thread with no title is called where only its stored title is known. */
 export const UNTITLED_THREAD = 'Untitled thread';
 
-/** A stored thread title as shown, or `UNTITLED_THREAD` when it is empty. */
 export function storedThreadTitle(title: string | null | undefined): string {
     return title?.trim() || UNTITLED_THREAD;
 }
@@ -16,23 +14,10 @@ function previewText(text: string): string {
     return trimmed.length > MAX_LEN ? trimmed.slice(0, MAX_LEN - 1) + '…' : trimmed;
 }
 
-/** Preview title for a composing/draft thread, derived from its compose text.
- *  Internal helper for `threadDisplayTitle`; kept exported for unit tests. */
 export function composingTitle(composeText: string): string {
     return previewText(composeText) || 'Empty draft';
 }
 
-/** Single source of truth for the title the user sees, in both the drawer
- *  row and the chat header. The fallback chain prevents the header from
- *  flashing "Untitled Thread" between Send and `ThreadTitleGenerated`:
- *    1. composing → live composeText preview (drawer + header agree as the
- *       user types).
- *    2. real generated/renamed title → use it.
- *    3. no title yet → preview of the first user message (pending optimistic
- *       message before SSE; first `MessageReceived` event after SSE catches
- *       up). This is what the LLM is about to title anyway.
- *    4. nothing to derive from → "Untitled Thread" final fallback.
- *  Both surfaces MUST call this so they cannot drift. */
 export function threadDisplayTitle(thread: ThreadState): string {
     if (thread.meta.state === 'composing') {
         return composingTitle(getDraft(thread.meta.id).text);
@@ -50,16 +35,6 @@ export function threadDisplayTitle(thread: ThreadState): string {
 }
 
 function firstUserMessageText(thread: ThreadState): string {
-    // Map iteration is insertion-ordered; events are inserted by handleEvent
-    // in seq order during DB load and SSE arrival, so the first MessageReceived
-    // we hit is the one with the lowest seq. Out-of-order SSE on reconnect can
-    // theoretically swap, but only AFTER a generated title arrived (which
-    // short-circuits this path) — in practice we never run when that matters.
-    //
-    // `SpokenMessageReceived` counts too. It is the caller's own words on a
-    // call the talker answered alone, and such a call writes no
-    // `MessageReceived` at all. The engine's `format_display_title` takes the
-    // same row from `first_message`, so the two surfaces agree.
     for (const ev of thread.events.values()) {
         if (ev?.type === 'MessageReceived' || ev?.type === 'SpokenMessageReceived') return ev.text;
     }

@@ -7,7 +7,6 @@ import type { OngoingGroup } from '../../store/store';
 import { landingGroupFor } from '../../store/actions/event-navigation';
 import { openThreadFilterPanel, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 
-// Pure ←/→ tree-navigation logic for the drawer — no signals, no DOM.
 
 const state = (sections: string[] = [], families: string[] = [], revealed: string[] = []): NavCollapseState => ({
   sectionCollapsed: (k) => sections.includes(k),
@@ -74,19 +73,15 @@ describe('leftAction (collapse / ascend)', () => {
   });
 
   it('cascades child → parent family → section (the spec example)', () => {
-    // ← on a child collapses the parent's family and focuses the parent.
     expect(leftAction(thread('c-1', 1, 'p-1', false, 'current'), state())).toEqual({
       type: 'collapseFamily', threadId: 'p-1', focusKey: 'p-1',
     });
-    // ← again, now on the parent (family collapsed), collapses the section.
     expect(leftAction(thread('p-1', 0, null, true, 'current'), state([], ['p-1']))).toEqual({
       type: 'collapseSection', sectionKey: 'current',
     });
   });
 
   it('hides revealed archived children before collapsing the parent family / section', () => {
-    // No live family (hasChildren false), but archived children are revealed:
-    // ← turns the archived-reveal toggle off instead of jumping to the section.
     const node = thread('p', 0, null, false, 'current', 2);
     expect(leftAction(node, state([], [], ['p']))).toEqual({ type: 'hideArchived', threadId: 'p' });
   });
@@ -126,13 +121,8 @@ describe('rightAction (expand / descend)', () => {
   });
 
   it('reveals archived children before descending, on an already-expanded parent with both', () => {
-    // A row with one live child AND hidden archived children renders expanded
-    // by default (families aren't collapsed unless the user collapses them).
-    // Without this ordering, → always matched the descend branch below and the
-    // archived toggle was never reachable by keyboard for such a row at all.
     const nodes = [thread('p', 0, null, true, 'current', 1), thread('c', 1, 'p', false, 'current')];
     expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
-    // A second → press, now that it's revealed, descends into the live child.
     expect(rightAction(nodes[0], nodes, 0, state([], [], ['p']))).toEqual({ type: 'focusKey', key: 'c' });
   });
   it('is a no-op on an expanded parent whose next row is a sibling (no rendered child)', () => {
@@ -155,8 +145,6 @@ describe('rightAction (expand / descend)', () => {
   });
 
   it('reveals archived children once the live family has nothing left to descend into', () => {
-    // Expanded live family with no rendered next child (edge case) still falls
-    // through to the archived-reveal toggle instead of stopping at none.
     const nodes = [thread('p', 0, null, true, 'current', 2), thread('s', 0, null, false, 'current')];
     expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
   });
@@ -179,7 +167,6 @@ describe('the Ongoing grouping (tiles)', () => {
     ];
     expect(new Set(keys).size).toBe(keys.length);
     expect(nodeKey(tile('in-flight'))).toBe(ongoingTileNavKey('in-flight'));
-    // Section-prefixed, so nothing reads a tile as a thread.
     expect(nodeKey(tile('in-flight')).startsWith(sectionNavKey(''))).toBe(true);
   });
 
@@ -208,11 +195,6 @@ describe('the Ongoing grouping (tiles)', () => {
 });
 
 describe('handleDrawerKeyDown: filter-panel suppression', () => {
-  // The filter panel is a view inside this pane, covering the list, and its rows
-  // are real controls. Their keys bubble out to the pane container, so the
-  // container's list-nav has to stand down while the panel is up: otherwise
-  // Enter on a View row would ALSO open whatever thread the invisible list
-  // happens to have highlighted.
   const keyEvent = (key: string) => {
     let prevented = false;
     const e = { key, preventDefault: () => { prevented = true; } } as unknown as KeyboardEvent;

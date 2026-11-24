@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.58.0"
+LUCIDOS_DEFAULT_VERSION="0.59.1"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -123,7 +123,7 @@ LUCIDOS_UNINSTALL_URL="${LUCIDOS_UNINSTALL_URL:-}"          # URL for uninstall.
 LUCIDOS_TLS_CERT="${LUCIDOS_TLS_CERT:-}"                    # opt-in TLS (--tls-cert): cert path; with --tls-key the gateway serves https
 LUCIDOS_TLS_KEY="${LUCIDOS_TLS_KEY:-}"                      # opt-in TLS (--tls-key): private-key path; both-or-neither
 LUCIDOS_NO_TLS="${LUCIDOS_NO_TLS:-}"                        # set to 1 (or --no-tls) to drop the TLS pair a re-run would keep from the service
-LUCIDOS_BIND="${LUCIDOS_BIND:-}"                            # optional (--bind): all | loopback | <IP> — written to the machine-global ~/.lucidos/network.toml
+LUCIDOS_BIND="${LUCIDOS_BIND:-}"                            # optional (--bind): all | loopback | <IP> — written to the machine-global network.toml
 INSTALL_EXTERNAL_ADDRESS=""                                  # optional (--external-address): origin written to network.toml. Flag only: the gateway reads LUCIDOS_EXTERNAL_ADDRESS itself, as a lock
 
 # Source-build (--dev) config — preserves the legacy behavior verbatim.
@@ -168,8 +168,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # ensure_storage_root <dir>: make <dir> owner-only (ADR 0456), so another local
 # user cannot traverse into what Lucidos stores there. A copy of
-# scripts/lib/storage_root.sh's, because a piped run fetches only the libs the
-# origin serves. crates/lucidos-home pins the two bodies equal.
+# scripts/lib/storage_root.sh's, kept per ADR 0456. crates/lucidos-home pins
+# the two bodies equal.
 ensure_storage_root() {
     (umask 077 && mkdir -p "$1") && chmod 700 "$1"
 }
@@ -244,8 +244,10 @@ source_install_libs() {
 # extract path from fetching anything it doesn't need). install_common.sh rides
 # along for finish_install's preflight (install_ca_bundle_candidates): on the
 # download path it was already sourced (re-sourcing pure helpers is a no-op),
-# and on the from-tarball path this is where it first loads.
-source_service_lib() { _source_libs service.sh install_common.sh; }
+# and on the from-tarball path this is where it first loads. The health check
+# reaches loopback through loopback_curl.sh, which sources storage_root.sh from
+# beside itself, so both are fetched before it.
+source_service_lib() { _source_libs storage_root.sh loopback_curl.sh service.sh install_common.sh; }
 
 # ── checksum verification (download / from-tarball; OS-aware, fail-closed) ────
 ensure_checksum_tool() {
@@ -555,6 +557,7 @@ finish_install() {
     resolve_instance
     apply_external_address_config
     report_coexisting_app
+    trust_local_certificate "$runtime_dir"
 
     if [ "$decision" = "service" ]; then
         register_service "$runtime_dir" "$manager"
@@ -566,6 +569,41 @@ finish_install() {
             info "Re-run on a machine with launchd (macOS) or systemd --user (Linux) to install the always-on service."
         fi
         launch_runtime "$runtime_dir"
+    fi
+}
+
+# install_has_gui_session: true when this login is a desktop session, which
+# has browsers to trust the certificate for and can show macOS's password
+# prompt. macOS asks launchd for the session type: Aqua is the logged-in
+# desktop, and an SSH login gets another. Linux names a display server.
+install_has_gui_session() {
+    case "$(uname -s)" in
+        Darwin) [ "$(launchctl managername 2>/dev/null)" = "Aqua" ] ;;
+        *) [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] ;;
+    esac
+}
+
+# trust_local_certificate <runtime-dir>: trust the loopback CA, so this user's
+# browsers open https://localhost without a warning. The CLI makes the CA when
+# no gateway has yet. Warn, never die: the gateway serves either way, and the
+# printed command repeats the step.
+trust_local_certificate() {
+    local cli
+    cli="$(service_runtime_cli "$1")"
+    if ! install_has_gui_session; then
+        info "To open Lucidos in a browser on this computer, trust its local certificate first:"
+        info "  $cli tls trust"
+        return 0
+    fi
+    step "Trusting the local certificate for https://localhost"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        info "macOS asks for your password to add it to your login keychain."
+    fi
+    if "$cli" tls trust; then
+        ok "Browsers on this computer trust https://localhost:$LUCIDOS_PORT"
+    else
+        warn "Could not trust the local certificate. Browsers will warn on https://localhost until you run:"
+        warn "  $cli tls trust"
     fi
 }
 
@@ -658,18 +696,18 @@ apply_external_address_config() {
 # origin: https or localhost — plain http://<host> can't register them, so the
 # hints lead with the two zero-config secure paths.
 print_remote_access_hints() {
-    local scheme; scheme="$(install_url_scheme)"
+    local scheme; scheme="$(wide_url_scheme)"
     printf '\n'
     if [ -n "$LUCIDOS_BIND" ] && [ "$LUCIDOS_BIND" != "loopback" ]; then
         printf '  Remote:   bound to %s — open %s://<this-host>:%s/ from your devices.\n' "$LUCIDOS_BIND" "$scheme" "$LUCIDOS_PORT"
         if [ "$scheme" = "http" ]; then
             printf '            %sNote:%s browsers grant push notifications + PWA install only on a\n' "$C_YELLOW" "$C_RESET"
-            printf '            secure origin (https or localhost) — use an SSH tunnel, tailscale\n'
-            printf '            serve, or re-run with --tls-cert/--tls-key for full remote function.\n'
+            printf '            secure origin (https or localhost) — use tailscale serve, or re-run\n'
+            printf '            with --tls-cert/--tls-key for full remote function.\n'
         fi
     else
         printf '  Remote:   listens on localhost only (secure default). To use it from other devices:\n'
-        printf '    ssh -L %s:localhost:%s <this-host>   # full app incl. push, zero config\n' "$LUCIDOS_PORT" "$LUCIDOS_PORT"
+        printf '    Settings → Access → Remote gateways   # in Lucidos on your other computer\n'
         printf '    tailscale serve --bg %s              # trusted HTTPS on your tailnet\n' "$LUCIDOS_PORT"
         printf '    re-run with --bind all [--tls-cert <crt> --tls-key <key>]\n'
     fi
@@ -815,11 +853,11 @@ register_service() {
 
     if have curl; then
         step "Waiting for the gateway to come up"
-        if service_health_wait "$LUCIDOS_PORT" "$LUCIDOS_HEALTH_TIMEOUT" 1 "$(install_url_scheme)"; then
+        if service_health_wait "$LUCIDOS_PORT" "$LUCIDOS_HEALTH_TIMEOUT" 1; then
             ok "Gateway healthy on port $LUCIDOS_PORT"
         else
             die "The service was registered but the gateway did not answer
-       $(install_url_scheme)://localhost:$LUCIDOS_PORT/ within ${LUCIDOS_HEALTH_TIMEOUT}s. It will keep retrying
+       $(local_url) within ${LUCIDOS_HEALTH_TIMEOUT}s. It will keep retrying
        (KeepAlive / Restart=always). Check the logs:
 $(service_log_hint "$manager" "$data" "$slug")
        then re-open the URL, or run $(uninstall_hint "$slug") to remove it."
@@ -897,9 +935,12 @@ validate_tls_config() {
     [ -r "$LUCIDOS_TLS_KEY" ]  || die "--tls-key: file not readable: $LUCIDOS_TLS_KEY"
 }
 
-# install_url_scheme — https when TLS is configured, else http. For the health
-# probe + every printed URL.
-install_url_scheme() { if tls_enabled; then printf 'https'; else printf 'http'; fi; }
+# wide_url_scheme — what a wide listener serves: https when TLS is configured,
+# else http. Loopback always serves https, from the loopback CA (local_url).
+wide_url_scheme() { if tls_enabled; then printf 'https'; else printf 'http'; fi; }
+
+# local_url — the address this machine's browsers open.
+local_url() { printf 'https://localhost:%s/' "$LUCIDOS_PORT"; }
 
 # append_tls_env <env-block> — append the TLS pairs when configured (mirrors
 # append_provider_creds; ends with printf so `set -e` is safe).
@@ -1009,11 +1050,13 @@ register_systemd() {
     ok "systemd unit $unit_name enabled + started"
     # Survive logout/reboot. May require privileges; announce + best-effort, never
     # fail the install over it.
-    if loginctl enable-linger "$USER" >/dev/null 2>&1; then
+    # A container or a cron shell may leave USER unset, and set -u is on.
+    local user="${USER:-$(id -un)}"
+    if loginctl enable-linger "$user" >/dev/null 2>&1; then
         ok "Enabled user lingering (the service runs across logout/reboot)"
     else
         warn "Could not enable user lingering — the service may stop on logout."
-        info "To make it survive logout/reboot, run:  sudo loginctl enable-linger $USER"
+        info "To make it survive logout/reboot, run:  sudo loginctl enable-linger $user"
     fi
 }
 
@@ -1027,12 +1070,11 @@ service_log_hint() {
 }
 
 print_running() {
-    local runtime_dir="$1" url
-    url="$(install_url_scheme)://localhost:$LUCIDOS_PORT"
+    local runtime_dir="$1"
     printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
     printf '%s  Starting Lucidos 🚀%s\n' "$C_BOLD" "$C_RESET"
     printf '========================================\n'
-    printf '  %sOpen:%s     %s%s/%s\n' "$C_BOLD" "$C_RESET" "$C_BOLD$C_BLUE" "$url" "$C_RESET"
+    printf '  %sOpen:%s     %s%s%s\n' "$C_BOLD" "$C_RESET" "$C_BOLD$C_BLUE" "$(local_url)" "$C_RESET"
     printf '  Instance: %s  (port %s)\n' "$LUCIDOS_INSTANCE" "$LUCIDOS_PORT"
     printf '  Runtime:  %s\n' "$runtime_dir"
     printf '  Data:     %s\n' "$LUCIDOS_GATEWAY_DATA"
@@ -1045,12 +1087,11 @@ print_running() {
 }
 
 print_service_running() {
-    local runtime_dir="$1" manager="$2" slug="$LUCIDOS_INSTANCE" url
-    url="$(install_url_scheme)://localhost:$LUCIDOS_PORT"
+    local runtime_dir="$1" manager="$2" slug="$LUCIDOS_INSTANCE"
     printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
     printf '%s  Lucidos is running as a service 🚀%s\n' "$C_BOLD" "$C_RESET"
     printf '========================================\n'
-    printf '  %sOpen:%s     %s%s/%s\n' "$C_BOLD" "$C_RESET" "$C_BOLD$C_BLUE" "$url" "$C_RESET"
+    printf '  %sOpen:%s     %s%s%s\n' "$C_BOLD" "$C_RESET" "$C_BOLD$C_BLUE" "$(local_url)" "$C_RESET"
     printf '  Instance: %s%s%s  (port %s)\n' "$C_BOLD" "$slug" "$C_RESET" "$LUCIDOS_PORT"
     printf '  Runtime:  %s  (shared)\n' "$runtime_dir"
     printf '  Data:     %s\n' "$LUCIDOS_GATEWAY_DATA"
@@ -1095,7 +1136,8 @@ print_installed() {
 $(append_tls_env "$(service_runtime_env_pairs "$runtime_dir" "$LUCIDOS_GATEWAY_DATA" "$LUCIDOS_PORT")")
 EOF
     printf '    %q\n' "$(service_runtime_program "$runtime_dir")"
-    printf '  Then open: %s%s://localhost:%s/%s\n' "$C_BLUE" "$(install_url_scheme)" "$LUCIDOS_PORT" "$C_RESET"
+    printf '  Then open: %s%s%s\n' "$C_BLUE" "$(local_url)" "$C_RESET"
+    printf '  First trust its local certificate:  %s tls trust\n' "$(service_runtime_cli "$runtime_dir")"
     printf '%s========================================%s\n\n' "$C_GREEN" "$C_RESET"
 }
 
@@ -1142,10 +1184,10 @@ dispatch_uninstall() {
     # Shebang sniff before `exec bash -c`, for the same reason _source_libs
     # sniffs a fetched helper lib: `curl -fsSL` plus a non-empty test cannot see
     # a SOFT-404, and this line hands unknown remote content straight to bash.
-    # It is not hypothetical here: as of the 2026-07-30 docs audit the published
-    # front door serves install.sh and scripts/lib/*.sh but NOT uninstall.sh, so
-    # <origin>/uninstall.sh returns the landing page at status 200 and a piped
-    # `install.sh --uninstall` executed that HTML. Fail loud and name the
+    # It was not hypothetical: the front door once served install.sh and
+    # scripts/lib/*.sh but NOT uninstall.sh, so <origin>/uninstall.sh returned
+    # the landing page at status 200 and a piped `install.sh --uninstall`
+    # executed that HTML. Fail loud and name the
     # fallback instead. Drop this only if you also want a hijacked or
     # misconfigured origin to reach `exec`.
     case "$payload" in
@@ -1396,7 +1438,7 @@ ensure_docker_running() {
     if $SUDO docker info >/dev/null 2>&1; then
         warn "Docker works with sudo but not as your user — you are not in the 'docker' group."
         info "Adding you to the docker group (requires sudo)…"
-        $SUDO usermod -aG docker "$USER" 2>/dev/null || true
+        $SUDO usermod -aG docker "${USER:-$(id -un)}" 2>/dev/null || true
         die "Log out and back in (or run: newgrp docker) so the group change takes effect, then re-run this installer. Lucidos must use Docker without sudo."
     fi
     die "The Docker daemon is not running. Start it (e.g. 'sudo systemctl start docker') and re-run."
@@ -1636,14 +1678,14 @@ Flags:
                         free port for a NEW instance if it's taken). Pinning it sets/
                         changes this instance's port.
   --bind B              gateway network bind: all | loopback | <IP>. Written to the
-                        machine-global ~/.lucidos/network.toml (the same knob the
+                        machine-global network.toml (the same knob the
                         picker's Settings → Network access edits). Default: loopback
-                        only — use an SSH tunnel or tailscale serve for remote access.
+                        only — use tailscale serve or a remote gateway for remote access.
   --external-address URL
                         the origin other devices reach this gateway at, through a
                         route you run: a reverse proxy, a VPN or a company name.
                         Scheme, host and optional port, no path. Written to
-                        ~/.lucidos/network.toml, and put in every pairing QR ahead
+                        the machine-global network.toml, and put in every pairing QR ahead
                         of the tailnet. The same value as Settings → Access and
                         'lucidos external-address'. LUCIDOS_EXTERNAL_ADDRESS in the
                         gateway's environment overrides it and locks the setting.

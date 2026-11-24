@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** Opening a dropdown must not change the trigger's width.
- *
- *  `▾` and `▴` can differ in width, as they do in the iOS fallback font. So the
- *  chevron keeps one glyph and CSS turns it over.
- *  `dropdown-chevron-single-glyph.test.ts` keeps every other trigger on it. */
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

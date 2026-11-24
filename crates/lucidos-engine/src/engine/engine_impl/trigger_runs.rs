@@ -22,7 +22,7 @@ use crate::triggers::TriggerConfig;
 /// Why an off-schedule run request cannot proceed. Each variant is a case where
 /// submitting anyway would report a run that does not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RunRefusal {
+pub enum RunRefusal {
     /// No trigger with this id is registered.
     NotFound { trigger_id: String },
     /// The caller is itself a trigger fire. Refused even when the target is the
@@ -50,7 +50,7 @@ pub(crate) enum RunRefusal {
 impl RunRefusal {
     /// User- and agent-facing explanation. Names the trigger and, where there
     /// is one, the action that does work instead.
-    pub(crate) fn message(&self) -> String {
+    pub fn message(&self) -> String {
         match self {
             Self::NotFound { trigger_id } => {
                 format!("No trigger found with ID {}", trigger_id)
@@ -90,7 +90,7 @@ impl RunRefusal {
 /// not an error: cron admission coalesces a redundant fire, and reporting it as
 /// started would be a lie.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RunOutcome {
+pub enum RunOutcome {
     /// Admitted and running now.
     Started { name: String },
     /// Over capacity; runs when capacity frees. `position` is the 1-based queue
@@ -112,7 +112,7 @@ impl RunOutcome {
     /// Machine-readable discriminator for API consumers, kebab-case per the
     /// public-API convention. The frontend picks its toast style from this;
     /// `already-running` must never be styled as a successful start.
-    pub(crate) fn status(&self) -> &'static str {
+    pub fn status(&self) -> &'static str {
         match self {
             Self::Started { .. } => "started",
             Self::Queued { .. } => "queued",
@@ -120,7 +120,7 @@ impl RunOutcome {
         }
     }
 
-    pub(crate) fn message(&self) -> String {
+    pub fn message(&self) -> String {
         match self {
             Self::Started { name } => {
                 format!("Started an off-schedule run of trigger '{}'.", name)
@@ -197,7 +197,7 @@ impl LucidosEngine {
     /// `SubmitOutcome::completion`, because a trigger run is unbounded in
     /// duration and the callers are a chat turn, a CLI invocation, and an HTTP
     /// request.
-    pub(crate) async fn run_trigger_off_schedule(
+    pub async fn run_trigger_off_schedule(
         &self,
         trigger_id: &str,
     ) -> Result<RunOutcome, RunRefusal> {
@@ -224,7 +224,7 @@ impl LucidosEngine {
             .expect("check_off_schedule_run rejects a missing config")
             .name;
 
-        log!(
+        log_legacy!(
             "[Triggers] Off-schedule run requested for '{}' ({})",
             name,
             trigger_id
@@ -285,6 +285,10 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            program_grants: vec![],
+            folder_grants: vec![],
+            program_denies: vec![],
+            folder_denies: vec![],
             coding_agent_grant: false,
             context_ceiling: None,
             mcp_servers: vec![],

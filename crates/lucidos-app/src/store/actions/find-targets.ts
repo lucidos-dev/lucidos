@@ -1,9 +1,3 @@
-/**
- * What the find bar searches with, in a chunk of its own (ADR 0436). The bar
- * opens only once this is in memory (`openFind`), so a search never waits on
- * it. `find-bar.ts` decides which surface a query goes to; this module owns
- * the matcher, the host's one painter, and a target per kind of view.
- */
 
 import { createFinder, createPainter, highlightApiPresent, type ClearBand, type FindResult } from '@lucidos/find';
 import { askFrame, tellFrame } from './app-bridge';
@@ -17,8 +11,6 @@ function isCount(n: unknown): n is number {
   return typeof n === 'number' && Number.isInteger(n) && n >= 0;
 }
 
-/** Read a frame's answer. It crossed a `postMessage` from code the host does
- *  not trust, so anything but a well-formed count is refused. */
 export function parseFindReply(value: unknown): FindResult | null {
   const v = value as { total?: unknown; current?: unknown; capped?: unknown } | null;
   if (!v || typeof v !== 'object') return null;
@@ -28,7 +20,6 @@ export function parseFindReply(value: unknown): FindResult | null {
   return { total, current, capped: v.capped === true };
 }
 
-/** How long an app frame gets to answer. An app with no SDK never does. */
 export const FIND_TIMEOUT_MS = 2000;
 
 function visibleElement(selector: string): HTMLElement | null {
@@ -40,17 +31,13 @@ function visibleElement(selector: string): HTMLElement | null {
 
 const FILE_UNSEARCHABLE = 'This file can’t be searched';
 
-/** The highlight registry is the document's, so the host has one painter. */
 const hostPainter = createPainter(highlightApiPresent);
 
-/** A text preview's body, without the repo preview's file tree beside it. */
 function pageRoot(): Element | null {
   const body = visibleElement('.file-preview-frame-body');
   return body?.querySelector('.repo-preview-split-main') ?? body;
 }
 
-/** What the open bar leaves of the screen. On a phone it sticks over the top
- *  of the file, so a match under it is out of view. */
 function pageBand(): ClearBand | undefined {
   const bar = visibleElement('.file-preview-frame > .find-bar-slot');
   return bar ? { top: bar.getBoundingClientRect().bottom, bottom: window.innerHeight } : undefined;
@@ -58,7 +45,6 @@ function pageBand(): ClearBand | undefined {
 
 const pageFinder = createFinder(pageRoot, hostPainter, pageBand);
 
-/** The source view's row for `line`, which a requested find starts from. */
 function lineRow(line: number | undefined): Element | undefined {
   if (line === undefined) return undefined;
   return pageRoot()?.querySelector(`[data-line="${line}"]`) ?? undefined;

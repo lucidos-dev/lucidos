@@ -940,8 +940,8 @@ settlement, to these shapes only.
 - **Python that shells out to a literal is judged as that literal**
   (`python_program_proof`). `subprocess.run`, `check_output`, `check_call` and
   `call` with a string and `shell=True` or a list of strings, and `getoutput` /
-  `getstatusoutput` with a string, qualify. The rest of the code must pass
-  `python_is_statically_safe` and name no relocating call, `environ` or
+  `getstatusoutput` with a string, qualify. The rest of the code must carry no
+  `python_side_effect_signal` and name no relocating call, `environ` or
   `putenv`. A non-literal argument, an unlisted keyword (`cwd`, `env`,
   `stdin`, ...) or any other use of `subprocess` keeps the refusal. A
   Catastrophic literal wins over the proof.
@@ -976,3 +976,30 @@ Implementation: `engine/command_guard.rs` (`lucidos_call_is_workspace_local`,
 `rebinds_lucidos_cli`, `python_program_proof`, `inline_python_is_proven`,
 `blank_proven_inline_python`). Plan:
 `docs/plans/2026-11-01-command-guard-proves-workspace-local-lucidos-calls.md`.
+
+## Addendum: workspace operation refusals distinguish execution from data
+
+The workspace destruction floor inspects the operation and target within an
+executable command. A mention of `pg_ctl`, `dropdb`, or a control URL in a
+document does not establish such an operation.
+
+The operation scan preserves shell quoting and places heredoc bodies with their
+consumers. A shell or SQL interpreter can execute its input; a literal file
+write cannot. Python literal subprocess calls reuse the existing lexer.
+Known data calls may carry ordinary string contents without making them code.
+Unknown execution, dynamic arguments and recursion limits retain conservative
+refusals. Read-only database probes and control requests receive their own
+classification rather than borrowing keywords from other commands.
+
+This changes only the workspace operation floor. Filesystem destruction checks,
+secret protection, normal classification and consent remain in force. Real
+workspace destruction still precedes grants, for chat and both coding agents.
+Regression pairs cover inert data and executed operations at the shared guard
+and coding-agent gate.
+
+## Addendum: one owner per harm
+
+[ADR 0728](0728-command-guard-one-owner-per-harm.md) assigns each harm to one layer.
+It defines the shared corpus, sandbox ownership, combined threshold, private paths, program grants
+and native trigger write confinement. Static scope cards still precede execution. An observed
+sandbox refusal may offer a folder grant and a new run.

@@ -1,13 +1,3 @@
-/**
- * A memory source box wraps at its spaces, never mid-word.
- *
- * The regression: `.memory-source-pre` set `word-break: break-all`. A leaf
- * seven levels deep in the tree browser gets a box about 260px wide. There
- * "the import drops rows" read "the imp" over "ort drops ro" over "ws".
- *
- * `overflow-wrap: anywhere` breaks a long token, such as a URL or a hash,
- * only where it cannot fit on a line of its own.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -21,7 +11,6 @@ import { rulesTargeting, styleSheetPaths } from './css-rule-helpers';
 const stylesRoot: string = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sheets = styleSheetPaths(stylesRoot).map((path) => ({ path, css: readFileSync(path, 'utf-8') }));
 
-/** The class every source box carries, and the one the tree browser adds. */
 const SOURCE_CLASSES = ['memory-source-pre', 'tree-line-source'];
 
 describe('a memory source box wraps at its spaces', () => {

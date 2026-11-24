@@ -126,7 +126,6 @@ describe('handleGlobalEvent — Backup terminal events', () => {
     );
   });
 
-  // The toast names a problem the Backup page fixes, so the tap goes there.
   it('tapping the BackupFailed toast dismisses it and opens the Backup page', () => {
     handleGlobalEvent('BackupFailed', { error: 'Google Drive is full' });
 
@@ -138,7 +137,6 @@ describe('handleGlobalEvent — Backup terminal events', () => {
   });
 });
 
-// The pass outlives its HTTP request, so these events are its only report.
 describe('handleGlobalEvent: the recommended cleanup', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -218,7 +216,6 @@ describe('handleGlobalEvent: ProxyConfigRejected', () => {
     );
   });
 
-  // A healthy workspace must stay silent, so nothing learns to ignore it.
   it('says nothing when the list is empty or absent', () => {
     handleGlobalEvent('ProxyConfigRejected', { rejected: [] });
     handleGlobalEvent('ProxyConfigRejected', {});

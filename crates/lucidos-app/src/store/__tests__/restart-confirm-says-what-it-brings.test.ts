@@ -1,17 +1,8 @@
 // @vitest-environment jsdom
-/**
- * The confirm every restart surface opens, in its new-version shape.
- *
- * Driven through the real `showConfirm`, so what is asserted is the dialog
- * state the user would be looking at. The copy itself is pinned next door in
- * `restartConfirmCopy.test.ts`; this file is about the wiring: which shape is
- * raised, and what each answer does.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../utils/platform', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/platform')>()),
-  // The desktop shell's extra "Restart App" action is not what this covers.
   isTauri: () => false,
 }));
 vi.mock('../../api/client', async (importOriginal) => ({
@@ -46,12 +37,10 @@ const COMMITS: PendingCommits = {
   groups: [{ kind: 'new', total: 2, descriptions: ['a thing', 'another thing'] }],
 };
 
-/** Answer the confirm currently on screen. */
 function answer(value: boolean): void {
   confirmState.peek().resolve?.(value);
 }
 
-/** The standing offer the toast makes, so a decline can be shown to leave it. */
 function raiseVersionToast(): void {
   showToast('New version available.', 'info', {
     key: NEW_VERSION_TOAST_KEY,
@@ -102,8 +91,6 @@ describe('a new version is ready', () => {
     await asked;
     expect(restartEngine).not.toHaveBeenCalled();
     expect(engineRestarting.value).toBe(false);
-    // Declining is not deferring: the toast stays up and this build is not
-    // remembered as dismissed, so the offer is still standing.
     expect(toasts.value.some((t) => t.key === NEW_VERSION_TOAST_KEY)).toBe(true);
     expect(markEngineVersionDismissed).not.toHaveBeenCalled();
   });

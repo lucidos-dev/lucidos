@@ -1,4 +1,3 @@
-/** Separate lazy chunk: ordinary replies never download the diagram library. */
 import libraryUrl from 'mermaid/dist/mermaid.min.js?url';
 let pending: Promise<string> | undefined;
 export function loadMermaidLibrary(): Promise<string> {

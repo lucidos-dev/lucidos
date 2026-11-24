@@ -1,7 +1,4 @@
-/* Settings → Intelligence: the intelligence ladders (IntelligencePage). */
 
-/* Short of room, the controls drop under the title as one right-packed line.
-   Neither side squeezes, so no label breaks and no button overlaps another. */
 .ladder-title {
     display: flex;
     flex-wrap: wrap;
@@ -25,7 +22,6 @@
     white-space: nowrap;
 }
 
-/* The title is an uppercase eyebrow; its controls read as ordinary text. */
 .ladder-show-off {
     display: flex;
     align-items: center;
@@ -47,11 +43,6 @@
     padding: 0.125rem var(--space-sm);
 }
 
-/* The head and each row are separate grids, so their tracks must resolve to
-   the same lengths. Both grids set the same font size, which every `ch` track
-   is measured against. A track is never narrower than its head word or its
-   control. A band track fits "estimated", and Intelligence fits all of
-   "not estimated". */
 .ladder-grid {
     display: grid;
     grid-template-columns:
@@ -85,8 +76,6 @@
     color: var(--text-secondary);
 }
 
-/* Default and on each take a column of their own, centred under the head
-   that names it. */
 .ladder-actions {
     display: contents;
 }
@@ -97,7 +86,6 @@
     text-align: center;
 }
 
-/* The grip is what a mouse drags. It stays quiet until the row is hovered. */
 .ladder-grip {
     display: flex;
     align-items: center;
@@ -107,7 +95,6 @@
     transition: opacity var(--duration-fast), color var(--duration-fast);
 }
 
-/* Only a rung that is on can be dragged, so only its grip takes the press. */
 .ladder-grip-live {
     cursor: grab;
     touch-action: none;
@@ -125,8 +112,6 @@
     cursor: grabbing;
 }
 
-/* The arrows are the keyboard's way to reorder. Each stays out of sight until
-   it takes keyboard focus, and then shows in the grip's place. */
 .ladder-move:not(:focus-visible) {
     position: absolute;
     width: 1px;
@@ -144,7 +129,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    /* It lies over the grip, so only a shown arrow may take the pointer. */
     pointer-events: none;
 }
 
@@ -156,8 +140,6 @@
     visibility: hidden;
 }
 
-/* An off rung stays in its place, dimmed, with its switch at full strength so
-   turning it back on reads as the obvious action. */
 .ladder-row-off .ladder-grid > :not(.ladder-actions),
 .ladder-row-off .ladder-actions > :not(.toggle-switch) {
     opacity: 0.45;
@@ -179,27 +161,21 @@
     width: 8rem;
 }
 
-/* Fits "100%", so dragging never moves the slider. */
 .ladder-share-value {
     min-width: 5ch;
     text-align: right;
 }
 
-/* The Reset buttons sit flush right, so the section keeps tap reach there
-   and hands it back, rather than scroll sideways on a phone. */
 .ladder-section {
     container: ladder / inline-size;
     padding-right: var(--tap-reach-inline);
     margin-right: calc(-1 * var(--tap-reach-inline));
 }
 
-/* The cell label shows only where the column heads are gone. */
 .ladder-cell-label {
     display: none;
 }
 
-/* A rung in flight: it follows the pointer, and the row it would land on
-   shows an accent edge. */
 .ladder-row {
     position: relative;
 }
@@ -224,10 +200,6 @@
 .ladder-row-drop-before::before { top: -1px; }
 .ladder-row-drop-after::after { bottom: -1px; }
 
-/* Too narrow for the columns, as on a phone. The rung name takes the first
-   line with its star and switch at the right, and the three bands sit under
-   it in equal columns, each under its own label. The grip gives way to press
-   and drag on the whole row. `--ladder-compact` tells the drag code it is on. */
 @container ladder (max-width: 36rem) {
     .ladder-head {
         display: none;
@@ -270,7 +242,6 @@
         margin-left: 0.375rem;
     }
 
-    /* A focused arrow shows beside the star, and the hidden ones open no gap. */
     .ladder-order {
         display: contents;
     }
@@ -291,7 +262,6 @@
     }
 }
 
-/* The title is an uppercase eyebrow; the mark reads as ordinary text. */
 .ladder-customised {
     display: inline-block;
     margin-left: var(--space-sm);

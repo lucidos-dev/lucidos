@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The composer's rung control loads off the first frame (ADR 0436). Until its
- * code arrives the row draws the same button, and a press on it is held: the
- * control takes it as it mounts and opens, so the press is never lost.
- */
 import { beforeAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

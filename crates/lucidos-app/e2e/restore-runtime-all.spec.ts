@@ -1,5 +1,3 @@
-/** Production runtime, real IndexedDB/Web Locks and actual page reloads.
- * The routed origin is disposable; no engine or user workspace is contacted. */
 import { test, expect } from '@playwright/test';
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +20,6 @@ test.beforeAll(async () => {
       export * from './src/api/client/_core';`,
       resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'ts' },
     bundle: true, write: false, format: 'iife', globalName: 'restore',
-    // Match Vite's SDK source alias; the package main is an iframe IIFE.
     alias: { '@lucidos/sdk': fileURLToPath(new URL('../../../packages/lucidos-sdk/src/index.ts', import.meta.url)) },
     plugins: [{ name: 'build-identity', setup(b) {
       b.onResolve({ filter: /^virtual:build-id$/ }, () => ({ path: 'build-id', namespace: 'fixture' }));
@@ -73,8 +70,6 @@ for (const baseline of [undefined, null, 'previous-generation']) {
     await page.evaluate(() => {
       restore.installRestoreRuntime();
       restore.patchDraft('old-composer', { text: 'keep this local edit' });
-      // The reload destroys this execution context; report durable results from
-      // the new page rather than intercepting or replacing location.reload.
       void restore.acceptRestoreHello(restore.beginRestoreConnection(), 'restored-generation');
     });
     await expect.poll(() => reloads).toBe(1);
@@ -97,7 +92,7 @@ for (const baseline of [undefined, null, 'previous-generation']) {
       return restore.acceptRestoreHello(restore.beginRestoreConnection(), 'restored-generation');
     })).toBe(true);
     expect(requests).toHaveLength(1);
-    expect(reloads).toBe(2); // exactly the restore reload and the explicit reload
+    expect(reloads).toBe(2);
   });
 }
 
@@ -202,8 +197,6 @@ test('aborted generation commit retains the old observation and retries before r
     return { failed, ready: restore.restoreAdmissionReady(), inert: document.body.inert,
       generation: await store.readGeneration(), records: await store.readRecoveries() };
   })).toEqual({ failed: true, ready: false, inert: false, generation: null, records: [] });
-  // No reload follows a failed commit, so editing resumes until the retry
-  // captures again.
   const navigation = page.waitForEvent('framenavigated', frame => frame === page.mainFrame());
   await page.evaluate(() => {
     void restore.acceptRestoreHello(restore.beginRestoreConnection(), 'restored-generation');
@@ -246,8 +239,6 @@ test('page death after commit retains recovery and discards stale HTTP work befo
   });
   await Promise.all([pendingRead, pendingWrite]);
   await page.evaluate(() => { restore.beginRestoreConnection(); });
-  // Responses and retryable transport failures from the old invocation must
-  // neither update callers nor retry a mutation while restore admission is shut.
   await answerRead();
   await dropWrite();
   await page.evaluate(() => {
@@ -261,9 +252,6 @@ test('page death after commit retains recovery and discards stale HTTP work befo
     ready: restore.restoreAdmissionReady(),
   }))).toEqual({ results: [], ready: false });
   expect(requests.sort()).toEqual([`${origin}/api/v1/stale-read`, `${origin}/api/v1/stale-write`]);
-  // Hold the real reload's document request after the runtime's durable commit.
-  // Closing the page here kills its runtime and releases its Web Lock without
-  // letting a new document boot or recover anything in the original page.
   let reachedReload!: () => void;
   const reloadRequested = new Promise<void>(resolve => { reachedReload = resolve; });
   let releaseReload!: () => void;
@@ -271,7 +259,7 @@ test('page death after commit retains recovery and discards stale HTTP work befo
   await page.route(`${origin}/`, async route => {
     reachedReload();
     await released;
-    await route.abort().catch(() => {}); // the page may already be gone
+    await route.abort().catch(() => {});
   });
   await page.evaluate(() => {
     void restore.acceptRestoreHello(restore.beginRestoreConnection(), 'restored-generation');
@@ -333,9 +321,6 @@ for (const previous of [null, '00000000-0000-4000-8000-000000000001']) {
     });
     const firstWrite = page.waitForRequest(`${origin}/api/v1/fenced-retry`);
     await page.evaluate(async ({ previous, current }) => {
-      // A durable observation may predate this page's first stream hello.
-      // Keep invocations alive in this document to prove the generation guard
-      // rejects them, rather than letting navigation cancel their promises.
       await restore.createRestoreGenerationStore(null, 'earlier-page').observe(current);
       restore.observeSourceGeneration(previous);
       const results: Array<{ kind: string; code: number }> = [];

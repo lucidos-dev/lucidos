@@ -54,7 +54,7 @@ impl ActorField {
     /// row cannot wedge the trigger registry.
     pub(crate) fn from_stored(field: Option<&Value>, trigger_id: &str) -> Option<Self> {
         Self::parse(field).unwrap_or_else(|e| {
-            log!("[Triggers] Ignored actor on trigger {trigger_id}: {e}");
+            log_legacy!("[Triggers] Ignored actor on trigger {trigger_id}: {e}");
             None
         })
     }

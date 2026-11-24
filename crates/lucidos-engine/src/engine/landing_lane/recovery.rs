@@ -7,11 +7,19 @@
 
 use super::state::{Lane, Place, ResolvingBatch};
 use super::LaneMember;
+use crate::engine::thread_events::MessageOrigin;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BatchFailure {
+    pub(super) batch_id: Uuid,
+    pub(super) reason: String,
+    pub(super) actor: Option<MessageOrigin>,
+}
+
 /// One event the lane's state depends on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LaneRecord {
     Queued(LaneMember),
     Unqueued(Uuid),
@@ -23,18 +31,41 @@ pub(crate) enum LaneRecord {
         members: Vec<LaneMember>,
     },
     BatchEnded(Uuid),
+    BatchFailureRequested(BatchFailure),
+    /// `LaneArrivalsHeld`, `age_secs` before the read.
+    ArrivalsHeld {
+        batch_id: Uuid,
+        age_secs: u64,
+    },
+    ArrivalsReleased(Uuid),
 }
 
-/// Fold `records`, oldest first, into the lane they describe.
+/// Fold `records`, oldest first, into the lane they describe. While a hold
+/// is open, every `ChangeQueued` is an arrival it held: nothing else queues
+/// a change then.
 pub(crate) fn fold(records: &[LaneRecord], is_pending: impl Fn(Uuid) -> bool) -> Lane {
     let mut lane = Lane::default();
+    let mut queued = HashMap::new();
     for record in records {
         match record {
-            LaneRecord::Queued(member) => lane.wait(member.clone()),
+            LaneRecord::Queued(member) => {
+                queued.insert(member.change_id, member);
+                lane.hold(member.clone());
+            }
+            LaneRecord::ArrivalsHeld { batch_id, .. } => {
+                lane.hold_arrivals(*batch_id);
+            }
+            LaneRecord::ArrivalsReleased(batch_id) => {
+                lane.release_arrivals(*batch_id);
+            }
             LaneRecord::Unqueued(id) => {
+                queued.remove(id);
                 lane.unqueue(*id);
             }
-            LaneRecord::Applied(id) => lane.landed(*id),
+            LaneRecord::Applied(id) => {
+                queued.remove(id);
+                lane.landed(*id);
+            }
             LaneRecord::BatchStarted {
                 batch_id,
                 base_sha,
@@ -46,8 +77,15 @@ pub(crate) fn fold(records: &[LaneRecord], is_pending: impl Fn(Uuid) -> bool) ->
                 *lane_thread_id,
                 members.clone(),
             )),
+            LaneRecord::BatchFailureRequested(_) => {}
             LaneRecord::BatchEnded(batch_id) => {
-                lane.end_batch(*batch_id);
+                if let Some(batch) = lane.end_batch(*batch_id) {
+                    for member in batch.members().filter(|m| m.remote.is_some()) {
+                        if let Some(source) = queued.get(&member.change_id) {
+                            lane.wait((*source).clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -57,22 +95,46 @@ pub(crate) fn fold(records: &[LaneRecord], is_pending: impl Fn(Uuid) -> bool) ->
 
 /// What recovery hands the driver: the lane, every batch this workspace
 /// opened, open or closed, and the members a failed batch left queued.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct LaneRestore {
     pub(crate) lane: Lane,
+    pub(super) remote_failure: Option<BatchFailure>,
     /// Only these batches' lane worktrees are this workspace's to retire.
     pub(crate) opened_here: HashSet<Uuid>,
     /// Pending changes whose latest lane event queued them, yet the lane
     /// holds them nowhere. A crash between `LaneBatchFailed` and a member's
     /// `ChangeUnqueued` leaves one.
     pub(crate) stranded: Vec<Uuid>,
+    /// How long ago the lane's open arrival hold began, so its cap counts
+    /// from then.
+    pub(crate) hold_age_secs: Option<u64>,
 }
 
 impl LaneRestore {
     pub(crate) fn of(records: &[LaneRecord], is_pending: impl Fn(Uuid) -> bool) -> Self {
         let lane = fold(records, &is_pending);
         let stranded = stranded(records, &lane, &is_pending);
+        let hold_age_secs = lane.arrival_hold().and_then(|hold| {
+            records.iter().rev().find_map(|record| match record {
+                LaneRecord::ArrivalsHeld { batch_id, age_secs } if *batch_id == hold.batch_id => {
+                    Some(*age_secs)
+                }
+                _ => None,
+            })
+        });
+        let remote_failure = lane.resolving().and_then(|batch| {
+            records.iter().rev().find_map(|record| match record {
+                LaneRecord::BatchFailureRequested(failure)
+                    if failure.batch_id == batch.batch_id =>
+                {
+                    Some(failure.clone())
+                }
+                _ => None,
+            })
+        });
         Self {
+            remote_failure,
+            hold_age_secs,
             lane,
             opened_here: records
                 .iter()
@@ -95,7 +157,11 @@ fn stranded(records: &[LaneRecord], lane: &Lane, is_pending: impl Fn(Uuid) -> bo
         let (change_id, is_queued) = match record {
             LaneRecord::Queued(member) => (member.change_id, true),
             LaneRecord::Unqueued(id) | LaneRecord::Applied(id) => (*id, false),
-            LaneRecord::BatchStarted { .. } | LaneRecord::BatchEnded(_) => continue,
+            LaneRecord::BatchStarted { .. }
+            | LaneRecord::BatchEnded(_)
+            | LaneRecord::BatchFailureRequested(_)
+            | LaneRecord::ArrivalsHeld { .. }
+            | LaneRecord::ArrivalsReleased(_) => continue,
         };
         if queued.insert(change_id, is_queued).is_none() {
             order.push(change_id);
@@ -156,6 +222,7 @@ mod tests {
         LaneMember {
             change_id: Uuid::from_bytes([n; 16]),
             snapshot_sha: format!("snap{n}"),
+            remote: None,
         }
     }
 
@@ -222,6 +289,23 @@ mod tests {
                 "resolving after step {cut}"
             );
         }
+    }
+
+    #[test]
+    fn an_open_batch_recovers_a_remote_member_without_a_local_row() {
+        let mut remote = member(2);
+        remote.remote = Some(
+            crate::engine::thread_events::landing_lane::RemoteLaneSource {
+                oid: "queue-object".into(),
+                title: "Remote change".into(),
+                summary: "From another host".into(),
+                branch: "remote-change".into(),
+                gateway: None,
+            },
+        );
+        let restored = LaneRestore::of(&[started(vec![remote.clone()])], |_| false);
+        let batch = restored.lane.resolving().unwrap();
+        assert_eq!(batch.unlanded().collect::<Vec<_>>(), vec![&remote]);
     }
 
     /// Killed at batch open: the batch is back, with its lane thread, and
@@ -364,6 +448,68 @@ mod tests {
         assert_eq!(LaneRestore::of(&history, all_pending).stranded, vec![id(1)]);
         let gone = LaneRestore::of(&history, |change| change != id(1));
         assert!(gone.stranded.is_empty(), "no longer pending, so not queued");
+    }
+
+    fn held(age_secs: u64) -> LaneRecord {
+        LaneRecord::ArrivalsHeld {
+            batch_id: BATCH,
+            age_secs,
+        }
+    }
+
+    /// I11: killed during a hold, the restart holds the same arrivals in
+    /// arrival order, apart from what waited before it, and knows its age.
+    #[test]
+    fn a_restart_during_a_hold_rebuilds_its_arrivals_in_order() {
+        let history = [
+            started(vec![member(1)]),
+            LaneRecord::Queued(member(2)),
+            held(120),
+            LaneRecord::Queued(member(3)),
+            LaneRecord::Queued(member(4)),
+        ];
+        let restore = LaneRestore::of(&history, all_pending);
+        let hold = restore.lane.arrival_hold().expect("the hold survives");
+        assert_eq!(hold.batch_id, BATCH);
+        assert_eq!(hold.arrivals(), &[id(3), id(4)]);
+        assert_eq!(restore.lane.waiting(), &[member(2), member(3), member(4)]);
+        assert_eq!(restore.hold_age_secs, Some(120));
+        assert!(restore.stranded.is_empty());
+    }
+
+    /// A released hold, or one whose batch ended before the release was
+    /// written, comes back closed. Its arrivals still wait, in order.
+    #[test]
+    fn a_released_or_ended_hold_is_not_rebuilt() {
+        let base = [
+            started(vec![member(1)]),
+            held(5),
+            LaneRecord::Queued(member(2)),
+        ];
+        for end in [
+            LaneRecord::ArrivalsReleased(BATCH),
+            LaneRecord::BatchEnded(BATCH),
+        ] {
+            let mut history = base.to_vec();
+            history.push(end.clone());
+            let restore = LaneRestore::of(&history, all_pending);
+            assert!(restore.lane.arrival_hold().is_none(), "after {end:?}");
+            assert_eq!(restore.hold_age_secs, None);
+            assert_eq!(restore.lane.waiting(), &[member(2)]);
+        }
+    }
+
+    /// A held arrival discarded or applied elsewhere leaves the hold too.
+    #[test]
+    fn a_held_arrival_no_longer_pending_leaves_the_hold() {
+        let history = [
+            started(vec![member(1)]),
+            held(5),
+            LaneRecord::Queued(member(2)),
+            LaneRecord::Queued(member(3)),
+        ];
+        let lane = fold(&history, |change| change != id(2));
+        assert_eq!(lane.arrival_hold().unwrap().arrivals(), &[id(3)]);
     }
 
     /// A failed batch's members come back neither queued nor resolving.

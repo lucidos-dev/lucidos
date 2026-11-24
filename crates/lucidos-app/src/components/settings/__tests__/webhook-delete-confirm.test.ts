@@ -48,8 +48,6 @@ describe('deleting a webhook asks first', () => {
     void confirmWebhookDeletion(hook());
     const [question, consequence] = confirmState.value.message.split('\n\n');
     expect(question).toBe('Delete the webhook "deploys"?');
-    // The path carries the hook's id, so a replacement is a different URL
-    // rather than this one restored. That is the part a sender pays for.
     expect(consequence).toContain('stops answering');
     expect(consequence).toContain('different path');
     confirmState.value.resolve?.(false);

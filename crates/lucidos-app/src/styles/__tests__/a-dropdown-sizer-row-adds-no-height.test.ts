@@ -1,21 +1,3 @@
-/**
- * A dropdown's hidden option labels measure width, never height.
- *
- * `.dropdown-sizer` stacks every option label in one grid cell. The trigger is
- * then as wide as the widest of them, and never resizes on a pick. A grid cell
- * is as TALL as its tallest item too, and that is the trap. A label the UI font
- * cannot draw falls back to a font with taller metrics, and raises the whole
- * control.
- *
- * The compose destination picker draws one: its "Register a repository" row
- * opens with a fullwidth plus, which Fira Code has no glyph for. So the picker
- * stood taller than the coding-agent chip beside it. Measured in Chromium
- * against these sheets: 34px beside 31px before the fix, 31px beside 31px
- * after, with the trigger's width unchanged either way.
- *
- * A source scan, because what it pins is a pair of declarations. Only a browser
- * lays out the fallback glyph they defend against.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -29,7 +11,6 @@ import { cssRules, selectorList, styleSheetPaths, type CssRule } from './css-rul
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesRoot: string = resolve(here, '..');
 
-/** Every rule in every sheet that styles a child of `.dropdown-sizer`. */
 function sizerChildRules(): CssRule[] {
   const out: CssRule[] = [];
   for (const path of styleSheetPaths(stylesRoot)) {
@@ -40,7 +21,6 @@ function sizerChildRules(): CssRule[] {
   return out;
 }
 
-/** Rules that reach the hidden rows alone, leaving the shown one out. */
 function hiddenRowRules(): CssRule[] {
   return sizerChildRules().filter(r =>
     selectorList(r.selector).every(one => one.includes(':not(:first-child)')));

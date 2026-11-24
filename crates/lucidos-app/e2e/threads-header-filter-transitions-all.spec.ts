@@ -3,64 +3,39 @@ import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer, isMobileViewport } from './helpers';
 import { clearAllThreads, psql, seedThreadRow } from './db-helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-// The threads Filter's fades. Every swap of what the drawer shows dips through
-// the pane background: the navigation cover rises over the leaving view, holds
-// while the views swap, and clears off the arriving one. That covers the list to
-// Filters and back, and a grouping change from the header's grouping button.
-// The pane title switches word at once, with no fade. The Filter
-// button's glyph is button feedback, on --duration-fast. Under Ongoing the
-// button fades out in a slot that keeps its box, so nothing beside it moves.
-// Unsuffixed, so it runs on desktop Chromium, phone Chromium and iPhone WebKit.
-//
-// Most tests slow every animation tenfold through the Animation speed slider,
-// so each fade spans about 90 to 120 frames and a sampled frame lands mid-fade.
 
-/** The slider's slowest position: 0.1x, so --duration-slow lasts 3s. */
 const SLOWEST = '-10';
-/** A slowed dip, plus its fuse and room for the frame it lands on. */
 const SLOW_FADE_MS = 3_600;
-/** Two frames: a CI runner's WebKit frame lands about 20ms after the last. */
 const WEBKIT_FRESH_ELEMENT_LATE_START_MS = 45;
 
 interface Frame {
-  /** The navigation cover's opacity, or -1 once it has unmounted. */
   veil: number;
   coverVisible: boolean;
   panel: boolean;
   panelVisible: boolean;
   listVisible: boolean;
-  /** The drawing of the leaving list a grouping change holds over the pane. */
   drawing: boolean;
   drawingVisible: boolean;
-  /** Count pills in the drawing still painted: one that sets its own
-   *  `visibility: visible` beats a hidden drawing unless its opacity is 0. */
   drawingBadges: number;
   drawingText: string;
   glyph: Record<string, number>;
   titleText: string;
   titleOpacity: number;
-  /** The Filter button's slot: shown under Folders, faded out under Ongoing. */
   slotShown: boolean;
   slotWidth: number;
   slotOpacity: number;
-  /** Search's x: the Filter button must never move it. */
   searchX: number;
 }
 
-/** The layout's own copies: the page mounts both header rows, one hidden. */
 function selectors(page: Page) {
   const s = isMobileViewport(page)
     ? { header: '.mobile-threads-header', title: '.mobile-header-title', drawer: '.mobile-threads-pane .thread-drawer' }
     : { header: '.desktop-header .threads-header', title: '.threads-header-title', drawer: '.thread-drawer' };
-  // The list and the layers over it: the filter cover, the drawing and the veil.
   return { ...s, body: `${s.drawer} > .thread-drawer-body` };
 }
 
-/** Installs `window.__fx`, which reads one frame and samples many. It runs in
- *  the page, so a click and the frames after it share one clock. */
 async function installProbe(page: Page): Promise<void> {
   await page.addInitScript((sel) => {
     const q = (s: string) => document.querySelector(s) as HTMLElement | null;
@@ -114,7 +89,6 @@ async function installProbe(page: Page): Promise<void> {
         }
         return frames;
       },
-      /** Waits frame by frame until `pred` holds, at most `ms`. */
       async until(pred: (f: ReturnType<typeof fx.read>) => boolean, ms = 5_000) {
         const end = performance.now() + ms;
         while (performance.now() < end) {
@@ -124,14 +98,12 @@ async function installProbe(page: Page): Promise<void> {
         return false;
       },
       toggle: () => fx.button()!.click(),
-      /** Press the header's grouping button, which offers `grouping`. */
       pickGrouping(grouping: 'folders' | 'ongoing') {
         const offer = grouping === 'ongoing' ? 'Show Ongoing' : 'Show Folders';
         const button = q(`${sel.header} .grouping-btn`);
         if (!button?.getAttribute('aria-label')?.startsWith(offer)) throw new Error(`the grouping button does not offer ${grouping}`);
         button.click();
       },
-      /** A row in the panel, by its visible label. */
       clickPanelRow(label: string) {
         const rows = Array.from(fx.cover()!.querySelectorAll<HTMLElement>('.thread-filter-option'));
         const row = rows.find(r => !r.classList.contains('thread-filter-option-child')
@@ -146,18 +118,15 @@ async function installProbe(page: Page): Promise<void> {
 
 async function open(page: Page, { slow = true, grouping }: { slow?: boolean; grouping?: 'ongoing' } = {}): Promise<void> {
   await installProbe(page);
-  // Folders is the default, stored as no key at all.
   if (grouping) await page.addInitScript((g) => localStorage.setItem('lucidos-drawer-grouping', g), grouping);
   if (slow) {
     await page.addInitScript((pos) => localStorage.setItem('lucidos-animation-speed-slider', pos), SLOWEST);
   }
   await navigateToApp(page);
   await openThreadDrawer(page);
-  // Keep the pointer off the header, so no hover veil reads as a state.
   await page.mouse.move(1, 700);
 }
 
-/** Frames strictly inside a fade, not at either end. */
 const mid = (v: number) => v > 0.05 && v < 0.95;
 
 test.describe('Threads Filter fades', () => {
@@ -185,16 +154,13 @@ test.describe('Threads Filter fades', () => {
       for (const [i, f] of frames.entries()) {
         expect(f.listVisible && f.panelVisible, `${phase} frame ${i}: rows and options drawn together`).toBe(false);
       }
-      // It starts over the leaving view, from transparent.
       expect(shows(frames[0]), `${phase}: the leaving view went before the dip`).toBe(leaving);
       expect(frames[0].veil, `${phase}: the cover started opaque`).toBeLessThan(0.2);
-      // One swap, and it lands under an opaque cover.
       const swap = frames.findIndex(f => shows(f) === arriving);
       expect(swap, `${phase}: the arriving view never showed`).toBeGreaterThan(0);
       expect(frames.slice(swap).every(f => shows(f) === arriving), `${phase}: the views swapped back`).toBe(true);
       expect(frames[swap - 1].veil, `${phase}: the leaving view went under a thin cover`).toBeGreaterThan(0.9);
       expect(frames[swap].veil, `${phase}: the arriving view showed under a thin cover`).toBeGreaterThan(0.9);
-      // The cover rises steadily, then falls steadily, then unmounts.
       const rising = frames.slice(0, swap);
       const falling = frames.slice(swap).filter(f => f.veil >= 0);
       expect(rising.filter(f => mid(f.veil)).length, `${phase}: the leaving view never faded out`).toBeGreaterThan(5);
@@ -206,7 +172,6 @@ test.describe('Threads Filter fades', () => {
         expect(falling[i].veil, `${phase} frame ${swap + i}: the cover rose after the swap`).toBeLessThanOrEqual(falling[i - 1].veil + 0.01);
       }
       expect(frames.at(-1)!.veil, `${phase}: the cover outlived its fuse`).toBe(-1);
-      // The title does not fade: it says the arriving view from the first frame.
       const word = arriving === 'threads' ? 'Folders' : 'Filters';
       for (const [i, f] of frames.entries()) {
         expect(f.titleText, `${phase} frame ${i}: the title lagged the tap`).toBe(word);
@@ -216,7 +181,6 @@ test.describe('Threads Filter fades', () => {
 
     dips(opening, 'open', 'threads');
     dips(closing, 'close', 'filters');
-    // Kept mounted, so the next open costs no render.
     expect(closing.at(-1)!.panel, 'the panel was unmounted').toBe(true);
   });
 
@@ -252,7 +216,6 @@ test.describe('Threads Filter fades', () => {
       fx.toggle();
       await fx.until((f: Frame) => f.veil === -1);
       fx.toggle();
-      // Mid-dip, while the leaving panel is still on screen.
       await fx.until((f: Frame) => f.veil > 0.3);
       const cover = fx.cover() as HTMLElement;
       const box = cover.getBoundingClientRect();
@@ -277,7 +240,6 @@ test.describe('Threads Filter fades', () => {
     const result = await page.evaluate(async () => {
       const fx = (window as unknown as { __fx: any }).__fx;
       fx.toggle();
-      // Mid-dip, while the leaving list is still on screen.
       await fx.until((f: Frame) => f.veil > 0.3 && f.listVisible);
       const list = fx.cover().parentElement.querySelector('.thread-drawer-list') as HTMLElement;
       const box = list.getBoundingClientRect();
@@ -303,7 +265,6 @@ test.describe('Threads Filter fades', () => {
     };
 
     await run('toggle');
-    // Untick Lucidos: thread types now narrow the list, so the funnel fills.
     let frames = await run('Lucidos');
     expect(crossfaded(frames, 'all', 'filtered'), 'outline to solid did not fade').toBe(true);
     settledOn(frames, 'filtered');
@@ -312,9 +273,6 @@ test.describe('Threads Filter fades', () => {
     settledOn(frames, 'all');
   });
 
-  // A grouping change replaces the list. It must play the dip a panel swap
-  // plays: the leaving list stays on screen (as a drawing) until the midpoint,
-  // and the arriving list shows only under the opaque cover.
   const groupingCases = [
     { name: 'Folders to Ongoing', from: undefined, to: 'ongoing', leavingText: 'grouping-dip' },
     { name: 'Ongoing to Folders', from: 'ongoing', to: 'folders', leavingText: 'Blocked' },
@@ -324,7 +282,6 @@ test.describe('Threads Filter fades', () => {
       psql(seedThreadRow({ id: randomUUID(), title: 'grouping-dip', now: new Date().toISOString(), status: 'failed', archiveState: 'inbox' }));
       await open(page, { grouping: c.from });
       const { drawer } = selectors(page);
-      // The leaving list is on screen, with something in it to draw.
       await expect(page.locator(c.from === 'ongoing' ? `${drawer} .ongoing-grouping` : `${drawer} .thread-row`, { hasText: c.leavingText }).first())
         .toBeVisible();
       const frames = await page.evaluate(async ({ ms, to }) => {
@@ -336,27 +293,21 @@ test.describe('Threads Filter fades', () => {
       const shows = (f: Frame) => (f.drawingVisible ? 'leaving' : 'arriving');
       for (const [i, f] of frames.entries()) {
         expect(f.panelVisible, `frame ${i}: the panel showed`).toBe(false);
-        // The title names the arriving grouping from the first frame.
         expect(f.titleText, `frame ${i}: the title lagged the tap`).toBe(c.to === 'ongoing' ? 'Ongoing' : 'Folders');
         expect(f.titleOpacity, `frame ${i}: the title faded`).toBe(1);
-        // The grouping moves no glyph: the type filter is what fills the funnel.
         expect(f.glyph.all, `frame ${i}: the glyph moved`).toBe(1);
       }
-      // It starts over the leaving list, drawn as it was, under a clear cover.
       expect(shows(frames[0]), 'the leaving list went before the dip').toBe('leaving');
       expect(frames[0].drawingText, 'the drawing is not the leaving list').toContain(c.leavingText);
       expect(frames[0].veil, 'the cover started opaque').toBeLessThan(0.2);
-      // One swap, under an opaque cover.
       const swap = frames.findIndex(f => shows(f) === 'arriving');
       expect(swap, 'the arriving list never showed').toBeGreaterThan(0);
       expect(frames.slice(swap).every(f => shows(f) === 'arriving'), 'the drawing came back').toBe(true);
-      // Nothing in the drawing outlives the midpoint, a collapsed count included.
       for (const [i, f] of frames.slice(swap).entries()) {
         expect(f.drawingBadges, `frame ${swap + i}: a count in the drawing stayed on screen`).toBe(0);
       }
       expect(frames[swap - 1].veil, 'the leaving list went under a thin cover').toBeGreaterThan(0.9);
       expect(frames[swap].veil, 'the arriving list showed under a thin cover').toBeGreaterThan(0.9);
-      // The same shape as a panel swap: rise, hold, fall, unmount.
       const rising = frames.slice(0, swap);
       const falling = frames.slice(swap).filter(f => f.veil >= 0);
       expect(rising.filter(f => mid(f.veil)).length, 'the leaving list never faded out').toBeGreaterThan(5);
@@ -386,7 +337,6 @@ test.describe('Threads Filter fades', () => {
       const drawing = fx.drawing() as HTMLElement;
       const list = fx.cover().parentElement.querySelector('.thread-drawer-list') as HTMLElement;
       const box = drawing.getBoundingClientRect();
-      // Aim at the drawn row too: a live row stood there a moment ago.
       const drawnRow = Array.from(drawing.querySelectorAll<HTMLElement>('.thread-row'))
         .find(r => (r.textContent ?? '').includes('grouping-tap'))!.getBoundingClientRect();
       const points = [[box.left + box.width / 2, box.top + box.height / 2], [drawnRow.left + drawnRow.width / 2, drawnRow.top + drawnRow.height / 2]];
@@ -405,7 +355,6 @@ test.describe('Threads Filter fades', () => {
   });
 
   test('opening the panel mid-dip holds the drawing to the new midpoint, with no flash', async ({ page }) => {
-    // The panel opens under Folders only, so the dip starts from Ongoing.
     await open(page, { grouping: 'ongoing' });
     const result = await page.evaluate(async (ms) => {
       const fx = (window as unknown as { __fx: any }).__fx;
@@ -433,9 +382,6 @@ test.describe('Threads Filter fades', () => {
       fx.pickGrouping('ongoing');
       await new Promise(r => requestAnimationFrame(r));
       await new Promise(r => requestAnimationFrame(r));
-      // "At once" is the slot's transition length, not a frame count. A
-      // stalled animation clock can leave even a 0.3ms fade unfinished two
-      // frames on, as it does after drawer-grouping-all.spec.ts in one run.
       const anims = fx.button()?.closest('.filter-slot')?.getAnimations() ?? [];
       const slotMs = Math.max(0, ...anims.map((a: Animation) => Number(a.effect?.getComputedTiming().duration ?? 0)));
       await Promise.all(anims.map((a: Animation) => a.finished));
@@ -467,7 +413,6 @@ test.describe('Threads Filter fades', () => {
     for (const [phase, frames] of [['leave', leaving], ['return', returning]] as const) {
       for (const [i, f] of frames.entries()) {
         expect(f.slotShown, `${phase} frame ${i}: the slot lagged the pick`).toBe(phase === 'return');
-        // Nothing moves: the slot keeps its box, and Search stays put.
         expect(Math.abs(f.slotWidth - before.slotWidth), `${phase} frame ${i}: the slot changed width`).toBeLessThan(0.5);
         expect(Math.abs(f.searchX - before.searchX), `${phase} frame ${i}: Search moved`).toBeLessThan(0.5);
       }
@@ -491,7 +436,6 @@ test.describe('Threads Filter fades', () => {
     expect(resting.shapes.length).toBeGreaterThan(1);
     for (const c of resting.shapes) expect(c, 'a shape inside the stack is translucent').toBe('rgb(255, 255, 255)');
 
-    // Pressed, it paints opaque like any pressed header icon.
     await button.click();
     await page.mouse.move(1, 700);
     await expect.poll(async () => (await read()).wrapper).toBe('1');
@@ -529,10 +473,6 @@ test.describe('Threads Filter fades', () => {
       return { opening, closing };
     });
 
-    // The button's fades run on elements that stay mounted, so they share a
-    // frame everywhere. The cover is a fresh element, and WebKit can start its
-    // animation a frame or two late (ADR 0291). It rests transparent, so a late
-    // start only holds the leaving view a little longer. It must never lead.
     const coverMayTrailMs = browserName === 'webkit' ? WEBKIT_FRESH_ELEMENT_LATE_START_MS : 1;
     for (const [phase, list] of Object.entries(starts)) {
       const names = list.map(a => a.what).join(' | ');
@@ -562,7 +502,6 @@ test.describe('Threads Filter fades', () => {
       const opened = fx.read();
       const button = fx.button() as HTMLElement;
       const durations = {
-        // The swap is a 0s transition, so its delay is what reduced motion drops.
         swap: seconds(fx.cover(), 'transitionDelay'),
         glyph: seconds(button.querySelector('.crossfade-glyph .crossfade-layer')),
         wrapper: seconds(button.querySelector('.crossfade-glyph')),

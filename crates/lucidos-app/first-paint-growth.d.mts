@@ -1,4 +1,3 @@
-/** Types for `first-paint-growth.mjs`, so its tests need no suppression. */
 
 export interface FirstPaintReport {
   entryBytes: number;

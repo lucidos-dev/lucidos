@@ -4,7 +4,6 @@ import { makeTrigger } from './__tests__/fixtures';
 
 describe('hasNoMoreRuns', () => {
   it('is true for an active schedule-only trigger with nothing upcoming', () => {
-    // A one-shot that already fired: its cron matched a single past moment.
     expect(hasNoMoreRuns(makeTrigger({ cron_expressions: ['0 0 9 4 8 *'] }))).toBe(true);
   });
 
@@ -13,7 +12,6 @@ describe('hasNoMoreRuns', () => {
   });
 
   it('is false for a paused trigger', () => {
-    // Paused reads as "Paused", not "No more runs": resuming brings it back.
     expect(hasNoMoreRuns(makeTrigger({ paused: true }))).toBe(false);
   });
 
@@ -22,8 +20,6 @@ describe('hasNoMoreRuns', () => {
   });
 
   it('is false when the schedule can never fire, so the error chip wins', () => {
-    // Both states have no next_run, but they mean opposite things: a spent
-    // one-shot did its job, a never-firing cron never worked at all.
     const dead = makeTrigger({
       cron_expressions: ['0 0 9 31 2 *'],
       schedule_error:

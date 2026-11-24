@@ -707,46 +707,46 @@ fn partition_chat_thread_ids_keeps_chat_threads() {
 
 // --- urgent follow-up redirect (the Lucidos Agent lane) --------------------
 
-/// The redirect flag starts clear, so an ordinary Stop keeps meaning
-/// `UserStop`. Only `cancel_thread_for_followup` sets it.
+/// The cancel cause starts empty, so an ordinary Stop keeps meaning
+/// `UserStop`. Only a redirect or a Hold sets it.
 #[test]
-fn redirect_followup_starts_clear() {
+fn cancel_cause_starts_empty() {
     let threads = make_threads();
     let tid = Uuid::new_v4();
     let (_token, _rx, _guard) = register(&threads, tid);
 
-    let handle_flag = {
+    let cause = {
         let map = threads.lock().unwrap();
-        map.get(&tid).unwrap().redirect_followup.clone()
+        map.get(&tid).unwrap().cancel_cause.clone()
     };
     assert!(
-        !handle_flag.load(Ordering::Acquire),
+        cause.lock().unwrap().is_none(),
         "a fresh turn must not look like a redirect: that would relabel a real Stop"
     );
 }
 
-/// Drained on read, exactly like `cancel_actor`. A flag left set would relabel
-/// the NEXT turn's Stop on the same thread as a redirect, which would then be
+/// Drained on read, exactly like `cancel_actor`. A cause left set would
+/// relabel the NEXT turn's Stop on the same thread, which would then be
 /// withheld from the parent as a non-terminal outcome and leave the parent
 /// waiting on a child that had stopped.
 #[test]
-fn redirect_followup_is_drained_on_read() {
+fn cancel_cause_is_drained_on_read() {
     let threads = make_threads();
     let tid = Uuid::new_v4();
     let (_token, _rx, _guard) = register(&threads, tid);
 
-    let flag = {
+    let cause = {
         let map = threads.lock().unwrap();
-        map.get(&tid).unwrap().redirect_followup.clone()
+        map.get(&tid).unwrap().cancel_cause.clone()
     };
-    flag.store(true, Ordering::Release);
+    *cause.lock().unwrap() = Some(crate::engine::thread_events::CancelCause::SupersededByFollowup);
 
     assert!(
-        flag.swap(false, Ordering::AcqRel),
+        cause.lock().unwrap().take().is_some(),
         "the first read sees the redirect"
     );
     assert!(
-        !flag.swap(false, Ordering::AcqRel),
-        "the second read must not: a stale flag would relabel the next turn"
+        cause.lock().unwrap().take().is_none(),
+        "the second read must not: a stale cause would relabel the next turn"
     );
 }

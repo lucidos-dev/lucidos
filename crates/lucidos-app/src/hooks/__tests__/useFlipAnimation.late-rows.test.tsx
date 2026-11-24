@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The drawer windows its rows, so a row off screen stands in a gap. Collapsing
- * Current lifts Archive into view, and its rows mount one commit later, after
- * the FLIP pass has run. They must move with the header above them, not
- * appear at their final place over the rows still rolling away.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
@@ -14,7 +8,6 @@ import { useFlipTransitions, type FlipSection } from '../useFlipAnimation';
 const ROW_HEIGHT = 50;
 const CURRENT = ['c1', 'c2', 'c3'];
 const ARCHIVE = ['x', 'y'];
-/** What the fake timeline reads when the batch's first frame starts it. */
 const FIRST_FRAME = 1234;
 
 interface FakeAnimation {
@@ -27,7 +20,6 @@ interface FakeAnimation {
 
 let host: HTMLElement;
 let animations: FakeAnimation[];
-/** The archived rows the row window has mounted. */
 const mountedArchive = signal<string[]>([]);
 
 function ArchiveRows() {
@@ -57,7 +49,6 @@ function Drawer({ collapsed = false, current = CURRENT, archive = ARCHIVE, reset
     );
 }
 
-/** A row sits at its index in the list. Anything else has no box. */
 function rowRect(this: HTMLElement): DOMRect {
     const id = this.dataset.flipId;
     const rows = id && this.parentElement ? [...this.parentElement.querySelectorAll<HTMLElement>('[data-flip-id]')] : [];
@@ -94,7 +85,6 @@ function rowOf(id: string): HTMLElement {
     return host.querySelector<HTMLElement>(`[data-flip-id="${id}"]`)!;
 }
 
-/** The animations run on the row itself, never on a copy of it. */
 function animationsOn(id: string): FakeAnimation[] {
     const row = rowOf(id);
     return animations.filter(a => a.target === row);
@@ -134,7 +124,6 @@ describe('rows that mount a commit after the FLIP pass', () => {
         const header = keyframesOf('__section_archive');
         expect(header, 'the Archive header slides up').toHaveLength(1);
 
-        // The row window mounts the archived rows in its own follow-up commit.
         mountedArchive.value = ARCHIVE;
         await settle();
 
@@ -188,7 +177,6 @@ describe('rows that mount a commit after the FLIP pass', () => {
         render(<Drawer />, host);
         await settle();
 
-        // c1 is archived. The row window brings its new row into view a commit later.
         render(<Drawer current={['c2', 'c3']} archive={['c1', ...ARCHIVE]} />, host);
         mountedArchive.value = ['c1', ...ARCHIVE];
         await settle();

@@ -1,8 +1,3 @@
-/**
- * The hand-written TS copies of the coding-agent change state agree with the
- * types generated from the engine (ADR 0400): the app's own union, and the
- * SDK's standalone one. The pins are types, so `tsc` is what fails on a drift.
- */
 import { describe, it, expect } from 'vitest';
 import type { CodingAgentChangeState } from './threads';
 import type { ChangeStateKind } from '../generated/thread-lifecycle';

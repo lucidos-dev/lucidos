@@ -27,6 +27,7 @@ use tauri::Manager;
 /// How long the desk must sit still before the pass runs. Long enough to
 /// swallow one reconfiguration's burst, short enough that nobody sits looking
 /// at a window hanging off the edge.
+#[cfg(any(target_os = "macos", test))]
 const DESK_SETTLE: Duration = Duration::from_millis(500);
 
 /// How often the pass thread wakes to ask whether the desk has gone quiet.
@@ -39,6 +40,7 @@ const DESK_POLL: Duration = Duration::from_millis(250);
 static PASS_DUE_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// The desk changed, so a pass is owed and the quiet period starts again.
+#[cfg(target_os = "macos")]
 fn note_desk_changed() {
     *PASS_DUE_AT.lock().unwrap() = Some(Instant::now() + DESK_SETTLE);
 }

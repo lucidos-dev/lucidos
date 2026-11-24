@@ -12,9 +12,9 @@ fn walk(running: &Version, facts: &NoticeFacts, cursor: Option<&str>) -> Vec<Str
     let notices = parse(RELEASE_NOTICES_TOML).unwrap();
     let mut cursor = cursor.map(str::to_string);
     let mut walked = Vec::new();
-    while let Some(next) = owed(&notices, running, facts, cursor.as_deref()) {
+    while let Some(next) = owed(&notices, running, facts, cursor.as_deref()).next() {
         let id = next.id.clone();
-        cursor = advanced_cursor(&notices, running, facts, cursor.as_deref(), &id);
+        cursor = advanced_cursor(&notices, running, facts, cursor.as_deref(), &id, None);
         assert_eq!(cursor.as_deref(), Some(id.as_str()));
         walked.push(id);
     }

@@ -1,12 +1,3 @@
-/**
- * A cache miss on the repository registry is not a verdict.
- *
- * `repositories` is a projection refreshed by `Repository*` SSE, so it goes
- * stale for as long as that frame takes to arrive. `viewThreadCcDiff` used to
- * answer straight off it and toast "is not registered" for a repo that exists,
- * which `.claude/rules/frontend.md` forbids. It now re-reads the registry
- * before concluding, the way `navigateToTrigger` does.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   repositories, repoSource, repoDiff, repoPending, repoViewMode,
@@ -38,8 +29,6 @@ vi.mock('../../api/client', async (importOriginal) => {
   };
 });
 
-/** The repo the cached list is missing. The re-read is what finds it, standing
- *  in for the SSE frame that had not arrived yet. */
 const REPO = { id: 'repo-9', name: 'example-repo', path: '/repos/example-repo' };
 
 const { viewThreadCcDiff } = await import('./repositories');
@@ -70,8 +59,6 @@ describe('viewThreadCcDiff on a stale repository registry', () => {
   });
 
   it('re-reads the registry before reporting a repo as unregistered', async () => {
-    // Loaded, and missing the repo: exactly what a registration whose SSE frame
-    // has not landed yet looks like.
     repositories.value = { status: 'loaded', data: [] };
 
     await viewThreadCcDiff('thread-1');

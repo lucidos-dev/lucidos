@@ -11,9 +11,6 @@ vi.mock('./actions/cross-workspace', () => ({ openWorkspaceThreadUrl, parseWorks
 
 import { routeExternalAnchorClick } from './externalAnchorClick';
 
-/** Click inside the link, as the shell's document listener sees it. The click
- *  reports whether the router cancelled it, then is cancelled so jsdom does not
- *  try to follow the link. */
 function clickOn(href: string | null, { prevented = false } = {}): { claimed: boolean } {
   document.body.innerHTML = href === null ? '<a><b id="t">x</b></a>' : `<a href="${href}"><b id="t">x</b></a>`;
   const e = new MouseEvent('click', { bubbles: true, cancelable: true });

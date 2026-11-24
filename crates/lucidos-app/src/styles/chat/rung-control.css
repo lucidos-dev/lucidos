@@ -1,22 +1,3 @@
-/* The rung control: the prompt bar's one place to choose a model and effort.
- *
- * It is a small pill beside the round send button, and its middle opens the
- * rung list. A step at each end, ‹ and ›, walks the list one rung either
- * way.
- *
- * It sits level with the row's icons, overhanging the send button's footprint
- * equally above and below, so it never makes the row taller.
- *
- * IT NEVER RESIZES: its label has one width per face set, whatever the rung,
- * thread or room. A longer name ends in an ellipsis, and the tooltip names it
- * in full. Lack of room folds the pill into the ⋯ menu, never shortens it.
- *
- * The desktop face shows steps, name, effort and caret. The compact face (the
- * phone layout, or a composer row narrower than `COMPOSER_COMPACT_MAX_REM`, set
- * as `data-composer-compact` on the row) shows the rung's intelligence badge
- * (`1.12×`) alone, as plain text, which still opens the list and steps on ←
- * and →. A rung with no estimate, or a pair off the ladder, has no badge, so
- * it keeps its name. */
 
 .rung-control {
     --rung-height: 1.75rem;
@@ -27,7 +8,6 @@
     margin-block: calc((var(--send-round-size) - var(--rung-height)) / 2);
 }
 
-/* Keep the loading face in the same box as the selected model. */
 .rung-control[data-pending] {
     color: var(--text-muted);
 }
@@ -57,7 +37,6 @@
     overflow: hidden;
 }
 
-/* The name gives way first, so the effort stays whole beside it. */
 .rung-name {
     min-width: 0;
     overflow: hidden;
@@ -83,10 +62,7 @@
     transform: rotate(180deg);
 }
 
-/* ── The pill ── */
 
-/* The pill draws the frame, so the steps and the trigger between
- * them read as one control. Its corner matches the action slot beside it. */
 .rung-pill {
     border: 1px solid var(--border-color);
     border-radius: var(--radius-control);
@@ -129,7 +105,6 @@
     }
 }
 
-/* ── A step at each end ── */
 
 .rung-pill .rung-step {
     justify-content: center;
@@ -162,9 +137,7 @@
     }
 }
 
-/* ── The compact face: the badge alone in the frame ── */
 
-/* Round, like the compact action slot beside it. */
 [data-composer-compact] .rung-pill {
     border-radius: var(--radius-round);
 }
@@ -192,4 +165,20 @@
 .rung-pill:has(.rung-trigger[aria-disabled="true"]) .rung-intelligence {
     color: var(--text-muted);
     cursor: default;
+}
+
+.rung-next-turn {
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.rung-turn-summary {
+    padding: var(--space-md);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+.rung-turn-summary > :last-child {
+    color: var(--accent);
+    margin-top: var(--space-xs);
 }

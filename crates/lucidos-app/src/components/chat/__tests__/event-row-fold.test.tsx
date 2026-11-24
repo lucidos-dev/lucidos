@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The event row's fold rolls open through `<Disclosure>`, like every other
- * fold in the app.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

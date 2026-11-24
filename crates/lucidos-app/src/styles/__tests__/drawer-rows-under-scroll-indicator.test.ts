@@ -1,10 +1,3 @@
-/**
- * The drawer's scroll indicator stays on top of the rows. A thread row is
- * positioned. When its scroller is not a stacking context, iOS WebKit lifts
- * each such row into a layer above the scroller, over the native indicator.
- * The focused row's opaque fill then hides the thumb. No emulator splits the
- * layers that way, so the source pins the stacking context.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

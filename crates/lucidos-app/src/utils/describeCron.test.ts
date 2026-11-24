@@ -6,7 +6,6 @@ describe('describeCron', () => {
     vi.useRealTimers();
   });
 
-  // -- Frequency patterns --
 
   it('every minute', () => {
     expect(describeCron('0 * * * * *')).toBe('Every minute');
@@ -36,7 +35,6 @@ describe('describeCron', () => {
     expect(describeCron('0 0 */1 * * *')).toBe('Every hour');
   });
 
-  // -- Daily --
 
   it('daily at time', () => {
     expect(describeCron('0 0 8 * * *')).toBe('Daily at 08:00');
@@ -54,7 +52,6 @@ describe('describeCron', () => {
     expect(describeCron('0 0 12 * * *')).toBe('Daily at 12:00');
   });
 
-  // -- Weekday patterns --
 
   it('weekdays (1-5)', () => {
     expect(describeCron('0 0 8 * * 1-5')).toBe('Weekdays at 08:00');
@@ -84,7 +81,6 @@ describe('describeCron', () => {
     expect(describeCron('0 0 9 * * 1-3')).toBe('Every Monday–Wednesday at 09:00');
   });
 
-  // -- Monthly on Nth day (month is *) --
 
   it('monthly on specific day', () => {
     expect(describeCron('0 0 12 4 * *')).toBe('4th of every month at 12:00');
@@ -130,51 +126,49 @@ describe('describeCron', () => {
     expect(describeCron('0 0 8 13 * *')).toBe('13th of every month at 08:00');
   });
 
-  // -- Specific date (day + month both set) --
 
   it('specific date in the future shows current year', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 2, 3, 10, 0)); // Mar 3, 2026 10:00
+    vi.setSystemTime(new Date(2026, 2, 3, 10, 0));
     expect(describeCron('0 15 12 4 3 *')).toBe('Mar 4, 2026 at 12:15');
   });
 
   it('specific date already passed this year shows next year', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 2, 5, 10, 0)); // Mar 5, 2026 10:00
+    vi.setSystemTime(new Date(2026, 2, 5, 10, 0));
     expect(describeCron('0 15 12 4 3 *')).toBe('Mar 4, 2027 at 12:15');
   });
 
   it('specific date on the same day but time already passed shows next year', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 2, 4, 13, 0)); // Mar 4, 2026 13:00 (after 12:15)
+    vi.setSystemTime(new Date(2026, 2, 4, 13, 0));
     expect(describeCron('0 15 12 4 3 *')).toBe('Mar 4, 2027 at 12:15');
   });
 
   it('specific date on the same day before the time shows current year', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 2, 4, 11, 0)); // Mar 4, 2026 11:00 (before 12:15)
+    vi.setSystemTime(new Date(2026, 2, 4, 11, 0));
     expect(describeCron('0 15 12 4 3 *')).toBe('Mar 4, 2026 at 12:15');
   });
 
   it('specific date in a different month', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 0, 15, 10, 0)); // Jan 15, 2026
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0));
     expect(describeCron('0 0 9 25 12 *')).toBe('Dec 25, 2026 at 09:00');
   });
 
   it('specific date in a past month rolls to next year', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 5, 1, 10, 0)); // Jun 1, 2026
+    vi.setSystemTime(new Date(2026, 5, 1, 10, 0));
     expect(describeCron('0 0 9 25 1 *')).toBe('Jan 25, 2027 at 09:00');
   });
 
   it('specific date at midnight', () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 0, 1, 0, 0)); // Jan 1, 2026
+    vi.setSystemTime(new Date(2026, 0, 1, 0, 0));
     expect(describeCron('0 0 0 14 2 *')).toBe('Feb 14, 2026 at 00:00');
   });
 
-  // -- Edge cases --
 
   it('invalid field count returns raw cron', () => {
     expect(describeCron('* * * *')).toBe('* * * *');
@@ -188,9 +182,6 @@ describe('describeCron', () => {
     expect(describeCron('0 0 12 15 * 1')).toBe('15th & Monday at 12:00');
   });
 
-  // A day-of-month field naming more than one day. `parseInt` reads only the
-  // leading token, so each of these used to state a schedule the expression
-  // does not have. The raw cron is the honest answer.
 
   it('a stepped day of month falls back to the raw cron', () => {
     expect(describeCron('0 0 12 */2 * *')).toBe('0 0 12 */2 * *');
@@ -212,8 +203,6 @@ describe('describeCron', () => {
     expect(describeCron('0 0 12 */2 6 *')).toBe('0 0 12 */2 6 *');
   });
 
-  // An hour or minute field naming more than one value has the same hole: the
-  // label used to state the leading run and drop the rest.
 
   it('an hour list falls back rather than dropping every hour but the first', () => {
     expect(describeCron('0 30 9,17 * * *')).toBe('0 30 9,17 * * *');
@@ -235,8 +224,6 @@ describe('describeCron', () => {
     expect(describeCron('0 0,30 8 * * *')).toBe('0 0,30 8 * * *');
   });
 
-  // A frequency label must never state a slower schedule than the trigger
-  // runs on. Each of these used to read as a fraction of its real run count.
 
   it('a stepped seconds field falls back rather than reading "Every minute"', () => {
     expect(describeCron('*/30 * * * * *')).toBe('*/30 * * * * *');
@@ -301,7 +288,6 @@ describe('validateCron', () => {
   });
 
   it('rejects invalid syntax', () => {
-    // Letters in a numeric-only field (day-of-month)
     expect(validateCron('0 0 8 abc * *')).toContain('Invalid syntax');
   });
 });

@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The engine's browser tool runs these scripts on every page it opens, under
- * the user's logged-in browser profile. They click a cookie banner's accept
- * button. They must click nothing else: an "Accept" on an invitation, a friend
- * request or a terms page would be clicked as the user, with no approval.
- *
- * The scripts are `include_str!`d by `runtime/browser_consent.rs`, so no
- * engine test can run them. This suite runs them in jsdom, wrapped the same
- * way the engine wraps them: the shared context helper first, then the body.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -34,7 +24,6 @@ function runFrameProbe(): Record<string, unknown> {
   return JSON.parse(json as string);
 }
 
-/** Renders `html` and records which buttons receive a click. */
 function render(html: string): string[] {
   document.body.innerHTML = html;
   const clicked: string[] = [];
@@ -61,8 +50,6 @@ describe('browser consent scripts', () => {
   let restore: () => void;
 
   beforeEach(() => {
-    // jsdom does no layout and has no innerText. Give every element a
-    // visible box and read innerText from the text content.
     const proto = HTMLElement.prototype;
     const rect = Element.prototype.getBoundingClientRect;
     const innerText = Object.getOwnPropertyDescriptor(proto, 'innerText');

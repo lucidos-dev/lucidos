@@ -11,7 +11,10 @@ If an intent ID shows in the prompt but not under `apps/<app>/intents/`, **check
 
 ## Three sources
 
-`IntentStore::load_all` in `crates/lucidos-engine/src/core/intents.rs` walks:
+The agent prompt in `crates/lucidos-agents-api/src/engine/chat/process/system_prompt.rs`
+advertises the intent IDs loaded by the engine.
+
+`IntentStore::load_all` in `crates/lucidos-core/src/core/intents.rs` walks:
 
 | Source | ID format | Notes |
 |---|---|---|
@@ -59,3 +62,10 @@ ls $DATA/triggers/*/*.md      2>/dev/null
 ```
 
 The live system prompt's "## Available Intents" section is the ground truth. If it disagrees with the shell list, the engine wins: the loader rejected a file (for example, for invalid frontmatter).
+
+## Diagnostic evidence
+
+Registry diagnostic lines remain private in maintainer bundles.
+Diagnostics do not replace filesystem enumeration when checking which intents exist.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

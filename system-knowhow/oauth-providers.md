@@ -298,6 +298,12 @@ configure; this is why `authorize_params` refuses `state`.
 - **Spotify / Dropbox**: short scope names per their docs. Dropbox's account
   scope is `account_info.read`, which its POST userinfo endpoint needs. A
   connection without it still works, but reports no email.
+- **Sign-in scopes**: a Settings Connect press asks the engine to add the
+  provider's sign-in scopes to the purpose. A row's optional `sign_in_scopes`
+  field sets them (Dropbox: `account_info.read`, because it refuses `openid`).
+  A row without the field gets `openid email profile`. A credential named after
+  a known provider gets that row's scopes. Any other credential on a known
+  provider's `auth_url` host gets that row's scopes too.
 - **Dropbox for backups** needs four:
   `files.content.write files.content.read files.metadata.read account_info.read`.
   Write covers the folder create, the upload and the retention delete. Read
@@ -330,6 +336,20 @@ three:
 So the order is: enable the permissions in the App Console, press Submit, then
 connect. If they connected first: enable, Submit, then reconnect. "Tick the box"
 alone leaves them looking at the same error.
+
+**A Dropbox app is a public client by default.** Leave the credential's client
+secret blank and Lucidos authenticates with PKCE, which works on the loopback
+path. A web redirect URI (Lucidos opened at an https address from another
+machine) needs the real App secret from the Settings tab. The secret is never
+the App key, which is the client ID.
+
+**`invalid_client` on the token exchange.** The error opens with the fix for how
+the request authenticated: re-enter or clear a client secret, or add one where
+the request used PKCE. It then gives the redirect URI sent and a count of
+characters outside visible ASCII in the client ID and secret.
+The usual cause is the App key pasted into the client secret field. Lucidos
+refuses to connect or save a credential whose secret equals its client ID.
+To fix it, re-enter the secret from the console, or clear the field to use PKCE.
 
 ## Microsoft (Entra): redirect URI platform buckets
 
@@ -401,7 +421,8 @@ Adding a known provider is a **knowhow edit, not an engine change**:
 1. `web_search` for the provider's OAuth 2.0 authorization + token endpoints
    (and userinfo endpoint if it has one).
 2. Add a row to `oauth-providers.json` with its `base_url` and, so the Connect
-   button can help too, its `console_url`, `client_type` and `setup_hint`.
+   button can help too, its `console_url`, `client_type` and `setup_hint`. Add
+   `sign_in_scopes` if the provider rejects `openid email profile`.
 3. Note any scope quirks under "Notes on scopes".
 
 The next `request_credential` / `connect_oauth_account` for that provider then

@@ -1,15 +1,9 @@
 // @vitest-environment jsdom
-/**
- * The thread ⋯ menu leads with Show in Folders. The item is present exactly
- * when the host passes `onShowInFolders`; which hosts do is pinned in
- * `drawer/__tests__/row-menu-show-in-folders.test.tsx`.
- */
 import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { ThreadOverflowItemsChunk, ThreadOverflowMenu } from '../ThreadOverflowMenu';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 let host: HTMLElement | null = null;

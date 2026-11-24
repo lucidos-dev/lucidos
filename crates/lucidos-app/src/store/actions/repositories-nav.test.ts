@@ -1,14 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { panelOverlay, repoSource, repoSelectedChangeId, selectedLines, repoDiff, repoPending } from '../store';
 
-// Spy on nav helpers so we can verify push-vs-replace without touching the
-// real localStorage-backed nav stack.
 const pushNavState = vi.fn();
 const replaceNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState, replaceNavState }));
 
-// revealContentPane mutates splitRatio + writes to localStorage on desktop;
-// stub it so tests don't leak that state across files.
 const revealContentPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane }));
 
@@ -107,8 +103,6 @@ describe('openRepoFilePreview push-vs-replace', () => {
   });
 });
 
-// The app-iframe / NavigationRequested entry point: the path arrives ALREADY
-// encoded and the caller has no repo context, so the action binds one.
 describe('openEncodedRepoFilePreview (navigate bridge)', () => {
   const ENCODED = 'repo:repo-2:file:src/main/resources/transforms/x.jslt';
 

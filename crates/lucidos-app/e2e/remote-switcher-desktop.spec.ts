@@ -3,8 +3,6 @@ import { assertHealthy, navigateToApp } from './helpers';
 
 test('opens a remote workspace through this gateway while local rows stay available', async ({ page }) => {
   await assertHealthy(page);
-  // Stamp a gateway context over the disposable engine; relay local requests
-  // back to it while the remote workspace uses the stub below.
   await page.route('**/*', async (route) => {
     const request = route.request();
     const url = new URL(request.url());

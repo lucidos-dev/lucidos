@@ -1,3 +1,4 @@
+import { spendCapResetTime } from '../../utils/spendCap';
 import { useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
@@ -12,38 +13,34 @@ import { formatBackfillSpend, usd } from './treeBackfillFormat';
 
 const RETRYING = 'A summary failed, retrying.';
 
-/** The Tree backfill's progress bar, shown while Tree is chosen. Structure
- *  first: the row and the bar's track draw at once, and only the values wait
- *  on the read, which the Memory section starts. The store signal is the
- *  subscription, so SSE frames move it. A backfill held at its spending cap
- *  offers Continue and a switch back to Classic. */
 export function TreeBackfillStatus({ onPickModel, onSwitchToClassic }: {
   onPickModel: () => void;
   onSwitchToClassic: () => void;
 }) {
-  // The cap Continue was pressed at. The press stays spent until a frame
-  // brings a new cap, so a second click cannot raise it twice.
   const [continuedFrom, setContinuedFrom] = useState<number | null>(null);
   const loadable = treeBackfill.value;
   const state = loadable.status === 'loaded' ? loadable.data : null;
-  // A Tree workspace still reads `off` until the switch's first frame lands.
   const progress = state?.state === 'running' ? state.progress : state?.state === 'off' ? NO_BACKFILL_PROGRESS : null;
   const ready = state?.state === 'ready';
-  // Turns already read the trees; the older threads are still being built.
   const filling = state?.state === 'ready' && state.filling && state.filling.done < state.filling.total
     ? state.filling
     : null;
   const counted = filling ?? progress;
   const percent = filling ? backfillPercent(filling) : ready ? 100 : progress ? backfillPercent(progress) : 0;
   const held = counted?.held && counted.cap_usd !== null ? { cap: counted.cap_usd, next: counted.next_cap_usd } : null;
-  // A finished backfill still names a failing model: live summaries wait on it.
-  const failingModel = (counted ?? (state?.state === 'ready' ? state.filling : null))?.failing_model ?? null;
-  const working = counted !== null && counted.total > 0 && !counted.waiting_for_model && !held && !failingModel;
+  const liveProgress = counted ?? (state?.state === 'ready' ? state.filling : null);
+  const failingModel = liveProgress?.failing_model ?? null;
+  const spendCapHeldUntil = liveProgress?.spend_cap_held_until ?? null;
+  const working = counted !== null && counted.total > 0 && !counted.waiting_for_model && !held && !failingModel && !spendCapHeldUntil;
   const spend = counted ? formatBackfillSpend(counted) : null;
 
   let label: ComponentChildren = null;
   if (loadable.status === 'failed') {
     label = <span class="error-text">Could not read the progress: {loadable.error}</span>;
+  } else if (spendCapHeldUntil) {
+    label = liveProgress?.spend_cap_resets_at
+      ? <>Waiting for the spend cap to reset at {spendCapResetTime(liveProgress.spend_cap_resets_at)}.</>
+      : <>Waiting for the spend cap to reset. Reset time not supplied.</>;
   } else if (held) {
     label = (
       <>

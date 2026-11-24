@@ -4,11 +4,6 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, openThreadDrawer, assertHealthy } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
-/** "Move to top level" in the thread menu (ADR 0278): the item is offered on a
- *  nested row only, it confirms, and the row leaves its family live.
- *
- *  Runs on every project. A desktop row opens its menu from its ⋯. A mobile row
- *  opens the same menu from a hold. */
 
 function seedParentChild(): { parentId: string; childId: string } {
   const parentId = randomUUID();
@@ -21,11 +16,9 @@ function seedParentChild(): { parentId: string; childId: string } {
   return { parentId, childId };
 }
 
-/** The wrapper that carries a row's nesting (`is-nested`). */
 const rowWrap = (page: Page, threadId: string) =>
   page.locator(`.thread-drawer .thread-row-wrap:has(.thread-row[data-thread-nav="${threadId}"])`).first();
 
-/** Open one row's menu: its ⋯ where the row draws one, else a hold. */
 async function openRowMenu(page: Page, threadId: string): Promise<void> {
   const opened = await page.evaluate(async (id) => {
     const row = [...document.querySelectorAll(`.thread-drawer .thread-row[data-thread-nav="${id}"]`)]
@@ -61,7 +54,6 @@ const moveItem = (page: Page) =>
 test.describe('Move to top level', () => {
   test.beforeEach(async ({ page, context }) => {
     await assertHealthy(page);
-    // A collapsed Archive section from another spec would hide the seeded rows.
     await context.addInitScript(() => {
       localStorage.removeItem('lucidos-drawer-collapsed');
     });
@@ -80,7 +72,6 @@ test.describe('Move to top level', () => {
     const dialog = page.locator('.confirm-dialog');
     await expect(dialog).toBeVisible();
     await expect(dialog).toContainText('It keeps running and finishes on its own');
-    // Not red: nothing is stopped or lost.
     const ok = page.locator('[data-role="confirm-ok"]', { hasText: 'Move out' });
     await expect(ok).not.toHaveClass(/\baction-btn-danger\b/);
     await ok.click();

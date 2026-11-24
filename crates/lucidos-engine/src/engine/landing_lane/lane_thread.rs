@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 /// What a run on a lane thread carries: its batch, and where it resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaneDuty {
-    pub(crate) batch_id: Uuid,
-    pub(crate) worktree: LaneWorktree,
+pub struct LaneDuty {
+    pub batch_id: Uuid,
+    pub worktree: LaneWorktree,
     /// Where the integration branch starts.
     pub(crate) base_sha: String,
 }
@@ -24,11 +24,7 @@ pub(crate) struct LaneDuty {
 impl LaneDuty {
     /// The lane worktree, made again if something removed it, so a run never
     /// starts in a missing directory.
-    pub(crate) async fn ensure_worktree(
-        &self,
-        repo_root: &Path,
-        workspace: &Path,
-    ) -> Result<(), String> {
+    pub async fn ensure_worktree(&self, repo_root: &Path, workspace: &Path) -> Result<(), String> {
         super::integration::ensure_lane_worktree(
             repo_root,
             workspace,
@@ -42,7 +38,7 @@ impl LaneDuty {
 /// How a lane thread's run ended. Every run that carries a batch gives the
 /// lane exactly one of these, however it ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LaneThreadEnd {
+pub enum LaneThreadEnd {
     /// The turn ended cleanly with nothing left unmerged. The lane checks the
     /// integration branch and lands it.
     Completed,
@@ -56,7 +52,7 @@ pub(crate) enum LaneThreadEnd {
 
 /// Why a batch failed when its lane thread was archived, deleted or
 /// discarded.
-pub(crate) const LANE_THREAD_CLOSED: &str = "The lane thread was archived, deleted or discarded.";
+pub const LANE_THREAD_CLOSED: &str = "The lane thread was archived, deleted or discarded.";
 
 /// The persisted events that close a thread for good: an archive and a
 /// delete. [`lane_thread_closures`] reads the same two.
@@ -103,16 +99,13 @@ async fn lane_thread_closed(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool
 /// - An `Ok` with no completion is a Stop during startup, or a session that
 ///   ended between turns. The batch waits, as after any Stop.
 /// - Any other error failed to start or prepare the run.
-pub(crate) fn unanswered_run_end(
-    outcome: Result<(), &str>,
-    shutting_down: bool,
-) -> Option<LaneThreadEnd> {
+pub fn unanswered_run_end(outcome: Result<(), &str>, shutting_down: bool) -> Option<LaneThreadEnd> {
     if shutting_down {
         return None;
     }
     match outcome {
         Ok(()) => Some(LaneThreadEnd::Stopped),
-        Err(e) if e == crate::engine::claude_code::STALE_RESUME_ERROR => None,
+        Err(e) if e == crate::engine::continuation_reason::STALE_RESUME_ERROR => None,
         Err(e) => Some(LaneThreadEnd::Failed(format!(
             "The lane thread could not start: {e}"
         ))),
@@ -131,31 +124,21 @@ enum LaneThreadRole {
     },
 }
 
-/// A lane thread whose batch ended takes no run while its integration branch
-/// is still there: a run without the batch would work on that branch as if
-/// it were the thread's own, and propose it as a change.
-pub(crate) const LANE_THREAD_ENDED: &str = "This lane thread's batch has ended, and the lane is \
-     still removing its integration branch. Send again in a moment.";
+/// Closed lane conversations retain their batch identity (ADR 0662).
+pub(crate) const LANE_THREAD_ENDED: &str = "This landing batch has ended. \
+    Apply any pending source changes again to start a new landing batch.";
+
+pub(crate) use crate::engine::thread_events::landing_lane::lane_batch_ended;
+/// The newest batch `thread_id` is the lane thread of: its id, its base sha,
+/// and whether it landed or failed.
+use crate::engine::thread_events::landing_lane::lane_batch_of_thread;
 
 async fn lane_thread_role(
     pool: &sqlx::PgPool,
     workspace: &Path,
     thread_id: Uuid,
 ) -> Result<LaneThreadRole, sqlx::Error> {
-    let row: Option<(String, String, bool)> = sqlx::query_as(
-        "SELECT s.aggregate_id, s.payload->'data'->>'base_sha', EXISTS ( \
-             SELECT 1 FROM events e \
-             WHERE e.aggregate = 'landing_lane' AND e.aggregate_id = s.aggregate_id \
-               AND e.event_type IN ('LaneBatchLanded', 'LaneBatchFailed')) \
-         FROM events s \
-         WHERE s.event_type = 'LaneBatchStarted' \
-           AND s.payload->'data'->>'lane_thread_id' = $1 \
-         ORDER BY s.sequence DESC LIMIT 1",
-    )
-    .bind(thread_id.to_string())
-    .fetch_optional(pool)
-    .await?;
-    let Some((batch, base_sha, ended)) = row else {
+    let Some((batch, base_sha, ended)) = lane_batch_of_thread(pool, thread_id).await? else {
         return Ok(LaneThreadRole::NotLane);
     };
     let Ok(batch_id) = Uuid::parse_str(&batch) else {
@@ -204,12 +187,9 @@ async fn is_lane_turn(pool: &sqlx::PgPool, request_event_id: Uuid) -> Result<boo
 /// while the turn waits for its worktree. Run anyway, it would merge every
 /// member as an ordinary thread and propose them again.
 ///
-/// Any other run on a thread whose batch ended runs as an ordinary thread once
-/// its integration branch is gone. The run holds the thread's claim here, so
-/// no lane-thread run works in the lane worktree, and it retires what the lane
-/// left. `Err` refuses the run when the branch stays: each later run tries
-/// again, so a removal that timed out cannot refuse the thread for good.
-pub(crate) async fn lane_duty_for_run(
+/// A closed lane thread never becomes an ordinary worker. The run holds the
+/// thread claim, so it can retire the integration branch before refusing.
+pub async fn lane_duty_for_run(
     pool: &sqlx::PgPool,
     workspace: &Path,
     repo_root: &Path,
@@ -231,35 +211,28 @@ pub(crate) async fn lane_duty_for_run(
             .await
             // An unknown tries the removal, which refuses on its own unknown.
             .or_unknown(true);
-            if !still_there
-                || super::integration::retire_lane_worktree(pool, repo_root, &worktree).await
-            {
-                Ok(None)
-            } else {
-                Err(LANE_THREAD_ENDED.into())
+            if still_there {
+                super::integration::retire_lane_worktree(pool, repo_root, &worktree).await;
             }
+            Err(LANE_THREAD_ENDED.into())
         }
     }
 }
 
-/// The batch whose lane-thread session a stale session on `thread_id` is.
-/// `session_branch` is the branch its latest `SessionStarted` recorded.
-///
-/// An open batch's lane thread always qualifies. So does a closed batch's,
-/// while its last session still ran on the integration branch. A former lane
-/// thread that has since run as an ordinary thread on its own branch gets
-/// `None`, so its own teardown runs.
-pub(crate) async fn lane_batch_of_stale_session(
+/// Stale cleanup never proposes a historical lane conversation's work.
+/// Explicit Discard may still clean up a historical ordinary branch.
+pub async fn lane_batch_of_stale_session(
     pool: &sqlx::PgPool,
     workspace: &Path,
     thread_id: Uuid,
     session_branch: Option<&str>,
+    discard: bool,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     Ok(match lane_thread_role(pool, workspace, thread_id).await? {
         LaneThreadRole::NotLane => None,
         LaneThreadRole::Resolving(duty) => Some(duty.batch_id),
         LaneThreadRole::Ended { batch_id, worktree } => {
-            (session_branch == Some(worktree.branch.as_str())).then_some(batch_id)
+            (!discard || session_branch == Some(worktree.branch.as_str())).then_some(batch_id)
         }
     })
 }
@@ -284,10 +257,11 @@ pub(super) async fn lane_thread_state(
     if !opened {
         return Ok(LaneThreadState::NotOpened);
     }
-    let in_flight = crate::engine::agent_recovery::branch_turn_in_flight(pool, lane_branch).await?;
+    let in_flight =
+        crate::engine::branch_recovery_queries::branch_turn_in_flight(pool, lane_branch).await?;
     Ok(
         if in_flight == Some(false)
-            && crate::engine::agent_recovery::last_turn_ended_cleanly(pool, thread_id).await
+            && crate::engine::coding_turn_end::last_turn_ended_cleanly(pool, thread_id).await
         {
             LaneThreadState::Finished
         } else {

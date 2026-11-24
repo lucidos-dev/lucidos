@@ -18,7 +18,6 @@ import {
   pauseAudibleMedia,
 } from './oneSound';
 
-/** jsdom plays nothing, so `paused` is set by hand and `pause` is a spy. */
 function media(tag: 'audio' | 'video', { playing = false, muted = false } = {}) {
   const el = document.createElement(tag);
   el.muted = muted;
@@ -28,7 +27,6 @@ function media(tag: 'audio' | 'video', { playing = false, muted = false } = {}) 
   return { el, pause };
 }
 
-/** A start message, whatever its clock reading. */
 const started = { type: SOUND_STARTED_MESSAGE_TYPE, startedAt: expect.any(Number) };
 
 describe('installOneSound', () => {

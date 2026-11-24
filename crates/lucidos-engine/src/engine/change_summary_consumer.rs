@@ -122,13 +122,13 @@ async fn backfill(engine: Arc<LucidosEngine>, in_flight: InFlight) {
     let (pending, applied) = match listed {
         Ok(lists) => lists,
         Err(e) => {
-            log!("[ChangeSummary] Backfill could not list changes: {}", e);
+            log_legacy!("[ChangeSummary] Backfill could not list changes: {}", e);
             return;
         }
     };
     let targets = backfill_targets(pending.iter().chain(&applied));
     if !targets.is_empty() {
-        log!(
+        log_legacy!(
             "[ChangeSummary] Backfilling {} change summaries",
             targets.len()
         );
@@ -197,7 +197,7 @@ async fn summarize_change(engine: &LucidosEngine, thread_id: Uuid, change_id: Uu
             Ok(Some(change)) => change,
             Ok(None) => return,
             Err(e) => {
-                log!("[ChangeSummary] Could not read change {}: {}", change_id, e);
+                log_legacy!("[ChangeSummary] Could not read change {}: {}", change_id, e);
                 return;
             }
         };
@@ -224,7 +224,7 @@ async fn summarize_once(
     let started = std::time::Instant::now();
     match write_summary(&engine.event_bus, &call, thread_id, change_id, description).await {
         Ok(summary) => {
-            log!(
+            log_legacy!(
                 "[ChangeSummary] Summarized {} in {:?}: {:?}",
                 change_id,
                 started.elapsed(),
@@ -233,7 +233,7 @@ async fn summarize_once(
             // The Changes panel reads its lists from this frame.
             engine.broadcast_changes_updated().await;
         }
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[ChangeSummary] No summary for {} after {:?}: {}",
             change_id,
             started.elapsed(),

@@ -1,12 +1,3 @@
-/**
- * Desktop: the header palettes open on one line, each over its own pane.
- *
- * Search Everywhere used to centre on the window, so it straddled the pane
- * divider. File search sat 2rem from the top of the window, inside the header.
- * Both now hang from the header on the Lucidos menu's line. Each centres on the
- * pane whose header holds the button that opened it: Conversation for Search
- * Everywhere, Canvas for file search.
- */
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, clickHeaderAction, navigateToApp, openFilesPanel } from './helpers';
 
@@ -17,7 +8,6 @@ interface Geometry {
   right: number;
 }
 
-/** Horizontal extent and top edge of the first element matching `selector`. */
 async function geometry(page: Page, selector: string): Promise<Geometry> {
   return page.locator(selector).first().evaluate((el) => {
     const r = el.getBoundingClientRect();
@@ -25,13 +15,11 @@ async function geometry(page: Page, selector: string): Promise<Geometry> {
   });
 }
 
-/** The palette sits wholly inside its pane, so it never straddles the divider. */
 function expectInside(panel: Geometry, pane: Geometry): void {
   expect(panel.left, 'palette starts inside its pane').toBeGreaterThanOrEqual(pane.left - 0.5);
   expect(panel.right, 'palette ends inside its pane').toBeLessThanOrEqual(pane.right + 0.5);
 }
 
-/** Where the Lucidos menu hangs, the line every header palette shares. */
 async function headerLine(page: Page): Promise<number> {
   await page.locator('.desktop-header [data-role="brand-menu-toggle"]').click();
   const top = (await geometry(page, '.brand-menu')).top;

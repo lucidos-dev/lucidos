@@ -1,11 +1,3 @@
-/**
- * The compose draft follows the server's *compose revision* (ADR 0437,
- * `docs/plans/2026-10-12-compose-draft-follows-a-server-revision.md`).
- *
- * Every case replays one interleaving with explicit synchronization points:
- * a PUT is held until the test resolves it, and each report lands exactly
- * where the test delivers it. No sleeps.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -46,14 +38,12 @@ import type { ThreadSummary } from '../../api/threads';
 const T = 't-rev';
 const originalFetch = globalThis.fetch;
 
-/** A PUT the test holds open until it answers. */
 interface HeldPut {
   body: { text: string; compose_epoch?: number };
   answer: (res: Response) => void;
 }
 
 let puts: HeldPut[] = [];
-/** What the next DELETE answers. */
 let deleteAnswer: () => Response = () => new Response(JSON.stringify({ summary_version: 6 }), { status: 200 });
 
 function report(revision: number, text: string, extra: Record<string, unknown> = {}) {
@@ -141,7 +131,6 @@ function activeThread(): ThreadState {
   };
 }
 
-/** Type `text` and let the debounce fire, so its PUT is in flight. */
 async function typeAndFlush(text: string): Promise<void> {
   updateCompose(T, { text });
   await vi.advanceTimersByTimeAsync(300);
@@ -325,8 +314,6 @@ describe('a new draft keeps the picks it was seeded with', () => {
   });
 });
 
-/** The fences this change replaced must not come back under their old names
- *  (C10 in the plan). */
 describe('the retired compose fences stay gone', () => {
   const RETIRED = [
     'composeEditedAt', 'composeSentAt', 'composePutSettledAt', 'composeEditWatermark',

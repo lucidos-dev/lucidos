@@ -6,11 +6,8 @@ import {
 } from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
-/** Three pages of events (`THREAD_EVENTS_PAGE_SIZE` is 400, two per exchange
- *  here), so the thread opens on its newest page. */
 const EXCHANGES = 600;
 
-/** The linked turn sits on the page behind the newest one, half way up. */
 const TARGET = 300;
 
 function seedLongThread(): { threadId: string; targetId: string } {
@@ -51,9 +48,6 @@ test.describe('A deep link into an old turn of a long thread', () => {
   });
 
   test('draws from the target turn, never the whole thread, and stays on it', async ({ page }) => {
-    // The link claims the target's turn (ADR 0631). Turns older than it stay
-    // undrawn until the reader scrolls up. A render-all drew all 600, which
-    // is what got the iOS page killed.
     await assertHealthy(page);
     clearNotifications();
     const seeded = seedLongThread();
@@ -98,8 +92,6 @@ test.describe('A deep link into an old turn of a long thread', () => {
       throw new Error(`target not in view, last state: ${JSON.stringify(last)}\n\n${error.message}`);
     });
 
-    // The claim releases about a second after landing. The window must keep
-    // its floor at the target, and nothing may carry the reader off it.
     await page.waitForTimeout(3000);
     expect(await inView(), `target left view, state: ${JSON.stringify(last)}`).toBe(true);
     const drawn = await countExchanges(page);

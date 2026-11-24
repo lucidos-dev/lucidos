@@ -92,6 +92,33 @@ class Blocks(unittest.TestCase):
                 blocks.run('sync', manifest, root)
             self.assertEqual(first.read_bytes(), before)
 
+    def split_doc(self, root, second_part):
+        (root / 'system-knowhow/doc').mkdir(parents=True)
+        (root / 'system-knowhow/doc.md').write_text('Index only')
+        part = root / 'system-knowhow/doc/one.md'
+        part.write_bytes(BEGIN + b'\nstale\n' + END)
+        (root / 'system-knowhow/doc/two.md').write_bytes(second_part)
+        manifest = root / 'fragments.json'
+        manifest.write_text(json.dumps({'schema_version': 1, 'documents': {
+            'system-knowhow/doc.md': {'Sample': FRESH.decode(), 'Other': FRESH.decode()}}}))
+        return part, manifest
+
+    def test_sync_fills_blocks_in_the_parts_of_a_split_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            other = b'<!-- generated:begin Other -->x' + END
+            part, manifest = self.split_doc(root, other)
+            blocks.run('sync', manifest, root)
+            self.assertEqual(part.read_bytes(), BEGIN + FRESH + END)
+            self.assertIn(FRESH, (root / 'system-knowhow/doc/two.md').read_bytes())
+
+    def test_a_split_document_holds_each_block_once(self):
+        for second in (b'No markers', BEGIN + b'x' + END):
+            with self.subTest(second=second), tempfile.TemporaryDirectory() as directory:
+                _, manifest = self.split_doc(pathlib.Path(directory), second)
+                with self.assertRaises(ValueError):
+                    blocks.run('sync', manifest, pathlib.Path(directory))
+
 
 unittest.main()
 PY

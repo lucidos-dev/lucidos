@@ -8,7 +8,6 @@ import { installRestoreAdmission } from '../../utils/restoreAdmission';
 
 type Handler = ((e: any) => void) | null;
 
-/** Just enough of `XMLHttpRequest` to drive every path the transport takes. */
 class FakeXhr {
   static last: FakeXhr | null = null;
   upload: { onprogress: Handler; onload: Handler } = { onprogress: null, onload: null };
@@ -49,7 +48,6 @@ function current(): FakeXhr {
   return FakeXhr.last;
 }
 
-/** The transport awaits device registration before opening the request. */
 async function sent(): Promise<FakeXhr> {
   await vi.advanceTimersByTimeAsync(0);
   return current();
@@ -63,18 +61,17 @@ describe('postWithUploadProgress', () => {
   });
   afterEach(() => {
     observeSourceGeneration(null);
-    installRestoreAdmission({ ready: () => true, wait: async () => {} });
+    installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     vi.useRealTimers();
     delete (globalThis as any).XMLHttpRequest;
   });
 
   it('rejects uploads waiting across a restore without sending bytes', async () => {
-    // The page was admitted before the restore, so the upload is bound to it.
     observeSourceGeneration(null);
     let release!: () => void;
     let ready = false;
     const wait = new Promise<void>((resolve) => { release = resolve; });
-    installRestoreAdmission({ ready: () => ready, wait: () => wait });
+    installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => wait });
     const request = postWithUploadProgress('/api/v1/threads/t/blobs', new FormData());
     const rejected = expect(request).rejects.toMatchObject({ httpCode: 409 });
     observeSourceGeneration('00000000-0000-4000-8000-000000000001');
@@ -119,7 +116,6 @@ describe('postWithUploadProgress', () => {
     const rejection = expect(p).rejects.toSatisfy((err: unknown) => isTransientFetchError(err)
       && (err as DOMException).name === 'TimeoutError');
     const xhr = await sent();
-    // Progress keeps the deadline alive.
     await vi.advanceTimersByTimeAsync(UPLOAD_STALL_MS - 1);
     xhr.progress(5, 100);
     await vi.advanceTimersByTimeAsync(UPLOAD_STALL_MS - 1);
@@ -134,7 +130,6 @@ describe('postWithUploadProgress', () => {
     const rejection = expect(p).rejects.toSatisfy((err: unknown) => (err as DOMException).name === 'TimeoutError');
     const xhr = await sent();
     xhr.bodySent();
-    // The stall deadline no longer applies once the body is out.
     await vi.advanceTimersByTimeAsync(UPLOAD_RESPONSE_MS - 1);
     expect(xhr.aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);

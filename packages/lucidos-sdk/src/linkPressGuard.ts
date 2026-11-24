@@ -1,21 +1,8 @@
-/**
- * The link press guard: a swipe that starts on a link never opens it.
- *
- * iOS fires `click` after a short drag that stays under its ~10 px cancel
- * threshold. So a swipe that began on a link can open the page, in Safari or
- * in the in-app web view. The guard records each touch itself. It cancels the
- * click of a touch that was not a tap, before any link handler sees it.
- *
- * It rules on links only (`a[href]`), and only on a click close after its
- * touch. An old swipe never vetoes a mouse click or a keyboard Enter.
- */
 
 import { cancelledPressWasATap } from './tapPress';
 
-/** How long after a touch ends a click counts as that touch's synthetic twin. */
 export const LINK_CLICK_AFTER_TOUCH_MS = 500;
 
-/** What the guard knew when it cancelled a link click. */
 export interface SwallowedLinkClick {
   href: string;
   movedPx: number;
@@ -23,18 +10,13 @@ export interface SwallowedLinkClick {
   heldMs: number;
 }
 
-/** What the guard knew when a touch that started on a link ended, tap or not. */
 export interface LinkTouch extends SwallowedLinkClick {
   tap: boolean;
 }
 
 export interface LinkPressGuardOptions {
-  /** Called once per touch that started on a link (a touchend's target), for
-   *  the breadcrumb. */
   onLinkTouch?: (info: LinkTouch) => void;
-  /** Called once per cancelled click, for the breadcrumb. */
   onSwallowed?: (info: SwallowedLinkClick) => void;
-  /** Injected clock, so the click window is testable. */
   now?: () => number;
 }
 
@@ -44,7 +26,6 @@ interface TouchContact {
   screenY: number;
 }
 
-/** What the guard reads off a touch event, in screen space like the tap gates. */
 interface TouchLike {
   changedTouches: ArrayLike<TouchContact>;
   touches: ArrayLike<unknown>;
@@ -74,8 +55,6 @@ function contactOf(e: TouchLike, identifier: number): TouchContact | null {
   return null;
 }
 
-/** Install the guard on `target` and return the uninstall. The default,
- *  `window`, captures ahead of every `document` listener, whatever their order. */
 export function installLinkPressGuard(
   target: EventTarget = window,
   opts: LinkPressGuardOptions = {},
@@ -110,8 +89,6 @@ export function installLinkPressGuard(
     travel(press, e);
   }
 
-  // A cancel counts like a lift: iOS can take a press mid-swipe, and the click
-  // that follows a drag still arrives on some paths.
   function onEnd(raw: Event): void {
     const e = raw as unknown as TouchLike;
     const p = press;
@@ -140,7 +117,6 @@ export function installLinkPressGuard(
   }
 
   function onClick(e: Event): void {
-    // Consuming, so a stale swipe never rules on a later click.
     const v = verdict;
     verdict = null;
     if (!v || v.tap || clock() - v.endedAt > LINK_CLICK_AFTER_TOUCH_MS) return;
@@ -164,7 +140,6 @@ export function installLinkPressGuard(
     ['touchcancel', onEnd],
     ['click', onClick],
   ];
-  // The touch listeners are passive and the click one is not: it cancels.
   for (const [type, fn] of listeners) {
     target.addEventListener(type, fn, { capture: true, passive: type !== 'click' });
   }

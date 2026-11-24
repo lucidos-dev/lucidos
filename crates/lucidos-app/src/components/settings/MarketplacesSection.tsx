@@ -19,15 +19,6 @@ import {
 import { AddOfficialMarketplaceButton } from '../plugins/AddOfficialMarketplaceButton';
 import type { PluginMarketplace } from '../../store/types';
 
-/** Self-skeletonizing marketplace row: rendered with no props inside a
- *  SkeletonProvider (`<MarketplaceRow />`) it draws itself as a loading
- *  placeholder via the Sk* leaves; with a real `marketplace` it renders normally.
- *  Props are optional only to support the skeleton call.
- *
- *  The name renames in place. The URL below it is read-only, because it is the
- *  marketplace's identity: the engine keys the entry on a hash of it, so a
- *  changed URL is a different marketplace. Point somewhere else with Remove
- *  plus the Add form above. */
 function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
   const sk = useSkeleton();
   const name = marketplace?.name ?? '';
@@ -43,10 +34,6 @@ function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
       <div class="list-row-info">
         <div class="app-store-marketplace-name-slot">
           <SkText class="title list-row-name" as="div" w="9rem">{name}</SkText>
-          {/* Mounted whether or not we are renaming, invisible and pointer-inert
-              over the name until then. iOS raises the keyboard only for a
-              focus() inside the user's gesture, and a field the tap renders does
-              not exist yet at that moment. The pencil focuses this one. */}
           {!sk && (
             <input
               ref={inputRef}
@@ -56,12 +43,9 @@ function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
               {...PROSE_TEXT_ATTRS}
               aria-label="Marketplace name"
               tabIndex={renaming ? 0 : -1}
-              // Exposed exactly while the field is real. Idle, it is a textbox
-              // that does nothing, and it reads the name out a second time.
               aria-hidden={!renaming}
               onInput={(e) => setDraft((e.currentTarget as HTMLInputElement).value)}
               onBlur={renaming ? commit : undefined}
-              // The blur commits, so the central Escape policy must not blur it.
               data-escape-self
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void commit();
@@ -104,9 +88,6 @@ function MarketplaceRow({ marketplace }: { marketplace?: PluginMarketplace }) {
   );
 }
 
-/** Settings → Marketplaces. Add/remove the git repositories (plugin
- *  marketplaces) the Store scans for installable plugins. Moved here out of the
- *  Store toolbar so the Store itself is just a searchable plugin list. */
 export function MarketplacesSection() {
   usePanelRefresh('marketplaces', refreshPluginCatalog);
   const loadable = marketplaceCatalog.value;
@@ -157,9 +138,6 @@ export function MarketplacesSection() {
           disabled={saving}
         />
         <div class="app-store-marketplace-form-tail">
-          {/* A display name is prose, unlike the URL beside it: the keyboard's
-              own capitalization is what a name wants, and an autocapitalized URL
-              is a broken one. */}
           <input
             class="settings-text-input app-store-name-input"
             value={name}

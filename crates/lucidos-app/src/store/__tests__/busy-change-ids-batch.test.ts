@@ -1,9 +1,3 @@
-/**
- * An Apply All member stays busy until it resolves, even on a page that never
- * saw the batch start. A reload restores the batch from the server, but not
- * the live `applyingChangeIds`, so the busy set reads the batch itself.
- * Otherwise a queued member offers Apply and Discard mid-batch.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { applyAllBatch, applyingChangeIds, applyNowRequests, busyChangeIds, changes } from '../store';
 

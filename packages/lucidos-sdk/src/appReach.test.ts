@@ -1,10 +1,3 @@
-/**
- * The matcher over the engine's generated answer.
- *
- * The table itself is the engine's, and its own tests cover what is in it.
- * These cases are about the matching: a param must not swallow a segment, a
- * wildcard must not reach a sibling route, and an unknown route is refused.
- */
 import { describe, it, expect } from 'vitest';
 import { appMayCall, normalizeSuffix, pathMatchesPattern } from './appReach';
 
@@ -50,9 +43,6 @@ describe('appMayCall', () => {
     expect(appMayCall('POST', '/notifications')).toBe(true);
   });
 
-  // A user env var lands in every run_bash and run_python, so a name like
-  // PYTHONPATH is host code execution. The engine keeps the read and refuses
-  // the writes; this is the matcher half of that answer.
   it('refuses a write to the env vars the agent runs under', () => {
     expect(appMayCall('POST', '/env-vars')).toBe(false);
     expect(appMayCall('PUT', '/env-vars')).toBe(false);
@@ -74,13 +64,10 @@ describe('appMayCall', () => {
   });
 
   it('answers from the route the engine would pick, not from every match', () => {
-    // `/data/edit` matches the `/data/*path` wildcard too. The literal route
-    // is the one axum routes to, and it serves POST alone.
     expect(appMayCall('POST', '/data/edit')).toBe(true);
     expect(appMayCall('GET', '/data/edit')).toBe(false);
     expect(appMayCall('PUT', '/data/edit')).toBe(false);
     expect(appMayCall('DELETE', '/data/edit')).toBe(false);
-    // Same for upload, and the wildcard still answers for anything else.
     expect(appMayCall('POST', '/data/upload')).toBe(true);
     expect(appMayCall('DELETE', '/data/upload')).toBe(false);
     expect(appMayCall('DELETE', '/data/artifacts/x.md')).toBe(true);
@@ -88,7 +75,6 @@ describe('appMayCall', () => {
 
   it('refuses a route nobody classified', () => {
     expect(appMayCall('GET', '/not-a-route')).toBe(false);
-    // A plain prefix check would take this, and it is a different route.
     expect(appMayCall('GET', '/models-registry')).toBe(false);
     expect(appMayCall('GET', '/data-export')).toBe(false);
   });
@@ -98,7 +84,6 @@ describe('normalizeSuffix', () => {
   it('resolves a dot segment before anything is checked', () => {
     expect(normalizeSuffix('/data/../credentials')?.pathname).toBe('/credentials');
     expect(normalizeSuffix('/data/%2e%2e/credentials')?.pathname).toBe('/credentials');
-    // So the traversal is refused on what it actually resolves to.
     expect(appMayCall('GET', normalizeSuffix('/data/%2e%2e/credentials')!.pathname)).toBe(false);
   });
 

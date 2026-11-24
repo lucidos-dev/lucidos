@@ -1,8 +1,3 @@
-/**
- * The Rename thread shortcut (F2) opens the rename dialog for the focused
- * thread, and does nothing with no thread focused. The title is display-only,
- * so the dialog is the one place a rename happens.
- */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../../../store/actions/threadRename', () => ({

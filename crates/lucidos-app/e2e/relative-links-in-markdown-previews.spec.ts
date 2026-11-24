@@ -6,9 +6,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 
-/** A tester's reported gap: a relative link such as `[x](../../other.md)`
- *  inside a rendered markdown preview must open its target in Lucidos' own
- *  preview. Covers a workspace artifact AND a registered-repository file. */
 
 async function openByPath(page: Page, filePath: string): Promise<void> {
   const res = await apiRequest(page).post('/api/v1/ui/navigate', {
@@ -26,8 +23,6 @@ const WS_GUIDE = `${WS_ROOT}/guide.md`;
 test.describe('a relative link in a workspace markdown preview', () => {
   test.beforeAll(() => {
     mkdirSync(resolve(WORKSPACE, 'data', `${WS_ROOT}/sub/deep`), { recursive: true });
-    // Leading prose, not a bare link: a link starting flush at the content
-    // edge sits under the mobile edge-swipe zone and is unclickable there.
     writeFileSync(resolve(WORKSPACE, 'data', WS_START), 'See the [guide](../../guide.md) for more.\n');
     writeFileSync(resolve(WORKSPACE, 'data', WS_GUIDE), '# Guide\n\nYou made it to the guide.\n');
   });
@@ -52,12 +47,9 @@ test.describe('a relative link in a workspace markdown preview', () => {
   });
 });
 
-/** A committed scratch repo with two markdown files, one deep under the other,
- *  linking back up with `../../`. */
 function createScratchRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), 'lucidos-e2e-repo-links-'));
   mkdirSync(join(dir, 'docs', 'sub', 'deep'), { recursive: true });
-  // Leading prose, not a bare link: see the comment on the workspace fixture.
   writeFileSync(join(dir, 'docs', 'sub', 'deep', 'start.md'), 'See the [guide](../../guide.md) for more.\n');
   writeFileSync(join(dir, 'docs', 'guide.md'), '# Guide\n\nYou made it from the repo.\n');
   const run = (...args: string[]) => execFileSync('git', args, { cwd: dir });

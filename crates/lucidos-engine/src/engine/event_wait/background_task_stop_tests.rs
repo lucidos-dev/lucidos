@@ -10,9 +10,9 @@
 
 use super::*;
 use crate::core::event_subscription::matchable_thread_payload;
+use crate::engine::bash_background_recovery::completion_event;
 use crate::engine::event_wait::{catch_up_from_watermark, waits_matching};
 use crate::engine::thread_events::{ActorMode, ThreadEvent};
-use crate::engine::tools::bash_background_recovery::completion_event;
 use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 use serde_json::json;
 use std::path::Path;
@@ -101,6 +101,7 @@ impl Stores {
             .expect("watermark");
         let armed_at = Utc::now();
         let wait = LiveWait {
+            background_timing: None,
             wait_id: Uuid::new_v4(),
             thread_id,
             tool_use_id: tool_use_id.to_string(),
@@ -252,7 +253,7 @@ async fn a_kill_for_the_whole_thread_still_delivers() {
 /// The engine's own wait over two tasks, one of them stopped. The rest stays
 /// watched through a replacement that keeps the original watermark, so a
 /// completion that landed in between is still found. The replacement is
-/// written before the cancel, so a waiting child never reads as finished.
+/// written before the cancel, so a child holding a wait never reads as finished.
 #[tokio::test]
 async fn stopping_one_task_narrows_the_engines_wait_to_the_rest() {
     let s = Stores::new().await;

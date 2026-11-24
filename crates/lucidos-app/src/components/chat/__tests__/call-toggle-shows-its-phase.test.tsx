@@ -1,15 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A call has four non-idle phases, and the button must show which one it is in.
- *
- * Two of them are WORK: the connect takes seconds and the hang-up takes a round
- * trip. Both used to paint the same red as a live call, so the press that
- * mattered most read as a dead button. A caller reported exactly that.
- *
- * Rendered rather than poked through props, because the claim is about what a
- * reader sees. The stylesheet's half of it is scanned separately, in
- * `styles/__tests__/call-toggle-phase-paint.test.ts`.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -25,16 +14,12 @@ import { CALL_IDLE, callStatusLabel } from '../../../voice/callState';
 import { tooltipWithShortcut } from '../../../store/actions/keybindings';
 import type { CallPhase, CallState } from '../../../voice/callState';
 
-// The picker's list is code-split, and the hold opens it once it is in
-// memory. Warm it, so a hold opens at once.
 beforeAll(() => MicrophoneList.preload());
 
 const PHASES: CallPhase[] = ['idle', 'connecting', 'listening', 'speaking', 'ending'];
 
 let host: HTMLDivElement;
 
-/** Rendered inside `act`, so the dwell timer is armed by the time a test
- *  advances the clock. */
 function mount(phase: CallPhase, extra: Partial<CallState> = {}): void {
   preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
   voiceCall.value = { ...CALL_IDLE, phase, threadId: 't', ...extra };
@@ -43,8 +28,6 @@ function mount(phase: CallPhase, extra: Partial<CallState> = {}): void {
   });
 }
 
-/** Move the call on without remounting, so the dwell's own effect decides what
- *  happens to the flag. */
 function moveTo(phase: CallPhase): void {
   act(() => {
     voiceCall.value = { ...voiceCall.value, phase };
@@ -69,12 +52,6 @@ function region(): HTMLElement {
   return el as HTMLElement;
 }
 
-/**
- * What the control says about itself, minus the phase attribute.
- *
- * Dropped on purpose: it is the hook the stylesheet paints through, so leaving
- * it in would make every phase distinct by construction and prove nothing.
- */
 function look(): string {
   const el = control();
   return [
@@ -86,8 +63,6 @@ function look(): string {
 }
 
 function pointer(type: string): PointerEvent {
-  // jsdom has no PointerEvent constructor, so a MouseEvent carrying the same
-  // fields stands in. `useLongPress` reads only `button` and `clientX/Y`.
   return new MouseEvent(type, {
     bubbles: true,
     cancelable: true,
@@ -142,8 +117,6 @@ describe('the call control shows which phase it is in', () => {
     }
   });
 
-  /** The whole defect. Four phases painted one binary, so a hang-up looked
-   *  like nothing at all until the socket closed. */
   it('gives every phase a look of its own', () => {
     const looks = PHASES.map((phase) => {
       mount(phase);
@@ -178,8 +151,6 @@ describe('the name and the tooltip track the phase', () => {
     });
   }
 
-  /** "End the call" on a button that is already ending is a lie, and it was
-   *  the label both transitional phases wore. */
   it('never offers to end a call that is already ending', () => {
     mount('ending');
     expect(control().getAttribute('aria-label')).not.toBe('End the call');
@@ -220,8 +191,6 @@ describe('the ending control is dead, and looks it', () => {
     }
   });
 
-  /** The hold settles the microphone the NEXT call opens, which this call
-   *  ending decides nothing about. So it survives the dead press. */
   it('still opens the microphone picker on a hold', async () => {
     mount('ending');
     await hold(control());
@@ -238,8 +207,6 @@ describe('the hidden region is left exactly as it was', () => {
     }
   });
 
-  /** A live utterance still wins over the phase, which is the region's own
-   *  rule and not this component's to restate. */
   it('lets a live utterance speak over the phase, as before', () => {
     mount('listening', { utterance: 'live', utteranceCount: 1 });
     expect(region().textContent).toBe(callStatusLabel(voiceCall.value));
@@ -253,15 +220,7 @@ describe('the hidden region is left exactly as it was', () => {
   });
 });
 
-/**
- * On iOS a first call after a page load pays the browser's microphone prompt,
- * and a human reads it behind a sheet covering our UI. A spinner through that
- * tells the reader we are busy when we are waiting on them.
- */
 describe('a connect that dwells says what it is waiting for', () => {
-  /** The component's own threshold. Restated rather than exported: the number
-   *  is a product decision, and a test reading it from the source proves only
-   *  that the source equals itself. */
   const DWELL_MS = 2_000;
   const CONNECTING_TIP = tooltipWithShortcut('Connecting. Press to cancel', 'toggleCall');
   const WAITING_TIP = 'Waiting for microphone access';
@@ -270,9 +229,6 @@ describe('a connect that dwells says what it is waiting for', () => {
     return control().getAttribute('data-tooltip');
   }
 
-  /** Both sides of the threshold on one mount, so the last millisecond is what
-   *  flips the copy. Two separate mounts would pass with the timer armed at the
-   *  wrong moment, or never armed at all. */
   it('claims progress until the dwell is up, then names the microphone', () => {
     mount('connecting');
     expect(tip()).toBe(CONNECTING_TIP);
@@ -292,8 +248,6 @@ describe('a connect that dwells says what it is waiting for', () => {
     expect(tip()).toBe(WAITING_TIP);
   });
 
-  /** The region narrates the phase, and the phase never moved. A second
-   *  announcement here would be the timer talking, not the call. */
   it('leaves the hidden region alone throughout', () => {
     mount('connecting');
     expect(region().textContent).toBe('Connecting');
@@ -301,7 +255,6 @@ describe('a connect that dwells says what it is waiting for', () => {
     expect(region().textContent).toBe('Connecting');
   });
 
-  /** A name says what a press does, and the press still cancels. */
   it('leaves the name of the button alone throughout', () => {
     mount('connecting');
     tick(DWELL_MS * 3);

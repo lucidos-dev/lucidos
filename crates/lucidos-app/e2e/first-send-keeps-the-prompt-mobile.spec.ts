@@ -9,10 +9,6 @@ import {
   waitForResponse,
 } from './helpers';
 
-/** The first send swaps the compose view for the thread view beside the
- *  prompt. The prompt must keep its DOM node through that swap, because
- *  useHideOnScroll measures that node as the transcript's bottom padding.
- *  Measuring any other node pushes the first turn out of view. `ThreadPane.tsx`. */
 
 const PROMPT = '.mobile-swipe-pane .prompt-area';
 
@@ -23,14 +19,12 @@ test.describe('First send with dynamic bars', () => {
     await assertHealthy(page);
   });
 
-  // The pref is global and the e2e database resets only between projects.
   test.afterEach(async ({ page }) => {
     await disableMobileDynamicBars(page);
   });
 
   test('keeps the prompt node, so the transcript reserves only its height', async ({ page }) => {
     await enableMobileDynamicBars(page);
-    // Record every write of the prompt height beside the prompt's real height.
     await page.addInitScript((promptSel) => {
       const writes: PromptHeightWrite[] = [];
       (window as unknown as { __promptHeightWrites: PromptHeightWrite[] }).__promptHeightWrites = writes;
@@ -69,7 +63,6 @@ test.describe('First send with dynamic bars', () => {
       expect(write.publishedPx, JSON.stringify(write)).toBeLessThanOrEqual(write.promptPx + 1);
     }
 
-    // The turn the send created is on screen, above the prompt.
     const turnVisible = await page.evaluate((sel) => {
       const turn = document.querySelector('.mobile-swipe-pane .thread-content.visible .chat-exchange');
       const prompt = document.querySelector(sel);

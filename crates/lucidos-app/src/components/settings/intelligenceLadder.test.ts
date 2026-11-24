@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { ServedIntelligenceRung } from '../../api/types';
+import type { IntelligenceLadder, ServedIntelligenceRung } from '../../api/types';
 import {
   draggedRung, KEEP_PRICES_CURRENT_CRON, KEEP_PRICES_CURRENT_SLUG, keepPricesCurrentTrigger, ladderOverride, movedRung,
-  percent, toggledRung,
+  percent, starredLadder, toggledRung,
 } from './intelligenceLadder';
 
 const rung = (model: string, effort: string, on = true): ServedIntelligenceRung => ({
@@ -87,8 +87,6 @@ describe('Keep prices current', () => {
     }
   });
 
-  /** Lucidos never creates the price trigger by itself (ADR 0525): the
-   *  page's button is the one caller of the request that builds it. */
   it('is built only by the Intelligence page', () => {
     const sources = import.meta.glob<string>(
       ['../../**/*.{ts,tsx}', '!../../**/*.test.{ts,tsx}', '!./intelligenceLadder.ts'],
@@ -99,4 +97,26 @@ describe('Keep prices current', () => {
       .map(([path]) => path);
     expect(callers).toEqual(['./IntelligencePage.tsx']);
   });
+});
+
+it('draws the new default on and keeps the old default on', () => {
+  const ladder: IntelligenceLadder = {
+    surface: 'chat',
+    source: '',
+    estimated: '',
+    customised: true,
+    climbs: true,
+    shipped_rungs: shippedPairs,
+    default_rung: shippedPairs[0],
+    reference: null,
+    long_prompt_share: null,
+    rungs: [{ ...shipped[0], is_default: true }, ...shipped.slice(1)],
+  };
+  const next = starredLadder(ladder, shipped[1]);
+  expect(next.default_rung).toEqual({ model: 'b', effort: 'low' });
+  expect(next.rungs.map(({ on, is_default }) => [on, is_default])).toEqual([
+    [true, false], [true, true], [true, false],
+  ]);
+  expect(toggledRung(next.rungs, 1)).toEqual(next.rungs);
+  expect(ladder.rungs[1].on).toBe(false);
 });

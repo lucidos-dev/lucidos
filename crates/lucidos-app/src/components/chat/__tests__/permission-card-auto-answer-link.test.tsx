@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** A pending command card links to the Auto-answer coding-agent cards switch.
- *
- *  Only a command tool carries it, only while the card waits for an answer,
- *  and only while auto-answer is off. The command guard switch plays no part.
- *  With auto-answer on, the card links to the judge model instead, but only
- *  while no judge model resolves. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 

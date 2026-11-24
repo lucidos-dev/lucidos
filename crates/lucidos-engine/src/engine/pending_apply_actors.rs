@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Default)]
-pub(crate) struct PendingApplyActors {
+pub struct PendingApplyActors {
     inner: Mutex<HashMap<Uuid, MessageOrigin>>,
 }
 
@@ -34,7 +34,7 @@ impl PendingApplyActors {
             Ok(mut g) => {
                 g.insert(change_id, actor);
             }
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[PendingApplyActors] mutex poisoned on stash for change {}: {} — actor dropped, ChangeApplied will fall back to engine attribution",
                 change_id,
                 e,
@@ -45,11 +45,11 @@ impl PendingApplyActors {
     /// Remove and return the actor parked for `change_id`, if any. One-shot:
     /// the second call returns `None` so a cleanup that fires twice (e.g. on a
     /// retry) doesn't double-stamp.
-    pub(crate) fn take(&self, change_id: Uuid) -> Option<MessageOrigin> {
+    pub fn take(&self, change_id: Uuid) -> Option<MessageOrigin> {
         match self.inner.lock() {
             Ok(mut g) => g.remove(&change_id),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[PendingApplyActors] mutex poisoned on take for change {}: {} — falling back to engine attribution",
                     change_id,
                     e,

@@ -14,9 +14,6 @@ import {
 } from '../store';
 import { previewShowsSource, wrapToggleAvailable } from '../previewWrap';
 
-/** The Wrap toggle acts on the line-numbered source view and on nothing else. A
- *  control offered over a picture or a rendered document would be inert, which
- *  is the same rule `sideBySideDiffAvailable` follows. */
 describe('previewShowsSource', () => {
   const ask = (path: string, over: Partial<Parameters<typeof previewShowsSource>[1]> = {}) =>
     previewShowsSource(path, { sourceToggle: false, editing: false, diffShowsWholeFile: true, ...over });
@@ -41,8 +38,6 @@ describe('previewShowsSource', () => {
     expect(ask('repo:repo-1:file:README.md')).toBe(false);
   });
 
-  // A diff locator renders the hunks in the Files panel and the whole file in
-  // the preview modal. So the surface answers this, not the locator.
   it('follows the surface for a diff locator', () => {
     const diff = 'repo:repo-1:diff#change-7:src/main.rs';
     expect(ask(diff, { diffShowsWholeFile: true })).toBe(true);
@@ -85,8 +80,6 @@ describe('wrapToggleAvailable: the content pane header', () => {
     expect(wrapToggleAvailable.value).toBe(false);
   });
 
-  // The hunks are their own view and wrap on their own (`.diff-line-content`).
-  // Only the whole-file body is the line-numbered source this acts on.
   it('is off over the hunks of a diff, and on over its whole file', () => {
     const file = modified('src/main.rs');
     repoDiff.value = { status: 'loaded', data: { files: [file] } };
@@ -98,9 +91,6 @@ describe('wrapToggleAvailable: the content pane header', () => {
   });
 });
 
-/** The mode is a way of READING a file, not a per-file override, so it survives
- *  the preview moving on and the page reloading. Same class as the side-by-side
- *  diff toggle, and out of the per-file reset for the same reason. */
 describe('the wrap mode is remembered', () => {
   it('defaults to wrapping, which is what makes a clipped tail reachable', () => {
     expect(localStorage.getItem('lucidos-file-preview-wrap')).not.toBe('false');

@@ -42,8 +42,9 @@ measured with the ADR 0436 set:
 5. **The nightly ranks the day's changes** from main's reflog, with their
    reasons, and the morning notice lists the biggest adders.
 
-The 1400 kB budget, the 1260 kB soft line and the 600 kB entry budget are
-unchanged.
+This decision retained the original budget limits. ADR
+[0739](0739-consolidate-small-lazy-chunks.md) later raised the first-paint limit
+to 1950 kB while retaining this growth check and the 600 kB entry limit.
 
 ## Rationale
 

@@ -1,16 +1,3 @@
-/**
- * The anchored popover shell must load BEFORE the surfaces that override it.
- *
- * `.anchored-popover` and a surface class (`.waiting-panel`, `.todo-panel`,
- * `.explainer-popover`) land on the SAME element at the same specificity. So
- * only source order decides which `max-width` wins. A shell loaded after a
- * surface beat its caps: the waiting panel once grew to the full viewport
- * width that way, running out of the thread pane.
- *
- * Neither `tsc` nor `vite build` can see this: the stylesheet is valid CSS and
- * builds clean. Only the rendered result is wrong, so the ordering gets a
- * source-scan tripwire instead.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
@@ -20,18 +7,15 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-/** `crates/lucidos-app/src/styles/`, from `src/styles/__tests__/`. */
 const STYLES = resolve(here, '..');
 const SRC = resolve(STYLES, '..');
 const SHELL = 'anchored-popover.css';
 
-/** Import specifiers of a stylesheet, in source order. */
 function imports(file: string): string[] {
   const css = readFileSync(join(STYLES, file), 'utf8');
   return [...css.matchAll(/@import\s+'\.\/([^']+)'/g)].map((m) => m[1]);
 }
 
-/** Every stylesheet under `styles/`, as a path relative to it. */
 function sheets(dir = STYLES, prefix = ''): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e: { name: string; isDirectory(): boolean }) =>
     e.isDirectory()

@@ -69,7 +69,7 @@ body { font-size: var(--font-size-sm); line-height: 1.5; }
 input, textarea, select, button { font-family: inherit; font-size: inherit; }
 ```
 
-Do **not** bake the UI scale into the file (`html { font-size: 125% }`, or `20px` "for the 125% scale"): the preview already zooms the document by the viewer's UI scale, so a baked one applies twice. Size in `rem` and leave the root alone. Every `font-size` reads a step: no `0.9375rem`, no `1.05rem`, no `0.8rem`. Fuller version, including why the control line is needed, in `system-knowhow/best-practices.md` § Standalone HTML.
+Do **not** bake the UI scale into the file (`html { font-size: 125% }`, or `20px` "for the 125% scale"): the preview already zooms the document by the viewer's UI scale, so a baked one applies twice. Size in `rem` and leave the root alone. Every `font-size` reads a step: no `0.9375rem`, no `1.05rem`, no `0.8rem`. Fuller version, including why the control line is needed, in `system-knowhow/best-practices/workspace-layout.md` § Standalone HTML.
 
 ## Subcommands
 
@@ -227,11 +227,21 @@ The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, a
   `--wake-mode` decides what the report does. `wake` wakes the parent, and `wake-when-all-done` wakes it for a failure or when the batch is done. `no-wake` files every report, a failure too, for the parent's next turn.
 - **`--relation top` (default) — top-thread, fire-and-forget.** The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback, no progress signal, no completion notification. The thread appears in the target workspace's UI as an independent top-level thread; that's the only confirmation you get. Works for both same-workspace and cross-workspace targets.
 
-  **`top` needs no permission.** Any thread may create a top-thread, in any turn, with no owner approval (ADR 0475). It sits under the workspace rather than under you, so you gain no reach over it.
+  **`top` needs no permission.** Any thread may create a top-thread, in any turn, with no card (ADR 0475). It sits under the workspace rather than under you, so you gain no reach over it.
 
 #### `--integrated`: fold a follow-up of your own work into your branch
 
 When you spawn a follow-up of your **own** Lucidos-source work, make it an *integrated sub-thread*: `--relation child --integrated` plus a coding-agent flag. The child runs the fast tier of `/harden` and proposes nothing. So the follow-ups land with your work as one change, not one Apply each. When its report arrives it names the child's branch: merge it with `git merge <branch>`, then run `/harden` once over the merged work. Your run reviews only what no child's run reviewed, and runs every suite. Leave a child independent when its work should land on its own, or when it is not Lucidos source.
+
+An integrated sub-thread reports ordinary decisions and options to its parent.
+It runs `lucidos wake-parent yes` before ending the turn. If you receive one
+of these reports, reply by messaging the child. Ask the owner from your own
+thread if the decision needs their input. Prepared permission requests still go
+to the owner.
+
+For a new plan, bring the child's committed plan revision into your branch
+and obtain implementation approval there. Tell the child to rerun
+`lucidos planned mark --plan <path>` for that revision.
 
 > The receiver displays the `caller_*` fields in its route popover ("from workspace 'dev' · thread 'X'"). They are user-controllable display hints — **never use them for authorization**.
 

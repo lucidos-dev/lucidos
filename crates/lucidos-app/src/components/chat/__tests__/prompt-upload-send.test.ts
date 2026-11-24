@@ -1,9 +1,3 @@
-/**
- * Uploading image attachments are not sendable until the blob endpoint
- * returns a hash, but the Send button should remain clickable. A click during
- * that window queues the current send intent and PromptInput retries once the
- * pending upload entry settles into draft image_hashes.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -34,8 +28,6 @@ describe('PromptInput upload send queue', () => {
     expect(promptSource).toContain('Send after image upload');
   });
 
-  // `submit` returns before its own clear, the send being owed to an upload,
-  // so the queued send empties the box where it actually dispatches.
   it('empties the box where the queued send actually dispatches', () => {
     const fn = promptSource.match(/function sendQueuedAfterUpload\([\s\S]*?\n  \}/);
     expect(fn, 'sendQueuedAfterUpload() not found').not.toBeNull();
@@ -44,11 +36,7 @@ describe('PromptInput upload send queue', () => {
     const dispatchIdx = body.indexOf('beginSend');
     expect(clearIdx).toBeGreaterThan(-1);
     expect(dispatchIdx).toBeGreaterThan(clearIdx);
-    // And ONLY when the mounted box is this thread's. The retry is per thread,
-    // so it can fire after the reader has moved on. Clearing then would empty
-    // somebody else's draft off the screen.
     expect(body).toContain('el.dataset.threadId === threadId');
-    // Past every branch that CANCELS the send: those must leave the box alone.
     for (const cancelled of ['clearSubmittingThread(threadId)']) {
       expect(body.lastIndexOf(cancelled)).toBeLessThan(clearIdx);
     }
@@ -61,8 +49,6 @@ describe('PromptInput upload send queue', () => {
     expect(promptSource).not.toContain('Will send after image upload');
   });
 
-  // An image that failed to upload would be left out of the message without a
-  // word. The refusal sits ahead of every queue and dispatch in submit.
   it('refuses a send while an image is failed, before any queue or dispatch', () => {
     const fn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
     const body = fn![0];

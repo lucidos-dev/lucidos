@@ -3,8 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { GlyphBadge } from './GlyphBadge';
 
-// Only "3" draws off its slot, and a "Wide" font adds a little. The measurement
-// itself is pinned in inkCentre.test.ts.
 vi.mock('../../utils/inkCentre', () => ({
   measureInkShift: (text: string, style: CSSStyleDeclaration) =>
     (text === '3' ? 0.025 : 0) + (style.fontFamily === 'Wide' ? 0.01 : 0),
@@ -44,7 +42,6 @@ describe('GlyphBadge', () => {
   });
 
   it('measures again when its font changes under the same text', () => {
-    // A theme card keeps its "Custom" text while the card's own font changes.
     render(<div style={{ fontFamily: 'Narrow' }}><GlyphBadge class="badge">3</GlyphBadge></div>, host);
     render(<div style={{ fontFamily: 'Wide' }}><GlyphBadge class="badge">3</GlyphBadge></div>, host);
     expect(badge().style.getPropertyValue('--badge-ink-shift')).toBe('0.0350em');

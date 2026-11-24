@@ -1,26 +1,9 @@
-/**
- * Bug: Transient SSE events for threads not in the map create phantom skeletons.
- * These "empty threads" show "..." title and "No messages in this thread",
- * then vanish on reload because the API doesn't return them (no DB backing).
- *
- * Root cause: handleThreadEvent creates a skeleton for ANY SSE event, including
- * transient ones (seq=null) like ChildrenCountChanged. Transient events have no
- * DB row, so the skeleton is a phantom.
- *
- * Fix: only create skeletons for persisted events (seq !== null).
- *
- * Second round: a persisted event can lack a DB row too. The engine reads the
- * aggregate inside the emitting transaction, so an event carrying none means
- * the row is gone. That skeleton is the same phantom, so both halves of the
- * gate live here.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { threadMap, focusedThreadId } from '../store';
 import { handleThreadEvent } from '../actions/thread-sync';
 import { makeThreadAggregate } from '../actions/threads-test-helpers';
 import type { ThreadState } from '../thread-events';
 
-// handleThreadEvent uses requestAnimationFrame for batched signal updates.
 vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 0));
 vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
 
@@ -59,9 +42,6 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
   };
 }
 
-// ---------------------------------------------------------------------------
-// Phantom thread prevention — transient events must not create skeletons
-// ---------------------------------------------------------------------------
 describe('Phantom thread prevention', () => {
   beforeEach(() => {
     threadMap.value = new Map();
@@ -69,14 +49,10 @@ describe('Phantom thread prevention', () => {
   });
 
   it('ChildrenCountChanged for unknown parent must NOT create a skeleton', () => {
-    // Scenario: parent chat thread finished long ago, not in recent thread list.
-    // Child CC thread starts → backend sends ChildrenCountChanged to parent.
-    // Parent is NOT in the map. Without the fix, a phantom skeleton appears.
     const parentId = 'old-parent-thread';
 
     handleThreadEvent({
       thread_id: parentId,
-      // No seq — ChildrenCountChanged is transient
       event: { type: 'ChildrenCountChanged', active: 1, total: 1 },
       created: '2026-04-16T12:00:00Z',
     });
@@ -85,7 +61,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('TextStreaming for unknown thread must NOT create a skeleton', () => {
-    // Scenario: SSE connects before loadAllThreads, transient streaming arrives.
     const threadId = 'not-yet-loaded';
 
     handleThreadEvent({
@@ -110,9 +85,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('persisted event for unknown thread DOES create a skeleton', () => {
-    // Scenario: new thread starts, SessionStarted arrives via SSE.
-    // This should still create a skeleton (it has a DB row). The aggregate is
-    // what says the row is there, so a live persisted event always carries one.
     const threadId = 'new-thread';
 
     handleThreadEvent({
@@ -131,10 +103,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('a skeleton for an old thread takes its identity from the aggregate, not the event', () => {
-    // Real case: the worktree cleanup emits WorktreeCleaned for archived coding
-    // threads the drawer never loaded. The skeleton read "Untitled Thread" with
-    // the Lucidos Agent pill. It also took the cleanup's time as its creation
-    // time, which floated it to the top of Archive. A reload fixed all three.
     const threadId = 'old-archived-cc-thread';
 
     handleThreadEvent({
@@ -161,11 +129,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('persisted event for unknown thread with NO aggregate creates nothing', () => {
-    // The aggregate is read from `thread_summaries` inside the emitting
-    // transaction, so its absence on a persisted event means the row is gone.
-    // A skeleton built from that has no title and no content, and a reload
-    // sweeps it away. Found by drawer-archive-pagination, which counted one
-    // drawer row more than it seeded.
     const threadId = 'thread-whose-row-was-truncated';
 
     handleThreadEvent({
@@ -179,7 +142,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('ChildrenCountChanged for thread already in map updates it normally', () => {
-    // Transient events for threads already in the map should still work.
     const parentId = 'loaded-parent';
     const map = threadMap.value;
     map.set(parentId, makeThread(parentId));
@@ -197,12 +159,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('ChildrenCountChanged does not bump meta.updatedAt to the broadcast NOW()', () => {
-    // 42aab0773 broadcasts each ancestor's aggregate via ChildrenCountChanged
-    // whenever a descendant flips is_blocking. The ancestor isn't doing
-    // anything itself — without the targeted exclusion in handleEvent the
-    // transient-event branch would set meta.updatedAt = broadcast NOW(),
-    // churning the drawer's "X ago" timestamp on every leaf state change
-    // across the entire ancestor chain.
     const ancestorId = 'ancestor';
     const ancestorOwnLastActivity = '2026-04-01T00:00:00Z';
     const map = threadMap.value;
@@ -217,23 +173,19 @@ describe('Phantom thread prevention', () => {
     handleThreadEvent({
       thread_id: ancestorId,
       event: { type: 'ChildrenCountChanged', active: 3, total: 5 },
-      created: '2026-04-16T12:00:00Z', // broadcast NOW() — must NOT propagate
-      // Real backend carries the ancestor's OWN unchanged last_activity in
-      // the aggregate (update_parent_after_child_terminal doesn't touch
-      // last_activity). applyAggregateToMeta overlays it as a no-op.
+      created: '2026-04-16T12:00:00Z',
       aggregate: makeThreadAggregate(ancestorId, {
         lastActivity: ancestorOwnLastActivity,
         section: 'archived',
         activeChildrenCount: 3,
         totalChildrenCount: 5,
-        // descendant flipped, so the ancestor count moves
         blockingDescendantCount: 2, attentionDescendantCount: 2,
       }),
     });
 
     const ancestor = threadMap.value.get(ancestorId)!;
     expect(ancestor.meta.blockingDescendantCount).toBe(2);
-    expect(ancestor.meta.updatedAt).toBe(ancestorOwnLastActivity); // NOT bumped
+    expect(ancestor.meta.updatedAt).toBe(ancestorOwnLastActivity);
   });
 
   it('CodingAgentDiffChanged applies aggregate diff flag without bumping updatedAt', () => {
@@ -265,12 +217,6 @@ describe('Phantom thread prevention', () => {
   });
 
   it('ChildrenCountChanged with section flip applies the section change', () => {
-    // Regression guard for the broken-short-circuit bug: when a CC child fires
-    // ResponseFailed/ResponseCanceled once parent_callback_pending is FALSE, the backend
-    // calls update_parent_after_child_terminal(decrement=false, surface_to_inbox=true)
-    // — counts stay equal but archive_state flips to 'inbox'. Earlier short-
-    // circuit would have dropped the section change. With the cleaner targeted
-    // updatedAt exclusion, applyAggregateToMeta still runs and the section moves.
     const parentId = 'parent';
     const map = threadMap.value;
     map.set(parentId, makeThread(parentId, {
@@ -286,7 +232,7 @@ describe('Phantom thread prevention', () => {
       created: '2026-04-16T12:00:00Z',
       aggregate: makeThreadAggregate(parentId, {
         lastActivity: '2026-04-01T00:00:00Z',
-        section: 'inbox', // <-- surfaced
+        section: 'inbox',
         totalChildrenCount: 1,
       }),
     });
@@ -295,12 +241,9 @@ describe('Phantom thread prevention', () => {
   });
 
   it('CodingAgentThreadSpawned for unknown parent still creates the child thread', () => {
-    // CodingAgentThreadSpawned is transient but has a side effect: creating the child CC
-    // thread. The parent skeleton should NOT be created, but the child should.
     const parentId = 'old-parent';
     const childId = 'cc-child-new';
 
-    // Focus a different thread (the parent is NOT focused)
     const focusedId = 'my-focused-thread';
     const map = threadMap.value;
     map.set(focusedId, makeThread(focusedId));
@@ -313,18 +256,13 @@ describe('Phantom thread prevention', () => {
       created: '2026-04-16T12:00:00Z',
     });
 
-    // Parent should NOT be in the map (transient event, not loaded)
     expect(threadMap.value.has(parentId)).toBe(false);
-    // Child SHOULD be created by handleTransientSideEffects
     expect(threadMap.value.has(childId)).toBe(true);
     expect(threadMap.value.get(childId)!.meta.title).toBe('Fix the bug');
     expect(threadMap.value.get(childId)!.meta.channel).toBe('claude_code');
   });
 
   it('CodingAgentThreadSpawned leaves the focused thread\'s pending rows where the user sent them', () => {
-    // An agent's spawn is unrelated to what the user is sending elsewhere. The
-    // pending row belongs to the focused thread, whose MessageReceived swaps it
-    // by event id. Moved, it sat in the child as a stuck "Requesting" row.
     const focusedId = 'thread-the-user-is-typing-in';
     const childId = 'cc-child-of-another-thread';
     const map = threadMap.value;
@@ -343,7 +281,6 @@ describe('Phantom thread prevention', () => {
     expect(threadMap.value.get(focusedId)!.pendingUserMessages.map(p => p.eventId)).toEqual(['evt-mine']);
     const child = threadMap.value.get(childId)!;
     expect(child.pendingUserMessages).toEqual([]);
-    // The engine stores `system` for a thread an agent's message started.
     expect(child.meta.initiator).toBe('system');
   });
 });

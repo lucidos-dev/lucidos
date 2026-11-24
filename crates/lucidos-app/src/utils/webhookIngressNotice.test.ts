@@ -1,12 +1,3 @@
-/**
- * The ingress wording table, read by the app bar and by every enabled row on the
- * Webhooks page.
- *
- * One property carries the module: the ADDRESS FAMILY is in every sentence. The
- * outage this feature exists to catch was IPv4 alone, with IPv6 answering
- * correctly all night. Wording that flattened that would repeat the failure at
- * the last layer, after the engine had gone to the trouble of measuring it.
- */
 import { describe, it, expect } from 'vitest';
 
 import {
@@ -37,23 +28,16 @@ describe('ingressFamiliesPhrase', () => {
   });
 
   it('reads the same however the engine ordered the list', () => {
-    // Two surfaces render one outage. If arrival order leaked into the words,
-    // the bar and the row could describe the same failure differently.
     expect(ingressFamiliesPhrase(['ipv6', 'ipv4'])).toBe('IPv4 and IPv6');
   });
 
   it('falls back to the path rather than claiming a family it was not told', () => {
-    // Unreachable today: the engine declares an outage only with a family down.
-    // A fallback that guessed "every address" would be the wrong kind of wrong.
     expect(ingressFamiliesPhrase([])).toBe('the public path');
   });
 });
 
 describe('webhookIngressNotice', () => {
   it('names the family in the title, so one family down never reads as all', () => {
-    // The bar is the whole point of the feature. A title saying only "webhook
-    // deliveries are not arriving" would have read as false during the real
-    // outage. Anyone could see IPv6 working.
     expect(webhookIngressNotice(outage()).title)
       .toBe('Webhook deliveries over IPv4 are not arriving');
     expect(webhookIngressNotice(outage({ families: ['ipv4', 'ipv6'] })).title)
@@ -67,17 +51,12 @@ describe('webhookIngressNotice', () => {
   });
 
   it('measures the outage from `down_secs`, never from the client clock', () => {
-    // The engine sends the span the database measured, beside the instant. A
-    // client with a skewed clock therefore cannot report its own skew as outage
-    // time (ADR 0053). Moving the instant alone must change nothing.
     const shifted = outage({ down_since: '1999-01-01T00:00:00Z' });
     expect(webhookIngressNotice(shifted).detail)
       .toBe(webhookIngressNotice(outage()).detail);
   });
 
   it('claims a lost reply, never a lost delivery', () => {
-    // The probe knows what it met. It does not know whether a sender tried, so
-    // counting deliveries as lost would be an invention.
     const detail = webhookIngressNotice(outage()).detail;
     expect(detail).toContain('gets no reply');
     for (const invented of ['lost', 'dropped', 'missed']) {
@@ -99,9 +78,6 @@ describe('webhookIngressRowLine', () => {
   });
 
   it('names no webhook, because the ingress sits in front of all of them', () => {
-    // Drawn on every enabled row. The probe targets one hook, and what failed
-    // is the path they share, so naming the target would be wrong about the
-    // rest.
     const line = webhookIngressRowLine(outage());
     expect(line).not.toContain('node.tailnet.ts.net');
     expect(line).not.toContain('8443');

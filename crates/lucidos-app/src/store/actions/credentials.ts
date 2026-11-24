@@ -39,7 +39,6 @@ export function openAddCredential(): void {
   pushNavState();
 }
 
-/** `id`, not the service name: a name no longer identifies one row. */
 export function openEditCredential(id: string): void {
   landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential', editing: id } });
   pushNavState();
@@ -51,31 +50,13 @@ export function openCredentialRequest(request: CredentialRequest): void {
 }
 
 export function closeCredentialForm(): void {
-  // Dismissing the form abandons whatever Connect queued behind it. Without
-  // this, cancelling a registration and later saving an unrelated credential
-  // would open a browser for a provider the user walked away from.
   cancelPendingOAuthConnect();
-  // And it answers the request that opened it, so it is not offered again.
   const form = activeInlineForm.value;
   const requestId = form?.type === 'credential' ? form.request?.form_request_id : undefined;
   closeInlineForm();
   if (requestId) void cancelFormRequestById(requestId);
 }
 
-/** Save a credential the engine ASKED for, then continue whatever was blocked.
- *
- *  Two things the plain create path cannot do, and the reason this exists as its
- *  own entry point rather than as flags on `submitNewCredential`:
- *
- *  1. **A repair updates, it never creates.** A request carrying
- *     `existing_credential_id` targets a row that already exists (an OAuth
- *     Client saved without the endpoints a flow needs). Creating would make a
- *     second `oauth_client` for one provider, and a name plus an auth type is
- *     the credential's identity, so that pair is a duplicate.
- *  2. **The flow continues.** Saving used to close the form and stop, which is
- *     what left a user who pressed Connect looking at the Accounts page with no
- *     idea that pressing Connect again was the next step.
- */
 export async function submitRequestedCredential(
   request: CredentialRequest,
   service: string,
@@ -89,11 +70,6 @@ export async function submitRequestedCredential(
     ? await submitCredentialEdit(request.existing_credential_id, {
         base_urls: baseUrls,
         auth_type: authType,
-        // The STORED header, which the form passes in. Never hardcode the
-        // default here. A scope widening reaches this line for an ordinary API
-        // credential, and would reset an `X-Api-Key` one to `Authorization`,
-        // breaking every call through it. An `oauth_client` never travels the
-        // proxy auth pipeline, has no meaningful header, and takes the fallback.
         auth_header: authHeader?.trim() || 'Authorization',
         auth_value: authValue,
         env_var_name: envVarName,
@@ -112,7 +88,6 @@ export async function submitRequestedCredential(
   return true;
 }
 
-/** Shared success/error/reload handling for credential saves. */
 async function runCredentialSave(
   apiCall: () => Promise<ApiResult>,
   failMsg: string
@@ -123,9 +98,6 @@ async function runCredentialSave(
       showToast(data.error || failMsg, 'error');
       return false;
     }
-    // `closeInlineForm`, NOT `closeCredentialForm`: closing because the save
-    // SUCCEEDED must not abandon the authorization the save just unblocked.
-    // Only a user dismissing the form does that.
     closeInlineForm();
     await loadCredentials();
     return true;
@@ -135,7 +107,6 @@ async function runCredentialSave(
   }
 }
 
-/** Create a brand-new credential (also used by the engine credential-request flow). */
 export async function submitNewCredential(
   service: string,
   baseUrls: string[],
@@ -148,9 +119,6 @@ export async function submitNewCredential(
     showToast('Service name is required', 'error');
     return false;
   }
-  // A `secret` is signed with rather than sent, so it declares no base URL and
-  // an empty scope is its correct state. Requiring one here made the type
-  // unsaveable from the credential form.
   if (authType !== 'secret' && baseUrls.length === 0) {
     showToast('Base URL is required', 'error');
     return false;
@@ -173,7 +141,6 @@ export async function submitNewCredential(
   );
 }
 
-/** Update every editable field of an existing credential, addressed by `id`. */
 export async function submitCredentialEdit(
   id: string,
   body: UpdateCredentialBody
@@ -181,11 +148,6 @@ export async function submitCredentialEdit(
   return runCredentialSave(() => updateCredential(id, body), 'Failed to update credential');
 }
 
-/**
- * Delete by `id`. The service name is still passed, for the confirm prompt
- * only: "Delete credentials for \"google\"?" is what the user can act on, and
- * a uuid in a dialog is not.
- */
 export async function deleteCredential(id: string, serviceName: string): Promise<void> {
   if (!(await showConfirm(`Delete credentials for "${serviceName}"?`, 'Delete', { variant: 'danger' }))) {
     return;

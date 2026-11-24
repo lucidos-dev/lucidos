@@ -1,13 +1,10 @@
 // @vitest-environment jsdom
-/** The prompt bar's rung list filters as the user types, the way the model
- *  picker and every other dropdown do. The ladder link survives any query. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { RungPicker } from '../RungPicker';
 import { LADDER_LINK_LABEL, LADDER_LINK_ROW } from '../rungRows';
 
-// A desktop with a mouse: the box waits for a keystroke there.
 vi.mock('../../../utils/viewport', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/viewport')>()),
   isTouchDevice: () => false,
@@ -57,7 +54,6 @@ describe('the rung list filter', () => {
     expect(host.querySelector<HTMLInputElement>('input')?.value).toBe('opus');
     expect(labels()).toEqual(['Opus 5.5 · medium', 'Opus 5.5 · high', LADDER_LINK_LABEL]);
 
-    // Enter picks the first match, as the highlight reset to the top.
     type(list, 'Enter');
     expect(onPick).toHaveBeenCalledWith('opus|medium');
   });

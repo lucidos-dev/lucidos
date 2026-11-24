@@ -143,6 +143,21 @@ Spend last week was 412, up 38% on the week before.
 read = true
 
 [[turn]]
+kind = "trigger-routine-report"
+source = "trigger"
+message = "Send me the weekly spend report every Monday."
+reply = """
+Spend last week was 412, in line with the past three weeks.
+
+- **Model calls:** 301, within the usual range.
+- **Hosting:** 61, unchanged.
+- **Image calls:** 50, in line with recent weeks.
+
+There were no new charges or budget alerts.
+"""
+read = false
+
+[[turn]]
 kind = "finding"
 source = "agent"
 message = "The event wait on PriceDropped delivered: the flight watch fired."

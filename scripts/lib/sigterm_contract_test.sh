@@ -24,7 +24,7 @@ FAIL=0
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 
-MAIN_RS="$PROJECT_DIR/crates/lucidos-engine/src/main.rs"
+MAIN_RS="$PROJECT_DIR/crates/lucidos-engine-bin/src/main.rs"
 
 echo "test: main.rs installs SIGUSR1 handler as legitimate stop signal"
 if grep -q "SignalKind::user_defined1()" "$MAIN_RS"; then

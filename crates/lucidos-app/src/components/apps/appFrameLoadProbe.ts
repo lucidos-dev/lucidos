@@ -19,14 +19,11 @@ export const SLOW_LOAD_MS = 3000;
 
 const CATEGORY = 'app-frame';
 
-/** Which frame this is, in the words the log is read in. */
 export interface FrameLabel {
   app: string;
-  /** `canvas`, or a widget's place: `dashboard`, `inline`, `option`. */
   place: string;
 }
 
-/** What the host knows about its own connection to the engine. */
 export interface HostSample {
   sinceResumeMs: number | null;
   eventStream: string | null;
@@ -43,15 +40,27 @@ export function sampleHost(): HostSample {
   };
 }
 
-/** The frame document's own request, in milliseconds from navigation start, or
- *  `null` when the browser does not expose it. */
-export function frameDocumentTiming(frame: HTMLIFrameElement | null): Record<string, number> | null {
+export type FrameDocumentTiming = Record<
+  'start' | 'fetchStart' | 'requestStart' | 'responseStart' | 'responseEnd',
+  number | null
+>;
+
+export function frameDocumentTiming(
+  frame: HTMLIFrameElement | null,
+  attachedAt: number,
+): FrameDocumentTiming | null {
   if (!frame?.src) return null;
   const url = frame.src.split('#', 1)[0];
-  const entries = performance.getEntriesByName(url, 'resource') as PerformanceResourceTiming[];
-  const entry = entries[entries.length - 1];
-  if (!entry) return null;
-  const ms = (value: number) => Math.round(value);
+  let own: PerformanceResourceTiming[];
+  try {
+    own = (performance.getEntriesByName(url, 'resource') as PerformanceResourceTiming[])
+      .filter((entry) => entry.startTime >= attachedAt);
+  } catch {
+    return null;
+  }
+  if (own.length !== 1) return null;
+  const [entry] = own;
+  const ms = (value: number) => (value > 0 ? Math.round(value - attachedAt) : null);
   return {
     start: ms(entry.startTime),
     fetchStart: ms(entry.fetchStart),
@@ -62,24 +71,18 @@ export function frameDocumentTiming(frame: HTMLIFrameElement | null): Record<str
 }
 
 export interface FrameLoadProbe {
-  /** The frame's document fired `load`. */
   noteLoad(): void;
-  /** The app called `lucidos.ui.ready()`. */
   noteReady(): void;
-  /** The cover lifted. `fused` says the fuse lifted it. */
   noteRevealed(fused: boolean): void;
-  /** The frame element is going away, by unmount or by a reload. */
   abandon(): void;
 }
 
 type Log = (category: string, message: string, data: Record<string, unknown>) => void;
 
-/** Start watching one frame element. One probe per element: a reload takes a
- *  fresh element, so it takes a fresh probe. `frame` is read when a line is
- *  written, since the element may not exist yet. */
 export function startFrameLoadProbe(
   label: FrameLabel,
   frame: () => HTMLIFrameElement | null,
+  attachedAt: number,
   host: () => HostSample = sampleHost,
   log: Log = postClientLog,
 ): FrameLoadProbe {
@@ -93,12 +96,16 @@ export function startFrameLoadProbe(
   let closed = false;
 
   const times = () => ({ loadMs, readyMs, revealMs, fused });
-  // Loaded and revealed: nothing is left to wait for.
+  const documentTiming = () => ({
+    frameDocument: loadMs === null ? null : frameDocumentTiming(frame(), attachedAt),
+  });
+  const end = (message: string) =>
+    log(CATEGORY, message, { ...label, sinceMountMs: since(), ...times(), ...documentTiming() });
   const settleIfDone = () => {
     if (closed || loadMs === null || revealMs === null) return;
     closed = true;
     clearTimeout(timer);
-    if (slow) log(CATEGORY, 'slow load ended', { ...label, sinceMountMs: since(), ...times() });
+    if (slow) end('slow load ended');
   };
 
   const timer = setTimeout(() => {
@@ -110,7 +117,7 @@ export function startFrameLoadProbe(
       loaded: loadMs !== null,
       ready: readyMs !== null,
       ...host(),
-      frameDocument: frameDocumentTiming(frame()),
+      ...documentTiming(),
     });
   }, SLOW_LOAD_MS);
 
@@ -132,7 +139,7 @@ export function startFrameLoadProbe(
       if (closed) return;
       closed = true;
       clearTimeout(timer);
-      if (slow) log(CATEGORY, 'slow load abandoned', { ...label, sinceMountMs: since(), ...times() });
+      if (slow) end('slow load abandoned');
     },
   };
 }

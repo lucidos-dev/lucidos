@@ -1,13 +1,9 @@
 // @vitest-environment jsdom
-// `retrySrc` resolves a src against the page origin, so it needs a real one.
 import { describe, it, expect } from 'vitest';
 import {
   isRetryableImageSrc, retrySrc, retryDelayMs, MAX_ATTEMPTS, BASE_DELAY_MS, MAX_DELAY_MS,
 } from './imageRetry';
 
-// Root cause: a bare <img> that fails a transient load never re-fetches. The
-// element stays broken while tapping to open it creates a fresh one that
-// succeeds. Both callers self-heal by re-requesting with a cache-busted URL.
 
 describe('isRetryableImageSrc', () => {
   it('retries server-fetched URLs', () => {
@@ -46,8 +42,6 @@ describe('retrySrc', () => {
     expect(retrySrc(url, 1)).toBe(`${url}?retry=1`);
   });
 
-  // Markdown can embed any third-party image, and a signature covers the exact
-  // query string. An unsigned retry= on the end of one 403s every attempt.
   it('re-requests a cross-origin URL unchanged, signature intact', () => {
     const signed = 'https://cdn.example.test/a.png?X-Amz-Signature=abc';
     expect(retrySrc(signed, 1)).toBe(signed);
@@ -59,7 +53,6 @@ describe('retryDelayMs', () => {
     expect(retryDelayMs(0)).toBe(BASE_DELAY_MS);
     expect(retryDelayMs(1)).toBe(BASE_DELAY_MS * 2);
     expect(retryDelayMs(2)).toBe(BASE_DELAY_MS * 4);
-    // Capped well before MAX_ATTEMPTS exhausts.
     expect(retryDelayMs(MAX_ATTEMPTS)).toBe(MAX_DELAY_MS);
   });
 });

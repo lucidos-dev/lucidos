@@ -1,16 +1,3 @@
-/**
- * Tests for the drafts-view filter helper.
- *
- * The drafts toggle in the threads header collapses the drawer to a single
- * "Drafts" section that includes any thread carrying real draft content
- * (composeText.length > 0 || composeImages.length > 0). Composing rows with
- * neither text nor images are ghost rows — never surface them; the centered
- * compose view is the only UI for an empty draft. See the matching
- * composingThreads tests for the Current-section draft rows' mirror filter.
- *
- * Composing (new) threads come first, then drafts on existing threads; within
- * each group the most recently touched is on top.
- */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { composingThreads, draftThreads } from './ThreadDrawer';
@@ -78,11 +65,6 @@ function asMap(threads: ThreadState[]): Map<string, ThreadState> {
 
 describe('draftThreads', () => {
   it('excludes composing threads with no text and no images', () => {
-    // A composing thread without content is a ghost row — `updateCompose`
-    // auto-discards on local user clear, but races (POST/DELETE ordering),
-    // SSE skeletons created from a peer's `ThreadStarted`, and DELETE
-    // failures all leave server-side ghost rows whose only UI surface
-    // would be the placeholder "Empty draft" title.
     const composing = makeThread('a', { state: 'composing' });
     const result = draftThreads(asMap([composing]));
     expect(result).toEqual([]);
@@ -125,9 +107,6 @@ describe('draftThreads', () => {
   });
 
   it('excludes discarded threads even with stale composeText', () => {
-    // Discarded threads should never show — they are tombstoned. The compose
-    // fields may linger on the projection until cleanup, but the user already
-    // walked away from them.
     const discarded = makeThread('a', { state: 'discarded', composeText: 'orphan' });
     const result = draftThreads(asMap([discarded]));
     expect(result).toEqual([]);
@@ -151,10 +130,6 @@ describe('draftThreads', () => {
 
 describe('composingThreads', () => {
   it('excludes composing threads with no text and no images', () => {
-    // Mirror of draftThreads — the Current-section draft rows must never
-    // render an "Empty draft" row. Ghost composing rows arise from POST/DELETE races,
-    // SSE skeletons born from a peer device's ThreadStarted with no
-    // follow-up ThreadComposeChanged, and failed local discards.
     const composing = makeThread('a', { state: 'composing' });
     expect(composingThreads(asMap([composing]))).toEqual([]);
   });
@@ -188,10 +163,6 @@ describe('composingThreads', () => {
   });
 
   it('excludes composing threads whose only text is whitespace', () => {
-    // Local input goes through `composeIsEmpty` which trims; an SSE-applied
-    // remote update doesn't run the auto-discard. Both surfaces must agree
-    // that whitespace-only text is empty, otherwise the same symptom
-    // (visible "Empty draft"-style row) recurs with whitespace as the title.
     const composing = makeThread('a', { state: 'composing', composeText: '   \n\t' });
     expect(composingThreads(asMap([composing]))).toEqual([]);
   });

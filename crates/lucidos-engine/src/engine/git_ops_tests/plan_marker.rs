@@ -193,14 +193,14 @@ fn validate_plan_files_trims_and_drops_empty_entries() {
 #[test]
 fn bounded_fix_violations_names_only_what_left_the_bound() {
     let bound = vec![
-        "crates/lucidos-engine/src/api/proxy.rs".to_string(),
-        "crates/lucidos-engine/src/api/proxy_tests.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy_tests.rs".to_string(),
     ];
     assert!(bounded_fix_violations(&bound, &bound).is_empty());
     assert!(bounded_fix_violations(&bound, &[]).is_empty());
 
     let strayed = vec![
-        "crates/lucidos-engine/src/api/proxy.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy.rs".to_string(),
         "crates/lucidos-app/src/main.tsx".to_string(),
     ];
     assert_eq!(
@@ -211,7 +211,7 @@ fn bounded_fix_violations_names_only_what_left_the_bound() {
     // A plan file is always in bounds: a session whose fix turned out wider
     // still has to write one, and that file is how it reports the decision.
     let with_plan = vec![
-        "crates/lucidos-engine/src/api/proxy.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy.rs".to_string(),
         "docs/plans/2026-08-29-wider.md".to_string(),
     ];
     assert!(bounded_fix_violations(&bound, &with_plan).is_empty());
@@ -546,6 +546,7 @@ async fn consuming_leaves_a_proposed_marker_for_the_approval() {
             .await
             .unwrap(),
         Some(ApprovedPlan {
+            plan_only: false,
             plan_path: Some("docs/plans/x.md".into())
         }),
         "the approval hands back the file the CLI marks approved",
@@ -734,8 +735,8 @@ async fn bounded_security_fix_stores_and_returns_its_bound() {
     let head_sha = current_head_sha(&repo_path).await.unwrap();
 
     let bound = vec![
-        "crates/lucidos-engine/src/api/proxy.rs".to_string(),
-        "crates/lucidos-engine/src/api/proxy_tests.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy_tests.rs".to_string(),
     ];
     record_planned(
         &pool,
@@ -766,9 +767,9 @@ async fn bounded_security_fix_stores_and_returns_its_bound() {
     // A fix that has to grow re-marks with the full list rather than sneaking
     // past Apply, so the upsert must replace the bound.
     let wider = vec![
-        "crates/lucidos-engine/src/api/proxy.rs".to_string(),
-        "crates/lucidos-engine/src/api/proxy_tests.rs".to_string(),
-        "crates/lucidos-engine/src/api/proxy_builtin.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy_tests.rs".to_string(),
+        "crates/lucidos-agents-api/src/api/proxy_builtin.rs".to_string(),
     ];
     record_planned(
         &pool,

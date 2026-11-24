@@ -64,7 +64,7 @@ write_installer() { # <dir> <origin> [<extra-lib>…]
 LUCIDOS_INSTALL_URL="\${LUCIDOS_INSTALL_URL:-$origin/install.sh}"
 LUCIDOS_DEFAULT_VERSION="0.18.0"
 LUCIDOS_LIBS="stage_runtime.sh headless_tarball.sh install_common.sh $*"
-source_service_lib() { _source_libs service.sh install_common.sh; }
+source_service_lib() { _source_libs storage_root.sh loopback_curl.sh service.sh install_common.sh; }
 EOF
 }
 
@@ -102,11 +102,11 @@ write_soft_404() { # <file>
 EOF
 }
 
-# A complete, healthy origin: installer, uninstaller, and all four libs.
+# A complete, healthy origin: installer, uninstaller, and all six libs.
 write_healthy_origin() { # <dir> <origin>
   write_installer "$1" "$2"
   write_uninstaller "$1" "$2"
-  write_libs "$1" stage_runtime.sh headless_tarball.sh install_common.sh service.sh
+  write_libs "$1" stage_runtime.sh headless_tarball.sh install_common.sh service.sh storage_root.sh loopback_curl.sh
 }
 
 reset_origins() {
@@ -123,10 +123,12 @@ expected="/install.sh
 /uninstall.sh
 /scripts/lib/headless_tarball.sh
 /scripts/lib/install_common.sh
+/scripts/lib/loopback_curl.sh
 /scripts/lib/service.sh
-/scripts/lib/stage_runtime.sh"
+/scripts/lib/stage_runtime.sh
+/scripts/lib/storage_root.sh"
 if [ "$(printf '%s\n' "$routes" | sort)" = "$(printf '%s\n' "$expected" | sort)" ]; then
-  pass "derives the six publish routes a piped run would fetch"
+  pass "derives the eight publish routes a piped run would fetch"
 else
   fail "derived the wrong route set: $(printf '%s' "$routes" | tr '\n' ' ')"
 fi
@@ -363,7 +365,7 @@ repin "$SCRIPT_DIR/../../install.sh" "$REAL_DIR/install.sh"
 repin "$SCRIPT_DIR/../../uninstall.sh" "$REAL_DIR/uninstall.sh"
 
 real_routes="$(fdp_derive_routes "$REAL" "$(mktemp -d)" 2>&1)"; rc=$?
-# The route set as of 2026-07-31. This list is an ASSERTION, not configuration:
+# The route set since the loopback health check (desktop-window-https plan). This list is an ASSERTION, not configuration:
 # it must never be edited to make a red go away. A diff here means a piped run
 # now fetches a different set of paths, which is the moment to check that BOTH
 # of the site publisher's route-discovery paths know about the change.
@@ -371,10 +373,12 @@ real_expected="/install.sh
 /uninstall.sh
 /scripts/lib/headless_tarball.sh
 /scripts/lib/install_common.sh
+/scripts/lib/loopback_curl.sh
 /scripts/lib/service.sh
-/scripts/lib/stage_runtime.sh"
+/scripts/lib/stage_runtime.sh
+/scripts/lib/storage_root.sh"
 if [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$real_routes" | sort)" = "$(printf '%s\n' "$real_expected" | sort)" ]; then
-  pass "the real installers derive exactly the six known publish routes"
+  pass "the real installers derive exactly the eight known publish routes"
 else
   fail "the real route set changed, or the scrape stopped matching (rc=$rc): $(printf '%s' "$real_routes" | tr '\n' ' ')
         If a route was ADDED or REMOVED on purpose, update real_expected here AND make sure the site

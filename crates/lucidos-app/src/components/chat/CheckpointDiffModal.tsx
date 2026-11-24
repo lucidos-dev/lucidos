@@ -19,18 +19,6 @@ function close() {
 
 type CheckpointDiff = { files: DiffFile[]; reclaimed: boolean };
 
-/** What one checkpointed command changed: the diff between the snapshot taken
- *  before it ran and the one taken after.
- *
- *  This is the answer to "what am I actually undoing". Before it existed the
- *  card offered a bare Undo, so the only way to learn what a destructive step
- *  had done was to click it and compare the workspace afterwards. The two
- *  snapshots the guard already takes are exactly the two sides of this diff, so
- *  it costs one `git diff` and no new bookkeeping.
- *
- *  Renders through `InlineDiffList`, the same component the repository and
- *  change diffs use, so a checkpoint diff looks like every other diff in the
- *  product rather than a second dialect. */
 export function CheckpointDiffModal() {
   const checkpoint = checkpointDiffModal.value;
   const checkpointId = checkpoint?.checkpoint_id;
@@ -38,9 +26,6 @@ export function CheckpointDiffModal() {
   const showLoading = useDelayedLoading(loadable);
   const paneCentre = usePaneCentre('conversation');
 
-  // Keyed on the id rather than the event object: the card re-renders (and
-  // hands us a fresh object) when the paired revert lands, and refetching the
-  // same diff on that flip would blank the panel the user is reading.
   useEffect(() => {
     if (!checkpointId) return;
     let cancelled = false;
@@ -73,10 +58,6 @@ export function CheckpointDiffModal() {
         {loadable.status !== 'failed' && (
           <LoadingFade showSkeleton={showLoading} skeleton={<DiffSkeleton files={2} class="folder-tree" />}>
             {loadable.status === 'loaded' && (
-              // A reclaimed pair is not an empty diff, and must not read as one.
-              // The snapshots behind an old card are dropped after 30 days. Cards
-              // written before the post image existed never had a second side to
-              // diff against.
               loadable.data.reclaimed
                 ? (
                   <div class="empty-state">

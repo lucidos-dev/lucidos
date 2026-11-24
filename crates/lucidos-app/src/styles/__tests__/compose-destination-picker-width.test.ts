@@ -1,10 +1,3 @@
-/**
- * The compose destination dropdown matches the prompt box width on a phone
- * only. There its label nearly spans the pane, so a content-width dropdown
- * ends just short of the prompt box's edge. On desktop it keeps its label's
- * width. The desktop half guards against a dropdown stretched across a wide
- * pane, and the phone half guards the stretch itself.
- */
 import { describe, it, expect } from 'vitest';
 import postcss, { type AtRule, type Rule } from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -23,7 +16,6 @@ const TRIGGER = '.compose-destination-row .compose-destination-picker .dropdown-
 
 type Layout = 'any' | 'phone';
 
-/** The media query a rule sits under: none, or the phone layout. */
 function layoutOf(rule: Rule): Layout | 'other' {
   const parent = rule.parent;
   if (parent?.type === 'root') return 'any';
@@ -31,7 +23,6 @@ function layoutOf(rule: Rule): Layout | 'other' {
   return 'other';
 }
 
-/** Declarations of one selector, from the rules under the given layout. */
 function declarationsOf(selector: string, layout: Layout): Record<string, string> {
   const root = postcss.parse(readFileSync(INPUT_CSS, 'utf8'));
   const out: Record<string, string> = {};
@@ -73,7 +64,6 @@ describe('the compose destination picker on a phone', () => {
   });
 
   it('leaves the coding-agent chip beside it at its own content width', () => {
-    // So the picker, not the chip, is what absorbs the row's stretch.
     expect(declarationsOf('.compose-coding-agent-chip', 'any')['flex-shrink']).toBe('0');
   });
 });

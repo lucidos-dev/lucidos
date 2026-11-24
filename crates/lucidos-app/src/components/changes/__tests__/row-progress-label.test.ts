@@ -1,7 +1,3 @@
-/**
- * A busy change row says what its action is doing. An apply names its phase,
- * so the reader sees that a long wait is hardening rather than a stuck merge.
- */
 import { describe, it, expect } from 'vitest';
 import { rowProgressLabel } from '../ChangesView';
 import type { Change } from '../../../api/client';
@@ -63,8 +59,6 @@ describe('a single apply', () => {
   });
 });
 
-// A live batch never fills `applyingChangeIds`: only a reload serves it. So
-// the cases below run with the lists empty, as an open page has them.
 describe('an Apply All member', () => {
   it('reads as applying while nothing places it, never as hardening ahead of its turn', () => {
     expect(rowProgressLabel(makeChange({ needs_hardening: true }), undefined, NO_PHASES, batch())).toBe('Applying...');
@@ -87,9 +81,5 @@ describe('an Apply All member', () => {
 describe('a row action that is not an apply', () => {
   it('says it is discarding, never applying', () => {
     expect(rowProgressLabel(makeChange(), 'discard', NO_PHASES, null)).toBe('Discarding...');
-  });
-
-  it('says it is setting the change aside', () => {
-    expect(rowProgressLabel(makeChange(), 'set-aside', NO_PHASES, null)).toBe('Setting aside...');
   });
 });

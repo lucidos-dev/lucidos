@@ -1,10 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Notification } from '../types';
 
-// The toast module reaches the navigation dispatcher through `resolveDeepLink`,
-// so the whole navigate graph loads with it. None of it runs here: these keep
-// the import inert, exactly as `__tests__/presence-check-toast.test.ts`
-// does for the arrival matrix.
 vi.mock('./restore-snapshot', () => ({ confirmSnapshotRestore: vi.fn().mockResolvedValue(undefined) }));
 import { confirmSnapshotRestore } from './restore-snapshot';
 
@@ -57,7 +53,6 @@ function unreadSet(...ids: string[]): void {
   };
 }
 
-/** Land a toast the way an active page acts on a PresenceCheck. */
 function arrive(id: string): void {
   presentInAppNotification({
     title: 'Claude is asking',
@@ -105,8 +100,6 @@ describe('a read drops the toast', () => {
     arrive('n-1');
     expect(toastFor('n-1')).toBeTruthy();
 
-    // What the seen target rule does: `markReadOptimistic` drops the row from
-    // the unread set, which is what the badge falls on.
     unreadSet();
 
     expect(toastFor('n-1')).toBeUndefined();
@@ -134,9 +127,6 @@ describe('a read drops the toast', () => {
 });
 
 describe('a read the unread set cannot report', () => {
-  // The `NotificationRead` arm of `handleGlobalEvent` is what calls these. It
-  // is slower than the set by a round trip, and it answers where the set
-  // cannot: the row was never in it to leave it.
   it('drops a toast whose row the set never carried', () => {
     arrive('n-1');
     unreadSet('n-other');
@@ -178,9 +168,6 @@ describe('a read the unread set cannot report', () => {
 
 describe('a toast the page never held as unread', () => {
   it('survives a set that lands without it', () => {
-    // The toast rides `PresenceCheck` while the unread reload
-    // `NotificationCreated` kicked off is still in flight. Bare absence is
-    // therefore not a read, and dropping on it would hide a fresh notification.
     arrive('n-1');
     unreadSet('n-other');
 
@@ -207,7 +194,6 @@ describe('a set that is not loaded', () => {
     servedUnreadNotifications.value = { status: 'loading' };
     expect(toastFor('n-1')).toBeTruthy();
 
-    // The baseline survived, so the read that follows is still a transition.
     unreadSet();
     expect(toastFor('n-1')).toBeUndefined();
   });
@@ -246,10 +232,6 @@ describe('the overflow toast counts what is still unread', () => {
   });
 
   it('stays gone once the reader has cleared it', () => {
-    // The pile outlives the toast, so a read that decremented it blindly would
-    // raise a fresh one. A read must never put a toast back on screen: that is
-    // the inverse of the whole rule. The X and the toast's own tap both land
-    // here, and the tap opens the panel the new toast would cover.
     fold();
     dismissToast(OVERFLOW_KEY);
 

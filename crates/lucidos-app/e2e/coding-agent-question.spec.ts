@@ -3,31 +3,7 @@ import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } fr
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/**
- * Browser e2e for CC AskUserQuestion interactive UI.
- *
- * We inject a synthetic UserQuestionAsked event directly into the DB for a
- * CC thread (mirroring what the engine would do after intercepting CC's
- * AskUserQuestion tool_use). UserQuestionAsked starts its OWN exchange — the
- * QuestionBody renders as the body of an initiator panel (the asking agent's
- * chip, the short "Claude" in a CC thread), NOT inline in the prior CC response
- * panel. The browser must:
- *   - Render a divider initiator panel containing the question + options.
- *   - Persist a UserQuestionAnswered event after the user clicks an option.
- *   - Flip the SAME panel in place to its answered state (selected option
- *     highlighted, others dimmed) — no new panel materializes for the click.
- *
- * Spawning a real CC subprocess that emits AskUserQuestion is out of scope
- * for browser e2e — the parser-level wiring is covered by Rust unit tests.
- */
 
-/** How many pixels of the prompt's PLACEHOLDER are painted past the bottom of
- *  the box, i.e. clipped by its `overflow-y: hidden` (0 = the whole thing is
- *  readable). Runs in the page: renders the placeholder as a value in an
- *  off-layout clone of the real textarea and compares the height that needs
- *  against the height the box has. The card names neither escape any more, so
- *  the sentence in the placeholder is the only thing that does, and it wraps at
- *  phone widths and in a narrowed thread pane. */
 function placeholderOverflowPx(el: Element): number {
   const ta = el as HTMLTextAreaElement;
   const probe = ta.cloneNode() as HTMLTextAreaElement;
@@ -44,11 +20,6 @@ function placeholderOverflowPx(el: Element): number {
   return Math.max(0, needed - ta.clientHeight);
 }
 
-/** An answer resumes the agent: the engine starts a real Claude Code process
- *  for the thread. End it, and wait until the engine lets it go, before the
- *  rows are deleted. Left running, it writes events for about a minute. Each
- *  one re-creates the deleted row under a LATER spec. See
- *  docs/e2e-test-decisions.md § "A spec ends every session it starts". */
 async function endResumedSession(request: APIRequestContext, threadId: string): Promise<void> {
   const answered = psql(`SELECT COUNT(*) FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered'`);
   if (answered === '0') return;
@@ -57,8 +28,6 @@ async function endResumedSession(request: APIRequestContext, threadId: string): 
     expect(res.ok(), `commands for thread ${threadId}: HTTP ${res.status()}`).toBe(true);
     return (await res.json()).has_active_session === true;
   };
-  // Before the session registers, a stop has nothing to reach and the spawn
-  // goes ahead. A resume that already ended by itself needs no stop.
   const endedAfterAnswer = () => psql(
     `SELECT COUNT(*) FROM events e JOIN events a ON a.thread_id = e.thread_id
      WHERE a.thread_id = '${threadId}' AND a.event_type = 'UserQuestionAnswered' AND e.created > a.created
@@ -70,8 +39,6 @@ async function endResumedSession(request: APIRequestContext, threadId: string): 
     timeout: 30_000,
   }).toBe(true);
   if (await live()) {
-    // A 404 means it ended between the poll and the stop. The poll below is
-    // the check that counts.
     const stop = await request.post(`/api/v1/claude-code/stop?thread_id=${threadId}&discard=true`);
     expect([200, 404], `stop thread ${threadId}: HTTP ${stop.status()}`).toContain(stop.status());
   }
@@ -91,7 +58,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     const toolUseId = `tu-e2e-${suffix}`;
     const now = new Date().toISOString();
 
-    // Seed a CC thread + UserQuestionAsked event.
     const msgEventId = randomUUID();
     const sessionStartedId = randomUUID();
     const questionEventId = randomUUID();
@@ -116,87 +82,43 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await navigateToApp(page);
       await openThreadDrawer(page);
 
-      // Open the seeded thread.
       const row = page.locator(`.thread-row:has-text("CC Question E2E ${suffix}")`).first();
       await expect(row).toBeVisible({ timeout: 10_000 });
       await row.click();
       await ensureOnThreadPane(page);
 
-      // The QuestionBody lives inside the initiator panel of the divider
-      // exchange. Both SplitLayout (desktop) and MobileSwipeContainer (mobile)
-      // render simultaneously, so we scope to the visible copy — `.first()`
-      // would otherwise pick the hidden one. We locate the panel by its
-      // unique question text, not by `data-tool-use-id`, because the answered
-      // body drops the data attribute when it flips to its resolved render.
       const panel = page
         .locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("Pick option ${suffix}"))`)
         .first();
       await expect(panel).toBeVisible({ timeout: 10_000 });
-      // Chip on the divider reads the asking agent. It is the SHORT "Claude" in
-      // a CC thread: this row is the app's tightest on a phone, so the coding
-      // agent's own name is shortened here and nowhere else (`describeExecutor`).
       await expect(panel.locator('.initiator-label')).toHaveText('Claude');
-      // Pending body carries `data-tool-use-id` and exposes the option buttons.
       const pendingBody = panel.locator(`.initiator-body .question-body[data-tool-use-id="${toolUseId}"]`).first();
       await expect(pendingBody).toBeVisible();
       await expect(pendingBody).toContainText(`Yes ${suffix}`);
       await expect(pendingBody).toContainText(`No ${suffix}`);
 
-      // The card is the question and its options, nothing else: no guide line
-      // under the answers.
       await expect(pendingBody.locator('.question-hint')).toHaveCount(0);
       await expect(pendingBody.locator('.question-option')).toHaveCount(2);
-      // The prompt row is where the two escapes that need no option slot are
-      // named: typing (routed to this question as a freetext answer) by this
-      // placeholder, and Cancel by the Cancel button's tooltip. Without them
-      // named somewhere the agent invents an "Other, I'll type it" option, which
-      // just sends that label back as the user's answer. Literal on purpose: an
-      // e2e spec can't import from `src/`, so this is the one deliberate
-      // duplicate of `PLACEHOLDER_ANSWERING` in `prompt-input-helpers.ts`.
-      // Change both together.
       const promptInput = page.locator('[data-role="prompt-input"]:visible').first();
       await expect(promptInput).toHaveAttribute('placeholder', 'Type custom answer here…');
-      // The placeholder has to be READABLE, which is not free: a textarea sizes
-      // to its VALUE, so `overflow-y: hidden` silently clips a placeholder that
-      // wraps, and this is the longest of the three (it wraps in a narrowed
-      // thread pane and at large UI scales). Assert the box is as tall as
-      // rendering the placeholder as a value would need, which holds on every
-      // project rather than pinning a per-viewport number.
       await expect.poll(
         () => promptInput.evaluate(placeholderOverflowPx), { intervals: [200], timeout: 5_000 },
       ).toBe(0);
 
-      // Click the second option.
       await pendingBody.locator('.question-option').nth(1).click();
 
-      // The DB should have a UserQuestionAnswered for this tool_use_id.
       await expect.poll(
         () => psql(`SELECT COUNT(*) FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = '${toolUseId}'`),
         { intervals: [400], timeout: 10_000 },
       ).toBe('1');
 
-      // The SAME panel flips in place to its answered state. We re-locate the
-      // answered body inside the same panel (matched by question text) so we
-      // prove no new initiator panel materialized for the click.
       const answered = panel.locator('.initiator-body .question-body-answered').first();
       await expect(answered).toBeVisible({ timeout: 10_000 });
-      // The picked option is highlighted; the other is dimmed.
       const selectedOption = answered.locator('.question-option-selected');
       await expect(selectedOption).toHaveCount(1);
       await expect(selectedOption).toContainText(`No ${suffix}`);
       await expect(answered.locator('.question-option-dimmed')).toHaveCount(1);
-      // Nothing left to answer, so the prompt stops inviting one.
       await expect(promptInput).toHaveAttribute('placeholder', 'Post a follow up…');
-      // The extra height has to be given back too. resizeTextarea writes it as
-      // inline px, and a placeholder swap never touches the value it keys off.
-      // So without the re-measure the composer keeps the box the answering
-      // placeholder needed, after that placeholder is gone.
-      //
-      // Resting is a line plus the box's own padding: the composer declares no
-      // floor of its own and takes the shell's (panels/previews.css). So the
-      // bound is two lines, one line of tolerance over resting. Compare the
-      // CONTENT box (clientHeight carries the padding) so the same assertion
-      // holds on desktop and phone alike.
       await expect.poll(
         () => promptInput.evaluate((el) => {
           const ta = el as HTMLTextAreaElement;
@@ -208,8 +130,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         { intervals: [200], timeout: 5_000 },
       ).toBe(true);
 
-      // Exactly one divider initiator panel for this question — flipping
-      // happens in-place, no duplicate panel materialized.
       await expect(
         page.locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("Pick option ${suffix}"))`),
       ).toHaveCount(1);
@@ -249,8 +169,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       answer: { kind: 'Selected', option_id: 'opt-0' },
     }).replace(/'/g, "''");
 
-    // Two separate UserQuestionAsked events in the same CC turn (MP1) — each
-    // should be its own divider panel, not coalesced.
     psql([
       `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Multi Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"do stuff","channel":"claude_code"}'::jsonb, '${stamp(0)}', 'thread', '${threadId}', '${threadId}')`,
@@ -269,9 +187,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await row.click();
       await ensureOnThreadPane(page);
 
-      // Each question gets its own divider initiator panel. We locate by the
-      // unique question text rather than `data-tool-use-id`, because the
-      // answered body strips the data attribute when it flips state.
       const panel1 = page
         .locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("First question ${suffix}"))`)
         .first();
@@ -281,10 +196,7 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(panel1).toBeVisible({ timeout: 10_000 });
       await expect(panel2).toBeVisible({ timeout: 10_000 });
 
-      // Panel 1 already has its answer applied (Selected → answered body).
       await expect(panel1.locator('.initiator-body .question-body-answered')).toBeVisible();
-      // Panel 2 is still pending — the pending body carries `data-tool-use-id`
-      // and the clickable option button is present.
       await expect(panel2.locator('.initiator-body .question-body-answered')).toHaveCount(0);
       await expect(panel2.locator(`.question-body[data-tool-use-id="${tool2}"]`)).toBeVisible();
       await expect(panel2.locator('.question-option')).toHaveCount(1);
@@ -338,34 +250,26 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(panel).toBeVisible({ timeout: 10_000 });
       const pendingBody = panel.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first();
 
-      // Submit lives in the prompt action row (PromptInput.tsx). One prompt
-      // renders per layout, so scope by visibility. With no pick and an empty
-      // box the row shows a lone Cancel instead.
       const submit = page.locator('.prompt-actions-row:visible button[aria-label="Submit answer"]').first();
       await expect(page.locator('.prompt-actions-row:visible button[aria-label="Cancel"]')).toBeVisible();
       await expect(submit).toHaveCount(0);
 
-      // Toggle Red and Green (skip Blue).
       await pendingBody.locator('.question-option').nth(0).click();
       await pendingBody.locator('.question-option').nth(2).click();
       await expect(submit).toBeEnabled();
       await expect(pendingBody.locator('.question-option[aria-pressed="true"]')).toHaveCount(2);
 
-      // Toggle Red off — back to one.
       await pendingBody.locator('.question-option').nth(0).click();
       await expect(pendingBody.locator('.question-option[aria-pressed="true"]')).toHaveCount(1);
 
-      // Re-toggle Red, then Submit.
       await pendingBody.locator('.question-option').nth(0).click();
       await submit.click();
 
-      // DB: UserQuestionAnswered with MultiSelected[opt-0, opt-2].
       await expect.poll(
         () => psql(`SELECT payload->'answer' FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = '${toolUseId}'`),
         { intervals: [400], timeout: 10_000 },
       ).toContain('MultiSelected');
 
-      // Panel flips in place: Red and Green selected, Blue dimmed.
       const answered = panel.locator('.initiator-body .question-body-answered').first();
       await expect(answered).toBeVisible({ timeout: 10_000 });
       await expect(answered.locator('.question-option-selected')).toHaveCount(2);
@@ -402,10 +306,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       answer: { kind: 'Canceled' },
     }).replace(/'/g, "''");
 
-    // Seed a question + a Canceled answer (the engine writes this when the
-    // user hits Stop while CC is paused on AskUserQuestion). `has_response,
-    // true` keeps the row visible in the drawer — `get_recent_threads` filters
-    // out idle threads with no response, so the seed must claim a response.
     psql([
       `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Cancel Question E2E ${suffix}', 'claude_code', '${stamp(0)}', 1, false, true, 'idle', 'inbox', true, 0)`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${stamp(0)}', 'thread', '${threadId}', '${threadId}')`,
@@ -423,7 +323,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await row.click();
       await ensureOnThreadPane(page);
 
-      // Locate by question text — the answered body has no `data-tool-use-id`.
       const panel = page
         .locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("Cancel question ${suffix}"))`)
         .first();
@@ -431,12 +330,8 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
 
       const answered = panel.locator('.initiator-body .question-body-answered').first();
       await expect(answered).toBeVisible();
-      // All options dimmed; nothing selected.
       await expect(answered.locator('.question-option-selected')).toHaveCount(0);
       await expect(answered.locator('.question-option-dimmed')).toHaveCount(2);
-      // Cancel renders as a disabled red Cancel button styled like the picked
-      // permission affordance — assert via class, not text, so the assertion
-      // survives copy edits.
       await expect(answered.locator('.question-cancel-picked')).toBeVisible();
     } finally {
       psql([
@@ -446,11 +341,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }
   });
 
-  // Escape inside the composer is the keyboard twin of the red Cancel button:
-  // with a question pending it stamps that question `Canceled`, which is how the
-  // user steers the agent somewhere else without picking an option. The
-  // placeholder is what tells them Cancel is there at all, so the key that
-  // performs it has to actually perform it.
   test('Escape in the prompt cancels the pending question', async ({ page }) => {
     await assertHealthy(page);
 
@@ -487,9 +377,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         .first();
       await expect(panel).toBeVisible({ timeout: 10_000 });
 
-      // Focus the prompt explicitly: arriving on a parked question seeds focus
-      // onto the card's first option instead (threadEntryFocusTarget), and this
-      // is about Escape from the COMPOSER.
       const promptInput = page.locator('[data-role="prompt-input"]:visible').first();
       await promptInput.focus();
       await promptInput.press('Escape');
@@ -506,11 +393,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
     }
   });
 
-  // The *choice card* keyboard contract (docs/glossary.md, choiceCardNav.ts).
-  // Opening a thread already parked on a question must land focus on the card
-  // rather than the prompt. That is `threadEntryFocusTarget` winning over the
-  // prompt's own thread-switch focus, which is the half that races if either
-  // side decides independently.
   test('first option takes visible keyboard focus, arrows step, Enter answers', async ({ page, request }) => {
     await assertHealthy(page);
 
@@ -550,14 +432,8 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         .locator(`.question-body[data-tool-use-id="${toolUseId}"]:visible .question-option`);
       await expect(options).toHaveCount(3, { timeout: 10_000 });
 
-      // Seeded on the FIRST option, so Enter answers with no pointer at all.
       await expect(options.nth(0)).toBeFocused({ timeout: 10_000 });
 
-      // ...and the focus is VISIBLE. This is why the CSS pairs an ungated
-      // :focus-visible with a hover-gated plain :focus: nothing the user
-      // pressed put focus here, and :focus-visible's heuristic alone would
-      // leave the ring off exactly when they most need to see what Enter is
-      // about to answer.
       const ring = await page.evaluate(() => {
         const el = document.activeElement as HTMLElement | null;
         return el ? getComputedStyle(el).boxShadow : '';
@@ -565,7 +441,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       expect(ring).not.toBe('');
       expect(ring).not.toBe('none');
 
-      // Arrows step, and clamp rather than wrap at the top.
       await page.keyboard.press('ArrowDown');
       await expect(options.nth(1)).toBeFocused();
       await page.keyboard.press('ArrowUp');
@@ -576,7 +451,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await page.keyboard.press('ArrowDown');
       await expect(options.nth(2)).toBeFocused();
 
-      // Enter is the button's own native activation, no key handling of ours.
       await page.keyboard.press('Enter');
 
       await expect.poll(

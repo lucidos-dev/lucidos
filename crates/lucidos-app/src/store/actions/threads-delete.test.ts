@@ -1,22 +1,9 @@
-/** The delete confirmation says only what is true of THIS family.
- *
- *  Invariant I8 of `docs/plans/2026-09-16-implement-thread-deletion.md`. Each
- *  line below is gated on one preflight flag. A line shown when its flag is off
- *  is a claim the delete does not make: branch work on a chat thread, backups
- *  on a workspace that never took one, forgetting on a thread that taught
- *  nothing.
- *
- *  The closing Archive line answers to the same rule, on the one fact that is
- *  not in the preflight: whether this thread still has an Archive to take.
- */
 
 import { describe, it, expect } from 'vitest';
 import { deleteConfirmation, formatDeleteErrorToast } from './threads-delete';
 import type { DeletePreflight } from '../../api/threads';
 import { ApiError } from '../../api/client';
 
-/** A single chat thread with nothing to warn about. Each case below turns on
- *  exactly the flag it is testing. */
 function preflight(over: Partial<DeletePreflight> = {}): DeletePreflight {
   return {
     thread_count: 1,
@@ -31,8 +18,6 @@ function preflight(over: Partial<DeletePreflight> = {}): DeletePreflight {
   };
 }
 
-/** One row per conditional line: the flag that shows it, and a phrase that
- *  appears only in that line. */
 const CONDITIONAL_LINES: {
   label: string;
   on: Partial<DeletePreflight>;
@@ -105,9 +90,6 @@ describe('deleteConfirmation', () => {
   });
 
   it('names Archive only where Archive is on offer', () => {
-    // An archived thread has no Archive action left, and delete is its only way
-    // out. Pointing at a way out the dialog does not show is the same lie as a
-    // warning that does not apply.
     expect(deleteConfirmation(preflight(), 'Heat pump', false).message)
       .not.toContain('Archive');
     expect(deleteConfirmation(preflight(), 'Heat pump', true).message)
@@ -161,9 +143,6 @@ describe('deleteConfirmation', () => {
   });
 
   it('separates each line into its own paragraph', () => {
-    // `<DialogMessage>` renders one <p> per blank-line block, and collapses a
-    // single newline to a space. Six conditions on one line would read as a
-    // wall of text.
     const all = deleteConfirmation(
       preflight({ memory_count: 1, has_applied_changes: true }),
       'Heat pump',

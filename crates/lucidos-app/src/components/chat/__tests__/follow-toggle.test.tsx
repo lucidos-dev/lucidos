@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/** The follow toggle floats over the composer's top edge, in the down
- *  chevron's slot, and its shortcut presses what it presses.
- *
- *  Both ask one resolver for the state: the follow seed in compose context and
- *  the live flag everywhere else. So the shortcut cannot light what the button
- *  would not.
- *
- *  Plan: `docs/plans/2026-10-28-the-follow-toggle-floats-with-the-down-chevron.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 
@@ -94,14 +86,10 @@ describe('the floating follow toggle', () => {
   });
 
   it('keeps the keyboard up when pressed', () => {
-    // The reader arms and disarms it while typing. A press that blurred the
-    // prompt dropped the iOS keyboard mid-sentence.
     focus(makeThreadState('t1'));
     expect(button().props.onMouseDown).toBe(keepFocusOnPress);
   });
 
-  /** A theme without a hue sets `--accent` to the text colour (Mono does), so
-   *  an accent-only toggle read the same armed or not. So the magnet fills. */
   it('shows its state by fill, not by colour alone', () => {
     const fillOf = (armed: boolean) => (FollowLiveEdgeIcon({ armed }) as AnyVNode).props.fill;
     expect(fillOf(true)).toBe('currentColor');

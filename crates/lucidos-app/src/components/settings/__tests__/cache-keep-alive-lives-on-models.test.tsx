@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** The cache keep-alive setting covers the Lucidos Agent too, so it lives on
- *  Settings › Models (ADR 0556). Search lands there, and Coding Agents keeps a
- *  one-line pointer that opens it. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

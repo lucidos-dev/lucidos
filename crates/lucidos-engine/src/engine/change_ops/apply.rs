@@ -1,6 +1,5 @@
 use super::apply_claim::{ApplyClaim, APPLY_IN_PROGRESS_MESSAGE};
 use super::*;
-use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, bounded_fix_refusal_for, branch_changed_files_checked,
     branch_head_sha, catchup_and_ff_to_main, clear_temp_merge_state, commit_worktree_or_err,
@@ -8,8 +7,9 @@ use crate::engine::git_ops::{
     find_worktree_for_branch, git_ran_ok, has_branch_commits, has_full_harden_marker,
     push_main_in_background, recover_no_commits_branch, worktree_add, worktree_dirty_files,
     worktrees_dir, BoundedFixInputs, NoCommitsRecovery, PlanMarkerState, WorktreeLookup,
-    MAIN_LOCKS, MERGE_MUTEX,
+    MAIN_LOCKS,
 };
+use crate::engine::in_place_merge::InPlaceMergeStart;
 use crate::engine::landing_lane::{queued_snapshot, takes_landing_lane, Submission};
 use crate::engine::{ApplyResult, ApplyStatus};
 
@@ -40,7 +40,7 @@ pub(crate) async fn resolve_harden_worktree(
 ) -> Result<PathBuf, String> {
     match lookup {
         WorktreeLookup::Found(existing) => {
-            log!(
+            log_legacy!(
                 "[Changes] Reusing existing worktree {} for hardening of branch {}",
                 existing.display(),
                 branch_name
@@ -87,7 +87,7 @@ impl LucidosEngine {
     /// `dirty` is passed in because callers know their worktree differently:
     /// `apply_now` holds the path, while `apply_change` has to look it up and
     /// must turn an unanswerable lookup into `Err` rather than "nothing dirty".
-    pub(crate) async fn bounded_fix_refusal(
+    pub async fn bounded_fix_refusal(
         &self,
         repo_root: &Path,
         dirty: Result<Vec<String>, String>,
@@ -115,7 +115,7 @@ impl LucidosEngine {
     /// CHANGE branch, while the merge publishes the session's own branch, which
     /// for an original Tier-3 session is a temp one. Tier 1 passes one name
     /// twice, since its session runs on the change branch.
-    pub(crate) async fn bounded_fix_refusal_for_resolution(
+    pub async fn bounded_fix_refusal_for_resolution(
         &self,
         repo_root: &Path,
         worktree_path: &Path,
@@ -158,11 +158,7 @@ impl LucidosEngine {
     /// The files an Apply of `branch_name` would land: its commits ahead of
     /// `main`, plus its worktree's uncommitted files. `None` when git could not
     /// answer either half.
-    pub(crate) async fn landing_files(
-        &self,
-        repo_root: &Path,
-        branch_name: &str,
-    ) -> Option<Vec<String>> {
+    pub async fn landing_files(&self, repo_root: &Path, branch_name: &str) -> Option<Vec<String>> {
         let committed = branch_changed_files_checked(repo_root, branch_name).await;
         let dirty = self.dirty_files_for_bound(repo_root, branch_name).await;
         match (committed, dirty) {
@@ -171,7 +167,7 @@ impl LucidosEngine {
                 Some(landing)
             }
             (Err(e), _) | (_, Err(e)) => {
-                log!(
+                log_legacy!(
                     "[Changes] landing files of {}: {}. Treating them as unknown",
                     branch_name,
                     e
@@ -197,10 +193,10 @@ impl LucidosEngine {
         repo_root: &Path,
         actor: Option<MessageOrigin>,
         result_message: &'static str,
-    ) -> ApplyResult {
+    ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
         let change_id = claim.change_id();
         if let Err(e) = git_ran_ok(&["branch", "-D", &change.branch_name], repo_root).await {
-            log!(
+            log_legacy!(
                 "[Changes] Could not delete branch {} while resolving change {} as a no-op: {}",
                 change.branch_name,
                 change_id,
@@ -217,14 +213,14 @@ impl LucidosEngine {
             actor,
             None,
         )
-        .await;
+        .await?;
         self.broadcast_changes_updated().await;
-        ApplyResult::noop(
+        Ok(ApplyResult::noop(
             change_id,
             change.thread_id,
             change.files.len(),
             result_message,
-        )
+        ))
     }
 
     /// The success tail every merge path shares once `main` has moved: push
@@ -238,7 +234,7 @@ impl LucidosEngine {
         kind_ctx: &ApplyKindContext,
         effective_requires_restart: bool,
         merged: MergedMain<'_>,
-    ) -> ApplyResult {
+    ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
         let change_id = claim.change_id();
         let MergedMain {
             repo_root,
@@ -250,17 +246,18 @@ impl LucidosEngine {
         if !kind_ctx.is_app() {
             push_main_in_background(repo_root, &self.event_bus);
         }
-        self.emit_change_applied(
-            claim,
-            change.thread_id.unwrap_or(change_id),
-            effective_requires_restart,
-            files_have_client_update(&change.files),
-            commits.clone(),
-            change.thread_title.clone(),
-            actor.clone(),
-            Some(AppliedMerge::new(&pre_sha, &post_sha)),
-        )
-        .await;
+        let build_request = self
+            .emit_change_applied(
+                claim,
+                change.thread_id.unwrap_or(change_id),
+                effective_requires_restart,
+                files_have_client_update(&change.files),
+                commits.clone(),
+                change.thread_title.clone(),
+                actor.clone(),
+                Some(AppliedMerge::new(&pre_sha, &post_sha)),
+            )
+            .await?;
         self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
             .await;
         self.emit_entity_events_for_change_apply(
@@ -272,7 +269,7 @@ impl LucidosEngine {
         )
         .await;
         self.broadcast_changes_updated().await;
-        ApplyResult::applied_with_merge(
+        Ok(ApplyResult::applied_with_merge(
             change_id,
             change.thread_id,
             effective_requires_restart,
@@ -281,6 +278,7 @@ impl LucidosEngine {
             &commits,
             change.files.len(),
         )
+        .with_version_build(build_request))
     }
 
     /// Apply a single pending change: merge its branch into main.
@@ -362,6 +360,20 @@ impl LucidosEngine {
             .await?
             .ok_or("Change not found")?;
 
+        if let Some(thread_id) = change.thread_id {
+            if change.is_pending() {
+                crate::engine::thread_events::emit_change_apply_requested(
+                    &self.event_bus,
+                    thread_id,
+                    change_id,
+                    &change.branch_name,
+                    &change.repo_root,
+                    actor.clone(),
+                )
+                .await;
+            }
+        }
+
         // Resolve coding-agent-kind context up front so every branch below
         // (hardening gate, restart gating, post-success refresh) reads the
         // same value. App threads:
@@ -438,7 +450,7 @@ impl LucidosEngine {
                 if let Some((pre_sha, post_sha)) =
                     find_branch_merge_in_main(&repo_root, &change.branch_name).await
                 {
-                    log!("[Changes] Branch {} already merged into main as {} — marking change {} applied",
+                    log_legacy!("[Changes] Branch {} already merged into main as {} — marking change {} applied",
                         change.branch_name,
                         &post_sha[..post_sha.floor_char_boundary(8)],
                         change_id);
@@ -449,7 +461,7 @@ impl LucidosEngine {
                     // We can't reset to main here because the branch ref is
                     // gone, so the worktree is effectively detached at the
                     // pre-merge SHA; the spawn dispatcher handles that case.
-                    return Ok(self
+                    return self
                         .finish_merged_apply(
                             &change,
                             &claim,
@@ -463,7 +475,7 @@ impl LucidosEngine {
                                 commits,
                             },
                         )
-                        .await);
+                        .await;
                 }
             }
         }
@@ -472,7 +484,7 @@ impl LucidosEngine {
         if let Some(merge) = change.merge_worktree() {
             let wt = &merge.path;
             if !std::path::Path::new(wt).exists() {
-                log!(
+                log_legacy!(
                     "[Changes] Stale merge worktree {} no longer exists, clearing metadata",
                     wt
                 );
@@ -520,7 +532,7 @@ impl LucidosEngine {
             if self.merge_ownership_for_change(tid, change_id).await
                 == MergeOwnership::ResolverOwnsIt
             {
-                log!(
+                log_legacy!(
                     "[Changes] Apply refused for {} (thread {}): a conflict resolution is in flight and owns the merge",
                     change_id,
                     tid
@@ -555,7 +567,7 @@ impl LucidosEngine {
             PlanFloor::Exempt => {}
             PlanFloor::Held(hold) => {
                 let msg = hold.apply_refusal();
-                log!(
+                log_legacy!(
                     "[Changes] Apply blocked: plan floor holds branch {} ({:?}, change {})",
                     change.branch_name,
                     hold,
@@ -593,7 +605,7 @@ impl LucidosEngine {
                     .bounded_fix_refusal(&plan_repo_root, dirty, &change.branch_name)
                     .await
                 {
-                    log!(
+                    log_legacy!(
                         "[Changes] Apply blocked: bounded security fix left its bound on branch {} (change {})",
                         change.branch_name,
                         change_id
@@ -617,7 +629,7 @@ impl LucidosEngine {
         let marker_hardened = !kind_ctx.is_app()
             && has_full_harden_marker(&self.pool, &plan_repo_root, &change.branch_name).await;
         if marker_hardened && !change.hardened {
-            log!(
+            log_legacy!(
                 "[Changes] Marker found but DB not set — marking change {} as hardened",
                 change_id
             );
@@ -641,21 +653,20 @@ impl LucidosEngine {
             // Live session: route harden through it (emit + send). If send fails
             // the boundary is already up — fall through to the worktree spawn
             // without re-emitting. No live session: emit boundary now.
-            if let Some(session) =
-                CodingAgentChangeOps::live_session_info(self.as_ref(), thread_id).await
-            {
+            if let Some(session) = self.live_session_info(thread_id).await {
                 match self
                     .request_hardening_in_session(thread_id, &session.msg_tx)
                     .await
                 {
                     Ok(answered) => {
-                        log!(
+                        log_legacy!(
                             "[Changes] Reusing existing session on thread {} for hardening",
                             thread_id
                         );
                         // The session's turn end never applies, so this apply
                         // owes its own outcome once hardening settles.
-                        self.spawn_apply_after_session_harden(
+                        self.agent_host().spawn_apply_after_session_harden(
+                            self,
                             thread_id,
                             change_id,
                             answered,
@@ -669,7 +680,7 @@ impl LucidosEngine {
                         ));
                     }
                     Err(e) => {
-                        log!(
+                        log_legacy!(
                             "[Changes] Live session on thread {} did not accept harden message ({}); falling back to fresh worktree",
                             thread_id,
                             e
@@ -697,12 +708,12 @@ impl LucidosEngine {
                     }
                 };
 
-            log!(
+            log_legacy!(
                 "[Changes] Not hardened — spawning hardening recovery for change {} (thread {})",
                 change_id,
                 thread_id
             );
-            CodingAgentChangeOps::spawn_hardening(
+            self.agent_host().spawn_hardening(
                 self.as_ref(),
                 thread_id,
                 wt_path,
@@ -757,13 +768,13 @@ impl LucidosEngine {
         if !has_branch_commits(&repo_root, &change.branch_name).await {
             match recover_no_commits_branch(&repo_root, &change.branch_name, &change.files).await {
                 Ok(NoCommitsRecovery::AutoCommitted) => {
-                    log!(
+                    log_legacy!(
                         "[Changes] Auto-committed worktree for branch {} — proceeding with merge",
                         change.branch_name
                     );
                 }
                 Ok(NoCommitsRecovery::LegitimateNoOp) => {
-                    return Ok(self
+                    return self
                         .finalize_change_as_noop(
                             &change,
                             &claim,
@@ -771,15 +782,15 @@ impl LucidosEngine {
                             actor.clone(),
                             "Change applied (no commits to merge).",
                         )
-                        .await);
+                        .await;
                 }
                 Ok(NoCommitsRecovery::AlreadyApplied) => {
-                    log!(
+                    log_legacy!(
                         "[Changes] Branch {} already merged into main — marking change {} as applied (no-op)",
                         change.branch_name,
                         change_id
                     );
-                    return Ok(self
+                    return self
                         .finalize_change_as_noop(
                             &change,
                             &claim,
@@ -787,11 +798,11 @@ impl LucidosEngine {
                             actor.clone(),
                             "Change already present on main — marked applied.",
                         )
-                        .await);
+                        .await;
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    log!(
+                    log_legacy!(
                         "[Changes] Refusing silent-apply for change {}: {}",
                         change_id,
                         msg
@@ -853,7 +864,7 @@ impl LucidosEngine {
         if let Some(thread_id) = change.thread_id {
             match self.begin_in_place_merge(thread_id).await {
                 InPlaceMergeStart::Ready(session) => {
-                    log!(
+                    log_legacy!(
                         "[Changes] Live agent session found for thread {} — merging in-place",
                         thread_id
                     );
@@ -886,7 +897,7 @@ impl LucidosEngine {
                     )
                     .await
                     {
-                        log!(
+                        log_legacy!(
                             "[Changes] Fast-forward merge succeeded for {} (Tier 1)",
                             change.branch_name
                         );
@@ -896,8 +907,10 @@ impl LucidosEngine {
                         // apply_now_success emits ChangeApplied, the entity-cache
                         // events (App*/Artifact*), AND AppUiRefreshRequested (for
                         // app threads) internally — no sibling emit needed here.
-                        let commits = self
+                        let (commits, build_request) = self
+                            .agent_host()
                             .apply_now_success(
+                                self,
                                 &claim,
                                 thread_id,
                                 effective_requires_restart,
@@ -909,7 +922,7 @@ impl LucidosEngine {
                                 &change.branch_name,
                                 actor.clone(),
                             )
-                            .await;
+                            .await?;
                         return Ok(ApplyResult::applied_with_merge(
                             change_id,
                             Some(thread_id),
@@ -918,17 +931,19 @@ impl LucidosEngine {
                             post_sha,
                             &commits,
                             change.files.len(),
-                        ));
+                        )
+                        .with_version_build(build_request));
                     }
 
                     // `main` diverged — hand the CC-assisted resolution to a
                     // background task and return immediately. The task clears
                     // the in-progress flag and emits the terminal event.
-                    log!(
+                    log_legacy!(
                         "[Changes] main diverged for {} — spawning async in-place conflict recovery",
                         change.branch_name
                     );
-                    self.spawn_in_place_conflict_recovery(
+                    self.agent_host().spawn_in_place_conflict_recovery(
+                        self,
                         thread_id,
                         claim,
                         session,
@@ -947,7 +962,7 @@ impl LucidosEngine {
                     ));
                 }
                 InPlaceMergeStart::Claimed(holder) => {
-                    log!(
+                    log_legacy!(
                         "[Changes] Thread {} is claimed by {:?}; returning conflict",
                         thread_id,
                         holder
@@ -956,11 +971,11 @@ impl LucidosEngine {
                         change_id,
                         thread_id,
                         change.files.len(),
-                        crate::engine::claude_code::claim_refusal_message(holder),
+                        crate::engine::session_claim_refusal::claim_refusal_message(holder),
                     ));
                 }
                 InPlaceMergeStart::SessionStopping => {
-                    log!(
+                    log_legacy!(
                         "[Changes] Apply refused for {} (thread {}): the session is stopping",
                         change_id,
                         thread_id
@@ -969,7 +984,7 @@ impl LucidosEngine {
                         change_id,
                         thread_id,
                         change.files.len(),
-                        crate::engine::claude_code::SESSION_STOPPING_MESSAGE,
+                        crate::engine::session_claim_refusal::SESSION_STOPPING_MESSAGE,
                     ));
                 }
                 // No live session — fall through to the dead-session tiers below.
@@ -1035,7 +1050,7 @@ impl LucidosEngine {
                 // Fast path: try ff directly
                 match catchup_and_ff_to_main(&repo_root, &wt_path, &change.branch_name).await {
                     Ok((pre_sha, post_sha)) => {
-                        log!(
+                        log_legacy!(
                             "[Changes] Fast path succeeded for {} (Tier 2)",
                             change.branch_name
                         );
@@ -1060,7 +1075,7 @@ impl LucidosEngine {
                         // worktree and branch are preserved above so the
                         // next user message resumes the same Claude Code session.
                         // ChangeApplied is the user-visible signal.
-                        return Ok(self
+                        return self
                             .finish_merged_apply(
                                 &change,
                                 &claim,
@@ -1074,12 +1089,12 @@ impl LucidosEngine {
                                     commits,
                                 },
                             )
-                            .await);
+                            .await;
                     }
                     Err(_) => {
                         // ff failed — CC needs to merge main into the branch,
                         // in a detached task (see the spawn below).
-                        log!(
+                        log_legacy!(
                             "[Changes] Fast path failed for {} — spawning a detached CC merge (Tier 2)",
                             change.branch_name
                         );
@@ -1087,9 +1102,11 @@ impl LucidosEngine {
                 }
 
                 // Look up resume token for potential resume
-                let resume_token =
-                    CodingAgentChangeOps::lookup_session_id_for_resume(self.as_ref(), thread_id)
-                        .await;
+                let resume_token = crate::engine::session_queries::lookup_latest_cc_session_id(
+                    self.pool(),
+                    thread_id,
+                )
+                .await;
 
                 // Park the actor by change_id so the conflict-recovery cleanup
                 // in `run_session.rs` (the `if let Some(change) = conflict_change`
@@ -1139,17 +1156,19 @@ impl LucidosEngine {
                 let tier3_repo_root = repo_root.clone();
                 let task_actor = actor.clone();
                 Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
-                    match CodingAgentChangeOps::run_merge_session_tier2(
-                        engine.as_ref(),
-                        thread_id,
-                        &claim,
-                        thread_hold,
-                        &merge_wt,
-                        &branch_name,
-                        &description,
-                        resume_token,
-                    )
-                    .await
+                    match engine
+                        .agent_host()
+                        .run_merge_session_tier2(
+                            engine.as_ref(),
+                            thread_id,
+                            &claim,
+                            thread_hold,
+                            &merge_wt,
+                            &branch_name,
+                            &description,
+                            resume_token,
+                        )
+                        .await
                     {
                         Ok(_) => {
                             // The cleanup already emitted the terminal and, on
@@ -1177,7 +1196,7 @@ impl LucidosEngine {
                                         .await;
                                 }
                                 Ok(_) => {}
-                                Err(e) => log!(
+                                Err(e) => log_legacy!(
                                     "[Changes] post-merge re-read of {} failed: {} — \
                                      skipping the orphan-sibling reconcile",
                                     change_id,
@@ -1187,7 +1206,7 @@ impl LucidosEngine {
                             engine.broadcast_changes_updated().await;
                         }
                         Err(e) => {
-                            log!(
+                            log_legacy!(
                                 "[Changes] CC merge failed for {}: {} — falling back to Tier 3",
                                 change_id,
                                 e
@@ -1208,7 +1227,7 @@ impl LucidosEngine {
                                 )
                                 .await
                             {
-                                log!(
+                                log_legacy!(
                                     "[Changes] Tier-3 fallback after the Tier-2 merge failure also failed for {}: {}",
                                     change_id,
                                     e
@@ -1242,7 +1261,7 @@ impl LucidosEngine {
     /// Hand a Lucidos-source change to the landing lane and return its answer.
     /// A failure to read the snapshot is announced here, like every refusal
     /// above it.
-    pub(crate) async fn queue_in_landing_lane(
+    pub async fn queue_in_landing_lane(
         &self,
         change: crate::core::changes::Change,
         claim: ApplyClaim,
@@ -1348,12 +1367,12 @@ impl LucidosEngine {
 
         // Fast path: branch may already be a descendant of main
         {
-            let _merge_guard = MERGE_MUTEX.lock().await;
+            let _merge_guard = MAIN_LOCKS.lock_merge().await;
             let held = self.lock_workspace_repo().await;
             let fast_forward = ff_main_to_branch(&held, repo_root, &change.branch_name).await;
             drop(held);
             if let Ok(shas) = fast_forward {
-                log!(
+                log_legacy!(
                     "[Changes] Fast path succeeded for {} (Tier 3)",
                     change.branch_name
                 );
@@ -1362,7 +1381,7 @@ impl LucidosEngine {
                 // main now, and the thread may resume CC against it later. No
                 // worktree exists for this branch in Tier 3, so there's
                 // nothing to reset.
-                return Ok(self
+                return self
                     .finish_merged_apply(
                         change,
                         &claim,
@@ -1376,7 +1395,7 @@ impl LucidosEngine {
                             commits,
                         },
                     )
-                    .await);
+                    .await;
             }
         }
 
@@ -1401,12 +1420,12 @@ impl LucidosEngine {
                 if let Ok((pre_sha, post_sha)) = result {
                     // `catchup_and_ff_to_main` deletes change.branch_name on success.
                     // On failure, leave it intact so the CC slow path below can still merge from it.
-                    log!(
+                    log_legacy!(
                         "[Changes] Auto-merge path succeeded for {} (Tier 3)",
                         change.branch_name
                     );
                     let commits = commits_in_range(repo_root, &pre_sha, &post_sha).await;
-                    return Ok(self
+                    return self
                         .finish_merged_apply(
                             change,
                             &claim,
@@ -1420,7 +1439,7 @@ impl LucidosEngine {
                                 commits,
                             },
                         )
-                        .await);
+                        .await;
                 }
             }
         }
@@ -1443,7 +1462,7 @@ impl LucidosEngine {
         )
         .await
         {
-            log!("[Changes] Apply refused for {}: {}", change_id, msg);
+            log_legacy!("[Changes] Apply refused for {}: {}", change_id, msg);
             self.emit_apply_failed(
                 change.thread_id.unwrap_or(change_id),
                 change_id,
@@ -1507,12 +1526,8 @@ impl LucidosEngine {
         if let Some(a) = actor.as_ref() {
             self.pending_apply_actors.stash(change_id, a.clone());
         }
-        CodingAgentChangeOps::spawn_merge_session(
-            self.as_ref(),
-            thread_id,
-            claim,
-            &change.description,
-        );
+        self.agent_host()
+            .spawn_merge_session(self.as_ref(), thread_id, claim, &change.description);
         Ok(ApplyResult::conflict(
             change_id,
             thread_id,

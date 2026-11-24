@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * One cap on mounted widget frames across a thread (ADR 0415). Past it, the
- * frame furthest from view unmounts first.
- */
 import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -27,8 +23,6 @@ afterEach(() => {
   scrolledIntoView.clear();
 });
 
-// Each frame sits 100px below the last on a 400px viewport, by its index. An
-// index in `scrolledIntoView` sits at the top instead.
 const scrolledIntoView = new Set<number>();
 const realRect = HTMLElement.prototype.getBoundingClientRect;
 beforeAll(() => {
@@ -87,7 +81,6 @@ describe('the widget frame budget', () => {
     const last = host.querySelector<HTMLElement>(`[data-index="${count - 1}"] .widget-frame`)!;
     expect(last.querySelector('iframe'), 'evicted, furthest from view').toBeNull();
 
-    // Off screen still: the claim is not taken again, so the cap holds.
     act(() => { reports.get(last)?.(false); });
     expect(last.querySelector('iframe')).toBeNull();
     expect(mountedWidgetFrameCount()).toBe(MAX_MOUNTED_WIDGET_FRAMES);
@@ -103,7 +96,6 @@ describe('the widget frame budget', () => {
       render(
         <div>
           {Array.from({ length: count }, (_, i) => (
-            // Every frame at index 0 sits in view.
             <div key={i} data-index={0}>
               <WidgetFrame appId="player" params={{ clip: `${i}.mp3` }} reveal="on-load" place="option" />
             </div>
@@ -115,7 +107,6 @@ describe('the widget frame budget', () => {
     expect(host.querySelectorAll('iframe')).toHaveLength(count);
   });
 
-  /** Invariant: the fit check never evicts a frame the user can see. */
   it('keeps a fit check\'s frames outside the cap, so they evict nothing', () => {
     act(() => {
       render(

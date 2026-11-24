@@ -20,18 +20,10 @@ function ordinal(n: number): string {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-/** Whether the field names exactly one value.
- *
- *  A step, a list (`1,15`) or a range names more than one, and `parseInt` reads
- *  only the leading token. A stepped day therefore rendered as `NaNth`, `1,15`
- *  as `1st` dropping the 15, and an hour of `9,17` as `09:00` dropping the
- *  17:00 run. Callers fall back to the raw cron rather than state a schedule
- *  the expression does not have. */
 function namesOneValue(field: string): boolean {
   return /^\d+$/.test(field);
 }
 
-/** The day of the month when the field names exactly one day, else null. */
 function bareDayOfMonth(dom: string): number | null {
   return namesOneValue(dom) ? parseInt(dom) : null;
 }
@@ -61,41 +53,30 @@ function describeWeekday(dow: string): string {
   return WEEKDAY_NAMES[dow.toUpperCase()] || dow;
 }
 
-/**
- * Convert a 6-field cron expression to a human-readable description.
- * Format: second minute hour day-of-month month day-of-week
- */
 export function describeCron(cron: string): string {
   const parts = cron.trim().split(/\s+/);
   if (parts.length !== 6) return cron;
 
   const [second, minute, hour, dom, month, dow] = parts;
 
-  // Every label below fires at most once a minute. A seconds field naming more
-  // than one value fires more often than any of them says.
   if (!namesOneValue(second)) return cron;
 
-  // The frequency labels name no month, so they hold only for every month.
   const everyDay = dom === '*' && month === '*' && dow === '*';
 
-  // Every minute
   if (minute === '*' && hour === '*' && everyDay) {
     return 'Every minute';
   }
 
-  // Every N minutes (*/N)
   if (minute.startsWith('*/') && hour === '*' && everyDay) {
     const n = parseInt(minute.slice(2));
     if (!isNaN(n)) return n === 1 ? 'Every minute' : `Every ${n} minutes`;
   }
 
-  // Every hour at :MM
   if (namesOneValue(minute) && hour === '*' && everyDay) {
     const m = parseInt(minute);
     return m === 0 ? 'Every hour' : `Every hour at :${String(m).padStart(2, '0')}`;
   }
 
-  // Every N hours, once in each: a minute field naming more fires more often.
   if (hour.startsWith('*/') && namesOneValue(minute) && everyDay) {
     const n = parseInt(hour.slice(2));
     if (!isNaN(n)) return n === 1 ? 'Every hour' : `Every ${n} hours`;
@@ -104,15 +85,12 @@ export function describeCron(cron: string): string {
   const hasTime = namesOneValue(hour) && namesOneValue(minute);
   const timeStr = hasTime ? formatTime(hour, minute) : '';
 
-  // Specific month constraint
   const monthStr = month !== '*' ? ` in ${MONTH_NAMES[month.toUpperCase()] || month}` : '';
 
-  // Daily at HH:MM
   if (hasTime && dom === '*' && dow === '*' && month === '*') {
     return `Daily at ${timeStr}`;
   }
 
-  // Weekday pattern
   if (hasTime && dom === '*' && dow !== '*' && month === '*') {
     const dayDesc = describeWeekday(dow);
     if (dayDesc === 'weekdays') return `Weekdays at ${timeStr}`;
@@ -120,7 +98,6 @@ export function describeCron(cron: string): string {
     return `Every ${dayDesc} at ${timeStr}`;
   }
 
-  // Specific date: both day-of-month and month are set (not recurring)
   if (hasTime && dom !== '*' && month !== '*' && dow === '*') {
     const d = bareDayOfMonth(dom);
     const monthName = MONTH_NAMES[month.toUpperCase()] || month;
@@ -136,7 +113,6 @@ export function describeCron(cron: string): string {
     }
   }
 
-  // Monthly on Nth day (month is *)
   if (hasTime && dom !== '*' && month === '*' && dow === '*') {
     const d = bareDayOfMonth(dom);
     if (d !== null) {
@@ -144,7 +120,6 @@ export function describeCron(cron: string): string {
     }
   }
 
-  // Specific day of month + day of week (both set)
   if (hasTime && dom !== '*' && dow !== '*') {
     const d = bareDayOfMonth(dom);
     if (d !== null) {
@@ -152,14 +127,9 @@ export function describeCron(cron: string): string {
     }
   }
 
-  // Fallback: return the raw cron
   return cron;
 }
 
-/**
- * Basic frontend validation of a 6-field cron expression.
- * Returns null if valid, or an error message.
- */
 export function validateCron(cron: string): string | null {
   const trimmed = cron.trim();
   if (!trimmed) return 'Cron expression is required';
@@ -174,21 +144,17 @@ export function validateCron(cron: string): string | null {
     const field = parts[i];
     if (field === '*') continue;
 
-    // Allow named weekdays/months
     if (i === 5 && /^[A-Z,-]+$/i.test(field)) continue;
     if (i === 4 && /^[A-Z,-]+$/i.test(field)) continue;
 
-    // Check each comma-separated part
     const segments = field.split(',');
     for (const seg of segments) {
-      // Step value: */N or N/N
       const stepMatch = seg.match(/^(\*|\d+)\/(\d+)$/);
       if (stepMatch) {
         const step = parseInt(stepMatch[2]);
         if (step === 0 || step > maxValues[i]) return `Invalid step value in ${fieldNames[i]}: ${seg}`;
         continue;
       }
-      // Range: N-N
       const rangeMatch = seg.match(/^(\d+)-(\d+)$/);
       if (rangeMatch) {
         const a = parseInt(rangeMatch[1]);
@@ -196,7 +162,6 @@ export function validateCron(cron: string): string | null {
         if (a > maxValues[i] || b > maxValues[i]) return `Value out of range in ${fieldNames[i]}: ${seg}`;
         continue;
       }
-      // Single number
       if (/^\d+$/.test(seg)) {
         const n = parseInt(seg);
         if (n > maxValues[i]) return `Value out of range in ${fieldNames[i]}: ${n} (max ${maxValues[i]})`;

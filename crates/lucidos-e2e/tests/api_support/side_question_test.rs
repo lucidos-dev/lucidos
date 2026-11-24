@@ -146,7 +146,7 @@ async fn a_side_question_naming_an_unknown_image_is_refused() {
 }
 
 #[tokio::test]
-async fn a_codex_thread_says_side_questions_are_not_available() {
+async fn a_codex_thread_without_a_session_is_refused_without_spawning() {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
@@ -159,7 +159,7 @@ async fn a_codex_thread_says_side_questions_are_not_available() {
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 400, "{body}");
     assert!(
-        error_of(&body).contains("not available in Codex threads"),
+        error_of(&body).contains("no coding-agent session yet"),
         "{body}"
     );
     assert_eq!(thread_event_count(&pool, thread_id).await, 0);
@@ -174,7 +174,7 @@ async fn a_claude_code_thread_with_no_session_yet_is_refused_without_spawning() 
     let (status, body) = ask(&thread_id.to_string(), "what is X?").await;
     assert_eq!(status, 400, "{body}");
     assert!(
-        error_of(&body).contains("no Claude Code session yet"),
+        error_of(&body).contains("no coding-agent session yet"),
         "{body}"
     );
     let (status, body) = ask(&thread_id.to_string(), "   ").await;

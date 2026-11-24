@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level. Mirrors
-// the scaffolding in thread-loading-stale.test.ts, which drives the same module.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -77,12 +75,10 @@ describe('the Retry button on a thread that failed to load', () => {
     await settle();
     forceRetryThreadEvents('t1');
     await settle();
-    // The watchdog is capped at one retry, so it cannot loop.
     expect(fetchEvents).toHaveBeenCalledTimes(1);
 
     retryThreadEvents('t1');
     await settle();
-    // A press is the user asking, and the cap is not theirs.
     expect(fetchEvents).toHaveBeenCalledTimes(2);
 
     retryThreadEvents('t1');

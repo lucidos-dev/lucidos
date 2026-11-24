@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A phone's round button opens its menu on a touch. WebKit drops the synthetic
- * click with the keyboard up, so the face takes the touch path.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -37,7 +33,6 @@ function draw() {
   });
 }
 
-/** A tap as WebKit delivers it: `touchend`, then the twin click. */
 function tap(el: Element): void {
   act(() => {
     el.dispatchEvent(new Event('touchend', { bubbles: true, cancelable: true }));

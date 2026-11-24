@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-// This file renders markdown, and the sanitizer runs on a real DOM.
-// The default `node` environment has none.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 
@@ -64,10 +62,6 @@ describe('ChildCompletionRow', () => {
     vi.clearAllMocks();
   });
 
-  /** The callback shares ONE marker with the event wait, the event delivery and the
-   *  trigger fire: all four report that something happened outside this thread,
-   *  and they used to say it in four dialects. This pins that it is the shared
-   *  row rather than a card of its own again. */
   it('is an event row: pill, linked title, state word', () => {
     const tree = ChildCompletionRow(baseProps);
     const row = findByClass(tree, 'event-row');
@@ -76,16 +70,11 @@ describe('ChildCompletionRow', () => {
     expect(row!.props['data-state']).toBe('success');
     expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread returned');
     expect(vnodeText(findByClass(tree, 'event-row-meta'))).toContain('Refactor the foo helper');
-    // The one event row that legitimately shows a verdict, because the verdict
-    // it reports is the CHILD's outcome rather than the row's own.
     const pill = findByClass(tree, 'event-row-state');
     expect(vnodeText(pill)).toBe('Success');
     expect(pill!.props['data-tone']).toBe('good');
   });
 
-  /** Straight off `pending_change_ids`. A row written before that field existed
-   *  omits the count rather than claiming zero: a row states no fact its event
-   *  does not carry. */
   it.each<[string[] | undefined, string | undefined]>([
     [undefined, undefined],
     [[], undefined],
@@ -97,8 +86,6 @@ describe('ChildCompletionRow', () => {
     else expect(text).not.toContain('pending change');
   });
 
-  /** An orchestrator's children held every change, so the row showed nothing
-   *  pending while two changes waited below it. */
   it('counts the changes pending in its sub-threads apart from its own', () => {
     const below = (n: number) =>
       Array.from({ length: n }, (_, i) => ({
@@ -112,8 +99,6 @@ describe('ChildCompletionRow', () => {
     expect(vnodeText(ChildCompletionRow(baseProps))).not.toContain('sub-threads');
   });
 
-  /** A filed report reuses the card and adds one line, so a reader knows no
-   *  turn of this thread answered it. */
   it('says a filed report did not wake this thread', () => {
     const filed = ChildCompletionRow({ ...baseProps, filed: true });
     expect(vnodeText(findByClass(filed, 'event-row-subject'))).toBe('Child thread report filed');
@@ -144,7 +129,6 @@ describe('ChildCompletionRow', () => {
     expect(vnodeText(link)).toBe('Untitled thread');
   });
 
-  /** One fold, labelled Details like every other event card's. */
   it('renders agent summary inside a collapsed fold', () => {
     const tree = ChildCompletionRow(baseProps);
     const fold = findByType(tree, EventRowFoldView);
@@ -158,9 +142,6 @@ describe('ChildCompletionRow', () => {
     expect(findByType(tree, EventRowFoldView)).toBeNull();
   });
 
-  /** The four appear together in one stream, so each has to be distinguishable
-   *  from the other three. The pill says a child thread returned; the state word
-   *  carries the verdict, so each reads apart from the other three. */
   it.each([
     { status: 'success' as const, word: 'Success', tone: 'good' },
     { status: 'failure' as const, word: 'Failure', tone: 'bad' },

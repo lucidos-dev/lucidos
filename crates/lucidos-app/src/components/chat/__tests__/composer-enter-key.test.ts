@@ -1,11 +1,3 @@
-/**
- * What Enter does in the composer, in both modes of `composer_enter_key`.
- *
- * `composerEnterSends` is the composer's only send-on-a-key rule. It runs the
- * real `matchShortcut`, so the default shortcuts are exercised as shipped.
- *
- * Plan: docs/plans/2026-10-16-composer-enter-key-setting.md
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

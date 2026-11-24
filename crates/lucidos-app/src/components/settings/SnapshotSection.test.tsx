@@ -26,7 +26,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   context.workspace = 'demo';
   vi.mocked(json).mockResolvedValue([entry]);
-  vi.mocked(requestGenerationGuard).mockReturnValue(Object.assign(() => {}, { headers: {} }));
+  vi.mocked(requestGenerationGuard).mockReturnValue(Object.assign(() => {}, { headers: {}, gated: true }));
   host = document.createElement('div'); document.body.append(host);
 });
 afterEach(() => { render(null, host); host.remove(); document.querySelector('meta[name="lucidos-workspace-id"]')?.remove(); });
@@ -48,7 +48,7 @@ it('names the target and external side effects before a canceled restore sends n
 
 it('refuses a restore when its generation changes while confirmation is open', async () => {
   vi.mocked(showConfirm).mockResolvedValue(true);
-  vi.mocked(requestGenerationGuard).mockReturnValue(Object.assign(() => { throw new Error('Generation changed'); }, { headers: {} }));
+  vi.mocked(requestGenerationGuard).mockReturnValue(Object.assign(() => { throw new Error('Generation changed'); }, { headers: {}, gated: true }));
   await open(); await restore();
   expect(mutatingFetch).not.toHaveBeenCalled();
 });

@@ -40,7 +40,7 @@ fn enabled_value(value: Option<&str>) -> bool {
 ///
 /// Callers keep their own constant and hand it here. The number stays beside
 /// the code that chose it, and only the decision to ignore it lives here.
-pub(crate) fn body_cap(normal: usize) -> Option<usize> {
+pub fn body_cap(normal: usize) -> Option<usize> {
     match full_bodies() {
         true => None,
         false => Some(normal),

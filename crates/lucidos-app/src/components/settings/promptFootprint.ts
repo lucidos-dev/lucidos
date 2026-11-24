@@ -1,22 +1,16 @@
 import type { FootprintItem, FootprintSection, WorkspacePromptFootprint } from '../../api/client';
 import { countOf } from '../../utils/recommendedCleanup';
 
-/** What the Run audit button sends. It names the audit and the section, so it
- *  routes to the audit root and runs only the prompt-footprint section.
- *  `the_footprint_page_prompt_routes_to_the_audit_root` pins the routing. */
 export const PROMPT_FOOTPRINT_AUDIT_PROMPT = "Audit my workspace's prompt footprint.";
 
-/** How many items the Largest tab lists. */
 export const LARGEST_ITEMS_SHOWN = 8;
 
 export type ItemTab = 'largest' | 'clipped' | 'unused';
 
-/** The sections that cost anything, largest first. */
 export function costlySections(report: WorkspacePromptFootprint): FootprintSection[] {
   return report.sections.filter((s) => s.chars > 0).sort((a, b) => b.chars - a.chars);
 }
 
-/** A meter's fill, as a share of the ceiling, capped at full. */
 export function meterFraction(chars: number, ceiling: number): number {
   if (ceiling <= 0) return 1;
   return Math.min(1, chars / ceiling);
@@ -26,14 +20,11 @@ function allItems(report: WorkspacePromptFootprint): FootprintItem[] {
   return report.sections.flatMap((s) => s.items);
 }
 
-/** Whether an item goes on the Unused tab. A knowhow doc is never proven
- *  unused, since a shell read leaves no trace, so it is "not loaded by name". */
 export function looksUnused(item: FootprintItem): boolean {
   const verdict = item.usage?.verdict;
   return verdict === 'unused' || verdict === 'not-loaded-by-name';
 }
 
-/** The items each tab lists. */
 export function itemsFor(report: WorkspacePromptFootprint, tab: ItemTab): FootprintItem[] {
   const items = allItems(report);
   switch (tab) {
@@ -46,7 +37,6 @@ export function itemsFor(report: WorkspacePromptFootprint, tab: ItemTab): Footpr
   }
 }
 
-/** The one line the Run audit card leads with. */
 export function findingsLine(report: WorkspacePromptFootprint): string {
   const over = report.sections.filter((s) => s.over_ceiling).length;
   const clipped = itemsFor(report, 'clipped').length;
@@ -83,8 +73,6 @@ export function kindLabel(kind: FootprintItem['kind']): string {
   return KIND_LABELS[kind];
 }
 
-/** When an item was last used, for its row. An MCP server's line says how
- *  many threads enabled it and how many called it instead. */
 export function usageLine(item: FootprintItem): string | null {
   if (item.mcp_threads) {
     const { enabled, called } = item.mcp_threads;

@@ -39,6 +39,10 @@ mkdir -p "$OUT"
 # shellcheck source=host_memory_guard.sh
 source "$SCRIPT_DIR/host_memory_guard.sh"
 
+# The existing native-reader fixtures model macOS.
+# shellcheck disable=SC2329
+_host_mem_os() { printf 'Darwin'; }
+
 # Keep the suite hermetic. The boundary check now calls _host_mem_attr_report,
 # which would otherwise run real ps / footprint / lsof against THIS host. An empty
 # candidate list is enough to keep it hermetic: with no candidates it never calls
@@ -474,8 +478,8 @@ test_the_2026_07_26_wedge_stops_on_the_corroborated_floor() {
 # is not on this machine. They never silently pass on a host that has no gate.
 PREFLIGHT_GATE="${PREFLIGHT_GATE:-$HOME/workspaces/dev/data/knowhow/lucidos-ops/scripts/preflight-memory-gate.sh}"
 
-# The gate reads the host through vm_stat, sysctl and ps, and it now also SLEEPS
-# between its confirm re-samples. Shadow all four on PATH so one known reading
+# The gate reads the host through vm_stat, sysctl, ps and uname, and it also SLEEPS
+# between its confirm re-samples. Shadow all five on PATH so one known reading
 # can be replayed through it, the same way every test above replays one through
 # the running guard. awk and sed stay real.
 #
@@ -530,7 +534,10 @@ printf '%s\n' "\$1" >> "$GATE_SLEEPS"
 exit 0
 EOF
     printf '#!/bin/bash\nexit 0\n' > "$dir/ps"
-    chmod +x "$dir/vm_stat" "$dir/sysctl" "$dir/ps" "$dir/sleep"
+    # The gate is its own process and picks its reader by `uname -s`, so the
+    # vm_stat replay needs a Darwin host on every runner, Linux included.
+    printf '#!/bin/bash\necho Darwin\n' > "$dir/uname"
+    chmod +x "$dir/vm_stat" "$dir/sysctl" "$dir/ps" "$dir/sleep" "$dir/uname"
     printf '%s' "$dir"
 }
 
@@ -2478,6 +2485,56 @@ CASES
 }
 
 # A host nobody can read is never refused, so a clone on Linux builds.
+test_linux_build_gate_reads_proc_and_cgroup() {
+    echo "test: Linux pressure and cgroup headroom reach the build verdict"
+    local linux_fixture_proc="$SANDBOX/linux-proc" mount="$SANDBOX/linux-cgroup" result
+    reset_state
+    mkdir -p "${linux_fixture_proc}/self" "${linux_fixture_proc}/pressure" "$mount/worker/task"
+    printf 'MemTotal: 67108864 kB\nMemAvailable: 16777216 kB\n' >"${linux_fixture_proc}/meminfo"
+    printf '0::/slice/worker/task\n' >"${linux_fixture_proc}/self/cgroup"
+    printf '20 10 0:12 /slice %s rw - cgroup2 cgroup rw\n' "$mount" >"${linux_fixture_proc}/self/mountinfo"
+    printf 'max\n' >"$mount/worker/task/memory.max"
+    printf '8589934592\n' >"$mount/worker/memory.max"
+    printf '7516192768\n' >"$mount/worker/memory.current"
+    printf 'some avg10=16.00 avg60=0.00 avg300=0.00 total=10\n' >"${linux_fixture_proc}/pressure/memory"
+    (
+        unset HOST_PRESSURE_LEVEL_OVERRIDE
+        _host_mem_os() { printf 'Linux'; }
+        _host_mem_proc_root() { printf '%s' "${linux_fixture_proc}"; }
+        assert_eq '1.00' "$(_host_mem_read_available_gb)" "cgroup limits available memory"
+        assert_eq '8.00' "$(_host_mem_read_physical_gb)" "the parent cgroup limits physical memory"
+        assert_eq '2' "$(_host_mem_read_pressure_level)" "Linux partial stalls corroborate low headroom"
+        result=0
+        host_memory_gate_verdict 8 >"$OUT/linux-bg.out" || result=$?
+        assert_eq '1' "$result" "low headroom under Linux pressure is NO-GO"
+        assert_says "$OUT/linux-bg.out" 'available 1.00 GB under 8 GB' 'the gate names the measured headroom'
+        printf '8589934592\n' >"$mount/worker/memory.current"
+        printf 'inactive_file 8589934592\n' >"$mount/worker/memory.stat"
+        assert_eq '8.00' "$(_host_mem_read_available_gb)" "inactive file cache counts as reclaimable"
+        result=0
+        host_memory_gate_verdict 8 || result=$?
+        assert_eq '0' "$result" "reclaimable cache at the hard limit is GO"
+        printf 'inactive_file 0\n' >"$mount/worker/memory.stat"
+        result=0
+        host_memory_gate_verdict 8 >"$OUT/linux-bg-full.out" || result=$?
+        assert_eq '1' "$result" "a hard limit with no reclaimable cache is NO-GO"
+        assert_says "$OUT/linux-bg-full.out" 'available Linux memory is 0.00 GB' 'the gate names exhausted headroom'
+        printf 'full avg10=6.00 avg60=0.00 avg300=0.00 total=10\n' >"$mount/worker/task/memory.pressure"
+        assert_eq '4' "$(_host_mem_read_pressure_level)" "full stalls in the cgroup are critical"
+        rm "$mount/worker/memory.max" "$mount/worker/task/memory.pressure"
+        assert_eq '16.00' "$(_host_mem_read_available_gb)" "an unlimited group uses MemAvailable"
+        result=0
+        host_memory_gate_verdict 8 || result=$?
+        assert_eq '0' "$result" "partial stalls with sufficient headroom are GO"
+        rm "${linux_fixture_proc}/meminfo" "${linux_fixture_proc}/pressure/memory"
+        result=0
+        host_memory_gate_verdict 8 || result=$?
+        assert_eq '0' "$result" "an unreadable Linux host is GO"
+        [ "$FAIL" -eq 0 ]
+    )
+    assert_eq '0' "$?" "Linux memory fixtures pass"
+}
+
 test_the_build_gate_fails_open_on_an_unreadable_host() {
     echo "test: the build gate is GO when no reading can be taken"
     local rc
@@ -2702,6 +2759,7 @@ drive_recovery() { # <out> [env assignments...]
             echo "$1" >> "$RW_WAITS"
             echo $(($(cat "$RW_CLOCK") + $1)) > "$RW_CLOCK"
         }
+        # shellcheck disable=SC2329 # Called by host_memory_wait_for_recovery.
         _host_mem_read_available_gb() {
             local i
             i="$(wc -l < "$RW_WAITS" | tr -d ' ')"
@@ -2791,6 +2849,7 @@ test_a_recovery_that_lands_past_the_deadline_does_not_resume() {
     echo "20" > "$RW_AVAIL"
     (
         # The third reading takes 100 s, as a critical confirm window can.
+        # shellcheck disable=SC2329 # Called by host_memory_wait_for_recovery.
         _host_mem_read_compressor_gb() {
             if [ "$(wc -l < "$RW_WAITS" | tr -d ' ')" -ge 2 ]; then
                 echo $(($(cat "$RW_CLOCK") + 100)) > "$RW_CLOCK"
@@ -3039,6 +3098,7 @@ test_attribution_does_not_change_the_stop_decision
 test_attribution_classifies_by_run_membership_not_name
 
 test_the_build_gate_agrees_with_the_preflight_gate
+test_linux_build_gate_reads_proc_and_cgroup
 test_the_build_gate_fails_open_on_an_unreadable_host
 test_the_build_gate_waits_for_recovery_then_refuses_at_the_deadline
 test_the_build_gate_line_follows_the_floor_knob

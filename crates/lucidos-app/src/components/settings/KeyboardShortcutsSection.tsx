@@ -6,8 +6,6 @@ import { currentComposerEnterKey, setComposerEnterKey, type ComposerEnterKey } f
 import { isMac } from '../../utils/platform';
 import { Explainer } from '../shared/Explainer';
 
-// Derived, not hand-maintained: a category added to the registry can't be
-// silently missing from the sheet. Order = first appearance in SHORTCUT_DEFS.
 const CATEGORIES = [...new Set(SHORTCUT_DEFS.map((d) => d.category))];
 
 export const COMPOSER_ENTER_KEY_LABELS: Record<ComposerEnterKey, string> = {
@@ -18,7 +16,6 @@ export const COMPOSER_ENTER_KEY_LABELS: Record<ComposerEnterKey, string> = {
 const enterChord = (mod: boolean, shift: boolean): string =>
   formatBinding({ mod, shift, alt: false, key: 'Enter' } satisfies Binding, isMac);
 
-/** The Composer group: what Enter does in the chat composer. */
 function ComposerEnterKeyRow() {
   const mode = currentComposerEnterKey();
   const enter = enterChord(false, false);
@@ -54,21 +51,15 @@ function ComposerEnterKeyRow() {
   );
 }
 
-/** Settings → Keyboard Shortcuts. Lists every registry shortcut with its
- *  current (possibly-customized) binding and a Record button to rebind it.
- *  Bindings are synced across devices via the `keybindings` workspace
- *  preference. */
 export function KeyboardShortcutsSection() {
   const [recordingId, setRecordingId] = useState<ShortcutId | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!recordingId) return;
-    // Window capture runs before every document listener, the global shortcut
-    // dispatcher's Escape capture included, so no recorded chord also acts.
     function onKey(e: KeyboardEvent) {
       const outcome = recordChord(e, recordingId!);
-      if (outcome.kind === 'modifier') return; // bare Ctrl/Cmd/etc — keep waiting
+      if (outcome.kind === 'modifier') return;
       e.preventDefault();
       e.stopPropagation();
       switch (outcome.kind) {
@@ -111,7 +102,6 @@ export function KeyboardShortcutsSection() {
               <div class="list-row" key={def.id} data-search-anchor={shortcutSearchAnchor(def.id)}>
                 <div class="list-row-info">
                   <span class="title">{def.label}</span>
-                  {/* It explains the default chord, so a rebound one hides it. */}
                   {def.mnemonic && !isCustomized(def.id) && (
                     <span class="list-row-details" data-role="shortcut-mnemonic">{def.mnemonic}</span>
                   )}

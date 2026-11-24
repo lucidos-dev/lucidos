@@ -3,18 +3,6 @@ import { exchangeResponseEvents, exchangeSteps } from './exchange-render';
 import type { Exchange } from './exchange';
 import type { ResponseEvent, StepOutcome } from '../types';
 
-/** A coding-agent turn always has ONE live row.
- *
- *  The Lucidos Agent arm gets that for free: the engine emits `ThoughtStreamed`
- *  before every LLM call, so a `Thinking` row opens there and the call that
- *  thinking pass produces renames it. A coding agent emits no such event between a
- *  `CodingAgentToolResult` and the next `CodingAgentToolCalled`, so the
- *  transcript used to show a column of finished checks with nothing live in it,
- *  and only the "Working" header said work was happening.
- *
- *  Both projections therefore DERIVE the row: while a coding-agent turn is live
- *  and no step is pending, one `Thinking` row is appended at the end. Every
- *  assertion here runs against both, because they are mirrors. */
 
 const TS = '2026-08-11T09:00:00Z';
 
@@ -32,8 +20,6 @@ function ccExchange(steps: Exchange['steps'], extra: Partial<Exchange> = {}): Ex
 
 type Row = { description: string; outcome: StepOutcome };
 
-/** The step rows of BOTH projections, keyed by the name each is known by, so a
- *  failure names which mirror drifted. */
 function bothProjections(steps: Exchange['steps'], threadIdle = false, extra: Partial<Exchange> = {}, isLast = true): Record<string, Row[]> {
   const exchange = ccExchange(steps, extra);
   const summary: Row[] = exchangeSteps(exchange, isLast, threadIdle)
@@ -47,7 +33,6 @@ function bothProjections(steps: Exchange['steps'], threadIdle = false, extra: Pa
 const pendingOf = (rows: Row[]) => rows.filter(r => r.outcome === 'pending');
 const lastOf = <T>(items: T[]): T | undefined => items[items.length - 1];
 
-/** Assert over both projections, naming the one that failed. */
 function forBoth(steps: Exchange['steps'], assert: (rows: Row[], projection: string) => void, threadIdle = false, extra: Partial<Exchange> = {}, isLast = true) {
   for (const [projection, rows] of Object.entries(bothProjections(steps, threadIdle, extra, isLast))) {
     assert(rows, projection);
@@ -62,8 +47,6 @@ const toolResult = (id: string) =>
 const text = (t: string) => ev({ type: 'CodingAgentTextStreamed', text: t });
 
 describe('a live coding-agent turn always has exactly one pending row', () => {
-  // The reported bug, driven event by event: at NO point may the turn be
-  // without a live row, and at no point may it have two.
   it('holds across tool called, tool result, tool called', () => {
     const drive = [promptSent(), toolCalled('tu-a', 'a.rs'), toolResult('tu-a'), toolCalled('tu-b', 'b.rs')];
     for (let n = 1; n <= drive.length; n++) {
@@ -76,8 +59,6 @@ describe('a live coding-agent turn always has exactly one pending row', () => {
   it('the row between a result and the next call is a Thinking row', () => {
     forBoth([promptSent(), toolCalled('tu-a', 'a.rs'), toolResult('tu-a')], (rows, projection) => {
       expect(pendingOf(rows), projection).toEqual([{ description: 'Thinking', outcome: 'pending' }]);
-      // The finished call keeps its check: the live row is ADDED, it does not
-      // reopen the row that just resolved.
       expect(rows.filter(r => r.outcome === 'success'), projection).toHaveLength(1);
     });
   });
@@ -90,12 +71,6 @@ describe('a live coding-agent turn always has exactly one pending row', () => {
   });
 
   it('the row is the FIRST thing a turn shows, before it has produced anything', () => {
-    // Read off a live thread (2026-08-11): a follow-up that RESUMES the
-    // subprocess emits no `CodingAgentPromptSent`, so for the twenty seconds
-    // between `SessionStarted` and the first tool call the turn held only
-    // `SessionStarted` and two `CodingAgentSettingsChanged`. None of those
-    // draws a row, while the header already read "Working", so the transcript
-    // was empty under a working turn for the whole window.
     forBoth([
       ev({ type: 'SessionStarted', session_id: 's1', channel: 'claude_code' }),
       ev({ type: 'CodingAgentSettingsChanged', model: 'claude-opus-5[1m]' }),
@@ -116,8 +91,6 @@ describe('a live coding-agent turn always has exactly one pending row', () => {
   });
 
   it('a resumed session with no CodingAgentPromptSent gets the row too', () => {
-    // A resume fires no prompt event, so the turn's first row comes from the
-    // tool call itself. The gap after its result is the same gap.
     forBoth([toolCalled('tu-a', 'a.rs'), toolResult('tu-a')], (rows, projection) => {
       expect(pendingOf(rows), projection).toEqual([{ description: 'Thinking', outcome: 'pending' }]);
     });
@@ -125,9 +98,6 @@ describe('a live coding-agent turn always has exactly one pending row', () => {
 });
 
 describe('parallel tool calls do not each open a row', () => {
-  // Coding agents issue parallel calls routinely and a result pairs back by
-  // tool_use_id. A row may open only when NOTHING is left pending, or a
-  // "Thinking" marker would sit next to calls that are still running.
   const calls = [promptSent(), toolCalled('tu-a', 'a.rs'), toolCalled('tu-b', 'b.rs'), toolCalled('tu-c', 'c.rs')];
 
   it('three calls, three staggered results: no Thinking row until the last lands', () => {
@@ -163,38 +133,24 @@ describe('a finished turn gains no trailing row', () => {
   });
 
   it('a quiescent thread with no terminator leaves nothing pending', () => {
-    // An engine that died mid-turn emits no terminator at all; `threadIdle` is
-    // the projection's other way of knowing nothing is running.
     forBoth([promptSent(), toolCalled('tu-a', 'a.rs'), toolResult('tu-a')], (rows, projection) => {
       expect(pendingOf(rows), projection).toHaveLength(0);
-    }, /* threadIdle */ true);
+    },  true);
   });
 
   it('a handed-off exchange shimmers nothing', () => {
-    // The fold gave the running turn to a later exchange, so nothing more lands
-    // here and a live row here would shimmer half a screen above the work.
     forBoth([promptSent(), toolCalled('tu-a', 'a.rs'), toolResult('tu-a')], (rows, projection) => {
       expect(pendingOf(rows), projection).toHaveLength(0);
-    }, /* threadIdle */ false, { continuationMoved: true });
+    },  false, { continuationMoved: true });
   });
 
   it('an exchange the turn has moved on from shimmers nothing', () => {
-    // Coding-agent events are not request-id routed: they fold chronologically
-    // into the last exchange. So an older turn left terminator-less (the user
-    // sent a follow-up mid-turn and the rest of the work landed below) is not
-    // live, and a row here would shimmer half a screen above the one that is.
     forBoth([promptSent(), toolCalled('tu-a', 'a.rs'), toolResult('tu-a')], (rows, projection) => {
       expect(pendingOf(rows), projection).toHaveLength(0);
-    }, /* threadIdle */ false, {}, /* isLast */ false);
+    },  false, {},  false);
   });
 
   it('a switch-teardown boundary shows nothing live, drain or not', () => {
-    // The engine went down with this boundary, so it is closed by construction
-    // however the thread's projection reads (it settles at `paused`, which is
-    // not quiescent). What lands under it is the dying subprocess's drain: a
-    // rejected tool result and a whitespace flush, which is coding-agent
-    // content by type and not work by any reading. A row here would give the
-    // boundary a renderable body reading "Working" while nothing is running.
     const teardown: Exchange = {
       userEvent: { type: 'ResponseAborted', cause: 'engine_shutdown', actor: { kind: 'device' }, created: TS, _eventId: 'ab-1' } as never,
       userSeq: 0,
@@ -217,12 +173,6 @@ describe('a finished turn gains no trailing row', () => {
 });
 
 describe('the live row never splits the response text', () => {
-  // The engine flushes coding-agent text at every renderable boundary
-  // (`should_flush`: paragraph break, closed code fence, heading, rule), so a
-  // multi-paragraph answer arrives as SEVERAL visible CodingAgentTextStreamed
-  // events. A step row wedged between them would defeat
-  // `mergeAdjacentTextEvents`, whose whole job is to let a markdown document
-  // split across flushes render as one document.
   const streamed = [
     promptSent(),
     toolCalled('tu-a', 'a.rs'),
@@ -248,8 +198,6 @@ describe('the live row never splits the response text', () => {
 
 describe('only coding-agent turns derive a row', () => {
   it('a live chat turn between a tool result and the next thought is unchanged', () => {
-    // The chat arm needs nothing: the engine emits `ThoughtStreamed` before
-    // every LLM call, so its live row is a real event.
     const chat: Exchange = {
       userEvent: { type: 'MessageReceived', text: 'dedup my list', created: TS, channel: 'chat', _eventId: 'msg-1' } as never,
       userSeq: 0,
@@ -266,8 +214,6 @@ describe('only coding-agent turns derive a row', () => {
   });
 
   it('a stepless user message projects no rows at all', () => {
-    // A queued follow-up bubble has no steps and must not sprout one, or it
-    // reads as a turn that is already working.
     forBoth([], (rows, projection) => {
       expect(rows, projection).toHaveLength(0);
     });

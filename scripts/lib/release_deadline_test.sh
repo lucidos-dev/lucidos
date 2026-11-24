@@ -34,6 +34,10 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# The release scripts ask for GitHub access before they read their flags, and
+# this host may name no account. Every row is refused before any gh call, so a
+# token nobody uses satisfies the check.
+export GH_TOKEN=unused
 # shellcheck source=scripts/lib/release_deadline.sh
 source "$SCRIPT_DIR/release_deadline.sh"
 # release_notarize_json_field is what notarize_poll reads notarytool's reply
@@ -240,7 +244,8 @@ echo "test: the deadline governs INSTEAD of NOTARIZE_POLL_TIMEOUT, not beside it
 # deadline set, the deadline is the only bound: this is what lets an operator
 # ask for a wait LONGER than the 7200s default.
 NOTARIZE_POLL_TIMEOUT=0
-NOTARIZE_DEADLINE="$(( $(date '+%s') + 1 ))"
+# Three seconds, so a clock tick before the first poll cannot skip it.
+NOTARIZE_DEADLINE="$(( $(date '+%s') + 3 ))"
 NOTARIZE_DEADLINE_EXPIRED=0
 NOTARIZE_POLL_INTERVAL=1
 NOTARYTOOL_STATUS="In Progress"

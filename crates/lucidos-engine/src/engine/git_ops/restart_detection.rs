@@ -2,20 +2,17 @@ use std::path::Path;
 
 /// True if `repo_path` doesn't canonicalize to `dev_root`. Falls back to raw
 /// equality when canonicalization fails (test-only paths, repos missing on disk).
-pub(crate) fn is_external_repo_path(repo_path: &Path, dev_root: &Path) -> bool {
+pub fn is_external_repo_path(repo_path: &Path, dev_root: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(repo_path) != canon(dev_root)
 }
 
-/// The crates the engine, gateway and `lucidos` CLI binaries are built from.
-/// Everything in them but tests and docs is compiled in or feeds the build.
-const BINARY_CRATES: &[&str] = &[
-    "crates/lucidos-engine/",
-    "crates/lucidos-gateway/",
-    "crates/lucidos-cli/",
-];
+#[path = "../../../../engine_crate_paths.rs"]
+mod engine_crate_paths;
 
-/// Files outside [`BINARY_CRATES`] that a binary `include_str!`s or
+const FRONT_DOOR_CRATES: &[&str] = &["lucidos-gateway", "lucidos-cli"];
+
+/// Files outside the binary crates that a binary `include_str!`s or
 /// `include_bytes!`s. A running process serves the copy it was BUILT with, so
 /// only a rebuild picks up an edit. Some read as docs or frontend files by
 /// path: the changelog, the CLI skill, the stylesheet served to app iframes.
@@ -25,8 +22,11 @@ const EMBEDDED_FILES: &[&str] = &[
     "CHANGELOG.md",
     "release-notices.toml",
     ".claude/skills/lucidos-cli/SKILL.md",
+    "crates/lucidos-app/VERSION",
     "crates/lucidos-app/index.html",
     "crates/lucidos-app/public/favicon.svg",
+    "crates/lucidos-app/public/outbox-handoff.js",
+    "crates/lucidos-app/public/remote-client-upgrade.js",
     "crates/lucidos-app/src/styles/global/shared-components.css",
     "crates/lucidos-app/src/styles/global/surface.css",
     "crates/lucidos-app/src/styles/global/text-input.css",
@@ -46,7 +46,7 @@ const APP_COMPILE_INPUTS: &[&str] = &[
 /// Rust source files (excluding tests/docs), SQL migrations, the SDK bundle
 /// sources, the desktop app's compile inputs, and every file a binary embeds
 /// all trigger a restart.
-pub(crate) fn files_require_restart(files: &[String]) -> bool {
+pub fn files_require_restart(files: &[String]) -> bool {
     files.iter().any(|f| {
         let is_rust_source = f.ends_with(".rs")
             || f == "Cargo.toml"
@@ -59,7 +59,15 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
         // `web-dev.sh -b` on engine restart; without restart the previously-
         // built dist/sdk.js keeps being served.
         let is_sdk_bundle_source = f.starts_with("packages/lucidos-sdk/") && !is_test_or_doc;
-        let in_binary_crate = BINARY_CRATES.iter().any(|c| f.starts_with(c)) && !is_test_or_doc;
+        let crate_name = f
+            .strip_prefix("crates/")
+            .and_then(|path| path.split_once('/'))
+            .map(|(name, _)| name);
+        let in_binary_crate = !is_test_or_doc
+            && crate_name.is_some_and(|name| {
+                FRONT_DOOR_CRATES.contains(&name)
+                    || engine_crate_paths::engine_crates().any(|engine_crate| engine_crate == name)
+            });
         // The host's @font-face resolves the vendored fonts through Vite, and
         // `core::fonts` embeds the same files to serve app iframes.
         let is_vendored_font =
@@ -72,11 +80,12 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
             || in_binary_crate
             || is_vendored_font
             || EMBEDDED_FILES.contains(&f.as_str())
+            || engine_crate_paths::ENGINE_INVENTORY_INPUTS.contains(&f.as_str())
     })
 }
 
 /// File extensions an app's iframe directly serves (HTML / CSS / JS / static
-/// assets). Matches what `/api/v1/app/<id>/...` streams in `crates/lucidos-engine/src/api/apps.rs`.
+/// assets). Matches what `/api/v1/app/<id>/...` streams in `crates/lucidos-agents-api/src/api/apps.rs`.
 const APP_IFRAME_BUNDLED_EXTENSIONS: &[&str] = &[
     "html", "htm", "css", "js", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "woff", "woff2",
     "ttf", "otf", "json",
@@ -112,32 +121,26 @@ pub(crate) fn any_iframe_bundled_file_changed(files: &[String], app_id: &str) ->
     })
 }
 
-/// Directories whose files feed the served client bundle. Mirrors `watchDirs`
-/// in `crates/lucidos-app/dev-build-watch.mjs`.
-pub(super) const CLIENT_BUNDLE_DIRS: &[&str] = &[
-    "crates/lucidos-app/src/",
-    "crates/lucidos-app/public/",
-    "crates/lucidos-app/vite/",
-    "packages/lucidos-sdk/src/",
-];
+pub use crate::core::git::files_have_client_update;
+#[cfg(test)]
+pub(super) use crate::core::git::{CLIENT_BUNDLE_DIRS, CLIENT_BUNDLE_FILES};
 
-/// Single files that feed the served client bundle. Mirrors `watchFiles` in
-/// `crates/lucidos-app/dev-build-watch.mjs`.
-pub(super) const CLIENT_BUNDLE_FILES: &[&str] = &[
-    "crates/lucidos-app/index.html",
-    "crates/lucidos-app/vite.config.ts",
-    "crates/lucidos-app/package.json",
-    "package.json",
-    "package-lock.json",
-];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// True if any of `files` is an input the build-watch rebuilds the served
-/// client from. After a frontend-only Apply the engine waits for that rebuild,
-/// so a file the watch ignores (an e2e spec, a script) must not count: no
-/// build would run, and the wait would end in a false "not served yet" warning.
-pub(crate) fn files_have_client_update(files: &[String]) -> bool {
-    files.iter().any(|f| {
-        CLIENT_BUNDLE_FILES.contains(&f.as_str())
-            || CLIENT_BUNDLE_DIRS.iter().any(|dir| f.starts_with(dir))
-    })
+    #[test]
+    fn configured_engine_crates_include_embedded_assets() {
+        for name in engine_crate_paths::engine_crates() {
+            assert!(files_require_restart(&[format!(
+                "crates/{name}/src/embedded.css"
+            )]));
+            assert!(!files_require_restart(&[format!(
+                "crates/{name}/tests/fixture.css"
+            )]));
+        }
+        assert!(files_require_restart(&[
+            engine_crate_paths::TIER_MAP_PATH.into()
+        ]));
+    }
 }

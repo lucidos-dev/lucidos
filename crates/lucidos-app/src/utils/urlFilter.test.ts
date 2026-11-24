@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import { isMainFrameUrl } from './urlFilter';
 
 describe('isMainFrameUrl', () => {
-  // Valid top-level URLs should pass
   it('accepts normal http URLs', () => {
     expect(isMainFrameUrl('https://vg.no')).toBe(true);
     expect(isMainFrameUrl('https://www.dn.no/article/123')).toBe(true);
@@ -10,20 +9,17 @@ describe('isMainFrameUrl', () => {
     expect(isMainFrameUrl('https://en.wikipedia.org/wiki/Main_Page')).toBe(true);
   });
 
-  // about: URLs should be rejected
   it('rejects about: URLs', () => {
     expect(isMainFrameUrl('about:')).toBe(false);
     expect(isMainFrameUrl('about:blank')).toBe(false);
     expect(isMainFrameUrl('about:srcdoc')).toBe(false);
   });
 
-  // data: and blob: URLs should be rejected (iframe content)
   it('rejects data: and blob: URLs', () => {
     expect(isMainFrameUrl('data:text/html,<h1>test</h1>')).toBe(false);
     expect(isMainFrameUrl('blob:https://example.com/abc-123')).toBe(false);
   });
 
-  // Ad tracker URLs should be rejected
   it('rejects Google ad tracking URLs', () => {
     expect(isMainFrameUrl('https://ep2.adtrafficquality.google/sodar/sodar2/253/runner.html')).toBe(false);
     expect(isMainFrameUrl('https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js')).toBe(false);
@@ -44,19 +40,16 @@ describe('isMainFrameUrl', () => {
     expect(isMainFrameUrl('https://ads.example.com/ad-iframe.html')).toBe(false);
   });
 
-  // Empty and invalid URLs
   it('rejects empty and invalid URLs', () => {
     expect(isMainFrameUrl('')).toBe(false);
     expect(isMainFrameUrl('javascript:void(0)')).toBe(false);
   });
 
-  // Should accept URLs even if they have query params or fragments
   it('accepts URLs with query params and fragments', () => {
     expect(isMainFrameUrl('https://vg.no/nyheter?id=123#top')).toBe(true);
     expect(isMainFrameUrl('https://www.google.com/search?q=test')).toBe(true);
   });
 
-  // Google search is fine, Google ads are not
   it('distinguishes Google search from Google ads', () => {
     expect(isMainFrameUrl('https://www.google.com/search?q=test')).toBe(true);
     expect(isMainFrameUrl('https://www.google.com')).toBe(true);

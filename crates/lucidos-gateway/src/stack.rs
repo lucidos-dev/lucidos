@@ -11,9 +11,11 @@
 use crate::engine_hop::{self, Credential, EngineAddress};
 use crate::postgres::PgHandle;
 use crate::registry::Workspace;
+use crate::row_subscription::RowSubscription;
+use lucidos_gateway_stamp::{StampKey, ENV_STAMP_KEY_ON_STDIN, ENV_STARTED_BY_GATEWAY};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Does `path` lie inside a coding-agent worktree — one of the
@@ -102,22 +104,64 @@ pub struct StackRuntime {
     pub health_misses: u32,
     pub last_spawn: Option<Instant>,
     pub last_error: Option<String>,
-    /// Last unread-notification count fetched from this engine (the picker's
-    /// per-workspace badge + the aggregate Tauri / gateway-PWA total). `None`
-    /// when the engine isn't healthy / hasn't been polled yet — a stopped
-    /// workspace contributes no badge. Refreshed by the supervise loop.
+    /// The shared unread count, as the row subscription last read it.
+    /// Background aggregates use it; a device-facing listing replaces it with
+    /// that device's own count. `None` when unknown.
     pub last_unread: Option<u64>,
     /// What this engine last said about its backups (the picker's per-row backup
     /// line). `None` when unknown, on exactly the terms `last_unread` is: no
-    /// healthy engine to ask, or a poll that did not answer. Refreshed by the
-    /// supervise loop.
+    /// live row subscription, or a read that did not answer.
     pub last_successful_backup: Option<LastSuccessfulBackup>,
+    /// The task that keeps the two fields above current.
+    pub row_subscription: RowSubscription,
 }
 
 impl StackRuntime {
     /// Where this stack's engine answers: its engine socket.
     pub fn engine_address(&self) -> EngineAddress {
         EngineAddress::for_workspace(&self.resolved_dir, self.ws.port)
+    }
+
+    /// Say nothing on the row: no badge, no backup line, no device count.
+    pub fn blank_row(&mut self) {
+        self.last_unread = None;
+        self.last_successful_backup = None;
+        self.row_subscription.forget_devices();
+    }
+
+    /// End the row subscription. A row with no live stream shows nothing.
+    pub fn stop_row_subscription(&mut self) {
+        self.row_subscription.stop();
+        self.blank_row();
+    }
+
+    /// Keep the row subscription in step with one healthy probe of `engine`.
+    ///
+    /// An engine without `event_filter` is older than the row stream, and
+    /// would count a subscriber as a page. The gateway sends it nothing. Its
+    /// row stays quiet until it restarts onto a newer build, which the
+    /// supervisor brings about once it is idle.
+    pub fn keep_row_subscription(
+        &mut self,
+        event_filter: bool,
+        stack: &std::sync::Arc<tokio::sync::Mutex<StackRuntime>>,
+        engine: &EngineAddress,
+    ) {
+        if self.row_subscription.note_engine_stream(event_filter) {
+            crate::log!(
+                "[Gateway] the engine of '{}' is older than the row stream: its picker row shows \
+                 no badge and no backup line until it restarts",
+                lucidos_diagnostic_log::private(self.ws.id.clone())
+            );
+        }
+        if !event_filter {
+            self.stop_row_subscription();
+        } else if !self.row_subscription.is_live() {
+            // Blank until the stream's hello brings the first snapshot.
+            self.blank_row();
+            self.row_subscription
+                .start(std::sync::Arc::downgrade(stack), engine.clone());
+        }
     }
 }
 
@@ -126,19 +170,32 @@ impl StackRuntime {
 /// part of [`WorkspaceStatus`].
 ///
 /// The gateway holds no database handle (ADR 0014 §1), so this HTTP read is the
-/// only way it can know any of it. It re-serializes rather than re-deciding:
-/// staleness is the engine's call, made against the one threshold in
-/// `core::backup::BACKUP_STALE_AFTER_SECONDS`.
+/// only way it can know any of it. Staleness stays the engine's call, made
+/// against the one threshold in `core::backup::BACKUP_STALE_AFTER_SECONDS`:
+/// the engine names the instant, and the gateway only compares it with its
+/// clock.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LastSuccessfulBackup {
     /// When the newest successful backup run finished, or `None` when this
     /// workspace has never produced one.
     pub at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The engine's verdict that `at` is too old (or absent).
+    /// The engine's verdict that `at` is too old (or absent), at the read.
     pub stale: bool,
+    /// When the engine said `at` turns stale. No event announces that
+    /// instant, so [`Self::as_of`] applies it on each listing.
+    #[serde(skip)]
+    pub stale_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether backups are set up at all. It is what separates "the schedule has
     /// never produced an archive" from "nobody set backups up here".
     pub configured: bool,
+}
+
+impl LastSuccessfulBackup {
+    /// This reading at `now`: stale once the engine's own instant has passed.
+    pub fn as_of(mut self, now: chrono::DateTime<chrono::Utc>) -> Self {
+        self.stale = self.stale || self.stale_at.is_some_and(|at| now > at);
+        self
+    }
 }
 
 /// Serializable status view for the control API / picker.
@@ -146,11 +203,20 @@ pub struct LastSuccessfulBackup {
 pub struct WorkspaceStatus {
     pub id: String,
     pub name: String,
+    /// The workspace directory, resolved. Engines project it into
+    /// `GET /api/v1/workspaces`, so a sandboxed agent can find a peer.
+    pub path: PathBuf,
     pub port: u16,
     pub health: Health,
     /// Whether the gateway auto-starts this workspace on boot (the picker renders
     /// a per-workspace toggle bound to it). Mirrors [`Workspace::autostart`].
     pub autostart: bool,
+    /// Who made the workspace. Agents read it to see which entries the
+    /// workspace broker may delete or restore.
+    pub origin: crate::registry::WorkspaceOrigin,
+    /// [`crate::registry::WorkspaceOrigin::is_machine_made`], so an engine reads
+    /// the verb split instead of restating it.
+    pub machine_made: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     /// Unread-notification count for this workspace's per-row badge. Omitted
@@ -165,17 +231,46 @@ pub struct WorkspaceStatus {
     pub last_successful_backup: Option<LastSuccessfulBackup>,
 }
 
+impl WorkspaceStatus {
+    /// The row for a workspace with no engine to ask: no badge, no backup line.
+    pub fn without_engine(
+        ws: &Workspace,
+        path: PathBuf,
+        health: Health,
+        last_error: Option<String>,
+    ) -> Self {
+        WorkspaceStatus {
+            id: ws.id.clone(),
+            name: ws.name.clone(),
+            path,
+            port: ws.port,
+            health,
+            autostart: ws.autostart,
+            origin: ws.cleanup.origin,
+            machine_made: ws.cleanup.origin.is_machine_made(),
+            last_error,
+            unread_count: None,
+            last_successful_backup: None,
+        }
+    }
+}
+
 impl StackRuntime {
     pub fn status(&self) -> WorkspaceStatus {
         WorkspaceStatus {
             id: self.ws.id.clone(),
             name: self.ws.name.clone(),
+            path: self.resolved_dir.clone(),
             port: self.ws.port,
             health: self.health,
             autostart: self.ws.autostart,
+            origin: self.ws.cleanup.origin,
+            machine_made: self.ws.cleanup.origin.is_machine_made(),
             last_error: self.last_error.clone(),
             unread_count: self.last_unread,
-            last_successful_backup: self.last_successful_backup,
+            last_successful_backup: self
+                .last_successful_backup
+                .map(|line| line.as_of(chrono::Utc::now())),
         }
     }
 }
@@ -201,6 +296,10 @@ fn engine_env_overrides(
         // Identity + callback so the engine's /api/v1/restart can ask the
         // gateway to restart this one stack in place (dev Apply path).
         ("LUCIDOS_WORKSPACE_ID", ws.id.clone().into()),
+        (
+            "LUCIDOS_WORKSPACE_ORIGIN",
+            ws.cleanup.origin.as_str().into(),
+        ),
         ("LUCIDOS_GATEWAY_PORT", gateway_port.to_string().into()),
         // The port a webhook delivery arrives on, resolved once here so the
         // engine never re-derives it. The engine has no dependency on this
@@ -217,23 +316,40 @@ fn engine_env_overrides(
     ]
 }
 
-/// The gateway's own cert and key, under names the engine never serves with.
+/// The frontend preview's two certificates, under names the engine never
+/// serves with (ADR 0267).
+///
+/// - The preview leaf from the loopback CA, which Vite serves loopback with.
+/// - The gateway's user cert, which Vite serves every other name with. Empty
+///   when the gateway has none, and then Vite binds loopback only.
 ///
 /// A loopback engine loses `LUCIDOS_TLS_*` so it serves plain HTTP to the
-/// gateway. Its frontend preview still needs the gateway's cert: the device
-/// cookie is `Secure` on a TLS gateway, so a preview on plain HTTP never
-/// receives it off `localhost` (ADR 0267). Empty when the gateway serves plain
-/// HTTP, which tells the engine the gateway's scheme too.
-fn gateway_tls_handoff(cert: Option<&str>, key: Option<&str>) -> Vec<(&'static str, String)> {
-    match (cert, key) {
-        (Some(c), Some(k)) if crate::net_config::serves_tls(cert, key) => vec![
-            // Trimmed, as `serves_tls` and the gateway's own listener trim: a
-            // padded path would pass the check here and fail Vite's `existsSync`.
-            ("LUCIDOS_GATEWAY_TLS_CERT", c.trim().to_string()),
-            ("LUCIDOS_GATEWAY_TLS_KEY", k.trim().to_string()),
-        ],
-        _ => Vec::new(),
-    }
+/// gateway. `None` removes a name, so an engine never inherits a stale pair.
+fn preview_tls_handoff(
+    leaf: Option<&lucidos_loopback_ca::PreviewLeaf>,
+    user_cert: Option<&str>,
+    user_key: Option<&str>,
+) -> [(&'static str, Option<String>); 4] {
+    use lucidos_local_token::loopback_cert::{
+        PREVIEW_TLS_CERT_ENV, PREVIEW_TLS_KEY_ENV, PREVIEW_USER_TLS_CERT_ENV,
+        PREVIEW_USER_TLS_KEY_ENV,
+    };
+    let user = match (user_cert, user_key) {
+        // Trimmed, as `serves_tls` and the gateway's own listener trim: a
+        // padded path would pass the check here and fail Vite's `existsSync`.
+        (Some(c), Some(k)) if crate::net_config::serves_tls(user_cert, user_key) => {
+            Some((c.trim().to_string(), k.trim().to_string()))
+        }
+        _ => None,
+    };
+    let (user_cert, user_key) = user.unzip();
+    let path = |p: &Path| p.display().to_string();
+    [
+        (PREVIEW_TLS_CERT_ENV, leaf.map(|l| path(&l.cert))),
+        (PREVIEW_TLS_KEY_ENV, leaf.map(|l| path(&l.key))),
+        (PREVIEW_USER_TLS_CERT_ENV, user_cert),
+        (PREVIEW_USER_TLS_KEY_ENV, user_key),
+    ]
 }
 
 /// Spawn a workspace engine: detached, pointed at its workspace dir and
@@ -254,15 +370,42 @@ fn gateway_tls_handoff(cert: Option<&str>, key: Option<&str>) -> Vec<(&'static s
 /// `loopback`, so the ports file cannot disagree with the scheme the engine
 /// serves on its TCP port. Publishing it is part of the spawn (ADR 0136), so
 /// a new spawn site cannot leave a workspace unresolvable.
+///
+/// The engine's stamp key is born here too, and crosses only the engine's
+/// stdin pipe. A spawn site cannot hand out an engine without one.
+pub struct EngineLaunch<'a> {
+    pub loopback: bool,
+    pub proto: &'a str,
+    pub disposable: bool,
+    pub managed_database: bool,
+    /// The frontend preview's leaf, when the gateway could write one.
+    pub preview_leaf: Option<&'a lucidos_loopback_ca::PreviewLeaf>,
+}
+
+fn managed_database_handoff(cmd: &mut Command, managed: bool) {
+    cmd.env_remove("LUCIDOS_MANAGED_DATABASE");
+    if managed {
+        cmd.env("LUCIDOS_MANAGED_DATABASE", "1");
+    }
+}
+
 pub fn spawn_engine(
     engine_bin: &Path,
     ws: &Workspace,
     resolved_dir: &Path,
     database_url: &str,
     gateway_port: u16,
-    loopback: bool,
-    proto: &str,
-) -> std::io::Result<Child> {
+    launch: EngineLaunch<'_>,
+) -> std::io::Result<SpawnedEngine> {
+    let EngineLaunch {
+        loopback,
+        proto,
+        disposable,
+        managed_database,
+        preview_leaf,
+    } = launch;
+    let stamp_key = StampKey::generate()?;
+    crate::diagnostic_log::secret(stamp_key.handover_line().trim().to_owned());
     // The engine keeps its owner lock and pidfile in here, and wants a writable
     // CWD.
     let state_dir = resolved_dir.join(".lucidos");
@@ -275,27 +418,29 @@ pub fn spawn_engine(
     crate::file_backup::exclude(&state_dir, "workspace state dir");
 
     let mut cmd = Command::new(engine_bin);
-    cmd.current_dir(resolved_dir)
-        .envs(engine_env_overrides(
-            ws,
-            resolved_dir,
-            database_url,
-            gateway_port,
-        ))
-        .envs(gateway_tls_handoff(
-            std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
-            std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
-        ));
+    // Always override inheritance, including launches against external databases.
+    managed_database_handoff(&mut cmd, managed_database);
+    cmd.current_dir(resolved_dir).envs(engine_env_overrides(
+        ws,
+        resolved_dir,
+        database_url,
+        gateway_port,
+    ));
+    for (name, value) in preview_tls_handoff(
+        preview_leaf,
+        std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
+        std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
+    ) {
+        match value {
+            Some(v) => cmd.env(name, v),
+            None => cmd.env_remove(name),
+        };
+    }
 
-    // Never hand a spawned engine a frontend pinned to a coding-agent worktree.
-    // This inherit is what makes such a pin self-perpetuating: the worktree's
-    // `dist/` reaches every engine the gateway spawns, so the stack keeps
-    // serving a frozen build across restarts. Dropping the var makes the engine
-    // serve nothing rather than something stale, and a visible failure beats an
-    // invisible one. `LUCIDOS_STATIC_DIR` is already optional (ADR 0021).
+    // Persistent engines must not inherit a frontend pinned to a worktree (ADR 0021).
     if let Some(dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
-        if path_is_in_cc_worktree(Path::new(&dir)) {
-            crate::log!(
+        if !disposable && path_is_in_cc_worktree(Path::new(&dir)) {
+            crate::log_legacy!(
                 "[Gateway] refusing to pass worktree-pinned LUCIDOS_STATIC_DIR to engine \
                  '{}': {} — relaunch the stack from the real checkout \
                  (see docs/plans/2026-07-26-worktree-pinned-stack-guard.md)",
@@ -335,9 +480,9 @@ pub fn spawn_engine(
         }
     }
 
-    // Detach into its own session so a gateway death doesn't cascade.
+    // Persistent engines survive gateway death. Disposable engines stay in its owned group.
     #[cfg(unix)]
-    {
+    if !disposable {
         use std::os::unix::process::CommandExt;
         // SAFETY: setsid is async-signal-safe and takes no pointers. Failure
         // (already a session leader) is harmless — ignore the result.
@@ -349,9 +494,48 @@ pub fn spawn_engine(
         }
     }
 
-    let child = cmd.spawn()?;
+    // The flag says a key is coming, so the engine reads one line of stdin.
+    // The key itself never enters the environment, where `ps eww` reads it.
+    cmd.env(ENV_STAMP_KEY_ON_STDIN, "1").stdin(Stdio::piped());
+    // A gateway restarted under this engine takes it back as its own.
+    cmd.env(ENV_STARTED_BY_GATEWAY, "1");
+    let mut child = cmd.spawn()?;
+    let stamp_key = hand_over_stamp_key(&mut child, stamp_key);
     publish_ports_file(resolved_dir, ws, ws.port, proto);
-    Ok(child)
+    Ok(SpawnedEngine { child, stamp_key })
+}
+
+/// An engine [`spawn_engine`] started, and the stamp key it holds. `None`
+/// means the handover failed, so the engine boots keyless.
+#[derive(Debug)]
+pub struct SpawnedEngine {
+    pub child: Child,
+    pub stamp_key: Option<StampKey>,
+}
+
+/// Write the key line into the child's stdin and close the pipe. Returns the
+/// key only when it arrived.
+///
+/// A failure is logged, never returned: the engine then boots keyless, which
+/// fails closed (every device claim unattested). The gateway records no key
+/// for it, so the supervisor's idle re-key respawns it.
+fn hand_over_stamp_key(child: &mut Child, key: StampKey) -> Option<StampKey> {
+    use std::io::Write as _;
+    let Some(mut stdin) = child.stdin.take() else {
+        crate::log_legacy!(
+            "[Gateway] engine pid {} has no stdin pipe for its stamp key",
+            child.id()
+        );
+        return None;
+    };
+    if let Err(e) = stdin.write_all(key.handover_line().as_bytes()) {
+        crate::log_legacy!(
+            "[Gateway] could not hand engine pid {} its stamp key: {e}",
+            child.id()
+        );
+        return None;
+    }
+    Some(key)
 }
 
 /// Publish `<workspace>/.lucidos/ports` for an engine that is up.
@@ -374,7 +558,7 @@ pub fn publish_ports_file(resolved_dir: &Path, ws: &Workspace, api_port: u16, pr
     let existing = std::fs::read_to_string(&path).ok();
     let contents = merge_ports_file(existing.as_deref(), api_port, proto);
     if let Err(e) = std::fs::write(&path, contents) {
-        crate::log!(
+        crate::log_legacy!(
             "[Gateway] could not write {} for '{}': {e} \
              (cross-workspace spawns aimed at this workspace will not resolve it)",
             path.display(),
@@ -555,14 +739,14 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
     #[cfg(unix)]
     if let Some(pid) = live_engine_pid(resolved_dir) {
         let Some(signal_pid) = single_process_pid(pid) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] ignoring pidfile in {} naming pid {pid}, which is no single process",
                 resolved_dir.display()
             );
             return;
         };
         if let Some(exe) = other_program_at_pid(signal_pid, ENGINE_EXECUTABLE_NAME) {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] pidfile in {} names pid {pid}, now running {}; not signalling it",
                 resolved_dir.display(),
                 exe.display()
@@ -691,7 +875,7 @@ async fn get_body(
             .await
             .map_err(|e| {
                 if e.is_foreign() {
-                    crate::log!("[Gateway] engine probe {path} at {engine} refused: {e}");
+                    crate::log_legacy!("[Gateway] engine probe {path} at {engine} refused: {e}");
                     ProbeOutcome::Foreign
                 } else if e.is_unreachable() {
                     ProbeOutcome::Unreachable
@@ -725,6 +909,15 @@ pub struct EngineProbe {
     pub outcome: ProbeOutcome,
     /// `Reachable` unless a healthy engine reported otherwise.
     pub database: DatabaseHealth,
+    /// A healthy engine said a gateway spawned it. `false` for an engine
+    /// another starter launched, and for an older engine that omits the field.
+    pub started_by_gateway: bool,
+    /// A healthy engine's workspace client names
+    /// [`lucidos_gateway_stamp::workspace_client::LOOPBACK_TLS`].
+    pub calls_gateway_over_tls: bool,
+    /// A healthy engine said it serves the row stream. `false` for an older
+    /// engine, which would count a subscriber as a page.
+    pub event_filter: bool,
 }
 
 /// What an engine's health body says about its database (ADRs 0037, 0301).
@@ -746,12 +939,20 @@ pub async fn probe_engine(engine: &EngineAddress, workspace: &Path) -> EnginePro
     let outcome = |outcome| EngineProbe {
         outcome,
         database: DatabaseHealth::Reachable,
+        started_by_gateway: false,
+        calls_gateway_over_tls: false,
+        event_filter: false,
     };
     match get_body(engine, "/api/v1/health", PROBE_TIMEOUT).await {
         Ok((status, body)) if status.is_success() => match own_health_body(&body, workspace) {
             Some(health) => EngineProbe {
                 outcome: ProbeOutcome::Healthy,
                 database: database_health(&health),
+                started_by_gateway: health.get("started_by_gateway")
+                    == Some(&serde_json::Value::Bool(true)),
+                calls_gateway_over_tls: calls_gateway_over_tls(&health),
+                event_filter: health.get(lucidos_gateway_stamp::row_stream::HEALTH_FIELD)
+                    == Some(&serde_json::Value::Bool(true)),
             },
             None => outcome(ProbeOutcome::Foreign),
         },
@@ -828,10 +1029,18 @@ fn started_at_in(health: &serde_json::Value) -> Option<chrono::DateTime<chrono::
     Some(chrono::DateTime::parse_from_rfc3339(stamp).ok()?.into())
 }
 
-/// Fetch a running engine's unread-notification count via the count-only probe
-/// (`?limit=0`) the engine already exposes — reused so the gateway needs no new
-/// engine endpoint. Best-effort: any transport / non-2xx / parse failure returns
-/// `None`, so a slow or just-restarted engine simply shows no badge that tick.
+fn calls_gateway_over_tls(health: &serde_json::Value) -> bool {
+    use lucidos_gateway_stamp::workspace_client::{ClientContract, LOOPBACK_TLS};
+    health
+        .get("workspace_client")
+        .and_then(|c| serde_json::from_value::<ClientContract>(c.clone()).ok())
+        .is_some_and(|contract| contract.has(LOOPBACK_TLS))
+}
+
+/// Read a running engine's unread-notification count through its count-only
+/// probe (`?limit=0`). The row subscription calls it on a poke. Best-effort:
+/// any transport, non-2xx or parse failure returns `None`, so the row shows no
+/// badge until the retry answers.
 ///
 /// This HTTP read is the ONLY count path: the gateway deliberately holds no DB
 /// handle (ADR 0014 §1). So a STOPPED workspace contributes nothing to the
@@ -842,6 +1051,20 @@ pub async fn fetch_unread_count(engine: &EngineAddress) -> Option<u64> {
     json.get("unread_count")?.as_u64()
 }
 
+/// Whether an engine runs no turn right now, read off the thread list it
+/// already serves. `None` when it did not answer, which no caller may read as
+/// idle: a respawn then would kill a turn that never resumes.
+pub async fn engine_is_idle(engine: &EngineAddress) -> Option<bool> {
+    let body = get_success_body(engine, "/api/v1/threads/list?status=running&limit=1").await?;
+    no_thread_listed(&body)
+}
+
+/// Is this thread-list body an empty list? `None` for any other shape.
+fn no_thread_listed(body: &str) -> Option<bool> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(json.as_array()?.is_empty())
+}
+
 /// Fetch a running engine's backup line, for the picker's per-row note.
 /// Best-effort on the same terms as [`fetch_unread_count`], and for the same
 /// reason: the gateway holds no database handle (ADR 0014 §1), so a stopped
@@ -849,9 +1072,7 @@ pub async fn fetch_unread_count(engine: &EngineAddress) -> Option<u64> {
 ///
 /// Every failure returns `None`, including a malformed `at`. A row that says
 /// nothing is honest; a row that reports a nightly-backed-up workspace as never
-/// backed up is not. Older engines have no such route, so a 404 lands here too
-/// and leaves those rows quiet. Deliberately no `provider` parameter and no
-/// cloud call, so this is cheap enough for the 2s supervise pass.
+/// backed up is not. Deliberately no `provider` parameter and no cloud call.
 pub async fn fetch_last_successful_backup(engine: &EngineAddress) -> Option<LastSuccessfulBackup> {
     let body = get_success_body(engine, "/api/v1/backup/last-successful").await?;
     parse_last_successful_backup(&body)
@@ -874,10 +1095,18 @@ fn parse_last_successful_backup(body: &str) -> Option<LastSuccessfulBackup> {
                 .with_timezone(&chrono::Utc),
         ),
     };
+    // Lenient, unlike `at`: without the instant the row keeps the engine's
+    // verdict from the read, which is still true of that moment.
+    let stale_at = json
+        .get("stale_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
     Some(LastSuccessfulBackup {
         at,
         stale: json.get("stale")?.as_bool()?,
         configured: json.get("configured")?.as_bool()?,
+        stale_at,
     })
 }
 
@@ -937,17 +1166,29 @@ pub enum RestartIntentNotify {
 ///
 /// **`None` means skip, not "unknown device".** The engine refuses a call with
 /// no device anyway, so not calling is both cheaper and the same answer.
+///
+/// `signer` is the workspace id and the engine's stamp key. The engine accepts
+/// only a stamped device, so an engine adopted keyless refuses the notify.
 pub async fn notify_restart_intent(
     engine: &EngineAddress,
+    signer: Option<(&str, &StampKey)>,
     device_id: Option<&str>,
 ) -> RestartIntentNotify {
     let Some(device_id) = device_id.map(str::trim).filter(|d| !d.is_empty()) else {
         return RestartIntentNotify::Skipped;
     };
-    let Ok(req) = axum::http::Request::post("/api/v1/internal/restart-intent")
-        .header(HEADER_DEVICE_ID, device_id)
-        .body(axum::body::Body::empty())
-    else {
+    let mut req = axum::http::Request::post("/api/v1/internal/restart-intent")
+        .header(HEADER_DEVICE_ID, device_id);
+    if let Some((workspace_id, key)) = signer {
+        req = req.header(
+            lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+            key.sign_now(lucidos_gateway_stamp::Claim::Device {
+                workspace_id,
+                device_id,
+            }),
+        );
+    }
+    let Ok(req) = req.body(axum::body::Body::empty()) else {
         return RestartIntentNotify::Failed;
     };
     let sent = tokio::time::timeout(
@@ -958,18 +1199,18 @@ pub async fn notify_restart_intent(
     match sent {
         Ok(Ok(r)) if r.status().is_success() => RestartIntentNotify::Delivered,
         Ok(Ok(r)) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] restart intent to {engine} returned {}",
                 r.status()
             );
             RestartIntentNotify::Failed
         }
         Ok(Err(e)) => {
-            crate::log!("[Gateway] restart intent to {engine} failed: {e}");
+            crate::log_legacy!("[Gateway] restart intent to {engine} failed: {e}");
             RestartIntentNotify::Failed
         }
         Err(_) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] restart intent to {engine} timed out after {RESTART_INTENT_TIMEOUT:?}"
             );
             RestartIntentNotify::Failed
@@ -1029,28 +1270,30 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Block until `pid` is an observably exited-but-unreaped child (`ps` state
-    /// `Z`), returning false if it never gets there. `ps` state is the portable
-    /// read: macOS reserves `WNOWAIT` for `waitid`, there is no /proc here, and
-    /// `try_wait` would REAP the child, which is the very state under test.
-    ///
-    /// A poll rather than a fixed sleep, because these tests share a machine
-    /// with the whole suite. A sleep long enough to be reliable under load is a
-    /// sleep the whole suite pays on every run.
+    /// Wait for our `true` child to exit without collecting its status.
+    /// `WNOWAIT` leaves it a zombie for the liveness probe to inspect and reap.
     #[cfg(unix)]
-    fn wait_until_defunct(pid: u32) -> bool {
-        for _ in 0..200 {
-            let state = std::process::Command::new("ps")
-                .args(["-o", "state=", "-p", &pid.to_string()])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            if state.starts_with('Z') {
-                return true;
+    fn wait_until_defunct(pid: u32) {
+        loop {
+            // SAFETY: zero initializes the output buffer; waitid writes it and
+            // waits only for this test's child. WNOWAIT preserves its status.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                panic!("could not observe exited child: {error}");
+            }
         }
-        false
     }
 
     /// The bug this whole helper exists for: an exited child that nobody has
@@ -1067,10 +1310,7 @@ mod tests {
             .expect("spawn true")
             .id();
 
-        assert!(
-            wait_until_defunct(pid),
-            "fixture never became an observable zombie"
-        );
+        wait_until_defunct(pid);
         // SAFETY: signal 0 is an existence check only. This is the premise of
         // the whole helper: the old probe accepted this pid as alive.
         assert!(
@@ -1099,13 +1339,8 @@ mod tests {
             .expect("spawn true");
         let pid = bystander.id();
         // Wait for it to actually exit, so it is exactly the kind of child
-        // `waitpid(0, …)` would grab if the guard were missing. Polled, not
-        // slept: a busy machine can leave a just-spawned `true` unscheduled past
-        // any fixed delay, and the test would then pass for the wrong reason.
-        assert!(
-            wait_until_defunct(pid),
-            "bystander never exited, so the guard would not be under test"
-        );
+        // `waitpid(0, …)` would grab if the guard were missing.
+        wait_until_defunct(pid);
 
         assert!(!pid_is_live(0), "pid 0 must never read as live");
 
@@ -1273,6 +1508,7 @@ mod tests {
             last_error: None,
             last_unread: None,
             last_successful_backup: None,
+            row_subscription: Default::default(),
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["autostart"], serde_json::json!(true));
@@ -1318,7 +1554,9 @@ mod tests {
     #[tokio::test]
     async fn a_named_device_reaches_the_engines_restart_intent_route() {
         let (_dir, engine, captured) = capturing_engine().await;
-        let outcome = notify_restart_intent(&engine, Some("picker-device")).await;
+        let key = StampKey::generate().unwrap();
+        let outcome =
+            notify_restart_intent(&engine, Some(("dev", &key)), Some("picker-device")).await;
 
         assert_eq!(outcome, RestartIntentNotify::Delivered);
         let got = captured.lock().await.to_lowercase();
@@ -1331,6 +1569,17 @@ mod tests {
             "the device the picker named must ride the request, or the engine \
              refuses it and the restart stays unattributed; engine saw:\n{got}"
         );
+        let stamp = got
+            .lines()
+            .find_map(|l| l.strip_prefix("x-lucidos-gateway-stamp: "))
+            .expect("the device is stamped, or the engine reads it as unattested");
+        assert!(key.verify_now(
+            stamp.trim(),
+            lucidos_gateway_stamp::Claim::Device {
+                workspace_id: "dev",
+                device_id: "picker-device",
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1341,7 +1590,7 @@ mod tests {
         let (_target_dir, target, target_saw) = capturing_engine().await;
         let (_bystander_dir, bystander, bystander_saw) = capturing_engine().await;
 
-        notify_restart_intent(&target, Some("d1")).await;
+        notify_restart_intent(&target, None, Some("d1")).await;
 
         assert!(
             !target_saw.lock().await.is_empty(),
@@ -1363,7 +1612,7 @@ mod tests {
 
         for absent in [None, Some(""), Some("   ")] {
             assert_eq!(
-                notify_restart_intent(&engine, absent).await,
+                notify_restart_intent(&engine, None, absent).await,
                 RestartIntentNotify::Skipped,
                 "no device to name means no notify, not an empty one"
             );
@@ -1382,7 +1631,8 @@ mod tests {
         // is restarting it for a reason.
         let dir = test_engine::scratch();
         let started = Instant::now();
-        let outcome = notify_restart_intent(&test_engine::unreachable(&dir), Some("d1")).await;
+        let outcome =
+            notify_restart_intent(&test_engine::unreachable(&dir), None, Some("d1")).await;
 
         assert_eq!(outcome, RestartIntentNotify::Failed);
         assert!(
@@ -1393,7 +1643,7 @@ mod tests {
         );
     }
 
-    /// A polled count surfaces as `unread_count` for the picker's per-row badge.
+    /// A known count surfaces as `unread_count` for the picker's per-row badge.
     #[test]
     fn workspace_status_serializes_unread_count_when_known() {
         let ws = Workspace {
@@ -1418,6 +1668,7 @@ mod tests {
             last_error: None,
             last_unread: Some(4),
             last_successful_backup: None,
+            row_subscription: Default::default(),
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["unread_count"], serde_json::json!(4));
@@ -1452,6 +1703,7 @@ mod tests {
             last_error: None,
             last_unread: None,
             last_successful_backup: backup,
+            row_subscription: Default::default(),
         }
     }
 
@@ -1465,6 +1717,7 @@ mod tests {
             at: Some(at),
             stale: false,
             configured: true,
+            stale_at: None,
         }));
         let json = serde_json::to_value(stack.status()).unwrap();
         let line = &json["last_successful_backup"];
@@ -1487,6 +1740,7 @@ mod tests {
             at: None,
             stale: true,
             configured: false,
+            stale_at: None,
         }));
         let json = serde_json::to_value(stack.status()).unwrap();
         let line = &json["last_successful_backup"];
@@ -1495,7 +1749,17 @@ mod tests {
         assert_eq!(line["configured"], serde_json::json!(false));
     }
 
-    /// The engine's answer, read the way the poll reads it.
+    /// The re-key waits for an empty running list, and reads anything else as
+    /// not idle.
+    #[test]
+    fn idleness_is_an_empty_running_list_and_nothing_else() {
+        assert_eq!(no_thread_listed("[]"), Some(true));
+        assert_eq!(no_thread_listed(r#"[{"thread_id":"t1"}]"#), Some(false));
+        assert_eq!(no_thread_listed(r#"{"error":"nope"}"#), None);
+        assert_eq!(no_thread_listed("not json"), None);
+    }
+
+    /// The engine's answer, read the way the row subscription reads it.
     #[test]
     fn a_backup_answer_parses_with_and_without_a_timestamp() {
         let dated = parse_last_successful_backup(
@@ -1512,10 +1776,41 @@ mod tests {
         assert!(never.stale);
     }
 
+    /// The engine names the instant its verdict flips, and a listing applies
+    /// it. So a backup turns stale on the row with no event and no re-read.
+    #[test]
+    fn a_backup_line_turns_stale_at_the_engines_instant() {
+        let line = parse_last_successful_backup(
+            r#"{"at":"2026-08-26T02:00:07Z","stale":false,"configured":true,
+                "stale_at":"2026-08-27T08:00:07Z"}"#,
+        )
+        .expect("a dated answer");
+        let stale_at = line.stale_at.expect("the engine named the instant");
+        assert!(!line.as_of(stale_at).stale);
+        assert!(line.as_of(stale_at + chrono::Duration::seconds(1)).stale);
+        // The instant never reaches the picker: the wire shape is unchanged.
+        let json = serde_json::to_value(line).unwrap();
+        assert!(json.get("stale_at").is_none(), "{json}");
+
+        // Without the instant the engine's verdict stands, either way.
+        let now = chrono::Utc::now();
+        for stale in [true, false] {
+            let body = format!(r#"{{"at":null,"stale":{stale},"configured":true}}"#);
+            let line = parse_last_successful_backup(&body).unwrap();
+            assert_eq!(line.stale_at, None);
+            assert_eq!(line.as_of(now).stale, stale);
+        }
+        let garbled = parse_last_successful_backup(
+            r#"{"at":null,"stale":false,"configured":true,"stale_at":"soon"}"#,
+        )
+        .expect("an unreadable instant does not discard the reading");
+        assert_eq!(garbled.stale_at, None);
+    }
+
     /// Anything the gateway cannot read whole is UNKNOWN, so the row stays
     /// quiet. A garbled timestamp is the sharp case: forwarded as text it would
     /// reach the picker as an `Invalid Date`, and a missing `stale` would have
-    /// the row guess. An older engine 404s instead, which never gets this far.
+    /// the row guess.
     #[test]
     fn an_unreadable_backup_answer_is_no_answer() {
         for body in [
@@ -1640,6 +1935,76 @@ mod tests {
         assert_eq!(probe_health(&own, &ours).await, ProbeOutcome::Healthy);
     }
 
+    /// Only an engine that says so reads as a gateway's own. An older engine
+    /// omits the field, and an engine another starter launched says `false`.
+    #[tokio::test]
+    async fn a_probe_reads_whether_a_gateway_spawned_the_engine() {
+        let root = tempfile::TempDir::new().unwrap();
+        let ours = root.path().join("ours");
+        std::fs::create_dir_all(&ours).unwrap();
+        for (said, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let mut body = serde_json::json!({"status": "ok", "workspace_path": &ours});
+            if let Some(said) = said {
+                body["started_by_gateway"] = serde_json::json!(said);
+            }
+            let (_dir, engine) = engine_answering(body.to_string());
+            let probe = probe_engine(&engine, &ours).await;
+            assert_eq!(probe.outcome, ProbeOutcome::Healthy);
+            assert_eq!(probe.started_by_gateway, expected, "{body}");
+        }
+    }
+
+    /// Only an engine that says it serves the row stream is subscribed to.
+    /// An older engine omits the field and would count the gateway as a page.
+    #[tokio::test]
+    async fn a_probe_reads_whether_the_engine_serves_the_row_stream() {
+        let root = tempfile::TempDir::new().unwrap();
+        let ours = root.path().join("ours");
+        std::fs::create_dir_all(&ours).unwrap();
+        let field = lucidos_gateway_stamp::row_stream::HEALTH_FIELD;
+        let cases = [
+            (Some(serde_json::json!(true)), true),
+            (Some(serde_json::json!(false)), false),
+            (Some(serde_json::json!("true")), false),
+            (None, false),
+        ];
+        for (said, expected) in cases {
+            let mut body = serde_json::json!({"status": "ok", "workspace_path": &ours});
+            if let Some(said) = said {
+                body[field] = said;
+            }
+            let (_dir, engine) = engine_answering(body.to_string());
+            let probe = probe_engine(&engine, &ours).await;
+            assert_eq!(probe.outcome, ProbeOutcome::Healthy);
+            assert_eq!(probe.event_filter, expected, "{body}");
+        }
+    }
+
+    /// Only an engine whose workspace client names the https loopback calls
+    /// its gateway over TLS. An older engine names no such capability.
+    #[tokio::test]
+    async fn a_probe_reads_whether_the_engine_calls_its_gateway_over_tls() {
+        use lucidos_gateway_stamp::workspace_client::ClientContract;
+        let root = tempfile::TempDir::new().unwrap();
+        let ours = root.path().join("ours");
+        std::fs::create_dir_all(&ours).unwrap();
+        let older = serde_json::json!({"min": 1, "max": 1, "capabilities": ["workspace-api-v1"]});
+        let cases = [
+            (Some(serde_json::json!(ClientContract::engine())), true),
+            (Some(older), false),
+            (None, false),
+        ];
+        for (contract, expected) in cases {
+            let mut body = serde_json::json!({"status": "ok", "workspace_path": &ours});
+            if let Some(contract) = contract {
+                body["workspace_client"] = contract;
+            }
+            let (_dir, engine) = engine_answering(body.to_string());
+            let probe = probe_engine(&engine, &ours).await;
+            assert_eq!(probe.calls_gateway_over_tls, expected, "{body}");
+        }
+    }
+
     /// Only a body naming the expected directory counts, by canonical path.
     #[test]
     fn a_health_body_is_ours_only_when_it_names_our_workspace() {
@@ -1689,11 +2054,50 @@ mod tests {
                 "DATABASE_URL",
                 "LUCIDOS_API_PORT",
                 "LUCIDOS_WORKSPACE_ID",
+                "LUCIDOS_WORKSPACE_ORIGIN",
                 "LUCIDOS_GATEWAY_PORT",
                 "LUCIDOS_HOOK_PORT",
             ],
             "the workspace-specific set changed: add the new variable here deliberately"
         );
+    }
+
+    #[test]
+    fn a_spawned_engine_gets_its_registered_origin() {
+        use crate::registry::WorkspaceOrigin;
+        for origin in [
+            WorkspaceOrigin::User,
+            WorkspaceOrigin::Unknown,
+            WorkspaceOrigin::Agent,
+            WorkspaceOrigin::Demo,
+            WorkspaceOrigin::Eval,
+            WorkspaceOrigin::E2e,
+        ] {
+            let ws = Workspace {
+                id: "sample".into(),
+                name: "Sample".into(),
+                dir: "/ws/sample".into(),
+                port: 5173,
+                database_url: None,
+                cleanup: crate::registry::WorkspaceCleanup {
+                    origin,
+                    ..Default::default()
+                },
+                autostart: false,
+            };
+            let overrides = engine_env_overrides(
+                &ws,
+                Path::new("/ws/sample"),
+                "postgres://local/sample",
+                5251,
+            );
+            let handed = overrides
+                .iter()
+                .find(|(key, _)| *key == "LUCIDOS_WORKSPACE_ORIGIN")
+                .unwrap();
+            let wire = serde_json::to_value(origin).unwrap();
+            assert_eq!(handed.1.to_str().unwrap(), wire.as_str().unwrap());
+        }
     }
 
     /// The engine probes its own public ingress, so it must be told the port a
@@ -1728,27 +2132,45 @@ mod tests {
     }
 
     #[test]
-    fn a_tls_gateway_hands_its_pair_on_under_names_the_engine_never_serves_with() {
-        let handed = gateway_tls_handoff(Some("/certs/cert.pem"), Some("/certs/key.pem"));
+    fn the_preview_gets_its_leaf_and_the_user_cert_under_names_the_engine_never_serves_with() {
+        let leaf = lucidos_loopback_ca::PreviewLeaf {
+            cert: PathBuf::from("/home/user/.lucidos/preview-tls/dev/preview-cert.pem"),
+            key: PathBuf::from("/home/user/.lucidos/preview-tls/dev/preview-key.pem"),
+        };
+        let handed = preview_tls_handoff(
+            Some(&leaf),
+            Some(" /certs/cert.pem "),
+            Some("/certs/key.pem\n"),
+        );
         assert_eq!(
             handed,
             [
-                ("LUCIDOS_GATEWAY_TLS_CERT", "/certs/cert.pem".to_string()),
-                ("LUCIDOS_GATEWAY_TLS_KEY", "/certs/key.pem".to_string()),
+                (
+                    "LUCIDOS_PREVIEW_TLS_CERT",
+                    Some("/home/user/.lucidos/preview-tls/dev/preview-cert.pem".to_string())
+                ),
+                (
+                    "LUCIDOS_PREVIEW_TLS_KEY",
+                    Some("/home/user/.lucidos/preview-tls/dev/preview-key.pem".to_string())
+                ),
+                (
+                    "LUCIDOS_PREVIEW_USER_TLS_CERT",
+                    Some("/certs/cert.pem".to_string())
+                ),
+                (
+                    "LUCIDOS_PREVIEW_USER_TLS_KEY",
+                    Some("/certs/key.pem".to_string())
+                ),
             ]
         );
-        assert_eq!(
-            gateway_tls_handoff(Some(" /certs/cert.pem "), Some("/certs/key.pem\n"))[0].1,
-            "/certs/cert.pem"
-        );
-        // The engine serves TLS iff it sees `LUCIDOS_TLS_*`. Handing the pair on
+        // The engine serves TLS iff it sees `LUCIDOS_TLS_*`. Handing a pair on
         // under that name would make its loopback port serve https, against the
         // http its ports file names.
         assert!(handed.iter().all(|(k, _)| !k.starts_with("LUCIDOS_TLS_")));
     }
 
     #[test]
-    fn a_plain_http_gateway_hands_nothing_on() {
+    fn a_missing_leaf_or_user_cert_clears_its_names() {
         // The same rule `serves_tls` applies: an empty value is how a launch
         // script spells unset, so half a pair is no pair.
         for (cert, key) in [
@@ -1758,7 +2180,9 @@ mod tests {
             (Some(""), Some("/certs/key.pem")),
         ] {
             assert!(
-                gateway_tls_handoff(cert, key).is_empty(),
+                preview_tls_handoff(None, cert, key)
+                    .iter()
+                    .all(|(_, value)| value.is_none()),
                 "{cert:?} / {key:?}"
             );
         }
@@ -1809,6 +2233,80 @@ mod tests {
     /// The spawner writes no pidfile. Only the engine names itself, once it
     /// holds the workspace's owner lock (ADR 0438).
     #[test]
+    fn disposable_engine_remains_in_the_owned_gateway_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("engine");
+        std::fs::write(&script, "#!/bin/sh\nread -r key\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ws = Workspace::gateway_provisioned("smoke".into(), "Smoke".into(), 42000);
+        let mut spawned = spawn_engine(
+            &script,
+            &ws,
+            tmp.path(),
+            "postgres://local/smoke",
+            5252,
+            EngineLaunch {
+                loopback: true,
+                proto: "http",
+                disposable: true,
+                managed_database: false,
+                preview_leaf: None,
+            },
+        )
+        .unwrap();
+        let group = unsafe { libc::getpgid(spawned.child.id() as i32) };
+        let _ = spawned.child.kill();
+        spawned.child.wait().unwrap();
+        assert_eq!(group, unsafe { libc::getpgrp() });
+    }
+
+    #[test]
+    fn database_handoff_removes_inherited_provenance_for_external_launches() {
+        let mut command = Command::new("/usr/bin/env");
+        command.env("LUCIDOS_MANAGED_DATABASE", "1");
+        managed_database_handoff(&mut command, false);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("LUCIDOS_MANAGED_DATABASE=")));
+    }
+
+    #[test]
+    fn real_engine_spawn_hands_off_provenance_only_for_managed_databases() {
+        use std::os::unix::fs::PermissionsExt;
+        for managed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let script = root.path().join("engine");
+            std::fs::write(&script, "#!/bin/sh\nread -r key\nprintf '%s' \"${LUCIDOS_MANAGED_DATABASE-absent}\" > managed.txt\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let ws = Workspace::gateway_provisioned("fixture".into(), "Fixture".into(), 42000);
+            let mut spawned = spawn_engine(
+                &script,
+                &ws,
+                root.path(),
+                "postgres://local/fixture",
+                5252,
+                EngineLaunch {
+                    loopback: true,
+                    proto: "http",
+                    disposable: true,
+                    managed_database: managed,
+                    preview_leaf: None,
+                },
+            )
+            .unwrap();
+            assert!(spawned.child.wait().unwrap().success());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("managed.txt")).unwrap(),
+                if managed { "1" } else { "absent" }
+            );
+        }
+    }
+
+    #[test]
     fn a_spawn_publishes_the_ports_file_and_leaves_the_pidfile_to_the_engine() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
@@ -1822,17 +2320,22 @@ mod tests {
             autostart: false,
         };
 
-        let mut child = spawn_engine(
+        let mut spawned = spawn_engine(
             Path::new("/usr/bin/true"),
             &ws,
             dir,
             "postgres://local/smoke",
             5252,
-            true,
-            "http",
+            EngineLaunch {
+                loopback: true,
+                proto: "http",
+                disposable: false,
+                managed_database: false,
+                preview_leaf: None,
+            },
         )
         .expect("stand-in engine spawns");
-        let _ = child.wait();
+        let _ = spawned.child.wait();
 
         assert_eq!(
             std::fs::read_to_string(dir.join(".lucidos/ports")).unwrap(),
@@ -1841,6 +2344,80 @@ mod tests {
         assert!(
             !lucidos_owner_lock::engine::pid_path(dir).exists(),
             "the spawner named a process that does not own the workspace yet"
+        );
+    }
+
+    /// Invariant 2 of the unattested-callers plan: the stamp key crosses the
+    /// stdin pipe and nothing else. The stand-in engine records its
+    /// environment and the first line of its stdin.
+    #[cfg(unix)]
+    #[test]
+    fn the_stamp_key_crosses_stdin_and_never_the_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let script = dir.join("stand-in-engine.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nenv > \"$LUCIDOS_WORKSPACE/env.txt\"\nhead -n 1 > \"$LUCIDOS_WORKSPACE/stdin.txt\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ws = Workspace {
+            id: "stamped".into(),
+            name: "Stamped".into(),
+            dir: dir.display().to_string(),
+            port: 42001,
+            database_url: None,
+            cleanup: Default::default(),
+            autostart: false,
+        };
+
+        let mut spawned = spawn_engine(
+            &script,
+            &ws,
+            dir,
+            "postgres://local/stamped",
+            5252,
+            EngineLaunch {
+                loopback: true,
+                proto: "http",
+                disposable: false,
+                managed_database: false,
+                preview_leaf: None,
+            },
+        )
+        .expect("stand-in engine spawns");
+        assert!(spawned.child.wait().unwrap().success());
+
+        let line = std::fs::read_to_string(dir.join("stdin.txt")).unwrap();
+        let received = StampKey::read_handover(line.as_bytes()).expect("the key arrived on stdin");
+        let claim = lucidos_gateway_stamp::Claim::Device {
+            workspace_id: "stamped",
+            device_id: "d1",
+        };
+        assert!(
+            received.verify_now(
+                &spawned
+                    .stamp_key
+                    .as_ref()
+                    .expect("the handover succeeded")
+                    .sign_now(claim),
+                claim
+            ),
+            "the engine received the key the gateway keeps"
+        );
+
+        let env = std::fs::read_to_string(dir.join("env.txt")).unwrap();
+        assert!(env
+            .lines()
+            .any(|l| l == format!("{ENV_STAMP_KEY_ON_STDIN}=1")));
+        assert!(env
+            .lines()
+            .any(|l| l == format!("{ENV_STARTED_BY_GATEWAY}=1")));
+        assert!(
+            !env.contains(line.trim()),
+            "the stamp key leaked into the engine's environment"
         );
     }
 }

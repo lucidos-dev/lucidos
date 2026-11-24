@@ -26,8 +26,6 @@ describe('holdSoftwareKeyboard', () => {
     expect(proxy.isConnected).toBe(false);
   });
 
-  // A fine pointer has no software keyboard, and the proxy would replace the
-  // real opener that a dialog hands focus back to on close.
   it('leaves focus alone on a fine pointer', () => {
     setCoarsePointer(false);
     const opener = document.createElement('button');
@@ -38,7 +36,6 @@ describe('holdSoftwareKeyboard', () => {
   });
 });
 
-// The header keeps still for these, since the screen behind an overlay must.
 describe('isOverlayField', () => {
   afterEach(() => {
     document.body.innerHTML = '';
@@ -64,8 +61,6 @@ describe('showPrompt on a finger', () => {
     document.body.innerHTML = '';
   });
 
-  // The dialog's input only focuses after a render, outside the tap, and iOS
-  // raises no keyboard there unless a field already holds it.
   it('holds the keyboard within the call that opened it', () => {
     void showPrompt('Give this thread a new name.');
     expect((document.activeElement as HTMLElement).tagName).toBe('INPUT');

@@ -1,9 +1,3 @@
-/**
- * A model call no thread made records on the home thread, and can create it
- * before any thread list did. Those calls reach the client as SSE events on a
- * thread the list never sent. The event's aggregate is what marks it home, so
- * it stays out of Current whatever event introduced it.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { threadMap, focusedThreadId } from '../store';
 import { handleThreadEvent } from '../actions/thread-sync';

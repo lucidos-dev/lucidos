@@ -962,6 +962,7 @@ pub(crate) fn live_frame(window: &tauri::Window) -> Option<Rect> {
 /// AppKit measures a window's y UP from the primary's bottom edge, and this
 /// module measures it DOWN from the primary's top edge. This height is the
 /// whole difference between the two.
+#[cfg(target_os = "macos")]
 pub(crate) fn primary_screen_height(app: &tauri::AppHandle) -> Option<i64> {
     let primary = app.primary_monitor().ok().flatten()?;
     let height = panel_points(&primary).frame.height;
@@ -971,6 +972,7 @@ pub(crate) fn primary_screen_height(app: &tauri::AppHandle) -> Option<i64> {
 /// The point AppKit's `setFrameTopLeftPoint:` takes to put `frame` where it
 /// says. The same flip tao's `window_position` makes, so a seat and a tao move
 /// agree on where a frame is.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn appkit_top_left(frame: Rect, primary_screen_height: i64) -> (f64, f64) {
     (frame.x as f64, (primary_screen_height - frame.y) as f64)
 }

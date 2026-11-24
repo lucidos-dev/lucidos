@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * One Escape undoes one step. In the waiting panel's condition drill-in, the
- * first Escape goes back to the list and the second closes the panel. That is
- * how `ModelSelectionPicker`'s steps answer Escape through the overlay stack.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -35,7 +30,7 @@ function waitingThread(): ThreadState {
       liveEventWaitCount: 1,
       liveEventWaits: [WAIT],
       activeChildrenCount: 0,
-      waitingChildrenCount: 0,
+      awaitedChildrenCount: 0,
     } as unknown as ThreadMeta,
     events: new Map(),
   } as unknown as ThreadState;
@@ -75,7 +70,6 @@ describe('the waiting panel drill-in answers Escape one step at a time', () => {
     waitingPanelCondition.value = { eventType: 'PullRequestReviewed', conditions: [{ pr: 412 }] };
     await settled();
     expect(document.querySelector('[data-role="waiting-condition"]')).not.toBeNull();
-    // The drill-in replaced the focused door, so focus moved to the way back.
     expect(document.activeElement?.getAttribute('data-role')).toBe('surface-back');
 
     dismissTopOverlay();
@@ -83,7 +77,6 @@ describe('the waiting panel drill-in answers Escape one step at a time', () => {
     expect(waitingPanelCondition.value).toBeNull();
     expect(panel(), 'the first Escape keeps the panel open').not.toBeNull();
     expect(document.querySelector('.event-wait-list')).not.toBeNull();
-    // Coming back out, focus lands on the door that leads in again.
     expect(document.activeElement?.getAttribute('data-role')).toBe('event-wait-condition');
 
     dismissTopOverlay();
@@ -94,8 +87,6 @@ describe('the waiting panel drill-in answers Escape one step at a time', () => {
   it('falls back to the list when the drilled-in wait is gone', async () => {
     waitingIndicatorAction()!.onMenuClick!(anchor);
     await settled();
-    // The fallback is a `useEffect`, which Preact defers past the next frame,
-    // so a bare timer can win the race. `act` flushes it.
     await act(async () => {
       waitingPanelCondition.value = { eventType: 'DeployFinished', conditions: [{ env: 'prod' }] };
     });

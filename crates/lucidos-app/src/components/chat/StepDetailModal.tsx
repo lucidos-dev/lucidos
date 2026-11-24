@@ -16,18 +16,14 @@ import { StepOutcomeIcon } from '../shared/icons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkText, SkeletonProvider, useSkeleton } from '../shared/Skeleton';
 
-/** Why a step's detail cannot be fetched: it was recorded with no event id. */
 const STEP_WITHOUT_ID = 'the step was saved without an id, so it cannot be looked up';
 
 function close() {
   stepDetailModal.value = null;
 }
 
-/** Line widths a code block shimmers with while its text loads. */
 const CODE_SKELETON_LINES = ['92%', '78%', '85%', '40%'];
 
-/** A command or result block. Under a `SkeletonProvider` it draws its own box
- *  with shimmer lines, so the placeholder has the loaded block's shape. */
 function StepCodeBlock({ class: cls, text }: { class: string; text?: string }) {
   if (useSkeleton()) {
     return (
@@ -48,11 +44,6 @@ function ResultBlock({ text }: { text?: string }) {
   );
 }
 
-/** ToolResult.result area. Renders inline if the snapshot already carried it
- *  (live SSE, `?include_context=true`, or any path where the server didn't
- *  strip). Otherwise it reads the step detail cache, which the row usually
- *  filled on press. `null` result is the image-only ToolResult contract: the
- *  surrounding `<pre>` block is elided. */
 function ResultArea({
   inlineResult,
   resultStripped,
@@ -62,9 +53,6 @@ function ResultArea({
   resultStripped: boolean | undefined;
   resultEventId: string | undefined;
 }) {
-  // A stripped marker without an event id is an upstream contract break. The
-  // failed Loadable says so where the user is looking, and the warning flags
-  // it for the developer console. Reopening the step retries.
   const missingId = !!resultStripped && !resultEventId;
   useEffect(() => {
     if (missingId) console.warn('[StepDetailModal] ToolResult is result_stripped but has no event_id; cannot lazy-fetch.');
@@ -89,10 +77,8 @@ function ResultArea({
       </>
     );
   } else if (loadable.status === 'loaded' && loadable.data.result) {
-    // An image-only or empty result draws nothing.
     content = <ResultBlock text={loadable.data.result} />;
   }
-  // A settled empty result drops its wrapper too, or the body's gap opens round it.
   if (!resultStripped || (loadable.status === 'loaded' && !content)) return content;
   return (
     <LoadingFade
@@ -105,17 +91,6 @@ function ResultArea({
   );
 }
 
-/** The step's command at the top of the body: its un-elided primary argument,
- *  or the description when that is all there is.
- *
- *  Two sources, one look. `inlineFull` is what the fold computed when the row
- *  still carried its args, which only a `generate_image` call does. Every other
- *  row has had them stripped, so this reads them from the step detail cache. It then
- *  runs the SAME formatter the fold would have, rather than asking the server
- *  for a rendered string. One formatter per channel, so the paths cannot drift.
- *
- *  The full command is the complete form of the step's description. The
- *  description stands in only when there is none, or it adds nothing. */
 function CommandArea({
   inlineFull,
   description,
@@ -131,7 +106,6 @@ function CommandArea({
   callEventId: string | undefined;
   toolChannel: 'chat' | 'coding_agent' | undefined;
 }) {
-  // Same contract break, and same handling, as `ResultArea`'s missing id.
   const missingId = !!argsStripped && !callEventId;
   useEffect(() => {
     if (missingId) console.warn('[StepDetailModal] tool call is args_stripped but has no event_id; cannot lazy-fetch.');
@@ -141,8 +115,6 @@ function CommandArea({
     [argsStripped, callEventId],
   );
   const fetchedArgs = fetched?.value;
-  // The channel decides the formatter, because each has its own and the inline
-  // label was built with that one. See `tool_channel`.
   const loadable: Loadable<{ full: string | undefined }> = useMemo(() => {
     if (missingId) return toFailed<{ full: string | undefined }>(new Error(STEP_WITHOUT_ID));
     if (!fetchedArgs) return { status: 'loaded', data: { full: inlineFull } };
@@ -165,8 +137,6 @@ function CommandArea({
     const full = loadable.data.full;
     content = full && full !== description ? <StepCodeBlock class="step-detail-full" text={full} /> : descriptionLine;
   }
-  // Nothing draws before the gate: the description would flash, then give way
-  // to the full command on most loads.
   if (!argsStripped) return content;
   return (
     <LoadingFade
@@ -179,20 +149,11 @@ function CommandArea({
   );
 }
 
-/** The one-line explanation under the step, for the two outcomes whose
- *  status does not account for an EMPTY result area below it. Without one
- *  the emptiness reads as a second mystery on top of the first.
- *
- *  The rest need no entry. `'success'` and `'error'` have a result, and so does
- *  `'denied'`: the refusal the agent was handed. `'pending'` is self-evident,
- *  the row it was opened from being the one that shimmers. */
 const STEP_DETAIL_NOTE: Partial<Record<StepOutcome, string>> = {
   unfinished: 'The turn ended before this tool reported a result, so what it did (if anything) was not recorded.',
   blocked: 'Waiting for your decision on the permission card. The tool has not run, so there is nothing to report yet.',
 };
 
-/** The head's tone icon: the transcript row's own outcome mark, or the spinner
- *  of work in flight. The title beside it names the outcome. */
 function StepDetailIcon({ outcome }: { outcome: StepOutcome }) {
   return (
     <span
@@ -205,16 +166,6 @@ function StepDetailIcon({ outcome }: { outcome: StepOutcome }) {
   );
 }
 
-/** What one step DID: its description, the untruncated command behind it, the
- *  reasoning that produced it, and whatever it reported back.
- *
- *  The head stays one short line on any width: the outcome and when. The body
- *  opens on the step itself, as its full command or else its description.
- *
- *  Deliberately NOT the context the model was looking at. That is the *context
- *  viewer*, opened from the step row's context counter, and duplicating it here
- *  would make the counter a second door to the same room. See
- *  `ContextViewerModal`. */
 export function StepDetailModal() {
   const step = stepDetailModal.value;
   const paneCentre = usePaneCentre('conversation');

@@ -36,13 +36,10 @@ const STYLE_OPTIONS = [
   { value: 'italic', label: 'Italic' },
 ];
 
-/** What a font can be, read from its group: a mono font also sets code. */
 function fitsLabel(group: FontGroup): string {
   return group === 'mono' ? 'UI and code' : 'UI';
 }
 
-/** Settings → Appearance → Workspace fonts: install a font file into the
- *  workspace, then pick it like any other font (ADR 0308). */
 export function WorkspaceFontsSection() {
   const list = workspaceFontList.value;
   const showLoading = useDelayedLoading(list);
@@ -105,7 +102,6 @@ async function confirmAndRemove(id: string, name: string): Promise<void> {
   }
 }
 
-/** One installed font, its name set in the font itself. Self-skeletonizing. */
 function WorkspaceFontRow({ font }: { font?: WorkspaceFont }) {
   useEffect(() => {
     if (font) registerWorkspaceFont(font, dataMountUrl);
@@ -132,8 +128,6 @@ function WorkspaceFontRow({ font }: { font?: WorkspaceFont }) {
   );
 }
 
-/** A font directory the engine refused, with its reason, so it can be fixed or
- *  removed rather than silently missing from the picker. */
 function BrokenFontRow({ broken }: { broken: InvalidWorkspaceFont }) {
   return (
     <div class="workspace-font-row">
@@ -148,12 +142,10 @@ function BrokenFontRow({ broken }: { broken: InvalidWorkspaceFont }) {
   );
 }
 
-/** A label from the first file's name: `BrandSans-Bold.woff2` is `BrandSans`. */
 function labelFromFileName(name: string): string {
   return name.replace(/\.[^.]+$/, '').split(/[-_]/)[0] ?? '';
 }
 
-/** What the picker holds, in the words the native input would use. */
 export function chosenFilesSummary(files: FontFileChoice[]): string {
   if (files.length === 0) return 'No file chosen';
   if (files.length === 1) return files[0]!.file.name;

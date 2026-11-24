@@ -1,11 +1,7 @@
 // @vitest-environment jsdom
-//
-// jsdom, not the `document` stub in test-setup.ts: the property under test is
-// how a real HTML parser reads the escaped markup.
 import { describe, it, expect } from 'vitest';
 import { utils } from './utils';
 
-/** Parses `markup` and returns the attributes its first element ended up with. */
 function attributesOf(markup: string): Record<string, string> {
   const host = document.createElement('div');
   host.innerHTML = markup;

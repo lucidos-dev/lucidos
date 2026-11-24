@@ -7,19 +7,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
-// global.css is an @import barrel; the :root design tokens live in the base partial.
 const css = readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8');
 
-/**
- * Regression test: a modal overlay (StepDetailModal, ScaleModal, …) MUST sit
- * above the floating header chrome so it actually
- * blocks the rest of the UI. Previous bug: --z-modal was 2000 while
- * --z-control-panel was 2200, so header buttons (compose, search, menu,
- * thread nav, title) punched through the dim backdrop. Hovering them
- * showed tooltips, clicking them ran their action instead of closing the
- * modal, and the modal failed its core promise of "next click outside
- * closes it".
- */
 describe('modal overlay z-index (regression: header punch-through)', () => {
   function tokenValue(name: string): number {
     const m = css.match(new RegExp(`--${name}:\\s*(\\d+)\\s*;`));
@@ -36,26 +25,12 @@ describe('modal overlay z-index (regression: header punch-through)', () => {
   });
 });
 
-/**
- * An `overlayClass` may not name a z-index.
- *
- * `<Overlay>` writes an INLINE one on the same `.modal-overlay` element, the
- * modal's place in the band (`store/overlayStack.ts`), and inline beats a class
- * rule. A level named in the class is therefore dead.
- *
- * It is dead silently, which is why this is a scan. `.image-popup` carried
- * `calc(var(--z-control-panel) + 100)`, which resolves to the band floor: it
- * looked like it was working, and would have gone on looking like it until one
- * of the two tokens moved.
- */
 describe('no backdrop overlayClass declares its own z-index', () => {
   const SRC: string = resolve(here, '../../..');
 
   const tsxFiles: string[] = readdirSync(SRC, { recursive: true, encoding: 'utf-8' })
     .filter((f: string) => f.endsWith('.tsx'));
 
-  /** Every class handed to `<Overlay overlayClass=…>`, read off the source so a
-   *  new overlay joins this check without being listed anywhere. */
   function overlayClasses(): string[] {
     const found = new Set<string>();
     for (const f of tsxFiles) {
@@ -69,8 +44,6 @@ describe('no backdrop overlayClass declares its own z-index', () => {
     expect(overlayClasses().length).toBeGreaterThan(0);
   });
 
-  /** The scan can only read a literal, so a computed one would pass by being
-   *  invisible. Fail on it instead of scanning less than the codebase has. */
   it('refuses a computed overlayClass, which it cannot follow', () => {
     const computed: string[] = tsxFiles.filter((f: string) =>
       /overlayClass=\{/.test(readFileSync(resolve(SRC, f), 'utf-8')));
@@ -86,16 +59,10 @@ describe('no backdrop overlayClass declares its own z-index', () => {
       .join('\n');
     const offenders: string[] = [];
     for (const cls of overlayClasses()) {
-      // The class has to be the LAST compound in its selector, since that is
-      // what targets the `.modal-overlay` element itself. `.cls.other {` counts
-      // and so does `.cls, .a {`. A DESCENDANT (`.cls .inner {`) does not: that
-      // styles something inside the overlay, which may level itself freely.
-      // `(?![\w-])` keeps `.cls-inner` from matching as `.cls`.
       const rule = new RegExp(
         `\\.${cls}(?![\\w-])[^\\s{,>+~]*(?:\\s*,[^{]*)?\\s*\\{([^}]*)\\}`, 'g',
       );
       for (const m of allCss.matchAll(rule)) {
-        // A rule that excludes the overlay element does not level it.
         if (m[0].includes(':not(.modal-overlay)')) continue;
         if (/z-index:/.test(m[1])) offenders.push(cls);
       }

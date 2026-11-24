@@ -18,11 +18,20 @@ struct StubHost {
     covers_head_calls: AtomicUsize,
     covers_head: AtomicBool,
     fail: AtomicBool,
+    deferral: AtomicBool,
+    needed: AtomicBool,
+    pool: Option<sqlx::PgPool>,
+    head: AtomicUsize,
+    snapshots: Mutex<Vec<usize>>,
     retried_failures: Mutex<Vec<Option<String>>>,
 }
 
 impl StubHost {
     fn new() -> Arc<Self> {
+        Self::with_pool(None)
+    }
+
+    fn with_pool(pool: Option<sqlx::PgPool>) -> Arc<Self> {
         Arc::new(StubHost {
             build: BackgroundBuild::default(),
             state: Mutex::new(BuildState::Idle),
@@ -34,6 +43,11 @@ impl StubHost {
             covers_head_calls: AtomicUsize::new(0),
             covers_head: AtomicBool::new(true),
             fail: AtomicBool::new(false),
+            deferral: AtomicBool::new(false),
+            needed: AtomicBool::new(true),
+            pool,
+            head: AtomicUsize::new(0),
+            snapshots: Mutex::new(Vec::new()),
             retried_failures: Mutex::new(Vec::new()),
         })
     }
@@ -64,6 +78,9 @@ impl Drop for KillProbe<'_> {
 
 #[async_trait::async_trait]
 impl BuildHost for StubHost {
+    async fn deferred_build_needed(&self) -> bool {
+        self.needed.load(Ordering::SeqCst)
+    }
     fn background_build(&self) -> &BackgroundBuild {
         &self.build
     }
@@ -86,6 +103,10 @@ impl BuildHost for StubHost {
             .unwrap()
             .push(previous_failure.map(str::to_string));
         let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        self.snapshots
+            .lock()
+            .unwrap()
+            .push(self.head.load(Ordering::SeqCst));
         let mut probe = KillProbe(Some(&self.killed));
         self.release.acquire().await.unwrap().forget();
         probe.0 = None;
@@ -97,6 +118,20 @@ impl BuildHost for StubHost {
             BuildState::ready_from(built_head.clone())
         };
         FinishedBuild { state, built_head }
+    }
+
+    async fn automatic_deferral(&self) -> super::BuildDeferral {
+        if let Some(pool) = &self.pool {
+            return crate::engine::build_deferral::automatic_build_deferral(pool).await;
+        }
+        if self.deferral.load(Ordering::SeqCst) {
+            super::BuildDeferral::Defer(crate::engine::build_deferral::ActiveThreads {
+                count: 1,
+                threads: vec![],
+            })
+        } else {
+            super::BuildDeferral::Admit
+        }
     }
 
     async fn covers_head(&self, _finished: &FinishedBuild) -> bool {
@@ -276,4 +311,182 @@ async fn a_superseded_build_cannot_publish_progress() {
     until("replacement build", || host.started() == 2).await;
     host.release_one();
     until_settled(&host).await;
+}
+
+#[tokio::test]
+async fn automatic_requests_coalesce_until_admitted_and_manual_overrides() {
+    let host = StubHost::new();
+    host.deferral.store(true, Ordering::SeqCst);
+    for _ in 0..3 {
+        super::automatic(&host).await;
+    }
+    assert_eq!(host.started(), 0);
+    let mut state = host.build_state();
+    if let BuildState::Deferred(deferred) = &mut state {
+        deferred.since = std::time::Instant::now() - Duration::from_secs(365 * 24 * 3600);
+    }
+    host.set_build_state(state);
+    let since = host.build_state().deferred().unwrap().since;
+    super::automatic(&host).await;
+    super::start_deferred_build_if_admitted(&host).await;
+    assert_eq!(host.build_state().deferred().unwrap().since, since);
+    assert_eq!(host.started(), 0);
+    join_or_start(&host);
+    until("manual override", || host.started() == 1).await;
+    host.release_one();
+    until_settled(&host).await;
+    assert_eq!(host.started(), 1);
+    assert_eq!(host.killed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_joined_follow_up_waits_without_hiding_ready() {
+    let host = StubHost::new();
+    host.covers_head.store(false, Ordering::SeqCst);
+    super::automatic(&host).await;
+    until("first build", || host.started() == 1).await;
+    host.deferral.store(true, Ordering::SeqCst);
+    super::automatic(&host).await;
+    host.release_one();
+    until_settled(&host).await;
+    assert!(matches!(
+        host.build_state(),
+        BuildState::Ready {
+            deferred: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(host.started(), 1);
+    super::start_deferred_build_if_admitted(&host).await;
+    assert_eq!(host.started(), 1);
+    host.deferral.store(false, Ordering::SeqCst);
+    super::start_deferred_build_if_admitted(&host).await;
+    until("released follow-up", || host.started() == 2).await;
+    host.release_one();
+    until_settled(&host).await;
+    assert_eq!(host.killed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn restart_overrides_a_hold_and_failed_follow_up_keeps_diagnostics() {
+    let host = StubHost::new();
+    host.fail.store(true, Ordering::SeqCst);
+    host.covers_head.store(false, Ordering::SeqCst);
+    super::automatic(&host).await;
+    until("first build", || host.started() == 1).await;
+    host.deferral.store(true, Ordering::SeqCst);
+    super::automatic(&host).await;
+    host.release_one();
+    until_settled(&host).await;
+    assert_eq!(host.build_state().as_wire(), "deferred");
+    assert_eq!(host.build_state().failure().unwrap().summary, "broke at 1");
+    restart(&host);
+    until("explicit retry", || host.started() == 2).await;
+    assert_eq!(
+        host.retried_failures.lock().unwrap()[1].as_deref(),
+        Some("broke at 1")
+    );
+    host.release_one();
+    until_settled(&host).await;
+}
+
+/// Production preference/query + scheduler, with only the compiler substituted.
+#[tokio::test]
+async fn workspace_activity_holds_coalesces_and_releases_on_one_tick() {
+    use crate::core::prefs;
+    use crate::test_support::{seed_preference, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let thread = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO thread_summaries(thread_id, title, status, is_coding_agent) VALUES ($1, 'Worker', 'waiting_for_user_answer', true)")
+        .bind(thread).execute(&pool).await.unwrap();
+
+    // Default workspaces still build with a blocked coding thread.
+    let default_host = StubHost::with_pool(Some(pool.clone()));
+    assert_eq!(
+        super::automatic(&default_host).await,
+        super::BuildDeferral::Admit
+    );
+    until("default build", || default_host.started() == 1).await;
+    default_host.release_one();
+    until_settled(&default_host).await;
+
+    seed_preference(&pool, prefs::DEFER_VERSION_BUILDS.key(), "while-coding")
+        .await
+        .unwrap();
+    let host = StubHost::with_pool(Some(pool.clone()));
+    for head in 1..=3 {
+        host.head.store(head, Ordering::SeqCst);
+        assert!(matches!(
+            super::automatic(&host).await,
+            super::BuildDeferral::Defer(_)
+        ));
+    }
+    assert_eq!(host.started(), 0);
+    super::start_deferred_build_if_admitted(&host).await;
+    assert_eq!(host.started(), 0);
+
+    // A fresh host derives the same hold from durable workspace state.
+    let fresh = StubHost::with_pool(Some(pool.clone()));
+    super::automatic(&fresh).await;
+    assert_eq!(fresh.build_state().as_wire(), "deferred");
+    assert_eq!(fresh.started(), 0);
+
+    sqlx::query("UPDATE thread_summaries SET status='idle' WHERE thread_id=$1")
+        .bind(thread)
+        .execute(&pool)
+        .await
+        .unwrap();
+    super::start_deferred_build_if_admitted(&host).await;
+    until("one tick starts the latest HEAD", || host.started() == 1).await;
+    assert_eq!(*host.snapshots.lock().unwrap(), vec![3]);
+    assert!(host.build_state().deferred().is_none());
+
+    // Activity that begins during a build must leave that build alone.
+    sqlx::query("UPDATE thread_summaries SET status='running' WHERE thread_id=$1")
+        .bind(thread)
+        .execute(&pool)
+        .await
+        .unwrap();
+    super::automatic(&host).await;
+    host.release_one();
+    until_settled(&host).await;
+    assert_eq!(host.started(), 1);
+    assert_eq!(host.killed.load(Ordering::SeqCst), 0);
+    assert_eq!(host.build_state().as_wire(), "ready");
+    drop((host, fresh, default_host));
+    teardown_test_db(&db).await;
+}
+
+#[test]
+fn automatic_paths_use_admission_and_explicit_api_bypasses_it() {
+    let follow = include_str!("follow_main.rs");
+    let apply = include_str!("change_ops_emitters.rs");
+    let api = include_str!("../../../lucidos-agents-api/src/api/history.rs");
+    let tick = include_str!("frontend_refresh.rs");
+    assert!(follow.contains("self.automatic_background_rebuild().await"));
+    assert!(apply.contains("engine.automatic_background_rebuild().await.into()"));
+    assert!(api.contains("RebuildMode::Join => state.engine.join_or_start_background_rebuild()"));
+    assert!(api.contains("RebuildMode::Restart => state.engine.restart_background_rebuild()"));
+    assert!(tick.contains("engine.start_deferred_build_if_admitted().await"));
+}
+
+#[tokio::test]
+async fn a_peer_covering_head_clears_the_hold_and_keeps_ready() {
+    for ready in [false, true] {
+        let host = StubHost::new();
+        let state = if ready {
+            BuildState::ready_from(Some("older".into()))
+        } else {
+            BuildState::Idle
+        };
+        host.set_build_state(state.with_deferral());
+        host.needed.store(false, Ordering::SeqCst);
+        super::start_deferred_build_if_admitted(&host).await;
+        assert_eq!(host.started(), 0);
+        assert!(host.build_state().deferred().is_none());
+        assert_eq!(
+            host.build_state().as_wire(),
+            if ready { "ready" } else { "idle" }
+        );
+    }
 }

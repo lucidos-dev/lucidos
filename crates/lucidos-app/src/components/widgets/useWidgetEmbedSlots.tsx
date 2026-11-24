@@ -9,8 +9,6 @@ import { useMermaidBlocks } from '../shared/useMermaidBlocks';
 const SLOT_MARK = `${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"`;
 const SLOT_SELECTOR = `[${SLOT_MARK}]`;
 
-/** Whether rendered markdown holds a slot this hook mounts. Text that only
- *  names the attribute, or forges it without the nonce, does not count. */
 export function hasWidgetEmbedSlot(html: string): boolean {
   return html.includes(SLOT_MARK);
 }
@@ -25,11 +23,6 @@ function slotEmbed(slot: HTMLElement): WidgetEmbed | null {
   }
 }
 
-/** Mount an *inline widget* into each embed slot the markdown renderer wrote
- *  in `host` (ADRs 0415, 0466). Only while `final`: a streaming reply replaces
- *  its HTML on every token, so it shows each embed's label instead. A
- *  re-render with the same `html` keeps its slots, and so its frames.
- *  `eventId` is the turn's starter, which a pin records. */
 export function useWidgetEmbedSlots(host: HTMLElement | null, html: string, final: boolean, threadId: string, eventId?: string): void {
   useLayoutEffect(() => {
     if (!host || !final) return undefined;
@@ -60,8 +53,6 @@ export function useWidgetEmbedSlots(host: HTMLElement | null, html: string, fina
   }, [host, html, final, threadId, eventId]);
 }
 
-/** Reply HTML whose widget embeds mount as inline widgets once the text is
- *  final. `eventId` is the turn's starter. */
 export function ReplyHtml({ html, final, threadId, eventId, class: className, textSeq }: {
   html: string;
   final: boolean;

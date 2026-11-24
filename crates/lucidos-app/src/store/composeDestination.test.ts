@@ -1,8 +1,3 @@
-/** Compose destination — pure mapping/encoding helpers plus the
- *  `applyDestination` write path (inputMode + selectedScope + composing
- *  draft mode). The wire shape is pinned separately by
- *  `actions/compose-toggle-channel.test.ts`; this suite covers the picker's
- *  state plumbing. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -119,8 +114,6 @@ describe('option value encoding round-trips', () => {
   it('unknown values fall back to the Lucidos Agent', () => {
     expect(parseOptionValue('__hdr-coding')).toEqual({ kind: 'lucidos-agent' });
     expect(parseOptionValue('')).toEqual({ kind: 'lucidos-agent' });
-    // The register-repo sentinel is NOT a destination — callers intercept it
-    // before parsing; parseOptionValue itself treats it as unknown.
     expect(parseOptionValue(REGISTER_REPO_OPTION_VALUE)).toEqual({ kind: 'lucidos-agent' });
   });
 });
@@ -146,12 +139,7 @@ describe('applyDestination', () => {
     applyDestination(id, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
 
     expect(inputMode.value).toEqual({ type: 'coding_agent' });
-    // The target is stored on THIS draft's override…
     expect(getComposeSelectionOverride(id).scope).toEqual({ kind: 'app', appId: 'a1' });
-    // …and mirrored to the localStorage last-used seed so the NEXT new draft
-    // starts from it. This is leak-safe: an EXISTING draft resolves its OWN scope
-    // (or the fixed {lucidos} default), never the shared selectedScope — so this
-    // pick does not move another draft (the original per-draft bug).
     expect(selectedScope.value).toEqual({ kind: 'app', appId: 'a1' });
     expect(resolveScope('other-draft')).toEqual({ kind: 'lucidos' });
     expect(getDraft(id).mode).toBe('claude_code');
@@ -166,23 +154,15 @@ describe('applyDestination', () => {
     applyDestination(id, { kind: 'lucidos-agent' });
 
     expect(inputMode.value).toEqual({ type: 'do' });
-    // Scope is the remembered coding target — switching to the agent must not
-    // forget it, so flipping back lands on the same target.
     expect(selectedScope.value).toEqual({ kind: 'external', repoId: 'r1' });
     expect(getDraft(id).mode).toBe('lucidos');
   });
 
   it('no focused thread writes the pending slot AND the last-used scope seed, without leaking to existing drafts', () => {
-    // selectedScope starts at {lucidos} (beforeEach). Pick a DIFFERENT target so
-    // the writes are distinguishable.
     applyDestination(null, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
 
     expect(inputMode.value).toEqual({ type: 'coding_agent' });
-    // Pending slot captured the target (transferred onto the draft at creation)…
     expect(pendingComposeSelection.value.scope).toEqual({ kind: 'app', appId: 'a1' });
-    // …and the localStorage last-used seed is updated so the fresh compose view
-    // and the next new draft start from it. Leak-safe: an EXISTING draft resolves
-    // its own scope (fixed default here), never this seed.
     expect(selectedScope.value).toEqual({ kind: 'app', appId: 'a1' });
     expect(resolveScope('existing-draft')).toEqual({ kind: 'lucidos' });
     expect(getDraft(null).mode).toBe(null);
@@ -199,9 +179,6 @@ describe('applyDestination', () => {
   });
 
   it('re-picking the same destination is a no-op (no signal identity churn)', () => {
-    // The Dropdown fires onChange even on a click of the already-selected
-    // option — applyDestination must not rewrite signals (subscriber
-    // re-renders) or re-patch the draft (debounced PUT + SSE fan-out).
     applyDestination(null, { kind: 'coding', scope: { kind: 'app', appId: 'a1' } });
     const pendingBefore = pendingComposeSelection.value;
     const modeBefore = inputMode.value;
@@ -213,7 +190,6 @@ describe('applyDestination', () => {
   });
 
   it('null draft mode is patched even when the global mode already matches', () => {
-    // null = the engine hasn't acked a pick yet; the patch locks it in.
     const id = 'dest-null-mode';
     inputMode.value = { type: 'coding_agent' };
     putThread(id, 'composing');
@@ -271,9 +247,6 @@ describe('a deleted repository stops being the compose target', () => {
     expect(getDraft('on-kept').mode).toBe('claude_code');
   });
 
-  // The draft has no mode of its own, and `inputMode` flips to the agent in
-  // the same pass. The draft still needs an explicit mode, or a later flip
-  // back to coding would aim it at the Lucidos source.
   it('a draft that inherits the coding mode gets an explicit Lucidos Agent mode', () => {
     inputMode.value = { type: 'coding_agent' };
     selectedScope.value = gone;
@@ -323,7 +296,6 @@ describe('a deleted repository stops being the compose target', () => {
     const listOf = (...ids: string[]): void => {
       repositories.value = { status: 'loaded', data: ids.map(repo) };
     };
-    /** The refetch the watch confirms with, answering with `ids`. */
     const serverHas = (...ids: string[]) => vi.fn(async () => { listOf(...ids); });
     const settle = () => new Promise(resolve => setTimeout(resolve, 0));
     let dispose: () => void = () => {};
@@ -351,8 +323,6 @@ describe('a deleted repository stops being the compose target', () => {
       expect(inputMode.value).toEqual({ type: 'do' });
     });
 
-    // A thread load writes a draft's selection first, then its thread row and
-    // its mode, all in one task. The watch must judge the draft after all three.
     it.each([
       ['the thread row lands after the selection', false],
       ['the thread row is already there', true],
@@ -369,9 +339,6 @@ describe('a deleted repository stops being the compose target', () => {
       expect(getDraft('restored').mode).toBe('lucidos');
     });
 
-    // This device's list can lag a repo another device just registered and
-    // aimed a draft at. Resetting on the cache alone would sync the reset
-    // to every device.
     it('keeps a target that the cached list lacks but the server has', async () => {
       listOf('kept');
       const refetch = serverHas('kept', 'added-elsewhere');
@@ -398,8 +365,6 @@ describe('a deleted repository stops being the compose target', () => {
       expect(refetch).not.toHaveBeenCalled();
     });
 
-    // A draft being sent is `active`, so the watch skips it. A failed send
-    // hands it back as `composing`, and the watch must catch it then.
     it('resets a draft that a failed send hands back', async () => {
       listOf('kept');
       dispose = installUnregisteredRepoTargetReset(serverHas('kept'));
@@ -454,7 +419,6 @@ describe('composeDraftContextName', () => {
   it('chat draft has no context chip — same as a started chat thread', () => {
     expect(composeDraftContextName('lucidos', { kind: 'lucidos' }, repos)).toBeUndefined();
     expect(composeDraftContextName(null, { kind: 'lucidos' }, repos)).toBeUndefined();
-    // A chat draft ignores any leftover coding scope.
     expect(composeDraftContextName('lucidos', { kind: 'external', repoId: 'r1' }, repos)).toBeUndefined();
   });
 

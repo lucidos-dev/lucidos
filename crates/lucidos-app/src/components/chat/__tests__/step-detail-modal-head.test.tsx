@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** The step details modal keeps its head to one short line on any width: the
- *  outcome mark, the outcome word and the time (ADR 0290). The step itself opens
- *  the body. It sits over the Conversation pane, not across the pane divider. */
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
 import { StepDetailModal } from '../StepDetailModal';

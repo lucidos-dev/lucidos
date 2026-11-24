@@ -105,7 +105,7 @@ fn humanize_span(span: Duration) -> String {
 }
 
 /// What `cancel_event_wait` did. Both arms carry the text the agent reads.
-pub(crate) enum CancelEventWaitOutcome {
+pub enum CancelEventWaitOutcome {
     Stopped(String),
     /// Nothing was stopped: a bad argument, or an id that is not live on this
     /// thread. Reported as an error so the agent corrects itself in the same
@@ -299,7 +299,7 @@ impl LucidosEngine {
     /// with what will actually re-open the thread. Diffing `EventWaitStarted`
     /// against the three resolutions by hand is what the agent was reduced to,
     /// and it got the answer wrong.
-    pub(crate) async fn list_event_waits_for_thread(&self, thread_id: Uuid) -> Vec<EventWaitView> {
+    pub async fn list_event_waits_for_thread(&self, thread_id: Uuid) -> Vec<EventWaitView> {
         let now = Utc::now();
         let mut waits = self.live_waits.for_thread(thread_id).await;
         waits.sort_by(|a, b| b.armed_at.cmp(&a.armed_at));
@@ -307,13 +307,13 @@ impl LucidosEngine {
     }
 
     /// The `list_event_waits` tool result.
-    pub(crate) async fn list_event_waits_text(&self, thread_id: Uuid) -> String {
+    pub async fn list_event_waits_text(&self, thread_id: Uuid) -> String {
         render_event_wait_list(&self.list_event_waits_for_thread(thread_id).await)
     }
 
     /// Stand down one of this thread's subscriptions, the ones watching a given
     /// event type, or all of them.
-    pub(crate) async fn cancel_event_waits_for_agent(
+    pub async fn cancel_event_waits_for_agent(
         &self,
         thread_id: Uuid,
         wait_id: Option<Uuid>,

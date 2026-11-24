@@ -86,7 +86,7 @@ async fn recorded(
         entities: entities.to_vec(),
         source: source.clone(),
     }];
-    record_correction(&bus, summary, summary, removed, None)
+    record_correction(&bus, summary, summary, removed, None, None)
         .await
         .unwrap();
     let mut rows = EventStore::new(pool.clone())

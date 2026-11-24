@@ -64,14 +64,16 @@ test_each_broken_limit_is_refused() {
         's = s.replace("  contents: read", "  contents: write")')"
     expect_refused "a third trigger" "must trigger only" "$(doctored trigger \
         "s = s.replace(\"branches: ['e2e/**', 'main']\", \"branches: ['e2e/**', 'main', 'rc/**']\")")"
-    expect_refused "the engine job saving a cache" "job engine may save a cache" "$(doctored engine-save \
-        'i = s.index("  engine:"); j = s.index("save-if: false", i); s = s[:j] + "save-if: true" + s[j + 14:]')"
+    expect_refused "the suites job saving a cache" "job suites may save a cache" "$(doctored suites-save \
+        'i = s.index("\n  suites:\n"); j = s.index("save-if: false", i); s = s[:j] + "save-if: true" + s[j + 14:]')"
     expect_refused "a test job saving a cache with actions/cache/save" "job macos saves a cache with actions/cache/save" "$(doctored macos-save \
         'i = s.index("\n  macos:\n"); j = s.index("actions/cache/restore@", i); s = s[:j] + "actions/cache/save@" + s[j + 22:]')"
-    expect_refused "the engine job running without the plan" "job engine does not need the plan job" "$(doctored engine-needs \
-        'i = s.index("  engine:"); j = s.index("    needs: plan\n", i); s = s[:j] + s[j + 16:]')"
-    expect_refused "the engine job running unasked" "only when the plan asks for it" "$(doctored engine-unasked \
-        "s = s.replace(\"&& needs.plan.outputs.has_engine == 'true'\", '')")"
+    expect_refused "the suites job running without the plan" "job suites does not need the plan job" "$(doctored suites-needs \
+        'i = s.index("\n  suites:\n"); j = s.index("    needs: plan\n", i); s = s[:j] + s[j + 16:]')"
+    expect_refused "the suites job running unasked" "only when the plan asks for it" "$(doctored suites-unasked \
+        "s = s.replace(\"&& needs.plan.outputs.has_suites == 'true'\", '')")"
+    expect_refused "the confinement job running unasked" "only when the plan asks for it" "$(doctored confinement-unasked \
+        "s = s.replace(\"&& needs.plan.outputs.has_confinement == 'true'\", '')")"
     expect_refused "a job on main pushes other than seed-cache" "seed-cache job must run only on main" "$(doctored seed-anywhere \
         "s = s.replace(\"&& github.ref == 'refs/heads/main'\", '')")"
     expect_refused "the plan on any branch" "plan job must run only on an e2e/ branch" "$(doctored plan-anywhere \
@@ -88,6 +90,9 @@ test_each_broken_limit_is_refused() {
         's = s.replace("retention-days: 2", "retention-days: 7", 1)')"
     expect_refused "the macos job running after a cancelled build" "after a cancelled or failed build" "$(doctored macos-cancelled \
         's = s.replace("(needs.build-macos.result == \x27success\x27 || needs.build-macos.result == \x27skipped\x27)", "needs.build-macos.result != \x27failure\x27")')"
+    # shellcheck disable=SC2016 # the ${{ }} is a GitHub expression, not shell
+    expect_refused "a test job without the e2e prefix" "must be named 'e2e" "$(doctored test-prefix \
+        's = s.replace("name: e2e ${{ matrix.id }}", "name: ${{ matrix.id }}", 1)')"
     expect_refused "webkit off macOS" "macos-15" "$(doctored webkit \
         's = s.replace("fromJSON(needs.plan.outputs.macos)", "fromJSON(needs.plan.outputs.linux)")')"
 }

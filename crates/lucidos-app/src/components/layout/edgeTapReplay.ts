@@ -1,16 +1,11 @@
 import { cancelledPressWasATap } from '@lucidos/tap-press';
 import { opensSoftwareKeyboard } from '../../utils/dom';
 
-/** The part of an element the replay target decision reads. Structural, so the
- *  decision unit-tests without a DOM. */
 export interface ReplayCandidate {
   tagName: string;
   classList: { contains(name: string): boolean };
 }
 
-/** Pure decision: where does a tap that began on an edge strip land? The
- *  topmost element of the stack that is not a strip. `null` for an app frame,
- *  because a host cannot click into one: the SDK's own touch bridge owns it. */
 export function pickReplayTarget<T extends ReplayCandidate>(stack: readonly T[]): T | null {
   const top = stack.find((el) => !el.classList.contains('edge-swipe-zone'));
   return top && top.tagName !== 'IFRAME' ? top : null;
@@ -29,7 +24,6 @@ interface PressEventLike {
   touches: ArrayLike<unknown>;
 }
 
-/** What the replay needs off the document. */
 export interface ReplayHost {
   addEventListener(type: string, listener: (e: never) => void, capture: boolean): void;
   removeEventListener(type: string, listener: (e: never) => void, capture: boolean): void;
@@ -38,18 +32,6 @@ export interface ReplayHost {
   dispatchClick(target: ReplayCandidate, x: number, y: number): void;
 }
 
-/** Hand a click to the row under an edge strip.
- *
- *  The strip sits over the content, and the gate cancels the touchstart that
- *  lands on it. WebKit then drops the synthetic click, so a tap on a row near
- *  the edge does nothing.
- *
- *  Call this for a touch the gate cancelled. It watches that touch. A lift
- *  that is a tap clicks the element under the finger. A tap is one finger,
- *  within the tap threshold, and not held to a long press.
- *
- *  The lift is read at `document` capture, since a re-render can strand the
- *  strip's own touch. Returns the stop, which ends the watch early. */
 export function replayEdgeTap(host: ReplayHost, start: PressEventLike): () => void {
   const first = start.changedTouches[start.changedTouches.length - 1];
   if (!first) return () => {};
@@ -106,7 +88,6 @@ export function replayEdgeTap(host: ReplayHost, start: PressEventLike): () => vo
   return stop;
 }
 
-/** The real document as a `ReplayHost`. */
 export function documentReplayHost(doc: Document = document): ReplayHost {
   return {
     addEventListener: (type, listener, capture) => doc.addEventListener(type, listener as EventListener, capture),
@@ -114,8 +95,6 @@ export function documentReplayHost(doc: Document = document): ReplayHost {
     elementsFromPoint: (x, y) => doc.elementsFromPoint(x, y),
     now: () => Date.now(),
     dispatchClick: (target, x, y) => {
-      // A synthetic click never focuses, so a text field takes focus here.
-      // The touchend is a user gesture, so iOS still opens the keyboard.
       if (opensSoftwareKeyboard(target as Element)) (target as HTMLElement).focus({ preventScroll: true });
       (target as Element).dispatchEvent(new MouseEvent('click', {
         bubbles: true,

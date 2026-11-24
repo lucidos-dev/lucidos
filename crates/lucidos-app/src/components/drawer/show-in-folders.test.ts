@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Show in Folders: `planFoldersReveal` decides what hides a thread's
- * row, and `revealThreadInFolders` undoes exactly that. It always lands on the
- * Folders grouping. The thread filter is the one thing it never undoes on its
- * own: a filtered-out thread gets a toast.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { planFoldersReveal, revealThreadInFolders, setFamilyCollapsed, setSectionCollapsed } from './ThreadDrawer';
 import { computeFamilyGraph, collapsedAncestorIds } from './family-graph';
@@ -95,15 +89,12 @@ describe('planFoldersReveal', () => {
     });
 
     it('names the section the family routes to, not the thread own section', () => {
-        // An archived sub-thread under a live parent renders in Current.
         const threads = [makeThread('root'), makeThread('child', { parentId: 'root', section: 'archived' })];
         expect(planFoldersReveal('child', threads, ALL, new Set()))
             .toMatchObject({ kind: 'reveal', section: 'current' });
     });
 
     it('names the hidden-archived ancestor chain of a thread the family tree hides', () => {
-        // child is a fully-archived branch, hidden by default under the live
-        // root — landing on it (e.g. via search) must reveal it there too.
         const threads = [makeThread('root'), makeThread('child', { parentId: 'root', section: 'archived' })];
         expect(planFoldersReveal('child', threads, ALL, new Set()))
             .toEqual({
@@ -168,7 +159,6 @@ describe('revealThreadInFolders', () => {
         expect(threadSearchQuery.value).toBe('');
         expect(drawerGrouping.value).toBe('folders');
         expect(JSON.parse(localStorage.getItem('lucidos-drawer-collapsed') ?? '[]')).not.toContain('current');
-        // Only the leaf's own ancestors open. An unrelated family stays collapsed.
         expect(JSON.parse(localStorage.getItem('lucidos-drawer-collapsed-families') ?? '[]')).toEqual(['other']);
         expect(toasts.value).toHaveLength(0);
     });

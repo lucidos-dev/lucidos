@@ -1,9 +1,5 @@
 // @vitest-environment jsdom
-/**
- * The thread title's ⋯ menu carries Find in thread, the route to the
- * transcript's find bar on a phone. A drawer row's menu does not: the item is
- * present exactly when the host passes `onFindInThread`.
- */
+import '../../../utils/renderMarkdown';
 import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -13,7 +9,6 @@ import { FindBar } from '../FindBar';
 import { findTargets, resetFind } from '../../../store/actions/find-bar';
 import type { ThreadState } from '../../../store/thread-events';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => Promise.all([ThreadOverflowItemsChunk.preload(), findTargets.preload()]));
 
 let host: HTMLElement | null = null;
@@ -37,7 +32,6 @@ function menuItems(): HTMLElement[] {
     return [...document.querySelectorAll<HTMLElement>('.thread-overflow-menu [role="menuitem"]')];
 }
 
-/** A finger: the only pointer with an on-screen keyboard. */
 function useCoarsePointer(): void {
     window.matchMedia = vi.fn((query: string) => ({
         matches: query === '(pointer: coarse)',
@@ -67,9 +61,6 @@ describe('Find in thread in the thread overflow menu', () => {
     });
 });
 
-// iOS raises the keyboard only for a focus made inside the tap itself. The
-// find field mounts a render later, so a text field must already hold focus
-// when the item's click returns: no render, effect, frame or timer between.
 describe('Find in thread on a phone', () => {
     const thread = { meta: { id: 't', state: 'active', home: false } } as unknown as ThreadState;
 
@@ -82,7 +73,6 @@ describe('Find in thread on a phone', () => {
         act(() => { root.querySelector<HTMLElement>('.thread-title-menu')!.click(); });
         const item = menuItems().find((el) => el.textContent === 'Find in thread')!;
         let focusedInTap: Element | null = null;
-        // A window listener runs last in the click's own dispatch.
         window.addEventListener('click', () => { focusedInTap = document.activeElement; }, { once: true });
         item.click();
         return focusedInTap;

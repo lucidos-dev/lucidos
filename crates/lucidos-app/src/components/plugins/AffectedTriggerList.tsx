@@ -2,8 +2,6 @@ import type { ComponentChildren } from 'preact';
 import type { AffectedPath, AffectedTrigger } from '../../store/types';
 import { PluginSection } from './PluginSection';
 
-/** Why a trigger relies on a removed path, in the user's words. An owning-app
- *  match names the app by its folder, since the app may be gone already. */
 export function affectedReasonLabel({ path, reason }: AffectedPath): string {
   switch (reason) {
     case 'named-in-run':
@@ -15,10 +13,6 @@ export function affectedReasonLabel({ path, reason }: AffectedPath): string {
   }
 }
 
-/** The *affected triggers* of a plugin update or uninstall: each trigger, the
- *  removed paths it relies on, and why. Open by default, because the engine
- *  leaves these triggers alone and this list is the only warning before the
- *  next fire. Every plugin panel and receipt lists them through here. */
 export function AffectedTriggerList({
   label,
   triggers,
@@ -49,6 +43,5 @@ export function AffectedTriggerList({
   );
 }
 
-/** What happens next, said once for every surface that lists them. */
 export const AFFECTED_TRIGGERS_NEXT_RUN =
   'Their next run warns that this know-how is gone until you edit them.';

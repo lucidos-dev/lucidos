@@ -18,10 +18,6 @@ function renderedImage(toolCall: ThreadEvent): Extract<ResponseEvent, { type: 'i
     Extract<ResponseEvent, { type: 'image' }> | undefined;
 }
 
-/** The image carries the prompt it was generated from, because that is the only
- *  thing in the conversation that describes it. The `thread:N` reference it used
- *  to carry instead is an LLM-facing handle (see `view_image` / `input_images`
- *  in the engine's image tools) and says nothing to a human. */
 describe('generated image description in the render layer', () => {
   it('carries the generating call\'s un-elided prompt', () => {
     const image = renderedImage({ type: 'ToolCalled', name: 'generate_image', args: { prompt: PROMPT } });
@@ -61,9 +57,6 @@ describe('GeneratedImage tooltip', () => {
     return { wrapper, img };
   }
 
-  /** Placement: the wrapper is a block as wide as the whole response column, so
-   *  a tooltip anchored there centers over empty space beside the picture. It
-   *  belongs on the `<img>`, whose rect is the picture itself. */
   it('anchors to the image, never to the full-width wrapper', () => {
     const { wrapper, img } = parts(PROMPT);
     expect(wrapper.props['data-tooltip']).toBeUndefined();

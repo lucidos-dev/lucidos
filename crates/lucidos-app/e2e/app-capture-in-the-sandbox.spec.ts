@@ -5,25 +5,13 @@ import { test, expect } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry } from './helpers';
 
-// An app frame is sandboxed at an opaque origin (ADR 0227). The capture the
-// agent reads runs inside it, and any child frame it made would get an opaque
-// origin of its own. A capture that cannot paint falls back to the DOM
-// snapshot, silently.
-//
-// This spec asks a frame the real shell built for a capture, the way the host
-// does, and reads the picture back. Each check names a way it went wrong: no
-// picture, a colour the rasterizer cannot paint, a font or an image the SVG
-// snapshot could not load. See docs/plans/2026-10-08-app-capture-without-an-iframe.md.
 
 const APP_ID = 'e2e-capture-app';
 
-/** A CSS Color 4 colour, which a rasterizer must paint and not parse. */
 const SWATCH = 'oklch(0.7 0.15 150)';
 
-/** Narrow pixel glyphs, so a fallback face lands far from where VT323 does. */
 const PROBE_TEXT = 'MMMMMMMMMMMM';
 
-/** A few hundred styled nodes, so the deadline check is about a real app. */
 const ROWS = Array.from({ length: 300 }, (_, i) =>
   `<li style="padding: ${i % 7}px; color: hsl(${(i * 37) % 360} 60% 40%)">Row ${i}</li>`).join('');
 
@@ -31,10 +19,8 @@ const LOGO = readFileSync(fileURLToPath(new URL('../public/favicon-48.png', impo
 
 const FRAME_SELECTOR = `iframe[data-role="app-ui-frame"][src*="${APP_ID}"]`;
 
-/** Open the fixture app in the real shell, and return its frame once it paints. */
 async function openCaptureApp(page: Page): Promise<Frame> {
   await page.addInitScript((id) => {
-    // An init script runs in EVERY frame, and the app frame's storage throws.
     if (window.parent !== window) return;
     localStorage.setItem('app-window-open', id);
   }, APP_ID);
@@ -51,7 +37,6 @@ async function openCaptureApp(page: Page): Promise<Frame> {
   return frame;
 }
 
-/** Ask the frame for a capture the way the host does: a host request it answers. */
 function askCapture(page: Page, args: { format?: string }) {
   return page.evaluate(async ({ selector, args }) => {
     const iframe = document.querySelector(selector) as HTMLIFrameElement;
@@ -72,8 +57,6 @@ function askCapture(page: Page, args: { format?: string }) {
   }, { selector: FRAME_SELECTOR, args });
 }
 
-/** Undefined until `beforeAll` builds it, so a `beforeAll` that throws part way
- *  still leaves the `afterAll` below able to run. */
 let fixture: { dir: string; cleanup: () => void } | undefined;
 
 test.describe('an app frame captures itself', () => {
@@ -139,8 +122,6 @@ test.describe('an app frame captures itself', () => {
       'VT323 and the fallback face must differ enough to tell apart',
     ).toBeGreaterThan(0.15);
 
-    // Ask the way the host does: a host request the frame answers. The frame
-    // reads its font and image over the real host bridge.
     const result = await askCapture(page, {});
 
     expect(result.dom, 'the capture fell back to the DOM snapshot').not.toMatch(/^\[screenshot unavailable/);
@@ -158,7 +139,6 @@ test.describe('an app frame captures itself', () => {
       ctx.drawImage(img, 0, 0);
       const scale = img.width / viewportWidth;
       const at = (x: number, y: number) => Array.from(ctx.getImageData(Math.round(x * scale), Math.round(y * scale), 1, 1).data);
-      /** The mean colour over a box, since one pixel of an icon may be white. */
       const mean = (box: typeof logo) => {
         const data = ctx.getImageData(
           Math.round(box.left * scale), Math.round(box.top * scale),
@@ -173,7 +153,6 @@ test.describe('an app frame captures itself', () => {
       reference.fillStyle = swatchColour;
       reference.fillRect(0, 0, 1, 1);
 
-      // The rightmost dark pixel on a row through the middle of the text.
       const row = ctx.getImageData(0, Math.round((probe.top + probe.height / 2) * scale), canvas.width, 1).data;
       let inkRight = -1;
       for (let x = 0; x < canvas.width; x++) if (row[x * 4] < 100) inkRight = x;
@@ -208,8 +187,6 @@ test.describe('an app frame captures itself', () => {
       `the text ends at ${picture.inkRight}, not at VT323's ${layout.probe.right}: the font was not embedded`,
     ).toBeLessThan(layout.probe.width * 0.06);
   });
-  // A saved capture is a file for a plugin's media/ folder, so it must be
-  // sharp: the device pixel ratio, in the format the engine asked for.
   test.describe('a saved capture', () => {
     test.use({ deviceScaleFactor: 2 });
 
@@ -221,8 +198,6 @@ test.describe('an app frame captures itself', () => {
       expect(result.dom, 'the capture fell back to the DOM snapshot').not.toMatch(/^\[screenshot unavailable/);
       const bytes = Buffer.from(result.screenshot, 'base64');
       expect([...bytes.subarray(0, 8)], 'the picture is not a PNG').toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-      // IHDR holds the width at bytes 16 to 19. A wide viewport meets the
-      // long-edge cap before 2x, so the check is "above 1x, at most 2x".
       const width = bytes.readUInt32BE(16);
       expect(width, 'the picture is still at 1x').toBeGreaterThan(viewportWidth);
       expect(width, 'the picture is past 2x').toBeLessThanOrEqual(viewportWidth * 2);

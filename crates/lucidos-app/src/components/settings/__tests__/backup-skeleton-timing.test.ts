@@ -24,19 +24,11 @@ describe('backupSlotsPending', () => {
   });
 
   it('holds the health card while the registry is in flight', () => {
-    // The status read is per destination, so it cannot be issued until the
-    // registry lands. Keyed on the status read alone, the card sat at zero
-    // height for that whole read. It then grew a box at the top of a page that
-    // already looked settled.
     const p = backupSlotsPending({ status: 'loading' }, false, { status: 'not-loaded' });
     expect(p.status).toBe(true);
   });
 
   it('keeps holding the health card in the frame between the registry and its own read', () => {
-    // The status fetch is started by an effect, which runs AFTER the render that
-    // settled the registry. A gate reading `status === "loading"` went false for
-    // that one frame, and `useDelayedFlag` resets on any drop: the skeleton
-    // blinked out and came back 300ms later as a second wave.
     const p = backupSlotsPending(READY, true, { status: 'not-loaded' });
     expect(p).toEqual({ controls: false, status: true });
   });
@@ -63,10 +55,6 @@ describe('backupSlotsPending', () => {
   });
 
   it('stays pending without a break across a whole cold open', () => {
-    // What makes the section shimmer ONCE rather than in waves: the shared delay
-    // gate is armed on the first render and stays armed until the last first-load
-    // read settles. One false anywhere in this sequence disarms it, and the next
-    // slot to appear then starts its own 300ms wave.
     const coldOpen: [Loadable<BackupProviderInfo[]>, boolean, Loadable<BackupStatus>][] = [
       [{ status: 'not-loaded' }, false, { status: 'not-loaded' }],
       [{ status: 'loading' }, false, { status: 'not-loaded' }],

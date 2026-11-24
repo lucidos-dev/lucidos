@@ -16,11 +16,6 @@ vi.mock('../../api/client', () => ({
   deleteTriggerApi: vi.fn(),
 }));
 
-// Pane helper: navigateToTrigger must call revealContentPane (the canonical
-// "reveal content pane" helper that swipes on mobile AND expands a collapsed
-// split on desktop), NOT an ad-hoc isMobile()+navigateToPane('content') that
-// only handles mobile. See `.claude/rules/frontend.md`.
-// Use vi.hoisted to declare the spy BEFORE vi.mock's hoisted call needs it.
 const { mockRevealContentPane, mockSetActiveMenu } = vi.hoisted(() => ({
   mockRevealContentPane: vi.fn(),
   mockSetActiveMenu: vi.fn(),
@@ -72,7 +67,6 @@ describe('pruneStaleSelectedTriggerIds', () => {
     pruneStaleSelectedTriggerIds();
 
     expect([...selectedTriggerIds.value]).toEqual(['live-1']);
-    // No write — `setSelectedTriggerIds` only fires when something dropped.
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 });
@@ -89,9 +83,6 @@ describe('submitTrigger scroll reset', () => {
   });
 
   it('drops the saved trigger list scroll on update so the list returns to top', async () => {
-    // Bug: editing a trigger far down a long list, saving, returning landed
-    // back at the row instead of the top — useScrollMemory restored the
-    // pre-edit scroll position.
     localStorage.setItem(SCROLL_KEY, '500');
     mockUpdateTrigger.mockResolvedValue({ success: true });
 
@@ -101,7 +92,6 @@ describe('submitTrigger scroll reset', () => {
       cronExpressions: ['0 0 0 * * *'],
       triggerId: 't1',
       goToReview: false,
-      sideEffectGrant: [],
       codingAgentGrant: false,
       model: null,
       reasoningEffort: null,
@@ -121,7 +111,6 @@ describe('submitTrigger scroll reset', () => {
       run: { type: 'intent', intent: 'do thing' },
       cronExpressions: ['0 0 0 * * *'],
       goToReview: false,
-      sideEffectGrant: [],
       codingAgentGrant: false,
       model: null,
       reasoningEffort: null,
@@ -142,7 +131,6 @@ describe('submitTrigger scroll reset', () => {
       cronExpressions: ['0 0 0 * * *'],
       triggerId: 't1',
       goToReview: false,
-      sideEffectGrant: [],
       codingAgentGrant: false,
       model: null,
       reasoningEffort: null,
@@ -150,8 +138,6 @@ describe('submitTrigger scroll reset', () => {
     });
 
     expect(ok).toBe(false);
-    // Form is still open; the user hasn't navigated, so the saved position
-    // must be preserved for the eventual successful save (or cancel).
     expect(localStorage.getItem(SCROLL_KEY)).toBe('500');
   });
 });
@@ -172,7 +158,6 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     name: 'Digest',
     cronExpressions: ['0 0 8 * * *'],
     goToReview: false,
-    sideEffectGrant: [],
     codingAgentGrant: false,
     provider: null,
   };
@@ -189,15 +174,11 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     mockCreateTrigger.mockClear();
     await submitTrigger({ ...base, run: intentRun, model: null, reasoningEffort: null });
     const body = mockCreateTrigger.mock.calls[0][0];
-    // Omitted, not null: a brand-new trigger has no stored pin to clear, so the
-    // payload stays exactly what it was before the field existed.
     expect(body.model).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
   });
 
   it('sends null on update so switching back to Default clears the stored pin', async () => {
-    // Omitting the field would mean "leave unchanged" to the engine, which
-    // would silently keep the old model after the user chose Default.
     await submitTrigger({
       ...base, run: intentRun, triggerId: 't1', model: null, reasoningEffort: null,
     });
@@ -213,7 +194,6 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     });
     expect(mockUpdateTrigger.mock.calls[0][1].provider).toBe('anthropic');
 
-    // Default model: a backend has nothing to pin, and the engine refuses one.
     mockUpdateTrigger.mockClear();
     await submitTrigger({
       ...base, run: intentRun, triggerId: 't1',
@@ -223,14 +203,11 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
   });
 
   it('forces both to null for a script trigger, which runs no LLM', async () => {
-    // Guards the intent → script switch: the form still holds the model the
-    // user picked while it was an intent trigger, and none of it applies now.
     await submitTrigger({
       ...base,
       run: { type: 'script', path: 'digest/run.py' },
       triggerId: 't1',
       goToReview: true,
-      sideEffectGrant: ['email'],
       model: 'gemini-3.8-flash',
       reasoningEffort: 'low',
       provider: 'vertex',
@@ -240,12 +217,10 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
     expect(body.reasoning_effort).toBeNull();
     expect(body.provider).toBeNull();
     expect(body.go_to_review).toBe(false);
-    expect(body.side_effect_grant).toEqual([]);
+    expect(body).not.toHaveProperty('side_effect_grant');
   });
 
   it('sends the coding-agent grant for either run type, and false to revoke it', async () => {
-    // A script can start a thread through the CLI too, so the grant is not
-    // gated on the intent path like the LLM-only fields.
     const edit = { ...base, triggerId: 't1', model: null, reasoningEffort: null };
     await submitTrigger({
       ...edit, run: { type: 'script', path: 'digest/run.py' }, codingAgentGrant: true,
@@ -274,7 +249,6 @@ describe('submitTrigger surfaces the engine warnings', () => {
     run: { type: 'intent', intent: 'summarize' } as const,
     cronExpressions: ['0 0 8 * * *'],
     goToReview: false,
-    sideEffectGrant: [],
     codingAgentGrant: false,
     model: null,
     reasoningEffort: null,
@@ -282,8 +256,6 @@ describe('submitTrigger surfaces the engine warnings', () => {
   };
 
   it('toasts an event-type warning on create, so a typo is caught at save time', async () => {
-    // A trigger armed on a type nobody has emitted looks armed and never fires.
-    // A warning nobody reads is the same bug one layer up.
     mockCreateTrigger.mockResolvedValue({
       success: true,
       warnings: ['ReleaseFinnished has never been emitted in this workspace.'],
@@ -306,8 +278,6 @@ describe('submitTrigger surfaces the engine warnings', () => {
 
     await submitTrigger({ ...base, triggerId: 't1', on: [{ event_type: 'OrderShiped' }] });
 
-    // Toasts prepend, so the column reads newest first and the cron one is
-    // last.
     expect(toasts.value.map(t => t.type)).toEqual(['warning', 'warning']);
     expect(toasts.value[0].message).toContain('OrderShiped');
     expect(toasts.value[1].message).toContain('Day-of-month');
@@ -331,13 +301,6 @@ describe('navigateToTrigger pane reveal', () => {
   });
 
   it('reveals the content pane via the canonical helper (mobile swipe + desktop expand)', async () => {
-    // The earlier implementation reached for navigateToPane('content') under
-    // an isMobile() gate to compensate for setActiveMenu's bug-prone pane
-    // conditional. After consolidating on revealContentPane(), the deep-link
-    // path hits one canonical helper that handles BOTH mobile swipe and
-    // desktop split-collapsed expansion. Without that, opening a trigger
-    // deep-link on a desktop with the split collapsed silently looked like
-    // nothing happened.
     await navigateToTrigger('t1');
     expect(mockRevealContentPane).toHaveBeenCalledTimes(1);
   });
@@ -353,9 +316,6 @@ describe('navigateToTrigger stale-cache reconfirm', () => {
   });
 
   it('re-fetches the source of truth on a cache miss before navigating (sibling just created the trigger)', async () => {
-    // The cached list is loaded but momentarily stale — a sibling thread just
-    // created `t-new` and the Trigger* SSE refresh hasn't landed. navigateToTrigger
-    // must re-fetch (not conclude "no longer exists") and then navigate.
     triggers.value = { status: 'loaded', data: [] };
     mockListTriggers.mockResolvedValue({ triggers: [makeTrigger({ id: 't-new', name: 'Fresh' })] });
 
@@ -376,7 +336,6 @@ describe('navigateToTrigger stale-cache reconfirm', () => {
     expect(mockRevealContentPane).not.toHaveBeenCalled();
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].type).toBe('error');
-    // Names the id AND where the navigate came from — never a bare generic.
     expect(toasts.value[0].message).toContain('gone-id');
     expect(toasts.value[0].message).toContain('thread "X"');
   });
@@ -395,9 +354,6 @@ describe('navigateToTrigger lands on the row, not the edit form', () => {
   });
 
   it('switches to the Triggers panel with NO overlay and stamps the scroll target', async () => {
-    // The row carries Run once, the pause toggle and the last-run chip, which
-    // is what "here is your trigger" points at. The edit form carries none of
-    // them, and it is one tap away from the row.
     await navigateToTrigger('t1');
 
     expect(mockSetActiveMenu).toHaveBeenCalledWith('triggers');
@@ -409,9 +365,6 @@ describe('navigateToTrigger lands on the row, not the edit form', () => {
 
     await navigateToTrigger('t1');
 
-    // setActiveMenu is called with no overlay argument, so its `null` default
-    // clears whatever was open. Pinned because passing the form back would
-    // silently restore the old landing.
     expect(mockSetActiveMenu).toHaveBeenCalledWith('triggers');
     expect(mockSetActiveMenu.mock.calls[0]).toHaveLength(1);
   });

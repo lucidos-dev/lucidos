@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// jsdom lays nothing out, so every turn would read as hidden.
 vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/elementVisibility')>()),
   isElementVisible: () => true,
@@ -24,13 +23,11 @@ import { collapsedExchanges, collapsedInitiators, detailsExpanded, openSubAgentG
 import { makeThreadState } from '../__tests__/thread-events-helpers';
 import type { ThreadEvent } from '../thread-events';
 
-// jsdom has no layout. Every range sits at the top of the viewport.
 Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 10, 10);
 Element.prototype.scrollIntoView = () => {};
 
 const ID = 'thread-1';
 
-/** A passage's blocks, without the blank text marked leaves between them. */
 const blocks = (text: string) => text.split('\u0000').map((b) => b.trim()).filter(Boolean);
 
 function thread(events: Array<[number, ThreadEvent]>, over: { hasOlderEvents?: boolean } = {}) {
@@ -46,7 +43,6 @@ const conversation: Array<[number, ThreadEvent]> = [
   [4, { type: 'TextStreamed', text: 'No pear here.' } as ThreadEvent],
 ];
 
-/** A painter that records what it was asked to paint. */
 function recordingPainter(): FindPainter & { painted: Array<{ ranges: string[]; current: number }> } {
   const painted: Array<{ ranges: string[]; current: number }> = [];
   return {
@@ -56,7 +52,6 @@ function recordingPainter(): FindPainter & { painted: Array<{ ranges: string[]; 
   };
 }
 
-/** Draw the conversation's turns the way the transcript does. */
 function drawTurns() {
   document.body.innerHTML = `<div class="thread-view"><div class="thread-content">
     <div class="chat-exchange" data-thread-id="${ID}" data-user-seq="1">
@@ -72,7 +67,6 @@ function drawTurns() {
 }
 
 beforeEach(() => {
-  // The session is the module's, so each test starts its own.
   transcriptTarget(ID, recordingPainter()).clear();
   document.body.innerHTML = '';
   collapsedExchanges.value = new Set();
@@ -175,10 +169,8 @@ describe('the transcript target', () => {
     drawTurns();
     const painter = recordingPainter();
     const target = transcriptTarget(ID, painter);
-    // Turn 3 draws its message without a bubble, as an API caller's would.
     expect(await target.run('pear', 1)).toEqual({ total: 2, current: 1, capped: false });
     expect(painter.painted[painter.painted.length - 1]).toEqual({ ranges: ['pear', 'pear'], current: 0 });
-    // The side question's "apple" is drawn, but no passage counts it.
     await target.run('apple');
     expect(painter.painted[painter.painted.length - 1].ranges).toHaveLength(3);
   });

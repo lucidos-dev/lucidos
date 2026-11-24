@@ -7,30 +7,15 @@ import {
   type Exemption,
 } from './loading-guard-scan';
 
-/**
- * Loading states draw a skeleton built from the real component, never a bare
- * loader (`.claude/rules/frontend.md` § "Async Data Loading"). Source scans,
- * default-deny:
- *
- *  - A: the retired generic-bar `ListSkeleton` stays gone (only `ListSkeletonOf`).
- *  - B: every `<LoadingFade>` is paired with a self-skeletonizing skeleton.
- *  - C: no bare loader: no `loading-spinner` class and no "Loading…" text.
- *    Every component that consumes a `Loadable` draws a skeleton, unless an
- *    exemption names the rule that lets it skip one.
- */
 
 const RETIRED_GENERIC = /\bListSkeleton\b/;
 
-/** A self-skeletonizing form: the provider, the list helper, a capitalised
- *  `*Skeleton` component, or a row reading `useSkeleton()`. Capitalised on
- *  purpose: `LoadingFade`'s own `showSkeleton` prop must not count. */
 const APPROVED_SKELETON = /ListSkeletonOf|SkeletonProvider|\b[A-Z]\w*Skeleton\b|folderTreeSkeletonRow|useSkeleton\(\)/;
 
 function drawsSkeleton(code: string): boolean {
   return APPROVED_SKELETON.test(code);
 }
 
-/** Branches on a Loadable's status, or gates a loader on one. */
 function consumesLoadable(code: string): boolean {
   return /\.status\s*(===|!==)\s*'(loading|loaded|not-loaded)'|\buseDelayedLoading\(|\buseLoadableFetch\b/.test(code);
 }
@@ -43,12 +28,11 @@ function loadingLiterals(code: string): string[] {
   return code.match(/Loading(?: [a-z]+)*(?:…|\.\.\.)/g) ?? [];
 }
 
-/** Consumers that may skip a skeleton, each with the rule that says so. */
 const CONSUMER_EXEMPT: Record<string, Exemption> = {
-  'components/chat/AgentPauseStrip.tsx': { tag: 'single-value', why: 'the paused line stays absent until the engine says the agent is paused' },
-  'components/chat/ThreadPeopleRow.tsx': { tag: 'single-value', why: 'the People line stays absent until the roles are read, then rolls in' },
+  'components/chat/ThreadUsers.tsx': { tag: 'single-value', why: 'the Users icon and panel stay absent until the roles are read, then roll in' },
   'components/chat/CacheKeepAlive.tsx': { tag: 'single-value', why: 'the cache-warm line stays absent until the engine says how long is left' },
   'components/chat/chat-exchange-parts.tsx': { tag: 'single-value', why: 'a change card holds its headline line empty until it loads' },
+  'components/chat/ProviderBlockActions.tsx': { tag: 'single-value', why: 'the Switch to Claude Code button stays absent until the binary probe answers' },
   'components/chat/ComposeDestinationRow.tsx': { tag: 'structure-first', why: 'destination dropdown; the lists only fill its options' },
   'components/chat/FrontendPreviewSection.tsx': { tag: 'structure-first', why: 'control menu section; dims its button until the slot is read' },
   'components/chat/MessageRoutePanel.tsx': { tag: 'no-visual', why: 'label lookup that falls back to the raw id' },
@@ -56,14 +40,15 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/layout/Drawer.tsx': { tag: 'no-visual', why: 'derives the pinned set; draws nothing itself' },
   'components/picker/NetworkAccessPopover.tsx': { tag: 'structure-first', why: 'the canonical structure-first popover' },
   'components/plugins/CatalogScanFailure.tsx': { tag: 'single-value', why: 'a failure notice beside a list with its own skeleton' },
-  'components/settings/PeopleSection.tsx': { tag: 'structure-first', why: 'the Add a person row draws at once; person rows wait for the list' },
   'components/settings/PairDeviceSection.tsx': { tag: 'working-state', why: 'mints a pairing code on a button press' },
+  'components/settings/PairingRequestsSection.tsx': { tag: 'single-value', why: 'the section stays absent until a request waits; an empty list, the usual answer, draws nothing' },
   'components/settings/CacheKeepAliveSection.tsx': { tag: 'structure-first', why: 'LoadableToggle holds both switches and defers their values' },
   'components/settings/DebuggingSection.tsx': { tag: 'structure-first', why: 'LoadableToggle holds the switch and defers its value' },
   'components/settings/JudgmentModelRow.tsx': { tag: 'structure-first', why: 'real picker row; defers which choices it offers' },
   'components/settings/MemoryModuleSection.tsx': { tag: 'structure-first', why: 'real segmented control; presses nothing until preferences load' },
   'components/settings/MemoryPage.tsx': { tag: 'structure-first', why: 'real sections; the inspector stays until preferences say Tree' },
   'components/settings/TreeBackfillStatus.tsx': { tag: 'structure-first', why: 'real progress row; the bar track draws at once, values wait' },
+  'components/settings/ProviderSpendCap.tsx': { tag: 'single-value', why: 'the provider hold line and its Try now action stay absent until a hold is known' },
   'components/settings/ProviderBlock.tsx': { tag: 'structure-first', why: 'switch drawn at once; config rows stay shut until known' },
   'components/settings/ChatGptPlanSettings.tsx': { tag: 'structure-first', why: 'real sign-in rows inside the provider fold; the button waits for the status' },
   'components/settings/ClaudeGatewaySettings.tsx': { tag: 'structure-first', why: 'real sign-in rows inside the provider fold; Sign in waits for the status' },
@@ -79,7 +64,6 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/plugins/PluginInstallPanel.tsx': { tag: 'structure-first', why: "the receipt's Open buttons name the app by id until the apps list lands" },
 };
 
-/** "Loading…" literals that may stay, keyed by file. */
 const LITERAL_EXEMPT: Record<string, Exemption & { literal: string }> = {
   'components/chat/composeDestinationOptions.ts': {
     tag: 'structure-first', literal: 'Loading…', why: 'a disabled option inside the destination dropdown',
@@ -113,13 +97,14 @@ describe('skeleton guard scanners', () => {
 
   it('reports a bad exemption list', () => {
     const offenders = new Set(['a.tsx', 'b.tsx']);
-    const raw = (p: string) => (p === 'gone.tsx' ? null : p === 'b.tsx' ? 'no comment' : 'x');
+    const raw = (p: string) => (p === 'gone.tsx' ? null : 'x');
     expect(exemptionProblems({
-      'a.tsx': { tag: 'nope' as never, why: '' },
-      'gone.tsx': { tag: 'single-value', why: '' },
-      'c.tsx': { tag: 'single-value', why: '' },
-      'b.tsx': { tag: 'best-effort', why: '' },
+      'a.tsx': { tag: 'nope' as never, why: 'r' },
+      'gone.tsx': { tag: 'single-value', why: 'r' },
+      'c.tsx': { tag: 'single-value', why: 'r' },
+      'b.tsx': { tag: 'best-effort', why: ' ' },
     }, offenders, raw)).toHaveLength(4);
+    expect(exemptionProblems({ 'b.tsx': { tag: 'best-effort', why: 'r' } }, offenders, raw)).toEqual([]);
   });
 });
 
@@ -147,7 +132,6 @@ describe('skeleton convention guard', () => {
       .map((f) => f.path));
     const all = new Set([...consumers, ...spinners, ...literals]);
 
-    // A spinner or an unexempt literal is never excused; a consumer may be.
     const excused = (p: string) => !!CONSUMER_EXEMPT[p] && !spinners.has(p) && !literals.has(p);
     expect([...all].filter((p) => !excused(p)), 'draw a skeleton from the real component (frontend.md § Async Data Loading)').toEqual([]);
     expect([

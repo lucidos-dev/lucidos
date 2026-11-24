@@ -18,7 +18,7 @@ A compose draft is a thread in `threadMap` (`meta.state === 'composing'`). `send
 
 - **Every compose-view dropdown is PER-DRAFT** (scope, coding-agent backend, model and reasoning). The value lives in `composeSelections[id]` as an override, read through `resolve*(threadId)`. Reading a mutable global (`selectedScope`) in a compose surface leaks one draft's pick into every other.
 - **Writes go through `updateComposeSelection(threadId-or-null, …)`**, and scope through `applyDestination`. A bare `setChatModelSelection` from a compose surface is the bug.
-- **No compose pick writes an account preference** (`chat_model`, `chat_reasoning_efforts`, `coding_agent_default`), because each is the fallback of every override-less draft. A backend pick is the one exception (ADR 0247).
+- **Model and reasoning picks never write account preferences.** Coding-agent chip picks remember `coding_agent_default` through `selectComposeCodingAgent` (ADR 0006). The server preserves existing drafts atomically. New drafts copy the seed. Provider picks follow ADR 0247.
 - **An existing draft resolves scope as `override.scope ?? {kind:'lucidos'}`.** `selectedScope` only seeds a NEW draft, in `ensureFocusedComposeThread`. Picks made before a draft exists use `pendingComposeSelection`.
 - **Selections are server-synced** (ADR 0437). At promotion, `sendCompose` binds them onto the send and clears them.
 
@@ -94,9 +94,9 @@ Errors must propagate to the frontend — never silently skip, swallow, or log-o
 
 ### Carve-out: best-effort telemetry
 
-A narrow `console.warn` (no toast, no `Loadable` failed) is acceptable only for **best-effort telemetry that runs without user intent and recovers on its own**. Examples: presence pongs, heartbeats, push keepalive, startup probes, tab-close `keepalive` flushes. Every site needs:
+A narrow `console.warn` (no toast, no `Loadable` failed) fits only **best-effort telemetry that runs without user intent and self-recovers**: presence pongs, heartbeats, push refreshes, startup probes, tab-close flushes. Every site needs:
 
-1. **A comment** saying WHY a toast is wrong and HOW the user still finds out.
+1. **A reason**: why no toast, how the user finds out. A read gives it in its `READ_EXEMPT` row. A write's comment opens `BEST-EFFORT:`.
 2. **No mutating user intent on the failed line.** A user who clicked is owed a toast.
 3. **Self-recovery** on the next attempt, or an escalation that surfaces.
 
@@ -155,7 +155,7 @@ Desktop pane resizing follows the *clamped divider* contract (`docs/glossary.md`
 
 ## Modals & Popovers: Click-Outside Dismiss
 
-**Non-negotiable: any click outside an overlay closes it and does NOT activate anything else.** Every modal, popover, dropdown, palette and sheet dismisses on an outside click AND swallows that click. Escape dismisses too. While it is open **the UI behind is inert**, even for a backdrop-less popover.
+**Non-negotiable: any click outside an overlay closes it and does NOT activate anything else.** That covers every modal, popover, dropdown, palette and sheet. Escape dismisses too. While it is open **the UI behind is inert**, even for a backdrop-less popover.
 
 **Build every overlay through `<Overlay>`** (`components/shared/Overlay.tsx`). Never hand-roll a `mousedown`/`pointerdown`/`click` close handler, close from a backdrop-only `onClick`, or call `useDismissOnOutside` from a feature component.
 
@@ -167,8 +167,8 @@ What `<Overlay>` does for you (`makeDismissHandlers`, `store/overlayStack.ts`):
 1. `pointerdown` outside the panel and anchor → `onClose()` and a swallow of the next paired event. The swallow is a one-shot `document` listener that OUTLIVES the unmount.
 2. The paired `touchend` is captured at `document` and stopped.
 3. The paired `click` is captured and stopped.
-4. A `click` with no outside pointerdown (a synthetic `.click()`) takes a click-capture fallback. A click dispatched WITHIN an inside click's dispatch counts as inside.
-5. The anchor is exempt, and so is the toast layer (`.toast-container`).
+4. A `click` with no outside pointerdown (a synthetic `.click()`) takes a click-capture fallback. A click nested in an inside click's dispatch, or ending a press begun inside, counts as inside.
+5. The anchor and the toast layer (`.toast-container`) are exempt.
 6. Escape dismisses through the LIFO `overlayStack`, standing down while an element is natively fullscreen.
 7. **Inert-behind:** `<html>` gets `data-overlay-open`, and CSS sets `.app-shell > * { pointer-events: none }`. It re-enables `[data-overlay-panel]`, `[data-overlay-anchor]` and `[data-overlay-layer]`. It targets `.app-shell`'s **children**, never `.app-shell` itself, which must stay a hit target.
 8. **Keyboard focus** (ADR 0335): a dialog contains Tab, an anchored popover wraps it only while focus is inside. A new overlay adds no Tab code.

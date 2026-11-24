@@ -1,8 +1,3 @@
-/**
- * The menu drawer opens only once its chunk is in memory (ADR 0436). Until
- * then, a forced close or a second open takes the waiting open back. So the
- * drawer never slides in over whatever came next.
- */
 import { describe, it, expect, vi } from 'vitest';
 
 const chunk = vi.hoisted(() => {

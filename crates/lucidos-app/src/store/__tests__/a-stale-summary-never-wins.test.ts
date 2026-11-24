@@ -1,14 +1,3 @@
-/** The client never replaces its thread status with an older summary.
- *
- *  Every summary carries `summaryVersion`, which the engine bumps on each
- *  change to the row. So arrival order stops mattering: a reordered broadcast,
- *  a duplicate delivery and a slow resync read all lose to what the client
- *  already holds.
- *
- *  The last block replays the reported race. A coding-agent follow-up lands
- *  its first steps, then a resync read taken before them arrives saying idle.
- *  The turn must keep reading "Working", never flash "Done".
- */
 import { describe, it, expect } from 'vitest';
 import {
   UNVERSIONED,
@@ -102,7 +91,6 @@ describe('the versioned apply', () => {
   });
 });
 
-/** The reported race, event by event, with the aggregates the engine sends. */
 describe('a follow-up never flashes Done over a stale idle read', () => {
   const FOLLOW_UP: Array<[number, ThreadEvent, number]> = [
     [1, { type: 'MessageReceived', text: 'fix bug', channel: 'claude_code' } as ThreadEvent, 1],
@@ -119,7 +107,6 @@ describe('a follow-up never flashes Done over a stale idle read', () => {
     for (const [seq, event, version] of FOLLOW_UP) {
       handleEvent(map, T, seq, event, AT, `e${seq}`, aggregate(version, STATUS_AFTER[seq]));
     }
-    // A resync read taken while the thread sat idle after the first turn.
     upsertThread(map, summary(3, 'idle'), false);
 
     const thread = map.get(T)!;

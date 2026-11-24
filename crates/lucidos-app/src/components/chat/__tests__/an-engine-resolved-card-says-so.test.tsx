@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/** A permission card the engine resolved says so, rather than posing as a click.
- *
- *  The engine resolves a card itself in several cases: an unattended deny, a
- *  session that ended, a message that superseded it, a restart. None of those
- *  is a Deny the user pressed, so no button reads as picked, and a note in
- *  plain words says what happened. A real Deny click carries the user-click
- *  reason and draws no note, since the picked button already says it.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import {
@@ -47,14 +39,23 @@ describe('engineResolutionNote', () => {
     );
   });
 
-  // A reason the card has no words for yet is never silent.
+  it('says a restart closed the card, in every lane and on older cards', () => {
+    const restart = 'Closed when Lucidos restarted. Nobody denied it.';
+    for (const reason of [
+      'Interrupted by an engine restart before anyone answered',
+      'Coding agent terminated before answering: request expired',
+      'Chat turn ended before answering — request expired',
+    ]) {
+      expect(engineResolutionNote({ allowed: false, reason })).toBe(restart);
+    }
+  });
+
   it('falls back to the first sentence of a reason it cannot translate', () => {
     expect(engineResolutionNote({ allowed: false, reason: 'A new reason. With more after it.' }))
       .toBe('A new reason.');
     expect(engineResolutionNote({ allowed: false, reason: 'One sentence' })).toBe('One sentence');
   });
 
-  // The first matching opening wins, so a prefix would shadow a longer one.
   it('has no opening that is a prefix of another', () => {
     const notes = [...PLAIN_RESOLUTION_NOTES, ...LEGACY_RESOLUTION_NOTES];
     for (const [a] of notes) {
@@ -86,18 +87,14 @@ describe('the coding-agent card', () => {
     expect(host.querySelector('.permission-btn-picked')).toBeNull();
   });
 
-  // A parked card that ran out its wait was shown to someone, so it never
-  // claims nobody was there to ask.
   it('says nobody answered a parked card in time', () => {
-    const expired = 'Auto-denied: nobody answered this permission card within its permission wait'; // a legacy stored reason
+    const expired = 'Auto-denied: nobody answered this permission card within its permission wait';
     render(<PermissionBody event={event} resolved={{ allowed: false, reason: expired }} />, host);
     expect(note()).toBe('Refused by Lucidos: nobody answered this card in time.');
     expect(note()).not.toContain('nobody was there to ask');
     expect(host.querySelector('.permission-btn-picked')).toBeNull();
   });
 
-  // An ungranted side effect was refused by policy, not for want of someone
-  // to ask, and an engine-started run has no trigger to blame.
   it('says an unattended run had no permission for a side effect', () => {
     const ungranted =
       'Auto-denied: this unattended coding-agent session has no side-effect grant for sending ' +

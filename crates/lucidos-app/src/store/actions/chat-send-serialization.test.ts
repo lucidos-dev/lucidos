@@ -1,19 +1,3 @@
-/**
- * Two rapid sends on one thread must reach the engine in the order the user
- * pressed send. Before this suite, `sendMessage` fired each POST without
- * waiting for the previous one, so two in-flight requests could be delivered
- * out of order by the network and the engine recorded them reversed
- * (`docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`): the later
- * message won the race, started the turn, and the earlier one was queued and
- * injected into it minutes later, so the model read them backwards too.
- *
- * The chain must not cost anything the user can see: the optimistic rows still
- * appear instantly, and a failed send never blocks the next one.
- *
- * The chain only paces, and a successor waits for its predecessor to settle
- * with no timer. The engine orders, by the page's input chain and each send's
- * input sequence (ADR 0449).
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.hoisted(() => {
@@ -55,6 +39,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
   submitChat: vi.fn(),
+  answerThreadQuestion: vi.fn(),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
   putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
@@ -87,7 +72,7 @@ vi.mock('../../utils/tauri', () => ({
 
 import { focusedThreadId, threadMap, selectedScope, connectionStatus, panelOverlay } from '../store';
 import { retryUnsentMessage, sendMessage } from './chat';
-import { inSendChain } from './sendChain';
+import { answerThreadQuestion } from './chat-claude-code';
 import { SEND_RETRY_BACKOFF_MS } from './sendRetry';
 import { pageOwnerId } from '../pageOwner';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -98,8 +83,11 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDeviceId } from './devices';
 import { makeOptimisticThreadState } from '../thread-events';
-import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { ApiError, submitChat } from '../../api/client';
+import { _resetComposeDraftsForTesting, getDraft, patchDraft } from '../composeDrafts';
+import { ApiError, submitChat, answerThreadQuestion as apiAnswerThreadQuestion } from '../../api/client';
+import { unsentMessages } from '../unsentMessages';
+import { liveUnsentMessageRecords } from '../unsentMessageRecords';
+import { acceptComposeReport, parseComposeReport, _resetComposeSyncForTesting } from '../composeSync';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 
@@ -110,7 +98,6 @@ const mockedGetWebviewContent = vi.mocked(getWebviewContent);
 const THREAD_A = '11111111-1111-4111-8111-111111111111';
 const THREAD_B = '22222222-2222-4222-8222-222222222222';
 
-/** A promise plus its resolve/reject, so a test can hold a POST open. */
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
@@ -132,7 +119,6 @@ function seedActiveThread(id: string): void {
   threadMap.value = next;
 }
 
-/** Let queued microtasks run so a chained send can reach `submitChat`. */
 async function flush(): Promise<void> {
   for (let i = 0; i < 5; i++) await Promise.resolve();
 }
@@ -153,6 +139,7 @@ beforeEach(() => {
   mockedIsTauri.mockReturnValue(false);
   mockedGetWebviewContent.mockReset();
   _resetComposeDraftsForTesting();
+  _resetComposeSyncForTesting();
 });
 
 afterEach(() => {
@@ -160,6 +147,74 @@ afterEach(() => {
 });
 
 describe('per-thread send serialization', () => {
+  it('rebases rapid ordinary sends through their acknowledgements', async () => {
+    seedActiveThread(THREAD_A);
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 7, compose_epoch: 7 }));
+    const first = deferred<{ event_id: string; compose: { summary_version: number; compose_epoch: number } }>();
+    mockedSubmitChat.mockReturnValueOnce(first.promise);
+    for (const epoch of [8, 9]) mockedSubmitChat.mockImplementationOnce(async (body) => {
+      expect(body.compose_epoch).toBe(epoch);
+      return { event_id: body.event_id!, compose: { summary_version: epoch + 1, compose_epoch: epoch + 1 } };
+    });
+    const sends = ['first', 'second', 'third'].map(message => sendMessage(message, undefined, { threadId: THREAD_A, focus: false }));
+    expect(mockedSubmitChat.mock.calls[0][0].compose_epoch).toBe(7);
+    first.resolve({ event_id: mockedSubmitChat.mock.calls[0][0].event_id!, compose: { summary_version: 8, compose_epoch: 8 } });
+    expect(await Promise.all(sends)).toEqual(['sent', 'sent', 'sent']);
+  });
+
+  it('retains a stale chained intent after saved acceptance and renews it only on explicit Retry', async () => {
+    seedActiveThread(THREAD_A);
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 7, compose_epoch: 7 }));
+    const first = deferred<{ event_id: string; compose: { summary_version: number; compose_epoch: number } }>();
+    mockedSubmitChat.mockReturnValueOnce(first.promise).mockRejectedValueOnce(
+      new ApiError(409, 'The saved draft changed before this send', { reason: 'compose_snapshot_stale' }),
+    );
+    const p1 = sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
+    const images = ['a'.repeat(64)];
+    const p2 = sendMessage('keep stale content', images, { threadId: THREAD_A, focus: false });
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 9, compose_epoch: 9 }));
+    patchDraft(THREAD_A, { text: 'newer local draft', image_hashes: [], mode: 'lucidos' });
+    first.resolve({ event_id: mockedSubmitChat.mock.calls[0][0].event_id!, compose: { summary_version: 8, compose_epoch: 8 } });
+    expect(await Promise.all([p1, p2])).toEqual(['sent', 'shown-as-failed']);
+    const stale = mockedSubmitChat.mock.calls[1][0];
+    expect(stale.compose_epoch).toBe(8);
+    expect(getDraft(THREAD_A).text).toBe('newer local draft');
+    expect(liveUnsentMessageRecords().find(record => record.eventId === stale.event_id)).toMatchObject({
+      body: { message: 'keep stale content', image_hashes: images, compose_epoch: 8 },
+      refusal: { reason: 'compose_snapshot_stale' },
+    });
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: stale.event_id!, compose: { summary_version: 10, compose_epoch: 10 } });
+    expect(await retryUnsentMessage(stale.event_id!)).toBe('sent');
+    expect(mockedSubmitChat.mock.calls[2][0]).toMatchObject({ event_id: stale.event_id, compose_epoch: 9 });
+  });
+
+  it('retains a conflicting send and its images for an explicit retry', async () => {
+    seedActiveThread(THREAD_A);
+    const images = ['a'.repeat(64), 'b'.repeat(64)];
+    mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'A later input overtook this send', { reason: 'overtaken' }));
+    const outcome = await sendMessage('keep this message', images, { threadId: THREAD_A, focus: false });
+    const original = mockedSubmitChat.mock.calls[0][0];
+    expect(outcome).toBe('shown-as-failed');
+    expect(unsentMessages.value.get(original.event_id!)).toMatchObject({ body: original });
+    expect(liveUnsentMessageRecords().find(r => r.eventId === original.event_id)).toMatchObject({
+      phase: 'unsent', body: original, refusal: { reason: 'overtaken', message: 'A later input overtook this send' },
+    });
+    const newerDraft = { text: 'newer draft', image_hashes: ['c'.repeat(64)], mode: 'lucidos' as const };
+    patchDraft(THREAD_A, newerDraft);
+    mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'Still overtaken', { reason: 'overtaken' }));
+    expect(await retryUnsentMessage(original.event_id!)).toBe('shown-as-failed');
+    expect(getDraft(THREAD_A)).toEqual(newerDraft);
+    expect(unsentMessages.value.get(original.event_id!)?.body).toMatchObject({
+      message: 'keep this message', image_hashes: images, event_id: original.event_id,
+    });
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: original.event_id! });
+    expect(await retryUnsentMessage(original.event_id!)).toBe('sent');
+    expect(mockedSubmitChat.mock.calls[1][0]).toMatchObject({
+      message: 'keep this message', image_hashes: images, event_id: original.event_id,
+    });
+    expect(unsentMessages.value.has(original.event_id!)).toBe(false);
+  });
+
   it('holds the second POST until the first settles, and sends them in order', async () => {
     seedActiveThread(THREAD_A);
     const first = deferred<{ event_id: string }>();
@@ -171,7 +226,6 @@ describe('per-thread send serialization', () => {
     const p2 = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
     await flush();
 
-    // Only the first is on the wire while it is still in flight.
     expect(sentMessages()).toEqual(['first']);
 
     first.resolve({ event_id: 'e1' });
@@ -239,7 +293,6 @@ describe('per-thread send serialization', () => {
     vi.mocked(getDeviceId).mockImplementationOnce(() => { throw new Error('boom'); });
 
     await expect(sendMessage('broken', undefined, { threadId: THREAD_A, focus: false })).rejects.toThrow('boom');
-    // Its row goes too: no sweep will come for it.
     expect(threadMap.value.get(THREAD_A)!.pendingUserMessages.map(m => m.text)).toEqual([]);
     const p = sendMessage('next', undefined, { threadId: THREAD_A, focus: false });
     await flush();
@@ -272,7 +325,13 @@ describe('per-thread send serialization', () => {
     const answer = deferred<boolean>();
     mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
 
-    const answering = inSendChain(THREAD_A, () => answer.promise);
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 7, compose_epoch: 7 }));
+    vi.mocked(apiAnswerThreadQuestion).mockImplementationOnce(async (_thread, _tool, _answer, _position, accepted) => {
+      await answer.promise;
+      accepted?.({ summary_version: 8, compose_epoch: 8, text: '', image_hashes: [] });
+      return true;
+    });
+    const answering = answerThreadQuestion(THREAD_A, 'synthetic-question', { kind: 'FreeText', text: 'the answer' });
     const p = sendMessage('after the tap', undefined, { threadId: THREAD_A, focus: false });
     await flush();
     expect(sentMessages()).toEqual([]);
@@ -280,11 +339,10 @@ describe('per-thread send serialization', () => {
     answer.resolve(true);
     await Promise.all([answering, p]);
     expect(sentMessages()).toEqual(['after the tap']);
+    expect(mockedSubmitChat.mock.calls[0][0].compose_epoch).toBe(8);
   });
 
   it('a successor waits for an unsettled send however long it takes, with no timer', async () => {
-    // The engine refuses an overtaken input, so a timer that released the
-    // successor early would only get the earlier send refused.
     vi.useFakeTimers();
     seedActiveThread(THREAD_A);
     const unsettled = deferred<{ event_id: string }>();
@@ -322,7 +380,6 @@ describe('per-thread send serialization', () => {
     const [first, onB, second] = sentBodies();
     for (const body of [first, onB, second]) expect(body.input_chain).toBe(pageOwnerId);
     expect(second.input_seq).toBe(first.input_seq + 1);
-    // Each thread numbers its own inputs.
     expect(onB.input_seq).not.toBe(first.input_seq + 1);
   });
 
@@ -343,7 +400,7 @@ describe('per-thread send serialization', () => {
     expect(retry.event_id).toBe(attempt.event_id);
   });
 
-  it('a manual Retry of a Not sent message takes a fresh sequence and keeps its event id', async () => {
+  it('a manual Retry after an unknown outcome preserves the exact wire intent', async () => {
     vi.useFakeTimers();
     seedActiveThread(THREAD_A);
     mockedSubmitChat.mockRejectedValue(new TypeError('Load failed'));
@@ -358,9 +415,9 @@ describe('per-thread send serialization', () => {
     await retryUnsentMessage(original.event_id);
 
     const [after, retried] = sentBodies();
-    // The engine dedupes it by event id, and orders it after what was sent since.
     expect(retried.event_id).toBe(original.event_id);
-    expect(retried.input_seq).toBeGreaterThan(after.input_seq);
+    expect(retried).toEqual(original);
+    expect(retried.input_seq).toBeLessThan(after.input_seq);
   });
 
   it('does not serialize across different threads', async () => {
@@ -375,7 +432,6 @@ describe('per-thread send serialization', () => {
     const p2 = sendMessage('on B', undefined, { threadId: THREAD_B, focus: false });
     await flush();
 
-    // B must not wait behind A's open POST.
     expect(sentMessages()).toEqual(['on A', 'on B']);
 
     openOnA.resolve({ event_id: 'e1' });
@@ -383,12 +439,7 @@ describe('per-thread send serialization', () => {
   });
 
   it('claims the chain slot at call time, so an await before the POST cannot reorder', async () => {
-    // The Tauri panel path awaits `getWebviewContent()` while building the
-    // body. Two of those resolve in whatever order the webview answers, so a
-    // chain that took its slot at POST time would let the second send overtake
-    // the first and reverse them, which is the very bug the chain prevents.
     seedActiveThread(THREAD_A);
-    // `panelUrl` is computed from the overlay, so open a url-preview overlay.
     panelOverlay.value = { type: 'url-preview', url: 'https://example.com/page' };
     mockedIsTauri.mockReturnValue(true);
     const slowExtract = deferred<{ title: string; content: string }>();
@@ -400,8 +451,6 @@ describe('per-thread send serialization', () => {
     const p1 = sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
     const p2 = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
 
-    // The SECOND send's extraction finishes first, so it reaches the POST
-    // first. It must still wait, because the first send already holds the slot.
     await flush();
     expect(sentMessages()).toEqual([]);
 
@@ -412,11 +461,6 @@ describe('per-thread send serialization', () => {
   });
 
   it('dispatches a lone send synchronously, without deferring a microtask', async () => {
-    // An empty chain must not cost even one microtask: `sendMessage` issues the
-    // POST inside the caller's synchronous turn, and callers observe that (the
-    // compose suite asserts on the fetch mock right after `sendFollowup`,
-    // without awaiting). Awaiting an already-resolved `waitForTurn` broke three
-    // of those tests, so the empty case skips the await entirely.
     seedActiveThread(THREAD_A);
     mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
 
@@ -430,7 +474,6 @@ describe('per-thread send serialization', () => {
     mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
 
     await sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
-    // No pending predecessor: this must reach the wire without awaiting a timer.
     const p = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
     await flush();
     expect(sentMessages()).toEqual(['first', 'second']);

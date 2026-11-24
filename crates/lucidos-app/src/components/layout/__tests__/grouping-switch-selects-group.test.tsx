@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A press on the grouping button that switches to Ongoing selects a group:
- * Blocked when the button carried a badge, else the stored group while
- * it has rows, else the first group with rows.
- * The pure rule is `ongoingGroupOnSwitch`, pinned in ongoing-groups.test.ts.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

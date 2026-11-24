@@ -1,13 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PreservedComposeIntent } from './restoreGenerationRecords';
 
-// Model IndexedDB's serialized transactions and structured cloning. These
-// tests check the journal's concurrency and failure contract without opening
-// any live device store or importing the application signals.
 const device = vi.hoisted(() => ({
   databases: new Map<string, Map<string, unknown>>(),
   tails: new Map<string, Promise<unknown>>(),
   failNextCommit: false,
+  payloadReads: 0,
 }));
 
 vi.mock('./deviceDatabase', async (original) => {
@@ -16,32 +14,53 @@ vi.mock('./deviceDatabase', async (original) => {
     ...actual,
     openDeviceDatabase(name: string) {
       return {
-        transact(storeName: string, mode: IDBTransactionMode, body: (store: IDBObjectStore) => unknown) {
-          const key = `${name}/${storeName}`;
-          const run = (device.tails.get(key) ?? Promise.resolve()).then(async () => {
-            const saved = device.databases.get(key) ?? new Map();
-            const staged = structuredClone(saved);
+        transact(storeName: string | string[], mode: IDBTransactionMode, body: (store: IDBObjectStore) => unknown) {
+          const names = typeof storeName === 'string' ? [storeName] : storeName;
+          const run = (device.tails.get(name) ?? Promise.resolve()).then(() => {
+            const staged = new Map(names.map((store) =>
+              [store, structuredClone(device.databases.get(`${name}/${store}`) ?? new Map())]));
             const events: Array<() => void> = [];
-            const store = {
-              get(id: string) {
-                const req = { result: structuredClone(staged.get(id)), onsuccess: null as null | (() => void) };
-                events.push(() => req.onsuccess?.());
-                return req;
+            let aborted = false;
+            const key = (id: IDBValidKey) => typeof id === 'string' ? id : JSON.stringify(id);
+            const transaction = {
+              abort: () => { aborted = true; },
+              objectStore(store: string) {
+                const values = staged.get(store)!;
+                function request(result: unknown) {
+                  const req = { result, onsuccess: null as null | (() => void) };
+                  events.push(() => req.onsuccess?.());
+                  return req;
+                }
+                return {
+                  transaction,
+                  get(id: IDBValidKey) {
+                    if (store === 'upload-bytes') device.payloadReads += 1;
+                    return request(structuredClone(values.get(key(id))));
+                  },
+                  put(value: unknown, id: IDBValidKey) { values.set(key(id), structuredClone(value)); },
+                  add(value: unknown, id: IDBValidKey) {
+                    if (values.has(key(id))) transaction.abort();
+                    else values.set(key(id), structuredClone(value));
+                    return request(id);
+                  },
+                };
               },
-              put(value: unknown, id: string) { staged.set(id, structuredClone(value)); },
-            } as unknown as IDBObjectStore;
-            const req = body(store) as IDBRequest | undefined;
-            for (const event of events) event();
+            };
+            const req = body(transaction.objectStore(names[0]) as unknown as IDBObjectStore) as IDBRequest | undefined;
+            for (const event of events) {
+              if (aborted) break;
+              event();
+            }
             if (mode === 'readwrite') {
-              if (device.failNextCommit) {
+              if (aborted || device.failNextCommit) {
                 device.failNextCommit = false;
                 throw new Error('transaction aborted');
               }
-              device.databases.set(key, staged);
+              for (const [store, values] of staged) device.databases.set(`${name}/${store}`, values);
             }
             return req?.result;
           });
-          device.tails.set(key, run.catch(() => {}));
+          device.tails.set(name, run.catch(() => {}));
           return run;
         },
       };
@@ -49,7 +68,12 @@ vi.mock('./deviceDatabase', async (original) => {
   };
 });
 
-import { createRestoreGenerationStore } from './restoreGenerationRecords';
+import {
+  createRestoreGenerationStore,
+  importRestoreJournal,
+  RESTORE_OBSERVATIONS_STORE,
+  restoreGenerationDbName,
+} from './restoreGenerationRecords';
 
 function intent(text: string): PreservedComposeIntent {
   return {
@@ -66,6 +90,7 @@ beforeEach(() => {
   device.databases.clear();
   device.tails.clear();
   device.failNextCommit = false;
+  device.payloadReads = 0;
 });
 
 describe('device restore generation journal', () => {
@@ -138,6 +163,29 @@ describe('device restore generation journal', () => {
     const records = await a.readRecoveries();
     records[0].intent.drafts[0].selection.model = 'changed-model';
     expect((await a.readRecoveries())[0].intent).toEqual(intent('original'));
+  });
+});
+
+describe('importing the http origin\'s journal', () => {
+  async function httpJournal() {
+    await createRestoreGenerationStore('alpha', 'http-page').preserve('restore-a', intent('typed on http'));
+    const journal = {
+      observations: [...device.databases.get(`${restoreGenerationDbName('alpha')}/${RESTORE_OBSERVATIONS_STORE}`)!]
+        .map(([key, value]) => [key, value] as [IDBValidKey, unknown]),
+      uploadBytes: [],
+    };
+    device.databases.clear();
+    return journal;
+  }
+
+  it('adds the carried recoveries to an observation this origin already made', async () => {
+    const journal = await httpJournal();
+    const https = createRestoreGenerationStore('alpha', 'https-page');
+    await https.observe('restore-a');
+    await importRestoreJournal('alpha', journal);
+    await importRestoreJournal('alpha', journal);
+    expect(await https.readGeneration()).toBe('restore-a');
+    expect((await https.readRecoveries()).map((r) => r.intent.drafts[0].draft.text)).toEqual(['typed on http']);
   });
 });
 
@@ -216,8 +264,6 @@ describe('cross-tab generation compare and commit', () => {
   });
 });
 
-// Exercise the real barrier, journal and reconstruction together. The server
-// stand-in creates once, modelling a lost response after durable creation.
 import { RestoreGenerationBarrier } from './restoreGeneration';
 import { recoverRestoreDrafts } from './restoreDraftRecovery';
 
@@ -258,8 +304,6 @@ it('recovers the edited descendant instead of resurrecting its original after an
   await a.preserve('restore-a', intent('original'));
   const original = (await a.readRecoveries())[0];
   await a.prepareRecovery(original, 'restore-a', () => 'recovered-a');
-  // A lost acknowledgement is enough to leave completed empty. The durable
-  // destination, rather than completion, establishes the content's lineage.
   const b = createRestoreGenerationStore('alpha', 'page-b');
   await b.observe('restore-b');
   await b.prepareRecovery(original, 'restore-b', () => 'prepared-before-capture');
@@ -270,7 +314,6 @@ it('recovers the edited descendant instead of resurrecting its original after an
   const descendant = (await b.readRecoveries())[1];
   expect((await b.prepareRecovery(descendant, 'restore-b', () => 'recovered-b'))?.drafts)
     .toEqual([{ sourceThreadId: 'recovered-a', threadId: 'recovered-b' }]);
-  // Repeat the lineage through a third generation and preserve all originals.
   const c = createRestoreGenerationStore('alpha', 'page-c');
   const latest = intent('edited twice');
   latest.drafts[0].threadId = 'recovered-b';
@@ -401,7 +444,7 @@ it('journals late sources atomically across reconnects and competing tabs withou
   expect(records).toHaveLength(2);
   expect(records[0].intent.captureOwnerId).toBe('owner');
   expect(records[1].intent.captureOwnerId).toBeUndefined();
-  expect(records[1].intent.drafts[0].uploads).toEqual([upload]);
+  expect((await store.materializeDraft(records[1].intent.drafts[0])).uploads).toEqual([upload]);
   expect((await store.prepareRecovery(records[1], 'restored', () => 'unused', new Set()))?.drafts).toEqual([]);
 });
 
@@ -411,13 +454,14 @@ it('keeps late bytes behind an already retained queue and refuses obsolete gener
   await store.observe('restored');
   const queue = { ownerId: 'other', threadId: 'old', text: 'queued', intent: { useCodingAgent: false, context: null }, localIds: ['file'] };
   await store.journalHistorical('restored', await captureHistoricalSources('restored', { uploads: [], queuedUploadSendRecords: [queue] }, []), 'queue');
-  const upload = { localId: 'file', ownerId: 'other', threadId: 'old' } as import('./pendingUploadRecords').PendingUploadRecord;
+  const upload = { localId: 'file', ownerId: 'other', threadId: 'old', name: 'photo',
+    mime: 'image/png', size: 1, createdAt: 1, bytes: new Uint8Array([5]).buffer };
   const late = await captureHistoricalSources('restored', { uploads: [upload], queuedUploadSendRecords: [queue] }, []);
   device.failNextCommit = true;
   await expect(store.journalHistorical('restored', late, 'late')).rejects.toThrow('transaction aborted');
   expect(await store.readRecoveries()).toHaveLength(1);
   await store.journalHistorical('restored', late, 'retry');
-  expect((await store.readRecoveries())[1].intent.drafts[0].uploads).toEqual([upload]);
+  expect((await store.materializeDraft((await store.readRecoveries())[1].intent.drafts[0])).uploads).toEqual([upload]);
   await store.observe('newer');
   await expect(store.journalHistorical('restored', late, 'stale')).rejects.toThrow('generation changed');
   expect(await store.readGeneration()).toBe('newer');
@@ -436,7 +480,7 @@ it('retains a late upload version after completion without duplicating it on con
   const prepared = await store.prepareRecovery(original, 'restored', () => 'original-destination', new Set());
   await store.completeRecoveryDraft(original, 'restored', prepared!.drafts[0].threadId);
   const adopted = { ...upload, ownerId: 'adopter' };
-  const newer = { ...upload, sourceGeneration: 'newer', bytes: new Uint8Array([2]).buffer };
+  const newer = { ...upload, sourceGeneration: 'newer', migratedBytes: true as const, bytes: new Uint8Array([2]).buffer };
   const batch = await capture([upload, adopted, newer]);
   device.failNextCommit = true;
   await expect(store.journalHistorical('restored', batch, 'failed')).rejects.toThrow('transaction aborted');
@@ -444,7 +488,7 @@ it('retains a late upload version after completion without duplicating it on con
   await Promise.all([store.journalHistorical('restored', batch, 'a'), store.journalHistorical('restored', batch, 'b')]);
   const records = await store.readRecoveries();
   expect(records).toHaveLength(2);
-  expect(records[1].intent.drafts.flatMap((d) => d.uploads ?? [])).toEqual([adopted, newer]);
+  expect((await Promise.all(records[1].intent.drafts.map(store.materializeDraft))).flatMap(d => d.uploads ?? [])).toEqual([adopted, newer]);
   const late = await store.prepareRecovery(records[1], 'restored', () => crypto.randomUUID(), new Set());
   expect(late?.drafts).toHaveLength(2);
   expect(late?.drafts[0].threadId).toBe('original-destination');
@@ -459,7 +503,7 @@ it('shares only exact standalone upload lineage across concurrent recovery alloc
   const upload = { localId: 'file', ownerId: 'owner', threadId: 'old', sourceGeneration: 'old',
     name: 'photo', mime: 'image/png', size: 1, createdAt: 1, bytes: new Uint8Array([1]).buffer };
   const versions = [upload, { ...upload, ownerId: 'adopter' }, { ...upload, landedHash: 'landed' },
-    { ...upload, sourceGeneration: 'older', bytes: new Uint8Array([2]).buffer },
+    { ...upload, sourceGeneration: 'older', migratedBytes: true as const, bytes: new Uint8Array([2]).buffer },
     { ...upload, localId: 'independent' }, { ...upload, mime: 'image/jpeg' }];
   await store.journalHistorical('restored', await captureHistoricalSources('restored', {
     uploads: versions, queuedUploadSendRecords: [],
@@ -481,7 +525,7 @@ it('shares only exact standalone upload lineage across concurrent recovery alloc
   expect(createDraftIfAbsent).toHaveBeenCalledTimes(4);
   expect(await recoverRestoreDrafts(store, 'restored', effects)).toEqual({ status: 'ready', recovered: 0 });
   expect(createDraftIfAbsent).toHaveBeenCalledTimes(4);
-  expect((await store.readRecoveries())[0].intent.drafts.flatMap((d) => d.uploads ?? [])).toEqual(versions);
+  expect((await Promise.all(retained.intent.drafts.map(store.materializeDraft))).flatMap(d => d.uploads ?? [])).toEqual(versions);
 });
 
 
@@ -569,4 +613,87 @@ it('recognizes explicit copies as descendants for later automatic recovery', asy
   expect((await nextPage.prepareRecovery(descendant, 'second', () => 'next-copy'))?.drafts).toEqual([
     { sourceThreadId: 'review-copy', threadId: 'next-copy' },
   ]);
+});
+
+it('reads archived payloads only on first retention across twenty reconnects', async () => {
+  const { captureHistoricalSources } = await import('./restoreHistoricalSources');
+  const store = createRestoreGenerationStore('reconnects', 'observer');
+  await store.observe('restored');
+  const upload = { localId: 'file', ownerId: 'owner', threadId: 'old', sourceGeneration: 'old',
+    name: 'photo', mime: 'image/png', size: 1, createdAt: 1, byteKey: ['identity', 0] as [string, number] };
+  const readBytes = vi.fn(async () => new Uint8Array([1]).buffer);
+  const batch = await captureHistoricalSources('restored', { uploads: [upload], queuedUploadSendRecords: [] }, []);
+  await store.journalHistorical('restored', batch, 'first', readBytes);
+  expect(readBytes).toHaveBeenCalledOnce();
+  readBytes.mockClear();
+  for (let i = 0; i < 20; i += 1) await store.journalHistorical('restored', batch, `reconnect-${i}`, readBytes);
+  expect(readBytes).not.toHaveBeenCalled();
+  expect(await store.readRecoveries()).toHaveLength(1);
+});
+
+it('keeps one journal payload across twenty retained revisions and loads it only for the selected draft', async () => {
+  const store = createRestoreGenerationStore('journal-bytes', 'owner');
+  const upload = { localId: 'file', ownerId: 'owner', threadId: 'old',
+    name: 'photo', mime: 'image/png', size: 1, createdAt: 1, bytes: new Uint8Array([7]).buffer };
+  for (let i = 0; i < 20; i += 1) {
+    const capture = intent('before restore');
+    capture.drafts[0].uploads = [{ ...upload, ownerId: `owner-${i}`, landedHash: `landed-${i}` }];
+    await store.preserve(`restore-${i}`, capture);
+  }
+  expect(device.databases.get('lucidos-restore-generation:journal-bytes/upload-bytes')?.size).toBe(1);
+  device.payloadReads = 0;
+  const records = await store.readRecoveries();
+  expect(records).toHaveLength(20);
+  const attachments = records.map((r) => r.intent.drafts[0].uploads![0]);
+  expect(attachments.every((u) => !('bytes' in u))).toBe(true);
+  expect(attachments.map((u) => u.landedHash)).toEqual(Array.from({ length: 20 }, (_, i) => `landed-${i}`));
+  expect(device.payloadReads).toBe(0);
+  expect((await store.materializeDraft(records[19].intent.drafts[0])).uploads).toEqual([
+    { ...upload, ownerId: 'owner-19', landedHash: 'landed-19' },
+  ]);
+  expect(device.payloadReads).toBe(1);
+});
+
+it('rolls back the observation and all new payloads on a new identity collision', async () => {
+  const store = createRestoreGenerationStore('collision', 'owner');
+  const upload = { localId: 'file', ownerId: 'owner', threadId: 'old',
+    name: 'photo', mime: 'image/png', size: 1, createdAt: 1, bytes: new Uint8Array([1]).buffer };
+  const first = intent('first');
+  first.drafts[0].uploads = [upload];
+  await store.preserve('first', first);
+  const collision = intent('collision');
+  collision.drafts[0].uploads = [{ ...upload, localId: 'independent' },
+    { ...upload, ownerId: 'another', bytes: new Uint8Array([2]).buffer }];
+  await expect(store.preserve('second', collision)).rejects.toThrow('transaction aborted');
+  expect(await store.readGeneration()).toBe('first');
+  expect(device.databases.get('lucidos-restore-generation:collision/upload-bytes')?.size).toBe(1);
+  const [record] = await store.readRecoveries();
+  expect(await store.materializeDraft(record.intent.drafts[0])).toEqual(first.drafts[0]);
+});
+
+it('reuses a journal attachment when retaining a new queue source that references it', async () => {
+  const { captureHistoricalSources } = await import('./restoreHistoricalSources');
+  const store = createRestoreGenerationStore('journal-refs', 'observer');
+  await store.observe('restored');
+  const upload = { localId: 'file', ownerId: 'owner', threadId: 'old', sourceGeneration: 'before',
+    name: 'photo', mime: 'image/png', size: 1, createdAt: 1, byteKey: ['foreign-key', 0] as [string, number] };
+  const bytes = new Uint8Array([1]).buffer;
+  const readBytes = vi.fn(async () => bytes);
+  await store.journalHistorical('restored', await captureHistoricalSources('restored', {
+    uploads: [upload], queuedUploadSendRecords: [],
+  }, []), 'upload', readBytes);
+  readBytes.mockClear();
+  device.payloadReads = 0;
+  const queue = { ownerId: 'owner', threadId: 'old', sourceGeneration: 'before', text: 'queued',
+    intent: { useCodingAgent: false, context: null }, localIds: ['file'] };
+  await store.journalHistorical('restored', await captureHistoricalSources('restored', {
+    uploads: [upload], queuedUploadSendRecords: [queue],
+  }, []), 'queue', readBytes);
+  expect(readBytes).not.toHaveBeenCalled();
+  expect(device.payloadReads).toBe(0);
+  const [original, queued] = await store.readRecoveries();
+  const draft = queued.intent.drafts[0];
+  expect(draft.uploads).toEqual(original.intent.drafts[0].uploads);
+  expect(draft.uploads![0].byteKey).not.toEqual(upload.byteKey);
+  expect((await store.materializeDraft(draft)).uploads?.[0].bytes).toEqual(bytes);
 });

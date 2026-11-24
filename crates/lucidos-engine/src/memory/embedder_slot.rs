@@ -26,64 +26,12 @@
 //! binding.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
 use super::fastembed::{model_id_from_env, FastEmbedProvider};
 use super::provider::EmbeddingProvider;
 
-/// Where the background loader has got to with the embedding model. Lives on
-/// the slot rather than beside it so "the embedder is installed" and "the
-/// loader says it is still downloading" cannot disagree: [`EmbedderSlot::install`]
-/// is the only way to fill the slot and it sets [`Ready`](Self::Ready) itself.
-///
-/// In-memory only. A restart simply re-runs the load and re-derives this, so it
-/// is runtime status, not durable state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum EmbeddingModelLoadState {
-    /// Cache is cold: bytes are being fetched from the model hub. `total_bytes`
-    /// is what is known so far (see `model_download::DownloadFrame`).
-    Downloading {
-        downloaded_bytes: u64,
-        total_bytes: u64,
-    },
-    /// Every file is local; the ONNX session is being built. Seconds, not
-    /// minutes. Also the state a fresh boot starts in, before the loader has
-    /// found out whether anything needs downloading, and the state it holds
-    /// while ANOTHER engine on this machine downloads into the shared model
-    /// cache (nothing is failing and no backoff is in effect, so `Waiting` would
-    /// be the wrong reading; see `embedder_retry::delay_before_pass`).
-    Loading,
-    /// Installed. Memory search, extraction and semantic thread search are live.
-    Ready,
-    /// A fetch-class failure (offline, hub blocked). The loader is backing off
-    /// and will try again; `attempt` counts the tries so far.
-    Waiting { attempt: u32 },
-    /// Terminal. The loader has stopped trying, and only a fix plus a restart
-    /// will change that.
-    Failed { message: String },
-}
-
-impl EmbeddingModelLoadState {
-    /// Whether the loader has stopped for good. Callers use this to tell a
-    /// temporary degradation ("not yet") from a permanent one ("not going to").
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Failed { .. })
-    }
-}
-
-/// The embedding model's current status, as both the REST snapshot
-/// (`GET /api/v1/memory/embedding-model-status`) and the
-/// `EmbeddingModelStatusChanged` SSE payload. One shape for both so a client
-/// that loads mid-download and one that watches the stream read the same thing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmbeddingModelStatus {
-    /// Which model this is about, so the reading is unambiguous after a config
-    /// change.
-    pub model_id: String,
-    pub load_state: EmbeddingModelLoadState,
-}
+pub use crate::engine::thread_events::{EmbeddingModelLoadState, EmbeddingModelStatus};
 
 /// Error every embed call returns while the model hasn't loaded yet. Names the
 /// cause and the self-healing so the message is actionable wherever it

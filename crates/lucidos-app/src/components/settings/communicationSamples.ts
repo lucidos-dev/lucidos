@@ -13,22 +13,8 @@ import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
 import type { EventCondition } from '../../store/store';
 import type { SlownessEpisode } from '../../store/actions/slowness';
 
-/** Everything the communication-surface gallery fires, kept out of the page so
- *  the page is layout and this is content.
- *
- *  Every sample here is INERT. Nothing restarts, downloads, navigates, or
- *  writes a preference. That is the whole point of the gallery: the surfaces
- *  can be judged before a real flow is pointed at any of them. A source scan
- *  guards it (`__tests__/communication-samples-inert.test.ts`).
- *
- *  Copy is taken from the real call sites rather than invented, so a surface is
- *  judged at the lengths that actually occur. */
 
-// --- Toasts ---
 
-/** Keyed for two reasons. A second press then REPLACES the sample rather than
- *  piling up duplicates, and a toast's own buttons can dismiss it by name. A
- *  sample with a dead button would misrepresent the shape it is there to show. */
 const SAMPLE_SHORT = 'sample-toast-short';
 const SAMPLE_LONG = 'sample-toast-long';
 const SAMPLE_ACTIONS = 'sample-toast-actions';
@@ -69,8 +55,6 @@ export function sampleProgressToast(): void {
   });
 }
 
-/** Four at once, staggered. A shape has to hold up as a STACK as well as
- *  one at a time, and toasts do arrive in bursts. */
 export function sampleToastBurst(): void {
   sampleShortToast();
   setTimeout(sampleLongToast, 300);
@@ -78,18 +62,7 @@ export function sampleToastBurst(): void {
   setTimeout(sampleActionToast, 900);
 }
 
-// --- Banners ---
 
-/** The outage the ingress bar draws, at the shape of the real one.
- *
- *  One family down and the other healthy, because that is the case the bar
- *  exists for. A both-families sample would read as an obvious outage. The
- *  wording that matters is the wording for a path half of the internet still
- *  reaches. Eight hours is the span the real failure ran for.
- *
- *  The other two banners take their sample inline on the page: each is a couple
- *  of literal props. This one is a record, so it lives here with the rest of the
- *  content. */
 export const SAMPLE_INGRESS_OUTAGE: WebhookIngressOutage = {
   webhook_name: 'github-ci',
   host: 'node.tailnet.ts.net',
@@ -109,14 +82,6 @@ export const SAMPLE_INGRESS_OUTAGE: WebhookIngressOutage = {
   down_secs: 28_800,
 };
 
-/** A hook somebody switched off that is still being delivered to.
- *
- *  The highest-value alarm in the set, and the one whose wording is hardest to
- *  get right, so it is the sample. The numbers are the real incident's: a hook
- *  disabled by hand, eighteen days of GitHub deliveries, every one refused
- *  before the body was read.
- *
- *  A record rather than inline props, for the reason the outage above is. */
 export const SAMPLE_WEBHOOK_REFUSAL: WebhookRefusal = {
   webhook_id: '6f1c0f3e-0000-4000-8000-000000000001',
   webhook_name: 'GitHub workflow runs',
@@ -128,8 +93,6 @@ export const SAMPLE_WEBHOOK_REFUSAL: WebhookRefusal = {
   refusing_secs: 1_555_200,
 };
 
-/** A machine short on memory because of another app, the case that prompted
- *  the bar: Lucidos was the victim, and the bar says so by naming the app. */
 export const SAMPLE_MEMORY_EPISODE: SlownessEpisode = {
   state: 'slow',
   episode_id: 'sample',
@@ -141,8 +104,6 @@ export const SAMPLE_MEMORY_EPISODE: SlownessEpisode = {
   ],
 };
 
-/** Lucidos slow with memory calm, as when a build saturates the processor.
- *  The bar names no cause, only the busiest apps and one thing to do. */
 export const SAMPLE_UNCLEAR_EPISODE: SlownessEpisode = {
   state: 'slow',
   episode_id: 'sample-unclear',
@@ -154,8 +115,6 @@ export const SAMPLE_UNCLEAR_EPISODE: SlownessEpisode = {
   slow_workspaces: ['dev'],
 };
 
-/** An engine that answers while its database does not, as when Docker's VM
- *  stalls. The bar names the database and how to restart it. */
 export const SAMPLE_DATABASE_EPISODE: SlownessEpisode = {
   state: 'slow',
   episode_id: 'sample-database',
@@ -164,7 +123,6 @@ export const SAMPLE_DATABASE_EPISODE: SlownessEpisode = {
   slow_workspaces: ['dev'],
 };
 
-/** A nearly full disk, which stalls the database behind it. */
 export const SAMPLE_DISK_EPISODE: SlownessEpisode = {
   state: 'slow',
   episode_id: 'sample-disk',
@@ -172,11 +130,6 @@ export const SAMPLE_DISK_EPISODE: SlownessEpisode = {
   free_bytes: 4e8,
 };
 
-/** The other cause, which wants different words and a different fix.
- *
- *  Here the hook is on, the path is fine, and the deliveries reach the verifier
- *  and fail it. Sending this reader to the enable switch would waste the trip,
- *  which is why the two never share a sentence. */
 export const SAMPLE_WEBHOOK_VERIFICATION_REFUSAL: WebhookRefusal = {
   webhook_id: '6f1c0f3e-0000-4000-8000-000000000002',
   webhook_name: 'GitHub workflow runs',
@@ -188,15 +141,12 @@ export const SAMPLE_WEBHOOK_VERIFICATION_REFUSAL: WebhookRefusal = {
   refusing_secs: 97_200,
 };
 
-// --- Popovers ---
 
-/** The condition the waiting panel drills into. */
 export const SAMPLE_CONDITION: EventCondition = {
   eventType: 'PullRequestReviewed',
   conditions: [{ repo: 'example-org/example-repo', pr: 412 }],
 };
 
-// --- Dialogs ---
 
 export function sampleConfirmDanger(): void {
   void showConfirm('Delete the trigger "Daily digest"? This cannot be undone.', 'Delete', {
@@ -219,8 +169,6 @@ export function samplePrompt(): void {
   });
 }
 
-/** The three acknowledgements: something has already happened and the user has
- *  to see it. Nothing to decide, so each carries a lone [OK] and no Cancel. */
 export function sampleAcknowledgeWedged(): void {
   void showConfirm(
     'New engine version pending, and rebuilding cannot deliver it: a build for '
@@ -248,8 +196,6 @@ export function sampleAcknowledgeStranded(): void {
   );
 }
 
-/** The cross-thread consent prompt: another thread asks to put something on
- *  screen, and the user can decline. */
 export function sampleConsentPrompt(): void {
   void showConfirm(
     '"Nightly digest" wants to open the Files panel.',
@@ -258,13 +204,7 @@ export function sampleConsentPrompt(): void {
   );
 }
 
-// --- Progress dialog ---
 
-/** Frames the packaged install really emits, in order. Real frames rather than
- *  invented copy: the dialog is then built by the shipped `appUpdateDialogState`,
- *  so the preview cannot drift from the run it depicts. The version is a fixed
- *  synthetic value, deliberately not the real release, so it can never collide
- *  with the `RELEASE` file being shipped. */
 const INSTALL_FRAMES: AppUpdateRunning[] = [
   { version: '9.9.9', phase: 'checking' },
   { version: '9.9.9', phase: 'downloading', downloaded: 12_582_912, total: 68_157_440 },
@@ -275,9 +215,6 @@ const INSTALL_FRAMES: AppUpdateRunning[] = [
   { version: '9.9.9', phase: 'relaunching' },
 ];
 
-/** One install frame as the gallery shows it: the real dialog, with its Cancel
- *  swapped for a way out of the preview. The swap is what keeps the sample
- *  inert, since the real Cancel would abandon an actual run. */
 function sampleInstallDialog(frame: AppUpdateRunning): ProgressDialogState {
   return {
     ...appUpdateDialogState(frame, stopSampleProgressDialog),
@@ -287,8 +224,6 @@ function sampleInstallDialog(frame: AppUpdateRunning): ProgressDialogState {
 
 let ticker: ReturnType<typeof setInterval> | null = null;
 
-/** Stop the fake run and clear the slot. Idempotent, so the page can call it on
- *  unmount without knowing whether a run is going. */
 export function stopSampleProgressDialog(): void {
   if (ticker !== null) {
     clearInterval(ticker);
@@ -297,9 +232,6 @@ export function stopSampleProgressDialog(): void {
   progressDialog.value = { visible: false, title: '', message: '', progress: null };
 }
 
-/** Walk the install frames on a slow ticker, so every one can be looked at.
- *  The real run passes through some of these in under a second, which is
- *  exactly why the gallery does not reuse its timing. */
 export function playSampleProgressDialog(): void {
   stopSampleProgressDialog();
   let i = 0;
@@ -315,15 +247,12 @@ export function playSampleProgressDialog(): void {
   }, 2000);
 }
 
-/** Hold one phase still, for looking at the layout rather than the sequence. */
 export function showSampleProgressPhase(index: number): void {
   stopSampleProgressDialog();
   const frame = INSTALL_FRAMES[Math.min(Math.max(index, 0), INSTALL_FRAMES.length - 1)];
   progressDialog.value = sampleInstallDialog(frame);
 }
 
-/** The engine restart, which shares the dialog and has no honest percentage.
- *  Built from the shipped builder, so this is the real thing with a way out. */
 export function sampleRestartDialog(): void {
   stopSampleProgressDialog();
   progressDialog.value = {

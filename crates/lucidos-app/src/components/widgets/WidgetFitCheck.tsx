@@ -8,29 +8,20 @@ import type { WidgetSize } from '../../store/types';
 import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM, widgetBoxCss, widgetCellPx } from '../../utils/dashboardGeometry';
 import { WidgetBox } from './WidgetBox';
 
-/** The narrowest common phone width in CSS px: Android's 360, below the
- *  iPhone SE and mini at 375. */
 export const PHONE_COLUMN_PX = 360;
 
-/** Every surface a check draws on, in the order the note lists them. */
 export const WIDGET_FIT_SURFACES: readonly WidgetFitSurface[] = ['desk-tile', 'phone-column'];
 
-/** Past the frame's own settle cap, the time a box waits for its answer. The
- *  first box also loads the frame. */
 export const FIT_ANSWER_SLACK_MS = 2000;
 
-/** What a widget that never answers is told it did. */
 const NO_ANSWER = 'the widget did not answer: it may not load the SDK, or it failed to load';
 
-/** The root font size in px at `scale` percent. The root is the browser's
- *  default size times the shell's own scale. */
 function remPxAt(scale: number): number {
   const root = document.documentElement;
   const shell = parseFloat(root.style.getPropertyValue('--user-ui-scale')) || 100;
   return (parseFloat(getComputedStyle(root).fontSize) / shell) * scale;
 }
 
-/** A cell's edge and the gap on `surface`, in px, at `scale` percent. */
 export function surfaceCellPx(surface: WidgetFitSurface, scale: number): { cell: number; gap: number } {
   const rem = remPxAt(scale);
   const cell = surface === 'desk-tile' ? DASHBOARD_CELL_REM * rem : widgetCellPx(PHONE_COLUMN_PX, rem);
@@ -43,8 +34,6 @@ function boxOf(surface: WidgetFitSurface, size: WidgetSize, fit: WidgetFit): Wid
     : { surface, size, box: fit.box, findings: fit.findings, total: fit.total };
 }
 
-/** One surface: the real widget box, walked through each size in turn, the
- *  way a user resizes a card. */
 function SurfaceProbe({ surface, request, onDone }: {
   surface: WidgetFitSurface;
   request: WidgetFitRequest;
@@ -52,7 +41,6 @@ function SurfaceProbe({ surface, request, onDone }: {
 }) {
   const [step, setStep] = useState(0);
   const boxes = useRef<WidgetFitBox[]>([]);
-  // Set once the surface has answered, so a late answer adds nothing.
   const done = useRef(false);
   const size = request.sizes[step];
   const measure = `${request.requestId}:${surface}:${size}`;
@@ -68,8 +56,6 @@ function SurfaceProbe({ surface, request, onDone }: {
     else finish();
   };
 
-  // A widget that never answers one size answers none: every size left is
-  // told so, rather than waiting each one out.
   useEffect(() => {
     if (size === undefined) return undefined;
     const deadline = setTimeout(() => {
@@ -97,7 +83,6 @@ function SurfaceProbe({ surface, request, onDone }: {
   );
 }
 
-/** One check: both surfaces side by side, and one report once both finish. */
 function FitRun({ request }: { request: WidgetFitRequest }) {
   const results = useRef(new Map<WidgetFitSurface, WidgetFitBox[]>());
   const [finished, setFinished] = useState<WidgetFitSurface[]>([]);
@@ -105,8 +90,6 @@ function FitRun({ request }: { request: WidgetFitRequest }) {
   useEffect(() => {
     if (finished.length < WIDGET_FIT_SURFACES.length) return;
     const boxes = WIDGET_FIT_SURFACES.flatMap((surface) => results.current.get(surface) ?? []);
-    // No user asked for this, and no toast fits. The agent finds out: the
-    // engine reads a missing answer as "not checked" when its wait runs out.
     postWidgetFitReportApi(request.requestId, boxes)
       .catch((e) => console.warn('[WidgetFit] the fit report did not reach the engine:', e))
       .finally(() => finishWidgetFit(request.requestId));
@@ -129,10 +112,6 @@ function FitRun({ request }: { request: WidgetFitRequest }) {
   );
 }
 
-/** Renders the *widget fit checks* the engine asks this window for
- *  (`engine/widget_fit.rs`), one at a time, where no one sees them. The
- *  boxes are the real `WidgetBox`, at the cell each surface draws at the
- *  check's UI scale. */
 export function WidgetFitCheck() {
   const request = widgetFitRequests.value[0];
   return request ? <FitRun key={request.requestId} request={request} /> : null;

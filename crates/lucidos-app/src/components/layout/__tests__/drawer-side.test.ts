@@ -1,30 +1,11 @@
-/**
- * The menu drawer slides out from the edge its opener sits nearest, so the panel
- * reads as coming from under the button the user pressed.
- *
- * This exists because the mobile thread pane header puts its hamburger at the
- * row's TRAILING edge (mirroring the thread drawer toggle at the leading edge),
- * while the mobile content pane header keeps its own at the leading edge. One
- * fixed side would be wrong for one of them.
- *
- * Desktop is always `left`: the panel is positioned to emerge from the split
- * divider rather than from a viewport edge (`@media (--desktop-layout)` in
- * mobile.css), so an anchor sitting right of the viewport middle (a wide
- * Conversation side pushes the content header's hamburger there) must NOT flip
- * it. The `.drawer-right` CSS is scoped to the mobile breakpoint for the same
- * reason, belt and braces.
- */
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   drawerSide, drawerSideFor, openDrawer, forceCloseDrawer,
 } from '../drawerState';
 import { DrawerChunk } from '../drawerState';
 
-// The drawer is code-split and opens once it is in memory. Warm it, so an
-// open lands at once.
 beforeAll(() => DrawerChunk.preload());
 
-/** Minimal stand-in for the hamburger element: openDrawer only measures it. */
 function anchorAt(left: number, width = 28): HTMLElement {
   return { getBoundingClientRect: () => ({ left, width }) } as unknown as HTMLElement;
 }

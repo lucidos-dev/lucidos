@@ -1,20 +1,5 @@
 import type { NavigateUi } from '@lucidos/sdk';
 
-/** Button label for a `navigate`-kind notification tap, shown in the
- *  notification detail panel (`NotificationDetailInline`).
- *
- *  A navigate tap is actionable from the OS-push tap and the in-app toast
- *  (both run `handleNavigationRequest`), but the detail panel would otherwise
- *  ignore the `tap` field entirely — so a navigate notification (e.g. the
- *  "N changes ready to apply" trigger push, which taps to the Changes panel)
- *  would be a dead end when read from the bell. This label gives that button
- *  its text.
- *
- *  Targets mirror the SDK `NavigateTarget` union. `thread` / `app` are usually
- *  served by the panel's dedicated "Open thread" / "Open <app>" buttons, but
- *  this still labels them for a navigate tap that lacks the matching row
- *  metadata. The trailing fallback guards a target string the engine added
- *  after this build — `validateTap` doesn't constrain the target value. */
 export function navigateTapLabel(to: NavigateUi): string {
   switch (to.target) {
     case 'dashboard':
@@ -26,8 +11,6 @@ export function navigateTapLabel(to: NavigateUi): string {
     case 'apps':
       return 'View apps';
     case 'app-store':
-      // `app-store` is the retained navigate target; it opens the Plugins panel
-      // (its marketplace catalog). The "App Store" / "Store tab" names are retired.
       return 'Open Plugins';
     case 'triggers':
       return 'View triggers';

@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyAggregateToMeta, type ThreadAggregate, type ThreadMeta } from '../thread-meta';
 
-/** Only the fields `applyAggregateToMeta` reads before it reaches the backend
- *  set; a full fixture would just rot. */
 function meta(codingAgents?: ThreadMeta['codingAgents']): ThreadMeta {
   return {
     status: 'idle',

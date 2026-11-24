@@ -1,13 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   createTapGate, touchActivated, takePressOutcome, notePressOutcome,
-  CANCELLED_TAP_SETTLE_MS, type ScrollNode,
+  CANCELLED_TAP_SETTLE_MS, FACE_SEEN_MS, pressPredatesFace, type ScrollNode,
 } from './tapGesture';
 import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
 import { TAP_MOVE_THRESHOLD_PX } from '@lucidos/tap-press';
 
-/** A pointer carrying BOTH coordinate spaces, so a test can move one and hold
- *  the other still. That is the whole distinction the gate rests on. */
 interface Probe {
   screenX: number;
   screenY: number;
@@ -15,15 +13,12 @@ interface Probe {
   clientY: number;
 }
 
-/** Finger on the screen at (x, y), page viewport aligned with the screen. */
 function at(x: number, y: number): Probe {
   return { screenX: x, screenY: y, clientX: x, clientY: y };
 }
 
 describe('createTapGate', () => {
   it('treats a click without a recorded press as a tap (keyboard activation)', () => {
-    // Tab+Enter/Space on a focused button fires a synthetic `click` with no
-    // preceding `pointerdown`. Suppressing those would break keyboard a11y.
     const gate = createTapGate();
     expect(gate.isTap()).toBe(true);
   });
@@ -37,14 +32,14 @@ describe('createTapGate', () => {
   it('treats a press with sub-threshold wobble as a tap', () => {
     const gate = createTapGate();
     gate.down(at(100, 200));
-    gate.move(at(105, 203)); // 5,3 px of finger wobble during a real tap
+    gate.move(at(105, 203));
     expect(gate.isTap()).toBe(true);
   });
 
   it('cancels the tap when movement exceeds the threshold (vertical scroll)', () => {
     const gate = createTapGate();
     gate.down(at(100, 200));
-    gate.move(at(101, 230)); // 30 px down, the user starting a scroll
+    gate.move(at(101, 230));
     expect(gate.isTap()).toBe(false);
   });
 
@@ -74,26 +69,17 @@ describe('createTapGate', () => {
   });
 
   it('cancel() clears the in-flight press so a follow-up click is not auto-suppressed', () => {
-    // pointercancel (iOS killing the gesture) should not poison the next
-    // unrelated activation. Once cleared, the gate behaves as if no press
-    // happened, which means the next click is treated as a tap.
     const gate = createTapGate();
     gate.down(at(0, 0));
-    gate.move(at(0, 100)); // would have canceled
+    gate.move(at(0, 100));
     gate.cancel();
     expect(gate.isTap()).toBe(true);
   });
 });
 
-/** The reported bug: on an iOS PWA with the keyboard up, the composer's Submit
- *  did nothing tap after tap, while the ungated icon buttons beside it worked.
- *  Only the gated buttons were dead, and the gate measured the finger against
- *  the page viewport instead of against the screen. */
 describe('createTapGate measures the finger, not the viewport', () => {
   it('holds a stationary finger to be a tap while the viewport scrolls under it', () => {
     const press: Probe = { screenX: 100, screenY: 700, clientX: 100, clientY: 300 };
-    // The visual viewport settles by 40 px with the keyboard up. The finger
-    // never moved, so its screen position is unchanged.
     const settled: Probe = { screenX: 100, screenY: 700, clientX: 100, clientY: 340 };
     const gate = createTapGate();
     gate.down(press);
@@ -102,8 +88,6 @@ describe('createTapGate measures the finger, not the viewport', () => {
   });
 
   it('cancels a finger that crossed the screen while the content travelled with it', () => {
-    // The mirror case. During a content scroll the page moves under the
-    // finger, so the client position barely changes across a real swipe.
     const press: Probe = { screenX: 100, screenY: 700, clientX: 100, clientY: 300 };
     const dragged: Probe = { screenX: 100, screenY: 620, clientX: 100, clientY: 302 };
     const gate = createTapGate();
@@ -130,9 +114,6 @@ describe('createTapGate reports the press it discarded', () => {
   });
 
   it('keeps measuring past the threshold that already doomed the press', () => {
-    // A swipe crosses 8 px early and travels on. Reporting the crossing
-    // instead of the travel makes every rejection read as a hair over the
-    // threshold. That is the one thing the number has to tell apart.
     const gate = createTapGate();
     gate.down(at(100, 209));
     gate.move(at(100, 218));
@@ -156,8 +137,6 @@ describe('createTapGate reports the press it discarded', () => {
   });
 
   it('consumes the press, so the next click is judged fresh', () => {
-    // Both entry points settle the same in-flight press, which is what lets a
-    // caller pick one without the other leaving a verdict behind.
     const gate = createTapGate();
     gate.down(at(100, 200));
     gate.move(at(100, 240));
@@ -166,15 +145,12 @@ describe('createTapGate reports the press it discarded', () => {
   });
 });
 
-/** The reported bug: the composer's Send did nothing on a phone with the
- *  keyboard up. Nothing on screen said why, because the click WebKit dropped
- *  never reached the handler that would have toasted. */
-/** A clock the test moves by hand, plus a countable event. */
 function harness(opts: {
   enabled?: () => boolean;
   gate?: { pass(): boolean; spend(): void; aborted?(): boolean };
   destructive?: () => boolean;
   pageVisible?: () => boolean;
+  shownAt?: () => number | null;
 } = {}) {
   let t = 1_000;
   const action = vi.fn();
@@ -191,16 +167,12 @@ describe('touchActivated', () => {
   });
 
   it('cancels the synthetic click the touch would produce', () => {
-    // preventDefault on touchend is what suppresses the compatibility mouse
-    // events. Without it both paths would fire and the message would go twice.
     const { handlers, touch } = harness();
     handlers.onTouchEnd(touch);
     expect(touch.preventDefault).toHaveBeenCalledTimes(1);
   });
 
   it('ignores a click that arrives as the twin of a touch it already served', () => {
-    // The belt to preventDefault's suspenders: a browser that dispatches the
-    // click anyway must not send a second message.
     const { action, handlers, touch, advance } = harness();
     handlers.onTouchEnd(touch);
     advance(50);
@@ -209,16 +181,12 @@ describe('touchActivated', () => {
   });
 
   it('runs the action on a click with no touch behind it', () => {
-    // Desktop, and keyboard activation, which fires a click and no touch.
     const { action, handlers } = harness();
     handlers.onClick();
     expect(action).toHaveBeenCalledTimes(1);
   });
 
   it('serves a click long after the last touch', () => {
-    // A hybrid device: a finger, then a trackpad. A sticky handled-by-touch
-    // flag would eat this click, because the suppressed twin never arrives to
-    // clear it.
     const { action, handlers, touch, advance } = harness();
     handlers.onTouchEnd(touch);
     advance(5_000);
@@ -227,7 +195,6 @@ describe('touchActivated', () => {
   });
 
   it('serves a second real tap inside the twin window', () => {
-    // The window guards the click path only. Two quick taps are two actions.
     const { action, handlers, touch, advance } = harness();
     handlers.onTouchEnd(touch);
     advance(120);
@@ -236,9 +203,6 @@ describe('touchActivated', () => {
   });
 
   it('eats one twin per touch, never a second click inside the window', () => {
-    // A touch has one synthetic twin. Swallowing every click for the whole
-    // window would eat a real press that followed it, which is a live hazard on
-    // the morph button: it shares one handler pair across Send and Cancel.
     const { action, handlers, touch, advance } = harness();
     handlers.onTouchEnd(touch);
     advance(50);
@@ -249,23 +213,8 @@ describe('touchActivated', () => {
   });
 });
 
-/** The bug reported a THIRD time, after touch activation had landed and then
- *  been retuned: the composer's Send still did nothing on a phone with the
- *  keyboard up, wherever the finger pressed, until the keyboard was dismissed.
- *
- *  Both of the touch path's tests so far asked whether the finger was still on
- *  the button at the lift. Both cost a coordinate comparison across the span of
- *  a press, and the visual viewport settles under a stationary finger while the
- *  keyboard is up. Screen space did not escape that. Each shipped as a SILENT
- *  decline onto a click iOS was not going to send.
- *
- *  So the touch path now takes every press. These cases pin that, because it is
- *  the only path there is on the device that reported this. */
 describe('touchActivated takes every press it is given', () => {
   it('runs the action however far the finger travelled', () => {
-    // A press that slid off a constructive button now fires it. That is the
-    // trade: the alternative measured something the platform corrupts, and paid
-    // for a wrong answer with a dead button nobody could diagnose.
     const { action, handlers, touch } = harness();
     handlers.onTouchEnd(touch);
     expect(action).toHaveBeenCalledTimes(1);
@@ -279,9 +228,6 @@ describe('touchActivated takes every press it is given', () => {
   });
 
   it('stands the touch path down while disabled, leaving the click path whole', () => {
-    // The morph button is one node that turns destructive. While it reads
-    // Cancel the touch path must not fire it early, AND must not swallow the
-    // click that still has to reach it.
     const { action, handlers, touch } = harness({ enabled: () => false });
     handlers.onTouchEnd(touch);
     expect(action).not.toHaveBeenCalled();
@@ -291,16 +237,11 @@ describe('touchActivated takes every press it is given', () => {
   });
 });
 
-/** A touch the way the cancel path reads it: one finger, its screen position,
- *  and every contact still on the glass. */
 function contact(screenX: number, screenY: number, fingersDown: number) {
   const point = { identifier: 0, screenX, screenY };
   return { changedTouches: [point], touches: new Array(fingersDown).fill(point) };
 }
 
-/** The first `canceled` line in the ledger. iOS took a press on Send that
- *  moved 6px in 77ms, with the button in the home-indicator strip. No click
- *  follows a `touchcancel`, so the draft stayed put and the user tapped again. */
 describe('touchActivated serves a tap the system cancelled', () => {
   function cancelledTap(moveTo: number, heldMs: number, opts: Parameters<typeof harness>[0] = {}) {
     const h = harness(opts);
@@ -340,8 +281,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 
   it('fires a destructive face on a cancelled tap, once the settle window passes', () => {
-    // The ledger's Cancel: 5px in 59ms, in the home-indicator strip. It took
-    // three taps to stop a turn.
     vi.useFakeTimers();
     try {
       const { action } = cancelledTap(5, 59, { destructive: () => true, pageVisible: () => true });
@@ -367,7 +306,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 
   it('drops a destructive cancelled tap when the face turns back to Send', () => {
-    // One node serves both faces, so firing late would send the draft.
     vi.useFakeTimers();
     try {
       let cancelFace = true;
@@ -381,7 +319,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 
   it('never fires a destructive face on a cancelled scroll', () => {
-    // A scroll that began on Cancel must not abort a live turn.
     const { action } = cancelledTap(TAP_MOVE_THRESHOLD_PX + 1, 50, { destructive: () => true });
     expect(action).not.toHaveBeenCalled();
   });
@@ -399,7 +336,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 
   it('counts the travel the cancel event itself reports', () => {
-    // The browser can take a scroll with no `touchmove` delivered first.
     const { action, handlers } = harness();
     handlers.onTouchStart(contact(100, 800, 1));
     handlers.onTouchCancel(contact(100, 800 - TAP_MOVE_THRESHOLD_PX - 1, 0));
@@ -407,7 +343,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 
   it('never runs a press an overlay dismiss swallowed', () => {
-    // A tap outside an open overlay only closes it, cancelled or not.
     takePressOutcome(0);
     const { action, handlers } = harness();
     handlers.onTouchStart(contact(100, 800, 1));
@@ -418,7 +353,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 
   it('serves a click that follows a served cancel', () => {
-    // No click follows a `touchcancel`, so there is no twin to ignore.
     const { action, handlers } = cancelledTap(0, 50);
     handlers.onClick();
     expect(action).toHaveBeenCalledTimes(2);
@@ -439,13 +373,6 @@ describe('touchActivated serves a tap the system cancelled', () => {
   });
 });
 
-/** Where the scroll-vs-tap gate lives now. What it catches is the `click` iOS
- *  fires after a touch that was starting a scroll, so it belongs to the click
- *  path. In front of BOTH paths it also vetoed the touch path, on the same
- *  measurement described above, which turned the dead button into a toast. */
-/** A gate wired the way `morphActivationGate` wires it, plus a report spy.
- *  Shared by the two describes below, which ask about the same wiring from the
- *  constructive and the destructive side. */
 function gated() {
   const gate = createTapGate();
   const reported = vi.fn();
@@ -485,9 +412,6 @@ describe('the tap gate guards the click path alone', () => {
   });
 
   it('spends the press the touch path served, so it cannot rule on the next one', () => {
-    // The gate holds ONE press. An unspent one would veto the next activation
-    // arriving with no press of its own, such as a keyboard Enter on the same
-    // button.
     const { gate, reported, activation } = gated();
     const { action, handlers, touch, advance } = harness({ gate: activation });
     gate.down(at(100, 200));
@@ -500,8 +424,6 @@ describe('the tap gate guards the click path alone', () => {
   });
 
   it('does not let a twin click rule on the press the touch path spent', () => {
-    // The twin check runs before the gate, so a browser that dispatches the
-    // suppressed click anyway does not reach it at all.
     const asked = vi.fn(() => true);
     const { handlers, touch, advance } = harness({ gate: { pass: asked, spend: () => {} } });
     handlers.onTouchEnd(touch);
@@ -517,15 +439,6 @@ describe('the tap gate guards the click path alone', () => {
   });
 });
 
-/** The bug reported a SEVENTH time, and the first with evidence. The probe
- *  logged `Cancel: dead` with the finger still, the node connected, the row
- *  unchanged and the keyboard up. So WebKit dispatched the touch to Cancel and
- *  dropped the click, and Cancel had no touch path to fall back on.
- *
- *  It had none by decision. The touch path takes every press it is given, which
- *  is right for Send and wrong for Cancel: a scroll landing there would abort a
- *  live turn. A destructive face therefore RULES on the gate instead of spending
- *  it. See `docs/plans/2026-08-28-cancel-survives-the-ios-keyboard.md`. */
 describe('a destructive face asks the gate rather than spending it', () => {
   it('serves a stationary press inside the gesture, which is the whole fix', () => {
     const { gate, reported, activation } = gated();
@@ -549,9 +462,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 
   it('cancels the twin of a refused press, so no path serves it', () => {
-    // The hole this closes. `pass()` CONSUMES the press, so the twin click
-    // arrives with none behind it and the gate waves it through. The action the
-    // gate just refused would run about 300ms after the finger lifted.
     const { gate, reported, activation } = gated();
     const { action, handlers, touch, advance } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
@@ -587,9 +497,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 
   it('stands down while disabled, leaving the click path whole', () => {
-    // The settle window holds Cancel disabled after a Send morphs into it. A
-    // disabled element still receives touch events, so `disabled` alone is not
-    // the guard.
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({
       gate: activation,
@@ -604,8 +511,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 
   it('leaves the constructive path spending the gate, never asking it', () => {
-    // The scar this must not reopen. Two shipped fixes asked the constructive
-    // path a question, and both were reported as a dead Send.
     const { gate, reported, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => false });
     gate.down(at(100, 200));
@@ -617,10 +522,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 
   it('refuses a lift the system already took the gesture for', () => {
-    // The hole a first pass left open, and the sharpest one. A scroll makes the
-    // browser take the pointer and fire `pointercancel`, which clears the gate.
-    // The lift still arrives, and an empty gate reads as a tap, so the abort
-    // has to be asked about on its own.
     const { gate, reported, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
@@ -629,8 +530,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
     gate.cancel();
     handlers.onTouchEnd(touch);
     expect(action).not.toHaveBeenCalled();
-    // Silent: the system took the gesture, which is the platform working. The
-    // gate's toast is for a press the app itself discarded.
     expect(reported).not.toHaveBeenCalled();
   });
 
@@ -642,6 +541,17 @@ describe('a destructive face asks the gate rather than spending it', () => {
     gate.cancel();
     handlers.onTouchEnd(touch);
     expect(action).not.toHaveBeenCalled();
+  });
+
+  it('claims a lift the system took as aborted, so the probe never calls it dead', () => {
+    takePressOutcome(0);
+    const { gate, activation } = gated();
+    const { handlers, touch } = harness({ gate: activation, destructive: () => true });
+    gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
+    gate.cancel();
+    handlers.onTouchEnd(touch);
+    expect(takePressOutcome(5_000)).toBe('aborted');
   });
 
   it('lets the next press through, so one abort cannot wedge the button', () => {
@@ -658,8 +568,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 
   it('never raises the abort flag for a press the touch path served', () => {
-    // `spend` and `cancel` were one method. Sharing them made every served
-    // press look like a gesture the system had taken.
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => false });
     gate.down(at(100, 200));
@@ -678,8 +586,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 
   it('reads the flag per press, since one node serves Send and Cancel', () => {
-    // The morph is a single button that turns destructive. The flag is a thunk
-    // for that reason, read per press rather than captured at bind time.
     let destructive = false;
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => destructive });
@@ -697,10 +603,6 @@ describe('a destructive face asks the gate rather than spending it', () => {
   });
 });
 
-/** The iOS PWA report: "I did not press Cancel". Twice, a Send held for well
- *  over a second sent at once. Its lift arrived after the button had morphed into
- *  Stop and the settle window had run out. The lift then stopped the turn it had
- *  just started. One press is one activation, of the face it began on. */
 describe('a press serves only the face it started on, once', () => {
   function morph() {
     const face = { destructive: false };
@@ -784,14 +686,8 @@ describe('a press serves only the face it started on, once', () => {
   });
 });
 
-/** The phone report: scrolling the Lucidos menu opened the Setup guide confirm
- *  on the lift. The press began on that row, and the touch path took every
- *  press. The browser scrolling the menu under a moving finger is what says
- *  the press was a scroll. */
 describe('a press that scrolled a container above the button serves nothing', () => {
   function insideScroller() {
-    // The root has no parent, as `<html>` has none. It stands for the document,
-    // which the iOS keyboard moves under a stationary finger.
     const root: ScrollNode = { scrollTop: 0, scrollLeft: 0, parentElement: null };
     const scroller: ScrollNode = { scrollTop: 0, scrollLeft: 0, parentElement: root };
     const row: ScrollNode = { scrollTop: 0, scrollLeft: 0, parentElement: scroller };
@@ -829,8 +725,6 @@ describe('a press that scrolled a container above the button serves nothing', ()
   });
 
   it('the app scrolling the container under a still finger is not a scroll', () => {
-    // Stick-to-bottom moves the transcript while a reply streams. A tap held
-    // still through that must not go dead.
     const { scroller, action, handlers, press, liftAt } = insideScroller();
     handlers.onTouchStart(press);
     scroller.scrollTop = 140;
@@ -839,8 +733,6 @@ describe('a press that scrolled a container above the button serves nothing', ()
   });
 
   it('the document scrolling is not a scroll of the menu', () => {
-    // The keyboard shifts the document while a finger is on Send. Reading the
-    // root as a scroller would bring back the dead Send.
     const { root, action, handlers, press, liftAt } = insideScroller();
     handlers.onTouchStart(press);
     root.scrollTop = 300;
@@ -854,5 +746,80 @@ describe('a press that scrolled a container above the button serves nothing', ()
     scroller.scrollTop = 40;
     handlers.onTouchCancel(contact(100, 160, 0));
     expect(action).not.toHaveBeenCalled();
+  });
+});
+
+describe('a destructive face refuses a press that began before it was shown', () => {
+  function stamped(timeStamp: number) {
+    return { ...contact(100, 200, 1), timeStamp };
+  }
+
+  it('refuses a queued tap whose touch predates the paint, and claims it', () => {
+    takePressOutcome(0);
+    const { action, handlers, touch } = harness({ destructive: () => true, shownAt: () => 5_000 });
+    handlers.onTouchStart(stamped(4_900));
+    handlers.onTouchEnd(touch);
+    expect(action).not.toHaveBeenCalled();
+    expect(touch.preventDefault).toHaveBeenCalledTimes(1);
+    expect(takePressOutcome(5_000)).toBe('refused');
+  });
+
+  it('refuses a tap faster than anyone could react to the new face', () => {
+    const { action, handlers, touch } = harness({ destructive: () => true, shownAt: () => 5_000 });
+    handlers.onTouchStart(stamped(5_000 + FACE_SEEN_MS - 1));
+    handlers.onTouchEnd(touch);
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('refuses a tap while the face is not painted yet', () => {
+    const { action, handlers, touch } = harness({ destructive: () => true, shownAt: () => null });
+    handlers.onTouchStart(stamped(4_900));
+    handlers.onTouchEnd(touch);
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('serves a tap on the face once the user has seen it', () => {
+    const { action, handlers, touch } = harness({ destructive: () => true, shownAt: () => 5_000 });
+    handlers.onTouchStart(stamped(5_000 + FACE_SEEN_MS));
+    handlers.onTouchEnd(touch);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a queued tap the system cancelled, too', () => {
+    const { action, handlers } = harness({
+      destructive: () => true,
+      shownAt: () => 5_000,
+      pageVisible: () => true,
+    });
+    vi.useFakeTimers();
+    try {
+      handlers.onTouchStart(stamped(4_900));
+      handlers.onTouchCancel(contact(100, 200, 0));
+      vi.advanceTimersByTime(CANCELLED_TAP_SETTLE_MS);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves a constructive face alone: Send serves a queued tap', () => {
+    const { action, handlers, touch } = harness({ destructive: () => false, shownAt: () => 5_000 });
+    handlers.onTouchStart(stamped(4_900));
+    handlers.onTouchEnd(touch);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('judges a touch with no timeStamp as before', () => {
+    expect(pressPredatesFace(null, 5_000)).toBe(false);
+    expect(pressPredatesFace(null, null)).toBe(false);
+  });
+});
+
+describe('a face standing down claims the press', () => {
+  it('claims a lift on a disabled touch path as refused, so the probe stays quiet', () => {
+    takePressOutcome(0);
+    const { handlers, touch } = harness({ enabled: () => false });
+    handlers.onTouchEnd(touch);
+    expect(takePressOutcome(5_000)).toBe('refused');
   });
 });

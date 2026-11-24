@@ -67,7 +67,6 @@ describe('landingLaneView', () => {
       batch: {
         batchId: 'b-1',
         step: 'resolving',
-        // The lane thread has no title until its first turn names it.
         laneThread: { threadId: 'lane-t', title: 'Lane thread' },
         members: [
           { changeId: 'c-1', threadId: 't-1', title: 'Card gate fix' },

@@ -1,13 +1,4 @@
 // @vitest-environment jsdom
-/**
- * On a phone the thread title is its own menu button. The row draws no pin and
- * no ⋯: a tap on the title toggles the thread menu, and a hold opens it.
- *
- * Rendered rather than poked through props, because the composition is the
- * thing under test. The hold has to swallow its own lift. The title has to be
- * the overlay's anchor, so a second tap closes. And Pin has to reach the menu,
- * now that no button carries it.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { MobileThreadTitleBar } from '../../layout/MobileAppHeader';
@@ -32,7 +23,6 @@ vi.mock('../../../store/actions/thread-loading', () => ({
 import { handleSaveThread } from '../../../store/actions/threads';
 import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 const THREAD_ID = 'title-1';
@@ -89,7 +79,6 @@ function titleButton(): HTMLButtonElement {
   return el as HTMLButtonElement;
 }
 
-/** The open menu lives in a portal, so it is looked up on the document. */
 function openMenu(): HTMLElement | null {
   return document.querySelector<HTMLElement>('.thread-overflow-menu');
 }
@@ -100,8 +89,6 @@ function menuItems(): string[] {
 }
 
 function pointer(type: string, init: { clientX?: number; clientY?: number } = {}): PointerEvent {
-  // jsdom has no PointerEvent constructor, so a MouseEvent carrying the same
-  // fields stands in. `useLongPress` reads only `button` and `clientX/Y`.
   return new MouseEvent(type, {
     bubbles: true,
     cancelable: true,
@@ -111,7 +98,6 @@ function pointer(type: string, init: { clientX?: number; clientY?: number } = {}
   }) as unknown as PointerEvent;
 }
 
-/** Let Preact commit its microtask rerender, which fake timers do not drive. */
 async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -128,7 +114,6 @@ async function tap(target: HTMLElement): Promise<void> {
   await flush();
 }
 
-/** Press, hold past the 450ms threshold, lift, and the lift's paired click. */
 async function hold(target: HTMLElement): Promise<void> {
   target.dispatchEvent(pointer('pointerdown'));
   vi.advanceTimersByTime(500);
@@ -203,7 +188,6 @@ describe('a hold', () => {
 
   it('opens nothing when the pointer travels: that is a scroll', async () => {
     mount();
-    // A pan ends in `pointercancel`, and the browser pairs no click with it.
     const button = titleButton();
     button.dispatchEvent(pointer('pointerdown'));
     button.dispatchEvent(pointer('pointermove', { clientY: 40 }));

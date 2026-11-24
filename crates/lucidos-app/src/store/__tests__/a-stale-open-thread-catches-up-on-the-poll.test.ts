@@ -1,17 +1,3 @@
-/**
- * The open thread's transcript catches up on the next health poll when the
- * wake's own catch-up did not land.
- *
- * The reported shape, from an iOS PWA: the header read "Waiting for your
- * answer" over a turn still reading "Working". The steps and the question card
- * that followed were missing. A wake runs two reads side by side. The thread
- * list landed and moved `meta.status`. The open thread's catch-up died in
- * transport on a stale WebKit connection, and gave up silently. Nothing retried
- * it until the reader left the thread and came back.
- *
- * Real `connection` and `thread-loading`, so the stale mark, the coalesce rule
- * and the poll are the code that ships. Only the network is mocked.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { makeThreadState } from '../actions/threads-test-helpers';
 import { connectionStatus, focusedThreadId, threadMap, threadsLoaded } from '../store';
@@ -45,8 +31,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   }),
 }));
 
-// The poll opens the event stream when the engine answers, and a test has none.
-vi.mock('../actions/thread-sync', () => ({
+vi.mock('../actions/thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),
@@ -81,14 +66,11 @@ beforeEach(() => {
   focusedThreadId.value = ID;
 });
 
-/** A wake marks the open thread behind, and its catch-up fails twice in
- *  transport: `refreshThreadEvents` retries a transient rejection once. */
 async function wakeWhoseCatchUpDies(): Promise<void> {
   markLoadedThreadsStale();
   fetchEvents.mockRejectedValue(new TypeError('Load failed'));
   await refreshThreadEvents(ID, { coalesce: true });
   expect(fetchEvents).toHaveBeenCalledTimes(2);
-  // The list read beside it landed, so the header already says the thread waits.
   const thread = threadMap.value.get(ID)!;
   threadMap.value = new Map([[ID, { ...thread, meta: { ...thread.meta, status: 'waiting_for_user_answer' } }]]);
 }
@@ -150,8 +132,6 @@ describe('an open thread whose wake catch-up did not land', () => {
   });
 
   it('leaves the empty-thread recovery its own request on each budgeted tick', async () => {
-    // A slow refresh still in flight must not use up the recovery's three
-    // attempts, which exist to ask again after the backend has committed.
     const EMPTY = 'empty-thread';
     threadMap.value = new Map([[EMPTY, makeThreadState(EMPTY, { eventsLoaded: true })]]);
     focusedThreadId.value = EMPTY;

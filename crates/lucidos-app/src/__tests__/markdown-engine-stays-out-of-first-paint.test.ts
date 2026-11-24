@@ -1,13 +1,3 @@
-/**
- * The markdown engine (`marked`, DOMPurify and the renderer) is its own chunk,
- * outside the first-paint set (ADR 0436). The entry asks for it as it
- * evaluates, and markdown draws as plain text until it lands
- * (`utils/renderMarkdown.ts`). One static import of it from the entry or the
- * shell puts about 85 kB back on first paint.
- *
- * This walks the static import graphs from `main.tsx` and `App.tsx`, as Rollup
- * does for the entry and shell chunks (`staticImportGraph.ts`).
- */
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';

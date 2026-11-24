@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Appearance › Dynamic bars: the installed iOS app always runs
- *  dynamic bars, so only there the switch is on, disabled and explained. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

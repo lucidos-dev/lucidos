@@ -4,6 +4,7 @@ use crate::runtime::agent_runtime::{
     WithdrawRequest,
 };
 use crate::runtime::codex::CodexConfig;
+use crate::runtime::stub_executable::write_stub_executable;
 use std::path::{Path, PathBuf};
 
 /// Stand up the app-server driver over a stub shell script that speaks just
@@ -28,6 +29,7 @@ fn stub_script(turn_body: &str) -> String {
     format!(
         r##"#!/bin/sh
 LOG="$STUB_LOG"
+auth=apiKey
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LOG"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -36,7 +38,16 @@ while IFS= read -r line; do
       printf '{{"id":%s,"result":{{"userAgent":"stub/0.139.0"}}}}\n' "$id"
       ;;
     *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
-      printf '{{"id":%s,"result":{{"thread":{{"id":"t-1"}},"model":"gpt-5.5"}}}}\n' "$id"
+      printf '{{"id":%s,"result":{{"thread":{{"id":"t-1"}},"model":"gpt-5.5","modelProvider":"openai"}}}}\n' "$id"
+      ;;
+    *'"method":"config/read"'*)
+      printf '{{"id":%s,"result":{{"config":{{"chatgpt_base_url":"https://chatgpt.com/backend-api"}}}}}}\n' "$id"
+      ;;
+    *'"method":"modelProvider/list"'*)
+      printf '{{"id":%s,"result":{{"defaultProviderId":"openai","data":[{{"id":"openai","baseUrl":null,"settings":{{"type":"openai"}}}}]}}}}\n' "$id"
+      ;;
+    *'"method":"account/read"'*)
+      printf '{{"id":%s,"result":{{"requiresOpenaiAuth":true,"account":{{"type":"%s"}}}}}}\n' "$id" "$auth"
       ;;
     *'"method":"turn/start"'*)
       printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1","items":[],"status":"inProgress"}}}}}}\n' "$id"
@@ -60,6 +71,279 @@ done
 /// The session context every stub session is spawned with.
 const STUB_SESSION_CONTEXT: &str = "SESSION CONTEXT: branch `stub-branch`";
 
+/// Reject one live steer, then accept it as the next turn's input. Ordering of
+/// the terminal versus RPC reply varies to exercise the turn-end race.
+async fn rejected_steer_is_delivered_once(error: &str, terminal_first: bool, unsupported: bool) {
+    rejected_steer_policy(error, terminal_first, unsupported, false).await;
+}
+
+async fn rejected_steer_policy(
+    error: &str,
+    terminal_first: bool,
+    unsupported: bool,
+    ceiling: bool,
+) {
+    let finish = r#"printf '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-1","status":"completed"}}}\n'"#;
+    let body = format!("turns=$((turns+1))\n      if [ \"$turns\" -gt 1 ]; then {finish}; fi");
+    let rejection =
+        format!(r#"printf '{{"id":%s,"error":{{"code":-32601,"message":"{error}"}}}}\n' "$id""#);
+    let live_body = if terminal_first {
+        format!("{finish}\n      {rejection}")
+    } else if unsupported && !ceiling {
+        rejection
+    } else {
+        format!("{rejection}\n      {finish}")
+    };
+    let handler = format!(
+        r#"    *'"method":"turn/steer"'*)
+      case "$line" in
+        *'"input":[]'*) printf '{{"id":%s,"error":{{"code":-32600,"message":"thread not found"}}}}\n' "$id" ;;
+        *) {live_body} ;;
+      esac
+      ;;
+    *'"method":"turn/start"'*)"#
+    );
+    let script = stub_script(&body)
+        .replace("auth=apiKey", "auth=apiKey\nturns=0")
+        .replace("    *'\"method\":\"turn/start\"'*)", &handler);
+    let mut s = stub_driver_scripted(&script, None);
+    let first = uuid::Uuid::new_v4();
+    let followup = uuid::Uuid::new_v4();
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "Original work".into(),
+            images: vec![],
+            uuid: first,
+        })
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init {
+            can_steer: true,
+            ..
+        }
+    ));
+    assert!(
+        matches!(next_event(&mut s.events_rx).await, AgentEvent::InputRead { input } if input == first)
+    );
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: ceiling,
+            text: "Follow-up".into(),
+            images: vec![],
+            uuid: followup,
+        })
+        .unwrap();
+    if unsupported {
+        assert!(matches!(
+            next_event(&mut s.events_rx).await,
+            AgentEvent::SteerFallback {
+                can_steer: false,
+                interrupting,
+            } if interrupting != ceiling
+        ));
+    }
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Result { .. }
+    ));
+    assert!(
+        matches!(next_event(&mut s.events_rx).await, AgentEvent::InputRead { input } if input == followup)
+    );
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Result { .. }
+    ));
+    let requests = std::fs::read_to_string(&s.requests_log).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| line.contains("\"method\":\"turn/start\""))
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| line.contains("\"method\":\"turn/steer\""))
+            .count(),
+        2,
+        "probe plus one live attempt"
+    );
+    assert_eq!(
+        requests.contains("\"method\":\"turn/interrupt\""),
+        unsupported && !ceiling
+    );
+    drop(s.input_tx);
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Exited { .. }
+    ));
+}
+
+#[tokio::test]
+async fn turn_id_mismatch_queues_the_input_until_the_turn_finishes() {
+    rejected_steer_is_delivered_once("expectedTurnId does not match active turn", false, false)
+        .await;
+}
+
+#[tokio::test]
+async fn terminal_before_steer_rejection_preserves_the_input() {
+    rejected_steer_is_delivered_once("no active turn", true, false).await;
+}
+
+#[tokio::test]
+async fn unsupported_live_steer_falls_back_without_losing_the_input() {
+    rejected_steer_is_delivered_once("Method not found", false, true).await;
+}
+
+#[tokio::test]
+async fn unsupported_probe_keeps_legacy_capability_without_using_the_version() {
+    let handler = r#"    *'"method":"turn/steer"'*)
+      printf '{"id":%s,"error":{"code":-32600,"message":"Invalid request: unknown variant turn/steer"}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)"#;
+    let script = stub_script(HAPPY_TURN_BODY)
+        .replace("stub/0.139.0", "stub/999.0")
+        .replace("    *'\"method\":\"turn/start\"'*)", handler);
+    let mut s = stub_driver_scripted(&script, None);
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init {
+            can_steer: false,
+            ..
+        }
+    ));
+    drop(s.input_tx);
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Exited { .. }
+    ));
+}
+
+#[tokio::test]
+async fn mid_turn_input_steers_once_without_interrupting() {
+    successful_steer(false).await;
+}
+
+#[tokio::test]
+async fn a_terminal_before_steer_acceptance_waits_for_the_receipt() {
+    successful_steer(true).await;
+}
+
+async fn successful_steer(terminal_first: bool) {
+    let script = stub_script("").replace(
+        "    *'\"method\":\"turn/start\"'*)",
+        r#"    *'"method":"turn/steer"'*)
+      case "$line" in
+        *'"input":[]'*) printf '{"id":%s,"error":{"code":-32600,"message":"thread not found"}}\n' "$id" ;;
+        *)
+          printf '{"id":%s,"result":{"turnId":"turn-1"}}\n' "$id"
+          printf '{"method":"item/completed","params":{"threadId":"t-1","item":{"id":"a","type":"agentMessage","phase":"final_answer","text":"Finished original work with the follow-up"}}}\n'
+          printf '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-1","status":"completed"}}}\n'
+          ;;
+      esac
+      ;;
+    *'"method":"turn/start"'*)"#,
+    );
+    let acknowledgement = r#"printf '{"id":%s,"result":{"turnId":"turn-1"}}\n' "$id""#;
+    let terminal = r#"printf '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-1","status":"completed"}}}\n'"#;
+    let script = if terminal_first {
+        script
+            .replace(acknowledgement, "")
+            .replace(terminal, &format!("{terminal}\n{acknowledgement}"))
+    } else {
+        script
+    };
+    let mut s = stub_driver_scripted(&script, None);
+    let first = uuid::Uuid::new_v4();
+    let followup = uuid::Uuid::new_v4();
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "Finish the implementation".into(),
+            images: vec![],
+            uuid: first,
+        })
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init {
+            can_steer: true,
+            ..
+        }
+    ));
+    assert!(
+        matches!(next_event(&mut s.events_rx).await, AgentEvent::InputRead { input } if input == first)
+    );
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "Show me the colors too".into(),
+            images: vec![],
+            uuid: followup,
+        })
+        .unwrap();
+    // Text may stream before acknowledgement, but the terminal must wait.
+    let mut reads = 0;
+    let mut messages = 0;
+    for _ in 0..2 {
+        match next_event(&mut s.events_rx).await {
+            AgentEvent::InputRead { input } if input == followup => reads += 1,
+            AgentEvent::Message { .. } => messages += 1,
+            other => panic!("unexpected event before receipt and terminal: {other:?}"),
+        }
+    }
+    assert_eq!((reads, messages), (1, 1));
+    let AgentEvent::Result {
+        error: None,
+        turn_end: Some(turn_end),
+        ..
+    } = next_event(&mut s.events_rx).await
+    else {
+        panic!("expected an error-free Result with turn-end facts");
+    };
+    assert_eq!(
+        turn_end,
+        crate::engine::thread_events::TurnEndFacts {
+            status: crate::engine::thread_events::TurnEndStatus::Completed,
+            final_answer: true,
+            agent_messages: 1,
+            steered_inputs: 1,
+            last_item: Some("agentMessage".to_string()),
+        },
+        "the turn end records the steer Codex accepted"
+    );
+    let requests: Vec<serde_json::Value> = std::fs::read_to_string(&s.requests_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["method"] == "turn/start")
+            .count(),
+        1
+    );
+    assert!(!requests.iter().any(|r| r["method"] == "turn/interrupt"));
+    let steer = requests
+        .iter()
+        .find(|r| r["method"] == "turn/steer" && r["params"]["expectedTurnId"] == "turn-1")
+        .expect("steer targets the live turn");
+    assert_eq!(steer["params"]["threadId"], "t-1");
+    assert_eq!(
+        steer["params"]["input"][0]["text"],
+        "Show me the colors too"
+    );
+    drop(s.input_tx);
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Exited { .. }
+    ));
+}
+
 fn stub_driver(turn_body: &str, resume: Option<&str>) -> StubSession {
     stub_driver_scripted(&stub_script(turn_body), resume)
 }
@@ -67,16 +351,20 @@ fn stub_driver(turn_body: &str, resume: Option<&str>) -> StubSession {
 /// [`stub_driver`] over a whole stub script, for a child that answers a request
 /// differently from [`stub_script`].
 fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
+    stub_driver_with_env(stub, resume, Vec::new())
+}
+
+fn stub_driver_with_env(
+    stub: &str,
+    resume: Option<&str>,
+    mut env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> StubSession {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let requests_log = tmp.path().join("requests.log");
     let script = tmp.path().join("codex-stub.sh");
-    std::fs::write(&script, stub).expect("write stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_stub_executable(&script, stub);
 
+    env.push(("STUB_LOG".into(), requests_log.clone().into_os_string()));
     let config = CodexConfig {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
@@ -85,11 +373,10 @@ fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
-        env: vec![(
-            std::ffi::OsString::from("STUB_LOG"),
-            requests_log.clone().into_os_string(),
-        )],
+        env,
     };
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -119,15 +406,226 @@ fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
     }
 }
 
+#[tokio::test]
+async fn standing_deny_hook_must_be_verified_before_the_first_turn() {
+    let handler = r#"    *'"method":"hooks/list"'*)
+      printf '{"id":%s,"result":{"data":[]}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)"#;
+    let script = stub_script("").replace("    *'\"method\":\"turn/start\"'*)", handler);
+    let mut session = stub_driver_with_env(
+        &script,
+        None,
+        vec![("LUCIDOS_THREAD_ID".into(), "test".into())],
+    );
+    session
+        .input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "First turn".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .unwrap();
+    let mut refused = false;
+    loop {
+        match next_event(&mut session.events_rx).await {
+            AgentEvent::Result { error, .. } => {
+                assert!(error
+                    .unwrap()
+                    .contains("could not verify the standing deny hook"));
+                refused = true;
+            }
+            AgentEvent::Exited { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(refused);
+    let requests = std::fs::read_to_string(&session.requests_log).unwrap();
+    assert!(requests.contains("\"method\":\"hooks/list\""));
+    assert!(!requests.contains("\"method\":\"turn/start\""));
+}
+
 async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> AgentEvent {
     // 30s, not 10s: each stub turn forks an `sh` child; under a fully loaded
     // full-suite run (3k+ tests sharing the host) the spawn + pipe round
     // trips have been observed to exceed 10s. The timeout only bounds
     // failure latency — passing runs never wait it out.
-    tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
-        .await
-        .expect("event within 30s")
-        .expect("events channel open")
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let event = rx.recv().await.expect("events channel open");
+            // Content/permission tests leave billing observations to the
+            // dedicated account/config integration test below.
+            if !matches!(event, AgentEvent::BillingObserved { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("event within 30s")
+}
+
+#[tokio::test]
+async fn effective_account_and_config_are_observed_before_usage_on_resume() {
+    let mut s = stub_driver(HAPPY_TURN_BODY, Some("t-1"));
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "ping".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .unwrap();
+    let mut provider = None;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            match s.events_rx.recv().await.expect("open") {
+                AgentEvent::BillingObserved { attribution } => {
+                    provider = Some(attribution.provider_id())
+                }
+                AgentEvent::Usage { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("usage arrives");
+    assert_eq!(provider, Some("openai"));
+    let requests = logged_requests(&s.requests_log);
+    let position = |method: &str| {
+        requests
+            .iter()
+            .position(|line| line.contains(method))
+            .unwrap()
+    };
+    assert!(position("account/read") < position("turn/start"));
+    assert!(position("config/read") < position("turn/start"));
+    assert!(position("modelProvider/list") < position("turn/start"));
+    s.cancel.cancel();
+}
+
+#[tokio::test]
+async fn codex_resume_startup_snapshot_precedes_new_process_billing_without_losing_counts() {
+    let branch = r#"    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)"#;
+    let startup = r#"      printf '{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","turnId":"old-turn","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":2}}}}\n'"#;
+    let script = stub_script(HAPPY_TURN_BODY)
+        .replace(branch, &format!("{branch}\n{startup}"))
+        .replace("auth=apiKey", "auth=chatgpt");
+    let mut s = stub_driver_scripted(&script, Some("t-1"));
+    let first = next_event(&mut s.events_rx).await;
+    assert!(matches!(first, AgentEvent::UsageRestored { snapshot }
+        if snapshot.input_tokens == 6 && snapshot.cache_read_tokens == 4
+            && snapshot.output_tokens == 2));
+    // The same vector on a newly submitted turn is billed from this process.
+    assert_eq!(
+        billing_for_next_turn(&mut s).await.provider_id(),
+        "chatgpt-plan"
+    );
+    s.cancel.cancel();
+}
+
+async fn billing_for_next_turn(
+    s: &mut StubSession,
+) -> super::super::billing_provider::BillingAttribution {
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "ping".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut billing = None;
+        loop {
+            match s.events_rx.recv().await.expect("open") {
+                AgentEvent::BillingObserved { attribution } => billing = Some(attribution),
+                AgentEvent::Usage { .. } => {
+                    return billing.expect("fresh observation precedes usage")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("usage arrives even without billing support")
+}
+
+#[tokio::test]
+async fn billing_is_reobserved_for_each_turn_after_account_changes() {
+    let script = stub_script(HAPPY_TURN_BODY)
+        .replace("LOG=", "reads=0\nLOG=")
+        .replace("*'\"method\":\"account/read\"'*)", "*'\"method\":\"account/read\"'*)\nreads=$((reads + 1))\n[ \"$reads\" -lt 2 ] || auth=chatgpt");
+    let mut s = stub_driver_scripted(&script, None);
+    let first = billing_for_next_turn(&mut s).await;
+    let second = billing_for_next_turn(&mut s).await;
+    s.cancel.cancel();
+    assert_eq!(first.provider_id(), "openai");
+    assert_eq!(second.provider_id(), "chatgpt-plan");
+    let requests = logged_requests(&s.requests_log);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|line| line.contains("modelProvider/list"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn billing_timeout_and_custom_endpoint_never_inherit_openai() {
+    for script in [
+        stub_script(HAPPY_TURN_BODY).replace("account/read", "unsupported-account-read"),
+        stub_script(HAPPY_TURN_BODY)
+            .replace("modelProvider/list", "unsupported-model-provider-list"),
+        stub_script(HAPPY_TURN_BODY).replace("config/read", "unsupported-config-read"),
+        stub_script(HAPPY_TURN_BODY).replace(
+            r#"https://chatgpt.com/backend-api"#,
+            r#"https://example.com/v1"#,
+        ),
+        stub_script(HAPPY_TURN_BODY)
+            .replace(r#""baseUrl":null"#, r#""baseUrl":"https://example.com/v1""#),
+    ] {
+        let mut s = stub_driver_scripted(&script, Some("t-1"));
+        let billing = billing_for_next_turn(&mut s).await;
+        s.cancel.cancel();
+        assert_eq!(billing.provider_id(), "unknown");
+    }
+}
+
+#[tokio::test]
+async fn a_late_account_reply_cannot_relabel_usage_after_the_timeout() {
+    let body = format!(
+        r#"printf '{{"id":%s,"result":{{"requiresOpenaiAuth":true,"account":{{"type":"apiKey"}}}}}}\n' "$late_id"
+{HAPPY_TURN_BODY}"#
+    );
+    let script = stub_script(&body).replace(
+        r#"printf '{"id":%s,"result":{"requiresOpenaiAuth":true,"account":{"type":"%s"}}}\n' "$id" "$auth""#,
+        "late_id=$id",
+    );
+    assert!(
+        script.contains("late_id=$id"),
+        "stub replacement must match"
+    );
+    let mut s = stub_driver_scripted(&script, None);
+    let billing = billing_for_next_turn(&mut s).await;
+    s.cancel.cancel();
+    assert_eq!(billing.provider_id(), "unknown");
+}
+
+#[tokio::test]
+async fn a_late_provider_reply_cannot_relabel_usage_after_the_timeout() {
+    let response = r#"printf '{"id":%s,"result":{"defaultProviderId":"openai","data":[{"id":"openai","baseUrl":null,"settings":{"type":"openai"}}]}}\n' "$id""#;
+    let body = format!("{}\n{HAPPY_TURN_BODY}", response.replace("$id", "$late_id"));
+    let script = stub_script(&body).replacen(response, "late_id=$id", 1);
+    assert!(
+        script.contains("late_id=$id"),
+        "stub replacement must match"
+    );
+    let mut s = stub_driver_scripted(&script, None);
+    let billing = billing_for_next_turn(&mut s).await;
+    s.cancel.cancel();
+    assert_eq!(billing.provider_id(), "unknown");
 }
 
 fn logged_requests(log: &Path) -> Vec<String> {
@@ -150,6 +648,7 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
     let ping = uuid::Uuid::new_v4();
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: ping,
@@ -233,11 +732,56 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
     );
 }
 
+/// A sub-agent runs on its own thread over the same connection. Its turn end
+/// must neither end the session's turn nor abandon the session's open command.
+const SUB_AGENT_TURN_END_BODY: &str = r#"printf '{"method":"item/started","params":{"threadId":"t-1","turnId":"turn-1","item":{"id":"c1","type":"commandExecution","command":"./harden.sh","commandActions":[],"cwd":"/wt","status":"inProgress"}}}\n'
+      printf '{"method":"turn/completed","params":{"threadId":"t-sub","turn":{"id":"turn-sub","items":[],"status":"completed"}}}\n'
+      printf '{"method":"item/completed","params":{"threadId":"t-1","turnId":"turn-1","item":{"id":"c1","type":"commandExecution","command":"./harden.sh","commandActions":[],"cwd":"/wt","status":"completed","aggregatedOutput":"ok","exitCode":0}}}\n'
+      printf '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}\n'"#;
+
+#[tokio::test]
+async fn a_sub_agents_turn_end_does_not_end_the_session_turn() {
+    let mut s = stub_driver(SUB_AGENT_TURN_END_BODY, None);
+    s.input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "go".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .expect("send input");
+
+    let mut seen = Vec::new();
+    loop {
+        let ev = next_event(&mut s.events_rx).await;
+        let done = matches!(ev, AgentEvent::Result { .. });
+        seen.push(ev);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { id, status, .. } if id == "c1" && status == "success"
+        )),
+        "the command must finish normally, not as abandoned: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { status, .. } if status == "error"
+        )),
+        "no abandoned tool result: {seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn resume_uses_thread_resume_with_stored_id() {
     let mut s = stub_driver(HAPPY_TURN_BODY, Some("sid-9"));
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "follow up".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -274,6 +818,7 @@ async fn approval_round_trip_accept_reaches_the_child() {
     let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -324,6 +869,7 @@ async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
     let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -372,6 +918,7 @@ async fn approval_deny_sends_decline() {
     let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -412,6 +959,7 @@ async fn withdraw(s: &StubSession, input_uuid: uuid::Uuid) -> InputWithdrawal {
 
 fn input(text: &str) -> AgentInput {
     AgentInput {
+        defer_on_steer_failure: false,
         text: text.into(),
         images: vec![],
         uuid: uuid::Uuid::new_v4(),
@@ -479,6 +1027,7 @@ async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
     let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -528,6 +1077,7 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
     let mut s = stub_driver(turn_body, None);
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -562,6 +1112,23 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
 }
 
 #[tokio::test]
+async fn an_unrequested_interrupt_fails_the_turn() {
+    let turn_body = r#"printf '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-1","items":[],"status":"interrupted"}}}\n'"#;
+    let mut s = stub_driver(turn_body, None);
+    s.input_tx.send(input("go")).unwrap();
+    let error = loop {
+        if let AgentEvent::Result { error, .. } = next_event(&mut s.events_rx).await {
+            break error;
+        }
+    };
+    assert_eq!(
+        error.as_deref(),
+        Some(crate::runtime::codex::UNREQUESTED_INTERRUPT_ERROR)
+    );
+    s.cancel.cancel();
+}
+
+#[tokio::test]
 async fn cancellation_kills_session_and_emits_exited() {
     let mut s = stub_driver(HAPPY_TURN_BODY, None);
     s.cancel.cancel();
@@ -583,7 +1150,7 @@ async fn stale_resume_falls_back_to_fresh_thread() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let requests_log = tmp.path().join("requests.log");
     let script = tmp.path().join("codex-stub.sh");
-    std::fs::write(
+    write_stub_executable(
         &script,
         r##"#!/bin/sh
 LOG="$STUB_LOG"
@@ -608,13 +1175,7 @@ while IFS= read -r line; do
   esac
 done
 "##,
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     let config = CodexConfig {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
@@ -623,6 +1184,8 @@ done
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: vec![(
             std::ffi::OsString::from("STUB_LOG"),
@@ -646,6 +1209,7 @@ done
     ));
     input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "continue please".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -721,6 +1285,7 @@ done
     let rejected = uuid::Uuid::new_v4();
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: rejected,
@@ -748,6 +1313,7 @@ done
     // session context.
     s.input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "again".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -806,16 +1372,10 @@ async fn a_child_that_dies_before_its_handshake_reports_its_words_and_code() {
 async fn the_stderr_tail_masks_the_spawns_injected_secrets() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let script = tmp.path().join("codex-stub.sh");
-    std::fs::write(
+    write_stub_executable(
         &script,
         "#!/bin/sh\necho \"bad token $LUCIDOS_AGENT_ORIGIN_TOKEN\" >&2\nexit 1\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     let config = CodexConfig {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
@@ -824,9 +1384,11 @@ async fn the_stderr_tail_masks_the_spawns_injected_secrets() {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: vec![(
-            std::ffi::OsString::from(crate::api::actor::ENV_AGENT_ORIGIN_TOKEN),
+            std::ffi::OsString::from(crate::core::subprocess_origin::ENV_AGENT_ORIGIN_TOKEN),
             std::ffi::OsString::from("origin-token-0123456789"),
         )],
     };
@@ -850,4 +1412,79 @@ async fn the_stderr_tail_masks_the_spawns_injected_secrets() {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn context_ceiling_rejected_steer_waits_for_idle_without_interrupting() {
+    rejected_steer_policy("unknown method", false, true, true).await;
+    rejected_steer_policy("expected turn mismatch", false, false, true).await;
+}
+
+/// A Stop racing a refused RPC must not leave its fallback queued for a new turn.
+#[tokio::test]
+async fn context_ceiling_withdraw_during_steer_refusal_never_starts_another_turn() {
+    let handler = r#"    *'"method":"turn/steer"'*)
+      case "$line" in
+        *'"input":[]'*) printf '{"id":%s,"error":{"code":-32600,"message":"thread not found"}}\n' "$id" ;;
+        *)
+          printf '{"method":"item/completed","params":{"threadId":"t-1","turnId":"turn-1","item":{"id":"receipt","type":"agentMessage","text":"steer pending"}}}\n'
+          while [ ! -f "$LOG.release" ]; do sleep 0.01; done
+          printf '{"id":%s,"error":{"code":-32601,"message":"unknown method"}}\n' "$id"
+          printf '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"turn-1","status":"completed"}}}\n'
+          ;;
+      esac
+      ;;
+    *'"method":"turn/start"'*)"#;
+    let script = stub_script("").replace("    *'\"method\":\"turn/start\"'*)", handler);
+    let mut s = stub_driver_scripted(&script, None);
+    let running = input("work");
+    s.input_tx.send(running.clone()).unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init {
+            can_steer: true,
+            ..
+        }
+    ));
+    assert!(
+        matches!(next_event(&mut s.events_rx).await, AgentEvent::InputRead { input: id } if id == running.uuid)
+    );
+    let mut ceiling = input("handoff");
+    ceiling.defer_on_steer_failure = true;
+    s.input_tx.send(ceiling.clone()).unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Message { .. }
+    ));
+    assert_eq!(
+        withdraw(&s, ceiling.uuid).await,
+        InputWithdrawal::AlreadyRead
+    );
+    std::fs::write(format!("{}.release", s.requests_log.display()), "").unwrap();
+    assert!(
+        matches!(next_event(&mut s.events_rx).await, AgentEvent::InputRejected { input } if input == ceiling.uuid)
+    );
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::SteerFallback {
+            interrupting: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Result { .. }
+    ));
+    let requests = logged_requests(&s.requests_log);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|line| line.contains("\"method\":\"turn/start\""))
+            .count(),
+        1
+    );
+    assert!(!requests
+        .iter()
+        .any(|line| line.contains("\"method\":\"turn/interrupt\"")));
+    s.cancel.cancel();
 }

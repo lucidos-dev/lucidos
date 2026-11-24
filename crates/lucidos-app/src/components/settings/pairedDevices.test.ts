@@ -40,8 +40,6 @@ describe('deviceDetails', () => {
   });
 
   it('drops the clause for a device paired before the gateway recorded it', () => {
-    // Every device paired before this shipped has no value, and it fills in on
-    // that device's next request. Faking one would misreport it as stale.
     expect(deviceDetails({ paired_at: pairedAt }, now)).toBe('Paired a month ago');
   });
 
@@ -57,14 +55,10 @@ describe('revokeConfirmMessage', () => {
     const message = revokeConfirmMessage({ label: 'My iPhone', isSelf: true, isLast: false });
     expect(message).toMatch(/device you are using/);
     expect(message).toMatch(/signs you out/);
-    // Other devices are fine, and saying so is what stops this reading worse
-    // than it is.
     expect(message).toMatch(/other paired devices keep working/i);
   });
 
   it('warns that revoking the last device leaves nothing paired', () => {
-    // The one that strands a user: with nothing paired, no browser anywhere can
-    // mint a code, so recovery has to start on the machine.
     const message = revokeConfirmMessage({ label: 'My iPhone', isSelf: false, isLast: true });
     expect(message).toMatch(/only paired device/);
     expect(message).toMatch(/desktop app/);
@@ -86,8 +80,6 @@ describe('revokeConfirmMessage', () => {
   });
 
   it('splits its paragraphs on a blank line, which is what the dialog renders', () => {
-    // `showConfirm` takes one string, and `DialogMessage` makes a paragraph per
-    // blank-line block. A single newline would collapse to a space.
     const message = revokeConfirmMessage({ label: 'My iPhone', isSelf: true, isLast: false });
     expect(message.split('\n\n')).toHaveLength(2);
   });
@@ -99,8 +91,6 @@ describe('where the list sits', () => {
   const settings: string = readFileSync(resolve(here, './SettingsView.tsx'), 'utf8');
 
   it('is one list, on the Devices page', () => {
-    // Two lists under one word made the same phone read as two devices. The
-    // Devices page joins the halves; Access keeps only Pair a device.
     expect(settings).toMatch(/usePairedDevices/);
     expect(settings).toMatch(/buildDeviceRows/);
     expect(page).toMatch(/<PairDeviceSection/);
@@ -112,9 +102,6 @@ describe('where the list sits', () => {
   });
 
   it('still points Access at where Revoke went', () => {
-    // The list moved, so browsing has to be told. A search hit only helps
-    // somebody who already knows the word. The list was pulled up beside Pair a
-    // device because people looking for Revoke did not find it.
     expect(page).toMatch(/openSettingsSubview\('devices'\)/);
     const add = page.indexOf('<PairDeviceSection');
     const pointer = page.indexOf("openSettingsSubview('devices')");
@@ -128,11 +115,6 @@ describe('where the list sits', () => {
 });
 
 
-/**
- * The pairing half is async-fetched, so it is a `Loadable`. All four states
- * have to stay distinct: a gateway that BROKE must never render as a
- * deployment that never had one, which is what a shared `null` did.
- */
 describe('the pairing half as a Loadable', () => {
   it('is a loaded list when the gateway answers', async () => {
     const { pairedRows, pairingIsKnown } = await import('../../store/actions/pairedDevices');
@@ -145,8 +127,6 @@ describe('the pairing half as a Loadable', () => {
   });
 
   it('knows nothing while the fetch is in flight', async () => {
-    // Rendering "Not paired" here would be a guess, and it would flip a moment
-    // later when the real answer lands.
     const { pairedRows, pairingIsKnown } = await import('../../store/actions/pairedDevices');
     expect(pairedRows({ status: 'loading' })).toBe(null);
     expect(pairingIsKnown({ status: 'loading' })).toBe(false);
@@ -162,8 +142,6 @@ describe('the pairing half as a Loadable', () => {
   });
 
   it('treats "no gateway serves this page" as a loaded fact, not a failure', async () => {
-    // A direct engine port answers 404 for `/~/`. There is nothing wrong, and
-    // there is also no pairing to report.
     const { pairedRows, pairingIsKnown, NO_GATEWAY } = await import('../../store/actions/pairedDevices');
     const absent = { status: 'loaded' as const, data: NO_GATEWAY };
     expect(pairedRows(absent)).toBe(null);

@@ -1,11 +1,5 @@
 // @vitest-environment jsdom
-/**
- * The find bar opens only once its targets are in memory (ADR 0436). Until
- * then nothing reads as open. A toggle or a reset takes the waiting open back,
- * so the bar never appears over whatever came next. Each case loads a
- * fresh copy of the bar, so each starts with its targets cold.
- */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
 const chunk = vi.hoisted(() => {
   const state = { release: () => {}, arrived: Promise.resolve() };
@@ -36,6 +30,7 @@ async function land(bar: FindBar): Promise<void> {
 }
 
 describe('opening the find bar before its targets arrive', () => {
+  beforeAll(async () => { await import('./find-bar'); });
   beforeEach(() => { vi.resetModules(); });
 
   it('opens once they land, and not before', async () => {

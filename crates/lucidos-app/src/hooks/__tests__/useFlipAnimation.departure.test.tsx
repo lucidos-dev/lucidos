@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A row that leaves its section exits as a copy, folding where it stood. A
- * thread that lands in another section never flies there. A newer batch must
- * not cut that exit short: another row can land while the copy is still
- * leaving. Every other animation of the older batch is still taken over.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
@@ -33,7 +27,6 @@ function Drawer({ ids, archive = [] }: { ids: string[]; archive?: string[] }) {
     );
 }
 
-/** A row sits at its index in the list. Anything else has no box. */
 function rowRect(this: HTMLElement): DOMRect {
     const id = this.dataset.flipId;
     const rows = id ? [...this.parentElement!.querySelectorAll<HTMLElement>('[data-flip-id]')] : [];
@@ -93,7 +86,6 @@ describe('a departing row copy', () => {
         expect(exit, 'the copy of b animates').toBeDefined();
         expect(slide, 'c slides up into the gap').toBeDefined();
 
-        // Another row lands while b's copy is still leaving.
         render(<Drawer ids={['n', 'a', 'c']} />, host);
         await nextFrame();
 
@@ -125,12 +117,10 @@ describe('a departing row copy', () => {
         const layer = host.querySelector('.flip-departure-layer')!;
         const exit = animations.find(a => layer.contains(a.target))!;
 
-        // An unrelated change keeps b in Archive: its copy keeps folding.
         render(<Drawer ids={['n', 'a', 'c']} archive={['b']} />, host);
         await nextFrame();
         expect(exit.cancelled, 'the exit runs on while b stays moved').toBe(false);
 
-        // A rejected archive puts b back in Current.
         render(<Drawer ids={['n', 'a', 'b', 'c']} />, host);
         await nextFrame();
         expect(exit.cancelled, 'the copy stops leaving').toBe(true);
@@ -151,7 +141,6 @@ describe('a departing row copy', () => {
         const layer = host.querySelector('.flip-departure-layer')!;
         const exit = animations.find(a => layer.contains(a.target))!;
 
-        // A rejected archive puts b straight back.
         render(<Drawer ids={['a', 'b', 'c']} />, host);
         await nextFrame();
 

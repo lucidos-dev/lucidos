@@ -2,19 +2,13 @@ import type { PendingUpload, PendingUploadState } from '../../store/pendingUploa
 import { BlobImage } from '../shared/BlobImage';
 import { CloseIcon, RetryIcon, WarningIcon } from '../shared/icons';
 
-/** How one pending chip draws its state. `ring` is a fraction for a known
- *  amount and `'spin'` for a wait of unknown length. It is null when the chip
- *  shows an action or a verdict instead. */
 export interface PendingChipView {
   ring: number | 'spin' | null;
   caption: string;
-  /** The accessible name of the state, and its tooltip. */
   label: string;
-  /** What the overlay offers: nothing, a Retry, or a refusal that cannot be retried. */
   action: 'none' | 'retry' | 'refused';
 }
 
-/** Pure, so every state is pinned by a test without a renderer. */
 export function pendingChipView(state: PendingUploadState): PendingChipView {
   switch (state.kind) {
     case 'waiting-for-thread':
@@ -24,8 +18,6 @@ export function pendingChipView(state: PendingUploadState): PendingChipView {
       const percent = Math.round(fraction * 100);
       return { ring: fraction, caption: `${percent}%`, label: `Uploading image, ${percent}%`, action: 'none' };
     }
-    // Still uploading to the user: on a phone, WebKit hands over a small image
-    // before any of its bytes travel, so this state covers the real transfer.
     case 'finishing':
       return { ring: 'spin', caption: 'Uploading', label: 'Uploading image, waiting for Lucidos to confirm', action: 'none' };
     case 'retrying':
@@ -43,7 +35,6 @@ const RING_RADIUS = 15;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
 function ProgressRing({ ring }: { ring: number | 'spin' }) {
-  // A spinning ring shows a fixed quarter arc; the turning says "working".
   const fraction = ring === 'spin' ? 0.25 : ring;
   return (
     <svg class={`upload-ring${ring === 'spin' ? ' upload-ring-spin' : ''}`} viewBox="0 0 36 36" aria-hidden="true">
@@ -68,8 +59,6 @@ interface PendingUploadChipProps {
   onRemove: () => void;
 }
 
-/** An attached image still on its way to the engine. It never looks like a
- *  finished one: it shows progress, a wait, or what went wrong. */
 export function PendingUploadChip({ upload, onOpen, onRetry, onRemove }: PendingUploadChipProps) {
   const view = pendingChipView(upload.state);
   const failed = upload.state.kind === 'failed';
@@ -82,8 +71,6 @@ export function PendingUploadChip({ upload, onOpen, onRetry, onRemove }: Pending
         src={upload.previewUrl}
         class="image-preview-thumb"
         onClick={(e) => onOpen(e.currentTarget)}
-        // The progress overlay lets taps through to the thumbnail, so the
-        // thumbnail carries its tooltip.
         data-tooltip={view.action === 'none' ? view.label : undefined}
       />
       {view.action === 'retry' ? (

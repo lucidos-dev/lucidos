@@ -1,6 +1,6 @@
 # 0213: One opener buys one answer: the floor is spent by the answer it bought, never held for the call
 
-- **Status**: Accepted
+- **Status**: Accepted, and amended by [ADR 0666](0666-a-call-opens-listening.md)
 - **Date**: 2026-09-17
 
 ## Context
@@ -126,3 +126,30 @@ saying" with a delegation and a wait.
 **Reword the block and tell the talker to wait.** ADR 0211 weighed and rejected
 this as the whole fix, for the reason that still holds. The fence here is that
 idea kept as the cheap half, under a mechanism.
+
+## Amendment, 2026-11-11: the record leaves out what was said aloud, and marks where each call ended
+
+**The fence alone failed on the Live talker.** Two calls on one thread opened on
+a non-speech caller row, a chuckle and noise read as Portuguese. Each time the
+talker recited the earlier call's own lines, in order: the hand-over, the
+progress claims, "just a minute". One claimed work no doer turn was doing. The
+budget above held, and the eight turns it allows were enough to recite.
+
+**So the record no longer holds a line the talker wrote.** Its spoken rows and
+its delegation reasons are left out. The caller's rows stay, and so do the
+doer's written answers, which carry every fact the spoken lines paraphrased.
+`RECORD_OPENS` says the spoken lines are left out, and `You` now names what
+Lucidos wrote back.
+
+**Each earlier call ends with a mark, in place.** It says how the call ended. Some
+calls end on a reply cut off. Their mark says the caller did not hear all of the
+last answer, so passing it on again stays honest. The last line before
+the fence is then a finished call, not the one starting.
+
+**The filter lives in the section, never in the fold.** The doer reads the same
+fold and keeps every spoken row (ADR 0149).
+
+This retires the alternative above, "Drop the conversation turns from the
+block", only in part. The caller's turns and the written answers stay, so "what
+were we saying" still has an answer. What goes is the talker's script.
+Evidence: `docs/plans/2026-11-11-live-voice-call-review.md` § F0.

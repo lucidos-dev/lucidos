@@ -1,10 +1,3 @@
-/**
- * The toast stack is ONE stack, in the window's bottom-right corner on desktop
- * and below the header on a phone. The corner is decision 6 of
- * docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md. This pins its
- * geometry, so a stray shape rule or a per-pane column cannot come back
- * unnoticed.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -48,8 +41,6 @@ describe('the toast corner', () => {
   it('keeps no other shape and no per-pane column', () => {
     expect(componentsCss).not.toContain('data-toast-placement');
     expect(componentsCss).not.toContain('data-toast-pane');
-    // A window-anchored stack never moves with the divider, so it has no place
-    // on the drag kill list.
     expect(shellCss).not.toContain('.toast-column');
   });
 });

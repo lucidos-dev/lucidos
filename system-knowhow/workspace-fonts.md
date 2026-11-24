@@ -92,8 +92,8 @@ with the reason, such as a missing face file. Fix the file, or remove the font.
   calling device, or the user picks it under Settings → Appearance & Behavior → Typography → Font.
 - **From a theme:** name it in `fonts.ui`, or in `fonts.mono` for a `mono` font.
   The theme write is refused unless the font is installed and fits the slot. See
-  `system-knowhow/themes.md` § Fonts. Approval cards still show a command in a
-  catalog code font (`system-knowhow/themes.md` § Protected surfaces).
+  `system-knowhow/themes/switch-themes.md` § Fonts. Approval cards still show a command in a
+  catalog code font (`system-knowhow/themes/switch-themes.md` § Protected surfaces).
 
 If the font is removed later, the preference or theme quietly paints as if it
 named nothing.

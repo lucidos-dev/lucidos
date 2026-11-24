@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** The checkpoint modal draws diff cards as its loading placeholder, past the
- *  delay gate, never a spinner. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

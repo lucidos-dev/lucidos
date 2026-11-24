@@ -60,7 +60,7 @@ impl QuestionMove {
             Self::Asked(tool_use_id.clone())
         } else if let ThreadEvent::CodingAgentToolResult { tool_use_id, .. } = event {
             Self::ResultOf(tool_use_id.clone())
-        } else if super::agent_recovery::ends_question_park(event.event_type()) {
+        } else if crate::engine::question_park_sql::ends_question_park(event.event_type()) {
             Self::Ended
         } else {
             Self::Untouched
@@ -166,7 +166,7 @@ where
             // cache is stale too, and a thread back in its cached state would
             // read as unchanged.
             Err(BroadcastStreamRecvError::Lagged(n)) => {
-                log!(
+                log_legacy!(
                     "[PendingChangeWatch] Broadcast lagged by {} events, rebuilding the changes frame",
                     n
                 );
@@ -262,6 +262,7 @@ mod tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         }
     }
 

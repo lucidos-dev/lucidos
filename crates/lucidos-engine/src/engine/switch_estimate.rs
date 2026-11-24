@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use super::cache_ttl::{CacheTtl, WriteSplit};
 use super::handoff_estimate::thread_model;
-use super::successor::{
-    current_session_capture_sql, last_cache_refresh_started_sql, thread_context,
+use crate::engine::handoff_state::thread_context;
+use crate::engine::session_capture_sql::{
+    current_session_capture_sql, last_cache_refresh_started_sql,
 };
 use crate::llm::model_prices::{price_of, ModelPrice};
 use crate::runtime::intelligence_ladder::{model_run_by, runs_same_model};
@@ -81,7 +82,7 @@ pub enum CacheRebuild {
 
 /// How warm a thread's prompt cache is now, as evidence shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheRemaining {
+pub enum CacheRemaining {
     /// Warm for this many more whole seconds.
     Warm(i64),
     /// Its lifetime passed, or the thread never wrote a cache.
@@ -127,7 +128,7 @@ pub(crate) fn estimate(
 
 /// The model and effort `thread_id`'s latest turn in its current session ran
 /// at: the current pair of a thread with no live session to ask.
-pub(crate) async fn last_turn_settings(
+pub async fn last_turn_settings(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
@@ -145,7 +146,7 @@ pub(crate) async fn last_turn_settings(
 
 /// The estimate for switching `thread_id` to `target`. `current` is the
 /// model and effort the thread runs on.
-pub(crate) async fn switch_estimate(
+pub async fn switch_estimate(
     pool: &PgPool,
     thread_id: Uuid,
     subject: SwitchSubject,
@@ -213,7 +214,7 @@ pub(crate) async fn cache_remaining(
 }
 
 /// [`cache_remaining`], with the TTL evidence it was measured on.
-pub(crate) async fn cache_remaining_and_ttl(
+pub async fn cache_remaining_and_ttl(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<(CacheRemaining, CacheTtl), sqlx::Error> {

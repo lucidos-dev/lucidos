@@ -8,7 +8,6 @@
 
 use super::landing::{landing_merge_of, move_local_main, LandingMerge, MAX_PUSH_ATTEMPTS};
 use super::LaneMember;
-use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
     add_paths_to_worktree_exclude, clear_stranded_worktree_dir, consume_harden_marker,
     consume_plan_marker, git_answer, git_answer_when_ok, git_cmd, has_unmerged_paths, landing_base,
@@ -16,6 +15,7 @@ use crate::engine::git_ops::{
     worktree_current_branch, worktree_liveness, worktrees_dir, BaseRefusal, GitAnswer,
     LandingOrder, MainLocks, PushOutcome, LANE_BRANCH_PREFIX,
 };
+use crate::engine::worktree_artifacts::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::worktree_cleanup::{
     remove_worktree_and_optionally_delete_branch, BranchDisposal,
 };
@@ -30,9 +30,9 @@ const SHORT_BATCH_ID_LEN: usize = 8;
 
 /// Where a lane batch resolves: its worktree and its integration branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaneWorktree {
-    pub(crate) path: PathBuf,
-    pub(crate) branch: String,
+pub struct LaneWorktree {
+    pub path: PathBuf,
+    pub branch: String,
 }
 
 impl LaneWorktree {
@@ -120,16 +120,16 @@ pub(crate) async fn ensure_lane_worktree(
     }
     let marker = lane.path.join(WORKTREE_WORKSPACE_MARKER);
     if let Err(e) = tokio::fs::write(&marker, workspace.to_string_lossy().as_bytes()).await {
-        log!(
+        log_legacy!(
             "[LandingLane] Failed to tag {} for this workspace: {}",
             lane.path.display(),
             e
         );
     }
     add_paths_to_worktree_exclude(&lane.path, WORKTREE_EXCLUDE_PATHS).await;
-    crate::engine::agent_session::link_node_modules(repo_root, &lane.path).await;
+    crate::engine::worktree_provision::link_node_modules(repo_root, &lane.path).await;
     // After node_modules: the SDK bundles build with its esbuild.
-    crate::engine::agent_session::provision_generated_files(&lane.path).await;
+    crate::engine::worktree_provision::provision_generated_files(&lane.path).await;
     Ok(())
 }
 
@@ -202,9 +202,91 @@ pub(crate) async fn verify_integration(
     Ok(merges)
 }
 
+/// Full hardening for the head read while the driver holds the lane thread.
+pub(crate) struct IntegrationCertification {
+    head: Option<String>,
+}
+
+impl IntegrationCertification {
+    pub(crate) async fn load(pool: &sqlx::PgPool, repo: &Path, branch: &str) -> Self {
+        use crate::engine::git_ops::{harden_marker, HardenMarker, HardenTier};
+        let head = match harden_marker(pool, repo, branch).await {
+            HardenMarker::Recorded {
+                head_sha,
+                fresh: true,
+                tier: HardenTier::Full,
+            } => Some(head_sha),
+            _ => None,
+        };
+        Self { head }
+    }
+}
+
+/// Context for carrying a certificate while main-check coverage is active.
+pub(crate) struct CertificateCarry<'a> {
+    pub(crate) bus: &'a crate::engine::event_bus::EventBus,
+    pub(crate) batch_id: Uuid,
+    pub(crate) branch: &'a str,
+    pub(crate) merges: &'a [(Uuid, LandingMerge)],
+}
+
+async fn changed_paths(worktree: &Path, from: &str, to: &str) -> Result<Vec<Vec<u8>>, String> {
+    let diff = git_cmd(
+        &[
+            "diff",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--name-only",
+            "-z",
+            from,
+            to,
+            "--",
+        ],
+        worktree,
+    )
+    .await?;
+    if !diff.status.success() {
+        return Err(String::from_utf8_lossy(&diff.stderr).into_owned());
+    }
+    Ok(diff
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|p| !p.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+async fn disjoint_catch_up(
+    worktree: &Path,
+    before: &str,
+    main: &str,
+    head: &str,
+    merges: &[(Uuid, LandingMerge)],
+) -> Result<bool, String> {
+    let parents = git_stdout(&["show", "-s", "--format=%P", head], worktree).await?;
+    if !parents.split_whitespace().eq([before, main]) {
+        return Ok(false);
+    }
+    let base = git_stdout(&["merge-base", "--all", before, main], worktree).await?;
+    if base.lines().count() != 1 {
+        return Ok(false);
+    }
+    let incoming: std::collections::HashSet<_> = changed_paths(worktree, &base, main)
+        .await?
+        .into_iter()
+        .collect();
+    let mut batch = changed_paths(worktree, &base, before).await?;
+    for (_, merge) in merges {
+        batch.extend(changed_paths(worktree, &merge.first_parent, &merge.merge_sha).await?);
+    }
+    Ok(batch.iter().all(|path| !incoming.contains(path)))
+}
+
 /// What landing the integration branch did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IntegrationLanding {
+    /// No current full certification; a catch-up may have changed the head.
+    NeedsHardening { caught_up: bool },
     /// `main` moved from `pre` to `post`.
     Landed { pre: String, post: String },
     /// `main` gained commits that conflict with the resolution. The catch-up
@@ -221,21 +303,34 @@ pub(crate) enum IntegrationLanding {
 
 /// Land a verified integration branch, under the merge lock, so nothing moves
 /// `main` between the read and the move. When `main` moved since the branch
-/// last held it, `main` merges in first. A clean catch-up lands. A
-/// conflicting one is aborted and reported, never a failure.
+/// last held it, `main` merges in first. A disjoint catch-up can carry hardening.
+/// A conflicting catch-up is aborted and reported, never a failure.
 ///
 /// Origin-first, `main` means `origin/main`. The batch is fetched against,
 /// pushed, and only then moves local `main`. A rejected push catches up again.
 /// Local-first, the caller pushes after.
 pub(crate) async fn land_integration(
+    remote: &[&LaneMember],
     locks: &MainLocks,
     repo_root: &Path,
     order: &LandingOrder,
     worktree: &Path,
+    certification: &IntegrationCertification,
+    carry: Option<CertificateCarry<'_>>,
 ) -> Result<IntegrationLanding, String> {
     let _merge = locks.lock_merge().await;
+    let mut certified = certification.head.clone();
     let mut rejected = String::new();
     for _ in 0..MAX_PUSH_ATTEMPTS {
+        let before = git_stdout(&["rev-parse", "HEAD"], worktree).await?;
+        if certified.as_deref() != Some(before.as_str()) {
+            return Ok(IntegrationLanding::NeedsHardening { caught_up: false });
+        }
+        let order = if remote.is_empty() {
+            order
+        } else {
+            &LandingOrder::OriginFirst
+        };
         let base = match landing_base(repo_root, order).await {
             Ok(base) => base,
             Err(BaseRefusal::MainUnreadable(e)) => return Err(e),
@@ -245,7 +340,37 @@ pub(crate) async fn land_integration(
             return Ok(conflict);
         }
         let head = git_stdout(&["rev-parse", "HEAD"], worktree).await?;
-        if base.origin.needs_push(&head) {
+        if head != before {
+            let Some(carry) = &carry else {
+                return Ok(IntegrationLanding::NeedsHardening { caught_up: true });
+            };
+            if !disjoint_catch_up(worktree, &before, &base.base, &head, carry.merges)
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(IntegrationLanding::NeedsHardening { caught_up: true });
+            }
+            if let Err(e) = crate::engine::git_ops::carry_harden_marker(
+                carry.bus,
+                repo_root,
+                carry.branch,
+                carry.batch_id,
+                &before,
+                &head,
+            )
+            .await
+            {
+                log_legacy!("[LandingLane] could not carry hardening: {}", e);
+                return Ok(IntegrationLanding::NeedsHardening { caught_up: true });
+            }
+            certified = Some(head.clone());
+        }
+        if !remote.is_empty() {
+            if let Err(error) = super::remote::land(repo_root, &head, remote).await {
+                rejected = error;
+                continue;
+            }
+        } else if base.origin.needs_push(&head) {
             match push_to_origin_main(repo_root, &head).await {
                 PushOutcome::Pushed => {}
                 PushOutcome::Rejected(e) => {
@@ -299,7 +424,7 @@ async fn catch_up(worktree: &Path, main: &str) -> Result<Option<IntegrationLandi
                 .map(|log| log.lines().map(str::to_string).collect())
                 .unwrap_or_default();
             if let Err(e) = git_stdout(&["merge", "--abort"], worktree).await {
-                log!("[LandingLane] catch-up merge --abort: {}", e);
+                log_legacy!("[LandingLane] catch-up merge --abort: {}", e);
             }
             Ok(Some(IntegrationLanding::CatchUpConflict {
                 main_sha: main.to_string(),
@@ -337,11 +462,11 @@ pub(crate) async fn remove_lane_worktree(repo_root: &Path, lane: &LaneWorktree) 
                 BranchDisposal::WhenMerged
             };
         match remove_worktree_and_optionally_delete_branch(&lane.path, None, disposal).await {
-            Some(_) => log!(
+            Some(_) => log_legacy!(
                 "[LandingLane] removed lane worktree {}",
                 lane.path.display()
             ),
-            None => log!(
+            None => log_legacy!(
                 "[LandingLane] kept lane worktree {}: it could not be moved aside",
                 lane.path.display()
             ),
@@ -352,7 +477,7 @@ pub(crate) async fn remove_lane_worktree(repo_root: &Path, lane: &LaneWorktree) 
         GitAnswer::No => return true,
         GitAnswer::Yes => {}
         GitAnswer::Unknown => {
-            log!(
+            log_legacy!(
                 "[LandingLane] could not read whether {} is gone",
                 lane.branch
             );
@@ -361,11 +486,11 @@ pub(crate) async fn remove_lane_worktree(repo_root: &Path, lane: &LaneWorktree) 
     }
     match git_stdout(&["branch", "-D", &lane.branch], repo_root).await {
         Ok(_) => {
-            log!("[LandingLane] deleted {}", lane.branch);
+            log_legacy!("[LandingLane] deleted {}", lane.branch);
             true
         }
         Err(e) => {
-            log!("[LandingLane] kept {}: {}", lane.branch, e);
+            log_legacy!("[LandingLane] kept {}: {}", lane.branch, e);
             false
         }
     }

@@ -1,16 +1,3 @@
-/**
- * The header's pane dividers run to the window's top edge.
- *
- * The bug: on the packaged macOS build a theme with a visible
- * `--header-divider` drew both dividers from the header's top edge down. The
- * reclaimed title-bar band above stayed unbroken, so each divider read as a
- * stub hanging from the band. The focus wash already rises through the band
- * by the same `--titlebar-inset`, so the dividers now match it.
- *
- * Off the macOS Tauri build `--titlebar-inset` is unset, so the rise is 0px.
- *
- * A SOURCE SCAN because no WebDriver reaches WKWebView (ADR 0016).
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

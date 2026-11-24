@@ -15,13 +15,13 @@
 #   ./scripts/e2e.sh [--no-webkit]                   # on GitHub's runners when it can, ADR 0386
 #   ./scripts/e2e.sh --local [--packaged] [--no-webkit]   # on this host
 #
-# --no-webkit skips the mobile-webkit browser project. The compressor does not
+# --no-webkit skips the two WebKit browser projects. The compressor does not
 # drain between projects, so mobile-webkit spends the session's whole budget
-# whenever it runs. Splitting it out is what lets the other five finish and
-# lets it start from a cold host:
+# whenever it runs. Splitting WebKit out lets the cheap projects finish and
+# lets WebKit start from a cold host:
 #
-#   ./scripts/e2e.sh --local --no-webkit          # the five cheap projects
-#   ./scripts/e2e-browser.sh --local --webkit     # then mobile-webkit, on a cold host
+#   ./scripts/e2e.sh --local --no-webkit          # the cheap projects
+#   ./scripts/e2e-browser.sh --local --webkit     # then WebKit, on a cold host
 #
 # --packaged (or LUCIDOS_E2E_PACKAGED=1) appends the macOS packaged-build boot
 # smoke test (scripts/e2e-packaged.sh) as a final phase. OFF by default: it does a

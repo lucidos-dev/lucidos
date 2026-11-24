@@ -7,9 +7,6 @@ describe('isUnstampedBuildId', () => {
   });
 
   it('treats a real stamped id as carrying a staleness signal', () => {
-    // A stamped id is the hex digest of the emitted asset filenames — never
-    // underscore-prefixed. Mistaking one for the placeholder would silently
-    // disable the refresh badge for a genuinely stale bundle.
     expect(isUnstampedBuildId('1ba1c823d933')).toBe(false);
   });
 

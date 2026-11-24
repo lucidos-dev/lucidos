@@ -1,10 +1,3 @@
-/**
- * Tests for categorizeThreads + the family-aware effective sort keys in
- * ThreadDrawer. The contract: a family (a thread plus all transitive
- * descendants reachable via parentThreadId) renders as a unit — same section,
- * sorted together — so nestByParent can render the child directly below its
- * parent. Section priority: current > saved > archive.
- */
 
 import { describe, it, expect } from 'vitest';
 import { categorizeThreads, computeFamilyKeys, THREAD_DRAWER_SECTION_ORDER } from './ThreadDrawer';
@@ -21,6 +14,7 @@ type ThreadOpts = {
     codingAgentChangeState?: CodingAgentChangeState;
     updatedAt?: string;
     lastRevivedAt?: string;
+    heldBy?: string;
 };
 
 function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
@@ -47,6 +41,9 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         latestTodoList: null,
         liveEventWaitCount: 0,
         liveEventWaits: [],
+        hold: opts.heldBy
+            ? { reason: 'Waiting on the vendor', root_thread_id: opts.heldBy, placed_at: '2026-04-12T00:00:00Z' }
+            : undefined,
     };
     return {
         meta,
@@ -59,10 +56,6 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
     };
 }
 
-// Convenience builders. A running thread and a CTA (proposed change) thread
-// both land in Current — the former is the system's turn, the latter the
-// user's — distinguished at the row level (status icon / attention filter), not
-// by a separate section. Current itself sorts purely by creation time.
 const running = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, status: 'running' });
 const withCta = (id: string, opts: ThreadOpts = {}) =>
@@ -78,9 +71,6 @@ function ids(list: ThreadState[]): string[] {
 
 describe('categorizeThreads — family-aware section routing', () => {
     it('keeps a family together in Current when any descendant is running, even with a sibling CTA', () => {
-        // Running and CTA both resolve to Current, so the family renders as one
-        // unit there. The CTA still surfaces on the child row + the attention
-        // sort; it no longer pulls the family into a separate section.
         const parent = running('parent');
         const child = withCta('child', { parentId: 'parent' });
         const out = categorizeThreads([parent, child]);
@@ -88,9 +78,6 @@ describe('categorizeThreads — family-aware section routing', () => {
     });
 
     it('keeps a family in Current when idle no-CTA siblings sit under a running child', () => {
-        // A CC parent with one running child and two idle children (changes
-        // applied, nothing proposed) renders as one family unit in
-        // Current — no member splits off into another section.
         const parent = makeThread('parent', { activeChildrenCount: 1 });
         const runningChild = running('running-child', { parentId: 'parent' });
         const doneA = makeThread('done-a', { parentId: 'parent' });
@@ -100,8 +87,6 @@ describe('categorizeThreads — family-aware section routing', () => {
     });
 
     it('pins family to Saved when the root is saved, regardless of a CTA descendant', () => {
-        // Save is an explicit user pin — "keep this visible to me" — and
-        // overrides automatic categorization for the whole family.
         const parent = inSaved('parent');
         const child = withCta('child', { parentId: 'parent' });
         const out = categorizeThreads([parent, child]);
@@ -127,8 +112,6 @@ describe('categorizeThreads — family-aware section routing', () => {
     });
 
     it('leaves an orphan child as its own family root when the parent is paginated out', () => {
-        // parent isn't in the input list (filtered out, different page, etc.).
-        // Child has no anchor — it's its own root and lands in Current.
         const child = withCta('child', { parentId: 'missing-parent' });
         const sibling = running('sibling');
         const out = categorizeThreads([child, sibling]);
@@ -136,9 +119,6 @@ describe('categorizeThreads — family-aware section routing', () => {
     });
 
     it('lifts the whole chain into Current when running anywhere pulls the family up', () => {
-        // Grandparent running, child saved (non-root), grandchild has a CTA →
-        // family in Current. Current outranks a saved NON-root member; only a
-        // saved ROOT pins the family to Saved.
         const grandparent = running('grandparent');
         const child = inSaved('child', { parentId: 'grandparent' });
         const grandchild = withCta('grandchild', { parentId: 'child' });
@@ -161,14 +141,38 @@ describe('categorizeThreads — family-aware section routing', () => {
         const child = withCta('child', { parentId: 'parent' });
         child.meta.state = 'composing';
         const out = categorizeThreads([parent, child]);
-        // Child is filtered out entirely → parent stays in Current alone.
         expect(ids(out.current)).toEqual(['parent']);
     });
 });
 
+describe('categorizeThreads — On hold', () => {
+    it('lists a held root and the sub-threads it reached in On hold, even while one runs', () => {
+        const root = makeThread('root', { heldBy: 'root' });
+        const child = running('child', { parentId: 'root', heldBy: 'root' });
+        const out = categorizeThreads([root, child]);
+        expect(ids(out.onHold)).toEqual(['root', 'child']);
+        expect(out.current).toEqual([]);
+    });
+
+    it('roots a family at the held thread, so its live parent stays in Current', () => {
+        const parent = running('parent');
+        const held = withCta('held', { parentId: 'parent', heldBy: 'held' });
+        const out = categorizeThreads([parent, held]);
+        expect(ids(out.current)).toEqual(['parent']);
+        expect(ids(out.onHold)).toEqual(['held']);
+    });
+
+    it('keeps a saved held root in Saved, since a pin beats a hold', () => {
+        const root = makeThread('root', { saved: true, heldBy: 'root' });
+        const out = categorizeThreads([root]);
+        expect(ids(out.saved)).toEqual(['root']);
+        expect(out.onHold).toEqual([]);
+    });
+});
+
 describe('ThreadDrawer section order', () => {
-    it('renders Saved before Current and Archive', () => {
-        expect(THREAD_DRAWER_SECTION_ORDER).toEqual(['saved', 'current', 'archive']);
+    it('renders Saved, then On hold, Current and Archive', () => {
+        expect(THREAD_DRAWER_SECTION_ORDER).toEqual(['saved', 'on_hold', 'current', 'archive']);
     });
 });
 
@@ -181,14 +185,10 @@ describe('computeFamilyKeys — family-aware effective sort keys', () => {
         });
         const keys = computeFamilyKeys([parent, child]);
         expect(keys.get('parent')?.recentKey).toBe('2026-05-15T00:00:00Z');
-        // Every family member maps to the same family-derived record.
         expect(keys.get('child')?.recentKey).toBe('2026-05-15T00:00:00Z');
     });
 
     it('isolated family with stale parent + fresh child sorts above an unrelated stale family', () => {
-        // Two families in the same archive section. Family A's child has fresh
-        // activity; family B has nothing recent. Sorted by recentKey desc,
-        // family A (lifted by its child) must come first.
         const aParent = inArchive('a-parent', { updatedAt: '2026-04-01T00:00:00Z' });
         const aChild = inArchive('a-child', {
             parentId: 'a-parent',
@@ -200,15 +200,10 @@ describe('computeFamilyKeys — family-aware effective sort keys', () => {
         const sorted = [...threads].sort((x, y) =>
             keys.get(y.meta.id)!.recentKey.localeCompare(keys.get(x.meta.id)!.recentKey),
         );
-        // a-parent and a-child tie on the family recent key, so their relative
-        // order is the input order. The key assertion: both precede b-parent.
         expect(ids(sorted)).toEqual(['a-parent', 'a-child', 'b-parent']);
     });
 
     it('cycle members converge on a shared root so the family is one record', () => {
-        // Defensive: data corruption could create a parentThreadId cycle. The
-        // implementation canonicalizes on the lex-min visited id so both
-        // members map to the *same* FamilyKeys record.
         const a = makeThread('a', { parentId: 'b' });
         const b = makeThread('b', { parentId: 'a' });
         const keys = computeFamilyKeys([a, b]);

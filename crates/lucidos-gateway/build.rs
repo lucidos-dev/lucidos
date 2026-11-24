@@ -97,7 +97,7 @@ fn git_short_head(project_root: &Path) -> Option<String> {
 
 /// The git files that change exactly when HEAD moves: HEAD itself (checkout,
 /// detached moves), the branch ref it names (commits), and `packed-refs`.
-/// Hand-synced with crates/lucidos-engine/build.rs, which says why.
+/// Hand-synced with crates/lucidos-engine/build_support/paths.rs, which says why.
 fn head_trigger_paths(project_root: &Path) -> Vec<PathBuf> {
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git")

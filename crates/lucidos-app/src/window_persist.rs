@@ -15,6 +15,8 @@
 //! The clamp that sanitises a restored frame is `window_restore`, and the
 //! record's own format is `window_session`.
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -50,6 +52,96 @@ pub(crate) fn window_state_flags() -> StateFlags {
 /// `tauri.conf.json`, so its label does mean one window across launches.
 pub(crate) fn plugin_tracks(label: &str) -> bool {
     label == crate::app_window::MAIN_WINDOW_LABEL
+}
+
+/// Where this process keeps both window records: the session record and the
+/// plugin's file.
+///
+/// The dev binary embeds `tauri.conf.json`, so its identifier is the packaged
+/// app's, and so are its app-data and app-config dirs. Recording there let a
+/// dev window and the packaged client overwrite each other's frames. So dev
+/// keeps its records in a dir its launcher names, or keeps none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WindowRecords {
+    /// The packaged client: its app-data dir, and the plugin's default path.
+    Packaged,
+    /// A dev window the launcher started, with an absolute UTF-8 dir of its own.
+    Dev(PathBuf),
+    /// A dev binary with no dir of its own, such as a bare `cargo run`. It
+    /// registers no plugin, since the plugin's exit save ignores its filter.
+    Nowhere,
+}
+
+impl WindowRecords {
+    /// A relative dir counts as none: the plugin joins its filename onto the
+    /// packaged app-config dir, so only an absolute path escapes it. It takes
+    /// that filename as a string, so a dir that is not UTF-8 counts as none too.
+    fn resolve(is_dev: bool, dev_dir: Option<OsString>) -> Self {
+        if !is_dev {
+            return Self::Packaged;
+        }
+        match dev_dir.map(PathBuf::from) {
+            Some(dir) if dir.is_absolute() && dir.to_str().is_some() => Self::Dev(dir),
+            _ => Self::Nowhere,
+        }
+    }
+
+    /// Whether this process keeps any window record, and so runs the plugin.
+    pub(crate) fn keeps_records(&self) -> bool {
+        !matches!(self, Self::Nowhere)
+    }
+
+    /// The dir the session record lives in, or `None` to record nothing.
+    pub(crate) fn session_dir(&self) -> Option<PathBuf> {
+        match self {
+            // No `HOME`, so nowhere to keep a record.
+            Self::Packaged => desktop::app_data_dir_from_env().ok(),
+            Self::Dev(dir) => Some(dir.clone()),
+            Self::Nowhere => None,
+        }
+    }
+
+    /// The plugin's file, when it is not the plugin's default. Absolute, so
+    /// the plugin's join onto its app-config dir returns it unchanged.
+    fn plugin_filename(&self) -> Option<String> {
+        match self {
+            Self::Dev(dir) => dir
+                .join(tauri_plugin_window_state::DEFAULT_FILENAME)
+                .to_str()
+                .map(str::to_owned),
+            Self::Packaged | Self::Nowhere => None,
+        }
+    }
+}
+
+/// This process's [`WindowRecords`], resolved once from the environment.
+pub(crate) fn window_records() -> &'static WindowRecords {
+    static RECORDS: std::sync::OnceLock<WindowRecords> = std::sync::OnceLock::new();
+    RECORDS.get_or_init(|| {
+        WindowRecords::resolve(
+            tauri::is_dev(),
+            std::env::var_os(crate::dev_window::RECORDS_DIR_ENV),
+        )
+    })
+}
+
+/// The window-state plugin, configured for this process's [`window_records`],
+/// or `None` when it keeps none.
+pub(crate) fn window_state_plugin<R: tauri::Runtime>() -> Option<tauri::plugin::TauriPlugin<R>> {
+    let records = window_records();
+    if !records.keeps_records() {
+        return None;
+    }
+    let builder = tauri_plugin_window_state::Builder::new()
+        .with_state_flags(window_state_flags())
+        // `main` only. Every other label is a per-process counter, so the
+        // plugin would restore one window's geometry onto an unrelated one.
+        .with_filter(plugin_tracks);
+    let builder = match records.plugin_filename() {
+        Some(filename) => builder.with_filename(filename),
+        None => builder,
+    };
+    Some(builder.build())
 }
 
 /// How long the windows must sit still before the debounced background flush
@@ -196,7 +288,8 @@ pub(crate) fn persist_windows(app: &tauri::AppHandle) {
 /// record, so the plugin's frame is read only for a workspace that record holds
 /// nothing for. Main thread only, like every geometry read here.
 fn save_plugin_state(app: &tauri::AppHandle, what: &str) {
-    if main_is_wearing_a_rescue(app) {
+    // A process with nowhere to record registered no plugin to call.
+    if !window_records().keeps_records() || main_is_wearing_a_rescue(app) {
         return;
     }
     if let Err(e) = app.save_window_state(window_state_flags()) {
@@ -240,32 +333,24 @@ pub(crate) fn resolve_window_session_plan() -> &'static [window_session::Restore
     static PLAN: std::sync::OnceLock<Vec<window_session::RestoredWindow>> =
         std::sync::OnceLock::new();
     PLAN.get_or_init(|| {
-        // Dev restores nothing: it shares the packaged app-data dir and
-        // `desktop::launch` is a no-op there, so the record is not its to read.
-        if tauri::is_dev() {
-            return Vec::new();
-        }
-        let Ok(app_data) = desktop::app_data_dir_from_env() else {
+        let Some(dir) = window_records().session_dir() else {
             return Vec::new();
         };
         let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
         let restore = crate::should_show_window_at_startup(&args, false);
-        window_session::restore_plan(&window_session::read(&app_data), restore)
+        window_session::restore_plan(&window_session::read(&dir), restore)
     })
 }
 
 /// The window session this process may act on, or an empty one when there is
 /// none to read.
 ///
-/// Dev is empty by construction. It shares the packaged app-data dir, so acting
-/// on the record would let a dev run rearrange the packaged client's windows.
-/// The same rule [`persist_window_session`] follows on the write side.
+/// Where the record lives is [`window_records`]'s answer, the same one
+/// [`persist_window_session`] writes to.
 pub(crate) fn readable_window_session() -> window_session::WindowSession {
-    if tauri::is_dev() {
-        return window_session::WindowSession::default();
-    }
-    desktop::app_data_dir_from_env()
-        .map(|app_data| window_session::read(&app_data))
+    window_records()
+        .session_dir()
+        .map(|dir| window_session::read(&dir))
         .unwrap_or_default()
 }
 
@@ -395,14 +480,7 @@ pub(crate) fn forget_closed_window(app: &tauri::AppHandle) {
 /// Reading each window's geometry is a main-thread call, same as the plugin's
 /// save, so this is only ever reached through [`persist_windows`].
 pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
-    // Dev shares the packaged install's app-data dir, and `desktop::launch`
-    // restores nothing there. Writing would only let a dev run rearrange the
-    // packaged client's windows.
-    if tauri::is_dev() {
-        return;
-    }
-    let Ok(app_data) = desktop::app_data_dir_from_env() else {
-        // No `HOME`, so nowhere to keep a record.
+    let Some(dir) = window_records().session_dir() else {
         return;
     };
     // Enumerates WEBVIEWS and reaches each window through `webview.window()`,
@@ -443,8 +521,8 @@ pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
     if !PRESENTED.may_write(window_session::any_window_is_navigated(&windows)) {
         return;
     }
-    let previous = window_session::read(&app_data);
-    window_session::write(&app_data, &window_session::capture(&previous, &windows));
+    let previous = window_session::read(&dir);
+    window_session::write(&dir, &window_session::capture(&previous, &windows));
 }
 
 #[cfg(test)]
@@ -549,6 +627,64 @@ mod tests {
         for label in ["window-0", "window-7", "url-preview-1", "lucidos-tray", ""] {
             assert!(!plugin_tracks(label), "{label:?} is tracked");
         }
+    }
+
+    #[test]
+    fn the_packaged_client_keeps_its_records_where_it_always_has() {
+        for dev_dir in [None, Some("/checkout/.launch/dev-window".into())] {
+            let records = WindowRecords::resolve(false, dev_dir);
+            assert_eq!(records, WindowRecords::Packaged);
+            // The plugin's default path, and the app-data dir for the session.
+            assert_eq!(records.plugin_filename(), None);
+            assert!(records.keeps_records());
+            assert_eq!(records.session_dir(), desktop::app_data_dir_from_env().ok());
+        }
+    }
+
+    // The dev binary shares the packaged app's identifier, so its default dirs
+    // ARE the packaged client's. A dev window recording there overwrote the
+    // packaged main's frame, and wore it after a switch.
+    #[test]
+    fn a_dev_window_never_records_in_the_packaged_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = WindowRecords::resolve(true, Some(dir.path().into()));
+        assert_eq!(records, WindowRecords::Dev(dir.path().to_path_buf()));
+        assert_eq!(records.session_dir().as_deref(), Some(dir.path()));
+        assert!(records.keeps_records());
+        // The plugin joins its filename onto the packaged app-config dir. An
+        // absolute filename replaces that base entirely.
+        let packaged_config = std::path::Path::new("/Users/me/Library/Application Support/x");
+        let plugin_file = packaged_config.join(records.plugin_filename().unwrap());
+        assert_eq!(
+            plugin_file,
+            dir.path().join(tauri_plugin_window_state::DEFAULT_FILENAME)
+        );
+    }
+
+    // `Nowhere` registers no plugin at all: its exit save ignores the filter
+    // and would write the packaged file.
+    #[test]
+    fn a_dev_binary_with_no_dir_of_its_own_records_nothing() {
+        for dev_dir in [None, Some("".into()), Some("relative/dev-window".into())] {
+            let records = WindowRecords::resolve(true, dev_dir.clone());
+            assert_eq!(records, WindowRecords::Nowhere, "{dev_dir:?}");
+            assert_eq!(records.session_dir(), None);
+            assert_eq!(records.plugin_filename(), None);
+            assert!(!records.keeps_records());
+        }
+    }
+
+    // The plugin takes its filename as a string, so a dir it cannot be handed
+    // would leave it on the packaged path.
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_dir_that_is_not_utf8_counts_as_none() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = OsString::from_vec(b"/checkout/\xff/dev-window".to_vec());
+        assert_eq!(
+            WindowRecords::resolve(true, Some(dir)),
+            WindowRecords::Nowhere
+        );
     }
 
     #[test]

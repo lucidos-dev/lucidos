@@ -12,7 +12,6 @@ import {
 import { connectionStatus } from '../store/store';
 import { revealBootEscape, setBootStatus } from '../utils/bootSplash';
 
-// The status line is the unit under test; the splash DOM controller is not.
 vi.mock('../utils/bootSplash', () => ({
   setBootStatus: vi.fn(),
   bootSplashPresent: vi.fn(() => true),
@@ -48,25 +47,16 @@ describe('bootSplashShouldRelease', () => {
     expect(bootSplashShouldRelease('connected', false, true)).toBe(false);
   });
 
-  // The reported symptom: the engine answers /health so the connection is live,
-  // but its database is gone, so the thread list can never arrive. Waiting it out
-  // was 15s of a black screen reading "Loading…". Coming down hands off to the
-  // app, where the authoritative "can't reach its database" toast is already up.
   it('releases when a connected engine reports its database unreachable', () => {
     expect(bootSplashShouldRelease('connected', false, false)).toBe(true);
   });
 
-  // The load-bearing negative case, and the same mistake delayedBootStatus
-  // already documents: the release must come from POSITIVE evidence. Nothing has
-  // been heard from the engine yet here, so the splash stands.
   it('does not release on absence of evidence while the first probe is in flight', () => {
     expect(bootSplashShouldRelease('connecting', false, true)).toBe(false);
     expect(bootSplashShouldRelease('connecting', false, false)).toBe(false);
   });
 
   it('does not release for an unreachable ENGINE, which has its own escape', () => {
-    // A disconnected engine is the boot watchdog's / gateway escape's case, not
-    // this one; releasing here would drop the splash mid-cold-start on a blip.
     expect(bootSplashShouldRelease('disconnected', false, false)).toBe(false);
   });
 });
@@ -77,10 +67,6 @@ describe('delayedBootStatus', () => {
     expect(delayedBootStatus('connected', true)).toBe('Loading…');
   });
 
-  // The regression: an iOS PWA on a direct engine port whose first health
-  // round-trip simply hadn't landed yet was told the workspace wasn't running —
-  // by the very page that engine had just served. No probe has failed while the
-  // status is 'connecting', so there is no evidence to name a cause from.
   it('never accuses a workspace of being down while the first probe is still in flight', () => {
     expect(delayedBootStatus('connecting', true)).toBe('Connecting…');
     expect(delayedBootStatus('connecting', false)).toBe('Connecting…');
@@ -95,8 +81,6 @@ describe('delayedBootStatus', () => {
   });
 });
 
-// The message and the affordance must agree about when the workspace is
-// unreachable, so both read the same predicate.
 describe('workspaceIsUnreachable', () => {
   it('is true only for a direct port whose probe actually failed', () => {
     expect(workspaceIsUnreachable('disconnected', true)).toBe(true);
@@ -131,12 +115,6 @@ describe('remainingRevealMs', () => {
     expect(remainingRevealMs(BOOT_SPLASH_MIN_REVEAL_MS + 500, false)).toBe(0);
   });
 
-  // A document that plays no reveal has nothing for the floor to protect: the
-  // gateway handover (the mark was already built and is standing on screen) and
-  // a notification tap (no mark at all). Holding the floor would add a second of
-  // formed-mark stare to an already slow cold boot, and made every tap read as a
-  // relaunch. Which documents qualify is `bootSplashPlaysNoReveal`'s job, tested
-  // against the real class names in utils/bootSplash.test.ts.
   it('holds nothing when this document plays no reveal, however early it is ready', () => {
     for (const elapsed of [0, 100, BOOT_SPLASH_MIN_REVEAL_MS - 1]) {
       expect(remainingRevealMs(elapsed, true)).toBe(0);
@@ -173,9 +151,6 @@ describe('startDelayedBootStatus', () => {
     expect(written).toHaveBeenLastCalledWith('Connecting…');
   });
 
-  // The stale-claim half of the fix: the line used to be sampled once at the
-  // delay, so a connection landing a moment later left the wrong text up for the
-  // rest of the splash's life.
   it('retracts the line when the connection lands after the delay', () => {
     teardown = startDelayedBootStatus(true);
     vi.advanceTimersByTime(STATUS_DELAY_MS);
@@ -185,14 +160,11 @@ describe('startDelayedBootStatus', () => {
     expect(written).toHaveBeenLastCalledWith('Loading…');
   });
 
-  // Naming the cause is not enough on a direct port: the user cannot start the
-  // workspace from that origin, so the splash must also offer the gateway.
   it('offers the gateway escape exactly when the workspace is unreachable', () => {
     const revealed = vi.mocked(revealBootEscape);
     revealed.mockClear();
     teardown = startDelayedBootStatus(true);
     vi.advanceTimersByTime(STATUS_DELAY_MS);
-    // Still probing: no failure to act on yet.
     expect(revealed).not.toHaveBeenCalled();
     connectionStatus.value = 'disconnected';
     expect(revealed).toHaveBeenCalled();

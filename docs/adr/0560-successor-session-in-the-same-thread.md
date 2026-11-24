@@ -2,7 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-23
-- **Amended by**: [0629: A coding-agent session hands off at an engine-enforced context ceiling](0629-engine-enforced-context-ceiling.md)
+- **Amended by**: [0629: A coding-agent session hands off at an engine-enforced context ceiling](0629-engine-enforced-context-ceiling.md), [0675: A lane thread's handoff starts a fresh session, and a closed lane thread neither hands off nor replays one](0675-lane-thread-handoffs.md)
 - **Supersedes**: [0474](0474-successor-threads.md), [0503](0503-build-chain.md), [0507](0507-successor-inherits-handoff-consent.md)
 - **Amends**: [0557](0557-harden-runs-on-the-default-floor.md), [0493](0493-a-plan-cards-new-thread-pick-is-owner-consent.md), [0497](0497-plan-card-offers-a-new-thread-for-a-cheaper-implementer.md), [0505](0505-named-handoff-checkpoints.md), [0539](0539-successor-context-by-cache-warmth.md)
 
@@ -29,7 +29,8 @@ creates a successor thread any more.
 
 All four moments do this: a plan card's `Implement in a fresh session` pick,
 "handoff this session", **Continue with context** on the *Successor card*, and
-an automatic *handoff checkpoint*. **Start fresh** stays a plain new thread.
+an automatic *handoff checkpoint*. After a ceiling handoff, **Start fresh**
+above the composer opens a draft for a plain new thread.
 
 - **The record.** The new session's `SessionStarted` carries continuity
   `handoff`, with the checkpoint, its progress and the opening message. A resume
@@ -50,6 +51,11 @@ an automatic *handoff checkpoint*. **Start fresh** stays a plain new thread.
   the current session only.
 - **No authority.** Starting a session in its own thread is an act in the
   thread's own subtree. No owner approval card, no consent record.
+- **The work stays running.** An eligible automatic successor keeps the thread
+  `running` and in In flight across old-session idle/end and successor startup.
+  Stop, failure, questions, automation pauses, next-input starts and closed-lane
+  exclusions take precedence. Runtime claims still serialize processes; a running
+  thread does not prove the old process owns it.
 - **A dirty worktree is fine.** The branch never moves, so nothing is lost. The
   opening message tells the session to read `git status` first.
 - **The CLI.** `lucidos successor start` takes over from `spawn`, which stays

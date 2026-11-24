@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The surfaces of the *cache keep-alive status* that read the thread: the card a
- * keep-alive run leaves in the transcript, and the waiting panel's Prompt cache
- * section. Both speak the run's sentences (`keepAliveSentence`), and the
- * explainer shows the keep-alive math.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -74,7 +68,6 @@ function mount(node: preact.ComponentChild): HTMLElement {
 }
 
 afterEach(() => {
-  // Unmount, so an open explainer leaves the overlay stack.
   act(() => {
     for (const root of mounted.splice(0)) render(null, root);
   });
@@ -82,9 +75,6 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** A warming run with prices and odds: a ping $0.06, the reread $0.74, beats
- *  every 4.5 minutes, a cap of 2. Of 10 past waits, 5 ended before the first
- *  ping, 2 after one, 1 after two, and 2 outlasted the cap. */
 const priced = warming({
   beats: 1, budget_beats: 2, beat_every_secs: 270, cost_usd: 0.06, context_tokens: 118_000,
   ping_usd: 0.059, reread_usd: 0.7375, odds: { samples: 10, slots: [5, 2, 1], after_cap: 2 },
@@ -133,7 +123,6 @@ describe('the run sentences', () => {
 });
 
 describe('the cap source', () => {
-  // A learned cap's hours read on the user's clock, so pin it.
   beforeEach(() => {
     preferences.value = { status: 'loaded', data: { timezone: 'UTC' } };
   });
@@ -239,7 +228,6 @@ describe('the keep-alive math', () => {
   });
 });
 
-/** The closed states carry the cap's odds and interval, as the engine copies them. */
 const withMath = { ping_usd: 0.059, reread_usd: 0.7375, beat_every_secs: 270, odds: { samples: 10, slots: [5, 2, 1], after_cap: 2 } };
 const closed = (status: CacheKeepAliveStatus): CacheKeepAliveStatus => ({ ...status, ...withMath }) as CacheKeepAliveStatus;
 
@@ -255,6 +243,11 @@ describe('the final score of a closed run', () => {
     const math = keepAliveMath(closed({ ...ended, beats: 2, cost_usd: 0.12, context_tokens: 118_000 }))!;
     expect(math.score).toEqual({ keepWarm: 0.12, noKeepAlive: 0.57 });
     expect(math.landed).toBe(2);
+  });
+
+  it('scores a warm wake the last real request kept warm as pings spent for nothing', () => {
+    const math = keepAliveMath(closed({ ...ended, beats: 2, cost_usd: 0.12, saved_usd: 0, context_tokens: 118_000 }))!;
+    expect(math.score).toEqual({ keepWarm: 0.12, noKeepAlive: 0 });
   });
 
   it('scores an ended run on a cold cache like a stopped one, with no row to mark', () => {
@@ -429,7 +422,6 @@ describe('the Prompt cache section', () => {
     fetchCacheWarmth.mockResolvedValue(COLD);
   });
 
-  /** Mount the section, then let the warmth read land. */
   async function mountRead(status: CacheKeepAliveStatus): Promise<HTMLElement> {
     let root!: HTMLElement;
     await act(async () => {
@@ -551,7 +543,6 @@ describe('the keep-alive explainer', () => {
     threadMap.value = new Map();
   });
 
-  /** Open the card's explainer and return the document's text. */
   async function explain(status: CacheKeepAliveStatus): Promise<string> {
     threadMap.value = new Map([['t1', threadWith(status)]]);
     const root = mount(<KeepAliveRow threadId="t1" status={status} />);
@@ -624,7 +615,6 @@ describe('the keep-alive explainer', () => {
   });
 
   it('compares an open run with no odds against the reread, up to the expected wake', async () => {
-    // 65 minutes at a ping every 260 s is 15 pings, inside the budget of 17.
     const text = await explain({ ...unprimed, expected_wake: { at: '2026-10-19T10:05:00Z', source: 'agent' } } as CacheKeepAliveStatus);
     expect(text).toContain('A ping reads 134k tokens for $0.03.');
     expect(text).toContain('Keeping it warm to the expected wake takes 15 pings, about $0.40, against $0.67 to reread. That saves about $0.27.');
@@ -638,7 +628,6 @@ describe('the keep-alive explainer', () => {
   });
 
   it('charges every ping when the plan stops before the expected wake', async () => {
-    // 120 minutes at a ping every 260 s needs 27 pings, past the budget of 17.
     const text = await explain({ ...unprimed, expected_wake: { at: '2026-10-19T11:00:00Z', source: 'agent' } } as CacheKeepAliveStatus);
     expect(text).toContain('The plan stops after 17 pings, before the expected wake, so the reply rereads anyway: keeping it warm costs about $0.45 more.');
   });

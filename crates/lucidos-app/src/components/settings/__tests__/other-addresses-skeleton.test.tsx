@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Access › Other addresses draws URL rows as its loading placeholder,
- *  under a toggle that is there from the first frame. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

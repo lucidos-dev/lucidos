@@ -1,18 +1,5 @@
-/**
- * The shared walk behind `focus-ring-not-clipped.spec.ts`: focus every visible
- * control in a scope the way the keyboard would, and report each focus ring an
- * ancestor cuts.
- *
- * The ring (`--focus-ring`) is an outward `box-shadow`, and a shadow adds
- * nothing to a box's scrollable overflow. So a scrolling or clipping ancestor
- * cuts it wherever the control sits flush with that ancestor's edge. No source
- * scan can tell "flush", so this runs in the browser against the resolved
- * cascade. The fix is ring room at the clipping box
- * (`.claude/rules/frontend-css.md`).
- */
 import type { Page } from '@playwright/test';
 
-/** One cut ring: who draws it, what cuts it, and on which edges. */
 export interface ClippedRing {
   control: string;
   ringOwner: string;
@@ -22,19 +9,13 @@ export interface ClippedRing {
 
 export interface RingWalk {
   clipped: ClippedRing[];
-  /** Controls checked. A walk that checked none proves nothing. */
   checked: number;
-  /** Controls that never matched `:focus-visible`, so their ring went unseen. */
   notFocusVisible: string[];
 }
 
-/** Every control inside `scope` (a selector, default the whole document). */
 export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWalk> {
-  // Keyboard modality, so a programmatic focus matches :focus-visible.
   await page.keyboard.press('Shift');
   return page.evaluate(async (scopeSelector) => {
-    // A surface still fading in reads as invisible, so let entrances finish.
-    // A spinner never does, so infinite animations are left running.
     await Promise.all(document.getAnimations()
       .filter(a => a.effect?.getComputedTiming().iterations !== Infinity)
       .map(a => a.finished.catch(() => undefined)));
@@ -55,11 +36,9 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
       return `${el.tagName.toLowerCase()}${cls}${label ? ` "${label}"` : ''}`;
     };
 
-    // Alpha 0 only: `rgba(…, 0)` or `/ 0)`, never an opaque `rgb(…, 0)`.
     const transparent = (color: string): boolean =>
       color === 'transparent' || /^rgba\([^)]*,\s*0\)$|\/\s*0\)$/.test(color.trim());
 
-    // How far past the border box each painted ring reaches, per side.
     const reach = (el: Element): Sides => {
       const cs = getComputedStyle(el);
       const out: Sides = { top: 0, right: 0, bottom: 0, left: 0 };
@@ -70,7 +49,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
         out.left = Math.max(out.left, left);
       };
       if (cs.boxShadow && cs.boxShadow !== 'none') {
-        // Split on top-level commas; colour functions carry commas inside.
         let depth = 0;
         let start = 0;
         const parts: string[] = [];
@@ -101,9 +79,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
       return out;
     };
 
-    // The elements a focus can repaint: the control, the frames around it
-    // (`:focus-within`, `:has(:focus-visible)`), and a drawn sibling such as
-    // a toggle's slider.
     const ringCandidates = (el: Element): Element[] => {
       const out: Element[] = [el];
       let a = el.parentElement;
@@ -119,9 +94,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
     const makesCbForAbsolute = (cs: CSSStyleDeclaration): boolean =>
       cs.position !== 'static' || makesCbForFixed(cs);
 
-    // The box each ancestor lets paint, or null when it lets everything
-    // through. A scroller lets through its whole scrollable area, which a
-    // shadow never extends. A `clip` box lets through only its padding box.
     const overflowBox = (a: Element, cs: CSSStyleDeclaration): Box | null => {
       const r = a.getBoundingClientRect();
       const left = r.left + a.clientLeft;
@@ -146,8 +118,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
       const vals = m[1].trim().split(/\s+/);
       if (!vals.every(v => /^-?[\d.]+(px|%)$/.test(v))) return null;
       const r = a.getBoundingClientRect();
-      // A percentage resolves against the box's height for top and bottom,
-      // and its width for the sides.
       const px = (v: string, side: number) => v.endsWith('%') ? parseFloat(v) / 100 * side : parseFloat(v);
       const [tv, rv = tv, bv = tv, lv = rv] = vals;
       const [t, rt, b, l] = [px(tv, r.height), px(rv, r.width), px(bv, r.height), px(lv, r.width)];
@@ -160,8 +130,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
         xmin: r.left - ring.left, xmax: r.right + ring.right,
         ymin: r.top - ring.top, ymax: r.bottom + ring.bottom,
       };
-      // The owner's own clip-path shapes its ring on purpose, as a full-height
-      // bar keeps only its sides.
       const own = clipPathBox(owner, getComputedStyle(owner));
       if (own) {
         ringBox.xmin = Math.max(ringBox.xmin, own.xmin);
@@ -182,14 +150,10 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
       let position = getComputedStyle(owner).position;
       for (let a = owner.parentElement; a && a !== document.body; a = a.parentElement) {
         const cs = getComputedStyle(a);
-        // A clip-path clips every descendant; overflow clips only the
-        // containing-block chain.
         check(a, clipPathBox(a, cs));
         if (position === 'fixed' && !makesCbForFixed(cs)) continue;
         if (position === 'absolute' && !makesCbForAbsolute(cs)) continue;
         check(a, overflowBox(a, cs));
-        // A scroller can bring the ring into its own view, so what clips the
-        // scroller further out is a question about the scroller.
         const scrolls = (v: string) => v !== 'visible' && v !== 'clip';
         if (scrolls(cs.overflowX) || scrolls(cs.overflowY)) break;
         position = cs.position;
@@ -211,9 +175,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
 
     const clipped: ClippedRing[] = [];
     const notFocusVisible: string[] = [];
-    // A text field that is focused already goes first and keeps its focus: some
-    // close on blur, like the device rename. With no resting state to compare,
-    // only its own ring counts. Anything else is refocused the keyboard's way.
     const isTextField = (el: Element | null) => !!el?.matches('input, textarea, [contenteditable="true"]');
     const keep = isTextField(restore) ? restore : null;
     const focusedFirst = controls.filter(el => el === keep);
@@ -250,7 +211,6 @@ export async function walkFocusRings(page: Page, scope = 'body'): Promise<RingWa
   }, scope);
 }
 
-/** One line per cut ring, for an assertion message. */
 export function formatClipped(clipped: ClippedRing[]): string {
   return clipped
     .map(c => `${c.control}${c.ringOwner === c.control ? '' : ` (ring on ${c.ringOwner})`} cut ${c.edges.join('+')} by ${c.clip}`)

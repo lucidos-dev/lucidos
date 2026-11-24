@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Rendered checks that the apps panel row and the menu drawer draw an app's
- * picture through `AppIcon`: the icon file when the app has one, the monogram
- * tile when not (ADR 0414, invariant I3). The source scan beside this file
- * covers every surface; these mount two of them.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -1,20 +1,5 @@
-/**
- * Regression: a completed thread's status dot stuck on "running" until reload,
- * and a stale read putting an idle status over a turn already running.
- *
- * A resync GET (`loadAllThreads` -> `upsertThread`, or `refreshThreadEvents`
- * -> `applyEventRows`) can fire before a live event and land after it. A
- * trigger bumps the summary's `summary_version` on every change to the row.
- * The client refuses any summary older than the one it holds.
- *
- * `last_activity` cannot order these reads. Several status changes do not
- * bump it, and the client holds engine time in `updatedAt`. So a timestamp
- * lets an equal-timestamp stale read through and refuses a fresh one. The
- * last two cases in each block pin both of those.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -47,7 +32,7 @@ vi.mock('../../api/threads', () => ({
 }));
 
 const RUNNING_AT = '2026-06-15T16:36:48.000Z';
-const IDLE_AT = '2026-06-15T16:36:51.571Z'; // a later, newer last_activity
+const IDLE_AT = '2026-06-15T16:36:51.571Z';
 
 function summary(overrides: Partial<ThreadSummary>): ThreadSummary {
   return {
@@ -105,10 +90,8 @@ function aggregate(overrides: Partial<ThreadAggregate>): ThreadAggregate {
   };
 }
 
-/** The version the live state holds in every case below. */
 const LIVE = 5;
 
-/** A thread whose live meta holds `status` at version `LIVE`. */
 function liveThread(overrides: Partial<ThreadState> & { status?: ThreadState['meta']['status'] } = {}): ThreadState {
   const { status = 'idle', ...rest } = overrides;
   const thread = makeThreadState('t1', { ...rest, meta: { id: 't1', updatedAt: IDLE_AT, ...rest.meta } });
@@ -136,21 +119,12 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
     expect(map.get('t1')!.meta.summaryVersion).toBe(LIVE + 1);
   });
 
-  /** The lifecycle marker is the same kind of field and the same trap. An iOS
-   *  wake fires `loadAllThreads`, the user presses Send while that GET is out,
-   *  and the answer still says `composing`. Unguarded, the composer replaces
-   *  the transcript the message just went into. */
   it('does not send an active thread back to composing on an older GET', () => {
     const map = new Map([['t1', liveThread({ meta: { id: 't1', state: 'active' } as ThreadState['meta'] })]]);
     upsertThread(map, summary({ state: 'composing', summary_version: LIVE - 1 }), false);
     expect(map.get('t1')!.meta.state).toBe('active');
   });
 
-  /** The same race at an EQUAL version, which is the common one: nothing
-   *  raises the version until the send's `MessageReceived` lands. The send's
-   *  pending row and its pending compose edit are what make the snapshot stale.
-   *  Unguarded, the composer came back holding the sent text, ready to be sent
-   *  twice. */
   it('does not send a just-sent draft back to composing on a same-version GET from before the send', () => {
     const map = new Map([['t1', liveThread({
       meta: { id: 't1', state: 'active' } as ThreadState['meta'],
@@ -162,9 +136,6 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
     expect(getDraft('t1').text).toBe('');
   });
 
-  /** A GET that goes out AFTER the send, while its POST is still in flight,
-   *  passes the send stamp. The engine has not seen the message yet, so its row
-   *  still holds the last draft write from typing. */
   it('does not restage the pre-send draft while the send is still pending', () => {
     const map = new Map([['t1', liveThread({
       meta: { id: 't1', state: 'active' } as ThreadState['meta'],
@@ -176,24 +147,18 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
     expect(getDraft('t1').text).toBe('');
   });
 
-  /** The guard must stay one-sided. A fresh snapshot is still what rescues an
-   *  SSE skeleton stuck at `composing`, which no drawer section draws. */
   it('applies state from a newer GET snapshot', () => {
     const map = new Map([['t1', liveThread({ meta: { id: 't1', state: 'composing' } as ThreadState['meta'] })]]);
     upsertThread(map, summary({ state: 'active', summary_version: LIVE + 1 }), false);
     expect(map.get('t1')!.meta.state).toBe('active');
   });
 
-  /** A Stop moves status without bumping `last_activity`, so the timestamp
-   *  guard read this older snapshot as fresh and put `running` back. */
   it('refuses an older snapshot even when its last_activity ties the live one', () => {
     const map = new Map([['t1', liveThread()]]);
     upsertThread(map, summary({ status: 'running', summary_version: LIVE - 1, last_activity: IDLE_AT }), false);
     expect(map.get('t1')!.meta.status).toBe('idle');
   });
 
-  /** `updatedAt` holds engine broadcast time, a later clock than the row's
-   *  `last_activity`. The timestamp guard refused this genuinely newer read. */
   it('applies a newer snapshot even when its last_activity reads older', () => {
     const map = new Map([['t1', liveThread()]]);
     upsertThread(map, summary({ status: 'running', summary_version: LIVE + 1, last_activity: RUNNING_AT }), false);

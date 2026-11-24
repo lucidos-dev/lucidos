@@ -1,4 +1,3 @@
-/** The Memory tree shows depth by indent alone, with no guide rail. */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

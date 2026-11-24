@@ -16,9 +16,6 @@ import { openAddCredential, openEditCredential } from '../actions/credentials';
 import { statesEqual } from '../actions/navigation';
 import type { NavEntry } from '../actions/navigation';
 
-// switchMenuItem and openAddCredential trigger loaders (apps, notifications,
-// credentials) as side effects — mock the API so tests don't fire real fetches
-// (which fail in the JSDOM environment).
 vi.mock('../../api/client', () => ({
   listAppsApi: vi.fn().mockResolvedValue([]),
   getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
@@ -145,10 +142,6 @@ describe('PanelOverlay discriminated union', () => {
   });
 
   describe('closeInlineForm resets trigger list scroll', () => {
-    // Save/Cancel/Escape on a trigger form all converge here, so the scroll
-    // reset must live at this layer rather than per-button. Without it, the
-    // user lands back at the row they edited (useScrollMemory restores the
-    // pre-edit offset) instead of the top.
     beforeEach(() => localStorage.clear());
 
     it('clears the saved trigger list scroll when a trigger form closes', () => {
@@ -161,8 +154,6 @@ describe('PanelOverlay discriminated union', () => {
     });
 
     it('preserves the trigger list scroll when a non-trigger form closes', () => {
-      // Other form types (credentials, app-edit) shouldn't blow away unrelated
-      // saved positions just because they share the close path.
       localStorage.setItem('lucidos-scroll-content-triggers', '500');
       panelOverlay.value = { type: 'form', form: { type: 'credential' } };
 
@@ -208,11 +199,9 @@ describe('PanelOverlay discriminated union', () => {
   describe('invalid states are impossible', () => {
     it('cannot have both app UI and file preview active simultaneously', () => {
       panelOverlay.value = { type: 'app-ui', app: fakeApp };
-      // There's no way to also have file preview — it's a single union value
       expect(previewFile.value).toBeNull();
       expect(currentApp.value).not.toBeNull();
 
-      // Setting file preview replaces app UI entirely
       panelOverlay.value = { type: 'file-preview', path: 'test.md' };
       expect(currentApp.value).toBeNull();
       expect(previewFile.value).toBe('test.md');
@@ -321,10 +310,6 @@ describe('overlaysEqual (via statesEqual)', () => {
     )).toBe(false);
   });
 
-  // Two credential REQUEST forms (engine asking for different services) must
-  // not be considered equal — otherwise the second request silently fails to
-  // push a nav entry and the user can't navigate forward to it after going
-  // back.
   it('credential request forms for different services → not equal', () => {
     expect(statesEqual(
       makeNav({ type: 'form', form: { type: 'credential', request: { service: 'helius' } } }),
@@ -339,8 +324,6 @@ describe('overlaysEqual (via statesEqual)', () => {
     )).toBe(false);
   });
 
-  // Email-confirm forms with different draft contents must be distinct entries
-  // — otherwise opening a second confirmation while one is open silently fails.
   it('email-confirm forms for different drafts → not equal', () => {
     const draftA = { type: 'email-confirm' as const, request: {
       to: ['a@example.com'], subject: 'A', body: 'hi', account: 'work', from: 'me@example.com',

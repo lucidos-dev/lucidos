@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level.
-// vi.hoisted runs before any imports are resolved.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -12,7 +10,6 @@ vi.hoisted(() => {
     get length() { return storage.size; },
     key: (_i: number) => null,
   };
-  // scrollToBottom() needs document.querySelector and requestAnimationFrame
   if (typeof globalThis.document === 'undefined') {
     (globalThis as any).document = {};
   }
@@ -38,7 +35,6 @@ import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThr
 import { focusSpawnedThread, focusThread, focusThreadOrBootstrap, focusThreadOrBootstrapResult, unfocusThread } from './threads';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 
-// Mock the API module
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
   fetchThreadById: vi.fn(),
@@ -48,9 +44,6 @@ vi.mock('../../api/threads', () => ({
   archiveThread: vi.fn().mockResolvedValue({ archived: [] }),
 }));
 
-// Use the real isComposeFocusedHere — the compose-preservation tests below
-// plant a fake activeElement + querySelectorAll to drive its branches. Mocking
-// only the focus-side-effect helpers keeps the predicate honest if it grows.
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
@@ -68,9 +61,6 @@ vi.mock('../../api/client', async (importOriginal) => ({
   getThreadQueue: vi.fn(),
 }));
 
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
 
 beforeEach(() => {
   threadMap.value = new Map();
@@ -111,7 +101,7 @@ describe('ensureThreadInMap', () => {
       message_count: 3,
       section: 'archived',
       active_children_count: 0,
-      waiting_children_count: 2,
+      awaited_children_count: 2,
       total_children_count: 0,
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
@@ -129,7 +119,7 @@ describe('ensureThreadInMap', () => {
     expect(thread!.meta.title).toBe('Search Result Thread');
     expect(thread!.meta.channel).toBe('chat');
     expect(thread!.meta.messageCount).toBe(3);
-    expect(thread!.meta.waitingChildrenCount).toBe(2);
+    expect(thread!.meta.awaitedChildrenCount).toBe(2);
     expect(thread!.eventsLoaded).toBe(true);
   });
 
@@ -169,11 +159,6 @@ describe('ensureThreadInMap', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// ensureThreadByIdInMap — thread-link click bootstrapping when only the ID
-// is known (the thread isn't in the loaded list — e.g. an archived thread
-// past the per-source Archive window).
-// ---------------------------------------------------------------------------
 
 describe('ensureThreadByIdInMap', () => {
   function summary(overrides: Record<string, unknown> = {}) {
@@ -218,12 +203,6 @@ describe('ensureThreadByIdInMap', () => {
   });
 
   it('reads the by-id endpoint, NEVER the grouped thread list', async () => {
-    // The grouped GET /api/v1/threads assembles saved + recent archive + active
-    // + composing + the family base: p50 262ms of server time at ~5k threads,
-    // paid to learn about one row. It sat on the notification-tap critical path
-    // (a tap navigating to a thread outside the loaded window blocks here with
-    // nothing on screen) and duplicated the grouped fetch the same cold boot had
-    // already issued.
     threadMap.value = new Map();
     (fetchThreadById as any).mockResolvedValue(summary());
 
@@ -233,9 +212,6 @@ describe('ensureThreadByIdInMap', () => {
   });
 
   it('carries `saved` off the summary, so a saved thread does not land unsaved', async () => {
-    // The grouped endpoint conveys saved structurally (membership in its `saved`
-    // array); one bare summary cannot, so the flag rides on the row itself.
-    // Guessing false here would show a saved thread as unsaved in the drawer.
     threadMap.value = new Map();
     (fetchThreadById as any).mockResolvedValue(summary({ saved: true }));
 
@@ -258,7 +234,6 @@ describe('ensureThreadByIdInMap', () => {
 
   it('returns false when the API has no record of the thread (404)', async () => {
     threadMap.value = new Map();
-    // fetchThreadById maps the engine's 404 to null: a real "gone" verdict.
     (fetchThreadById as any).mockResolvedValue(null);
 
     const ok = await ensureThreadByIdInMap('does-not-exist');
@@ -267,9 +242,6 @@ describe('ensureThreadByIdInMap', () => {
   });
 
   it('propagates fetch errors to the caller (no swallow)', async () => {
-    // "Could not ask" must stay distinct from "gone": landThreadHash retries a
-    // thrown failure (a peer engine lazy-starting behind the gateway routinely
-    // fails the first request) and must never retry a 404.
     threadMap.value = new Map();
     (fetchThreadById as any).mockRejectedValue(new Error('network down'));
 
@@ -277,13 +249,6 @@ describe('ensureThreadByIdInMap', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// focusThreadOrBootstrapResult: the tap must be acknowledged before the
-// metadata lands. 80% of this workspace's notifications navigate to a thread,
-// and when the thread is outside the loaded window the old code awaited the
-// fetch with nothing on screen: no pane movement, no skeleton, no cursor. On a
-// cold push tap the map is always empty, so it happened on every single one.
-// ---------------------------------------------------------------------------
 
 describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', () => {
   function summary(id: string) {
@@ -327,9 +292,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
 
     const pending = focusThreadOrBootstrapResult('target');
 
-    // Both true on this tick, with the fetch still in flight. The focus is what
-    // moves the pane; the flag is what stops ThreadView's stale-pointer cleanup
-    // from immediately undoing it (the thread is legitimately not in the map).
     expect(focusedThreadId.value).toBe('target');
     expect(awaitedThreadId.value).toBe('target');
 
@@ -344,7 +306,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
 
     expect(outcome.kind).toBe('focused');
     expect(focusedThreadId.value).toBe('target');
-    // Left set, it would exempt a genuinely stale pointer from cleanup later.
     expect(awaitedThreadId.value).toBeNull();
   });
 
@@ -356,14 +317,11 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     const outcome = await focusThreadOrBootstrapResult('ghost');
 
     expect(outcome.kind).toBe('not-found');
-    // Not left staring at a skeleton for a thread that will never arrive.
     expect(focusedThreadId.value).toBe('was-here');
     expect(awaitedThreadId.value).toBeNull();
   });
 
   it('holds the focus on a spawn the thread queue still holds', async () => {
-    // A queued spawn owns no summary row yet, so the by-id read 404s on a
-    // thread that is about to exist. Opening one is not a dead link.
     threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
     focusedThreadId.value = 'was-here';
     (fetchThreadById as any).mockResolvedValue(null);
@@ -384,8 +342,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
   });
 
   it('focuses a spawn the queue admitted between the two reads', async () => {
-    // The by-id read 404s while the spawn is queued. The queue then admits it
-    // before its own read answers, so the queue no longer lists it either.
     threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
     focusedThreadId.value = 'was-here';
     (fetchThreadById as any).mockResolvedValueOnce(null).mockResolvedValue(summary('admitted'));
@@ -412,9 +368,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
   });
 
   it('names the thread and the origin when the bootstrap misses', async () => {
-    // A bare "Thread not found" strips the identity, which the no-hidden-errors
-    // rule counts as a swallowed error. Most callers here are not a direct
-    // click: a sibling thread's `NavigationRequested`, a notification tap.
     (fetchThreadById as any).mockResolvedValue(null);
     toasts.value = [];
 
@@ -451,7 +404,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
   });
 
   it('a superseded bootstrap does not yank focus off the newer one', async () => {
-    // The user taps a second notification while the first is still in flight.
     const first = deferred<any>();
     const second = deferred<any>();
     (fetchThreadById as any)
@@ -462,8 +414,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     const p2 = focusThreadOrBootstrapResult('second');
     expect(awaitedThreadId.value).toBe('second');
 
-    // The FIRST one now fails. It must not restore its own `previousFocus`,
-    // which would drag the user off the thread they actually asked for last.
     first.reject(new Error('too late'));
     await p1;
 
@@ -486,18 +436,11 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     expect(fetchThreadById).not.toHaveBeenCalled();
   });
 
-  // The other producer of an awaited thread. The engine hands back the id of a
-  // thread it has just spawned: a plugin setup thread, an upstream-patch
-  // thread. Its row reaches this client over SSE, which can land after the
-  // response that named it. A plain focusThread on that id is undone by
-  // ThreadView's stale-pointer cleanup, which lands the user on the compose
-  // view. That is the plugin-update bug this pair of tests pins.
   it('focusSpawnedThread claims the await for a thread not in the map', () => {
     focusSpawnedThread('spawned');
 
     expect(focusedThreadId.value).toBe('spawned');
     expect(awaitedThreadId.value).toBe('spawned');
-    // The exemption ThreadView reads, stated as ThreadView states it.
     expect(threadsLoaded.value && awaitedThreadId.value !== 'spawned').toBe(false);
   });
 
@@ -507,8 +450,6 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
 
     focusThread('elsewhere');
 
-    // Left set, it would exempt a genuinely stale pointer for the rest of the
-    // session. The arrival release lives in ThreadView, its only reader.
     expect(awaitedThreadId.value).toBeNull();
   });
 
@@ -522,20 +463,9 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
   });
 });
 
-// ---------------------------------------------------------------------------
-// Bug: CC thread spawned by chat shows in Archive instead of Active
-// ---------------------------------------------------------------------------
 
 describe('CC thread spawned by chat — status from API is authoritative', () => {
   it('API status always overwrites SSE skeleton status', async () => {
-    // Scenario: SSE creates a CC thread skeleton with status='running'
-    // (from CodingAgentThreadSpawned). Then loadAllThreads runs and the API doesn't
-    // include this thread in the active set (Claude Code session hasn't registered yet).
-    // The API snapshot is NOT older than the live `updatedAt`, so
-    // `upsertThread`'s staleness guard lets it through and the server's
-    // 'idle' replaces the skeleton's 'running'. `eventsLoaded` plays no part
-    // in that decision (the sibling case below pins the same outcome with it
-    // set), so the two differ only in setup.
     const map = new Map<string, ThreadState>();
     map.set('cc-1', makeThreadState('cc-1', {
       meta: {
@@ -549,7 +479,6 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         summaryVersion: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-       // Set by SSE skeleton
         lastRevivedAt: '',
         messageCount: 0,
         section: 'archived',
@@ -558,13 +487,11 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
     }));
     threadMap.value = map;
 
-    // API response includes the CC thread in archive but NOT in active set
-    // (because the Claude Code session hasn't registered itself yet)
     (fetchThreads as any).mockResolvedValue({
       saved: [],
       active_threads: [],
       composing: [],
-      active: [],  // CC thread NOT in active set
+      active: [],
       archive: [
         { thread_id: 'cc-1', title: 'Fix OAuth URLs', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'idle', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null },
       ],
@@ -572,15 +499,10 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
 
     await loadAllThreads();
 
-    // The API status is authoritative: a non-stale snapshot overwrites the SSE
-    // skeleton's 'running'.
     expect(threadMap.value.get('cc-1')!.meta.status).toBe('idle');
   });
 
   it('API status is applied even if SSE status differs', async () => {
-    // Scenario: CC thread was running, engine restarted, events loaded show
-    // a terminal state (ResponseAborted). API now reports thread as not active.
-    // With eventsLoaded=true, the downgrade is safe — no race window.
     const map = new Map<string, ThreadState>();
     map.set('cc-1', makeThreadState('cc-1', {
       meta: {
@@ -594,13 +516,12 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
         summaryVersion: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-       // Was running before restart
         lastRevivedAt: '',
         messageCount: 0,
         section: 'archived',
         activeChildrenCount: 0,
       },
-      eventsLoaded: true,  // Events have been loaded — downgrade is safe
+      eventsLoaded: true,
     }));
     threadMap.value = map;
 
@@ -608,7 +529,7 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
       saved: [],
       active_threads: [],
       composing: [],
-      active: [],  // Thread no longer active after restart
+      active: [],
       archive: [
         { thread_id: 'cc-1', title: 'Aborted Session', channel: 'claude_code', last_activity: '2026-03-19T20:00:00Z', created_at: '2026-03-19T20:00:00Z', message_count: 1, section: 'inbox', status: 'idle', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
       ],
@@ -616,25 +537,13 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
 
     await loadAllThreads();
 
-    // API status is applied — backend is authoritative
     expect(threadMap.value.get('cc-1')!.meta.status).toBe('idle');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Event replay must not override API status
-// ---------------------------------------------------------------------------
 
 describe('event replay must not override API status', () => {
   it('API status=idle is preserved after replaying events ending with CodingAgentPromptSent', async () => {
-    // Scenario: CC thread had a CodingAgentPromptSent as the last
-    // status-affecting event (session crashed mid-work). The migration backfill
-    // correctly set status='idle' in the DB. But event replay in applyEventRows
-    // was overriding it to 'running' because the last CodingAgentPromptSent
-    // calls updateStatusFromEvent which sets meta.status='running'.
-    //
-    // This is the exact bug: thread shows "In Progress" in the drawer despite
-    // the backend knowing it's idle.
     (fetchThreads as any).mockResolvedValue({
       saved: [],
       active_threads: [
@@ -647,7 +556,7 @@ describe('event replay must not override API status', () => {
           message_count: 5,
           section: 'archived',
           active_children_count: 0,
-          status: 'idle',  // Backend says idle (session is dead)
+          status: 'idle',
           coding_agent_change_state: { kind: 'none' },
           coding_agent_is_external_repo: false,
           last_revived_at: null,
@@ -681,7 +590,6 @@ describe('event replay must not override API status', () => {
         created: '2026-03-28T19:05:00Z',
         event_id: 'e3',
       },
-      // Automated prompt — sets status='running' during replay, but the session is dead.
       {
         sequence: 4,
         event_type: 'CodingAgentPromptSent',
@@ -696,11 +604,7 @@ describe('event replay must not override API status', () => {
         created: '2026-03-30T08:41:01Z',
         event_id: 'e5',
       },
-      // No terminal event — session crashed here
     ], currentAggregate: {
-      // Backend snapshot: status='idle' (last revival is in the past, agent dead).
-      // currentAggregate is the source of truth — frontend overlays it after
-      // replaying events, preventing per-event derivations from leaking through.
       threadId: 'stuck-t1',
       title: 'Stuck Thread',
       channel: 'claude_code',
@@ -730,14 +634,10 @@ describe('event replay must not override API status', () => {
     await loadAllThreads();
 
     const thread = threadMap.value.get('stuck-t1')!;
-    // currentAggregate said 'idle' — replay must NOT override this to 'running'
     expect(thread.meta.status).toBe('idle');
   });
 
   it('refreshThreadEvents allows new events to update status', async () => {
-    // Scenario: thread was idle, user sends a message while SSE was disconnected.
-    // On reconnect, refreshThreadEvents fetches the new MessageReceived from DB.
-    // The event must update status to 'running' — it's a real live event, not stale replay.
     const map = new Map<string, ThreadState>();
     map.set('refresh-t1', makeThreadState('refresh-t1', {
       meta: { id: 'refresh-t1', title: 'Refresh Thread', channel: 'claude_code', saved: false, createdAt: '2026-03-28T19:00:00Z', updatedAt: '2026-03-28T19:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0 },
@@ -756,7 +656,6 @@ describe('event replay must not override API status', () => {
         event_id: 'e4',
       },
     ], currentAggregate: {
-      // Backend snapshot after the new MessageReceived: status='running'.
       threadId: 'refresh-t1',
       title: 'Refresh Thread',
       channel: 'claude_code',
@@ -786,40 +685,17 @@ describe('event replay must not override API status', () => {
     const { refreshThreadEvents } = await import('./thread-loading');
     await refreshThreadEvents('refresh-t1');
 
-    // New event must update status — refreshThreadEvents does NOT preserve stale status
     expect(threadMap.value.get('refresh-t1')!.meta.status).toBe('running');
   });
 });
 
-// ---------------------------------------------------------------------------
-// refreshThreadEvents — retry once on transient DOMException / transport error
-// ---------------------------------------------------------------------------
-// The runResumeSync / resyncLoadedThreads paths fan refreshThreadEvents out over
-// every loaded thread on SSE reconnect, iOS PWA wake, or right after an engine
-// restart. On iOS Safari the browser cancels in-flight fetches mid-flight
-// (suspend/resume, lifecycle, network change), surfacing as AbortError; fails
-// the first request on a stale HTTP/2 connection, surfacing as TypeError "Load
-// failed"; and over a dropped tunnel the request hangs until the 10s client
-// deadline fires, surfacing as TimeoutError. A single retry covers the
-// recoverable case, and a failure that survives it stays silent because none of
-// those three say anything about the engine and the connection dot owns a
-// sustained outage.
-//
-// A VERDICT (the engine answered and refused) still reaches the user, through
-// one keyed card for the whole fan-out whose copy counts the affected threads.
-// The unkeyed per-thread card this replaced was the reported symptom: a column
-// of `request timed out` toasts, one per thread, none auto-dismissing.
 
 describe('refreshThreadEvents — retry on transient DOMException / transport error', () => {
   beforeEach(() => {
     toasts.value = [];
     _resetThreadEventsFailuresForTesting();
     clearThreadFetchGuards();
-    // The verdict branch is gated on a reachable engine (the dot owns outages),
-    // and the signal's own default is 'connecting'.
     connectionStatus.value = 'connected';
-    // showToast suppresses everything while the workspace is unavailable; one
-    // case below drives that deliberately, so reset it for the rest.
     databaseReachable.value = true;
   });
 
@@ -882,10 +758,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('t1');
 
     expect(mock).toHaveBeenCalledTimes(2);
-    // No toast — the refresh runs without user intent (resyncLoadedThreads
-    // on wake / SSE reconnect) and SSE recovers any missed events. Toasting
-    // surfaced a dozen errors per wake cycle on iOS PWA — visible noise
-    // the user couldn't act on.
     expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
   });
 
@@ -918,10 +790,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('t1');
 
     expect(mock).toHaveBeenCalledTimes(2);
-    // No toast — this is the exact pile the user reported after returning to a
-    // backgrounded iOS PWA once the engine had restarted: the resync's fetches
-    // hit a stale connection (TypeError "Load failed"). SSE recovers any missed
-    // events; the refresh is background (runResumeSync), not user-initiated.
     expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
   });
 
@@ -938,11 +806,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('t1');
 
     expect(mock).toHaveBeenCalledTimes(2);
-    // This case used to assert the opposite, on the reasoning that waiting the
-    // full 10s window and getting nothing is a stronger signal than a cancel.
-    // True of one request; false of a fan-out, which fires one per loaded thread
-    // and so turns one dropped tunnel into N identical `request timed out` cards.
-    // The connection dot reports the outage, once.
     expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
   });
 
@@ -981,9 +844,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     const { refreshThreadEvents } = await import('./thread-loading');
     await Promise.all([...map.keys()].map(id => refreshThreadEvents(id)));
 
-    // The reported symptom was a column of near-identical cards, one per thread,
-    // none of them auto-dismissing. One card, and it counts rather than naming
-    // one of ten arbitrarily.
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].message).toBe('Failed to refresh thread events for 10 threads: boom');
   });
@@ -1004,7 +864,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     const { refreshThreadEvents } = await import('./thread-loading');
     await refreshThreadEvents('untitled');
 
-    // A raw thread id in user-facing copy names nothing the user can look up.
     expect(toasts.value[0].message).toBe('Failed to refresh thread events for 1 thread: boom');
     expect(toasts.value[0].message).not.toContain('untitled');
   });
@@ -1020,8 +879,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     const { refreshThreadEvents } = await import('./thread-loading');
     await refreshThreadEvents('t1');
 
-    // The dot already says the engine is unreachable. A card per thread on top
-    // of it is the same fact told N more times.
     expect(toasts.value).toHaveLength(0);
   });
 
@@ -1072,17 +929,13 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     mock.mockReset();
     mock.mockResolvedValue(noNewEventsSnapshot());
     await refreshThreadEvents('a');
-    // Two are still behind, so the card stands, but "3" is now a provably wrong
-    // number and must not survive the recovery.
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].message).toBe('Failed to refresh thread events for 2 threads: boom');
 
     await refreshThreadEvents('b');
-    // Down to one, so the card can name it again.
     expect(toasts.value[0].message).toBe('Failed to refresh thread events for "Thread C": boom');
 
     await refreshThreadEvents('c');
-    // Now false of everyone.
     expect(toasts.value).toHaveLength(0);
   });
 
@@ -1096,16 +949,12 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
       .mockImplementationOnce(() => new Promise(res => { settleFirst = res; }))
       .mockRejectedValue(new Error('boom'));
 
-    // A wake's runResumeSync and an SSE Lagged resync both target this thread.
     const { refreshThreadEvents } = await import('./thread-loading');
     const first = refreshThreadEvents('t1', { coalesce: true });
     const second = refreshThreadEvents('t1', { coalesce: true });
     settleFirst(noNewEventsSnapshot());
     await Promise.all([first, second]);
 
-    // The second call is dropped rather than racing: it would otherwise double
-    // the requests the pool exists to bound, and if its failure settled last it
-    // would record a verdict for a thread that had just refreshed cleanly.
     expect(mock).toHaveBeenCalledTimes(1);
     expect(toasts.value).toHaveLength(0);
   });
@@ -1122,12 +971,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
 
     const { refreshThreadEvents } = await import('./thread-loading');
     const fanOut = refreshThreadEvents('t1', { coalesce: true });
-    // Several callers treat a resolved refresh as read-after-write PROOF:
-    // `schedulePendingCleanup` force-drops a pending message on it,
-    // `checkConnection`'s empty-thread recovery spends one of three budgeted
-    // attempts, and the cancel / queued-message heals need a request issued
-    // after their own POST returned. Coalescing any of those into an in-flight
-    // request that predates the write would make the proof a lie.
     await refreshThreadEvents('t1');
     expect(mock).toHaveBeenCalledTimes(2);
 
@@ -1145,15 +988,10 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
 
     const { refreshThreadEvents } = await import('./thread-loading');
     const first = refreshThreadEvents('t1', { coalesce: true });
-    // A second resume lands while the first fan-out is still in flight. Both the
-    // 1s coalescing gate and `resumeInFlight` expire well before a slow refresh
-    // settles, so the guard is reset and a fresh attempt is admitted.
     clearThreadFetchGuards();
     const second = refreshThreadEvents('t1', { coalesce: true });
     expect(mock).toHaveBeenCalledTimes(2);
 
-    // The older attempt finishes. Its release must not free the newer one's
-    // slot, or a third attempt would pile on with two already in flight.
     settle[0](noNewEventsSnapshot());
     await first;
     await refreshThreadEvents('t1', { coalesce: true });
@@ -1161,7 +999,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
 
     settle[1](noNewEventsSnapshot());
     await second;
-    // Once the owner releases, the thread is refreshable again.
     const third = refreshThreadEvents('t1', { coalesce: true });
     expect(mock).toHaveBeenCalledTimes(3);
     settle[2](noNewEventsSnapshot());
@@ -1174,10 +1011,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
     const { refreshThreadEvents } = await import('./thread-loading');
 
-    // Older attempt FAILS after a newer one already refreshed cleanly and
-    // RELEASED its claim: raising a card off it would report a thread that is up
-    // to date. The claim is gone by then, so only the report high-water mark can
-    // still tell that a newer conclusion has landed.
     mock.mockReset();
     let failOld: (e: unknown) => void = () => {};
     mock.mockImplementationOnce(() => new Promise((_res, rej) => { failOld = rej; }))
@@ -1189,8 +1022,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await old1;
     expect(toasts.value).toHaveLength(0);
 
-    // Older attempt SUCCEEDS after a newer one failed: retracting the card
-    // would hide a failure that is still true.
     _resetThreadEventsFailuresForTesting();
     clearThreadFetchGuards();
     toasts.value = [];
@@ -1214,8 +1045,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     mock.mockReset();
     let failOld: (e: unknown) => void = () => {};
     mock.mockImplementationOnce(() => new Promise((_res, rej) => { failOld = rej; }))
-      // The newer attempt dies transiently on both tries, so it reports nothing
-      // and simply releases its claim.
       .mockRejectedValue(new DOMException('aborted', 'AbortError'));
 
     const { refreshThreadEvents } = await import('./thread-loading');
@@ -1225,19 +1054,11 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     failOld(new Error('boom'));
     await older;
 
-    // Gating on the live claim would have swallowed this genuine verdict: the
-    // newer attempt released the claim without ever concluding anything.
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].message).toContain('boom');
   });
 
   it('a recovery never RAISES a card that was suppressed while the failures were real', async () => {
-    // The engine keeps answering /health while its database is down, so the dot
-    // stays green and every fetch 500s into the failing map as a verdict. But
-    // showToast drops everything while `workspaceUnavailable()` holds, because
-    // the database toast is the one authoritative surface. Nothing may then turn
-    // the RECOVERY into the moment a brand-new sticky card appears, carrying a
-    // now-stale reason and counting down as the rest of the threads catch up.
     const map = new Map<string, ThreadState>();
     for (const id of ['x', 'y', 'z']) {
       map.set(id, makeThreadState(id, { meta: { id, title: id }, eventsLoaded: true, lastDbSeq: 1 }));
@@ -1278,8 +1099,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('p');
     mock.mockRejectedValue(new Error('500 Internal Server Error'));
     await refreshThreadEvents('q');
-    // `Map.set` on an existing key keeps its ORIGINAL position, so re-recording
-    // p has to move it to the end or the card would keep reporting q's reason.
     mock.mockRejectedValue(new Error('connection reset'));
     await refreshThreadEvents('p');
 
@@ -1297,10 +1116,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('t1');
     expect(toasts.value).toHaveLength(1);
 
-    // The reconcile-on-read backstop only runs when a LATER fetch settles, and
-    // the only failing thread leaves none to settle: nothing fetches it again,
-    // and with no other loaded thread nothing fetches at all. So the removal
-    // site cleans up directly.
     const pruned = new Map(threadMap.value);
     pruned.delete('t1');
     threadMap.value = pruned;
@@ -1328,9 +1143,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('kept');
     expect(toasts.value[0].message).toBe('Failed to refresh thread events for 2 threads: boom');
 
-    // sendMessage deletes the row of an optimistic thread whose send failed.
-    // Nothing will ever fetch it again, so an entry keyed on it would hold the
-    // card open forever at a count including a thread the user cannot see.
     const pruned = new Map(threadMap.value);
     pruned.delete('doomed');
     threadMap.value = pruned;
@@ -1357,15 +1169,6 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
   });
 });
 
-// ---------------------------------------------------------------------------
-// loadThreadEvents: same verdict / delivery-failure split as the refresh above
-// ---------------------------------------------------------------------------
-// loadAllThreads fans this out over the focused thread plus every active and
-// saved one, on boot and on every wake, so it storms the same way. Its transient
-// branch is silent for the same reasons AND because the user is already told by
-// the two surfaces that can act on it: `eventsLoadFailed` paints the focused
-// thread's own failed empty state, and the resume sync retries every thread
-// carrying the flag.
 
 describe('loadThreadEvents: verdict vs delivery failure', () => {
   beforeEach(() => {
@@ -1378,8 +1181,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
     threadMap.value = map;
   });
 
-  /** loadThreadEvents makes three attempts with a 1s then 2s backoff. Fake
-   *  timers keep that off the wall clock without weakening the assertion. */
   async function runLoad(threadId: string): Promise<void> {
     const { loadThreadEvents } = await import('./thread-loading');
     vi.useFakeTimers();
@@ -1402,8 +1203,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
 
     expect(mock).toHaveBeenCalledTimes(3);
     expect(toasts.value).toHaveLength(0);
-    // The flag is what ThreadView renders and what runResumeSync retries, so it
-    // must be set on the silent branch too.
     expect(threadMap.value.get('L1')!.eventsLoadFailed).toBe(true);
   });
 
@@ -1431,8 +1230,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
     vi.useFakeTimers();
     try {
       const failing = loadThreadEvents('L1');
-      // A resume cleared the guard and put a second load on this thread; it
-      // lands successfully while this one is still working through its backoff.
       await vi.advanceTimersByTimeAsync(1500);
       threadMap.value.get('L1')!.eventsLoaded = true;
       await vi.advanceTimersByTimeAsync(5000);
@@ -1441,8 +1238,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
       vi.useRealTimers();
     }
 
-    // The thread is loaded and rendering, so this attempt's failure describes
-    // nothing the user can see, and must neither card it nor re-flag it.
     expect(toasts.value).toHaveLength(0);
     expect(threadMap.value.get('L1')!.eventsLoadFailed).toBe(false);
   });
@@ -1457,15 +1252,11 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
     const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
     mock.mockReset();
 
-    // The focused-thread recovery refreshes R1 while the ThreadView watchdog
-    // reloads it: both fire on the same "loaded but empty" condition.
     let failRefresh: (e: unknown) => void = () => {};
     mock.mockImplementationOnce(() => new Promise((_res, rej) => { failRefresh = rej; }));
     const { refreshThreadEvents, loadThreadEvents } = await import('./thread-loading');
     const refreshing = refreshThreadEvents('R1');
 
-    // The full load lands: it carries no `after`, so it holds everything a
-    // refresh would have fetched.
     threadMap.value.get('R1')!.eventsLoaded = false;
     mock.mockResolvedValue({ events: [], currentAggregate: null });
     await loadThreadEvents('R1');
@@ -1474,9 +1265,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
     failRefresh(new Error('boom'));
     await refreshing;
 
-    // Without the load claiming the report high-water mark, this stale verdict
-    // would card a thread that is holding the whole snapshot, with nothing left
-    // to retract it.
     expect(toasts.value).toHaveLength(0);
   });
 
@@ -1491,14 +1279,12 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
     mock.mockReset();
 
     const { refreshThreadEvents, loadThreadEvents } = await import('./thread-loading');
-    // A load starts first, so it holds the LOWEST token of the three.
     let settleLoad: (v: unknown) => void = () => {};
     mock.mockImplementationOnce(() => new Promise(res => { settleLoad = res; }));
     threadMap.value.get('R2')!.eventsLoaded = false;
     const loading = loadThreadEvents('R2');
     threadMap.value.get('R2')!.eventsLoaded = true;
 
-    // A middle refresh is still in flight when a newer one reports a verdict.
     let failMiddle: (e: unknown) => void = () => {};
     mock.mockImplementationOnce(() => new Promise((_res, rej) => { failMiddle = rej; }));
     const middle = refreshThreadEvents('R2');
@@ -1506,8 +1292,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
     await refreshThreadEvents('R2');
     expect(toasts.value[0].message).toContain('newest');
 
-    // The load lands last. A bare `set` here would lower the mark to the load's
-    // start-time token and re-admit the middle attempt.
     settleLoad({ events: [], currentAggregate: null });
     await loading;
     failMiddle(new Error('stale middle'));
@@ -1535,8 +1319,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
       [THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY].sort(),
     );
 
-    // A landed refresh says nothing about the thread whose history never
-    // arrived, so it must leave that card alone.
     mock.mockReset();
     mock.mockResolvedValue({ events: [], currentAggregate: null });
     await refreshThreadEvents('R1');
@@ -1545,9 +1327,6 @@ describe('loadThreadEvents: verdict vs delivery failure', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Section — focusThread does NOT auto-archive (user must click Archive/Apply/Discard)
-// ---------------------------------------------------------------------------
 
 describe('focusThread — section', () => {
   it('does not archive an inbox thread when focused', () => {
@@ -1559,7 +1338,6 @@ describe('focusThread — section', () => {
 
     focusThread('t1');
 
-    // Section stays 'inbox' — no auto-archive on focus
     expect(threadMap.value.get('t1')!.meta.section).toBe('inbox');
   });
 
@@ -1571,14 +1349,10 @@ describe('focusThread — section', () => {
     const mapBefore = threadMap.value;
     focusThread('t1');
 
-    // threadMap reference should not change (no unnecessary signal trigger)
     expect(threadMap.value).toBe(mapBefore);
   });
 });
 
-// ---------------------------------------------------------------------------
-// Section — loadAllThreads preserves section from API
-// ---------------------------------------------------------------------------
 
 describe('loadAllThreads — section', () => {
   beforeEach(() => {
@@ -1626,23 +1400,15 @@ describe('loadAllThreads — section', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Section — upsertThread must not overwrite updatedAt with stale API value
-// ---------------------------------------------------------------------------
 
 describe('upsertThread — updatedAt monotonic', () => {
   it('does not overwrite a newer SSE-derived updatedAt with a stale API last_activity', () => {
-    // Scenario: Claude Code session is actively streaming. SSE events have updated
-    // meta.updatedAt to 19:31. Then loadAllThreads runs (e.g. on visibility
-    // change / resume) and the API returns last_activity=19:21 because the
-    // backend projection doesn't update for CC streaming events. The stale
-    // API value must NOT overwrite the fresher SSE-derived timestamp.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: {
         id: 't1', title: 'CC Thread', channel: 'claude_code', saved: false,
         createdAt: '2026-03-31T19:21:38Z',
-        updatedAt: '2026-03-31T19:31:54Z', // SSE-updated (newer)
+        updatedAt: '2026-03-31T19:31:54Z',
         status: 'running', codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false, lastRevivedAt: '',
         messageCount: 0, section: 'archived', activeChildrenCount: 0,
@@ -1653,7 +1419,7 @@ describe('upsertThread — updatedAt monotonic', () => {
       thread_id: 't1',
       title: 'CC Thread',
       channel: 'claude_code',
-      last_activity: '2026-03-31T19:21:38Z', // stale backend value
+      last_activity: '2026-03-31T19:21:38Z',
       created_at: '2026-03-31T19:21:38Z',
       message_count: 1,
       section: 'archived',
@@ -1661,7 +1427,6 @@ describe('upsertThread — updatedAt monotonic', () => {
       summaryVersion: 0,
     } as any, false);
 
-    // updatedAt must keep the newer SSE value, not regress to the stale API value
     expect(map.get('t1')!.meta.updatedAt).toBe('2026-03-31T19:31:54Z');
   });
 
@@ -1682,7 +1447,7 @@ describe('upsertThread — updatedAt monotonic', () => {
       thread_id: 't1',
       title: 'Thread',
       channel: 'chat',
-      last_activity: '2026-03-31T12:00:00Z', // newer
+      last_activity: '2026-03-31T12:00:00Z',
       created_at: '2026-03-31T10:00:00Z',
       message_count: 2,
       section: 'archived',
@@ -1690,7 +1455,6 @@ describe('upsertThread — updatedAt monotonic', () => {
       summaryVersion: 0,
     } as any, false);
 
-    // API has a newer timestamp — should advance
     expect(map.get('t1')!.meta.updatedAt).toBe('2026-03-31T12:00:00Z');
   });
 });

@@ -1,9 +1,3 @@
-/**
- * The action slot keeps one width per face set, in every state (ADR 0573).
- * Every control that can stand in the slot wears `.action-slot`, and that class
- * names one width per face set: the button, or the round button under
- * `data-composer-compact`. Every face's word is short enough for the button.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -20,7 +14,6 @@ const rowCss = strip(read('../../../styles/chat/input-messages.css'));
 const prompt = read('../PromptInput.tsx');
 const banner = read('../WaitingBanner.tsx');
 
-/** The rules scoped to the compact face, with the attribute prefix dropped. */
 const compactRules = (css: string) =>
   [...css.matchAll(/(?:^|\n)((?:\[data-composer-compact\][^{}]*?)) \{([^}]*)\}/g)]
     .map((m) => `${m[1].split('[data-composer-compact] ').join('')} {${m[2]}}`).join('\n');
@@ -39,10 +32,8 @@ describe('the action slot keeps one width per face set', () => {
   });
 
   it('dresses every control that stands in the slot as one', () => {
-    // Send and Stop, and the three lone answer faces.
     expect(prompt).toContain("'action-btn send-cancel-morph action-slot'");
     expect(prompt.match(/class="action-btn action-btn-(confirm|danger) action-slot"/g)?.length).toBe(3);
-    // Send or Stop wins whenever it stands, so a banner never hides Stop.
     expect(prompt).toContain('sendButton ?? (bannerActions && <ActionSlot occupant={bannerActions.slot} compact={composerCompact} />)');
   });
 });
@@ -53,11 +44,9 @@ it('keeps the face rules out of the phone media query', () => {
 });
 
 describe('every face fits the button', () => {
-  /** The closed set of words a face can show. A new one must fit the button at
-   *  every UI scale, which `composer-action-slot-widths-all.spec.ts` checks. */
   const FACE_WORDS = [
     'Send', 'Ask', 'Stop', 'Submit', 'Cancel',
-    'Apply', 'Discard', 'Archive', 'Landing', 'Waiting', 'Bring back',
+    'Apply', 'Discard', 'Archive', 'Landing', 'Waiting',
   ];
 
   it('gives the busy and lane faces their plain word', () => {

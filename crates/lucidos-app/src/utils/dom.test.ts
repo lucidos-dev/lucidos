@@ -1,13 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-// Stub HTMLElement before importing — match scroll.test.ts pattern.
 if (typeof globalThis.HTMLElement === 'undefined') {
   (globalThis as any).HTMLElement = class HTMLElement {
     tagName = '';
     isContentEditable = false;
     contentEditable = 'inherit';
-    // Match HTMLInputElement.type's real normalization — defaults to 'text',
-    // never empty string. opensSoftwareKeyboard relies on this invariant.
     type = 'text';
   };
 }
@@ -38,7 +35,6 @@ describe('focusIfNeeded', () => {
 
   it('does nothing when element is null', () => {
     (globalThis as any).document = { activeElement: null };
-    // Should not throw
     focusIfNeeded(null);
   });
 });
@@ -85,7 +81,6 @@ describe('opensSoftwareKeyboard', () => {
   it('returns true for default input (no type attribute = text)', () => {
     const el = new (globalThis as any).HTMLElement();
     el.tagName = 'INPUT';
-    // type defaults to 'text' in the stub (matches real HTMLInputElement.type)
     expect(opensSoftwareKeyboard(el)).toBe(true);
   });
 
@@ -117,15 +112,10 @@ describe('viewportIsKeyboardShrunk', () => {
   });
 
   it('ignores a shrink too small to be a keyboard', () => {
-    // Browser chrome and a settling safe-area inset move it by this much. iOS
-    // never shrinks the LAYOUT viewport for the keyboard, so the gap is large
-    // whenever the keys are really up.
     expect(viewportIsKeyboardShrunk(784, 844)).toBe(false);
   });
 
   it('reads a zero-height visual viewport as no reading, not as a keyboard', () => {
-    // iOS 27 reports this transiently in a standalone PWA. Read as a keyboard,
-    // it sized the app shell to 0px and blanked the screen.
     expect(viewportIsKeyboardShrunk(0, 852)).toBe(false);
   });
 });

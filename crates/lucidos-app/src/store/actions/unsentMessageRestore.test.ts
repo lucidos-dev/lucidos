@@ -24,6 +24,8 @@ import { ApiError, submitChat } from '../../api/client';
 import {
   createMemoryUnsentMessageBackend,
   readUnsentMessageStore,
+  persistSendingMessage,
+  markUnsentMessageRecordUnsent,
   _resetUnsentMessageRecordsForTesting,
   type UnsentMessageBackend,
   type UnsentMessageRecord,
@@ -97,7 +99,6 @@ beforeEach(() => {
 
 afterEach(() => {
   observeSourceGeneration(null);
-  // A refused Retry schedules a compose write; drop it with the thread.
   for (const id of threadMap.value.keys()) forgetComposeState(id);
   _resetUndeliveredComposeDraftsForTesting();
   _resetComposeDraftsForTesting();
@@ -128,7 +129,25 @@ describe('restoreUnsentMessages', () => {
     expect(copies).toEqual([UNSENT_AFTER_RELOAD_COPY, unsentMessageCopy(1)]);
   });
 
-  it('a Retry after the reload re-posts the stored request, placed in this page\'s inputs', async () => {
+  it('restores an explicitly refused send with its refusal after a page reload', async () => {
+    const original = record('e-refused');
+    persistSendingMessage(original);
+    markUnsentMessageRecordUnsent(original.eventId, 0, { reason: 'overtaken', message: 'A later input reached this thread first.' });
+    const [persisted] = await readUnsentMessageStore();
+    expect(persisted.refusal?.reason).toBe('overtaken');
+    await backend.put({ ...persisted, ownerId: EARLIER_PAGE });
+    _resetUnsentMessageRecordsForTesting(backend);
+    unsentMessages.value = new Map();
+
+    await restoreUnsentMessages();
+
+    const [exchange] = exchangesOf(LIVE);
+    expect(exchangeError(exchange)?.message).toBe('Not sent: A later input reached this thread first.');
+    expect(unsentMessages.value.get(original.eventId)?.body).toEqual(original.body);
+    expect((await readUnsentMessageStore())[0].refusal).toEqual(persisted.refusal);
+  });
+
+  it('a Retry after reload preserves an uncertain stored wire intent', async () => {
     const stored = record('e-1');
     await seed(stored);
     await restoreUnsentMessages();
@@ -136,9 +155,8 @@ describe('restoreUnsentMessages', () => {
 
     expect(await retryUnsentMessage('e-1')).toBe('sent');
 
-    // The reloaded page is a new input chain (ADR 0449); the request is otherwise as stored.
     const reposted = mockedSubmitChat.mock.calls[0][0];
-    expect(reposted).toEqual({ ...stored.body, input_chain: pageOwnerId, input_seq: reposted.input_seq });
+    expect(reposted).toEqual(stored.body);
     expect(await storedIds()).toEqual([]);
   });
 
@@ -261,9 +279,11 @@ describe('a record whose thread is gone or could not be checked', () => {
   it('leaves another open tab\'s records alone', async () => {
     Object.defineProperty(globalThis.navigator, 'locks', {
       configurable: true,
-      value: { query: async () => ({ held: [{ name: PAGE_OWNER_LOCK_PREFIX + 'other-tab' }] }), request: async () => {} },
+      value: {
+        query: async () => ({ held: [{ name: PAGE_OWNER_LOCK_PREFIX + 'other-tab' }] }),
+        request: (...args: [string, () => Promise<never>]) => args[1](),
+      },
     });
-    // Their thread would read as gone here, so a wrong adopt would move it.
     await seed(record('theirs', { ownerId: 'other-tab', threadId: 't-gone' }), record('orphan'));
     await restoreUnsentMessages();
     expect(await storedIds()).toEqual(['orphan', 'theirs']);
@@ -332,8 +352,6 @@ describe('a follow-up restored after a reload', () => {
   });
 });
 
-/** A thread-list read: the engine's row for `threadId` in `state`, holding
- *  `composeText` as its draft. */
 function summary(threadId: string, state: 'composing' | 'active', composeText: string): ThreadSummary {
   return {
     thread_id: threadId,
@@ -415,4 +433,47 @@ it('rechecks origin before settling a lookup that crossed a restore', async () =
   expect(outcome.shown + outcome.delivered + outcome.movedToDraft).toBe(0);
   expect(await storedIds()).toEqual(['lookup-race']);
   expect(unsentMessages.peek().size).toBe(0);
+});
+
+it('restores the whole card answer with its original placement instead of an ordinary message', async () => {
+  const { unsentPicks } = await import('../pendingDecisions');
+  const live = threadMap.value.get(LIVE)!;
+  live.meta = { ...live.meta, status: 'waiting_for_user_answer' };
+  handleEvent(threadMap.value, LIVE, 1, { type: 'UserQuestionAsked', tool_use_id: 'card-journal', question: 'Choose', options: [] } as unknown as StoredEvent, '2026-10-03T08:00:00Z', 'question');
+  const questionPick = { toolUseId: 'card-journal', answer: { kind: 'MultiSelected' as const, option_ids: ['a'], text: 'held', image_hashes: ['image', 'image'] }, placement: { event_id: 'card-event', input_chain: 'old-page', input_seq: 4, compose_epoch: 9 } };
+  await seed(record('card-event', { questionPick }));
+  expect((await restoreUnsentMessages()).shown).toBe(1);
+  expect(unsentPicks.map.value.get('card-journal')).toMatchObject({ answer: questionPick.answer, placement: questionPick.placement });
+  expect(unsentMessages.value.size).toBe(0);
+  unsentPicks.clear('card-journal');
+  expect(await storedIds()).toEqual([]);
+});
+
+it.each(['resolved', 'terminated', 'outside-window', 'gone'])('recovers a composer pick in a draft when its card is %s', async (state) => {
+  const { unsentPicks } = await import('../pendingDecisions');
+  const answer = { kind: 'MultiSelected' as const, option_ids: ['a'], text: 'held', image_hashes: ['image', 'image'] };
+  const questionPick = { toolUseId: 'retired-card', answer, placement: { event_id: 'held-answer', input_chain: 'old-page', input_seq: 1 } };
+  if (state === 'gone') threadMap.value = new Map();
+  if (state === 'terminated' || state === 'resolved') {
+    handleEvent(threadMap.value, LIVE, 1, { type: 'UserQuestionAsked', tool_use_id: 'retired-card', question: 'Choose', options: [] } as unknown as StoredEvent, '2026-10-03T08:00:00Z', 'question');
+  }
+  if (state === 'resolved') {
+    const live = threadMap.value.get(LIVE)!;
+    live.meta = { ...live.meta, status: 'waiting_for_user_answer' };
+    handleEvent(threadMap.value, LIVE, 2, { type: 'UserQuestionAnswered', tool_use_id: 'retired-card', answer: { kind: 'FreeText', text: 'another answer' } } as unknown as StoredEvent, '2026-10-03T08:00:01Z', 'other-answer');
+  }
+  await seed(record('held-answer', { questionPick, body: { message: 'Selected choice\n\nheld', image_hashes: answer.image_hashes, mode: 'human' } }));
+  await restoreUnsentMessages();
+  expect(unsentPicks.map.peek().has('retired-card')).toBe(false);
+  expect(getDraft(focusedThreadId.peek()!)).toMatchObject({ text: 'Selected choice\n\nheld', image_hashes: ['image', 'image'] });
+  expect(await storedIds()).toEqual([]);
+});
+
+it('settles an exact recorded composer pick instead of restoring another draft', async () => {
+  const questionPick = { toolUseId: 'accepted-card', answer: { kind: 'FreeText' as const, text: 'held' }, placement: { event_id: 'accepted-answer', input_chain: 'old-page', input_seq: 1 } };
+  engineRow(LIVE, 1, 'held', '2026-10-03T08:00:00Z', 'accepted-answer');
+  await seed(record('accepted-answer', { questionPick }));
+  expect((await restoreUnsentMessages()).delivered).toBe(1);
+  expect(focusedThreadId.peek()).toBeNull();
+  expect(await storedIds()).toEqual([]);
 });

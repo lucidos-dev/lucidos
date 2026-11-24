@@ -10,57 +10,9 @@ import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 import { LoadableToggle } from '../shared/LoadableToggle';
 
-/** Settings → System → Debugging: developer/diagnostic toggles, off by default
- *  except Autocorrect.
- *
- *  - "Capture context per step" is a server preference (`capture_context`),
- *    moved here from the former Models → Debugging group so all diagnostics share
- *    one home. Calling `currentCaptureContext()` in render subscribes to
- *    preference updates (it reads `preferences.value`), same as LocaleSection.
- *  - "Perf instrumentation" toggles the per-device `lucidos:perf` localStorage
- *    flag that gates `recordPerfSample` (see utils/perfQueue.ts). It's NOT a
- *    server preference — device-local by design, read live, takes effect on the
- *    next sample with no reload. localStorage isn't reactive, so the checked
- *    state is held locally for immediate UI feedback; the gate reads the flag
- *    directly.
- *  - "Animation speed" scales every UI transition via `speedMultiplier` (a
- *    device-global slider persisted in localStorage, see store.ts/effects.ts).
- *    It lives here as a diagnostic: slowing animations down makes transition
- *    glitches inspectable. The user-facing control is Motion in Appearance,
- *    and reduced motion wins over this, so the slider disables while it is on.
- *  - "Autocorrect" is the device-scoped `autocorrect` preference, on iOS only.
- *    It works around a UIKit bug rather than diagnosing one (ADR 0262). It
- *    starts on, like autocorrect in any other app, and a device that keeps
- *    hitting the bug turns it off.
- *  - "Communication surfaces" opens the surface gallery, which renders every
- *    toast, banner and dialog against realistic content and performs no
- *    operation. It is its own subview rather than rows here, because it is a
- *    page of samples rather than a setting.
- *  - "Restart engine" is shown on a PACKAGED install only, and is the packaged
- *    counterpart of System > Overview's dev-only "Rebuild & Restart". Both sites
- *    branch on `restartControlHome`, so exactly one of the two ever renders. A
- *    packaged install ships its binary and has no source to rebuild, so the dev
- *    label was a lie there and the action is purely a recovery one: it belongs
- *    with the diagnostics, not on the page a user reads to see their version.
- *    Both routes go through `confirmAndRestartEngine`, the single
- *    confirm-then-restart entry point.
- *
- *    Its explainer deliberately does NOT name a mechanism, because the packaged
- *    restart has two shapes: the desktop app drives `restart_service`
- *    (`launchctl kickstart -k` on the LaunchAgent, taking the gateway and every
- *    workspace engine it spawned down with it), while a browser/PWA client POSTs
- *    /restart, which the engine forwards to the gateway control API to respawn
- *    just this workspace's stack. The blast radius is what the user needs, so
- *    that is what the explainer states.
- *
- *  Every row's prose is behind an *explainer* (`components/shared/Explainer.tsx`)
- *  rather than sitting under the row as a `.settings-row-note`: this page is a
- *  handful of switches and was three quarters grey paragraph. Nothing here is
- *  state-dependent or a next action, so every row's prose moved. */
 export function DebuggingSection() {
-  // Lazy initializer: read localStorage once on mount, not on every render. The
-  // panel remounts each time it's opened, so this reflects the current flag.
   const [perfOn, setPerfOn] = useState(() => isPerfEnabled());
+  const packaged = enginePackaged.value;
 
   return (
     <div class="settings-section">
@@ -98,23 +50,27 @@ export function DebuggingSection() {
               (<code>[Client/perf]</code> lines) for diagnosing lag.
             </p>
             <p>
-              Per-device and off by default: turn it on only while measuring. Takes
-              effect immediately, no reload.
+              From-source installs record automatically. Packaged installs start
+              with recording off. The switch applies to this device immediately.
             </p>
           </Explainer>
         </span>
-        <label class="toggle-switch">
-          <input
-            type="checkbox"
-            checked={perfOn}
-            onChange={(e) => {
-              const on = (e.currentTarget as HTMLInputElement).checked;
-              setPerfEnabled(on);
-              setPerfOn(on);
-            }}
-          />
-          <span class="toggle-slider" />
-        </label>
+        {packaged === false && <span>Always on</span>}
+        {packaged === true && (
+          <label class="toggle-switch">
+            <input
+              type="checkbox"
+              aria-label="Perf instrumentation"
+              checked={perfOn}
+              onChange={(e) => {
+                const on = (e.currentTarget as HTMLInputElement).checked;
+                setPerfEnabled(on);
+                setPerfOn(isPerfEnabled());
+              }}
+            />
+            <span class="toggle-slider" />
+          </label>
+        )}
       </div>
       <div class="settings-row" data-search-anchor="debugging:animation-speed">
         <span class="settings-row-label">
@@ -150,8 +106,6 @@ export function DebuggingSection() {
           </span>
         </div>
       </div>
-      {/* iPhone and iPad only: the bug it works around is in iOS's own
-          keyboard, and elsewhere the switch would change nothing visible. */}
       {isIOS() && (
         <div class="settings-row" data-search-anchor="debugging:autocorrect">
           <span class="settings-row-label">
@@ -194,7 +148,7 @@ export function DebuggingSection() {
           Open
         </button>
       </div>
-      {restartControlHome(enginePackaged.value) === 'debugging' && (
+      {restartControlHome(packaged === true) === 'debugging' && (
         <div class="settings-row" data-search-anchor="debugging:restart-engine">
           <span class="settings-row-label">
             Restart engine

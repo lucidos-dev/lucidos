@@ -1,11 +1,5 @@
 // @vitest-environment jsdom
-/**
- * The Memory page's inspector lists Classic's saved memories, so a Tree
- * workspace shows only the Tree section and its summary tree browser. Until
- * preferences load the inspector stays, so a Classic workspace never sees it
- * arrive late.
- */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../MemoryInspector', async () => {
   const { h } = await import('preact');
@@ -32,6 +26,8 @@ async function mount(host: HTMLElement, prefs: 'not-loaded' | 'classic' | 'tree'
 }
 
 describe('the Memory page', () => {
+  beforeAll(async () => { await import('../MemoryPage'); });
+
   let host: HTMLElement;
   let unmount: () => void = () => {};
 

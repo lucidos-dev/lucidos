@@ -1,15 +1,3 @@
-/**
- * A failed multi-select answer hands the answer back.
- *
- * Reported from an iOS PWA: a three-option answer failed to send twice. Each
- * failure cleared the toggles and the composer, so the user re-picked all three
- * from scratch before the third attempt landed. The clearing is right, being
- * the send gesture. Losing it on a failure is not.
- *
- * The transport half of the same report is fixed in
- * `src/api/client/chat-answer-retry.test.ts`. This is what the user keeps when
- * the retry does not save them either.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -35,8 +23,6 @@ describe('recoverableAnswerDraft', () => {
   });
 
   it('keeps a fresh pick made during the failure window', () => {
-    // The user re-picked while the POST was in flight. That is the newer
-    // answer, so the stale one stays gone.
     expect(recoverableAnswerDraft({
       sentIds: ['opt-0'], sentText: '', currentIds: ['opt-2'], currentDraft: '',
     }).ids).toBeNull();
@@ -78,8 +64,6 @@ describe('the submit sites leave the message to the action', () => {
   });
 
   it('the multi-select submit restores through the draft, not the textarea', () => {
-    // The sync effect writes the box from the draft and resizes it. Writing
-    // both would be two sources for one value.
     const body = submitMultiBody();
     expect(body).toMatch(/updateCompose\(focused, \{ text: recovered\.text \}\)/);
     expect(body).not.toMatch(/writeComposerValue\(el, recovered/);

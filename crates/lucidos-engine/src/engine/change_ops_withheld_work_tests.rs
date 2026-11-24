@@ -58,6 +58,7 @@ async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
 
 fn proposed(change_id: Uuid, description: &str, files: &[String], set_aside: bool) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: change_id.to_string(),
         description: Some(description.into()),
         files: files.to_vec(),
@@ -107,7 +108,15 @@ async fn hold_of(
     bus: &EventBus,
     input: &ProposeChangeInput<'_>,
 ) -> Option<ProposalHold> {
-    match withhold_unready(pool, bus, input).await.expect("withhold") {
+    match withhold_unready(
+        pool,
+        bus,
+        input,
+        crate::engine::change_ops::HoldReentry::default(),
+    )
+    .await
+    .expect("withhold")
+    {
         HoldOutcome::Clear => None,
         HoldOutcome::Held(hold, _) => Some(hold),
     }
@@ -287,6 +296,7 @@ async fn handed_off_work_withdraws_the_pending_change_unannounced() {
             worktree_path: None,
             worktree_head_sha: Some(branch_head(&repo).await),
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -345,6 +355,7 @@ async fn an_integrated_child_hands_up_hardened_work_and_never_proposes() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: BRANCH.into(),
@@ -603,6 +614,7 @@ async fn an_unfinished_turn_withdraws_a_set_aside_change_it_moved_past() {
         thread_id,
         ThreadEvent::ChangeSetAside {
             change_id: change_id.to_string(),
+            hold_id: None,
         },
     )
     .await;
@@ -640,6 +652,7 @@ async fn the_branch_moved_unless_the_last_idle_recorded_its_head() {
         worktree_path: None,
         worktree_head_sha: sha.map(str::to_string),
         bg_bash_pending: false,
+        turn_end: None,
     };
 
     assert!(branch_moved_since_last_idle(&pool, thread_id, &repo, BRANCH).await);
@@ -769,16 +782,15 @@ async fn bring_back_withdraws_an_incomplete_set_aside_row_and_redecides_it() {
 #[test]
 fn bring_back_redecides_an_incomplete_row_instead_of_restoring_it() {
     let src = include_str!("change_ops/set_aside.rs");
-    let body = &src[src.find("pub(crate) async fn bring_back_change(").unwrap()..];
+    let body = &src[src.find("async fn bring_back_change(").unwrap()..];
     let incomplete = &body[body.find("if change.incomplete {").unwrap()..];
     let arm = &incomplete[..incomplete.find("return Ok(());").unwrap()];
     let withdraw = arm
         .find("withdraw_for_redecision(")
         .expect("withdraws first");
-    let redecide = arm
-        .find("self.redecide_branch_work(")
-        .expect("then re-decides");
-    assert!(withdraw < redecide);
+    let host = arm.find("self.agent_host()").expect("calls the agent host");
+    let redecide = arm.find(".redecide_branch_work(").expect("then re-decides");
+    assert!(withdraw < host && host < redecide);
     let read = arm
         .find("branch_changed_files_checked(")
         .expect("reads the branch first");
@@ -797,7 +809,7 @@ fn bring_back_redecides_an_incomplete_row_instead_of_restoring_it() {
 #[test]
 fn propose_turn_work_withholds_every_unfinished_turn() {
     let src = include_str!("change_ops/propose.rs");
-    let body = &src[src.find("pub(crate) async fn propose_turn_work(").unwrap()..];
+    let body = &src[src.find("async fn propose_turn_work(").unwrap()..];
     let body = &body[..body.find("\n    }\n").unwrap()];
     let finished_arm = body
         .find("if finished {")
@@ -858,13 +870,19 @@ async fn a_hold_withdraws_an_open_change_the_turn_committed_past() {
             worktree_path: None,
             worktree_head_sha: Some(head),
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
 
-    let same = withhold_unready(&pool, &bus, &input(thread_id, &repo_str, "work", &work))
-        .await
-        .expect("withhold");
+    let same = withhold_unready(
+        &pool,
+        &bus,
+        &input(thread_id, &repo_str, "work", &work),
+        crate::engine::change_ops::HoldReentry::default(),
+    )
+    .await
+    .expect("withhold");
     assert_eq!(
         same,
         HoldOutcome::Held(
@@ -875,9 +893,14 @@ async fn a_hold_withdraws_an_open_change_the_turn_committed_past() {
     assert_eq!(status_of(&pool, change_id).await, ChangeStatus::Pending);
 
     let more = files(&["a.txt", "b.txt"]);
-    let moved = withhold_unready(&pool, &bus, &input(thread_id, &repo_str, "more", &more))
-        .await
-        .expect("withhold");
+    let moved = withhold_unready(
+        &pool,
+        &bus,
+        &input(thread_id, &repo_str, "more", &more),
+        crate::engine::change_ops::HoldReentry::default(),
+    )
+    .await
+    .expect("withhold");
     assert_eq!(
         moved,
         HoldOutcome::Held(
@@ -956,6 +979,7 @@ async fn work_after_a_queued_change_waits_for_its_landing() {
         &bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: false,
             client_update: false,
@@ -975,5 +999,37 @@ async fn work_after_a_queued_change_waits_for_its_landing() {
     assert_eq!(landed, None, "the landed change frees the next proposal");
 
     pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_hold_the_agent_will_reenter_announces_no_owner_action() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, repo, thread_id) = thread_with_work(&bus).await;
+    let repo_str = repo.to_string_lossy().to_string();
+    let work = files(&["a.txt"]);
+    let outcome = withhold_unready(
+        &pool,
+        &bus,
+        &input(thread_id, &repo_str, "work", &work),
+        HoldReentry {
+            plan: true,
+            hardening: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        HoldOutcome::Held(ProposalHold::Plan(PlanHold::Missing), _)
+    ));
+    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(withheld[0]["reason"], "plan_missing");
+    assert_eq!(withheld[0]["agent_returns"], true);
+    assert_eq!(
+        read_change_state(&pool, thread_id).await,
+        CodingAgentChangeState::Unproposed { reason: None }
+    );
     teardown_test_db(&db).await;
 }

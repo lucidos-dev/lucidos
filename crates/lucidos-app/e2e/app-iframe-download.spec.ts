@@ -4,22 +4,6 @@ import { test, expect } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry } from './helpers';
 
-// Regression for the bug where every app-UI download was silently blocked.
-// AppUiInline.tsx rendered the app iframe with no `allow-downloads`. Chrome
-// refused any download navigation from inside it: a same-origin
-// `<a download>`, a `blob:` object URL, or a `data:` URI. The app had no way
-// to observe the refusal, so a click just did nothing.
-//
-// The fixture loads the SDK, which a real app does. The frame is isolated
-// (ADR 0227), so its own files are cross-origin to it and a browser ignores the
-// `download` attribute on a cross-origin link. The SDK's click handler asks the
-// engine for the file as an attachment instead. `blob:` and `data:` need none
-// of that and would download from a bare frame too. So the `allow-downloads`
-// regression this guards is still caught by all three.
-//
-// This opens a real app through the same restore path sdk-iframe-mount.spec.ts
-// uses. The iframe then carries AppUiInline's actual production `sandbox`
-// attribute, not a string copied into the test.
 
 const APP_ID = 'e2e-download-test';
 let fixture: { dir: string; cleanup: () => void };
@@ -49,8 +33,6 @@ document.getElementById('blob-download').addEventListener('click', function () {
 `,
       js: '',
     });
-    // A same-origin file for the plain `<a download>` case, served statically
-    // alongside index.html via the app's `/*path` route.
     writeFileSync(resolve(fixture.dir, 'payload.txt'), 'from a same-origin file');
   });
 
@@ -58,10 +40,6 @@ document.getElementById('blob-download').addEventListener('click', function () {
     fixture.cleanup();
   });
 
-  // Mirrors sdk-iframe-mount.spec.ts: seeding `app-window-open` before
-  // navigation makes loadApps()'s restore branch mount the app via the real
-  // AppUiInline component. The sandbox is production code, not a copied
-  // string.
   async function openAppOnLoad(page: import('@playwright/test').Page): Promise<void> {
     await page.addInitScript((id) => {
       localStorage.setItem('app-window-open', id);
@@ -76,16 +54,8 @@ document.getElementById('blob-download').addEventListener('click', function () {
     await expect(iframeLoc).toBeVisible({ timeout: 10_000 });
     const appFrame = page.frameLocator('iframe[data-role="app-ui-frame"]:visible');
     await expect(appFrame.locator('#ready')).toBeVisible({ timeout: 10_000 });
-    // `#ready` paints as the HTML parses; the load cover clears on the frame's
-    // `load`, which waits for `sdk.js`. Clicking between the two lands on the
-    // cover, which is what it is for. Wait it out rather than force past it: a
-    // real tap in that window hits the cover too.
     await expect(page.locator('.app-ui-cover')).toHaveCount(0, { timeout: 10_000 });
 
-    // 10s, not the usual 5: Chromium's download subsystem takes a one-time
-    // beat to initialize on the first download of a fresh browser instance,
-    // which this is. A real regression never fires the event at all, so a
-    // looser timeout here doesn't weaken the assertion.
     const [sameOriginDownload] = await Promise.all([
       page.waitForEvent('download', { timeout: 10_000 }),
       appFrame.locator('#same-origin-download').click(),

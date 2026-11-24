@@ -1,20 +1,3 @@
-/**
- * Bug: persisted `focusedThreadId` localStorage value can point at a thread
- * the backend doesn't know about (deleted server-side, never committed because
- * the user never sent, or carried over from a different workspace). On reload,
- * ThreadView gates loadThreadEvents on `threadInMap`, so the load never fires
- * and the empty-state spinner spins forever — after 8 seconds the user sees
- * "Taking too long? Tap to reload" and the same id survives every reload
- * because nothing ever clears it.
- *
- * Fix: after loadAllThreads completes its fetch, if `focusedThreadId` is set
- * but the thread is still missing from `threadMap`, clear the persisted id
- * and emit a `cleared_ghost_focus` lifecycle breadcrumb.
- *
- * Observed on an iOS PWA: every Client/lifecycle startup since at least 15:27
- * reported `prev_focused_thread:"5e7139f5-…"` for a thread with zero rows in
- * `events` and no `thread_summaries` entry.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/threads', () => ({
@@ -88,7 +71,7 @@ describe('loadAllThreads — ghost focused-thread clear', () => {
     threadMap.value = new Map();
     focusedThreadId.value = null;
     awaitedThreadId.value = null;
-    try { localStorage.removeItem(FOCUSED_THREAD_KEY); } catch { /* ignore */ }
+    try { localStorage.removeItem(FOCUSED_THREAD_KEY); } catch {  }
   });
 
   it('clears focusedThreadId + localStorage when backend has no record of it', async () => {
@@ -160,23 +143,16 @@ describe('loadAllThreads — ghost focused-thread clear', () => {
   });
 
   it('does not wipe a user navigation that landed during the fetchThreads await', async () => {
-    // Race: ghost id G is captured at the top of loadAllThreadsInner, then the
-    // user taps thread R during the await. The clear must check the live
-    // signal — not the captured local — before wiping, otherwise it snaps the
-    // user back to the compose screen.
     const ghostId = 'ghost-id';
     const userPickedId = 'real-picked-id';
     focusedThreadId.value = ghostId;
     localStorage.setItem(FOCUSED_THREAD_KEY, ghostId);
 
     const resp = emptyResponse();
-    // The real thread the user navigates to mid-await IS in the response — it
-    // gets upserted into threadMap normally.
     resp.active_threads = [summary(userPickedId)];
     resp.active = [userPickedId];
 
     fetchThreadsMock.mockImplementation(async () => {
-      // Simulate the user tapping a thread row during the network roundtrip.
       focusedThreadId.value = userPickedId;
       localStorage.setItem(FOCUSED_THREAD_KEY, userPickedId);
       return resp;
@@ -194,10 +170,6 @@ describe('loadAllThreads — ghost focused-thread clear', () => {
   });
 
   it('keeps an awaited thread the backend has not heard of yet', async () => {
-    // A spawn the Thread Queue has only QUEUED owns no thread_summaries row, so
-    // the backend truthfully reports it missing. Clearing it here would undo
-    // the navigation the confirm just made, which is the compose-view bug in
-    // the other direction. Same exemption ThreadView's cleanup applies.
     const spawnedId = 'queued-setup-thread';
     awaitedThreadId.value = spawnedId;
     focusedThreadId.value = spawnedId;

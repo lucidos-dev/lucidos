@@ -8,18 +8,12 @@ import { dirname, resolve } from 'node:path';
 import { measureScrollbarGutter, publishScrollbarGutter } from './scrollbarGutter';
 
 interface FakeTranscript {
-  /** Width the element takes out of its own content box (scrollbar + borders). */
   reserved: number;
-  /** 0 for an inactive layout's copy, which must never be the one measured. */
   offsetWidth?: number;
-  /** `visible` is the compose-empty welcome, which reserves nothing. */
   overflowY?: string;
   borderWidth?: string;
 }
 
-// The test env is `node` (no jsdom), so stub just enough document: some number of
-// live `.thread-content` elements, plus a probe element whose clientWidth is
-// narrower than its offsetWidth by whatever the simulated platform reserves.
 function fakeDoc(probeReserved: number, transcripts: FakeTranscript[] = []) {
   const attached: unknown[] = [];
   const cssTexts: string[] = [];
@@ -55,7 +49,6 @@ function fakeDoc(probeReserved: number, transcripts: FakeTranscript[] = []) {
   return { doc: doc as unknown as Document, attached, cssTexts, vars };
 }
 
-/** The `.thread-content` rule body, straight out of the stylesheet. */
 function threadContentRule(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   const css = readFileSync(resolve(here, '../styles/chat/input-messages.css'), 'utf-8');
@@ -66,10 +59,6 @@ function threadContentRule(): string {
 
 describe('measureScrollbarGutter', () => {
   it('reports what the LIVE transcript reserved, not what the probe guessed', () => {
-    // The iOS split this exists for: the detached probe picks up the
-    // ::-webkit-scrollbar width (0.5rem = 9px at the mobile root) while the real
-    // scroll container reserves nothing, so a probe-derived value pushed the
-    // composer's right edge 9px inside the cards it docks under.
     const { doc } = fakeDoc(9, [{ reserved: 0 }]);
     expect(measureScrollbarGutter(doc)).toBe(0);
   });
@@ -87,8 +76,6 @@ describe('measureScrollbarGutter', () => {
   });
 
   it('discounts the transcript element own borders', () => {
-    // offsetWidth - clientWidth is gutter + borders; only the gutter is the
-    // composer's to subtract.
     const { doc } = fakeDoc(0, [{ reserved: 17, borderWidth: '1px' }]);
     expect(measureScrollbarGutter(doc)).toBe(15);
   });
@@ -99,10 +86,6 @@ describe('measureScrollbarGutter', () => {
   });
 
   it('skips the compose-empty welcome, which is not a scroll container', () => {
-    // It reuses `.thread-content` with `overflow: visible` and reserves nothing.
-    // Letting it answer would drop the compensation from the composer while it is
-    // still the same element about to dock under a real transcript, so the box
-    // would slide sideways on the way into a thread. Falls back to the probe.
     const { doc } = fakeDoc(15, [{ reserved: 0, overflowY: 'visible' }]);
     expect(measureScrollbarGutter(doc)).toBe(15);
   });
@@ -118,12 +101,6 @@ describe('measureScrollbarGutter', () => {
   });
 
   it('probes with the transcript scroll container declarations, verbatim', () => {
-    // The fallback probe is only trustworthy as a CLONE: engines disagree about
-    // whether `overflow-y: scroll` or `scrollbar-gutter: stable` is what reserves
-    // the space (Chromium honours the stable gutter without overflow, WebKit needs
-    // the scrollbar drawn, headless Chromium zeroes the scrollbar but not the
-    // gutter), so a probe missing either declaration answers a different
-    // question than the one .thread-content asks.
     const { doc, cssTexts } = fakeDoc(8);
     measureScrollbarGutter(doc);
     expect(cssTexts).toHaveLength(1);

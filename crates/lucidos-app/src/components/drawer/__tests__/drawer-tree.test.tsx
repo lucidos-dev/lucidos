@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The drawer's tree, `.thread-drawer-tree`:
- * - ARIA 1.2 lets a tree own only tree items and groups. The grouping is
- *   picked in the header. So under both groupings and on both layouts, the
- *   drawer holds one tree with every tree item inside it.
- * - Focus that lands on the scroller around the tree moves on to the tree,
- *   which holds the list nav.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

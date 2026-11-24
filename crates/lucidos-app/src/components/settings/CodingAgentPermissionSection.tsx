@@ -1,3 +1,4 @@
+import { PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE } from '@lucidos/preference-catalog';
 import {
   CC_PERMISSION_MODES,
   currentCodingAgentPermissionMode,
@@ -6,7 +7,7 @@ import {
 } from '../../store/actions/preferences';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
 
 const PERMISSION_MODE_COPY: Record<CcPermissionMode, { label: string; description: string }> = {
   'accept-edits': {
@@ -19,37 +20,17 @@ const PERMISSION_MODE_COPY: Record<CcPermissionMode, { label: string; descriptio
   },
 };
 
-const DEFAULT_PERMISSION_MODE = PREFERENCE_CATALOG.coding_agent_claude_permission_mode.fallback;
+const DEFAULT_PERMISSION_MODE = PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE.fallback;
 
-/** The picker's options, in the order a user should weigh them: the safe
- *  default first. Each carries its one-line trade-off as a second row, so the
- *  cost is on screen while choosing, not only in the explainer. */
 export const PERMISSION_MODE_OPTIONS: DropdownOption[] = [
   DEFAULT_PERMISSION_MODE,
   ...CC_PERMISSION_MODES.filter((mode) => mode !== DEFAULT_PERMISSION_MODE),
 ].map((mode) => ({ value: mode, ...PERMISSION_MODE_COPY[mode] }));
 
-/** Guards against a value the engine would reject, so a stale or hand-edited
- *  preference cannot be re-saved from here. Pure, unit tested. */
 export function isPermissionMode(value: string): value is CcPermissionMode {
   return (CC_PERMISSION_MODES as readonly string[]).includes(value);
 }
 
-/**
- * Settings → Coding Agents → Permissions: which of Claude Code's own permission
- * modes its threads run in.
- *
- * It has to be a Lucidos setting. The engine passes `--permission-mode` on
- * every spawn, and Claude Code prefers a CLI value to any settings file. So a
- * user cannot choose the mode from their own `~/.claude/settings.json`. Codex
- * has no equivalent and ignores the key.
- *
- * Reads through `currentCodingAgentPermissionMode` and writes through
- * `setCodingAgentPermissionMode`, both signal-backed. The write applies
- * locally before the request, so the picker never waits on a round trip.
- * Delivery is parked and retried rather than toasted when a suspended PWA
- * aborts the fetch. A raw `setPreference` here would reintroduce that loss.
- */
 export function CodingAgentPermissionSection() {
   const mode = currentCodingAgentPermissionMode();
 

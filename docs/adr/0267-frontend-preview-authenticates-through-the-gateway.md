@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-24
+- **Amended by**: [0745: Loopback serves HTTPS from a per-user, name-constrained CA](0745-loopback-serves-tls-from-a-per-user-ca.md), which gives the preview a leaf from the loopback CA
 - **Amends**: [ADR 0055](0055-frontend-preview-is-a-separate-origin.md)
 
 ## Context
@@ -39,6 +40,9 @@ paired device. It forwards nothing else.
 engines as `LUCIDOS_GATEWAY_TLS_CERT` / `_KEY`, which the engine never serves
 with, and the engine hands them to Vite. So the preview's scheme is always the
 gateway's.
+
+ADR 0745 amends the source: on loopback Vite serves a preview leaf from the
+loopback CA, and beyond loopback only a user certificate, chosen by SNI.
 
 **No gateway, no preview.** A directly-launched engine refuses to start one.
 

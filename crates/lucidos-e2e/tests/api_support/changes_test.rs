@@ -1,6 +1,7 @@
 use crate::support::{
-    base_url, commit_on_new_branch, db_url, git, git_in, http_client, insert_session_started,
-    local_process_client, seed_cc_thread_summary, user_client, workspace_path,
+    as_stamped_device, base_url, commit_on_new_branch, db_url, git, git_in, http_client,
+    insert_session_started, local_process_client, seed_cc_thread_summary, user_client,
+    workspace_path, E2E_DEVICE_ID,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -99,13 +100,11 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
         body
     );
 
-    // Both events must be present, and MissingHardeningDetected must come first
-    // (we emit it before attempting the worktree creation that fails).
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT event_type, sequence FROM events \
-         WHERE aggregate_id = $1::text \
-           AND event_type IN ('MissingHardeningDetected', 'ChangeApplyFailed') \
-         ORDER BY sequence ASC",
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT event_type, payload FROM events
+         WHERE aggregate_id = $1::text
+           AND event_type IN ('ChangeApplyRequested', 'MissingHardeningDetected', 'ChangeApplyFailed')
+         ORDER BY sequence",
     )
     .bind(thread_id)
     .fetch_all(&pool)
@@ -113,21 +112,17 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
     .expect("failed to query events");
 
     assert_eq!(
-        rows.len(),
-        2,
-        "expected MissingHardeningDetected + ChangeApplyFailed, got: {:?}",
-        rows
+        rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        [
+            "ChangeApplyRequested",
+            "MissingHardeningDetected",
+            "ChangeApplyFailed"
+        ],
     );
-    assert_eq!(
-        rows[0].0, "MissingHardeningDetected",
-        "MissingHardeningDetected must be emitted before ChangeApplyFailed: {:?}",
-        rows
-    );
-    assert_eq!(
-        rows[1].0, "ChangeApplyFailed",
-        "second event order: {:?}",
-        rows
-    );
+    let requested = &rows[0].1;
+    assert_eq!(requested["change_id"], change_id.to_string());
+    assert_eq!(requested["branch_name"], branch);
+    assert_eq!(requested["repo_root"], repo_root);
 
     // Cleanup
     let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
@@ -490,7 +485,7 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
             "head_sha": "deadbeef",
             "state": "bounded_security_fix",
             "reason": "unscoped proxy key; covered by proxy_tests::refuses_foreign_host",
-            "files": ["crates/lucidos-engine/src/api/proxy.rs"],
+            "files": ["crates/lucidos-agents-api/src/api/proxy.rs"],
         }))
         .send()
         .await
@@ -686,8 +681,8 @@ async fn sequential_apply_two_changes_succeeds() {
 
     // Apply change 1
     let url1 = format!("{}/api/v1/changes/{}/apply", base_url(), change1_id);
-    let resp1 = client
-        .post(&url1)
+    // Sign after the shared tree lock: the setup/wait may outlive a stamp.
+    let resp1 = as_stamped_device(client.post(&url1), E2E_DEVICE_ID)
         .send()
         .await
         .expect("Apply change 1 request failed");
@@ -743,8 +738,7 @@ async fn sequential_apply_two_changes_succeeds() {
 
     // Apply change 2 — this was the failing case before the fix
     let url2 = format!("{}/api/v1/changes/{}/apply", base_url(), change2_id);
-    let resp2 = client
-        .post(&url2)
+    let resp2 = as_stamped_device(client.post(&url2), E2E_DEVICE_ID)
         .send()
         .await
         .expect("Apply change 2 request failed");
@@ -775,8 +769,7 @@ async fn sequential_apply_two_changes_succeeds() {
     );
 
     // Idempotent re-apply — must report status=noop, not silently 200 with empty body.
-    let resp_repeat = client
-        .post(&url1)
+    let resp_repeat = as_stamped_device(client.post(&url1), E2E_DEVICE_ID)
         .send()
         .await
         .expect("Re-apply change 1 request failed");
@@ -875,11 +868,13 @@ async fn marker_state(
 
 /// POST one change's Apply and return the JSON body, asserting a 200.
 async fn apply_ok(client: &reqwest::Client, change_id: Uuid) -> serde_json::Value {
-    let resp = client
-        .post(format!("{}/api/v1/changes/{}/apply", base_url(), change_id))
-        .send()
-        .await
-        .expect("apply request failed");
+    let resp = as_stamped_device(
+        client.post(format!("{}/api/v1/changes/{}/apply", base_url(), change_id)),
+        E2E_DEVICE_ID,
+    )
+    .send()
+    .await
+    .expect("apply request failed");
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.expect("apply non-JSON");
     assert_eq!(
@@ -1577,7 +1572,7 @@ async fn a_plan_only_change_applies_only_once_its_plan_is_approved() {
         .expect("Failed to connect to E2E workspace database");
     let _tree = crate::support::workspace_tree_lock().write().await;
 
-    for state in ["proposed", "planned"] {
+    for state in ["proposed", "planned", "plan_only"] {
         let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
         let branch = format!("e2e-test/plan-only-{state}-{suffix}");
         let plan = format!("docs/plans/e2e-plan-only-{suffix}.md");
@@ -1674,4 +1669,83 @@ async fn harden_refuses_a_thread_with_no_work_held_for_hardening() {
     assert_eq!(resp.status().as_u16(), 409, "{:?}", resp.text().await);
 
     pool.close().await;
+}
+
+/// A design marker retains plan-only scope through the approval API.
+#[tokio::test]
+async fn design_plan_approval_never_opens_the_source_edit_gate() {
+    let client = local_process_client();
+    let repo = workspace_path();
+    let branch = format!("e2e-test/design-plan-{}", Uuid::new_v4());
+    let body = json!({
+        "repo_root": repo.to_str().unwrap(), "branch_name": branch,
+        "head_sha": "test-head", "state": "proposed", "kind": "design",
+        "plan_path": "docs/plans/example-design.md",
+    });
+    let mark = client
+        .post(format!("{}/api/v1/internal/mark-planned", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mark.status().as_u16(), 204);
+    let approval: serde_json::Value = client
+        .post(format!("{}/api/v1/internal/approve-plan", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(approval["approved"], true);
+    assert_eq!(approval["plan_only"], true);
+    let marker: serde_json::Value = client
+        .get(format!("{}/api/v1/internal/planned-state", base_url()))
+        .query(&[
+            ("repo_root", repo.to_str().unwrap()),
+            ("branch_name", branch.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(marker["state"], "SATISFIED");
+    assert_eq!(marker["kind"], "plan_only");
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    sqlx::query("DELETE FROM planned_branches WHERE branch_name = $1")
+        .bind(&branch)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+/// Planning stages belong to the signed subprocess thread, never a device's
+/// claimed thread id or a machine-local shell with no thread attribution.
+#[tokio::test]
+async fn planning_start_requires_process_authority_and_a_calling_thread() {
+    let url = format!("{}/api/v1/internal/start-plan", base_url());
+    let device = user_client().await;
+    let refused = device
+        .post(&url)
+        .json(&json!({ "kind": "design" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+
+    let shell = local_process_client();
+    let threadless = shell
+        .post(&url)
+        .json(&json!({ "kind": "implementation" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(threadless.status(), 400);
+    assert!(threadless.text().await.unwrap().contains("calling thread"));
 }

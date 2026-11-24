@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level.
-// vi.hoisted runs before any imports are resolved.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -12,7 +10,6 @@ vi.hoisted(() => {
     get length() { return storage.size; },
     key: (_i: number) => null,
   };
-  // setFollowLiveEdge() needs document.querySelector and requestAnimationFrame
   if (typeof globalThis.document === 'undefined') {
     (globalThis as any).document = {};
   }
@@ -31,7 +28,7 @@ import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
 import { fetchThreads, type CodingAgentChangeState } from '../../api/threads';
 import * as scrollState from '../../components/chat/scrollState';
-import { awayFromBottom, followSurvivesScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
+import { awayFromBottom, classifyScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
 import { provideScrollState } from '../../components/chat/scrollStateHandle';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { threadScrollKey } from '../savedScroll';
@@ -44,7 +41,6 @@ import { focusThread, handleSaveThread, unfocusThread } from './threads';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 import { _resetComposeSyncForTesting } from '../composeSync';
 
-// Mock the API module
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
@@ -53,9 +49,6 @@ vi.mock('../../api/threads', () => ({
   archiveThread: vi.fn().mockResolvedValue({ archived: [] }),
 }));
 
-// Use the real isComposeFocusedHere — the compose-preservation tests below
-// plant a fake activeElement + querySelectorAll to drive its branches. Mocking
-// only the focus-side-effect helpers keeps the predicate honest if it grows.
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
@@ -72,11 +65,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
 
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
 
-// The store reaches scrollState through the handle, which the shell fills.
 provideScrollState(scrollState);
 
 beforeEach(() => {
@@ -110,11 +99,6 @@ describe('focusThread', () => {
   });
 
   it('does not move the transcript, whatever it finds there', () => {
-    // focusThread used to scroll the transcript to the bottom for any thread
-    // with no saved position, and skip when there was one. It positions nothing
-    // now: `useScrollMemory` owns the opening position on both branches (restore
-    // a saved one, else open at the top via `resetOnEmpty`), so focusThread
-    // cannot disagree with it about where the reader lands.
     const el = {
       parentElement: null,
       scrollTop: 1234,
@@ -141,20 +125,11 @@ describe('focusThread', () => {
     }
   });
 
-  // The standing follow is one global, so the thread being OPENED must not
-  // inherit the one the reader armed in the thread they left. The request
-  // itself is not lost: it is recorded as that thread's reading position and
-  // resumed on re-entry (see `hooks/useScrollMemory.ts`).
   describe('the standing follow and the thread being opened', () => {
-    /** A transcript whose reader is already AT the live edge, so arming the
-     *  follow writes no scroll and runs no tween. These tests are about
-     *  `focusThread` retiring the follow, not about how the toggle travels, and
-     *  the rAF stub at the top of this file runs its callback synchronously,
-     *  which a tween would recurse on forever. */
     function makeTranscript() {
       return {
         parentElement: null,
-        scrollTop: 8500, // 9000 - 500, the live edge
+        scrollTop: 8500,
         scrollHeight: 9000,
         clientHeight: 500,
         getBoundingClientRect: () => ({ width: 400, height: 500 }),
@@ -175,61 +150,49 @@ describe('focusThread', () => {
     it('retires it when the reader opens a DIFFERENT thread', () => {
       withTranscript((el) => {
         focusThread('t1');
-        setFollowLiveEdge(true); // the reader arms it here
-        expect(followSurvivesScroll(el)).toBe(true);
+        setFollowLiveEdge(true);
+        expect(classifyScroll(el).followSurvives).toBe(true);
 
         focusThread('t2');
-        expect(followSurvivesScroll(el)).toBe(false);
+        expect(classifyScroll(el).followSurvives).toBe(false);
       });
     });
 
     it('keeps it when the reader re-taps the thread they are already in', () => {
-      // Not an open at all: nothing is inheriting anything, and the scroll
-      // memory does not re-run on an unchanged key, so a retire here would end
-      // the follow with nothing left to resume it.
       withTranscript((el) => {
         focusThread('t1');
         setFollowLiveEdge(true);
 
         focusThread('t1');
-        expect(followSurvivesScroll(el)).toBe(true);
+        expect(classifyScroll(el).followSurvives).toBe(true);
       });
     });
 
     it('retires it when the reader leaves for the compose view', () => {
-      // The compose view has its own scroll container and registers itself as
-      // the active one, so a follow left armed would ride its growth instead.
       withTranscript((el) => {
         focusThread('t1');
         setFollowLiveEdge(true);
 
         unfocusThread();
-        expect(followSurvivesScroll(el)).toBe(false);
+        expect(classifyScroll(el).followSurvives).toBe(false);
       });
     });
   });
 
   it('leaves the chevron signals to the scroll listener', () => {
-    // notAtTop and awayFromBottom must NOT be manually reset here: the scroll
-    // listener owns them exclusively. A manual reset makes the chevron vanish
-    // when no scroll event follows, e.g. re-focusing the thread you are already
-    // in, where scrollTop does not change at all.
     notAtTop.value = true;
     awayFromBottom.value = true;
     focusThread('t1');
-    focusThread('t1'); // re-focus the same thread
+    focusThread('t1');
     expect(notAtTop.value).toBe(true);
     expect(awayFromBottom.value).toBe(true);
   });
 
   it('navigates to thread pane on mobile', () => {
-    // Bug: toast onClick handlers call focusThread() but the user stays on
-    // whichever pane they were on. On mobile, focusing a thread must also
-    // switch to the thread pane so it becomes visible.
     const origWidth = globalThis.innerWidth;
-    (globalThis as any).innerWidth = 375; // mobile
+    (globalThis as any).innerWidth = 375;
     try {
-      mobileView.value = 'threads'; // user is on thread list pane
+      mobileView.value = 'threads';
       focusThread('t1');
       expect(mobileView.value).toBe('thread');
     } finally {
@@ -264,25 +227,21 @@ describe('focusThread', () => {
 
   it('does not change mobileView on desktop', () => {
     const origWidth = globalThis.innerWidth;
-    (globalThis as any).innerWidth = 1024; // desktop
+    (globalThis as any).innerWidth = 1024;
     try {
       mobileView.value = 'threads';
       focusThread('t1');
-      // On desktop, mobileView is unused — must not be mutated
       expect(mobileView.value).toBe('threads');
     } finally {
       (globalThis as any).innerWidth = origWidth;
     }
   });
 
-  // Pane-group activation: navigating to a thread must re-activate the Threads
-  // pane group when arriving from the Content group, so keyboard Tab (handlePaneTab,
-  // anchored on focusedPane) lands on the conversation rather than the content view.
   it('desktop: re-activates the Threads pane group when arriving from content', () => {
     const origWidth = globalThis.innerWidth;
-    (globalThis as any).innerWidth = 1024; // desktop
+    (globalThis as any).innerWidth = 1024;
     try {
-      focusedPane.value = 'content'; // user was viewing an app/Settings
+      focusedPane.value = 'content';
       focusThread('t1');
       expect(focusedPane.value).toBe('thread');
     } finally {
@@ -294,10 +253,8 @@ describe('focusThread', () => {
     const origWidth = globalThis.innerWidth;
     (globalThis as any).innerWidth = 1024;
     try {
-      focusedPane.value = 'drawer'; // browsing the thread list via keyboard
+      focusedPane.value = 'drawer';
       focusThread('t1');
-      // Only the cross-group (content) case switches; an intra-Threads-group
-      // focus must survive so Enter-to-peek keeps the drawer accent + arrow nav.
       expect(focusedPane.value).toBe('drawer');
     } finally {
       (globalThis as any).innerWidth = origWidth;
@@ -306,11 +263,11 @@ describe('focusThread', () => {
 
   it('mobile: never touches focusedPane (panes are navigated, not focused)', () => {
     const origWidth = globalThis.innerWidth;
-    (globalThis as any).innerWidth = 375; // mobile
+    (globalThis as any).innerWidth = 375;
     try {
       focusedPane.value = 'content';
       focusThread('t1');
-      expect(focusedPane.value).toBe('content'); // unchanged on mobile
+      expect(focusedPane.value).toBe('content');
     } finally {
       (globalThis as any).innerWidth = origWidth;
     }
@@ -318,15 +275,6 @@ describe('focusThread', () => {
 
 });
 
-// ---------------------------------------------------------------------------
-// The perf open mark
-//
-// `thread-render` is the only sample that measures a thread open, and the mark
-// is what arms it. The mark used to be stamped under `loadThreadEvents`'
-// `eventsLoaded` early return, so only a thread's FIRST open of the session
-// recorded anything. Back / forward between visited threads was invisible,
-// which is the navigation a reader is most likely to call slow.
-// ---------------------------------------------------------------------------
 
 describe('the perf open mark', () => {
   beforeEach(() => _resetThreadOpenMarksForTesting());
@@ -354,8 +302,6 @@ describe('the perf open mark', () => {
   });
 
   it('leaves no mark on a thread nobody is looking at', () => {
-    // loadAllThreads eagerly loads non-focused threads. A mark left on one
-    // would be taken by a much later render and report a renderMs in minutes.
     withThread('background', true);
     focusedThreadId.value = 'somewhere-else';
 
@@ -364,27 +310,21 @@ describe('the perf open mark', () => {
     expect(takeThreadOpenStart('background')).toBeUndefined();
   });
 
-  // The two below are the same failure reached two ways: a mark laid where no
-  // render follows. The next streamed event changes the exchange count and
-  // consumes it, so the sample reports however long the reader sat still as a
-  // render. Only a focus TRANSITION may stamp.
 
   it('does not re-stamp when the reader re-taps the thread already open', () => {
     withThread('t', true);
     focusThread('t');
-    expect(takeThreadOpenStart('t')?.warm).toBe(true); // the real open
+    expect(takeThreadOpenStart('t')?.warm).toBe(true);
 
-    focusThread('t'); // re-tap: renders nothing
+    focusThread('t');
 
     expect(takeThreadOpenStart('t')).toBeUndefined();
   });
 
   it('does not stamp when a resync reloads the focused thread', () => {
-    // loadAllThreads reloads the focused thread on every SSE reopen, Lagged
-    // and iOS PWA wake. A warm one fetches nothing, so it is not an open.
     withThread('t', true);
     focusThread('t');
-    takeThreadOpenStart('t'); // consume the real open's mark
+    takeThreadOpenStart('t');
 
     void loadThreadEvents('t');
 
@@ -400,7 +340,7 @@ describe('unfocusThread', () => {
   });
 
   it('desktop: reveals the thread pane group when arriving from content', () => {
-    focusedPane.value = 'content'; // user was viewing an app/Settings
+    focusedPane.value = 'content';
     unfocusThread();
     expect(focusedPane.value).toBe('thread');
   });
@@ -418,8 +358,6 @@ describe('unfocusThread', () => {
   });
 
   it('revealPane:false leaves the visible pane alone (stale-pointer cleanup)', () => {
-    // ThreadView's render-phase cleanup passes this so a background-mounted pane
-    // on mobile can't yank a user off the content pane.
     const origWidth = globalThis.innerWidth;
     (globalThis as any).innerWidth = 375;
     try {
@@ -432,9 +370,6 @@ describe('unfocusThread', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// focusedThreadId persistence
-// ---------------------------------------------------------------------------
 
 describe('focusedThreadId persistence', () => {
   it('saves focusedThreadId to localStorage when focusing a thread', () => {
@@ -449,30 +384,21 @@ describe('focusedThreadId persistence', () => {
   });
 
   it('sendMessage persists new thread ID to localStorage', async () => {
-    // Root cause of iOS Safari PWA bug: sendMessage() used to clear localStorage
-    // for new threads, so reloading the page lost the focused thread.
     const { sendMessage } = await import('./chat');
     const { connectionStatus } = await import('../store');
 
-    // Simulate connected state
     connectionStatus.value = 'connected';
 
-    // No focused thread — this will create a new one
     focusedThreadId.value = null;
     localStorage.removeItem('lucidos-focused-thread');
 
     await sendMessage('hello');
 
-    // focusedThreadId should be set to the new thread ID
     expect(focusedThreadId.value).not.toBeNull();
-    // localStorage must persist it — this is the bug fix
     expect(localStorage.getItem('lucidos-focused-thread')).toBe(focusedThreadId.value);
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleSaveThread
-// ---------------------------------------------------------------------------
 
 describe('handleSaveThread', () => {
   it('sets saved to true in threadMap', async () => {
@@ -486,9 +412,6 @@ describe('handleSaveThread', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// loadAllThreads — metadata merge and focus preservation
-// ---------------------------------------------------------------------------
 
 describe('loadAllThreads', () => {
   beforeEach(() => {
@@ -528,7 +451,6 @@ describe('loadAllThreads', () => {
     expect(archiveThreadCount.value).toBe(247);
   });
 
-  /** Mock a boot carrying `count` active threads, newest first by id order. */
   function activeThreadsResponse(count: number) {
     const ids = Array.from({ length: count }, (_, i) => `a${i}`);
     (fetchThreads as any).mockResolvedValue({
@@ -536,7 +458,6 @@ describe('loadAllThreads', () => {
       active: ids,
       active_threads: ids.map((id, i) => ({
         thread_id: id, title: id, channel: 'chat', initiator: 'user',
-        // Descending, so the prefetch's newest-first sort has something to sort.
         last_activity: `2026-08-04T10:${String(59 - i).padStart(2, '0')}:00Z`,
         created_at: '2026-08-04T10:00:00Z',
         message_count: 1, section: 'inbox', status: 'idle',
@@ -550,7 +471,6 @@ describe('loadAllThreads', () => {
     return ids;
   }
 
-  /** Instrument `fetchThreadEvents` with the concurrency and order it saw. */
   async function recordEventFetches() {
     const { fetchThreadEvents } = await import('../../api/threads');
     const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
@@ -577,24 +497,17 @@ describe('loadAllThreads', () => {
   }
 
   it('resolves only after its eager per-thread loads settle, and bounds them', async () => {
-    // The eager loads run through a pool (they used to be one unbounded
-    // `Promise.all`), and the pool is now CAPPED. Three things must hold. A
-    // caller ordering work after `loadAllThreads` still sees every load it
-    // started finished. A boot fires no request-per-active-thread burst. And
-    // the burst is bounded in TOTAL, not only in width.
     activeThreadsResponse(12);
     const { stats, restore } = await recordEventFetches();
 
     await loadAllThreads();
 
-    // No focused thread here, so every fetch came from the capped prefetch.
     expect(stats.settled).toBe(THREAD_EVENTS_PREFETCH_LIMIT);
     expect(stats.peak).toBeLessThanOrEqual(THREAD_EVENTS_FETCH_CONCURRENCY);
     restore();
   });
 
   it('prefetches the most recently active threads, not an arbitrary slice', async () => {
-    // The cap only helps if it keeps the threads worth keeping. `a0` is newest.
     activeThreadsResponse(12);
     const { stats, restore } = await recordEventFetches();
 
@@ -607,18 +520,12 @@ describe('loadAllThreads', () => {
   });
 
   it('loads the focused thread first and alone, ahead of the prefetch', async () => {
-    // The reader is looking at exactly one thread, and it used to share a
-    // four-wide pool with every active and saved one. So its transcript
-    // competed for bandwidth with a pile nobody asked for, which is the whole
-    // reported symptom on a phone.
     const ids = activeThreadsResponse(12);
     focusedThreadId.value = ids[5];
     const { stats, restore } = await recordEventFetches();
 
     await loadAllThreads();
 
-    // First, and on its own: the prefetch rounds that follow are what raise
-    // the peak above one.
     expect(stats.seen[0]).toBe(ids[5]);
     expect(stats.settled).toBe(THREAD_EVENTS_PREFETCH_LIMIT + 1);
     restore();
@@ -638,7 +545,6 @@ describe('loadAllThreads', () => {
   });
 
   it('updates metadata for threads already in map (SSE skeletons)', async () => {
-    // SSE skeleton has stale title but newer updatedAt from live events
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T17:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
@@ -654,12 +560,10 @@ describe('loadAllThreads', () => {
     const t1 = threadMap.value.get('t1')!;
     expect(t1.meta.title).toBe('Real Title');
     expect(t1.meta.channel).toBe('claude_code');
-    // API time (18:30) is newer than SSE skeleton (17:00) — advances
     expect(t1.meta.updatedAt).toBe('2026-03-15T18:30:00Z');
   });
 
   it('does not overwrite SSE-generated title with stale API data', async () => {
-    // SSE delivered ThreadTitleGenerated → generatedTitleIds has this thread
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Generated Title', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
@@ -667,7 +571,6 @@ describe('loadAllThreads', () => {
     threadMap.value = map;
     generatedTitleIds.add('t1');
 
-    // API returns stale first-message-truncated title
     mockApiResponse([
       { thread_id: 't1', title: 'we used to have a floating down...', channel: 'chat', last_activity: '2026-03-15T18:30:00Z' },
     ]);
@@ -704,7 +607,6 @@ describe('loadAllThreads', () => {
 
     await loadAllThreads();
 
-    // Should keep t2 focused (from localStorage), not auto-focus t1 (most recent)
     expect(focusedThreadId.value).toBe('t2');
   });
 
@@ -721,7 +623,6 @@ describe('loadAllThreads', () => {
   });
 
   it('API updatedAt only advances forward, never regresses', async () => {
-    // SSE skeletons with timestamps from live events
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:30:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
@@ -731,7 +632,6 @@ describe('loadAllThreads', () => {
     }));
     threadMap.value = map;
 
-    // API: t1 has stale last_activity (older than SSE), t2 has newer last_activity
     mockApiResponse([
       { thread_id: 't1', title: 'Old Thread', channel: 'chat', last_activity: '2026-03-15T10:00:00Z' },
       { thread_id: 't2', title: 'Recent Thread', channel: 'claude_code', last_activity: '2026-03-15T18:00:00Z' },
@@ -739,9 +639,7 @@ describe('loadAllThreads', () => {
 
     await loadAllThreads();
 
-    // t1: SSE value (19:30) is newer than API (10:00) — keep SSE value
     expect(threadMap.value.get('t1')!.meta.updatedAt).toBe('2026-03-15T19:30:00Z');
-    // t2: API value (18:00) is newer than SSE (15:00) — advance to API value
     expect(threadMap.value.get('t2')!.meta.updatedAt).toBe('2026-03-15T18:00:00Z');
   });
 
@@ -813,7 +711,6 @@ describe('loadAllThreads', () => {
 
   it('threadsLoaded is false before loadAllThreads resolves', async () => {
     expect(threadsLoaded.value).toBe(false);
-    // SSE skeletons exist in threadMap but threadsLoaded is still false
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1'));
     threadMap.value = map;
@@ -822,9 +719,6 @@ describe('loadAllThreads', () => {
   });
 
   it('preserves API channel on initial load — thread_summaries source is authoritative', async () => {
-    // API returns channel='trigger' (authoritative from thread_summaries).
-    // Events may carry different channels (e.g., a follow-up MessageReceived with
-    // channel='chat'), but the API value must win on initial load.
     (fetchThreads as any).mockResolvedValue({
       saved: [],
       active_threads: [
@@ -835,7 +729,6 @@ describe('loadAllThreads', () => {
       composing: [],
     });
 
-    // Event has a different channel — this must NOT overwrite the API channel
     const { fetchThreadEvents } = await import('../../api/threads');
     (fetchThreadEvents as any).mockResolvedValue({ events: [
       {
@@ -849,20 +742,11 @@ describe('loadAllThreads', () => {
 
     await loadAllThreads();
 
-    // API channel is preserved — events don't overwrite on initial load
     const thread = threadMap.value.get('t1')!;
     expect(thread.meta.channel).toBe('trigger');
   });
 });
 
-// ---------------------------------------------------------------------------
-// loadAllThreads — compose-state preservation while user is typing
-//
-// loadAllThreads runs on SSE reconnect / Lagged events / resume. The API
-// returns the LAST PERSISTED compose state, which can be 250ms+ stale due
-// to the debounced PUT. Without a guard, upsertThread overwrites the user's
-// in-flight keystrokes, losing text and jumping the cursor.
-// ---------------------------------------------------------------------------
 
 describe('loadAllThreads — compose preservation', () => {
   beforeEach(() => {
@@ -871,7 +755,7 @@ describe('loadAllThreads — compose preservation', () => {
   });
 
   function mockComposeApiResponse(threadId: string, composeText: string, composeImages: string[] = []) {
-    (fetchThreads as any).mockResolvedValue({
+    const response = {
       saved: [],
       active_threads: [],
       composing: [],
@@ -894,11 +778,33 @@ describe('loadAllThreads — compose preservation', () => {
         compose_images: composeImages,
         compose_mode: null,
       }],
-    });
+    };
+    (fetchThreads as any).mockResolvedValue(response);
+    return response;
   }
 
-  /** Plant a fake textarea matching `[data-role="prompt-input"]` and mark it as
-   *  document.activeElement so isComposeFocusedHere() returns true. */
+  it.each([false, true])('saved-draft acceptance during a list read reconciles with pending edit=%s', async (localEdit) => {
+    const { handleGlobalEvent } = await import('./thread-sync');
+    const { setDraft } = await import('../composeDrafts');
+    const { noteLocalComposeEdit } = await import('../composeSync');
+    const stale = mockComposeApiResponse('t1', 'saved content', ['saved-image']);
+    let release!: (response: typeof stale) => void;
+    (fetchThreads as any).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const reading = loadAllThreads();
+    if (localEdit) {
+      setDraft('t1', { text: 'later local edit', image_hashes: ['local-image'], mode: 'lucidos' });
+      noteLocalComposeEdit('t1');
+    }
+    mockComposeApiResponse('t1', '');
+    const readsBefore = vi.mocked(fetchThreads).mock.calls.length;
+    handleGlobalEvent('DraftSubmissionAccepted', { thread_id: 't1' });
+    release(stale);
+    await reading;
+    expect(vi.mocked(fetchThreads).mock.calls.length).toBe(readsBefore + 1);
+    expect(getDraft('t1').text).toBe(localEdit ? 'later local edit' : '');
+    expect(getDraft('t1').image_hashes).toEqual(localEdit ? ['local-image'] : []);
+  });
+
   function focusPromptOnThread(threadId: string): void {
     const el: any = {
       dataset: { threadId, role: 'prompt-input' },
@@ -914,10 +820,6 @@ describe('loadAllThreads — compose preservation', () => {
     (globalThis.document as any).activeElement = null;
   }
 
-  /** A local edit is a *pending intent* until a write covering it is
-   *  answered (ADR 0437). No snapshot replaces it meanwhile, focused or not.
-   *  The orderings by revision are pinned in
-   *  `store/__tests__/compose-follows-server-revision.test.ts`. */
   it('a pending local edit holds over a snapshot, text and images alike', async () => {
     const { updateCompose } = await import('./compose');
     const map = new Map<string, ThreadState>();
@@ -933,8 +835,6 @@ describe('loadAllThreads — compose preservation', () => {
     expect(getDraft('t1').image_hashes).toEqual(['local-img-hash']);
   });
 
-  /** Nothing pending: a newer snapshot is the engine's draft, and dropping it
-   *  because the box has focus would let the next keystroke overwrite it. */
   it('a newer snapshot applies to a focused composer with nothing pending', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'hello' } }));
@@ -949,23 +849,19 @@ describe('loadAllThreads — compose preservation', () => {
     unfocusPrompt();
   });
 
-  // A peer's clear that arrives via a resync (the SSE clear was missed while
-  // disconnected) applies when nothing is pending here.
   it('still clears a server-originated draft (never edited here) when the snapshot is empty', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'from a peer device' } }));
     threadMap.value = map;
     unfocusPrompt();
 
-    mockComposeApiResponse('t1', ''); // peer cleared it; resync carries empty
+    mockComposeApiResponse('t1', '');
 
     await loadAllThreads();
 
     expect(getDraft('t1').text).toBe('');
   });
 
-  // An EMPTY snapshot (the shared draft was sent or discarded elsewhere) clears
-  // the draft even when the textarea is focused here.
   it('clears a focused server-originated draft when the resync snapshot is empty (peer sent elsewhere)', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'follow-up drafted on my other device' } }));
@@ -973,7 +869,7 @@ describe('loadAllThreads — compose preservation', () => {
     focusedThreadId.value = 't1';
     focusPromptOnThread('t1');
 
-    mockComposeApiResponse('t1', ''); // peer's send cleared compose_text server-side
+    mockComposeApiResponse('t1', '');
 
     await loadAllThreads();
 
@@ -981,8 +877,3 @@ describe('loadAllThreads — compose preservation', () => {
     unfocusPrompt();
   });
 });
-
-// ---------------------------------------------------------------------------
-// ensureThreadInMap — search result click bootstrapping
-// ---------------------------------------------------------------------------
-

@@ -1,18 +1,3 @@
-/** Regression: the prompt toggle decides routing at SEND time, not at
- *  draft-creation time. A user who types in Lucidos then toggles to Claude
- *  before hitting Enter must end up on Claude — and vice versa.
- *
- *  The bug this guards against: `startComposeIfNeeded` stamps
- *  `thread.meta.channel` from `currentComposeMode()` at the moment of the
- *  first keystroke. Toggling later updates `draft.mode` (and the toggle UI
- *  re-renders correctly), but did NOT update `thread.meta.channel`. Then
- *  `sendMessage` decided CC-vs-chat from the stale channel and ignored the
- *  explicit `useCodingAgent` option, sending `use_coding_agent: undefined`
- *  to the backend. Result: clicking "Claude" still started a Lucidos thread.
- *
- *  The fix locks `channel` at promotion time in `sendCompose` (alongside
- *  the existing `state: 'active'` and `repoId` writes) so the channel
- *  matches the mode the user actually picked. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
@@ -49,7 +34,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
   submitChat: vi.fn().mockResolvedValue({ event_id: 'srv-evt' }),
-  cancelChat: vi.fn().mockResolvedValue(undefined),
+  cancelChat: vi.fn().mockResolvedValue({ canceled: true, taken_back_messages: [], failed_take_back_ids: [] }),
   stopClaudeCode: vi.fn().mockResolvedValue(undefined),
   putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
@@ -151,10 +136,6 @@ function putThread(id: string, metaOverrides: Partial<ThreadMeta>): void {
 
 describe('toggle-after-typing routes to the toggled channel (regression)', () => {
   it('Lucidos draft toggled to Claude before send routes to Claude Code', async () => {
-    // Repro of "I selected Claude Code in the toggle but it started Lucidos":
-    // user typed first (creating a thread with channel='chat'), then toggled
-    // to Claude (which patches draft.mode but not thread.meta.channel), then
-    // hit Send.
     const draftId = 'toggle-lucidos-to-cc';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
@@ -167,9 +148,6 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
   });
 
   it('Claude draft toggled to Lucidos before send routes to Lucidos', async () => {
-    // Mirror of the bug: user picked Claude first, started typing (thread
-    // created with channel='claude_code'), then toggled back to Lucidos.
-    // The Lucidos pick must beat the stale Claude channel.
     const draftId = 'toggle-cc-to-lucidos';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
@@ -182,9 +160,6 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
   });
 
   it('locks thread.meta.channel to the picked mode at promotion (CC pick)', async () => {
-    // Channel is the source of truth post-promotion — cancel, retry, UI badges
-    // all read it. Locking at send-time prevents the cancel-wrong-endpoint
-    // sibling bug and any later UI drift.
     const draftId = 'lock-channel-cc';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
@@ -209,9 +184,6 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
   });
 
   it('cancelCurrentExchange routes to stopClaudeCode after toggle-to-CC send', async () => {
-    // Sibling bug: if channel stays stale, Cancel called immediately after
-    // the toggle-then-send hits the wrong endpoint (cancelChat instead of
-    // stopClaudeCode). Locking channel at promotion fixes this too.
     const draftId = 'cancel-after-toggle-cc';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
@@ -238,8 +210,6 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
   });
 
   it('promoting a draft with matching channel + mode still works (no regression)', async () => {
-    // Sanity: the happy path where channel and mode already agree must keep
-    // working exactly as before — otherwise the fix has broken the common case.
     const draftId = 'happy-path';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'claude_code' });
@@ -252,11 +222,6 @@ describe('toggle-after-typing routes to the toggled channel (regression)', () =>
   });
 
   it('promoting a draft with null mode and CC option still routes via CC', async () => {
-    // draft.mode is null when the row arrived via SSE before the engine acked
-    // the picked mode — readers fall back to currentComposeMode(). The submit
-    // path computes useCodingAgent via effectiveSendMode (which already does
-    // that fallback) and passes it explicitly. sendCompose must honour it
-    // even though draft.mode itself says null.
     const draftId = 'null-mode-cc';
     focusedThreadId.value = draftId;
     putThread(draftId, { state: 'composing', channel: 'chat' });
@@ -283,8 +248,6 @@ describe('coding-agent backend binding at promotion', () => {
     const body = lastBody();
     expect(body.use_coding_agent).toBe(true);
     expect(body.coding_agent).toBe('codex');
-    // Bound at promotion (drafts-are-threads rule) so later picker drift
-    // can't retarget this thread.
     expect(threadMap.value.get(draftId)?.meta.codingAgent).toBe('codex');
   });
 

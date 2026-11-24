@@ -1,13 +1,3 @@
-/**
- * Tests for `computeHiddenArchivedThreads` / `filterHiddenArchived` /
- * `visibleChildrenCount` — the fix for an archived child thread staying
- * listed under a live parent (slack-20261002-hide-archived-child-threads).
- *
- * The existing `archivedSubThreads` cue (lifted-family.test.ts) dims such a
- * row but keeps rendering it. This suite covers the layer on top: hiding a
- * FULLY archived branch by default, and revealing it again on request,
- * without ever hiding a branch that still carries live work.
- */
 
 import { describe, it, expect } from 'vitest';
 import {
@@ -84,8 +74,6 @@ describe('computeHiddenArchivedThreads', () => {
     });
 
     it('never hides the family root', () => {
-        // A fully-archived root with no live descendants naturally routes the
-        // whole family to Archive, so there's nothing to hide there either.
         const parent = inArchive('parent');
         const graph = computeFamilyGraph([parent]);
         const { hidden } = computeHiddenArchivedThreads([parent], graph);
@@ -94,9 +82,6 @@ describe('computeHiddenArchivedThreads', () => {
     });
 
     it('keeps an archived branch visible when it still carries a live descendant', () => {
-        // `child` is archived with no direct live children, but its OWN child
-        // is running. That running grandchild makes child's natural section
-        // Current too, so child was never a hiding candidate.
         const parent = running('parent', { totalChildrenCount: 1 });
         const child = makeThread('child', { parentId: 'parent', section: 'archived' });
         const grandchild = running('grandchild', { parentId: 'child' });
@@ -181,8 +166,6 @@ describe('filterHiddenArchived', () => {
         const graph = computeFamilyGraph(threads);
         const { hidden } = computeHiddenArchivedThreads(threads, graph);
 
-        // Revealing the PARENT's archived children shows `child`, but
-        // `grandchild` needs its own reveal on `child` to show too.
         const visible = filterHiddenArchived(threads, hidden, new Set(['parent']), graph);
         expect(visible.map(t => t.meta.id).sort()).toEqual(['child', 'parent']);
 
@@ -198,9 +181,6 @@ describe('filterHiddenArchived', () => {
 });
 
 describe('renderedFamilyRows', () => {
-    // A family collapsed while it had live sub-threads, all of which were
-    // archived since. Its row draws no chevron any more, so that collapse can
-    // never be undone. It must not swallow the rows the reveal toggle shows.
     it('shows revealed archived children under a family that draws no chevron', () => {
         const parent = running('parent', { totalChildrenCount: 2 });
         const a = inArchive('a', { parentId: 'parent' });
@@ -243,8 +223,6 @@ describe('visibleChildrenCount', () => {
     });
 
     it('is unaffected by whether the hidden children are currently revealed', () => {
-        // The "N sub-threads" count stays constant; only the separate archived
-        // toggle's own label/visibility changes with reveal state.
         const parent = running('parent', { totalChildrenCount: 2 });
         const child = inArchive('child', { parentId: 'parent' });
         const liveChild = running('child2', { parentId: 'parent' });
@@ -278,8 +256,6 @@ describe('orderedCurrentForReview excludes default-hidden archived branches', ()
 
 describe('inboxThreadCount, the section badge', () => {
     it('counts inbox threads only, as Archive all counts them', () => {
-        // A lifted archived parent, a dimmed archived middle over a live
-        // grandchild, and a revealed archived branch all render in Current.
         const lifted = inArchive('lifted', { totalChildrenCount: 2 });
         const live = running('live', { parentId: 'lifted' });
         const middle = inArchive('middle', { parentId: 'lifted', totalChildrenCount: 1 });

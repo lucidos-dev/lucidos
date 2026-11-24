@@ -52,25 +52,26 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     // hostname that is not loopback. `None` means we found nothing reachable,
     // and then there is no QR to draw.
     let origin = if args.qr {
-        let probe = gateway::probe_client()?;
+        let probe = Probe::new(&client, &base)?;
         match args.host.map(str::trim).filter(|h| !h.is_empty()) {
             // An explicit host is an assertion about a network we cannot see,
             // so it is never refused. Probing only picks which of its two
             // origins to use, and falls back to the ported one.
             Some(host) => Some(
-                reachable_origin(&probe, &base, host)
-                    .unwrap_or_else(|| origin_at_host(&base, host)),
+                reachable_origin(&probe, host)
+                    .unwrap_or_else(|| origin_at_host(&probe.off_loopback_base, host)),
             ),
             None => pairing_origin(
                 crate::external_address::stored(&client, &base, &token),
-                || gateway_https_origin(&probe, &base),
-                || tailnet_origin(&probe, &base),
+                || gateway_https_origin(&probe),
+                || tailnet_origin(&probe),
             ),
         }
     } else {
         crate::external_address::stored(&client, &base, &token)
     };
 
+    let waits = crate::devices::any_paired(&client, &base, &token) == Some(true);
     let mut request = client
         .post(format!("{base}{PAIRING_CODE_PATH}"))
         .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
@@ -136,8 +137,21 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         println!("  Unless that device names itself, it will be listed as \"{label}\".");
     }
     println!("  It works once and expires in {minutes} minutes.");
+    if waits {
+        print!("{}", awaiting_owner_note("device"));
+    }
     println!();
     Ok(())
+}
+
+/// Pure: what a code minted here waits for, once a device is paired. The
+/// redeemer of `kind` waits until a paired device taps Allow.
+fn awaiting_owner_note(kind: &str) -> String {
+    format!(
+        "\n  A device is already paired here, so the new {kind} waits until you tap\n  \
+         Allow under Settings -> Access on a paired device. If no paired device\n  \
+         works any more, run `lucidos devices revoke --all` and pair again.\n"
+    )
 }
 
 /// `lucidos pair --gateway`: mint a secret that lets another gateway relay this
@@ -146,7 +160,11 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
 /// It prints the `https` address the other gateway should use, found the way a
 /// device QR finds one. Without one there is nothing to pair over, so it says
 /// what to set up instead.
-pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), BoxError> {
+pub fn cmd_pair_gateway(
+    port: Option<u16>,
+    label: Option<&str>,
+    manage: bool,
+) -> Result<(), BoxError> {
     let client = gateway::client()?;
     let base = gateway::the_gateway(
         &client,
@@ -155,23 +173,30 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
          name the one the other gateway will reach",
     )?;
     let token = local_token()?;
-    let probe = gateway::probe_client()?;
+    let probe = Probe::new(&client, &base)?;
     let address = gateway_pairing_origin(
         crate::external_address::stored(&client, &base, &token),
-        || gateway_https_origin(&probe, &base),
-        || tailnet_origin(&probe, &base),
+        || gateway_https_origin(&probe),
+        || tailnet_origin(&probe),
     );
 
+    let waits = crate::devices::any_paired(&client, &base, &token) == Some(true);
     let mut request = client
         .post(format!("{base}{GATEWAY_PAIRING_CODE_PATH}"))
         .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
     if let Some(label) = label {
         request = request.query(&[("label", label)]);
     }
+    if manage {
+        request = request.query(&[("manage", "true")]);
+    }
     let Minted { code, minutes, .. } = mint(request)?;
 
     println!();
     println!("  Gateway pairing secret: {code}");
+    if manage {
+        println!("  Devices on the other gateway may manage this gateway's users and devices.");
+    }
     println!();
     println!("  On the other gateway, open Settings -> Access -> Add a remote gateway,");
     match &address {
@@ -190,6 +215,9 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
     }
     println!();
     println!("  It works once and expires in {minutes} minutes.");
+    if waits {
+        print!("{}", awaiting_owner_note("gateway"));
+    }
     println!();
     Ok(())
 }
@@ -274,13 +302,55 @@ fn gateway_pairing_origin(
     })
 }
 
+/// What a pairing probe needs: this gateway at loopback, and the way another
+/// device would reach it.
+struct Probe {
+    /// This gateway's health at loopback, asked once.
+    ours: Option<serde_json::Value>,
+    /// The client for an address off loopback. It checks certificates against
+    /// the public roots a phone trusts, so an origin it accepts is one the new
+    /// device can open. It follows no redirect: a redirect to loopback would
+    /// otherwise prove this gateway at an origin that is not its own.
+    remote: reqwest::blocking::Client,
+    /// This gateway's loopback base, with the scheme the gateway serves off loopback.
+    off_loopback_base: String,
+}
+
+impl Probe {
+    fn new(loopback: &reqwest::blocking::Client, base: &str) -> Result<Self, BoxError> {
+        let remote = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let ours = health(loopback, base);
+        let off_loopback_base = off_loopback_base(base, ours.as_ref());
+        Ok(Self {
+            ours,
+            remote,
+            off_loopback_base,
+        })
+    }
+}
+
+/// Pure: `base` with the scheme the gateway serves on an address that is not
+/// loopback. Loopback is https on every gateway, but another address is https
+/// only behind an operator certificate. Its health names the source.
+fn off_loopback_base(base: &str, health: Option<&serde_json::Value>) -> String {
+    let operator = health
+        .and_then(|h| h.pointer("/tls/source"))
+        .and_then(serde_json::Value::as_str)
+        == Some("operator");
+    let scheme = if operator { "https" } else { "http" };
+    let authority = base.split_once("://").map_or(base, |(_, a)| a);
+    format!("{scheme}://{authority}")
+}
+
 /// The HTTPS origin this gateway serves with its own certificate, once it
 /// answers there as this gateway. Its health names the origin.
-fn gateway_https_origin(client: &reqwest::blocking::Client, base: &str) -> Option<String> {
-    let ours = health(client, base)?;
+fn gateway_https_origin(probe: &Probe) -> Option<String> {
+    let ours = probe.ours.as_ref()?;
     let origin = ours.pointer("/tls/https_origin")?.as_str()?;
-    let id = ours.get("instance_id")?.as_str()?;
-    reaches_this_gateway(client, origin, id).then(|| origin.to_string())
+    let id = instance_id(ours)?;
+    reaches_this_gateway(&probe.remote, origin, &id).then(|| origin.to_string())
 }
 
 /// The tailnet origin another device can open, or `None` with the reason
@@ -289,7 +359,7 @@ fn gateway_https_origin(client: &reqwest::blocking::Client, base: &str) -> Optio
 /// Tailscale is asked, through `lucidos-tailscale`, and only to FIND AN ADDRESS
 /// TO PRINT, never in the auth decision, which keeps ADR 0094 intact. The
 /// address and name are the ones Tailscale reports (ADR 0588).
-fn tailnet_origin(client: &reqwest::blocking::Client, base: &str) -> Option<String> {
+fn tailnet_origin(probe: &Probe) -> Option<String> {
     let state = lucidos_tailscale::tailnet_state();
     let Some(node) = state.node() else {
         if let Some(reason) = state.reason() {
@@ -297,10 +367,10 @@ fn tailnet_origin(client: &reqwest::blocking::Client, base: &str) -> Option<Stri
         }
         return None;
     };
-    let ours = our_instance(client, base, "No tailnet address")?;
-    tailnet_candidates(base, node)
+    let ours = our_instance(probe, "No tailnet address")?;
+    tailnet_candidates(&probe.off_loopback_base, node)
         .into_iter()
-        .find(|origin| reaches_this_gateway(client, origin, &ours))
+        .find(|origin| reaches_this_gateway(&probe.remote, origin, &ours))
 }
 
 /// The tailnet origins worth trying, most useful first.
@@ -330,11 +400,11 @@ fn tailnet_candidates(base: &str, node: &lucidos_tailscale::TailnetNode) -> Vec<
 /// answers where the gateway's own port does not.
 ///
 /// So this asks instead of inferring, and health is the question it asks.
-fn reachable_origin(client: &reqwest::blocking::Client, base: &str, host: &str) -> Option<String> {
-    let ours = our_instance(client, base, "Using the gateway's own port at --host")?;
-    qr_origin_candidates(base, host)
+fn reachable_origin(probe: &Probe, host: &str) -> Option<String> {
+    let ours = our_instance(probe, "Using the gateway's own port at --host")?;
+    qr_origin_candidates(&probe.off_loopback_base, host)
         .into_iter()
-        .find(|origin| reaches_this_gateway(client, origin, &ours))
+        .find(|origin| reaches_this_gateway(&probe.remote, origin, &ours))
 }
 
 /// The origins worth trying for `host`, most specific first.
@@ -358,13 +428,17 @@ fn qr_origin_candidates(base: &str, host: &str) -> Vec<String> {
 /// from the other one is a dead QR. So the answer must carry our id, and a
 /// gateway older than `instance_id` proves nothing.
 fn reaches_this_gateway(client: &reqwest::blocking::Client, origin: &str, ours: &str) -> bool {
-    health_instance(client, origin).as_deref() == Some(ours)
+    health(client, origin)
+        .as_ref()
+        .and_then(instance_id)
+        .as_deref()
+        == Some(ours)
 }
 
 /// This gateway's `instance_id` over loopback, or `None` with `outcome` and
 /// the reason printed.
-fn our_instance(client: &reqwest::blocking::Client, base: &str, outcome: &str) -> Option<String> {
-    let ours = health_instance(client, base);
+fn our_instance(probe: &Probe, outcome: &str) -> Option<String> {
+    let ours = probe.ours.as_ref().and_then(instance_id);
     if ours.is_none() {
         eprintln!(
             "  {outcome}: the gateway is older than this CLI and cannot prove which \
@@ -374,9 +448,9 @@ fn our_instance(client: &reqwest::blocking::Client, base: &str, outcome: &str) -
     ours
 }
 
-/// The `instance_id` the gateway's health answers with at `origin`.
-fn health_instance(client: &reqwest::blocking::Client, origin: &str) -> Option<String> {
-    health(client, origin)?
+/// The `instance_id` a gateway's health carries.
+fn instance_id(health: &serde_json::Value) -> Option<String> {
+    health
         .get("instance_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
@@ -399,8 +473,8 @@ fn health(client: &reqwest::blocking::Client, origin: &str) -> Option<serde_json
 
 /// `base` with its hostname swapped for `host`, keeping the scheme and port.
 ///
-/// The same move `MobileAccessPage`'s `originAtHost` makes, and for the same
-/// reason: whatever answered at `127.0.0.1:<port>` answers at `<host>:<port>`.
+/// The same move `MobileAccessPage`'s `originAtHost` makes. `base` is the
+/// off-loopback one, so its scheme is what answers at `<host>:<port>`.
 fn origin_at_host(base: &str, host: &str) -> String {
     let (scheme, authority) = base.split_once("://").unwrap_or(("https", base));
     match authority.rsplit_once(':') {
@@ -483,8 +557,28 @@ mod tests {
              Content-Length: 0\r\nConnection: close\r\n\r\n",
             gateway::HEALTH_PATH
         ));
-        let probe = gateway::probe_client().unwrap();
-        assert!(!reaches_this_gateway(&probe, &elsewhere, "ours"));
+        let probe = probe_at("http://127.0.0.1:1");
+        assert!(!reaches_this_gateway(&probe.remote, &elsewhere, "ours"));
+    }
+
+    fn probe_at(base: &str) -> Probe {
+        Probe::new(&gateway::client().unwrap(), base).unwrap()
+    }
+
+    #[test]
+    fn off_loopback_is_https_only_behind_an_operator_certificate() {
+        let operator = serde_json::json!({"tls": {"source": "operator"}});
+        let tailnet = serde_json::json!({"tls": {"source": "tailnet"}});
+        let base = "https://127.0.0.1:5252";
+        assert_eq!(
+            off_loopback_base(base, Some(&operator)),
+            "https://127.0.0.1:5252"
+        );
+        assert_eq!(
+            off_loopback_base(base, Some(&tailnet)),
+            "http://127.0.0.1:5252"
+        );
+        assert_eq!(off_loopback_base(base, None), "http://127.0.0.1:5252");
     }
 
     const UNASKED: fn() -> Option<String> = || panic!("a later rung must not be probed");
@@ -550,8 +644,8 @@ mod tests {
         let base = answer_once(health_answer(&format!(
             r#"{{"instance_id":"ours","tls":{{"https_origin":"{served}"}}}}"#
         )));
-        let probe = gateway::probe_client().unwrap();
-        assert_eq!(gateway_https_origin(&probe, &base), Some(served));
+        let probe = probe_at(&base);
+        assert_eq!(gateway_https_origin(&probe), Some(served));
     }
 
     #[test]
@@ -560,8 +654,8 @@ mod tests {
         let base = answer_once(health_answer(&format!(
             r#"{{"instance_id":"ours","tls":{{"https_origin":"{served}"}}}}"#
         )));
-        let probe = gateway::probe_client().unwrap();
-        assert_eq!(gateway_https_origin(&probe, &base), None);
+        let probe = probe_at(&base);
+        assert_eq!(gateway_https_origin(&probe), None);
     }
 
     #[test]
@@ -569,8 +663,8 @@ mod tests {
         let base = answer_once(health_answer(
             r#"{"instance_id":"ours","tls":{"source":"none","https_origin":null}}"#,
         ));
-        let probe = gateway::probe_client().unwrap();
-        assert_eq!(gateway_https_origin(&probe, &base), None);
+        let probe = probe_at(&base);
+        assert_eq!(gateway_https_origin(&probe), None);
     }
 
     #[test]
@@ -695,5 +789,13 @@ mod tests {
             painted,
             "\u{1b}[30;47mab\u{1b}[0m\n\u{1b}[30;47mcd\u{1b}[0m\n"
         );
+    }
+
+    #[test]
+    fn the_waiting_note_names_the_redeemer_and_the_way_back_in() {
+        let note = awaiting_owner_note("gateway");
+        assert!(note.contains("the new gateway waits"), "{note}");
+        assert!(note.contains("lucidos devices revoke --all"), "{note}");
+        assert!(note.lines().all(|l| l.chars().count() <= 80), "{note}");
     }
 }

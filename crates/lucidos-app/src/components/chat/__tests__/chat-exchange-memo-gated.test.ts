@@ -1,14 +1,3 @@
-// A permission decision must survive the memo, on the rebuild path too.
-//
-// The card marks a call in the PREVIOUS exchange, and that exchange's own
-// steps do not change. So `userSeq`, `steps.length` and the last step's `seq`
-// are all identical across the mark. On the incremental fold path `revision`
-// carries it, because the fold adds the owning exchange to `touched`. A FULL
-// rebuild allocates fresh objects with no revision, and there the field
-// fingerprint is the only thing deciding: without the two mark sets in it, the
-// held call keeps rendering "In progress" until something else re-renders it.
-//
-// See `docs/plans/2026-08-25-permission-blocked-step-state.md`.
 
 import { describe, it, expect } from 'vitest';
 import { chatExchangePropsEqual } from '../ChatExchange';
@@ -25,8 +14,6 @@ function exchange(over: Partial<Exchange> = {}): Exchange {
   };
 }
 
-/** The props the memo sees, with only the exchange varying. `revision` is 0 on
- *  both sides, which is what a full rebuild hands the render sites. */
 const props = (ex: Exchange) => ({ exchange: ex, revision: 0 } as never);
 
 const equal = (a: Exchange, b: Exchange) => chatExchangePropsEqual(props(a), props(b));
@@ -58,9 +45,6 @@ describe('the memo sees a permission decision on a call it owns', () => {
 });
 
 describe('and does not re-render for a difference that is not one', () => {
-  // The two spellings of "nothing is marked". A resolution deletes the last
-  // entry rather than dropping the set. So an exchange that has been through a
-  // card carries an empty set where a fresh one carries nothing at all.
   it('treats an absent set and an empty set as the same state', () => {
     expect(equal(exchange(), exchange({ blockedStepSeqs: new Set() }))).toBe(true);
     expect(equal(exchange({ deniedStepSeqs: new Set() }), exchange())).toBe(true);

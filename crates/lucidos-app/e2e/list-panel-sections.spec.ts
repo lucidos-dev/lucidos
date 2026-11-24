@@ -1,19 +1,6 @@
-/**
- * The list panels share one section header and one row hairline
- * (docs/plans/2026-09-30-list-panel-section-headers.md).
- *
- * Triggers, Changes and Thread queue each draw the drawer's header: a bold
- * uppercase label at the body step, with a count. Every row carries a hairline
- * inset to the content column, a collapsed header carries one too, and so does
- * the Changes button row. The unit scan pins the markup and the rules. Only a
- * real layout resolves the cascade and the insets.
- *
- * Each panel's read is mocked, so the sections are known. The service worker
- * is blocked, since a request it makes never reaches `page.route`.
- */
 import { test, expect, type Page } from './fixtures';
 import {
-  apiRequest, assertHealthy, gotoWithRetry, navigateToApp, openTriggersPanel, waitForEventStream,
+  apiRequest, assertHealthy, gotoWithRetry, mockChangesState, navigateToApp, openTriggersPanel, waitForEventStream,
 } from './helpers';
 
 test.use({ serviceWorkers: 'block' });
@@ -47,7 +34,7 @@ function change(id: string, over: Record<string, unknown> = {}) {
 
 const CHANGES_STATE = {
   pending: [change('ready'), change('second')],
-  set_aside: [change('parked', { status: 'set_aside' })],
+  set_aside: [],
   applied: [
     change('done', { status: 'applied', resolved_at: '2026-01-01T01:00:00Z', pre_merge_sha: 'a1' }),
   ],
@@ -93,7 +80,6 @@ async function settle(page: Page): Promise<void> {
   await expect(page.locator('.boot-splash')).toHaveCount(0, { timeout: 30_000 });
 }
 
-/** Each visible section header in `root`, measured against the body step. */
 async function headerLooks(page: Page, root: string) {
   return page.evaluate((rootSel) => {
     const scope = Array.from(document.querySelectorAll(rootSel))
@@ -121,9 +107,6 @@ async function headerLooks(page: Page, root: string) {
   }, root);
 }
 
-/** Every hairline under `selector` inside `root`: where the line runs against
- *  the element's content box. A panel header hands its left padding to its
- *  toggle, so its content starts where the toggle's does. */
 async function hairlines(page: Page, root: string, selector: string) {
   return page.evaluate(({ rootSel, sel }) => {
     const scope = Array.from(document.querySelectorAll(rootSel))
@@ -173,8 +156,7 @@ test.describe('list panel sections', () => {
   });
 
   test('Changes: drawer headers, hairlines under every row and the button row, a collapse that sticks', async ({ page }) => {
-    await page.route('**/api/v1/changes*', (route) =>
-      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(CHANGES_STATE) }));
+    await mockChangesState(page, CHANGES_STATE);
     await page.addInitScript(() => {
       localStorage.setItem('lucidos-active-menu-item', 'changes');
       localStorage.setItem('lucidos-mobile-view', 'content');
@@ -184,15 +166,15 @@ test.describe('list panel sections', () => {
     await settle(page);
 
     const panel = '.panel-content.list-rows-divided';
-    expectDrawerLook(await headerLooks(page, panel), ['Ready', 'Set aside', 'Recently applied']);
+    expectDrawerLook(await headerLooks(page, panel), ['Ready', 'Recently applied']);
     expectInset(await hairlines(page, panel, '.list-row'), 'a change row');
     expectInset(await hairlines(page, panel, '.changes-bulk-actions'), 'the button row');
     await page.locator(panel).first().screenshot({ path: test.info().outputPath('changes.png') });
 
-    const setAside = page.locator('.list-section-title-collapsible:visible', { hasText: 'Set aside' });
-    await setAside.locator('.list-section-toggle').click();
-    await expect(page.locator('.change-row:visible', { hasText: 'Thread parked' })).toHaveCount(0);
-    await expect(setAside).toHaveClass(/\bcollapsed\b/);
+    const applied = page.locator('.list-section-title-collapsible:visible', { hasText: 'Recently applied' });
+    await applied.locator('.list-section-toggle').click();
+    await expect(page.locator('.change-row:visible', { hasText: 'Thread done' })).toHaveCount(0);
+    await expect(applied).toHaveClass(/\bcollapsed\b/);
     expectInset(
       await hairlines(page, panel, '.list-section-title-collapsible.collapsed'),
       'a collapsed header',
@@ -200,8 +182,8 @@ test.describe('list panel sections', () => {
 
     await page.reload();
     await expect(page.locator('.changes-bulk-actions:visible')).toBeVisible({ timeout: 15_000 });
-    await expect(setAside).toHaveClass(/\bcollapsed\b/);
-    await expect(page.locator('.change-row:visible', { hasText: 'Thread parked' })).toHaveCount(0);
+    await expect(applied).toHaveClass(/\bcollapsed\b/);
+    await expect(page.locator('.change-row:visible', { hasText: 'Thread done' })).toHaveCount(0);
   });
 
   test('Triggers: drawer headers with the count, rename kept, hairlines under every trigger', async ({ page }) => {

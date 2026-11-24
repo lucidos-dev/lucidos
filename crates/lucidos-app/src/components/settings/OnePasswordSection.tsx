@@ -20,19 +20,12 @@ import { useServerBackedField } from '../../hooks/useServerBackedField';
 
 const ONEPASSWORD_FIELDS = [{ label: 'Service account token' }, { label: 'op path' }];
 
-/** What a passing Test says: the vaults the service account reaches. */
 export function describeVaultCheck(check: OnepasswordVaultCheck): string {
   if (check.vaults.length === 0) return `${check.cli} works, but this service account reaches no vaults.`;
   const noun = check.vaults.length === 1 ? 'vault' : 'vaults';
   return `Reaches ${check.vaults.length} ${noun}: ${check.vaults.join(', ')}.`;
 }
 
-/** Settings, 1Password: the service account token that reads every *secret
- *  reference*, where `op` lives, and a Test that runs it.
- *
- *  The token never comes back from the engine, so the field starts blank and
- *  a blank save keeps the stored token. Re-reads whenever the credentials
- *  list changes, since every save or delete moves it. */
 export function OnePasswordSection() {
   const [status, setStatus] = useState<Loadable<OnepasswordStatus>>({ status: 'not-loaded' });
   const [attempt, setAttempt] = useState(0);

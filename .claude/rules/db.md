@@ -1,12 +1,12 @@
 ---
 paths:
-  - "crates/lucidos-engine/migrations/**"
+  - "crates/lucidos-core/migrations/**"
   - "**/*.sql"
 ---
 
 # Database Schema Reference
 
-Lucidos uses **event sourcing**: the `events` table is the central source of truth. Projections such as `thread_summaries` are maintained in-tx by the EventBus. `crates/lucidos-engine/migrations/` is the schema authority, and `SystemEvent` (`crates/lucidos-engine/src/engine/event_bus_system_event.rs`) is the event catalog. Per-table and per-event notes live in [`docs/database-schema-notes.md`](../../docs/database-schema-notes.md) and [`docs/system-events.md`](../../docs/system-events.md).
+Lucidos uses **event sourcing**: the `events` table is the central source of truth. Projections such as `thread_summaries` are maintained in-tx by the EventBus. `crates/lucidos-core/migrations/` is the schema authority, and `SystemEvent` (`crates/lucidos-core/src/engine/event_bus_system_event.rs`) is the event catalog. Per-table and per-event notes live in [`docs/database-schema-notes.md`](../../docs/database-schema-notes.md) and [`docs/system-events.md`](../../docs/system-events.md).
 
 ## Conventions
 
@@ -60,7 +60,7 @@ The timestamp column is `created`, not `created_at`. `aggregate_id` is `text`, s
 
 The catalog is `SystemEvent`, and each variant's doc comment states its payload and emit site. Behaviour that the comments do not carry is in `docs/system-events.md`. The rules below bind every event:
 
-- **Events are immutable and named in the past tense.** The wire shape is `SystemEvent` with `#[serde(tag = "type", content = "data")]`. Rename a variant only with a serde alias, because old rows keep their names.
+- **Events are immutable and named in the past tense.** The wire shape is `SystemEvent` with `#[serde(tag = "type", content = "data")]`. Rename a variant only with a serde alias, because old rows keep their names, or with a migration that rewrites those rows (ADR 0655).
 - **A new variant costs five match arms and a doc comment.** It states its aggregate, `aggregate_id`, payload, and whether it is persisted. Record its projection effect in `docs/system-events.md` when the comment cannot hold it.
 - **Audit events carry `actor`**, and the actor merges into the payload through `merge_actor`. An engine-driven event (ingress, supervisor, flaky detection) carries none.
 - **`Credential*`, reveal and token events never carry a secret**, only the service name and type. An event that states a set carries the result in full, never a delta.
@@ -73,3 +73,10 @@ The catalog is `SystemEvent`, and each variant's doc comment states its payload 
 ## Column notes
 
 Column-level notes (`parent_callback_pending`, `live_event_waits`, `compose_epoch`, the webhook *delivery outcome stamps* and *refusal run*, and the rest) are in `docs/database-schema-notes.md` § Thread projections and § Webhooks. Read them before you change a column, a projection arm, or a writer of one.
+
+## Main check compatibility
+
+`MainCheckFailed.fix_thread_id` remains required. `superseded_by_fix` is optional:
+a failure predating a fix landing stays failed in history but cannot reopen red.
+A later passing check closes red with `passed_on_newer_main`. Continued failures
+retain the repair owner while updating the red's check and details (ADR 0682).

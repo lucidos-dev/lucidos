@@ -2,18 +2,18 @@
 //! both the manual API handler and the scheduled cron), and the failure
 //! notification dedup helper.
 
-use crate::api::SharedEngine;
 use crate::core::backup::crypto::SealingKey;
 use crate::core::backup::recipient;
 use crate::core::keep_awake::{self, AwakeHold, Work};
 use crate::core::snapshot::{ArchiveJobGuard, ArchiveJobSlot, Busy};
+use crate::engine::types::SharedEngine;
 use crate::scheduler::notifications::SettingsPage;
 use tokio_util::sync::CancellationToken;
 
 use super::push;
 
 /// Holds the shared archive-job slot and keeps the computer awake for backup.
-pub(crate) struct BackupGuard {
+pub struct BackupGuard {
     _slot: ArchiveJobGuard,
     _awake: AwakeHold,
 }
@@ -21,7 +21,7 @@ pub(crate) struct BackupGuard {
 impl BackupGuard {
     /// Returns `Some` when the caller has exclusive ownership of the backup
     /// slot, `None` if another archive job is already running.
-    pub(crate) fn try_acquire(engine: &SharedEngine) -> Option<Self> {
+    pub fn try_acquire(engine: &SharedEngine) -> Option<Self> {
         engine
             .archive_job_slot
             .try_acquire(crate::core::snapshot::ArchiveJobKind::Backup)
@@ -56,7 +56,7 @@ async fn slot_for_schedule(
 /// the `BackupGuard` so it can clear the in-progress flag before the terminal
 /// SSE — otherwise a status refetch triggered by the SSE races the flag and
 /// briefly shows "Backup in progress" after the backup already finished.
-pub(crate) async fn run_backup(
+pub async fn run_backup(
     guard: BackupGuard,
     engine: &SharedEngine,
     pool: &sqlx::PgPool,
@@ -68,7 +68,7 @@ pub(crate) async fn run_backup(
     use crate::core::backup;
     use crate::engine::event_bus::{BusEvent, SystemEvent};
 
-    let progress = crate::api::backup::progress_sender(engine.event_bus.clone());
+    let progress = progress_sender(engine.event_bus.clone());
 
     // Capture start/finish so the persisted terminal event + last_run record the
     // run's duration (the durable backup history — see `BackupLastRun` /
@@ -86,7 +86,7 @@ pub(crate) async fn run_backup(
 
     match result {
         Ok(entry) => {
-            log!(
+            log_legacy!(
                 "[Backup] Completed: {} ({:.1} MB)",
                 entry.filename,
                 entry.size_bytes as f64 / 1024.0 / 1024.0
@@ -121,10 +121,10 @@ pub(crate) async fn run_backup(
                     let workspace_name = backup::workspace_archive_name(workspace);
                     if let Err(e) = backup::prune_old_backups(provider, workspace_name, keep).await
                     {
-                        log!("[Backup] Pruning failed (non-fatal): {}", e);
+                        log_legacy!("[Backup] Pruning failed (non-fatal): {}", e);
                     }
                 }
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[Backup] Could not read the retention count ({}); skipping pruning this run rather than defaulting to {}",
                     e,
                     crate::core::prefs::BACKUP_RETENTION.default_number()
@@ -134,7 +134,7 @@ pub(crate) async fn run_backup(
         Err(e) => {
             let slept = time_asleep(finished_at - started_at, monotonic_start.elapsed());
             let msg = describe_backup_failure(&e.to_string(), slept);
-            log!("[Backup] Failed: {}", msg);
+            log_legacy!("[Backup] Failed: {}", msg);
             persist_last_run(pool, &backup::BackupLastRun::failure(&msg, started_at)).await;
             drop(guard);
             engine
@@ -201,13 +201,13 @@ fn spoken_duration(d: std::time::Duration) -> String {
 /// terse and both paths get identical error handling.
 async fn persist_last_run(pool: &sqlx::PgPool, run: &crate::core::backup::BackupLastRun) {
     if let Err(e) = crate::core::backup::persist_last_run(pool, run).await {
-        log!("[Backup] Failed to persist last-run outcome: {}", e);
+        log_legacy!("[Backup] Failed to persist last-run outcome: {}", e);
     }
 }
 
 /// The refusal a backup meets when the workspace has neither a backup
 /// recipient nor a legacy key. Nothing is sealed under a key nobody saved.
-pub(crate) fn backups_not_set_up_message() -> String {
+pub fn backups_not_set_up_message() -> String {
     format!(
         "Backups are not set up yet. Open {} and create a backup key.",
         SettingsPage::BACKUP.link()
@@ -232,18 +232,18 @@ pub(super) async fn run_scheduled_backup(
     let guard = match acquired {
         Ok(slot) => BackupGuard::holding(slot),
         Err(Busy::Backup) => {
-            log!("[Backup] Skipping scheduled backup: another backup is already running");
+            log_legacy!("[Backup] Skipping scheduled backup: another backup is already running");
             return;
         }
         Err(Busy::Snapshot) => {
             let msg = "A workspace snapshot job held the archive slot for six hours, so the scheduled backup did not run.";
-            log!("[Backup] {}", msg);
+            log_legacy!("[Backup] {}", msg);
             notify_backup_failure(&engine, &provider_id, msg).await;
             return;
         }
     };
 
-    log!(
+    log_legacy!(
         "[Backup] Starting scheduled backup (provider: {})",
         provider_id
     );
@@ -254,7 +254,7 @@ pub(super) async fn run_scheduled_backup(
     let provider = match backup::get_provider(&provider_id, pool) {
         Ok(p) => p,
         Err(e) => {
-            log!("[Backup] {}, skipping", e);
+            log_legacy!("[Backup] {}, skipping", e);
             notify_backup_failure(&engine, &provider_id, &e.to_string()).await;
             return;
         }
@@ -265,7 +265,7 @@ pub(super) async fn run_scheduled_backup(
         Ok(state) => state,
         Err(e) => {
             let msg = format!("Cannot read the backup recipient: {e}");
-            log!("[Backup] {}", msg);
+            log_legacy!("[Backup] {}", msg);
             notify_backup_failure(&engine, &provider_id, &msg).await;
             return;
         }
@@ -273,7 +273,7 @@ pub(super) async fn run_scheduled_backup(
     let key = match recipient::sealing_key(pool, &workspace).await {
         Ok(Some(key)) => key,
         Ok(None) => {
-            log!("[Backup] Skipping scheduled backup: backups are not set up");
+            log_legacy!("[Backup] Skipping scheduled backup: backups are not set up");
             notify_once(
                 &engine,
                 BACKUPS_NOT_SET_UP_TITLE,
@@ -285,7 +285,7 @@ pub(super) async fn run_scheduled_backup(
         }
         Err(e) => {
             let msg = format!("Cannot load the backup key: {e}");
-            log!("[Backup] {}", msg);
+            log_legacy!("[Backup] {}", msg);
             notify_backup_failure(&engine, &provider_id, &msg).await;
             return;
         }
@@ -382,7 +382,7 @@ async fn notified_within(engine: &SharedEngine, title: &str, window_secs: i64) -
     .fetch_one(engine.pool())
     .await
     .unwrap_or_else(|e| {
-        log!("[Backup] Notification dedup lookup failed: {}", e);
+        log_legacy!("[Backup] Notification dedup lookup failed: {}", e);
         false
     })
 }
@@ -417,7 +417,7 @@ async fn emit_backup_notification(
         }))
         .await
     {
-        log!("[Backup] Failed to emit notification: {}", e);
+        log_legacy!("[Backup] Failed to emit notification: {}", e);
     }
 
     push::send_push_to_all(engine, title, message, Some(notification_id));
@@ -502,7 +502,7 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
         Some(m) => match crate::core::backup::provider_readiness(pool, m).await {
             Ok(r) => Some(r),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Backup] Could not resolve {} readiness for the failure notification: {}",
                     provider_id,
                     e
@@ -565,6 +565,23 @@ pub(super) async fn load_backup_catch_up_floor(
         schedule_written,
         restored_at,
     })
+}
+
+pub fn progress_sender(
+    event_bus: crate::engine::event_bus::EventBus,
+) -> impl Fn(&str, usize, usize) + Send + Sync + 'static {
+    move |phase: &str, current: usize, total: usize| {
+        // Broadcast synchronously from both async and blocking callers.
+        // Detached sends could deliver progress after completion or failure and
+        // leave the Backup card showing an active upload.
+        event_bus.broadcast_transient_system(
+            crate::engine::event_bus::SystemEvent::BackupProgress {
+                phase: phase.to_string(),
+                progress: current,
+                total,
+            },
+        );
+    }
 }
 
 #[cfg(test)]

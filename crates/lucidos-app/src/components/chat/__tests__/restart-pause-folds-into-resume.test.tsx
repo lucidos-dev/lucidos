@@ -7,10 +7,6 @@ import { devices } from '../../../store/actions/devices';
 import { pairedDevices } from '../../../store/actions/pairedDevices';
 import type { Exchange, StoredEvent, ThreadState } from '../../../store/thread-events';
 
-// A restart the user asked for writes two boundaries: "Paused by restart" and,
-// once the new engine is up, "Resumed after engine restart". Read together they
-// are one event. So once the resume lands, the pause draws no panel of its own
-// and its details move into the resume's info popover.
 
 const TS = '2026-09-24T12:00:00Z';
 

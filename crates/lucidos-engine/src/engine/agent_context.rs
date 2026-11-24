@@ -27,7 +27,7 @@ const SAFE_PREFERENCE_KEYS: &[&str] = &[
 /// message in its transcript, so it gets a block only when the conversation
 /// does not already hold this one ([`SentDeviceContexts`]).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct DeviceContext {
+pub struct DeviceContext {
     /// The last used device's lines, empty when no device is known.
     device_lines: Vec<String>,
     known_devices: Vec<SeenDevice>,
@@ -38,13 +38,13 @@ pub(crate) struct DeviceContext {
 /// What a block says apart from how fresh it is. Two blocks with an equal
 /// fingerprint tell the agent the same thing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContextFingerprint(String);
+pub struct ContextFingerprint(String);
 
 impl DeviceContext {
     /// The last used device is the one when the block is built. A later answer
     /// in the same live turn can move it, so the header says when.
     /// `navigate_ui` resolves it again at call time.
-    pub(crate) fn render(&self) -> String {
+    pub fn render(&self) -> String {
         if self.device_lines.is_empty()
             && self.known_devices.is_empty()
             && self.preference_lines.is_empty()
@@ -114,9 +114,9 @@ impl DeviceContext {
 
 /// A block the next message carries, with what to remember once the agent
 /// has read it.
-pub(crate) struct DeviceBlock {
-    pub(crate) text: String,
-    pub(crate) fingerprint: ContextFingerprint,
+pub struct DeviceBlock {
+    pub text: String,
+    pub fingerprint: ContextFingerprint,
 }
 
 /// The block one coding-agent conversation last read.
@@ -133,7 +133,7 @@ struct SentDeviceContext {
 /// losing it costs one extra block and never a missing one. An engine restart
 /// empties it.
 #[derive(Default)]
-pub(crate) struct SentDeviceContexts(std::sync::Mutex<HashMap<Uuid, SentDeviceContext>>);
+pub struct SentDeviceContexts(std::sync::Mutex<HashMap<Uuid, SentDeviceContext>>);
 
 impl SentDeviceContexts {
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, SentDeviceContext>> {
@@ -145,7 +145,7 @@ impl SentDeviceContexts {
     /// not seen `Init` name (`None`) always gets the block. `unread` lists
     /// blocks queued but not yet read: one that differs would be the agent's
     /// latest, so it forces a send.
-    pub(crate) fn block_for(
+    pub fn block_for(
         &self,
         thread_id: Uuid,
         conversation: Option<&str>,
@@ -164,12 +164,7 @@ impl SentDeviceContexts {
     }
 
     /// Call once the agent has read an input carrying the block.
-    pub(crate) fn record(
-        &self,
-        thread_id: Uuid,
-        conversation: &str,
-        fingerprint: ContextFingerprint,
-    ) {
+    pub fn record(&self, thread_id: Uuid, conversation: &str, fingerprint: ContextFingerprint) {
         self.entries().insert(
             thread_id,
             SentDeviceContext {
@@ -180,7 +175,7 @@ impl SentDeviceContexts {
     }
 
     /// Compaction can drop the block from the agent's summary.
-    pub(crate) fn forget(&self, thread_id: Uuid) {
+    pub fn forget(&self, thread_id: Uuid) {
         self.entries().remove(&thread_id);
     }
 }
@@ -212,7 +207,28 @@ const USER_ACTION_EVENT_TYPES: &[&str] =
 /// makes the laptop the last used device. Nothing before the anchor counts.
 /// With no anchor, or a failed lookup, the turn's own device stands.
 /// `navigate_ui` and the context block both read it here, so they agree.
-pub(crate) async fn last_used_device(
+///
+/// A hand-over may have replaced the id the event recorded. The answer is then
+/// the id the device answers to now, so a navigation reaches the open page.
+pub async fn last_used_device(
+    pool: &PgPool,
+    thread_id: Uuid,
+    turn_anchor: Option<Uuid>,
+    turn_device: Option<&str>,
+) -> Option<String> {
+    let recorded = recorded_last_used_device(pool, thread_id, turn_anchor, turn_device).await?;
+    match DeviceStore::current_id(pool, &recorded).await {
+        Ok(Some(current)) => Some(current),
+        Ok(None) => Some(recorded),
+        Err(e) => {
+            log_legacy!("[AgentContext] current id lookup failed for device {recorded}: {e}");
+            Some(recorded)
+        }
+    }
+}
+
+/// [`last_used_device`] as the events recorded it, before any hand-over.
+async fn recorded_last_used_device(
     pool: &PgPool,
     thread_id: Uuid,
     turn_anchor: Option<Uuid>,
@@ -245,7 +261,9 @@ pub(crate) async fn last_used_device(
     match newest {
         Ok(found) => found.or(fallback),
         Err(e) => {
-            log!("[AgentContext] last used device lookup failed for thread {thread_id}: {e}");
+            log_legacy!(
+                "[AgentContext] last used device lookup failed for thread {thread_id}: {e}"
+            );
             fallback
         }
     }
@@ -253,7 +271,7 @@ pub(crate) async fn last_used_device(
 
 /// The block for one turn, about its last used device. `turn_device` is the
 /// device the turn's own event names.
-pub(crate) async fn build_user_device_preferences_context_for_turn(
+pub async fn build_user_device_preferences_context_for_turn(
     pool: &PgPool,
     thread_id: Uuid,
     turn_anchor: Option<Uuid>,
@@ -270,7 +288,7 @@ const KNOWN_DEVICES_WITHIN_DAYS: i32 = 30;
 
 /// Build context for a coding-agent input from the persisted event that caused
 /// it. That event anchors the turn.
-pub(crate) async fn build_user_device_preferences_context_for_origin(
+pub async fn build_user_device_preferences_context_for_origin(
     pool: &PgPool,
     event_store: &EventStore,
     thread_id: Uuid,
@@ -280,7 +298,7 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
         Ok(Some(row)) => device_from_event_row(&row),
         Ok(None) => None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentContext] Failed to load origin event {} for device/preferences context: {}",
                 origin_id,
                 e
@@ -297,7 +315,7 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
     .await
 }
 
-pub(crate) fn prepend_user_device_preferences_context(context: &str, text: &str) -> String {
+pub fn prepend_user_device_preferences_context(context: &str, text: &str) -> String {
     if context.trim().is_empty() {
         return text.to_string();
     }
@@ -348,7 +366,7 @@ async fn build_known_devices(pool: &PgPool) -> Vec<SeenDevice> {
     match DeviceStore::recently_seen(pool, KNOWN_DEVICES_LIMIT, KNOWN_DEVICES_WITHIN_DAYS).await {
         Ok(devices) => devices,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentContext] Failed to list known devices for agent context: {}",
                 e
             );
@@ -371,7 +389,7 @@ fn format_known_device(device: &SeenDevice) -> String {
     )
 }
 
-pub(crate) fn format_age(secs: i64) -> String {
+pub fn format_age(secs: i64) -> String {
     match secs {
         s if s < 60 => "just now".to_string(),
         s if s < 3600 => format!("{} min ago", s / 60),
@@ -401,7 +419,7 @@ async fn build_preference_lines(pool: &PgPool, device_id: Option<&str>) -> Vec<S
     let prefs = match prefs {
         Ok(prefs) => prefs,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentContext] Failed to load user-facing preferences for agent context: {}",
                 e
             );
@@ -592,6 +610,18 @@ mod tests {
             None,
             "a finished child thread is not a user action"
         );
+    }
+
+    /// A Continue routed into a live run forwards and renders as a user input
+    /// did before it had a kind of its own.
+    #[test]
+    fn a_routed_continue_renders_like_a_user_input() {
+        use crate::engine::{AgentInputKind, AgentUserInput};
+        let requested = Uuid::new_v4();
+        let input = AgentUserInput::continuation("Continue".into(), requested);
+        assert_eq!(input.kind, AgentInputKind::Continuation);
+        assert_eq!(input.user_origin(), Some(requested));
+        assert!(input.kind.writes_prompt_sent());
     }
 
     /// The agent picks a device on purpose from this list. So each row carries

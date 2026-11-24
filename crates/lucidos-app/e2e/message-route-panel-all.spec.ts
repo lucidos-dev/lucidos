@@ -6,11 +6,6 @@ import { psql } from './db-helpers';
 test.describe('Message route panel', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // Every test here addresses the FIRST badge in the transcript and one
-    // scrolls the pane away from the bottom. The follow seed ships armed, so
-    // it would write the reader back to the live edge under both. That is what
-    // timed out the scroll test on mobile-webkit: Playwright scrolled the badge
-    // into view, the follow took it away again, and the click never landed.
     await disarmFollowSeed(page);
   });
 
@@ -20,24 +15,17 @@ test.describe('Message route panel', () => {
     await sendMessage(page, `Say exactly: "ok ${msg}"`);
     await waitForResponse(page);
 
-    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
     const badge = page.locator('.initiator-timestamp-button:visible').first();
     await expect(badge).toBeVisible();
     await badge.click();
 
     const panel = page.locator('.message-route-panel');
     await expect(panel).toBeVisible();
-    // Clicking the user actor opens the origin-only popover (executor info has its
-    // own button on the response panel since the per-panel popover split).
     await expect(panel).toContainText('Origin');
 
-    // The frontend always sends x-lucidos-device-id (auto-generated in
-    // localStorage on first call), so origin is Device. The popover names it
-    // on a "Sent from" row, from the devices list.
     const originSection = panel.locator('.route-section').first();
     await expect(originSection).toContainText(/Sent from|Sent by|Workspace/);
 
-    // Outside-click dismisses the panel.
     await page.locator('.app-shell').click({ position: { x: 5, y: 5 } });
     await expect(panel).toBeHidden();
   });
@@ -48,7 +36,6 @@ test.describe('Message route panel', () => {
     await sendMessage(page, `Say exactly: "ack ${msg}"`);
     await waitForResponse(page);
 
-    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
     const badge = page.locator('.initiator-timestamp-button:visible').first();
     await badge.click();
     const panel = page.locator('.message-route-panel');
@@ -64,7 +51,6 @@ test.describe('Message route panel', () => {
     await sendMessage(page, `Say exactly: "ok ${msg}"`);
     await waitForResponse(page);
 
-    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
     const badge = page.locator('.initiator-timestamp-button:visible').first();
     await badge.click();
     const panel = page.locator('.message-route-panel');
@@ -76,14 +62,12 @@ test.describe('Message route panel', () => {
 
   test('scrolling the chat keeps the panel open and re-anchored to the badge', async ({ page }) => {
     await navigateToApp(page);
-    // Send several messages so the chat pane has something to scroll.
     for (let i = 0; i < 4; i++) {
       const m = uniqueMessage(`route-panel-scroll-${i}`);
       await sendMessage(page, `Say exactly: "ok ${m}"`);
       await waitForResponse(page);
     }
 
-    // User messages are chromeless bubbles now — the timestamp is the origin trigger.
     const badge = page.locator('.initiator-timestamp-button:visible').first();
     await badge.click();
     const panel = page.locator('.message-route-panel');
@@ -94,8 +78,6 @@ test.describe('Message route panel', () => {
     const panelBefore = await panel.boundingBox();
     expect(panelBefore).not.toBeNull();
 
-    // Chat pane is its own scroll container, not window — walk up from the badge
-    // to find the actual scroller.
     await badge.evaluate((el) => {
       let n: HTMLElement | null = el;
       while (n) {
@@ -110,11 +92,6 @@ test.describe('Message route panel', () => {
 
     await expect(panel).toBeVisible();
 
-    // The panel re-anchors via requestAnimationFrame on the capture-phase scroll
-    // listener (useAnchoredPosition), so the reposition lands a frame or two after
-    // the scroll fires — not synchronously. Poll until the panel has caught up to
-    // the badge rather than reading boundingBox once, which raced the rAF on
-    // WebKit (panel still at its pre-scroll y → delta ≈ the full scroll distance).
     await expect
       .poll(
         async () => {
@@ -131,9 +108,6 @@ test.describe('Message route panel', () => {
   });
 
   test('engine-origin MessageReceived renders the engine explainer copy in popover', async ({ page }) => {
-    // Inject a thread with a MessageReceived event stamped with engine origin
-    // (mirrors what the engine emits after Tasks 8-10). This bypasses the live
-    // CC recovery path so the test is deterministic.
     const threadId = randomUUID();
     const eventId = randomUUID();
     const respId = randomUUID();
@@ -152,15 +126,12 @@ test.describe('Message route panel', () => {
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respId}', 'ResponseGenerated', '{"text":"ok","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));
 
-      // Pre-seed the focused thread so navigateToApp lands on it directly
-      // (mirrors the pattern used by cc-stuck-waiting.spec.ts).
       await page.addInitScript((tid: string) => {
         localStorage.setItem('lucidos-focused-thread', tid);
       }, threadId);
       await navigateToApp(page);
       await assertHealthy(page);
 
-      // An engine-seeded message draws no actor header; its time opens the popover.
       const badge = page.locator('.initiator-timestamp-button:visible').first();
       await expect(badge).toBeVisible();
       await badge.click();
@@ -168,8 +139,6 @@ test.describe('Message route panel', () => {
       const panel = page.locator('.message-route-panel');
       await expect(panel).toBeVisible();
       const originSection = panel.locator('.route-section').first();
-      // An engine origin renders its explainer: a "Why Lucidos acted" heading
-      // over a plain sentence.
       await expect(originSection).toContainText('Why Lucidos acted');
       await expect(originSection).toContainText(/picked it back up/i);
     } finally {
@@ -180,8 +149,6 @@ test.describe('Message route panel', () => {
     }
   });
 
-  // A plugin setup seed carries a typed plugin_setup reason, and the popover
-  // names the update from it. This is the payload the engine writes.
   test('a plugin setup seed names the plugin update, never Unknown', async ({ page }) => {
     const threadId = randomUUID();
     const eventId = randomUUID();
@@ -216,7 +183,6 @@ test.describe('Message route panel', () => {
       await navigateToApp(page);
       await assertHealthy(page);
 
-      // An engine-seeded message draws no actor header; its time opens the popover.
       const badge = page.locator('.initiator-timestamp-button:visible').first();
       await expect(badge).toBeVisible();
       await badge.click();
@@ -236,10 +202,6 @@ test.describe('Message route panel', () => {
   });
 
   test('a spawn attributed without parent linkage links back to its spawning thread', async ({ page }) => {
-    // The `relation: "top"` shape the engine now emits: a ThreadLink origin
-    // naming the launching thread, and NO parent_thread_id (a top spawn reports
-    // back to nobody). Before the split those travelled together, so dropping
-    // the linkage also dropped the attribution and Origin read "Unknown".
     const spawningThreadId = randomUUID();
     const spawnedId = randomUUID();
     const eventId = randomUUID();
@@ -276,8 +238,6 @@ test.describe('Message route panel', () => {
       await navigateToApp(page);
       await assertHealthy(page);
 
-      // Agent-mode MessageReceived keeps its actor chip (not a chromeless user
-      // bubble), so the chip is the popover trigger.
       const badge = page.locator('.initiator-actor:visible').first();
       await expect(badge).toBeVisible();
       await badge.click();
@@ -287,8 +247,6 @@ test.describe('Message route panel', () => {
       const originSection = panel.locator('.route-section').first();
       await expect(originSection).toContainText('Parent thread');
       await expect(originSection).not.toContainText('Unknown');
-      // Named and clickable, resolved live from the thread list rather than
-      // rendered as a bare id.
       await expect(originSection.locator('button.accent-link')).toHaveText(spawningThreadTitle);
     } finally {
       psql([

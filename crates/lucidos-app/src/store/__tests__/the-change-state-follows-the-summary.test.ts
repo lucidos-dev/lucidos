@@ -1,6 +1,3 @@
-/** ADR 0400: the live thread meta carries `codingAgentChangeState` from both
- *  summary paths, the SSE aggregate and the list read. Only a proposal reads
- *  as ready to review; withheld work does not. */
 import { describe, it, expect } from 'vitest';
 import {
   applyAggregateToMeta,
@@ -68,8 +65,6 @@ describe('the change state on the live thread', () => {
     expect(changeReadyToReview(thread.meta)).toBe(false);
   });
 
-  // The fan-out gate in thread-sync.ts reads the changed signal, so a state
-  // that says the same thing must not report a change.
   it('reports no change for an equal state in a new object', () => {
     const thread = freshThread();
     applyAggregateToMeta(thread.meta, aggregate(1, { ...PROPOSED }));

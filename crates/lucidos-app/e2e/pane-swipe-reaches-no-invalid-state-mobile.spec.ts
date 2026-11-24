@@ -1,30 +1,10 @@
-/**
- * Mobile: a pane swipe reaches no invalid state.
- *
- * The strip follows one lead at a time, only a lift commits, and every drag
- * ends at rest (`components/layout/paneDrag.ts`). The rules are unit-tested.
- * This spec checks the strip itself in a browser, for the four shapes the
- * user felt as "weird intermittent states":
- *
- *   - a cancelled far drag, which used to switch panes;
- *   - a thumb resting on the edge strip, which used to hijack every other
- *     touch and cancel its scroll;
- *   - a navigation mid-drag, which used to leave every later move animating;
- *   - a drag during a slide, which used to jump the strip to the slide's end.
- *
- * Touches are generic `Event`s with hand-built lists, because WebKit refuses
- * the Touch and TouchEvent constructors. Each touch carries an identifier.
- */
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, ensureOnThreadPane, navigateToApp, waitForPaneAtRest } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
 interface Point { id: number; x: number; y: number }
 
-/** Dispatch one touch event on the element under its changed touch. Returns
- *  whether the strip cancelled it. */
 async function fire(page: Page, type: string, touches: Point[], changed: Point[]): Promise<boolean> {
   return page.evaluate(({ type, touches, changed }) => {
     const at = changed[changed.length - 1];
@@ -42,7 +22,6 @@ async function fire(page: Page, type: string, touches: Point[], changed: Point[]
   }, { type, touches, changed });
 }
 
-/** Drag touch `id` from `x0` to `x1` in 20px steps, with `others` held down. */
 async function dragTo(page: Page, id: number, x0: number, x1: number, y: number, others: Point[] = []): Promise<void> {
   const step = x1 > x0 ? 20 : -20;
   for (let x = x0 + step; step > 0 ? x <= x1 : x >= x1; x += step) {
@@ -52,7 +31,6 @@ async function dragTo(page: Page, id: number, x0: number, x1: number, y: number,
 
 const mobileView = (page: Page) => page.locator('.app-header').first().getAttribute('data-mobile-view');
 
-/** The visible pane's left edge, which is 0 when the strip rests on it. */
 async function visiblePaneLeft(page: Page, index: number): Promise<number> {
   return page.evaluate((i) => document.querySelectorAll('.mobile-swipe-pane')[i].getBoundingClientRect().left, index);
 }
@@ -85,10 +63,8 @@ test.describe('Mobile pane swipe reaches no invalid state', () => {
   test('a thumb resting on the edge strip neither hijacks a swipe nor blocks a scroll', async ({ page }) => {
     const { w, y } = await screen(page);
     const thumb = { id: 1, x: 4, y };
-    // The edge guard still cancels the thumb's own touch.
     expect(await fire(page, 'touchstart', [thumb], [thumb])).toBe(true);
 
-    // A vertical scroll beside it keeps its default.
     const mid = Math.round(w * 0.5);
     const scroll = { id: 2, x: mid, y };
     expect(await fire(page, 'touchstart', [thumb, scroll], [scroll])).toBe(false);
@@ -97,7 +73,6 @@ test.describe('Mobile pane swipe reaches no invalid state', () => {
     await fire(page, 'touchend', [thumb], [scrolled]);
     expect(await mobileView(page)).toBe('thread');
 
-    // A swipe beside it leads the strip and commits on its own lift.
     const x0 = Math.round(w * 0.8);
     const x1 = Math.round(w * 0.1);
     await fire(page, 'touchstart', [thumb, { id: 3, x: x0, y }], [{ id: 3, x: x0, y }]);
@@ -123,7 +98,6 @@ test.describe('Mobile pane swipe reaches no invalid state', () => {
       const el = document.querySelector<HTMLElement>('.mobile-swipe-track')!;
       return { transition: el.style.transition, transform: el.style.transform };
     });
-    // The strip slides to the new pane, and the finger no longer moves it.
     expect(track.transition).not.toBe('none');
     expect(track.transform).toBe('translateX(0px)');
     await fire(page, 'touchend', [], [{ id: 1, x: Math.round(w * 0.1), y }]);
@@ -136,7 +110,6 @@ test.describe('Mobile pane swipe reaches no invalid state', () => {
   test('a drag during a slide catches the strip where it is on screen', async ({ page }) => {
     const original = await page.evaluate(() => document.documentElement.style.getPropertyValue('--duration-scale'));
     try {
-      // A ten-times slower slide, so the drag lands well inside it.
       await page.evaluate(() => document.documentElement.style.setProperty('--duration-scale', '10'));
       await page.evaluate(() => {
         document.querySelector<HTMLElement>('button.mobile-dot[aria-label="content view"]')!.click();
@@ -145,12 +118,10 @@ test.describe('Mobile pane swipe reaches no invalid state', () => {
       const { w, y } = await screen(page);
       const x = Math.round(w * 0.5);
 
-      // A tap leaves the slide running.
       await fire(page, 'touchstart', [{ id: 1, x, y }], [{ id: 1, x, y }]);
       await fire(page, 'touchend', [], [{ id: 1, x, y }]);
       expect(await page.evaluate(() => document.querySelector('.mobile-swipe-track')!.getAnimations().length)).toBeGreaterThan(0);
 
-      // One task, so the slide cannot advance between the two readings.
       const jump = await page.evaluate(({ x, y }) => {
         const track = document.querySelector<HTMLElement>('.mobile-swipe-track')!;
         const offset = () => new DOMMatrix(getComputedStyle(track).transform).m41;
@@ -168,8 +139,6 @@ test.describe('Mobile pane swipe reaches no invalid state', () => {
         send('touchmove', x - 12);
         return Math.abs(offset() - before);
       }, { x, y });
-      // The lock threshold leaves 4px of visible drag. Jumping to the slide's
-      // end moved the strip by most of a pane.
       expect(jump).toBeLessThan(20);
 
       await fire(page, 'touchend', [], [{ id: 2, x: x - 12, y }]);

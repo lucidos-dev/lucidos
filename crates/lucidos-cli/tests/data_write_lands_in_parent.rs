@@ -341,7 +341,7 @@ fn write_fails_loudly_when_the_engine_rejects_it() {
 }
 
 /// Run `lucidos data write <path>` against the workspace, with `content` on
-/// stdin, the way `system-knowhow/themes.md` § "Make a theme" documents it.
+/// stdin, the way `system-knowhow/themes/switch-themes.md` § "Make a theme" documents it.
 fn data_write_from_stdin(workspace: &std::path::Path, path: &str, content: &str) -> Output {
     let mut child = Command::new(LUCIDOS)
         .args(["data", "write", path])
@@ -399,7 +399,7 @@ fn the_documented_theme_command_writes_under_themes() {
 #[test]
 fn a_refused_theme_exits_non_zero_with_the_engines_reason() {
     // The body `write_data` answers for a theme that breaks a rule.
-    const REFUSAL: &str = r#"{"error":"`dark`: the value of --accent is empty, longer than 120 characters, or uses a banned form (url(), ;, braces, @, backslash, a comment)"}"#;
+    const REFUSAL: &str = r#"{"error":"`dark`: the value of --accent is empty, longer than 256 characters, or uses a banned form (url(), ;, braces, @, backslash, a comment)"}"#;
     let (port, requests) = spawn_stub_engine_replying(StatusCode::UNPROCESSABLE_ENTITY, REFUSAL);
 
     let tmp = tempfile::tempdir().unwrap();

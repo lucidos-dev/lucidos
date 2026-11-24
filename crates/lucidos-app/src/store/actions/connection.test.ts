@@ -5,11 +5,7 @@ import { makeThreadState } from './threads-test-helpers';
 import { ApiError } from '../../api/client';
 import { gapRefreshedVersion } from '../eventGap';
 
-// Mock all external dependencies so handleResume can run in isolation.
 vi.mock('../../api/client', async (importActual) => ({
-  // `ApiError` and `isTransientFetchError` are pure and are the very thing the
-  // thread-list refresh branches on, so they come from the real module rather
-  // than a stub that would let the test agree with itself.
   ...(await importActual<typeof import('../../api/client')>()),
   checkHealth: vi.fn().mockResolvedValue({
     status: 'loaded',
@@ -17,7 +13,7 @@ vi.mock('../../api/client', async (importActual) => ({
   }),
   API_BASE: 'http://localhost:3000',
 }));
-vi.mock('./thread-sync', () => ({
+vi.mock('./thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),
 }));
@@ -25,10 +21,6 @@ vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
   retryStaleOpenThreadEvents: vi.fn().mockReturnValue(false),
-  // runResumeSync retries every thread carrying `eventsLoadFailed` through
-  // this; the mock proxy throws on an undeclared export the moment that line
-  // runs, so omitting it turns a behavioural assertion into a mock error as
-  // soon as a fixture sets the flag.
   loadThreadEvents: vi.fn().mockResolvedValue(undefined),
   clearThreadFetchGuards: vi.fn(),
   markLoadedThreadsStale: vi.fn(),
@@ -51,9 +43,8 @@ vi.mock('./whatsNew', () => ({
   reloadChangelogIfRead: vi.fn(),
 }));
 
-// Import after mocks are set up
 const { handleResume } = await import('./connection');
-const { reviveThreadEvents } = await import('./thread-sync');
+const { reviveThreadEvents } = await import('./thread-stream');
 const { loadPreferences } = await import('./preferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
 const { reloadChangelogIfRead } = await import('./whatsNew');
@@ -114,10 +105,6 @@ describe('handleResume preserves credential request form', () => {
 
     await handleResume();
 
-    // User often takes a screenshot, switches tabs, or alt-tabs while filling
-    // out credentials — the panel must survive every focus event. The data
-    // lives on panelOverlay (and is persisted in the nav stack), so resync
-    // does not need to "refetch" it from the original SSE event.
     expect(activeInlineForm.value).not.toBeNull();
     expect(activeInlineForm.value?.type).toBe('credential');
   });
@@ -137,12 +124,6 @@ describe('handleResume preserves credential request form', () => {
   });
 });
 
-/**
- * Preferences have no SSE re-trigger of their own beyond `PreferencesChanged`
- * / `LanguageSet` / `TimezoneSet`, and nothing else re-runs the loader once it
- * fails. A resume must reload them, or a fetch cancelled at startup leaves
- * Settings showing every value at its default for the whole page load.
- */
 describe('handleResume reloads preferences', () => {
   it('calls loadPreferences on every resume', async () => {
     await handleResume();
@@ -151,11 +132,6 @@ describe('handleResume reloads preferences', () => {
   });
 });
 
-/**
- * A resume fires on every window focus, beside the click that raised the window.
- * Cutting a live stream there drops the frame that click caused, such as an
- * app's navigate. The resume asks `reviveThreadEvents`, which decides.
- */
 describe('handleResume keeps the event stream', () => {
   it('revives the stream instead of tearing it down', async () => {
     vi.mocked(reviveThreadEvents).mockClear();
@@ -166,11 +142,6 @@ describe('handleResume keeps the event stream', () => {
   });
 });
 
-/**
- * A wake that replaces a stale stream opens it as a first open, so its open
- * runs no gap reconcile. The resume must repair the signals only frames move, or a
- * backup that finished while the device slept leaves the Backup page stale.
- */
 describe('handleResume repairs the state a gap leaves behind', () => {
   it('bumps every registered version counter once', async () => {
     const version = gapRefreshedVersion();
@@ -182,16 +153,6 @@ describe('handleResume repairs the state a gap leaves behind', () => {
   });
 });
 
-/**
- * A release notice is baked into the engine binary, so the list changes when
- * the engine does. The one event over it, `ReleaseNoticeResolved`, fires when
- * somebody ANSWERS a notice and never when a new one arrives. So a page that
- * read the list just before an update restart keeps the outgoing build's
- * answer, and an upgraded workspace shows nothing at all.
- *
- * That is the reported defect: one window read at `08:23:11` from the engine
- * about to be replaced, and never asked the new one.
- */
 describe('handleResume re-reads the release notices', () => {
   it('asks the engine again, because a restart can have brought a new notice', async () => {
     await handleResume();
@@ -200,11 +161,6 @@ describe('handleResume re-reads the release notices', () => {
   });
 });
 
-/**
- * What's New read during an update restart fails, or holds the outgoing
- * build's list. No event announces a changelog, so the reconnect is the only
- * chance to correct either before the user restarts the app by hand.
- */
 describe('handleResume re-reads the changelog', () => {
   it('asks the engine again, because a restart can have failed or outdated it', async () => {
     await handleResume();
@@ -235,11 +191,6 @@ describe('handleResume thread-events refresh', () => {
     await handleResume();
     for (let i = 0; i < 5; i++) await Promise.resolve();
 
-    // The focused thread is the one whose staleness the user can see, so it is
-    // the one worth a request now. Asserted as the SET of ids rather than a
-    // count, because these fixture threads hold no events and so also trip
-    // `checkConnection`'s separate empty-focused-thread recovery, which
-    // refreshes the same id once more.
     expect(new Set(refresh.mock.calls.map(c => c[0]))).toEqual(new Set(['focused']));
     expect(mark).toHaveBeenCalled();
   });
@@ -255,9 +206,6 @@ describe('handleResume thread-events refresh', () => {
     await handleResume();
     for (let i = 0; i < 40; i++) await Promise.resolve();
 
-    // A wake used to dump one request per loaded thread onto a link it was
-    // still re-establishing, each carrying its own 10s client deadline. Bounding
-    // that to four at a time queued the burst; marking removes it.
     expect(refresh).not.toHaveBeenCalled();
     expect(mark).toHaveBeenCalled();
   });
@@ -282,9 +230,6 @@ describe('handleResume thread-events refresh', () => {
     await handleResume();
     for (let i = 0; i < 40; i++) await Promise.resolve();
 
-    // These are FULL snapshots, up to three attempts each, and the set is
-    // largest at exactly the wrong moment. They stay eager because the retry
-    // landing is what retracts the load-failure card.
     expect(load).toHaveBeenCalledTimes(20);
     expect(peak).toBeLessThanOrEqual(THREAD_EVENTS_FETCH_CONCURRENCY);
     load.mockReset();
@@ -298,16 +243,9 @@ describe('handleResume thread-list refresh', () => {
     focusedThreadId.value = null;
     toasts.value = [];
     connectionStatus.value = 'connected';
-    // A resume happens on a client that already has its list. Load-bearing for
-    // these two: with it false, `checkConnection`'s separate cold-start retry
-    // (`!threadsLoaded`) issues its OWN `loadAllThreads` first, deliberately
-    // swallows the rejection, and the resume refresh below then gets the mock's
-    // default resolve, so both cases would pass without exercising anything.
     threadsLoaded.value = true;
   });
 
-  /** Drive one resume with `loadAllThreads` rejecting, and let the fire-and-forget
-   *  refresh settle (`runResumeSync` does not await it). */
   async function resumeWithFailingThreadList(err: unknown): Promise<void> {
     const { loadAllThreads } = await import('./thread-loading');
     const load = loadAllThreads as unknown as ReturnType<typeof vi.fn>;
@@ -317,12 +255,6 @@ describe('handleResume thread-list refresh', () => {
     load.mockResolvedValue(undefined);
   }
 
-  // The reported iOS PWA card. Over a dropped tunnel the GET hangs rather than
-  // refusing, so the 10s client deadline fires while the engine is answering
-  // this endpoint in milliseconds. The dot owns a sustained outage; this site
-  // must not report the link as a refusal. The rules themselves are covered in
-  // thread-list-refresh.test.ts; this pins that the resume site routes through
-  // them rather than keeping a catch block of its own.
   it('raises no card when the refresh times out', async () => {
     await resumeWithFailingThreadList(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
     expect(toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY)).toBeUndefined();

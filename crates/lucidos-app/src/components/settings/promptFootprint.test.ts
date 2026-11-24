@@ -43,7 +43,6 @@ describe('the prompt footprint page helpers', () => {
     expect(itemsFor(report(), 'largest').map((i) => i.id)).toEqual(['ops/nightly', 'a', 'b', 'a']);
     expect(itemsFor(report(), 'largest').length).toBeLessThanOrEqual(LARGEST_ITEMS_SHOWN);
     expect(itemsFor(report(), 'clipped').map((i) => i.id)).toEqual(['a']);
-    // The open-app section names `a` again, unjudged, so it is unused once.
     expect(itemsFor(report(), 'unused').map((i) => i.id)).toEqual(['a']);
   });
 

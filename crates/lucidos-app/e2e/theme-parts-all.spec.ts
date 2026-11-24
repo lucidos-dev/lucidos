@@ -5,16 +5,6 @@ import { test, expect, type Page } from './fixtures';
 import { apiRequest, gotoWithRetry, shellDeviceId } from './helpers';
 import { appPath, createIframeAppFixture } from './db-helpers';
 
-// Theme parts in a real browser (ADR 0307), in Chromium and WebKit. Every test
-// uses a fixture theme from e2e/themes/, never a shipped theme.
-//
-//   - a glow on chat text never reaches a protected card nested inside it;
-//   - theme-effects `reduce` drops part shadows and filters, keeps colours and
-//     letter-spacing, and a live toggle repaints;
-//   - a colour token holding smuggled text cannot add a shadow layer;
-//   - an app frame paints parts only when it loads the SDK stylesheet, and
-//     not when it opts out;
-//   - a theme written before parts, with --text-glow alone, still glows.
 
 const EVERY_CAP = 'e2e-parts-every-cap';
 const TEXT_GLOW = 'e2e-text-glow-only';
@@ -24,18 +14,11 @@ const fixture = (name: string): string => readFileSync(resolve(here, 'themes', n
 
 const CHUNK = '#lp-chunk';
 const CARDS = ['#lp-question', '#lp-permission', '#lp-form', '#lp-split'];
-/** Inside each card: plain text, and the elements the chat part rules target. */
 const CARD_PARTS = ['.lp-text', 'h2', 'a', 'code', 'pre'];
 const PAINT = ['color', 'caret-color', 'text-shadow', 'letter-spacing', 'box-shadow', 'filter', 'background-color'];
 
-/** What a protected card holds: plain text, and every element a chat part
- *  rule targets. */
 const CARD_BODY = '<span class="lp-text">Allow this?</span><h2>Heading</h2><a href="#">link</a><code>code</code><pre>block</pre>';
 
-/** Protected roots inside every part that is a container: chat text, a code
- *  block and the composer box. No real transcript nests them like this. Part
- *  selectors reach around them, and the protected reset must stop everything
- *  at the card. */
 const TRANSCRIPT = `
 <div class="response-body"><div class="response-chunk" id="lp-chunk">
   Glowing prose <a href="#">a link</a>
@@ -59,7 +42,6 @@ async function setPreference(page: Page, key: string, value: string): Promise<vo
   expect((await res.json()).success, `${key}=${value}`).toBe(true);
 }
 
-/** Put this device back on the defaults a fresh device has. */
 async function resetPreferences(page: Page): Promise<void> {
   await setPreference(page, 'theme', 'lucidos');
   await setPreference(page, 'theme-effects', 'system');
@@ -81,7 +63,6 @@ async function style(page: Page, selector: string, prop: string): Promise<string
   );
 }
 
-/** Every paint property of every element inside the protected cards. */
 async function cardPaint(page: Page): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const card of CARDS) {
@@ -92,7 +73,6 @@ async function cardPaint(page: Page): Promise<Record<string, string>> {
   return out;
 }
 
-/** Shadow layers in a computed value: top-level commas plus one. */
 function layers(value: string): number {
   if (value === 'none' || value === '') return 0;
   let depth = 0;
@@ -129,8 +109,6 @@ test.describe('theme parts', () => {
 
   test('a glow on chat text never reaches a protected card nested inside it', async ({ page }) => {
     await injectTranscript(page);
-    // The protected palette is clamped against the screen's scanlines (ADR
-    // 0313), so the baseline carries the same scanlines and no other part.
     const everyCap = JSON.parse(fixture('parts-every-cap.json'));
     const screenOnly = {
       name: 'Screen only',
@@ -146,11 +124,9 @@ test.describe('theme parts', () => {
     await setPreference(page, 'theme', EVERY_CAP);
     await waitForToken(page, '--part-chat-text-text-shadow', true);
 
-    // The theme paints the prose around the cards.
     expect(layers(await style(page, CHUNK, 'text-shadow'))).toBe(1);
     expect(await style(page, CHUNK, 'color')).toBe('rgb(204, 51, 102)');
     expect(await style(page, CHUNK, 'letter-spacing')).not.toBe('normal');
-    // Inside the cards, every paint property is what the baseline paints.
     expect(await cardPaint(page)).toEqual(plain);
     for (const card of CARDS) {
       expect(await style(page, `${card} .lp-text`, 'text-shadow')).toBe('none');
@@ -172,8 +148,6 @@ test.describe('theme parts', () => {
 
     await setPreference(page, 'theme-effects', 'reduce');
     await expect(page.locator('html')).toHaveAttribute('data-theme-effects', 'reduce');
-    // The composer's border and shadow ease (previews.css), so every read waits
-    // for the resting value rather than catching one mid-transition.
     for (const [selector, prop] of [
       [CHUNK, 'text-shadow'], ['#lp-icon', 'filter'], ['#lp-box', 'box-shadow'],
       ['#lp-textarea', 'text-shadow'], ['#lp-title', 'text-shadow'],
@@ -184,7 +158,6 @@ test.describe('theme parts', () => {
     expect(await style(page, CHUNK, 'letter-spacing')).toBe(spacing);
     await expect.poll(() => style(page, '#lp-box', 'border-color')).toBe('rgb(51, 255, 51)');
 
-    // A live toggle repaints without re-applying the theme.
     await setPreference(page, 'theme-effects', 'full');
     await expect.poll(() => style(page, CHUNK, 'text-shadow')).not.toBe('none');
   });
@@ -196,7 +169,6 @@ test.describe('theme parts', () => {
     const capped = await style(page, CHUNK, 'text-shadow');
     expect(layers(capped)).toBe(1);
 
-    // Straight onto the token, and through an untyped custom property.
     for (const smuggle of [
       { '--accent': 'red, 9em 9em 5em red' },
       { '--lp-evil': 'red, 9em 9em 5em red', '--accent': 'var(--lp-evil)' },
@@ -259,8 +231,6 @@ test.describe('theme parts', () => {
   });
 });
 
-// App frames: parts reach an app only through the SDK stylesheet it loads, and
-// `data-theme-parts="off"` on its <html> switches them off.
 const PLAIN_APP = 'e2e-theme-parts-plain';
 const SDK_APP = 'e2e-theme-parts-sdk';
 const OPTED_OUT_APP = 'e2e-theme-parts-off';
@@ -305,19 +275,16 @@ ${[PLAIN_APP, SDK_APP, OPTED_OUT_APP].map(id => `<iframe id="${id}" src="${appPa
         .evaluate((el, p) => getComputedStyle(el).getPropertyValue(p), prop);
       await expect(frame(SDK_APP).locator('#text')).toBeVisible();
 
-      // The SDK app got the tokens from its own seed, and paints them.
       expect(layers(await frameStyle(SDK_APP, 'body', 'text-shadow'))).toBe(1);
       expect(await frameStyle(SDK_APP, 'body', 'letter-spacing')).not.toBe('normal');
       expect(await frameStyle(SDK_APP, '#control', 'border-top-color')).toBe('rgb(51, 255, 51)');
       expect(await frameStyle(SDK_APP, '#control', 'box-shadow')).not.toBe('none');
 
-      // The opted-out app has the same tokens and paints none of them.
       for (const [selector, prop] of [['body', 'text-shadow'], ['#link', 'text-shadow'], ['#control', 'box-shadow']]) {
         expect(await frameStyle(OPTED_OUT_APP, selector, prop), `${selector} ${prop}`).toBe('none');
       }
       expect(await frameStyle(OPTED_OUT_APP, 'body', 'letter-spacing')).toBe('normal');
 
-      // The plain app has no part token and no part paint.
       const inline = await frame(PLAIN_APP).locator('html').evaluate(el => (el as HTMLElement).style.cssText);
       expect(inline).not.toContain('--part-');
       expect(await frameStyle(PLAIN_APP, 'body', 'text-shadow')).toBe('none');

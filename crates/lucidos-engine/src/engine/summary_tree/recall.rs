@@ -29,15 +29,15 @@ const ARTIFACT_CHARS: usize = 30_000;
 
 /// One line a recall tool returns.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct RecallLine {
-    pub(crate) id: String,
-    pub(crate) text: String,
+pub struct RecallLine {
+    pub id: String,
+    pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) sender_device_id: Option<String>,
+    pub sender_device_id: Option<String>,
 }
 
 /// Open `id` `levels` levels down. A leaf opens into its source.
-pub(crate) async fn zoom(
+pub async fn zoom(
     pool: &PgPool,
     id: NodeId,
     levels: u32,
@@ -74,7 +74,7 @@ pub(crate) async fn zoom(
 
 /// The top of a tree: how many entries it holds, and the lines tiling them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct TreeTop {
+pub struct TreeTop {
     pub(crate) entries: u64,
     /// The largest blocks tiling `[0, entries)`, oldest first. An unbuilt
     /// block shows as its built halves, as in [`zoom`].
@@ -82,7 +82,7 @@ pub(crate) struct TreeTop {
 }
 
 /// The top of `scope`'s tree, where a browser starts before it zooms.
-pub(crate) async fn top(pool: &PgPool, scope: SummaryScope) -> Result<TreeTop, BoxError> {
+pub async fn top(pool: &PgPool, scope: SummaryScope) -> Result<TreeTop, BoxError> {
     match scope {
         SummaryScope::Thread(thread) => {
             let tree = ThreadTree::load(pool, thread).await?;
@@ -115,7 +115,7 @@ async fn check_workspace(pool: &PgPool, id: NodeId) -> Result<(), BoxError> {
 }
 
 /// The time range `id` covers, first entry to last.
-pub(crate) async fn date(pool: &PgPool, id: NodeId) -> Result<serde_json::Value, BoxError> {
+pub async fn date(pool: &PgPool, id: NodeId) -> Result<serde_json::Value, BoxError> {
     let (from, to) = match id.scope {
         SummaryScope::Thread(thread) => {
             let tree = ThreadTree::load(pool, thread).await?;
@@ -145,7 +145,7 @@ pub(crate) async fn date(pool: &PgPool, id: NodeId) -> Result<serde_json::Value,
 /// One `search` result: a message, its address in its thread's tree, and the
 /// workspace leaf of its turn once that is built.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct SearchHit {
+pub struct SearchHit {
     pub(crate) id: String,
     pub(crate) workspace_id: Option<String>,
     pub(crate) thread_id: Uuid,
@@ -156,7 +156,7 @@ pub(crate) struct SearchHit {
 
 /// Text search over the log, through the trigram index on message text,
 /// returning tree addresses.
-pub(crate) async fn search(
+pub async fn search(
     pool: &PgPool,
     events: &crate::core::EventStore,
     text: &str,

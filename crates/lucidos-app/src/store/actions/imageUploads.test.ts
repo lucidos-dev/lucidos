@@ -73,7 +73,6 @@ function addEntry(localId = 'u-1', contentHash?: string): void {
   });
 }
 
-/** SHA-256 of the bytes [1, 2, 3], as the engine's `compute_hash` names them. */
 const HASH_123 = '039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81';
 
 function stateOf(localId = 'u-1'): PendingUploadState | undefined {
@@ -121,7 +120,6 @@ describe('runPendingUpload', () => {
   const originalFetch = globalThis.fetch;
   beforeEach(() => {
     vi.useFakeTimers();
-    // The draft PUT that follows a landed hash.
     globalThis.fetch = vi.fn(async () => new Response(null, { status: 204 })) as unknown as typeof fetch;
     connectionStatus.value = 'connected';
     seedThread();
@@ -202,7 +200,6 @@ describe('runPendingUpload', () => {
     expect(uploadThreadBlob).toHaveBeenCalledTimes(UPLOAD_RETRY_DELAYS_MS.length + 1);
     expect(stateOf()).toEqual({ kind: 'failed', reason: 'Lucidos could not be reached', retryable: true });
     expect(toasts.value.some((t) => t.message.includes('Image upload failed'))).toBe(true);
-    // The image is still there for the user to retry or remove.
     expect(getPendingUpload(THREAD, 'u-1')?.file).toBeTruthy();
 
     vi.mocked(uploadThreadBlob).mockReset().mockResolvedValue({ hash: 'h1', mime: 'image/png', byte_size: 3 });
@@ -248,7 +245,6 @@ describe('runPendingUpload', () => {
 
     cancelPendingUpload(THREAD, 'u-1');
     expect(signal?.aborted).toBe(true);
-    // The answer races the cancel and loses.
     answer({ hash: 'h1', mime: 'image/png', byte_size: 3 });
     await run;
     expect(getDraft(THREAD).image_hashes).toEqual([]);
@@ -270,9 +266,6 @@ describe('runPendingUpload', () => {
 describe('landing on the ImageUploaded event', () => {
   const originalFetch = globalThis.fetch;
 
-  /** An upload the engine took but whose answer never reaches the page. It
-   *  rejects on abort, as `postWithUploadProgress` does. `answer` lands the
-   *  late answer anyway, for the race where it loses to the event. */
   function lostAnswer(): { answer: (hash: string) => void; signal: () => AbortSignal | undefined } {
     let answer!: (v: { hash: string; mime: string; byte_size: number }) => void;
     let signal: AbortSignal | undefined;
@@ -411,7 +404,6 @@ describe('landing on the ImageUploaded event', () => {
   });
 
   it('without Web Crypto an image carries no hash and still lands on its answer', async () => {
-    // What an insecure context keeps: no `subtle`, no `randomUUID`.
     const real = globalThis.crypto;
     vi.stubGlobal('crypto', { getRandomValues: real.getRandomValues.bind(real) });
     vi.mocked(uploadThreadBlob).mockResolvedValue({ hash: 'h1', mime: 'image/png', byte_size: 3 });
@@ -457,10 +449,8 @@ describe('pending upload records', () => {
   };
   const storedIds = async () => (await readPendingUploadStore()).uploads.map((r) => r.localId);
   const onlyEntryId = () => ownedPendingUploadRecords()[0]?.localId;
-  /** The upload leaves once the image is hashed, which is real async work. */
   const uploadStarted = () => vi.waitFor(() => expect(uploadThreadBlob).toHaveBeenCalled());
 
-  /** An upload that waits until the test answers it. */
   function heldUpload(): { answer: (hash: string) => void; signal: () => AbortSignal | undefined } {
     let answer!: (v: { hash: string; mime: string; byte_size: number }) => void;
     let signal: AbortSignal | undefined;
@@ -477,7 +467,6 @@ describe('pending upload records', () => {
     seedThread();
     toasts.value = [];
     _resetPendingUploadRecordsForTesting();
-    // An earlier test's draft write left the engine holding a hash.
     noteServerDraft(THREAD, '', []);
     vi.mocked(uploadThreadBlob).mockReset();
     vi.mocked(awaitThreadStarted).mockReset().mockImplementation(async () => {});
@@ -513,7 +502,6 @@ describe('pending upload records', () => {
   });
 
   it('a landed image stays on the device while still attached', async () => {
-    // The draft write that would carry the hash has not been answered yet.
     globalThis.fetch = vi.fn(() => new Promise<Response>(() => {})) as unknown as typeof fetch;
     const upload = heldUpload();
     const run = attach();

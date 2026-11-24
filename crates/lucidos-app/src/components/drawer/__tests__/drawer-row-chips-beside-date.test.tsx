@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Every drawer row carries its chips beside the date, and the agent mark last.
- * A row with sub-threads puts its "Show N sub-threads" link and archived toggle
- * on a line below them.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { ThreadRow } from '../ThreadDrawer';
@@ -72,8 +67,6 @@ function mount(totalChildrenCount: number, overrides: Partial<ThreadMeta> = {}):
 }
 
 beforeEach(() => {
-  // jsdom has no layout. The name chip measures its lines on mount, and an
-  // empty list reads as one line, which needs no width pin.
   Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -97,7 +90,6 @@ describe('where a drawer row puts its chips', () => {
     expect(familyLine, 'no sub-thread line rendered').not.toBeNull();
     expect(familyLine!.querySelector(':scope > .family-disclosure')).not.toBeNull();
     expect(familyLine!.querySelector('.label')).toBeNull();
-    // Below the chips, not above them.
     expect(host.querySelector('.thread-row-meta + .thread-row-family-line')).not.toBeNull();
   });
 
@@ -119,7 +111,7 @@ describe('the agent mark', () => {
   it.each([
     [{ channel: 'claude_code', codingAgent: 'claude-code' }, '.claude-icon', 'Claude Code'],
     [{ channel: 'claude_code', codingAgent: 'codex' }, '.codex-icon', 'Codex'],
-    [{ channel: 'chat', codingAgent: undefined }, '.lucidos-mark-icon', 'Lucidos Agent'],
+    [{ channel: 'chat', codingAgent: undefined }, '.lucidos-mark', 'Lucidos Agent'],
     [{ channel: 'trigger', codingAgent: undefined }, 'svg', 'Trigger'],
   ] as const)('draws the mark for %o', (overrides, iconSelector, label) => {
     mount(0, overrides);
@@ -127,6 +119,14 @@ describe('the agent mark', () => {
     expect(mark.querySelector(iconSelector)).not.toBeNull();
     expect(mark.getAttribute('aria-label')).toBe(label);
     expect(host.querySelector('.message-channel-tag')).toBeNull();
+  });
+
+  it('carries the original flat Lucidos mark and the optional brand tile in the same centred slot', () => {
+    mount(0, { channel: 'chat', codingAgent: undefined });
+    const mark = host.querySelector('.thread-row-agent')!;
+    expect(mark.querySelector('.lucidos-mark-icon')?.getAttribute('fill')).toBe('currentColor');
+    expect(mark.querySelector('.lucidos-mark .lmk-bg')).not.toBeNull();
+    expect(host.querySelectorAll('.thread-row-agent')).toHaveLength(1);
   });
 
   it('keeps the red ERROR tag for an unknown channel', () => {

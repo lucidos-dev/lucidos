@@ -35,6 +35,18 @@ pub const ENV_MAX_BUILDS: &str = "LUCIDOS_MAX_CONCURRENT_BUILDS";
 /// which is what stops `make test` deadlocking against `test-engine.sh`.
 pub const ENV_HELD: &str = "LUCIDOS_BUILD_SLOT_HELD";
 
+/// Socket supplied by a background task's watchdog. An open connection
+/// marks a build-slot wait for as long as the broker holds it.
+pub const ENV_WAIT_SOCKET: &str = "LUCIDOS_BUILD_SLOT_WAIT_SOCKET";
+
+#[cfg(unix)]
+pub fn notify_background_wait() -> Option<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(std::env::var_os(ENV_WAIT_SOCKET)?).ok()
+}
+
+/// Nice increment a lease passes to each directly wrapped step.
+pub const ENV_LEASE_NICE: &str = "LUCIDOS_BUILD_SLOT_LEASE_NICE";
+
 /// Test seam: overrides the pool directory that would otherwise sit under
 /// `$HOME`. Tests must never touch the real machine-wide pool.
 pub const ENV_POOL_DIR: &str = "LUCIDOS_BUILD_SLOT_DIR";
@@ -43,9 +55,11 @@ pub const ENV_POOL_DIR: &str = "LUCIDOS_BUILD_SLOT_DIR";
 /// is what a foreground build wants.
 pub const ENV_NICE: &str = "LUCIDOS_BUILD_SLOT_NICE";
 
-/// Set to `1` to wait as a priority waiter ([`SlotClass::Priority`]). Only the
-/// engine's own background rebuild sets it.
-pub const ENV_PRIORITY: &str = "LUCIDOS_BUILD_SLOT_PRIORITY";
+/// The build's scheduling class: ordinary, priority, or background.
+pub const ENV_CLASS: &str = "LUCIDOS_BUILD_SLOT_CLASS";
+
+/// Compatibility input from older engines. New spawns set only ENV_CLASS.
+pub const ENV_LEGACY_PRIORITY: &str = "LUCIDOS_BUILD_SLOT_PRIORITY";
 
 /// The cargo variable the core share is exported as. Read as well as written:
 /// a value the caller already set always wins.
@@ -65,8 +79,11 @@ const DEFAULT_NICE: i32 = 10;
 /// Highest increment honoured. The kernel clamps above this anyway.
 const MAX_NICE: i32 = 19;
 
-/// Gibibytes of host RAM we assume one heavy build needs.
-const GIB_PER_BUILD: u64 = 16;
+/// Gibibytes budgeted for one heavy build, including headroom above measured peaks.
+const GIB_PER_BUILD: u64 = 12;
+
+/// Gibibytes reserved for the OS and standing services before sizing the pool.
+const GIB_HOST_RESERVE: u64 = 8;
 
 /// Ceiling on the derived count. Past this, cores rather than memory bind, and
 /// nobody wants sixteen concurrent rustc trees on one box.
@@ -88,23 +105,45 @@ const WAITING_FILE: &str = "waiting.lock";
 /// File priority waiters hold a shared lock on. See
 /// [`BuildSlotPool::priority_waiting`].
 const PRIORITY_FILE: &str = "priority.lock";
+const BACKGROUND_FILE: &str = "background.lock";
 
 /// Who is asking for a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotClass {
-    /// Every build nobody is watching: agent lint, tests, e2e.
+    /// Automatic repairs yield freed slots to chosen work.
+    Background,
+    /// Chosen work: ordinary agent lint, tests, e2e and terminal builds.
     Ordinary,
     /// The build a user is waiting on. Ordinary builds leave a freed slot to
     /// it, and it runs un-niced unless told otherwise.
     Priority,
 }
 
-/// The class [`ENV_PRIORITY`] asks for. Only the exact value `1` means
-/// priority, so a typo degrades to ordinary rather than jumping the line.
+impl SlotClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Priority => "priority",
+            Self::Background => "background",
+        }
+    }
+}
+
+/// Unknown values keep the ordinary class.
 pub fn resolve_class(raw: Option<&str>) -> SlotClass {
     match raw.map(str::trim) {
-        Some("1") => SlotClass::Priority,
+        Some("priority") => SlotClass::Priority,
+        Some("background") => SlotClass::Background,
         _ => SlotClass::Ordinary,
+    }
+}
+
+/// Older engines can still ask for Apply priority when the new class is unset.
+pub fn resolve_class_with_legacy(raw: Option<&str>, legacy: Option<&str>) -> SlotClass {
+    if raw.is_none() && legacy.map(str::trim) == Some("1") {
+        SlotClass::Priority
+    } else {
+        resolve_class(raw)
     }
 }
 
@@ -166,7 +205,8 @@ pub fn resolve_capacity(
     }
     match total_ram_bytes {
         Some(bytes) => Capacity {
-            value: ((bytes / GIB) / GIB_PER_BUILD).clamp(1, MAX_DERIVED_CAPACITY) as usize,
+            value: ((bytes / GIB).saturating_sub(GIB_HOST_RESERVE) / GIB_PER_BUILD)
+                .clamp(1, MAX_DERIVED_CAPACITY) as usize,
             source: CapacitySource::HostRam,
         },
         None => Capacity {
@@ -182,12 +222,11 @@ fn parse_capacity(raw: Option<&str>) -> Option<usize> {
     (n >= 1).then_some(n)
 }
 
-/// Total host RAM in bytes, or `None` on a platform we cannot read.
+/// RAM available to host build slots, bounded by the Linux cgroup limit.
 pub fn host_total_ram_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        parse_meminfo_total(&text)
+        linux_ram_bytes(Path::new("/proc"))
     }
     #[cfg(target_os = "macos")]
     {
@@ -204,6 +243,63 @@ pub fn host_total_ram_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_ram_bytes(proc: &Path) -> Option<u64> {
+    let host = std::fs::read_to_string(proc.join("meminfo"))
+        .ok()
+        .and_then(|text| parse_meminfo_total(&text));
+    host.into_iter().chain(linux_cgroup_limit(proc)).min()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_cgroup_limit(proc: &Path) -> Option<u64> {
+    let groups = std::fs::read_to_string(proc.join("self/cgroup")).ok()?;
+    let member = Path::new(groups.lines().find_map(|line| line.strip_prefix("0::"))?);
+    let namespace_path = member.strip_prefix("/").ok()?;
+    if namespace_path
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let mounts = std::fs::read_to_string(proc.join("self/mountinfo")).ok()?;
+    let mut limit = None;
+    for line in mounts.lines() {
+        let Some((fields, fs)) = line.split_once(" - ") else {
+            continue;
+        };
+        if fs.split_whitespace().next() != Some("cgroup2") {
+            continue;
+        }
+        let mut paths = fields.split_whitespace().skip(3);
+        let Some((root, mount)) = paths.next().zip(paths.next()) else {
+            continue;
+        };
+        let root = mountinfo_path(root);
+        let mount = mountinfo_path(mount);
+        let relative = member.strip_prefix(root).unwrap_or(namespace_path);
+        let leaf = Path::new(&mount).join(relative);
+        if !leaf.is_dir() {
+            continue;
+        }
+        for directory in leaf.ancestors().take_while(|path| path.starts_with(&mount)) {
+            let bound = std::fs::read_to_string(directory.join("memory.max"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            limit = limit.into_iter().chain(bound).min();
+        }
+    }
+    limit
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_path(path: &str) -> String {
+    path.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 /// `MemTotal:  16316108 kB` from `/proc/meminfo`, as bytes.
@@ -230,8 +326,7 @@ pub fn inherited_slot() -> Option<String> {
 /// every `cargo` under it reads.
 ///
 /// A non-root process cannot lower a nice increment again, so the broker
-/// applies it once, at the grant. A nested acquisition therefore imposes
-/// [`BuildLimits::NONE`] rather than a second increment.
+/// applies it once. A lease delegates this to each directly wrapped step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildLimits {
     /// Nice increment for the process that spawns the build. `0` leaves the
@@ -243,12 +338,21 @@ pub struct BuildLimits {
 }
 
 impl BuildLimits {
-    /// Impose nothing. What a nested acquisition uses, and what an ungoverned
-    /// build gets when there is no pool to grant anything.
+    /// Impose nothing when there is no grant or the limits already apply.
     pub const NONE: Self = Self {
         nice: 0,
         jobs: None,
     };
+
+    /// A lease already exported the job count, but has yet to nice this step.
+    /// An ordinary nested wrapper inherits both limits from its parent.
+    pub fn nested(lease_nice: Option<&str>) -> Self {
+        let nice = lease_nice
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .unwrap_or_default()
+            .clamp(0, MAX_NICE);
+        Self { nice, ..Self::NONE }
+    }
 }
 
 /// The nice increment for a granted build, from [`ENV_NICE`] or the class
@@ -262,6 +366,7 @@ pub fn resolve_nice(raw: Option<&str>, class: SlotClass) -> i32 {
     let default = match class {
         SlotClass::Ordinary => DEFAULT_NICE,
         SlotClass::Priority => 0,
+        SlotClass::Background => 15,
     };
     let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
         return default;
@@ -367,10 +472,18 @@ impl BuildSlotPool {
     /// Take the first free slot for a build of `class`. An ordinary build
     /// yields to a waiting priority build. Nothing raises the slot count.
     pub fn try_acquire_as(&self, label: &str, class: SlotClass) -> Option<BuildSlotGuard> {
+        let _background_turn = if class == SlotClass::Background {
+            match self.flag_turn(WAITING_FILE) {
+                OrdinaryTurn::Open(held) => held,
+                OrdinaryTurn::Yield => return None,
+            }
+        } else {
+            None
+        };
         // Held until the slot walk ends, so the check and the take are one step.
         let _turn = match class {
             SlotClass::Priority => None,
-            SlotClass::Ordinary => match self.ordinary_turn() {
+            SlotClass::Ordinary | SlotClass::Background => match self.ordinary_turn() {
                 OrdinaryTurn::Open(held) => held,
                 OrdinaryTurn::Yield => return None,
             },
@@ -412,10 +525,13 @@ impl BuildSlotPool {
         }
         // Announce that somebody is queued behind the pool, so a releasing
         // holder knows to emit rather than staying silent on the fast path.
-        let _waiting = self.mark_waiting();
+        let _waiting = match class {
+            SlotClass::Background => self.mark_background_waiting(),
+            SlotClass::Ordinary | SlotClass::Priority => self.mark_waiting(),
+        };
         let _priority = match class {
             SlotClass::Priority => self.mark_priority_waiting(),
-            SlotClass::Ordinary => None,
+            SlotClass::Ordinary | SlotClass::Background => None,
         };
         let started = Instant::now();
         loop {
@@ -446,7 +562,7 @@ impl BuildSlotPool {
     /// go silent for exactly the subscriber that needs waking.
     pub fn mark_waiting(&self) -> Option<WaitingFlag> {
         let file = self.open_flag_file(WAITING_FILE)?;
-        fs2::FileExt::try_lock_shared(&file).ok()?;
+        fs2::FileExt::lock_shared(&file).ok()?;
         Some(WaitingFlag { file })
     }
 
@@ -457,15 +573,25 @@ impl BuildSlotPool {
     /// failure direction is a redundant announcement rather than a waiter left
     /// asleep.
     pub fn anyone_waiting(&self) -> bool {
-        let Some(file) = self.open_flag_file(WAITING_FILE) else {
-            return true;
-        };
+        self.try_anyone_waiting().unwrap_or(true)
+    }
+
+    /// Admission can fail open on unreadable state without hiding it from builds.
+    pub fn try_anyone_waiting(&self) -> Result<bool, BoxError> {
+        Ok(self.flag_waiting(WAITING_FILE)? || self.flag_waiting(BACKGROUND_FILE)?)
+    }
+
+    fn flag_waiting(&self, name: &str) -> Result<bool, BoxError> {
+        let file = self
+            .open_flag_file(name)
+            .ok_or_else(|| format!("Cannot read build waiters: {name}"))?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => {
-                let _ = fs2::FileExt::unlock(&file);
-                false
+                fs2::FileExt::unlock(&file)?;
+                Ok(false)
             }
-            Err(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -473,13 +599,20 @@ impl BuildSlotPool {
     /// waits. Shared, so two priority builds can wait at once. The kernel drops
     /// it on death, so no priority claim can outlive its waiter.
     ///
-    /// Blocking, unlike [`mark_waiting`](Self::mark_waiting). The only thing
+    /// Blocking, like [`mark_waiting`](Self::mark_waiting). The only thing
     /// that can hold the file exclusively is an [`ordinary_turn`], which lasts
     /// one slot walk. A non-blocking try would lose the flag for the whole wait.
     ///
     /// [`ordinary_turn`]: Self::ordinary_turn
     pub fn mark_priority_waiting(&self) -> Option<WaitingFlag> {
         let file = self.open_flag_file(PRIORITY_FILE)?;
+        fs2::FileExt::lock_shared(&file).ok()?;
+        Some(WaitingFlag { file })
+    }
+
+    /// Background waiters announce separately, so they never block themselves.
+    pub fn mark_background_waiting(&self) -> Option<WaitingFlag> {
+        let file = self.open_flag_file(BACKGROUND_FILE)?;
         fs2::FileExt::lock_shared(&file).ok()?;
         Some(WaitingFlag { file })
     }
@@ -500,7 +633,11 @@ impl BuildSlotPool {
     /// cannot be opened means nobody waits. The other direction would stall
     /// every ordinary build on the host behind a broken file.
     fn ordinary_turn(&self) -> OrdinaryTurn {
-        let Some(file) = self.open_flag_file(PRIORITY_FILE) else {
+        self.flag_turn(PRIORITY_FILE)
+    }
+
+    fn flag_turn(&self, name: &str) -> OrdinaryTurn {
+        let Some(file) = self.open_flag_file(name) else {
             return OrdinaryTurn::Open(None);
         };
         match fs2::FileExt::try_lock_exclusive(&file) {

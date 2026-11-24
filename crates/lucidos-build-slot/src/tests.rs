@@ -50,16 +50,42 @@ fn a_capacity_file_with_surrounding_whitespace_still_parses() {
 
 #[test]
 fn host_ram_derivation_has_a_floor_of_one_and_a_ceiling() {
-    // A small laptop must still be able to build, so the floor is 1 rather
-    // than the 0 that the raw division yields.
-    assert_eq!(resolve_capacity(None, None, Some(4 * GB)).value, 1);
-    assert_eq!(resolve_capacity(None, None, Some(8 * GB)).value, 1);
-    assert_eq!(resolve_capacity(None, None, Some(16 * GB)).value, 1);
-    assert_eq!(resolve_capacity(None, None, Some(32 * GB)).value, 2);
-    assert_eq!(resolve_capacity(None, None, Some(48 * GB)).value, 3);
-    assert_eq!(resolve_capacity(None, None, Some(64 * GB)).value, 4);
-    // Past the ceiling, cores bind rather than memory.
+    for gib in [0, 4, 8, 15, 16] {
+        assert_eq!(
+            resolve_capacity(None, None, Some(gib * GB)).value,
+            1,
+            "host RAM: {gib} GiB"
+        );
+    }
     assert_eq!(resolve_capacity(None, None, Some(512 * GB)).value, 8);
+}
+
+#[test]
+fn host_ram_derivation_matches_common_mac_and_linux_sizes() {
+    let cases = [
+        // macOS reports nominal RAM.
+        (16, 1),
+        (24, 1),
+        (32, 2),
+        (36, 2),
+        (48, 3),
+        (64, 4),
+        (128, 8),
+        // Linux MemTotal is lower than nominal RAM.
+        (15, 1),
+        (23, 1),
+        (31, 1),
+        (35, 2),
+        (47, 3),
+        (62, 4),
+        (125, 8),
+    ];
+
+    for (gib, expected) in cases {
+        let resolved = resolve_capacity(None, None, Some(gib * GB));
+        assert_eq!(resolved.source, CapacitySource::HostRam);
+        assert_eq!(resolved.value, expected, "host RAM: {gib} GiB");
+    }
 }
 
 #[test]
@@ -79,6 +105,40 @@ fn meminfo_total_parses_and_tolerates_a_missing_line() {
     assert_eq!(parse_meminfo_total(text), Some(16_316_108 * 1024));
     assert_eq!(parse_meminfo_total("MemFree: 1 kB\n"), None);
     assert_eq!(parse_meminfo_total("MemTotal:\n"), None);
+}
+
+#[test]
+fn linux_capacity_uses_the_smallest_visible_cgroup_limit() {
+    let fixture = tempfile::tempdir().unwrap();
+    let proc = fixture.path().join("proc");
+    let mount = fixture.path().join("cgroup mount");
+    let leaf = mount.join("worker/job");
+    std::fs::create_dir_all(proc.join("self")).unwrap();
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::write(
+        proc.join("meminfo"),
+        format!("MemTotal: {} kB\n", 64 * GB / 1024),
+    )
+    .unwrap();
+    std::fs::write(proc.join("self/cgroup"), "0::/slice/worker/job\n").unwrap();
+    std::fs::write(
+        proc.join("self/mountinfo"),
+        format!(
+            "20 10 0:12 /slice {} rw - cgroup2 cgroup rw\n",
+            mount.display().to_string().replace(' ', "\\040")
+        ),
+    )
+    .unwrap();
+    std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
+    std::fs::write(mount.join("worker/memory.max"), (16 * GB).to_string()).unwrap();
+
+    assert_eq!(linux_ram_bytes(&proc), Some(16 * GB));
+    assert_eq!(
+        resolve_capacity(None, None, linux_ram_bytes(&proc)).value,
+        1
+    );
+    std::fs::write(mount.join("worker/memory.max"), "max\n").unwrap();
+    assert_eq!(linux_ram_bytes(&proc), Some(64 * GB));
 }
 
 #[test]
@@ -365,8 +425,8 @@ fn an_ordinary_wait_raises_no_priority_flag() {
 
 #[test]
 fn the_slot_class_comes_from_the_environment_value() {
-    assert_eq!(resolve_class(Some("1")), SlotClass::Priority);
-    assert_eq!(resolve_class(Some(" 1 ")), SlotClass::Priority);
+    assert_eq!(resolve_class(Some("priority")), SlotClass::Priority);
+    assert_eq!(resolve_class(Some(" priority ")), SlotClass::Priority);
     for other in [None, Some(""), Some("0"), Some("yes"), Some("true")] {
         assert_eq!(resolve_class(other), SlotClass::Ordinary, "{other:?}");
     }
@@ -625,4 +685,83 @@ fn the_pool_dir_override_wins_over_home() {
         std::env::remove_var(ENV_POOL_DIR);
     }
     assert_eq!(resolved, dir.path());
+}
+
+#[test]
+fn background_builds_leave_freed_slots_to_waiting_chosen_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let held = p.try_acquire("existing build").unwrap();
+    let ordinary = p.mark_waiting().unwrap();
+    drop(held);
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_none());
+    let chosen = p.try_acquire_as("chosen", SlotClass::Ordinary).unwrap();
+    drop(chosen);
+    drop(ordinary);
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_some());
+}
+
+#[test]
+fn priority_builds_beat_ordinary_and_background_waiters() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let priority = p.mark_priority_waiting().unwrap();
+    assert!(p.try_acquire_as("ordinary", SlotClass::Ordinary).is_none());
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_none());
+    assert!(p.try_acquire_as("apply", SlotClass::Priority).is_some());
+    drop(priority);
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_some());
+}
+
+#[test]
+fn build_classes_have_distinct_defaults() {
+    assert_eq!(resolve_class(Some("background")), SlotClass::Background);
+    assert_eq!(resolve_class(Some("priority")), SlotClass::Priority);
+    assert_eq!(resolve_class(None), SlotClass::Ordinary);
+    assert_eq!(resolve_nice(None, SlotClass::Background), 15);
+    assert_eq!(resolve_nice(None, SlotClass::Ordinary), 10);
+    assert_eq!(resolve_nice(None, SlotClass::Priority), 0);
+}
+
+#[test]
+fn background_waiters_observe_older_brokers_without_blocking_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let legacy = p.mark_waiting().unwrap();
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_none());
+    drop(legacy);
+    let background = p.mark_background_waiting().unwrap();
+    assert!(p.anyone_waiting());
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_some());
+    drop(background);
+    assert!(!p.anyone_waiting());
+}
+
+#[test]
+fn the_new_class_overrides_the_older_engines_priority_input() {
+    assert_eq!(
+        resolve_class_with_legacy(None, Some("1")),
+        SlotClass::Priority
+    );
+    assert_eq!(
+        resolve_class_with_legacy(Some("background"), Some("1")),
+        SlotClass::Background
+    );
+    assert_eq!(
+        resolve_class_with_legacy(Some("ordinary"), Some("1")),
+        SlotClass::Ordinary
+    );
+    assert_eq!(
+        resolve_class_with_legacy(Some("invalid"), Some("1")),
+        SlotClass::Ordinary
+    );
+}
+
+#[test]
+fn unreadable_waiter_state_is_explicit_for_admission_and_conservative_for_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    std::fs::create_dir(dir.path().join(WAITING_FILE)).unwrap();
+    assert!(p.try_anyone_waiting().is_err());
+    assert!(p.anyone_waiting());
 }

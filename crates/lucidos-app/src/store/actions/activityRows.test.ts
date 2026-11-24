@@ -101,7 +101,6 @@ describe('activityRows', () => {
       phases,
     });
     expect(rows).toHaveLength(1);
-    // The batch is the title; its member in flight, phase and all, is the body's.
     expect(rows[0].label).toBe('Applying 3 changes');
     expect(rows[0].detail).toBe('1 done');
     expect(rows[0].body).toEqual({
@@ -114,7 +113,6 @@ describe('activityRows', () => {
         phase: 'Hardening',
       },
       count: { done: 1, total: 3 },
-      // The member in flight owns its own span, so no member reads as an empty track.
       progress: { done: 1 / 3, working: 1 / 3 },
       timeLeft: null,
       canceling: false,
@@ -134,7 +132,6 @@ describe('activityRows', () => {
       phases: new Map([['t-2', { phase: 'hardening', eventId: null, startedAt: TEN_MIN_AGO }]]),
       estimates: ESTIMATES,
     });
-    // 10 min left of a 20 min hardening, then one predicted 18 min conflict.
     expect(rows[0].body).toMatchObject({
       kind: 'apply-all',
       thread: { phase: 'Hardening · 10 min, usually ~20 min' },
@@ -174,7 +171,6 @@ describe('activityRows', () => {
       applyAllActive: true,
       batch: { changeIds: ['c-2'], resolvedChangeIds: [], applyingChangeIds: [], resolvingChangeIds: [] },
       pending,
-      // t-2 is the batch member: its phase belongs to the Apply All row.
       phases: new Map([['t-2', { phase: 'merging', eventId: null, startedAt: null }]]),
       applyingNow: new Set(['t-1']),
     });
@@ -201,8 +197,6 @@ describe('activityRows', () => {
     expect(rows.map((r) => r.label)).toEqual(['Hardening: Card gate fix']);
   });
 
-  /** A reloaded page saw no MergeConflictDetected, and the iOS PWA reloads on
-   *  almost every open. The served row still says the apply is resolving. */
   it('counts a conflict the engine says is resolving, with no event seen', () => {
     const rows = activityRows({
       ...IDLE,
@@ -224,8 +218,6 @@ describe('activityRows', () => {
     });
   });
 
-  /** ADR 0314: the Apply All row names the member being applied, and each
-   *  member parked on a conflict keeps its own row with its phase. */
   it('gives a parked batch member its own row beside the Apply All row', () => {
     const rows = activityRows({
       ...IDLE,
@@ -246,8 +238,6 @@ describe('activityRows', () => {
     });
   });
 
-  /** ADR 0463: a member handed to the landing lane parks too. Waiting there,
-   *  it has not applied, so the count must not reach the batch's size. */
   it('does not count members waiting in the landing lane as done', () => {
     const rows = activityRows({
       ...IDLE,
@@ -283,8 +273,6 @@ describe('activityRows', () => {
     expect(rows.map((r) => r.key)).toEqual(['frontend-refresh', 'apply-t-1']);
   });
 
-  /** The row gives the header its label only. The menu builds the body
-   *  (landingLaneRow.test.ts). */
   describe('the landing lane row', () => {
     const LANE: LandingLane = {
       open_batch: { batch_id: 'b-1', lane_thread_id: 'lane-t', members: ['c-1', 'c-2'], step: 'resolving' },
@@ -305,6 +293,16 @@ describe('activityRows', () => {
         label: 'Landing 2 changes',
         detail: '1 waiting',
         queued: false,
+        body: { kind: 'landing-lane' },
+      }]);
+    });
+
+    it('keeps a multiple-landers warning visible after the lane empties', () => {
+      const lane = { ...LANE, open_batch: null, waiting: [], multiple_landers: true };
+      expect(activityRows({ ...IDLE, lane })).toEqual([{
+        key: 'landing-lane',
+        label: 'Multiple landers detected',
+        queued: true,
         body: { kind: 'landing-lane' },
       }]);
     });
@@ -331,8 +329,6 @@ describe('activityRows', () => {
       expect(activityRows({ ...IDLE, mainCheck: { state: 'unavailable', summary: 'no remote' } })).toEqual([]);
     });
 
-    /** The lane, not the apply, decides when a parked member lands. So the
-     *  lane row names it, and the Apply All row says where it stands. */
     it('gives a member the lane holds no apply row of its own', () => {
       const rows = activityRows({
         ...IDLE,

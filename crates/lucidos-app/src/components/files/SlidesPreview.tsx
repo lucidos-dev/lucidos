@@ -66,16 +66,6 @@ function flattenSlides(deck: SlidesDeck): FlatSlide[] {
   return result;
 }
 
-/** Scrub a deck field that is injected as HTML.
- *
- *  A `.slides` file is an artifact the model writes, and these fields reach the
- *  host origin through `dangerouslySetInnerHTML`. Setting `innerHTML` never runs
- *  a `<script>`, but it does fire an `<img onerror>`, so the deck gets the same
- *  scrub chat markdown gets. Each site also carries `.authored-html`, so a
- *  deck's inline style stays inside its own box.
- *
- *  Every `dangerouslySetInnerHTML` in this file goes through here. Pinned by
- *  `SlidesPreview.test.ts`, which scans the source for a site that skipped it. */
 function slideHtml(raw: string | undefined): string {
   return sanitizeHtmlFragments(raw || '');
 }
@@ -207,9 +197,6 @@ interface Props {
   content: string;
 }
 
-/** The model writes these files, so valid JSON can still have the wrong shape:
- *  `null`, a string where a list goes. Every node renders eagerly inside the
- *  try, and the app has no error boundary, so a throw here would blank it. */
 export function SlidesPreview({ content }: Props) {
   let deck: SlidesDeck;
   try {

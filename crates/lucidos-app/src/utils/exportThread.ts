@@ -5,8 +5,6 @@ import { errorDetail, isAbortError } from './errorDetail';
 import { isIOS, isTauri } from './platform';
 import { saveToDownloads } from './tauri';
 
-// 60 chars keeps "thread-<8>-<slug>.json" comfortably under the 255-byte
-// filesystem name limit on Windows / macOS / Linux.
 function titleSlug(title: string): string {
     const slug = (title || 'untitled')
         .toLowerCase()
@@ -28,33 +26,18 @@ function triggerDownload(blob: Blob, filename: string): void {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // Defer revoke so Safari / iOS WebKit can start the download — they need
-    // the object URL to remain live for at least one tick after click().
     setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-/** The folder's own name, for a toast that says where the file went. Both
- *  separators split, so a Windows path reads like a POSIX one. A path with no
- *  segment to take is returned whole. */
 function folderLabel(dir: string): string {
     const segments = dir.split(/[/\\]/).filter(Boolean);
     return segments[segments.length - 1] ?? dir;
 }
 
-/** Can this browser hand `file` to the OS share sheet? Tested against the
- *  actual file rather than the API's presence: iOS answers no for a payload it
- *  will not take, and a `Share` button that cannot share is worse than none. */
 function canShareFile(file: File): boolean {
     return typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] });
 }
 
-/** Hand the export to the OS share sheet, which on iOS is the route to sending
- *  it and to Save to Files.
- *
- *  Called straight from the toast button's click, never after an await:
- *  `navigator.share` needs transient user activation, and awaiting first spends
- *  it. A dismissed sheet rejects with AbortError, which is the user's decision
- *  rather than a failure, so it says nothing. Every other rejection toasts. */
 function shareFile(file: File): void {
     void navigator.share({ files: [file], title: file.name }).catch((err: unknown) => {
         if (isAbortError(err)) return;
@@ -62,28 +45,6 @@ function shareFile(file: File): void {
     });
 }
 
-/** Wraps the events with workspace + title + exported_at so a JSON file
- *  attached to a bug report carries enough context to identify the thread
- *  without the report author having to type it out.
- *
- *  Passes `includeContext: true` so the dump retains `ContextCaptured.sections`
- *  + `tools` — the snapshot endpoint strips these by default for the modal's
- *  lazy-fetch path, but an export that drops the prompt sections defeats the
- *  point of a bug-report attachment.
- *
- *  **The desktop client saves through Rust, not through the webview.** wry
- *  attaches a download delegate only when the app registers a download handler,
- *  and it registers none, so an `<a download>` click there is silently dropped.
- *  `saveToDownloads` both makes the file exist and reports the folder, which is
- *  what the toast opens. A browser keeps the blob download, and its toast can
- *  only NAME the folder: no web API opens one.
- *
- *  **iOS gets the share sheet INSTEAD of the download, not alongside it.**
- *  WebKit honours no `<a download>`, so the anchor opened the JSON in a viewer
- *  and took the PWA off the thread. A toast then named a downloads folder the
- *  file had never reached. The share sheet is the real route there, and it
- *  carries Save to Files. A sheet that refuses the file leaves the anchor as the
- *  only route left, so that case keeps it. */
 export async function exportThread(threadId: string, title: string): Promise<void> {
     const filename = `thread-${shortId(threadId)}-${titleSlug(title)}.json`;
     try {
@@ -105,7 +66,6 @@ export async function exportThread(threadId: string, title: string): Promise<voi
             return;
         }
         const blob = new Blob([json], { type: 'application/json' });
-        // Captured now, so the button's click can share without awaiting first.
         const file = new File([blob], filename, { type: blob.type });
         const shareable = canShareFile(file);
         const shareOnly = isIOS() && shareable;

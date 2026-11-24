@@ -1,10 +1,3 @@
-/**
- * The bridged storage mirror.
- *
- * An isolated frame's own storage throws, so the host holds it. The bridge is
- * async and every reader here is synchronous, which is why the whole store is
- * primed once and served from memory.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as bridge from './_bridge';
 import {
@@ -43,8 +36,6 @@ function snapshot(fill: (s: ReturnType<typeof emptyAppStorageSnapshot>) => void)
 
 describe('the mirror keeps the stores apart', () => {
   it('a session value does not answer a local read of the same name', async () => {
-    // `localStorage` and `sessionStorage` are separate stores, and one flat map
-    // would quietly merge them.
     vi.spyOn(bridge, 'callHost').mockResolvedValue(snapshot((s) => {
       s.sdk.local.shared = 'from-local';
       s.sdk.session.shared = 'from-session';
@@ -66,8 +57,6 @@ describe('the mirror keeps the stores apart', () => {
   });
 
   it('an SDK write is readable at once, without waiting on the host', () => {
-    // The host is told after, so a reader never awaits a round trip. The host
-    // scopes by workspace and app, so the key travels bare.
     const tell = vi.spyOn(bridge, 'tellHost').mockImplementation(() => {});
     wsSessionSet('scroll', '420');
 

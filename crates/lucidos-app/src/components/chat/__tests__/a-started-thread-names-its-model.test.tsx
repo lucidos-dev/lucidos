@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A started coding-agent thread with no model of its own still names one.
- * Right after a send, before the session publishes its pair, the pill names
- * the default implementer, never "Default". With no default set, it names the
- * backend, whose own config picks.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';

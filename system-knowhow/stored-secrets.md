@@ -39,7 +39,7 @@ One 32-byte key per workspace database, named after the database
 - **The signed macOS app** keeps it in the **Keychain**: service
   `Lucidos workspace secrets`, account `lucidos_<workspace>`.
 - **Everything else** (Linux, the headless install, a dev build) keeps it in a
-  key file, `~/.lucidos/secret-keys/lucidos_<workspace>.key`, readable by its
+  key file, `~/.lucidos/private/secret-keys/` (`~/.lucidos/secret-keys/` in a home an older release created)`lucidos_<workspace>.key`, readable by its
   owner only.
 
 The Keychain holds the **key**, not the secrets. The secrets stay in the
@@ -56,6 +56,12 @@ Postgres hides columns a role cannot read, so `information_schema.columns`
 does not even list `credentials.auth_value`. **A missing column does not mean
 the secret is stored elsewhere.** It means this role cannot see it.
 
+Writes are closed too. The role writes no table in a user or unknown
+workspace. Machine-made workspaces keep write grants, but secret-bearing
+tables and the always-read-only tables stay protected there. See
+`system-knowhow/best-practices`, section "The workspace database", for the
+command that replaces each write.
+
 So never conclude "the secrets are not in the database" from the agent role's
 view.
 
@@ -69,7 +75,7 @@ answer on a permission prompt.
 **Run the checks below only when the user asks you to verify or prove it.**
 Run them one at a time, so a prompt names one command the user can judge.
 
-**Never name `~/.lucidos/secret-keys/` in a command**, not even to list it. The
+**Never name `~/.lucidos/private/secret-keys/` or `~/.lucidos/secret-keys/` in a command**, not even to list it. The
 command guard asks the user before any command that mentions that directory.
 
 What the agent role CAN see:

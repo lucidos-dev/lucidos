@@ -1,5 +1,3 @@
-// Shared scaffolding for the thread-wiring tests, split across
-// thread-wiring-*.test.ts.
 import { type ThreadState } from '../thread-events';
 
 export const TS = '2026-04-17T00:00:00Z';

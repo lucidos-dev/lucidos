@@ -1,10 +1,3 @@
-/**
- * A coding agent's process can die holding a follow-up it never read. The next
- * session forwards it again, which records a second `CodingAgentPromptSent`
- * for the same message. The transcript still shows one bubble, queued until
- * the agent reads it or the user removes it. See
- * docs/plans/2026-10-17-a-follow-up-a-dead-agent-never-read.md.
- */
 import { describe, it, expect } from 'vitest';
 import {
   computeExchanges,
@@ -27,8 +20,6 @@ const forwarded = (text: string, id: string) =>
 
 const FOLLOW_UP = 'also add a test';
 
-/** The reported order: the first process takes the follow-up into its queue
- *  and dies, and the next session resumes the turn and forwards it again. */
 const redelivered = [
   ev(1, message('build it'), 'm1'),
   ev(2, read('m1')),

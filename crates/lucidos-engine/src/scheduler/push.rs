@@ -10,8 +10,8 @@ use sqlx::PgPool;
 use super::push_test_log;
 
 use super::notification_plain_text::plain_text_body;
-use crate::api::SharedEngine;
 use crate::core::secret_store::{PushAuth, Secret, VapidPrivateKey};
+use crate::engine::types::SharedEngine;
 
 /// Spec §3: the engine waits this long for pongs before deciding push.
 ///
@@ -114,7 +114,7 @@ impl PushSubscriptionStore {
     /// device's `user_agent`.
     ///
     /// The caller gates wake-pushes (Layer 3 in
-    /// `system-knowhow/notifications.md` §4.5) on the UA. A row with no
+    /// `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5) on the UA. A row with no
     /// `device_id`, and a device with no recorded UA, both pair with `None`.
     pub async fn get_push_enabled(
         pool: &PgPool,
@@ -236,7 +236,7 @@ pub async fn get_or_create_vapid_keys(
     .await?
     .rows_affected();
     if created > 0 {
-        log!("[Push] Generated new VAPID key pair");
+        log_legacy!("[Push] Generated new VAPID key pair");
     }
     stored_vapid_keys(pool)
         .await?
@@ -302,7 +302,7 @@ pub fn send_push_to_all_with_app(
     let body = body.to_string();
     let app_id = app_id.map(str::to_string);
     spawn_carrying_chain_depth(async move {
-        fan_out_os_surface(
+        if let Err(error) = fan_out_os_surface(
             &engine,
             &title,
             &body,
@@ -311,9 +311,38 @@ pub fn send_push_to_all_with_app(
             link_thread_id,
             link_event_id,
             tap,
+            false,
         )
-        .await;
+        .await
+        {
+            log_legacy!("[Push] Fan-out failed: {}", error);
+        }
     });
+}
+
+/// Await the complete push fan-out for a durable users notice. The worker
+/// records completion only after this boundary, never after spawning a task.
+pub(crate) async fn send_user_only_push(
+    engine: &SharedEngine,
+    title: &str,
+    body: &str,
+    notification_id: uuid::Uuid,
+    thread_id: uuid::Uuid,
+    event_id: Option<uuid::Uuid>,
+    tap: crate::scheduler::notifications::Tap,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fan_out_os_surface(
+        engine,
+        title,
+        body,
+        Some(notification_id),
+        None,
+        Some(thread_id),
+        event_id,
+        tap,
+        true,
+    )
+    .await
 }
 
 /// `tokio::spawn`, with the caller's event-trigger chain depth scoped onto the
@@ -335,7 +364,7 @@ fn spawn_carrying_chain_depth(work: impl std::future::Future<Output = ()> + Send
 /// workspace with no web-push subscription still gets toasts and native
 /// banners.
 ///
-/// Non-fatal throughout: one bad subscription must not sink the fan-out.
+/// Attempt every subscription, then report incomplete delivery for retry.
 #[allow(clippy::too_many_arguments)]
 async fn fan_out_os_surface(
     engine: &SharedEngine,
@@ -346,7 +375,8 @@ async fn fan_out_os_surface(
     link_thread_id: Option<uuid::Uuid>,
     link_event_id: Option<uuid::Uuid>,
     tap: crate::scheduler::notifications::Tap,
-) {
+    durable: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Every surface below shows text verbatim, so none of them gets markdown.
     let body = &plain_text_body(body);
     let pool = engine.pool();
@@ -355,24 +385,50 @@ async fn fan_out_os_surface(
     let source_generation = match crate::core::snapshot::boundary::read(pool).await {
         Ok(boundary) => boundary.map(|b| b.restore_id),
         Err(error) => {
-            log!("[Push] Cannot read source generation: {}", error);
-            return;
+            log_legacy!("[Push] Cannot read source generation: {}", error);
+            return Err(error.into());
         }
     };
     // MAY be empty: a desktop-only workspace never creates one, because the
     // embedded WKWebView cannot subscribe to Web Push. Do NOT bail on empty
     // here. A connected client still needs the toast or the native banner, and
     // the "nobody reachable" bail comes once the client count is known.
-    let audience = push_audience(pool, notification_id, &tap, link_event_id).await;
+    let mut audience = match push_audience(pool, notification_id, &tap, link_event_id).await {
+        Ok(audience) => audience,
+        Err(error) if durable => return Err(error.into()),
+        Err(error) => {
+            log_legacy!("[Push] Cannot read audience (pushing team): {}", error);
+            crate::engine::thread_users::Audience::Team
+        }
+    };
+    if durable {
+        if let (Some(id), Some(devices)) = (notification_id, audience.device_ids()) {
+            let snapshot = crate::gateway_users::current();
+            let mut unread = std::collections::BTreeSet::new();
+            for device in devices {
+                let actor = crate::engine::thread_events::MessageOrigin::Device {
+                    device_id: device.clone(),
+                };
+                let reader = crate::gateway_users::Reader::of(Some(&actor), &snapshot);
+                if !crate::scheduler::NotificationStore::is_read(pool, id, &reader).await? {
+                    unread.insert(device);
+                }
+            }
+            if unread.is_empty() {
+                return Ok(());
+            }
+            audience = crate::engine::thread_users::Audience::Devices(unread);
+        }
+    }
     let push_group = read_push_group(pool, notification_id).await;
-    let subs_with_ua: Vec<_> = match PushSubscriptionStore::get_push_enabled(pool).await {
+    let mut subs_with_ua: Vec<_> = match PushSubscriptionStore::get_push_enabled(pool).await {
         Ok(subs) => subs
             .into_iter()
             .filter(|(sub, _)| audience.reaches(sub.device_id.as_deref()))
             .collect(),
         Err(e) => {
-            log!("[Push] Failed to fetch subscriptions: {}", e);
-            return;
+            log_legacy!("[Push] Failed to fetch subscriptions: {}", e);
+            return Err(e);
         }
     };
 
@@ -381,7 +437,7 @@ async fn fan_out_os_surface(
         Err(e) => {
             // Spec §3 failure handling: with no view of the candidates, the
             // safer side is to send the push.
-            log!(
+            log_legacy!(
                 "[Push] Failed to query device_presence candidates (sending push anyway): {}",
                 e
             );
@@ -396,8 +452,20 @@ async fn fan_out_os_surface(
     // connected or recently heartbeating, so no client for a toast or a native
     // banner either. Both halves are required, because a connected client with
     // no subscription anywhere is still a valid recipient.
-    if subs_with_ua.is_empty() && expected_pongs == 0 {
-        return;
+    if !durable && subs_with_ua.is_empty() && expected_pongs == 0 {
+        return Ok(());
+    }
+
+    if durable {
+        if let Some(id) = notification_id {
+            let mut pending = Vec::new();
+            for entry in subs_with_ua {
+                if !push_receipt_exists(pool, id, &entry.0.endpoint).await? {
+                    pending.push(entry);
+                }
+            }
+            subs_with_ua = pending;
+        }
     }
 
     // Pick wake targets before the move below consumes the paired list.
@@ -405,7 +473,20 @@ async fn fan_out_os_surface(
     let subscriptions: Vec<PushSubscription> =
         subs_with_ua.into_iter().map(|(sub, _)| sub).collect();
 
-    let push_allowed = if expected_pongs == 0 {
+    let prior_decision: Option<bool> = if durable {
+        sqlx::query_scalar(
+            "SELECT push_allowed FROM user_only_message_dispatches WHERE notification_id = $1",
+        )
+        .bind(notification_id)
+        .fetch_one(pool)
+        .await?
+    } else {
+        None
+    };
+
+    let push_allowed = if let Some(allowed) = prior_decision {
+        allowed
+    } else if expected_pongs == 0 {
         // Nobody to pong, so push immediately.
         true
     } else if let Some(nid) = notification_id {
@@ -430,47 +511,80 @@ async fn fan_out_os_surface(
         true
     };
 
+    if durable && prior_decision.is_none() {
+        sqlx::query(
+            "UPDATE user_only_message_dispatches SET push_allowed = $2 WHERE notification_id = $1",
+        )
+        .bind(notification_id)
+        .bind(push_allowed)
+        .execute(pool)
+        .await?;
+    }
+
     if !push_allowed {
-        log!("[Push] Suppressed OS push (PresenceCheck: a page handled it in the app)");
-        return;
+        log_legacy!("[Push] Suppressed OS push (PresenceCheck: a page handled it in the app)");
+        return Ok(());
     }
 
     // Native desktop surface (§1, §4). A connected Tauri app cannot receive
     // the web push below, because its WKWebView has no service-worker push.
     // Browser clients ignore this frame. A Tauri page shows the banner, or
     // the in-app toast if its window came forward since it answered.
+    let mut native_pending = false;
     if let Some(nid) = notification_id {
-        emit_native_push_requested(
-            &engine.event_bus,
-            nid,
-            title,
-            body,
-            link_thread_id,
-            link_event_id,
-            app_id,
-            tap.clone(),
-            audience.device_ids(),
-        )
-        .await;
+        let native_audience = if durable {
+            let mut pending = Vec::new();
+            for device in crate::core::DeviceStore::native_push_devices(pool).await? {
+                if audience.reaches(Some(&device))
+                    && !push_receipt_exists(pool, nid, &format!("native:{device}")).await?
+                {
+                    pending.push(device);
+                }
+            }
+            native_pending = !pending.is_empty();
+            Some(pending)
+        } else {
+            audience.device_ids()
+        };
+        if !durable || native_pending {
+            if let Err(error) = emit_native_push_requested(
+                &engine.event_bus,
+                nid,
+                title,
+                body,
+                link_thread_id,
+                link_event_id,
+                app_id,
+                tap.clone(),
+                native_audience,
+            )
+            .await
+            {
+                log_legacy!("[Push] Native broadcast failed: {}", error);
+            }
+        }
     }
-
-    // No web-push subscriptions, so the native broadcast above is the whole OS
-    // surface.
+    // Native completion comes from the client after the OS accepts its banner.
+    // A pending native target must not prevent web subscriptions from sending.
     if subscriptions.is_empty() {
-        return;
+        return if native_pending {
+            Err("Native delivery awaits client receipt".into())
+        } else {
+            Ok(())
+        };
     }
 
-    // Declarative `app_badge` (see `build_push_payload`). Both halves are
-    // resolved once for the whole fan-out; `app_badge_for` picks which one a
-    // subscription gets. Best-effort: a failure omits the badge field, or
-    // falls back to the own count.
+    // Counts are resolved once per recipient. Failed gateway reads fall back
+    // only to that recipient's own workspace count.
     let unread_counts = unread_counts_by_device(pool, &subscriptions).await;
-    let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
+    let cross_workspace_totals = cross_workspace_unread_totals(&subscriptions).await;
 
-    let deliveries: Vec<(PushSubscription, String)> = subscriptions
-        .into_iter()
-        .map(|sub| {
-            let payload_bytes = build_push_payload_fitted(
+    let deliveries = badge_deliveries(
+        subscriptions,
+        &unread_counts,
+        &cross_workspace_totals,
+        |sub, badge| {
+            build_push_payload_fitted(
                 source_generation,
                 title,
                 body,
@@ -480,22 +594,55 @@ async fn fan_out_os_surface(
                 link_event_id,
                 &tap,
                 sub.scope_url.as_deref(),
-                app_badge_for(
-                    sub.scope_url.as_deref(),
-                    unread_counts.get(&sub.device_id).copied().flatten(),
-                    cross_workspace_total,
-                ),
+                badge,
                 push_group.as_ref(),
             )
-            .to_string();
-            (sub, payload_bytes)
-        })
-        .collect();
+        },
+    );
 
-    fan_out_payload(pool, deliveries, "notification", notification_id).await;
+    let mut web_failure = None;
+    let mut wake_endpoints = durable.then(std::collections::BTreeSet::new);
+    if durable {
+        let nid = notification_id.ok_or("Durable push needs a notification id")?;
+        let outcomes =
+            futures::future::join_all(deliveries.into_iter().map(|(sub, payload)| async move {
+                if push_receipt_exists(pool, nid, &sub.endpoint).await? {
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(None);
+                }
+                let target = sub.endpoint.clone();
+                let delivered =
+                    fan_out_payload(pool, vec![(sub, payload)], "notification", Some(nid)).await;
+                // Expired subscriptions were removed by the transport; they need no retry.
+                let remains: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM push_subscriptions WHERE endpoint = $1)",
+                )
+                .bind(&target)
+                .fetch_one(pool)
+                .await?;
+                if delivered == 0 && remains {
+                    return Err("Push subscription delivery failed".into());
+                }
+                record_push_receipt(pool, nid, &target).await?;
+                Ok((delivered > 0).then_some(target))
+            }))
+            .await;
+        for outcome in outcomes {
+            match outcome {
+                Ok(Some(target)) => {
+                    if let Some(endpoints) = &mut wake_endpoints {
+                        endpoints.insert(target);
+                    }
+                }
+                Err(error) => web_failure = Some(error),
+                _ => {}
+            }
+        }
+    } else {
+        fan_out_payload(pool, deliveries, "notification", notification_id).await;
+    }
 
     // Layer 3 of the macOS-Chromium wedge mitigation (see
-    // `system-knowhow/notifications.md` §4.5). The wake's only job is to be a
+    // `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5). The wake's only job is to be a
     // second push event arriving at the service worker, which drains any
     // queued `notificationclick`.
     //
@@ -508,13 +655,40 @@ async fn fan_out_os_surface(
             source_generation,
             wake_targets,
             nid,
+            wake_endpoints,
             MAC_CHROMIUM_WAKE_DELAY,
         );
     }
+    if let Some(error) = web_failure {
+        return Err(error);
+    }
+    if native_pending {
+        return Err("Native delivery awaits client receipt".into());
+    }
+    Ok(())
+}
+
+async fn push_receipt_exists(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    target: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_only_message_push_receipts WHERE notification_id = $1 AND target = $2)")
+        .bind(id).bind(target).fetch_one(pool).await?)
+}
+
+pub async fn record_push_receipt(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    target: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query("INSERT INTO user_only_message_push_receipts (notification_id, target) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(id).bind(target).execute(pool).await?;
+    Ok(())
 }
 
 /// Delay between the original push and the follow-up wake-push (Layer 3 in
-/// `system-knowhow/notifications.md` §4.5).
+/// `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5).
 ///
 /// Short enough that a click queued in the wedged service worker drains before
 /// the user gives up on the dead tap. Long enough that Chrome does not
@@ -524,7 +698,8 @@ const MAC_CHROMIUM_WAKE_DELAY: std::time::Duration = std::time::Duration::from_s
 
 /// Spawn one delayed wake-push per device id. Fire and forget: the wake is
 /// best-effort, and a dropped one leaves the next genuine push to the device
-/// to drain the queued click.
+/// to drain the queued click. Durable notices restrict the endpoints to those
+/// delivered in this attempt.
 ///
 /// **Surviving engine shutdown is incidental, never guaranteed.** The spawned
 /// task holds an `Arc<LucidosEngine>`, but its `JoinHandle` is dropped, so a
@@ -536,29 +711,37 @@ fn schedule_mac_chromium_wakes(
     source_generation: Option<uuid::Uuid>,
     device_ids: Vec<String>,
     notification_id: uuid::Uuid,
+    endpoints: Option<std::collections::BTreeSet<String>>,
     delay: std::time::Duration,
 ) {
     for device_id in device_ids {
         let engine = engine.clone();
+        let endpoints = endpoints.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            match send_wake_push_to_device(&engine, source_generation, &device_id, notification_id)
-                .await
+            match send_wake_push_to_device(
+                &engine,
+                source_generation,
+                &device_id,
+                notification_id,
+                endpoints.as_ref(),
+            )
+            .await
             {
-                Ok(0) => log!(
+                Ok(0) => log_legacy!(
                     "[Push] Layer-3 wake-push for {} on {}: nothing sent \
                      (notification read during the delay window, or device \
                      unsubscribed)",
                     notification_id,
                     device_id
                 ),
-                Ok(n) => log!(
+                Ok(n) => log_legacy!(
                     "[Push] Layer-3 wake-push for {} delivered to {} sub(s) on {}",
                     notification_id,
                     n,
                     device_id
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[Push] Layer-3 wake-push for {} on {} failed: {}",
                     notification_id,
                     device_id,
@@ -579,40 +762,30 @@ async fn read_push_group(
     crate::scheduler::NotificationStore::push_group(pool, id)
         .await
         .unwrap_or_else(|e| {
-            log!("[Push] Cannot read the push group (ungrouped): {}", e);
+            log_legacy!("[Push] Cannot read the push group (ungrouped): {}", e);
             None
         })
 }
 
 /// Who a notification's OS push reaches: the audience its row recorded
 /// (ADR 0623). A push with no notification works the audience out from the
-/// thread it opens. Any lookup that fails reaches the whole team: a push must
-/// never silently reach nobody.
+/// thread it opens. A failed lookup aborts delivery rather than widening it.
 async fn push_audience(
     pool: &PgPool,
     notification_id: Option<uuid::Uuid>,
     tap: &crate::scheduler::notifications::Tap,
     link_event_id: Option<uuid::Uuid>,
-) -> crate::engine::thread_people::Audience {
-    use crate::engine::thread_people::{audience_of_notification, Audience};
-    let resolved = match notification_id {
+) -> Result<crate::engine::thread_users::Audience, sqlx::Error> {
+    use crate::engine::thread_users::{audience_of_notification, Audience};
+    match notification_id {
         Some(id) => crate::scheduler::NotificationStore::audience(pool, id)
             .await
             .map(Audience::from_device_ids),
         None => {
-            audience_of_notification(
-                pool,
-                tap,
-                link_event_id,
-                &crate::gateway_operators::current(),
-            )
-            .await
+            audience_of_notification(pool, tap, link_event_id, &crate::gateway_users::current())
+                .await
         }
-    };
-    resolved.unwrap_or_else(|e| {
-        log!("[Push] Cannot read the audience (pushing everyone): {}", e);
-        Audience::Team
-    })
+    }
 }
 
 /// What a page needs to put a notification on screen as an in-app toast.
@@ -634,10 +807,10 @@ struct ToastContent<'a> {
 ///
 /// The check carries the toast. A page shows it, auto-reads, or holds it for
 /// the badge BEFORE it answers. So the push is suppressed only on a page's
-/// word that the reader already has the notification (notifications.md §3-§4).
+/// word that the reader already has the notification (system-knowhow/notifications/3-the-presencecheck-protocol.md §3-§4).
 async fn run_presence_check(
     event_bus: &crate::engine::event_bus::EventBus,
-    presence_tracker: &crate::api::presence_pong::PresenceTracker,
+    presence_tracker: &crate::engine::presence_tracker::PresenceTracker,
     toast: ToastContent<'_>,
     expected_pongs: usize,
 ) -> bool {
@@ -664,7 +837,7 @@ async fn run_presence_check(
     {
         // No page knows to pong, so no informed decision is possible. With no
         // pongs the decision sends the push, the safer side.
-        log!("[Push] Failed to broadcast PresenceCheck: {}", e);
+        log_legacy!("[Push] Failed to broadcast PresenceCheck: {}", e);
         return presence_tracker.decide(notification_id);
     }
 
@@ -686,7 +859,7 @@ async fn run_presence_check(
 /// when it is not active, and the in-app toast when it is (§4 row matrix).
 ///
 /// Non-fatal, and the worst case is the desktop user seeing only the bell
-/// badge. See `system-knowhow/notifications.md` §1, §4.
+/// badge. See `system-knowhow/notifications/1-conceptual-model.md` §1, `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4.
 #[allow(clippy::too_many_arguments)]
 async fn emit_native_push_requested(
     event_bus: &crate::engine::event_bus::EventBus,
@@ -698,9 +871,9 @@ async fn emit_native_push_requested(
     app_id: Option<&str>,
     tap: crate::scheduler::notifications::Tap,
     audience: Option<Vec<String>>,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sent_at_ms = crate::engine::now_epoch_millis();
-    if let Err(e) = event_bus
+    event_bus
         .emit(crate::engine::event_bus::BusEvent::System(
             crate::engine::event_bus::SystemEvent::NativePushRequested {
                 notification_id,
@@ -714,14 +887,8 @@ async fn emit_native_push_requested(
                 audience,
             },
         ))
-        .await
-    {
-        log!(
-            "[Push] Failed to broadcast NativePushRequested for {}: {}",
-            notification_id,
-            e
-        );
-    }
+        .await?;
+    Ok(())
 }
 
 /// Broadcast a [`SystemEvent::NativePushDismissRequested`] so a connected Tauri
@@ -733,12 +900,12 @@ async fn emit_native_push_requested(
 /// revokes a subscription after three silent pushes.
 ///
 /// Non-fatal, and the worst case is a stale OS banner the user swipes away.
-/// See `system-knowhow/notifications.md` §4 and
+/// See `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4 and
 /// `docs/plans/2026-05-18-cross-device-notification-dismiss-design.md`.
-pub(crate) async fn emit_native_push_dismiss_requested(
+pub async fn emit_native_push_dismiss_requested(
     event_bus: &crate::engine::event_bus::EventBus,
     notification_id: Option<uuid::Uuid>,
-    reader: &crate::gateway_operators::Reader,
+    reader: &crate::gateway_users::Reader,
 ) {
     let sent_at_ms = crate::engine::now_epoch_millis();
     if let Err(e) = event_bus
@@ -751,7 +918,7 @@ pub(crate) async fn emit_native_push_dismiss_requested(
         ))
         .await
     {
-        log!(
+        log_legacy!(
             "[Push] Failed to broadcast NativePushDismissRequested for {:?}: {}",
             notification_id,
             e
@@ -763,7 +930,7 @@ pub(crate) async fn emit_native_push_dismiss_requested(
 /// dispatcher bug that silently queues `notificationclick` until a new push
 /// event drains the service worker.
 ///
-/// This gates the Layer 3 wake-push (`system-knowhow/notifications.md` §4.5),
+/// This gates the Layer 3 wake-push (`system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5),
 /// so every other browser avoids an extra push per notification. The UA is
 /// stored on the `devices` row at register time, so the decision needs no
 /// per-push round trip to the page.
@@ -778,8 +945,8 @@ fn is_mac_chromium(user_agent: &str) -> bool {
 /// The deduplicated device ids that should receive a follow-up wake-push.
 ///
 /// **Dedup matters.** Two tabs on one device produce two subscriptions sharing
-/// a `device_id`, and `send_wake_push_to_device` already fans out to every
-/// subscription on the device. Once is enough to drain the queued
+/// a `device_id`, and `send_wake_push_to_device` already fans out to eligible
+/// subscriptions on the device. Once is enough to drain the queued
 /// `notificationclick`.
 ///
 /// A subscription with no `device_id`, or a device with no recorded
@@ -814,7 +981,7 @@ fn pick_mac_chromium_wake_targets(
 /// replacing the one the tap closed.
 ///
 /// The caller re-fetches the live read state at fire time, because the tap
-/// lands DURING the wake delay. See `system-knowhow/notifications.md` §4.5.
+/// lands DURING the wake delay. See `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5.
 fn wake_still_needed(notification: &crate::scheduler::notifications::Notification) -> bool {
     !notification.read
 }
@@ -831,15 +998,16 @@ async fn send_wake_push_to_device(
     source_generation: Option<uuid::Uuid>,
     device_id: &str,
     notification_id: uuid::Uuid,
+    endpoints: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let pool = engine.pool();
     // This provenance was captured before scheduling the timer, never adopted
     // from the current workspace after its delay.
-    let reader = crate::gateway_operators::Reader::of(
+    let reader = crate::gateway_users::Reader::of(
         Some(&crate::engine::thread_events::MessageOrigin::Device {
             device_id: device_id.to_string(),
         }),
-        &crate::gateway_operators::current(),
+        &crate::gateway_users::current(),
     );
     let notification =
         match crate::scheduler::NotificationStore::get_by_id(pool, &reader, notification_id).await?
@@ -854,32 +1022,32 @@ async fn send_wake_push_to_device(
         return Ok(0);
     }
 
-    let subscriptions = PushSubscriptionStore::get_push_enabled_for_device(pool, device_id).await?;
+    let subscriptions: Vec<_> = PushSubscriptionStore::get_push_enabled_for_device(pool, device_id)
+        .await?
+        .into_iter()
+        .filter(|sub| endpoints.is_none_or(|allowed| allowed.contains(&sub.endpoint)))
+        .collect();
     if subscriptions.is_empty() {
         return Ok(0);
     }
 
-    let unread_count = read_unread_count(pool, &reader).await;
-    let cross_workspace_total = cross_workspace_unread_total(&subscriptions).await;
+    let unread_counts = unread_counts_by_device(pool, &subscriptions).await;
+    let cross_workspace_totals = cross_workspace_unread_totals(&subscriptions).await;
     let push_group = read_push_group(pool, Some(notification_id)).await;
-    let deliveries: Vec<(PushSubscription, String)> = subscriptions
-        .into_iter()
-        .map(|sub| {
-            let payload_bytes = build_wake_payload(
+    let deliveries = badge_deliveries(
+        subscriptions,
+        &unread_counts,
+        &cross_workspace_totals,
+        |sub, badge| {
+            build_wake_payload(
                 source_generation,
                 &notification,
                 sub.scope_url.as_deref(),
-                app_badge_for(
-                    sub.scope_url.as_deref(),
-                    unread_count,
-                    cross_workspace_total,
-                ),
+                badge,
                 push_group.as_ref(),
             )
-            .to_string();
-            (sub, payload_bytes)
-        })
-        .collect();
+        },
+    );
     Ok(fan_out_payload(pool, deliveries, "wake", Some(notification_id)).await)
 }
 
@@ -892,7 +1060,7 @@ const DEFAULT_NOTIFICATION_TAG: &str = "lucidos-notification";
 /// Top-level magic that opts the payload into Declarative Web Push parsing
 /// (RFC 8030 homage). Required by Safari 18.5+ to read `notification.navigate`
 /// for the tap path even though the iOS SW `push` handler may still run. See
-/// `system-knowhow/notifications.md` §4.5.
+/// `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5.
 const DECLARATIVE_WEB_PUSH_MAGIC: i64 = 8030;
 
 /// Hard ceiling the web-push transport enforces, in BYTES of the plaintext
@@ -1023,7 +1191,7 @@ fn fit_payload_body(
     let payload = build(&truncated);
     let payload_len = payload.to_string().len();
     if payload_len <= MAX_PUSH_PAYLOAD_BYTES {
-        log!(
+        log_legacy!(
             "[Push] Truncated {} body to fit the {} B payload ceiling: {} B of body kept {} B \
              ({} B payload, {} B envelope overhead). The notification row keeps the full text.",
             kind,
@@ -1037,7 +1205,7 @@ fn fit_payload_body(
         // Nothing left to give: the envelope alone overshoots. Returned anyway,
         // so the send loop's last-resort arm reports the real per-subscription
         // failure.
-        log!(
+        log_legacy!(
             "[Push] Cannot fit the {} payload for this subscription: {} B with the body dropped \
              entirely, over the {} B ceiling. The envelope alone (title plus deep-link URLs) is \
              too large, so NO push will be delivered here.",
@@ -1094,7 +1262,7 @@ fn build_navigate_params(
 /// NOT applied to that window: WebKit focuses it, the URL never changes, and
 /// the page-side router finds nothing to route. A query string changes the
 /// document, so iOS performs a real navigation the page picks up on load or
-/// resume. See `system-knowhow/notifications.md` §4.5.
+/// resume. See `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` §4.5.
 ///
 /// TEMPORARY MEASURE (`docs/temporary-measures.md` § "Cross-document
 /// notification-tap reload on iOS"). The cross-document URL is what makes every
@@ -1161,38 +1329,38 @@ fn navigate_url_sw(params: &str) -> String {
 /// goes out (just without touching the badge that one time).
 async fn read_unread_count(
     pool: &sqlx::PgPool,
-    reader: &crate::gateway_operators::Reader,
+    reader: &crate::gateway_users::Reader,
 ) -> Option<i64> {
     match crate::scheduler::NotificationStore::count_unread(pool, reader).await {
         Ok(count) => Some(count),
         Err(e) => {
-            log!("[Push] Failed to count unread (omitting app_badge): {}", e);
+            log_legacy!("[Push] Failed to count unread (omitting app_badge): {}", e);
             None
         }
     }
 }
 
-/// Each subscribed device's own unread count: on a team gateway every person
+/// Each subscribed device's own unread count: on a team gateway every user
 /// badges what they have not read.
 async fn unread_counts_by_device(
     pool: &sqlx::PgPool,
     subscriptions: &[PushSubscription],
-) -> std::collections::HashMap<Option<String>, Option<i64>> {
-    let snapshot = crate::gateway_operators::current();
+) -> std::collections::HashMap<(Option<String>, BadgeScope), Option<i64>> {
+    let Some(snapshot) = crate::gateway_users::known() else {
+        return Default::default();
+    };
     let mut counts = std::collections::HashMap::new();
     for sub in subscriptions {
-        if counts.contains_key(&sub.device_id) {
+        let scope = badge_scope(sub.scope_url.as_deref());
+        let key = (sub.device_id.clone(), scope);
+        if counts.contains_key(&key) {
             continue;
         }
-        let actor = sub
-            .device_id
-            .clone()
-            .map(|device_id| crate::engine::thread_events::MessageOrigin::Device { device_id });
-        let reader = crate::gateway_operators::Reader::of(actor.as_ref(), &snapshot);
-        counts.insert(
-            sub.device_id.clone(),
-            read_unread_count(pool, &reader).await,
-        );
+        let Some(reader) = badge_reader(sub.device_id.as_deref(), scope, &snapshot) else {
+            counts.insert(key, None);
+            continue;
+        };
+        counts.insert(key, read_unread_count(pool, &reader).await);
     }
     counts
 }
@@ -1205,7 +1373,7 @@ const GATEWAY_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 
 /// Who served the install a subscription belongs to, which decides what its
 /// app-icon badge counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BadgeScope {
     /// A direct engine port, or a legacy row with no scope: this workspace.
     Own,
@@ -1259,78 +1427,148 @@ fn app_badge_for(
     }
 }
 
-/// The gateway's fresh cross-workspace unread total, for this fan-out.
-///
-/// Resolved ONCE per fan-out, and only when a subscription needs it. No
-/// gateway-scoped subscription, or no gateway at all, means no request.
-/// Best-effort throughout: `None` on every failure path, and the caller then
-/// badges the workspace's own count.
-async fn cross_workspace_unread_total(subscriptions: &[PushSubscription]) -> Option<i64> {
-    if !subscriptions
-        .iter()
-        .any(|sub| badge_scope(sub.scope_url.as_deref()) == BadgeScope::Gateway)
+/// Both normal and wake fan-outs resolve each payload's badge through this path.
+fn badge_deliveries(
+    subscriptions: Vec<PushSubscription>,
+    own: &std::collections::HashMap<(Option<String>, BadgeScope), Option<i64>>,
+    gateway: &std::collections::HashMap<String, Option<i64>>,
+    payload: impl Fn(&PushSubscription, Option<i64>) -> serde_json::Value,
+) -> Vec<(PushSubscription, String)> {
+    subscriptions
+        .into_iter()
+        .map(|sub| {
+            let badge = app_badge_for(
+                sub.scope_url.as_deref(),
+                own.get(&(sub.device_id.clone(), badge_scope(sub.scope_url.as_deref())))
+                    .copied()
+                    .flatten(),
+                sub.device_id
+                    .as_ref()
+                    .and_then(|id| gateway.get(id).copied().flatten()),
+            );
+            let body = payload(&sub, badge).to_string();
+            (sub, body)
+        })
+        .collect()
+}
+
+/// Gateway fallbacks require a known recipient. Direct single-reader installs
+/// use the same shared reader as their inbox.
+fn badge_reader(
+    device_id: Option<&str>,
+    scope: BadgeScope,
+    snapshot: &crate::gateway_users::UserSnapshot,
+) -> Option<crate::gateway_users::Reader> {
+    if scope == BadgeScope::Relayed
+        || (scope == BadgeScope::Gateway
+            && (snapshot.user_count() == 0 || device_id.is_none_or(|id| id.is_empty())))
     {
         return None;
     }
-    let gateway_port = crate::api::base_path::gateway_port()?;
-    match tokio::time::timeout(
-        GATEWAY_TOTAL_TIMEOUT,
-        ask_gateway_unread_total(&gateway_port),
-    )
-    .await
+    let Some(device_id) = device_id.filter(|id| !id.is_empty()) else {
+        return (snapshot.user_count() < 2).then_some(crate::gateway_users::Reader::Team);
+    };
+    if (scope == BadgeScope::Gateway || snapshot.user_count() >= 2)
+        && snapshot.user_of_device(device_id).is_none()
     {
-        Ok(total) => total,
-        Err(_) => {
-            log!(
-                "[Push] gateway on :{} did not answer the unread total within {:?}; \
-                 badging this workspace's own count",
-                gateway_port,
-                GATEWAY_TOTAL_TIMEOUT
-            );
-            None
-        }
+        return None;
     }
+    let actor = crate::engine::thread_events::MessageOrigin::Device {
+        device_id: device_id.into(),
+    };
+    Some(crate::gateway_users::Reader::of(Some(&actor), snapshot))
 }
 
-/// The hop itself, unbounded: [`cross_workspace_unread_total`] owns the
-/// deadline. Resolved scheme first, the other protocol second, so a
-/// dev/packaged TLS mismatch still connects (`.claude/rules/rust.md`
-/// § Intra-host scheme).
-async fn ask_gateway_unread_total(gateway_port: &str) -> Option<i64> {
+/// Fresh totals, deduplicated by recipient within this fan-out.
+async fn cross_workspace_unread_totals(
+    subscriptions: &[PushSubscription],
+) -> std::collections::HashMap<String, Option<i64>> {
+    gateway_unread_totals_at(
+        subscriptions,
+        crate::core::base_path::gateway_port().as_deref(),
+    )
+    .await
+}
+
+async fn gateway_unread_totals_at(
+    subscriptions: &[PushSubscription],
+    gateway_port: Option<&str>,
+) -> std::collections::HashMap<String, Option<i64>> {
+    let Some(port) = gateway_port else {
+        return Default::default();
+    };
+    let recipients: std::collections::BTreeSet<_> = subscriptions
+        .iter()
+        .filter(|sub| badge_scope(sub.scope_url.as_deref()) == BadgeScope::Gateway)
+        .filter_map(|sub| sub.device_id.as_deref().filter(|id| !id.is_empty()))
+        .collect();
+    futures::future::join_all(recipients.into_iter().map(|id| async move {
+        let count =
+            match tokio::time::timeout(GATEWAY_TOTAL_TIMEOUT, ask_gateway_unread_total(port, id))
+                .await
+            {
+                Ok(count) => count,
+                Err(_) => {
+                    log_legacy!(
+                        "[Push] gateway unread total timed out; badging the recipient's own count"
+                    );
+                    None
+                }
+            };
+        (id.to_owned(), count)
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
+/// The hop itself, unbounded: [`gateway_unread_totals_at`] owns the
+/// deadline.
+async fn ask_gateway_unread_total(gateway_port: &str, recipient_device_id: &str) -> Option<i64> {
     let client = match crate::gateway_auth::client_builder().build() {
         Ok(client) => client,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Push] could not build the gateway client ({}); badging this workspace's own count",
                 e
             );
             return None;
         }
     };
-    for scheme in crate::net_config::peer_scheme_order() {
-        let url = format!("{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/unread-total");
-        let Ok(resp) = client.get(&url).send().await else {
-            continue; // unreachable on this scheme, so try the other protocol
-        };
-        if !resp.status().is_success() {
-            // The gateway answered and refused; the other scheme won't differ.
-            log!(
-                "[Push] gateway unread total returned {}; badging this workspace's own count",
-                resp.status()
+    let url = format!(
+        "{}/~/api/v1/control/unread-total",
+        lucidos_local_token::client::origin(gateway_port)
+    );
+    let resp = match client
+        .get(&url)
+        .query(&[("recipient-device-id", recipient_device_id)])
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            log_legacy!(
+                "[Push] gateway on :{} unreachable ({}); badging this workspace's own count",
+                gateway_port,
+                e
             );
             return None;
         }
-        let Ok(body) = resp.text().await else {
-            log!("[Push] gateway unread total body was unreadable; badging this workspace's own count");
-            return None;
-        };
-        return parse_unread_total(&body);
+    };
+    if !resp.status().is_success() {
+        log_legacy!(
+            "[Push] gateway unread total returned {}; badging this workspace's own count",
+            resp.status()
+        );
+        return None;
     }
-    log!(
-        "[Push] gateway on :{} unreachable; badging this workspace's own count",
-        gateway_port
-    );
-    None
+    let Ok(body) = resp.text().await else {
+        log_legacy!(
+            "[Push] gateway unread total body was unreadable; badging this workspace's own count"
+        );
+        return None;
+    };
+    parse_unread_total(&body)
 }
 
 /// Pull the aggregate out of the gateway's `{"total": N}` answer. Pure, so the
@@ -1427,7 +1665,7 @@ fn build_push_payload_fitted(
 /// Build the JSON payload delivered to the push transport.
 ///
 /// The wire shape is the Declarative Web Push envelope.
-/// `system-knowhow/notifications.md` § Layer 1 writes it out field by field,
+/// `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md` § Layer 1 writes it out field by field,
 /// with each client's handling and one tested dead end nobody should retry.
 ///
 /// **Two navigate URL forms, same params.** `notification.navigate` is what
@@ -1547,7 +1785,8 @@ async fn fan_out_payload(
     }
 }
 
-#[cfg(not(feature = "e2e-test-hooks"))]
+// The e2e call site selects the push log, but Clippy still checks this transport.
+#[cfg_attr(feature = "e2e-test-hooks", allow(dead_code))]
 async fn fan_out_to_web_push(
     pool: &PgPool,
     deliveries: Vec<(PushSubscription, String)>,
@@ -1556,7 +1795,7 @@ async fn fan_out_to_web_push(
     let keys = match get_or_create_vapid_keys(pool).await {
         Ok(k) => k,
         Err(e) => {
-            log!("[Push] Failed to get VAPID keys for {}: {}", kind, e);
+            log_legacy!("[Push] Failed to get VAPID keys for {}: {}", kind, e);
             return 0;
         }
     };
@@ -1564,7 +1803,7 @@ async fn fan_out_to_web_push(
     let client = match web_push::IsahcWebPushClient::new() {
         Ok(c) => c,
         Err(e) => {
-            log!("[Push] Failed to create push client for {}: {}", kind, e);
+            log_legacy!("[Push] Failed to create push client for {}: {}", kind, e);
             return 0;
         }
     };
@@ -1585,13 +1824,13 @@ async fn fan_out_to_web_push(
                 match builder.build() {
                     Ok(sig) => sig,
                     Err(e) => {
-                        log!("[Push] Failed to build VAPID signature for {}: {}", kind, e);
+                        log_legacy!("[Push] Failed to build VAPID signature for {}: {}", kind, e);
                         return None;
                     }
                 }
             }
             Err(e) => {
-                log!("[Push] Failed to create VAPID builder for {}: {}", kind, e);
+                log_legacy!("[Push] Failed to create VAPID builder for {}: {}", kind, e);
                 return None;
             }
         };
@@ -1611,7 +1850,7 @@ async fn fan_out_to_web_push(
                 // something the guard cannot shrink: an oversized title, bad
                 // subscription keys, an unparseable endpoint. Say plainly that
                 // this device gets NOTHING.
-                log!(
+                log_legacy!(
                     "[Push] NO {} push delivered to {} ({} B payload): the encrypted message \
                      could not be built: {}. The notification row and bell badge are \
                      unaffected, so nothing else surfaces this failure.",
@@ -1631,7 +1870,7 @@ async fn fan_out_to_web_push(
 
     for endpoint in outcome.stale_endpoints {
         if let Err(e) = PushSubscriptionStore::unsubscribe(pool, &endpoint).await {
-            log!("[Push] Failed to remove stale subscription: {}", e);
+            log_legacy!("[Push] Failed to remove stale subscription: {}", e);
         }
     }
 
@@ -1644,11 +1883,9 @@ async fn fan_out_to_web_push(
 /// `send` as "Never times out", and isahc bounds only the connect. A socket that
 /// finished its TLS handshake and then went quiet would park the fan-out for
 /// good. Generous, because a phone radio waking from idle is slow but not dead.
-#[cfg(not(feature = "e2e-test-hooks"))]
 const PUSH_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What one pass over the subscriptions achieved.
-#[cfg(not(feature = "e2e-test-hooks"))]
 #[derive(Debug, Default, PartialEq)]
 struct SendOutcome {
     delivered: usize,
@@ -1664,7 +1901,6 @@ struct SendOutcome {
 /// that never answers. A send that runs out of time is a failure for that
 /// subscription only, and the subscription is kept: a silent socket says
 /// nothing about whether the endpoint is still valid.
-#[cfg(not(feature = "e2e-test-hooks"))]
 async fn send_each<'d, Fut, E>(
     deliveries: &'d [(PushSubscription, String)],
     kind: &str,
@@ -1688,19 +1924,19 @@ where
         match result {
             Ok(Ok(())) => {
                 outcome.delivered += 1;
-                log!("[Push] Sent {} to {}", kind, endpoint_label);
+                log_legacy!("[Push] Sent {} to {}", kind, endpoint_label);
             }
             Ok(Err(e)) => {
                 let err_str = e.to_string();
                 // 410 Gone means the subscription is no longer valid.
                 if err_str.contains("410") || err_str.contains("Gone") {
-                    log!(
+                    log_legacy!(
                         "[Push] Subscription expired (410), will remove: {}",
                         endpoint_label
                     );
                     outcome.stale_endpoints.push(sub.endpoint.clone());
                 } else {
-                    log!(
+                    log_legacy!(
                         "[Push] Failed to send {} to {}: {}",
                         kind,
                         endpoint_label,
@@ -1708,7 +1944,7 @@ where
                     );
                 }
             }
-            Err(_) => log!(
+            Err(_) => log_legacy!(
                 "[Push] Gave up sending {} to {} after {:?} with no answer; \
                  keeping the subscription",
                 kind,
@@ -1748,10 +1984,10 @@ async fn fan_out_to_push_log(
         match push_test_log::record(pool, device_id, nid, payload).await {
             Ok(()) => {
                 delivered += 1;
-                log!("[Push:test] Logged {} to {}", kind, endpoint_label);
+                log_legacy!("[Push:test] Logged {} to {}", kind, endpoint_label);
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Push:test] Failed to write push_log for {}: {}",
                     endpoint_label,
                     e

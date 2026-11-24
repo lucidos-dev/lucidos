@@ -1,14 +1,3 @@
-/** `draftPresentThreadIds` is a coarse signal exposing only WHICH threads
- *  carry a non-empty draft — never the draft contents. The drawer's draft
- *  indicator subscribes to it instead of `composeDrafts`, so per-keystroke
- *  text mutations don't fan a re-render across every visible ThreadRow.
- *
- *  These tests pin the contract: the signal reference must stay stable across
- *  same-presence keystrokes (the perf invariant) and must flip on the
- *  empty↔non-empty boundary (the correctness invariant). Without the
- *  same-presence stability guard, ThreadRows re-render per character — the
- *  exact regression that prompted this signal.
- */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   _resetComposeDraftsForTesting,
@@ -76,9 +65,6 @@ describe('draftPresentThreadIds membership', () => {
   });
 });
 
-/** ThreadRow subscribes to draftPresentThreadIds via threadHasUnsentDraft —
- *  if its reference flips on a no-op keystroke, every visible row re-renders
- *  per character. That regression is the exact symptom of this bug. */
 describe('draftPresentThreadIds reference stability (perf isolation)', () => {
   it('keystrokes inside a non-empty draft do NOT change the signal reference', () => {
     patchDraft('t-1', { text: 'a' });

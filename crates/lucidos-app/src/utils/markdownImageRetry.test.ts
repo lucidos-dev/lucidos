@@ -1,16 +1,5 @@
 // @vitest-environment jsdom
-// The handler is delegated off `document` and reads the DOM through `closest`.
 
-/**
- * A markdown `![alt](src)` image is raw `<img>` markup, so it cannot be a
- * `<BlobImage>` and had no retry at all. A truncated response therefore left a
- * screenshot painted only down to the row where the bytes stopped. It stayed
- * that way, inside a correctly sized box, until the thread was reopened.
- *
- * The retry is delegated from one document listener rather than bound per
- * component, because every markdown surface mounts the same raw markup: a chat
- * turn, a rendered `.md` preview, a notification body.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { installMarkdownImageRetry, isImageRetryPending } from './markdownImageRetry';
 import { MAX_ATTEMPTS, retryDelayMs } from './imageRetry';
@@ -27,8 +16,6 @@ function mountImage(src: string, wrapperClass = 'markdown-content'): HTMLImageEl
   return img;
 }
 
-/** jsdom never loads an image, so the browser's own event is simulated. It is
- *  dispatched without bubbling, exactly as a resource error arrives. */
 function fail(img: HTMLImageElement): void {
   img.dispatchEvent(new Event('error'));
 }
@@ -129,8 +116,6 @@ describe('installMarkdownImageRetry', () => {
   });
 
   it('says a retry is pending from the failure until the re-request goes out', () => {
-    // The arrival hold reads this: a broken image reports `complete`, but its
-    // height is still on its way.
     const img = mountImage(SRC);
     expect(isImageRetryPending(img)).toBe(false);
     fail(img);

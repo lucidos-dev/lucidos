@@ -51,6 +51,13 @@ assert_eq() {
     fi
 }
 
+assert_says_text() { # <text> <needle> <message>
+    case "$1" in
+        *"$2"*) pass "$3" ;;
+        *) fail "$3 (no '$2' in '$1')" ;;
+    esac
+}
+
 assert_says() {
     local file="$1" needle="$2" msg="$3"
     if grep -qF "$needle" "$file"; then
@@ -130,6 +137,33 @@ lift report_webkit_phase_selection
 lift run_specs_chunked
 lift _run_browser_project_body
 lift run_browser_project
+lift project_matches_filter
+lift pw_args_filter_projects
+lift e2e_github_is_filtered "$(dirname "$E2E_LIB_SH")/e2e_github.sh"
+lift webkit_flag_contradiction
+lift webkit_run_is_narrowed
+lift narrowed_run_keeps
+lift report_webkit_narrowing_dropped
+lift e2e_browser_projects "$E2E_LIB_SH"
+lift e2e_webkit_projects "$(dirname "$E2E_LIB_SH")/e2e_projects.sh"
+lift is_webkit_project "$(dirname "$E2E_LIB_SH")/e2e_projects.sh"
+
+# A lifted function reads its arrays from their one definition, never a copy.
+# macOS bash 3.2 aborts on an unset array under `set -u`, where bash 5 reads it
+# as empty, so a missing lift passes here and fails there.
+lift_array() { # <array> <script>
+    local body
+    # awk, since a sed range tests its end only from the line after its start
+    # and so runs a one-line array on into whatever follows it.
+    body="$(awk -v start="$1=(" 'index($0, start) == 1 { on = 1 } on { print } on && /\)$/ { exit }' "$2")"
+    if [ -z "$body" ]; then
+        echo "FATAL: could not lift the array $1 out of ${2#"$PROJECT_DIR"/}." >&2
+        exit 1
+    fi
+    printf '%s\n\n' "$body" >> "$LIFTED"
+}
+lift_array E2E_GITHUB_VALUE_FLAGS "$(dirname "$E2E_LIB_SH")/e2e_github.sh"
+lift_array E2E_GITHUB_TAIL_VALUE_FLAGS "$(dirname "$E2E_LIB_SH")/e2e_github.sh"
 
 # shellcheck source=/dev/null
 source "$LIFTED"
@@ -139,7 +173,7 @@ source "$LIFTED"
 HOST_MEMORY_STOP_EXIT=71
 MEMORY_STOPPED=""
 # shellcheck disable=SC2034 # read by the lifted functions, not from this file
-TEST_FILE=""
+TEST_FILES=()
 # shellcheck disable=SC2034 # read by the lifted functions, not from this file
 PW_ARGS=()
 # shellcheck disable=SC2034 # read by the lifted functions, not from this file
@@ -147,6 +181,8 @@ CMD=(npx playwright test)
 OUTPUT_ARG=()
 WEBKIT_CHUNK_RANGE_APPLIED=""
 WEBKIT_PHASE_APPLIED=""
+# shellcheck disable=SC2034 # read by the lifted report_webkit_narrowing_dropped
+WEBKIT_NARROWING_DROPPED=""
 MEMORY_RESUMES=0
 MEMORY_STOP_HISTORY=""
 RUN_UNVERIFIED=""
@@ -1158,6 +1194,131 @@ test_an_interrupted_invocation_stays_out_of_the_tally() {
     assert_silent_about "$SANDBOX/tally-trip3" "stopped-line" "a tripped invocation stays out of the tally"
 }
 
+test_a_filter_drops_only_the_project_it_selects_nothing_on() {
+    echo "test: a project runs under a filter only when Playwright lists a test for it"
+    local stub="$SANDBOX/list-stub.sh" rc
+    cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    *--project=desktop-webkit*) echo "Error: No tests found"; exit 1 ;;
+    *--project=chromium*) echo "Error: the config did not load"; exit 1 ;;
+    *--project=mobile-webkit*)
+        echo "SyntaxError: a spec did not load"
+        echo "Error: No tests found"
+        exit 1
+        ;;
+esac
+echo "Total: 3 tests in 1 file"
+STUB
+    chmod +x "$stub"
+    # shellcheck disable=SC2034 # read by the lifted project_matches_filter
+    CMD=("$stub")
+    rc=0; project_matches_filter mobile || rc=$?
+    assert_eq "0" "$rc" "a project with a matching test runs"
+    rc=0; project_matches_filter desktop-webkit || rc=$?
+    assert_eq "1" "$rc" "a project with no matching test does not run"
+    rc=0; project_matches_filter chromium || rc=$?
+    assert_eq "0" "$rc" "any other list failure is left for the real run to report"
+    rc=0; project_matches_filter mobile-webkit || rc=$?
+    assert_eq "0" "$rc" "a spec that fails to load still runs, so its error shows"
+}
+
+test_every_array_a_lifted_function_reads_is_defined() {
+    echo "test: no lifted function reads an array this file never defines"
+    local name missing=""
+    # Bash 5 reads an unset array as empty under `set -u`. Bash 3.2 aborts.
+    while IFS= read -r name; do
+        case "$name" in
+            # Locals of the lifted functions, and bash's own.
+            cc_specs | nav_specs | filters | specs | chunk | PIPESTATUS) continue ;;
+        esac
+        declare -p "$name" > /dev/null 2>&1 || missing="$missing $name"
+    done <<EOF
+$(grep -oE '\$\{[#!]?[A-Za-z_][A-Za-z0-9_]*\[' "$LIFTED" | sed -E 's/^\$\{[#!]?//; s/\[$//' | sort -u)
+EOF
+    assert_eq "" "$missing" "every array is defined before a lifted function reads it"
+    # The scan itself must see the arrays lift_array exists for.
+    if grep -qF 'E2E_GITHUB_TAIL_VALUE_FLAGS[' "$LIFTED"; then
+        pass "the scan reads names with digits"
+    else
+        fail "the lifted code no longer reads E2E_GITHUB_TAIL_VALUE_FLAGS, so this guard checks nothing"
+    fi
+    assert_eq "1" "$(grep -c '^E2E_GITHUB_TAIL_VALUE_FLAGS=(' "$LIFTED")" "each array is lifted once, with nothing after it"
+}
+
+test_a_webkit_flag_refuses_a_pinned_project_of_the_other_kind() {
+    echo "test: --webkit beside a pinned Chromium project is refused, never run without WebKit"
+    local out
+    out="$(webkit_flag_contradiction 1 "" --project=chromium)"
+    assert_says_text "$out" "chromium is not a WebKit project" "--webkit refuses --project=chromium"
+    out="$(webkit_flag_contradiction 1 "" --grep x --project mobile-webkit mobile --workers 1)"
+    assert_says_text "$out" "mobile is not a WebKit project" "the split form is read, every value of it"
+    out="$(webkit_flag_contradiction 1 "" --project mobile-webkit --grep chromium)"
+    assert_eq "" "$out" "another option's value is never read as a project"
+    out="$(webkit_flag_contradiction "" 1 --project=desktop-webkit)"
+    assert_says_text "$out" "desktop-webkit is a WebKit project" "--no-webkit refuses a WebKit project"
+    out="$(webkit_flag_contradiction "" 1 '--project=*-webkit')"
+    assert_says_text "$out" "is a WebKit project" "a glob is matched against every project"
+    out="$(webkit_flag_contradiction 1 "" --project=mobile-webkit --project=desktop-webkit)"
+    assert_eq "" "$out" "--webkit accepts the WebKit projects"
+    out="$(webkit_flag_contradiction "" 1 --project=chromium --shard=1/2)"
+    assert_eq "" "$out" "--no-webkit accepts a Chromium project, as a GitHub shard passes it"
+    out="$(webkit_flag_contradiction 1 "" --project=CHROMIUM)"
+    assert_says_text "$out" "chromium is not a WebKit project" "the name's case is ignored, as Playwright ignores it"
+    out="$(webkit_flag_contradiction "" "" --project=chromium)"
+    assert_eq "" "$out" "no flag, no contradiction"
+}
+
+test_a_narrowed_run_keeps_desktop_webkit_out_and_says_so() {
+    echo "test: a chunk range or a phase runs only mobile-webkit's part, and the report names what stayed out"
+    local rc out kept="" project
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_CHUNKS LUCIDOS_E2E_WEBKIT_PHASE; webkit_run_is_narrowed) || rc=$?
+    assert_eq "1" "$rc" "a plain run is not narrowed"
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_CHUNKS; LUCIDOS_E2E_WEBKIT_PHASE=both webkit_run_is_narrowed) || rc=$?
+    assert_eq "1" "$rc" "both phases is not a narrowing"
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_CHUNKS; LUCIDOS_E2E_WEBKIT_PHASE=nav webkit_run_is_narrowed) || rc=$?
+    assert_eq "0" "$rc" "one phase is a narrowing"
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_PHASE; LUCIDOS_E2E_WEBKIT_CHUNKS=40- webkit_run_is_narrowed) || rc=$?
+    assert_eq "0" "$rc" "a chunk range is a narrowing"
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_PHASE; LUCIDOS_E2E_WEBKIT_CHUNKS=abc webkit_run_is_narrowed) || rc=$?
+    assert_eq "1" "$rc" "a range the parser widens back to every chunk is no narrowing"
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_PHASE; LUCIDOS_E2E_WEBKIT_CHUNKS=1- webkit_run_is_narrowed) || rc=$?
+    assert_eq "1" "$rc" "a range that names every chunk is no narrowing"
+    rc=0; (unset LUCIDOS_E2E_WEBKIT_CHUNKS; LUCIDOS_E2E_WEBKIT_PHASE=bogus webkit_run_is_narrowed) || rc=$?
+    assert_eq "1" "$rc" "a phase the parser widens back to both is no narrowing"
+
+    for project in $(e2e_browser_projects --webkit); do
+        ! narrowed_run_keeps "$project" || kept="$kept $project"
+    done
+    assert_eq " mobile-webkit" "$kept" "of the WebKit projects, only mobile-webkit runs"
+    kept=""
+    for project in $(e2e_browser_projects); do
+        ! narrowed_run_keeps "$project" || kept="$kept $project"
+    done
+    assert_eq " chromium mobile mobile-webkit" "$kept" "the cheap projects are untouched"
+
+    out="$(WEBKIT_NARROWING_DROPPED="" report_webkit_narrowing_dropped)"
+    assert_eq "" "$out" "nothing dropped, nothing reported"
+    out="$(WEBKIT_NARROWING_DROPPED="desktop-webkit" report_webkit_narrowing_dropped)"
+    assert_says_text "$out" "desktop-webkit did NOT run" "the closing report names the project that stayed out"
+    assert_says_text "$out" "Coverage is incomplete" "and says coverage is incomplete"
+}
+
+test_only_a_real_filter_asks_the_projects() {
+    echo "test: the projects are asked only about a filter, never in an interactive mode"
+    local rc
+    rc=0; pw_args_filter_projects --grep swipe || rc=$?
+    assert_eq "0" "$rc" "a --grep is a filter"
+    rc=0; pw_args_filter_projects swipe-mobile.spec.ts || rc=$?
+    assert_eq "0" "$rc" "a positional is a filter"
+    rc=0; pw_args_filter_projects --workers 1 || rc=$?
+    assert_eq "1" "$rc" "an option's value is no filter"
+    rc=0; pw_args_filter_projects || rc=$?
+    assert_eq "1" "$rc" "no arguments is no filter"
+    rc=0; pw_args_filter_projects --ui --grep swipe || rc=$?
+    assert_eq "1" "$rc" "UI mode is never probed"
+}
+
 test_the_cc_phase_runs_first_and_nav_second
 test_both_phases_still_shard
 test_desktop_specs_are_excluded_from_both_phases
@@ -1178,6 +1339,11 @@ test_no_phase_selection_runs_both_phases
 test_the_nav_phase_alone_runs_only_nav_and_says_so
 test_the_cc_phase_alone_runs_only_cc_and_says_so
 test_a_garbage_phase_value_runs_both_phases
+test_a_filter_drops_only_the_project_it_selects_nothing_on
+test_only_a_real_filter_asks_the_projects
+test_every_array_a_lifted_function_reads_is_defined
+test_a_webkit_flag_refuses_a_pinned_project_of_the_other_kind
+test_a_narrowed_run_keeps_desktop_webkit_out_and_says_so
 test_a_nav_only_run_composes_with_a_chunk_range
 test_a_phase_selection_on_an_unsplittable_set_says_it_ran_everything
 test_a_trip_inside_a_nav_chunk_stops_the_run_as_a_memory_stop

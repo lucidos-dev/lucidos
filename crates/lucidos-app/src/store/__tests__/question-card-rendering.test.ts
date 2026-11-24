@@ -6,6 +6,7 @@ import {
   computeSubmitMultiCount,
   promptPlaceholder,
   threadHasConversation,
+  PLACEHOLDER_AGENT_PAUSED,
   PLACEHOLDER_ANSWERING,
   PLACEHOLDER_SIDE_QUESTION,
   PLACEHOLDER_FOLLOW_UP,
@@ -91,13 +92,6 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
   });
 
   it('keeps resume-marker Thinking step spinning when AskUserQuestion ToolResult fires', () => {
-    // After UserQuestionAnswered, the engine emits a CodingAgentPromptSent
-    // resume marker (empty text → Thinking spinner). Then CC's PreToolUse
-    // hook unblocks and CC processes the synthetic tool_result for the
-    // AskUserQuestion, which surfaces as CodingAgentToolResult. That
-    // CodingAgentToolResult must NOT resolve the resume-marker Thinking
-    // spinner — the spinner should keep spinning until CC produces real
-    // output (text or a non-AskUserQuestion tool call).
     const ex = exchange([
       step(1, { type: 'SessionStarted', session_id: 'sess', branch: '' }),
       step(2, { type: 'CodingAgentTextStreamed', text: 'thinking…' }),
@@ -117,14 +111,12 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
       step(6, { type: 'CodingAgentToolResult', name: '', result: 'opt-0' }),
     ]);
 
-    // The resume-marker Thinking step must still be a spinner (success: null).
     const events = exchangeResponseEvents(ex, true);
     const stepEvents = events.filter(e => e.type === 'step') as Array<{ description: string; outcome: StepOutcome }>;
     const trailingThinking = stepEvents[stepEvents.length - 1];
     expect(trailingThinking.description).toBe('Thinking');
     expect(trailingThinking.outcome).toBe('pending');
 
-    // exchangeSteps (the parallel projection used by other UI surfaces) must agree.
     const steps = exchangeSteps(ex, true, false);
     const lastStep = steps[steps.length - 1];
     expect(lastStep.description).toBe('Thinking');
@@ -143,9 +135,6 @@ describe('AnswerKind discriminated union', () => {
   });
 
   it('MultiSelected accepts optional text alongside option_ids', () => {
-    // Mirrors the Rust `text: Option<String>` field. The prompt-row Submit
-    // bundles the textarea contents into the answer when a multi-select
-    // question is pending.
     const a: AnswerKind = { kind: 'MultiSelected', option_ids: ['opt-0'], text: 'plus this' };
     if (a.kind === 'MultiSelected') {
       expect(a.text).toBe('plus this');
@@ -158,11 +147,6 @@ describe('AnswerKind discriminated union', () => {
   });
 });
 
-// PromptInput derives BOTH of its per-render question facts from this one
-// walk: `multiSelect` picks the prompt-row Submit control, and the mere
-// presence of a pending question switches the placeholder to the answering
-// one. A second walk per keystroke is what the helper's own gating comment
-// exists to avoid, so there is no separate multi-select finder to test.
 describe('findLatestPendingQuestion', () => {
   it('returns the toolUseId of the latest unanswered multi-select question', () => {
     const thread = buildThreadState([
@@ -217,8 +201,6 @@ describe('findLatestPendingQuestion', () => {
         multi_select: false,
       } as ThreadEvent,
     ]);
-    // Single-select answers through the card, so no prompt-row Submit. The
-    // placeholder still flips: typing is a valid freetext answer to it.
     expect(findLatestPendingQuestion(thread)).toEqual({
       toolUseId: 'tu_single',
       multiSelect: false,
@@ -235,20 +217,10 @@ describe('promptPlaceholder', () => {
     expect(promptPlaceholder(true, true, false)).toBe(PLACEHOLDER_ANSWERING);
   });
 
-  // The card renders the question and its options, nothing else, so the two
-  // escapes that need no option slot are named by the prompt row. This
-  // placeholder is the typing half: text typed here routes to the pending
-  // question as a `FreeText` answer. Cancel (which stamps it `Canceled`) is
-  // named by the Cancel button's tooltip instead, `ANSWER_CANCEL_TOOLTIP`,
-  // pinned in `components/chat/__tests__/question-card.test.tsx`. Drop either
-  // half and an agent starts inventing an "Other, I'll type it" option, which
-  // just hands its label back as the answer.
   it('names the typing escape, since nothing on the card does', () => {
     expect(PLACEHOLDER_ANSWERING).toBe('Type custom answer here…');
   });
 
-  // A permission card leaves the thread `waiting_for_user_answer` with no
-  // pending question, and typed text there is an ordinary message.
   it('keeps the follow-up placeholder when no question card is pending', () => {
     expect(promptPlaceholder(true, false, false)).toBe(PLACEHOLDER_FOLLOW_UP);
   });
@@ -261,11 +233,18 @@ describe('promptPlaceholder', () => {
     expect(promptPlaceholder(true, false, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
   });
 
-  // The mode wins over a pending card: Send asks, and the × goes back to it.
   it('invites a side question over a pending card in side-question mode', () => {
     expect(promptPlaceholder(true, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
   });
 
+  it('says the agent is paused, so nothing else has to (ADR 0657)', () => {
+    expect(promptPlaceholder(true, false, false, true)).toBe(PLACEHOLDER_AGENT_PAUSED);
+  });
+
+  it('lets a pending card and the side-question mode win over the pause', () => {
+    expect(promptPlaceholder(true, true, false, true)).toBe(PLACEHOLDER_ANSWERING);
+    expect(promptPlaceholder(true, false, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
+  });
 });
 
 describe('threadHasConversation', () => {
@@ -275,7 +254,6 @@ describe('threadHasConversation', () => {
     expect(threadHasConversation(null, undefined)).toBe(false);
   });
 
-  // A cold open focuses the thread before the thread list lands.
   it('is true for a focused thread not yet in the thread list', () => {
     expect(threadHasConversation('thread-1', undefined)).toBe(true);
   });
@@ -307,7 +285,6 @@ describe('threadHasConversation', () => {
     expect(threadHasConversation('thread-1', sending)).toBe(true);
   });
 
-  // A long thread opens before its events land; it must not flash the new-thread line.
   it('is true for a thread still loading', () => {
     expect(threadHasConversation('thread-1', { ...buildThreadState([]), eventsLoaded: false })).toBe(true);
   });

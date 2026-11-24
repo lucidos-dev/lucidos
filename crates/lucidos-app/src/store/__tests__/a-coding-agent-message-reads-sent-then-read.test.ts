@@ -1,8 +1,3 @@
-/**
- * A message sent to a coding agent reads "Sent" until the agent takes it in,
- * then "Read". The engine records the read as `CodingAgentInputRead`, naming
- * the `MessageReceived` it acknowledges.
- */
 import { describe, it, expect } from 'vitest';
 import { groupIntoExchanges, messageReadTimestamp, readMarkers, type StoredEvent, type ThreadEvent } from '../thread-events';
 
@@ -54,8 +49,6 @@ describe('the read marker', () => {
   });
 
   it('starts the markers at a read message, never at a read child wake', () => {
-    // A child wake's read names its `ChildThreadCompleted`. It proves nothing
-    // about the messages before it, which may predate read events.
     const exchanges = groupIntoExchanges(new Map([
       ev(1, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done' }, 'w1'),
       ev(2, read('w1')),

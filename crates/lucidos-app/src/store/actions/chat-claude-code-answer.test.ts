@@ -7,10 +7,8 @@ const markThreadAnswering = vi.fn();
 const clearThreadAnswering = vi.fn();
 const markThreadRerenderStart = vi.fn();
 const clearThreadRerenderStart = vi.fn();
-// Focused thread is 't1' (the id the tests answer on) so the perf re-render mark
-// is stamped on the focused path.
 const focusedThreadId = { value: 't1' };
-const threadMap = { value: new Map() };
+const threadMap = { value: new Map(), peek() { return this.value; } };
 
 class ApiError extends Error {
   constructor(public readonly httpCode: number, public readonly reason: string) {
@@ -22,8 +20,6 @@ vi.mock('../store', () => ({ showToast, markThreadAnswering, clearThreadAnswerin
 vi.mock('../../api/client', () => ({
   answerThreadQuestion: apiAnswerThreadQuestion,
   ApiError,
-  // Inlined rather than re-exported: the real one lives in `_core`, which pulls
-  // in the store. The same three browser wordings as `isTransportError`.
   isTransientFetchError: (err: unknown) =>
     err instanceof TypeError && /Load failed|Failed to fetch|NetworkError/i.test(err.message),
 }));
@@ -36,9 +32,16 @@ vi.mock('./send-probe', () => ({ probeStreamAfterSend }));
 vi.mock('./thread-sync', () => ({}));
 vi.mock('./threads', () => ({}));
 const position = { input_chain: 'page-chain', input_seq: 7 };
+let knownEpoch = 12;
+let nextSeq = 7;
+beforeEach(() => { knownEpoch = 12; nextSeq = 7; });
 vi.mock('./sendChain', () => ({
-  inSendChain: (_threadId: string, send: (p: typeof position) => Promise<unknown>) => send(position),
+  enterSendChain: () => ({
+    waitForTurn: null, position: { ...position, input_seq: nextSeq++ }, epochForPost: () => knownEpoch, release: vi.fn(), accepted: vi.fn(),
+  }),
 }));
+
+vi.mock('../composeSync', () => ({ knownComposeEpoch: () => knownEpoch, parseComposeReport: vi.fn(), acceptComposeReport: vi.fn() }));
 
 const { answerThreadQuestion, answerFailureMessage, retryUnsentPick } = await import('./chat-claude-code');
 const { pendingAnswers, unsentPicks } = await import('../pendingDecisions');
@@ -55,10 +58,6 @@ describe('answerThreadQuestion', () => {
   });
 
   it('sends the answer without moving the transcript', async () => {
-    // This used to pin to the bottom before the POST, so the answered card's
-    // height-shrink could not unstick the tail and the resumed stream would
-    // follow. Answering is not a request to go to the live edge: the resumed
-    // stream grows below the reader, and the chevron is how they follow it.
     await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-a' });
 
     expect(apiAnswerThreadQuestion).toHaveBeenCalledTimes(1);
@@ -93,18 +92,13 @@ describe('answerThreadQuestion', () => {
     expect(markThreadAnswering).toHaveBeenCalledWith('t1');
     const markOrder = markThreadAnswering.mock.invocationCallOrder[0];
     const apiOrder = apiAnswerThreadQuestion.mock.invocationCallOrder[0];
-    expect(markOrder).toBeLessThan(apiOrder); // optimism is set before the await
-    // On success the PromptInput effect clears it once status leaves
-    // waiting_for_user_answer — the action must NOT clear it itself.
+    expect(markOrder).toBeLessThan(apiOrder);
     expect(clearThreadAnswering).not.toHaveBeenCalled();
-    // Perf: the re-render mark is stamped (focused thread) and NOT cleared on success.
     expect(markThreadRerenderStart).toHaveBeenCalledWith('t1', expect.objectContaining({ cause: 'answer' }));
     expect(clearThreadRerenderStart).not.toHaveBeenCalled();
   });
 
   it('leaves a quiet pick unmarked, since no resume follows it', async () => {
-    // The flag reads as a resuming agent: it hides the keep-alive pill and
-    // draws a working row until the status settles, so the transcript jumped.
     threadMap.value = new Map([['t1', { events: new Map([[1, {
       type: 'UserQuestionAsked',
       tool_use_id: 'tool-use-1',
@@ -127,7 +121,6 @@ describe('answerThreadQuestion', () => {
     expect(outcome).toBe('refused');
     expect(markThreadAnswering).toHaveBeenCalledWith('t1');
     expect(clearThreadAnswering).toHaveBeenCalledWith('t1');
-    // Perf: no resume render is coming → the stale re-render mark is dropped.
     expect(clearThreadRerenderStart).toHaveBeenCalledWith('t1');
   });
 
@@ -144,14 +137,6 @@ describe('answerThreadQuestion', () => {
   });
 });
 
-/**
- * One failed tap, one message, and it names the cause.
- *
- * The reported pair was "Could not send answer. Please try again." over
- * "Failed to send answer: unknown error", twice each for two taps. The action
- * raised one and the submit site raised the other, so the count is the
- * contract: the callers roll their optimistic state back and stay quiet.
- */
 describe('the one failure message', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -216,8 +201,81 @@ describe('a tapped answer that gets no answer', () => {
       .mockResolvedValueOnce(true);
     expect(await answerSettled()).toBe('sent');
     const [first, retry] = apiAnswerThreadQuestion.mock.calls.map(call => (call as unknown[])[3]);
-    expect(first).toEqual({ event_id: expect.any(String), ...position });
+    expect(first).toEqual({ event_id: expect.any(String), ...position, compose_epoch: 12 });
     expect(retry).toEqual(first);
+  });
+
+  it('keeps an uncertain explicit Retry at its original identity and epoch', async () => {
+    apiAnswerThreadQuestion.mockRejectedValue(new TypeError('Load failed'));
+    expect(await answerSettled()).toBe('unsent');
+    const first = (apiAnswerThreadQuestion.mock.calls[0] as unknown[])[3];
+    knownEpoch = 99;
+    apiAnswerThreadQuestion.mockReset();
+    apiAnswerThreadQuestion.mockResolvedValueOnce(true);
+    expect(await retryUnsentPick('tool-use-1')).toBe('sent');
+    expect((apiAnswerThreadQuestion.mock.calls[0] as unknown[])[3]).toEqual(first);
+  });
+
+  it('journals a composer answer and keeps it after a refused card Retry', async () => {
+    const { readUnsentMessageStore, _resetUnsentMessageRecordsForTesting } = await import('../unsentMessageRecords');
+    _resetUnsentMessageRecordsForTesting();
+    const answer = { kind: 'MultiSelected', option_ids: ['opt-a'], text: 'held text', image_hashes: ['image', 'image'] } as const;
+    apiAnswerThreadQuestion.mockRejectedValue(new TypeError('Load failed'));
+    const sending = answerThreadQuestion('t1', 'tool-use-1', structuredClone(answer) as unknown as import('../thread-events').AnswerKind);
+    await vi.advanceTimersByTimeAsync(ALL_RETRIES_MS + 1);
+    expect(await sending).toBe('unsent');
+    const [stored] = await readUnsentMessageStore();
+    expect(stored.questionPick).toEqual({ toolUseId: 'tool-use-1', answer, placement: expect.any(Object) });
+    apiAnswerThreadQuestion.mockReset().mockRejectedValue(new ApiError(500, 'unavailable'));
+    expect(await retryUnsentPick('tool-use-1')).toBe('unsent');
+    expect(unsentPicks.map.value.get('tool-use-1')?.answer).toEqual(answer);
+    expect((await readUnsentMessageStore())[0].questionPick?.answer).toEqual(answer);
+  });
+
+  it('retains a refused uncertain answer and gives only its next explicit Retry a fresh fence', async () => {
+    apiAnswerThreadQuestion.mockRejectedValue(new TypeError('Load failed'));
+    expect(await answerSettled()).toBe('unsent');
+    const original = (apiAnswerThreadQuestion.mock.calls[0] as unknown[])[3] as { event_id: string; input_seq: number };
+    knownEpoch = 99;
+    apiAnswerThreadQuestion.mockReset();
+    apiAnswerThreadQuestion.mockRejectedValueOnce(Object.assign(new ApiError(409, 'Another send was accepted first.'), { body: { reason: 'compose_snapshot_stale' } }));
+    expect(await retryUnsentPick('tool-use-1')).toBe('unsent');
+    expect(unsentPicks.map.value.get('tool-use-1')).toMatchObject({ answer: pick, refusal: { reason: 'compose_snapshot_stale' } });
+    apiAnswerThreadQuestion.mockReset();
+    apiAnswerThreadQuestion.mockResolvedValueOnce(true);
+    expect(await retryUnsentPick('tool-use-1')).toBe('sent');
+    const posting = (apiAnswerThreadQuestion.mock.calls[0] as unknown[])[3] as { event_id: string; input_seq: number; compose_epoch: number };
+    expect(posting.event_id).not.toBe(original.event_id);
+    expect(posting.input_seq).toBeGreaterThan(original.input_seq);
+    expect(posting.compose_epoch).toBe(99);
+  });
+
+  it('keeps composer content when an explicit Retry meets a duplicate conflict', async () => {
+    const { readUnsentMessageStore, _resetUnsentMessageRecordsForTesting } = await import('../unsentMessageRecords');
+    _resetUnsentMessageRecordsForTesting();
+    const answer = { kind: 'FreeText' as const, text: 'keep this answer', image_hashes: ['image'] };
+    apiAnswerThreadQuestion.mockRejectedValue(new TypeError('Load failed'));
+    const sending = answerThreadQuestion('t1', 'tool-use-1', answer);
+    await vi.advanceTimersByTimeAsync(ALL_RETRIES_MS + 1);
+    expect(await sending).toBe('unsent');
+    apiAnswerThreadQuestion.mockReset().mockResolvedValue(false);
+    expect(await retryUnsentPick('tool-use-1')).toBe('unsent');
+    expect(unsentPicks.map.value.get('tool-use-1')?.answer).toEqual(answer);
+    expect((await readUnsentMessageStore())[0].questionPick?.answer).toEqual(answer);
+  });
+
+  it('freezes answer content before its first attempt', async () => {
+    apiAnswerThreadQuestion.mockRejectedValueOnce(new TypeError('Load failed')).mockResolvedValueOnce(true);
+    const answer = { kind: 'MultiSelected' as const, option_ids: ['first'], text: 'original', image_hashes: ['image'] };
+    const sending = answerThreadQuestion('t1', 'tool-use-1', answer);
+    answer.option_ids.push('later');
+    answer.image_hashes.push('later-image');
+    answer.text = 'later';
+    await vi.advanceTimersByTimeAsync(ALL_RETRIES_MS + 1);
+    expect(await sending).toBe('sent');
+    for (const call of apiAnswerThreadQuestion.mock.calls) {
+      expect((call as unknown[])[2]).toEqual({ kind: 'MultiSelected', option_ids: ['first'], text: 'original', image_hashes: ['image'] });
+    }
   });
 
   it('stays answering while it retries', async () => {
@@ -246,6 +304,7 @@ describe('a tapped answer that gets no answer', () => {
     expect(unsentPicks.map.value.get('tool-use-1')).toEqual({
       threadId: 't1',
       answer: pick,
+      placement: { event_id: expect.any(String), ...position, compose_epoch: 12 },
       failure: { attempts: ATTEMPTS, reason: 'Load failed' },
     });
   });
@@ -260,7 +319,7 @@ describe('a tapped answer that gets no answer', () => {
     const retried = retryUnsentPick('tool-use-1');
     expect(pendingAnswers.map.value.get('tool-use-1')).toEqual(pick);
     expect(unsentPicks.map.value.has('tool-use-1')).toBe(false);
-    expect(apiAnswerThreadQuestion).toHaveBeenCalledWith('t1', 'tool-use-1', pick, expect.objectContaining(position));
+    expect(apiAnswerThreadQuestion).toHaveBeenCalledWith('t1', 'tool-use-1', pick, expect.objectContaining(position), expect.any(Function));
     answer(true);
     expect(await retried).toBe('sent');
   });

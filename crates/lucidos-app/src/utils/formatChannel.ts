@@ -8,13 +8,6 @@ export function formatChannel(channel: string): string {
   return channel;
 }
 
-/** Backend-aware name of what drives a thread: the drawer row mark's tooltip
- *  and accessible name. Every coding-agent thread carries the `claude_code`
- *  channel, so the backend lives on `codingAgent`: a Codex thread reads
- *  "Codex", not "Claude Code". Plain chat threads read "Lucidos Agent", the LLM
- *  driving them. Other channels fall through to {@link formatChannel}, which
- *  says "Lucidos" where a shorter word is wanted. An absent `codingAgent` reads
- *  as Claude Code. */
 export function formatThreadChannelLabel(channel: string, codingAgent?: CodingAgent | null): string {
   if (channel === 'claude_code' && codingAgent === 'codex') return 'Codex';
   if (channel === 'lucidos' || channel === 'chat') return 'Lucidos Agent';

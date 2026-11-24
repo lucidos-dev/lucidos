@@ -1,7 +1,7 @@
 ---
 name: Workspace audit: cross-cutting
 description: The cross-cutting audit section: credentials in workspace code, broken references, duplicates, removed CLI flags, removed thread-summary fields, retired LLM tools and the retired work-item names.
-sources: ["system-knowhow/js-sdk.md", "system-knowhow/lucidos-cli.md", "system-knowhow/intent-registry.md", "system-knowhow/triggers.md", "crates/lucidos-cli/src/*", "crates/lucidos-engine/src/llm/tools/*", "crates/lucidos-engine/src/engine/tools/*", "crates/lucidos-engine/src/api/threads*", "crates/lucidos-engine/src/core/store/threads/*"]
+sources: ["system-knowhow/js-sdk.md", "system-knowhow/js-sdk/*.md", "system-knowhow/lucidos-cli.md", "system-knowhow/lucidos-cli/*.md", "system-knowhow/coding-agent-flows.md", "system-knowhow/intent-registry.md", "system-knowhow/triggers.md", "system-knowhow/triggers/*.md", "crates/lucidos-cli/src/*", "crates/lucidos-core/src/llm/tools/*", "crates/lucidos-agents-api/src/engine/tools/*", "crates/lucidos-agents-api/src/api/threads*", "crates/lucidos-core/src/core/store/threads/*"]
 ---
 
 # Workspace audit section: cross-cutting
@@ -25,9 +25,132 @@ scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
 
 ## Checks
 
+- **The lander inferred from pairing direction.** Read `lucidos landing setting` in the workspace whose behavior you are auditing.
+- **Fix evidence counted as an owner decision.** Check the kind and origin of `PlanApproved`.
+
+- **Standing denies edited through their mirror.** The permissions store
+  controls these rules. Flag recipes editing the mirror file as **broken**.
+  See the *standing deny* entry in `system-knowhow/glossary.md`.
+
+- **Apply mistaken for a live version.** Check version claims against `system-knowhow/glossary/core-terms-15.md` § Build deferral.
+  Flag recipes claiming a held version is running as **stale**.
+
+
+- **Pairing mistaken for agent return authority.** An outgoing pairing alone never grants the peer access through its caller.
+  Check routed recipes against `system-knowhow/lucidos-cli/waiting-through-an-engine-restart.md` § `lucidos workspaces targets` and `system-knowhow/remote-access/settings-access-2.md` § Agent return access.
+  Flag credential copying, inferred return grants or remote child callbacks as **broken**.
+
+- **Direct spawns assumed to verify the calling workspace.** Check recipes against `system-knowhow/lucidos-cli/subcommands-4.md` § `lucidos spawn-thread`.
+  Pair gateways to check future calls; retrying the same direct spawn does not establish its identity.
+
+- **Host-log transfers with simulated consent or blind retries.** Flag agent-authored approvals and retries of uncertain operations as **broken**.
+  Check `system-knowhow/lucidos-cli/subcommands-2.md` § `lucidos diagnostic-log prepare-host-transfer` and § `lucidos diagnostic-log host-transfer-status`.
+
+- **Gateway control requests bypassing consent.** Check agent channel recipes against `system-knowhow/lucidos-cli/subcommands-14.md` § `lucidos update-channel`.
+  Flag token reads, caller-selected ports or approval reuse for a different request as **broken**.
+
+- **Browser media helpers used in unattended scripts.** `lucidos.media.poster` needs a mounted app frame and its host bridge.
+  Flag scripts or recipes expecting it to work without a browser as **broken**.
+  Reference: `system-knowhow/js-sdk/lucidos-media.md` § `lucidos.media`.
+
+- **Ceiling handoffs assumed to need Continue.** Check recipes against `system-knowhow/lucidos-cli/subcommands-12.md` § `lucidos successor start`.
+  Interrupted work continues after the agent's narrative turn; natural turn ends and engine briefs wait for input.
+  Flag unconditional Continue instructions as **stale**.
+
+- **Ordinary owner questions from integrated sub-threads.** Flag recipes that
+  rely on an integrated sub-thread opening an ordinary owner card as **broken**.
+  Check `system-knowhow/lucidos-cli/subcommands-7.md` § `lucidos wake-parent yes|no` and `system-knowhow/lucidos-cli/subcommands-11.md` § `lucidos planned mark`.
+
+- **Prepared batches mistaken for visible cards.** Check batch, workspace classify and workspace delete recipes against `system-knowhow/lucidos-cli/subcommands-9.md` § `lucidos permissions batch`.
+  Flag ending after preparation without asking the question tool with the printed id alone as **broken**.
+  Lucidos runs the approved batch. Flag repeating it after Run all or Allow once as **broken**.
+
+- **Home hold reach confused with resume authority.** Check recipes against `system-knowhow/lucidos-cli/subcommands-3.md` § `lucidos threads resume [--thread <uuid>]`.
+  Home may hold any thread in its workspace. Only the owner resumes, or the thread's own agent inside a turn the owner's message started.
+  Flag a recipe that has Home, a parent or a trigger run `lucidos threads resume` as **broken**.
+  Flag a recipe that still runs `lucidos threads pause-automation` as **stale**: it is a one-release alias of `lucidos threads hold`.
+
+- **Ladder edits assumed open to agents.** Check ladder recipes against `system-knowhow/lucidos-cli/subcommands-4.md` § Editing a ladder.
+  An agent's edit needs the owner's `edit-intelligence-ladder` permission.
+  Flag a recipe that writes a ladder preference directly, or skips the printed request id, as **broken**.
+
+- **Private paths treated as workspace privacy.** Private paths cover external files and folders.
+  Workspace data and registered repository history remain available through Lucidos.
+  Check the enforcement level in Settings → Permissions before claiming a process is confined.
+- **Home writes mistaken for sandbox probes.** Review probes against `system-knowhow/agent-sandbox.md` § Is this process sandboxed?
+  Flag a successful home write treated as proof of an unsandboxed process as **broken**.
+  An inherited sandbox protects the outer engine's workspace, so a probe must target that workspace.
+
+- **Changed plans treated as missing approvals.** For a `plan_changed` hold, check whether the agent can restore the approved text.
+  Flag a routine re-approval request as **broken** when restoring that text would clear the hold.
+
+- **Successor backend choices contradict the flow.** Check questions against `system-knowhow/coding-agent-flows` § Backend policy belongs to the flow.
+  When a new plan approval is required, flag missing fresh-session choices for readable backends as **broken** when handoff is available.
+  At other checkpoints, flag mandatory alternatives based only on installed backends as **broken**.
+  Check intelligence fit before backend preference and keep backend, model and effort flags together.
+  Compare estimates only against equal, present references.
+  Check generated model fallbacks against `system-knowhow/js-sdk/lucidos-preferences-user-settings.md` § Common keys before proposing changes to stored model pins.
+
+- **Event query boundaries treated as inclusive.** CLI `events query` and `events count` use exclusive `since` and `until` bounds.
+  Audit inventory windows against that contract before asserting event parity.
+
+- **Restored billing matched across process boundaries.** Check against `system-knowhow/coding-agent-events/billing-evidence.md` § Billing evidence.
+  Codex restored usage needs the latest prior main-session capture, an exact token vector and that process's persisted backend-session binding.
+  Missing evidence stays unknown; a broader history search cannot supply it.
+
+- **Direct-port device authority.** Check rig recipes against `system-knowhow/lucidos-cli/waiting-through-an-engine-restart.md` § `lucidos workspaces device-session`.
+  Flag registration alone or paired device ids in sessions as **broken**.
+  Lasting mint consent must bind device, exact TTL and gateway-recorded creator
+  workspace; missing/foreign provenance stays once-only. Flag reuse across any
+  other device, lifetime or creator, or a mint without current provenance validation, as **broken**.
+  Flag prechecks treated as mints or sessions reused after re-keying as **broken**.
+
+- **Trigger runs in Review.** Check for `ThreadReadRequested` before counting a run as requiring a read. Placement in Current and a trigger's call to `request_read` can precede the judge's decision. See [Triggers](../triggers.md).
+
+- **Thread verdicts from history.** Read current `liveness` before calling a thread stalled, failed or done.
+  Use the thread-scoped events header or a thread list/search row; see `system-knowhow/glossary/core-terms-10.md` § Thread liveness.
+
+- **Red main mistaken for a check stop.** Checks continue while red; continued failures retain one repair owner.
+  Check automation against the main repair contract in `system-knowhow/glossary.md`.
+  Flag recipes that start a separate repair for every failed or flaky finding as **broken**.
+
+- **Confusing acceptance with message recording.** Ordinary HTTP sends acknowledge durable acceptance, not execution.
+  Check retries against `system-knowhow/thread-queue.md`; preserve the original wire intent after an unknown outcome.
+  Flag recipes clearing a newer compose draft after replay as **broken**.
+
+- **Fit-only credentials mistaken for owner authority.** Check renderer recipes against `docs/widget-fit-renderer.md`.
+  Flag credentials in shell state, frame messages, URLs, saved evidence or general request headers as **broken**.
+  Only the selected main-frame fit-report request may carry the credential; it grants no Device or owner authority.
+
+- **Stop restoration mistaken for a response-only draft.** Stop restores unread chat inputs into durable compose with each removal (ADR 0710).
+  Reports, reload and replay retain exact restoration additions until the next submission consumes the journal.
+  Compose PUTs preserve that journal; pending devices reconcile additions once without replacing local edits.
+  Flag recipes that append the Stop response again, or clear the journal on a compose PUT, as **broken**.
+
+- **Saved-draft snapshots mistaken for authority.** Review draft recipes against `system-knowhow/lucidos-cli/subcommands-2.md` § `lucidos threads drafts`.
+  A snapshot's revision and epoch identify saved content; neither grants permission to submit it.
+  Flag direct compose clearing or arbitrary Human-mode POSTs offered as submission shortcuts as **broken**.
+  Submission goes through `lucidos threads submit-draft` (§ `lucidos threads submit-draft`), with a standing instruction or a permission.
+  Flag a recipe that submits a draft on reach alone, even over its own child, as **broken**.
+
+- **Agent text standing in for the owner's answer.** Check recipes against `system-knowhow/lucidos-cli/subcommands-8.md` § `lucidos permissions list` and `system-knowhow/lucidos-cli/subcommands-3.md` § `lucidos threads resume [--thread <uuid>]`.
+  Only the owner's pick on a permission request or a batch grants, and only the owner resumes a thread on hold.
+  A trigger's program or folder grant needs the owner's answer to the engine's permission request.
+  A trigger intent run that raises a program grant request waits for an answer. Its Allow once covers that run only.
+  Only the owner lifts a *trigger deny*, so a recipe that revokes one through the trigger update API is **broken**.
+  The owner starts the review of earlier runs with **Check my workspace** in the release notice.
+  The review still asks the owner for each trigger's program grants.
+  A recipe may tell an agent to grant itself a permission, resume a thread on hold, or send a draft.
+  Flag it as **broken** when it lacks the owner's authority.
+
+- **Assuming every announced artifact becomes memory.** Check recipes against `docs/system-events.md` § Artifact provenance and provider holds.
+  Unattended trigger writes stay readable but do not create workspace memory leaves.
+  Flag a recipe relying on automatic recall of those files as **drift**; have it read the file explicitly.
+
 - **Pairing links in recipes.** Generate fresh device links with `lucidos pair`; never copy credentials into query URLs or workspace files.
 
 - **Cleanup authority.** Workspace review is read-only. Refuse recipes that use local tokens for manual deletion or infer ownership from workspace names.
+  Keep the gate’s reason when reporting a delete or bulk archive refusal. A device lookup failure calls for a retry.
 
 - **Restore authority inferred from a caller-provided workspace.** Review snapshot recipes against `system-knowhow/backups/workspace-snapshots.md` and `system-knowhow/lucidos-cli.md`.
   Flag self-restore instructions or retries after unknown delivery as **broken**.
@@ -35,16 +158,21 @@ scan retired-work-items "lucidos\.workItems|/api/v1/work-items" $all
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 - **A credential written into workspace code.** One rule over four surfaces, so it lives here, not in the `apps`, `knowhow` and `scripts` sections. Where the workspace calls an external API the engine holds a credential for, use its builtin proxy or configure a credential-backed entry in `data/config/apis.json`.
-  Builtin sign-ins stay inside the engine; see `system-knowhow/js-sdk.md` § `lucidos.proxy`. Flag:
+  Builtin sign-ins stay inside the engine; see `system-knowhow/js-sdk/lucidos-media.md` § `lucidos.proxy`. Flag:
 
   - An inline auth header. `curl -H "Authorization: Bearer $CRED_<NAME>"`, a pasted literal token, an `Authorization` / `X-API-Key` / `Bearer` header built in JS, or `requests.get(url, headers={"Authorization": ...})` and its equivalents.
   - Prose telling a future session to "set `$CRED_X`", or to read the credential out of the environment.
 
   Walk `data/apps/**`, `data/scripts/**`, every `scripts/` under a trigger, and the fenced `bash` / `sh` / `python` / `js` / `ts` blocks in `data/knowhow/**/*.md`.
 
-  The fix differs only by caller: `lucidos.proxy(name).fetch(...)` in an app, `lucidos proxy <name>` in a script, `proxy_request` for the LLM. Severity: **drift**, since the call still works. Give a pasted literal token its own line in the report: the file is git-tracked, so the credential needs rotating, not just rerouting. Owns the rule: `system-knowhow/js-sdk.md` § `lucidos.proxy` and `system-knowhow/lucidos-cli.md` § `lucidos proxy`.
+  The fix differs only by caller: `lucidos.proxy(name).fetch(...)` in an app, `lucidos proxy <name>` in a script, `proxy_request` for the LLM. Severity: **drift**, since the call still works. Give a pasted literal token its own line in the report: the file is git-tracked, so the credential needs rotating, not just rerouting. Owns the rule: `system-knowhow/js-sdk/lucidos-media.md` § `lucidos.proxy` and `system-knowhow/lucidos-cli/subcommands-13.md` § `lucidos proxy`.
 
 - Broken references: missing `knowhow:` ID, missing script path, manifest pointing at a deleted asset.
+
+- **Build slot grants reused across jobs.** A launch build owns its grant until the build shell releases it or dies.
+  Flag recipes that persist the grant's environment for reuse by other jobs as **broken**.
+  A queued background build has yet to receive a grant.
+  See `system-knowhow/lucidos-cli/subcommands-6.md` § `lucidos build-slot --lease`.
 - Model request recipes use `lucidos.modelRequest` and `lucidos.proxy` without
   reading credentials. See `system-knowhow/js-sdk.md` for the selection contract.
 - Duplicated content: same knowhow text in two files, same script copied between apps.
@@ -55,6 +183,7 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
   `data/scripts/**`, each trigger's `scripts/`, and `data/apps/**`, and recommend
   the replacement. Severity: **broken** (the call errors on next use). Currently
   removed:
+  - Removed `lucidos update-address` → `lucidos update-channel`; use `add <name> <url> --use`, `set stable`, or `show`.
   - Removed `lucidos spawn-thread --parent` → `--relation child` (a same-workspace
     parent-with-callback spawn). Do NOT flag `threads list --parent <uuid>` or
     `threads count --parent <uuid>`, which are current, unrelated filters.
@@ -83,6 +212,10 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
     object. Unfinished work is `unproposed` with `reason: "turn_incomplete"`.
     Do NOT flag SQL that reads `thread_summaries.coding_agent_requires_restart`:
     that column still exists.
+  - `waiting_children_count` → `awaited_children_count` (ADR 0672). The new
+    count is wider: it also counts running children, and children that wait on
+    a child of their own. Code that meant only idle children holding an event
+    wait lists the children and reads each one's `live_event_wait_count`.
 - **Retired LLM tools still named by workspace code.** The `retired-tools`
   scan finds every mention across `data/apps/**`, `data/triggers/**`,
   `data/knowhow/**` and `data/scripts/**`. Fix every hit, so none survives the
@@ -97,8 +230,8 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
 - **The retired work-item names.** The `retired-work-items` scan finds the
   retired `lucidos.workItems` namespace and `/api/v1/work-items` routes (ADR
   0649). Both are gone, with no alias, so a hit is **broken**. Recommend
-  `lucidos.threads.people` and `/api/v1/threads/people`, per
-  `system-knowhow/js-sdk.md` § "lucidos.threads.people". A hit in the Factory
+  `lucidos.threads.users` and `/api/v1/threads/users`, per
+  `system-knowhow/js-sdk/lucidos-threads-thread-management.md` § "lucidos.threads.users". A hit in the Factory
   app means the team copied it before the rename: copy its three files again
   (`system-knowhow/team-workspace.md` § 5).
 
@@ -125,3 +258,11 @@ is a copy of the trigger's `run`, written from its events. Rewrite the
 `system-knowhow/triggers.md`. The engine then rewrites the file.
 
 Verify by re-running the `retired-tools` scan. It should fall to zero.
+
+User-only message delivery intents and transport receipts are internal bookkeeping. Thread deletion removes intents and cascades receipts with notifications, serialized with recovery.
+
+## Diagnostic evidence
+
+Run `lucidos diagnostic-log query` for runtime evidence and check the reported status of each requested source.
+See [Agent Sandbox](../agent-sandbox.md) for the access rules.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

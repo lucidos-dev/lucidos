@@ -19,7 +19,7 @@ const FIX: &str = "Pick a judge model under Settings → Models → Command judg
 /// `judge_enabled` is the guard and its judge both on. Off, the static lists
 /// decide and no model is needed. With no provider at all the turn fails on
 /// its own, naming the missing provider, which is the fix the user needs.
-pub(crate) async fn guarded_turn_refusal(
+pub async fn guarded_turn_refusal(
     pool: &PgPool,
     registry: &ModelRegistry,
     router: &dyn LlmProvider,
@@ -44,7 +44,7 @@ pub(crate) async fn command_judge_unresolved(
 }
 
 /// [`command_judge_unresolved`] for a chat judge `selection` already made.
-pub(crate) async fn unresolved_judge(
+pub async fn unresolved_judge(
     pool: &PgPool,
     selection: &AuxSelection,
     registry: &ModelRegistry,

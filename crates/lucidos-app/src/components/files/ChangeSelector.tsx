@@ -17,8 +17,6 @@ function changeLabel(change: Change): string {
   return (change.description || 'Claude Code changes').split('\n')[0];
 }
 
-/** One change in the menu. With no `change`, inside a `SkeletonProvider`, it
- *  is the placeholder a page still loading appends. */
 function ChangeOption({ change, active = false, showResolved = false, onPick }: {
   change?: Change;
   active?: boolean;
@@ -48,7 +46,6 @@ export function ChangeSelector() {
   if (loadable.status === 'failed') return <LoadableError error={loadable.error} noun="changes" />;
 
   const data = loadable.status === 'loaded' ? loadable.data : null;
-  // Nothing to choose from: the control unmounts with its slot.
   if (data && data.pending.length === 0 && data.applied.length === 0) return null;
 
   const selectedId = repoSelectedChangeId.value;
@@ -114,8 +111,6 @@ export function ChangeSelector() {
                 ))}
               </>
             )}
-            {/* The next page's rows, drawn at the bottom of a list that already
-                scrolls, so nothing above them moves. */}
             <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <ChangeOption />} />}>
               {null}
             </LoadingFade>

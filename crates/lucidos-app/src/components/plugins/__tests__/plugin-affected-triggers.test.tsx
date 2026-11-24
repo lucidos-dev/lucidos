@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A plugin update or uninstall that removes a file a user's trigger relies on
- * warns about it in the panel and on the receipt. The engine leaves the
- * trigger as it is, so this list is the user's only sight of it before confirm.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginInstallPanel } from '../PluginInstallPanel';

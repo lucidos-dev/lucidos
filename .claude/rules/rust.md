@@ -1,19 +1,31 @@
 ---
 paths:
+  - "crates/lucidos-core/**/*.rs"
   - "crates/lucidos-engine/**/*.rs"
+  - "crates/lucidos-agents-api/**/*.rs"
+  - "crates/lucidos-engine-bin/**/*.rs"
+  - "crates/lucidos-engine-boot/**/*.rs"
   - "Cargo.toml"
   - "Cargo.lock"
 ---
 
 # Rust Conventions
 
-- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Seven are blessed, each because a caller branches on it:
+- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with the following exceptions where a caller branches on the error:
+  - `llm::spend_cap::SpendCapReached`: retry loops stop on a billing refusal, and background callers hold until its reset.
   - `LifecycleViolation` (`engine/thread_lifecycle.rs`): the EventBus rejection path fails fast on its typed payload.
   - `llm::ModelNotServed`: an unset default moves to its next model (ADR 0403).
   - `lucidos_engine_socket::ConnectError` and the gateway's `engine_hop::HopError`: a probe tells `Unreachable` from `Foreign` (ADR 0445).
   - `agent_session::start_failure::AgentStartFailure`: a coding-agent turn that could not begin. `agent_exit_of` attaches `agent_exit` to the `ResponseFailed` (ADR 0487).
   - `llm::prefill::PrefillRefused`: the keep-alive's first-beat guard marks a provider that refused a prefill unable to prefill (ADR 0556).
+  - `llm::ProviderError`: the retry loops downcast to it and branch on `kind.is_retryable()`. Every model provider failure is built through its parser (ADR 0673).
   - `llm::chatgpt_plan::ChatGptPlanError`: the Responses retry loop refreshes or stops on its failure kind, and the limit pause reads `LimitReached` (ADR 0636).
+  - `agent_session::spawn_gate::StartAwaitsOwner`: a run parked on the owner's Allow once card. `ensure_run_failure_terminator_emitted` writes no failure for it, so the thread reads as waiting, and the Thread Queue completes its entry.
+  - `scheduler::user_tasks::TriggerRunAwaitsOwner`: a trigger run parked on its grant card. The scheduler sends no failure notice for it, and the executor logs no failure.
+  - `agent_drafts::DraftRefusal`: the draft route answers `Invalid` with 400 and `Internal` with 500.
+  - `permission::batch::BatchError`: the batch route answers `Refused` with 400 and `Unreadable` with 500.
+  - `thread_hold::HoldError`: the Hold and Resume routes answer `NotFound` with 404, `Refused` with 400 and `Internal` with 500.
+  - `event_bus::CardSlotTaken`: Validate refuses an agent permission prompt while another card is open, and `card_queue::post_permission_prompt` waits for a free slot and emits again.
   - `core::snapshot::store::DiskFloorRefused`: the snapshot capture job reads its `needed_bytes` to fail with the space to free. Every other caller sees the `snapshot_disk_floor` slug.
   - `api::error::ApiError` is not an error type in this sense. It is the `/api/v1` response shape (`status` plus `{"error": msg}`), and handlers return `Result<_, ApiError>`. Internal code keeps the boxed trait object. `ApiError::with_reason` adds a `reason` slug for a refusal a client must tell apart.
   - A new custom type needs the same structural reason. "I want a typed error for this layer" is not one. If the caller only formats the error into a string, use the boxed trait object.
@@ -50,7 +62,7 @@ paths:
   - **A device actor carries the id only** (`MessageOrigin::Device { device_id }`). A display resolves the name through `DeviceStore::friendly_name`. A new `ThreadEvent` variant uses `EventMeta::with_actor(actor)`. A `SystemEvent` variant adds `actor: Option<MessageOrigin>` as a `#[serde(default, skip_serializing_if = "Option::is_none")]` field.
 - **What the AGENT wrote names which agent.** An agent's own output stamps `EventMeta::authored_by(AgentParticipant::…)` (ADR 0150). Stamp the AUTHORED event only, never the turn's shared request meta, or a user's Stop click is attributed to the agent.
 - **Dependencies: the committed lockfile is authoritative, and builds are `--locked` (ADR 0020).** Keep caret ranges in `Cargo.toml` (`serde = "1"`), never `=` pins. Commit `Cargo.toml` and `Cargo.lock` together. Change a version only through a deliberate `cargo update`.
-- **Schema changes are migrations.** Create one with `./scripts/new-migration.sh <description>`, never a hand-picked timestamp (parallel branches collide and crash startup on `_sqlx_migrations_pkey`). The file is `YYYYMMDDHHMMSS_description.sql` in `crates/lucidos-engine/migrations/`. Never put ALTER TABLE in `init_schema`.
+- **Schema changes are migrations.** Create one with `./scripts/new-migration.sh <description>`, never a hand-picked timestamp (parallel branches collide and crash startup on `_sqlx_migrations_pkey`). The file is `YYYYMMDDHHMMSS_description.sql` in `crates/lucidos-core/migrations/`. Never put ALTER TABLE in `init_schema`.
 
 ## Database
 
@@ -68,16 +80,16 @@ Only conversational data goes through the HTTP API. DB access, vector search, em
 
 ## Intra-host scheme: never hardcode `http`/`https`
 
-An HTTP call between co-located Lucidos processes resolves its scheme through **`net_config::tls_scheme` / `tls_scheme_from` / `peer_scheme_order`** (`SCHEME_HTTP` / `SCHEME_HTTPS`). That covers engine to gateway control API and any `127.0.0.1` hop. The decision lives in `net_config` only. Never re-derive it from `LUCIDOS_TLS_*` inline.
+**A gateway's loopback listener is always https, from the loopback CA.** Name it with `lucidos_local_token::client::origin(port)`. Plaintext loopback gets the outbox hand-off or a `301`, never the API, so there is no http fallback.
 
-- A process serves TLS iff both `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY` point at non-empty paths. Dev keeps the certs (`https`). The packaged gateway strips them (`http`), per ADR 0014.
-- For a peer whose scheme might differ, use `peer_scheme_order()`: the resolved scheme first, the other second.
-- A self-signed dev cert on a loopback hop is accepted with `danger_accept_invalid_certs(true)` + `no_proxy()`.
+- **A client of a loopback listener builds through `lucidos_local_token::client`** (the *loopback client*): only the loopback CA, no proxy, no redirect. A grep test fails on a second copy. Shell uses `scripts/lib/loopback_curl.sh`, the Vite preview `loopbackAgent`.
+- **What a process serves on its own port** resolves through `net_config::tls_scheme` / `tls_scheme_from`, never `LUCIDOS_TLS_*` inline. A gateway-spawned or e2e engine serves plain http.
+- **The gateway hands its frontend preview two pairs**: `LUCIDOS_PREVIEW_TLS_*` (the preview leaf) and `LUCIDOS_PREVIEW_USER_TLS_*` (its user certificate). The engine never serves with them.
 - **The gateway's hop to an engine has no scheme.** It uses the *engine socket* through `engine_hop` (ADR 0445).
 
 ## API URL Conventions
 
-**Every HTTP route lives under `/api/v1/`.** The engine mounts one router there (`create_router` in `crates/lucidos-engine/src/api/mod.rs`). Define a new route relative to the mount (`/threads/list`). The nest stamps the prefix once.
+**Every HTTP route lives under `/api/v1/`.** The engine mounts one router there (`create_router` in `crates/lucidos-agents-api/src/api/mod.rs`). Define a new route relative to the mount (`/threads/list`). The nest stamps the prefix once.
 
 - Frontend callers build URLs from the single `API` const in `crates/lucidos-app/src/api/client.ts`.
 - SDK callers pass suffix-only paths (`request('/threads/list')`). `_fetch.ts` stamps the prefix. For a full URL (`EventSource`, `<script src>`, hrefs) use `apiUrl('/events')`.
@@ -93,6 +105,8 @@ When you change the event system, update all 5 surfaces:
 3. App UI JS API: `api/app_ui.rs`
 4. HTTP API handlers: `api/history.rs`
 5. System prompt: `engine/chat/process/system_prompt.rs`
+
+**A new capability manifest domain is a *route-backed tool* (ADR 0751).** Declare `llm_execution: LlmExecution::Route` and write no handler: the tool runs the route its CLI calls. Only the domains on the shrink-only `LEGACY_IN_PROCESS` list keep a handler.
 
 `emit_event(event_type, payload)` takes a PascalCase past-tense type, and the payload must include `summary`. `query_events(event_id?, event_type?, thread_id?, since?, until?, limit?, byte_limit?)` returns newest first. `limit` defaults to 50 (max 200). `byte_limit` defaults to 128 KB (max 512 KB). `event_id` resolves ONE event by primary key (the `evt-<32 hex>` address) and errors when nothing matches. `thread_id` takes a uuid, or `current` / `this` on the LLM tool only, since HTTP and SDK have no ambient caller.
 

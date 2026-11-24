@@ -1,22 +1,9 @@
-/**
- * Tests for the pending message safety timer.
- *
- * Bug: If SSE drops after submitChat() succeeds, the pending user message
- * is never cleared because the MessageReceived SSE event never arrives.
- * effectiveThreadStatus() returns 'running' forever → "Requesting..." stuck.
- *
- * Fix: After submitChat() succeeds, a safety timer calls refreshThreadEvents()
- * after PENDING_MESSAGE_SAFETY_MS. If that send's pending row is still there
- * after a refresh that landed, it is removed. No other row is touched.
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { effectiveThreadStatus, threadMap } from '../store';
 import type { ThreadState } from '../thread-events';
 import { PENDING_MESSAGE_SAFETY_MS, STALE_EXCHANGE_FOLLOWUP_MS, schedulePendingCleanup } from './chat';
 import { refreshThreadEvents } from './thread-loading';
 
-// Override only refreshThreadEvents; keep the rest of thread-loading real so
-// other consumers in chat.ts's import graph are unaffected.
 vi.mock('./thread-loading', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./thread-loading')>();
   return { ...actual, refreshThreadEvents: vi.fn().mockResolvedValue(true) };
@@ -91,17 +78,6 @@ describe('Pending message safety timer', () => {
   });
 });
 
-/**
- * The safety cleanup must NOT force-drop a persisted pending message when its
- * recovery refetch failed transiently. `schedulePendingCleanup` only runs after
- * submitChat() succeeded, so the MessageReceived is already in the DB; clearing
- * the optimistic row when the refetch threw (host contention / offline) destroys
- * a message that is safely persisted. That is the `coding-agent-follow-ups:36`
- * "follow-up lost entirely under rapid send-while-working" flake — a follow-up
- * MessageReceived SSE lagging past 30s while the safety refetch also times out.
- * The gating is channel-independent, so a 'chat' thread exercises it cleanly
- * (no CC second-refresh timer to muddy refetch call counts).
- */
 describe('schedulePendingCleanup gates force-clear on refetch success', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -114,13 +90,8 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
   });
 
   it('keeps a stale pending message when the safety refetch FAILS, and retries', async () => {
-    // Resolves FALSE, not rejects. `refreshThreadEvents` catches every path, so
-    // the rejection this used to mock is a shape it cannot produce: the gate
-    // read as always-succeeded in production while looking tested here.
     vi.mocked(refreshThreadEvents).mockResolvedValue(false);
     const thread = makeThread();
-    // Old enough that a landed refetch WOULD drop it, so its survival is the
-    // refetch-failure gate's doing.
     const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
     thread.pendingUserMessages.push({ text: 'msg2', eventId: 'e-2', created: staleTime });
     threadMap.value = new Map([['thread-1', thread]]);
@@ -128,11 +99,9 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     schedulePendingCleanup('thread-1', 'e-2');
     await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS);
 
-    // Persisted message survives the failed refetch instead of being dropped.
     expect(thread.pendingUserMessages).toHaveLength(1);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
 
-    // A retry was rescheduled — the next window fires another refetch attempt.
     await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(2);
     expect(thread.pendingUserMessages).toHaveLength(1);
@@ -148,7 +117,6 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     schedulePendingCleanup('thread-1', 'e-gone');
     await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS);
 
-    // A successful refetch proves the event is absent → safe to drop the stuck row.
     expect(thread.pendingUserMessages).toHaveLength(0);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
   });
@@ -177,15 +145,10 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     threadMap.value = new Map([['thread-1', thread]]);
 
     schedulePendingCleanup('thread-1', 'e-3');
-    // Well past the cap: the polling must stop, and the row must survive it.
     await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS * 10);
 
     expect(refreshThreadEvents).toHaveBeenCalledTimes(3);
-    // Running out of tries proves no more than one failure did, and dropping
-    // here would silently delete a message the engine may well have persisted.
     expect(thread.pendingUserMessages).toHaveLength(1);
-    // Marked, so it stops counting as a turn in flight: a bare kept row pins
-    // effectiveThreadStatus on 'running' for the life of the page.
     expect(thread.pendingUserMessages[0].unconfirmed).toBe(true);
     expect(effectiveThreadStatus(thread)).not.toBe('running');
   });
@@ -200,11 +163,9 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
 
-    // Simulate the real MessageReceived finally landing (SSE recovered).
     thread.pendingUserMessages = [];
     await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS);
 
-    // The rescheduled timer exits at the guard — no further refetch churn.
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
   });
 });

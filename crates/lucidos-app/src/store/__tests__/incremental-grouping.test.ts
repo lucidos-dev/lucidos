@@ -1,13 +1,3 @@
-// Equivalence suite for the incremental exchange-grouping cache.
-//
-// `computeExchanges` memoizes a resumable fold per thread (keyed on the
-// `thread.events` Map object) so a streaming token doesn't re-sort and
-// re-walk the whole event history every frame. The contract: its result is
-// ALWAYS deep-equal to a from-scratch `groupIntoExchanges` over the same
-// events. These tests replay realistic event sequences step-by-step and
-// assert that equivalence after EVERY event — including the sequences that
-// must force a full rebuild (out-of-order arrival, legacy rerun-in-place
-// aborts, missing `created` timestamps).
 
 import { describe, it, expect } from 'vitest';
 import { makeThreadState } from './thread-events-helpers';
@@ -19,15 +9,9 @@ import {
   type ThreadState,
 } from '../thread-events';
 
-/** Strictly-increasing ISO timestamps, n seconds past a fixed base. */
 const at = (n: number) =>
   new Date(Date.UTC(2026, 5, 1, 0, 0, 0, 0) + n * 1000).toISOString();
 
-/** Assert the cached/incremental result equals a from-scratch full pass.
- *  The reference runs on a CLONE of the events map so it cannot share any
- *  cache entry with the incremental path. `revision` is cache bookkeeping
- *  (a mutation counter for memoized renderers), not grouping semantics —
- *  strip it before the deep compare. */
 function expectMatchesFull(thread: ThreadState): void {
   const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
   const reference = groupIntoExchanges(new Map(thread.events)).map(
@@ -36,10 +20,6 @@ function expectMatchesFull(thread: ThreadState): void {
   expect(incremental).toEqual(reference);
 }
 
-/** Reference fold over `thread.events` + the synthetic pending MessageReceived
- *  events (the ground truth the pending fast-path AND the fallback must both
- *  equal). Mirrors the synthetic construction documented in computeExchanges:
- *  MAX_SAFE_INTEGER-based seqs, `created` for CC / `_displayCreated` for chat. */
 function expectMatchesAugmented(thread: ThreadState): void {
   const augmented = new Map(thread.events);
   const isCC = thread.meta.channel === 'claude_code';
@@ -60,8 +40,6 @@ function expectMatchesAugmented(thread: ThreadState): void {
   expect(incremental).toEqual(reference);
 }
 
-/** Replay events through handleEvent with increasing timestamps, asserting
- *  incremental ≡ full after every single step. */
 function replay(
   events: Array<{ seq: number; event: ThreadEvent }>,
   channel: 'chat' | 'claude_code' = 'chat',
@@ -109,8 +87,6 @@ describe('incremental grouping ≡ full grouping', () => {
         { seq: 3, event: { type: 'CodingAgentToolCalled', name: 'Bash', args: {}, tool_use_id: 'tu-1', coding_agent: 'claude-code' } as ThreadEvent },
         { seq: 4, event: { type: 'CodingAgentPermissionRequest', request_id: 'pr-1', tool_use_id: 'tu-perm', tool_name: 'Bash', input: {}, summary: 'run a command' } as ThreadEvent },
         { seq: 5, event: { type: 'CodingAgentPermissionResolved', request_id: 'pr-1', allowed: true, coding_agent: 'claude-code' } as ThreadEvent },
-        // Result for the seq-3 call lands AFTER the divider — must re-route
-        // to the call's exchange in both paths.
         { seq: 6, event: { type: 'CodingAgentToolResult', name: 'Bash', result: 'ok', tool_use_id: 'tu-1', coding_agent: 'claude-code' } as ThreadEvent },
         { seq: 7, event: { type: 'CodingAgentTextStreamed', text: 'done', coding_agent: 'claude-code' } as ThreadEvent },
         { seq: 8, event: { type: 'CodingAgentIdled', has_changes: false, coding_agent: 'claude-code' } as ThreadEvent },
@@ -124,19 +100,13 @@ describe('incremental grouping ≡ full grouping', () => {
       { seq: 1, event: { type: 'MessageReceived', text: 'ask me' } as ThreadEvent },
       { seq: 2, event: { type: 'ToolCalled', name: 'ask_user_question', args: {} } as ThreadEvent },
       { seq: 3, event: { type: 'UserQuestionAsked', tool_use_id: 'q-1', cc_session_id: 's-1', question: 'pick one', options: [] } as ThreadEvent },
-      // Agent races past the unanswered question — flips questionOvertaken.
       { seq: 4, event: { type: 'TextStreamed', text: 'continuing anyway' } as ThreadEvent },
-      // The answer routes back to the divider and clears the flag.
       { seq: 5, event: { type: 'UserQuestionAnswered', tool_use_id: 'q-1', answer: { kind: 'Selected', option_id: 'a' } } as ThreadEvent },
       { seq: 6, event: { type: 'ResponseGenerated', text: 'done' } as ThreadEvent },
     ]);
   });
 
   it('question divider re-anchored below a ChildThreadCompleted that landed while it waited', () => {
-    // The 8144b43e shape. The answer re-orders the exchange array in place
-    // (`reanchorResolvedDivider`), which the incremental fold must reproduce
-    // exactly — a splice is the one mutation that could desync the cached
-    // array from a from-scratch pass.
     replay([
       { seq: 1, event: { type: 'MessageReceived', text: 'do the release' } as ThreadEvent },
       { seq: 2, event: { type: 'ToolCalled', name: 'ask_user_question', args: {}, request_event_id: 'evt-1' } as ThreadEvent },
@@ -149,9 +119,6 @@ describe('incremental grouping ≡ full grouping', () => {
   });
 
   it('child completion mid-thought hands the turn over (continuationMoved)', () => {
-    // The handoff sets a flag on the exchange the turn LEFT, which the
-    // incremental fold must set at the same event as the from-scratch pass —
-    // it decides whether an orphaned Thinking marker still renders.
     replay([
       { seq: 1, event: { type: 'MessageReceived', text: 'do the release' } as ThreadEvent },
       { seq: 2, event: { type: 'ThoughtStreamed', text: 'planning', request_event_id: 'evt-1' } as ThreadEvent },
@@ -172,9 +139,6 @@ describe('incremental grouping ≡ full grouping', () => {
   });
 
   it('legacy rerun-in-place: terminal AFTER abort forces a coherent rebuild', () => {
-    // ResponseAborted shares request_event_id with a LATER ResponseGenerated —
-    // the full pass retro-classifies the abort as a superseded step, so the
-    // incremental path must detect the late terminal and rebuild.
     replay([
       { seq: 1, event: { type: 'MessageReceived', text: 'go' } as ThreadEvent },
       { seq: 2, event: { type: 'ResponseAborted', cause: 'engine_shutdown', request_event_id: 'req-1' } as unknown as ThreadEvent },
@@ -194,8 +158,6 @@ describe('incremental grouping ≡ full grouping', () => {
   });
 
   it('a coding-agent follow-up abort keeps its boundary despite the shared req id', () => {
-    // The session's one request_event_id is on every turn's terminal, so the
-    // earlier ResponseGenerated must not supersede the follow-up's abort.
     const cc = { channel: 'claude_code', request_event_id: 'req-1' };
     const thread = replay(
       [
@@ -217,8 +179,6 @@ describe('incremental grouping ≡ full grouping', () => {
     expectMatchesFull(thread);
     handleEvent(map, 'thread-1', 2, { type: 'ResponseGenerated', text: 'r' } as ThreadEvent, at(20), 'evt-2');
     expectMatchesFull(thread);
-    // A refresh replay delivers a missed event whose created is EARLIER than
-    // the last folded event — sorted position is in the middle, not the end.
     handleEvent(map, 'thread-1', 3, { type: 'MessageReceived', text: 'missed' } as ThreadEvent, at(15), 'evt-3');
     expectMatchesFull(thread);
     handleEvent(map, 'thread-1', 4, { type: 'MessageReceived', text: 'after' } as ThreadEvent, at(30), 'evt-4');
@@ -246,8 +206,6 @@ describe('incremental grouping ≡ full grouping', () => {
     handleEvent(map, 'thread-1', 3, { type: 'TextStreamed', text: 'b' } as ThreadEvent, at(99), 'evt-3');
     const after = computeExchanges(thread);
     expectMatchesFull(thread);
-    // Fresh array identity (so signal subscribers fire), stable element
-    // identity (so per-exchange memoization holds).
     expect(after).not.toBe(before);
     expect(after[0]).toBe(before[0]);
   });
@@ -273,12 +231,9 @@ describe('incremental grouping ≡ full grouping', () => {
       text: 'queued follow-up',
       created: at(50),
     });
-    // Synthetic MessageReceived renders as a new trailing exchange.
     const withPending = computeExchanges(thread);
     expect(withPending[withPending.length - 1].userEvent.type).toBe('MessageReceived');
     expect((withPending[withPending.length - 1].userEvent as { text?: string }).text).toBe('queued follow-up');
-    // The real MessageReceived arrives (same eventId) — pending is consumed
-    // by handleEvent and the cached path resumes, still equivalent.
     const map = new Map([['thread-1', thread]]);
     handleEvent(map, 'thread-1', 3, { type: 'MessageReceived', text: 'queued follow-up' } as ThreadEvent, at(51), 'pending-1');
     expect(thread.pendingUserMessages).toHaveLength(0);
@@ -291,9 +246,7 @@ describe('incremental grouping ≡ full grouping', () => {
     const map = new Map([['thread-1', thread]]);
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'first' } as ThreadEvent, at(10), 'evt-1');
     handleEvent(map, 'thread-1', 2, { type: 'CodingAgentIdled', has_changes: false, coding_agent: 'claude-code' } as ThreadEvent, at(20), 'evt-2');
-    expectMatchesFull(thread); // warm the cache, no pending yet
-    // Follow-up sent "now" — created AFTER every persisted event, so the guard
-    // takes the fast append-trailing path.
+    expectMatchesFull(thread);
     thread.pendingUserMessages.push({ eventId: 'pending-1', text: 'follow up', created: at(30) });
     expectMatchesAugmented(thread);
     const ex = computeExchanges(thread);
@@ -307,31 +260,20 @@ describe('incremental grouping ≡ full grouping', () => {
     thread.meta.channel = 'claude_code';
     const map = new Map([['thread-1', thread]]);
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'first' } as ThreadEvent, at(10), 'evt-1');
-    expectMatchesFull(thread); // warm the cache
-    // A late persisted event lands with created AFTER the pending's created
-    // (CC clock-skew / event arriving before the MessageReceived echo cleared
-    // the pending). The guard must route to the augmented full re-fold rather
-    // than append-trailing — append-trailing would diverge.
+    expectMatchesFull(thread);
     thread.pendingUserMessages.push({ eventId: 'pending-1', text: 'follow up', created: at(15) });
     handleEvent(map, 'thread-1', 2, { type: 'CodingAgentTextStreamed', text: 'late', coding_agent: 'claude-code' } as ThreadEvent, at(20), 'evt-2');
-    expect(thread.pendingUserMessages).toHaveLength(1); // a CC stream event doesn't clear it
+    expect(thread.pendingUserMessages).toHaveLength(1);
     expectMatchesAugmented(thread);
   });
 
   it('abort and matching terminal arriving in ONE batch stay equivalent', () => {
-    // Regression: the validation pass used to check appended terminals only
-    // against aborts folded in PREVIOUS calls — an abort earlier in the SAME
-    // batch was invisible, so the incremental path kept a boundary exchange
-    // the from-scratch pass marks legacy-superseded. Batch = multiple
-    // handleEvent calls between two computeExchanges evaluations (an SSE
-    // flush or refresh replay on an unfocused-but-cached thread).
     const thread = makeThreadState();
     const map = new Map([['thread-1', thread]]);
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, at(1), 'evt-1');
-    expectMatchesFull(thread); // warm the cache
+    expectMatchesFull(thread);
     handleEvent(map, 'thread-1', 2, { type: 'ResponseAborted', cause: 'engine_shutdown', request_event_id: 'req-b' } as unknown as ThreadEvent, at(2), 'evt-2');
     handleEvent(map, 'thread-1', 3, { type: 'ResponseGenerated', text: 'rerun', request_event_id: 'req-b' } as unknown as ThreadEvent, at(3), 'evt-3');
-    // No computeExchanges between the two — both land in one appended batch.
     expectMatchesFull(thread);
   });
 
@@ -345,8 +287,6 @@ describe('incremental grouping ≡ full grouping', () => {
     const map = new Map([['thread-1', thread]]);
     handleEvent(map, 'thread-1', 3, { type: 'TextStreamed', text: 'b' } as ThreadEvent, at(99), 'evt-3');
     const after = computeExchanges(thread)[0];
-    // Same object (identity-stable), but the captured revision moved — this
-    // is what lets chatExchangePropsEqual detect the in-place steps.push.
     expect(after).toBe(before);
     expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
   });
@@ -373,11 +313,6 @@ describe('incremental grouping ≡ full grouping', () => {
     expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
   });
 
-  // A call is the sequence with the most fold state per event: a boundary that
-  // hands `current` back, rows routed to the bottom rather than to `current`,
-  // and a re-anchor held by an utterance. Each of those reads state the resumed
-  // fold has to carry, so this is the shape most able to drift between the two
-  // paths. See `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
   it('a call stays equivalent through every spoken turn', () => {
     replay([
       { seq: 1, event: { type: 'VoiceSessionStarted', session_id: 's1' } as ThreadEvent },
@@ -407,11 +342,7 @@ describe('incremental grouping ≡ full grouping', () => {
   });
 });
 
-/** A paged thread opens mid-turn, so the fold holds its leading steps in a
- *  continuation fragment. The cache resumes across every append, and the
- *  fragment is a live exchange like any other. */
 describe('incremental grouping over a paged thread', () => {
-  /** The paged reference, which is a different fold from the default one. */
   function expectMatchesPagedFull(thread: ThreadState): void {
     const incremental = computeExchanges(thread).map(({ revision: _r, ...rest }) => rest);
     const reference = groupIntoExchanges(new Map(thread.events), true)
@@ -440,8 +371,6 @@ describe('incremental grouping over a paged thread', () => {
     expect(exchanges[0].steps).toHaveLength(8);
   });
 
-  /** The last page lands, and the answer the fold branches on flips under an
-   *  unchanged events Map. A resumed fold would keep serving the fragment. */
   it('rebuilds when the thread stops being paged', () => {
     const { thread, map } = pagedThread();
     handleEvent(map, 'thread-1', 1, {
@@ -451,7 +380,6 @@ describe('incremental grouping over a paged thread', () => {
 
     thread.hasOlderEvents = false;
 
-    // Nothing older explains the missing boundary now, so it reads as corrupt.
     expect(computeExchanges(thread)).toHaveLength(0);
   });
 });

@@ -246,6 +246,7 @@ async fn only_a_delivery_suppresses_and_only_the_event_it_named() {
     // A whole wait lifecycle that hands the thread no event.
     for event in [
         ThreadEvent::EventWaitStarted {
+            background_timing: None,
             wait_id,
             tool_use_id: "toolu_x".into(),
             on: vec![crate::core::event_subscription::EventSubscription {

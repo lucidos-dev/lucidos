@@ -1,8 +1,3 @@
-/** Pure builder for the compose destination picker's option list. Lives apart
- *  from `ComposeDestinationRow.tsx` so the option set — including the
- *  packaged-build gate on "Lucidos source" — is unit-testable without rendering
- *  the component. The component derives the inputs (apps/repos Loadables,
- *  packaged flag, current destination) and feeds them here. */
 
 import type { DropdownOption } from '../shared/Dropdown';
 import {
@@ -13,30 +8,18 @@ import {
 } from '../../store/composeDestination';
 
 export type DestinationOptionInputs = {
-  /** The current destination — used to detect a restored target the lists no
-   *  longer contain (rendered as an explicit "· unavailable" row). */
   dest: ComposeDestination;
   apps: readonly { id: string; name: string }[];
-  /** Registered repos minus the Lucidos-source row (the caller filters it out;
-   *  the Lucidos source is offered as its own option, not a generic repo). */
   externalRepos: readonly { id: string; name: string }[];
-  /** True on a packaged desktop build — no Lucidos source checkout exists, so
-   *  "Lucidos source" would spawn against a non-existent repo and 500. Hidden
-   *  there; apps + external repos still work (they don't need the source tree). */
   packaged: boolean;
-  /** Apps or repos still loading — surfaced as an explicit pending row so the
-   *  open menu never reads as "no apps / no repos". */
   listsPending: boolean;
-  /** Error text when the repos list failed to load (null = no error). */
   reposError: string | null;
-  /** Error text when the apps list failed to load (null = no error). */
   appsError: string | null;
-  /** Teammates a new thread can be for. Empty off a team gateway (ADR 0649). */
-  people: readonly { id: string; name: string; has_device: boolean }[];
+  users: readonly { id: string; name: string; has_device: boolean }[];
 };
 
 export function buildDestinationOptions(inputs: DestinationOptionInputs): DropdownOption[] {
-  const { dest, apps, externalRepos, packaged, listsPending, reposError, appsError, people } = inputs;
+  const { dest, apps, externalRepos, packaged, listsPending, reposError, appsError, users } = inputs;
 
   const options: DropdownOption[] = [
     {
@@ -45,21 +28,17 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
       description: LUCIDOS_AGENT_BLURB,
     },
   ];
-  if (people.length > 0) {
-    options.push({ value: '__hdr-people', label: 'A teammate…', disabled: true });
-    for (const p of people) {
+  if (users.length > 0) {
+    options.push({ value: '__hdr-users', label: 'A teammate…', disabled: true });
+    for (const p of users) {
       options.push({
-        value: destinationToOptionValue({ kind: 'person', personId: p.id }),
+        value: destinationToOptionValue({ kind: 'user', userId: p.id }),
         label: p.name,
         description: p.has_device ? 'Starts with the agent paused' : 'No paired device, so no push reaches them',
       });
     }
   }
   options.push({ value: '__hdr-coding', label: 'Coding agent on…', disabled: true });
-  // "Lucidos source" edits the platform's own code — only meaningful on a dev
-  // build with a source checkout. A packaged install has none (is_packaged()),
-  // so picking it spawns against an unregistered repo and 500s
-  // ("Lucidos repo not registered — cannot classify folder"). Hide it there.
   if (!packaged) {
     options.push({
       value: destinationToOptionValue({ kind: 'coding', scope: { kind: 'lucidos' } }),
@@ -79,11 +58,9 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
       label: `${a.name} · app`,
     });
   }
-  // Loading must not look like "no apps / no repos".
   if (listsPending) {
     options.push({ value: '__loading', label: 'Loading…', disabled: true });
   }
-  // Failed must look different from empty — each list gets its own error row.
   if (reposError !== null) {
     options.push({
       value: '__repos-error',
@@ -104,14 +81,11 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
   }
   options.push({ value: REGISTER_REPO_OPTION_VALUE, label: '＋ Register a repository…' });
 
-  // A restored coding target whose app/repo no longer exists (or a Lucidos
-  // source target on a packaged build) would render the loading placeholder
-  // forever — surface it as an explicit unavailable row once the lists settle.
   const value = destinationToOptionValue(dest);
   if (!listsPending && !options.some(o => o.value === value)) {
     const codingScope = dest.kind === 'coding' ? dest.scope : null;
     const unavailableName =
-      dest.kind === 'person' ? 'That teammate'
+      dest.kind === 'user' ? 'That teammate'
       : codingScope?.kind === 'lucidos' ? 'Lucidos source'
       : codingScope?.kind === 'app' ? codingScope.appId
       : codingScope?.kind === 'external' ? codingScope.repoId

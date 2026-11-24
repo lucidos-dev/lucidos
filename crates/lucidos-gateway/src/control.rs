@@ -25,6 +25,7 @@ pub fn router() -> Router<GatewayState> {
         .route("/workspaces", get(list).post(create))
         .route("/workspace-order", put(set_workspace_order))
         .route("/cleanup", get(cleanup_review))
+        .route("/workspace-delete-batches", post(freeze_workspace_deletion))
         .route("/cleanup/batches", post(freeze_cleanup))
         .route("/cleanup/batches/:id/confirm", post(confirm_cleanup))
         .route("/trash", get(trash_list))
@@ -38,11 +39,11 @@ pub fn router() -> Router<GatewayState> {
         // Register a directory that already exists, without provisioning or
         // starting anything. `create`'s sibling for a tree somebody else owns.
         .route("/workspaces/adopt", post(adopt))
-        // Fresh aggregate unread total across running workspaces, computed on
-        // demand. The desktop dock badge reads this on its nudge (and periodic
-        // tick) so a just-read notification reflects immediately, rather than
-        // waiting for the supervise loop's cached `last_unread` to catch up.
+        // The unread total across running workspaces. The desktop dock badge
+        // reads it on its nudge and its periodic tick. That local read sums
+        // what each row subscription holds. A device's own total asks engines.
         .route("/unread-total", get(unread_total))
+        .route("/diagnostic-log", get(crate::diagnostic_log::query))
         // Restore a local backup archive into a new workspace (picker upload).
         // The body is a multipart upload of a potentially multi-GB archive, so the
         // default 2 MB extractor limit is lifted for this route only.
@@ -126,6 +127,8 @@ pub fn router() -> Router<GatewayState> {
         // immediately after — see the engine's `boot_failure`.
         .route("/workspaces/:id/boot-failure", post(set_boot_failure))
         .route("/workspaces/:id", delete(delete_workspace))
+        // The workspace broker: an engine acting for one of its agent threads.
+        .nest("/broker", crate::broker::router())
         // Request-level authorization for the whole destructive control plane.
         .layer(middleware::from_fn(control_authz))
 }
@@ -142,7 +145,7 @@ fn cleanup_device(
     device: Option<Extension<auth::AuthenticatedDevice>>,
     headers: &HeaderMap,
 ) -> Result<auth::AuthenticatedDevice, ApiError> {
-    if device.is_none() || headers.contains_key("x-lucidos-agent-origin-token") {
+    if device.is_none() || headers.contains_key(auth::HEADER_AGENT_ORIGIN_TOKEN) {
         return Err(ApiError::forbidden("cleanup requires a paired device"));
     }
     device
@@ -161,6 +164,24 @@ async fn freeze_cleanup(
         .map_err(|e| ApiError::conflict(format!("cleanup freeze failed: {e}")))?
         .map(|batch| Json(batch.public()))
 }
+#[derive(Deserialize)]
+struct FreezeWorkspaceDeletionBody {
+    workspaces: Vec<String>,
+}
+
+async fn freeze_workspace_deletion(
+    State(state): State<GatewayState>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+    headers: HeaderMap,
+    Json(body): Json<FreezeWorkspaceDeletionBody>,
+) -> Result<Json<crate::server::cleanup_actions::WorkspaceDeletionBatch>, ApiError> {
+    cleanup_device(device, &headers)?;
+    state
+        .freeze_workspace_deletion(body.workspaces)
+        .await
+        .map(Json)
+}
+
 async fn confirm_cleanup(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
@@ -463,9 +484,12 @@ struct DeleteBody {
     owner_token: Option<String>,
 }
 
-async fn list(State(state): State<GatewayState>) -> Json<Value> {
+async fn list(
+    State(state): State<GatewayState>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+) -> Json<Value> {
     Json(json!({
-        "workspaces": state.list_status().await,
+        "workspaces": state.list_status_for_device(device.as_ref().map(|d| &d.0), true).await,
         "order": state.workspace_order().keys(),
     }))
 }
@@ -490,11 +514,53 @@ async fn set_workspace_order(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Fresh aggregate unread total across running workspaces (see
-/// [`GatewayState::fresh_unread_total`]). Read by the Tauri desktop dock-badge
-/// loop on its nudge + periodic tick.
-async fn unread_total(State(state): State<GatewayState>) -> Json<Value> {
-    Json(json!({ "total": state.fresh_unread_total().await }))
+#[derive(Default, Serialize, Deserialize)]
+struct UnreadTotalQuery {
+    #[serde(rename = "recipient-device-id")]
+    recipient_device_id: Option<String>,
+}
+
+/// Background callers can select a paired recipient. Browser callers can only
+/// read their own inbox total; the desktop keeps its machine-wide aggregate.
+async fn unread_total(
+    State(state): State<GatewayState>,
+    Query(query): Query<UnreadTotalQuery>,
+    local: Option<Extension<auth::AuthenticatedLocalProcess>>,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
+) -> Result<Json<Value>, ApiError> {
+    let recipient = if let Some(id) = query.recipient_device_id {
+        if local.is_none() {
+            return Err(ApiError::forbidden(
+                "recipient selection requires a local process",
+            ));
+        }
+        let Some(paired) = state
+            .paired_devices()
+            .devices
+            .into_iter()
+            .find(|d| d.id == id)
+        else {
+            return Ok(Json(json!({ "total": null })));
+        };
+        Some(auth::AuthenticatedDevice {
+            id: paired.id,
+            label: paired.label,
+        })
+    } else if let Some(Extension(device)) = device {
+        Some(device)
+    } else if local.is_some() {
+        return Ok(Json(json!({ "total": state.shared_unread_total().await })));
+    } else {
+        return Err(ApiError::forbidden("an authenticated reader is required"));
+    };
+    let rows = state
+        .list_status_for_device(recipient.as_ref(), false)
+        .await;
+    let total = rows
+        .iter()
+        .filter(|row| row.health == crate::stack::Health::Healthy)
+        .try_fold(0u64, |sum, row| sum.checked_add(row.unread_count?));
+    Ok(Json(json!({ "total": total })))
 }
 
 async fn create(
@@ -530,7 +596,7 @@ async fn adopt(
     headers: HeaderMap,
     Json(body): Json<AdoptBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let device = device.is_some() && !headers.contains_key("x-lucidos-agent-origin-token");
+    let device = device.is_some() && !headers.contains_key(auth::HEADER_AGENT_ORIGIN_TOKEN);
     let (ws, owner_token) = state
         .adopt_workspace_with_cleanup(
             std::path::Path::new(body.dir.trim()),
@@ -694,7 +760,7 @@ async fn request_update_relay(
     let by = device
         .as_deref()
         .map_or("a local process", |d| d.label.as_str());
-    crate::log!(
+    crate::log_legacy!(
         "[Gateway] desktop update {} to {} requested by {by}",
         ticket.id,
         ticket.version
@@ -728,9 +794,8 @@ struct WorkspaceLocationQuery {
 
 /// Where a workspace this gateway does not serve lives, and how to reach it.
 ///
-/// The shape the client acts on. `scheme` appears only on the reachable arm: it
-/// is what the peer answered, and a gateway that answered nothing said nothing
-/// about its scheme.
+/// The shape the client acts on. It carries no scheme: every gateway follows
+/// one scheme rule per address, so the client keeps the scheme it arrived on.
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 enum WorkspaceLocation {
@@ -738,7 +803,6 @@ enum WorkspaceLocation {
     Reachable {
         install: String,
         gateway_port: u16,
-        scheme: &'static str,
         slug: String,
     },
     /// An install carries the workspace, and its gateway answered nothing.
@@ -777,19 +841,20 @@ async fn workspace_location(
             installs: found.into_iter().map(|peer| peer.install).collect(),
         })),
         peers::Located::One(peer) => {
-            let scheme = peers::probe_scheme(&peers::probe_client(), peer.gateway_port).await;
-            Ok(Json(match scheme {
-                Some(scheme) => WorkspaceLocation::Reachable {
-                    install: peer.install,
-                    gateway_port: peer.gateway_port,
-                    scheme,
-                    slug: peer.slug,
-                },
-                None => WorkspaceLocation::InstallNotRunning {
+            let running =
+                peers::answers_as_gateway(&peers::probe_client(), peer.gateway_port).await;
+            Ok(Json(if running {
+                WorkspaceLocation::Reachable {
                     install: peer.install,
                     gateway_port: peer.gateway_port,
                     slug: peer.slug,
-                },
+                }
+            } else {
+                WorkspaceLocation::InstallNotRunning {
+                    install: peer.install,
+                    gateway_port: peer.gateway_port,
+                    slug: peer.slug,
+                }
             }))
         }
     }
@@ -825,6 +890,9 @@ struct ReleaseCheckBody {
     enabled: Option<bool>,
     /// A `latest.json` URL under the shared rule, or `""` for the default.
     update_address: Option<String>,
+    channel: Option<String>,
+    custom_upsert: Option<crate::release_check::CustomSlot>,
+    custom_remove: Option<String>,
 }
 
 /// PUT /~/api/v1/control/release-check: write `~/.lucidos/updates.toml` and
@@ -838,12 +906,27 @@ async fn set_release_check_config(
     // The merge belongs to the writer, not here. It re-reads the file, so an
     // absent field settles on what is stored rather than on what this handler
     // last happened to see.
-    check
-        .update_config(body.enabled, body.update_address.as_deref())
-        .map_err(|e| match e {
-            ConfigWriteError::InvalidAddress(msg) => ApiError::bad_request(msg),
-            ConfigWriteError::Io(e) => ApiError::internal(e.to_string()),
-        })?;
+    if body.update_address.is_some()
+        && (body.channel.is_some() || body.custom_upsert.is_some() || body.custom_remove.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "use channel fields or update_address, not both",
+        ));
+    }
+    let result = if body.update_address.is_some() {
+        check.update_config(body.enabled, body.update_address.as_deref())
+    } else {
+        check.update_channels(
+            body.enabled,
+            body.channel.as_deref(),
+            body.custom_upsert.as_ref(),
+            body.custom_remove.as_deref(),
+        )
+    };
+    result.map_err(|e| match e {
+        ConfigWriteError::InvalidAddress(msg) => ApiError::bad_request(msg),
+        ConfigWriteError::Io(e) => ApiError::internal(e.to_string()),
+    })?;
     Ok(Json(check.snapshot()))
 }
 
@@ -916,11 +999,12 @@ fn external_address_json(
     let resolved = net_config::external_address(state.gateway_port());
     // A managed certificate covers its name, not an address. So an address
     // suggestion stays plain HTTP there, and its `308` lands on the name.
-    let scheme = if state.certs().state().source == crate::tls::managed::TlsSource::Operator {
-        net_config::SCHEME_HTTPS
-    } else {
-        net_config::SCHEME_HTTP
-    };
+    let scheme =
+        if state.certs().state().source == lucidos_gateway_tls::managed::TlsSource::Operator {
+            net_config::SCHEME_HTTPS
+        } else {
+            net_config::SCHEME_HTTP
+        };
     json!({
         "external_address": resolved.origin,
         "source": resolved.source,
@@ -940,7 +1024,9 @@ fn external_address_json(
 
 /// GET /~/api/v1/control/tls: the certificate source, its name and expiry, the
 /// origin it serves, and the last error.
-async fn tls_status(State(state): State<GatewayState>) -> Json<crate::tls::managed::TlsReport> {
+async fn tls_status(
+    State(state): State<GatewayState>,
+) -> Json<lucidos_gateway_tls::managed::TlsReport> {
     Json(state.certs().state().report(state.gateway_port()))
 }
 
@@ -973,7 +1059,7 @@ async fn set_external_address(
         let origin =
             net_config::valid_external_address(&requested).map_err(ApiError::bad_request)?;
         let verdict = crate::external_address::probe(&origin).await;
-        crate::log!(
+        crate::log_legacy!(
             "[NetConfig] external address probe: {}",
             crate::external_address::describe(&origin, &verdict)
         );
@@ -1033,10 +1119,10 @@ async fn rename(
     Path(id): Path<String>,
     Json(body): Json<RenameBody>,
 ) -> Result<StatusCode, ApiError> {
-    reject_invalid_id(&id)?;
+    reject_invalid_id(&id).map_err(ApiError::unchanged)?;
     let name = body.name.trim();
     if name.is_empty() {
-        return Err(ApiError::bad_request("workspace name must not be empty"));
+        return Err(ApiError::bad_request("workspace name must not be empty").unchanged());
     }
     state.rename_workspace(&id, name).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1079,7 +1165,7 @@ async fn start(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    reject_invalid_id(&id)?;
+    reject_invalid_id(&id).map_err(ApiError::unchanged)?;
     state.start_workspace(&id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1096,7 +1182,7 @@ async fn stop(
     Path(id): Path<String>,
     device: Option<Extension<auth::AuthenticatedDevice>>,
 ) -> Result<StatusCode, ApiError> {
-    reject_invalid_id(&id)?;
+    reject_invalid_id(&id).map_err(ApiError::unchanged)?;
     state
         .stop_workspace(&id, requesting_device(device.as_deref()))
         .await?;
@@ -1155,11 +1241,8 @@ async fn set_autostart(
     Path(id): Path<String>,
     Json(body): Json<AutostartBody>,
 ) -> Result<StatusCode, ApiError> {
-    reject_invalid_id(&id)?;
-    state
-        .set_autostart(&id, body.enabled)
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    reject_invalid_id(&id).map_err(ApiError::unchanged)?;
+    state.set_autostart(&id, body.enabled).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1171,7 +1254,7 @@ async fn delete_workspace(
 ) -> Result<StatusCode, ApiError> {
     reject_invalid_id(&id)?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    if headers.contains_key("x-lucidos-agent-origin-token") {
+    if headers.contains_key(auth::HEADER_AGENT_ORIGIN_TOKEN) {
         return Err(ApiError::forbidden("agents cannot delete workspaces"));
     }
     if body.owner_token.is_none() {
@@ -1190,12 +1273,51 @@ mod authz_tests {
     use super::*;
 
     #[tokio::test]
+    async fn workspace_delete_batches_require_a_device_without_agent_credentials() {
+        use tower::ServiceExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        let device = auth::AuthenticatedDevice {
+            id: "device".into(),
+            label: "Device".into(),
+        };
+        for (device, headers) in [
+            (None, HeaderMap::new()),
+            (
+                Some(Extension(device)),
+                headers(&[(auth::HEADER_AGENT_ORIGIN_TOKEN, "agent")]),
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/workspace-delete-batches")
+                .body(axum::body::Body::from(r#"{"workspaces":["sample"]}"#))
+                .unwrap();
+            *request.headers_mut() = headers;
+            request
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            if let Some(Extension(device)) = device {
+                request.extensions_mut().insert(device);
+            }
+            let response = router()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(!state.app_data().join("cleanup-batches").exists());
+    }
+
+    #[tokio::test]
     async fn abandon_staging_requires_device_before_reading_or_writing_trash() {
         let temp = tempfile::tempdir().unwrap();
         let state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
         for caller in [
             HeaderMap::new(),
-            headers(&[("x-lucidos-agent-origin-token", "agent")]),
+            headers(&[(auth::HEADER_AGENT_ORIGIN_TOKEN, "agent")]),
         ] {
             let result = trash_abandon_staging(
                 State(state.clone()),
@@ -1651,9 +1773,9 @@ mod authz_tests {
     #[tokio::test]
     async fn the_tls_read_says_why_there_is_no_https() {
         let state = crate::server::GatewayState::for_tests();
-        state
-            .certs()
-            .record(crate::tls::TlsState::none("The tailnet issues none."));
+        state.certs().record(lucidos_gateway_tls::TlsState::none(
+            "The tailnet issues none.",
+        ));
         let body = get_json(&state, "/~/api/v1/control/tls", true).await;
         assert_eq!(body["source"], "none");
         assert_eq!(body["error"], "The tailnet issues none.");
@@ -1665,7 +1787,7 @@ mod authz_tests {
         let state = crate::server::GatewayState::for_tests();
         state
             .certs()
-            .record(crate::tls::TlsState::none("a private reason"));
+            .record(lucidos_gateway_tls::TlsState::none("a private reason"));
         let body = get_json(&state, crate::peers::GATEWAY_HEALTH_PATH, false).await;
         assert_eq!(body["tls"]["source"], "none");
         assert_eq!(body["tls"]["https_origin"], Value::Null);
@@ -1734,7 +1856,7 @@ mod authz_tests {
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains(lucidos_update_address::RULE), "{text}");
+        assert!(text.contains(lucidos_update_channel::RULE), "{text}");
     }
 
     #[tokio::test]
@@ -2013,6 +2135,10 @@ struct SnapshotRestoreRequest {
 #[serde(deny_unknown_fields)]
 struct SnapshotCallerRequest {
     origin_token: String,
+    /// The workspace the restore lands in, sent by the target engine on the
+    /// verify call. The approval names it again on the spend call.
+    #[serde(default)]
+    target_workspace_id: Option<String>,
     #[serde(default)]
     approval: Option<SnapshotApprovalTarget>,
 }
@@ -2036,16 +2162,37 @@ struct SnapshotCaller {
 /// Neither the shared local token nor a source workspace supplied in a body
 /// proves which workspace spawned an agent. Route to that workspace's engine
 /// and let its private MAC key answer instead. Never start a stopped source.
+///
+/// Two callers: a target engine holding the local token, and a sandboxed agent
+/// admitted as an [`auth::AgentRestoreCaller`]. Neither stamp proves the source.
 async fn snapshot_restore_caller(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
     local: Option<Extension<auth::AuthenticatedLocalProcess>>,
+    agent: Option<Extension<auth::AgentRestoreCaller>>,
     Json(request): Json<SnapshotCallerRequest>,
 ) -> Result<Json<SnapshotCaller>, ApiError> {
     reject_invalid_id(&id)?;
     let refuse = || ApiError::forbidden("snapshot_restore_caller_unverified");
-    if local.is_none() || request.origin_token.is_empty() || request.origin_token.len() > 4096 {
+    if (local.is_none() && agent.is_none())
+        || request.origin_token.is_empty()
+        || request.origin_token.len() > 4096
+    {
         return Err(refuse());
+    }
+    // An agent restores only into a machine-made workspace (ADR 0671).
+    let target = request
+        .approval
+        .as_ref()
+        .map(|approval| &approval.target_workspace_id)
+        .or(request.target_workspace_id.as_ref());
+    if let Some(target) = target {
+        if !lucidos_gateway_constants::is_valid_workspace_id(target) {
+            return Err(refuse());
+        }
+        state
+            .refuse_agent_unless_machine_made(target, "snapshot-restore into")
+            .map_err(|_| ApiError::forbidden("snapshot_restore_target_protected"))?;
     }
     let engine = state.engine_address(&id).ok_or_else(refuse)?;
     let mut origin_token =
@@ -2070,7 +2217,7 @@ async fn snapshot_restore_caller(
     };
     let request = builder
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-lucidos-agent-origin-token", origin_token)
+        .header(auth::HEADER_AGENT_ORIGIN_TOKEN, origin_token)
         .body(body)
         .map_err(|_| refuse())?;
     let verify = async {
@@ -2115,7 +2262,7 @@ mod snapshot_caller_tests {
                 async move {
                     assert_eq!(headers[auth::HEADER_LOCAL_TOKEN], "test-local-token");
                     assert_eq!(
-                        headers["x-lucidos-agent-origin-token"],
+                        headers[auth::HEADER_AGENT_ORIGIN_TOKEN],
                         "source-signed-token"
                     );
                     assert_eq!(
@@ -2133,6 +2280,10 @@ mod snapshot_caller_tests {
         let engine = crate::engine_hop::test_engine::serve(&dir, app);
         let state = GatewayState::for_tests();
         state.set_route_for_test("source", engine);
+        let mut target =
+            crate::registry::Workspace::gateway_provisioned("target".into(), "Target".into(), 9101);
+        target.cleanup.origin = crate::registry::WorkspaceOrigin::E2e;
+        state.register_for_test(target);
         let call =
             |target: &str, local: bool| {
                 let mut builder = Request::builder()
@@ -2167,6 +2318,58 @@ mod snapshot_caller_tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// ADR 0671: an agent restores a snapshot only into a machine-made
+    /// workspace, whether the target arrives on the verify or the spend call.
+    #[tokio::test]
+    async fn a_user_or_unknown_target_is_refused_before_the_source_is_asked() {
+        let dir = crate::engine_hop::test_engine::scratch();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/api/v1/snapshots/restore-caller",
+            get(move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Json(json!({"workspace_id":"source", "source_thread_id":"thread"})) }
+            }),
+        );
+        let engine = crate::engine_hop::test_engine::serve(&dir, app);
+        let state = GatewayState::for_tests();
+        state.set_route_for_test("source", engine);
+        for (id, origin) in [
+            ("mine", crate::registry::WorkspaceOrigin::User),
+            ("legacy", crate::registry::WorkspaceOrigin::Unknown),
+        ] {
+            let mut ws =
+                crate::registry::Workspace::gateway_provisioned(id.into(), id.into(), 9102);
+            ws.cleanup.origin = origin;
+            state.register_for_test(ws);
+        }
+        for body in [
+            json!({"origin_token":"t", "target_workspace_id":"mine"}),
+            json!({"origin_token":"t", "target_workspace_id":"legacy"}),
+            json!({"origin_token":"t",
+                   "approval":{"target_workspace_id":"mine","snapshot_handle":"h"}}),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/~/api/v1/control/workspaces/source/snapshot-restore-caller")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let response = crate::server::gateway_router(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{body}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("snapshot_restore_target_protected"));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     async fn verify(state: GatewayState, local: bool, token: &str) -> Response {
         let mut request = Request::builder()
             .method("POST")
@@ -2196,7 +2399,7 @@ mod snapshot_caller_tests {
             get(move |headers: HeaderMap| async move {
                 assert_eq!(headers[auth::HEADER_LOCAL_TOKEN], "test-local-token");
                 if headers
-                    .get("x-lucidos-agent-origin-token")
+                    .get(auth::HEADER_AGENT_ORIGIN_TOKEN)
                     .and_then(|v| v.to_str().ok())
                     != Some("source-signed-token")
                 {
@@ -2245,6 +2448,139 @@ mod snapshot_caller_tests {
             verify(state, true, "source-signed-token").await.status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    fn peer(remote: &str, public_listener: bool) -> crate::pairing::Peer {
+        crate::pairing::Peer {
+            remote: remote.parse().unwrap(),
+            local: "127.0.0.1:5252".parse().unwrap(),
+            public_listener,
+        }
+    }
+
+    /// A sandboxed agent holds no local token. It reaches exactly the three
+    /// restore routes from loopback with its origin token, and nothing else.
+    #[tokio::test]
+    async fn an_agent_restore_caller_needs_loopback_an_origin_token_and_a_restore_route() {
+        let (source_dir, target_dir) = (
+            crate::engine_hop::test_engine::scratch(),
+            crate::engine_hop::test_engine::scratch(),
+        );
+        let source = Router::new().route(
+            "/api/v1/snapshots/restore-caller",
+            get(|headers: HeaderMap| async move {
+                if headers[auth::HEADER_AGENT_ORIGIN_TOKEN] != "source-signed-token" {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+                Json(json!({"workspace_id":"source", "source_thread_id":"thread"})).into_response()
+            }),
+        );
+        let target = Router::new().route(
+            "/api/v1/snapshots/:handle/restore",
+            post(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers[auth::HEADER_AGENT_ORIGIN_TOKEN],
+                    "source-signed-token"
+                );
+                assert_eq!(headers["x-lucidos-caller-kind"], "local-process");
+                StatusCode::ACCEPTED
+            }),
+        );
+        let state = GatewayState::for_tests();
+        state.set_route_for_test(
+            "source",
+            crate::engine_hop::test_engine::serve(&source_dir, source),
+        );
+        state.set_route_for_test(
+            "target",
+            crate::engine_hop::test_engine::serve(&target_dir, target),
+        );
+        let caller = "/~/api/v1/control/workspaces/source/snapshot-restore-caller";
+        let status = "/~/api/v1/control/workspaces/target/snapshot-restore-status";
+        let restore = "/target/api/v1/snapshots/snap_0123/restore";
+        let call = |method: &str,
+                    uri: &str,
+                    peer: Option<crate::pairing::Peer>,
+                    extra: &[(&str, &str)],
+                    token: &str| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json");
+            for (name, value) in extra {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder
+                .body(axum::body::Body::from(
+                    json!({"origin_token": token}).to_string(),
+                ))
+                .unwrap();
+            if let Some(peer) = peer {
+                request.extensions_mut().insert(peer);
+            }
+            crate::server::gateway_router(state.clone()).oneshot(request)
+        };
+        let origin = [(auth::HEADER_AGENT_ORIGIN_TOKEN, "source-signed-token")];
+        let v4 = Some(peer("127.0.0.1:40000", false));
+        let v6 = Some(peer("[::1]:40000", false));
+        for loopback in [v4, v6] {
+            let ok = call("POST", caller, loopback, &origin, "source-signed-token").await;
+            assert_eq!(ok.unwrap().status(), StatusCode::OK);
+            // The handler answers. This registry holds no journal, so it says 404.
+            let one = format!("{status}?restore_id=0b6e2a3c-5d4f-4a1b-9c8d-7e6f5a4b3c2d");
+            let read = call("GET", &one, loopback, &origin, "").await;
+            assert_eq!(read.unwrap().status(), StatusCode::NOT_FOUND);
+            // Without a restore id it would read whichever restore is latest.
+            let latest = call("GET", status, loopback, &origin, "").await;
+            assert_eq!(latest.unwrap().status(), StatusCode::FORBIDDEN);
+            let sent = call("POST", restore, loopback, &origin, "").await;
+            assert_eq!(sent.unwrap().status(), StatusCode::ACCEPTED);
+        }
+        // Admitted, yet the gateway never trusts the token: the source decides.
+        let forged = call("POST", caller, v4, &origin, "forged").await;
+        assert_eq!(forged.unwrap().status(), StatusCode::FORBIDDEN);
+        let forwarded = [origin[0], ("x-forwarded-for", "203.0.113.9")];
+        type Headers<'a> = &'a [(&'a str, &'a str)];
+        let refused: [(&str, &str, Option<crate::pairing::Peer>, Headers); 10] = [
+            ("POST", caller, v4, &[]),
+            ("POST", caller, None, &origin),
+            (
+                "POST",
+                caller,
+                Some(peer("192.168.1.5:40000", false)),
+                &origin,
+            ),
+            ("POST", caller, Some(peer("127.0.0.1:40000", true)), &origin),
+            ("POST", caller, v4, &forwarded),
+            ("GET", caller, v4, &origin),
+            (
+                "POST",
+                "/~/api/v1/control/workspaces/target/snapshot-restore",
+                v4,
+                &origin,
+            ),
+            ("GET", "/target/api/v1/threads/list", v4, &origin),
+            (
+                "POST",
+                "/target/api/v1/snapshots/snap_0123/check",
+                v4,
+                &origin,
+            ),
+            (
+                "POST",
+                "/target/api/v1/snapshots/%2e%2e/restore",
+                v4,
+                &origin,
+            ),
+        ];
+        for (method, uri, peer, extra) in refused {
+            let response = call(method, uri, peer, extra, "source-signed-token").await;
+            assert_eq!(
+                response.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} {peer:?} {extra:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2298,13 +2634,79 @@ struct SnapshotRestoreStatusQuery {
     restore_id: Option<String>,
 }
 
+/// An [`auth::AgentRestoreCaller`] proved nothing, so it reads only the restore
+/// it names. The engine mints each restore id at random and hands it to the
+/// requester alone, so the id is the capability.
 async fn snapshot_restore_status(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
+    agent: Option<Extension<auth::AgentRestoreCaller>>,
     Query(query): Query<SnapshotRestoreStatusQuery>,
 ) -> Result<Json<Value>, ApiError> {
     reject_invalid_id(&id)?;
+    if agent.is_some() && query.restore_id.is_none() {
+        return Err(ApiError::forbidden("snapshot_restore_id_required"));
+    }
     Ok(Json(
         json!({"restore": state.snapshot_restore_status_for(&id, query.restore_id.as_deref())?}),
     ))
+}
+
+#[cfg(test)]
+mod channel_control_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn channel_writes_merge_and_bad_requests_leave_the_file_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(temp.path().into()));
+        let app = crate::server::gateway_router(state.clone());
+        for body in [
+            json!({"custom_upsert":{"name":"Test","url":"https://example.com/latest.json"},"channel":"custom:Test"}),
+            json!({"enabled":false}),
+            json!({"channel":"stable"}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/~/api/v1/control/release-check")
+                        .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let before = state.release_check().config();
+        assert!(!before.enabled);
+        assert_eq!(before.custom.len(), 1);
+        for body in [
+            json!({"channel":"custom:Missing"}),
+            json!({"channel":"nightly"}),
+            json!({"custom_upsert":{"name":"Test","url":"http://example.com/latest.json"},"enabled":true}),
+            json!({"custom_remove":"Missing"}),
+            json!({"custom_upsert":{"name":"bad/name","url":"https://example.com/latest.json"}}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/~/api/v1/control/release-check")
+                        .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(state.release_check().config(), before);
+        }
+    }
 }

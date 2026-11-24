@@ -11,8 +11,6 @@ import { useBackgroundModels } from './useBackgroundModels';
 
 const TITLE = 'Choose how this workspace remembers';
 
-/** The *memory choice*: a workspace that never chose its memory module picks
- *  one here. Every way out writes `memory_module`, so it asks once. */
 export function MemoryChoice() {
   const background = useBackgroundModels();
   const read = useTreeEstimate(background);
@@ -22,8 +20,6 @@ export function MemoryChoice() {
     void setMemoryModule('classic');
   }
 
-  // The Start Tree press in Settings: the compactor starts the backfill under
-  // the same cap.
   async function chooseTree() {
     setStarting(true);
     try {
@@ -86,7 +82,6 @@ export function MemoryChoice() {
         <section class="memory-choice-cost">
           <CompactorModelRow background={background} read={read} label="What Tree costs a month" />
           {read.loadable.status === 'failed' ? <EstimateFailed read={read} /> : <MonthlyTiles read={read} />}
-          {/* Only a workspace with history has a one-time summary to price. */}
           {read.estimate && read.estimate.calls.high > 0 && <BackfillFigures read={read} />}
         </section>
         <p class="memory-choice-note">
@@ -98,7 +93,6 @@ export function MemoryChoice() {
   );
 }
 
-/** One tile per usage profile: a month of its turns at one turn's price. */
 function MonthlyTiles({ read }: { read: TreeEstimateRead }) {
   const { cost, unpriced, costLoading } = read;
   return (

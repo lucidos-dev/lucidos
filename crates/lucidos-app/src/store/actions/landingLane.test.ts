@@ -29,6 +29,13 @@ describe('the lane frames, as pure steps', () => {
     expect(lane).toEqual(LANE);
   });
 
+  it('keeps the landing setting when a batch opens', () => {
+    const lane = laneWithBatchStarted({ ...EMPTY_LANDING_LANE, setting: 'here' }, {
+      batch_id: 'b-1', lane_thread_id: 'lane-t', members: [{ change_id: 'c-1' }],
+    });
+    expect(lane.setting).toBe('here');
+  });
+
   it('only the open batch ends', () => {
     expect(laneWithBatchEnded(LANE, 'b-1')).toEqual({ open_batch: null, waiting: ['c-2'], gathering: false });
     expect(laneWithBatchEnded(LANE, 'b-2')).toBe(LANE);

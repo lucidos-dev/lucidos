@@ -50,8 +50,6 @@ function endpoint(id: SystemOneEndpointSpec['id']): SystemOneEndpointSpec {
 }
 
 describe('pickedEndpoint', () => {
-  /** The same ids the engine's `SystemOneEndpoint::from_id` matches. Drift here
-   *  shows a backend the engine does not act on. */
   it('reads every row id, forgiving case and space', () => {
     expect(pickedEndpoint('jev')?.id).toBe('jev');
     expect(pickedEndpoint('  JEV  ')?.id).toBe('jev');
@@ -68,7 +66,6 @@ describe('pickedEndpoint', () => {
     }
   });
 
-  /** Each row's picker value is distinct, so a pick names exactly one row. */
   it('gives every row its own picker value', () => {
     const values = SYSTEM_ONE_ENDPOINTS.map((e) => e.choice.value);
     expect(new Set(values).size).toBe(values.length);
@@ -76,8 +73,6 @@ describe('pickedEndpoint', () => {
 });
 
 describe('JUDGMENT_PREFERENCE_KEY', () => {
-  /** The keys the engine declares. A typo here writes a preference nothing
-   *  reads, which looks exactly like a control that does nothing. */
   it('names the four engine preference keys', () => {
     expect(JUDGMENT_PREFERENCE_KEY['command-guard']).toBe('judgment_command_guard');
     expect(JUDGMENT_PREFERENCE_KEY['query-classification'])
@@ -114,8 +109,6 @@ describe('systemOneConfigured', () => {
       .toBe(false);
   });
 
-  /** A self-hosted model often takes no key, so the URL and model set it up.
-   *  The engine refuses a row with no model, so the page must not offer one. */
   it('reads the custom endpoint as set up by its URL and model, no key needed', () => {
     const url = 'http://localhost:8000/v1/systemone';
     const both = loaded({ system_one_custom_url: url, system_one_custom_model: 'kev' });
@@ -128,8 +121,6 @@ describe('systemOneConfigured', () => {
 });
 
 describe('systemOneConfigured for a chat provider row', () => {
-  /** The engine resolves OpenAI from a stored key, OPENAI_API_KEY or a Codex
-   *  login, and only `/health` sees the last two. */
   it('reads OpenRouter and OpenAI as set up once /health lists their chat provider', () => {
     expect(systemOneConfigured('openai', loaded([]), NO_PREFS, ['openai'])).toBe(true);
     expect(systemOneConfigured('openrouter', loaded([]), NO_PREFS, ['openrouter'])).toBe(true);
@@ -141,7 +132,6 @@ describe('systemOneConfigured for a chat provider row', () => {
     expect(systemOneConfigured('openrouter', loaded([cred('openrouter')]), NO_PREFS, null)).toBe(true);
   });
 
-  /** Only a row that reuses a chat provider's key reads `/health`. */
   it('never reads TypeSafe as set up from a chat provider', () => {
     expect(systemOneConfigured('typesafe', loaded([]), NO_PREFS, ['openai', 'openrouter'])).toBe(false);
   });
@@ -151,16 +141,12 @@ describe('systemOneSwitchedOff', () => {
   const stored = (provider: SystemOneProviderId, key: string, value?: string) =>
     systemOneSwitchedOff(loaded(value === undefined ? {} : { [key]: value }), provider);
 
-  /** Absent means on, the rule every `provider_enabled_*` key follows. */
   it('is false while unset, set to true, or still loading', () => {
     expect(stored('typesafe', 'provider_enabled_typesafe')).toBe(false);
     expect(stored('typesafe', 'provider_enabled_typesafe', 'true')).toBe(false);
     expect(systemOneSwitchedOff({ status: 'loading' }, 'typesafe')).toBe(false);
   });
 
-  /** The engine's `prefs::parse_flag` takes every spelling in
-   *  `FLAG_OFF_VALUES`, in any case and padding, and nothing corrects this
-   *  side: a System One provider has no `/health` row. */
   it('reads every spelling the engine reads as off, on each provider’s own key', () => {
     for (const spelled of FLAG_OFF_VALUES) {
       for (const value of [spelled, spelled.toUpperCase(), `  ${spelled}  `]) {
@@ -179,8 +165,6 @@ describe('systemOneSwitchedOff', () => {
 });
 
 describe('sitePick', () => {
-  /** ADRs 0435 and 0472: the engine runs an unset wake decision on OpenAI Decisions
-   *  while OpenAI is served. The field must show what runs. */
   describe.each(['wake-decision'] as const)('%s', (site) => {
     const backend = JUDGMENT_PREFERENCE_KEY[site];
     const model = JUDGMENT_MODEL_KEY[site];
@@ -198,8 +182,6 @@ describe('sitePick', () => {
       expect(sitePick(site, loaded({ [backend]: 'chat' }), ['openai'])).toBeNull();
     });
 
-    /** A pinned chat model may be a local one kept for privacy: the default
-     *  must never send its turns to a vendor. */
     it('keeps a pinned chat model on chat', () => {
       expect(sitePick(site, loaded({ [model]: 'local-model' }), ['openai'])).toBeNull();
     });
@@ -217,8 +199,6 @@ describe('sitePick', () => {
 });
 
 describe('systemOneConsumers', () => {
-  /** The tool has no preference of its own: a stored key IS its condition
-   *  (ADR 0223). So it is listed where no site has moved at all. */
   it('lists the judge tool for TypeSafe on a key alone, ahead of any site', () => {
     expect(systemOneConsumers('typesafe', NO_PREFS, true, null)).toEqual(['The agent’s judge tool']);
     expect(systemOneConsumers('typesafe', NO_PREFS, false, null)).toEqual([]);
@@ -253,8 +233,6 @@ describe('offeredEndpoints', () => {
   const ids = (args: Parameters<typeof offeredEndpoints>[0]) =>
     offeredEndpoints(args).map((e) => e.id);
 
-  /** ADR 0363's no-change promise, seen from the picker. A workspace with no
-   *  System One provider set up sees exactly the models it saw before. */
   it('offers nothing with no provider set up', () => {
     expect(ids({ picked: null, configured: () => false, switchedOff: () => false })).toEqual([]);
   });
@@ -272,8 +250,6 @@ describe('offeredEndpoints', () => {
       .toEqual(['openrouter', 'clef', 'clef-flash', 'openai', 'custom']);
   });
 
-  /** The engine reads `TYPESAFE_API_KEY`, which this page cannot see. Without
-   *  the row, such a workspace renders a selection it can never change. */
   it('always offers the row the site is on', () => {
     expect(ids({ picked: endpoint('jev'), configured: () => false, switchedOff: () => true }))
       .toEqual(['jev']);
@@ -289,8 +265,6 @@ describe('judgmentModelChoices', () => {
     expect(judgmentModelChoices(base, [])).toEqual(base);
   });
 
-  /** Last, after the chat models, and with no tiers: picking one is one step,
-   *  exactly as an image model is. */
   it('appends each offered row with no reasoning tiers', () => {
     const rows = judgmentModelChoices(base, [endpoint('jev'), endpoint('clef')]);
     expect(rows).toHaveLength(3);
@@ -313,8 +287,6 @@ describe('judgmentSelectedModel', () => {
 });
 
 describe('judgmentPickWrites', () => {
-  /** Both halves, because the site may have been on a System One row. Writing
-   *  the model alone would leave the engine there under a field showing Haiku. */
   it('moves the backend back to chat and writes the pair', () => {
     expect(judgmentPickWrites({ model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low', provider: null })).toEqual({
       judgment: CHAT,
@@ -322,8 +294,6 @@ describe('judgmentPickWrites', () => {
     });
   });
 
-  /** The stored model is what switching back restores, so a System One pick
-   *  must not touch it. Each writes the id the engine reads. */
   it('writes only the row id for a System One pick', () => {
     for (const e of SYSTEM_ONE_ENDPOINTS) {
       const writes = judgmentPickWrites({ model: e.choice.value, reasoningEffort: null, provider: null });
@@ -334,8 +304,6 @@ describe('judgmentPickWrites', () => {
 });
 
 describe('judgmentSelectionCaveat', () => {
-  /** The engine runs chat while the provider is off, so a field reading the row
-   *  with nothing said would claim a backend nothing runs. */
   it('names the switched-off provider of the picked row', () => {
     const caveat = judgmentSelectionCaveat(endpoint('clef-flash'), true);
     expect(caveat).toContain('Cloudflare Workers AI');
@@ -350,14 +318,12 @@ describe('judgmentSelectionCaveat', () => {
 });
 
 describe('workersAiScope', () => {
-  /** The engine's `workers_ai_url` reads the account back out of this URL. */
   it('builds the scope the engine reads the account from', () => {
     expect(workersAiScope(' abc123 '))
       .toBe('https://api.cloudflare.com/client/v4/accounts/abc123/ai');
     expect(workersAiAccount(workersAiScope('abc123') ?? undefined)).toBe('abc123');
   });
 
-  /** The token is sent wherever the scope points, so only a plain id passes. */
   it('refuses an id the engine would refuse', () => {
     for (const id of ['', 'abc/../x', 'abc 123', 'abc-123']) {
       expect(workersAiScope(id), id).toBeNull();

@@ -16,13 +16,10 @@ export function ScaleModal() {
   const isOpen = scaleModalOpen.value;
   const rowRef = useRef<HTMLDivElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
-  /** The pointer that owns the drag, and the row it was measured against. */
   const drag = useRef<{ pointerId: number; track: TrackMetrics } | null>(null);
 
   if (!isOpen) return null;
 
-  /** Measured once per gesture: the modal cannot resize under a finger, and
-   *  reading the box on every move would force a layout after each thumb move. */
   function measureRow(): TrackMetrics | null {
     const row = rowRef.current;
     if (!row) return null;
@@ -39,13 +36,9 @@ export function ScaleModal() {
     const track = measureRow();
     if (!track) return;
     const row = e.currentTarget as HTMLElement;
-    // Own the whole gesture. Without capture a finger that slides off the row,
-    // or past either end of the track, stops delivering moves.
     row.setPointerCapture(e.pointerId);
     drag.current = { pointerId: e.pointerId, track };
     e.preventDefault();
-    // preventDefault suppresses the focus the press would otherwise bring, and
-    // the arrow keys below need it, so take it explicitly.
     row.focus({ preventScroll: true });
     const next = scaleAtPointer(e.clientX, track);
     if (next !== null) previewSliderValue(next);
@@ -59,7 +52,6 @@ export function ScaleModal() {
     if (next !== null) previewSliderValue(next);
   }
 
-  /** The drag this event ends, or `null` when it owns none. */
   function endDrag(e: PointerEvent): { track: TrackMetrics } | null {
     const active = drag.current;
     if (active?.pointerId !== e.pointerId) return null;
@@ -67,16 +59,12 @@ export function ScaleModal() {
     return active;
   }
 
-  /** A released drag commits where the finger left off. */
   function handlePointerUp(e: PointerEvent) {
     const active = endDrag(e);
     if (!active) return;
     commitSliderValue(scaleAtPointer(e.clientX, active.track) ?? previewScale.peek());
   }
 
-  /** A cancelled drag commits what is on screen instead of remapping the event.
-   *  `pointercancel` carries a last known position in name only, and a browser
-   *  that reports zeroes would map to the far left and persist 75% silently. */
   function handlePointerCancel(e: PointerEvent) {
     if (!endDrag(e)) return;
     commitSliderValue(previewScale.peek());

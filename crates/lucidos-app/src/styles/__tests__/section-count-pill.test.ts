@@ -1,9 +1,3 @@
-/**
- * A list panel's section header draws its count as a pill only while the section is
- * collapsed. An open section shows a bare number, one type step larger, drawn
- * by a second copy at that size. The pill is a `::before` layer, so it can
- * animate apart from the digits.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -41,8 +35,6 @@ describe('section count pill', () => {
   });
 
   it('shows exactly one copy of the number in each state', () => {
-    // Visibility, not a transparent colour: forced colours repaint a colour,
-    // and a hidden copy also leaves the accessibility tree.
     expect(rule(BADGE)?.props.get('visibility')).toBe('hidden');
     expect(rule(COLLAPSED_BADGE)?.props.get('visibility')).toBe('visible');
     expect(rule(COLLAPSED_OPEN)?.props.get('visibility')).toBe('hidden');
@@ -57,8 +49,6 @@ describe('section count pill', () => {
   });
 
   it('draws the open copy one type step up, over the pill\'s box', () => {
-    // A font-size on its own element, so it rests untransformed. The box is
-    // the pill's, so the row keeps its height.
     expect(rule(COUNT)?.props.get('--section-count-open-scale')).toBe('1.2');
     expect(rule(OPEN)?.props.get('font-size')).toBe('var(--font-size-sm)');
     expect(rule(OPEN)?.props.get('position')).toBe('absolute');
@@ -66,8 +56,6 @@ describe('section count pill', () => {
   });
 
   it('rests both copies untransformed', () => {
-    // Chromium draws a scaling glyph from a bitmap, so a copy resting at a
-    // scale stays soft until the scale ends. Each copy scales only on its way.
     expect(rule(COLLAPSED_BADGE)?.props.get('scale')).toBe('none');
     expect(rule(OPEN)?.props.has('scale')).toBe(false);
     expect(rule(OPEN)?.props.has('translate')).toBe(false);
@@ -79,7 +67,6 @@ describe('section count pill', () => {
   it('grows each copy from its own whole-pixel baseline', () => {
     expect(rule(BADGE, TRIMMED)?.props.get('transform-origin'))
       .toBe('50% calc(100% - var(--badge-baseline-inset))');
-    // Trimmed to its baseline, the open copy's bottom edge is the baseline.
     const open = rule(OPEN, TRIMMED);
     expect(open?.props.get('text-box-trim')).toBe('trim-end');
     expect(open?.props.get('text-box-edge')).toBe('cap alphabetic');
@@ -88,9 +75,6 @@ describe('section count pill', () => {
   });
 
   it('moves the baseline in one step, never mid-animation', () => {
-    // WebKit repaints a scaling glyph every frame and snaps its baseline to
-    // the pixel grid. A transitioned baseline therefore dips a pixel partway.
-    // Only the scale animates, and it grows from the baseline.
     const numberRules = ['section-count-badge', 'section-count-open']
       .flatMap(cls => rulesTargeting(sheet('section-header.css'), cls))
       .concat(rulesTargeting(sheet('badges.css'), 'section-count-badge'))
@@ -107,7 +91,6 @@ describe('section count pill', () => {
     for (const r of [rule(BADGE), rule(COLLAPSED_BADGE), rule(OPEN)]) {
       expect(r?.props.get('transition') ?? '').toMatch(/^scale var\(--duration-/);
     }
-    // The open copy leaves at once, so the pill's number is alone on collapse.
     expect(rule(COLLAPSED_OPEN)?.props.get('transition')).toBe('none');
     for (const r of [rule(PILL), rule(COLLAPSED_PILL)]) {
       const transition = r?.props.get('transition') ?? '';

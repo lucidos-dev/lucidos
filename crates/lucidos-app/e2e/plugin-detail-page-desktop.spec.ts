@@ -1,22 +1,10 @@
-/**
- * A Plugins panel row leads with its plugin icon and opens the plugin detail
- * page (ADR 0414, Phase 4). The page shows every screenshot and video in one
- * strip, the README, and the media the engine left out.
- *
- * The catalog read and the media route are mocked, so one row carries media
- * without a marketplace. The route's own headers are pinned in the API e2e
- * suite (`plugin_catalog_test.rs`).
- */
 import { test, expect, type Page } from './fixtures';
 import { gotoWithRetry } from './helpers';
 
-// The page reads the catalog more than once, and a read the service worker
-// makes skips the route mocks below.
 test.use({ serviceWorkers: 'block' });
 
 const MEDIA = '/api/v1/plugins/media/catalog/mkt-e2e/habit-tracker/0.1.0';
 
-/** A 1x1 PNG, enough for an `<img>` to load. */
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
   'base64',

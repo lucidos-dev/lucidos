@@ -10,7 +10,7 @@
 //! short-circuits both [`setup`] and [`show`]. Browser / PWA clients still get
 //! the web push on the same engine branch, so dev keeps a working notification
 //! channel. A packaged build (`cargo tauri build`) is a real bundle and
-//! delivers. See `system-knowhow/notifications.md` §4.
+//! delivers. See `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4.
 //!
 //! Tap routing is delegate-based (UN has no synchronous "wait for click" like
 //! the old crate): a `UNUserNotificationCenterDelegate` receives the tap on the
@@ -21,9 +21,9 @@
 
 #[cfg(any(target_os = "macos", test))]
 use crate::window_target::{
-    is_workspace_route, labels_in, preferred_label, window_context, window_origin, workspace_url,
-    WindowContext,
+    is_workspace_route, preferred_label, window_context, windows_in, workspace_url, WindowContext,
 };
+use crate::window_target::{window_origin, LiveWindow};
 
 /// Separator between the workspace route and the engine notification id inside
 /// a UN request identifier. Safe on both sides: a uuid never contains it, and a
@@ -149,8 +149,8 @@ fn tap_belongs_to(link: &serde_json::Value, workspace: Option<&str>) -> bool {
 /// reopen builds its restored windows on the same origin, and it is not
 /// macOS-only. The body is a fold over `window_origin`, which is platform
 /// independent, so widening this costs nothing.
-pub(crate) fn gateway_origin(windows: &[(String, String)]) -> Option<&str> {
-    windows.iter().find_map(|(_, url)| window_origin(url))
+pub(crate) fn gateway_origin(windows: &[LiveWindow]) -> Option<&str> {
+    windows.iter().find_map(|window| window_origin(&window.url))
 }
 
 /// Where a native banner tap should land. Decided in Rust because only the
@@ -173,7 +173,7 @@ pub(crate) enum TapTarget {
 }
 
 /// Pick the window a tap raised by `owner` belongs in, given every top-level app
-/// window as `(label, url)`.
+/// window.
 ///
 /// **This is the native counterpart of `isWorkspaceShell` + `clients.openWindow` in
 /// `public/sw.js`**, and it enforces the same rule the service worker does for
@@ -190,7 +190,7 @@ pub(crate) enum TapTarget {
 /// A malformed `owner` is treated as no owner rather than used to build a URL.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn choose_tap_target(
-    windows: &[(String, String)],
+    windows: &[LiveWindow],
     owner: Option<&str>,
     origin: &str,
 ) -> TapTarget {
@@ -199,19 +199,19 @@ pub(crate) fn choose_tap_target(
     };
     let url = workspace_url(origin, owner);
 
-    if let Some(label) = preferred_label(&labels_in(windows, WindowContext::Workspace(owner))) {
+    if let Some(label) = preferred_label(&windows_in(windows, WindowContext::Workspace(owner))) {
         return TapTarget::Focus(label.to_string());
     }
     // Deliberately BEFORE the neutral branch: `main` is unnavigated only while
     // `desktop::launch` is still waiting on the gateway, and its pending
     // navigation would clobber anything we pointed another window at.
-    if windows.iter().any(|(label, url)| {
-        label == crate::app_window::MAIN_WINDOW_LABEL
-            && window_context(url) == WindowContext::Unnavigated
+    if windows.iter().any(|window| {
+        window.label == crate::app_window::MAIN_WINDOW_LABEL
+            && window_context(&window.url) == WindowContext::Unnavigated
     }) {
         return TapTarget::LaunchInto { url };
     }
-    if let Some(label) = preferred_label(&labels_in(windows, WindowContext::Neutral)) {
+    if let Some(label) = preferred_label(&windows_in(windows, WindowContext::Neutral)) {
         return TapTarget::Navigate {
             label: label.to_string(),
             url,
@@ -254,7 +254,7 @@ mod imp {
     /// Set at [`show`], consumed on tap.
     /// In-process only — a tap after the app fully quit can't route (matches the
     /// old `mac-notification-sys` behaviour; the bell badge driven by
-    /// `NotificationCreated` stays the durable signal). See notifications.md §4.
+    /// `NotificationCreated` stays the durable signal). See system-knowhow/notifications/3-the-presencecheck-protocol.md §4.
     fn pending() -> &'static Mutex<HashMap<String, serde_json::Value>> {
         static P: OnceLock<Mutex<HashMap<String, serde_json::Value>>> = OnceLock::new();
         P.get_or_init(|| Mutex::new(HashMap::new()))
@@ -269,7 +269,7 @@ mod imp {
     /// across both paths and never re-fires on a later reload. Capped like
     /// [`pending`] (FIFO drop) so a long-resident client whose signals are all
     /// missed can't grow it unbounded. See `store/actions/native-push.ts` and
-    /// `system-knowhow/notifications.md` §4.
+    /// `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4.
     fn pending_taps() -> &'static Mutex<Vec<serde_json::Value>> {
         static T: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
         T.get_or_init(|| Mutex::new(Vec::new()))
@@ -374,7 +374,7 @@ mod imp {
                 // happens to be frontmost (e.g. a stale active-state signal got it
                 // wrong, the inverse of the "only sometimes" miss). Safe: a banner
                 // and an in-app toast can't both fire for one notification (engine
-                // gates them on opposite branches). See notifications.md §4.
+                // gates them on opposite branches). See system-knowhow/notifications/3-the-presencecheck-protocol.md §4.
                 completion_handler.call((UNNotificationPresentationOptions::Banner
                     | UNNotificationPresentationOptions::List
                     | UNNotificationPresentationOptions::Sound,));
@@ -432,10 +432,10 @@ mod imp {
     /// No-op in dev (see [`setup`]). Those two fields compose the request
     /// identifier ([`super::notification_identifier`]), which keys the
     /// pending-link map and scopes replace-by-id (the web-push `tag` equivalent)
-    /// to the raising workspace.
-    pub fn show(title: &str, body: &str, link: serde_json::Value) {
+    /// to the raising workspace. Returns true only after OS acceptance.
+    pub fn show(title: &str, body: &str, link: serde_json::Value) -> Result<bool, String> {
         if tauri::is_dev() {
-            return;
+            return Ok(false);
         }
         let identifier = super::link_identifier(&link);
 
@@ -456,8 +456,21 @@ mod imp {
             &content,
             None,
         );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let completion = RcBlock::new(move |error: *mut NSError| {
+            let result = if error.is_null() {
+                Ok(true)
+            } else {
+                // UN owns the error for the duration of this callback.
+                Err(unsafe { (&*error).localizedDescription().to_string() })
+            };
+            let _ = sender.send(result);
+        });
         UNUserNotificationCenter::currentNotificationCenter()
-            .addNotificationRequest_withCompletionHandler(&request, None);
+            .addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("Native notification acceptance timed out: {error}"))?
     }
 
     /// Remove already-delivered native banner(s) — the cross-device dismiss
@@ -625,7 +638,7 @@ mod imp {
     /// workspace, so an unconditional take let whichever page woke first swallow
     /// a tap raised by a workspace it is not serving. Another workspace's tap is
     /// LEFT IN PLACE for the window this tap's router is bringing up. See
-    /// `native-push.ts` and `system-knowhow/notifications.md` §4.
+    /// `native-push.ts` and `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4.
     pub fn take_pending_taps(workspace: Option<&str>) -> Vec<serde_json::Value> {
         let mut taps = pending_taps().lock().unwrap();
         let (mine, theirs) = std::mem::take(&mut *taps)
@@ -642,13 +655,14 @@ pub use imp::{
 };
 
 /// Non-macOS desktop has no native notification path (the engine still
-/// web-pushes browser / PWA clients); these are no-ops so call sites stay
-/// platform-agnostic.
+/// web-pushes browser / PWA clients); setup remains a no-op.
 #[cfg(not(target_os = "macos"))]
 pub fn setup(_app: &tauri::AppHandle) {}
 
 #[cfg(not(target_os = "macos"))]
-pub fn show(_title: &str, _body: &str, _link: serde_json::Value) {}
+pub fn show(_title: &str, _body: &str, _link: serde_json::Value) -> Result<bool, String> {
+    Err("Native notifications are unavailable on this platform".into())
+}
 
 /// No native banner removal off macOS (no native notification path here); a
 /// no-op so the Tauri command stays platform-agnostic.
@@ -740,15 +754,24 @@ mod tests {
         assert!(!identifier_belongs_to("myws|abc-123", ""));
     }
 
-    /// `(label, url)` pairs in the shape `choose_tap_target` takes.
-    fn windows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(label, url)| ((*label).to_string(), (*url).to_string()))
-            .collect()
-    }
+    use crate::window_target::tests::{hidden, windows};
 
     const ORIGIN: &str = "http://localhost:3210";
+
+    #[test]
+    fn a_tap_fronts_the_visible_window_rather_than_a_hidden_main() {
+        let open = hidden(
+            windows(&[
+                ("main", "http://localhost:3210/personal/"),
+                ("window-2", "http://localhost:3210/personal/"),
+            ]),
+            "main",
+        );
+        assert_eq!(
+            choose_tap_target(&open, Some("personal"), ORIGIN),
+            TapTarget::Focus("window-2".to_string())
+        );
+    }
 
     #[test]
     fn tap_belongs_to_leaves_another_workspaces_tap_in_the_stash() {

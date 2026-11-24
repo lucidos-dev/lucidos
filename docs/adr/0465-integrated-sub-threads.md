@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-13
+- **Amended by**: [0731: An integrated sub-thread hands off to a successor session like any coding-agent thread](0731-integrated-sub-threads-hand-off.md),
+  [0741](0741-integrated-sub-threads-report-decisions-to-the-parent.md)
 - **Amends**: [0416](0416-unhardened-work-is-never-proposed.md),
   [0315](0315-incremental-hardening.md)
 

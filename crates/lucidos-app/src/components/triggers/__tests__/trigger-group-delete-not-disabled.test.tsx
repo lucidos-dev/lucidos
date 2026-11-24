@@ -1,20 +1,4 @@
 // @vitest-environment jsdom
-/**
- * **Invariant: the group header's delete never renders disabled.**
- *
- * ADR 0168, the same rule `changes/__tests__/no-disabled-change-action.test.tsx`
- * holds for the change actions. `.icon-btn:disabled` sets `pointer-events:
- * none`, so a disabled button answers neither hover nor long press, and the
- * tooltip stating the block is the one thing it cannot show.
- *
- * What shipped: a group with members drew the trash icon at 25% opacity, with
- * `data-tooltip="Move triggers out first"` on that dead control and nothing
- * else on the row saying so. The control read as broken. The button stays live
- * instead, and `deleteTriggerGroup` toasts the server's refusal.
- *
- * Rendered rather than asserted through a selector: what is banned is a
- * `disabled` attribute in the markup.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 
@@ -73,8 +57,6 @@ describe('the trigger group header', () => {
     expect(deleteButton().getAttribute('data-tooltip')).toBe('Delete group');
   });
 
-  // The whole row, not just the trash: rename is in the same class and would
-  // take its tooltip out of reach the same way.
   it('draws no disabled control anywhere on the row', () => {
     render(<TriggerGroupHeader group={group({ member_count: 1 })} />, host);
     expect(disabledControls()).toEqual([]);

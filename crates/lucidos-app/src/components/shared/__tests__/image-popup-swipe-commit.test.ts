@@ -9,15 +9,6 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ImagePopup.tsx'), 'utf-8');
 
-// Architecture: each slide is positioned by its SHORTEST SIGNED DELTA from the
-// current index (so wrap-around neighbours sit adjacent on screen). The strip
-// rests at translateX(0); a swipe commit animates it by ±W in the swipe
-// direction, then snaps back to 0 as the signal updates and slides reposition.
-//
-// The previous "left = i*100%, strip = -index*W" model could not wrap: a
-// last→first commit set targetPx = 0 and dragged the strip backward through
-// every intermediate image. shortestDelta puts slide 0 at +100% when c=3, so
-// the forward commit slides it in from the right, as the user expects.
 describe('image popup swipe carousel (wrap-aware)', () => {
   it('renders every image, not just prev/current/next', () => {
     expect(source).toMatch(/state\.images\.map\(/);

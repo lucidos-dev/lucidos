@@ -5,9 +5,6 @@ import {
 } from '../event-rendering';
 import type { ResponseEvent } from '../types';
 
-// ===========================================================================
-// getCollapsedVisibleEvents
-// ===========================================================================
 describe('getCollapsedVisibleEvents', () => {
   it('shows only events from last text block onwards', () => {
     const events: ResponseEvent[] = [
@@ -57,9 +54,6 @@ describe('getCollapsedVisibleEvents', () => {
   });
 });
 
-// ===========================================================================
-// mergeAdjacentTextEvents
-// ===========================================================================
 describe('mergeAdjacentTextEvents', () => {
   it('merges consecutive text events into one', () => {
     const events: ResponseEvent[] = [

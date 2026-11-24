@@ -7,10 +7,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// The strip's rules live in `PaneDrag` and are tested in `paneDrag.test.ts`,
-// stranded touches included. The frontend test environment has no DOM, so
-// this file pins the strip's wiring to it in source.
-// See `docs/plans/2026-10-11-a-pane-swipe-reaches-no-invalid-state.md`.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const swipeSrc = readFileSync(resolve(here, '../MobileSwipeContainer.tsx'), 'utf-8');
@@ -56,7 +52,6 @@ describe('only the strip track writes the transform and transition', () => {
     expect(componentSrc).toMatch(/track\.style\.transform = correctValue;/);
   });
 
-  // The transitionend net may correct a resting strip, never a held one.
   it('leaves a held strip to the drag in the transitionend net', () => {
     expect(componentSrc).toMatch(/propertyName !== 'transform' \|\| drag\.holding\) return;/);
   });
@@ -65,7 +60,6 @@ describe('only the strip track writes the transform and transition', () => {
     const deferred = stripTrackSrc.match(/requestAnimationFrame\([\s\S]*?\}\);/g) ?? [];
     expect(deferred.length).toBe(1);
     expect(deferred[0]).toMatch(/if \(!isHeld\(\) && trackRef\.current\)/);
-    // The snap must reach a style pass before that frame turns it back on.
     const rest = stripTrackSrc.match(/rest\(animate\) \{[\s\S]*?\n {4}\},/)?.[0] ?? '';
     expect(rest).toMatch(/style\.transition = 'none';[\s\S]*?void track\.offsetWidth;[\s\S]*?requestAnimationFrame/);
     expect(swipeSrc.match(/requestAnimationFrame\(/g)?.length).toBe(1);
@@ -76,7 +70,6 @@ describe('only the strip track writes the transform and transition', () => {
     expect(follow).toMatch(/style\.transition = 'none'/);
   });
 
-  // ADR 0420: the strip is overflow: hidden, so a focus() can scroll it.
   it('resets the scroll offset whenever it rests', () => {
     const rest = stripTrackSrc.match(/rest\(animate\) \{[\s\S]*?\n {4}\},/)?.[0] ?? '';
     expect(rest).toMatch(/container\.scrollLeft = 0;/);
@@ -89,7 +82,6 @@ describe('only the strip track writes the transform and transition', () => {
   });
 });
 
-// The header keeps no visual feedback and gains the strip's touch rules.
 describe('the header swipe uses the same machine', () => {
   it('drives a PaneDrag with a track that draws nothing', () => {
     const hook = headerSrc.match(/function useHeaderPaneSwipe[\s\S]*?\n\}\n/)?.[0] ?? '';
@@ -99,7 +91,6 @@ describe('the header swipe uses the same machine', () => {
   });
 });
 
-// Defect 11: the image viewer committed a swipe on a cancel.
 describe('the image viewer never commits on a cancel', () => {
   it('springs a cancelled swipe back', () => {
     expect(viewerSrc).toMatch(/addEventListener\('touchcancel', handleTouchCancel,/);

@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The desktop title row follows the thread's title.
- *
- * A generated title and a rename both write `meta.title` on the thread object
- * in place. A signal-reading component skips a parent render whose props are
- * unchanged, so a row handed that same object kept its first title forever.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

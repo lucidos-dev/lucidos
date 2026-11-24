@@ -3,15 +3,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Width of `memory_entries.embedding` on a workspace created by THIS build.
-///
-/// Only used in the `CREATE TABLE IF NOT EXISTS` below, which means it does not
-/// govern an existing workspace: that column keeps whatever width it was created
-/// with, forever, and changing this constant would not migrate it. So nothing
-/// may assume the loaded model's width equals this. Ask
-/// [`PgVectorIndex::embedding_column_dimensions`] what the table actually has.
-const VECTOR_DIM: i32 = 384;
-
 /// Pull `N` out of a rendered pgvector column type, e.g. `vector(384)`.
 /// `None` for anything else, including a width-less `vector` (pgvector allows
 /// an unconstrained column, which imposes no width to disagree with).
@@ -37,49 +28,7 @@ fn to_pgvector_literal(v: &[f32]) -> String {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum MemorySource {
-    #[serde(rename = "artifact")]
-    Artifact { path: String, commit: String },
-    #[serde(rename = "event")]
-    Event { id: Uuid },
-}
-
-/// A memory entry a user correction removed: its text, its entities, and the
-/// source it was extracted from. A rebuild re-extracts under a new id but the
-/// same source, which is what lets a replay find the entry again.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CorrectedMemory {
-    pub summary: String,
-    #[serde(default)]
-    pub entities: Vec<String>,
-    pub source: MemorySource,
-}
-
-impl From<&MemoryEntry> for CorrectedMemory {
-    fn from(entry: &MemoryEntry) -> Self {
-        Self {
-            summary: entry.summary.clone(),
-            entities: entry.entities.clone(),
-            source: entry.source.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEntry {
-    pub id: Uuid,
-    pub source: MemorySource,
-    pub topic: String,
-    pub summary: String,
-    pub importance: f32,
-    pub entities: Vec<String>,
-    /// Timestamp from the source event or artifact (when the content was originally created)
-    pub src_created_at: DateTime<Utc>,
-    /// Timestamp when this memory entry row was inserted/updated
-    pub created_at: DateTime<Utc>,
-}
+pub use crate::engine::thread_events::{CorrectedMemory, MemoryEntry, MemorySource};
 
 #[derive(Debug)]
 pub struct SearchResult {
@@ -143,13 +92,11 @@ impl PgVectorIndex {
     where
         E: sqlx::Executor<'e, Database = sqlx::Postgres>,
     {
-        sqlx::query_scalar("SELECT to_regclass('public.memory_entries') IS NOT NULL")
-            .fetch_one(executor)
-            .await
+        crate::core::store::memory_table_exists(executor).await
     }
 
     /// The width `memory_entries.embedding` ACTUALLY has, read from the live
-    /// table rather than assumed from [`VECTOR_DIM`].
+    /// table rather than assumed from the provisioned default.
     ///
     /// This is what a loaded model has to agree with. The table is created
     /// `IF NOT EXISTS`, so a workspace provisioned by an older build keeps its
@@ -184,35 +131,7 @@ impl PgVectorIndex {
 
     /// Initialize the pgvector extension and create tables.
     async fn init_schema(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Enable pgvector extension
-        sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-            .execute(&self.pool)
-            .await?;
-
-        // Create memory entries table
-        // `extractor_version` is also added by a migration (idempotent ALTER) for
-        // upgrades; including it here covers fresh installs where init_schema
-        // creates the table from scratch.
-        sqlx::query(&format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS memory_entries (
-                id UUID PRIMARY KEY,
-                source JSONB NOT NULL,
-                topic TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                importance REAL NOT NULL,
-                entities JSONB NOT NULL DEFAULT '[]',
-                embedding vector({}) NOT NULL,
-                embedding_model TEXT NOT NULL,
-                src_created_at TIMESTAMPTZ NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL,
-                extractor_version INTEGER NOT NULL DEFAULT 0
-            )
-            "#,
-            VECTOR_DIM
-        ))
-        .execute(&self.pool)
-        .await?;
+        crate::core::store::ensure_memory_entries_table(&self.pool).await?;
 
         // HNSW index with tuned build parameters for better recall.
         // m=24 (default 16): more connections per node = better recall, slightly more storage.
@@ -1104,7 +1023,7 @@ mod embedding_dimension_tests {
         assert_eq!(parse_vector_dimensions("vector(oops)"), None);
     }
 
-    /// Read the width from the LIVE table, not from `VECTOR_DIM`: an existing
+    /// Read the width from the LIVE table, not from the provisioned default: an existing
     /// workspace keeps whatever width its column was created with, and the
     /// dimension guard has to judge a model against that.
     #[tokio::test]
@@ -1118,7 +1037,7 @@ mod embedding_dimension_tests {
         let index = PgVectorIndex::new(pool.clone()).await.unwrap();
         assert_eq!(
             index.embedding_column_dimensions().await.unwrap(),
-            Some(VECTOR_DIM as usize),
+            Some(384),
             "a freshly created table reports the width this build creates"
         );
 

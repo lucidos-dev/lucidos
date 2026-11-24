@@ -10,7 +10,6 @@ import {
 
 const FRAME_MS = 16;
 
-/** Feeds `reports` one per frame from `start`, and returns each decision. */
 function run(reports: number[], from = 240, frameMs = FRAME_MS): HeightDecision[] {
   let state = initialHeightGuard(from);
   return reports.map((px, i) => {

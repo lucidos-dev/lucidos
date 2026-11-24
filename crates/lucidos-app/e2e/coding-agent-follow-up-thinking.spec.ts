@@ -3,15 +3,6 @@ import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } fr
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/**
- * A follow-up typed under an open question card, read once the reader pressed
- * Cancel, shows the agent's Thinking row while the agent works on it.
- *
- * Reported: the stopped turn's withheld proposal and idle landed under the
- * follow-up, so it read as finished. The transcript showed nothing below the
- * message, and only the title spinner said the agent was working. The rows are
- * seeded, as the engine writes them, since the fake Claude Code cannot ask.
- */
 test.describe('coding-agent follow-up after a canceled question', () => {
   test('shows a Thinking row under the follow-up while the agent works', async ({ page }) => {
     await assertHealthy(page);

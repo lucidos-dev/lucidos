@@ -13,7 +13,6 @@ import { importedChunkOf, chunkGroup, lazyComponent, lazyModule, whenLoaded } fr
 
 describe('importedChunkOf', () => {
   it('reads the chunk out of the loader Vite builds', () => {
-    // The shape `vite build` emits for `lazyComponent(() => import('./X'))`.
     const built = '()=>Te(()=>import("./WidgetMenu-uwJKaJJ3.js"),__vite__mapDeps([0,1]),import.meta.url).then(e=>e.WidgetMenuItems)';
     expect(importedChunkOf({ toString: () => built } as () => unknown)).toBe('./WidgetMenu-uwJKaJJ3.js');
   });
@@ -23,12 +22,6 @@ describe('importedChunkOf', () => {
   });
 });
 
-/**
- * `preload()` is how a chunk loads before anything mounts it: the shell chunk
- * at boot, and the idle prefetch of popover bodies (ADR 0288). It must share
- * the one load a mount would start, and never reject into a caller that fired
- * it and moved on.
- */
 describe('lazyComponent.preload', () => {
   beforeEach(() => reloadForStaleChunk.mockClear());
 
@@ -63,8 +56,6 @@ describe('lazyComponent.preload', () => {
     error.mockRestore();
   });
 
-  // console.error never reaches the server, and a phone stuck behind the boot
-  // splash has no other way to say which chunk failed or why.
   it('posts the failure to the engine log', async () => {
     postClientLog.mockClear();
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -78,10 +69,7 @@ describe('lazyComponent.preload', () => {
     error.mockRestore();
   });
 
-  // WebKit's "Importing a module script failed." names no URL. The log names
-  // the imported chunk from the loader's source.
   function failingBuiltLoader() {
-    // Vitest rewrites a real `import()`, so the loader wears the built source.
     return Object.assign(
       () => Promise.reject(new TypeError('Importing a module script failed.')),
       { toString: () => '()=>Te(()=>import("./doesNotExist-AbC123.js"),[],import.meta.url)' },
@@ -109,7 +97,6 @@ describe('lazyComponent.preload', () => {
     error.mockRestore();
   });
 
-  // The reload tears the page down mid-probe, and a load it heals needs none.
   it('does not probe a failure the reload takes over', async () => {
     postClientLog.mockClear();
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -140,7 +127,6 @@ describe('whenLoaded', () => {
   const pointerdown = (target: EventTarget) =>
     ({ type: 'pointerdown', target }) as unknown as PointerEvent;
 
-  /** A document stand-in that records the one listener `whenLoaded` adds. */
   function fakeDocument() {
     let listener: ((e: PointerEvent) => void) | null = null;
     return {
@@ -205,9 +191,6 @@ describe('whenLoaded', () => {
   });
 
   it('reports it is no longer pending, however it ended', async () => {
-    // The caller keeps the handle, and an outside press may cancel it. The next
-    // press on the trigger must then read "not pending" and open. It must not
-    // spend itself cancelling an open that is already gone.
     const { doc, press } = fakeDocument();
     const trigger = { contains: () => false } as unknown as Element;
     const never = new Promise<ComponentType>(() => {});

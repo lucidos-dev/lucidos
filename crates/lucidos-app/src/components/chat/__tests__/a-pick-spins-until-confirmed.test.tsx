@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** A card the user has answered says so before the engine confirms it. On a
- *  slow link or a busy host that wait can last seconds. The header reads
- *  "Sending" for the whole wait. Past the delay gate, the picked option or
- *  button also spins in its mark's slot.
- *
- *  The mark only moves forward: empty, then the spinner, then the mark. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type ComponentChildren } from 'preact';
 import { act } from 'preact/test-utils';

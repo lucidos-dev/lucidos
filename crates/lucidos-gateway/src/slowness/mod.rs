@@ -352,7 +352,7 @@ impl Slowness {
                 let (reason, scan) =
                     attribute(classifier.cause(), free_bytes, last_scan, lucidos_roots);
                 if transition == Transition::Opened {
-                    crate::log!("[Gateway] slowness episode opened: {}", describe(&reason));
+                    crate::log_legacy!("[Gateway] slowness episode opened: {}", describe(&reason));
                 }
                 let status = SlownessStatus::Slow {
                     episode_id: opened.to_rfc3339(),
@@ -362,7 +362,9 @@ impl Slowness {
             }
             _ => {
                 if transition == Transition::Closed {
-                    crate::log!("[Gateway] slowness episode closed after five quiet minutes");
+                    crate::log_legacy!(
+                        "[Gateway] slowness episode closed after five quiet minutes"
+                    );
                 }
                 (SlownessStatus::Normal, None)
             }

@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A confirm raised BY an open modal has to be drawn over it.
- *
- * `App.tsx` mounts `<ConfirmDialog />` ahead of most modal slots, and every
- * `.modal-overlay` shared one `--z-modal`, so paint order fell back to that
- * child list. A modal that asked a question therefore covered its own answer.
- *
- * The report, and the options weighed:
- * `docs/adr/0237-overlay-and-toast-paint-order.md`.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 
@@ -17,14 +7,10 @@ import { Overlay } from '../Overlay';
 import { confirmState, showConfirm } from '../../../store/store';
 import { _resetOverlayStackForTesting } from '../../../store/overlayStack';
 
-/** Preact batches a signal write into a microtask, so the re-render has not
- *  happened when the write returns. */
 function settled(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** The App-root overlay group, in App's own order: the confirm first, the
- *  modal that will raise it second. */
 function OverlayGroup() {
   return (
     <>
@@ -36,9 +22,6 @@ function OverlayGroup() {
   );
 }
 
-/** The paint depth of a `.modal-overlay`, read off the inline z-index the
- *  overlay derives from its stack position. Both share `--z-modal`, so the
- *  offset is the whole comparison. */
 function paintDepth(el: Element): number {
   const z = (el as HTMLElement).style.zIndex || el.getAttribute('style') || '';
   const m = z.match(/var\(--z-modal\)\s*\+\s*(\d+)/);

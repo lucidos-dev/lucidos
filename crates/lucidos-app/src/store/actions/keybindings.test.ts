@@ -50,7 +50,6 @@ describe('bindingFor', () => {
   });
 
   it('reads a renamed shortcut from its legacy persisted key', () => {
-    // previousThread → historyBack: a binding stored under the old id survives.
     setPrefs({ previousThread: 'mod+alt+j' });
     expect(bindingFor('historyBack')).toEqual({ mod: true, shift: false, alt: true, key: 'j' });
   });
@@ -90,7 +89,6 @@ describe('matchShortcut', () => {
   });
 
   it('lets a chord the user bound beat a newer default on the same chord', () => {
-    // Search's default is mod+K. A user who bound New thread there keeps it.
     setPrefs({ newThread: 'mod+k' });
     expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }))).toBe('newThread');
   });
@@ -140,7 +138,6 @@ describe('recordChord', () => {
   });
 
   it('reports a conflict with a different shortcut', () => {
-    // Recording newThread, but Ctrl+K is searchEverywhere's binding.
     expect(recordChord(evt({ ctrlKey: true, key: 'k' }), 'newThread')).toEqual({ kind: 'conflict', withId: 'searchEverywhere' });
   });
 
@@ -151,8 +148,6 @@ describe('recordChord', () => {
     });
   });
 
-  // Those chords send or add a new line in the composer, in either mode of
-  // composer_enter_key, so a shortcut on one would strand the send.
   it('refuses Enter, Shift+Enter and Cmd/Ctrl+Enter, which the composer owns', () => {
     for (const mods of [{}, { shiftKey: true }, { metaKey: true }, { ctrlKey: true }]) {
       expect(recordChord(evt({ ...mods, key: 'Enter' }), 'renameThread')).toEqual({ kind: 'composer' });

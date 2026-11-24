@@ -12,9 +12,6 @@ vi.mock('../scrollState', async (importOriginal) => ({
 import { continueThread } from '../../../api/client';
 import { continueStoppedThread } from '../continueStoppedThread';
 
-// Each press emits its own ContinuationRequested, so a second press while the
-// first is in flight would start a second resume. The banner's Continue and
-// the abort card's both go through this one guard.
 describe('continueStoppedThread', () => {
   beforeEach(() => {
     vi.mocked(continueThread).mockReset();

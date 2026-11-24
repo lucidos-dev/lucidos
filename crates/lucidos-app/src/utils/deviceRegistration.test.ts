@@ -1,10 +1,3 @@
-/**
- * A mutation waits for this page's device registration, and nothing else does.
- *
- * The e2e flake that found this: a first keystroke started a compose while
- * registration was still in flight. The engine refused it with a 401, and the
- * rollback cleared the reader's draft.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 type Module = typeof import('./deviceRegistration');

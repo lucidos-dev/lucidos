@@ -1,13 +1,3 @@
-/**
- * Stop on a chat thread retracts its queued follow-ups, and none of them comes
- * back once the turn ends.
- *
- * A turn with no live loop behind it ends with a stale settle: a
- * `ResponseAborted` with no `request_event_id`. Such a terminal ends the
- * running turn, never a queued follow-up. A step on the follow-up would bring
- * it back as a sent turn reading "Aborted", since the retraction filter keeps
- * only waiting messages out.
- */
 import { describe, it, expect } from 'vitest';
 import { computeExchanges } from './exchange-grouping';
 import type { StoredEvent } from './thread-event-types';
@@ -15,8 +5,6 @@ import { makeThreadState } from '../__tests__/thread-events-helpers';
 
 const at = (second: number) => `2026-10-07T12:16:${String(second).padStart(2, '0')}Z`;
 
-/** A running turn with `queued` follow-ups behind it, each retracted by Stop.
- *  `streamed` says whether the turn wrote a row routed by request id first. */
 function stoppedThread(queued: string[], terminal: StoredEvent, streamed = true): Map<number, StoredEvent> {
   const rows: StoredEvent[] = [
     { type: 'MessageReceived', text: 'active', channel: 'chat', _eventId: 'active', created: at(1) },

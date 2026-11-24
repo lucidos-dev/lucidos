@@ -1,11 +1,3 @@
-/**
- * The composer's Camera item on a page that has no camera API.
- *
- * Over plain http on a LAN, `navigator.mediaDevices` is undefined. Reading
- * `getUserMedia` off it used to throw inside the capture overlay's effect,
- * before its `.catch` existed. The user got a black overlay and no toast.
- * `openRearCamera` must reject instead, so the overlay's catch reports it.
- */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NO_CAMERA_API, openRearCamera } from '../PromptInput';
 

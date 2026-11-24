@@ -33,8 +33,6 @@ describe('selectedOptionIndex', () => {
   });
 
   it('falls back to 0 when the current value is absent', () => {
-    // A stored model/effort that has since been disabled or removed must still
-    // land on a valid row instead of -1 (which would highlight nothing).
     expect(selectedOptionIndex(opts, 'gone')).toBe(0);
   });
 

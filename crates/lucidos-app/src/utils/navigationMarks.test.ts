@@ -12,7 +12,6 @@ import {
   _setPerfEnabledForTesting,
 } from './perfQueue';
 
-/** Every sample the queue flushed, read off the batched POST body. */
 function flushed(fetchMock: ReturnType<typeof vi.fn>): Array<Record<string, unknown>> {
   flushPerfQueue();
   const calls = fetchMock.mock.calls;
@@ -90,7 +89,6 @@ describe('reportNavigation', () => {
     _setPerfEnabledForTesting(true);
     markNavigationStart('content', 'content-pane', performance.now());
     reportNavigation('content-view', 'settings');
-    // Nothing is recorded until the rAF resolves: the span is intent to PAINT.
     expect(flushed(fetchMock)).toEqual([]);
     rafs.forEach((cb) => cb());
     const samples = flushed(fetchMock);
@@ -115,17 +113,12 @@ describe('reportNavigation', () => {
     _setPerfEnabledForTesting(true);
     markNavigationStart('pane', 'content', performance.now());
     reportNavigation('pane');
-    // The second fire point runs on the same navigation and finds nothing.
     reportNavigation('content-view', 'settings');
     rafs.forEach((cb) => cb());
     expect(flushed(fetchMock)).toHaveLength(1);
   });
 
   it('discards a STALE mark rather than reporting an idle stretch', () => {
-    // The backstop. A stamp whose fire point never runs would sit there. The
-    // next navigation's effect would then take it and report the idle gap as
-    // its own span, which is worse than no sample: a plausible number nobody
-    // can trace.
     _setPerfEnabledForTesting(true);
     markNavigationStart('pane', 'content', performance.now() - 60_000);
     reportNavigation('content-view', 'settings');
@@ -143,9 +136,6 @@ describe('reportNavigation', () => {
   });
 
   it('drops the sample when the frame was suspended by a backgrounded page', () => {
-    // A hidden page suspends animation frames for as long as it is hidden, and
-    // iOS backgrounds a PWA constantly. The callback then runs on resume, so
-    // the span would be the suspension rather than the navigation.
     _setPerfEnabledForTesting(true);
     let clock = 10_000;
     vi.stubGlobal('performance', { now: () => clock });
@@ -153,15 +143,12 @@ describe('reportNavigation', () => {
     reportNavigation('pane');
     expect(rafs).toHaveLength(1);
 
-    clock += 45_000; // backgrounded, then resumed
+    clock += 45_000;
     rafs.forEach((cb) => cb());
     expect(flushed(fetchMock)).toEqual([]);
   });
 
   it('drops a navigation superseded before its frame ran', () => {
-    // Two taps inside one frame. Preact commits twice before any animation
-    // frame runs, so both reports are scheduled. The first names a destination
-    // that was never painted, and one painted frame owes one sample.
     _setPerfEnabledForTesting(true);
     markNavigationStart('pane', 'content', performance.now());
     reportNavigation('pane');
@@ -176,10 +163,6 @@ describe('reportNavigation', () => {
   });
 
   it('refuses a mark whose expected view is not the one that arrived', () => {
-    // A desktop reveal that expands a collapsed pane onto the view it already
-    // holds changes no key, so no effect runs and the mark waits. Without the
-    // expectation, an unrelated change soon after would be reported from that
-    // reveal's start time, inflated by the gap between them.
     _setPerfEnabledForTesting(true);
     markNavigationStart('content', 'content-pane', performance.now(), 'app');
     reportNavigation('content-view', 'settings');
@@ -198,8 +181,6 @@ describe('reportNavigation', () => {
   });
 
   it('lets a pane swap be taken by either fire point, expecting no view', () => {
-    // `navigateToPane` names no view: on mobile a reveal swaps the pane AND may
-    // change the key, and whichever effect runs first owns the reading.
     _setPerfEnabledForTesting(true);
     markNavigationStart('pane', 'content', performance.now());
     reportNavigation('content-view', 'app');

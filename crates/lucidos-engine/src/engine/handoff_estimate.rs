@@ -17,15 +17,15 @@ use uuid::Uuid;
 
 use super::event_bus::{BusEvent, EventBus};
 use super::handoff_history::{calls_per_unit, fresh_tokens_median, thread_repo_sql, HistoryKey};
-use super::successor::{current_session_capture_sql, ThreadContext};
 use super::switch_estimate::{cache_remaining, CacheRemaining};
 use super::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
+use crate::engine::handoff_state::ThreadContext;
+use crate::engine::session_capture_sql::current_session_capture_sql;
 use crate::llm::model_prices::{price_of, ModelPrice};
 use crate::runtime::intelligence_ladder::{IntelligenceLadder, IntelligenceRung};
+use crate::runtime::CodingAgent;
 
-/// Context size, in input tokens, at or under which a handoff never pays.
-/// Estimates are noisy there, and a context this small still works well.
-pub const HANDOFF_FLOOR_TOKENS: u64 = 100_000;
+pub use crate::engine::thread_events::HANDOFF_FLOOR_TOKENS;
 
 /// Main-session calls one unit of work takes, when history is thin.
 pub const CALLS_PER_UNIT_FALLBACK: f64 = 40.0;
@@ -71,38 +71,7 @@ impl CheckpointName {
     }
 }
 
-/// How far a flow's work has come at a checkpoint: `done` units of `total`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointProgress {
-    pub done: u32,
-    pub total: u32,
-}
-
-impl CheckpointProgress {
-    /// Parse `<done>/<total>`, with `total >= 1` and `done <= total`.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        let parsed = raw.split_once('/').and_then(|(done, total)| {
-            Some((done.trim().parse().ok()?, total.trim().parse().ok()?))
-        });
-        match parsed {
-            Some((done, total)) if total >= 1 && done <= total => Ok(Self { done, total }),
-            _ => Err(format!(
-                "The progress reads `<done>/<total>`, with 1 <= total and done <= total. Got `{raw}`."
-            )),
-        }
-    }
-
-    pub fn units_left(&self) -> u32 {
-        self.total - self.done
-    }
-}
-
-/// The wire form `parse` reads: `<done>/<total>`.
-impl std::fmt::Display for CheckpointProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.done, self.total)
-    }
-}
+pub use crate::engine::thread_events::checkpoint::CheckpointProgress;
 
 /// One checkpoint run, as the flow names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +178,42 @@ pub(crate) fn estimate(
     }
 }
 
+/// The default and risk choices on another installed backend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OtherBackendRungs {
+    pub coding_agent: CodingAgent,
+    pub floor_rung: IntelligenceRung,
+    pub risk_rung: Option<IntelligenceRung>,
+}
+
+impl OtherBackendRungs {
+    /// What `ladder` offers. A rung on a model the backend `refused` (it
+    /// substituted another) is never offered, so a refused default offers
+    /// nothing.
+    pub fn on_ladder(
+        ladder: &IntelligenceLadder,
+        refused: impl Fn(CodingAgent, &str) -> bool,
+    ) -> Option<Self> {
+        if !ladder.climbs {
+            return None;
+        }
+        let coding_agent = ladder.coding_agent?;
+        let runs = |rung: &&IntelligenceRung| !refused(coding_agent, &rung.model);
+        let floor = ladder.default_intelligence_rung.as_ref().filter(runs)?;
+        let at = ladder.on_position_of(floor)?;
+        let on = ladder.pairs();
+        Some(Self {
+            coding_agent,
+            floor_rung: floor.clone(),
+            risk_rung: on
+                .get(at + 1)
+                .filter(|_| at + 2 < on.len())
+                .filter(runs)
+                .cloned(),
+        })
+    }
+}
+
 /// The rungs a checkpoint run that declares the *default floor* offers a
 /// thread. The agent hands off onto one of them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -220,6 +225,8 @@ pub struct FloorRungs {
     /// it. The agent takes it for security work or a costly one-way door.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_rung: Option<IntelligenceRung>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_backends: Vec<OtherBackendRungs>,
 }
 
 impl FloorRungs {
@@ -236,23 +243,40 @@ impl FloorRungs {
         let below = |at: usize| on.get(at).filter(|_| thread_at < at).cloned();
         let risk_at = default_at + 1;
         Self {
+            other_backends: Vec::new(),
             floor_rung: below(default_at),
             risk_rung: below(risk_at).filter(|_| risk_at + 1 < on.len()),
         }
     }
 
     /// What `ladder` offers a thread on `thread`. A ladder that does not
-    /// climb offers nothing: its order says nothing about intelligence.
-    pub fn on_ladder(ladder: &IntelligenceLadder, thread: Option<&IntelligenceRung>) -> Self {
+    /// climb offers nothing: its order says nothing about intelligence. A
+    /// rung on a model the backend `refused` (it substituted another) is
+    /// never offered.
+    pub fn on_ladder(
+        ladder: &IntelligenceLadder,
+        thread: Option<&IntelligenceRung>,
+        refused: impl Fn(CodingAgent, &str) -> bool,
+    ) -> Self {
         if !ladder.climbs {
             return Self::default();
         }
         let at = |rung: &IntelligenceRung| ladder.on_position_of(rung);
-        Self::offered(
+        let offered = Self::offered(
             &ladder.pairs(),
             ladder.default_intelligence_rung.as_ref().and_then(at),
             thread.and_then(at),
-        )
+        );
+        let runs = |rung: &IntelligenceRung| {
+            ladder
+                .coding_agent
+                .is_none_or(|agent| !refused(agent, &rung.model))
+        };
+        Self {
+            floor_rung: offered.floor_rung.filter(runs),
+            risk_rung: offered.risk_rung.filter(runs),
+            ..offered
+        }
     }
 }
 
@@ -302,7 +326,7 @@ async fn verdict_from(
     readings: &Readings,
     offered: FloorRungs,
 ) -> Result<HandoffVerdict, sqlx::Error> {
-    let context = super::successor::thread_context(pool, thread_id).await?;
+    let context = crate::engine::handoff_state::thread_context(pool, thread_id).await?;
     let eligible = context.can_hand_off && !holds_open_change(pool, thread_id).await?;
     let unknown = HandoffVerdict {
         name: run.name.clone(),
@@ -431,7 +455,7 @@ pub async fn card_verdict(
         return Ok(None);
     };
     let held = offer_held_back(
-        super::successor::latest_offer_decline(pool, thread_id).await?,
+        crate::engine::handoff_state::latest_offer_decline(pool, thread_id).await?,
         inputs.context_tokens,
     );
     let eligible = context.can_hand_off && !held && !holds_open_change(pool, thread_id).await?;
@@ -491,7 +515,7 @@ pub async fn record_checkpoint(
 
 async fn read_thread(pool: &PgPool, thread_id: Uuid) -> Result<Readings, sqlx::Error> {
     Ok(Readings {
-        context_tokens: super::successor::thread_context(pool, thread_id)
+        context_tokens: crate::engine::handoff_state::thread_context(pool, thread_id)
             .await?
             .input_tokens,
         model: thread_model(pool, thread_id).await?,
@@ -512,7 +536,7 @@ async fn holds_open_change(pool: &PgPool, thread_id: Uuid) -> Result<bool, sqlx:
     .bind(crate::core::changes::ChangeStatus::Pending)
     .fetch_one(pool)
     .await?;
-    Ok(open || super::successor::awaits_landing(pool, thread_id).await?)
+    Ok(open || crate::engine::handoff_state::awaits_landing(pool, thread_id).await?)
 }
 
 /// The repository `thread_id` works in, which a median pools on.

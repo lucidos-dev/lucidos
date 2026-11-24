@@ -5,7 +5,6 @@ import { PROVIDERS, providerLabel } from '../../store/models';
 import { routeDrafts, saveModelRoutes, type RouteDraft } from '../../store/actions/models';
 import type { ModelInfo } from '../../api/types';
 
-/** Move the item at `from` by `step`, returning a new array. */
 function moved<T>(items: readonly T[], from: number, step: -1 | 1): T[] {
   const to = from + step;
   if (to < 0 || to >= items.length) return [...items];
@@ -14,14 +13,8 @@ function moved<T>(items: readonly T[], from: number, step: -1 | 1): T[] {
   return next;
 }
 
-/** Settings → Models: edit which backends serve one model, in the order the
- *  engine tries them, and which of them it remembers as picked.
- *
- *  Builtins take route edits too. Which backends serve a model is a fact the
- *  vendor can change, not part of the row's identity. */
 export function ModelRoutesEditor({ model, onClose }: { model: ModelInfo; onClose: () => void }) {
   const [drafts, setDrafts] = useState<RouteDraft[]>(() => routeDrafts(model));
-  // `undefined` until the user picks, so saving never replays a stale seed.
   const [preferred, setPreferred] = useState<string | undefined>(undefined);
   const shownPreferred = preferred ?? model.preferred_provider ?? '';
   const unused = PROVIDERS.filter((p) => !drafts.some((d) => d.provider === p.value));

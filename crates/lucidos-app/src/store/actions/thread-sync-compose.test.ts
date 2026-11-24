@@ -1,9 +1,12 @@
-/** How SSE thread events and compose reports reach the draft. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { focusedThreadId, threadMap } from '../store';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { handleThreadEvent, handleGlobalEvent } from './thread-sync';
+import { refreshThreadList } from './thread-list-refresh';
+
+vi.mock('./thread-list-refresh', () => ({ refreshThreadList: vi.fn(async () => {}) }));
+
 import { noteLocalComposeEdit, _resetComposeSyncForTesting } from '../composeSync';
 import {
   _resetThreadNavForTesting,
@@ -64,10 +67,6 @@ function makeActiveThread(overrides: MakeThreadOpts = {}): ThreadState {
 
 const originalDocument = globalThis.document;
 
-/** Plant a fake textarea matching `[data-role="prompt-input"]` and mark it as
- *  document.activeElement so isComposeFocusedHere() returns true. The `role`
- *  field on dataset must match the real DOM marker — isComposeFocusedHere
- *  reads document.activeElement directly and verifies dataset.role. */
 function focusPromptOnThread(threadId: string): void {
   const el = {
     dataset: { role: 'prompt-input', threadId },
@@ -102,9 +101,6 @@ describe('SSE thread events and the draft', () => {
     vi.restoreAllMocks();
   });
 
-  /** A send consumes the compose slot at accept, and the engine reports what
-   *  that left (ADR 0450). The thread event itself never touches the draft,
-   *  whoever sent it and wherever focus is. */
   it('a MessageReceived leaves the draft alone, focused or not, from any device', () => {
     focusPromptOnThread('t-1');
     handleThreadEvent({
@@ -290,9 +286,45 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
     expect(focusedThreadId.value).toBe('t-1');
     expect(getDraft('t-1').text).toBe('half-typed draft');
   });
+
+  it("an agent's new draft lands without moving focus or the user's own draft", () => {
+    focusPromptOnThread('t-1');
+    const meta = makeActiveThread({ id: 'agent-draft' }).meta;
+    handleThreadEvent({
+      thread_id: 'agent-draft',
+      seq: 1,
+      created: '2026-11-12T10:00:00Z',
+      event: { type: 'ThreadStarted', mode: 'lucidos' },
+      aggregate: {
+        ...meta, threadId: 'agent-draft', state: 'composing', initiator: 'system',
+        summaryVersion: 1, lastActivity: '', isSaved: false,
+      },
+    });
+    handleGlobalEvent('ThreadComposeChanged', {
+      id: 'agent-draft',
+      summary_version: 2,
+      compose_epoch: 0,
+      text: 'Here is the weekly summary.',
+      image_hashes: [],
+      mode: 'lucidos',
+    });
+
+    expect(focusedThreadId.value).toBe('t-1');
+    expect(getDraft('t-1').text).toBe('half-typed draft');
+    expect(threadMap.value.get('agent-draft')?.meta.state).toBe('composing');
+    expect(getDraft('agent-draft').text).toBe('Here is the weekly summary.');
+  });
 });
 
 describe('SSE ThreadComposeChanged is a compose report', () => {
+  it.each(['DraftSubmissionAccepted', 'OrdinarySubmissionAccepted'])('%s reads the committed compose report', (type) => {
+    vi.mocked(refreshThreadList).mockClear();
+    handleGlobalEvent(type, {
+      receipt: { thread_id: 't-1' },
+    });
+    expect(refreshThreadList).toHaveBeenCalledOnce();
+  });
+
   beforeEach(() => {
     localStorage.setItem('lucidos-device-id', 'me-device');
     focusedThreadId.value = 't-1';
@@ -334,8 +366,6 @@ describe('SSE ThreadComposeChanged is a compose report', () => {
     expect(getDraft('t-1').text).toBe('synced-from-peer draft');
   });
 
-  /** Dropping it would lose the peer's write: the next keystroke here would
-   *  PUT the older text plus the key over it. */
   it('a newer non-empty report applies while focused, when nothing is pending', () => {
     focusPromptOnThread('t-1');
     report(3, 'peer is typing something new');

@@ -1,11 +1,3 @@
-/**
- * Applying the live style remote's overrides onto `<html>`.
- *
- * Both cases below are regressions from the review of the change that added
- * this, and both are about the same thing: an inline custom property OUTLIVES
- * the map that set it, so "stop applying X" is a `removeProperty` call someone
- * has to make, and "reset" is a write that itself announces a change.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences } from '../store';
 import { applyStyleOverrides } from './preferences';
@@ -36,8 +28,6 @@ describe('applyStyleOverrides', () => {
       getPropertyValue: (k: string) => inlineProps[k] ?? '',
       removeProperty: (k: string) => { delete inlineProps[k]; },
     };
-    // Start from a clean applied-set: the module tracks what it wrote across
-    // calls, and an earlier suite may have left names behind.
     applyStyleOverrides({});
     inlineProps = {};
   });
@@ -56,15 +46,10 @@ describe('applyStyleOverrides', () => {
   it('removes a name dropped from the map', () => {
     applyStyleOverrides({ '--accent': '#ff0000' });
     applyStyleOverrides({});
-    // Not merely unset in the map: actually removed from the element, or the
-    // old value keeps painting until the next full reload.
     expect(inlineProps).not.toHaveProperty('--accent');
   });
 
   it('removes a name whose NEW value is invalid, rather than leaving the old one stuck', () => {
-    // The regression: keying the removal loop on the incoming map meant a name
-    // whose replacement failed validation was skipped by both loops, so it kept
-    // painting its previous value, from a function that promises to validate.
     applyStyleOverrides({ '--accent': '#ff0000' });
     applyStyleOverrides({ '--accent': 'url(http://evil.test/x.png)' });
     expect(inlineProps).not.toHaveProperty('--accent');
@@ -77,8 +62,6 @@ describe('applyStyleOverrides', () => {
   });
 
   it('mirrors the map to localStorage for the next first paint', () => {
-    // The boot script reads this key before any module runs, so a tuned value
-    // paints on the first frame instead of flashing the untuned one.
     applyStyleOverrides({ '--accent': '#ff0000' });
     expect(JSON.parse(localStorage.getItem('lucidos-style-overrides')!)).toEqual({ '--accent': '#ff0000' });
   });

@@ -21,44 +21,17 @@ function declarationValue(block: string, property: string): string | undefined {
   return block.match(new RegExp(`${escaped}\\s*:\\s*([^;]+)`))?.[1].trim();
 }
 
-// The navigation focus marker (.nav-focus-stuck, styles/global/host-components.css)
-// washes the marked element's padding box, so the gap it leaves around the content
-// on each side equals that side's padding. A settings row is padded 0.5rem
-// top/bottom and 0 at the sides. A plugin row is padded 1rem all round, too wide
-// for the clip. Each gets a scoped rule that sets all four sides to one gap, with
-// cancelling margins so nothing reflows. Settings shrinks to 0.375rem, the largest
-// gap that fits the clip container, and plugins to 0.75rem. These rules MUST stay
-// attached to the current marker class; a
-// rename that leaves them on the old class silently drops the rule and the gap
-// regresses (the same failure mode the chat rule's guard protects against). The
-// numbers below predate the repaint from an outline frame to a background wash and
-// are deliberately unchanged by it: both paints take their breathing room from the
-// same padding.
 describe('nav focus marker — uniform gap outside chat', () => {
   it('gives a focus-marked settings row a uniform gap that fits its clip container', () => {
     const block = getBlock(settingsCss, '.settings-row.nav-focus-stuck');
     expect(block).not.toBe('');
-    // Uniform 0.375rem gap on all four sides: sides grown from 0 (margin cancels),
-    // the 0.5rem feed padding shrunk to 0.375rem with the 0.125rem handed back as
-    // margin. 0.375 (not 0.5) because the gap + --nav-focus-reach (0.375rem) must fit
-    // within .settings-panel's --space-lg (1rem) side room, a pinned marker-geometry
-    // value; historically a 0.5rem grow overran the then-0.75rem gutter by 0.125rem
-    // and clipped the marker against .content-pane-body's overflow-x. That budget
-    // covers the marker's hard-edged wash, not its soft glow, whose wider blur is
-    // knowingly clipped there (see the rule's own comment in settings/base.css).
     expect(declarationValue(block, 'padding')).toBe('0.375rem');
     expect(declarationValue(block, 'margin')).toBe('0.125rem -0.375rem');
-    // The vertical margin is only safe (no content shift) if the section contains
-    // it — guard the BFC that makes that true.
     const section = getBlock(settingsCss, '.settings-section');
     expect(declarationValue(section, 'display')).toBe('flow-root');
   });
 
   it('preserves a nested settings row indent under the marker', () => {
-    // A .settings-row-child is indented via padding-left: 1rem. The uniform-gap
-    // rule (two classes) outranks that single-class indent, so the child needs a
-    // margin-left override to shift its box by (indent - gap) = 0.625rem and keep
-    // the content at its indent. Dropping this rule regresses the indent on focus.
     const block = getBlock(settingsCss, '.settings-row-child.nav-focus-stuck');
     expect(block).not.toBe('');
     expect(declarationValue(block, 'margin-left')).toBe('0.625rem');
@@ -67,9 +40,6 @@ describe('nav focus marker — uniform gap outside chat', () => {
   it('shrinks a focus-marked plugin row inward to a uniform gap', () => {
     const block = getBlock(pagesCss, '.app-store-plugin-row.nav-focus-stuck');
     expect(block).not.toBe('');
-    // Every side shrinks from the row's 1rem padding to 0.75rem. A positive margin
-    // cancels it, so the row keeps its content box and position. With a wash rather
-    // than a frame, this is the width of the highlighted band around the content.
     expect(declarationValue(block, 'padding')).toBe('var(--space-md)');
     expect(declarationValue(block, 'margin')).toBe('var(--space-xs)');
     const row = getBlock(pagesCss, '.list-row.app-store-plugin-row');

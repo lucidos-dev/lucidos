@@ -37,15 +37,16 @@ use crate::error::ApiError;
 use crate::pairing_qr;
 use crate::registry::SIGIL;
 use crate::server::GatewayState;
-use crate::tls;
+use lucidos_gateway_tls as tls;
 
 pub fn router() -> Router<GatewayState> {
     Router::new()
         .merge(crate::gateway_protocol::management_router())
         .route("/pairing-code", post(pairing_code))
-        .route("/devices", get(list_devices))
-        .route("/devices/:id", axum::routing::delete(revoke_device))
-        .merge(crate::operators_api::routes())
+        .merge(device_routes())
+        .merge(crate::users_api::routes())
+        .merge(crate::users_api::legacy_routes())
+        .merge(crate::pairing_requests::routes())
         // These mint, list and revoke credentials, so an app document must not
         // reach them with the user's cookie. Covers only the routes above it.
         .route_layer(middleware::from_fn(crate::control::control_authz))
@@ -53,6 +54,13 @@ pub fn router() -> Router<GatewayState> {
         // gate would add nothing against a caller who skips the browser.
         .route("/session", get(session))
         .route("/pair", post(pair))
+}
+
+/// List and revoke this gateway's devices. The manage hop serves these too.
+pub(crate) fn device_routes() -> Router<GatewayState> {
+    Router::new()
+        .route("/devices", get(list_devices))
+        .route("/devices/:id", axum::routing::delete(revoke_device))
 }
 
 /// May this path be served with no credential at all?
@@ -71,6 +79,11 @@ pub fn is_public_path(path: &str) -> bool {
         // one is gated except the tags on an app frame's own document.
         return is_public_app_asset(path);
     };
+    // Local update feeds are gateway data, not picker assets. They require
+    // the normal authentication pass before their stricter loopback/token gate.
+    if rest == "updates" || rest.starts_with("updates/") {
+        return false;
+    }
     if !rest.starts_with("api/") {
         // The picker shell and its bundled assets. Static files only: no
         // workspace data and no control surface is served from here.
@@ -149,7 +162,7 @@ const APP_ASSET_TREES: [&str; 1] = ["/fonts/"];
 /// that touches the workspace stays gated, over the host bridge instead.
 ///
 /// The engine owns the same list, in
-/// `crates/lucidos-engine/src/api/browser_origin.rs::is_public_app_asset`, and
+/// `crates/lucidos-agents-api/src/api/browser_origin.rs::is_public_app_asset`, and
 /// `the_two_halves_of_the_app_asset_exemption_agree` pins the two together. It
 /// sees `/api/v1/sdk.js` where we see `/<slug>/api/v1/sdk.js` (ADR 0014 §4).
 /// `server::fallback` is the other reader: an exempt path must not lazy-start a
@@ -309,14 +322,24 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
     // The gateway-to-gateway namespace has a door of its own: a gateway
     // credential, which that router checks. A device cookie opens nothing
     // there, so the device gate stands aside rather than letting one in.
+    // Browser metadata decides nothing there either: an older peer still
+    // forwards its browser's `Origin`, and must meet the upgrade answer.
     if crate::gateway_protocol::is_gateway_api_path(req.uri().path())
         && !carries_a_dot_segment(req.uri().path())
     {
         return next.run(req).await;
     }
+    if crate::remote_browser::foreign_private_request(&req) {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin access to private gateway routes is not allowed",
+        )
+            .into_response();
+    }
     // One scan of the `Cookie` header for a decision this then acts on twice:
     // stamp the device, and re-issue the credential it presented.
-    let (decision, matched) = state.authorize_with_match(req.headers());
+    let form = auth::CookieForm::of_request(&req);
+    let (decision, matched) = state.authorize_with_match(req.headers(), form);
     match decision {
         Authorization::Device { id, label } => {
             // Three reasons to hand this device a cookie. All are decided here,
@@ -342,13 +365,13 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
             let due = state.touch_device(&id, chrono::Utc::now());
             let refresh = matched
                 .filter(|_| renaming || page_load || due)
-                .and_then(|p| refreshed_credential_cookie(&state, &req, p));
+                .and_then(|p| refreshed_credential_cookie(&state, form, p));
             // Tell the proxy who this is. The engine keys push, preferences and
             // actor attribution on the same id. So the device the gateway let
             // in and the device the workspace knows are one row, not two.
             req.extensions_mut()
                 .insert(auth::AuthenticatedDevice { id, label });
-            let cookie_name = state.device_cookie_name().to_string();
+            let cookie_name = form.name(state.device_cookie_name());
             let mut response = next.run(req).await;
             if let Some(cookie) = refresh {
                 if !response_speaks_for_the_credential(&response, &cookie_name) {
@@ -364,9 +387,13 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
             req.extensions_mut().insert(auth::AuthenticatedLocalProcess);
             return next.run(req).await;
         }
+        Authorization::Unauthorized if admits_agent_restore_caller(&req) => {
+            req.extensions_mut().insert(auth::AgentRestoreCaller);
+            return next.run(req).await;
+        }
         Authorization::Unauthorized => {}
     }
-    state.log_device_refusal(req.headers());
+    state.log_device_refusal(req.headers(), form);
     if is_top_level_navigation(req.headers()) {
         // Show the pairing screen here, rather than a bare 401 with no
         // affordance. In place rather than redirected: see `serve_pairing_shell`.
@@ -393,6 +420,53 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
         })),
     )
         .into_response()
+}
+
+/// May a sandboxed agent make this snapshot restore call without a device or
+/// local token?
+///
+/// Only a direct loopback peer carrying an origin token, and only on the three
+/// restore routes. Loopback narrows who can try, but proves nothing: an
+/// `ssh -L` forward arrives from loopback too. So no admitted route may trust
+/// the caller. The source engine checks the origin token through
+/// `snapshot_restore_caller` (ADR 0645), and status needs a restore id.
+fn admits_agent_restore_caller(req: &Request) -> bool {
+    let loopback = req
+        .extensions()
+        .get::<crate::pairing::Peer>()
+        .is_some_and(|peer| !peer.public_listener && peer.remote.ip().to_canonical().is_loopback());
+    loopback
+        && !crate::pairing::is_forwarded(req.headers())
+        && req
+            .headers()
+            .get(auth::HEADER_AGENT_ORIGIN_TOKEN)
+            .is_some_and(|token| !token.is_empty())
+        && is_agent_restore_route(req.method(), req.uri().path())
+}
+
+fn is_agent_restore_route(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    use lucidos_gateway_constants::is_valid_workspace_id;
+    let segments: Vec<&str> = path.split('/').collect();
+    match (method, segments.as_slice()) {
+        (
+            &Method::POST,
+            ["", "~", "api", "v1", "control", "workspaces", id, "snapshot-restore-caller"],
+        )
+        | (
+            &Method::GET,
+            ["", "~", "api", "v1", "control", "workspaces", id, "snapshot-restore-status"],
+        ) => is_valid_workspace_id(id),
+        (&Method::POST, ["", target, "api", "v1", "snapshots", handle, "restore"]) => {
+            is_valid_workspace_id(target)
+                && !handle.is_empty()
+                && handle.len() <= 128
+                && handle
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        }
+        _ => false,
+    }
 }
 
 /// Is this request a nested document, rather than a subresource of one?
@@ -441,12 +515,10 @@ fn response_speaks_for_the_credential(response: &Response, name: &str) -> bool {
 /// the `Cookie` header is the only one.
 fn refreshed_credential_cookie(
     state: &GatewayState,
-    req: &Request,
+    form: auth::CookieForm,
     presented: auth::PresentedCredential<'_>,
 ) -> Option<axum::http::HeaderValue> {
-    let connection = tls::Connection::of(req.extensions());
-    let secure = auth::request_is_secure(req.headers(), connection.is_tls());
-    auth::credential_cookie(state.device_cookie_name(), presented.value(), secure)
+    auth::credential_cookie(state.device_cookie_name(), presented.value(), form)
         .parse()
         .ok()
 }
@@ -465,27 +537,33 @@ struct SessionBody {
 }
 
 /// Who is calling? Public, so an unpaired client can ask before it is refused.
-async fn session(State(state): State<GatewayState>, headers: HeaderMap) -> Json<SessionBody> {
-    Json(match state.authorize(&headers) {
-        Authorization::LocalProcess => SessionBody {
-            paired: true,
-            device_id: None,
-            device_label: None,
-            local: true,
+async fn session(
+    State(state): State<GatewayState>,
+    connection: tls::Connection,
+    headers: HeaderMap,
+) -> Json<SessionBody> {
+    Json(
+        match state.authorize(&headers, auth::CookieForm::of(&headers, &connection)) {
+            Authorization::LocalProcess => SessionBody {
+                paired: true,
+                device_id: None,
+                device_label: None,
+                local: true,
+            },
+            Authorization::Device { id, label } => SessionBody {
+                paired: true,
+                device_id: Some(id),
+                device_label: Some(label),
+                local: false,
+            },
+            Authorization::Unauthorized => SessionBody {
+                paired: false,
+                device_id: None,
+                device_label: None,
+                local: false,
+            },
         },
-        Authorization::Device { id, label } => SessionBody {
-            paired: true,
-            device_id: Some(id),
-            device_label: Some(label),
-            local: false,
-        },
-        Authorization::Unauthorized => SessionBody {
-            paired: false,
-            device_id: None,
-            device_label: None,
-            local: false,
-        },
-    })
+    )
 }
 
 /// What the mint call accepts.
@@ -493,14 +571,16 @@ async fn session(State(state): State<GatewayState>, headers: HeaderMap) -> Json<
 /// `label` names the device that redeems the code, so `lucidos pair --label`
 /// does more than print a name in the terminal. `origin` asks for a QR, and is
 /// the address the new device should open. Only the caller knows which of this
-/// machine's addresses another device can reach. `operator` names the person
-/// the device joins; without it the device joins the first operator.
+/// machine's addresses another device can reach. `user` names the user
+/// the device joins; without it the device joins the first user.
 #[derive(Deserialize, Default)]
 struct PairingCodeQuery {
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
     origin: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
     #[serde(default)]
     operator: Option<String>,
 }
@@ -526,9 +606,11 @@ struct PairingCodeBody {
 /// Gated by [`enforce`], so either a local process or an already-paired device
 /// may mint one. A paired device is allowed on purpose: it already holds full
 /// authority, so refusing it would add no safety and would strand a user who is
-/// away from the machine.
+/// away from the machine. A local process's code waits for a paired device's
+/// Allow at redeem time (`crate::pairing_requests`).
 async fn pairing_code(
     State(state): State<GatewayState>,
+    device: Option<axum::Extension<auth::AuthenticatedDevice>>,
     axum::extract::Query(query): axum::extract::Query<PairingCodeQuery>,
 ) -> Result<Json<PairingCodeBody>, ApiError> {
     let label = query
@@ -550,19 +632,21 @@ async fn pairing_code(
         })?),
         None => None,
     };
-    let operator_id = query
-        .operator
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    if let Some(id) = &operator_id {
-        if state.directory().operator(id).is_none() {
-            return Err(ApiError::bad_request("no person with that id"));
+    let user_id =
+        crate::users_api::requested_user(query.user.as_deref(), query.operator.as_deref())?
+            .map(str::to_string);
+    if let Some(id) = &user_id {
+        if state.directory().user(id).is_none() {
+            return Err(ApiError::bad_request("no user with that id"));
         }
     }
     let minted = state
-        .mint_pairing(crate::pairing::PairingIntent { label, operator_id })
+        .mint_pairing(crate::pairing::PairingIntent {
+            label,
+            user_id,
+            may_manage: false,
+            minter: crate::pairing_requests::minter(device.as_ref()),
+        })
         .map_err(ApiError::internal)?;
     let code = minted
         .code
@@ -636,13 +720,19 @@ async fn pair(
                  checked. Wait a minute and try again, or scan the QR code instead.",
             ))
         }
+        crate::server::PairingOutcome::AwaitingOwner => {
+            return Ok(crate::pairing_requests::awaiting_owner())
+        }
+        crate::server::PairingOutcome::Declined => {
+            return Err(ApiError::forbidden(crate::pairing_requests::DECLINED))
+        }
     };
-    let secure = auth::request_is_secure(&headers, connection.is_tls());
+    let form = auth::CookieForm::of(&headers, &connection);
     Ok((
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            auth::credential_cookie(state.device_cookie_name(), &credential, secure),
+            auth::credential_cookie(state.device_cookie_name(), &credential, form),
         )],
         Json(serde_json::json!({ "paired": true })),
     )
@@ -653,8 +743,12 @@ async fn pair(
 struct DeviceRow {
     id: String,
     label: String,
-    /// The person holding this device.
+    /// The user holding this device.
     #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    /// Older pages read membership under this wire name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    // See "User rename wire aliases" in docs/temporary-measures.md.
     operator_id: Option<String>,
     paired_at: String,
     /// Omitted for a device paired before the field existed, so the list can
@@ -673,7 +767,8 @@ async fn list_devices(State(state): State<GatewayState>) -> Result<Json<Vec<Devi
             .iter()
             .cloned()
             .map(|d| DeviceRow {
-                operator_id: directory.operator_of_device(&d.id).map(str::to_string),
+                user_id: directory.user_of_device(&d.id).map(str::to_string),
+                operator_id: directory.user_of_device(&d.id).map(str::to_string),
                 id: d.id,
                 label: d.label,
                 paired_at: d.paired_at,
@@ -688,21 +783,24 @@ async fn list_devices(State(state): State<GatewayState>) -> Result<Json<Vec<Devi
 /// longer resolves.
 async fn revoke_device(
     State(state): State<GatewayState>,
+    connection: tls::Connection,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
+    let form = auth::CookieForm::of(&headers, &connection);
     // Resolve the caller BEFORE revoking. Afterwards its credential matches no
     // stored device, so `authorize` returns `Unauthorized`. A device revoking
     // itself would then never be recognised as having done so, and would keep
     // sending a credential that no longer resolves.
-    let revoked_self = matches!(state.authorize(&headers), Authorization::Device { id: caller, .. } if caller == id);
+    let revoked_self = matches!(state.authorize(&headers, form), Authorization::Device { id: caller, .. } if caller == id);
     let removed = state.revoke_device(&id).map_err(ApiError::internal)?;
     if !removed {
         return Err(ApiError::bad_request("no paired device with that id"));
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     if revoked_self {
-        if let Ok(value) = auth::cleared_credential_cookie(state.device_cookie_name()).parse() {
+        if let Ok(value) = auth::cleared_credential_cookie(state.device_cookie_name(), form).parse()
+        {
             response.headers_mut().insert(header::SET_COOKIE, value);
         }
     }
@@ -879,7 +977,7 @@ mod tests {
         let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("the gateway crate sits in crates/")
-            .join("lucidos-engine/src/api/browser_origin.rs");
+            .join("lucidos-agents-api/src/api/browser_origin.rs");
         let source = std::fs::read_to_string(&engine)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", engine.display()));
         let body = source
@@ -1153,34 +1251,67 @@ mod tests {
         );
     }
 
-    /// One gateway serves loopback plain and its tailnet address over TLS. A
-    /// `Secure` cookie on the plain one is dropped, so the flag must follow the
-    /// connection the request arrived on.
+    /// One gateway can serve its LAN address plain and its tailnet address over
+    /// TLS. A `Secure` cookie on the plain one is dropped, so the form must
+    /// follow the connection the request arrived on.
     #[tokio::test]
-    async fn a_refreshed_cookie_is_secure_only_on_a_tls_connection() {
+    async fn a_refreshed_cookie_is_hardened_only_on_a_tls_connection() {
         use tower::ServiceExt as _;
-        for (connection, secure) in [
-            (tls::Connection::Tls, true),
-            (tls::Connection::Plain, false),
+        for (connection, form) in [
+            (tls::Connection::Tls, auth::CookieForm::Hardened),
+            (tls::Connection::Plain, auth::CookieForm::Plain),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
+            let name = form.name(state.device_cookie_name());
             let mut request = axum::extract::Request::builder()
                 .uri("/dev/api/v1/threads/list")
-                .header("cookie", own_device_cookie(&state))
+                .header("cookie", format!("{name}=cred-abc"))
                 .body(axum::body::Body::empty())
                 .unwrap();
             request.extensions_mut().insert(connection.clone());
             let response = gated_router(state).oneshot(request).await.unwrap();
             let cookie = set_cookie(&response);
             assert!(
-                !cookie.is_empty(),
-                "{connection:?}: a stale device gets a fresh cookie"
+                cookie.starts_with(&format!("{name}=cred-abc;")),
+                "{connection:?}: a stale device gets a fresh cookie: {cookie}"
             );
+            let hardened = form == auth::CookieForm::Hardened;
+            for attribute in ["; Secure", "; Partitioned"] {
+                assert_eq!(
+                    cookie.contains(attribute),
+                    hardened,
+                    "{connection:?}: {cookie}"
+                );
+            }
+        }
+    }
+
+    /// Each form reads only its own names. An https request ignores a plain
+    /// cookie, which any `http://localhost` page could have planted, and a
+    /// plain request never sees a hardened one.
+    #[tokio::test]
+    async fn a_cookie_of_the_other_form_does_not_authorize() {
+        use tower::ServiceExt as _;
+        for (connection, other) in [
+            (tls::Connection::Tls, auth::CookieForm::Plain),
+            (tls::Connection::Plain, auth::CookieForm::Hardened),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_with_device(dir.path(), None);
+            let name = other.name(state.device_cookie_name());
+            let mut request = axum::extract::Request::builder()
+                .uri("/dev/api/v1/threads/list")
+                .header("cookie", format!("{name}=cred-abc"))
+                .header("sec-fetch-mode", "cors")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(connection.clone());
+            let response = gated_router(state).oneshot(request).await.unwrap();
             assert_eq!(
-                cookie.contains("; Secure"),
-                secure,
-                "{connection:?}: {cookie}"
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{connection:?} with a {other:?} cookie"
             );
         }
     }
@@ -1296,14 +1427,19 @@ mod tests {
         // `revoke_device` clears the caller's own cookie and runs behind this
         // middleware. A revoke landing on a day the device was also due a
         // restamp must still clear, not be handed a fresh credential.
-        let mut cleared = StatusCode::NO_CONTENT.into_response();
-        cleared.headers_mut().insert(
-            header::SET_COOKIE,
-            auth::cleared_credential_cookie(TEST_COOKIE)
-                .parse()
-                .unwrap(),
-        );
-        assert!(response_speaks_for_the_credential(&cleared, TEST_COOKIE));
+        for form in [auth::CookieForm::Hardened, auth::CookieForm::Plain] {
+            let mut cleared = StatusCode::NO_CONTENT.into_response();
+            cleared.headers_mut().insert(
+                header::SET_COOKIE,
+                auth::cleared_credential_cookie(TEST_COOKIE, form)
+                    .parse()
+                    .unwrap(),
+            );
+            assert!(
+                response_speaks_for_the_credential(&cleared, &form.name(TEST_COOKIE)),
+                "{form:?}"
+            );
+        }
 
         // Another handler's unrelated cookie is not ours, so the refresh rides
         // alongside it rather than standing down or replacing it.
@@ -1529,7 +1665,7 @@ mod tests {
         // And nothing beyond them moved. The same cookieless caller asking for
         // workspace data is still refused, which is the whole device gate.
         let refused = get(&state, "/dev/api/v1/threads/list", &as_a_tag).await;
-        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1847,9 +1983,9 @@ mod tests {
             ("POST", "/~/api/v1/auth/pairing-code"),
             ("GET", "/~/api/v1/auth/devices"),
             ("DELETE", "/~/api/v1/auth/devices/no-such-device"),
-            ("GET", "/~/api/v1/auth/operators"),
-            ("POST", "/~/api/v1/auth/operators"),
-            ("PUT", "/~/api/v1/auth/devices/no-such-device/operator"),
+            ("GET", "/~/api/v1/auth/users"),
+            ("POST", "/~/api/v1/auth/users"),
+            ("PUT", "/~/api/v1/auth/devices/no-such-device/user"),
         ] {
             assert_eq!(
                 auth_plane_call(method, path, FROM_AN_APP_DOCUMENT).await,

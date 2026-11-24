@@ -1,11 +1,6 @@
-// Every full screen request in an app frame leaves breadcrumbs in the engine
-// log as `[Client/app-fullscreen]`. The SDK wraps the browser's own request
-// methods, so no app calls anything. On an iPhone, WebKit can accept a request
-// and never open it, and the log is the only place that shows it.
 
 import { traceToHost } from './hostTrace';
 
-/** A request with no open after this long never opened. */
 export const FULL_SCREEN_WAIT_MS = 2000;
 
 type Detail = Record<string, unknown>;
@@ -14,7 +9,6 @@ function trace(step: string, detail: Detail = {}): void {
   traceToHost('log.app-fullscreen', step, detail);
 }
 
-/** What the element looked like at the request. A video adds its readiness. */
 function describeRequest(api: string, element: Element): Detail {
   const detail: Detail = {
     api,
@@ -29,9 +23,6 @@ function describeRequest(api: string, element: Element): Detail {
   return detail;
 }
 
-/** Wrap `owner[method]`: `before` runs ahead of each call and `threw` after a
- *  synchronous throw. The call itself runs as the app made it, with its `this`,
- *  arguments, return value and error. Returns the undo. */
 function wrapMethod(
   owner: object,
   method: string,
@@ -44,7 +35,6 @@ function wrapMethod(
     try {
       hooks.before(this);
     } catch {
-      // Telemetry must never break the request.
     }
     try {
       return original.apply(this, args);
@@ -53,7 +43,6 @@ function wrapMethod(
         trace('threw', { api: method, error: String(error) });
         hooks.threw(this);
       } catch {
-        // Same: the app's own error is the one that counts.
       }
       throw error;
     }
@@ -61,7 +50,6 @@ function wrapMethod(
   return () => { slots[method] = original; };
 }
 
-/** Start tracing full screen in this document. Returns the teardown. */
 export function installFullScreenTrace(): () => void {
   const pending = new Map<EventTarget, ReturnType<typeof setTimeout>>();
 

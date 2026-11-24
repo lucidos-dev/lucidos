@@ -3,8 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h, render } from 'preact';
 import { paneCentre, paneOfFocus, paneUnder, usePaneCentre, type Pane } from './usePaneCentre';
 
-/** An element whose box spans `left` to `left + width`. jsdom lays nothing out,
- *  so the box is stubbed. */
 function boxed<T extends HTMLElement>(el: T, left: number, width: number): T {
   el.getBoundingClientRect = () => ({
     left, right: left + width, width, top: 0, bottom: 40, height: 40, x: left, y: 0, toJSON: () => ({}),
@@ -12,7 +10,6 @@ function boxed<T extends HTMLElement>(el: T, left: number, width: number): T {
   return el;
 }
 
-/** A desktop split: Conversation from 300 to 900, Canvas from 900 to 1600. */
 function mountSplit(conversationWidth = 600): void {
   const split = document.createElement('div');
   split.className = 'split-layout';
@@ -42,7 +39,6 @@ describe('paneUnder', () => {
 
   it('answers nothing for a button over no pane, or no button at all', () => {
     mountSplit();
-    // Over the drawer, left of the Conversation pane.
     expect(paneUnder(buttonAt(100))).toBeUndefined();
     expect(paneUnder(null)).toBeUndefined();
   });
@@ -80,7 +76,6 @@ describe('paneOfFocus', () => {
 });
 
 describe('usePaneCentre', () => {
-  /** Captures the observer's callback, so a test can play a pane resize. */
   function stubResizeObserver(): { resize: () => void; disconnected: () => boolean } {
     let callback: () => void = () => {};
     let gone = false;
@@ -92,7 +87,6 @@ describe('usePaneCentre', () => {
     return { resize: () => callback(), disconnected: () => gone };
   }
 
-  /** Renders the hook and returns readers for what it published. */
   function mountHook(pane: Pane | undefined): { centre: () => string; fit: () => string; host: HTMLElement } {
     const host = document.createElement('div');
     document.body.append(host);
@@ -111,11 +105,8 @@ describe('usePaneCentre', () => {
     mountSplit();
     const { centre, fit } = mountHook('conversation');
     expect(centre()).toBe('600px');
-    // The pane's width less a 1rem margin each side, so a palette capped by it
-    // never reaches the divider.
     expect(fit()).toBe('calc(600px - 2rem)');
 
-    // A divider drag: the Conversation pane grows, the window does not.
     boxed(document.querySelector<HTMLElement>('.pane-thread')!, 300, 800);
     observer.resize();
     await new Promise((resolve) => setTimeout(resolve, 0));

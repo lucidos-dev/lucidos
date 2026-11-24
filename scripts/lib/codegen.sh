@@ -7,11 +7,13 @@
 # every codegen input. A hit copies the outputs from the *codegen cache*, which
 # lives in the git common dir, so the main checkout and every worktree share it.
 # A miss renders the engine through `lucidos-codegen` or its ignored writer
-# test. The CLI writer test then composes the clap tree into the agent surface.
+# test. Then the built CLI or its writer test supplies the CLI command tree
+# for composition into the agent surface.
 
-# Everything whose change can change a generated file: the engine and every
-# crate it compiles from this repo, plus the lockfile and the toolchain. A
-# rendering run checks this list against cargo's dep-info (codegen_check_inputs).
+# The renderer, its local Rust dependencies and other inputs, plus the
+# lockfile and the toolchain. The core source holds the wire declarations the
+# reader crate parses from disk, and the compiled catalogs, constants and
+# fixtures.
 CODEGEN_INPUT_ROOTS=(
     .cargo/config.toml
     Cargo.lock
@@ -21,19 +23,32 @@ CODEGEN_INPUT_ROOTS=(
     scripts/lib/codegen.sh
     scripts/lib/codegen_blocks.py
     packages/lucidos-sdk/src/index.ts
+    crates/lucidos-agent-sandbox
+    crates/lucidos-agents-api
     crates/lucidos-build-slot
     crates/lucidos-capabilities
     crates/lucidos-claude-code-managed
+    crates/lucidos-core/Cargo.toml
+    crates/lucidos-core/build.rs
+    crates/lucidos-core/src
+    crates/lucidos-diagnostic-log
+    crates/lucidos-diagnostic-log-macros
     crates/lucidos-engine
+    crates/lucidos-engine-bin
+    crates/lucidos-engine-boot
     crates/lucidos-cli
     crates/lucidos-installs
-    crates/lucidos-update-address
+    crates/lucidos-update-channel
+    crates/lucidos-wire-codegen
     crates/lucidos-engine-socket
+    crates/lucidos-event-hooks
     crates/lucidos-file-backup-exclusion
     crates/lucidos-frame-capability
     crates/lucidos-gateway-constants
+    crates/lucidos-gateway-stamp
     crates/lucidos-home
     crates/lucidos-local-token
+    crates/lucidos-loopback-ca
     crates/lucidos-owner-lock
     crates/lucidos-pg-url
     crates/lucidos-secret-store
@@ -41,10 +56,20 @@ CODEGEN_INPUT_ROOTS=(
     crates/vendor
 )
 
+# The packages the renderers compile: the `lucidos-codegen` bin and the writer
+# tests behind each fallback. Every workspace crate they depend on needs an
+# entry in CODEGEN_INPUT_ROOTS (`codegen_uncovered_crates`).
+CODEGEN_RENDERER_PACKAGES=(lucidos-engine-bin lucidos-engine-boot lucidos-cli)
+
 # Files the engine embeds that no renderer reads, so a change to one is no
 # reason to render again. Keeping them out is what lets a frontend-only change
 # stay a cache hit. A path here must never feed a generated file.
 CODEGEN_COMPILE_ONLY=(
+    crates/crate-tiers.tsv
+    crates/engine_crate_paths.rs
+    crates/lucidos-core/migrations
+    eval/command-guard/cases.toml
+    crates/lucidos-app/VERSION
     .gitattributes
     scripts/lib/merge_drivers.sh
     crates/lucidos-app/src/utils/dataPathPrefixes.ts
@@ -63,18 +88,14 @@ CODEGEN_COMPILE_ONLY=(
     crates/lucidos-app/e2e/themes/
     crates/lucidos-app/src/components/settings/LocaleSection.tsx
     crates/lucidos-app/src/store/actions/entityReferences.ts
-    system-knowhow/lucidos-cli.md
-    system-knowhow/plugins.md
-    system-knowhow/running-python.md
-    system-knowhow/themes.md
 )
 
 # How many renderings the cache keeps, newest first.
 CODEGEN_CACHE_KEEP=32
 
 # One file every rendering writes, so its presence means a checkout has its
-# generated files. `codegen_sentinel_is_rendered` in the engine's codegen
-# module pins it to `render_all`.
+# generated files. `codegen_sentinel_is_rendered` in the engine-boot crate
+# pins it to `render_all`.
 CODEGEN_SENTINEL=crates/lucidos-app/src/generated/thread-event-wire.ts
 CODEGEN_BLOCKS=.codegen/knowhow-blocks.json
 
@@ -154,7 +175,8 @@ codegen_cached() { # <root> <fingerprint>
 # marks a <bin> from the e2e engine cache, whose engine input manifest already
 # matched this tree. Its age says nothing then, and its dep-info stayed behind
 # with the build that made it, so its inputs are not checked again here.
-# Every miss also compiles the CLI writer test and checks its dependencies.
+# Codegen uses the sibling `lucidos` after validating its dep-info.
+# The CLI writer test handles a miss without a usable sibling.
 codegen_render() { # <root> <fingerprint> [bin] [reused]
     local root=$1 fp=$2 bin=${3:-} reused=${4:-} cache tmp
     cache=$(codegen_cache_root "$root")
@@ -175,23 +197,25 @@ codegen_render() { # <root> <fingerprint> [bin] [reused]
 
 # Render without syncing or consulting the cache, for committed freshness.
 codegen_render_to() { # <root> <out> [bin] [reused]
-    local root=$1 tmp=$2 bin=${3:-} reused=${4:-}
+    local root=$1 tmp=$2 bin=${3:-} reused=${4:-} cli=""
     mkdir -p "$tmp"
     if [ -n "$bin" ]; then
+        cli="$(dirname "$bin")/lucidos"
         codegen_log "rendering with $bin"
         "$bin" --out "$tmp" --repo-root "$root" || { rm -rf "$tmp"; return 1; }
         if [ -z "$reused" ]; then
             codegen_check_inputs "$root" "$bin.d" "$bin" || { rm -rf "$tmp"; return 1; }
         fi
     else
-        codegen_writer "$root" "$tmp" lucidos-engine --lib codegen::tests::write_generated_outputs ||
+        codegen_writer "$root" "$tmp" lucidos-engine-boot --lib codegen::tests::write_generated_outputs ||
             { rm -rf "$tmp"; return 1; }
     fi
-    codegen_cli_surface "$root" "$tmp" || { rm -rf "$tmp"; return 1; }
+    codegen_cli_surface "$root" "$tmp" "$cli" || { rm -rf "$tmp"; return 1; }
 }
 
 # Cargo reports every dependency artifact, including cached ones. Check each
 # local crate's dep-info rather than only the writer's direct source list.
+# Fallback when the corresponding built writer is unavailable.
 codegen_writer() { # <root> <out> <package> <--lib|--bin=lucidos> <test>
     local root=$1 out=$2 package=$3 target=$4 test=$5 log artifacts dep artifact rc
     log=$(mktemp)
@@ -260,9 +284,16 @@ if not found:
 PYARTIFACTS
 }
 
-codegen_cli_surface() { # <root> <out>
-    codegen_writer "$1" "$2" lucidos-cli --bin=lucidos tests::write_agent_surface || return 1
-    python3 - "$2" <<'PYCOMBINE'
+codegen_cli_surface() { # <root> <out> [cli]
+    local root=$1 out=$2 cli=${3:-}
+    if [ -x "$cli" ] && codegen_check_inputs "$root" "$cli.d" "$cli" &&
+        "$cli" cli-surface --out "$out"; then
+        codegen_log "rendered the CLI surface with $cli"
+    else
+        rm -f "$out/cli-surface.json"
+        codegen_writer "$root" "$out" lucidos-cli --bin=lucidos tests::write_agent_surface || return 1
+    fi
+    python3 - "$out" <<'PYCOMBINE'
 import json
 import pathlib
 import sys
@@ -347,12 +378,14 @@ codegen_repo_inputs() { # <root> <dep-info>
             }' | LC_ALL=C sort -u
 }
 
-# The repo files in <dep-info> that no input root or compile-only entry
-# covers, one per line.
+# Cargo also lists the core crate directory because the engine build stamp
+# watches it. The directory entry itself has no renderer input bytes.
+# Descendants still need their own coverage.
 codegen_undeclared_inputs() { # <root> <dep-info>
     codegen_repo_inputs "$1" "$2" |
         CODEGEN_COVERED=$(printf '%s\n' "${CODEGEN_INPUT_ROOTS[@]}" "${CODEGEN_COMPILE_ONLY[@]}") awk '
             BEGIN { n = split(ENVIRON["CODEGEN_COVERED"], c, "\n") }
+            $0 == "crates/lucidos-core" { next }
             {
                 for (i = 1; i <= n; i++) {
                     if (c[i] == "") continue
@@ -360,6 +393,42 @@ codegen_undeclared_inputs() { # <root> <dep-info>
                 }
                 print
             }'
+}
+
+# The workspace crates the renderers depend on that no CODEGEN_INPUT_ROOTS entry
+# covers, one directory per line. This reads `cargo metadata` (JSON on stdin),
+# so it needs no compile. A cache hit never compiles the renderer, so
+# `codegen_check_inputs` alone would miss a new crate until the next miss.
+# `crates/lucidos-core` is covered by its own file entries. Paths are relative
+# to cargo's `workspace_root`, since cargo resolves symlinks in every path.
+codegen_uncovered_crates_in() { # metadata on stdin
+    CODEGEN_COVERED=$(printf '%s\n' "${CODEGEN_INPUT_ROOTS[@]}") \
+        CODEGEN_RENDERERS=$(printf '%s\n' "${CODEGEN_RENDERER_PACKAGES[@]}") python3 -c '
+import json, os, sys
+meta = json.load(sys.stdin)
+root = meta["workspace_root"]
+covered = [c for c in os.environ["CODEGEN_COVERED"].split("\n") if c]
+renderers = set(os.environ["CODEGEN_RENDERERS"].split("\n"))
+packages = {p["id"]: p for p in meta["packages"]}
+deps = {n["id"]: [d["pkg"] for d in n["deps"]] for n in meta["resolve"]["nodes"]}
+todo = [i for i, p in packages.items() if p["name"] in renderers]
+seen = set()
+while todo:
+    pid = todo.pop()
+    if pid not in seen:
+        seen.add(pid)
+        todo.extend(deps[pid])
+dirs = {os.path.relpath(os.path.dirname(packages[i]["manifest_path"]), root) for i in seen if packages[i]["source"] is None}
+for d in sorted(dirs):
+    if d != "crates/lucidos-core" and not any(d == c or d.startswith(c + "/") for c in covered):
+        print(d)
+'
+}
+
+codegen_uncovered_crates() { # <root>
+    local metadata
+    metadata=$(cd "$1" && cargo metadata --format-version 1 --locked --offline) || return 1
+    printf '%s' "$metadata" | codegen_uncovered_crates_in
 }
 
 # Build the SDK bundles into packages/lucidos-sdk/dist/. They import the
@@ -371,6 +440,7 @@ codegen_build_sdk() { # <root>
 codegen_usage() {
     cat >&2 <<'EOF'
 Usage: scripts/codegen.sh [--bin <lucidos-codegen> | --reused-bin <lucidos-codegen>] [--cached-only]
+       scripts/codegen.sh --fill-cache --bin <lucidos-codegen>
        scripts/codegen.sh --fingerprint [<rev>]
        scripts/codegen.sh --cache-dir [<rev>]
 
@@ -382,13 +452,16 @@ bundles in packages/lucidos-sdk/dist/.
                    render a miss with a lucidos-codegen the e2e engine cache
                    matched to this tree, without checking its inputs again
   --cached-only    never compile: on a miss keep the outputs already there
+  --fill-cache     render a miss into the shared cache only: write nothing
+                   into this checkout and build no SDK. The engine build uses
+                   it in its launch tree, so the live checkout syncs from it
   --fingerprint    print the codegen fingerprint of the working tree or <rev>
   --cache-dir      print the cached rendering for the working tree or <rev>
 EOF
 }
 
 codegen_main() { # <root> [args...]
-    local root=$1 bin="" reused="" cached_only="" fp dir
+    local root=$1 bin="" reused="" cached_only="" fill_cache="" fp dir
     shift
     case ${1:-} in
         --fingerprint) codegen_fingerprint "$root" "${2:-}"; return ;;
@@ -399,11 +472,22 @@ codegen_main() { # <root> [args...]
             --bin) bin=${2:?--bin needs a path}; shift 2 ;;
             --reused-bin) bin=${2:?--reused-bin needs a path}; reused=1; shift 2 ;;
             --cached-only) cached_only=1; shift ;;
+            --fill-cache) fill_cache=1; shift ;;
             -h | --help) codegen_usage; return 0 ;;
             *) codegen_usage; return 2 ;;
         esac
     done
+    if [ -n "$fill_cache" ] && { [ -z "$bin" ] || [ -n "$cached_only" ]; }; then
+        codegen_usage
+        return 2
+    fi
     fp=$(codegen_fingerprint "$root")
+    if [ -n "$fill_cache" ]; then
+        codegen_cached "$root" "$fp" >/dev/null && { codegen_log "cache hit"; return 0; }
+        codegen_log "cache miss"
+        codegen_render "$root" "$fp" "$bin" "$reused"
+        return
+    fi
     if dir=$(codegen_cached "$root" "$fp"); then
         codegen_log "cache hit"
     elif [ -n "$cached_only" ]; then

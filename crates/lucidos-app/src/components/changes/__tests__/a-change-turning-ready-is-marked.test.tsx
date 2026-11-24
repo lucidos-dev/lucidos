@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * **A change that turns ready while the panel is open wears the arrival
- * marker in Ready.** The panel shows its current state as it opens, so a
- * change that turned ready while it was shut is not marked.
- * Plan: `docs/plans/2026-10-02-arrival-motion-for-list-rows.md`.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -58,9 +52,6 @@ async function serve(pending: Change[]) {
   await act(() => { changes.value = { status: 'loaded', data: pending }; });
 }
 
-/** The row showing `description`. The marker must sit on the row itself:
- *  its wash is an inset shadow, so on a wrapper the row's hover tint would
- *  paint over it. */
 function rowFor(description: string): HTMLElement | null {
   const title = [...host.querySelectorAll<HTMLElement>('.change-description')].find(el => el.textContent === description);
   return title?.closest<HTMLElement>('.change-row') ?? null;
@@ -103,8 +94,6 @@ describe('a change turning ready', () => {
 
 describe('a change leaving Ready', () => {
   it('is not marked when it drops back to Not finished', async () => {
-    // A merge conflict or a resumed thread sends a Ready change back. It was
-    // already in the list, so it is no arrival.
     await serve([{ ...ready, thread_unsettled: true, apply_ready: false, resolving_conflict: true }, working]);
     expect(rowFor('Ready one')).not.toBeNull();
     expect(isMarked('Ready one')).toBe(false);

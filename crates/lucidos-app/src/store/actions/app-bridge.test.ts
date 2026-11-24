@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The host half of the app bridge, which is the trusted side.
- *
- * jsdom rather than the suite's default stubs, because the sender guard is
- * `contentWindow` identity against the live DOM. A stub `createElement` has no
- * frame to be, so the one check worth testing here could not run at all.
- *
- * An isolated app frame reaches the engine only through this, and the host
- * attaches the user's device id to what it sends. So the cases below are mostly
- * about what it REFUSES: a path outside the SDK's surface, a header that would
- * forge the actor, and a sender that is not a mounted app frame.
- */
 import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
 import { installRestoreAdmission } from '../../utils/restoreAdmission';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -48,8 +36,6 @@ describe('pathIsAllowed', () => {
   });
 
   it('answers per method, not per sub-tree', () => {
-    // The prefix list this replaced could not tell these apart: one route, and
-    // an app may read it and never write it.
     expect(pathIsAllowed('/models', 'GET')).toBe(true);
     expect(pathIsAllowed('/models', 'DELETE')).toBe(false);
     expect(pathIsAllowed('/preferences', 'PUT')).toBe(true);
@@ -58,7 +44,6 @@ describe('pathIsAllowed', () => {
 
   it('admits a bare route, and nothing that merely starts with its name', () => {
     expect(pathIsAllowed('/data')).toBe(true);
-    // A plain `startsWith` would take this, and it is a different route.
     expect(pathIsAllowed('/database-dump')).toBe(false);
     expect(pathIsAllowed('/models-registry')).toBe(false);
   });
@@ -75,11 +60,6 @@ describe('pathIsAllowed', () => {
   });
 
   it('refuses a traversal, plain or percent-encoded', () => {
-    // `/api/v1/data/../credentials` resolves to `/api/v1/credentials` at the
-    // network layer, so the sub-tree the path was admitted for is not where it
-    // lands. The URL parser counts `%2e%2e` as a dot segment too. A scan for a
-    // literal `..` therefore admitted the encoded form, and the call still
-    // landed on `/credentials`. Resolving first closes both at once.
     expect(pathIsAllowed('/data/../credentials')).toBe(false);
     expect(pathIsAllowed('/data/%2e%2e/credentials')).toBe(false);
     expect(pathIsAllowed('/data/%2E%2E/credentials')).toBe(false);
@@ -87,14 +67,11 @@ describe('pathIsAllowed', () => {
   });
 
   it('keeps a `..` that is part of a filename rather than a segment', () => {
-    // One segment, not a dot segment, so the URL parser leaves it alone and so
-    // must this. Refusing it would break a legitimate artifact path.
     expect(pathIsAllowed('/data/..%2Fcredentials')).toBe(true);
     expect(pathIsAllowed('/data/artifacts/..hidden.md')).toBe(true);
   });
 
   it('hands back the path it checked, so nothing renormalises afterwards', () => {
-    // The caller fetches THIS, which is what makes the check binding.
     expect(resolveBridgePath('/data/artifacts/x.md?v=2')).toBe('/data/artifacts/x.md?v=2');
     expect(resolveBridgePath('/threads/./list')).toBe('/threads/list');
   });
@@ -110,25 +87,11 @@ describe('pathIsAllowed', () => {
 });
 
 describe('the engine table covers the SDK', () => {
-  // A source scan, because the answer lives in the engine and the callers live
-  // in a different package. An SDK call the table refuses is a dead feature in
-  // every isolated app, and it would fail nowhere else.
   const here = dirname(fileURLToPath(import.meta.url));
   const SDK_SRC = resolve(here, '../../../../../packages/lucidos-sdk/src');
 
-  /**
-   * Every rooted path the SDK names, from its string and template literals.
-   *
-   * Deliberately wider than "the first argument to `request()`". The proxy
-   * builds its suffix into a local first. A scan keyed on the call shape missed
-   * that, which is the failure mode that makes a guard like this worthless.
-   * Quoted literals only, so a regex such as `/^\/+|\/+$/` is not mistaken for
-   * a path.
-   */
   function sdkPathLiterals(dir: string = SDK_SRC): string[] {
     const paths = new Set<string>();
-    // Recursive, because a top-level-only scan is a guard with a blind spot: a
-    // file under `src/boot/` would name a path nothing here would check.
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = resolve(dir, entry.name);
       if (entry.isDirectory()) {
@@ -145,33 +108,16 @@ describe('the engine table covers the SDK', () => {
     return [...paths];
   }
 
-  /** Drop comments before scanning. The SDK documents `data.edit` with JSON
-   *  pointers and the proxy with a sample upstream path, and both look exactly
-   *  like an API suffix. Neither is one, and neither is code. */
   function stripComments(source: string): string {
     return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   }
 
-  /** A path the SDK names that is not a bridged suffix. `/api/v1` is the base
-   *  the bridge prepends. `/app/` is an app's own asset URL, served outside
-   *  `/api/v1` entirely. */
   const NOT_BRIDGED = ['/api/v1', '/app/'];
 
-  /** The one path the SDK names that no bridged call may take: the stream the
-   *  host holds and relays. Matched exactly, because `/events/query` and
-   *  `/events/emit` are ordinary bridged calls and must stay covered here. */
   const NOT_BRIDGED_EXACT = ['/events'];
 
-  // Provider-native paths built by modelRequest travel through the proxy,
-  // whose bridged route is checked separately, rather than the engine router.
   const PROXY_UPSTREAM_PATHS = ['/messages', '/responses', '/chat/completions', '/publishers/anthropic/models/', '/publishers/google/models/'];
 
-  /** Reachable by SOME method, since a literal carries no verb.
-   *
-   *  A literal ending in `/` is a template prefix (`'/data/' + segments`)
-   *  rather than a whole path, so it is answered by the route it starts. Only
-   *  a trailing slash earns that: without it, `/model` would pass on `/models`
-   *  and a truncated path would read as covered. */
   function reachableSomehow(literal: string): boolean {
     if (appReachableMethods(literal).length > 0) return true;
     if (!literal.endsWith('/')) return false;
@@ -180,8 +126,6 @@ describe('the engine table covers the SDK', () => {
 
   it('admits every path the SDK asks for', () => {
     const refused = sdkPathLiterals()
-      // Slashes alone name no route: `appReach.ts` tests for a leading `//`,
-      // which the scan cannot tell from a path.
       .filter((p) => /[a-zA-Z]/.test(p))
       .filter((p) => !NOT_BRIDGED.some((n) => p.startsWith(n)))
       .filter((p) => !NOT_BRIDGED_EXACT.includes(p))
@@ -191,19 +135,12 @@ describe('the engine table covers the SDK', () => {
   });
 
   it('spells the device marker the way the SDK spells it', () => {
-    // Two copies, because the SDK bundles standalone and cannot import the
-    // host. A drift between them fails silently: the host would stop
-    // substituting, and every app would read the global preferences again
-    // while looking exactly as healthy as it does now.
     const source: string = readFileSync(resolve(SDK_SRC, 'preferences.ts'), 'utf8');
     const declared = /const THIS_DEVICE = '([^']+)'/.exec(source);
     expect(declared, 'the SDK no longer declares THIS_DEVICE').not.toBeNull();
     expect(declared?.[1]).toBe(THIS_DEVICE);
   });
 
-  // Nothing here asserts the table carries ONLY what the SDK asks for: it is
-  // wider on purpose, since `lucidos.request` reaches a route with no
-  // namespace. What may be in it is the engine's own test to make.
 });
 
 describe('the installed router', () => {
@@ -215,8 +152,6 @@ describe('the installed router', () => {
     _resetAppBridgeForTesting();
     frame = document.createElement('iframe');
     frame.setAttribute('data-role', 'app-ui-frame');
-    // The src the host set is what names the app. Every case needs it now,
-    // because the stamp rides on it.
     frame.setAttribute('src', '/app/habit-tracker/');
     document.body.appendChild(frame);
     fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
@@ -227,13 +162,11 @@ describe('the installed router', () => {
   afterEach(() => {
     stop();
     observeSourceGeneration(null);
-    installRestoreAdmission({ ready: () => true, wait: async () => {} });
+    installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     frame.remove();
     vi.unstubAllGlobals();
   });
 
-  /** Deliver a message as if it came from `source`. jsdom cannot set
-   *  `event.source` through `postMessage`, so the event is built by hand. */
   function deliver(source: unknown, data: unknown): void {
     const event = new MessageEvent('message', { data });
     Object.defineProperty(event, 'source', { value: source });
@@ -254,8 +187,6 @@ describe('the installed router', () => {
   });
 
   it('ignores a sender that is not a mounted app frame', async () => {
-    // A nested frame an app embeds, or any other window. `event.origin` cannot
-    // tell them apart once the app frame's origin is opaque, so identity does.
     const stranger = document.createElement('iframe');
     document.body.appendChild(stranger);
     deliver(stranger.contentWindow, call('/threads/list'));
@@ -277,8 +208,6 @@ describe('the installed router', () => {
   });
 
   it('makes no call for a method the route does not open', async () => {
-    // Read the model registry, never write it. The prefix list could not say
-    // this, and the engine's table can.
     deliver(frame.contentWindow, call('/models', {}, 'DELETE'));
     await new Promise((r) => setTimeout(r, 0));
     expect(fetchMock).not.toHaveBeenCalled();
@@ -288,8 +217,6 @@ describe('the installed router', () => {
   });
 
   it('names the calling app on the request', async () => {
-    // The bridge is the first place that knows which app is calling: the
-    // element is the host's, so its src is not the app's claim (ADR 0231).
     deliver(frame.contentWindow, call('/env-vars'));
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const sent = fetchMock.mock.calls[0][1].headers as Record<string, string>;
@@ -316,8 +243,6 @@ describe('the installed router', () => {
       { type: 'lucidos:bridge:push', channel: 'sse', data: { kind: 'frame', data: '{"type":"X"}' } },
     );
 
-    // Unmounted. The subscriber is pruned by `isConnected` on the element kept
-    // at subscribe time, never a DOM query: this runs once per streamed frame.
     posted.length = 0;
     frame.remove();
     fanOutEventFrame('{"type":"Y"}');
@@ -403,8 +328,6 @@ describe('the installed router', () => {
     }
 
     it('a frame that subscribes to a live stream gets its open at once', async () => {
-      // The usual case: the shell's stream was up long before the app loaded.
-      // Without this, `lucidos.sse.onOpen` never runs in an app frame.
       fanOutEventStreamStatus('open');
       await subscribe();
       expect(posted).toContainEqual(OPEN);
@@ -416,7 +339,6 @@ describe('the installed router', () => {
       await subscribe();
       expect(posted).not.toContainEqual(OPEN);
 
-      // The real open follows, and is the frame's first.
       fanOutEventStreamStatus('open');
       expect(posted.filter((m) => JSON.stringify(m) === JSON.stringify(OPEN))).toHaveLength(1);
     });
@@ -432,7 +354,6 @@ describe('the installed router', () => {
   });
 
   describe('fetch lanes: one busy app cannot fill the shell pool', () => {
-    /** A fetch that settles when the test says so. */
     interface Held { url: string; resolve: () => void; reject: (e: Error) => void }
     let held: Held[];
     let other: HTMLIFrameElement;
@@ -461,7 +382,6 @@ describe('the installed router', () => {
       args: { path, method, headers: {}, body: { kind: 'none' }, timeoutMs },
     });
 
-    /** Let every queued microtask and the dispatch it triggers run. */
     const settleTick = () => new Promise((r) => setTimeout(r, 0));
 
     it('never sends a queued app invocation after a generation change', async () => {
@@ -480,7 +400,7 @@ describe('the installed router', () => {
       let ready = false;
       let release!: () => void;
       const wait = new Promise<void>((resolve) => { release = resolve; });
-      installRestoreAdmission({ ready: () => ready, wait: () => wait });
+      installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => wait });
       deliver(frame.contentWindow, callWith('/threads/list'));
       await settleTick();
       expect(fetchMock).not.toHaveBeenCalled();
@@ -501,7 +421,7 @@ describe('the installed router', () => {
       let ready = true;
       let release!: () => void;
       const admission = new Promise<void>((resolve) => { release = resolve; });
-      installRestoreAdmission({ ready: () => ready, wait: () => admission });
+      installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => admission });
       deliver(frame.contentWindow, callWith('/threads/list'));
       await vi.waitFor(() => expect(readBody).toHaveBeenCalledOnce());
       ready = false;
@@ -588,7 +508,6 @@ describe('the installed router', () => {
       vi.setSystemTime(Date.now() + 2000);
       held[0].resolve();
       await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
-      // `waitFor` polls under the faked clock, so the exact figure drifts a little.
       const [remaining] = timeout.mock.lastCall as [number];
       expect(remaining).toBeLessThanOrEqual(3000);
       expect(remaining).toBeGreaterThan(2000);
@@ -608,7 +527,6 @@ describe('the installed router', () => {
 
   describe('log.app-link', () => {
     const send = (args: unknown) => deliver(frame.contentWindow, { type: BRIDGE_TYPE, id: '', op: 'log.app-link', args });
-    /** The client-log bodies the host posted, parsed. */
     const logged = () => fetchMock.mock.calls
       .filter(([url]) => String(url).endsWith('/internal/client-log'))
       .map(([, init]) => JSON.parse((init as RequestInit).body as string) as { category: string; message: string; data: Record<string, unknown> });
@@ -619,6 +537,7 @@ describe('the installed router', () => {
       await vi.waitFor(() => expect(logged()).toHaveLength(1));
       expect(logged()[0]).toEqual({
         category: 'app-link',
+        code: 'route',
         message: 'route',
         data: { app: 'habit-tracker', href: 'https://example.com/a' },
       });
@@ -658,6 +577,7 @@ describe('the installed router', () => {
       await vi.waitFor(() => expect(logged()).toHaveLength(1));
       expect(logged()[0]).toEqual({
         category: 'app-fullscreen',
+        code: 'never-opened',
         message: 'never-opened',
         data: { app: 'habit-tracker', readyState: 4 },
       });
@@ -691,8 +611,6 @@ describe('the installed router', () => {
   });
 
   it('answers a preference read scoped to "this device" with the real id', async () => {
-    // Theme, font and scale are device-scoped. The frame cannot read the id,
-    // so it names itself and the host fills in the one it stamps anyway.
     localStorage.setItem('lucidos-device-id', 'the-real-one');
     deliver(frame.contentWindow, call('/preferences?device_id=%40device'));
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));

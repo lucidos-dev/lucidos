@@ -1,19 +1,25 @@
 #!/bin/bash
 
-# Honor an inherited value — a hard assignment here would clobber the sandbox a
-# test pins before sourcing us, and this variable is load-bearing for signalling:
-# `e2e_workspace_env` exports it as $WORKSPACE, whose engine `stop_e2e_engine`
-# sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a
-# test aims that signal at the REAL e2e-test engine instead of the sandbox.
-# Same convention as `e2e_lock.sh` (`${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}`).
-# Nothing in the production path pre-sets it — `e2e-api.sh` / `e2e-browser.sh`
-# only bare-`export` it after we assign — so the default is unchanged there.
-E2E_WORKSPACE="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
-
 # Resolve paths: scripts/lib/e2e.sh → scripts/lib/ → scripts/ → project root
 _E2E_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _E2E_SCRIPTS_DIR="$(dirname "$_E2E_LIB_DIR")"
 _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
+
+# shellcheck source=e2e_root.sh
+source "$_E2E_LIB_DIR/e2e_root.sh"
+# Every local run keeps its secrets and Postgres under the e2e root, sandboxed
+# or not, so nothing here asks whether it runs in an agent's sandbox.
+e2e_root_env
+# shellcheck source=ps_tools.sh
+source "$_E2E_LIB_DIR/ps_tools.sh"
+ps_tools_env
+
+# Honor an inherited value. A hard assignment here would clobber the sandbox a
+# test pins before sourcing us, and this variable is load-bearing for
+# signalling: `e2e_workspace_env` exports it as $WORKSPACE, whose engine
+# `stop_e2e_engine` sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a test
+# aims that signal at the REAL e2e-test engine instead of the sandbox.
+E2E_WORKSPACE="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
 
 # The e2e stack is deliberately allowed to run from a coding-agent worktree: a CC
 # session's whole job is exercising the checkout it was invoked from, and the
@@ -76,10 +82,10 @@ export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 # delay this removes.
 export LUCIDOS_FORCE_QUERY_CLASSIFICATION="${LUCIDOS_FORCE_QUERY_CLASSIFICATION-all}"
 
-# E2E builds opt into the `e2e-test-hooks` cargo feature so the engine
+# E2E builds opt into `lucidos-engine-bin`'s forwarded `e2e-test-hooks` feature so the engine
 # compiles in the push-log stub (replaces real web-push send with an
 # in-process write) and the `GET /api/v1/_test/push-log` endpoint that
-# Playwright tests assert against. See system-knowhow/notifications.md §5.4.
+# Playwright tests assert against. See system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac-3.md §5.
 export ENGINE_BUILD_FEATURES="${ENGINE_BUILD_FEATURES:-e2e-test-hooks}"
 
 # e2e runs on a RELEASE engine by default (docs/plans/2026-06-28-e2e-always-release-build.md).
@@ -109,7 +115,7 @@ if [ -n "$RELEASE" ] && [ -z "${CARGO_BUILD_JOBS:-}" ]; then
     export CARGO_BUILD_JOBS="$_e2e_jobs"
 fi
 
-# Source shared infrastructure — provides detect_tls, setup_postgres, start_engine,
+# Source shared infrastructure — provides serve_plain_loopback, setup_postgres, start_engine,
 # start_vite, etc. Set the globals workspace.sh expects from its caller.
 PROJECT_DIR="$_E2E_PROJECT_DIR"
 FRONTEND_DIR="$_E2E_PROJECT_DIR/crates/lucidos-app"
@@ -122,6 +128,8 @@ source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
 source "$_E2E_LIB_DIR/host_memory_guard.sh"
 source "$_E2E_LIB_DIR/e2e_gateway.sh"
+# shellcheck source=scripts/lib/e2e_stamp.sh
+source "$_E2E_LIB_DIR/e2e_stamp.sh"
 source "$_E2E_LIB_DIR/engine_manifest.sh"
 # shellcheck source=scripts/lib/e2e_projects.sh
 source "$_E2E_LIB_DIR/e2e_projects.sh"
@@ -177,10 +185,17 @@ assert_e2e_workspace_is_disposable || exit 1
 # it can't rely on ensure_workspace_running having gone first.
 e2e_workspace_env() {
     assert_e2e_workspace_is_disposable || return 1
+    # Here, not at source time: the GitHub driver sources this file and binds
+    # no local socket.
+    e2e_root_fits_socket || return 1
+    e2e_root_writable || return 1
     export WORKSPACE="$E2E_WORKSPACE"
     resolve_workspace
     allocate_ports "$WORKSPACE"
-    detect_tls
+    # The e2e cluster has one fixed port, not the workspace's offset.
+    PG_PORT="$(e2e_pg_port)"
+    export PG_PORT
+    serve_plain_loopback
 }
 
 # ── build_e2e_engine_once ───────────────────────────────────────────────
@@ -200,25 +215,31 @@ build_e2e_engine_once() {
         build_or_find_engine
         return 0
     fi
-    local profile cached
+    local profile cached launch_dir
     profile="$(engine_build_profile)"
     cached="$(engine_cache_find "$PROJECT_DIR" "$profile" "$ENGINE_BUILD_FEATURES")"
     if [ -n "$cached" ]; then
         echo "Engine: REUSED cached build ${cached##*/}, built from this tree's Rust"
-        publish_launch_binaries "$cached" "$(launch_bin_dir)" || return 1
+        launch_dir="$(launch_bin_dir)" || return 1
+        publish_launch_binaries "$cached" "$launch_dir" || return 1
         BUILD=""
         build_or_find_engine
     else
         BUILD="1"
-        build_or_find_engine || return 1
-        engine_cache_store "$PROJECT_DIR" "$PROJECT_DIR/target/$profile" "$profile" "$ENGINE_BUILD_FEATURES" \
-            || echo "Engine cache: this build was not filed, so the next run compiles again."
+        ENGINE_BUILD_AFTER=file_e2e_engine_build build_or_find_engine || return 1
     fi
     # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
     # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
     # The frontend build reads the generated files this writes too.
     REUSED_CODEGEN_BIN="${cached:+$cached/lucidos-codegen}" generate_build_outputs || return 1
     export LUCIDOS_E2E_ENGINE_BUILT=1
+}
+
+# File the build just published in the engine cache. build_or_find_engine runs
+# it before a launch tree can move, so the manifest matches the binaries.
+file_e2e_engine_build() {
+    engine_cache_store "$LAUNCH_SOURCE_DIR" "$LAUNCH_UPLIFT_DIR" "$(engine_build_profile)" "$ENGINE_BUILD_FEATURES" \
+        || echo "Engine cache: this build was not filed, so the next run compiles again."
 }
 
 # ── frontend build: one shot, but never a STALE one ─────────────────────
@@ -389,6 +410,9 @@ ensure_workspace_running() {
         setup_postgres
         swap_ports
         attach_e2e_gateway || return 1
+        ENGINE_STAMP_KEY_FILE="$(e2e_stamp_key_path "$WORKSPACE")"
+        mint_e2e_stamp_key "$ENGINE_STAMP_KEY_FILE" \
+            "$(e2e_stamp_workspace_id "${LUCIDOS_WORKSPACE_ID:-}" "$WORKSPACE")" || return 1
         start_engine
     fi
 
@@ -638,11 +662,11 @@ e2e_spec_needs_real_claude_code() {
 
 # ── e2e_browser_projects ─────────────────────────────────────────────
 # The browser projects a full run exercises, one per line, in run order.
-# mobile-webkit goes last, and `--no-webkit` drops it. The loop in
-# scripts/e2e-browser.sh says why it is last.
+# The WebKit projects go last: `--no-webkit` drops them and `--webkit` keeps
+# only them. The loop in scripts/e2e-browser.sh says why mobile-webkit is last.
 e2e_browser_projects() {
-    printf '%s\n' chromium mobile
-    [ "${1:-}" = --no-webkit ] || printf '%s\n' mobile-webkit
+    [ "${1:-}" = --webkit ] || printf '%s\n' chromium mobile
+    [ "${1:-}" = --no-webkit ] || e2e_webkit_projects
 }
 
 # ── e2e_browser_lock_projects ────────────────────────────────────────
@@ -653,8 +677,9 @@ e2e_browser_projects() {
 #
 # <test-files> is the spec names a run targets, space separated, or empty.
 # A `--project` passed through to Playwright, and `--webkit`, name the projects
-# outright. Otherwise it is the full list, less mobile-webkit under
-# `--no-webkit`, less any project whose testIgnore drops every targeted spec.
+# outright: a WebKit run holds every slot whatever its filter. Otherwise it is
+# the full list, less the WebKit projects under `--no-webkit`, less any project
+# that runs no targeted spec.
 # Playwright's split `--project` is variadic: it takes every value up to the
 # next flag, so this does too.
 e2e_browser_lock_projects() {
@@ -669,7 +694,7 @@ e2e_browser_lock_projects() {
             *) [ -z "$in_project" ] || named="${named:+$named,}$arg" ;;
         esac
     done
-    [ -z "$use_webkit" ] || named="${named:+$named,}mobile-webkit"
+    [ -z "$use_webkit" ] || named="${named:+$named,}$(e2e_webkit_projects | paste -sd, -)"
     if [ -n "$named" ]; then
         printf '%s' "$named"
         return 0
@@ -780,8 +805,8 @@ report_e2e_mem_top_deltas() {
 report_webkit_excluded() {
     [ -n "${1:-}" ] || return 0
     echo ""
-    echo "[e2e] mobile-webkit was EXCLUDED by --no-webkit and did NOT run."
-    echo "[e2e] Coverage is incomplete until it runs on its own, on a cold host:"
+    echo "[e2e] The WebKit projects ($(e2e_webkit_projects | paste -sd, -)) were EXCLUDED by --no-webkit and did NOT run."
+    echo "[e2e] Coverage is incomplete until they run on their own, on a cold host:"
     echo "[e2e]   ./scripts/e2e-browser.sh --webkit"
 }
 
@@ -1107,7 +1132,9 @@ reset_e2e_workspace_tree() {
 # its settle window (seconds, default 20) before it fails.
 e2e_workspace_tree_status() {
     local out
-    out="$(git -C "$E2E_WORKSPACE" status --porcelain --untracked-files=all)" || return 1
+    # --no-optional-locks: a plain status refreshes the index under index.lock,
+    # and the engine's concurrent commit then fails with "File exists".
+    out="$(git -C "$E2E_WORKSPACE" --no-optional-locks status --porcelain --untracked-files=all)" || return 1
     [ -z "$out" ] || printf '%s\n' "$out" | LC_ALL=C sort
 }
 

@@ -1,8 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { trimToCap, recordPerfSample, flushPerfQueue, _resetPerfQueueForTesting, _setPerfEnabledForTesting, isPerfEnabled, setPerfEnabled, PERF_FLAG_KEY } from './perfQueue';
+import { enginePackaged } from '../store/enginePackaging';
+import { perfRecordingOn, trimToCap, recordPerfSample, flushPerfQueue, _resetPerfQueueForTesting, _setPerfEnabledForTesting, isPerfEnabled, setPerfEnabled, PERF_FLAG_KEY } from './perfQueue';
 
 describe('perf flag accessors', () => {
+  beforeEach(() => { enginePackaged.value = true; });
+
   afterEach(() => {
+    enginePackaged.value = true;
     vi.unstubAllGlobals();
   });
 
@@ -13,13 +17,37 @@ describe('perf flag accessors', () => {
       setItem: (k: string, v: string) => { store[k] = v; },
       removeItem: (k: string) => { delete store[k]; },
     });
-    expect(isPerfEnabled()).toBe(false); // default off (absent key)
+    expect(isPerfEnabled()).toBe(false);
     setPerfEnabled(true);
     expect(store[PERF_FLAG_KEY]).toBe('1');
     expect(isPerfEnabled()).toBe(true);
-    setPerfEnabled(false); // off removes the key, not sets '0'
+    setPerfEnabled(false);
     expect(PERF_FLAG_KEY in store).toBe(false);
     expect(isPerfEnabled()).toBe(false);
+  });
+
+  it('resolves the recording gate for each engine without storing a source opt-in', () => {
+    let stored: string | null = null;
+    const setItem = vi.fn((_key: string, value: string) => { stored = value; });
+    const removeItem = vi.fn(() => { stored = null; });
+    vi.stubGlobal('localStorage', { getItem: () => stored, setItem, removeItem });
+
+    expect(perfRecordingOn()).toBe(false);
+    enginePackaged.value = false;
+    expect(perfRecordingOn()).toBe(true);
+    setPerfEnabled(false);
+    expect(perfRecordingOn()).toBe(true);
+    expect(setItem).not.toHaveBeenCalled();
+    expect(removeItem).not.toHaveBeenCalled();
+
+    enginePackaged.value = true;
+    expect(perfRecordingOn()).toBe(false);
+    setPerfEnabled(true);
+    expect(perfRecordingOn()).toBe(true);
+    enginePackaged.value = null;
+    expect(perfRecordingOn()).toBe(false);
+    enginePackaged.value = true;
+    expect(perfRecordingOn()).toBe(true);
   });
 
   it('never throws and reads false where storage throws', () => {
@@ -45,8 +73,8 @@ describe('trimToCap', () => {
 
 describe('perf queue fire-and-forget', () => {
   beforeEach(() => {
-    _resetPerfQueueForTesting(); // a re-buffered failed flush must not leak across tests
-    _setPerfEnabledForTesting(true); // recording is default-off; these tests exercise the on path
+    _resetPerfQueueForTesting();
+    _setPerfEnabledForTesting(true);
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -66,19 +94,17 @@ describe('perf queue fire-and-forget', () => {
   });
 
   it('re-buffers samples after a network failure so a later flush retries them', async () => {
-    // First flush: network rejects → sample is re-buffered, not lost.
     vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('engine restarting'))));
     recordPerfSample('open', { eventCount: 1 });
     flushPerfQueue();
-    await new Promise((r) => setTimeout(r, 0)); // drain microtasks so the reject's .catch runs requeueFailed
-    // Second flush: engine back up → the re-buffered sample is delivered.
+    await new Promise((r) => setTimeout(r, 0));
     const ok = vi.fn((_u: string | URL, _i?: RequestInit) => Promise.resolve(new Response(null, { status: 204 })));
     vi.stubGlobal('fetch', ok);
     flushPerfQueue();
     expect(ok).toHaveBeenCalledTimes(1);
     const body = JSON.parse(ok.mock.calls[0][1]!.body as string);
     expect(body).toHaveLength(1);
-    expect(body[0]).toMatchObject({ category: 'perf', message: 'open' });
+    expect(body[0]).toMatchObject({ category: 'perf', code: 'open', message: 'open' });
   });
 
   it('flush batches buffered samples into one client-logs request and clears the buffer', () => {
@@ -93,8 +119,7 @@ describe('perf queue fire-and-forget', () => {
     expect(String(url)).toContain('/internal/client-logs');
     const body = JSON.parse(init!.body as string);
     expect(body).toHaveLength(2);
-    expect(body[0]).toMatchObject({ category: 'perf', message: 'open' });
-    // Buffer cleared → a second flush sends nothing.
+    expect(body[0]).toMatchObject({ category: 'perf', code: 'open', message: 'open' });
     flushPerfQueue();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -115,7 +140,7 @@ describe('perf queue default-off gate', () => {
     vi.stubGlobal('fetch', fetchMock);
     recordPerfSample('open', { eventCount: 1 });
     recordPerfSample('answer', { eventCount: 2 });
-    flushPerfQueue(); // nothing buffered → no request
+    flushPerfQueue();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -124,9 +149,9 @@ describe('perf queue default-off gate', () => {
       Promise.resolve(new Response(null, { status: 204 })));
     vi.stubGlobal('fetch', fetchMock);
     _setPerfEnabledForTesting(false);
-    recordPerfSample('open', { eventCount: 1 }); // dropped
+    recordPerfSample('open', { eventCount: 1 });
     _setPerfEnabledForTesting(true);
-    recordPerfSample('open', { eventCount: 2 }); // recorded
+    recordPerfSample('open', { eventCount: 2 });
     flushPerfQueue();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const body = JSON.parse(fetchMock.mock.calls[0][1]!.body as string);

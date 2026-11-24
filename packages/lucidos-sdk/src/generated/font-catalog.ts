@@ -56,7 +56,7 @@ export const WORKSPACE_FONT_ID_PREFIX = 'ws-';
 export const WORKSPACE_FONT_FALLBACKS: Readonly<Record<FontGroup, string>> = {
   sans: "system-ui, -apple-system, 'Segoe UI', sans-serif",
   serif: "Georgia, 'Times New Roman', serif",
-  mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+  mono: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace",
 };
 
 /** The engine's caps on a workspace font, which clients re-check. */
@@ -176,7 +176,7 @@ export const FONT_CATALOG: readonly FontEntry[] = [
   {
     id: 'monospace',
     label: "Monospace",
-    stack: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+    stack: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace",
     kind: 'both',
     group: 'mono',
     source: 'device',

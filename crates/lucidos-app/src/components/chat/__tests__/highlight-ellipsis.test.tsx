@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { highlightEllipsis } from '../highlightEllipsis';
-// The shared walker flattens a vnode tree to a tag-tagged string (surfacing
-// `class`), which is what lets these tests assert which spans got
-// `.ellipsis-marker` without booting a DOM.
 import { vnodeToText } from './vnodeToText';
 
 describe('highlightEllipsis', () => {
@@ -30,9 +27,6 @@ describe('highlightEllipsis', () => {
   });
 
   it('only treats "..." as an elision when it is at the very end', () => {
-    // A literal "..." in the middle of text must stay as content — we cannot
-    // distinguish it from real ASCII content there. Only the trailing form
-    // (which is what `describe_tool` emits) gets marked.
     const text = vnodeToText(highlightEllipsis('Edit a...b file'));
     expect(text).toBe('Edit a...b file');
   });

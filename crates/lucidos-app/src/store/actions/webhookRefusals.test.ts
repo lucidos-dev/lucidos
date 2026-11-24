@@ -1,10 +1,3 @@
-/**
- * What the two refusal surfaces are allowed to claim, pinned away from either.
- *
- * Both read one selector, so the rules live here. A failed refresh keeps what
- * stood, and the age keeps counting while it stands. The bar picks one hook to
- * speak for by a rule neither surface decides on its own.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../api/client', () => ({ fetchWebhookRefusals: vi.fn() }));
@@ -65,7 +58,6 @@ describe('webhook refusal readings', () => {
     mockFetch.mockResolvedValueOnce({ refusing: [refusal()] });
     await loadWebhookRefusals();
 
-    // An engine that cannot answer is itself one way deliveries stop landing.
     mockFetch.mockRejectedValueOnce(new Error('engine restarting'));
     await loadWebhookRefusals();
 
@@ -84,9 +76,6 @@ describe('webhook refusal readings', () => {
     mockFetch.mockResolvedValueOnce({ refusing: [refusal({ refusing_secs: 120 })] });
     await loadWebhookRefusals();
 
-    // The engine measures the span once and sends no frame while it stands. A
-    // bar reading "for 2 minutes" after eighteen days is the exact failure
-    // this whole feature exists to report.
     const eighteenDays = 18 * 24 * 60 * 60;
     const later = LANDED.getTime() + eighteenDays * 1000;
     expect(currentWebhookRefusals(later)[0].refusing_secs).toBe(120 + eighteenDays);
@@ -101,8 +90,6 @@ describe('webhook refusal readings', () => {
 
 describe('loudestWebhookRefusal', () => {
   it('speaks for the switched-off hook first', () => {
-    // The certain fault: nothing was read, so every delivery was thrown away.
-    // A verification failure is the same symptom with a cause to go and find.
     const picked = loudestWebhookRefusal([
       refusal({ webhook_id: 'a', cause: 'verification', enabled: true, refusing_secs: 900_000 }),
       refusal({ webhook_id: 'b', cause: 'disabled', refusing_secs: 1800 }),
@@ -119,8 +106,6 @@ describe('loudestWebhookRefusal', () => {
   });
 
   it('leaves the list it was given alone', () => {
-    // It is called during render off a signal-derived array, so a sort in
-    // place would reorder what the Webhooks page is drawing.
     const given = [
       refusal({ webhook_id: 'a', cause: 'verification', enabled: true }),
       refusal({ webhook_id: 'b' }),

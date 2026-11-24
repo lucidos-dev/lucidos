@@ -7,10 +7,26 @@ use std::sync::{Arc, Mutex};
 
 type Captured = Arc<Mutex<Option<serde_json::Value>>>;
 
+/// The CLI with none of the agent environment this test process may have
+/// inherited. A coding-agent session hands its subprocesses a live origin
+/// token and engine URL, and a spawn holding them posts to that engine.
+fn cli(bin: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    for inherited in [
+        "LUCIDOS_AGENT_ORIGIN_TOKEN",
+        "LUCIDOS_API_BASE_URL",
+        "LUCIDOS_THREAD_ID",
+        "LUCIDOS_EVENT_ID",
+    ] {
+        command.env_remove(inherited);
+    }
+    command
+}
+
 #[test]
 fn human_mode_from_agent_fails_before_workspace_resolution() {
     let tmp = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lucidos"))
+    let output = cli(env!("CARGO_BIN_EXE_lucidos"))
         .args(["spawn-thread", "--to"])
         .arg(tmp.path().join("missing-workspace"))
         .args(["--message", "Start a task", "--mode", "human"])
@@ -77,7 +93,7 @@ async fn spawn_thread_posts_caller_fields_in_body() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let thread_id = uuid::Uuid::new_v4().to_string();
     let event_id = uuid::Uuid::new_v4().to_string();
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -143,7 +159,7 @@ async fn spawn_thread_relation_child_posts_parent_fields_in_body() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let thread_id = uuid::Uuid::new_v4().to_string();
     let event_id = uuid::Uuid::new_v4().to_string();
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -191,7 +207,7 @@ async fn spawn_thread_codex_shortcut_posts_coding_agent_body() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -231,7 +247,7 @@ async fn spawn_thread_coding_agent_flag_posts_codex_body() {
     write_ports_file(&target, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -272,7 +288,7 @@ async fn spawn_thread_explicit_repo_flag_lands_in_body() {
     write_ports_file(&target, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -315,7 +331,7 @@ async fn spawn_thread_defaults_repo_from_lucidos_repo_env() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -363,7 +379,7 @@ async fn same_workspace_relation_top_omits_parent_fields() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let thread_id = uuid::Uuid::new_v4().to_string();
     let event_id = uuid::Uuid::new_v4().to_string();
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -416,7 +432,7 @@ async fn cross_workspace_relation_child_errors() {
     write_ports_file(&other, 2);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -461,7 +477,7 @@ async fn relation_sub_alias_still_accepted_as_child() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let thread_id = uuid::Uuid::new_v4().to_string();
     let event_id = uuid::Uuid::new_v4().to_string();
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -521,7 +537,7 @@ async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -576,7 +592,7 @@ async fn spawn_thread_folder_and_repo_are_mutually_exclusive() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -621,7 +637,7 @@ async fn spawn_thread_folder_requires_cc() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -663,7 +679,7 @@ async fn spawn_thread_reasoning_effort_lands_in_body() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -711,7 +727,7 @@ async fn spawn_thread_omits_reasoning_effort_when_not_asked() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -752,7 +768,7 @@ async fn spawn_thread_rejects_an_unknown_reasoning_effort() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -791,7 +807,7 @@ async fn spawn_thread_rejects_the_chat_only_none_level() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -824,7 +840,7 @@ async fn spawn_thread_reasoning_effort_requires_a_coding_agent() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -863,7 +879,7 @@ async fn spawn_thread_rejects_an_effort_the_named_model_lacks() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -906,7 +922,7 @@ async fn spawn_thread_rejects_codex_max_with_no_model_named() {
     write_ports_file(&caller, 1);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -946,7 +962,7 @@ async fn spawn_thread_allows_codex_xhigh_with_no_model_named() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -990,7 +1006,7 @@ async fn coding_agent_model_flag_sends_cc_model() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let output = std::process::Command::new(bin)
+    let output = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -1035,7 +1051,7 @@ async fn spawn_thread_empty_repo_flag_overrides_env_to_workspace_default() {
     write_ports_file(&caller, port);
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
-    let status = std::process::Command::new(bin)
+    let status = cli(bin)
         .args([
             "spawn-thread",
             "--to",
@@ -1067,4 +1083,146 @@ async fn spawn_thread_empty_repo_flag_overrides_env_to_workspace_default() {
         body.get("repo_id").is_none(),
         "--repo \"\" must drop the env-var default"
     );
+}
+
+/// Every request one stand-in engine received: path, target assertion, body.
+type Requests = Arc<Mutex<Vec<(String, Option<String>, serde_json::Value)>>>;
+
+/// A stand-in engine answering every POST with `status` and `answer`.
+async fn start_engine(status: u16, answer: serde_json::Value) -> (u16, Requests) {
+    let requests: Requests = Arc::default();
+    let record = requests.clone();
+    let app = axum::Router::new().fallback(
+        move |uri: axum::http::Uri,
+              headers: axum::http::HeaderMap,
+              body: axum::Json<serde_json::Value>| {
+            let record = record.clone();
+            let answer = answer.clone();
+            async move {
+                let asserted = headers
+                    .get("x-lucidos-target-workspace")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                record
+                    .lock()
+                    .unwrap()
+                    .push((uri.path().to_string(), asserted, body.0));
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(answer),
+                )
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, requests)
+}
+
+/// Run `spawn-thread --to dev` as a thread's subprocess in `caller`, whose
+/// own engine listens on `own_port`.
+fn spawn_from_a_thread(tmp: &Path, caller: &Path, own_port: u16) -> std::process::Output {
+    cli(env!("CARGO_BIN_EXE_lucidos"))
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--message",
+            "do the thing",
+            "--insecure-http",
+        ])
+        .env("LUCIDOS_WORKSPACE", caller)
+        .env("LUCIDOS_AGENT_ORIGIN_TOKEN", "a-thread-token")
+        .env(
+            "LUCIDOS_API_BASE_URL",
+            format!("http://127.0.0.1:{own_port}"),
+        )
+        .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env_remove("LUCIDOS_REPO")
+        .env("LUCIDOS_WORKSPACES_ROOT", tmp)
+        .current_dir(caller)
+        .output()
+        .expect("spawn cli")
+}
+
+/// Invariant 7: a thread's spawn into another workspace goes to its own
+/// engine, which vouches for the thread through the gateway. The target's
+/// port hears nothing directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_threads_spawn_into_another_workspace_goes_through_its_own_engine() {
+    let (own_port, own) = start_engine(200, serde_json::json!({"event_id": "e"})).await;
+    let (target_port, target) = start_engine(200, serde_json::json!({"event_id": "e"})).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("caller");
+    write_ports_file(&caller, own_port);
+    write_ports_file(&tmp.path().join("dev"), target_port);
+
+    let output = spawn_from_a_thread(tmp.path(), &caller, own_port);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let own = own.lock().unwrap().clone();
+    assert_eq!(own.len(), 1, "{own:?}");
+    let (path, asserted, body) = &own[0];
+    assert_eq!(path, "/api/v1/workspace-calls/dev/chat/stream");
+    assert_eq!(
+        asserted.as_deref(),
+        Some("caller"),
+        "the request is for the caller's own engine"
+    );
+    assert_eq!(body["message"], "do the thing");
+    assert!(target.lock().unwrap().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(thread:dev/"));
+}
+
+/// No gateway carries the call: the spawn falls back to the target's port,
+/// where it lands unattested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_gateway_the_spawn_posts_to_the_target_directly() {
+    let (own_port, own) = start_engine(
+        409,
+        serde_json::json!({"error": "no", "reason": "no_gateway"}),
+    )
+    .await;
+    let (target_port, target) = start_engine(200, serde_json::json!({"event_id": "e"})).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("caller");
+    write_ports_file(&caller, own_port);
+    write_ports_file(&tmp.path().join("dev"), target_port);
+
+    let output = spawn_from_a_thread(tmp.path(), &caller, own_port);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(own.lock().unwrap().len(), 1);
+    let target = target.lock().unwrap().clone();
+    assert_eq!(target.len(), 1, "{target:?}");
+    assert_eq!(target[0].0, "/api/v1/chat/stream");
+    assert_eq!(target[0].1.as_deref(), Some("dev"));
+    assert_eq!(target[0].2["caller_workspace"], "caller");
+}
+
+/// Any other refusal from the own engine is the answer, never a reason to
+/// go around the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_refusal_from_the_own_engine_is_the_answer() {
+    let (own_port, _) =
+        start_engine(403, serde_json::json!({"error": "stamp did not verify"})).await;
+    let (target_port, target) = start_engine(200, serde_json::json!({"event_id": "e"})).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("caller");
+    write_ports_file(&caller, own_port);
+    write_ports_file(&tmp.path().join("dev"), target_port);
+
+    let output = spawn_from_a_thread(tmp.path(), &caller, own_port);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stamp did not verify"));
+    assert!(target.lock().unwrap().is_empty());
 }

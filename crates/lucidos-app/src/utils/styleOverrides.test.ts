@@ -1,12 +1,3 @@
-/**
- * The live style remote's validator.
- *
- * The map is written by a preference, which means any app can set it through
- * `lucidos.preferences.set` and the chat agent can set it over HTTP. It ends up
- * in `document.documentElement.style`. So this is an untrusted input path into
- * the host's own inline style, and the injection cases below are the point of
- * the file, not padding.
- */
 import { describe, it, expect } from 'vitest';
 import {
   isValidOverrideName, isValidOverrideValue, parseStyleOverrides,
@@ -21,8 +12,6 @@ describe('override names', () => {
   });
 
   it('rejects anything that is not a custom property', () => {
-    // A bare property name would let the map set `color` or `content` on the
-    // root element, which is a different power from retuning a token.
     expect(isValidOverrideName('color')).toBe(false);
     expect(isValidOverrideName('-accent')).toBe(false);
     expect(isValidOverrideName('--')).toBe(false);
@@ -49,8 +38,6 @@ describe('override values', () => {
   });
 
   it('rejects a value that closes the declaration', () => {
-    // The whole injection vector in one character: everything after the `;`
-    // becomes a second declaration on the root element.
     expect(isValidOverrideValue('red; position: fixed')).toBe(false);
   });
 
@@ -61,8 +48,6 @@ describe('override values', () => {
   });
 
   it('rejects a value that fetches from another origin', () => {
-    // A custom property landing in a `background` issues the request, which
-    // tells the value's author the page was viewed.
     expect(isValidOverrideValue('url(http://evil.test/pixel.png)')).toBe(false);
     expect(isValidOverrideValue('URL( http://evil.test/x )')).toBe(false);
     expect(isValidOverrideValue('image-set("http://evil.test/x.png" 1x)')).toBe(false);
@@ -70,7 +55,6 @@ describe('override values', () => {
   });
 
   it('rejects escapes, comments, and oversize or empty values', () => {
-    // `\3b` is a semicolon that a naive scan for `;` would miss.
     expect(isValidOverrideValue('red\\3b position:fixed')).toBe(false);
     expect(isValidOverrideValue('red /* swallow the rest')).toBe(false);
     expect(isValidOverrideValue('')).toBe(false);
@@ -87,8 +71,6 @@ describe('parseStyleOverrides', () => {
   });
 
   it('drops invalid entries instead of failing the whole map', () => {
-    // One bad value written by an app must not cost the user every value they
-    // tuned by hand.
     const raw = JSON.stringify({
       '--accent': '#ff0000',
       'color': 'red',
@@ -117,8 +99,6 @@ describe('parseStyleOverrides', () => {
 
 describe('styleResetRequested', () => {
   it('matches the escape hatch in its real forms', () => {
-    // This is the way out of a value that made the UI unusable, so the match
-    // has to be forgiving about where in the query string it lands.
     expect(styleResetRequested('?style-reset')).toBe(true);
     expect(styleResetRequested('?a=1&style-reset')).toBe(true);
     expect(styleResetRequested('?style-reset=1')).toBe(true);
@@ -131,13 +111,3 @@ describe('styleResetRequested', () => {
     expect(styleResetRequested('?not-style-reset')).toBe(false);
   });
 });
-
-// The "other realms mirror this validator" guard is GONE, and its absence is
-// the point. Four realms used to apply this map from four hand-copied copies of
-// the rules, so the literals had to be pinned against each other. They now come
-// from one place: `@lucidos/appearance` defines them, this module re-exports
-// them for app code, and both FOUC scripts are built from a boot source that
-// imports the same functions. `appearanceBoot.test.ts` drives the boot script's
-// application for real against a fake document, including the two behaviours
-// this block used to infer from source order: that the overrides are applied
-// LAST, and that the storage key is workspace-scoped.

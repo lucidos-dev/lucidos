@@ -6,7 +6,7 @@
 ## Context
 
 Each thread has one stored compose draft and a *compose epoch* that counts
-submissions. A compose PUT carries the epoch it was composed under, and the
+submissions and durable Stop restorations (ADR 0710). A compose PUT carries the epoch it was composed under, and the
 engine refuses a write from before a submission.
 
 Three projection arms consumed the slot: `MessageReceived`, the coding-agent

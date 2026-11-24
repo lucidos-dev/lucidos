@@ -6,12 +6,10 @@ import {
 import { rowGestureHandlers } from './useRowActionsGesture';
 
 const row = document.createElement('div');
-/** A fake target whose `closest` matches any of `tags` in a selector list. */
 const inside = (...tags: string[]) => ({
   closest: (sel: string) => (sel.split(',').some((s) => tags.includes(s.trim())) ? {} : null),
 });
 const pinButton = inside('button');
-// The "N archived" text sits in the same <label> as the switch.
 const archivedLabelText = inside('label');
 
 function pointerDown(target: object = row, button = 0): PointerEvent {
@@ -125,8 +123,6 @@ describe('rowGestureHandlers', () => {
     });
 
     it('a hold that starts on the archived-reveal toggle or its text is left to it', () => {
-      // The toggle is a <label>, not a <button>. Holding any part of it must
-      // not open the row's menu.
       const h = build(true);
       h.onPointerDown!(pointerDown(archivedLabelText));
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);

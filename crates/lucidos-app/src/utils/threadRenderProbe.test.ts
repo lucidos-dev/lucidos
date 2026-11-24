@@ -1,25 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// platform.ts touches navigator/window at import time (no jsdom here) — mock it.
-//
-// isIOSPwa is pinned FALSE, so the suite runs as a WebKit client that is NOT the
-// phone: the packaged Mac app, where the blank came back. Re-narrow the probe to
-// the PWA and the emitting cases here go silent.
 let webKit = true;
 vi.mock('./platform', () => ({ isWebKit: () => webKit, isIOSPwa: () => false }));
-// liveness.ts touches the network / DOM at import time — stub postClientLog so we
-// can assert what the probe would emit without a real fetch.
 const postClientLog = vi.fn();
 vi.mock('./liveness', () => ({ postClientLog: (...a: unknown[]) => postClientLog(...a) }));
+let admissionPhase = 'admitted';
+vi.mock('./restoreAdmission', () => ({ restoreAdmissionPhase: () => admissionPhase }));
+vi.mock('../api/client/requestsInFlight', () => ({
+  requestsInFlight: () => ({ count: 2, oldestMs: 9000, oldestPaths: ['/api/v1/threads/t1'] }),
+}));
 
 import {
   classifyThreadRender,
   shouldReportThreadRender,
+  reportAbsentThreadRender,
   reportThreadRenderProbe,
   type ThreadRenderProbe,
 } from './threadRenderProbe';
 
-/** A baseline "healthy content thread" probe; tests override the suspect fields. */
 function probe(overrides: Partial<ThreadRenderProbe> = {}): ThreadRenderProbe {
   return {
     threadId: 't1',
@@ -44,15 +42,11 @@ describe('classifyThreadRender', () => {
   });
 
   it('missed-rerender: store HAS exchanges but the last render produced none', () => {
-    // The "summary present but body empty on cold open, recovers on scroll" bug:
-    // loadThreadEvents committed events to the store (freshExchangesLen > 0) but
-    // ThreadView never re-rendered to show them (renderedExchangesLen === 0).
     expect(classifyThreadRender(probe({ renderedExchangesLen: 0, freshExchangesLen: 4, contentChildCount: 0 })))
       .toBe('missed-rerender');
   });
 
   it('empty-render: content events exist but a fresh fold still yields zero exchanges', () => {
-    // Corrupted Map / grouping gap — the rebuildCorruptedThreadEvents domain.
     expect(classifyThreadRender(probe({ renderedExchangesLen: 0, freshExchangesLen: 0 })))
       .toBe('empty-render');
   });
@@ -63,14 +57,10 @@ describe('classifyThreadRender', () => {
   });
 
   it('content-present: exchanges rendered and DOM built (healthy OR compositor paint loss)', () => {
-    // JS cannot distinguish a healthy paint from an iOS layer whose texture was
-    // recycled — a blank-body report landing here IS the paint-loss case.
     expect(classifyThreadRender(probe())).toBe('content-present');
   });
 
   it('null DOM metrics do not false-positive as dom-missing', () => {
-    // ref not mounted yet → unknown DOM; must fold into content-present, not
-    // dom-missing (which requires an explicit zero child count).
     expect(classifyThreadRender(probe({ contentChildCount: null, contentScrollHeight: null })))
       .toBe('content-present');
   });
@@ -80,7 +70,6 @@ describe('classifyThreadRender', () => {
       .toBe('missed-rerender');
   });
 
-  // --- coding-agent variant (the latest repro: a CC thread with a spark icon) ---
   it('coding-agent thread: missed-rerender classified the same as chat', () => {
     expect(classifyThreadRender(probe({
       channel: 'claude_code', isCodingAgent: true,
@@ -130,5 +119,28 @@ describe('reportThreadRenderProbe', () => {
     reportThreadRenderProbe(probe());
     expect(postClientLog).toHaveBeenCalledTimes(1);
     expect(postClientLog.mock.calls[0][2]).toMatchObject({ class: 'content-present' });
+  });
+});
+
+describe('reportAbsentThreadRender', () => {
+  beforeEach(() => { postClientLog.mockClear(); webKit = true; admissionPhase = 'generation'; });
+
+  it('names the admission phase and the in-flight request count and age', () => {
+    reportAbsentThreadRender('t1');
+    expect(postClientLog).toHaveBeenCalledExactlyOnceWith('render', 'thread_render_probe', {
+      class: 'target-absent', thread_id: 't1', admission_phase: 'generation',
+      requests_in_flight: 2, oldest_request_ms: 9000,
+    });
+  });
+
+  it('never carries request paths', () => {
+    reportAbsentThreadRender('t1');
+    expect(JSON.stringify(postClientLog.mock.calls[0])).not.toContain('/api/');
+  });
+
+  it('does not emit off WebKit', () => {
+    webKit = false;
+    reportAbsentThreadRender('t1');
+    expect(postClientLog).not.toHaveBeenCalled();
   });
 });

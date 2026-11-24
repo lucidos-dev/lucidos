@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * One commands read per cue, never a loop. `loadCommands` writes the module
- * command cache when its response lands, so an effect that calls it must not
- * also subscribe to that cache. When it did, every response re-ran the effect:
- * the compose view wiped its commands and fetched again, forever, and the
- * button sat dimmed as if it had no commands.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';
@@ -27,14 +20,12 @@ vi.mock('../../../api/client', async (importOriginal) => ({
 const { CodingAgentControlMenu } = await import('../CodingAgentControlMenu');
 const { controlMenuParts } = await import('../controlMenuParts');
 
-// The menus' panel parts are code-split. Warm them, so a press opens at once.
 beforeAll(() => controlMenuParts.preload());
 const { codingAgentSessionVersion } = await import('../../../store/store');
 const { composeSelections } = await import('../../../store/composeSelections');
 
 let host: HTMLDivElement;
 
-/** Enough macrotasks for the first effect to run and several responses to land. */
 async function settle(): Promise<void> {
   for (let i = 0; i < 80; i++) await new Promise(r => setTimeout(r, 0));
 }
@@ -65,8 +56,6 @@ describe('the coding-agent commands read', () => {
     render(<CodingAgentControlMenu threadId="t1" codingAgent="claude-code" />, host);
     await settle();
     const afterMount = fetchCodingAgentCommands.mock.calls.length;
-    // The first test left the cache loaded, so an active button alone proves
-    // nothing about this mount.
     expect(afterMount).toBeGreaterThan(0);
 
     await settle();
@@ -74,15 +63,11 @@ describe('the coding-agent commands read', () => {
   });
 });
 
-/** The menu stays mounted across a draft switch and across the move from an
- *  active thread into compose, so those prop changes alone must refetch. A
- *  signal effect saw neither and kept the previous context's commands. */
 describe('the compose commands follow the focused context', () => {
   afterEach(() => {
     composeSelections.value = new Map();
   });
 
-  /** The repo and backend of the newest commands read. */
   function lastRequest(): { repoId: unknown; codingAgent: unknown } {
     const calls = fetchCodingAgentCommands.mock.calls as unknown as unknown[][];
     const [, repoId, codingAgent] = calls[calls.length - 1];

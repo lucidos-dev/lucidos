@@ -3,17 +3,9 @@ import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, ensureOnThreadPane, gotoWithRetry, waitForVisibleInput, waitForWorkspaceReady } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
-/**
- * An on-ready tile on the phone dashboard lifts its cover well before the 15 s
- * ready fuse, and logs no `slow load` line. The widget reads a data file over
- * the bridge, as Thread cost does. A stall in the bridge or the host shows as a
- * late cover or a logged line.
- */
 
-/** The cover must lift well under the 15 s ready fuse. */
 const READY_BUDGET_MS = 5_000;
 
-/** Enough rows that the read is a real transfer, not a one-packet reply. */
 const DATA_ROWS = 4_000;
 
 let written: string[] = [];

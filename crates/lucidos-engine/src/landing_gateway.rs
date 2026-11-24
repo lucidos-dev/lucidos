@@ -60,24 +60,34 @@ async fn order_for(packaged: bool, gateway_port: Option<&str>) -> LandingOrder {
 
 async fn gateway_paired(port: &str) -> Result<bool, String> {
     let client = gateway_client()?;
-    let mut last_error = String::new();
-    for scheme in crate::net_config::peer_scheme_order() {
-        let url = format!("{scheme}://127.0.0.1:{port}{GATEWAY_PAIRINGS_PATH}");
-        match client.get(&url).send().await {
-            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
-                return Ok(false)
-            }
-            Ok(response) if response.status().is_success() => {
-                let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-                return body["paired"]
-                    .as_bool()
-                    .ok_or_else(|| "the answer had no paired field".to_string());
-            }
-            Ok(response) => last_error = format!("HTTP {}", response.status()),
-            Err(e) => last_error = e.to_string(),
+    let url = format!(
+        "{}{GATEWAY_PAIRINGS_PATH}",
+        lucidos_local_token::client::origin(port)
+    );
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND => Ok(false),
+        status if status.is_success() => {
+            let body: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+            body["paired"]
+                .as_bool()
+                .ok_or_else(|| "the answer had no paired field".to_string())
         }
+        status => Err(format!("HTTP {status}")),
     }
-    Err(last_error)
+}
+
+/// The machine label used by the gateway when it introduces itself to peers.
+pub(crate) fn local_label() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes within the supplied buffer.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    let hostname = String::from_utf8_lossy(&buf[..end]);
+    let hostname = hostname.trim();
+    (!hostname.is_empty()).then(|| format!("Lucidos on {hostname}"))
 }
 
 /// A push moved `origin`'s `main`. Returns at once.
@@ -92,22 +102,22 @@ pub fn report_main_landed() {
         let client = match gateway_client() {
             Ok(c) => c,
             Err(e) => {
-                log!("[LandingGateway] {}", e);
+                log_legacy!("[LandingGateway] {}", e);
                 return;
             }
         };
-        let mut last_error = String::new();
-        for scheme in crate::net_config::peer_scheme_order() {
-            let url = format!("{scheme}://127.0.0.1:{port}{MAIN_LANDED_PATH}");
-            match client.post(&url).send().await {
-                Ok(response) if response.status().is_success() => return,
-                Ok(response) => last_error = format!("HTTP {}", response.status()),
-                Err(e) => last_error = e.to_string(),
-            }
-        }
-        log!(
+        let url = format!(
+            "{}{MAIN_LANDED_PATH}",
+            lucidos_local_token::client::origin(&port)
+        );
+        let refusal = match client.post(&url).send().await {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => format!("HTTP {}", response.status()),
+            Err(e) => e.to_string(),
+        };
+        log_legacy!(
             "[LandingGateway] the gateway did not take the landing report: {}",
-            last_error
+            refusal
         );
     });
 }

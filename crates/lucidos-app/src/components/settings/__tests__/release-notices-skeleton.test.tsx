@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › System › Release notices draws a notice row while the list
- *  loads, past the delay gate. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -38,10 +36,10 @@ it('keeps its title and draws no skeleton before the gate opens', () => {
 
 it('draws a notice row as the skeleton once the gate opens', () => {
   act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
-  expect(host.querySelector('.loading-fade-skeleton .release-notice-row .release-notice-row-title .sk-bar')).not.toBeNull();
+  expect(host.querySelector('.loading-fade-skeleton .release-notice-card .sk-bar')).not.toBeNull();
 });
 
 it('says there is nothing to do once an empty list lands', () => {
-  act(() => { releaseNoticeView.value = { status: 'loaded', data: { notices: [], next_id: null } as never }; });
+  act(() => { releaseNoticeView.value = { status: 'loaded', data: { releases: [], owed_through: null, action_prompt: null } }; });
   expect(host.querySelector('.loading-fade-content .empty-state')?.textContent).toContain('Nothing to do');
 });

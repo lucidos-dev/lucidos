@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { singleFlight } from './singleFlight';
 
-/** An ask that waits until the test lets it finish. */
 function gatedAsks() {
   const releases: (() => void)[] = [];
   const ask = () => new Promise<void>((resolve) => { releases.push(resolve); });
@@ -20,8 +19,6 @@ describe('singleFlight', () => {
     expect(releases).toHaveLength(1);
   });
 
-  /** A gateway added while a poll is in flight: the poll began before it was
-   *  saved, so only a second ask can list its workspaces. */
   it('runs one more ask for a fresh call, and waits for it', async () => {
     const { ask, releases } = gatedAsks();
     const run = singleFlight(ask);

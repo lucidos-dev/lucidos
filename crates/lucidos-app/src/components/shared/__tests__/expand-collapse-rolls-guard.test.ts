@@ -6,31 +6,16 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, relative } from 'node:path';
 
-/**
- * Every expand and collapse animates (`.claude/rules/frontend.md` § Every
- * Expand and Collapse Rolls). An inline toggle says so with `aria-expanded`,
- * and its content rolls through `<Disclosure>`. A popover toggle also carries
- * `aria-expanded`, beside an `aria-haspopup`, and opens through `<Overlay>`
- * instead, so it is not counted here. A pressed toggle, such as the header's
- * search button, carries no `aria-expanded`, so this scan reads the content
- * side too.
- *
- * A source scan, like `skeleton-guard`: jsdom runs no animation to assert.
- */
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SRC = resolve(here, '../../..'); // crates/lucidos-app/src
+const SRC = resolve(here, '../../..');
 
-/** Files whose inline toggle rolls somewhere other than a `<Disclosure>` in
- *  the same file, and where. */
 const ROLLS_ELSEWHERE: Record<string, string> = {
   'components/drawer/ThreadDrawer.tsx': 'the drawer rolls its rows as FLIP copies (useFlipAnimation)',
   'components/shared/SectionHeader.tsx': 'each caller rolls its section body in a <Disclosure>',
   'components/layout/ThreadsHeaderControls.tsx': 'it swaps the list for the filter panel under the navigation cover (ThreadFilterCover.tsx)',
 };
 
-/** How far from `aria-expanded` an `aria-haspopup` still belongs to the same
- *  element: a JSX opening tag with one attribute per line. */
 const SAME_ELEMENT_LINES = 12;
 
 function sourceFiles(dir: string): string[] {
@@ -46,8 +31,6 @@ function sourceFiles(dir: string): string[] {
   return out;
 }
 
-/** Whether the file holds an inline toggle: an `aria-expanded` with no
- *  `aria-haspopup` on its element. */
 function hasInlineToggle(src: string): boolean {
   const lines = src.split('\n');
   return lines.some((line, i) => {
@@ -57,11 +40,6 @@ function hasInlineToggle(src: string): boolean {
   });
 }
 
-/** A mount gated on an open or expanded flag, as `{xOpen.value && <X />}` or
- *  `xOpen.value ? <X /> : null`. It appears and vanishes in one frame, whoever
- *  flips the flag. The toggle can be anywhere, even a header button in
- *  another file, so this check reads the mount and not the toggle. A ternary
- *  whose else branch is JSX swaps two drawings, an icon say, and is not one. */
 const GATED_MOUNT = new RegExp(
   String.raw`(?<![!\w])\w*(?:[Oo]pen|[Ee]xpanded)(?:\.value)?\s*` +
     String.raw`(?:&&\s*\(?\s*<|\?\s*\(?\s*<(?:(?!\s:\s*[<(])[\s\S]){0,600}?\s:\s*null\b)`,

@@ -29,7 +29,7 @@ import { makeThreadState } from '../actions/threads-test-helpers';
 import type { ThreadAggregate, ThreadEvent, ThreadState } from '../thread-events';
 import { applyingNowThreadIds, applyNowRequests, threadMap } from '../store';
 import { flushThreadMap, handleThreadEvent } from '../actions/thread-sync';
-import { endClaudeCodeAndApply } from '../actions/chat-claude-code';
+import { endClaudeCodeAndApply } from '../actions/codingAgentChanges';
 import { applyNow, ApiError } from '../../api/client';
 
 type Mock = ReturnType<typeof vi.fn>;
@@ -40,7 +40,6 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   return { promise, resolve };
 }
 
-/** A coding-agent thread waiting with a change, at summary version 3. */
 function seed(): void {
   const map = new Map<string, ThreadState>();
   map.set('t', makeThreadState('t', {
@@ -55,7 +54,6 @@ function seed(): void {
   threadMap.value = map;
 }
 
-/** An SSE frame for `t` at `version`, with the engine's apply flag. */
 function frame(version: number, event: ThreadEvent, applyInFlight: boolean, status = 'waiting'): void {
   handleThreadEvent({
     thread_id: 't',
@@ -81,7 +79,6 @@ beforeEach(() => {
   applyNowRequests.value = new Map();
   seed();
   vi.resetAllMocks();
-  // Timers only: the thread map flushes on an animation frame, which must run.
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
 });
 
@@ -89,9 +86,6 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-// "Applying" is the engine's own word, projected on the thread summary from
-// ApplyNowStarted to ApplyNowEnded. Nothing else ends it: not a message from
-// another device, not a late proposal, not a timer (ADR 0437).
 describe('Apply Now follows the summary', () => {
   it('holds from the click until the engine ends the apply, whatever arrives meanwhile', async () => {
     const post = deferred<{ status: string; summary_version: number }>();
@@ -120,7 +114,6 @@ describe('Apply Now follows the summary', () => {
     const message = 'An apply is already in progress for this thread';
     (applyNow as Mock).mockRejectedValueOnce(new ApiError(409, message, { error: message, reason: 'apply_in_progress' }));
 
-    // Another device started the apply, and its frame lands after the refusal.
     await endClaudeCodeAndApply('t');
     expect(applyNow).toHaveBeenCalledOnce();
     frame(4, { type: 'ApplyNowStarted' } as unknown as ThreadEvent, true);

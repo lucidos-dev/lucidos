@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A remote row in the Lucidos menu's switcher opens the way a local row does.
- *
- * On the packaged desktop client a plain click must reach the shell's window
- * chooser, which opens a new window. A same-window navigation instead turns the
- * window the user clicked from into the remote workspace, and the local one is
- * gone.
- */
 import { afterEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -49,7 +41,6 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-/** Mount the menu row unfolded and hand back the `dev@cloud` row once it lands. */
 async function remoteRow(): Promise<HTMLElement> {
   rememberWorkspaceSwitcherExpanded(true);
   await act(async () => { render(<WorkspacesMenuRow onClose={() => {}} />, container); });

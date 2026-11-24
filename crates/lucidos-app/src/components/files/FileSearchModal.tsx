@@ -25,9 +25,6 @@ function sourceBadgeLabel(source: FileSearchResult['source']): string {
   return source === 'workspace' ? 'W' : source === 'repo' ? 'R' : 'C';
 }
 
-/** One search hit. Inside a `SkeletonProvider` it is the results list's
- *  loading placeholder. The list holds up to `MAX_SHOWN_RESULTS` rows, so the
- *  loaded path is plain markup and the skeleton check runs once per row. */
 function SearchResultRow({ result, selected = false, showBadge = false, onHover, onPick }: {
   result?: FileSearchResult;
   selected?: boolean;
@@ -73,26 +70,18 @@ function SearchResultRow({ result, selected = false, showBadge = false, onHover,
   );
 }
 
-/** The open-state body. Mounted by `<Overlay>` only while the modal is open, so
- *  the result rows (and their signal subscriptions) and the search compute
- *  don't run on every `visualViewport.resize` while closed — the same reason the
- *  overlay element itself stays mounted (hidden) rather than unmounting. */
 function FileSearchPanel() {
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
-  // A switch to another panel while it is open closes it. It opens from any
-  // panel, the dashboard included, so the panel it opened over keeps it.
   const active = activeMenuItem.value;
   const openedOver = useRef(active);
   useEffect(() => {
     if (active !== openedOver.current) closeFileSearch();
   }, [active]);
 
-  // Auto-focus on mount (the modal only mounts when open). iOS keeps the
-  // keyboard from openFileSearch's gesture-stack focus once the real input lands.
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
@@ -107,16 +96,6 @@ function FileSearchPanel() {
 
   const isRepo = repoSource.value !== null;
   const primarySource = isRepo ? repoFiles.value : artifacts.value;
-  // CC change files contribute when `loaded`. A `failed` changes signal
-  // bubbles up to the modal's failed state only when no other source has
-  // loaded AND the primary source has reached a terminal state — otherwise the
-  // modal still functions on what's available, and a still-loading primary
-  // shows its placeholder rows rather than a premature "Failed to load files".
-  //
-  // The repo gate runs HERE, before `anyLoaded` counts them: a change this
-  // surface cannot open contributes no row, so it cannot stand in for a loaded
-  // source either. Counting one that is filtered out renders an empty result
-  // list while the primary source is still loading.
   const ccChanges = openableChangeFiles(loadedOr(changes.value, []), isRepo);
   const ccChangesFailed = changes.value.status === 'failed';
   const anyLoaded = primarySource.status === 'loaded' || ccChanges.length > 0;
@@ -147,8 +126,6 @@ function FileSearchPanel() {
     }
   };
 
-  // On iOS, when the search input is focused the first tap on a button
-  // dismisses focus instead of firing click. Using onTouchEnd bypasses this.
   const closeTouchEnd = (e: TouchEvent) => { e.preventDefault(); closeFileSearch(); };
   const closeBtn = (
     <button class="icon-btn surface-close file-search-close" onTouchEnd={closeTouchEnd} onClick={closeFileSearch} aria-label="Close search" data-tooltip="Close search">
@@ -188,11 +165,9 @@ function FileSearchPanel() {
         {closeBtn}
       </div>
       <div class="file-search-results" ref={resultsRef}>
-        {/* A failed source still leaves the ones that loaded searchable. */}
         {failed && !anyLoaded ? (
           <div class="file-search-empty error-text">Failed to load files</div>
         ) : (
-          // The field above is live from the first frame; only the results wait.
           <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf count={6} row={() => <SearchResultRow />} />}>
             {anyLoaded && (shown.length === 0 ? (
               <div class="file-search-empty">No matching files</div>
@@ -223,15 +198,8 @@ function FileSearchPanel() {
 }
 
 export function FileSearchModal() {
-  // Over the Canvas pane, whose header holds the button that opens it.
   const open = fileSearchOpen.value;
   const paneCentre = usePaneCentre(open ? paneUnder(fileSearchAnchor.value) ?? 'canvas' : undefined);
-  // keepMounted: the overlay div is NEVER removed from the DOM — iOS Safari
-  // PWA's compositor leaves ghost pixels when a fixed-position layer is removed
-  // from the layer tree, so closing toggles `.file-search-closed` instead. The
-  // heavy body (FileSearchPanel) only mounts while open. Same pattern as
-  // SearchEverywhere. Contract (dismiss + swallow + anchor + Escape) lives in
-  // <Overlay>.
   return (
     <Overlay
       open={open}

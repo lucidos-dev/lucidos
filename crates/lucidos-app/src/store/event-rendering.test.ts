@@ -15,17 +15,12 @@ const text = (md: string): ResponseEvent => ({ type: 'text', md });
 const body = (events: ResponseEvent[], showSteps = true, showDetails = true, rowsHidden = 0) =>
   responseBody(events, { showSteps, showDetails, rowsHidden });
 
-/** The live step `ChatExchange` marks, so the header label can read where it
- *  sits. It names the FIRST pending row the body DRAWS, by its index in the
- *  turn's events. */
 describe('liveStepInBody', () => {
   it('names the pending row by its index in the turn', () => {
     expect(liveStepInBody(body([text('hi'), step('success'), step('pending')]))).toBe(2);
   });
 
   it('names the FIRST pending row when parallel calls leave several', () => {
-    // The "Working" label sits above every row, so the first pending row is the
-    // first one the reader meets coming down from it.
     expect(liveStepInBody(body([step('pending'), step('pending')]))).toBe(0);
   });
 
@@ -35,7 +30,6 @@ describe('liveStepInBody', () => {
 
   it('is -1 when no drawn step is pending', () => {
     expect(liveStepInBody(body([step('success'), step('error'), text('done')]))).toBe(-1);
-    // A step killed mid-call is terminal; a blocked one waits on the reader.
     expect(liveStepInBody(body([step('success'), step('unfinished')]))).toBe(-1);
     expect(liveStepInBody(body([step('success'), step('blocked')]))).toBe(-1);
     expect(liveStepInBody(body([text('just text')]))).toBe(-1);
@@ -43,12 +37,10 @@ describe('liveStepInBody', () => {
   });
 
   it('is -1 for a pending step the full response hides', () => {
-    // Details off keeps only what follows the last prose chunk.
     expect(liveStepInBody(body([text('a'), step('pending'), text('b')], true, false))).toBe(-1);
   });
 });
 
-/** The rows a body draws, flattened: every open row's events plus every marker. */
 function drawn(sections: BodySection[]): ResponseEvent[] {
   return sections.flatMap(s => s.rows.flatMap((r): ResponseEvent[] => {
     if (r.kind === 'marker') return [r.event];
@@ -57,14 +49,10 @@ function drawn(sections: BodySection[]): ResponseEvent[] {
   }));
 }
 
-/** Every row's key, the identity Preact matches it by. */
 function keys(sections: BodySection[]): string[] {
   return sections.flatMap(s => s.rows.map(r => `${s.key}/${r.kind}${r.key}`));
 }
 
-/** The body the two toggles roll. Each toggle state must still DRAW what it
- *  drew when hiding meant not rendering, and no toggle may move a row's key:
- *  a moved key remounts the row, which then snaps instead of rolling. */
 describe('responseBody', () => {
   const image: ResponseEvent = { type: 'image', base64: '', mime_type: 'image/png' };
   const turns: Record<string, ResponseEvent[]> = {
@@ -116,13 +104,9 @@ describe('responseBody', () => {
       body(events, showSteps, showDetails).flatMap(s => s.rows)
         .filter(r => r.kind === 'steps').map(r => r.kind === 'steps' && r.elided);
     const events = [text('plan'), step('success'), text('done'), step('success')];
-    // Between the two chunks: marked. After the last one: nothing to mark off.
     expect(elided(events, false, true)).toEqual([true, false]);
-    // Steps on draws the run itself.
     expect(elided(events, true, true)).toEqual([false, false]);
-    // The full response off hides the chunk before the run, so no boundary.
     expect(elided(events, false, false)).toEqual([false, false]);
-    // A marker on one side is not a chunk.
     expect(elided([text('a'), step('success'), { type: 'empty' }], false, true)).toEqual([false]);
   });
 
@@ -138,24 +122,14 @@ describe('responseBody', () => {
   });
 });
 
-/** What the response body is DRAWING, which is what decides whether the turn
- *  has anything to fold. A turn that draws nothing and folds anyway hides
- *  nothing, yet lights its collapse control as if it did. Reported while a
- *  coding-agent turn was in flight, which is where a blank body lives longest. */
 describe('drawsResponseRow', () => {
   it('draws a text event only when it has visible text', () => {
-    // A whitespace-only chunk is the norm, not a curiosity: one is pushed for
-    // every `CodingAgentTextStreamed`, and a torn-down subprocess signs off
-    // with a bare "\n\n". Counting those is how `events.length` runs ahead of
-    // anything on screen.
     expect(drawsResponseRow(text('an answer'), false)).toBe(true);
     expect(drawsResponseRow(text('  \n\n  '), false)).toBe(false);
     expect(drawsResponseRow(text(''), true)).toBe(false);
   });
 
   it('draws step mechanics only while the steps control is on', () => {
-    // A turn that has emitted only steps shows an EMPTY body to a reader who
-    // turned `stepsExpanded` off: nothing to fold until the first row lands.
     for (const outcome of ['pending', 'success', 'error', 'unfinished'] as StepOutcome[]) {
       expect(drawsResponseRow(step(outcome), true), outcome).toBe(true);
       expect(drawsResponseRow(step(outcome), false), outcome).toBe(false);
@@ -163,8 +137,6 @@ describe('drawsResponseRow', () => {
   });
 
   it('draws every marker unconditionally, whatever the steps control says', () => {
-    // Markers are not mechanics (`isStepMechanics`): each records that a thing
-    // happened, and no toggle hides one.
     const markers: ResponseEvent[] = [
       { type: 'image', base64: '', mime_type: 'image/png' },
       {
@@ -194,12 +166,6 @@ describe('drawsResponseRow', () => {
   });
 
   it('draws nothing for the kinds the response renderer has no arm for', () => {
-    // The reason this is an allow-list. `responseBody` draws a row for some
-    // kinds and none for these. A deny-list ("anything that is not a blank
-    // text") would count them as body content.
-    // A question and a permission render as initiator-panel dividers with their
-    // own fold, not as response rows; a `section_break` splits
-    // `responseBody` into sections. A turn holding only these has an empty body.
     const undrawn: ResponseEvent[] = [
       { type: 'section_break', channel: 'main' },
       { type: 'question', tool_use_id: 't1', question: 'Which?', options: [] },
@@ -212,10 +178,6 @@ describe('drawsResponseRow', () => {
   });
 });
 
-/** What the render window budgets by. A row the clamped slice renders as
- *  `null` costs nothing and fills no height, so the window must not count it.
- *  One reported turn held 748 text events and 45 with prose. With steps hidden,
- *  a run of 352 tool calls drew nothing at all. */
 describe('rowsDrawnByClamp', () => {
   const view = { showSteps: true, showDetails: true, folded: false };
   const silentRun = [text('\n\n'), step('success'), text('\n\n'), step('success')];
@@ -237,8 +199,6 @@ describe('rowsDrawnByClamp', () => {
   });
 
   it('marks nothing drawn on the collapsed-prose path, which ignores the clamp', () => {
-    // Two prose chunks and a step: turning details off draws only what follows
-    // the last prose, whatever `rowsHidden` says.
     const events = [text('first'), step('success'), text('last')];
     expect(headClampApplies(events, false)).toBe(false);
     expect(rowsDrawnByClamp(events, { ...view, showDetails: false }).some(Boolean)).toBe(false);

@@ -1,22 +1,13 @@
 // @vitest-environment jsdom
-/**
- * The Lucidos Agent's rung control: the same split button and pill as a coding
- * agent's, listing the chat ladder's rungs. A draft's pick is the draft's own.
- * A pick on a started thread asks the engine whether it rebuilds a warm cache,
- * and asks the user before it does. A chat thread has no successor, so the
- * choice is Keep or Switch anyway. The engine records the pick, and refuses it
- * while a turn runs, when the pill refuses every pick and step.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
-import estimates from '../../../../../lucidos-engine/src/llm/rung_estimates.json';
+import { bumpThreadEvents, flushThreadEventsBumpsNow } from '../../../store/threadActivity';
+import estimates from '../../../../../lucidos-core/src/llm/rung_estimates.json';
 import type { ChatSettingsPick, SwitchEstimate } from '../../../api/client';
 import type { IntelligenceLadder, ModelInfo, ServedIntelligenceRung } from '../../../api/types';
 
 import { DEFAULT_CHAT_MODEL } from '../../../store/models';
 
-/** The default chat model is Opus 5.5, whose label the pill reads from the
- *  fallback model list. */
 const OPUS = DEFAULT_CHAT_MODEL;
 
 const fetchSwitchEstimate = vi.fn<() => Promise<SwitchEstimate>>();
@@ -26,8 +17,6 @@ const served = (model: string, label: string, effort: string, on = true): Served
   model, label, effort, on, estimated: true, intelligence: null, cost: null, time: null, is_default: false,
 });
 
-/** The chat ladder: Haiku low and Opus medium and high on, Sonnet off. Read
- *  at call time, once the fallback model list has loaded. */
 const servedChatLadder = (): IntelligenceLadder => ({
   surface: 'chat',
   source: 'test',
@@ -72,14 +61,11 @@ const {
   confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels, chatLadder, preferences,
 } = await import('../../../store/store');
 const { ApiError } = await import('../../../api/client');
-const { rungLockedReason } = await import('../rungLockedReason');
-const { TURN_RUNNING_REASON } = await import('@lucidos/engine-constants');
 const { getComposeSelectionOverride, clearComposeSelection } = await import('../../../store/composeSelections');
 const { makeThreadState } = await import('../../../store/actions/threads-test-helpers');
 const { MODELS } = await import('../../../store/models');
 const { OFF_LADDER_NOTE } = await import('../rungRows');
 
-/** The models the tests use, read from the fallback list. */
 const idOf = (label: string) => MODELS.find((m) => m.label === label)!.value;
 const HAIKU = idOf('Haiku 5.5');
 const SONNET = idOf('Sonnet 5.5');
@@ -108,7 +94,6 @@ function openList(): Promise<void> {
   return settle();
 }
 
-/** A row's label, less the checkmark the row in force wears. */
 const labelOf = (row: Element | null) => row?.querySelector('.control-option-label')?.textContent?.replace('✓', '');
 
 function rowLabels(): string[] {
@@ -124,14 +109,12 @@ function checkedRow(): string | undefined {
   return labelOf(document.querySelector('.control-option-current'));
 }
 
-/** Pick Haiku's rung from the list: one tap commits model and effort. */
 async function pickHaiku(): Promise<void> {
   await openList();
   click('.control-option', 'Haiku 5.5 · low');
   await settle();
 }
 
-/** The model the engine was asked to record for `t1`, if any. */
 function recordedModel(): string | undefined {
   return recordChatSettings.mock.calls.find(([id]) => id === 't1')?.[1].model;
 }
@@ -140,7 +123,6 @@ function setStatus(status: 'idle' | 'running' | 'waiting_for_user_answer' | 'pau
   threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'chat', status, state: 'active' } })]]);
 }
 
-const LOCKED = rungLockedReason('running')!;
 
 function renderControl(props: { threadId?: string; composeContext: boolean }): void {
   render(<><RungControl {...props} codingAgent={null} /><ConfirmDialog /></>, host);
@@ -150,7 +132,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   previousPreferences = preferences.value;
   currentModel.value = OPUS;
-  // A failed registry read is still an answer: the pill draws from the fallback list.
   chatModels.value = { status: 'failed', error: 'test' };
   threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'chat', status: 'idle', state: 'active' } })]]);
   host = document.createElement('div');
@@ -310,24 +291,13 @@ describe('a pick on a started thread', () => {
     expect(toasts.value.some(t => t.type === 'error' && t.message.includes('engine down'))).toBe(true);
   });
 
-  it('records nothing when a turn starts while the estimate is read', async () => {
+  it('records the pick when a turn starts while the estimate is read', async () => {
     fetchSwitchEstimate.mockImplementation(async () => {
       setStatus('running');
       return KEEPS_CACHE;
     });
     await pickHaiku();
-    expect(recordChatSettings).not.toHaveBeenCalled();
-    expect(toasts.value.some(t => t.type === 'info' && t.message === LOCKED)).toBe(true);
-  });
-
-  it('says why, and claims no switch, when the engine refuses because a turn runs', async () => {
-    fetchSwitchEstimate.mockResolvedValue(KEEPS_CACHE);
-    recordChatSettings.mockRejectedValueOnce(
-      new ApiError(409, 'locked', { error: 'locked', reason: TURN_RUNNING_REASON }),
-    );
-    await pickHaiku();
-    expect(toasts.value.some(t => t.type === 'info' && t.message === LOCKED)).toBe(true);
-    expect(toasts.value.some(t => t.type === 'success')).toBe(false);
+    expect(recordedModel()).toBe(HAIKU);
   });
 
   it('shows an error when the engine refuses for another reason', async () => {
@@ -342,7 +312,9 @@ describe('a pick on a started thread', () => {
     const thread = threadMap.value.get('t1')!;
     const events = new Map(thread.events);
     events.set(10, { type: 'ChatSettingsChanged', model: HAIKU, reasoning_effort: 'low' });
-    threadMap.value = new Map([['t1', { ...thread, events }]]);
+    thread.events = events;
+    bumpThreadEvents('t1');
+    flushThreadEventsBumpsNow();
     await settle();
     expect(host.querySelector('.rung-pill .rung-name')!.textContent).toContain('Haiku 5.5');
   });
@@ -350,29 +322,48 @@ describe('a pick on a started thread', () => {
 
 describe('a started thread while a turn runs', () => {
   for (const status of ['running', 'waiting_for_user_answer', 'paused'] as const) {
-    it(`opens the list but keeps the current model while ${status}`, async () => {
+    it(`saves a pick while ${status}`, async () => {
       setStatus(status);
+      fetchSwitchEstimate.mockResolvedValue(KEEPS_CACHE);
       renderControl({ threadId: 't1', composeContext: false });
       await settle();
-      const trigger = host.querySelector<HTMLElement>('.rung-trigger')!;
-      expect(trigger.getAttribute('aria-disabled')).toBe('false');
-      expect(trigger.getAttribute('data-tooltip')).toBe(LOCKED);
-      expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
       await pickHaiku();
-      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
-      for (const step of host.querySelectorAll<HTMLElement>('.rung-step')) step.click();
-      await settle();
-      expect(toasts.value.filter(t => t.type === 'info' && t.message === LOCKED).length).toBeGreaterThan(0);
+      expect(recordedModel()).toBe(HAIKU);
       expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
-      expect(fetchSwitchEstimate).not.toHaveBeenCalled();
-      expect(recordChatSettings).not.toHaveBeenCalled();
     });
   }
+
+  it('keeps the live face with an asterisk and explains the latest next-turn pick', async () => {
+    setStatus('running');
+    const thread = threadMap.value.get('t1')!;
+    const events = new Map(thread.events);
+    events.set(1, { type: 'MessageReceived', text: 'hello', model: OPUS, reasoning_effort: 'medium' } as never);
+    events.set(2, { type: 'ChatSettingsChanged', model: HAIKU, reasoning_effort: 'low' });
+    threadMap.value = new Map([['t1', { ...thread, events }]]);
+    renderControl({ threadId: 't1', composeContext: false });
+    await settle();
+    expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
+    expect(host.querySelector('.rung-next-turn')!.textContent).toBe('*');
+    expect(host.querySelector('.rung-trigger')!.getAttribute('aria-label')).toContain('Next turn: Haiku 5.5 · low');
+    await openList();
+    expect(document.querySelector('.rung-turn-summary')!.textContent).toContain('Running: Opus 5.5 · medium');
+    expect(document.querySelector('.rung-turn-summary')!.textContent).toContain('* Next turn: Haiku 5.5 · low');
+    events.set(3, { type: 'ChatSettingsChanged', model: OPUS, reasoning_effort: 'high' });
+    threadMap.value.get('t1')!.events = new Map(events);
+    bumpThreadEvents('t1');
+    flushThreadEventsBumpsNow();
+    await settle();
+    expect(document.querySelector('.rung-turn-summary')!.textContent).toContain('Next turn: Opus 5.5 · high');
+    expect(host.querySelector('.rung-effort')!.textContent).toContain('medium');
+    threadMap.value = new Map([['t1', { ...thread, events: new Map(events), meta: { ...thread.meta, status: 'idle' } }]]);
+    await settle();
+    expect(host.querySelector('.rung-next-turn')).toBeNull();
+    expect(host.querySelector('.rung-effort')!.textContent).toContain('high');
+  });
 });
 
 const ALL_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** A registry row served by `providers`, in route order. */
 const registryRow = (id: string, label: string, providers = ['vertex']): ModelInfo => ({
   id,
   label,

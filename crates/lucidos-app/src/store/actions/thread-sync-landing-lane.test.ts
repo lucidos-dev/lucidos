@@ -1,9 +1,3 @@
-/**
- * The landing lane's frames reach the `landingLane` signal by name, with no
- * translation layer: `LaneBatchStarted` opens the batch, `LaneBatchLanded`
- * and `LaneBatchFailed` close it, and `ChangesUpdated` carries the whole lane.
- * The main check's frames reach the `mainCheck` signal the same way.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const showToast = vi.fn();

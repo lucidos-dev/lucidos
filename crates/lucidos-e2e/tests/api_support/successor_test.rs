@@ -7,8 +7,8 @@ use crate::support::{
     local_process_client, seed_cc_thread_summary, seed_chat_thread_summary, unique_marker,
     user_client, workspace_path,
 };
+use lucidos_agents_api::engine::successor::HANDOFF_OFFER_TOKENS;
 use lucidos_engine::core::prefs;
-use lucidos_engine::engine::successor::HANDOFF_OFFER_TOKENS;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -838,6 +838,69 @@ async fn a_warm_continue_asks_the_old_agent_for_its_narrative() {
     );
 }
 
+/// A provider block takes the brief path whatever the cache's warmth: the
+/// blocked session is never asked for a narrative, and the brief names the block.
+#[tokio::test]
+async fn a_blocked_thread_continues_from_a_brief_even_with_a_warm_cache() {
+    let client = user_client().await;
+    let pool = connect().await;
+    let old = WorktreeThread::seed(&pool, "successor-blocked").await;
+    insert_capture(
+        &pool,
+        old.thread_id,
+        json!({
+            "model": "claude-opus-5-5",
+            "usage": {
+                "input_tokens": HANDOFF_OFFER_TOKENS + 1,
+                "cache_creation_tokens": HANDOFF_OFFER_TOKENS + 1,
+                "cache_creation_1h_tokens": 0,
+            },
+        }),
+    )
+    .await;
+    insert_event(
+        &pool,
+        old.thread_id,
+        "ResponseFailed",
+        json!({
+            "error": "This request was blocked by our safety systems.",
+            "provider_error": {"code": "misalignment_policy_violation"},
+        }),
+    )
+    .await;
+    // The projection leaves a failed turn's thread `failed`, and the card's
+    // Continue must still go through.
+    sqlx::query("UPDATE thread_summaries SET status = 'failed' WHERE thread_id = $1")
+        .bind(old.thread_id)
+        .execute(&pool)
+        .await
+        .expect("mark the thread failed");
+
+    let (status, body) =
+        post_continue(&client, old.thread_id, json!({"message": "carry on"})).await;
+    let requested = count_events_of_type(&pool, old.thread_id, "SuccessorRequested").await;
+    let handoff = handoff_payload(&pool, old.thread_id).await;
+    archive(&client, old.thread_id).await;
+    delete_thread_rows(&pool, old.thread_id).await;
+
+    assert_eq!(status, 200, "Continue must succeed: {body}");
+    assert_eq!(
+        body["path"], "brief",
+        "a block outranks a warm cache: {body}"
+    );
+    assert_eq!(
+        requested, 0,
+        "no narrative is requested from the blocked session"
+    );
+    let handoff = handoff.expect("the handoff is recorded before the reply");
+    assert_eq!(handoff["opening"], "brief", "{handoff}");
+    let message = handoff["message"].as_str().expect("a message");
+    assert!(
+        message.contains("potentially unintended activity"),
+        "the brief names the block: {message}"
+    );
+}
+
 /// Stay here is a recorded decision at the context size the thread holds.
 #[tokio::test]
 async fn stay_here_records_the_size_it_declined_at() {
@@ -1249,15 +1312,15 @@ async fn a_child_handoff_keeps_its_parent_and_asks_nobody() {
         .fetch_one(&pool)
         .await
         .expect("read the child row");
-        let approvals =
-            count_events_of_type(&pool, child.thread_id, "OwnerApprovalRequested").await;
+        let requests =
+            count_events_of_type(&pool, child.thread_id, "PermissionRequestPrepared").await;
         let spawned = count_events_of_type(&pool, child.thread_id, "SuccessorThreadSpawned").await;
         archive(&user_client().await, child.thread_id).await;
         delete_thread_rows(&pool, parent).await;
 
         assert_eq!(status, 200, "the handoff must succeed: {body}");
         assert_eq!(place, (Some(parent), Some("wake".to_string())));
-        assert_eq!((approvals, spawned), (0, 0));
+        assert_eq!((requests, spawned), (0, 0));
         assert_eq!(again, 409, "{again_body}");
         assert_eq!(again_body["reason"], "handoff-pending", "{again_body}");
     }

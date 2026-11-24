@@ -16,8 +16,8 @@ pub const KEY_STORE_ENV: &str = "LUCIDOS_SECRET_KEY_STORE";
 /// The Keychain service every workspace key is filed under.
 pub const KEYCHAIN_SERVICE: &str = "Lucidos workspace secrets";
 
-/// The directory under `~/.lucidos` holding key files.
-pub const KEY_DIR_NAME: &str = "secret-keys";
+/// The directory under the private subtree holding key files.
+pub const KEY_DIR_NAME: &str = lucidos_home::private::SECRET_KEYS_DIR;
 
 /// A place that keeps named keys. A cloud KMS or a password manager can be
 /// another one.
@@ -152,12 +152,13 @@ pub fn store_of(kind: KeyStoreKind) -> Result<Box<dyn KeyStore>, BoxError> {
     }
 }
 
-/// `~/.lucidos/secret-keys`, outside every workspace directory, so a copy of
-/// a workspace never carries its key.
+/// The private entry `secret-keys`, outside every workspace directory, so a
+/// copy of a workspace never carries its key.
 pub fn default_key_dir() -> Result<PathBuf, BoxError> {
-    Ok(lucidos_home::path()
-        .ok_or("HOME is not set, so there is no key directory")?
-        .join(KEY_DIR_NAME))
+    if lucidos_home::path().is_none() {
+        return Err("HOME is not set, so there is no key directory".into());
+    }
+    Ok(lucidos_home::ensure_private_entry(KEY_DIR_NAME)?)
 }
 
 #[cfg(target_os = "macos")]

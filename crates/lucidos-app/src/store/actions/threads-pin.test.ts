@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage/document before store.ts loads at module level
-// (vi.hoisted runs before imports resolve). Mirrors threads-archive.test.ts.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -32,8 +30,6 @@ import { saveThread } from '../../api/threads';
 import { getThreadDisplaySection, threadMap, toasts } from '../store';
 import { handleSaveThread } from './threads';
 
-// Only saveThread is exercised here; the other named exports resolve to
-// undefined, which is fine because handleSaveThread never calls them.
 vi.mock('../../api/threads', () => ({
   saveThread: vi.fn(),
 }));
@@ -47,8 +43,6 @@ describe('handleSaveThread — pin error handling', () => {
     mockSave.mockReset();
   });
 
-  // A repeat save is a 200 now, so a 409 is a real refusal: the home thread
-  // is never pinned (ADR 0362). The row goes back and the user is told.
   it('reverts the optimistic pin and toasts when the server refuses it (409)', async () => {
     mockSave.mockRejectedValue(new ApiError(409, 'The home thread is never pinned.'));
 
@@ -78,8 +72,6 @@ describe('handleSaveThread — pin error handling', () => {
   });
 });
 
-// A pinned thread is never archived (ADR 0312). The engine moves it to the
-// inbox in the same event, and the optimistic flip does too.
 describe('handleSaveThread: pinning an archived thread', () => {
   beforeEach(() => {
     threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { saved: false, section: 'archived', status: 'idle' } })]]);

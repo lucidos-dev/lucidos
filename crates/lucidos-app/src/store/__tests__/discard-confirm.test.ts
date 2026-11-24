@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Discard deletes a change's branch and worktree, so the Changes panel's
-// Discard and Discard All ask first, as the thread's own Discard does.
 const showConfirm = vi.fn();
 vi.mock('../store', async () => {
   const actual = await vi.importActual<typeof import('../store')>('../store');

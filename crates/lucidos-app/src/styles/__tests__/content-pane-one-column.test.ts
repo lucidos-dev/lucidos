@@ -1,16 +1,3 @@
-/**
- * Every content-pane view, tab or overlay, is one column with one left edge,
- * width and top. The column is default-deny, so the ways to lose it are the
- * ones pinned here:
- *
- * - the default-deny rule itself goes missing or narrows to a class list,
- *   which is how the plugin detail page ended up left-aligned;
- * - a view root restates the cap, centres itself or sets its own top spacing,
- *   so it drifts the day the column changes.
- *
- * `e2e/content-pane-one-column-desktop.spec.ts` measures the rendered result.
- * The full-bleed opt-out list is pinned in `content-pane-end-space.test.ts`.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -28,7 +15,6 @@ const contentCss = cssRules(readFileSync(resolve(stylesRoot, 'panels/content.css
 
 const COLUMN = '.content-pane-body > :not(.content-view-full-bleed)';
 
-/** What places a view root in the pane. The column owns all of it. */
 const PLACEMENT = [
   'max-width', 'width', 'max-inline-size', 'inline-size',
   'margin', 'margin-inline', 'margin-left', 'margin-right',
@@ -36,7 +22,6 @@ const PLACEMENT = [
   'padding', 'padding-top', 'padding-block', 'padding-block-start',
 ];
 
-/** The transcript shares the token, so its cap is the column's twin, not a copy. */
 const TRANSCRIPT_SHEETS = /^chat\//;
 
 describe('the content pane column', () => {

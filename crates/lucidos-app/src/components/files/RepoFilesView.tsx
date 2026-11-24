@@ -18,16 +18,6 @@ import { changeBadgeLabel } from './changeBadge';
 import { diffStats } from './diffStats';
 import { DiffSkeleton, DiffStatsInline, DiffView } from './DiffView';
 
-/** Whether the registered-repo Files view has the data its CURRENT mode renders.
- *  Each mode gates ONLY on the data it actually draws, so the view is ready as
- *  soon as that data is in — not blocked on the other mode's fetch:
- *  - All-files mode draws the file tree (repoFiles) → gate on the tree.
- *  - Changes mode draws the diff (repoDiff), NOT the tree → gate on the diff.
- *  Gating Changes mode on the diff alone lets the diff list appear as soon as
- *  the diff loads, instead of waiting for the whole-repo tree listing that only
- *  All Files needs (and which is often the slower call). The diff gate still
- *  prevents the "No changes" flash, an empty [] rendered while the diff is in
- *  flight. Exported for the unit test. */
 export function repoFilesContentReady(opts: {
   filesStatus: Loadable<unknown>['status'];
   diffStatus: Loadable<unknown>['status'];
@@ -40,8 +30,6 @@ export function repoFilesContentReady(opts: {
 export function RepoFilesView() {
   const loadable = repoFiles.value;
   const diffLoadable = repoDiff.value;
-  // App-CC branch shows the diff directly (no repoFiles tree), so its spinner
-  // must key off the diff's own load state, not repoFiles'.
   const diffShowLoading = useDelayedLoading(diffLoadable);
   const pending = repoPending.value;
   const mode = repoViewMode.value;
@@ -52,16 +40,8 @@ export function RepoFilesView() {
     mode,
   });
   const showLoading = useDelayedFlag(!contentReady);
-  // Without a registered repo (app coding-agent threads use the workspace
-  // as their git root, which isn't a Repository row), the "All Files" tab
-  // would render an empty tree — hide the toggle and pin Changes view.
-  // The repo-file tree (repoFiles) isn't fetched for the app-CC path either,
-  // so don't gate the render on its load state.
   const hasRepo = repoSource.value != null;
 
-  // A file-tree listing failure only breaks All Files (it renders the tree);
-  // Changes mode draws the diff and doesn't need the tree, so don't let a tree
-  // failure hide a perfectly good diff. Switching to All Files surfaces it.
   if (hasRepo && mode === 'all' && loadable.status === 'failed') {
     return (
       <div class="files-toolbar">
@@ -81,13 +61,7 @@ export function RepoFilesView() {
   const changedFiles = diffLoaded ? diffLoadable.data.files : [];
   const changedMap = new Map(changedFiles.map(f => [f.path, f]));
 
-  // App-CC view: skip the toolbar entirely (no toggle / no expand-all
-  // controls apply) and render the inline diff. The empty bordered toolbar
-  // bar was a visual artifact.
   if (!hasRepo) {
-    // A non-terminal diff (loading or not-loaded) must show the skeleton, not
-    // fall through to InlineDiffList([]) -> "No changes". viewThreadCcDiff sets
-    // loading before this view mounts, but guard not-loaded defensively too.
     return (
       <LoadingFade showSkeleton={diffShowLoading} skeleton={<DiffSkeleton files={2} class="folder-tree" />}>
         {diffLoaded && (
@@ -103,9 +77,6 @@ export function RepoFilesView() {
     <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="folder-tree" row={folderTreeSkeletonRow} />}>
       {contentReady ? (
         <>
-          {/* Toolbar holds only the All Files / Changes toggle now (Expand/Collapse
-              all were removed). Skip rendering it entirely when there's no change to
-              toggle against, so we don't leave an empty padded bar. */}
           {(pending || repoSelectedChangeId.value) && (
             <div class="files-toolbar files-toolbar-bordered">
               <span class="files-toolbar-actions">
@@ -166,8 +137,6 @@ export function ChangesFileList({ files, activePath }: { files: DiffFile[]; acti
   );
 }
 
-/** One changed file. With no `file`, inside a `SkeletonProvider`, it is the
- *  list's loading placeholder. */
 function ChangedFileRow({ file, stats, active = false }: {
   file?: DiffFile;
   stats?: { additions: number; deletions: number };
@@ -181,8 +150,6 @@ function ChangedFileRow({ file, stats, active = false }: {
       <SkBlock w="1.25rem" h="1.25rem" round>
         <FileTypeIcon path={file?.path ?? ''} className="file-icon" />
       </SkBlock>
-      {/* `file-path`, not the tree's bare `file-name`: this row carries the
-          whole path, which wraps rather than ellipsising (components.css). */}
       <SkText class="file-name file-path" w="11rem">{file?.path}</SkText>
       {stats && <DiffStatsInline additions={stats.additions} deletions={stats.deletions} />}
       <SkBlock w="1.25rem" h="1rem" round>
@@ -196,15 +163,10 @@ function ChangedFileRow({ file, stats, active = false }: {
   );
 }
 
-/** The changed-files list drawn as its loading placeholder. */
 export function ChangesFileListSkeleton() {
   return <ListSkeletonOf count={6} containerClass="folder-tree" row={() => <ChangedFileRow />} />;
 }
 
-/** Diff renderer for app coding-agent threads (no registered repo to back the
- *  file-preview panel). Stacks each file's hunks inline so the user gets the
- *  full diff in one scroll, without depending on openRepoFilePreview (which
- *  no-ops when repoSource is null). */
 export function InlineDiffList({ files }: { files: DiffFile[] }) {
   if (files.length === 0) {
     return <div class="empty-state">No changes</div>;

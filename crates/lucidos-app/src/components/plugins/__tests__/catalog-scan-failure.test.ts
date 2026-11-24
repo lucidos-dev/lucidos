@@ -22,15 +22,11 @@ describe('catalogScanFailure', () => {
     expect(catalogScanFailure(loaded(), false)).toBeNull();
   });
 
-  // A skeleton is already showing. A failure beside it would describe rows the
-  // user cannot see.
   it('says nothing while the catalog is unloaded', () => {
     expect(catalogScanFailure({ status: 'not-loaded' }, false)).toBeNull();
     expect(catalogScanFailure({ status: 'loading' }, false)).toBeNull();
   });
 
-  // A scan that could not run leaves the list frozen. Without this notice the
-  // failure would be silent.
   it('carries the reason a scan could not run', () => {
     const catalog = loaded({ scan_error: 'read marketplace registry: boom' });
     expect(catalogScanFailure(catalog, false)).toEqual({
@@ -39,7 +35,6 @@ describe('catalogScanFailure', () => {
     });
   });
 
-  // Hiding it during a retry would move the list on every scheduler pass.
   it('stays up while a new scan runs, and says it is retrying', () => {
     const catalog = loaded({ scan_error: 'read marketplace registry: boom' });
     expect(catalogScanFailure(catalog, true)).toEqual({

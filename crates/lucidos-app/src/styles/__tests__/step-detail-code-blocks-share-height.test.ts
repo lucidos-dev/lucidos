@@ -1,10 +1,3 @@
-/**
- * The step-detail code blocks scroll inside themselves, so the body around
- * them must not scroll too. The body is a grid whose rows share the height.
- * A scroll box's automatic minimum height is 0, so long blocks split the room
- * and a short one keeps its full height. A flex column cannot do this,
- * because a block's flex base size ignores its max-height cap.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

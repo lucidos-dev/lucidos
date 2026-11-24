@@ -1,6 +1,3 @@
-/** A message typed while a question card waits IS that card's answer: the
- *  engine routes it there as `FreeText`. Until the answer lands, it draws on
- *  the card it answers rather than as a queued row below it. */
 import { describe, expect, it } from 'vitest';
 import { computeExchanges, type PendingUserMessage, type ThreadEvent, type ThreadStatus } from '../thread-events';
 import { makeThreadState, TS } from './thread-events-helpers';

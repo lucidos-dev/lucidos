@@ -86,7 +86,7 @@ impl ContinueKeySpec {
     /// row cannot wedge the trigger registry.
     pub(crate) fn from_stored(field: Option<&Value>, trigger_id: &str) -> Option<Self> {
         Self::parse(field).unwrap_or_else(|e| {
-            log!("[Triggers] Ignored continue_key on trigger {trigger_id}: {e}");
+            log_legacy!("[Triggers] Ignored continue_key on trigger {trigger_id}: {e}");
             None
         })
     }
@@ -150,7 +150,7 @@ pub(crate) async fn open_thread_for_key(
 /// `TriggerStarted` records it. Two racing fires therefore never both start
 /// a thread for the same key. In memory by design: a restart ends every fire
 /// that holds one, and the key itself lives in `thread_summaries`.
-pub(crate) struct ContinueKeyClaim {
+pub struct ContinueKeyClaim {
     pub key: String,
     _guard: OwnedMutexGuard<()>,
 }
@@ -174,7 +174,7 @@ pub(crate) async fn claim(key: String) -> ContinueKeyClaim {
 }
 
 /// Where an intent fire lands.
-pub(crate) enum FireTarget {
+pub enum FireTarget {
     /// A new thread. A keyed fire carries its claim until the thread records
     /// the key.
     NewThread(Option<ContinueKeyClaim>),

@@ -5,23 +5,10 @@ import { useServerBackedField } from '../../hooks/useServerBackedField';
 import { ApiKeyProviderSettings } from './ApiKeyProviderSettings';
 import { OPENROUTER_JEV_MODEL } from '@lucidos/engine-constants';
 
-/** Configure the OpenRouter provider credential (Settings →
- *  Providers). Stores a credential named `openrouter`; the engine builds an
- *  OpenAI-compatible provider pointed at openrouter.ai and sends it as the
- *  bearer key (preferring it over the LUCIDOS_OPENROUTER_API_KEY launch env
- *  var). OpenRouter authenticates with a single API key, so — like OpenAI —
- *  there's no auth-kind choice; stored as `api_key`.
- *
- *  The same key serves OpenRouter's System One row, whose System One model is
- *  the one extra field here. */
 export function OpenRouterProviderSettings() {
   const prefs = preferences.value;
   const savedModel = prefs.status === 'loaded' ? prefs.data[SYSTEM_ONE_OPENROUTER_MODEL_KEY] ?? '' : '';
-  // Server-backed, so a frame from another device repaints an untouched field
-  // and a draft survives one (ADR 0118).
   const [model, setModel] = useServerBackedField(savedModel);
-  // Re-arm once our own save lands. This page stays mounted, so without it the
-  // field ignores every later frame.
   useEffect(() => {
     if (model.trim() === savedModel.trim()) setModel(savedModel);
   }, [savedModel, model]);

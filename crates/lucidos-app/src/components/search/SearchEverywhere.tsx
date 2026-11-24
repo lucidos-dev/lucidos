@@ -24,7 +24,7 @@ import { paneOfFocus, paneUnder, usePaneCentre } from '../../hooks/usePaneCentre
 import { toFailed, type Loadable } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
-import { RECENTS_KEY } from '../../store/actions/entityReferences';
+import { RECENTS_KEY } from '../../store/actions/searchRecents';
 import { CloseIcon, ClearIcon } from '../shared/icons';
 import { SearchField } from '../shared/SearchField';
 import { CategoryIcon } from '../shared/CategoryIcon';
@@ -53,30 +53,21 @@ const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'threads', label: 'Threads' },
   { id: 'triggers', label: 'Triggers' },
   { id: 'changes', label: 'Changes' },
-  // Last, in the same place SECTION_ORDER breaks ties for the All tab. The
-  // strip never reorders: only the All tab's sections follow the hits.
   { id: 'menu', label: 'Menu' },
 ];
 
-/** The All tab's label before a query is typed. */
 const RECENT_LABEL = 'Recent';
 
 type LocalCategory = 'settings' | 'menu';
 type ServerSection = Exclude<ServerSearchCategory, 'all'>;
-/** A category the engine answers: one of `/search`'s, or Text search. */
 type EngineSection = ServerSection | 'text';
 
-/** Asked one request each, so a fast category never waits on a slow one:
- *  thread search embeds the query, the rest are listings. */
 const SERVER_SECTIONS: ServerSection[] = ['apps', 'files', 'threads', 'triggers', 'changes'];
 
-/** Keystrokes coalesce this long before the engine is asked. Local hits skip it. */
 export const SERVER_DEBOUNCE_MS = 150;
 
-/** The Text tab draws its lines this many at a time, adding more on scroll. */
 export const TEXT_TAB_WINDOW = 100;
 
-/** The two categories the frontend answers itself, never the engine. */
 function isLocalCategory(category: SearchCategory): category is LocalCategory {
   return category === 'settings' || category === 'menu';
 }
@@ -91,7 +82,6 @@ function localSection(section: LocalCategory, query: string, limit: number): Sea
     : getMenuSearchResults(query, limit);
 }
 
-/** The local half of the overview, so it renders on the keystroke. */
 function localOverview(query: string): Record<LocalCategory, SearchResultItem[]> {
   return { settings: localSection('settings', query, ALL_TAB_LIMIT), menu: localSection('menu', query, ALL_TAB_LIMIT) };
 }
@@ -104,8 +94,6 @@ function itemKey(item: PaletteItem): string {
   return `${item.category}:${item.id}`;
 }
 
-/** A Text hit is remembered as its file, since the line goes stale as the
- *  file changes. Shaped like the engine's own Files hit. */
 function fileRecent(path: string): SearchResultItem {
   return { id: path, title: path.slice(path.lastIndexOf('/') + 1), subtitle: path, category: 'files', score: 1 };
 }
@@ -145,21 +133,10 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
         return trigs.data.some(t => t.id === item.id);
       }
       case 'threads':
-        // This filter keeps every thread recent: `threadMap` holds only the
-        // loaded window, and nothing on a cold start, so a miss proves nothing.
-        // `dropDeletedThreads` and a not-found tap prune it instead.
         return true;
       case 'settings':
-        // Recents are persisted verbatim, so an id retired by a Settings
-        // restructure outlives the build that had it. `handleSelect` does
-        // `if (!entry) break`, which closes the palette and navigates nowhere:
-        // the same silent dead end the persisted nav stack got
-        // `migrateSettingsSubview` for. Drop the row instead of listing it.
         return findSettingsEntry(item.id) !== undefined;
       case 'menu':
-        // Same dead end as a retired settings id: a menu item dropped from
-        // MENU_ITEMS outlives the build that had it, and `handleSelect` would
-        // close the palette and navigate nowhere.
         return findMenuSearchEntry(item.id) !== undefined;
       case 'changes':
         return true;
@@ -172,9 +149,6 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
   return validated;
 }
 
-/** One hit. With no `item`, inside a `SkeletonProvider`, it is the results
- *  list's loading placeholder, and carries no `data-role`: the keyboard
- *  selection counts rows by it. */
 function ResultRow({ item, index = 0, selected = false, onSelect, onHover }: {
   item?: SearchResultItem;
   index?: number;
@@ -207,8 +181,6 @@ function ResultRow({ item, index = 0, selected = false, onSelect, onHover }: {
   );
 }
 
-/** One Text search line: the snippet with its match marked, then where the
- *  line is. Rows always have an item: the skeleton is drawn by `ResultRow`. */
 function TextHitRow({ item, index, selected, onSelect, onHover }: {
   item: TextHitItem;
   index: number;
@@ -237,8 +209,6 @@ function TextHitRow({ item, index, selected, onSelect, onHover }: {
   );
 }
 
-/** The trailing row while engine categories are still out. Local hits and the
- *  categories that already answered stay above it. */
 function PendingRow({ sections }: { sections: EngineSection[] }) {
   const names = sections.map(s => sectionLabel(s).toLowerCase()).join(', ');
   return (
@@ -249,16 +219,11 @@ function PendingRow({ sections }: { sections: EngineSection[] }) {
   );
 }
 
-/** Engine answers, each stamped with the search it answers. A section whose
- *  stamp is not the current search is still out, whatever it last held. */
 type ServerHits = { search: string; sections: Partial<Record<ServerSection, Loadable<SearchResultItem[]>>> };
 
 const NO_SERVER_HITS: ServerHits = { search: '', sections: {} };
 const NO_SECTIONS: ServerSection[] = [];
 
-/** Asks the engine one request per section, once the keystrokes pause, and
- *  stamps each answer with `search`. Drops every answer on close, so a
- *  reopened palette asks again rather than showing old ones. */
 function useServerHits(
   isOpen: boolean,
   search: string,
@@ -286,7 +251,6 @@ function useServerHits(
       for (const section of sections) {
         searchEverywhere(query, section, { signal: controller.signal, limit }).then(
           data => settle(section, { status: 'loaded', data: data.results[section] ?? [] }),
-          // Failed must not read as empty: the list says so under the rows.
           err => settle(section, toFailed(err)),
         );
       }
@@ -302,8 +266,6 @@ function useServerHits(
 
 type TextAnswer = { search: string; state: Loadable<TextSearchResponse> };
 
-/** Asks Text search once the keystrokes pause, stamped and aborted like
- *  `useServerHits`. A `null` mode asks nothing and returns `null`. */
 function useTextHits(
   isOpen: boolean,
   search: string,
@@ -353,23 +315,17 @@ export function SearchEverywhere() {
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
-  // The All tab's section order as last drawn for `query`, so a category that
-  // answers later slots in below what the user is already reading.
   const drawnSections = useRef<{ query: string; order: string[] }>({ query: '', order: [] });
 
   const isRecentsMode = !query && category === 'all';
   const isOpen = searchEverywhereOpen.value;
-  // The overview answers the All tab and every tab's dimming, so it is keyed by
-  // the query alone: switching tabs never asks it again.
   const overviewState = useServerHits(isOpen, query, query, query ? SERVER_SECTIONS : NO_SECTIONS, ALL_TAB_LIMIT);
   const overviewText = useTextHits(isOpen, query, query, query ? 'preview' : null);
-  // A category tab also asks for its own full page.
   const pageSections = useMemo(
     () => (isServerSection(category) ? [category] : NO_SECTIONS),
     [category],
   );
   const pageState = useServerHits(isOpen, `${category}\n${query}`, query, pageSections, undefined);
-  // Asked even with no query: the engine's answer says how much to type.
   const pageText = useTextHits(isOpen, `text\n${query}`, query, category === 'text' ? 'all' : null);
 
   const requested = category === 'all' ? (query ? SERVER_SECTIONS : NO_SECTIONS) : pageSections;
@@ -384,13 +340,8 @@ export function SearchEverywhere() {
   if (textState?.status === 'failed') failed.push({ section: 'text', error: textState.error });
   const requestedCount = requested.length + (textState ? 1 : 0);
   const textAnswer = textState?.status === 'loaded' ? textState.data : null;
-  // Placeholder rows only once a search has run past the delay gate. Hits
-  // still show the instant they arrive; the fade only lets the rows go.
   const showSearchLoading = useDelayedFlag(pending.length > 0);
 
-  // Over the pane whose header holds the button that opened it. Opened with
-  // no button (a shortcut, the Lucidos menu), it follows the focused pane group.
-  // Resolved once per open: every keystroke re-renders, and it measures layout.
   const anchor = searchEverywhereAnchor.value;
   const focus = focusedPane.value;
   const pane = useMemo(
@@ -410,7 +361,6 @@ export function SearchEverywhere() {
     if (isOpen) setRecents(validateRecents(loadRecents()));
   }, [isOpen]);
 
-  // Auto-focus input on open
   useEffect(() => {
     if (isOpen && inputRef.current) {
       inputRef.current.focus();
@@ -420,21 +370,8 @@ export function SearchEverywhere() {
   function handleSelect(item: PaletteItem) {
     saveRecent(isTextHit(item) ? fileRecent(item.hit.path) : item);
     close();
-    // After navigating, move real DOM focus into the destination pane's scroll
-    // surface (the transcript for a thread; the body scroller / iframe for an app,
-    // file, trigger, settings, or change) so a keyboard-driven selection continues
-    // there — Arrow/Page keys scroll it — instead of stranding focus on <body> when
-    // the modal closes. Typing still lands in the prompt via type-to-focus.
-    // Desktop-only and a no-op when nothing is focusable — both the "(if any)"
-    // cases — are handled inside focusPaneMainControl. Async navigations
-    // (app/trigger/change resolve their target before revealing the content pane)
-    // chain the focus off their promise so it lands after the destination renders.
     const focusDest = () => focusPaneMainControl(searchResultDestinationPane(item.category));
     if (isTextHit(item)) {
-      // The navigation router owns opening at a line: source view, the range
-      // and the scroll, applied after the open clears the previous file's.
-      // Find in file then opens on the query, from that line, and takes the
-      // focus, so the pane must not.
       void handleNavigationRequest(
         { target: 'file', file_path: item.hit.path, line: item.hit.line },
         { find: query },
@@ -449,14 +386,7 @@ export function SearchEverywhere() {
       case 'settings': {
         const entry = findSettingsEntry(item.id);
         if (!entry) break;
-        // One call, one nav-history entry: openSettingsSubview lands the
-        // Settings panel and the sub-section together.
         openSettingsSubview(entry.subview);
-        // An anchored entry scrolls to a specific row; SettingsView's scroll
-        // effect lands focus on that row's control (e.g. the Language dropdown).
-        // A top-level subview entry has no anchor — focus its first control via
-        // the pane instead. Calling focusDest for an anchored entry would grab
-        // the panel's first control and fight the row focus.
         if (entry.anchor) settingsScrollTarget.value = entry.anchor;
         else focusDest();
         break;
@@ -465,9 +395,6 @@ export function SearchEverywhere() {
       case 'menu': {
         const entry = findMenuSearchEntry(item.id);
         if (!entry) break;
-        // The id IS the destination, and switchMenuItem owns the data load, the
-        // nav push and the pane reveal. Resolving the entry first keeps a
-        // recents row from a retired build out of `activeMenuItem`.
         switchMenuItem(entry.id);
         focusDest();
         break;
@@ -504,7 +431,6 @@ export function SearchEverywhere() {
   function hitsOnTab(tab: SearchCategory): TabHits {
     if (tab === 'all' || !overviewLocal) return 'unknown';
     if (tab === 'text') {
-      // A query too short to search says nothing about the files.
       return overviewText?.status === 'loaded' && overviewText.data.status === 'ok'
         ? tabHits({ status: 'loaded', data: overviewText.data.hits })
         : 'unknown';
@@ -514,8 +440,6 @@ export function SearchEverywhere() {
       : tabHits(overviewState(tab));
   }
 
-  // The Text tab can hold thousands of lines. It draws a window that grows as
-  // the list scrolls, or as the selection moves past its end.
   const [shownRows, setShownRows] = useState(TEXT_TAB_WINDOW);
   useEffect(() => setShownRows(TEXT_TAB_WINDOW), [query, category]);
   const rendered = category === 'text' ? flat.slice(0, shownRows) : flat;
@@ -524,8 +448,6 @@ export function SearchEverywhere() {
     const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < list.clientHeight;
     if (category === 'text' && nearEnd && shownRows < flat.length) setShownRows(n => n + TEXT_TAB_WINDOW);
   }
-  // The selection follows its row, so a category landing above it cannot move
-  // the cursor onto another hit.
   const selectedIndex = selectedKey === null ? -1 : flat.findIndex(item => itemKey(item) === selectedKey);
   const selectAt = (index: number) => setSelectedKey(index >= 0 && flat[index] ? itemKey(flat[index]) : null);
 
@@ -535,9 +457,6 @@ export function SearchEverywhere() {
     }
   }, [category, selectedIndex, shownRows]);
 
-  // Scroll the selected result into view, once per selection. A row the Text
-  // tab has not drawn yet scrolls when its window grows. A window grown by the
-  // reader's own scrolling leaves the list where they put it.
   const scrolledToIndex = useRef(-1);
   useEffect(() => {
     if (selectedIndex < 0) {
@@ -588,10 +507,6 @@ export function SearchEverywhere() {
 
   const hasResults = flat.length > 0;
 
-  // keepMounted: iOS Safari PWA never unmounts the overlay — it toggles
-  // visibility via CSS to avoid ghost pixels from the will-change compositing
-  // layer. anchor: the search toggle, exempt from outside-dismiss so re-tapping
-  // it closes (never reopens). Both contracts live in <Overlay>.
   function row(item: PaletteItem, index: number) {
     const props = { index, selected: index === selectedIndex, onSelect: handleSelect, onHover: selectAt };
     return isTextHit(item)
@@ -611,8 +526,6 @@ export function SearchEverywhere() {
     return rendered.map(row);
   }
 
-  /** The Text tab's totals above its lines. The engine returns every line up
-   *  to its cap, so the counts are the list's own. */
   function textSummary() {
     if (category !== 'text' || !hasResults) return null;
     return (
@@ -622,8 +535,6 @@ export function SearchEverywhere() {
     );
   }
 
-  /** What Text search could not cover. The All tab says so only when it found
-   *  nothing, so a workspace with large files is not reminded on every search. */
   function textNotes() {
     if (textAnswer?.status !== 'ok') return null;
     const showSkipped = textAnswer.skipped_large_files > 0 && (category === 'text' || !textHits.length);

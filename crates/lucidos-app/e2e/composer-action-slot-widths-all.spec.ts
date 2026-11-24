@@ -1,27 +1,14 @@
 import { test, expect, Page } from './fixtures';
 import {
   assertHealthy, navigateToApp, ensureOnThreadPane, uniqueMessage, waitForVisibleInput, isMobileViewport,
-  hideDashboardRail,
+  hideDashboardRail, setDevicePreference,
 } from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
-/**
- * The composer row's picker and action button keep one width per layout, in
- * every state (ADR 0573). A thread with a pending change shows the Apply split
- * in the action slot; one typed character swaps it for Send. Neither control
- * may change width, and neither right edge may move.
- *
- * Every face's word fits its pill, at every UI scale the sweep reaches.
- *
- * Plan: `docs/plans/2026-10-25-composer-row-fixed-width-controls.md`.
- */
 
 interface SlotReading {
   slot: { left: number; right: number; width: number; height: number };
-  /** Null once the row folded the picker into the ⋯, which a narrow pane at a
-   *  large UI scale does. Folding is the row's only answer to lack of room. */
   picker: { right: number; width: number } | null;
-  /** Every visible slot word that overflows its box. */
   clipped: string[];
 }
 
@@ -44,8 +31,6 @@ async function readSlot(page: Page): Promise<SlotReading | null> {
   });
 }
 
-/** A reading taken once two consecutive reads agree, so a fold still
- *  settling is never measured. */
 async function settled(page: Page, label: string, ready: () => Promise<boolean>): Promise<SlotReading> {
   let previous: string | null = null;
   await expect.poll(async () => {
@@ -77,15 +62,14 @@ test.describe('The composer row keeps its widths', () => {
         await page.addInitScript((tid: string) => {
           localStorage.setItem('lucidos-focused-thread', tid);
         }, threadId);
-        // The rail would squeeze the thread pane until the picker folds, and a
-        // narrow pane draws the compact faces (ADR 0576). The mobile project
-        // keeps its emulated viewport.
         if (!isMobileViewport(page)) await page.setViewportSize({ width: 2600, height: 1000 });
         await hideDashboardRail(page);
         await navigateToApp(page);
         await ensureOnThreadPane(page);
         await expect(page.locator('.thread-action-buttons:visible')).toBeVisible({ timeout: 15_000 });
-        await page.evaluate((s) => document.documentElement.style.setProperty('--user-ui-scale', `${s}%`), scale);
+        await setDevicePreference(page, 'ui-scale', String(scale));
+        await expect.poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--user-ui-scale')))
+          .toBe(`${scale}%`);
 
         const apply = await settled(page, 'Apply', async () => (await row(page).locator('.split-button').count()) > 0);
         await (await waitForVisibleInput(page)).fill('x');
@@ -101,13 +85,13 @@ test.describe('The composer row keeps its widths', () => {
         expect([...apply.clipped, ...send.clipped], 'a face word is clipped').toEqual([]);
 
         if (isMobileViewport(page)) {
-          // The round button, Send's size, whatever it carries.
           expect(Math.abs(apply.slot.width - apply.slot.height)).toBeLessThan(1);
         } else {
           expect(apply.slot.width, 'the desktop slot is a pill, not a circle').toBeGreaterThan(apply.slot.height * 2);
         }
       } finally {
         cleanupCCThread(threadId, changeId, branch, file);
+        await setDevicePreference(page, 'ui-scale', '100');
       }
     });
   }

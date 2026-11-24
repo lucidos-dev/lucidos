@@ -1,13 +1,3 @@
-/**
- * A skeleton bar must show on whatever surface it sits on.
- *
- * The base `.sk-bar` rule paints two translucent stops, so a bar composites
- * over any background, `--bg-tertiary` included. A second copy of the gradient
- * on one surface is how an opaque bar would come back.
- *
- * So only the base rule may paint a bar. A surface that needs other colours
- * (the picker's brand gradient) sets `--sk-base` / `--sk-shine` and nothing else.
- */
 import { describe, it, expect } from 'vitest';
 import postcss from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

@@ -123,9 +123,11 @@ pub(crate) enum Drained {
     Failed,
     /// No model is configured, so nothing that needs one can be built.
     ModelUnavailable,
+    SpendCapped(crate::llm::ProviderKind, chrono::DateTime<chrono::Utc>),
 }
 
 enum NodeError {
+    SpendCapped(crate::llm::ProviderKind, chrono::DateTime<chrono::Utc>),
     ModelUnavailable(String),
     Failed(String),
     /// The compactor paused while the node waited on a breaker.
@@ -212,6 +214,15 @@ struct WorkspaceState {
     nodes: HashMap<NodeAddr, StoredNode>,
 }
 
+#[derive(Default)]
+struct SpendCapWait {
+    /// A release invalidates hold observations from earlier in-flight work.
+    generation: u64,
+    held_until: Option<chrono::DateTime<chrono::Utc>>,
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    parked: HashMap<SummaryScope, bool>,
+}
+
 pub(crate) struct Compactor {
     pool: PgPool,
     bus: EventBus,
@@ -220,6 +231,7 @@ pub(crate) struct Compactor {
     breakers: Breakers,
     /// The model whose breaker is open, as the progress count names it.
     failing_model: Mutex<Option<String>>,
+    spend_cap_wait: Mutex<SpendCapWait>,
     /// Woken by a change of the compactor's model or a pause, so a node
     /// parked on a breaker looks again.
     wake_parked: Notify,
@@ -297,6 +309,7 @@ impl Compactor {
             lanes: Lanes::default(),
             breakers,
             failing_model: Mutex::default(),
+            spend_cap_wait: Mutex::default(),
             wake_parked: Notify::new(),
             reads: Semaphore::new(READS),
             queue: Mutex::default(),
@@ -349,6 +362,7 @@ impl Compactor {
             .sum();
         let episode = self.episode.lock().unwrap();
         let episode = episode.as_ref();
+        let spend_cap_wait = self.spend_cap_wait.lock().unwrap();
         Some(BackfillProgress {
             done,
             total: backfill.total,
@@ -358,6 +372,8 @@ impl Compactor {
             waiting_for_model: self.waiting_for_model.load(Ordering::SeqCst),
             retrying: !backfill.failing.is_empty(),
             failing_model: self.failing_model.lock().unwrap().clone(),
+            spend_cap_held_until: spend_cap_wait.held_until,
+            spend_cap_resets_at: spend_cap_wait.resets_at,
             ready: backfill.ready,
             spent_usd: episode.and_then(Episode::priced_spend),
             cap_usd: episode.and_then(|e| e.cap_usd),
@@ -412,7 +428,7 @@ impl Compactor {
                 .as_ref()
                 .is_some_and(|b| b.ready && b.owed.is_empty());
             if finished {
-                log!("[SummaryTree] Backfill complete; every tree is built");
+                log_legacy!("[SummaryTree] Backfill complete; every tree is built");
                 q.backfill = None;
             }
             finished
@@ -447,9 +463,24 @@ impl Compactor {
 
     /// The compactor's model preference changed. Nodes waiting on a breaker
     /// look at the model again, so one on a working model goes on at once.
-    pub(crate) async fn model_changed(&self) {
+    pub(crate) async fn model_changed(self: &Arc<Self>) {
+        self.spend_cap_hold_ended().await;
         self.set_failing_model(None).await;
         self.wake_parked.notify_waiters();
+    }
+
+    pub(crate) async fn spend_cap_hold_ended(self: &Arc<Self>) {
+        let parked: Vec<_> = {
+            let mut wait = self.spend_cap_wait.lock().unwrap();
+            wait.generation += 1;
+            wait.held_until = None;
+            wait.resets_at = None;
+            wait.parked.drain().collect()
+        };
+        for (scope, urgent) in parked {
+            self.mark_dirty(scope, urgent);
+        }
+        self.announce_progress().await;
     }
 
     /// Name the model whose breaker is open, or `None`, and announce a change.
@@ -476,7 +507,7 @@ impl Compactor {
         match transition {
             Transition::Unchanged => {}
             Transition::Opened { wait } => {
-                log!(
+                log_legacy!(
                     "[SummaryTree] {} failed {} calls in a row; its next call waits {:?}",
                     model,
                     TRIP_AFTER,
@@ -487,13 +518,13 @@ impl Compactor {
                 }
             }
             Transition::Backoff { wait, notice } => {
-                log!(
+                log_legacy!(
                     "[SummaryTree] {} still fails; its next call waits {:?}",
                     model,
                     wait
                 );
                 if notice && current().await {
-                    log!(
+                    log_legacy!(
                         "[SummaryTree] {} has failed for over {:?} between calls; telling the user",
                         model,
                         MAX_WAIT
@@ -502,7 +533,7 @@ impl Compactor {
                 }
             }
             Transition::Closed => {
-                log!("[SummaryTree] {} answers again", model);
+                log_legacy!("[SummaryTree] {} answers again", model);
                 if self.failing_model.lock().unwrap().as_deref() == Some(model) {
                     self.set_failing_model(None).await;
                 }
@@ -522,7 +553,7 @@ impl Compactor {
         self.paused.store(false, Ordering::SeqCst);
         self.resumed.notify_waiters();
         if let Err(e) = self.seed().await {
-            log!("[SummaryTree] Could not re-seed the compactor: {}", e);
+            log_legacy!("[SummaryTree] Could not re-seed the compactor: {}", e);
         }
     }
 
@@ -536,7 +567,7 @@ impl Compactor {
         let this = self.clone();
         tokio::spawn(async move {
             if let Err(e) = this.seed().await {
-                log!("[SummaryTree] Could not seed the compactor: {}", e);
+                log_legacy!("[SummaryTree] Could not seed the compactor: {}", e);
             }
             let workers = (0..MAX_LIMIT)
                 .map(|_| Take::Any)
@@ -600,7 +631,7 @@ impl Compactor {
                 }
                 None => Default::default(),
             };
-            log!(
+            log_legacy!(
                 "[SummaryTree] Seeding {} scopes (ready: {}, {} owed, {} before ready, swept {} nodes of deleted threads)",
                 scope_count,
                 ready,
@@ -690,7 +721,7 @@ impl Compactor {
             *retry = Some(now + EPISODE_RETRY);
         }
         if let Err(e) = self.sync_episode(true).await {
-            log!("[SummaryTree] Could not open the backfill episode: {}", e);
+            log_legacy!("[SummaryTree] Could not open the backfill episode: {}", e);
         }
     }
 
@@ -700,7 +731,7 @@ impl Compactor {
         let estimate = match self.deps.backfill_estimate().await {
             Ok(estimate) => estimate,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[SummaryTree] No estimate, so this backfill runs with no cap: {}",
                     e
                 );
@@ -711,7 +742,7 @@ impl Compactor {
             return false;
         }
         let cap_usd = estimate.cost.as_ref().map(|c| c.cap_usd);
-        log!(
+        log_legacy!(
             "[SummaryTree] Backfill started on {} at {:?}: {}..{} calls, cap {:?} USD",
             estimate.model,
             estimate.effort,
@@ -727,13 +758,13 @@ impl Compactor {
                 actor,
             }))
             .await
-            .map_err(|e| log!("[SummaryTree] TreeBackfillStarted emit failed: {}", e))
+            .map_err(|e| log_legacy!("[SummaryTree] TreeBackfillStarted emit failed: {}", e))
             .is_ok()
     }
 
     /// Callers hold `opening`, and announce progress once they release it.
     async fn emit_cap_reached(&self, spent_usd: f64, cap_usd: f64) {
-        log!(
+        log_legacy!(
             "[SummaryTree] The backfill spent {:.2} of its {:.2} USD cap; holding it",
             spent_usd,
             cap_usd
@@ -756,7 +787,7 @@ impl Compactor {
     /// the hold kept back.
     pub(crate) async fn cap_raised(&self) {
         if let Err(e) = self.seed().await {
-            log!("[SummaryTree] Could not re-seed after a cap raise: {}", e);
+            log_legacy!("[SummaryTree] Could not re-seed after a cap raise: {}", e);
         }
     }
 
@@ -808,12 +839,6 @@ impl Compactor {
         self.wake.notify_waiters();
     }
 
-    /// The cache may have missed a change, so reload it whole.
-    pub(crate) fn forget_workspace(&self) {
-        self.workspace_stale.store(true, Ordering::SeqCst);
-        self.mark_dirty(SummaryScope::Workspace, true);
-    }
-
     /// A delete removed these threads' workspace leaves and moved the leaves
     /// after them. Their own scopes are re-marked so a drain sweeps any node
     /// written while the delete ran.
@@ -846,14 +871,15 @@ impl Compactor {
                 }
                 continue;
             };
+            let generation = self.spend_cap_wait.lock().unwrap().generation;
             let outcome = match self.drain(scope, urgent).await {
                 Ok(outcome) => outcome,
                 Err(e) => {
-                    log!("[SummaryTree] Drain of {} failed: {}", scope.as_db(), e);
+                    log_legacy!("[SummaryTree] Drain of {} failed: {}", scope.as_db(), e);
                     Drained::Failed
                 }
             };
-            self.finish(scope, urgent, outcome).await;
+            self.finish(scope, urgent, outcome, generation).await;
             if outcome == Drained::ModelUnavailable {
                 tokio::time::sleep(RETRY).await;
             }
@@ -899,8 +925,9 @@ impl Compactor {
     #[cfg(test)]
     pub(crate) async fn drain_next(self: &Arc<Self>) -> Option<(SummaryScope, Drained)> {
         let (scope, urgent) = self.pop(Take::Any)?;
+        let generation = self.spend_cap_wait.lock().unwrap().generation;
         let outcome = self.drain(scope, urgent).await.expect("drain");
-        self.finish(scope, urgent, outcome).await;
+        self.finish(scope, urgent, outcome, generation).await;
         Some((scope, outcome))
     }
 
@@ -932,7 +959,13 @@ impl Compactor {
 
     /// Settle a drain. A scope that goes back on the queue keeps its urgency,
     /// so live work never lands behind the backfill.
-    async fn finish(self: &Arc<Self>, scope: SummaryScope, urgent: bool, outcome: Drained) {
+    async fn finish(
+        self: &Arc<Self>,
+        scope: SummaryScope,
+        urgent: bool,
+        outcome: Drained,
+        generation: u64,
+    ) {
         let (redirty, progressed, gate_cleared, started_failing) = {
             let mut q = self.queue.lock().unwrap();
             let redirty = q.draining.remove(&scope).unwrap_or(false);
@@ -978,6 +1011,20 @@ impl Compactor {
                     self.mark_dirty(scope, false);
                 }
             }
+            Drained::SpendCapped(provider, _) => {
+                let held = {
+                    let holds = self.bus.spend_cap_holds().lock().await;
+                    let mut wait = self.spend_cap_wait.lock().unwrap();
+                    let held = wait.generation == generation && holds.refusal(provider).is_some();
+                    if held {
+                        *wait.parked.entry(scope).or_default() |= urgent || redirty;
+                    }
+                    held
+                };
+                if !held {
+                    self.mark_dirty(scope, urgent || redirty);
+                }
+            }
             Drained::Failed | Drained::ModelUnavailable => {
                 self.mark_dirty_after(scope, urgent, RETRY)
             }
@@ -989,7 +1036,7 @@ impl Compactor {
     /// again, which finds its trees built and sets the flag.
     async fn record_ready(self: &Arc<Self>, total: usize) {
         if let Err(e) = store::mark_ready(&self.pool).await {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Could not record the ready flag, re-seeding in {:?}: {}",
                 RETRY,
                 e
@@ -998,7 +1045,7 @@ impl Compactor {
             tokio::spawn(async move {
                 tokio::time::sleep(RETRY).await;
                 if let Err(e) = this.seed().await {
-                    log!("[SummaryTree] Could not re-seed the compactor: {}", e);
+                    log_legacy!("[SummaryTree] Could not re-seed the compactor: {}", e);
                 }
             });
             return;
@@ -1006,7 +1053,7 @@ impl Compactor {
         if let Some(backfill) = self.queue.lock().unwrap().backfill.as_mut() {
             backfill.ready = true;
         }
-        log!("[SummaryTree] The workspace tree and the recent threads are built; the workspace is ready");
+        log_legacy!("[SummaryTree] The workspace tree and the recent threads are built; the workspace is ready");
         let spent_usd = self
             .episode
             .lock()
@@ -1194,7 +1241,7 @@ impl Compactor {
         }
 
         if from.is_some() || !orphans.is_empty() {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Realigned {} from entry {:?}: {} leaves moved, {} orphan merges dropped",
                 scope.as_db(),
                 from,
@@ -1283,7 +1330,7 @@ impl Compactor {
             rewritten.push((addr, joined));
         }
         if !rewritten.is_empty() || !dropped.is_empty() || outgrown > 0 {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Re-derived {} verbatim nodes of {}; dropped {} to rebuild an agent's or the engine's words; {} no longer fit a node and keep their text",
                 rewritten.len(),
                 scope.as_db(),
@@ -1326,6 +1373,7 @@ impl Compactor {
         let mut busy = HashSet::new();
         let mut inflight = FuturesOrdered::new();
         let (mut failed, mut unavailable) = (false, false);
+        let mut spend_capped = None;
         let mut view = CompactionView::default();
 
         loop {
@@ -1404,11 +1452,17 @@ impl Compactor {
                     self.report_once(scope, addr, &e);
                     failed = true;
                 }
+                Err(NodeError::SpendCapped(provider, until)) => {
+                    spend_capped = Some((provider, until));
+                    failed = true;
+                }
                 Err(NodeError::Paused) => {}
             }
         }
 
-        Ok(if unavailable {
+        Ok(if let Some((provider, until)) = spend_capped {
+            Drained::SpendCapped(provider, until)
+        } else if unavailable {
             Drained::ModelUnavailable
         } else if failed {
             Drained::Failed
@@ -1422,7 +1476,7 @@ impl Compactor {
 
     fn report_once(&self, scope: SummaryScope, addr: NodeAddr, error: &str) {
         if self.reported.lock().unwrap().insert((scope, addr)) {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Node {} of {} failed, retrying every {:?}: {}",
                 addr,
                 scope.as_db(),
@@ -1515,6 +1569,7 @@ impl Compactor {
         capture_thread: Option<Uuid>,
         urgent: bool,
     ) -> Result<(String, String), NodeError> {
+        let generation = self.spend_cap_wait.lock().unwrap().generation;
         let (model, admission, permit) = loop {
             let (model, admission) = self.admit().await?;
             self.ensure_episode().await;
@@ -1546,6 +1601,10 @@ impl Compactor {
         let flex_refused = tier.is_some()
             && matches!(&fitted, Err(LineError::CallFailed(e)) if crate::llm::is_capacity_error(e));
         let transition = match &fitted {
+            Err(LineError::SpendCapped(_)) => {
+                drop(admission);
+                Transition::Unchanged
+            }
             _ if flex_refused => {
                 drop(admission);
                 Transition::Unchanged
@@ -1560,6 +1619,38 @@ impl Compactor {
                 self.flex_refusals.lock().unwrap().remove(&node);
                 self.set_waiting_for_model(false).await;
                 Ok((line, model.model))
+            }
+            Err(LineError::SpendCapped(cap)) => {
+                // Holds are already observed by the metered call service.
+                // A ChatGPT plan refusal is adapted here without changing its
+                // interactive pause contract.
+                if cap.provider == crate::llm::ProviderKind::ChatGptPlan {
+                    crate::engine::model_call::spend_cap::failed(&self.bus, &cap).await;
+                }
+                let until = crate::engine::model_call::spend_cap::status(&self.bus)
+                    .await
+                    .into_iter()
+                    .find(|hold| hold.provider == cap.provider.as_str())
+                    .map(|hold| hold.held_until)
+                    .unwrap_or_else(|| {
+                        cap.resets_at.unwrap_or(
+                            chrono::Utc::now() + crate::llm::spend_cap::SPEND_CAP_HOLD_DEFAULT,
+                        )
+                    });
+                let changed = {
+                    let mut wait = self.spend_cap_wait.lock().unwrap();
+                    if wait.generation == generation {
+                        wait.held_until = Some(until);
+                        wait.resets_at = cap.resets_at;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    self.announce_progress().await;
+                }
+                Err(NodeError::SpendCapped(cap.provider, until))
             }
             Err(LineError::CallFailed(e)) => {
                 if crate::llm::is_capacity_error(&e) {
@@ -1639,6 +1730,7 @@ fn enqueue(q: &mut Queue, scope: SummaryScope, urgent: bool) {
 /// Why [`fit_line`] gave no line. The breaker counts only a failed call: an
 /// empty line means the provider answered.
 enum LineError {
+    SpendCapped(crate::llm::spend_cap::SpendCapReached),
     CallFailed(String),
     Empty,
 }
@@ -1676,7 +1768,20 @@ async fn fit_line(
             None,
         );
         let response = call.await.map_err(|e| {
-            if e.is::<tokio::time::error::Elapsed>() {
+            if let Some(cap) = e.downcast_ref::<crate::llm::spend_cap::SpendCapReached>() {
+                LineError::SpendCapped(cap.clone())
+            } else if e
+                .downcast_ref::<crate::llm::chatgpt_plan::ChatGptPlanError>()
+                .is_some_and(|error| {
+                    error.failure == crate::llm::chatgpt_plan::ChatGptPlanFailure::LimitReached
+                })
+            {
+                LineError::SpendCapped(crate::llm::spend_cap::SpendCapReached {
+                    provider: crate::llm::ProviderKind::ChatGptPlan,
+                    resets_at: None,
+                    message: e.to_string(),
+                })
+            } else if e.is::<tokio::time::error::Elapsed>() {
                 LineError::CallFailed(format!("timed out after {:?}", model.deadline))
             } else {
                 LineError::CallFailed(e.to_string())

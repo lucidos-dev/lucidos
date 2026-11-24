@@ -1,9 +1,3 @@
-/**
- * Saving a new local base URL moves the saved key with it.
- *
- * The engine sends the `local` key only inside its credential scope. A URL
- * saved on its own would leave local chat keyless, and the server answers 401.
- */
 import { describe, it, expect } from 'vitest';
 import { providerKeyRescope } from './providerCredential';
 import type { CredentialInfo } from '../../store/types';

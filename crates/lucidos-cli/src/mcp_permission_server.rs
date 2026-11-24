@@ -374,11 +374,10 @@ fn call_ask_user_question(
         .get("multi_select")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let options: Vec<Value> = args
-        .get("options")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(engine_option).collect())
-        .unwrap_or_default();
+    let options = match parse_options(args.get("options")) {
+        Ok(options) => options,
+        Err(reason) => return Ok(tool_error_result(&reason)),
+    };
 
     // Engine wire shape — same as CC's `tool_input.questions` (the engine's
     // `parse_ask_user_question_inputs` reads `question` / `options[].label` /
@@ -413,19 +412,57 @@ fn call_ask_user_question(
 /// A failed request is a tool error with retry guidance, not a protocol error.
 /// The agent then asks again with the tool rather than in prose.
 fn card_not_shown_result(cause: &str) -> Value {
+    tool_error_result(&card_not_shown_reason(TOOL_ASK_USER_QUESTION, cause))
+}
+
+/// A tool result the model reads and acts on, unlike a protocol error.
+fn tool_error_result(text: &str) -> Value {
     serde_json::json!({
-        "content": [{
-            "type": "text",
-            "text": card_not_shown_reason(TOOL_ASK_USER_QUESTION, cause)
-        }],
+        "content": [{ "type": "text", "text": text }],
         "isError": true
     })
 }
 
+/// The card's options. An absent, blank or empty list is an intentional free-text
+/// question. Anything else that does not yield a button per entry is refused,
+/// so the model corrects the call: a card with no buttons would otherwise
+/// reach the user as free text they never asked for. Some models send the
+/// array as a JSON-encoded string, which is accepted.
+fn parse_options(raw: Option<&Value>) -> Result<Vec<Value>, String> {
+    let decoded;
+    let entries = match raw {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(text)) if text.trim().is_empty() => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(Value::String(text)) => {
+            decoded = serde_json::from_str::<Value>(text)
+                .ok()
+                .and_then(|value| match value {
+                    Value::Array(entries) => Some(entries),
+                    _ => None,
+                })
+                .ok_or(OPTIONS_SHAPE_ERROR)?;
+            &decoded
+        }
+        Some(_) => return Err(OPTIONS_SHAPE_ERROR.to_string()),
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            engine_option(entry).ok_or_else(|| {
+                format!("invalid option {entry}: each option needs a string `label`. {OPTIONS_SHAPE_ERROR}")
+            })
+        })
+        .collect()
+}
+
+const OPTIONS_SHAPE_ERROR: &str =
+    "`options` must be an array of labels or {label, description} objects, or omitted for a free-text question";
+
 /// One option in the engine's wire shape. The schema advertises plain labels,
 /// but a model may still send `{ label, description, preview }`. Dropping that
 /// object would leave the card with no button for it, so it passes through.
-/// Only an entry with no label at all is skipped.
+/// An entry with no string label yields `None`, which the caller refuses.
 fn engine_option(option: &Value) -> Option<Value> {
     if let Some(label) = option.as_str() {
         return Some(serde_json::json!({ "label": label }));
@@ -450,10 +487,7 @@ fn engine_option(option: &Value) -> Option<Value> {
 /// so the agent reads why no card was shown.
 fn ask_tool_result(resp: &AskUserQuestionResponseBody, question: &str) -> Value {
     match &resp.refusal {
-        Some(refusal) => serde_json::json!({
-            "content": [{ "type": "text", "text": refusal }],
-            "isError": true
-        }),
+        Some(refusal) => tool_error_result(refusal),
         None => {
             let answer = extract_single_answer(&resp.answers, question);
             let text = if resp.quiet {
@@ -706,6 +740,63 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn options_absent_null_blank_or_empty_mean_a_free_text_question() {
+        assert!(parse_options(None).unwrap().is_empty());
+        for free_text in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!("[]"),
+        ] {
+            assert!(
+                parse_options(Some(&free_text)).unwrap().is_empty(),
+                "{free_text}"
+            );
+        }
+    }
+
+    /// A protocol error may reach the model with no text, so it would ask in prose.
+    #[test]
+    fn malformed_options_come_back_as_a_tool_error_the_model_reads() {
+        let params = serde_json::json!({
+            "arguments": { "question": "Approve the plan?", "options": "Approve, Request changes" }
+        });
+        let result = call_ask_user_question(&params, &dummy_client(), "http://127.0.0.1:9", "tid")
+            .expect("a malformed call is still a tool result");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("`options` must be an array"), "{text}");
+    }
+
+    #[test]
+    fn a_json_encoded_options_array_still_yields_buttons() {
+        let encoded = Value::from(r#"["Approve", {"label": "Request changes"}]"#);
+        assert_eq!(
+            parse_options(Some(&encoded)).unwrap(),
+            vec![
+                serde_json::json!({ "label": "Approve" }),
+                serde_json::json!({ "label": "Request changes" }),
+            ]
+        );
+    }
+
+    /// A dropped choice must never turn into a button-less card.
+    #[test]
+    fn malformed_options_are_refused_instead_of_dropped() {
+        for bad in [
+            serde_json::json!("Approve, Request changes"),
+            serde_json::json!({ "label": "Approve" }),
+            serde_json::json!(7),
+            serde_json::json!(["Approve", 7]),
+            serde_json::json!([{ "description": "no label" }]),
+        ] {
+            let err = parse_options(Some(&bad)).unwrap_err();
+            assert!(err.contains("`options` must be an array"), "{bad}: {err}");
+        }
     }
 
     #[test]

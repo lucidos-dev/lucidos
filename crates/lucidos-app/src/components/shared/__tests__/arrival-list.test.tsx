@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * `<ArrivalList>`: a view shows its current state as it loads, then rolls in
- * and highlights only what arrives after that, and only where it is seen.
- * Plan: `docs/plans/2026-10-02-arrival-motion-for-list-rows.md`.
- *
- * jsdom has no Web Animations and no IntersectionObserver, so both are
- * stubbed. A test finishes a roll and decides what is on screen by hand.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -19,9 +11,7 @@ import { motionPreference } from '../../../utils/motion';
 
 interface FakeAnimation { el: HTMLElement; finish: () => void; cancel: () => void; finished: Promise<void> }
 let anims: FakeAnimation[] = [];
-/** Whether a row the marker checks reports as on screen. */
 let onScreen = true;
-/** A hidden tab updates no rendering, so its observers report nothing. */
 let tabHidden = false;
 const originalRect = HTMLElement.prototype.getBoundingClientRect;
 let host: HTMLElement;
@@ -43,7 +33,6 @@ function stubBrowser() {
   HTMLElement.prototype.getBoundingClientRect = function () {
     return { top: 0, bottom: 40, height: 40 } as DOMRect;
   };
-  // A real observer reports the target's state once, soon after `observe`.
   (globalThis as unknown as { IntersectionObserver: unknown }).IntersectionObserver = class {
     constructor(private callback: IntersectionObserverCallback) {}
     observe(el: Element) {
@@ -54,7 +43,6 @@ function stubBrowser() {
   };
 }
 
-/** A view: the hook stays mounted, and `open` folds its list away. */
 function View({ keys, open = true }: { keys: string[] | null; open?: boolean }) {
   const arrived = useArrivals(keys);
   if (!keys || !open) return null;
@@ -158,7 +146,6 @@ describe('ArrivalList', () => {
   });
 
   it('highlights a row that arrives as its list appears', async () => {
-    // A section with no rows draws no list, so its first row mounts the list.
     await show([], false);
     await show(['a']);
     expect(marked('a')).toBe(true);
@@ -231,7 +218,6 @@ describe('ArrivalList', () => {
       await show(['a', 'b']);
       await act(() => { vi.advanceTimersByTime(landed()); });
       await press();
-      // Acting early is banked, not dropped.
       expect(fading('b')).toBe(false);
       await act(() => { vi.advanceTimersByTime(hold()); });
       expect(fading('b')).toBe(true);

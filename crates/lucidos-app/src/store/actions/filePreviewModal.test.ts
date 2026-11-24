@@ -11,16 +11,9 @@ import {
 } from '../store';
 import { resolveFileTarget } from './fileTarget';
 
-// The escalation is the only thing that leaves the modal, so the router is the
-// one collaborator worth spying on. Everything else runs for real: the point of
-// this suite is that the modal resolves its locator through the SAME resolver
-// the router uses.
 const handleNavigationRequest = vi.fn();
 vi.mock('./navigation-request', () => ({ handleNavigationRequest }));
 
-// Module siblings of ./artifacts (which fileTarget imports for the real
-// `normalizeDataPath`) reach for the API client and the pane/nav actions at
-// import time. Same stubs as artifacts.test.ts.
 vi.mock('../../api/client', () => ({ listArtifacts: vi.fn(), uploadFile: vi.fn() }));
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
@@ -51,9 +44,6 @@ describe('openFilePreviewModal: what it shows', () => {
     expect(filePreviewModal.value?.path).toBe('artifacts/notes.md');
   });
 
-  // The security property: an app must not be able to reach a file through the
-  // modal that `navigate('file', …)` would not open. Both go through the one
-  // resolver, so a locator lands on the same path either way.
   it.each([
     'notes.md',
     'artifacts/research/report.md',
@@ -76,7 +66,6 @@ describe('openFilePreviewModal: what it shows', () => {
     expect(filePreviewModal.value!.path).toBe('artifacts/b.md');
   });
 
-  // The whole point of the modal: the app the reader is in stays put.
   it('navigates nothing', () => {
     const overlay = panelOverlay.value;
     openFilePreviewModal({ file_path: 'artifacts/notes.md', line: 5 });
@@ -87,10 +76,6 @@ describe('openFilePreviewModal: what it shows', () => {
     expect(activeMenuItem.value).toBe('apps');
   });
 
-  // The navigate router binds the Files panel to the repository it is opening
-  // (`openEncodedRepoFilePreview` → `switchRepoSource`). The modal must NOT:
-  // rebinding the panel behind the modal is the navigation this feature exists to
-  // avoid, and it would reset the panel's expanded folders and change list too.
   it('leaves the Files panel bound to its own repository', () => {
     openFilePreviewModal({ file_path: `repo:${REPO_ID}:file:src/main.rs`, line: 5 });
     expect(repoSource.value).toBe('the-repo-the-panel-is-bound-to');
@@ -99,7 +84,6 @@ describe('openFilePreviewModal: what it shows', () => {
   });
 });
 
-/** The view state the open modal provides to its preview body. */
 const view = () => filePreviewModal.value!.view;
 
 describe('openFilePreviewModal: the cited line', () => {
@@ -118,9 +102,6 @@ describe('openFilePreviewModal: the cited line', () => {
     expect(view().source.value).toBe(false);
   });
 
-  // A citation's line number is the part that goes stale; it must never cost the
-  // reader the file. Degradation is the resolver's (one rule for both surfaces),
-  // so this pins that the modal honours the verdict rather than second-guessing it.
   it.each([
     ['a stale zero', 'artifacts/notes.md', 0],
     ['a fractional line', 'artifacts/notes.md', 1.5],
@@ -132,12 +113,6 @@ describe('openFilePreviewModal: the cited line', () => {
     expect(view().source.value).toBe(false);
   });
 
-  // The diff view needs the panel's global repo state, which the modal must not
-  // touch. It previews the file instead, and because that IS a file view the
-  // citation is honoured.
-  //
-  // The locator reaches the state UNREWRITTEN, which is what keeps the change
-  // id: the modal renders the file at the change's end state, not at HEAD.
   it('previews a diff locator as the file at its change, at its line', () => {
     const locator = `repo:${REPO_ID}:diff#change-7:src/main.rs`;
     openFilePreviewModal({ file_path: locator, line: 42 });
@@ -154,9 +129,6 @@ describe('the modal is read-only', () => {
   });
 });
 
-// A file link in the transcript opens the modal over whatever the content pane
-// shows, a Files preview included. The two must never share a highlight, a
-// scroll target, the Source toggle or the editor.
 describe('the modal keeps its view state apart from the Files panel', () => {
   const panelState = () => ({
     source: filePreviewSource.value,
@@ -198,8 +170,6 @@ describe('the modal keeps its view state apart from the Files panel', () => {
   });
 });
 
-// What the host replies to an app with. Only a missing locator is refused:
-// everything else about a request degrades rather than fails.
 describe('filePreviewRequestError', () => {
   it('accepts any non-empty locator', () => {
     expect(filePreviewRequestError({ file_path: 'notes.md' })).toBeNull();
@@ -215,18 +185,11 @@ describe('filePreviewRequestError', () => {
   });
 });
 
-// The other half of the reply: whether the host can put ANYTHING on screen.
-// A modal nobody can see, with a promise that resolved, is what made the
-// fullscreen bug silent, so the host refuses instead and the app's documented
-// `catch { navigate('file', at) }` fallback takes over.
 describe('filePreviewBlockedReason', () => {
   it('is silent when the host can render its overlays', () => {
     expect(filePreviewBlockedReason(false)).toBeNull();
   });
 
-  // Reachable when an app calls requestFullscreen on its own content: the host
-  // document's fullscreen element is then the IFRAME, which renders no DOM
-  // children, so there is nowhere to put a modal and nothing outside it paints.
   it('names the reason when a fullscreen element the host does not own is up', () => {
     expect(filePreviewBlockedReason(true)).toContain('fullscreen');
   });
@@ -258,11 +221,6 @@ describe('escalateFilePreviewModal', () => {
     });
   });
 
-  // With the locator untouched, escalating a diff citation lands on the DIFF,
-  // which is exactly what `navigate('file', <that locator>)` does. Keeping the
-  // escalation identical to the router's own resolution is the property the
-  // whole shared-resolver design rests on; the router then applies its own line
-  // rule to it, which for a diff is to drop the range.
   it('escalates a diff locator to the diff, unrewritten', () => {
     const locator = `repo:${REPO_ID}:diff#change-7:src/main.rs`;
     openFilePreviewModal({ file_path: locator, line: 42 });

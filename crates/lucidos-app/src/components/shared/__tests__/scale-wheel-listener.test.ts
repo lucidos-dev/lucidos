@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { UI_SCALE_STEP, currentUiScale } from '../../../store/actions/preferences';
-import { installScaleWheel } from '../scaleWheelListener';
+import { installScaleWheel, pushScaleWheelArmedToFrame } from '../scaleWheelListener';
 import { scaleModalOpen, previewScale, _resetScaleTimersForTesting } from '../scaleModalState';
+import { FORWARD_WHEEL_TYPE, SCALE_WHEEL_CHANNEL } from '../../../../../../packages/lucidos-sdk/src/scaleWheelForward';
 
 vi.mock('../../../api/client', () => ({
   getPreferences: vi.fn(),
@@ -28,10 +29,6 @@ function key(type: 'keydown' | 'keyup', init: KeyboardEventInit): void {
   window.dispatchEvent(new KeyboardEvent(type, init));
 }
 
-/**
- * Cmd/Ctrl + wheel drives the UI scale with the panel closed too, and the
- * cancelling listener exists only while a wheel can be a zoom.
- */
 describe('Cmd/Ctrl + wheel steps the UI scale', () => {
   let teardown: () => void;
 
@@ -69,7 +66,6 @@ describe('Cmd/Ctrl + wheel steps the UI scale', () => {
   });
 
   it('is not listening at all with no modifier held and the panel closed', () => {
-    // Chrome's trackpad pinch: ctrl-wheel with no keydown. The browser keeps it.
     expect(wheel({ deltaY: -8, ctrlKey: true }).defaultPrevented).toBe(false);
   });
 
@@ -105,7 +101,6 @@ describe('Cmd/Ctrl + wheel steps the UI scale', () => {
   });
 
   it('a slow Cmd tick steps even when the window missed the keydown', () => {
-    // Cmd held across a window switch, or pressed while an app iframe had focus.
     scaleModalOpen.value = true;
     const before = previewScale.value;
     wheel({ deltaY: -4, metaKey: true });
@@ -123,7 +118,6 @@ describe('Cmd/Ctrl + wheel steps the UI scale', () => {
 
   it('leaves a wheel another surface already claimed', () => {
     key('keydown', { key: 'Meta', metaKey: true });
-    // The image popup's strip zooms its image on any wheel.
     const strip = document.body.appendChild(document.createElement('div'));
     strip.addEventListener('wheel', e => e.preventDefault());
     wheel({ deltaY: -100, metaKey: true }, strip);
@@ -137,7 +131,6 @@ describe('Cmd/Ctrl + wheel steps the UI scale', () => {
     for (let i = 0; i < 3; i++) wheel({ deltaY: -100, ctrlKey: true });
     flushFrame();
     expect(scaleModalOpen.value).toBe(true);
-    // The release, then the dismiss it triggers, with two notches still banked.
     key('keyup', { key: 'Control' });
     scaleModalOpen.value = false;
     flushFrame();
@@ -161,6 +154,81 @@ describe('Cmd/Ctrl + wheel steps the UI scale', () => {
     window.dispatchEvent(new Event('blur'));
     flushFrame();
     expect(scaleModalOpen.value).toBe(false);
+  });
+
+  describe('over an app frame', () => {
+    let frame: HTMLIFrameElement;
+
+    beforeEach(() => {
+      frame = document.body.appendChild(document.createElement('iframe'));
+      frame.dataset.role = 'app-ui-frame';
+    });
+
+    afterEach(() => frame.remove());
+
+    function forwarded(data: Record<string, unknown>, source: unknown = frame.contentWindow): void {
+      window.dispatchEvent(new MessageEvent('message', {
+        source: source as MessageEventSource,
+        data: { type: FORWARD_WHEEL_TYPE, deltaY: -100, deltaMode: 0, metaKey: false, ctrlKey: false, modifierKeyHeld: false, ...data },
+      }));
+    }
+
+    it('steps on a Cmd + wheel the frame forwarded, with focus in the frame', () => {
+      const before = currentUiScale();
+      forwarded({ metaKey: true, modifierKeyHeld: true });
+      flushFrame();
+      expect(scaleModalOpen.value).toBe(true);
+      expect(previewScale.value).toBe(before + UI_SCALE_STEP);
+    });
+
+    it('gives a forwarded slow tick with the key held its notch', () => {
+      const before = currentUiScale();
+      forwarded({ deltaY: -4, ctrlKey: true, modifierKeyHeld: true });
+      flushFrame();
+      expect(previewScale.value).toBe(before + UI_SCALE_STEP);
+    });
+
+    it('gives a forwarded slow Ctrl tick its notch when the shell saw the keydown', () => {
+      const before = currentUiScale();
+      key('keydown', { key: 'Control', ctrlKey: true });
+      forwarded({ deltaY: -4, ctrlKey: true, modifierKeyHeld: false });
+      flushFrame();
+      expect(previewScale.value).toBe(before + UI_SCALE_STEP);
+    });
+
+    it('ignores a forwarded wheel from anything but a mounted app frame', () => {
+      forwarded({ metaKey: true }, window);
+      forwarded({ metaKey: false, ctrlKey: false });
+      flushFrame();
+      expect(scaleModalOpen.value).toBe(false);
+    });
+
+    it('tells the frame when a wheel can be a zoom', () => {
+      const postMessage = vi.spyOn(frame.contentWindow!, 'postMessage');
+      key('keydown', { key: 'Meta', metaKey: true });
+      expect(postMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ channel: SCALE_WHEEL_CHANNEL, data: { armed: true } }), '*',
+      );
+      key('keyup', { key: 'Meta' });
+      expect(postMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ channel: SCALE_WHEEL_CHANNEL, data: { armed: false } }), '*',
+      );
+    });
+
+    it('arms a frame that loads while a wheel can be a zoom', () => {
+      const postMessage = vi.spyOn(frame.contentWindow!, 'postMessage');
+      scaleModalOpen.value = true;
+      postMessage.mockClear();
+      pushScaleWheelArmedToFrame(frame);
+      expect(postMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ channel: SCALE_WHEEL_CHANNEL, data: { armed: true } }), '*',
+      );
+      scaleModalOpen.value = false;
+      pushScaleWheelArmedToFrame(frame);
+      expect(postMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ channel: SCALE_WHEEL_CHANNEL, data: { armed: false } }), '*',
+      );
+    });
   });
 
   it('removes everything on teardown', () => {

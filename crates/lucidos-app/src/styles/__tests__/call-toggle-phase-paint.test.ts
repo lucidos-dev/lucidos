@@ -1,17 +1,3 @@
-/**
- * Each call phase paints itself, and the reduced-motion reader still sees four.
- *
- * The component test beside it (`components/chat/__tests__/
- * call-toggle-shows-its-phase.test.tsx`) proves the phase reaches the button.
- * This is the other half: that the stylesheet does something distinct with it.
- * Nothing else in the gate can see that. `tsc` never reads CSS and `vite build`
- * fails only on syntax, so a phase with no rule at all builds perfectly clean.
- *
- * Three properties, and the third is the one that decays quietly. A phase told
- * apart by motion ALONE collapses into its neighbour for anybody who asked
- * their system to stop moving. A caller reported exactly that: one control
- * that looked the same in two states.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -26,17 +12,14 @@ const css = readFileSync(resolve(here, '../chat/input-messages.css'), 'utf8');
 const rules = cssRules(css);
 const toneRules = cssRules(readFileSync(resolve(here, '../global/host-components.css'), 'utf8'));
 
-/** The four phases a call is in when the control is on screen and not idle. */
 const PHASES = ['connecting', 'listening', 'speaking', 'ending'] as const;
 
-/** Every rule whose selector names this phase of the call toggle. */
 function forPhase(phase: string): CssRule[] {
   return rules.filter(
     (r) => r.selector.includes('call-toggle') && r.selector.includes(`"${phase}"`),
   );
 }
 
-/** The same rules, split by whether reduced motion is in force. */
 function stillRules(phase: string): CssRule[] {
   return forPhase(phase).filter((r) => isReducedMotionRule(r));
 }
@@ -45,14 +28,6 @@ function movingRules(phase: string): CssRule[] {
   return forPhase(phase).filter((r) => !isReducedMotionRule(r));
 }
 
-/**
- * What a phase looks like once the motion is taken away.
- *
- * Declarations from the ordinary rules, then the reduced-motion ones on top,
- * with every `animation` dropped. Source order stands in for the cascade. That
- * holds here: the reduced-motion block is last, and every selector in the group
- * carries the same weight.
- */
 function stillLook(phase: string): string {
   const seen = new Map<string, string>();
   for (const rule of [...movingRules(phase), ...stillRules(phase)]) {
@@ -70,9 +45,6 @@ function stillLook(phase: string): string {
 describe('every call phase has a paint of its own', () => {
   for (const phase of PHASES) {
     it(`${phase} is styled at all`, () => {
-      // `listening` is the exception that proves the rule: it takes the base
-      // live paint and adds nothing, so it is the one phase with no rule of
-      // its own. Every other phase must declare something.
       const expected = phase === 'listening' ? 0 : 1;
       expect(forPhase(phase).length).toBeGreaterThanOrEqual(expected);
     });
@@ -89,8 +61,6 @@ describe('every call phase has a paint of its own', () => {
     }
   });
 
-  /** The floor flip must not resize the button, or the prompt actions row
-   *  reflows every time either side starts talking. */
   it('changes no box on a floor flip', () => {
     const geometry = ['width', 'height', 'padding', 'margin', 'border-width', 'font-size'];
     for (const phase of ['listening', 'speaking']) {
@@ -105,30 +75,21 @@ describe('every call phase has a paint of its own', () => {
 
 describe('a reader who stopped the motion still sees four phases', () => {
   it('leaves each transitional phase something static to be told apart by', () => {
-    // The whole point of the scan. Strip the animations and the four looks must
-    // still differ. A phase carried by motion alone reads as its neighbour the
-    // moment the system setting is on.
     const looks = PHASES.map(stillLook);
     expect(new Set(looks).size, looks.join('\n---\n')).toBe(PHASES.length);
   });
 
-  /** Colour alone is a thin distinction, and it is no distinction at all for a
-   *  reader who cannot separate green from grey. Brightness carries it, since
-   *  a drawn mark is ruled out (ADR 0207). */
   it('tells the transitional phases apart by brightness as well as by colour', () => {
     for (const phase of ['connecting', 'ending']) {
       expect(stillLook(phase), `${phase} rests at the same brightness as a live call`)
         .toContain('opacity');
     }
-    // And not at the SAME brightness, or the two collapse into each other.
     const rest = (phase: string): string | undefined =>
       forPhase(phase).find((r) => r.props.has('opacity'))?.props.get('opacity');
     expect(rest('connecting')).not.toBe(rest('ending'));
   });
 
   it('draws no ring around the handset, which ADR 0207 settled', () => {
-    // The owner refused one twice, so the control itself pulses instead. A
-    // pseudo-element under this selector is how a ring comes back.
     const drawn = rules.filter(
       (r) => r.selector.includes('call-toggle') && r.selector.includes('::'),
     );
@@ -137,8 +98,6 @@ describe('a reader who stopped the motion still sees four phases', () => {
 
   it('turns off every animation it declares', () => {
     for (const phase of PHASES) {
-      // A rule that already says `none` has nothing to turn off: the dwelt
-      // connect stops its own pulse, whatever the system setting says.
       const animated = movingRules(phase).filter(
         (r) => (r.props.get('animation') ?? 'none') !== 'none',
       );
@@ -152,8 +111,6 @@ describe('a reader who stopped the motion still sees four phases', () => {
   });
 
   it('declares its animations as bare literals, which the speed slider skips', () => {
-    // An activity indicator is not a transition, so it carries no
-    // `--duration-*` token. See .claude/rules/frontend-css.md.
     for (const phase of PHASES) {
       for (const rule of movingRules(phase)) {
         expect(rule.props.get('animation') ?? '').not.toContain('--duration');
@@ -173,8 +130,6 @@ describe('a reader who stopped the motion still sees four phases', () => {
 });
 
 describe('a connect that dwells stops claiming progress', () => {
-  /** Every rule for the dwelt connect, which the component marks with its own
-   *  attribute rather than a phase of its own. */
   const dwelt = rules.filter(
     (r) => r.selector.includes('call-toggle') && r.selector.includes('data-call-wait'),
   );
@@ -189,8 +144,6 @@ describe('a connect that dwells stops claiming progress', () => {
     expect(glyph[0].props.get('animation')).toBe('none');
   });
 
-  /** A still glyph is the plain connect's reduced-motion look too, so the dwelt
-   *  one needs a second difference or the two collapse for that reader. */
   it('holds the glyph brighter than the pulse rests it', () => {
     const dwelling = dwelt.find((r) => r.selector.includes('svg'))?.props.get('opacity');
     const connecting = movingRules('connecting')
@@ -201,8 +154,6 @@ describe('a connect that dwells stops claiming progress', () => {
   });
 
   it('takes the waiting tone, not the caution one', () => {
-    // `--accent-yellow` is the caution tone in this palette, and a browser
-    // asking for permission is not a caution. See global/base.css.
     const tinted = dwelt.filter((r) => r.props.has('color'));
     expect(tinted.length).toBeGreaterThan(0);
     for (const rule of tinted) {
@@ -211,17 +162,13 @@ describe('a connect that dwells stops claiming progress', () => {
   });
 
   it('names no hover of its own, so the pointer keeps its one promise', () => {
-    // A press here cancels the call, as it ends one in every other live
-    // phase. So the dwell takes the shared red hover below (ADR 0209).
     expect(dwelt.filter((r) => r.selector.includes(':hover'))).toEqual([]);
   });
 });
 
 describe('the colour says what is happening, the pointer what a press does', () => {
-  /** The live paint every non-idle phase starts from: the `live` tone. */
   const live = toneRules.find((r) => r.selector === '.icon-btn[aria-pressed="true"][data-tone="live"]');
 
-  /** Every hover rule the call toggle declares, in source order. */
   const hovers = rules.filter(
     (r) => r.selector.includes('call-toggle') && r.selector.includes(':hover'),
   );
@@ -232,8 +179,6 @@ describe('the colour says what is happening, the pointer what a press does', () 
   });
 
   it('keeps red off every resting phase', () => {
-    // Red is the hang-up, and a call that is up is not a failure. A resting
-    // rule reaching for it is what this test catches.
     const resting = rules.filter(
       (r) => r.selector.includes('call-toggle') && !r.selector.includes(':hover'),
     );
@@ -245,7 +190,6 @@ describe('the colour says what is happening, the pointer what a press does', () 
   });
 
   it('promises the hang-up under the pointer, and nowhere else', () => {
-    // Every hover but the spent control's is red: a press there ends the call.
     const dead = hovers.find((r) => r.selector.includes('"ending"'));
     const living = hovers.filter((r) => !r.selector.includes('"ending"'));
     expect(living.length, 'no live phase answers the pointer').toBeGreaterThan(0);
@@ -259,11 +203,7 @@ describe('the colour says what is happening, the pointer what a press does', () 
   });
 
   it('declares the shared hover after every phase it has to beat', () => {
-    // Same specificity, so source order decides. Declared earlier, the promise
-    // would lose to the connect's and the dwell's own tones.
     const shared = hovers.find((r) => !r.selector.includes('data-call-'));
-    // The rules it has to beat are the ones that PAINT a phase at rest. The
-    // reduced-motion block below it only takes motion away.
     const painted = rules.filter(
       (r) =>
         r.selector.includes('call-toggle') &&
@@ -293,8 +233,6 @@ describe('the ending control looks as dead as it behaves', () => {
     expect(cursors).toContain('default');
   });
 
-  /** `.icon-btn`'s own hover would hand the live red back, which is the one
-   *  thing a spent control must not offer. */
   it('does not brighten under the pointer', () => {
     const hovered = forPhase('ending').filter((r) => r.selector.includes(':hover'));
     expect(hovered.length, 'ending takes the base hover back').toBe(1);

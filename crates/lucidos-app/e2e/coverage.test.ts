@@ -5,8 +5,6 @@ import { SourceMapConsumer } from 'source-map-js';
 import { describe, expect, it } from 'vitest';
 import { coveredSourceFiles, type LoadedMap, type ScriptCoverage } from './coverage';
 
-// A real Chromium coverage recording of a three-module bundle: main.ts calls
-// greet.ts on load, and unused.ts is bundled but never called.
 const SAMPLE = fileURLToPath(new URL('./__fixtures__/coverage-sample', import.meta.url));
 const ASSETS = path.join(SAMPLE, 'assets');
 const scripts = JSON.parse(fs.readFileSync(path.join(SAMPLE, 'coverage.json'), 'utf8')) as ScriptCoverage[];

@@ -10,9 +10,6 @@ import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 import { contentLabel } from './pluginContent';
 import { NO_ENGINE_REQUIREMENT_CHIP, NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
 
-/** The parts a Plugins panel row and the plugin detail page share, so the two
- *  cannot disagree about a plugin's status, chips or buttons. The row shows
- *  a subset; the detail page shows all of it. */
 
 export function statusLabel(plugin: MarketplacePlugin): string {
   switch (plugin.status) {
@@ -26,13 +23,6 @@ function actionLabel(plugin: MarketplacePlugin): string {
   return plugin.status === 'update_available' ? 'Update' : 'Install';
 }
 
-/** The card's primary button. Progresses Install/Update → Setup → Open:
- *  - not installed → Install (or Update for an out-of-date install), disabled
- *    with the engine's reason when this Lucidos cannot install that version
- *  - installed with an unfinished setup thread → Setup (opens that thread)
- *  - installed and setup done (or none) with an app → Open (launches it)
- *  - installed with nothing to open → no button; the row says Installed
- *  An out-of-date install always shows Update first, before Setup/Open. */
 type CardAction =
   | { kind: 'install'; label: string; blockedReason?: string }
   | { kind: 'setup'; threadId: string }
@@ -58,9 +48,6 @@ export function fileCountLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'}`;
 }
 
-/** Tooltip for the "Modified" badge, listing the changed paths (capped so the
- *  tooltip stays readable). An update merges these changes, so the tooltip
- *  must never warn that it overwrites them. */
 function modifiedTooltip(paths?: string[]): string {
   const base = 'You have locally changed this plugin. An update merges your changes into the new version where it can.';
   if (!paths || paths.length === 0) return base;
@@ -69,14 +56,11 @@ function modifiedTooltip(paths?: string[]): string {
   return `${base} Changed: ${shown}${more}`;
 }
 
-/** Title-case a kebab-case category id for display: `developer-tools` →
- *  `Developer tools`. */
 export function categoryLabel(category: string): string {
   const spaced = category.replace(/-/g, ' ');
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
-/** The plugin icon: its own, its single app's, or the monogram tile. */
 export function PluginIcon({ plugin }: { plugin?: MarketplacePlugin }) {
   return (
     <SkBlock w="var(--app-icon-size)" h="var(--app-icon-size)" round>
@@ -90,8 +74,6 @@ function pluginIconSrc(plugin: MarketplacePlugin): string | undefined {
   return url ? pluginMediaUrl(url) : undefined;
 }
 
-/** The detail page's name, with the version and Modified badges beside it.
- *  A Store row shows the name alone. */
 export function PluginTitle({ plugin, nameClass }: { plugin?: MarketplacePlugin; nameClass: string }) {
   const sk = useSkeleton();
   return (
@@ -113,7 +95,6 @@ export function PluginTitle({ plugin, nameClass }: { plugin?: MarketplacePlugin;
   );
 }
 
-/** Why this Lucidos cannot install the plugin, beside the disabled Install. */
 function engineBlockedReason(plugin?: MarketplacePlugin): string | undefined {
   return plugin && !plugin.engine_compatible && plugin.status !== 'installed'
     ? plugin.engine_incompatible_reason
@@ -128,8 +109,6 @@ function EngineRequirementChip({ reason }: { reason: string }) {
   );
 }
 
-/** The detail page's line under the name: where the plugin comes from and how
- *  many files it has. */
 export function PluginSource({ plugin }: { plugin?: MarketplacePlugin }) {
   const source = plugin
     ? [plugin.marketplace_name, fileCountLabel(plugin.files_count)].filter(Boolean).join(' · ')
@@ -137,8 +116,6 @@ export function PluginSource({ plugin }: { plugin?: MarketplacePlugin }) {
   return <SkText class="plugin-detail-source" as="div" w="10rem">{source}</SkText>;
 }
 
-/** The detail page's content and category chips, and the engine notes. The
- *  no-requirement note informs an install, so an installed plugin drops it. */
 export function PluginMeta({ plugin }: { plugin?: MarketplacePlugin }) {
   const sk = useSkeleton();
   const blockedReason = engineBlockedReason(plugin);
@@ -169,8 +146,6 @@ export function PluginMeta({ plugin }: { plugin?: MarketplacePlugin }) {
   );
 }
 
-/** The row keeps one note: why its Install is disabled. Every other chip waits
- *  on the detail page, so the list stays calm. */
 export function PluginRowNote({ plugin }: { plugin?: MarketplacePlugin }) {
   const blockedReason = engineBlockedReason(plugin);
   if (!blockedReason) return null;
@@ -183,7 +158,6 @@ export function PluginRowNote({ plugin }: { plugin?: MarketplacePlugin }) {
 
 interface PluginActionsProps {
   plugin?: MarketplacePlugin;
-  /** True while this plugin's install is being staged. */
   busy?: boolean;
   onInstall?: (plugin: MarketplacePlugin) => void;
 }
@@ -192,7 +166,6 @@ interface PrimaryButton {
   label: string;
   onClick: () => void;
   blockedReason?: string;
-  /** Green, so an outdated plugin stands out from Install and Open. */
   confirm?: boolean;
 }
 
@@ -210,12 +183,6 @@ function primaryButton(
         confirm: plugin?.status === 'update_available',
       };
     case 'setup':
-      // The catalog surfaces this button for a present-or-queued setup thread;
-      // a gone one resolves to Open. A QUEUED one has no thread_summaries row
-      // at all. So a bootstrap fetch would 404, and a plain focusThread would
-      // be undone by ThreadView's stale-pointer cleanup and land on the compose
-      // view. `focusSpawnedThread` holds the focus until the row arrives,
-      // exactly as the confirm path in plugin-install.ts does.
       return { label: 'Setup', onClick: () => focusSpawnedThread(action.threadId) };
     case 'open':
       return { label: 'Open', onClick: () => void openAppById(action.appId) };
@@ -242,9 +209,6 @@ function PrimaryActionButton({ plugin, busy = false, onInstall }: PluginActionsP
   );
 }
 
-/** A Plugins panel row's one button: Install, Update, Setup or Open. With
- *  nothing to press, the row says Installed, since it shows no version badge.
- *  A tap never reaches the row behind it, which opens the plugin detail page. */
 export function PluginRowAction(props: PluginActionsProps) {
   const { plugin } = props;
   return (
@@ -256,7 +220,6 @@ export function PluginRowAction(props: PluginActionsProps) {
   );
 }
 
-/** The detail page's buttons: Uninstall and the primary. */
 export function PluginActions(props: PluginActionsProps) {
   const { plugin } = props;
   const isInstalled = !!plugin && plugin.status !== 'available';
@@ -276,8 +239,6 @@ export function PluginActions(props: PluginActionsProps) {
   );
 }
 
-/** The detail page's note on a locally changed plugin, with the offer to send
- *  the changes to its author. */
 export function PluginModifiedNotice({ plugin }: { plugin: MarketplacePlugin }) {
   if (!plugin.modified) return null;
   const count = plugin.modified_paths?.length ?? 0;

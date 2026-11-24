@@ -19,8 +19,10 @@ LUCIDOS_URL = "https://lucidos.example.com/factory"
 
 thread_id = os.environ.get("TRIGGER_EVENT_THREAD_ID")
 question = json.loads(os.environ.get("TRIGGER_EVENT_PAYLOAD", "{}"))
-# An owner approval card is Lucidos asking for authority, not a gate.
-wanted = thread_id and not question.get("owner_approval")
+# A permission request is Lucidos asking the owner for authority, not a gate.
+# The retired single-use card's key still marks a card raised before ADR 0688.
+engine_card = question.get("permission_request") or question.get("owner_approval")
+wanted = thread_id and not engine_card
 keyed = keyed_by(thread_id, "issue-tracker") if wanted else None
 if keyed:
     _root, (repo, number) = keyed

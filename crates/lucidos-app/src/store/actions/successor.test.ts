@@ -1,8 +1,3 @@
-/**
- * Continue on the *Successor card* starts a *successor session* in the same
- * thread. A message typed in a predecessor of a legacy successor thread moves
- * to the newest thread of its chain.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/client', async (importOriginal) => ({

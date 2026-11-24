@@ -70,8 +70,6 @@
 #   LUCIDOS_EVAL_SKIP_BUILD        1 to reuse an already-built engine
 #   LUCIDOS_EVAL_JUDGE_PROVIDER    pins the judge's provider, see below
 #   LUCIDOS_EVAL_GATEWAY_URL       the gateway each arm registers with
-#   LUCIDOS_EVAL_ENGINE_TLS_CERT   certificate the arm engines serve
-#   LUCIDOS_EVAL_ENGINE_TLS_KEY    its key. Set both, or neither
 #
 # RUNNING TWO PROVIDERS AT ONCE. Give each run its own label, or let each take
 # its model's, and their workspaces and databases never meet. Two things then
@@ -105,11 +103,6 @@
 # hashed into fixture_hash because it is part of the measurement. The provider
 # serving it is local credential setup, and hashing it would make one fixture
 # fail to pool across two machines.
-#
-# The three TLS variables default off ONE detection, mirroring `detect_tls` in
-# scripts/lib/workspace.sh, because the gateway decides its own scheme the same
-# way. Override the URL alone and you can point at a gateway whose scheme the
-# arms do not serve.
 #
 # EACH ARM IS REGISTERED AS A WORKSPACE, so the picker lists it and
 # `/eval-lean-1/` is browsable during the run and after it. Registration is
@@ -155,32 +148,10 @@ if [ -z "${LUCIDOS_EMBEDDING_MODEL:-}" ]; then
 fi
 export LUCIDOS_EMBEDDING_MODEL
 
-# Follow the dev stack's scheme, mirroring `detect_tls` in
-# scripts/lib/workspace.sh arm for arm: the checkout's `.certs/` first, then the
-# LUCIDOS_TLS_* pair, which is how a worktree supplies them because `.certs/` is
-# gitignored. A gateway started with certificates probes and proxies https, so
-# an arm serving plain http is unreachable through it. Both or neither: the
-# harness refuses half a pair.
-if [ -z "${LUCIDOS_EVAL_ENGINE_TLS_CERT:-}${LUCIDOS_EVAL_ENGINE_TLS_KEY:-}" ]; then
-    if [ -f "$PROJECT_DIR/.certs/cert.pem" ] && [ -f "$PROJECT_DIR/.certs/key.pem" ]; then
-        export LUCIDOS_EVAL_ENGINE_TLS_CERT="$PROJECT_DIR/.certs/cert.pem"
-        export LUCIDOS_EVAL_ENGINE_TLS_KEY="$PROJECT_DIR/.certs/key.pem"
-    elif [ -f "${LUCIDOS_TLS_CERT:-}" ] && [ -f "${LUCIDOS_TLS_KEY:-}" ]; then
-        export LUCIDOS_EVAL_ENGINE_TLS_CERT="$LUCIDOS_TLS_CERT"
-        export LUCIDOS_EVAL_ENGINE_TLS_KEY="$LUCIDOS_TLS_KEY"
-    fi
-fi
-
-# The gateway serves whatever that SAME detection gave it, so the control URL
-# has to agree. Hardcoding https against a checkout with no certificates fails
-# every adoption and every port lookup, and the arms then go unregistered on
-# every run with only a logged line to say so. Port per ADR 0014 §4.
-if [ -n "${LUCIDOS_EVAL_ENGINE_TLS_CERT:-}" ]; then
-    eval_gateway_proto=https
-else
-    eval_gateway_proto=http
-fi
-export LUCIDOS_EVAL_GATEWAY_URL="${LUCIDOS_EVAL_GATEWAY_URL:-$eval_gateway_proto://localhost:${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}}"
+# The arms serve plain http on loopback (decision 13 of
+# docs/plans/2026-11-19-desktop-window-https.md), and every gateway serves
+# https on loopback. Port per ADR 0014 §4.
+export LUCIDOS_EVAL_GATEWAY_URL="${LUCIDOS_EVAL_GATEWAY_URL:-https://localhost:${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}}"
 
 if [ $# -eq 0 ]; then
     echo "usage: $0 <seed|run|score|analyse|report> [args...]" >&2
@@ -191,7 +162,7 @@ mkdir -p "$LUCIDOS_EVAL_ROOT"
 
 if [ -z "${LUCIDOS_EVAL_SKIP_BUILD:-}" ]; then
     echo "[eval] building the engine and the harness"
-    cargo build --locked --release -p lucidos-engine -p lucidos-eval
+    cargo build --locked --release -p lucidos-engine-bin -p lucidos-eval
 fi
 
 export LUCIDOS_EVAL_ENGINE_BIN="${LUCIDOS_EVAL_ENGINE_BIN:-$PROJECT_DIR/target/release/lucidos-engine}"

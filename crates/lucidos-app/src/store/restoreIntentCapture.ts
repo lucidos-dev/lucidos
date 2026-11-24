@@ -1,7 +1,3 @@
-/** Capture before restore admission releases any thread loading or cleanup.
- * The caller freezes editing for this operation through the durable journal
- * commit and reload. Reads drain each store's writes; failures keep admission
- * closed. No source is adopted, expired, deleted or interpreted as a send. */
 import type { RestoreSourceOrigin } from '../utils/restoreSourceGeneration';
 import { queuedRestoreSourceId } from '../utils/restoreAdmission';
 import type { ComposeDraft } from './composeDrafts';
@@ -29,8 +25,6 @@ export interface LiveRestoreIntent {
 export async function captureRestoreIntent(sources: RestoreIntentCaptureSources): Promise<PreservedComposeIntent> {
   const [pending, storedUnsent] = await Promise.all([sources.readUploads(), sources.readUnsent()]);
   const live = await sources.readComposers();
-  // The live value wins: a cap or failed write must not erase an attachment
-  // or a newer send merely because it is absent or older in IndexedDB.
   const uploads = [...new Map([...pending.uploads, ...(live.uploads ?? [])].map((r) => [r.localId, r])).values()];
   const unsent = [...new Map([...storedUnsent, ...(live.unsent ?? [])].map((r) => [r.eventId, r])).values()];
   const queued = [...new Map([...pending.queuedUploadSendRecords, ...(live.queued ?? [])].map((r) => [JSON.stringify([r.ownerId, r.threadId]), r])).values()];
@@ -39,8 +33,6 @@ export async function captureRestoreIntent(sources: RestoreIntentCaptureSources)
     composerSource: sources.ownerId ? { ownerId: sources.ownerId, threadId } : undefined,
     selection: live.selections.get(threadId) ?? {},
   }));
-  // A local id or content hash alone says nothing about which retained intent
-  // owns the bytes. Match the same boundary used by historical capture.
   const sameOrigin = (upload: PendingUploadRecord, source: RestoreSourceOrigin & { ownerId: string; threadId: string }) =>
     upload.ownerId === source.ownerId && upload.threadId === source.threadId &&
     (upload.sourceGeneration ?? null) === (source.sourceGeneration ?? null);
@@ -49,8 +41,6 @@ export async function captureRestoreIntent(sources: RestoreIntentCaptureSources)
     const sourceThreadId = foreign ? `foreign-composer:${JSON.stringify([upload.ownerId, upload.threadId])}` : upload.threadId;
     let destination = drafts.find((d) => d.threadId === sourceThreadId);
     if (!destination && queued.some((q) => sameOrigin(upload, q) && q.localIds.includes(upload.localId))) continue;
-    // Landed bytes may outlive their composer solely for an unresolved send.
-    // Retain them with that source, unless the composer explicitly reuses them.
     if (upload.landedHash !== undefined &&
       unsent.some((s) => sameOrigin(upload, s) && s.body.image_hashes?.includes(upload.landedHash!)) &&
       !destination?.draft.image_hashes.includes(upload.landedHash)) continue;
@@ -63,8 +53,6 @@ export async function captureRestoreIntent(sources: RestoreIntentCaptureSources)
     }
     (destination.uploads ??= []).push(upload);
   }
-  // A send and a later composer edit are distinct intent, even on the same
-  // thread. Namespaced source keys remain stable across lost-response retries.
   for (const record of unsent) {
     drafts.push({
       threadId: `unsent:${record.eventId}`,
@@ -96,8 +84,6 @@ export async function captureRestoreIntent(sources: RestoreIntentCaptureSources)
     drafts.push({ threadId: 'pending-selection', draft: { text: '', image_hashes: [], mode: null },
       selection: live.pendingSelection });
   }
-  // Includes ArrayBuffers. Later live edits or upload completions cannot mutate
-  // the value while IndexedDB is committing the observation and capture.
   return structuredClone({ captureOwnerId: sources.ownerId, drafts, pendingSelection: live.pendingSelection,
     unsentMessages: unsent, queuedUploadSends: queued });
 }

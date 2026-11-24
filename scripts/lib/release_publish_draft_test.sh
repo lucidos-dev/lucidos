@@ -34,6 +34,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/test_skip.sh
+source "$SCRIPT_DIR/test_skip.sh"
+test_skip_unless_present "$SCRIPT_DIR/../.." scripts/release.sh scripts/lib/release_draft.sh
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELEASE_SH="$PROJECT_DIR/scripts/release.sh"
 PUBLISH_SH="$PROJECT_DIR/scripts/release-to-lucidos.sh"
@@ -332,7 +335,7 @@ done
 STUB_LOG="$(mktemp)"
 STUB_STATE="$(mktemp)"
 trap 'rm -f "$STUB_LOG" "$STUB_STATE"' EXIT
-printf 'RELEASE_VERSION=0.77.0\n' >"$STUB_STATE"
+printf 'RELEASE_VERSION=0.77.0\nSOURCE_COMMIT=fixture\n' >"$STUB_STATE"
 
 # stubbed_run <wait-rc> <advance-rc> <code> [draft-state]: run <code> under the
 # recorders and print the log, one call per line.
@@ -342,6 +345,7 @@ stubbed_run() {
         set -Eeuo pipefail
         fail() { echo "fail" >>"$LOG"; exit 1; }
         step() { :; }; begin_step() { :; }; end_step() { :; }
+        check_release_gate() { :; }
         gh() { :; }
         git() {
             case "$*" in

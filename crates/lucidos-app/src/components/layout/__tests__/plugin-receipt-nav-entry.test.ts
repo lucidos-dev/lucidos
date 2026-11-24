@@ -32,9 +32,6 @@ const uninstallRequest = {
 
 function entry(form: InlineForm): NavEntry {
   return {
-    // `files` is the menu item the reporting user was standing on: before the
-    // receipt existed, the history row for a resolved uninstall read as "Files"
-    // because the overlay was dropped and only this scalar was left.
     menuItem: 'files',
     settingsSubview: 'main',
     overlay: { type: 'form', form },

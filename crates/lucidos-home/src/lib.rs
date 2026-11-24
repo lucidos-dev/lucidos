@@ -6,10 +6,10 @@
 //! modes on purpose: a process umask would leak into every child, and an agent
 //! would then write 0600 files into the user's own projects.
 //!
-//! The storage roots are the Lucidos home (`~/.lucidos`), the gateway data
-//! dir, every workspace root and the user cache root. Whoever opens one calls
-//! [`ensure_storage_root`] first, so an install created before the rule
-//! converges on its next start.
+//! The storage roots are the Lucidos home (`~/.lucidos`), its private subtree,
+//! the gateway data dir, every workspace root and the user cache root. Whoever
+//! opens one calls [`ensure_storage_root`] first, so an install created before
+//! the rule converges on its next start.
 //!
 //! Design: `docs/plans/2026-10-12-other-local-users-cannot-read-lucidos-storage.md`.
 
@@ -17,6 +17,12 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+pub mod disposable;
+pub mod private;
+
+#[cfg(test)]
+mod disposable_tests;
 
 /// The Lucidos home's name under `$HOME`.
 pub const HOME_DIR_NAME: &str = ".lucidos";
@@ -27,7 +33,8 @@ pub const STORAGE_ROOT_MODE: u32 = 0o700;
 /// The variable that relocates the gateway data dir.
 pub const GATEWAY_DATA_ENV: &str = "LUCIDOS_GATEWAY_DATA";
 
-/// The gateway data dir's name under the Lucidos home, when nothing relocates it.
+/// The gateway data dir's name under the private subtree, when nothing
+/// relocates it.
 pub const GATEWAY_DIR_NAME: &str = "gateway";
 
 /// `$HOME/.lucidos`, without touching the disk. `None` when `HOME` is unset or
@@ -46,10 +53,38 @@ fn path_from(home: Option<OsString>) -> Option<PathBuf> {
     Some(path_in(Path::new(&home)))
 }
 
-/// The gateway data dir: `$LUCIDOS_GATEWAY_DATA`, else `~/.lucidos/gateway`.
-/// `None` only when neither `LUCIDOS_GATEWAY_DATA` nor `HOME` is set.
+/// Where the private entry `name` lives, without writing the disk: inside a
+/// moved subtree ([`private::relocated`]) with no older path considered, else
+/// [`private::entry_in`]. `None` when the subtree did not move and `HOME` is
+/// unset or empty.
+pub fn private_entry(name: &str) -> Option<PathBuf> {
+    match private::relocated() {
+        Some(dir) => Some(dir.join(name)),
+        None => Some(private::entry_in(&path()?, name)),
+    }
+}
+
+/// [`private_entry`], with the Lucidos home and the entry's parent made
+/// storage roots. For a caller about to create the entry.
+pub fn ensure_private_entry(name: &str) -> io::Result<PathBuf> {
+    let entry = match private::relocated() {
+        Some(dir) => dir.join(name),
+        None => private::entry_in(&ensure()?, name),
+    };
+    if let Some(parent) = entry.parent() {
+        ensure_storage_root(parent)?;
+    }
+    Ok(entry)
+}
+
+/// The gateway data dir: `$LUCIDOS_GATEWAY_DATA`, else
+/// the private entry `gateway`. `None` only when neither
+/// `LUCIDOS_GATEWAY_DATA`, a moved subtree nor `HOME` is set.
 pub fn gateway_data_dir() -> Option<PathBuf> {
-    gateway_data_dir_from(std::env::var_os(GATEWAY_DATA_ENV), path().as_deref())
+    match std::env::var_os(GATEWAY_DATA_ENV).filter(|dir| !dir.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => private_entry(GATEWAY_DIR_NAME),
+    }
 }
 
 /// [`gateway_data_dir`] with the Lucidos home given, so a caller that already
@@ -65,8 +100,16 @@ fn gateway_data_dir_from(
 ) -> Option<PathBuf> {
     match relocated.filter(|dir| !dir.is_empty()) {
         Some(dir) => Some(PathBuf::from(dir)),
-        None => Some(lucidos_home?.join(GATEWAY_DIR_NAME)),
+        None => Some(default_gateway_data_dir_in(lucidos_home?)),
     }
+}
+
+/// Where the gateway data dir sits under `lucidos_home` when nothing
+/// relocates it: a private entry, so an older home keeps it in place. Pure in
+/// its argument: a caller naming a home, such as the installs scan, gets that
+/// home's dir even under a moved subtree.
+pub fn default_gateway_data_dir_in(lucidos_home: &Path) -> PathBuf {
+    private::entry_in(lucidos_home, GATEWAY_DIR_NAME)
 }
 
 /// The Lucidos home, made a storage root. Call it before creating anything
@@ -181,7 +224,7 @@ mod tests {
         let home = Path::new("/home/u/.lucidos");
         assert_eq!(
             gateway_data_dir_from(None, Some(home)),
-            Some(PathBuf::from("/home/u/.lucidos/gateway"))
+            Some(PathBuf::from("/home/u/.lucidos/private/gateway"))
         );
         assert_eq!(
             gateway_data_dir_from(Some("/srv/gw".into()), None),
@@ -190,7 +233,7 @@ mod tests {
         // Empty reads as unset, as the shell's `${VAR:-default}` does.
         assert_eq!(
             gateway_data_dir_from(Some(OsString::new()), Some(home)),
-            Some(PathBuf::from("/home/u/.lucidos/gateway"))
+            Some(PathBuf::from("/home/u/.lucidos/private/gateway"))
         );
         assert_eq!(gateway_data_dir_from(None, None), None);
     }
@@ -228,10 +271,16 @@ mod tests {
         if own_uid == 0 {
             return; // root may chmod anything, so there is nothing to refuse
         }
-        let err = ensure_storage_root(Path::new("/")).unwrap_err();
+        // Root owns /tmp on a writable volume. `/` would not do: a sealed macOS
+        // system volume answers read-only before it checks the owner. A /tmp
+        // this user owns would be chmodded, so the test stands down there.
+        if std::fs::metadata("/tmp").unwrap().uid() != 0 {
+            return;
+        }
+        let err = ensure_storage_root(Path::new("/tmp")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         let message = err.to_string();
-        assert!(message.contains("storage root /"), "{message}");
+        assert!(message.contains("storage root /tmp"), "{message}");
         assert!(message.contains("uid 0"), "{message}");
     }
 
@@ -272,17 +321,48 @@ mod tests {
         assert!(STORAGE_ROOT_SH.contains(&line), "storage_root.sh: {line}");
         let prefix = format!("${{LUCIDOS_PREFIX:-$HOME/{HOME_DIR_NAME}}}");
         assert!(INSTALL_SH.contains(&prefix), "install.sh's default prefix");
-        let network_toml = format!("/{HOME_DIR_NAME}/network.toml");
+        let private_line = format!("LUCIDOS_PRIVATE_DIR_NAME=\"{}\"", private::DIR_NAME);
+        assert!(
+            STORAGE_ROOT_SH.contains(&private_line),
+            "storage_root.sh: {private_line}"
+        );
+        let network_toml = format!(
+            "lucidos_private_entry_in \"${{1%/}}/{HOME_DIR_NAME}\" {}",
+            private::NETWORK_TOML
+        );
         assert!(
             SERVICE_SH.contains(&network_toml),
             "service.sh's network.toml"
         );
         let gateway = shell_function_body(STORAGE_ROOT_SH, "gateway_data_dir");
-        let default = format!("${{{GATEWAY_DATA_ENV}:-$(lucidos_home_dir)/{GATEWAY_DIR_NAME}}}");
+        let default =
+            format!("${{{GATEWAY_DATA_ENV}:-$(lucidos_private_entry {GATEWAY_DIR_NAME})}}");
         assert!(
             gateway.contains(&default),
             "storage_root.sh's gateway_data_dir"
         );
+    }
+
+    /// Both shell resolvers are one copy of the Rust rule, over the same
+    /// closed list of names.
+    #[test]
+    fn the_shell_resolvers_match_the_rust_entry_rule() {
+        let lib = shell_function_body(STORAGE_ROOT_SH, "lucidos_private_entry_in");
+        let service = shell_function_body(SERVICE_SH, "lucidos_private_entry_in");
+        assert_eq!(
+            lib, service,
+            "service.sh's copy drifted from storage_root.sh"
+        );
+        let names_line = lib
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("local names=\""))
+            .expect("the resolver lists its names");
+        let mut shell: Vec<&str> = names_line.trim_end_matches('"').split(' ').collect();
+        let mut rust = private::legacy_entries();
+        shell.sort_unstable();
+        rust.sort_unstable();
+        assert_eq!(shell, rust);
+        assert!(lib.contains(&format!("/{}/", private::DIR_NAME)), "{lib}");
     }
 
     #[test]

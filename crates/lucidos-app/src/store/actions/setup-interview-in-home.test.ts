@@ -1,7 +1,3 @@
-/**
- * The setup interview runs in Home, where everything starts (ADR 0411), and
- * creates no thread of its own.
- */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./chat', async (importOriginal) => ({

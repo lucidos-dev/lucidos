@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The trigger detail page was the reported surface. These are the other two
- * that held the same shape: a draft copied out of an entity at mount, keyed on
- * that entity's id, so a later frame for the SAME entity reached nothing.
- *
- * Each surface gets the pair that matters. An untouched field follows the
- * frame. A touched one keeps the user's work. See ADR 0118.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -117,8 +109,6 @@ describe('the trigger group header follows the TriggerGroupRenamed frame', () =>
     render(<TriggerGroupHeader group={group()} />, host);
     expect(renameField().value).toBe('Nightly CI & Learning');
 
-    // The field stays mounted while the user is not renaming. A frame landing
-    // in that window used to leave the old name loaded in it.
     render(<TriggerGroupHeader group={group({ name: 'Nightly CI' })} />, host);
     await waitFor(() => renameField().value === 'Nightly CI');
 

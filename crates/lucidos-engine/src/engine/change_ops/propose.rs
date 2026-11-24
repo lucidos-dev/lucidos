@@ -1,9 +1,28 @@
 use super::*;
 use crate::engine::event_bus::EventBus;
 
+/// Hold kinds this caller will send the agent back for.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HoldReentry {
+    pub(crate) plan: bool,
+    pub(crate) hardening: bool,
+}
+
+impl HoldReentry {
+    pub fn contains(self, hold: ProposalHold) -> bool {
+        match hold {
+            ProposalHold::Plan(PlanHold::PlanOnlyAwaitingApproval)
+            | ProposalHold::IntegratedIntoParent
+            | ProposalHold::CarriedBySuccessor => false,
+            ProposalHold::Plan(_) => self.plan,
+            ProposalHold::HardeningMissing => self.hardening,
+        }
+    }
+}
+
 /// What a turn end did with the branch's work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProposeOutcome {
+pub enum ProposeOutcome {
     /// The change is pending under this id.
     Proposed(Uuid),
     /// The proposal hold keeps the branch, so nothing was proposed. The
@@ -40,6 +59,7 @@ async fn withhold_work(
     input: &ProposeChangeInput<'_>,
     branch_moved: bool,
     reason: Option<UnproposedReason>,
+    agent_returns: bool,
 ) -> Result<OpenChangeAfterHold, Box<dyn std::error::Error + Send + Sync>> {
     let open = match bus
         .changes_projection()
@@ -57,7 +77,7 @@ async fn withhold_work(
         Ok(Some(open)) => OpenChangeAfterHold::StillCarries(open.id),
         Ok(None) => OpenChangeAfterHold::None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Changes] get_open_by_branch({}): {}; leaving any open change in place",
                 input.branch_name,
                 e
@@ -66,7 +86,15 @@ async fn withhold_work(
         }
     };
     if let Some(reason) = reason.filter(|_| !matches!(open, OpenChangeAfterHold::StillCarries(_))) {
-        emit_proposal_withheld(bus, input.thread_id, input.branch_name, input.files, reason).await;
+        emit_proposal_withheld(
+            bus,
+            input.thread_id,
+            input.branch_name,
+            input.files,
+            reason,
+            agent_returns,
+        )
+        .await;
     }
     Ok(open)
 }
@@ -79,7 +107,7 @@ pub(crate) async fn withhold_unfinished_work(
     branch_moved: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let reason = Some(UnproposedReason::TurnIncomplete);
-    let open = withhold_work(bus, input, branch_moved, reason).await?;
+    let open = withhold_work(bus, input, branch_moved, reason, false).await?;
     Ok(open == OpenChangeAfterHold::Withdrawn)
 }
 
@@ -89,7 +117,7 @@ pub(crate) async fn withhold_unfinished_work(
 /// when it still carries everything: nothing may offer Apply before that
 /// session. A set-aside change stays set aside unless the branch moved past it,
 /// and a queued one stays queued: the landing lane lands the snapshot it froze.
-pub(crate) async fn withhold_handed_off_work(
+pub async fn withhold_handed_off_work(
     pool: &sqlx::PgPool,
     bus: &EventBus,
     thread_id: Uuid,
@@ -139,7 +167,7 @@ pub(crate) async fn branch_moved_since_last_idle(
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!("[Changes] last idle head for {}: {}", thread_id, e);
+        log_legacy!("[Changes] last idle head for {}: {}", thread_id, e);
         None
     })
     .flatten();
@@ -178,6 +206,7 @@ pub(crate) async fn withhold_for_landing(
             input.branch_name,
             input.files,
             UnproposedReason::AwaitingLanding,
+            false,
         )
         .await;
     }
@@ -199,6 +228,7 @@ pub(crate) async fn withhold_unready(
     pool: &sqlx::PgPool,
     bus: &EventBus,
     input: &ProposeChangeInput<'_>,
+    reentry: HoldReentry,
 ) -> Result<HoldOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let repo_root = Path::new(input.repo_root);
     let Some(hold) = read_proposal_hold(
@@ -212,7 +242,7 @@ pub(crate) async fn withhold_unready(
     else {
         return Ok(HoldOutcome::Clear);
     };
-    log!(
+    log_legacy!(
         "[Changes] Not proposing branch {} for thread {}: the proposal hold keeps it ({:?})",
         input.branch_name,
         input.thread_id,
@@ -220,7 +250,7 @@ pub(crate) async fn withhold_unready(
     );
     let moved =
         branch_moved_since_last_idle(pool, input.thread_id, repo_root, input.branch_name).await;
-    let open = withhold_work(bus, input, moved, Some(hold.into())).await?;
+    let open = withhold_work(bus, input, moved, Some(hold.into()), reentry.contains(hold)).await?;
     Ok(HoldOutcome::Held(hold, open))
 }
 
@@ -229,7 +259,7 @@ pub(crate) async fn withhold_unready(
 ///
 /// A failed emit is an error: the change would stay applicable over work it
 /// no longer covers, so no caller may carry on as if it was withdrawn.
-pub(crate) async fn emit_change_withdrawn(
+pub async fn emit_change_withdrawn(
     bus: &EventBus,
     thread_id: Uuid,
     change_id: Uuid,
@@ -249,18 +279,20 @@ pub(crate) async fn emit_change_withdrawn(
 }
 
 /// Announce work a turn end left on the branch and did not propose.
-pub(crate) async fn emit_proposal_withheld(
+pub async fn emit_proposal_withheld(
     bus: &EventBus,
     thread_id: Uuid,
     branch_name: &str,
     files: &[String],
     reason: UnproposedReason,
+    agent_returns: bool,
 ) {
     use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
     bus.emit_or_log(
         crate::engine::event_bus::BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ProposalWithheld {
+                agent_returns,
                 branch_name: branch_name.to_string(),
                 files: files.to_vec(),
                 reason,
@@ -277,8 +309,7 @@ pub(crate) async fn emit_proposal_withheld(
 
 /// A lane batch's integration branch lands through the landing lane, whole,
 /// and is never anybody's change (ADR 0463).
-pub(crate) const LANE_BRANCH_IS_NOT_A_CHANGE: &str =
-    "A lane batch's integration branch lands through the landing lane, never as a change.";
+pub(crate) use crate::core::git::LANE_BRANCH_IS_NOT_A_CHANGE;
 
 fn refuse_lane_branch(
     input: &ProposeChangeInput<'_>,
@@ -292,14 +323,15 @@ fn refuse_lane_branch(
 impl LucidosEngine {
     /// What a turn end does with its branch work (ADR 0400). A finished turn
     /// proposes it; an unfinished one never does, and says so.
-    pub(crate) async fn propose_turn_work(
+    pub async fn propose_turn_work(
         &self,
         input: ProposeChangeInput<'_>,
         finished: bool,
+        reentry: HoldReentry,
     ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
         refuse_lane_branch(&input)?;
         if finished {
-            return self.propose_change(input).await;
+            return self.propose_change(input, reentry).await;
         }
         if let Some(queued) = withhold_for_landing(&self.pool, &self.event_bus, &input).await? {
             return Ok(ProposeOutcome::AwaitingLanding(queued));
@@ -320,15 +352,16 @@ impl LucidosEngine {
     /// Propose the branch's work, unless the proposal hold keeps it
     /// ([`withhold_unready`]). If an open change already exists for this
     /// branch, reuses its id instead of creating a duplicate.
-    pub(crate) async fn propose_change(
+    pub async fn propose_change(
         &self,
         input: ProposeChangeInput<'_>,
+        reentry: HoldReentry,
     ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
         refuse_lane_branch(&input)?;
         if let Some(queued) = withhold_for_landing(&self.pool, &self.event_bus, &input).await? {
             return Ok(ProposeOutcome::AwaitingLanding(queued));
         }
-        match withhold_unready(&self.pool, &self.event_bus, &input).await? {
+        match withhold_unready(&self.pool, &self.event_bus, &input, reentry).await? {
             HoldOutcome::Clear => {}
             // Nothing new since it was proposed, so the open change stands.
             HoldOutcome::Held(_, OpenChangeAfterHold::StillCarries(id)) => {
@@ -467,6 +500,7 @@ impl LucidosEngine {
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::ChangeProposed {
+                            content: crate::engine::thread_events::ChangeContent::from_files(files),
                             change_id: change_id.to_string(),
                             description: Some(description.to_string()),
                             files: files.to_vec(),
@@ -499,11 +533,11 @@ impl LucidosEngine {
     /// Whether an open change already names `branch_name`. An unanswered read
     /// counts as no: a held idle then creates nothing, and the next idle asks
     /// again.
-    pub(crate) async fn branch_has_open_change(&self, branch_name: &str) -> bool {
+    pub async fn branch_has_open_change(&self, branch_name: &str) -> bool {
         match self.changes().get_open_by_branch(branch_name).await {
             Ok(row) => row.is_some(),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] get_open_by_branch({}): {}; treating it as having no open change",
                     branch_name,
                     e
@@ -531,7 +565,7 @@ impl LucidosEngine {
     ///
     /// The decision itself is [`should_reconcile_emptied_change`] — see its
     /// truth table for the refusals and why each one is load-bearing.
-    pub(crate) async fn reconcile_emptied_pending_change(
+    pub async fn reconcile_emptied_pending_change(
         &self,
         thread_id: Uuid,
         repo_root: &Path,
@@ -540,7 +574,7 @@ impl LucidosEngine {
         let existing = match self.changes().get_pending_by_branch(branch_name).await {
             Ok(row) => row,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] reconcile: get_pending_by_branch({}): {} — leaving the row alone",
                     branch_name,
                     e
@@ -551,7 +585,7 @@ impl LucidosEngine {
         let diff =
             crate::engine::git_ops::branch_changed_files_checked(repo_root, branch_name).await;
         if let (Some(row), Err(e)) = (existing.as_ref(), diff.as_ref()) {
-            log!(
+            log_legacy!(
                 "[Changes] reconcile: {} — leaving change {} at {} file(s)",
                 e,
                 row.id,
@@ -569,7 +603,7 @@ impl LucidosEngine {
         let hardened =
             crate::engine::git_ops::has_full_harden_marker(&self.pool, repo_root, branch_name)
                 .await;
-        let fallback = crate::engine::agent_session::change_description_fallback(
+        let fallback = crate::engine::session_queries::change_description_fallback(
             &self.pool,
             thread_id,
             branch_name,
@@ -581,7 +615,7 @@ impl LucidosEngine {
             crate::engine::git_ops::describe_branch_changes(repo_root, &log_range, &fallback, None)
                 .await;
 
-        log!(
+        log_legacy!(
             "[Changes] Branch {} has no diff left — change {} reconciled to 0 files (was {})",
             branch_name,
             existing.id,
@@ -605,7 +639,7 @@ impl LucidosEngine {
             })
             .await
         {
-            log!(
+            log_legacy!(
                 "[Changes] Failed to reconcile emptied change {}: {}",
                 existing.id,
                 e
@@ -620,7 +654,7 @@ impl LucidosEngine {
     ///
     /// The boundary event is stamped engine-origin internally (see
     /// `emit_missing_hardening_detected`), so callers don't pass an actor.
-    pub(crate) async fn request_hardening_in_session(
+    pub async fn request_hardening_in_session(
         &self,
         thread_id: Uuid,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
@@ -629,9 +663,9 @@ impl LucidosEngine {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         self.emit_missing_hardening_detected(thread_id).await;
-        crate::engine::agent_session::send_awaited_prompt(
+        crate::engine::coding_turn_end::send_awaited_prompt(
             msg_tx,
-            crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string(),
+            crate::engine::continuation_reason::AUTO_HARDEN_MESSAGE.to_string(),
         )
     }
 
@@ -641,24 +675,26 @@ impl LucidosEngine {
     /// Continue resumes one. Either way its turn end proposes through the
     /// normal floor. No apply runs, so it emits no `MissingHardeningDetected`,
     /// which marks an apply's hardening phase.
-    pub(crate) async fn harden_held_work(
+    pub async fn harden_held_work(
         &self,
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(session) = CodingAgentChangeOps::live_session_info(self, thread_id).await {
-            return self
-                .nudge_held_proposal_in_session(
-                    thread_id,
-                    ProposalHold::HardeningMissing,
-                    &session.msg_tx,
-                )
-                .await;
+        if !crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await {
+            if let Some(session) = self.live_session_info(thread_id).await {
+                return self
+                    .nudge_held_proposal_in_session(
+                        thread_id,
+                        ProposalHold::HardeningMissing,
+                        &session.msg_tx,
+                    )
+                    .await;
+            }
         }
         let requested = crate::engine::thread_events::emit_continuation_requested_or_log(
             &self.event_bus,
             thread_id,
-            crate::engine::agent_recovery::HARDEN_REQUESTED_REASON,
+            crate::engine::continuation_reason::HARDEN_REQUESTED_REASON,
             actor,
             "[Changes] ContinuationRequested (harden)",
         )
@@ -672,7 +708,7 @@ impl LucidosEngine {
     /// Tell a live agent why its turn-end proposal was held, and how to clear
     /// the hold. The `PromptInjected` anchor starts the exchange its reply
     /// groups under, as an event-wait re-entry does.
-    pub(crate) async fn nudge_held_proposal_in_session(
+    pub async fn nudge_held_proposal_in_session(
         &self,
         thread_id: Uuid,
         hold: ProposalHold,
@@ -712,7 +748,7 @@ impl LucidosEngine {
             })
             .await
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[Changes] PromptInjected (held proposal) emit failed: {}",
                     e
                 );

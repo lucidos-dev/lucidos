@@ -8,9 +8,11 @@
 # both variables name a live gateway that lists this workspace at the engine's
 # port, or neither is set.
 #
-# LUCIDOS_E2E_GATEWAY picks where that gateway comes from:
-#   auto (default)  a gateway already running: the inherited port, then dev's
-#   own             start a session-scoped gateway (GitHub shards)
+# LUCIDOS_E2E_GATEWAY picks it:
+#   none (default)  no gateway. A local run's workspace lives in the e2e root,
+#                   which no other gateway registers.
+#   own             start a session-scoped gateway (GitHub shards). Its data
+#                   and secrets stay under the e2e root.
 #
 # Sourced by e2e.sh, after workspace.sh. Tested by e2e_gateway_test.sh.
 
@@ -23,20 +25,12 @@ e2e_gateway_identity() {
     printf '%s %s\n' "$gateway_port" "$ws_id"
 }
 
-# The gateway ports to ask in auto mode, deduplicated. Pure.
-e2e_gateway_auto_candidates() {
-    local inherited="$1" dev="$2"
-    [ -z "$inherited" ] || echo "$inherited"
-    [ -z "$dev" ] || [ "$dev" = "$inherited" ] || echo "$dev"
-}
-
 # The port the gateway on $1 lists for workspace $2, or nothing.
 e2e_gateway_listed_port() {
-    local port="$1" ws_id="$2" scheme body
-    for scheme in https http; do
-        body="$(gateway_curl -sfk --max-time "${LUCIDOS_HEALTH_PROBE_TIMEOUT_S:-2}" \
-            "$scheme://127.0.0.1:$port/~/api/v1/control/workspaces" 2>/dev/null)" || continue
-        printf '%s' "$body" | python3 -c '
+    local port="$1" ws_id="$2" body
+    body="$(gateway_curl -sf --max-time "${LUCIDOS_HEALTH_PROBE_TIMEOUT_S:-2}" \
+        "$(loopback_origin "$port")/~/api/v1/control/workspaces" 2>/dev/null)" || return 0
+    printf '%s' "$body" | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
@@ -46,8 +40,6 @@ for w in data.get("workspaces", []):
     if w.get("id") == sys.argv[1]:
         print(w.get("port", ""))
 ' "$ws_id"
-        return 0
-    done
 }
 
 e2e_gateway_dir() { echo "$E2E_WORKSPACE/.lucidos/e2e-gateway"; }
@@ -78,12 +70,13 @@ e2e_gateway_env() {
         "LUCIDOS_STATIC_DIR=$static_dir"
 }
 
-# Only actual E2E adoption supplies provenance. Generic dev launches and auto
-# mode keep existing registration protection and never mint harness authority.
+# Only actual E2E adoption supplies provenance. Generic dev launches keep
+# existing registration protection and never mint harness authority.
 e2e_adopt_into_gateway() {
     # shellcheck disable=SC2153 # ENGINE_PORT is set by workspace.sh before adoption
     python3 "$_E2E_LIB_DIR/e2e_adopt.py" "$1" "$WORKSPACE" \
-        "$(workspace_slug)" "$ENGINE_PORT" "$(lucidos_home_dir)/local-token"
+        "$(workspace_slug)" "$ENGINE_PORT" "$(lucidos_private_entry local-token)" \
+        "$(loopback_ca_cert)"
 }
 
 # Start the harness's own gateway, or reuse the one this session started.
@@ -118,7 +111,7 @@ $(e2e_gateway_env "$dir" "$port" "$ENGINE_BIN" "$FRONTEND_DIR/dist")
 EOF
     env -u LUCIDOS_GATEWAY_PORT -u LUCIDOS_WORKSPACE_ID -u LUCIDOS_GATEWAY_BIND_ALL \
         -u LUCIDOS_TLS_CERT -u LUCIDOS_TLS_KEY \
-        -u LUCIDOS_GATEWAY_TLS_CERT -u LUCIDOS_GATEWAY_TLS_KEY \
+        -u LUCIDOS_PREVIEW_USER_TLS_CERT -u LUCIDOS_PREVIEW_USER_TLS_KEY \
         "${env_args[@]}" "$GATEWAY_BIN" >>"$dir/gateway.log" 2>&1 &
     # The gateway publishes gateway.pid itself once it owns $dir (ADR 0438).
     pid=$!
@@ -126,11 +119,11 @@ EOF
 
     local _
     for _ in {1..60}; do
-        if curl -sf --max-time 1 "http://127.0.0.1:$port/~/api/v1/health" >/dev/null 2>&1; then
+        if loopback_curl -sf --max-time 1 "$(loopback_origin "$port")/~/api/v1/health" >/dev/null 2>&1; then
             echo "e2e gateway: started its own on :$port (PID $pid, log $dir/gateway.log)"
             # A subshell, so the dev launcher's GATEWAY_WS_ID never leaks here.
             # A refusal is printed without its secret response body.
-            if ( e2e_adopt_into_gateway "http://127.0.0.1:$port" >/dev/null ); then
+            if ( e2e_adopt_into_gateway "$(loopback_origin "$port")" >/dev/null ); then
                 E2E_GATEWAY_PORT="$port"
                 return 0
             fi
@@ -177,39 +170,29 @@ stop_e2e_gateway() {
 # Give the engine about to start its gateway identity, or none. Call after
 # swap_ports, so ENGINE_PORT is the e2e engine's port, and before start_engine.
 attach_e2e_gateway() {
-    local mode="${LUCIDOS_E2E_GATEWAY:-auto}" ws_id candidates port identity=""
-    ws_id="$(workspace_slug)"
+    local mode="${LUCIDOS_E2E_GATEWAY:-none}" ws_id identity
     case "$mode" in
-        own)
-            start_e2e_gateway || return 1
-            candidates="$E2E_GATEWAY_PORT"
+        none)
+            unset LUCIDOS_GATEWAY_PORT LUCIDOS_WORKSPACE_ID
+            echo "e2e gateway: none, so the engine runs without one"
+            return 0
             ;;
-        auto)
-            candidates="$(e2e_gateway_auto_candidates \
-                "${LUCIDOS_GATEWAY_PORT:-}" "${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}")"
-            ;;
+        own) ;;
         *)
-            echo "ERROR: LUCIDOS_E2E_GATEWAY must be auto or own, not '$mode'" >&2
+            echo "ERROR: LUCIDOS_E2E_GATEWAY must be none or own, not '$mode'" >&2
             return 1
             ;;
     esac
-
+    start_e2e_gateway || return 1
+    ws_id="$(workspace_slug)"
     # shellcheck disable=SC2153 # ENGINE_PORT is workspace.sh's, set by swap_ports
-    for port in $candidates; do
-        identity="$(e2e_gateway_identity \
-            "$(e2e_gateway_listed_port "$port" "$ws_id")" "$ENGINE_PORT" "$port" "$ws_id")"
-        [ -z "$identity" ] || break
-    done
-
-    if [ -n "$identity" ]; then
-        export LUCIDOS_GATEWAY_PORT="${identity%% *}" LUCIDOS_WORKSPACE_ID="${identity#* }"
-        echo "e2e gateway: the engine is '$LUCIDOS_WORKSPACE_ID' to the gateway on :$LUCIDOS_GATEWAY_PORT"
-        return 0
-    fi
-    unset LUCIDOS_GATEWAY_PORT LUCIDOS_WORKSPACE_ID
-    if [ "$mode" = own ]; then
+    identity="$(e2e_gateway_identity \
+        "$(e2e_gateway_listed_port "$E2E_GATEWAY_PORT" "$ws_id")" "$ENGINE_PORT" "$E2E_GATEWAY_PORT" "$ws_id")"
+    if [ -z "$identity" ]; then
+        unset LUCIDOS_GATEWAY_PORT LUCIDOS_WORKSPACE_ID
         echo "ERROR: the e2e gateway does not list '$ws_id' at :$ENGINE_PORT" >&2
         return 1
     fi
-    echo "e2e gateway: none lists '$ws_id' at :$ENGINE_PORT, so the engine runs without one"
+    export LUCIDOS_GATEWAY_PORT="${identity%% *}" LUCIDOS_WORKSPACE_ID="${identity#* }"
+    echo "e2e gateway: the engine is '$LUCIDOS_WORKSPACE_ID' to the gateway on :$LUCIDOS_GATEWAY_PORT"
 }

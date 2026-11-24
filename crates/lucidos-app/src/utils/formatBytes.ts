@@ -1,5 +1,3 @@
-/** Pretty-print a byte count in the largest sensible unit. Pass `Math.ceil`
- * as `round` when the figure is a minimum the user must reach. */
 export function formatBytes(bytes: number, round: (value: number) => number = Math.round): string {
   if (bytes < 1024) return `${round(bytes)} B`;
   const units = ['KB', 'MB', 'GB', 'TB'];

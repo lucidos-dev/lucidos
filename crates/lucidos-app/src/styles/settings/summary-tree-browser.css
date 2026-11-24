@@ -1,4 +1,3 @@
-/* Summary tree browser: Settings → System → Memory on the Tree module. */
 .tree-browser-head {
     display: flex;
     flex-wrap: wrap;
@@ -14,7 +13,6 @@
     font-variant-numeric: tabular-nums;
 }
 
-/* The thread view's Back row takes a line of its own under the tabs. */
 .tree-browser-thread {
     order: 1;
     flex-basis: 100%;
@@ -34,13 +32,11 @@
 }
 
 .tree-lines {
-    /* The tree's own step per level, not a content-pane gutter. */
     --tree-indent: 1.25rem;
     display: flex;
     flex-direction: column;
 }
 
-/* A phone keeps the leaf readable at depth 8 with a narrower step. */
 @media (--phone-layout) {
     .tree-lines {
         --tree-indent: 0.875rem;
@@ -61,7 +57,6 @@
 }
 
 .tree-line:focus-visible {
-    /* Transparent outline is the forced-colors fallback (box-shadow is stripped). */
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
 }
@@ -111,7 +106,6 @@
     background: var(--bg-tertiary);
 }
 
-/* Who wrote the line, outlined so it never reads as a second count. */
 .tree-line-kind {
     border: 1px solid var(--border-color);
 }
@@ -133,7 +127,6 @@
     word-break: break-word;
 }
 
-/* Depth shows by indent alone, with no guide rail. */
 .tree-line-children {
     padding-left: var(--tree-indent);
 }

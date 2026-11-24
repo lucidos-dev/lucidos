@@ -81,3 +81,10 @@ parent nothing before. Now they carry the only `canceled` card.
   what "idle" means for every trigger and app that reads it.
 - **Call the state "paused".** Rejected. *Paused* already means a turn the
   engine resumes by itself, with no attention.
+
+## Amendment: a human Stop holds automatic wakes
+
+[ADR 0696](0696-human-stop-holds-automatic-wakes.md) makes a device Stop
+hold engine wakes until a human resume, on chat and coding-agent threads.
+Agent messages may still run, without lifting that hold. This preserves the
+stopped child's parent note and the separate automation pause.

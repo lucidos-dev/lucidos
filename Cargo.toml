@@ -1,10 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/lucidos-agent-sandbox",
     "crates/lucidos-build-slot",
     "crates/lucidos-capabilities",
     "crates/lucidos-claude-code-managed",
+    "crates/lucidos-diagnostic-log",
+    "crates/lucidos-diagnostic-log-macros",
+    "crates/lucidos-agents-api",
     "crates/lucidos-engine",
+    "crates/lucidos-core",
+    "crates/lucidos-engine-bin",
+    "crates/lucidos-engine-boot",
+    "crates/lucidos-event-hooks",
     "crates/lucidos-gateway",
     "crates/lucidos-app",
     "crates/lucidos-cli",
@@ -14,14 +22,19 @@ members = [
     "crates/lucidos-file-backup-exclusion",
     "crates/lucidos-frame-capability",
     "crates/lucidos-gateway-constants",
+    "crates/lucidos-gateway-stamp",
+    "crates/lucidos-gateway-tls",
     "crates/lucidos-home",
     "crates/lucidos-secret-store",
     "crates/lucidos-installs",
     "crates/lucidos-local-token",
+    "crates/lucidos-loopback-ca",
     "crates/lucidos-owner-lock",
     "crates/lucidos-pg-url",
+    "crates/lucidos-shell-env",
     "crates/lucidos-tailscale",
-    "crates/lucidos-update-address",
+    "crates/lucidos-update-channel",
+    "crates/lucidos-wire-codegen",
 ]
 # Third-party source carried for a patch, never linted or formatted as ours.
 # A temporary measure: docs/temporary-measures.md, "chromiumoxide is vendored
@@ -52,6 +65,19 @@ incremental = true
 
 [profile.e2e.package."*"]
 opt-level = 3
+codegen-units = 16
+incremental = false
+
+# Optimised builds from a checkout: `web-dev.sh -r`, `run.sh`, local e2e, and
+# Apply and follow-main builds. Shipped builds keep `release` (ADR 0669).
+# Our crates change on every commit, so they compile incrementally across many
+# codegen units. Dependencies build exactly as release builds them.
+[profile.local-release]
+inherits = "release"
+incremental = true
+codegen-units = 256
+
+[profile.local-release.package."*"]
 codegen-units = 16
 incremental = false
 

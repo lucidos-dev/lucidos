@@ -2,25 +2,25 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { DESKTOP_IGNORES, PHONE_SPECS } from './projectRules';
+import { DESKTOP_IGNORES, DESKTOP_WEBKIT_SPECS, PHONE_SPECS } from './projectRules';
 
 const E2E_DIR = __dirname;
 const E2E_LIB = resolve(E2E_DIR, '../../../scripts/lib/e2e_projects.sh');
-const PROJECTS = ['chromium', 'mobile', 'mobile-webkit'] as const;
+const PROJECTS = ['chromium', 'mobile', 'desktop-webkit', 'mobile-webkit'] as const;
+const SUFFIX_PROJECTS = PROJECTS.filter(p => p !== 'desktop-webkit');
 type Project = (typeof PROJECTS)[number];
 
 const SPECS = readdirSync(E2E_DIR).filter(file => file.endsWith('.spec.ts')).sort();
 
-/** What playwright.config.ts decides, from the same patterns it applies. */
 function configRuns(project: Project, spec: string): boolean {
-  return project === 'chromium' ? !DESKTOP_IGNORES.test(spec) : PHONE_SPECS.test(spec);
+  if (project === 'chromium') return !DESKTOP_IGNORES.test(spec);
+  if (project === 'desktop-webkit') return DESKTOP_WEBKIT_SPECS.includes(spec);
+  return PHONE_SPECS.test(spec);
 }
 
-/** What the shell mirror decides, one `<project> <spec> yes|no` line per pair.
- *  Lifts the one function rather than sourcing the whole library. */
 function shellRuns(): Set<string> {
   const script = `
-    eval "$(sed -n '/^project_runs_spec() {/,/^}/p' "$1")"
+    source "$1"
     shift
     for project in ${PROJECTS.join(' ')}; do
       for spec in "$@"; do
@@ -31,10 +31,6 @@ function shellRuns(): Set<string> {
   return new Set(out.split('\n').filter(Boolean));
 }
 
-/** What a spec looks like when it means to behave differently on a phone or
- *  in WebKit. A spec that only desktop Chromium runs never takes that branch.
- *  The navigation shims (`ensureMobileView`, `waitForPaneAtRest`) are no-ops on
- *  desktop and stay allowed. */
 const PLATFORM_BRANCHES: { name: string; pattern: RegExp }[] = [
   { name: 'isMobile', pattern: /\bisMobile\b/ },
   { name: 'isMobileViewport', pattern: /\bisMobileViewport\b/ },
@@ -45,7 +41,6 @@ const PLATFORM_BRANCHES: { name: string; pattern: RegExp }[] = [
   { name: 'touchscreen', pattern: /\btouchscreen\b/ },
 ];
 
-/** Code only: a comment may name a phone or WebKit to explain the spec. */
 function withoutComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 }
@@ -55,6 +50,8 @@ function platformBranches(src: string): string[] {
   return PLATFORM_BRANCHES.filter(b => b.pattern.test(code)).map(b => b.name);
 }
 
+const SHELL_MIRROR_TIMEOUT_MS = 60_000;
+
 describe('browser project rules', () => {
   it('the shell mirror agrees with playwright.config.ts for every spec', () => {
     const shell = shellRuns();
@@ -63,7 +60,7 @@ describe('browser project rules', () => {
         .map(spec => `${project} ${spec}: config ${configRuns(project, spec)}, shell ${shell.has(`${project} ${spec}`)}`));
     expect(SPECS.length).toBeGreaterThan(0);
     expect(disagreements).toEqual([]);
-  });
+  }, SHELL_MIRROR_TIMEOUT_MS);
 
   it('every spec runs on at least one project', () => {
     const orphans = SPECS.filter(spec => !PROJECTS.some(project => configRuns(project, spec)));
@@ -93,6 +90,16 @@ describe('browser project rules', () => {
     expect(PROJECTS.filter(p => configRuns(p, 'chat.spec.ts'))).toEqual(['chromium']);
     expect(PROJECTS.filter(p => configRuns(p, 'header-desktop.spec.ts'))).toEqual(['chromium']);
     expect(PROJECTS.filter(p => configRuns(p, 'swipe-mobile.spec.ts'))).toEqual(['mobile', 'mobile-webkit']);
-    expect(PROJECTS.filter(p => configRuns(p, 'drafts-all.spec.ts'))).toEqual(PROJECTS);
+    expect(PROJECTS.filter(p => configRuns(p, 'drafts-all.spec.ts'))).toEqual(SUFFIX_PROJECTS);
+  });
+
+  it('desktop WebKit runs a named list of specs that exist', () => {
+    expect(DESKTOP_WEBKIT_SPECS.length).toBeGreaterThan(0);
+    expect(DESKTOP_WEBKIT_SPECS.filter(spec => !SPECS.includes(spec))).toEqual([]);
+    expect(new Set(DESKTOP_WEBKIT_SPECS).size).toBe(DESKTOP_WEBKIT_SPECS.length);
+  });
+
+  it('desktop WebKit runs no phone-only spec', () => {
+    expect(DESKTOP_WEBKIT_SPECS.filter(spec => DESKTOP_IGNORES.test(spec))).toEqual([]);
   });
 });

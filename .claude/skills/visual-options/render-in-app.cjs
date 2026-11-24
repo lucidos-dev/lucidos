@@ -1,11 +1,3 @@
-// Renders a mockup inside the user's running Lucidos, read-only, and saves a
-// screenshot. It injects a stylesheet and an HTML fragment into the page and
-// saves nothing to the workspace. Usage lives in SKILL.md beside this file.
-//
-//   node render-in-app.cjs --url <workspace url> --out <png>
-//     [--hash thread=<uuid>] [--css <file>] [--html <file>]
-//     [--into <selector>] [--capture <selector>|viewport] [--hover <selector>]
-//     [--width 1300] [--height 1000] [--ui-scale 125] [--packaged mac]
 
 const path = require('node:path');
 const { readFileSync } = require('node:fs');
@@ -28,8 +20,6 @@ function args() {
   return out;
 }
 
-/** What the macOS app stamps before paint (`titlebar_inset_script`), read from
- *  the Rust that owns it rather than restated here. */
 function macTitlebar() {
   const read = (rel, pattern, what) => {
     const match = pattern.exec(readFileSync(path.join(repoRoot, rel), 'utf8'));
@@ -55,11 +45,9 @@ function macTitlebar() {
     viewport: { width: Number(a.width || 1300), height: Number(a.height || 1000) },
     deviceScaleFactor: 2,
   });
-  // `load`, never `networkidle`: the app holds an SSE stream open.
   await page.goto(`${a.url.replace(/\/+$/, '')}/${a.hash ? `#${a.hash}` : ''}`, { waitUntil: 'load' });
   await page.waitForSelector(into, { timeout: 20000 });
   await page.waitForTimeout(2500);
-  // After boot, never in an init script: boot rewrites the root's inline style.
   await page.evaluate(({ scale, mac }) => {
     const root = document.documentElement;
     if (scale) root.style.setProperty('--user-ui-scale', `${scale}%`);
@@ -78,9 +66,6 @@ function macTitlebar() {
     const scroller = capture === 'viewport' ? null : document.querySelector(capture);
     if (scroller) scroller.scrollTop = scroller.scrollHeight;
     if (!mac) return;
-    // The OS draws the lights, so the page has none: paint stand-ins, centred
-    // on the header bar as the shell centres the real ones. macOS geometry:
-    // 12px buttons, 20px apart. Their colours are the OS's, not the theme's.
     const barCentre = document.querySelector('.app-header').getBoundingClientRect().bottom / 2;
     ['#ff5f57', '#febc2e', '#28c840'].forEach((colour, i) => {
       const light = document.createElement('div');
@@ -91,8 +76,6 @@ function macTitlebar() {
   }, { css, html, into, capture, mac });
   await page.waitForTimeout(400);
   if (a.hover) await page.hover(a.hover);
-  // The packaged header reaches up into the title band above `.app-header`, so
-  // a header preview captures the viewport rather than the element.
   if (capture === 'viewport') await page.screenshot({ path: a.out });
   else await page.locator(capture).first().screenshot({ path: a.out });
   await browser.close();

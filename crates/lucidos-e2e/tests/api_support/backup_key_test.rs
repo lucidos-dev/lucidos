@@ -10,7 +10,7 @@
 //! `Referer` (ADR 0117). The switch deletes it.
 //!
 //! The e2e engine is no app bundle, so its key store is the key file under
-//! `~/.lucidos/secret-keys` (ADR 0509). A drop guard restores the original
+//! the private entry `secret-keys` (ADR 0509). A drop guard restores the original
 //! legacy key (or its absence) so the test is hermetic even on panic.
 
 use crate::support::{base_url, db_url, user_client};
@@ -191,6 +191,17 @@ async fn backups_wait_for_the_paste_back_and_never_store_the_backup_key() {
     let resp = put_schedule(&client, &api, "0 0 3 * * *").await;
     assert_eq!(resp.status().as_u16(), 200);
     put_schedule(&client, &api, "off").await;
+
+    // Sealing works now, but the disposable workspace has no Dropbox account,
+    // so a manual backup is refused up front rather than failing in the run.
+    let refused = post_json(
+        &client,
+        &format!("{api}/api/v1/backup"),
+        json!({ "provider": "dropbox" }),
+    )
+    .await;
+    assert_eq!(refused.status().as_u16(), 409);
+    assert_eq!(reason(refused).await, "provider-not-ready");
 
     // Verify tells the held key from another, and forgets both.
     let resp = post_json(&client, &verify_url, json!({ "backup_key": backup_key })).await;

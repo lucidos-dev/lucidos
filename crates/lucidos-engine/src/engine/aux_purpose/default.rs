@@ -105,7 +105,7 @@ fn measured_only(purpose: ContextPurpose) -> bool {
 
 /// Whether `purpose` asks no model at all, its selection having come from
 /// `source`: it runs only on measured models, and none was reachable.
-pub(crate) fn asks_no_model(purpose: ContextPurpose, source: ModelSource) -> bool {
+pub fn asks_no_model(purpose: ContextPurpose, source: ModelSource) -> bool {
     measured_only(purpose) && source == ModelSource::ChatModel
 }
 
@@ -119,7 +119,7 @@ pub(crate) fn asks_no_model(purpose: ContextPurpose, source: ModelSource) -> boo
 ///
 /// A purpose that needs vision recommends only models that read images, so
 /// its default never lands on one it would then refuse.
-pub(crate) fn recommended(purpose: ContextPurpose, registry: &ModelRegistry) -> Vec<String> {
+pub fn recommended(purpose: ContextPurpose, registry: &ModelRegistry) -> Vec<String> {
     let env = std::env::var(EXTRACTION_MODEL_ENV)
         .ok()
         .filter(|model| !model.trim().is_empty());
@@ -129,7 +129,7 @@ pub(crate) fn recommended(purpose: ContextPurpose, registry: &ModelRegistry) -> 
 /// The tier the badge in `purpose`'s picker marks as recommended for `model`.
 /// Only the compactor has one: its tiers are the measured *compactor
 /// default*'s. Every other purpose's default tier was never benchmarked.
-pub(crate) fn recommended_effort(purpose: ContextPurpose, model: &str) -> Option<&'static str> {
+pub fn recommended_effort(purpose: ContextPurpose, model: &str) -> Option<&'static str> {
     match model_source(purpose) {
         AuxModelSource::ProviderResolved => default_effort_for(model),
         _ => None,

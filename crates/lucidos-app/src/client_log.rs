@@ -1,146 +1,209 @@
-//! Where the packaged client's own diagnostics go.
-//!
-//! LaunchServices hands a launched app a write-only sink for fd 1 and fd 2, and
-//! nothing written there reaches the unified log. So every `eprintln!` in the
-//! client role was discarded, the updater's account of a relaunch that never
-//! happened included. The service and login agents take their sinks from their
-//! plists. The client has no plist, so it opens its own.
-//!
-//! Development is untouched. It runs from a terminal, where stderr already goes
-//! somewhere useful, and it shares the packaged app-data dir, which is not its
-//! to write into.
+//! Sanitized, classified diagnostics for the packaged desktop shell.
+//! Raw host output stays with the launching process; it is never a bundle source.
+use std::path::{Path, PathBuf};
 
-use std::io;
-use std::path::Path;
+use lucidos_diagnostic_log as shared;
 
-use crate::desktop;
-
-/// The client's combined stdout and stderr, under `<app-data>/logs/`.
-///
-/// One file, rather than the `.out` / `.err` pair the plists give the two
-/// agents. The interleaving is the point: the `open` a relaunch watcher could
-/// not complete has to read directly after the updater line that preceded it.
-const CLIENT_LOG: &str = "client.log";
-
-/// The single kept generation, rotated to at start.
-const CLIENT_LOG_PREVIOUS: &str = "client.log.1";
-
-/// The size at which a start rotates. Generous for a file only written on a
-/// fault, and small enough that two generations stay a rounding error beside
-/// the install. A log with no cap at all is not theoretical: the service's own
-/// `engine-service.out.log` reached 579 MB on one machine.
-const CLIENT_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Point this process's stdout and stderr at `<app-data>/logs/client.log`, and
-/// mark the start of a launch in it.
-///
-/// Called as the first statement of [`crate::run`], so everything after it is
-/// captured. Best-effort by design: a client that cannot open its log still has
-/// to start.
-pub(crate) fn install() {
-    if tauri::is_dev() {
-        return;
-    }
-    // The service's plist owns its sink, and `parse_service_boots` reads that
-    // file back to tell a crash loop from a slow boot. `main` routes the service
-    // before `crate::run`; this is the belt for that ordering.
-    if crate::launch_role(std::env::args_os()) == crate::LaunchRole::Service {
-        return;
-    }
-    if let Err(e) = redirect_to_app_data() {
-        // Nowhere to report this, by construction: the sink we failed to open
-        // is the one that would have carried it. A packaged build started from
-        // a terminal still shows it.
-        eprintln!("[client] no log file ({e}); diagnostics are being discarded");
-        return;
-    }
-    eprintln!(
-        "[client] launch starting (pid {}, v{})",
-        std::process::id(),
-        env!("CARGO_PKG_VERSION")
-    );
+pub(crate) enum Lifecycle {
+    LaunchStarting,
+    ServiceStartFailed,
+    GatewayHealthRetry,
+    GatewayHealthReached,
+    #[cfg(target_os = "macos")]
+    RelaunchScheduled,
+    Relaunch(crate::RelaunchOutcome),
 }
 
-/// Open the log, rotating an oversized one first, and take over both streams.
-fn redirect_to_app_data() -> io::Result<()> {
-    let app_data = desktop::app_data_dir_from_env()?;
-    lucidos_home::ensure_storage_root(&app_data)?;
-    let logs = app_data.join("logs");
-    std::fs::create_dir_all(&logs)?;
-    let log = logs.join(CLIENT_LOG);
-    rotate_if_large(&log, &logs.join(CLIENT_LOG_PREVIOUS), CLIENT_LOG_MAX_BYTES)?;
-    redirect_std_streams(&log)
-}
-
-/// Has the log earned a rotation? Pure, so the boundary is tested rather than
-/// reasoned about.
-fn should_rotate(size: u64, cap: u64) -> bool {
-    size > cap
-}
-
-/// Move an oversized `log` onto `previous`, replacing whatever was there.
-///
-/// Exactly one generation, so the pair is bounded at twice the cap. A log that
-/// is not there yet is the first launch, not a failure.
-fn rotate_if_large(log: &Path, previous: &Path, cap: u64) -> io::Result<()> {
-    let Ok(meta) = std::fs::metadata(log) else {
-        return Ok(());
-    };
-    if !should_rotate(meta.len(), cap) {
-        return Ok(());
-    }
-    std::fs::rename(log, previous)
-}
-
-/// Point fd 1 and fd 2 at `path`.
-#[cfg(unix)]
-fn redirect_std_streams(path: &Path) -> io::Result<()> {
-    redirect_fds(path, &[libc::STDOUT_FILENO, libc::STDERR_FILENO])
-}
-
-/// Owner-only, for a file nobody else has any business reading.
-///
-/// The app-data dir itself is world-readable, and the client's diagnostics
-/// carry what it was doing: workspace URLs, and on one preview error path an
-/// external URL the user opened. All of that used to be discarded. Keeping the
-/// file to its owner is what stops this widening what a local account can see.
-/// It is also the file a user is asked to send for support.
-#[cfg(unix)]
-const CLIENT_LOG_MODE: u32 = 0o600;
-
-/// Point every descriptor in `targets` at `path`, appending.
-///
-/// Appending rather than truncating, because a relaunch is exactly the moment
-/// the previous launch's last lines matter. `targets` is a parameter so a test
-/// can prove the mechanism against scratch descriptors, rather than seizing the
-/// harness's own streams mid-run.
-#[cfg(unix)]
-fn redirect_fds(path: &Path, targets: &[i32]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(CLIENT_LOG_MODE)
-        .open(path)?;
-    let fd = file.as_raw_fd();
-    for target in targets {
-        // SAFETY: `dup2` takes two descriptors and no pointers. `fd` is open for
-        // the whole call, and the caller owns every target. The duplicates
-        // outlive `file`, which is what makes dropping it below safe.
-        if unsafe { libc::dup2(fd, *target) } == -1 {
-            return Err(io::Error::last_os_error());
+impl Lifecycle {
+    fn record(self) -> (&'static str, shared::Line) {
+        match self {
+            Self::LaunchStarting => ("Client", shared::line!("client launch starting")),
+            Self::ServiceStartFailed => (
+                "Client",
+                shared::line!("could not start the background service"),
+            ),
+            Self::GatewayHealthRetry => (
+                "Client",
+                shared::line!("gateway health check timed out, retrying"),
+            ),
+            Self::GatewayHealthReached => {
+                ("Client", shared::line!("gateway health check succeeded"))
+            }
+            #[cfg(target_os = "macos")]
+            Self::RelaunchScheduled => ("Relaunch", shared::line!("relaunch watcher scheduled")),
+            Self::Relaunch(outcome) => {
+                use crate::RelaunchOutcome::*;
+                let line = match outcome {
+                    PreviousClientStillRunning => {
+                        shared::line!("relaunch canceled because the previous client did not exit")
+                    }
+                    ClientObserved => shared::line!("relaunched client process observed"),
+                    AttemptsExhausted => shared::line!("relaunch attempts exhausted"),
+                };
+                ("Relaunch", line)
+            }
         }
     }
+}
+
+pub(crate) fn record_lifecycle(event: Lifecycle) {
+    if !crate::desktop::is_packaged_desktop() {
+        return;
+    }
+    let result =
+        crate::desktop::app_data_dir_from_env().and_then(|root| record_lifecycle_at(&root, event));
+    if let Err(error) = result {
+        shared::stderr::host_error(&format!(
+            "[client] cannot record lifecycle diagnostic ({error})"
+        ));
+    }
+}
+
+fn record_lifecycle_at(root: &Path, event: Lifecycle) -> std::io::Result<()> {
+    lucidos_home::ensure_storage_root(root)?;
+    let _owner = lucidos_owner_lock::OwnerLock::acquire(&root.join("client-lifecycle-log.lock"))?;
+    let (label, line) = event.record();
+    shared::writer::Segments::open(&root.join(shared::CLIENT_LIFECYCLE_DIR))?
+        .append_line(label, line)
+}
+
+pub fn record_relaunch(outcome: crate::RelaunchOutcome) {
+    record_lifecycle(Lifecycle::Relaunch(outcome));
+}
+
+pub(crate) fn dir_for(app_data: &Path) -> PathBuf {
+    app_data.join(shared::CLIENT_LOG_DIR)
+}
+
+/// Source development keeps its terminal and never writes the packaged app's
+/// data directory. The service owns a separate log and starts before this path.
+pub(crate) fn install() {
+    if tauri::is_dev() || crate::launch_role(std::env::args_os()) == crate::LaunchRole::Service {
+        return;
+    }
+    let result = crate::desktop::app_data_dir_from_env().and_then(|root| {
+        lucidos_home::ensure_storage_root(&root)?;
+        start(&root)
+    });
+    if let Err(error) = result {
+        shared::stderr::host_error(&format!("[client] no diagnostic log ({error})"));
+    }
+    record_lifecycle(Lifecycle::LaunchStarting);
+}
+
+fn start(app_data: &Path) -> std::io::Result<()> {
+    if shared::started() {
+        return Ok(());
+    }
+    register_environment_secrets();
+    shared::start(&dir_for(app_data))?;
+    shared::install_panic_hook();
+    shared::stderr::install()?;
+    shared::stderr::install_stdout()?;
+    shared::record(
+        "Client",
+        shared::line!("launch starting pid={}", std::process::id()),
+    );
     Ok(())
 }
 
-/// macOS is the only packaged client Lucidos ships, and its sink is the reason
-/// this module exists. Anywhere else the streams are left alone.
-#[cfg(not(unix))]
-fn redirect_std_streams(_path: &Path) -> io::Result<()> {
+/// A detached relaunch watcher must not depend on the dying client's pipe
+/// reader. Its small headless helper owns a separate rotating sink, avoiding
+/// concurrent writers to the client's segments.
+pub fn capture_relaunch() {
+    register_environment_secrets();
+    let mut input = std::io::stdin().lock();
+    if !crate::desktop::is_packaged_desktop() {
+        let _ = std::io::copy(&mut input, &mut std::io::sink());
+        return;
+    }
+    let result = crate::desktop::app_data_dir_from_env()
+        .and_then(|root| capture_relaunch_at(&root, &mut input));
+    if let Err(error) = result {
+        shared::stderr::host_error(&format!("[client] no relaunch diagnostic log ({error})"));
+        // Still drain: a logging failure must never SIGPIPE the relaunch watcher.
+        let _ = std::io::copy(&mut input, &mut std::io::sink());
+    }
+}
+
+fn capture_relaunch_at(root: &Path, input: impl std::io::Read) -> std::io::Result<()> {
+    lucidos_home::ensure_storage_root(root)?;
+    // Rapid successive relaunches may overlap helpers. Serialize their writers,
+    // retaining the fixed two-segment cap rather than creating per-run files.
+    let _owner =
+        lucidos_owner_lock::OwnerLock::acquire(&root.join("client-relaunch-diagnostic-log.lock"))?;
+    shared::start(&root.join(shared::CLIENT_RELAUNCH_LOG_DIR))?;
+    shared::stderr::capture_reader("Relaunch", input);
+    flush();
     Ok(())
+}
+
+fn register_environment_secrets() {
+    shared::sanitize::register_secret_values(std::env::vars_os().filter_map(|(name, value)| {
+        secret_env_name(name.to_str()?)
+            .then(|| value.into_string().ok())
+            .flatten()
+    }));
+    if let Some(token) = lucidos_local_token::read() {
+        secret(token);
+    }
+}
+
+/// Spawn capture before the watcher, so the watcher always has a reader after
+/// this client exits. The helper never initializes Tauri or takes a client lock.
+#[cfg(target_os = "macos")]
+pub(crate) fn relaunch_output(exe: &Path) -> std::io::Result<std::process::Stdio> {
+    use std::process::{Command, Stdio};
+    if !crate::desktop::is_packaged_desktop() {
+        return Ok(Stdio::inherit());
+    }
+    let mut helper = Command::new(exe)
+        .arg("--capture-client-relaunch-log")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(Stdio::from(
+        helper.stdin.take().expect("piped helper stdin"),
+    ))
+}
+
+fn secret_env_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    if matches!(
+        name.as_str(),
+        "GOOGLE_APPLICATION_CREDENTIALS"
+            | "LUCIDOS_TLS_KEY"
+            | "LUCIDOS_PREVIEW_TLS_KEY"
+            | "LUCIDOS_PREVIEW_USER_TLS_KEY"
+    ) {
+        return false;
+    }
+    matches!(
+        name.as_str(),
+        "PGPASSWORD" | "DATABASE_URL" | "LUCIDOS_DATABASE_URL"
+    ) || name.starts_with("CRED_")
+        || name.starts_with("OAUTH_")
+        || [
+            "_TOKEN",
+            "_SECRET",
+            "_PASSWORD",
+            "_PASSWD",
+            "_KEY",
+            "_PAT",
+            "_CREDENTIALS",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+pub(crate) fn secret(value: String) -> String {
+    shared::sanitize::register_secret_values([value.clone()]);
+    value
+}
+
+pub(crate) fn flush() {
+    shared::flush(std::time::Duration::from_secs(1));
 }
 
 #[cfg(test)]
@@ -148,112 +211,237 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rotation_starts_above_the_cap_and_not_at_it() {
-        assert!(!should_rotate(0, 10));
-        assert!(!should_rotate(10, 10));
-        assert!(should_rotate(11, 10));
-    }
+    fn startup_and_relaunch_events_use_the_classified_lifecycle_segments() {
+        use crate::RelaunchOutcome::*;
 
-    #[test]
-    fn an_oversized_log_is_rotated_to_one_generation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join(CLIENT_LOG);
-        let previous = tmp.path().join(CLIENT_LOG_PREVIOUS);
+        let root = tempfile::tempdir().unwrap();
+        for event in [
+            Lifecycle::LaunchStarting,
+            Lifecycle::GatewayHealthReached,
+            Lifecycle::Relaunch(PreviousClientStillRunning),
+            Lifecycle::Relaunch(ClientObserved),
+            Lifecycle::Relaunch(AttemptsExhausted),
+        ] {
+            record_lifecycle_at(root.path(), event).unwrap();
+        }
 
-        std::fs::write(&log, b"first").expect("write the log");
-        rotate_if_large(&log, &previous, 1).expect("rotate");
-        assert!(!log.exists(), "the oversized log moves aside");
-        assert_eq!(std::fs::read(&previous).expect("read"), b"first");
-    }
-
-    // Two generations, never three. A client that faults on every start would
-    // otherwise leave a directory of them.
-    #[test]
-    fn a_second_rotation_replaces_the_kept_generation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join(CLIENT_LOG);
-        let previous = tmp.path().join(CLIENT_LOG_PREVIOUS);
-
-        std::fs::write(&log, b"first").expect("write the log");
-        rotate_if_large(&log, &previous, 1).expect("rotate once");
-        std::fs::write(&log, b"second").expect("write the log again");
-        rotate_if_large(&log, &previous, 1).expect("rotate twice");
-
-        assert_eq!(std::fs::read(&previous).expect("read"), b"second");
-        let kept: Vec<_> = std::fs::read_dir(tmp.path())
-            .expect("list")
-            .filter_map(Result::ok)
+        let path = root
+            .path()
+            .join(shared::CLIENT_LIFECYCLE_DIR)
+            .join(shared::writer::FILE_NAME);
+        let contents = std::fs::read_to_string(path).unwrap();
+        let messages: Vec<_> = contents
+            .lines()
+            .map(|text| {
+                let record: shared::writer::Record = serde_json::from_str(text).unwrap();
+                assert!(record.line.is_some());
+                record.render(shared::Destination::Maintainer)
+            })
             .collect();
-        assert_eq!(kept.len(), 1, "one generation, plus nothing else");
+        assert_eq!(
+            messages,
+            [
+                "client launch starting",
+                "gateway health check succeeded",
+                "relaunch canceled because the previous client did not exit",
+                "relaunched client process observed",
+                "relaunch attempts exhausted",
+            ]
+        );
+        assert!(!dir_for(root.path()).exists());
+        assert!(!root.path().join(shared::CLIENT_RELAUNCH_LOG_DIR).exists());
     }
 
     #[test]
-    fn a_log_under_the_cap_is_left_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join(CLIENT_LOG);
-        std::fs::write(&log, b"small").expect("write the log");
-        rotate_if_large(&log, &tmp.path().join(CLIENT_LOG_PREVIOUS), 1024).expect("no rotation");
-        assert_eq!(std::fs::read(&log).expect("read"), b"small");
-    }
-
-    // The first launch has no log yet, which is not a failure to report.
-    #[test]
-    fn a_missing_log_is_the_first_launch() {
-        let tmp = tempfile::tempdir().unwrap();
-        rotate_if_large(
-            &tmp.path().join(CLIENT_LOG),
-            &tmp.path().join(CLIENT_LOG_PREVIOUS),
-            1,
-        )
-        .expect("a missing log rotates to nothing");
-    }
-
-    // Both streams, one file, in the order they were written. Proven against
-    // scratch descriptors: seizing the real 1 and 2 would swallow whatever the
-    // harness printed during the window.
-    #[cfg(unix)]
-    #[test]
-    fn the_redirect_sends_every_stream_to_one_file_in_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(CLIENT_LOG);
-        // SAFETY: `dup` takes one descriptor and no pointers. fd 1 is open for
-        // the life of the process, and the copies are closed below.
-        let (first, second) = unsafe { (libc::dup(1), libc::dup(1)) };
-        assert!(first > 0 && second > 0, "the scratch descriptors opened");
-
-        redirect_fds(&path, &[first, second]).expect("redirect");
-        for (fd, line) in [(first, "from the first\n"), (second, "from the second\n")] {
-            // SAFETY: `fd` is a descriptor this test owns and `line` is a live
-            // slice of exactly `len` bytes.
-            unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+    fn relaunch_capture_survives_the_client_process() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "CLIENT_RELAUNCH_TEST_ROOT";
+        const HELPER: &str = "CLIENT_RELAUNCH_TEST_HELPER";
+        if let Some(root) = std::env::var_os(CHILD) {
+            if std::env::var_os(HELPER).is_some() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !Path::new(&root).join("owner-exited").exists() {
+                    assert!(std::time::Instant::now() < deadline, "owner did not exit");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                register_environment_secrets();
+                capture_relaunch_at(Path::new(&root), std::io::stdin().lock()).unwrap();
+            } else {
+                // This child must outlive the simulated GUI process. Waiting
+                // here would deadlock: the test releases it after this exits.
+                #[allow(clippy::zombie_processes)]
+                let mut helper = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "client_log::tests::relaunch_capture_survives_the_client_process",
+                        "--nocapture",
+                    ])
+                    .env(HELPER, "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                writeln!(
+                    helper.stdin.take().unwrap(),
+                    "PRIVATE_RELAUNCH_MARKER opaque-client-credential"
+                )
+                .unwrap();
+                // The process exits without waiting for capture, as the GUI does.
+            }
+            return;
         }
-        // SAFETY: both descriptors are this test's own and still open.
-        unsafe {
-            libc::close(first);
-            libc::close(second);
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client_log::tests::relaunch_capture_survives_the_client_process",
+                "--nocapture",
+            ])
+            .env(CHILD, root.path())
+            .env("CRED_DIAGNOSTIC_TEST", "opaque-client-credential")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(root.path().join("owner-exited"), b"").unwrap();
+        let path = root
+            .path()
+            .join(shared::CLIENT_RELAUNCH_LOG_DIR)
+            .join(shared::writer::FILE_NAME);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains("PRIVATE_RELAUNCH_MARKER") {
+                assert!(!text.contains("opaque-client-credential"));
+                for line in text.lines() {
+                    let record: shared::writer::Record = serde_json::from_str(line).unwrap();
+                    assert!(record.ts.ends_with('Z'));
+                    assert!(!record
+                        .render(shared::Destination::Maintainer)
+                        .contains("PRIVATE_"));
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached capture lost"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-
-        let written = std::fs::read_to_string(&path).expect("read the log");
-        assert_eq!(written, "from the first\nfrom the second\n");
     }
 
-    // The app-data dir is world-readable, and this file now keeps what the
-    // client was doing. A support request hands it to somebody; a local account
-    // must not be able to read it without being asked.
-    #[cfg(unix)]
     #[test]
-    fn the_log_is_created_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
+    fn shell_logging_wiring() {
+        if let Some(root) = std::env::var_os("CLIENT_DIAGNOSTIC_TEST_ROOT") {
+            start(Path::new(&root)).unwrap();
+            if std::env::var_os("CLIENT_DIAGNOSTIC_PANIC").is_some() {
+                panic!("PRIVATE_CLIENT_PANIC_MARKER");
+            }
+            use std::io::Write;
+            writeln!(
+                std::io::stderr(),
+                "PRIVATE_STDERR_MARKER opaque-client-credential"
+            )
+            .unwrap();
+            writeln!(std::io::stdout(), "PRIVATE_STDOUT_MARKER").unwrap();
+            let path = dir_for(Path::new(&root)).join(shared::writer::FILE_NAME);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                if text.contains("PRIVATE_STDERR_MARKER") && text.contains("PRIVATE_STDOUT_MARKER")
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing captures");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            flush();
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = child(root.path(), false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("opaque-client-credential"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PRIVATE_STDOUT_MARKER"));
+        assert_records(root.path(), "PRIVATE_STDERR_MARKER");
+        assert!(
+            !root.path().join("logs/client.log").exists(),
+            "no raw host-log copy"
+        );
+    }
 
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(CLIENT_LOG);
-        // SAFETY: `dup` takes one descriptor and no pointers, and fd 1 is open.
-        let scratch = unsafe { libc::dup(1) };
-        redirect_fds(&path, &[scratch]).expect("redirect");
-        // SAFETY: the descriptor is this test's own and still open.
-        unsafe { libc::close(scratch) };
+    fn child(root: &Path, panic: bool) -> std::process::Output {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "client_log::tests::shell_logging_wiring",
+                "--nocapture",
+            ])
+            .env("CLIENT_DIAGNOSTIC_TEST_ROOT", root)
+            .env("CRED_DIAGNOSTIC_TEST", "opaque-client-credential");
+        if panic {
+            command.env("CLIENT_DIAGNOSTIC_PANIC", "1");
+        }
+        command.output().unwrap()
+    }
 
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, CLIENT_LOG_MODE, "got {:o}", mode & 0o777);
+    fn assert_records(root: &Path, marker: &str) {
+        let text = std::fs::read_to_string(dir_for(root).join(shared::writer::FILE_NAME)).unwrap();
+        assert!(text.contains(marker));
+        assert!(!text.contains("opaque-client-credential"));
+        for line in text.lines() {
+            let record: shared::writer::Record = serde_json::from_str(line).unwrap();
+            assert!(record.ts.ends_with('Z'));
+            assert!(!record
+                .render(shared::Destination::Maintainer)
+                .contains("PRIVATE_"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir_for(root).join(shared::writer::FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn fatal_shell_panic_survives_process_exit() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!child(root.path(), true).status.success());
+        assert_records(root.path(), "PRIVATE_CLIENT_PANIC_MARKER");
+    }
+
+    #[test]
+    fn credentials_are_distinct_from_configuration_paths() {
+        for name in [
+            "CRED_EXAMPLE",
+            "OAUTH_EXAMPLE",
+            "GH_TOKEN",
+            "PGPASSWORD",
+            "DATABASE_URL",
+        ] {
+            assert!(secret_env_name(name));
+        }
+        for name in [
+            "HOME",
+            "PATH",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "LUCIDOS_TLS_KEY",
+        ] {
+            assert!(!secret_env_name(name));
+        }
+        assert_eq!(
+            dir_for(Path::new("/srv/app")),
+            Path::new("/srv/app/client-diagnostic-log")
+        );
     }
 }

@@ -3,7 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-14
 - **Amends**: [0417](0417-turn-end-gate-enforces-valid-states.md), [0426](0426-read-decision-leads-with-gemini-3-8-flash.md), [0433](0433-turn-end-decisions-are-judgment-sites.md), [0435](0435-wake-decision-shares-the-read-decisions-default.md)
-- **Amended by**: [0477](0477-read-decision-predicates-and-steadiness-measured.md), which measured the deferred split predicates and ways to steady the chat judge
+- **Amended by**: [0477](0477-read-decision-predicates-and-steadiness-measured.md), which measured the deferred split predicates and ways to steady the chat judge; [0747](0747-trigger-read-yes-goes-to-the-judge.md), which routes a trigger agent’s yes through the judge
 
 Record: `docs/plans/2026-10-14-trigger-runs-out-of-review.md`.
 

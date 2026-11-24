@@ -74,7 +74,7 @@ pub async fn provider_for(engine: &LucidosEngine) -> Result<Arc<dyn VoiceProvide
         return Err("no OpenAI key is configured".to_string());
     };
 
-    log!("[Voice] Calling {} with the key from {}", model, source);
+    log_legacy!("[Voice] Calling {} with the key from {}", model, source);
     // The two protocols share a key and nothing else, so the id decides here
     // and nowhere above. Both answer the same seam, so no caller learns which.
     if speaks_live(&model) {

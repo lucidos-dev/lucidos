@@ -21,6 +21,12 @@ use crate::workspace::BoxError;
 pub(crate) const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
 const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 
+/// Does this process hold its thread's origin token, as a Lucidos-spawned
+/// subprocess does?
+pub(crate) fn has_origin_token() -> bool {
+    std::env::var(ENV_AGENT_ORIGIN_TOKEN).is_ok_and(|token| !token.is_empty())
+}
+
 /// The *target workspace assertion*: which workspace this request is meant for.
 /// Mirrors `api::actor::HEADER_TARGET_WORKSPACE` under the same lockstep rule as
 /// the origin token above. The engine refuses with 409 when it names a
@@ -113,16 +119,10 @@ fn self_workspace_name() -> Option<String> {
     Some(name)
 }
 
-/// Blocking HTTP client preconfigured for the local Lucidos engine.
-/// Accepts the engine's self-signed cert because the target is `localhost`.
-/// Auto-forwards the thread-bound origin token when the matching env var
-/// is present (i.e., we're inside a Lucidos-spawned subprocess).
-///
-/// `no_proxy()` + `danger_accept_invalid_certs(true)` is the loopback pair
-/// `.claude/rules/rust.md` prescribes, and the one `pair.rs` and every engine
-/// and gateway client already use. Without it an `HTTPS_PROXY` in the
-/// environment, which a corporate machine exports globally, routes every
-/// subcommand's call to its own engine through that proxy.
+/// Blocking HTTP client preconfigured for the local Lucidos engine, which is
+/// a loopback target. Auto-forwards the thread-bound origin token when the
+/// matching env var is present (i.e., we're inside a Lucidos-spawned
+/// subprocess).
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
     engine_client_builder()
         .build()
@@ -130,9 +130,7 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
 }
 
 fn engine_client_builder() -> reqwest::blocking::ClientBuilder {
-    reqwest::blocking::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
+    lucidos_local_token::client::blocking_client_builder()
         .default_headers(default_headers_from_env())
         // Only our pre-connection policy may replay a request. A redirect
         // could otherwise fail to connect after the first server handled it.
@@ -315,7 +313,7 @@ fn root_cause(err: &reqwest::Error) -> String {
 const HEADER_CHILD_REPORTS_WAITING: &str = "lucidos-child-reports-waiting";
 
 /// The stderr line for a response announcing waiting child reports, if any.
-fn child_reports_note(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn child_reports_note(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let waiting: u64 = headers
         .get(HEADER_CHILD_REPORTS_WAITING)?
         .to_str()
@@ -343,6 +341,35 @@ pub(crate) fn send_expect_success(
     url: &str,
     req: reqwest::blocking::RequestBuilder,
 ) -> Result<String, BoxError> {
+    send_or_refusal(method, url, req)?
+}
+
+/// [`send_expect_success`], with a 4xx answer as the inner `Err`. The server
+/// read that request and refused it, so it did not land. The outer `Err` is a
+/// failure whose outcome is unknown.
+pub(crate) fn send_or_refusal(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<Result<String, BoxError>, BoxError> {
+    Ok(send_or_refusal_with_headers(method, url, req)?.map(|(_, text)| text))
+}
+
+/// [`send_expect_success`], keeping the response headers for a caller that
+/// reads a side channel the body does not carry.
+pub(crate) fn send_expect_success_with_headers(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<(reqwest::header::HeaderMap, String), BoxError> {
+    send_or_refusal_with_headers(method, url, req)?
+}
+
+fn send_or_refusal_with_headers(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<Result<(reqwest::header::HeaderMap, String), BoxError>, BoxError> {
     let start = Instant::now();
     let resp = req
         .send_with_connect_retry()
@@ -352,13 +379,19 @@ pub(crate) fn send_expect_success(
         // A side channel for the agent reading this, beside the body it parses.
         eprintln!("{note}");
     }
+    let headers = resp.headers().clone();
     let text = resp
         .text()
         .map_err(|e| format!("Failed to read response body: {}", e))?;
-    if !status.is_success() {
-        return Err(format!("{} {} returned {}: {}", method, url, status, text).into());
+    if status.is_success() {
+        return Ok(Ok((headers, text)));
     }
-    Ok(text)
+    let error: BoxError = format!("{} {} returned {}: {}", method, url, status, text).into();
+    if status.is_client_error() {
+        Ok(Err(error))
+    } else {
+        Err(error)
+    }
 }
 
 /// [`send_expect_success`], then parse the body as JSON.
@@ -549,6 +582,61 @@ mod tests {
             );
         });
         (port, rx)
+    }
+
+    /// Accept one request and answer it with `status_line`.
+    fn spawn_status_server(status_line: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                format!("HTTP/1.1 {status_line}\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes(),
+            );
+        });
+        port
+    }
+
+    /// A 4xx is a refusal the server read, so it is the inner error. A 5xx
+    /// leaves the outcome unknown, so it is the outer one.
+    #[test]
+    fn a_client_error_is_a_refusal_and_a_server_error_is_unknown() {
+        let send = |status_line| {
+            let url = format!("http://127.0.0.1:{}/x", spawn_status_server(status_line));
+            send_or_refusal("POST", &url, reqwest::blocking::Client::new().post(&url))
+        };
+        assert_eq!(send("200 OK").unwrap().unwrap(), "{}");
+        assert!(send("409 Conflict").unwrap().is_err());
+        assert!(send("500 Internal Server Error").is_err());
+    }
+
+    #[test]
+    fn a_stale_origin_token_refusal_keeps_the_server_body_verbatim() {
+        let body = r#"{"error":"The engine may have restarted since it was issued. Run it again.","reason":"origin_token_stale"}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            assert!(stream.read(&mut buf).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let url = format!("http://127.0.0.1:{port}/api/v1/data/artifacts/report.json");
+        let error = send_expect_success("PUT", &url, reqwest::blocking::Client::new().put(&url))
+            .unwrap_err()
+            .to_string();
+        server.join().unwrap();
+        assert_eq!(
+            error,
+            format!("PUT {url} returned 401 Unauthorized: {body}")
+        );
     }
 
     /// The deadline-carrying constructor sends the SAME two headers as the

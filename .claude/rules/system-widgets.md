@@ -29,5 +29,5 @@ a lighter stroke. They never take the bold full-colour motif
   filled, in the hue.
 
 `every_built_in_icon_follows_the_host_glyph_style` in
-`crates/lucidos-engine/src/core/system_widgets.rs` checks the grid, the stroke,
+`crates/lucidos-core/src/core/system_widgets.rs` checks the grid, the stroke,
 the banned elements and the shared hue.

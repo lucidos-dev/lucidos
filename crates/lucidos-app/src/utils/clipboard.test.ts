@@ -7,7 +7,6 @@ vi.mock('../store/store', () => ({ showToast }));
 const { copyImageToClipboard, fetchImageAsPng } = await import('./clipboard');
 const { clipboardAbilitiesOf } = await import('./platform');
 
-/** Records what it was built with, as the real `ClipboardItem` holds it. */
 class FakeClipboardItem {
   constructor(readonly items: Record<string, Promise<Blob>>) {}
 }
@@ -23,7 +22,6 @@ function stubClipboard(write: (items: FakeClipboardItem[]) => Promise<void>) {
   Object.defineProperty(navigator, 'clipboard', { value: { write }, configurable: true });
 }
 
-/** Lets the write's `then` and the fetch it waits on run. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 beforeEach(() => showToast.mockReset());
@@ -60,7 +58,6 @@ describe('copyImageToClipboard', () => {
     stubClipboard(write);
 
     copyImageToClipboard('/data/artifacts/shot.png');
-    // The item is built in the tap's own task, before the fetch has finished.
     expect(write).toHaveBeenCalledTimes(1);
     const [[[item]]] = write.mock.calls as unknown as [[FakeClipboardItem[]]];
     expect(Object.keys(item.items)).toEqual(['image/png']);

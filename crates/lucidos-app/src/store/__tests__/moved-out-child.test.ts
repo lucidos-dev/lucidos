@@ -1,6 +1,3 @@
-/** A child moved to top level, as its former parent's transcript shows it
- *  (ADR 0278). Like a stopped child's note, it wakes nothing. So it is a turn
- *  of its own, done at once, owning none of the work around it. */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getExchanges, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeStatus, isTurnlessBoundary, type ThreadEvent } from '../thread-events';

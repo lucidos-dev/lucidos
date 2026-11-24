@@ -1,19 +1,3 @@
-/**
- * The voice client is dumb, and this is what keeps it that way.
- *
- * ADR 0149 and the parent plan's decision 3: no provider name, model id,
- * endpoint or credential reaches the client. A page script can read anything
- * the bundle holds, so a key here is a key given away.
- *
- * Phase 3 could only check the engine's payload types, having no bundle to
- * read. This is the other half, and it is a source scan for the same reason
- * `voice::purity_tests` is: the property is structural, and a scan fails at the
- * first line rather than at run time.
- *
- * Scoped to the voice surfaces on purpose. The provider settings pages name
- * hosts because the reader typed them there, which is a different surface
- * doing a different job.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -25,8 +9,6 @@ import { dirname, join, relative, resolve } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(here, '../..');
 
-/** Every surface a call is built out of. A new one joins this list, or the
- *  guard below is blind to exactly the file that grew the feature. */
 const VOICE_PATHS = [
   'voice',
   'store/voice.ts',
@@ -36,7 +18,6 @@ const VOICE_PATHS = [
   'components/chat/MicrophonePicker.tsx',
 ];
 
-/** Files under one path, tests excluded: a test may quote what it forbids. */
 function sourcesUnder(rel: string): [string, string][] {
   const found: [string, string][] = [];
   const walk = (path: string): void => {
@@ -55,7 +36,6 @@ function voiceSources(): [string, string][] {
   return VOICE_PATHS.flatMap(sourcesUnder);
 }
 
-/** Every line matching a pattern, as `file:line`. */
 function offenders(pattern: RegExp): string[] {
   const hits: string[] = [];
   for (const [rel, text] of voiceSources()) {
@@ -75,8 +55,6 @@ describe('the voice client names no provider', () => {
     expect(offenders(/openai|anthropic|\bgpt-|\bclaude-|whisper|\bgemini\b|\bgrok\b/i)).toEqual([]);
   });
 
-  /** Identifier-shaped, not prose. Saying a call carries no credential is fine;
-   *  carrying a field named one is the leak. */
   it('holds no credential field', () => {
     expect(
       offenders(/\bapi[-_]?key\b|\bapiKey\b|\bBearer\b|\bAuthorization\b|\bclient[-_]?secret\b/),

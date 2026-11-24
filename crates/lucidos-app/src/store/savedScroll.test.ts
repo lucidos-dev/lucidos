@@ -3,8 +3,6 @@ import { contentScrollKey, resetContentScroll } from './savedScroll';
 
 describe('contentScrollKey', () => {
   it('matches the key shape ContentPane writes', () => {
-    // Tests the contract between writer (ContentPane) and invalidators
-    // (e.g., submitTrigger). If these drift, "reset on save" silently no-ops.
     expect(contentScrollKey('triggers')).toBe('lucidos-scroll-content-triggers');
   });
 });

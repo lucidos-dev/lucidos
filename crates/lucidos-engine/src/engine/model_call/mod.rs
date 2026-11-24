@@ -18,10 +18,10 @@
 //! thread caused the call. See [`AuxCapture`].
 
 mod capture;
+pub use crate::engine::event_bus::spend_cap;
 
-pub(crate) use capture::{
-    auxiliary_capture, model_call_failed, usage_from_response, AuxCapture, CallDetail,
-};
+pub(crate) use {capture::model_call_failed, capture::usage_from_response};
+pub use {capture::AuxCapture, capture::CallDetail};
 
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -40,7 +40,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 impl AuxCapture {
     /// Make one chat call and record what it cost, with the tier and time it
     /// took. A failed call records a `ModelCallFailed`, never a capture.
-    pub(crate) async fn chat<P: LlmProvider + ?Sized>(
+    pub async fn chat<P: LlmProvider + ?Sized>(
         &self,
         provider: &P,
         messages: Vec<Message>,
@@ -74,7 +74,7 @@ impl AuxCapture {
     }
 
     /// Ask one typed judgment and record what it cost.
-    pub(crate) async fn judge<J: JudgmentProvider + ?Sized>(
+    pub async fn judge<J: JudgmentProvider + ?Sized>(
         &self,
         judge: &J,
         state: serde_json::Value,
@@ -89,7 +89,7 @@ impl AuxCapture {
     /// usage. The row exists either way: an image the engine paid for must
     /// not be missing from the ledger. It names the serving model, never the
     /// provider's display label, since a cost breakdown groups on the model.
-    pub(crate) async fn generate<I: ImageProvider + ?Sized>(
+    pub async fn generate<I: ImageProvider + ?Sized>(
         &self,
         provider: &I,
         prompt: &str,
@@ -100,7 +100,7 @@ impl AuxCapture {
     }
 
     /// Run one web search and record the backend that answered.
-    pub(crate) async fn search(
+    pub async fn search(
         &self,
         chain: &WebSearchChain,
         query: &str,
@@ -119,7 +119,7 @@ impl AuxCapture {
 /// the stable-prefix fingerprint, since every later round of the turn sends
 /// the same prefix.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn turn_chat(
+pub async fn turn_chat(
     bus: &EventBus,
     thread_id: Uuid,
     meta: EventMeta,
@@ -167,10 +167,10 @@ struct TurnCall {
 
 /// What a turn's call reported, held until [`TurnCapture`] records it.
 #[derive(Default)]
-pub(crate) struct TurnReport {
-    pub(crate) usage: Option<ApiUsage>,
-    pub(crate) detail: CallDetail,
-    pub(crate) stable_prefix_fingerprint: Option<String>,
+pub struct TurnReport {
+    pub usage: Option<ApiUsage>,
+    pub detail: CallDetail,
+    pub stable_prefix_fingerprint: Option<String>,
 }
 
 /// Holds what a turn round's call reported, and records the call if it fails.
@@ -194,6 +194,14 @@ impl TurnSlot {
 
 #[async_trait::async_trait]
 impl CostSink for TurnSlot {
+    fn spend_cap_policy(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::llm::spend_cap::SpendCapPolicy>,
+        bool,
+    )> {
+        Some((std::sync::Arc::new(self.bus.clone()), true))
+    }
     async fn record(&self, cost: CallCost<'_>) {
         let response = match cost.reported {
             Reported::Chat(response) => Some(response),
@@ -229,7 +237,7 @@ impl CostSink for TurnSlot {
 /// The loop finishes it with its context sections. One that goes out of scope
 /// unfinished, on an early return or a panic, still records its usage from
 /// `Drop`. A forgotten finish then costs the row its detail, never the row.
-pub(crate) struct TurnCapture {
+pub struct TurnCapture {
     bus: EventBus,
     thread_id: Uuid,
     /// The turn's meta, which the finished row and the `Drop` fallback carry.
@@ -241,13 +249,13 @@ pub(crate) struct TurnCapture {
 
 impl TurnCapture {
     /// What the provider reported for this round.
-    pub(crate) fn usage(&self) -> Option<ApiUsage> {
+    pub fn usage(&self) -> Option<ApiUsage> {
         self.report.as_ref().and_then(|report| report.usage)
     }
 
     /// Emit the round's row. `build` receives what the call reported and
     /// returns the `ContextCaptured` to persist.
-    pub(crate) async fn finish(mut self, build: impl FnOnce(TurnReport) -> ThreadEvent) {
+    pub async fn finish(mut self, build: impl FnOnce(TurnReport) -> ThreadEvent) {
         let event = build(self.report.take().unwrap_or_default());
         self.bus
             .emit_or_log(
@@ -268,7 +276,7 @@ impl Drop for TurnCapture {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            crate::log!("[ModelCall] A turn row was dropped with no runtime to record it");
+            crate::log_legacy!("[ModelCall] A turn row was dropped with no runtime to record it");
             return;
         };
         let bus = self.bus.clone();
@@ -296,6 +304,7 @@ impl Drop for TurnCapture {
             stable_prefix_fingerprint: None,
             ttft_ms: report.detail.ttft_ms,
             request_id: report.detail.request_id,
+            telemetry_owned_by_cli: false,
             session: None,
         };
         runtime.spawn(async move {

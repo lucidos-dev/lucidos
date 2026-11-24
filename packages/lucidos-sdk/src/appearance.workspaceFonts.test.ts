@@ -1,10 +1,3 @@
-/**
- * Workspace fonts in the appearance contract (ADR 0308).
- *
- * An entry reaches a surface from the engine, from a seed and from local
- * storage, and storage can be forged. So a client rebuilds every entry, and
- * these cases pin that nothing from the wire reaches CSS or a URL unchecked.
- */
 import { describe, it, expect } from 'vitest';
 import {
   FONT_STACKS,
@@ -20,7 +13,6 @@ import {
 } from './appearance';
 import { WORKSPACE_FONT_FALLBACKS } from './generated/font-catalog';
 
-/** An entry as `GET /api/v1/fonts` serves one. */
 function served(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: 'ws-brand',

@@ -229,44 +229,6 @@ async fn find_branch_merge_in_main_works_after_branch_deleted() {
     );
 }
 
-/// Validates that MERGE_MUTEX serializes concurrent merge attempts.
-/// Two tasks that both acquire the mutex should execute sequentially,
-/// not concurrently -- the second task must wait for the first.
-#[tokio::test]
-async fn merge_mutex_serializes_concurrent_access() {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
-
-    let counter = Arc::new(AtomicU32::new(0));
-    let max_concurrent = Arc::new(AtomicU32::new(0));
-
-    let mut handles = Vec::new();
-    for _ in 0..5 {
-        let counter = counter.clone();
-        let max_concurrent = max_concurrent.clone();
-        handles.push(tokio::spawn(async move {
-            let _guard = MERGE_MUTEX.lock().await;
-            let active = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            // Track maximum concurrent holders
-            max_concurrent.fetch_max(active, Ordering::SeqCst);
-            // Simulate merge work
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            counter.fetch_sub(1, Ordering::SeqCst);
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-
-    // At most 1 task should hold the mutex at any time
-    assert_eq!(
-        max_concurrent.load(Ordering::SeqCst),
-        1,
-        "MERGE_MUTEX must serialize access -- max concurrent holders should be 1"
-    );
-}
-
 #[tokio::test]
 async fn commits_in_range_returns_subjects_in_chronological_order() {
     let (_tmp, repo) = make_test_repo().await;
@@ -888,14 +850,6 @@ async fn catchup_and_ff_with_concurrent_main_commit() {
     .await;
 }
 
-/// The I8 test below runs on a private lock pair, so this pins that
-/// production merges take the global locks every writer takes.
-#[test]
-fn production_merges_take_the_global_merge_and_repo_locks() {
-    assert!(std::ptr::eq(MAIN_LOCKS.merge, &MERGE_MUTEX));
-    assert!(std::ptr::eq(MAIN_LOCKS.repo, &WORKSPACE_REPO_MUTEX));
-}
-
 /// I8: a merge catches up with `main`, reads it and moves it as one step under
 /// the repo lock. A writer that commits to `main` under that lock lands before
 /// the catch-up. So the only attempt succeeds and keeps both commits.
@@ -915,11 +869,8 @@ async fn a_locked_writer_cannot_move_main_between_catch_up_and_ref_move() {
 
     // A pair of its own, so the merge below is the only thing that can queue
     // on these locks.
-    let locks: &'static MainLocks = Box::leak(Box::new(MainLocks {
-        merge: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
-        repo: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
-    }));
-    let writer = locks.repo.lock().await;
+    let locks = MainLocks::private_for_test();
+    let writer = locks.lock_repo().await;
     let mut merge = std::pin::pin!(catchup_and_ff_to_main_under(
         locks, &repo, &wt_dir, "feature"
     ));
@@ -939,7 +890,7 @@ async fn a_locked_writer_cannot_move_main_between_catch_up_and_ref_move() {
     // tokio hands a released lock to its first waiter, so a merge already
     // queued on it, before its catch-up, now owns it.
     assert!(
-        locks.repo.try_lock().is_err(),
+        locks.repo_is_locked_for_test(),
         "the merge must wait for the repo lock before it catches up with main"
     );
 

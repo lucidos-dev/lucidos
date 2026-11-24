@@ -1,11 +1,3 @@
-/**
- * What the install panel says about local changes an update is about to touch.
- *
- * Two decisions are pulled out as pure functions. The confirm panel holds its
- * keep control in a hook, and the suite's VNode walk stops at function
- * components. The receipt half has no hooks, so it is rendered directly, the
- * same way `plugin-receipts.test.tsx` does.
- */
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
@@ -21,14 +13,10 @@ function text(node: ComponentChildren): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
   if (Array.isArray(node)) return node.map(text).join('');
   const v = node as VNode<{ children?: ComponentChildren }>;
-  // Stop at function components, exactly as the receipts suite does: descending
-  // would invoke render-time hooks outside a real render.
   if (typeof v.type === 'function') return '';
   return text(v.props?.children);
 }
 
-/** The labelled file lists in a tree, read off their props without rendering
- *  them, for the same reason `text` stops at function components. */
 function fileLists(node: ComponentChildren): { label: string; files: string[] }[] {
   if (node === null || node === undefined || typeof node !== 'object') return [];
   if (Array.isArray(node)) return node.flatMap(fileLists);
@@ -62,18 +50,12 @@ describe('the keep control rewrites what every row promises', () => {
   });
 
   it('reads every row as replaced once it is cleared', () => {
-    // Clearing it sends keep_local_changes=false, which collapses every outcome
-    // to a replace. A row still claiming "Kept" would promise the opposite of
-    // the request the button is about to send.
     for (const outcome of ['merged', 'conflict', 'replaced'] as const) {
       expect(localChangeLabel(outcome, false)).toBe('Replaced, your version is saved aside');
     }
   });
 
   it('leaves a restore alone either way', () => {
-    // The user deleted the file, so there is no edit to keep or drop, and
-    // nothing is saved aside. Calling it "saved aside" would be a false
-    // promise, which is the whole reason it is its own outcome.
     for (const keep of [true, false]) {
       expect(localChangeLabel('restored', keep)).toContain('brings it back');
       expect(localChangeLabel('restored', keep)).not.toContain('saved aside');
@@ -81,8 +63,6 @@ describe('the keep control rewrites what every row promises', () => {
   });
 
   it('leaves a removal alone either way', () => {
-    // The new version dropped the file. Keeping it in place would leave the
-    // stale copy loading, so the control cannot keep it.
     for (const keep of [true, false]) {
       expect(localChangeLabel('removed', keep)).toBe(
         'No longer shipped. Removed, your version is saved aside',

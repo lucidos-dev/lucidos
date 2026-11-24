@@ -1,14 +1,3 @@
-/**
- * An explainer opens at its info icon, on every client.
- *
- * It was a centred modal with a scrim. It now hangs off the icon like the Waits
- * panel, clamped inside the pane that holds it (the viewport on a phone). Its
- * head and body share the surface inset. So the title and the first paragraph
- * start on one edge, one root em in from the frame.
- *
- * Runs on all three projects: the phone is where a popover near the screen edge
- * would clip, which is the case the clamp exists for.
- */
 import { test, expect, Page } from './fixtures';
 import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
 

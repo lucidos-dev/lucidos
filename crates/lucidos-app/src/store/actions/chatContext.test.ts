@@ -2,8 +2,6 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { panelOverlay, selectedLines, filePreviewModal, createPreviewViewState } from '../store';
 import { currentChatContext } from './chatContext';
 
-// Both file previews now render the same line-numbered source view, so a line
-// range picked in either one must reach the message the same way.
 describe('currentChatContext', () => {
   const ENCODED = 'repo:repo-1:file:src/main.rs';
 
@@ -13,8 +11,6 @@ describe('currentChatContext', () => {
     filePreviewModal.value = null;
   });
 
-  // A file link in a reply opens the preview modal over the Files panel. The
-  // message carries what the panel shows, never the glance over it.
   it('carries the Files panel selection, not the preview modal over it', () => {
     panelOverlay.value = { type: 'file-preview', path: 'artifacts/notes.md' };
     selectedLines.value = { start: 3, end: 4 };

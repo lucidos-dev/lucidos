@@ -4,8 +4,6 @@ import { networkAccessBody, type NetworkEditor } from '../NetworkAccessPopover';
 import type { Loadable } from '../../../store/types';
 import { draftFromBind } from '../../../utils/bindMode';
 
-/** Flatten a vnode tree into a string with `class` / `data-state` preserved so
- *  we can assert on per-state markers. Mirrors directory-picker-loadable.test.tsx. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -48,17 +46,12 @@ function render(state: Loadable<NetworkEditor>, saving = false, busy = false) {
   );
 }
 
-/** The active segment, or null when nothing is marked active. */
 function activeMode(text: string): string | null {
   return text.match(/<button class="ws-picker-net-mode active">([^<]*)<\/button>/)?.[1] ?? null;
 }
 
 describe('networkAccessBody: it opens on the saved bind', () => {
   it('marks NO mode active until the saved config lands', () => {
-    // The regression: with the draft held in signals that outlived the config,
-    // reopening rendered the last CLICKED mode as active while the refetch was
-    // still in flight, then snapped to the saved one. An unsettled state must
-    // claim nothing.
     for (const state of [
       { status: 'not-loaded' },
       { status: 'loading' },
@@ -90,8 +83,6 @@ describe('networkAccessBody: it opens on the saved bind', () => {
 
 describe('networkAccessBody: no layout jumps', () => {
   it('keeps the address row mounted in every state, opening it only for address mode', () => {
-    // Mounted always (so the settle animates rather than snapping), but only
-    // `is-open` when the saved/edited mode actually uses it.
     for (const state of [
       { status: 'loading' },
       { status: 'loaded', data: editor('all') },
@@ -113,8 +104,6 @@ describe('networkAccessBody: no layout jumps', () => {
     expect(failed).toContain('ws-picker-net-retry');
     expect(failed).toContain('gateway unreachable');
     expect(failed).toContain('ws-picker-net-collapse is-open');
-    // Loaded keeps the row mounted (collapsed) so recovering from a failure
-    // animates shut instead of popping.
     const ok = render({ status: 'loaded', data: editor('all') });
     expect(ok).toContain('ws-picker-net-retry');
     expect(ok).not.toContain('ws-picker-net-collapse is-open');
@@ -123,14 +112,10 @@ describe('networkAccessBody: no layout jumps', () => {
 
 describe('networkAccessBody: save is explained, never mutely grey', () => {
   it('says there is nothing to save when the draft still matches what is stored', () => {
-    // The user read an OFFERED Save as proof the shown bind was not theirs.
-    // An untouched draft must say so instead of leaving them to infer it.
     expect(render({ status: 'loaded', data: editor('all') })).toContain('No changes to save');
   });
 
   it('says what is missing when address mode has no usable address', () => {
-    // The case that stranded the user: picking Tailnet with no detected IP left
-    // an empty field and a grey Save with no stated reason.
     const empty: NetworkEditor = {
       config: { gateway_bind: 'all', inherit: true, detected_tailscale_ip: null },
       draft: { mode: 'address', address: '', inherit: true },
@@ -173,7 +158,6 @@ describe('networkAccessBody: save affordance', () => {
     });
     expect(withIp).toContain('ws-picker-net-detected');
     expect(withIp).toContain('Detected Tailscale');
-    // No detection: the generic hint stands in, same row, same height.
     const noIp = render({ status: 'loaded', data: editor('100.64.0.1') });
     expect(noIp).not.toContain('ws-picker-net-detected');
     expect(noIp).toContain('Your Tailscale 100.x address');

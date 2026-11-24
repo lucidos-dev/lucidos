@@ -1,13 +1,3 @@
-/**
- * The installed iOS app runs under a translucent status bar, so the header
- * fills the Dynamic Island area. Its controls sit below iOS 27's top-edge blur,
- * by a clearance only that app sets. iOS 27 ignores an unpainted strip, so no
- * strip exists (ADR 0553).
- *
- * `theme-color` carries the header's top colour for the other platforms'
- * toolbars. Every script reads that colour from `THEME_MODE_HEADER_TOP`. The
- * stylesheet and index.html cannot import it, so this pins them to it.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,7 +21,6 @@ function rootToken(selector: string, token: string): string {
   return value as string;
 }
 
-/** The header's top colour per mode, `var()` resolved against `:root`. */
 function headerTop(): { light: string; dark: string } {
   const resolveVar = (value: string): string => {
     const name = /^var\((--[\w-]+)\)$/.exec(value)?.[1];

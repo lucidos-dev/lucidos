@@ -1,14 +1,27 @@
-//! `lucidos main-check status`: where the *main check* stands (ADR 0464).
-//! Wraps `GET /api/v1/main-check`.
+//! `lucidos main-check status`: where the *main check* stands (ADR 0464), and
+//! `lucidos main-check setting`: the main-check setting (ADR 0694). Both wrap
+//! `GET /api/v1/main-check`.
 
 use crate::http::{client as http_client, send_expect_json};
 use crate::workspace::{BoxError, Workspace};
 use serde_json::Value;
 
+fn snapshot(ws: &Workspace) -> Result<Value, BoxError> {
+    let url = format!("{}/api/v1/main-check", ws.base_url());
+    send_expect_json("GET", &url, http_client()?.get(&url))
+}
+
+/// Print the main-check setting, which `scripts/harden-suites.sh` reads.
+pub(crate) fn cmd_setting(ws: &Workspace) -> Result<(), BoxError> {
+    if let Some(setting) = snapshot(ws)?.get("setting").and_then(Value::as_str) {
+        println!("{setting}");
+    }
+    Ok(())
+}
+
 /// Print the main check's state. `json` prints the engine's snapshot as is.
 pub(crate) fn cmd_status(ws: &Workspace, json: bool) -> Result<(), BoxError> {
-    let url = format!("{}/api/v1/main-check", ws.base_url());
-    let snapshot = send_expect_json("GET", &url, http_client()?.get(&url))?;
+    let snapshot = snapshot(ws)?;
     if json {
         println!("{snapshot}");
         return Ok(());
@@ -48,11 +61,45 @@ fn status_text(snapshot: &Value, workspace: &str) -> String {
     if !field("run_url").is_empty() {
         lines.push(format!("Run: {}", field("run_url")));
     }
-    if field("state") == "red" && !field("fix_thread_id").is_empty() {
+    if !field("setting").is_empty() {
+        lines.push(format!("Setting: {}", field("setting")));
+    }
+    if field("state") == "red"
+        && !field("fix_thread_id").is_empty()
+        && snapshot
+            .get("repair")
+            .is_none_or(|repair| repair["state"] == "running")
+    {
         lines.push(format!(
             "Fix thread: [Fix main](thread:{workspace}/{})",
             field("fix_thread_id")
         ));
+    }
+    if let Some(repair) = snapshot.get("repair") {
+        let state = repair
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        lines.push(format!("Main repair: {state}."));
+        if let Some(waiting) = repair.get("waiting_on").and_then(Value::as_array) {
+            for reason in waiting.iter().filter_map(Value::as_str) {
+                lines.push(format!("Waiting for: {reason}"));
+            }
+        }
+    }
+    for (field_name, label) in [("failures", "Failed"), ("flaky", "Flaky")] {
+        if let Some(tests) = snapshot.get(field_name).and_then(Value::as_array) {
+            for test in tests {
+                lines.push(format!(
+                    "{label}: {}: {}",
+                    test["suite"].as_str().unwrap_or(""),
+                    test["name"].as_str().unwrap_or("")
+                ));
+                if let Some(detail) = test["detail"].as_str().filter(|s| !s.is_empty()) {
+                    lines.push(detail.to_string());
+                }
+            }
+        }
     }
     lines.iter().map(|l| format!("{l}\n")).collect()
 }
@@ -114,6 +161,17 @@ mod tests {
         assert_eq!(
             status_text(&json!({"state": "idle"}), "myws"),
             "Main check: idle. No check runs and main is not red.\n"
+        );
+    }
+
+    #[test]
+    fn status_names_the_setting() {
+        assert_eq!(
+            status_text(
+                &json!({"state": "unavailable", "setting": "off", "summary": "the main-check setting is off"}),
+                "myws"
+            ),
+            "Main check: unavailable here, the main-check setting is off.\nSetting: off\n"
         );
     }
 }

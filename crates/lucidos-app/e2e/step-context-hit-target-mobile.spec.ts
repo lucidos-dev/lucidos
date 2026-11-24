@@ -1,16 +1,3 @@
-/**
- * A step row's context counter takes a tap that lands near it, on a phone.
- *
- * The counter is a short percentage pinned to the row's right end, about 20px
- * wide. Without a reach, the space on both sides takes no tap: the row gap and
- * margin on the left, the turn inset and pane gutter on the right. A tap there
- * lands on bare transcript and opens nothing, and on the right it reads as an
- * edge gesture.
- *
- * On touch the counter carries a transparent reach over that dead space
- * (`.step-context::before` in steps.css). It stays inside its own row, so a
- * near miss can never open a neighbouring row's context.
- */
 import { test, expect, Page } from './fixtures';
 import {
   assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps, watchPreferenceReads,
@@ -22,8 +9,6 @@ test.use({ viewport: { width: 393, height: 852 } });
 const CONTEXT_MODAL = '[data-role="context-captured-modal"]';
 const SCALES = [['100%', 16], ['112.5%', 18]] as const;
 
-/** Name what a tap at (x, y) reaches. A counter is named by its row's step,
- *  so a probe can tell its own row from a neighbour's. */
 const DESCRIBE = `(x, y) => {
   const el = document.elementFromPoint(x, y);
   if (!el) return 'nothing';
@@ -44,18 +29,12 @@ interface Probe {
   step: string;
   row: Box;
   main: Box;
-  /** The drawn percentage, which must not move. */
   text: Box;
-  /** The span around the counter's centre where a tap still reaches it. */
   hit: Box;
-  /** The pane's right edge, which the reach must stop short of. */
   paneRight: number;
-  /** What a tap at each probed point reaches, keyed by where it is. */
   at: Record<string, string>;
 }
 
-/** Scroll the counter nearest the pane's middle to the middle, clear of both
- *  scroll chevrons, and probe around it. */
 async function probeMiddleCounter(page: Page, offsets: number[]): Promise<Probe> {
   return page.evaluate(({ offsets, describeSrc }) => {
     const describe = new Function(`return ${describeSrc}`)() as (x: number, y: number) => string;
@@ -76,8 +55,6 @@ async function probeMiddleCounter(page: Page, offsets: number[]): Promise<Probe>
     const cx = (box.left + box.right) / 2;
     const cy = (box.top + box.bottom) / 2;
     const reaches = (x: number, y: number) => document.elementFromPoint(x, y)?.closest('[data-role="step-context"]') === counter;
-    // How far the reach runs from the centre, bisected to well under a
-    // hundredth of a pixel. A coarse step would undercount every edge.
     const walk = (dx: number, dy: number) => {
       let inside = 0;
       let outside = 120;
@@ -93,12 +70,8 @@ async function probeMiddleCounter(page: Page, offsets: number[]): Promise<Probe>
     const rowBox = rect(row);
     const eighthRem = parseFloat(getComputedStyle(document.documentElement).fontSize) / 8;
     const at: Record<string, string> = {
-      // The reach stops an eighth of a rem short of the step's own target,
-      // the margin WebKit's wide left-edge hit test needs.
       'gap start': describe(main.right + eighthRem + 0.5, cy),
       'gap middle': describe((main.right + box.left) / 2, cy),
-      // Above and below the drawn text, inside the row's line. The reach
-      // sits a fraction of a pixel off centre, so these keep a pixel of slack.
       'row top': describe(cx, rowBox.top + 3),
       'row bottom': describe(cx, rowBox.bottom - 3),
       'main end': describe(main.right - 1, cy),
@@ -130,9 +103,6 @@ async function setScale(page: Page, scale: string, rootPx: number): Promise<void
 async function openThread(page: Page, threadId: string): Promise<void> {
   await disarmFollowSeed(page);
   await page.addInitScript((tid: string) => localStorage.setItem('lucidos-focused-thread', tid), threadId);
-  // Every preference read ends in `applyUiScale`, which replaces the scale a
-  // spec wrote. The shell reads at startup and again when its event stream
-  // opens, so wait for both before the first `setScale`.
   const preferencesSettled = watchPreferenceReads(page);
   await navigateToApp(page);
   await preferencesSettled();
@@ -170,16 +140,11 @@ test.describe('The step context counter takes a near miss on a phone', () => {
       console.log(`[${info.project.name}] ${where}: text ${fmt(p.text)}, row ${fmt(p.row)}, `
         + `hit ${fmt(p.hit)}, pane right ${p.paneRight}\n  ${JSON.stringify(p.at)}`);
 
-      // The drawn percentage did not move: it still ends at the row's right
-      // edge, 0.625rem after the step's own target (the row gap plus the
-      // counter's margin).
       expect(p.text.right, `${where}: the percentage left the row's right end`).toBeCloseTo(p.row.right, 0);
       expect(p.text.left - p.main.right, `${where}: the gap before the counter changed`)
         .toBeCloseTo(0.625 * rootPx, 0);
 
-      // At least 44px wide at the 16px root, scaled with it.
       expect(p.hit.right - p.hit.left, `${where}: hit width`).toBeGreaterThanOrEqual((44 * rootPx) / 16);
-      // Never past the pane, where it would cover the edge-swipe strip's job.
       expect(p.hit.right, `${where}: the reach left the pane`).toBeLessThanOrEqual(p.paneRight);
 
       for (const key of ['gap start', 'gap middle', 'row top', 'row bottom']) {
@@ -189,10 +154,7 @@ test.describe('The step context counter takes a near miss on a phone', () => {
         expect(p.at[`left+${d}`], `${where}: a tap ${d}px left of the percentage`).toBe(own);
         expect(p.at[`right+${d}`], `${where}: a tap ${d}px right of the percentage`).toBe(own);
       }
-      // The step's own target keeps every pixel it had.
       expect(p.at['main end'], `${where}: the step's own target lost its end`).toBe('step-main');
-      // The reach stays inside its row, so a neighbour's tap stays the
-      // neighbour's: one row up and one row down each reach their own counter.
       expect(p.hit.top, `${where}: the reach rose into the row above`).toBeGreaterThanOrEqual(p.row.top - 0.5);
       expect(p.hit.bottom, `${where}: the reach fell into the row below`).toBeLessThanOrEqual(p.row.bottom + 0.5);
     }

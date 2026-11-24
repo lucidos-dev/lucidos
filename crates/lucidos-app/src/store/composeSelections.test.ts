@@ -1,8 +1,3 @@
-/** Per-draft compose selections must be independent across drafts and must
- *  never write the global picker signals / account defaults. These tests pin
- *  both: the correctness invariant (editing draft A never changes what draft B
- *  resolves) and the "draft-only, seed from default" invariant (an edit leaves
- *  every global untouched; an un-set draft resolves to the current global). */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   _resetComposeSelectionsForTesting,
@@ -29,7 +24,6 @@ import {
 
 afterEach(() => {
   _resetComposeSelectionsForTesting();
-  // Restore globals to their module defaults so tests don't bleed into each other.
   selectedScope.value = { kind: 'lucidos' };
   selectedCodingAgent.value = 'claude-code';
 });
@@ -54,8 +48,6 @@ describe('resolve* falls back to the current global default', () => {
 
 describe('resolveScope: real drafts never read the shared selectedScope (no-leak); the no-draft view reads the last-used seed', () => {
   it('a scope-less EXISTING draft resolves the fixed {lucidos} default, NOT selectedScope', () => {
-    // selectedScope is the last-used seed for NEW drafts only. An existing draft
-    // reading it is exactly the leak the per-draft design forbids.
     selectedScope.value = { kind: 'app', appId: 'seed-app' };
     expect(resolveScope('existing-draft')).toEqual({ kind: 'lucidos' });
   });
@@ -70,7 +62,6 @@ describe('resolveScope: real drafts never read the shared selectedScope (no-leak
     selectedScope.value = { kind: 'app', appId: 'seed-app' };
     patchComposeSelection('t-1', { scope: { kind: 'external', repoId: 'r-own' } });
     expect(resolveScope('t-1')).toEqual({ kind: 'external', repoId: 'r-own' });
-    // A pending pick on the no-draft view still moves only the no-draft view.
     patchComposeSelection(null, { scope: { kind: 'app', appId: 'pending-app' } });
     expect(resolveScope(null)).toEqual({ kind: 'app', appId: 'pending-app' });
     expect(resolveScope('t-1')).toEqual({ kind: 'external', repoId: 'r-own' });
@@ -81,7 +72,6 @@ describe('setComposeSelectionFromServer (DB/SSE hydration)', () => {
   it('REPLACES the local override wholesale (the DB is authoritative)', () => {
     patchComposeSelection('t-1', { model: 'stale', reasoningEffort: 'stale-effort' });
     setComposeSelectionFromServer('t-1', { model: 'fresh', codingAgent: 'codex' });
-    // The stale `reasoningEffort` is gone — replace, not merge.
     expect(getComposeSelectionOverride('t-1')).toEqual({ model: 'fresh', codingAgent: 'codex' });
   });
 
@@ -89,8 +79,7 @@ describe('setComposeSelectionFromServer (DB/SSE hydration)', () => {
     patchComposeSelection('t-1', { model: 'opus' });
     setComposeSelectionFromServer('t-1', null);
     currentModel.value = 'g-model';
-    expect(resolveModel('t-1')).toBe('g-model'); // back to the account default
-    // Empty object is treated the same as null.
+    expect(resolveModel('t-1')).toBe('g-model');
     patchComposeSelection('t-2', { model: 'opus' });
     setComposeSelectionFromServer('t-2', {});
     expect(resolveModel('t-2')).toBe('g-model');
@@ -109,7 +98,6 @@ describe('overrides are per-draft', () => {
     currentModel.value = 'default-model';
     patchComposeSelection('t-1', { model: 'opus' });
     expect(resolveModel('t-1')).toBe('opus');
-    // t-2 has no override → still the global default.
     expect(resolveModel('t-2')).toBe('default-model');
   });
 
@@ -119,7 +107,6 @@ describe('overrides are per-draft', () => {
     expect(resolveScope('t-1')).toEqual({ kind: 'external', repoId: 'repo-a' });
     expect(resolveCodingAgent('t-1')).toBe('codex');
     expect(resolveScope('t-2')).toEqual({ kind: 'app', appId: 'app-b' });
-    // t-2 never set codingAgent → global default.
     expect(resolveCodingAgent('t-2')).toBe('claude-code');
   });
 });
@@ -148,7 +135,6 @@ describe('editing a draft never writes the globals', () => {
 
 describe('resolveCc* is draft-only', () => {
   it('no draft override → null (no pick)', () => {
-    // null → the send omits the field → backend default.
     expect(resolveCcModel('t-1')).toBeNull();
     expect(resolveCcReasoningEffort('t-1')).toBeNull();
   });
@@ -175,13 +161,11 @@ describe('the pending slot (no focused draft) — the leak the bug report is abo
       codingAgent: 'codex',
       model: 'opus',
     });
-    // Pending slot captured it…
     expect(pendingComposeSelection.value).toMatchObject({
       scope: { kind: 'external', repoId: 'repo-a' },
       codingAgent: 'codex',
       model: 'opus',
     });
-    // …and NOT a single global (which every override-less draft reads).
     expect(selectedScope.value).toEqual({ kind: 'lucidos' });
     expect(selectedCodingAgent.value).toBe('claude-code');
     expect(currentModel.value).toBe('g-model');
@@ -189,19 +173,15 @@ describe('the pending slot (no focused draft) — the leak the bug report is abo
 
   it('a null-threadId pick does not change what an existing draft resolves', () => {
     selectedCodingAgent.value = 'claude-code';
-    // Existing draft has no override → resolves the stable global default.
     expect(resolveCodingAgent('existing')).toBe('claude-code');
-    // Fresh-compose pick goes to pending…
     patchComposeSelection(null, { codingAgent: 'codex' });
-    // …the existing draft is unaffected (still the global default)…
     expect(resolveCodingAgent('existing')).toBe('claude-code');
-    // …while the no-draft compose context resolves the pending pick.
     expect(resolveCodingAgent(null)).toBe('codex');
   });
 
   it('resolvers with a null threadId read the pending slot (?? global)', () => {
     currentModel.value = 'g-model';
-    expect(resolveModel(null)).toBe('g-model'); // empty pending → global
+    expect(resolveModel(null)).toBe('g-model');
     patchComposeSelection(null, { model: 'opus' });
     expect(resolveModel(null)).toBe('opus');
     expect(getComposeSelectionOverride(null)).toBe(pendingComposeSelection.value);
@@ -211,12 +191,10 @@ describe('the pending slot (no focused draft) — the leak the bug report is abo
     patchComposeSelection(null, { codingAgent: 'codex', scope: { kind: 'app', appId: 'a' } });
     const taken = takePendingComposeSelection();
     expect(taken).toMatchObject({ codingAgent: 'codex', scope: { kind: 'app', appId: 'a' } });
-    // Pending is cleared after taking.
     expect(pendingComposeSelection.value).toEqual({});
     seedComposeSelection('new-draft', taken);
     expect(resolveCodingAgent('new-draft')).toBe('codex');
     expect(resolveScope('new-draft')).toEqual({ kind: 'app', appId: 'a' });
-    // A brand-new (unseeded) compose context is back to the default.
     expect(getComposeSelectionOverride(null)).toEqual({});
   });
 

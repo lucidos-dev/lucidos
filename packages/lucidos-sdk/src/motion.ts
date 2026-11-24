@@ -1,4 +1,3 @@
-/** Shared animations read the appearance already published into this frame. */
 export function isReducedMotion(): boolean {
   return document.documentElement.getAttribute('data-motion') === 'reduce';
 }

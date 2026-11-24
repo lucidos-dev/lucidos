@@ -2,41 +2,13 @@ import { test, expect, type Page } from './fixtures';
 import { assertHealthy, hideDashboardRail, minThreadPane, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAWER_TOGGLE_LABEL } from './helpers';
 import { THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-/** Clamped divider drags (SplitLayout / DrawerDivider + splitHelpers; ADR 0056):
- *  a drag is clamped to the pane minimums as it moves, so it stops at the wall
- *  while the pointer keeps going, and nothing corrects it on release. While the
- *  drag is live the header regions track the panes 1:1 (data-pane-resizing
- *  disables their geometry transitions), the old always-on eases having left the
- *  header visibly disconnected from the panels mid-drag.
- *
- *  Desktop-only: the split layout and its header regions only exist on
- *  desktop (mobile swipes between full-screen panes). */
 
-// Generous settle wait. Nothing is deferred any more, but a toggle or a reopen
-// still animates for var(--duration-slow) (300ms).
 const SETTLE_MS = 1200;
-// All three pane floors are derived from the root font size now
-// (store/paneMinimums.ts), and these projects run at a 16px root. The Canvas
-// one is still the 360 it was written as. The Conversation one depends on its
-// header row: the traffic-lights reserve and the controls leading it. So this
-// spec computes it with the app's own function, from what the page shows. The
-// drawer's is not restated at all, since this spec MEASURES where the clamp
-// puts it.
 const MIN_CONTENT_PANE = 360;
 
-// Well below the drawer's floor: the clamp must refuse to follow the pointer
-// there rather than land and be corrected.
 const BELOW_FLOOR_X = 150;
-// Seeded before every drawer test so a narrowing drag has somewhere to travel
-// FROM. It has to clear the drawer's floor by a wide margin, and the floor is
-// 320 at these projects' 16px root now that it no longer varies by client
-// (ADR 0058): opening at the default would put the drawer on its wall already,
-// and a drag that cannot move proves nothing about a clamp. It must also leave
-// the split both pane floors, 858px with Home leading the row, or the Canvas
-// yields (ADR 0495): 1280 less the drawer and its 3px divider.
 const OPEN_DRAWER_WIDTH = 400;
 
 test.use({ viewport: { width: 1280, height: 800 } });
@@ -59,22 +31,6 @@ async function drawerWidth(page: Page): Promise<number> {
   return page.evaluate(() => document.querySelector('.thread-drawer')!.getBoundingClientRect().width);
 }
 
-/** Viewport x of a point on the thread side of the desktop header that
- *  `AppHeader.isInteractive()` treats as a plain GAP — the empty run between the
- *  leading icon cluster and the centered Lucidos mark.
- *
- *  Derived, not hardcoded, and that is the point. This used to be a literal
- *  `x: 200`, which silently stopped being a gap once the brand label's content
- *  grew left over it: `isInteractive` gates out that content (the chevrons and
- *  the mark are buttons), so the dblclick was ignored, the pane never moved,
- *  and the failure surfaced as an *animation* timeout in a test about animation
- *  — pointing at the wrong subsystem entirely. Reading the live geometry keeps
- *  the point valid as the header evolves, and if the gap ever really does close
- *  the explicit width check below says so instead.
- *
- *  Scoped to `.desktop-header`: `MobileAppHeader` renders FIRST and carries
- *  copies of these classes, so an unscoped `querySelector` returns the hidden
- *  mobile one (the 0x0-rect trap in .claude/rules/frontend.md). */
 async function threadHeaderGapX(page: Page): Promise<number> {
   const gap = await page.evaluate((leadSelector) => {
     const header = document.querySelector('.desktop-header');
@@ -82,17 +38,10 @@ async function threadHeaderGapX(page: Page): Promise<number> {
     const shown = (els: Iterable<Element | null>) => [...els]
       .map((el) => el?.getBoundingClientRect())
       .filter((r): r is DOMRect => !!r && r.width > 0);
-    // The drawer toggle rests in the header's corner. With the drawer shut, it
-    // leads the thread side. With the drawer open, it sits over the drawer, so
-    // the gap starts no earlier than the thread side itself does. New thread,
-    // and Home once it shows, lead the row after it.
     const leadingRight = Math.max(0, ...shown([header.querySelector('.thread-toggle-slot'), ...document.querySelectorAll(leadSelector)]).map((r) => r.right));
     const threadSide = header.querySelector('.pane-header-brand')?.getBoundingClientRect();
-    // The whole centred cluster, not the mark inside it: the chevrons take its
-    // ends, so the mark's left edge is well inside the interactive run.
     const cluster = header.querySelector('.pane-header-brand-label')?.getBoundingClientRect();
     if (!cluster || cluster.width === 0 || !threadSide) return null;
-    // The thread side's trailing actions start past the cluster.
     const trailingLeft = Math.min(threadSide.right, ...shown(header.querySelectorAll('button, a'))
       .filter((r) => r.left >= cluster.right && r.left < threadSide.right)
       .map((r) => r.left));
@@ -110,10 +59,6 @@ async function threadHeaderGapX(page: Page): Promise<number> {
   return (gap!.from + gap!.to) / 2;
 }
 
-/** openThreadDrawer returns as soon as the drawer has ANY width, but the open
- *  animates over var(--duration-slow): grabbing the divider mid-slide reads a
- *  stale bounding box and the drag silently misses it. Wait for the seeded
- *  OPEN_DRAWER_WIDTH to settle. */
 async function openDrawerAndSettle(page: Page): Promise<void> {
   await openThreadDrawer(page);
   await page.waitForFunction((want) => {
@@ -138,14 +83,11 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     await dragDivider(page, '.split-divider', 560);
     expect(Math.abs(await threadPaneWidth(page) - 560)).toBeLessThanOrEqual(2);
 
-    // Nothing corrects it: no deferred anything.
     await page.waitForTimeout(SETTLE_MS);
     expect(Math.abs(await threadPaneWidth(page) - 560)).toBeLessThanOrEqual(2);
   });
 
   test('the thread pane stops AT its minimum, during the drag and after it', async ({ page }) => {
-    // Mid-gesture, hard against the left edge: the divider is already at the
-    // wall, not somewhere illegal awaiting a correction.
     await dragDivider(page, '.split-divider', 2, { release: false });
     await page.evaluate(() => new Promise(requestAnimationFrame));
     const during = await threadPaneWidth(page);
@@ -175,10 +117,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   });
 
   test('a drag NEVER collapses a pane, at either extreme', async ({ page }) => {
-    // The collapse-state attributes swap header icon groups between hosts, so a
-    // flip while the pointer wiggles across a pane edge is the "icons dance
-    // between the headers" bug. A clamped drag cannot reach ratio 0 or 1, which
-    // is what makes the flip unreachable rather than merely postponed (ADR 0056).
     const flags = () => page.evaluate(() => ({
       thread: document.documentElement.hasAttribute('data-thread-collapsed'),
       content: document.documentElement.hasAttribute('data-content-collapsed'),
@@ -199,13 +137,8 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   });
 
   test('collapse is still reachable, by double-clicking the divider', async ({ page }) => {
-    // The drag lost the ability; every other route must keep it, or the change
-    // removed a capability rather than moving it.
     await page.locator('.split-divider').dblclick();
     await expect(page.locator('.pane-thread')).toHaveClass(/pane-collapsed/, { timeout: 5_000 });
-    // The class flips at once, but the divider slides to the wall. A press
-    // mid-slide kills the transition, so the divider snaps away and the
-    // second click lands on the Canvas pane. A user double-clicks it at rest.
     await expect.poll(() => threadPaneWidth(page), { timeout: 5_000 }).toBeLessThanOrEqual(1);
     await page.locator('.split-divider').dblclick();
     await expect(page.locator('.pane-thread')).not.toHaveClass(/pane-collapsed/, { timeout: 5_000 });
@@ -220,9 +153,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
       return Math.abs(region.left - pane.left);
     });
 
-    // Mid-drag, after a paint: the header region's left edge must sit on the
-    // content pane's left edge. With the old always-on 300ms ease the region
-    // would still be far from the pane right after a move.
     await page.evaluate(() => new Promise(requestAnimationFrame));
     expect(await measure()).toBeLessThanOrEqual(1.5);
 
@@ -235,7 +165,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
 
   test('the drawer stops AT its floor, during the drag and after it', async ({ page }) => {
     await openDrawerAndSettle(page);
-    // Mid-gesture: already at the wall, not below it awaiting a correction.
     await dragDivider(page, '.drawer-divider', BELOW_FLOOR_X, { release: false });
     await page.evaluate(() => new Promise(requestAnimationFrame));
     const during = await drawerWidth(page);
@@ -248,8 +177,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     expect(settled, 'the drawer moved after release').toBe(during);
     expect(settled, 'the drag never moved the drawer, so this is not the floor')
       .toBeLessThan(OPEN_DRAWER_WIDTH - 40);
-    // The floor is what the drawer's own header row needs, so the row has to fit
-    // in it: that is the property the number was standing in for.
     const fits = await page.evaluate(() => {
       const header = Array.from(document.querySelectorAll('.threads-header'))
         .find(h => h.getBoundingClientRect().width > 0) as HTMLElement | undefined;
@@ -273,13 +200,11 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     await page.waitForTimeout(SETTLE_MS);
     const floor = await drawerWidth(page);
 
-    // All the way to the window edge and past it. The drawer holds its floor.
     await dragDivider(page, '.drawer-divider', -200);
     await page.waitForTimeout(SETTLE_MS);
     await expect(page.locator('.thread-drawer')).not.toHaveClass(/thread-drawer-collapsed/);
     expect(await drawerWidth(page)).toBe(floor);
 
-    // Closing is the toggle's job, and it still works.
     await page.locator(`button[aria-label^="${DRAWER_TOGGLE_LABEL}"]:visible`).first().click();
     await expect(page.locator('.thread-drawer')).toHaveClass(/thread-drawer-collapsed/, { timeout: 5_000 });
     await openThreadDrawer(page);
@@ -287,12 +212,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   });
 
   test('widening the drawer stops at the thread pane\'s minimum, not past it', async ({ page }) => {
-    // The drawer drag holds the content pane at a constant pixel width, so every
-    // pixel the drawer gains comes out of the THREAD pane. That is the less
-    // obvious end of the drawer's clamp, and the one a ceiling-less version
-    // squeezed to nothing. At 1280 the split clears its floors by 19px, so the
-    // thread pane starts on its wall and the drag cannot travel. A wider window
-    // and a wider thread pane give it room.
     await page.setViewportSize({ width: 1600, height: 800 });
     await openDrawerAndSettle(page);
     await dragDivider(page, '.split-divider', 1200);
@@ -321,24 +240,14 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   test('drawer toggle slides the drawer header shut with the drawer — no pop', async ({ page }) => {
     await openDrawerAndSettle(page);
 
-    // openDrawerAndSettle opened the drawer; the toggle is a plain show/hide, so
-    // this second click simply hides it (no focus stage in between).
-    // Prefix match: the label carries a " (N blocked)" suffix whenever
-    // the thread list is hidden and something is waiting on the user.
     await page.locator(`button[aria-label^="${DRAWER_TOGGLE_LABEL}"]:visible`).first().click();
-    // The drawer header must pass through intermediate widths: it stays
-    // mounted and its width rides --content-offset through the transition.
-    // The old conditional render unmounted it at toggle time — width would
-    // jump straight to 0 and this wait would time out at an intermediate
-    // sample... by never seeing one (it polls every frame).
     await page.waitForFunction(() => {
       const header = document.querySelector('.threads-header');
-      if (!header) return false; // unmounting is exactly the pop we're pinning against
+      if (!header) return false;
       const w = header.getBoundingClientRect().width;
       return w > 20 && w < 280;
     }, undefined, { timeout: 2_000 });
 
-    // After the transition: still mounted, slid to zero, out of the tab order.
     await expect.poll(
       () => page.evaluate(() => {
         const header = document.querySelector('.threads-header');
@@ -347,8 +256,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
       }),
       { timeout: 5_000 },
     ).toBeLessThanOrEqual(1);
-    // Polled: the visibility transition flips to hidden right as the width
-    // lands — a single sample could race it by a frame.
     await expect.poll(
       () => page.evaluate(() =>
         getComputedStyle(document.querySelector('.threads-header')!).visibility),
@@ -357,15 +264,9 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   });
 
   test('maximizing the content pane fades the thread-side header instead of popping it', async ({ page }) => {
-    // Double-click the divider → thread pane collapses (content maximized).
     const divider = page.locator('.split-divider');
     await divider.dblclick();
 
-    // The brand must fade through intermediate opacities — display:none or
-    // unmount would make it vanish at the start of the pane animation.
-    // .desktop-header scoping matters: MobileAppHeader renders an earlier
-    // .pane-header-brand copy that is display:none on desktop, where
-    // transitions don't run and opacity flips instantly.
     await page.waitForFunction(() => {
       const brand = document.querySelector('.desktop-header .pane-header-brand');
       if (!brand) return false;
@@ -373,7 +274,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
       return opacity > 0.05 && opacity < 0.95;
     }, undefined, { timeout: 2_000 });
 
-    // Settled: still mounted, fully faded, hidden from interaction.
     await expect.poll(
       () => page.evaluate(() => {
         const brand = document.querySelector('.desktop-header .pane-header-brand');
@@ -382,8 +282,6 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
       }),
       { timeout: 5_000 },
     ).toBe(0);
-    // Polled: visibility flips at the opacity transition's end — a single
-    // sample could race it by a frame.
     await expect.poll(
       () => page.evaluate(() =>
         getComputedStyle(document.querySelector('.desktop-header .pane-header-brand')!).visibility),
@@ -392,39 +290,24 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   });
 
   test('maximizing the thread pane animates the pane body, not just the header', async ({ page }) => {
-    // Double-click the thread side of the header → content pane collapses, the
-    // thread pane maximizes to full width. The pane body must animate to full
-    // width over var(--duration-slow) like its header does — the bug was that
-    // the pane jumped instantly (its flex switched from basis-driven to
-    // grow-driven, and .pane-animate only transitioned flex-basis) while the
-    // header slid smoothly, so they read as disconnected.
-    const startWidth = await threadPaneWidth(page); // ~512 at ratio 0.4 / 1280
+    const startWidth = await threadPaneWidth(page);
     expect(startWidth).toBeLessThan(700);
 
-    // Land on a real non-interactive gap on the thread side, so
-    // onHeaderDblClick actually maximizes the thread pane (see
-    // threadHeaderGapX — a hardcoded x silently drifted onto the brand text).
     const header = page.locator('.app-header');
     const headerBox = await header.boundingBox();
     if (!headerBox) throw new Error('.app-header not visible');
     const gapX = await threadHeaderGapX(page);
     await header.dblclick({ position: { x: gapX - headerBox.x, y: 20 } });
 
-    // The pane width must pass through an intermediate value during the
-    // transition. With the bug it snaps straight to full width and this never
-    // samples an in-between value (waitForFunction would time out).
     await page.waitForFunction(() => {
       const w = document.querySelector('.pane-thread')!.getBoundingClientRect().width;
       return w > 650 && w < 1150;
     }, undefined, { timeout: 2_000 });
 
-    // Settled: thread fills the row (only the divider + its margin remain).
     await expect.poll(() => threadPaneWidth(page), { timeout: 5_000 }).toBeGreaterThan(1150);
   });
 });
 
-/** Comfortably above the drawer's floor on BOTH desktop builds, so the title has
- *  room to be a title and nothing below is measuring a clamp instead. */
 const WIDE_DRAWER = 500;
 
 async function openDrawerAtWidth(page: Page, width: number): Promise<void> {
@@ -435,11 +318,6 @@ async function openDrawerAtWidth(page: Page, width: number): Promise<void> {
   }, width, { timeout: 5_000 });
 }
 
-/** Where the drawer header's title actually landed, against the band it is
- *  centred on and the controls it must clear: Filter, which leads the row
- *  just past the drawer toggle, and Grouping at its trailing end. Scoped to
- *  `.desktop-header`: `MobileAppHeader` renders first and carries its own
- *  copies (the 0x0-rect trap in .claude/rules/frontend.md). */
 async function threadsHeaderGeometry(page: Page) {
   const geo = await page.evaluate(() => {
     const band = document.querySelector('.desktop-header .threads-header');
@@ -466,8 +344,6 @@ async function threadsHeaderGeometry(page: Page) {
 }
 
 test.describe('Threads header: a pane-centred title, and a band that answers no double-click', () => {
-  // Beside a WIDE_DRAWER, 1280 leaves the split less than its two pane floors
-  // (858px), and the Canvas yields (ADR 0495). This window leaves it 937.
   test.use({ viewport: { width: 1440, height: 800 } });
 
   test.beforeEach(async ({ page, context }) => {
@@ -492,14 +368,8 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
     expect(web.titleLeft, 'the title runs under the Filter button').toBeGreaterThanOrEqual(web.filterRight);
     expect(web.titleRight, 'the title runs under the Grouping button').toBeLessThanOrEqual(web.groupingLeft);
 
-    // Now the packaged macOS layout, where the row's two ends differ the most:
-    // the toggle rests after --titlebar-lights-reserve there. A title centred
-    // on the GAP between the ends would land well right of the pane's middle.
-    // The real build cannot be driven by a browser test (ADR 0016). But an
-    // attribute switches the layout and the reserve is a flat px, so stamping
-    // the attribute reproduces the geometry.
     await stampOverlayBuild(page);
-    await page.waitForTimeout(SETTLE_MS); // the row's lead moves to the reserve
+    await page.waitForTimeout(SETTLE_MS);
 
     const overlay = await threadsHeaderGeometry(page);
     expect(overlay.toggleRight, 'the lights reserve did not apply, so this proves nothing')
@@ -523,25 +393,14 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
     const before = await ratio();
     expect(before, 'SplitLayout publishes the ratio to CSS; nothing to compare against').not.toBe('');
 
-    // The title is the segment's largest non-interactive surface, so this is the
-    // click a user makes. Without the fence, onHeaderDblClick reads everything
-    // left of the split divider as "the thread side" and maximizes that pane
-    // group. The Conversation side still does exactly that, which the
-    // "maximizing the thread pane" test above covers.
     await page.locator('.desktop-header .threads-header-title').dblclick();
     await page.waitForTimeout(SETTLE_MS);
 
     expect(await ratio(), 'the drawer header maximized a pane group').toBe(before);
     await expect(page.locator('.pane-content')).not.toHaveClass(/pane-collapsed/);
     await expect(page.locator('.pane-thread')).not.toHaveClass(/pane-collapsed/);
-    // And the drawer it belongs to is untouched.
     expect(Math.abs(await drawerWidth(page) - WIDE_DRAWER)).toBeLessThanOrEqual(1);
 
-    // The bar is taller than the 2.25rem control row inside it, so a press a
-    // couple of px from its bottom edge lands on the bar rather than on
-    // `.threads-header`. That sliver is still the drawer's segment: it is why
-    // the attribution is geometry (headerDblClickRegion) and not a
-    // `closest('.threads-header')` fence, which would let exactly this through.
     const header = page.locator('.app-header');
     const box = await header.boundingBox();
     if (!box) throw new Error('.app-header not visible');

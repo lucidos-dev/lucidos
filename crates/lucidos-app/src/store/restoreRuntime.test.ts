@@ -13,11 +13,16 @@ const state = vi.hoisted(() => ({
   create: vi.fn(async () => {}), complete: vi.fn(async () => {}), reload: vi.fn(),
 }));
 vi.mock('../utils/basePath', () => ({ WORKSPACE_ID: 'test-workspace' }));
+vi.mock('../utils/lazyComponent', () => ({ lazyModule: <M>(load: () => Promise<M>) => {
+  let loaded: M | undefined;
+  return { preload: async () => { loaded = await load(); return true; }, isLoaded: () => loaded !== undefined, get: () => loaded! };
+} }));
 vi.mock('./restoreGenerationRecords', () => ({ createRestoreGenerationStore: () => ({
   journalHistorical: state.journal,
   readGeneration: async () => state.generation,
   observe: state.observe, preserve: state.preserve,
   readRecoveries: async () => state.recoveries,
+  materializeDraft: vi.fn(async (draft: unknown) => draft),
   prepareRecovery: async () => ({ generation: state.generation, drafts: [{ sourceThreadId: 'old', threadId: 'new' }], completed: [] }),
   completeRecoveryDraft: state.complete,
 }) }));
@@ -26,6 +31,8 @@ vi.mock('./composeDrafts', () => ({ composeDrafts: { peek: () => new Map([['old'
 vi.mock('./composeSelections', () => ({ composeSelections: { peek: () => new Map() }, pendingComposeSelection: { peek: () => ({}) } }));
 vi.mock('./pageOwner', () => ({ pageOwnerId: 'this-page', holdPageOwnerLock: vi.fn(), liveOwnerIds: async () => new Set<string>() }));
 vi.mock('./pendingUploadRecords', () => ({ livePendingUploadRecords: () => state.retained,
+  readPendingUploadHistory: async () => ({ uploads: [], queuedUploadSendRecords: [] }),
+  readArchivedUploadBytes: async () => undefined,
   readPendingUploadStore: async () => ({ uploads: [], queuedUploadSendRecords: [] }) }));
 vi.mock('./unsentMessages', () => ({ unsentMessages: { peek: () => state.cards } }));
 vi.mock('./uploadSendIntents', () => ({ queuedUploadSends: { peek: () => state.queued } }));
@@ -74,8 +81,6 @@ it('captures live composers and reloads once on a changed generation without rel
   expect(app.restoreAdmissionReady()).toBe(false);
 });
 
-// A failed capture must never leave the page frozen: the user still needs to
-// read and copy what they typed while the next connection retries admission.
 it('unfreezes the page when preserving intent fails on a changed generation', async () => {
   const app = await setup();
   state.preserve.mockRejectedValueOnce(new Error('QuotaExceededError'));
@@ -128,6 +133,20 @@ it('captures production in-memory files omitted from durable upload records', as
   expect(state.reload).toHaveBeenCalledTimes(1);
 });
 
+it('keeps the retained upload identity when its pending File is still present', async () => {
+  const bytes = new Uint8Array([4, 5]).buffer;
+  state.retained = [{ localId: 'file', threadId: 'old', name: 'photo.png', mime: 'image/png',
+    bytes, size: 2, createdAt: 1, ownerId: 'this-page', landedHash: 'confirmed' }];
+  const arrayBuffer = vi.fn(async () => bytes);
+  state.uploads.set('old', [{ localId: 'file', threadId: 'old', mime: 'image/png', previewUrl: '',
+    file: { name: 'photo.png', size: 2, arrayBuffer } as unknown as File,
+    state: { kind: 'offline', reason: 'offline' } }]);
+  const app = await setup();
+  expect(await app.acceptRestoreHello(app.beginRestoreConnection(), 'restored')).toBe(false);
+  expect(state.preserve.mock.calls[0][1].drafts[0].uploads).toEqual(state.retained);
+  expect(arrayBuffer).not.toHaveBeenCalled();
+});
+
 it('captures landed live bytes after their pending File detached and durable storage omitted them', async () => {
   state.retained = [{ localId: 'landed', threadId: 'old', name: 'photo.png', mime: 'image/png',
     bytes: new Uint8Array([4, 5]).buffer, size: 2, createdAt: 1, ownerId: 'this-page', landedHash: 'confirmed' }];
@@ -173,6 +192,36 @@ it('publishes the source origin only after successful reconstruction admission',
   expect(origin.sourceGeneration()).toBe('restored');
 });
 
+
+it('names the step a stalled admission is in, and never admits on the stall', async () => {
+  const app = await setup();
+  const { DeviceDatabaseStalledError } = await import('./deviceDatabase');
+  expect(app.restoreAdmissionPhase()).toBe('awaiting-hello');
+  const epoch = app.beginRestoreConnection();
+  let release!: () => void;
+  state.journal.mockReturnValueOnce(new Promise((_, reject) => {
+    release = () => reject(new DeviceDatabaseStalledError('test', 'transaction'));
+  }));
+  const hello = app.acceptRestoreHello(epoch, null);
+  await vi.waitFor(() => expect(app.restoreAdmissionPhase()).toBe('journal'));
+  release();
+  await expect(hello).rejects.toBeInstanceOf(DeviceDatabaseStalledError);
+  expect(app.restoreAdmissionReady()).toBe(false);
+  expect(app.restoreAdmissionPhase()).toBe('journal');
+
+  const retry = app.beginRestoreConnection();
+  expect(app.restoreAdmissionPhase()).toBe('awaiting-hello');
+  expect(await app.acceptRestoreHello(retry, null)).toBe(true);
+  expect(app.restoreAdmissionPhase()).toBe('admitted');
+});
+
+it('keeps a stale hello from moving the current connection phase', async () => {
+  const app = await setup();
+  const old = app.beginRestoreConnection();
+  app.beginRestoreConnection();
+  expect(await app.acceptRestoreHello(old, null)).toBe(false);
+  expect(app.restoreAdmissionPhase()).toBe('awaiting-hello');
+});
 
 it('keeps admission closed after late-source journal failure, and retries on reconnect', async () => {
   const app = await setup();
@@ -224,9 +273,6 @@ it('requires an admitted restored connection for explicit source review actions'
   await expect(app.readRetainedRestoreSources()).rejects.toThrow('connection changed');
 });
 
-// A page loading after a restore starts SDK calls before its first hello. The
-// hello matches the page baseline, so those calls belong to that generation.
-// A changed generation reloads the page instead, and the parked calls never send.
 it('admits SDK mutations begun before the first hello at the page baseline', async () => {
   const generation = '11111111-1111-4111-8111-111111111111';
   state.generation = generation;

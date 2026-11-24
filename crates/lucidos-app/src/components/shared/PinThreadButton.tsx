@@ -1,11 +1,6 @@
 import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
 import { PinButton } from './PinButton';
 
-/** Pin toggle — pins/unpins a thread (internally the `save` category: `is_saved`
- *  + the `ThreadSaved`/`ThreadUnsaved` events). The toggle maps exactly to the
- *  `resolveThreadActions` save/unsave mapping (`saved ? unsave : save`), so it
- *  can never drift from the selector the close cascade and server-side guards
- *  consult. The unpin path confirms internally (`handleUnsaveThread`). */
 export function PinThreadButton({ threadId, saved, stopPropagation, extraClass, tabIndex }: {
   threadId: string;
   saved: boolean;

@@ -1,16 +1,16 @@
-//! The gateway event log: devices and operators, event sourced (ADR 0623).
+//! The gateway event log: devices and users, event sourced (ADR 0623).
 //!
-//! Every pairing, revoke and operator change is one line of JSON appended to
+//! Every pairing, revoke and user change is one line of JSON appended to
 //! `<data dir>/gateway-events.jsonl`, and synced before anyone acts on it. The
 //! [`Directory`] is a projection of that file: replaying the log rebuilds it.
 //! The log needs no Postgres, so a device still signs in while Postgres is down.
 //!
-//! **An operator is identity without authority.** Nothing in the gateway reads
-//! an operator to allow or refuse a request. [`crate::auth::authorize_with_match`]
+//! **A user is identity without authority.** Nothing in the gateway reads
+//! a user to allow or refuse a request. [`crate::auth::authorize_with_match`]
 //! reads only [`Directory::devices`].
 //!
 //! The log replaces `paired-devices.json`, which [`open`] migrates exactly once
-//! into seed events, every device under one operator.
+//! into seed events, every device under one user.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -27,11 +27,11 @@ pub const LOG_FILE: &str = "gateway-events.jsonl";
 /// gateway reads it again, so a downgrade cannot revive a revoked device.
 const MIGRATED_SUFFIX: &str = "migrated";
 
-/// The name of the operator a gateway creates for itself: the one that holds
-/// every migrated device, or the first device paired with no operator named.
-pub const FIRST_OPERATOR_NAME: &str = "Owner";
+/// The name of the user a gateway creates for itself: the one that holds
+/// every migrated device, or the first device paired with no user named.
+pub const FIRST_USER_NAME: &str = "Owner";
 
-/// One change to the devices or operators, named in the past tense.
+/// One change to the devices or users, named in the past tense.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum GatewayEvent {
@@ -39,7 +39,7 @@ pub enum GatewayEvent {
         device_id: String,
         label: String,
         credential_digest: String,
-        operator_id: String,
+        user_id: String,
     },
     /// A device reached this gateway, at most once a day. A liveness hint for
     /// the devices list, never an auth input.
@@ -51,41 +51,41 @@ pub enum GatewayEvent {
     },
     DeviceMoved {
         device_id: String,
-        operator_id: String,
+        user_id: String,
     },
-    OperatorAdded {
-        operator_id: String,
+    UserAdded {
+        user_id: String,
         name: String,
     },
-    OperatorRenamed {
-        operator_id: String,
+    UserRenamed {
+        user_id: String,
         name: String,
     },
     /// Its devices were revoked first, each with its own `DeviceRevoked`.
-    OperatorRemoved {
-        operator_id: String,
+    UserRemoved {
+        user_id: String,
     },
-    OperatorEmailAdded {
-        operator_id: String,
+    UserEmailAdded {
+        user_id: String,
         email: String,
     },
-    OperatorEmailRemoved {
-        operator_id: String,
+    UserEmailRemoved {
+        user_id: String,
         email: String,
     },
     /// A device relayed through a gateway pairing arrived with a signed
-    /// operator that differs from the last one recorded for it.
-    RelayedOperatorSeen {
+    /// user that differs from the last one recorded for it.
+    RelayedUserSeen {
         device_id: String,
-        operator_id: String,
+        user_id: String,
         name: String,
         via: String,
-        /// The emails A holds for the person. An engine merges the relayed
-        /// person into the local one holding the same email.
+        /// The emails A holds for the user. An engine merges the relayed
+        /// user into the local one holding the same email.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         emails: Vec<String>,
     },
-    /// A gateway pairing ended, so its relayed people are gone. Device ids
+    /// A gateway pairing ended, so its relayed users are gone. Device ids
     /// relayed through it start with `<pairing_id>:`.
     RelayedPairingForgotten {
         pairing_id: String,
@@ -117,28 +117,28 @@ impl LoggedEvent {
     }
 }
 
-/// A person, as this gateway knows them.
+/// A user, as this gateway knows them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Operator {
+pub struct User {
     pub id: String,
     pub name: String,
-    /// Lowercase. One email belongs to at most one operator.
+    /// Lowercase. One email belongs to at most one user.
     pub emails: Vec<String>,
     pub added_at: String,
 }
 
 /// A device that reaches this gateway through a gateway pairing, with the
-/// operator the other gateway signed for it.
+/// user the other gateway signed for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RelayedDevice {
     /// The namespaced id this gateway's engines see.
     pub device_id: String,
     /// Namespaced like the device id, so it never collides with a local one.
-    pub operator_id: String,
+    pub user_id: String,
     pub name: String,
     /// The other gateway's label.
     pub via: String,
-    /// The emails A signed for the person, lowercase.
+    /// The emails A signed for the user, lowercase.
     #[serde(default)]
     pub emails: Vec<String>,
 }
@@ -148,9 +148,9 @@ pub struct RelayedDevice {
 pub struct Directory {
     /// Every paired device. Authorization reads this and nothing else.
     pub devices: PairedDevices,
-    /// Oldest first, which is what makes [`Directory::first_operator`] stable.
-    pub operators: Vec<Operator>,
-    /// Which operator holds each device.
+    /// Oldest first, which is what makes [`Directory::first_user`] stable.
+    pub users: Vec<User>,
+    /// Which user holds each device.
     pub memberships: BTreeMap<String, String>,
     pub relayed: Vec<RelayedDevice>,
 }
@@ -177,7 +177,7 @@ impl Directory {
                 device_id,
                 label,
                 credential_digest,
-                operator_id,
+                user_id,
             } => {
                 self.devices.devices.retain(|d| &d.id != device_id);
                 self.devices.devices.push(PairedDevice {
@@ -187,8 +187,7 @@ impl Directory {
                     paired_at: at.clone(),
                     last_seen_at: None,
                 });
-                self.memberships
-                    .insert(device_id.clone(), operator_id.clone());
+                self.memberships.insert(device_id.clone(), user_id.clone());
             }
             GatewayEvent::DeviceSeen { device_id } => {
                 if let Some(device) = self.device_mut(device_id) {
@@ -199,47 +198,44 @@ impl Directory {
                 self.devices.devices.retain(|d| &d.id != device_id);
                 self.memberships.remove(device_id);
             }
-            GatewayEvent::DeviceMoved {
-                device_id,
-                operator_id,
-            } => {
+            GatewayEvent::DeviceMoved { device_id, user_id } => {
                 if let Some(held) = self.memberships.get_mut(device_id) {
-                    held.clone_from(operator_id);
+                    held.clone_from(user_id);
                 }
             }
-            GatewayEvent::OperatorAdded { operator_id, name } => {
-                if self.operator(operator_id).is_none() {
-                    self.operators.push(Operator {
-                        id: operator_id.clone(),
+            GatewayEvent::UserAdded { user_id, name } => {
+                if self.user(user_id).is_none() {
+                    self.users.push(User {
+                        id: user_id.clone(),
                         name: name.clone(),
                         emails: Vec::new(),
                         added_at: at.clone(),
                     });
                 }
             }
-            GatewayEvent::OperatorRenamed { operator_id, name } => {
-                if let Some(operator) = self.operator_mut(operator_id) {
-                    operator.name.clone_from(name);
+            GatewayEvent::UserRenamed { user_id, name } => {
+                if let Some(user) = self.user_mut(user_id) {
+                    user.name.clone_from(name);
                 }
             }
-            GatewayEvent::OperatorRemoved { operator_id } => {
-                self.operators.retain(|o| &o.id != operator_id);
+            GatewayEvent::UserRemoved { user_id } => {
+                self.users.retain(|o| &o.id != user_id);
             }
-            GatewayEvent::OperatorEmailAdded { operator_id, email } => {
-                if let Some(operator) = self.operator_mut(operator_id) {
-                    if !operator.emails.contains(email) {
-                        operator.emails.push(email.clone());
+            GatewayEvent::UserEmailAdded { user_id, email } => {
+                if let Some(user) = self.user_mut(user_id) {
+                    if !user.emails.contains(email) {
+                        user.emails.push(email.clone());
                     }
                 }
             }
-            GatewayEvent::OperatorEmailRemoved { operator_id, email } => {
-                if let Some(operator) = self.operator_mut(operator_id) {
-                    operator.emails.retain(|e| e != email);
+            GatewayEvent::UserEmailRemoved { user_id, email } => {
+                if let Some(user) = self.user_mut(user_id) {
+                    user.emails.retain(|e| e != email);
                 }
             }
-            GatewayEvent::RelayedOperatorSeen {
+            GatewayEvent::RelayedUserSeen {
                 device_id,
-                operator_id,
+                user_id,
                 name,
                 via,
                 emails,
@@ -247,7 +243,7 @@ impl Directory {
                 self.relayed.retain(|r| &r.device_id != device_id);
                 self.relayed.push(RelayedDevice {
                     device_id: device_id.clone(),
-                    operator_id: operator_id.clone(),
+                    user_id: user_id.clone(),
                     name: name.clone(),
                     via: via.clone(),
                     emails: emails.clone(),
@@ -260,12 +256,12 @@ impl Directory {
         }
     }
 
-    pub fn operator(&self, id: &str) -> Option<&Operator> {
-        self.operators.iter().find(|o| o.id == id)
+    pub fn user(&self, id: &str) -> Option<&User> {
+        self.users.iter().find(|o| o.id == id)
     }
 
-    fn operator_mut(&mut self, id: &str) -> Option<&mut Operator> {
-        self.operators.iter_mut().find(|o| o.id == id)
+    fn user_mut(&mut self, id: &str) -> Option<&mut User> {
+        self.users.iter_mut().find(|o| o.id == id)
     }
 
     fn device_mut(&mut self, id: &str) -> Option<&mut PairedDevice> {
@@ -276,47 +272,47 @@ impl Directory {
         self.devices.devices.iter().any(|d| d.id == id)
     }
 
-    /// The operator a device belongs to.
-    pub fn operator_of_device(&self, device_id: &str) -> Option<&str> {
+    /// The user a device belongs to.
+    pub fn user_of_device(&self, device_id: &str) -> Option<&str> {
         self.memberships.get(device_id).map(String::as_str)
     }
 
-    /// The devices an operator holds, in pairing order.
-    pub fn devices_of(&self, operator_id: &str) -> Vec<&str> {
+    /// The devices a user holds, in pairing order.
+    pub fn devices_of(&self, user_id: &str) -> Vec<&str> {
         self.devices
             .devices
             .iter()
-            .filter(|d| self.operator_of_device(&d.id) == Some(operator_id))
+            .filter(|d| self.user_of_device(&d.id) == Some(user_id))
             .map(|d| d.id.as_str())
             .collect()
     }
 
-    /// The oldest operator still here: the one a pairing with no operator
+    /// The oldest user still here: the one a pairing with no user
     /// named joins.
-    pub fn first_operator(&self) -> Option<&Operator> {
-        self.operators.first()
+    pub fn first_user(&self) -> Option<&User> {
+        self.users.first()
     }
 
-    /// The events that pair a device. With no operator named it joins the
-    /// first operator, which a gateway with none creates first.
+    /// The events that pair a device. With no user named it joins the
+    /// first user, which a gateway with none creates first.
     pub fn pair(
         &self,
         device_id: &str,
         label: &str,
         credential_digest: &str,
-        operator_id: Option<&str>,
+        user_id: Option<&str>,
     ) -> Result<Vec<GatewayEvent>, Refusal> {
         let mut events = Vec::new();
-        let operator_id = match operator_id {
-            Some(id) if self.operator(id).is_some() => id.to_string(),
-            Some(_) => return Err("the person this pairing was for was removed".to_string()),
-            None => match self.first_operator() {
+        let user_id = match user_id {
+            Some(id) if self.user(id).is_some() => id.to_string(),
+            Some(_) => return Err("the user this pairing was for was removed".to_string()),
+            None => match self.first_user() {
                 Some(first) => first.id.clone(),
                 None => {
-                    let id = mint_operator_id()?;
-                    events.push(GatewayEvent::OperatorAdded {
-                        operator_id: id.clone(),
-                        name: FIRST_OPERATOR_NAME.to_string(),
+                    let id = mint_user_id()?;
+                    events.push(GatewayEvent::UserAdded {
+                        user_id: id.clone(),
+                        name: FIRST_USER_NAME.to_string(),
                     });
                     id
                 }
@@ -326,7 +322,7 @@ impl Directory {
             device_id: device_id.to_string(),
             label: label.to_string(),
             credential_digest: credential_digest.to_string(),
-            operator_id,
+            user_id,
         });
         Ok(events)
     }
@@ -341,25 +337,25 @@ impl Directory {
         }]
     }
 
-    pub fn add_operator(&self, name: &str) -> Result<Vec<GatewayEvent>, Refusal> {
-        Ok(vec![GatewayEvent::OperatorAdded {
-            operator_id: mint_operator_id()?,
+    pub fn add_user(&self, name: &str) -> Result<Vec<GatewayEvent>, Refusal> {
+        Ok(vec![GatewayEvent::UserAdded {
+            user_id: mint_user_id()?,
             name: valid_name(name)?,
         }])
     }
 
-    pub fn rename_operator(&self, id: &str, name: &str) -> Result<Vec<GatewayEvent>, Refusal> {
-        self.require_operator(id)?;
-        Ok(vec![GatewayEvent::OperatorRenamed {
-            operator_id: id.to_string(),
+    pub fn rename_user(&self, id: &str, name: &str) -> Result<Vec<GatewayEvent>, Refusal> {
+        self.require_user(id)?;
+        Ok(vec![GatewayEvent::UserRenamed {
+            user_id: id.to_string(),
             name: valid_name(name)?,
         }])
     }
 
-    /// Revoke every device the operator holds, then remove the operator. That
+    /// Revoke every device the user holds, then remove the user. That
     /// is how a team offboards someone.
-    pub fn remove_operator(&self, id: &str) -> Result<Vec<GatewayEvent>, Refusal> {
-        self.require_operator(id)?;
+    pub fn remove_user(&self, id: &str) -> Result<Vec<GatewayEvent>, Refusal> {
+        self.require_user(id)?;
         let mut events: Vec<GatewayEvent> = self
             .devices_of(id)
             .into_iter()
@@ -367,35 +363,35 @@ impl Directory {
                 device_id: device_id.to_string(),
             })
             .collect();
-        events.push(GatewayEvent::OperatorRemoved {
-            operator_id: id.to_string(),
+        events.push(GatewayEvent::UserRemoved {
+            user_id: id.to_string(),
         });
         Ok(events)
     }
 
     pub fn add_email(&self, id: &str, email: &str) -> Result<Vec<GatewayEvent>, Refusal> {
-        self.require_operator(id)?;
+        self.require_user(id)?;
         let email = normalize_email(email)?;
-        if let Some(holder) = self.operator_of_email(&email) {
+        if let Some(holder) = self.user_of_email(&email) {
             if holder.id == id {
                 return Ok(Vec::new());
             }
             return Err(format!("{email} already belongs to {}", holder.name));
         }
-        Ok(vec![GatewayEvent::OperatorEmailAdded {
-            operator_id: id.to_string(),
+        Ok(vec![GatewayEvent::UserEmailAdded {
+            user_id: id.to_string(),
             email,
         }])
     }
 
     pub fn remove_email(&self, id: &str, email: &str) -> Result<Vec<GatewayEvent>, Refusal> {
-        let operator = self.require_operator(id)?;
+        let user = self.require_user(id)?;
         let email = email.trim().to_lowercase();
-        if !operator.emails.contains(&email) {
-            return Err(format!("{} has no email {email}", operator.name));
+        if !user.emails.contains(&email) {
+            return Err(format!("{} has no email {email}", user.name));
         }
-        Ok(vec![GatewayEvent::OperatorEmailRemoved {
-            operator_id: id.to_string(),
+        Ok(vec![GatewayEvent::UserEmailRemoved {
+            user_id: id.to_string(),
             email,
         }])
     }
@@ -403,37 +399,37 @@ impl Directory {
     pub fn move_device(
         &self,
         device_id: &str,
-        operator_id: &str,
+        user_id: &str,
     ) -> Result<Vec<GatewayEvent>, Refusal> {
         if !self.has_device(device_id) {
             return Err("no paired device with that id".to_string());
         }
-        self.require_operator(operator_id)?;
-        if self.operator_of_device(device_id) == Some(operator_id) {
+        self.require_user(user_id)?;
+        if self.user_of_device(device_id) == Some(user_id) {
             return Ok(Vec::new());
         }
         Ok(vec![GatewayEvent::DeviceMoved {
             device_id: device_id.to_string(),
-            operator_id: operator_id.to_string(),
+            user_id: user_id.to_string(),
         }])
     }
 
-    /// The event recording a relayed device's signed operator, or none when
+    /// The event recording a relayed device's signed user, or none when
     /// it is what the log already says.
     pub fn relayed_seen(&self, seen: RelayedDevice) -> Option<GatewayEvent> {
         if self.relayed.contains(&seen) {
             return None;
         }
-        Some(GatewayEvent::RelayedOperatorSeen {
+        Some(GatewayEvent::RelayedUserSeen {
             device_id: seen.device_id,
-            operator_id: seen.operator_id,
+            user_id: seen.user_id,
             name: seen.name,
             via: seen.via,
             emails: seen.emails,
         })
     }
 
-    /// The event dropping the people relayed through an ended pairing, or
+    /// The event dropping the users relayed through an ended pairing, or
     /// none when it relayed nobody.
     pub fn pairing_forgotten(&self, pairing_id: &str) -> Option<GatewayEvent> {
         let prefix = format!("{pairing_id}:");
@@ -445,26 +441,26 @@ impl Directory {
             })
     }
 
-    /// The operator holding an email, matched without regard to case.
-    pub fn operator_of_email(&self, email: &str) -> Option<&Operator> {
+    /// The user holding an email, matched without regard to case.
+    pub fn user_of_email(&self, email: &str) -> Option<&User> {
         let email = email.trim().to_lowercase();
-        self.operators.iter().find(|o| o.emails.contains(&email))
+        self.users.iter().find(|o| o.emails.contains(&email))
     }
 
-    fn require_operator(&self, id: &str) -> Result<&Operator, Refusal> {
-        self.operator(id)
-            .ok_or_else(|| "no person with that id".to_string())
+    fn require_user(&self, id: &str) -> Result<&User, Refusal> {
+        self.user(id)
+            .ok_or_else(|| "no user with that id".to_string())
     }
 }
 
-fn mint_operator_id() -> Result<String, Refusal> {
-    lucidos_local_token::mint_hex(8).map_err(|e| format!("could not mint an operator id: {e}"))
+fn mint_user_id() -> Result<String, Refusal> {
+    lucidos_local_token::mint_hex(8).map_err(|e| format!("could not mint a user id: {e}"))
 }
 
 fn valid_name(name: &str) -> Result<String, Refusal> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("a person needs a name".to_string());
+        return Err("a user needs a name".to_string());
     }
     if name.chars().count() > 80 {
         return Err("a name is at most 80 characters".to_string());
@@ -578,6 +574,7 @@ pub fn open(
         path: app_data.join(LOG_FILE),
     };
     if log.path.exists() {
+        rename_operator_to_user(&log.path)?;
         let (events, torn) = read_log(&log.path)?;
         let opened = if torn {
             Opened::RepairedTornTail
@@ -611,18 +608,71 @@ pub fn open(
     ))
 }
 
-/// The events that reproduce a device store: one operator holding every
+/// Written under the data dir once [`cut_devices_once`] has run.
+pub const DEVICE_CUT_MARKER: &str = "device-cut-loopback-tls.done";
+
+/// Revoke every paired device and delete the old device stores, once.
+///
+/// Loopback moved to https with a partitioned cookie (ADR 0745), so no
+/// credential minted before it is accepted again. One `DeviceRevoked` per
+/// device, never a new event type: an older gateway would refuse to replay
+/// one, and a rollback would not boot. Users, emails, relayed devices and the
+/// gateway pairings stay.
+///
+/// Temporary: `docs/temporary-measures.md` § Loopback TLS device cut.
+///
+/// `None` when the cut ran before, else how many devices it revoked.
+pub fn cut_devices_once(
+    log: &EventLog,
+    directory: &mut Directory,
+    app_data: &Path,
+    legacy: Option<&Path>,
+) -> Result<Option<usize>, crate::BoxError> {
+    let marker = app_data.join(DEVICE_CUT_MARKER);
+    if marker.exists() {
+        return Ok(None);
+    }
+    let revoked: Vec<LoggedEvent> = directory
+        .devices
+        .devices
+        .iter()
+        .flat_map(|device| directory.revoke(&device.id))
+        .map(LoggedEvent::now)
+        .collect();
+    log.append(&revoked)?;
+    for event in &revoked {
+        directory.apply(event);
+    }
+    let store = auth::paired_devices_path(app_data);
+    let mut migrated = store.clone().into_os_string();
+    migrated.push(".");
+    migrated.push(MIGRATED_SUFFIX);
+    for stale in [Some(store.as_path()), Some(Path::new(&migrated)), legacy]
+        .into_iter()
+        .flatten()
+    {
+        match std::fs::remove_file(stale) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    std::fs::create_dir_all(app_data)?;
+    std::fs::write(&marker, b"")?;
+    Ok(Some(revoked.len()))
+}
+
+/// The events that reproduce a device store: one user holding every
 /// device, each paired and last seen when the store says.
 pub fn seed_events(store: &PairedDevices) -> Result<Vec<LoggedEvent>, crate::BoxError> {
     let Some(first) = store.devices.first() else {
         return Ok(Vec::new());
     };
-    let operator_id = mint_operator_id()?;
+    let user_id = mint_user_id()?;
     let mut events = vec![LoggedEvent {
         at: first.paired_at.clone(),
-        event: GatewayEvent::OperatorAdded {
-            operator_id: operator_id.clone(),
-            name: FIRST_OPERATOR_NAME.to_string(),
+        event: GatewayEvent::UserAdded {
+            user_id: user_id.clone(),
+            name: FIRST_USER_NAME.to_string(),
         },
     }];
     for device in &store.devices {
@@ -632,7 +682,7 @@ pub fn seed_events(store: &PairedDevices) -> Result<Vec<LoggedEvent>, crate::Box
                 device_id: device.id.clone(),
                 label: device.label.clone(),
                 credential_digest: device.credential_digest.clone(),
-                operator_id: operator_id.clone(),
+                user_id: user_id.clone(),
             },
         });
         if let Some(seen) = &device.last_seen_at {
@@ -650,17 +700,82 @@ pub fn seed_events(store: &PairedDevices) -> Result<Vec<LoggedEvent>, crate::Box
 /// Write the seed whole, then rename it into place, so a crash leaves either
 /// no log (and the store still there) or the complete one.
 fn write_seed(path: &Path, events: &[LoggedEvent]) -> Result<(), crate::BoxError> {
-    let tmp = path.with_extension("jsonl.tmp");
     let mut lines = String::new();
     for event in events {
         lines.push_str(&serde_json::to_string(event)?);
         lines.push('\n');
     }
+    replace_whole(path, &lines)
+}
+
+/// Write `contents` to a temp file, sync it, then rename it over `path`.
+fn replace_whole(path: &Path, contents: &str) -> Result<(), crate::BoxError> {
+    let tmp = path.with_extension("jsonl.tmp");
     let mut file = open_owner_only(&tmp, true)?;
-    file.write_all(lines.as_bytes())?;
+    file.write_all(contents.as_bytes())?;
     file.sync_data()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// What the log is copied to before [`rename_operator_to_user`] rewrites it.
+pub const PRE_USER_RENAME_SUFFIX: &str = "pre-user-rename";
+
+/// Rewrite a log written before *operator* became *user* (ADR 0655): the
+/// `Operator*` event types become `User*` and `operator_id` becomes `user_id`.
+/// The old file stays beside it. A log with nothing to rename is untouched,
+/// so a second run is a no-op. A line that does not parse is kept verbatim,
+/// for [`read_log`] to judge.
+fn rename_operator_to_user(path: &Path) -> Result<(), crate::BoxError> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut changed = false;
+    let mut rewritten = String::with_capacity(raw.len());
+    for line in raw.split_inclusive('\n') {
+        let body = line.trim_end_matches('\n');
+        let renamed = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|mut value| rename_logged_value(&mut value).then_some(value));
+        match renamed {
+            Some(value) => {
+                changed = true;
+                rewritten.push_str(&serde_json::to_string(&value)?);
+                rewritten.push_str(&line[body.len()..]);
+            }
+            None => rewritten.push_str(line),
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".");
+    backup.push(PRE_USER_RENAME_SUFFIX);
+    let backup = PathBuf::from(backup);
+    if !backup.exists() {
+        std::fs::copy(path, &backup)?;
+    }
+    replace_whole(path, &rewritten)
+}
+
+/// Rename one logged event in place. True when anything changed.
+fn rename_logged_value(logged: &mut serde_json::Value) -> bool {
+    let Some(event) = logged.get_mut("event") else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(serde_json::Value::String(kind)) = event.get_mut("type") {
+        if kind.contains("Operator") {
+            *kind = kind.replace("Operator", "User");
+            changed = true;
+        }
+    }
+    if let Some(serde_json::Value::Object(data)) = event.get_mut("data") {
+        if let Some(id) = data.remove("operator_id") {
+            data.insert("user_id".to_string(), id);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Read every event. A last line with no newline that does not parse is a

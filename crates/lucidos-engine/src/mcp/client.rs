@@ -158,15 +158,16 @@ impl McpClient {
     /// `server_label` is the registry id, carried so every later error can name
     /// the server that produced it.
     pub async fn connect(
+        sandbox: &crate::runtime::agent_sandbox::Sandbox,
         server_label: &str,
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
         mode: ActorMode,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        log!("{}", spawn_log_line(server_label, command, args));
+        log_legacy!("{}", spawn_log_line(server_label, command, args));
 
-        let mut cmd = tokio::process::Command::new(command);
+        let mut cmd = sandbox.command(command)?;
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -232,7 +233,7 @@ impl McpClient {
                     let text = String::from_utf8_lossy(&chunk);
                     let trimmed = text.trim_end();
                     if !trimmed.is_empty() {
-                        log!(
+                        log_legacy!(
                             "[MCP:stderr] [{}] {}",
                             label,
                             redact_subprocess_output(trimmed, &secrets)
@@ -297,14 +298,14 @@ impl McpClient {
         // The result itself is read leniently: a server may omit fields we do
         // not need, and none of them gate the connection.
         if let Ok(init) = serde_json::from_value::<InitializeResult>(result) {
-            log!(
+            log_legacy!(
                 "[MCP] '{}' speaks protocol {}",
                 self.server_label,
                 init.protocol_version
             );
             if let Some(info) = &init.server_info {
                 self.server_name = info.name.clone();
-                log!(
+                log_legacy!(
                     "[MCP] '{}' is {} v{}",
                     self.server_label,
                     info.name.as_deref().unwrap_or("unknown"),
@@ -351,7 +352,7 @@ impl McpClient {
                 self.server_label, e
             )
         })?;
-        log!(
+        log_legacy!(
             "[MCP] '{}' advertised {} tools",
             self.server_label,
             list.tools.len()
@@ -413,7 +414,7 @@ impl McpClient {
                     // a placeholder, so log which server and tool sent it: that
                     // is the only trace of what the model was denied.
                     ToolCallContent::Unknown => {
-                        crate::log!(
+                        crate::log_legacy!(
                             "[MCP] Server '{}' tool '{}' returned an unsupported content block",
                             self.server_label,
                             name

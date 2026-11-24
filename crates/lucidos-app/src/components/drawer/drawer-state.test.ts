@@ -2,11 +2,8 @@ import { beforeAll, describe, it, expect, beforeEach } from 'vitest';
 import { closeDrawer, drawerOpen, drawerClosing, openDrawer } from '../layout/drawerState';
 import { DrawerChunk } from '../layout/drawerState';
 
-// The drawer is code-split and opens once it is in memory. Warm it, so an
-// open lands at once.
 beforeAll(() => DrawerChunk.preload());
 
-/** Simulate the burger click handler logic from AppHeader */
 function burgerClick() {
   if (drawerOpen.value && !drawerClosing.value) closeDrawer();
   else openDrawer();
@@ -49,12 +46,9 @@ describe('Drawer state machine', () => {
   });
 
   it('burger click recovers from stuck closing state (onAnimationEnd never fired)', () => {
-    // Simulate: closeDrawer() was called, animation started but onAnimationEnd never fired
-    // State is stuck: drawerOpen=true, drawerClosing=true
     drawerOpen.value = true;
     drawerClosing.value = true;
 
-    // User clicks burger — should recover by opening the drawer
     burgerClick();
 
     expect(drawerOpen.value).toBe(true);

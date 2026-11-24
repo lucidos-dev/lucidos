@@ -1,18 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Diff answers a touch, exactly once, and drops the keyboard itself.
- *
- * It sits in the composer's action row, so the user reaches it with the mobile
- * keyboard up. There WebKit drops the synthetic click, and the button was
- * reported dead in exactly that state, alongside the answer Submit and the lone
- * Cancel. Diff is non-destructive and idempotent, so it takes the touch path
- * that Send and the answer Submit already have.
- *
- * Rendered rather than poked through its props, because both promises live in
- * the composition: the twin window is per-instance state inside
- * `useTouchActivated`, and the blur is what replaces the shared listener on
- * `click` that a suppressed click never reaches.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { DiffButton } from '../WaitingBanner';
@@ -49,9 +35,6 @@ function button(): HTMLButtonElement {
   return btn as HTMLButtonElement;
 }
 
-/** A tap as WebKit delivers it: `touchend` first, then the synthetic click the
- *  touch path cancelled. jsdom dispatches both, so the twin window is what has
- *  to stop the second from running the action again. */
 function tap(): void {
   const btn = button();
   btn.dispatchEvent(new Event('touchend', { bubbles: true, cancelable: true }));
@@ -82,8 +65,6 @@ describe('DiffButton', () => {
   });
 
   it('cancels the synthetic click, so nothing downstream sees it', () => {
-    // `installActionBtnBlurListener` and the app's other click consumers must
-    // not act on a press the touch path already served.
     const btn = button();
     const touchend = new Event('touchend', { bubbles: true, cancelable: true });
     btn.dispatchEvent(touchend);
@@ -98,8 +79,6 @@ describe('DiffButton', () => {
   });
 
   it('leaves a focused field elsewhere alone', () => {
-    // The blur is scoped to the prompt. A search box or a title editor holding
-    // focus is not the composer's keyboard to drop.
     const other = document.createElement('input');
     document.body.appendChild(other);
     other.focus();

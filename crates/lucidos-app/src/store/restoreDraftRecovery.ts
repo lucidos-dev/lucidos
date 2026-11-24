@@ -1,18 +1,10 @@
-/** Reconstruct captured composers as reviewable drafts. The transport adapter
- * must create by the supplied destination id and must never send a message.
- * Kept independent of application signals so admission can run before startup. */
 import type { RestoreGeneration } from './restoreGeneration';
 import type { PreservedComposeIntent, RestoreIntentStore } from './restoreGenerationRecords';
 
 export interface RestoreDraftRecoveryEffects {
   allocateId(): string;
-  /** Null means liveness cannot be established; retain foreign composers. */
   readLiveOwners?(): Promise<ReadonlySet<string> | null>;
-  /** Connection lease, checked after every asynchronous boundary. */
   isCurrent(): boolean;
-  /** Atomically create content and selections only if the destination does not
-   * exist. A retry MUST leave an existing draft untouched: the user may have
-   * edited it after a lost response. Never implement as create then PUT. */
   createDraftIfAbsent(threadId: string, source: PreservedComposeIntent['drafts'][number]): Promise<void>;
 }
 
@@ -40,7 +32,9 @@ export async function recoverRestoreDrafts(
       if (destinations.completed.includes(destination.threadId)) continue;
       const source = record.intent.drafts.find((draft) => draft.threadId === destination.sourceThreadId);
       if (!source) throw new Error('Preserved restore draft is missing');
-      await effects.createDraftIfAbsent(destination.threadId, source);
+      const draft = await store.materializeDraft(source);
+      if (!effects.isCurrent()) return outcome('stale');
+      await effects.createDraftIfAbsent(destination.threadId, draft);
       if (!effects.isCurrent()) return outcome('stale');
       await store.completeRecoveryDraft(record, generation, destination.threadId);
       if (!effects.isCurrent()) return outcome('stale');

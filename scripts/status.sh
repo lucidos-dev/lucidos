@@ -24,12 +24,13 @@ _shared_pg_port() {
 _iter_workspace_dirs() {
     local reg
     reg="$(gateway_data_dir)/config/workspaces.json"
-    if [ -f "$reg" ]; then
-        python3 - "$reg" "$(gateway_data_dir)" <<'PY'
+    if [ -f "$reg" ] && python3 - "$reg" "$(gateway_data_dir)" <<'PY'; then
 import json, os, sys
 reg, base = sys.argv[1:3]
 try:
     data = json.load(open(reg))
+except PermissionError:
+    sys.exit(1)
 except Exception:
     data = {}
 for w in data.get("workspaces", []):
@@ -41,6 +42,9 @@ for w in data.get("workspaces", []):
     print(d)
 PY
         return
+    fi
+    if [ -n "${LUCIDOS_AGENT_SANDBOXED:-}" ]; then
+        echo "note: the agent sandbox hides the gateway registry (ADR 0645), so this lists ~/workspaces only." >&2
     fi
     for d in "$HOME"/workspaces/*; do
         [ -d "$d/.lucidos" ] && echo "$d"
@@ -303,7 +307,27 @@ if [ -n "$JSON_MODE" ]; then
     exit 0
 fi
 
+# The dev gateway's loopback door, and the CA its TLS comes from. The probe
+# trusts only that CA, so a squatter on the port reads as not responding.
+show_gateway_status() {
+    local port="${LUCIDOS_DEV_GATEWAY_PORT:-$DEFAULT_DEV_GATEWAY_PORT}" ca
+    ca="$(loopback_ca_cert)"
+    if loopback_curl -fsS -o /dev/null --connect-timeout 2 --max-time 3 \
+        "$(loopback_origin "$port")/~/api/v1/health" 2>/dev/null; then
+        echo "  Gateway:   https://localhost:$port/ (healthy)"
+    else
+        echo "  Gateway:   not responding on https://localhost:$port/"
+    fi
+    if [ -f "$ca" ]; then
+        echo "  Local certificate: $ca"
+    else
+        echo "  Local certificate: none yet (the gateway makes it at start)"
+    fi
+}
+
 echo "=== Lucidos Engine Status ==="
+echo ""
+show_gateway_status
 echo ""
 
 if [ -n "$WORKSPACE" ]; then

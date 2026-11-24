@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::list_user_data_files;
+use crate::engine::file_text::{cap_chars, looks_binary, BINARY_SNIFF_BYTES, ELLIPSIS};
 use crate::engine::title_match::{title_match, TitleMatch};
-use crate::engine::tools::search::{cap_chars, looks_binary, BINARY_SNIFF_BYTES, ELLIPSIS};
 
 const MIN_QUERY_CHARS: usize = 3;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -35,7 +35,7 @@ const SCAN_CHUNK_FILES: usize = 256;
 /// `all` answers the Text tab: every line, up to [`ALL_LINES_CAP`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum TextSearchMode {
+pub enum TextSearchMode {
     Preview,
     All,
 }
@@ -62,7 +62,7 @@ impl TextSearchMode {
 /// dozen characters with an ellipsis where cut. The three strings concatenate
 /// to the visible snippet, so a client needs no offsets to highlight `matched`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct TextSearchHit {
+pub struct TextSearchHit {
     pub(crate) path: String,
     /// 1-based.
     pub(crate) line: usize,
@@ -73,7 +73,7 @@ pub(crate) struct TextSearchHit {
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
-pub(crate) enum TextSearchResponse {
+pub enum TextSearchResponse {
     QueryTooShort {
         min_query_chars: usize,
     },
@@ -90,7 +90,7 @@ pub(crate) enum TextSearchResponse {
 
 /// Searches the workspace's browseable data files. `cancelled` is polled per
 /// file, so a dropped request stops reading.
-pub(crate) fn search_workspace_text(
+pub fn search_workspace_text(
     workspace_path: &Path,
     query: &str,
     mode: TextSearchMode,

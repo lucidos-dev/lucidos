@@ -3,6 +3,31 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+const MAX_CLEANUP_MEMBERS: usize = 1000;
+
+fn validate_cleanup_size(size: usize) -> Result<(), ApiError> {
+    if !(1..=MAX_CLEANUP_MEMBERS).contains(&size) {
+        return Err(ApiError::bad_request(format!(
+            "select between 1 and {MAX_CLEANUP_MEMBERS} workspaces"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub(crate) struct WorkspaceDeletionBatch {
+    id: String,
+    phrase: String,
+    members: Vec<WorkspaceDeletionMember>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceDeletionMember {
+    id: String,
+    name: String,
+    database_backup: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Selection {
     pub id: String,
@@ -81,12 +106,7 @@ fn confirmation_with_branches<'a>(
 }
 fn batch_confirmation_phrase(members: &[FrozenMember]) -> Result<String, ApiError> {
     let protected = members.iter().find_map(|member| match &member.resource {
-        FrozenResource::Registered { workspace }
-            if matches!(
-                workspace.cleanup.origin,
-                crate::registry::WorkspaceOrigin::User | crate::registry::WorkspaceOrigin::Unknown
-            ) =>
-        {
+        FrozenResource::Registered { workspace } if !workspace.cleanup.origin.is_machine_made() => {
             Some(workspace.name.clone())
         }
         FrozenResource::Folder { directory } => Some(directory.display().to_string()),
@@ -101,6 +121,24 @@ fn batch_confirmation_phrase(members: &[FrozenMember]) -> Result<String, ApiErro
             format!("Delete {name}"),
             branches,
         )),
+        Some(_)
+            if members
+                .iter()
+                .all(|member| matches!(member.resource, FrozenResource::Registered { .. })) =>
+        {
+            let names = members
+                .iter()
+                .filter_map(|member| match &member.resource {
+                    FrozenResource::Registered { workspace } => Some(workspace.name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(confirmation_with_branches(
+                format!("Delete {} workspaces: {names}", members.len()),
+                branches,
+            ))
+        }
         Some(_) => Err(ApiError::bad_request(
             "user and unknown workspaces require a separate named confirmation",
         )),
@@ -285,7 +323,7 @@ impl GatewayState {
     }
 
     pub(super) fn cleanup_peer_paths(&self) -> Vec<PathBuf> {
-        crate::installs::inventory(std::env::current_exe().ok(), self.app_data())
+        self.install_inventory()
             .installs
             .into_iter()
             .filter_map(|install| install.data_dir)
@@ -582,11 +620,7 @@ impl GatewayState {
     }
 
     pub(crate) fn freeze_cleanup(&self, members: Vec<Selection>) -> Result<Batch, ApiError> {
-        if members.is_empty() || members.len() > 1000 {
-            return Err(ApiError::bad_request(
-                "select between 1 and 1000 workspaces",
-            ));
-        }
+        validate_cleanup_size(members.len())?;
         let report = self.inner.cleanup_review.lock().unwrap().report.clone();
         if report
             .scanned_at
@@ -661,6 +695,81 @@ impl GatewayState {
                 })
             })
             .collect::<Result<Vec<_>, ApiError>>()?;
+        if members.len() > 1
+            && members.iter().any(|member| match &member.resource {
+                FrozenResource::Registered { workspace } => {
+                    !workspace.cleanup.origin.is_machine_made()
+                }
+                _ => true,
+            })
+        {
+            return Err(ApiError::bad_request(
+                "user and unknown workspaces require a separate named confirmation",
+            ));
+        }
+        self.save_cleanup_batch(members)
+    }
+
+    pub(crate) async fn freeze_workspace_deletion(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<WorkspaceDeletionBatch, ApiError> {
+        validate_cleanup_size(ids.len())?;
+        let mut seen = HashSet::new();
+        let workspaces = {
+            let registry = self.inner.registry.lock().unwrap();
+            ids.iter()
+                .map(|id| {
+                    if !seen.insert(id) {
+                        return Err(ApiError::bad_request("duplicate workspace"));
+                    }
+                    registry.get(id).cloned().ok_or_else(|| {
+                        ApiError::conflict(format!("workspace is no longer registered: {id}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut members = Vec::with_capacity(workspaces.len());
+        let mut summaries = Vec::with_capacity(workspaces.len());
+        for workspace in workspaces {
+            let dir = workspace.resolve_dir(self.app_data());
+            let retained_branches =
+                tokio::task::spawn_blocking(move || crate::trash::retained_branches(&dir))
+                    .await
+                    .map_err(|e| ApiError::conflict(e.to_string()))?
+                    .map_err(|e| {
+                        ApiError::conflict(format!("branch observation unavailable: {e}"))
+                    })?;
+            let fingerprint = self
+                .cleanup_current_fingerprint(&workspace, retained_branches.clone())
+                .await
+                .map_err(|e| {
+                    ApiError::conflict(format!("{}: observation unavailable: {e}", workspace.name))
+                })?;
+            summaries.push(WorkspaceDeletionMember {
+                id: workspace.id.clone(),
+                name: workspace.name.clone(),
+                database_backup: workspace.cleanup.backs_up_database_on_delete(),
+            });
+            members.push(FrozenMember {
+                id: workspace.id.clone(),
+                fingerprint,
+                resource: FrozenResource::Registered { workspace },
+                retained_branches,
+            });
+        }
+        let state = self.clone();
+        let batch = tokio::task::spawn_blocking(move || state.save_cleanup_batch(members))
+            .await
+            .map_err(|e| ApiError::conflict(format!("cleanup freeze failed: {e}")))??;
+        Ok(WorkspaceDeletionBatch {
+            id: batch.id,
+            phrase: batch.phrase,
+            members: summaries,
+        })
+    }
+
+    fn save_cleanup_batch(&self, members: Vec<FrozenMember>) -> Result<Batch, ApiError> {
         let phrase = batch_confirmation_phrase(&members)?;
         let result = (|| -> Result<Batch, BoxError> {
             use std::os::unix::fs::DirBuilderExt;
@@ -720,20 +829,13 @@ impl GatewayState {
             let name = postgres::database_name(&workspace.id)?;
             crate::cleanup::registered_resources(&other_workspaces, &app_data, &peers)?
                 .require_unowned(&dir, &name)?;
-            let databases = postgres::cleanup_observations(&backend, &app_data)?;
-            let db = databases
-                .iter()
-                .find(|db| db.name == name)
-                .ok_or("database unavailable")?;
-            if db.warning.is_some() {
-                return Err("activity unavailable".into());
-            }
+            let db = postgres::cleanup_workspace_observation(&backend, &app_data, &workspace.id)?;
             let running =
                 lucidos_owner_lock::is_held(&lucidos_owner_lock::engine::lock_path(&dir))?;
             crate::cleanup::observed_workspace_fingerprint(
                 &workspace,
                 &dir,
-                Some(db),
+                Some(&db),
                 Some(running),
                 Some(crate::cleanup::allocated_bytes(&dir)?),
             )
@@ -933,7 +1035,7 @@ impl GatewayState {
                             .delete_confirmed_workspace(&ws, &audit)
                             .await
                             .map_err(|e| e.to_string()),
-                        Ok(_) => Err("workspace changed since review; skipped".into()),
+                        Ok(_) => Err("workspace changed since selection; skipped".into()),
                         Err(e) => Err(format!("observation unavailable; skipped: {e}")),
                     },
                 }
@@ -1108,8 +1210,10 @@ mod tests {
             let result = state
                 .delete_workspace_authorized_with_observation(
                     "scratch",
-                    Some("Scratch"),
-                    Some(token),
+                    crate::server::DeleteAuthority::OwnerToken {
+                        confirm: Some("Scratch"),
+                        owner_token: Some(token),
+                    },
                     |database| {
                         assert_eq!(database, "lucidos_scratch");
                         std::future::ready(observation.ok_or_else(|| "catalog unavailable".into()))
@@ -1634,6 +1738,183 @@ mod tests {
         assert!(!state.app_data().join("deleted").exists());
     }
 
+    #[tokio::test]
+    async fn gated_workspace_delete_freezes_without_review_and_skips_a_changed_member() {
+        let (Some(bin), Some(lib)) = (
+            std::env::var_os("LUCIDOS_PG_BIN_DIR").map(PathBuf::from),
+            std::env::var_os("LUCIDOS_PG_LIB_DIR").map(PathBuf::from),
+        ) else {
+            crate::diagnostic_log::test_notice(format_args!(
+                "SKIP workspace delete integration test: no bundled Postgres"
+            ));
+            return;
+        };
+        const CHILD: &str = "LUCIDOS_TEST_NAMED_WORKSPACE_DELETE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::Builder::new()
+                .prefix("ws-delete-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "server::cleanup_actions::tests::gated_workspace_delete_freezes_without_review_and_skips_a_changed_member",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LUCIDOS_PRIVATE_DIR", root.path().join("private"))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct TestCluster {
+            bin: PathBuf,
+            lib: PathBuf,
+            data: PathBuf,
+        }
+        impl Drop for TestCluster {
+            fn drop(&mut self) {
+                postgres::stop_cluster_robustly(&self.bin, &self.lib, &self.data);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        let _cluster = TestCluster {
+            bin: bin.clone(),
+            lib: lib.clone(),
+            data: postgres::embedded_data_dir(state.app_data()),
+        };
+        let backend = postgres::PgBackend::Embedded {
+            bin: bin.clone(),
+            lib,
+        };
+        Arc::get_mut(&mut state.inner).unwrap().pg_backend = backend.clone();
+        for (id, name, port) in [
+            ("keep", "Keep this workspace", 9100),
+            ("delete", "Delete this workspace", 9101),
+            ("unselected", "Unselected workspace", 9102),
+        ] {
+            let mut workspace = Workspace::gateway_provisioned(id.into(), name.into(), port);
+            if id == "keep" {
+                workspace.cleanup.origin = crate::registry::WorkspaceOrigin::Agent;
+            }
+            std::fs::create_dir_all(workspace.resolve_dir(state.app_data())).unwrap();
+            state
+                .inner
+                .registry
+                .lock()
+                .unwrap()
+                .workspaces
+                .push(workspace);
+            if id == "unselected" {
+                continue;
+            }
+            postgres::ensure(&backend, id, state.app_data(), None)
+                .await
+                .unwrap();
+            postgres::cleanup_query_database(
+                &backend,
+                state.app_data(),
+                &postgres::database_name(id).unwrap(),
+                "CREATE TABLE events (created timestamptz)",
+            )
+            .unwrap();
+        }
+        assert!(state
+            .inner
+            .cleanup_review
+            .lock()
+            .unwrap()
+            .report
+            .scanned_at
+            .is_none());
+
+        let batch = state
+            .freeze_workspace_deletion(vec!["keep".into(), "delete".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            batch
+                .members
+                .iter()
+                .map(|member| member.id.as_str())
+                .collect::<Vec<_>>(),
+            ["keep", "delete"]
+        );
+        assert_eq!(
+            batch.phrase,
+            "Delete 2 workspaces: Keep this workspace, Delete this workspace"
+        );
+        assert!(!batch.members[0].database_backup);
+        assert!(batch.members[1].database_backup);
+        let keep = state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .get("keep")
+            .unwrap()
+            .resolve_dir(state.app_data());
+        std::fs::write(keep.join("new-work"), "preserve this").unwrap();
+
+        let complete = state
+            .confirm_cleanup(&batch.id, &batch.phrase, "device")
+            .await
+            .unwrap();
+        assert_eq!(complete.results[0].status, "skipped");
+        assert_eq!(
+            complete.results[1].status, "deleted",
+            "{:?}",
+            complete.results[1].detail
+        );
+        assert!(keep.join("new-work").exists());
+        let registry = state.inner.registry.lock().unwrap();
+        assert!(registry.get("keep").is_some());
+        assert!(registry.get("delete").is_none());
+        assert!(registry.get("unselected").is_some());
+    }
+
+    #[tokio::test]
+    async fn workspace_delete_rejects_invalid_selections_before_observing_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .workspaces
+            .push(Workspace::gateway_provisioned(
+                "sample".into(),
+                "Sample".into(),
+                9100,
+            ));
+
+        for (ids, expected) in [
+            (vec![], axum::http::StatusCode::BAD_REQUEST),
+            (
+                vec!["sample", "sample"],
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (vec!["sample", "missing"], axum::http::StatusCode::CONFLICT),
+        ] {
+            let error = state
+                .freeze_workspace_deletion(ids.into_iter().map(str::to_owned).collect())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.into_response().status(), expected);
+        }
+        assert!(!state.app_data().join("cleanup-batches").exists());
+    }
+
     #[test]
     fn confirmation_names_retained_branches_in_stable_order() {
         assert_eq!(
@@ -1750,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_workspaces_require_separate_named_confirmation() {
+    fn registered_protected_workspaces_require_named_confirmation() {
         for origin in [
             crate::registry::WorkspaceOrigin::User,
             crate::registry::WorkspaceOrigin::Unknown,
@@ -1768,6 +2049,18 @@ mod tests {
             assert_eq!(
                 batch_confirmation_phrase(&members).unwrap(),
                 "Delete My workspace; keep branches: saved"
+            );
+            let other =
+                Workspace::gateway_provisioned("other".into(), "Another workspace".into(), 9101);
+            members.push(FrozenMember {
+                id: other.id.clone(),
+                fingerprint: "observed".into(),
+                resource: FrozenResource::Registered { workspace: other },
+                retained_branches: vec![],
+            });
+            assert_eq!(
+                batch_confirmation_phrase(&members).unwrap(),
+                "Delete 2 workspaces: My workspace, Another workspace; keep branches: saved"
             );
             members.push(FrozenMember {
                 id: "folder".into(),
@@ -2034,7 +2327,7 @@ mod tests {
                         label: "Test device".into(),
                     });
                     request.headers_mut().insert(
-                        "x-lucidos-agent-origin-token",
+                        crate::auth::HEADER_AGENT_ORIGIN_TOKEN,
                         HeaderValue::from_static("subprocess"),
                     );
                 }

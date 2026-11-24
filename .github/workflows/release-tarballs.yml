@@ -116,7 +116,28 @@ permissions:
   contents: write
 
 jobs:
+  release-gate:
+    if: github.repository == 'lucidos-dev/lucidos'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Verify release gate trailer
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/lib/release_blockers.sh
+          release_gate_verify_trailer . "$GITHUB_SHA" || {
+            echo 'Release refused: missing or invalid Release-Gate trailer' >&2
+            exit 1
+          }
+
   tarball:
+    needs: release-gate
     name: ${{ matrix.triple }}
     # Public mirror ONLY: the same guard install-smoke.yml puts on every job.
     #
@@ -159,7 +180,11 @@ jobs:
     defaults:
       run:
         shell: bash
-    timeout-minutes: 75   # container entries pay a cold rustup + apt install on top of the build
+    # Cold Intel Rust compilation alone has taken 69 minutes; leave room for staging.
+    timeout-minutes: 120
+    # Cache post-cleanup runs cargo metadata too, outside the build helper's shell.
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       # pgvector compiles against the relocatable PG via PGXS (needs make + a C
       # toolchain); the engine statically vendors OpenSSL (needs perl + cc); the
@@ -247,7 +272,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
-          prefix-key: v0-rust-rel
+          prefix-key: v1-rust-rel
           key: ${{ matrix.triple }}-${{ matrix.runner }}-${{ matrix.container || 'runner' }}
           save-if: ${{ startsWith(github.ref, 'refs/heads/rc/') }}
 
@@ -256,8 +281,11 @@ jobs:
         run: ./scripts/block-ort-upstream.sh
 
       - name: Build headless tarball (${{ matrix.triple }})
+        env:
+          LUCIDOS_E2E_FREE_FLOOR_MIN_GB: "1"
         run: |
           set -euo pipefail
+          echo "Memory gate: disposable CI runner uses a 1 GB floor; critical pressure and compressor checks remain active."
           ./scripts/build-headless.sh --triple "${{ matrix.triple }}" --out-dir dist/headless
           echo "--- artifacts:"
           ls -la dist/headless

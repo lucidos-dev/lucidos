@@ -15,7 +15,6 @@ import type { EnvironmentVariable } from '../../api/types';
 
 const NAME_HINT = 'Uppercase letters, digits and underscores; must start with a letter or underscore (e.g. LUCIDOS_REPO). Reserved names are rejected by the server.';
 
-/** Inline add/edit form row, mirroring AddRepositoryForm. */
 function AddEnvVarForm() {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState('');
@@ -75,11 +74,6 @@ function AddEnvVarForm() {
   );
 }
 
-/** A single env var row with inline edit, mirroring DeviceRow / repositoriesSection.
- *  Self-skeletonizing: rendered with no props inside a SkeletonProvider
- *  (`<EnvVarRow />`) it draws the DISPLAY mode as a loading placeholder via the
- *  Sk* leaves; with a real `envVar` it renders normally. Props are optional only
- *  to support the skeleton call. */
 function EnvVarRow({ envVar }: { envVar?: EnvironmentVariable }) {
   const sk = useSkeleton();
   const [editing, setEditing] = useState(false);
@@ -171,10 +165,6 @@ export function EnvironmentVariablesPage() {
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <EnvVarRow />} />}>
         {loadable.status === 'loaded' ? (
           <>
-            {/* Kept at rest rather than moved behind an explainer: this page
-                renders no section title and no label an info icon could sit on,
-                so hiding this sentence would leave the list with nothing naming
-                what it is. */}
             <p class="settings-section-desc">
               User-managed environment variables made available to agent scripts and tools.
             </p>

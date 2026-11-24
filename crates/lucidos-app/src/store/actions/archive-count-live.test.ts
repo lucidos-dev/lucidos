@@ -58,7 +58,6 @@ function frame(id: string, seq: number, type: string, section: 'inbox' | 'archiv
   };
 }
 
-/** Lets the coalesced count refresh run to completion. */
 async function settle(): Promise<void> {
   for (let i = 0; i < 5; i++) await Promise.resolve();
 }

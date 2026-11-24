@@ -1,10 +1,3 @@
-/**
- * The wiring between a press, a thread and a call.
- *
- * Two properties matter here and nowhere else. Voice has no entry point of its
- * own, so a call resolves its thread through the same path typing uses. And a
- * call belongs to that thread, so leaving it rings off.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { signal } from '@preact/signals';
 import {
@@ -29,7 +22,6 @@ import type { AudioDevice, CallPorts, CallSocket, SocketHandlers } from '../voic
 
 const THREAD = 'thread-1';
 
-/** A promise the test settles by hand, to hold a thread row in flight. */
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let settle: () => void = () => undefined;
   const promise = new Promise<void>((done) => {
@@ -51,9 +43,6 @@ function device(): AudioDevice {
 
 function fixture(opts: { resolveThread?: () => string; awaitThread?: () => Promise<void> } = {}) {
   const focused = signal<string | null>(THREAD);
-  // Whether the focused destination can take a call. The live store derives it
-  // from the prompt row's own resolution. Here it is a dial the test turns,
-  // because what is under test is what the store DOES with the answer.
   const reachable = signal(true);
   const problems: string[] = [];
   const dialled: string[] = [];
@@ -137,9 +126,6 @@ describe('the thread a call runs on', () => {
   });
 
   it('is a fresh draft when composing, by the path typing uses', async () => {
-    // Faithful to `ensureFocusedComposeThread`, which FOCUSES the draft it
-    // allocates. The dial's own focus check reads that, so a fake which only
-    // returned an id would make this test disagree with the app.
     const f = fixture({
       resolveThread: () => {
         f.focused.value = 'new-draft';
@@ -172,8 +158,6 @@ describe('the thread a call runs on', () => {
     f.store.press();
     row.resolve();
     await f.settle();
-    // One call, not a call placed and immediately rung off by its own second
-    // press. The toggle still reads as off during that window.
     expect(f.dialled).toEqual([THREAD]);
     expect(f.sent).toEqual([]);
     expect(f.store.call.value.phase).toBe('connecting');
@@ -186,7 +170,6 @@ describe('the thread a call runs on', () => {
     await f.settle();
     expect(f.dialled).toEqual([]);
     expect(f.problems[0]).toContain(NO_THREAD_TO_CALL_ON);
-    // The press woke the audio device, and no call took it.
     expect(f.releases()).toBe(1);
     f.store.dispose();
   });
@@ -195,8 +178,6 @@ describe('the thread a call runs on', () => {
     const row = deferred();
     const f = fixture({ awaitThread: () => row.promise });
     f.store.press();
-    // The focus watcher runs here and finds an idle call, so nothing stops the
-    // pending dial but the check inside it.
     f.focused.value = 'somewhere-else';
     row.resolve();
     await f.settle();
@@ -206,23 +187,16 @@ describe('the thread a call runs on', () => {
     f.store.dispose();
   });
 
-  /** The destination has the same blind spot as the focus above, and it can
-   *  move inside the same window: the picker sits beside the control that was
-   *  pressed. Dialling on would open a socket the engine refuses. */
   it('drops a dial whose destination moved while the row was landing', async () => {
     const row = deferred();
     const f = fixture({ awaitThread: () => row.promise });
     f.store.press();
-    // The watcher runs here and finds an idle call, as it does for a focus
-    // change. So only the check inside the dial can stop this one.
     f.reachable.value = false;
     row.resolve();
     await f.settle();
     expect(f.dialled).toEqual([]);
     expect(f.releases()).toBe(1);
     expect(f.store.call.value.phase).toBe('idle');
-    // Said, where the focus case is silent: this reader is still looking at
-    // the row they pressed, where the control has quietly gone.
     expect(f.problems).toHaveLength(1);
     expect(f.problems[0]).toContain('did not start');
     f.store.dispose();
@@ -271,8 +245,6 @@ describe('the call belongs to its thread', () => {
   });
 });
 
-/** A call reaches the Lucidos Agent and nothing else (ADR 0165). The thread
- *  can move under a live call, and that reads as the thread leaving. */
 describe('the call belongs to a destination it can reach', () => {
   it('rings off when the destination moves to a coding agent', async () => {
     const f = fixture();
@@ -283,9 +255,6 @@ describe('the call belongs to a destination it can reach', () => {
     f.store.dispose();
   });
 
-  /** The pick is a dropdown three controls away, so nothing else on screen
-   *  would say the call had gone. Unlike navigating away, which the reader
-   *  did on purpose and can see. */
   it('says why, because nothing else on screen would', async () => {
     const f = fixture();
     await f.goLive();
@@ -304,9 +273,6 @@ describe('the call belongs to a destination it can reach', () => {
     f.store.dispose();
   });
 
-  /** An unreachable destination with no call up is the ordinary state of every
-   *  coding-agent thread. Saying so on each one would toast at the reader for
-   *  nothing. */
   it('says nothing when no call is up', () => {
     const f = fixture();
     f.reachable.value = false;
@@ -326,13 +292,6 @@ describe('the toggle', () => {
   });
 });
 
-/**
- * A reason the reader can act on carries the way to act on it.
- *
- * The engine's talker refusal says to set a model in Settings. Until the Voice
- * section existed there was no such control, so the sentence named a place
- * that was not there. The button is what makes it true.
- */
 describe('the way out of a call that could not run', () => {
   it('lands the talker refusal on the settings that fix it', () => {
     toasts.value = [];
@@ -373,15 +332,6 @@ describe('why a call ended', () => {
   });
 });
 
-/**
- * The derivation the live store feeds its watcher, as opposed to what the
- * store does with the answer.
- *
- * The fixture above substitutes a hand-turned `reachable` signal, so nothing
- * there covers this half. It is the subtle one: a future edit reading a signal
- * through `peek` would leave a live call running on a coding-agent
- * destination, and every test above would still pass.
- */
 describe('whether a call reaches the focused thread', () => {
   beforeEach(() => {
     threadMap.value = new Map();
@@ -406,13 +356,11 @@ describe('whether a call reaches the focused thread', () => {
     focusedThreadId.value = id;
   }
 
-  /** Voice sessions live in the home thread alone (ADR 0362). */
   it('reaches the home thread', () => {
     started('home', 'chat', true);
     expect(callReachesTheFocusedThread.value).toBe(true);
   });
 
-  /** Any other thread is refused, a trigger's and a chat thread's alike. */
   it('reaches no other started thread', () => {
     started('t-1', 'chat', false);
     expect(callReachesTheFocusedThread.value).toBe(false);
@@ -420,14 +368,12 @@ describe('whether a call reaches the focused thread', () => {
     expect(callReachesTheFocusedThread.value).toBe(false);
   });
 
-  /** The compose view and a draft have no home thread, whatever their mode. */
   it('reaches neither the compose view nor a draft', () => {
     expect(callReachesTheFocusedThread.value).toBe(false);
     draft('d-1', 'lucidos');
     expect(callReachesTheFocusedThread.value).toBe(false);
   });
 
-  /** A call reaches the Lucidos Agent only (ADR 0165), on home too. */
   it('reads a started thread channel', () => {
     started('t-3', 'claude_code', true);
     expect(callReachesTheFocusedThread.value).toBe(false);

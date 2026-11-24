@@ -1,9 +1,10 @@
 //! The single chokepoint for a preference write's SIDE EFFECTS.
 //!
-//! Both entry paths — the `set_preference` LLM tool and the HTTP
-//! `PUT /api/v1/preferences` handler (which the Settings UI uses) — funnel
-//! through [`LucidosEngine::apply_preference_write`], so a preference's
-//! side-effects can never diverge by who made the write:
+//! Both entry paths, the `set_preference` LLM tool and the HTTP
+//! `PUT /api/v1/preferences` handler (which the Settings UI uses), funnel
+//! through [`LucidosEngine::apply_preference_write`]. The HTTP `DELETE` goes
+//! through [`LucidosEngine::apply_preference_reset`]. So a preference's side
+//! effects can never diverge by who made the write:
 //! - `language` / `timezone` refresh the engine's in-memory `user_language` /
 //!   `user_timezone` and emit `LanguageSet` / `TimezoneSet` (the frontend
 //!   live-applies on those), so the Settings → Locale controls take
@@ -30,7 +31,7 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
 /// What a preference write resolved to, for callers that need to react.
-pub(crate) struct PreferenceWriteOutcome {
+pub struct PreferenceWriteOutcome {
     /// `Some(enabled)` when the key was `push_notifications` — the tool layer
     /// uses it to drive the `[PUSH_NOTIFICATION_REQUEST]` permission handshake.
     pub push_enabled: Option<bool>,
@@ -43,7 +44,7 @@ impl LucidosEngine {
     /// from the catalog, the HTTP handler from the request body). Does NOT
     /// validate the key against the catalog (see module docs); callers that need
     /// the gate apply it first.
-    pub(crate) async fn apply_preference_write(
+    pub async fn apply_preference_write(
         &self,
         key: &str,
         value: &str,
@@ -60,6 +61,18 @@ impl LucidosEngine {
             .unwrap_or(PrefSideEffect::None);
 
         refuse_bad_value(key, value, side_effect)?;
+        let _landing_gate = if key == prefs::LANDING_SETTING.key() {
+            prefs::validate(&prefs::LANDING_SETTING.spec, value)?;
+            if device_id.is_some() {
+                return Err("The landing setting applies to the whole workspace.".into());
+            }
+            if value == "another-host" {
+                crate::engine::git_ops::probe_origin_landing_queue(self.repo_root()).await?;
+            }
+            Some(self.landing_setting_gate.lock().await)
+        } else {
+            None
+        };
 
         // Persist. Scope follows the caller's device_id, matching the historical
         // HTTP behavior (frontend sends device_id for device-scoped keys, omits it
@@ -112,7 +125,7 @@ impl LucidosEngine {
                     )
                     .await
                     {
-                        log!("[Preferences] Failed to set devices.push_enabled: {}", e);
+                        log_legacy!("[Preferences] Failed to set devices.push_enabled: {}", e);
                     }
                 }
             }
@@ -120,6 +133,50 @@ impl LucidosEngine {
         }
 
         Ok(PreferenceWriteOutcome { push_enabled })
+    }
+
+    /// Delete a global preference, so it reads as its default again, and apply
+    /// the same locale side effects a write does. `false` when no row existed.
+    pub async fn apply_preference_reset(
+        &self,
+        key: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, String> {
+        // The default, `here`, needs no origin probe, only the write's gate.
+        let _landing_gate = if key == prefs::LANDING_SETTING.key() {
+            Some(self.landing_setting_gate.lock().await)
+        } else {
+            None
+        };
+        let removed = PreferenceStore::delete(&self.pool, &self.event_bus, key, actor)
+            .await
+            .map_err(|e| format!("Failed to delete preference '{key}': {e}"))?;
+        if !removed {
+            return Ok(false);
+        }
+        // Both locale keys default to unset, which the caches hold as empty.
+        match prefs::lookup(key).map(|spec| spec.side_effect) {
+            Some(PrefSideEffect::Language) => {
+                self.user_language.write().await.clear();
+                self.event_bus
+                    .emit(BusEvent::System(SystemEvent::LanguageSet {
+                        language: String::new(),
+                    }))
+                    .await
+                    .map_err(|e| format!("Failed to emit LanguageSet: {e}"))?;
+            }
+            Some(PrefSideEffect::Timezone) => {
+                self.user_timezone.write().await.clear();
+                self.event_bus
+                    .emit(BusEvent::System(SystemEvent::TimezoneSet {
+                        timezone: String::new(),
+                    }))
+                    .await
+                    .map_err(|e| format!("Failed to emit TimezoneSet: {e}"))?;
+            }
+            Some(PrefSideEffect::Push | PrefSideEffect::None) | None => {}
+        }
+        Ok(true)
     }
 }
 
@@ -195,7 +252,7 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
     // here, on the path every writer shares, rather than failing to register
     // later. `"off"` and other inactive values skip cron parsing.
     if key == prefs::BACKUP_SCHEDULE.key() && crate::core::backup::is_schedule_active(value) {
-        crate::engine::tools::scheduler::parse_standard_cron(value)
+        crate::scheduler::cron_rules::parse_standard_cron(value)
             .map_err(|e| format!("Invalid backup schedule cron '{}': {}", value, e))?;
     }
 
@@ -205,6 +262,86 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{boot_mock_engine, setup_test_db, teardown_test_db};
+
+    /// A reset must reach what a write reached. The cached locale otherwise
+    /// keeps the old value until a restart, and the scheduler never re-arms.
+    #[tokio::test]
+    async fn a_reset_clears_the_cached_locale_and_announces_it() {
+        let (pool, db_name) = setup_test_db().await;
+        pool.close().await;
+        let (engine, _workspace) = boot_mock_engine(&db_name).await;
+        let mut events = engine.event_bus.subscribe();
+        for (key, value) in [
+            (prefs::TIMEZONE.key(), "Europe/Oslo"),
+            (prefs::LANGUAGE.key(), "Norwegian"),
+        ] {
+            engine
+                .apply_preference_write(key, value, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(engine.user_timezone().await, "Europe/Oslo");
+
+        assert!(engine
+            .apply_preference_reset(prefs::TIMEZONE.key(), None)
+            .await
+            .unwrap());
+        assert!(engine
+            .apply_preference_reset(prefs::LANGUAGE.key(), None)
+            .await
+            .unwrap());
+
+        assert_eq!(engine.user_timezone().await, "");
+        assert_eq!(*engine.user_language.read().await, "");
+        let mut cleared = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event.typed {
+                BusEvent::System(SystemEvent::TimezoneSet { timezone }) => cleared.push(timezone),
+                BusEvent::System(SystemEvent::LanguageSet { language }) => cleared.push(language),
+                _ => {}
+            }
+        }
+        assert_eq!(cleared, ["Europe/Oslo", "Norwegian", "", ""]);
+
+        // A key with no row changes nothing and says so.
+        assert!(!engine
+            .apply_preference_reset(prefs::TIMEZONE.key(), None)
+            .await
+            .unwrap());
+        drop(engine);
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A lane operation holds the landing gate while it acts on the setting
+    /// it read. A reset must wait for it, exactly as a write does.
+    #[tokio::test]
+    async fn a_landing_setting_reset_waits_for_the_landing_gate() {
+        let (pool, db_name) = setup_test_db().await;
+        pool.close().await;
+        let (engine, _workspace) = boot_mock_engine(&db_name).await;
+        let key = prefs::LANDING_SETTING.key();
+        PreferenceStore::set(&engine.pool, &engine.event_bus, key, "another-host", None)
+            .await
+            .unwrap();
+
+        let gate = engine.landing_setting_gate.lock().await;
+        let reset = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.apply_preference_reset(key, None).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !reset.is_finished(),
+            "the reset ran past a held landing gate"
+        );
+        let stored = PreferenceStore::get_all(&engine.pool).await.unwrap();
+        assert_eq!(stored.get(key).map(String::as_str), Some("another-host"));
+        drop(gate);
+        assert!(reset.await.unwrap().unwrap());
+        drop(engine);
+        teardown_test_db(&db_name).await;
+    }
 
     /// A retired model id is refused where Settings, the SDK and raw HTTP
     /// arrive, not only in the agent's tool. Stored, it would read as the

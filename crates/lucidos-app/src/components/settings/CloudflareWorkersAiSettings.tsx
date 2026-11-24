@@ -12,13 +12,6 @@ import {
 
 const SERVICE = SYSTEM_ONE_PROVIDERS['cloudflare-workers-ai'].credentialService;
 
-/**
- * Cloudflare Workers AI, for Clef and Clef-flash, on Settings →
- * Providers.
- *
- * One credential holds both halves: the token is the secret, and the account
- * rides in its scope URL, which is where the engine reads it from.
- */
 export function CloudflareWorkersAiSettings() {
   const existing = findProviderCredential(credentials.value, SERVICE);
   const storedAccount = workersAiAccount(existing?.base_urls[0]);
@@ -26,7 +19,6 @@ export function CloudflareWorkersAiSettings() {
   const [token, setToken] = useState('');
   const [saving, setSaving] = useState(false);
 
-  // A replaced token keeps the stored account unless a new one is typed.
   const scope = workersAiScope(account.trim() || storedAccount || '');
   const canSave = !!scope && !!token.trim() && !saving;
 

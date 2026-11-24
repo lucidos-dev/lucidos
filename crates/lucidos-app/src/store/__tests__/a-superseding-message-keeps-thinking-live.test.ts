@@ -1,9 +1,3 @@
-/**
- * A message sent mid-turn supersedes the running coding-agent turn. The engine
- * records the cancel and the message together, so the old session's idle can
- * land after the message. That idle closes the old turn: the new turn's
- * Thinking row stays live until its own work ends.
- */
 import { describe, it, expect } from 'vitest';
 import {
   computeExchanges,
@@ -72,8 +66,6 @@ describe.each([
   });
 });
 
-// An unfinished turn proposes nothing, and the engine records that before the
-// idle. The withheld proposal is the superseded turn's, not the new message's.
 describe.each([
   ['in one load', false],
   ['as each event arrives', true],

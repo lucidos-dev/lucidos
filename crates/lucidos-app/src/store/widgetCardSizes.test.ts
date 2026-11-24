@@ -1,6 +1,3 @@
-/** A card's size is the newest pick for its widget instance. It comes from the
- *  loaded events, or from the server's `cardSizes` for picks behind the page.
- *  I6 of docs/plans/2026-11-03-widgets-one-render-no-pin.md. */
 import { afterEach, describe, expect, it } from 'vitest';
 import { effect } from '@preact/signals';
 import { widgetCardSize } from './widgetCardSizes';

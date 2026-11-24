@@ -28,7 +28,7 @@ pub enum NotesVisibility {
 /// registry knows to think adaptively without always thinking starts shown: its
 /// prose before a tool call is a `text` block, which always shows. An
 /// always-thinking model and an unknown one start hidden.
-pub(crate) fn notes_visibility(spawn_model: Option<&str>) -> NotesVisibility {
+pub fn notes_visibility(spawn_model: Option<&str>) -> NotesVisibility {
     match spawn_model.and_then(thinking_mode) {
         Some(ThinkingMode::OffByDefault | ThinkingMode::OnByDefault) => NotesVisibility::Shown,
         Some(ThinkingMode::AlwaysOn) | None => NotesVisibility::Hidden,

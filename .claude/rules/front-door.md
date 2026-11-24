@@ -30,7 +30,7 @@ Two consequences of that split are load-bearing here:
   `release.sh` arms by blocking until the origin serves the candidate before it
   pushes the branch.
 - **The repo side can only DETECT a route-set divergence.** Both discovery paths
-  live in the site publisher, so the structural fix has to happen there.
+  live in the site publisher (see the end of this file).
 
 #### `front-door`: a parameterised origin, two modes, two host families
 
@@ -455,6 +455,6 @@ probes the union at both, and reports per route which origin serves shell.
   give), and that `FDP_RC_URL_DEFAULT` equals `rc_front_door_url`.
 
 **The repo side can only DETECT this.** The two discovery paths live in the site
-publisher, on the maintainer's machine, so the structural fix (one discovery
-function parameterised by destination) has to happen there.
+publisher, on the maintainer's machine. Both parse the libs out of the
+published `install.sh`, but each adds the top-level scripts by hand.
 

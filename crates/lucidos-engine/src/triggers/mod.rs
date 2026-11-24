@@ -3,7 +3,9 @@ pub mod affected;
 pub mod config;
 pub mod continue_key;
 pub mod definition;
+pub use crate::core::trigger_folder_grant as folder_grant;
 pub mod groups;
+mod groups_projection;
 pub mod registry;
 pub mod replay;
 pub mod run_history;
@@ -24,6 +26,7 @@ pub use config::{
 pub use continue_key::ContinueKeySpec;
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
+    TriggerGroupProjection,
 };
 pub use replay::{replay_trigger_events, TriggerEventRow};
 pub use run_history::{load_trigger_run_history, TriggerRunHistory};
@@ -72,7 +75,7 @@ pub fn find_matching_event_triggers(
         .filter(|t| {
             let is_own_fire = Some(t.id.as_str()) == emitting_trigger_id;
             if is_own_fire {
-                crate::log!(
+                crate::log_legacy!(
                     "[Triggers] Not waking '{}' on {}: its own fire emitted it",
                     t.name,
                     event_type
@@ -108,6 +111,10 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            program_grants: vec![],
+            folder_grants: vec![],
+            program_denies: vec![],
+            folder_denies: vec![],
             coding_agent_grant: false,
             context_ceiling: None,
             mcp_servers: vec![],
@@ -146,7 +153,7 @@ mod tests {
     /// quietly re-implement the comparison.
     #[test]
     fn matcher_parity_with_the_shared_predicate() {
-        use crate::core::event_subscription::tests::PARITY_CASES;
+        use crate::core::event_subscription::PARITY_CASES;
         for (sub_type, cond, event_type, payload, expected) in PARITY_CASES {
             let mut configs = HashMap::new();
             configs.insert(
@@ -195,6 +202,7 @@ mod tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         };
 
         let mut configs = HashMap::new();
@@ -325,6 +333,10 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            program_grants: vec![],
+            folder_grants: vec![],
+            program_denies: vec![],
+            folder_denies: vec![],
             coding_agent_grant: false,
             context_ceiling: None,
             mcp_servers: vec![],

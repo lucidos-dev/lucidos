@@ -14,15 +14,6 @@ import { ProviderBlock } from './ProviderBlock';
 import { claudeGatewayView, initialGatewayUrl, type ClaudeGatewayView } from './claudeGatewayView';
 import { providerAnchor } from '../../store/modelProviders';
 
-/** Configure the Claude gateway provider (Settings → Providers): the
- *  Anthropic API behind an organisation's own sign-in. Lucidos signs in as
- *  itself with a device code, and the engine keeps and refreshes the tokens.
- *
- *  The URL field starts on the stored `claude_gateway_url`, else on the gateway
- *  Claude Code's managed settings name. Nothing is stored until Sign in, which
- *  sends the URL with the request.
- *
- *  Renders only the provider block; `SettingsView` owns the section. */
 export function ClaudeGatewaySettings() {
   preferences.value;
   const loadable = claudeGatewayStatus.value;
@@ -86,8 +77,6 @@ export function ClaudeGatewaySettings() {
   );
 }
 
-/** The rows under the switch. Before the status loads they draw the
- *  signed-out form with Sign in disabled, so nothing moves when it lands. */
 function GatewayRows({ view, suggestedUrl }: {
   view: ClaudeGatewayView | null;
   suggestedUrl: string | null;
@@ -180,7 +169,6 @@ function PendingRows({ view }: { view: Extract<ClaudeGatewayView, { kind: 'pendi
       </div>
       <div class="settings-row">
         <span class="settings-row-label" />
-        {/* Stopping is a sign-out, which would also forget a stored sign-in. */}
         {!view.signedIn && (
           <button
             class="action-btn action-btn-secondary"

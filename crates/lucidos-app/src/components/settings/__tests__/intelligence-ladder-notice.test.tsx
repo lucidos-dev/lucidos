@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Intelligence: a ladder that does not climb offers Sort by
- *  intelligence, and a customised one wears a mark. Each shows only when it
- *  holds, and the button asks the engine to sort. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

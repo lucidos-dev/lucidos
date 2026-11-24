@@ -1,8 +1,3 @@
-/**
- * The row window keys each row's measured height on its layout props. These
- * tests pin that every prop that can change a row's height is in the key, and
- * that nothing which only paints is.
- */
 
 import { describe, it, expect } from 'vitest';
 import {
@@ -49,7 +44,6 @@ const BASE: ThreadRowLayoutProps = {
     isCollapsed: false, hiddenArchivedCount: 0, isArchivedRevealed: false,
 };
 
-/** A different value of the same type, for each layout prop. */
 const CHANGED: ThreadRowLayoutProps = {
     depth: 1, title: 'B', createdLabel: 'Oct 10 10:00:00', channel: 'claude_code', codingAgent: 'codex', codingAgents: ['claude-code', 'codex'],
     contextName: 'example-repo', totalChildren: 3, hasDraft: true, isHome: true, collapsible: true,

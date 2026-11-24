@@ -10,8 +10,6 @@ import {
 } from './pane';
 import { revealDashboard } from './dashboardNav';
 
-// A side pane's toggle reads what is DRAWN, and a tap swaps, else is disabled.
-// The drawer outranks the rail, so only showing the rail ever closes the drawer.
 
 const FLOORS = paneFloors();
 const DIVIDER = dividerBandPx();
@@ -21,7 +19,6 @@ const RAIL_ONLY = FLOORS.minThreadPx + FLOORS.railPx;
 const ROOMY = BOTH_SIDES + FLOORS.minContentPx + 400;
 const NO_ROOM_FOR_DRAWER = DRAWER_ONLY - 1;
 const NO_ROOM_FOR_RAIL = RAIL_ONLY - 1;
-// The rail yields to the drawn drawer, and fits alone.
 const RAIL_YIELDS = BOTH_SIDES - 1;
 
 function resize(windowPx: number) {

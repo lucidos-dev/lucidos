@@ -5,17 +5,12 @@ import { toasts, engineRestarting, dismissToast, showToast, TOAST_AUTO_DISMISS_M
 import { handleAppToastMessage } from '../../../store/actions/app-toast-bridge';
 import { markSwUpdateDismissed } from '../../../hooks/sw-update';
 
-// The store's keyed `dismissToast` layers user-dismiss side effects on top of the
-// structural removal for two host-owned keys. Mocked so the tests below can prove
-// the app bridge does NOT reach them, and (in the contrast case) that the host
-// path still does, i.e. that the assertion isn't vacuous.
 vi.mock('../../../hooks/sw-update', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../hooks/sw-update')>()),
   markSwUpdateDismissed: vi.fn(),
   markEngineVersionDismissed: vi.fn(),
 }));
 
-/** Walk a vnode tree, returning every node whose className contains `cls`. */
 function findByClass(node: ComponentChildren, cls: string, out: VNode[] = []): VNode[] {
   if (node === null || node === undefined || typeof node === 'boolean') return out;
   if (typeof node === 'string' || typeof node === 'number') return out;
@@ -32,10 +27,8 @@ function findByClass(node: ComponentChildren, cls: string, out: VNode[] = []): V
   return out;
 }
 
-/** The payload an app iframe posts for `lucidos.ui.toast(...)`. */
 const toastMsg = (payload: Record<string, unknown>) =>
   handleAppToastMessage('lucidos:ui:toast', payload);
-/** The payload an app iframe posts for `lucidos.ui.dismissToast(key)`. */
 const dismissMsg = (payload: Record<string, unknown>) =>
   handleAppToastMessage('lucidos:ui:dismissToast', payload);
 
@@ -46,8 +39,6 @@ beforeEach(() => {
 });
 
 describe('app toast bridge: spinning', () => {
-  // The whole point of the option: an app says "work in progress" and the host
-  // renders the indeterminate spinner in place of the severity icon.
   it('renders the spinner instead of the severity icon', () => {
     toastMsg({ message: 'Reindexing…', type: 'info', key: 'reindex', spinning: true });
     expect(toasts.value[0].spinning).toBe(true);
@@ -60,8 +51,6 @@ describe('app toast bridge: spinning', () => {
     expect(findByClass(ToastList(), 'toast-icon').length).toBe(1);
   });
 
-  // Everything on this payload crossed a postMessage boundary from app code, so
-  // a non-boolean must not arrive as a truthy `spinning`.
   it('ignores a non-boolean spinning rather than treating it as true', () => {
     toastMsg({ message: 'Reindexing…', type: 'info', spinning: 'yes' });
     expect(toasts.value[0].spinning).toBeUndefined();
@@ -77,7 +66,6 @@ describe('app toast bridge: title', () => {
     expect(findByClass(ToastList(), 'toast-title').length).toBe(1);
   });
 
-  // Untrusted like every other field: only a non-empty string is a title.
   it('ignores a title that is not a non-empty string', () => {
     toastMsg({ message: 'One', type: 'info', title: 42 });
     toastMsg({ message: 'Two', type: 'info', title: '' });
@@ -100,14 +88,10 @@ describe('app toast bridge: dismissToast', () => {
     expect(toasts.value.map((t) => t.key)).toEqual(['sync']);
   });
 
-  // An app can't know whether the toast is still up: the user may have closed it,
-  // or its duration may have expired. "Already gone" is the normal case.
   it('is a silent no-op for a key matching nothing', () => {
     toastMsg({ message: 'Syncing…', type: 'info', key: 'sync' });
     const before = toasts.value;
     expect(() => dismissMsg({ key: 'no-such-toast' })).not.toThrow();
-    // Same array identity: `removeToast` only reassigns when the key is present,
-    // so an app polling dismiss can't wake every toast subscriber each call.
     expect(toasts.value).toBe(before);
   });
 
@@ -118,9 +102,6 @@ describe('app toast bridge: dismissToast', () => {
     expect(toasts.value.length).toBe(1);
   });
 
-  // The security-relevant half. `dismissToast`'s string arm records the running
-  // build as user-dismissed for two host-owned keys, so routing an app's request
-  // through it would let any app suppress the user's own Lucidos update prompt.
   it('does not fire the host user-dismiss side effect for a host-owned key', () => {
     showToast('New version available', 'info', { key: 'update-available' });
     dismissMsg({ key: 'update-available' });
@@ -128,8 +109,6 @@ describe('app toast bridge: dismissToast', () => {
     expect(markSwUpdateDismissed).not.toHaveBeenCalled();
   });
 
-  // The contrast that keeps the assertion above honest: the HOST path (the user
-  // clicking the toast's close button) does still record the dismissal.
   it('but the host dismiss path still does', () => {
     showToast('New version available', 'info', { key: 'update-available' });
     dismissToast('update-available');
@@ -141,9 +120,6 @@ describe('app toast bridge: lifetime', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
-  // The documented default (js-sdk.md § Toasts): success and info close on their
-  // own whether or not the app keyed them. A keyed host toast stays up, so the
-  // bridge must not inherit that rule. Regression: a keyed "Saved" never closed.
   it('closes a keyed success toast on the host timer', () => {
     toastMsg({ message: 'Saved', type: 'success', key: 'save' });
     vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
@@ -164,8 +140,6 @@ describe('app toast bridge: lifetime', () => {
     expect(toasts.value.length).toBe(3);
   });
 
-  // No key means nothing can replace or dismiss it, and with no X either it
-  // would never leave.
   it('closes an unkeyed spinner on the host timer', () => {
     toastMsg({ message: 'Working…', type: 'info', spinning: true, dismissable: false });
     vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
@@ -179,6 +153,18 @@ describe('app toast bridge: lifetime', () => {
     expect(toasts.value).toEqual([]);
   });
 
+  it.each(['success', 'info', 'warning', 'error'])('lets an app close a timed %s even with dismissable false', (type) => {
+    toastMsg({ message: 'Finished', type, key: 'timed-app', durationMs: 8000, dismissable: false });
+    const buttons = findByClass(ToastList(), 'toast-close');
+    expect(buttons).toHaveLength(1);
+    (buttons[0].props as unknown as { onClick: () => void }).onClick();
+    expect(toasts.value).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    toastMsg({ message: 'Still working', type: 'info', key: 'timed-app', spinning: true });
+    vi.advanceTimersByTime(8000);
+    expect(toasts.value).toHaveLength(1);
+  });
+
   it('honours an explicit durationMs', () => {
     toastMsg({ message: 'Failed', type: 'error', key: 'a', durationMs: 1000 });
     vi.advanceTimersByTime(1000);
@@ -187,8 +173,6 @@ describe('app toast bridge: lifetime', () => {
 });
 
 describe('app toast bridge: message ownership', () => {
-  // `onAppFrameMessage` routes on this boolean, and it is what lets the dismiss branch
-  // sit ahead of the "confirm and prompt carry a message" guard.
   it('claims both toast messages and no others', () => {
     expect(toastMsg({ message: 'x' })).toBe(true);
     expect(dismissMsg({ key: 'x' })).toBe(true);
@@ -197,8 +181,6 @@ describe('app toast bridge: message ownership', () => {
     expect(handleAppToastMessage('lucidos:ui:preview-file', {})).toBe(false);
   });
 
-  // Claimed, but nothing to show: a toast without a message is malformed, not a
-  // confirm, so it must not fall through to the branches below it.
   it('claims a message-less toast without showing anything', () => {
     expect(toastMsg({ type: 'info' })).toBe(true);
     expect(toasts.value.length).toBe(0);

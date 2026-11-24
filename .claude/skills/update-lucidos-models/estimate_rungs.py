@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Write the rung estimates file, crates/lucidos-engine/src/llm/rung_estimates.json.
+"""Write the rung estimates file, crates/lucidos-core/src/llm/rung_estimates.json.
 
 Usage: estimate_rungs.py <inputs-dir> [--print]
 
 The inputs directory is docs/plans/rung-estimate-inputs, which the release
 drops, because Artificial Analysis (AA) forbids republishing its figures.
-Only order, the frontier flag and coarse bands ship. It holds:
+Only order, pair identities, frontier flags and coarse bands ship. It holds:
 
 - aa_rungs.csv: model,effort,score,cost_usd,time_s,output_tokens_m,
   output_speed_tps, read off AA's model pages. A pair needs a score, a cost
@@ -13,7 +13,6 @@ Only order, the frontier flag and coarse bands ship. It holds:
 - aa_coding.csv: model,effort,score, AA's Coding Agent Index (0 to 1), read
   off https://artificialanalysis.ai/agents/coding-agents. Pairs it lacks are
   left out.
-- eci_scores.csv: https://epoch.ai/data/eci_scores.csv (CC BY 4.0).
 - openrouter_speed.csv: model,throughput_tps, standard tier only. A model it
   lacks takes AA's speed instead.
 
@@ -22,9 +21,8 @@ force today. The engine prices the token band from the same table.
 
 Every pair carries two intelligence profiles:
 
-- general: AA's Intelligence Index at AA_WEIGHT, blended with an independent
-  view that borrows from AA only in aggregate. The view maps the model's ECI
-  onto AA's scale, less the median effort gap.
+- general: AA's Intelligence Index as measured. Every pair comes from one
+  AA snapshot, so no second source is blended in.
 - coding: AA's Coding Agent Index, scaled onto the general scale by matching
   mean and spread over the pairs both cover. A pair the index lacks takes its
   general score plus its model's mean measured gap (coding minus general), and
@@ -36,10 +34,10 @@ ranking or frontier selection. Downward observations emit review diagnostics;
 ties are estimates, not evidence of strict improvement. Raw inputs stay intact.
 coding_estimated indicates missing index coverage, not an unsmoothed score.
 
-Cost and time blend AA with the independent view the same way. Cost per task
-is the model's input cost plus output tokens per task at list price. Time is
-output tokens over the model's speed, calibrated against AA's times. The
-view's fits run over FIT_MODELS only, so adding a model never moves another.
+Cost is AA's measured cost per task: a pair AA has not costed is skipped.
+Time blends AA at AA_WEIGHT with an independent view: output tokens over the
+model's speed, calibrated against AA's times. The view's fit runs over
+FIT_MODELS only, so adding a model never moves another.
 
 Bands count steps from REFERENCE: the token band COST_STEPS_PER_DOUBLING to a
 doubling, the time band TIME_STEPS_PER_DOUBLING. The token band is cost per
@@ -54,7 +52,9 @@ other pair of that surface beats it on score and cost, where cost is the
 shipped token band plus the price, as the engine computes it. A pair the
 coding index never measured scores its general score there. Each surface's
 SHIPPED_DEFAULTS pair stays on even when another pair beats it, so a fresh
-workspace's default is a rung of its ladder. --print shows the estimates
+workspace's default is a rung of its ladder. Every pair also names every
+pair that dominates it, so runtime can recompute the frontier for available
+routes without raw scores. --print shows the estimates
 instead of writing.
 """
 
@@ -67,13 +67,13 @@ from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-TARGET = ROOT / "crates/lucidos-engine/src/llm/rung_estimates.json"
-PRICE_TABLE = ROOT / "crates/lucidos-engine/src/llm/model_prices.json"
+TARGET = ROOT / "crates/lucidos-core/src/llm/rung_estimates.json"
+PRICE_TABLE = ROOT / "crates/lucidos-core/src/llm/model_prices.json"
 
 SOURCE = (
-    "Lucidos estimate, weighted toward Artificial Analysis "
-    "(artificialanalysis.ai): its Intelligence Index and Coding Agent Index, "
-    "with the Epoch AI Capabilities Index, list prices and OpenRouter speed. "
+    "Lucidos estimate from Artificial Analysis (artificialanalysis.ai): its "
+    "Intelligence Index, Coding Agent Index and cost per task, with list "
+    "prices and OpenRouter speed. "
     "Bands only: see estimate_rungs.py in the update-lucidos-models skill."
 )
 
@@ -85,7 +85,7 @@ REFERENCE = ("claude-opus-5-5", "medium")
 SHIPPED_DEFAULTS = {
     "chat": REFERENCE,
     "claude_code": REFERENCE,
-    "codex": ("gpt-6.1-sol", "medium"),
+    "codex": ("gpt-6.2-sol", "medium"),
 }
 # Models whose coding index rows are ignored: the index measured them at one
 # effort only, so they take general, and max reads as xhigh. docs/temporary-measures.md.
@@ -94,20 +94,25 @@ COST_STEPS_PER_DOUBLING = 6
 TIME_STEPS_PER_DOUBLING = 3
 SCORE_POINTS_PER_STEP = 2
 
-# Every estimated model by its Lucidos id: its Epoch display name, and the
+# Every estimated model by its Lucidos id: its display name as AA's records
+# give it, and the
 # efforts each surface offers it at. Chat lists every builtin registry model
 # that is not retired, at the tiers `llm::reasoning::supported_efforts` gives
 # it on any route.
 MODELS = {
-    "claude-fable-5-2": ("Claude Fable 5.2", {"chat": CODING_EFFORTS}),
+    "claude-fable-5-2": ("Claude Fable 5.2", {
+        "chat": CODING_EFFORTS, "claude_code": CODING_EFFORTS}),
     "gemini-4-argon": ("Gemini 4 Argon", {"chat": ["low", "medium", "high"]}),
     "gemini-4-carbon": ("Gemini 4 Carbon", {"chat": ["low", "medium", "high"]}),
+    "gemini-4-neon": ("Gemini 4 Neon", {"chat": ["low", "medium", "high", "xhigh"]}),
     "claude-haiku-5-5": ("Claude Haiku 5.5", {
         "chat": CODING_EFFORTS, "claude_code": CODING_EFFORTS}),
     "claude-sonnet-5-5": ("Claude Sonnet 5.5", {
         "chat": CODING_EFFORTS, "claude_code": CODING_EFFORTS}),
     "claude-opus-5-5": ("Claude Opus 5.5", {
         "chat": CODING_EFFORTS, "claude_code": CODING_EFFORTS}),
+    "gpt-6.2-astra": ("GPT-6.2 Astra", {"chat": CODING_EFFORTS, "codex": CODING_EFFORTS}),
+    "gpt-6.2-sol": ("GPT-6.2 Sol", {"chat": CODING_EFFORTS, "codex": CODING_EFFORTS}),
     "gpt-6.1-sol": ("GPT-6.1 Sol", {"chat": CODING_EFFORTS, "codex": CODING_EFFORTS}),
     "gpt-6-astra": ("GPT-6 Astra", {
         "chat": ["none"] + CODING_EFFORTS, "codex": CODING_EFFORTS}),
@@ -127,12 +132,11 @@ MODELS = {
 
 SURFACES = {"chat": "general", "claude_code": "coding", "codex": "coding"}
 
-# The models the independent view fits against: AA measured each at every
-# coding effort.
+# The models the independent view fits against: AA's current index measures
+# each at every coding effort.
 FIT_MODELS = [
     "claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5",
-    "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
-    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna",
 ]
 
 # Keep the established coding scale fixed on additive model releases, just as
@@ -180,6 +184,86 @@ def coding_observations(rows):
     return found
 
 
+def coding_pair(record):
+    model = record.get("model")
+    if not isinstance(model, dict):
+        return None
+    release, effort = model.get("release"), model.get("effort")
+    if not isinstance(release, dict) or not isinstance(effort, dict):
+        return None
+    if not isinstance(effort.get("slug"), str):
+        return None
+    for identifier, (name, surfaces) in MODELS.items():
+        if release.get("shortName") == name and effort.get("slug") in {
+                e for efforts in surfaces.values() for e in efforts}:
+            return identifier, effort["slug"]
+    return None
+
+
+def evaluation_cohort(record):
+    evaluations = record.get("evals", [])
+    if not evaluations:
+        raise ValueError("coding provenance: missing evaluation cohort")
+    cohort = []
+    for evaluation in evaluations:
+        fields = ("datasetIndexName", "evaluationDatasetSlug", "refDatasetName", "weight")
+        if any(not evaluation.get(field) for field in fields):
+            raise ValueError("coding provenance: unidentified evaluation cohort")
+        cohort.append({field: evaluation[field] for field in fields})
+    names = [evaluation["datasetIndexName"] for evaluation in cohort]
+    if len(set(names)) != len(names) or not math.isclose(sum(e["weight"] for e in cohort), 1):
+        raise ValueError("coding provenance: invalid evaluation weights or duplicate datasets")
+    return sorted(cohort, key=lambda e: e["datasetIndexName"])
+
+
+def coding_snapshot(records, source_url, extracted):
+    observations, seen = [], set()
+    for record in records:
+        pair = coding_pair(record)
+        if pair is None:
+            continue
+        if pair in seen:
+            raise ValueError(f"coding provenance: duplicate observation {pair}")
+        seen.add(pair)
+        observations.append(record)
+    if not observations:
+        raise ValueError("coding provenance: no supported explicit model/effort observations")
+    evidence = {"source_url": source_url, "extracted": extracted,
+                "cohort": evaluation_cohort(observations[0]), "observations": observations}
+    coding_evidence(evidence)
+    return evidence
+
+
+def coding_evidence(evidence):
+    if not evidence.get("source_url") or not evidence.get("extracted") or not evidence.get("cohort"):
+        raise ValueError("coding provenance: source URL, extraction date and comparable cohort are required")
+    rows = []
+    for record in evidence.get("observations", []):
+        pair = coding_pair(record)
+        if pair is None:
+            raise ValueError("coding provenance: unidentified or unsupported model/effort")
+        if evaluation_cohort(record) != evidence["cohort"]:
+            raise ValueError("coding provenance: incompatible active evaluation cohort; refresh the complete snapshot")
+        versions = record.get("versions", {})
+        for evaluation in evidence["cohort"]:
+            version = versions.get(evaluation["datasetIndexName"], {})
+            if any(not version.get(bound, {}).get("version") for bound in ("min", "max")):
+                raise ValueError("coding provenance: missing harness versions")
+        if any(not record.get(field) for field in ("id", "displayLabel", "agentName")):
+            raise ValueError("coding provenance: missing source identity or harness")
+        rows.append({"model": pair[0], "effort": pair[1], "score": record["indexScore"]})
+    if not rows:
+        raise ValueError("coding provenance: empty active cohort")
+    return coding_observations(rows)
+
+
+def validated_coding(rows, evidence):
+    observed, verified = coding_observations(rows), coding_evidence(evidence)
+    if observed != verified:
+        raise ValueError("aa_coding.csv differs from coding provenance; reimport the coherent snapshot")
+    return observed
+
+
 def normalize_efforts(found):
     """Operational estimates use a monotone envelope, not raw benchmark ranks.
 
@@ -216,9 +300,10 @@ class Inputs:
                 key: number(row[key])
                 for key in ("score", "cost_usd", "time_s", "output_tokens_m", "output_speed_tps")
             }
-        self.coding = coding_observations(read_csv(folder / "aa_coding.csv"))
-        eci = {row["Model"]: float(row["eci"]) for row in read_csv(folder / "eci_scores.csv")}
-        self.eci = {model: eci[name] for model, (name, _) in MODELS.items() if name in eci}
+        provenance = folder / "coding-provenance.json"
+        if not provenance.exists():
+            raise ValueError("missing coding-provenance.json; import a coherent coding snapshot before calibration")
+        self.coding = validated_coding(read_csv(folder / "aa_coding.csv"), json.loads(provenance.read_text()))
         self.price_out = output_prices_today()
         unpriced = sorted({m for m, e in self.pairs() if self.estimable(m, e)}
                           - set(self.price_out))
@@ -260,48 +345,18 @@ def output_prices_today():
 
 
 class IndependentView:
-    """The non-AA estimate. It fits against AA across FIT_MODELS, never
-    against a single pair's figure."""
+    """The non-AA estimate of time uses an aggregate fit, not a single pair's
+    figure. FIT_MODELS anchors it, so adding another model never moves it.
+    """
 
     def __init__(self, inputs):
         self.inputs = inputs
         aa = inputs.aa
-        tasks_per_run = [
-            inputs.price_out[model] / 1e6
-            / slope([inputs.tokens(model, e) for e in CODING_EFFORTS],
-                    [aa[model][e]["cost_usd"] for e in CODING_EFFORTS])
-            for model in FIT_MODELS]
-        self.tasks = statistics.median(tasks_per_run)
         timed = [(m, e) for m in FIT_MODELS for e in CODING_EFFORTS if aa[m][e]["time_s"]]
         xs = [inputs.tokens(m, e) / inputs.aa_speed(m, e) for m, e in timed]
         ys = [aa[m][e]["time_s"] for m, e in timed]
         self.seconds_per_second = slope(xs, ys)
         self.base_seconds = statistics.mean(ys) - self.seconds_per_second * statistics.mean(xs)
-        tops = [(aa[m]["max"]["score"], inputs.eci[m]) for m in FIT_MODELS]
-        self.mean_aa = statistics.mean(a for a, _ in tops)
-        self.mean_eci = statistics.mean(e for _, e in tops)
-        self.aa_per_eci = slope([e for _, e in tops], [a for a, _ in tops])
-        efforts = {e for m in FIT_MODELS for e in aa[m]}
-        self.effort_gap = {
-            e: statistics.median(aa[m]["max"]["score"] - aa[m][e]["score"]
-                                 for m in FIT_MODELS if e in aa[m])
-            for e in efforts}
-
-    def output_cost(self, model, effort):
-        return self.inputs.tokens(model, effort) / self.tasks * self.inputs.price_out[model] / 1e6
-
-    def score(self, model, effort):
-        """None where Epoch has no score for the model."""
-        eci = self.inputs.eci.get(model)
-        if eci is None:
-            return None
-        return self.mean_aa + self.aa_per_eci * (eci - self.mean_eci) - self.effort_gap[effort]
-
-    def cost(self, model, effort):
-        input_cost = statistics.median(
-            max(0.0, r["cost_usd"] - self.output_cost(model, e))
-            for e, r in self.inputs.fit_rows(model).items() if r["cost_usd"] is not None)
-        return input_cost + self.output_cost(model, effort)
 
     def time(self, model, effort):
         speed = self.inputs.speed.get(model) or self.inputs.aa_speed(model, effort)
@@ -327,8 +382,8 @@ def estimates(inputs):
             out[(model, effort)] = {
                 "model": model,
                 "effort": effort,
-                "general": round(blend(aa["score"], view.score(model, effort))),
-                "cost": two_figures(blend(aa["cost_usd"], view.cost(model, effort))),
+                "general": round(aa["score"]),
+                "cost": two_figures(aa["cost_usd"]),
                 "time": two_figures(blend(aa["time_s"], time) if aa["time_s"] else time),
             }
     add_coding(out, inputs.coding)
@@ -345,6 +400,9 @@ def add_coding(found, coding):
     coding = {key: v for key, v in coding.items() if key[0] not in CODING_UNMEASURED}
     both = [(coding[key], row["general"]) for key, row in found.items()
             if key in coding and key[0] in CODING_SCALE_MODELS]
+    if (len(both) < 2 or len({c for c, _ in both}) < 2
+            or len({g for _, g in both}) < 2):
+        raise ValueError("no comparable coding calibration overlap; import measured anchor pairs with nonzero spread")
     mean_c, mean_g = (statistics.mean(v) for v in zip(*both))
     spread = statistics.stdev(g for _, g in both) / statistics.stdev(c for c, _ in both)
 
@@ -426,7 +484,10 @@ def surface(found, name):
             if effort in MODELS[model][1].get(name, [])]
     return [{"model": r["model"], "effort": r["effort"],
              "on": (r["model"], r["effort"]) == SHIPPED_DEFAULTS[name]
-             or not any(beats(other, r, profile) for other in rows)}
+             or not any(beats(other, r, profile) for other in rows),
+             "pinned": (r["model"], r["effort"]) == SHIPPED_DEFAULTS[name],
+             "dominators": [{"model": other["model"], "effort": other["effort"]}
+                            for other in rows if beats(other, r, profile)]}
             for r in ranked(rows, profile)]
 
 
@@ -442,7 +503,8 @@ def render(pairs, surfaces):
     note = (
         "The rung estimates: bands for every estimated (model, effort) pair, "
         "and each ladder surface's shipped pairs, ranked on its profile, with "
-        "whether each is on (runtime/intelligence_ladder.rs). Bands only, "
+        "global frontier flags, pinned defaults and all dominating pair identities "
+        "(runtime/intelligence_ladder.rs). Bands only, "
         "never a third-party figure (ADR 0500, ADR 0525). estimate_rungs.py "
         "in the update-lucidos-models skill writes it, so never edit it by hand."
     )

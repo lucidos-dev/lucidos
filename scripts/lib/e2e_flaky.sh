@@ -20,18 +20,32 @@ E2E_FLAKY_END_MARK="── end flaky ──"
 # timeout), or when the failure list does not add up to the summary's count:
 # those failures are never rerun.
 e2e_failed_engine_tests() {
-    local log="$1" count names
-    count="$(sed -n 's/^test result: FAILED\..* \([0-9][0-9]*\) failed.*/\1/p' "$log" | tail -1)"
-    [ -n "$count" ] || return 0
-    names="$(awk '
-        /^failures:$/ { listing = 1; names = ""; next }
-        listing && /^    [^ ]/ { sub(/^    /, ""); names = names $0 "\n"; next }
+    awk '
+        /^ *Running unittests / {
+            if (running) invalid = 1
+            running = 1
+            next
+        }
+        /^failures:$/ { listing = 1; names = ""; count = 0; next }
+        listing && /^    [^ ]/ {
+            sub(/^    /, "")
+            names = names $0 "\n"
+            count++
+            next
+        }
+        /^test result:/ {
+            if ($3 == "FAILED.") {
+                if ($6 != count || count == 0) invalid = 1
+                failed = failed names
+            }
+            running = listing = count = 0
+            names = ""
+            next
+        }
         listing && NF == 0 { if (names != "") listing = 0; next }
         listing { listing = 0 }
-        END { printf "%s", names }
-    ' "$log")"
-    [ "$(printf '%s' "$names" | grep -c .)" = "$count" ] || return 0
-    printf '%s' "$names"
+        END { if (!invalid && !running) printf "%s", failed }
+    ' "$1"
 }
 
 # e2e_rerun_failed_engine_tests <log> <test-engine.sh>: rerun what <log>'s run
@@ -52,7 +66,10 @@ EOF
     local rc=$?
     tee -a "$log" <"$rerun"
     # A name that matched nothing exits 0 with no test run: a pass nobody saw.
-    if [ "$rc" -ne 0 ] || ! grep -q "^test result: ok\. $count passed;" "$rerun"; then
+    if [ "$rc" -ne 0 ] || ! awk -v count="$count" '
+        /^test result: ok\./ { passed += $4 }
+        END { exit passed != count }
+    ' "$rerun"; then
         rm -f "$rerun"
         return 1
     fi

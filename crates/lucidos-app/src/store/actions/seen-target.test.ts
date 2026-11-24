@@ -91,7 +91,6 @@ function unread(id: string, tap: Tap): Notification {
 const threadTap = (threadId: string, eventId?: string): Tap =>
   ({ kind: 'navigate', to: { target: 'thread', id: threadId, event_id: eventId } } as Tap);
 
-// ---------------------------------------------------------------------------
 
 describe('which panes are on screen', () => {
   it('shows both panes on a desktop split', () => {
@@ -172,7 +171,6 @@ describe('the dwell', () => {
     const waits = emptySeenWaits();
     sampleSeen(waits, 1000, ['a']);
     expect(sampleSeen(waits, 1500, [])).toEqual([]);
-    // Coming back restarts the clock: time in the band must be continuous.
     sampleSeen(waits, 1600, ['a']);
     expect(sampleSeen(waits, 1600 + SEEN_DWELL_MS - 1, ['a'])).toEqual([]);
     expect(sampleSeen(waits, 1600 + SEEN_DWELL_MS, ['a'])).toEqual(['a']);
@@ -203,25 +201,18 @@ describe('the dwell', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
 
 interface ObserverFakes {
-  /** One entry per constructed observer, holding its callback. */
   intersection: Array<() => void>;
   mutation: Array<() => void>;
   disconnected: number;
 }
 
-/** Stand in for the two DOM observers the watch arms.
- *
- *  The suite runs against the minimal stub page rather than jsdom, so neither
- *  exists. Faking them is also what makes the arming ORDER assertable: a real
- *  observer would only report through the browser. */
 function installObserverFakes(): ObserverFakes {
   const fakes: ObserverFakes = { intersection: [], mutation: [], disconnected: 0 };
   const make = (into: Array<() => void>) => class {
     constructor(cb: () => void) { into.push(cb); }
-    observe() { /* the fake reports through its captured callback */ }
+    observe() {  }
     disconnect() { fakes.disconnected++; }
   };
   const g = globalThis as Record<string, unknown>;
@@ -272,7 +263,6 @@ describe('the watch', () => {
     vi.useRealTimers();
   });
 
-  /** Two samples a dwell apart, which is what the live triggers do for free. */
   function dwell(): void {
     resampleSeenTargets();
     vi.setSystemTime(SEEN_DWELL_MS);
@@ -288,7 +278,6 @@ describe('the watch', () => {
   });
 
   it('leaves a notification whose card is scrolled away', () => {
-    // This is §4 Row 2. Being on the thread is not being at the event.
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(false);
     servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
@@ -322,9 +311,6 @@ describe('the watch', () => {
     expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
   });
 
-  /** The reported bug. An agent's `send_notification` taps to its own thread,
-   *  and the reader is in that thread when it lands. Being there is not seeing
-   *  it: the toast is its surface, or the bell badge with toasts off. */
   describe('a notification that lands where the reader already is', () => {
     it('stays unread for the visit under way when it arrived', () => {
       focusedThreadId.value = 't-1';
@@ -377,8 +363,6 @@ describe('the watch', () => {
     });
 
     it('lets go once its presence check shows the page was away', () => {
-      // An iOS PWA resuming flushes NotificationCreated while already active.
-      // Its presence check is stale by then, and the OS push was the surface.
       focusedThreadId.value = 't-1';
       noteArrivalWhilePresent('n-1');
       noteArrivalWhileAway('n-1');
@@ -388,7 +372,6 @@ describe('the watch', () => {
     });
 
     it('is held before the unread set lands', () => {
-      // The creation event starts the reload, so the hold always beats it.
       focusedThreadId.value = 't-1';
       servedUnreadNotifications.value = { status: 'loaded', data: [] };
       noteArrivalWhilePresent('n-1');
@@ -433,8 +416,6 @@ describe('the watch', () => {
     });
 
     it('keeps at most MAX_HELD_ARRIVALS, the newest, however long the reader stays', () => {
-      // A row read before its reload lands never enters the unread set, so
-      // nothing prunes its arrival while the reader stays put.
       focusedThreadId.value = 't-1';
       for (let i = 0; i <= MAX_HELD_ARRIVALS; i++) noteArrivalWhilePresent(`n-${i}`);
       expect(_heldArrivalCountForTesting()).toBe(MAX_HELD_ARRIVALS);
@@ -470,15 +451,12 @@ describe('the watch', () => {
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
     const row = unread('n-1', { kind: 'modal' });
-    // Provenance only. Its thread being read must not clear it.
     (row as { thread_id?: string }).thread_id = 't-1';
     servedUnreadNotifications.value = { status: 'loaded', data: [row] };
     dwell();
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
 
-  /** A read request (ADR 0409) clears once the end of its reply has held in
-   *  the band for the dwell. Only the thread the reader has open counts. */
   describe('a read request', () => {
     function asked(status: 'idle' | 'running' = 'idle'): void {
       threadMap.value = new Map([
@@ -509,15 +487,11 @@ describe('the watch', () => {
       expect(markReplySeen).toHaveBeenCalledWith('t-1', expect.any(Number));
     });
 
-    /** A failed report is retried with no scroll or signal: the reader may
-     *  simply hold still on the reply. */
     it('reports again after a failed report while the reader holds still', async () => {
       focusedThreadId.value = 't-1';
       isReplyEndInViewport.mockReturnValue(true);
       markReplySeen.mockRejectedValueOnce(new Error('offline'));
       asked();
-      // Let the frame the setup itself scheduled pass, so no stray sample can
-      // stand in for the retry under test.
       await vi.advanceTimersByTimeAsync(50);
       resampleSeenTargets();
       vi.setSystemTime(Date.now() + SEEN_DWELL_MS);
@@ -549,8 +523,6 @@ describe('the watch', () => {
       expect(markReplySeen).not.toHaveBeenCalled();
     });
 
-    // Review lists a request whatever the thread still waits on (ADR 0424),
-    // so seeing the reply must clear it then too.
     it('is reported while the thread still waits on an event', () => {
       focusedThreadId.value = 't-1';
       isReplyEndInViewport.mockReturnValue(true);
@@ -597,8 +569,6 @@ describe('the watch', () => {
   });
 
   it('honours a place already on screen when the unread set lands late', () => {
-    // The cold open: the thread is restored and rendered while the startup
-    // fetch is still in flight, so the first samples have nothing to watch.
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
     resampleSeenTargets();
@@ -622,12 +592,9 @@ describe('the watch', () => {
     expect(markReadOptimistic).toHaveBeenCalledTimes(1);
   });
 
-  /** Long enough to cross a frame, so the coalesced sample actually runs. */
   const A_FRAME = 50;
 
   it('samples on its own when the location moves, and again when the dwell is up', () => {
-    // The whole chain with nothing driven by hand: the location effect, the
-    // coalescer, and the timer the first sample schedules for itself.
     isInViewport.mockReturnValue(true);
     servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     focusedThreadId.value = 't-1';
@@ -638,9 +605,6 @@ describe('the watch', () => {
   });
 
   it('wakes when the card finally renders, with nothing else firing', () => {
-    // The bug this pins: a sample can run before Preact commits the transcript,
-    // so the viewport observer arms on no element. Nothing else fires after a
-    // render, and the rule slept with its card on screen.
     const observers = installObserverFakes();
     let cards: unknown[] = [];
     stubQuerySelectorAll(() => cards);
@@ -649,11 +613,9 @@ describe('the watch', () => {
     servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     resampleSeenTargets();
 
-    // The card is not in the DOM yet, so the render watch is what stands guard.
     expect(observers.intersection).toHaveLength(0);
     expect(observers.mutation).toHaveLength(1);
 
-    // The transcript commits. Only the render watch can report it.
     cards = [{}];
     isInViewport.mockReturnValue(true);
     observers.mutation[0]();
@@ -663,8 +625,6 @@ describe('the watch', () => {
   });
 
   it('gives the render watch up after its deadline, so it cannot outlive the gap', () => {
-    // A windowed transcript can leave an older card permanently absent, and a
-    // whole-body observer must not run for the rest of that visit.
     const observers = installObserverFakes();
     stubQuerySelectorAll(() => []);
 
@@ -679,13 +639,6 @@ describe('the watch', () => {
   });
 
   it('a blur drops the dwell in flight, and the paired focus starts a new one', () => {
-    // A window can lose OS focus without ever hiding, which `isPageActive()`
-    // reads as inactive on desktop. Nothing in the page-visit pairing fires
-    // there, so this rule listens for the raw pair.
-    //
-    // `isPageActive` is deliberately left TRUE throughout, so what is measured
-    // is the blur handler's own effect rather than the gate's. A wait that
-    // survived the blur would complete on the advance below.
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
     servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
@@ -702,8 +655,6 @@ describe('the watch', () => {
   });
 
   it('samples on its own when the reader scrolls', () => {
-    // The card enters the band with no navigation at all, which is the case a
-    // location-only rule would miss.
     focusedThreadId.value = 't-1';
     servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     vi.advanceTimersByTime(SEEN_DWELL_MS * 2);
@@ -716,8 +667,6 @@ describe('the watch', () => {
   });
 
   it('reads nothing while stepping through threads faster than the dwell', () => {
-    // Drawer browsing with the arrow keys. Each thread's card is in the band on
-    // arrival, and none of them is read.
     isInViewport.mockReturnValue(true);
     servedUnreadNotifications.value = {
       status: 'loaded',
@@ -733,7 +682,6 @@ describe('the watch', () => {
       resampleSeenTargets();
     }
     expect(markReadOptimistic).not.toHaveBeenCalled();
-    // Resting on the last one reads only that one.
     vi.setSystemTime(400 + SEEN_DWELL_MS);
     resampleSeenTargets();
     expect(markReadOptimistic).toHaveBeenCalledTimes(1);

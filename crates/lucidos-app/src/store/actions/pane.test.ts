@@ -16,14 +16,6 @@ import {
   toggleSplitFromDivider,
 } from './pane';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pane state consistency tests
-//
-// Invariants:
-//   - mobileView is always one of MOBILE_VIEWS
-//   - threadDrawerOpen can only be true when mobileView === 'thread'
-//   - After any navigateToPane call, both drawers are closed
-// ─────────────────────────────────────────────────────────────────────────────
 
 function resetState(view: MobileView = 'thread') {
   mobileView.value = view;
@@ -50,9 +42,6 @@ describe('navigateToPane', () => {
   });
 
   it('keeps thread drawer open when navigating to thread pane', () => {
-    // Drawer is allowed to be open only on the thread pane, so navigating to
-    // 'thread' must preserve it (e.g. dismissing the last review lands the
-    // user on the compose view with the drawer still visible).
     mobileView.value = 'thread';
     threadDrawerOpen.value = true;
     navigateToPane('thread');
@@ -96,7 +85,6 @@ describe('navigateToPane', () => {
 
           const error = checkPaneConsistency();
           expect(error, `${from}(drawer=${drawerStart}) → ${to}`).toBeNull();
-          // Drawer is preserved when target is 'thread'; closed otherwise.
           const expectedDrawer = to === 'thread' ? drawerStart : false;
           expect(threadDrawerOpen.value).toBe(expectedDrawer);
           expect(drawerOpen.value).toBe(false);
@@ -184,9 +172,7 @@ describe('toggleThreads', () => {
     focusedPane.value = 'thread';
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(true);
-    // Pure show/hide: the toggle never moves focus onto the drawer.
     expect(focusedPane.value).toBe('thread');
-    // mobileView unchanged on desktop
     expect(mobileView.value).toBe('thread');
   });
 
@@ -195,7 +181,6 @@ describe('toggleThreads', () => {
     threadDrawerOpen.value = true;
     focusedPane.value = 'thread';
     toggleThreads();
-    // One click hides — no intermediate "take focus" stage.
     expect(threadDrawerOpen.value).toBe(false);
     expect(focusedPane.value).toBe('thread');
   });
@@ -206,17 +191,11 @@ describe('toggleThreads', () => {
     focusedPane.value = 'drawer';
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(false);
-    // A hidden pane must not stay the focused pane (would strand keyboard focus).
     expect(focusedPane.value).toBe('thread');
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Keyboard pane intents (toggles, divider steps, layout reset)
-// ─────────────────────────────────────────────────────────────────────────────
 
-/** Element stub for the mocked document.querySelector: offsetWidth for the
- *  step math, classList for setSplitRatio's triggerPaneAnimate. */
 function fakeEl(offsetWidth: number) {
   return { offsetWidth, classList: { add: () => {}, remove: () => {} } } as unknown as Element;
 }
@@ -231,43 +210,38 @@ function mockLayoutWidths({ splitLayout, contentRow }: { splitLayout?: number; c
 
 describe('toggleThreadPane / toggleContentPane (two-stage focus → hide)', () => {
   beforeEach(() => {
-    resetState(); // focusedPane = 'thread'
+    resetState();
     (globalThis as any).innerWidth = 1024;
     splitRatio.value = 0.5;
   });
   afterEach(() => vi.restoreAllMocks());
 
   it('desktop thread pane: already focused → collapses (focus follows to content), then restores + refocuses', () => {
-    // focusedPane starts 'thread' and the pane is visible → first press hides it.
     toggleThreadPane();
     expect(splitRatio.value).toBe(0);
     expect(focusedPane.value).toBe('content');
-    // Collapsed → next press expands and refocuses the thread pane.
     toggleThreadPane();
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
     expect(focusedPane.value).toBe('thread');
   });
 
   it('desktop thread pane: visible-but-unfocused → focuses first, hides only on the next press', () => {
-    focusedPane.value = 'content'; // thread pane visible but not focused
+    focusedPane.value = 'content';
     toggleThreadPane();
-    expect(splitRatio.value).toBe(0.5); // focus only — no collapse
+    expect(splitRatio.value).toBe(0.5);
     expect(focusedPane.value).toBe('thread');
     toggleThreadPane();
-    expect(splitRatio.value).toBe(0); // now it hides
+    expect(splitRatio.value).toBe(0);
     expect(focusedPane.value).toBe('content');
   });
 
   it('desktop content pane: focuses first, then collapses, then restores + refocuses', () => {
-    // focusedPane starts 'thread' → first press just focuses content.
     toggleContentPane();
     expect(splitRatio.value).toBe(0.5);
     expect(focusedPane.value).toBe('content');
-    // Focused + visible → next press collapses it (focus falls to thread).
     toggleContentPane();
     expect(splitRatio.value).toBe(1);
     expect(focusedPane.value).toBe('thread');
-    // Collapsed → next press expands and refocuses content.
     toggleContentPane();
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
     expect(focusedPane.value).toBe('content');
@@ -280,22 +254,20 @@ describe('toggleThreadPane / toggleContentPane (two-stage focus → hide)', () =
     toggleContentPane();
     expect(mobileView.value).toBe('content');
     expect(splitRatio.value).toBe(0.5);
-    expect(focusedPane.value).toBe('thread'); // unchanged on mobile
+    expect(focusedPane.value).toBe('thread');
     expect(checkPaneConsistency()).toBeNull();
   });
 });
 
 describe('toggleSplitFromDivider (divider double-click)', () => {
   beforeEach(() => {
-    resetState(); // focusedPane = 'thread'
+    resetState();
     (globalThis as any).innerWidth = 1024;
     splitRatio.value = 0.5;
   });
   afterEach(() => vi.restoreAllMocks());
 
   it('collapsing the thread pane moves the marker off it, so Tab still works', () => {
-    // A collapsed pane is visibility: hidden. A marker left on it made every
-    // Tab a dead key.
     toggleSplitFromDivider();
     expect(splitRatio.value).toBe(0);
     expect(focusedPane.value).toBe('content');
@@ -323,7 +295,7 @@ describe('a Canvas that yielded for room: every way to show it shows it', () => 
   const railWasShown = dashboardRailShown.value;
 
   beforeEach(() => {
-    resetState(); // focusedPane = 'thread'
+    resetState();
     (globalThis as any).innerWidth = 1024;
     splitRatio.value = 0.5;
     dashboardRailShown.value = false;
@@ -387,14 +359,9 @@ describe('focusPane', () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// revealContentPane — every content navigation activates the Content pane group
-// so keyboard tabbing (handlePaneTab, anchored on focusedPane) lands on the
-// freshly-navigated view rather than the previously-focused pane.
-// ─────────────────────────────────────────────────────────────────────────────
 describe('revealContentPane', () => {
   beforeEach(() => {
-    resetState(); // focusedPane = 'thread'
+    resetState();
     splitRatio.value = 0.5;
   });
   afterEach(() => vi.restoreAllMocks());
@@ -407,7 +374,7 @@ describe('revealContentPane', () => {
 
   it('desktop: re-expands a collapsed split (Threads group maximized)', () => {
     (globalThis as any).innerWidth = 1024;
-    splitRatio.value = 1; // content collapsed
+    splitRatio.value = 1;
     revealContentPane();
     expect(focusedPane.value).toBe('content');
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
@@ -431,34 +398,27 @@ describe('revealContentPane', () => {
     (globalThis as any).innerWidth = 375;
     revealContentPane();
     expect(mobileView.value).toBe('content');
-    expect(focusedPane.value).toBe('thread'); // mobile navigates, never focuses
+    expect(focusedPane.value).toBe('thread');
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// revealThreadPane — the mirror of revealContentPane for thread navigation
-// (focusThread / unfocusThread / sendMessage's raw-new-thread path). Desktop:
-// re-expand a collapsed Threads pane group, then re-activate it. The focus half
-// is skipped outside the cross-group case so drawer/thread focus is left alone.
-// Mobile: swipe to the thread pane.
-// ─────────────────────────────────────────────────────────────────────────────
 describe('revealThreadPane', () => {
   beforeEach(() => {
-    resetState(); // focusedPane = 'thread', mobileView = 'thread'
+    resetState();
     splitRatio.value = 0.5;
   });
   afterEach(() => vi.restoreAllMocks());
 
   it('desktop: re-activates the Threads pane group from the content group', () => {
     (globalThis as any).innerWidth = 1024;
-    focusedPane.value = 'content'; // arriving from the Content pane group
+    focusedPane.value = 'content';
     revealThreadPane();
     expect(focusedPane.value).toBe('thread');
   });
 
   it('desktop: leaves an existing drawer focus alone (no cross-group switch)', () => {
     (globalThis as any).innerWidth = 1024;
-    focusedPane.value = 'drawer'; // browsing the thread list via keyboard
+    focusedPane.value = 'drawer';
     revealThreadPane();
     expect(focusedPane.value).toBe('drawer');
   });
@@ -478,24 +438,15 @@ describe('revealThreadPane', () => {
     expect(splitRatio.value).toBe(0.5);
   });
 
-  // The bug this pins: a thread link clicked from the content pane (a change
-  // toast, a Search Everywhere hit, the New-thread button) moved the focused
-  // thread behind a zero-width Threads pane group, so the click read as a
-  // no-op. Mobile never hit it: panes there are navigated, not collapsed.
   it('desktop: re-expands a collapsed split (Content group maximized)', () => {
     (globalThis as any).innerWidth = 1024;
     focusedPane.value = 'content';
-    splitRatio.value = 0; // thread pane collapsed
+    splitRatio.value = 0;
     revealThreadPane();
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
     expect(focusedPane.value).toBe('thread');
   });
 
-  // A collapsed pane hides the thread drawer with it, so a 'drawer' marker
-  // surviving the collapse points at nothing on screen. Re-expanding for a
-  // navigation must land the focus on the pane it just revealed rather than
-  // honour that stale marker, which is why the cross-group guard above does
-  // not apply to the collapsed case.
   it('desktop: a re-expand overrides a stale drawer focus', () => {
     (globalThis as any).innerWidth = 1024;
     focusedPane.value = 'drawer';
@@ -510,7 +461,7 @@ describe('revealThreadPane', () => {
     mobileView.value = 'content';
     revealThreadPane();
     expect(mobileView.value).toBe('thread');
-    expect(focusedPane.value).toBe('thread'); // mobile navigates, never focuses
+    expect(focusedPane.value).toBe('thread');
   });
 
   it('mobile: keeps the thread drawer open when navigating to the thread pane', () => {
@@ -518,9 +469,6 @@ describe('revealThreadPane', () => {
     mobileView.value = 'thread';
     threadDrawerOpen.value = true;
     revealThreadPane();
-    // navigateToPane('thread') keeps the drawer (the `view !== 'thread'` guard) —
-    // this is what lets the archive "last review → compose, drawer stays open"
-    // behavior survive the move from a manual navigateToPane to revealThreadPane.
     expect(mobileView.value).toBe('thread');
     expect(threadDrawerOpen.value).toBe(true);
   });
@@ -559,7 +507,6 @@ describe('stepThreadPaneWidth', () => {
 
 describe('stepThreadDrawerWidth', () => {
   const ROW = 1600;
-  // Visible thread + content panes reserve their minimums against the drawer.
   const MAX = ROW - minThreadPanePx() - minContentPanePx();
 
   beforeEach(() => {
@@ -616,7 +563,7 @@ describe('stepThreadDrawerWidth', () => {
     expect(threadDrawerWidth.value).toBe(400);
 
     threadDrawerOpen.value = true;
-    splitRatio.value = 0; // drawer hides with the collapsed thread pane
+    splitRatio.value = 0;
     stepThreadDrawerWidth(1);
     expect(threadDrawerWidth.value).toBe(400);
   });
@@ -627,19 +574,12 @@ describe('resetPaneLayout', () => {
     resetState();
     (globalThis as any).innerWidth = 1024;
   });
-  // unstub as well as restore: three of these stub the root font size, and an
-  // inline unstub at the end of each is skipped by a failing assertion, which
-  // leaks the stubbed root into every later test in the file.
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
   it('restores the default split ratio and drawer width, persisting the width', () => {
-    // The reset is `max(default, floor)`, and at a 16px root the floor (320)
-    // already leads the constant (300), so this is the floor. That is the
-    // ordinary case since the drawer's floor became one number for every
-    // desktop client; the constant only leads below 100% ui-scale, pinned below.
     const width = Math.max(DEFAULT_DRAWER_WIDTH, minDrawerWidth());
     splitRatio.value = 0.8;
     threadDrawerWidth.value = 500;
@@ -650,10 +590,6 @@ describe('resetPaneLayout', () => {
   });
 
   it('never resets BELOW the drawer floor, which the default falls under', () => {
-    // The default is a constant while the floor is derived from the root font
-    // size, so the two cross: from a 16px root up the header row needs more than
-    // 300px, and a bare reset would put the drawer straight back under its own
-    // floor. Scale the root well past that crossing point.
     vi.stubGlobal('getComputedStyle', () => ({ fontSize: '32px', getPropertyValue: () => '' }));
     const floor = minDrawerWidth();
     expect(floor, 'a 32px root must put the floor above the default').toBeGreaterThan(DEFAULT_DRAWER_WIDTH);
@@ -665,9 +601,6 @@ describe('resetPaneLayout', () => {
   });
 
   it('resets to the default where the floor is below it, under 100% ui-scale', () => {
-    // The other side of that crossing, and why the `max` is not a one-way trip
-    // to the floor: at UI_SCALE_MIN (75%, a 12px root) the row needs 274px and
-    // the constant is what a reset lands on.
     vi.stubGlobal('getComputedStyle', () => ({ fontSize: '12px', getPropertyValue: () => '' }));
     expect(minDrawerWidth(), 'a 12px root must put the floor below the default')
       .toBeLessThan(DEFAULT_DRAWER_WIDTH);
@@ -685,11 +618,6 @@ describe('resetPaneLayout', () => {
   });
 });
 
-// iOS PWA cold-start: the last-viewed pane must survive the PWA being killed, so
-// reopening lands on the pane the user left (e.g. content), not a forced reset to
-// thread. The pane lives in localStorage (survives process death); the content
-// pane's actual content (open app/file) is independently restored from the
-// localStorage nav stack, so landing on `content` is never a stranded blank pane.
 describe('mobileView persistence (survives PWA close)', () => {
   beforeEach(() => {
     sessionStorage.removeItem('lucidos-mobile-view');
@@ -698,8 +626,6 @@ describe('mobileView persistence (survives PWA close)', () => {
   });
 
   it('cold start restores the last pane from localStorage', () => {
-    // Simulate the reopen scenario: the user closed on the content pane, iOS
-    // killed the PWA (sessionStorage gone), localStorage survives → land on content.
     writeWindowItem('lucidos-mobile-view', 'content');
     expect(getInitialMobileView()).toBe('content');
   });
@@ -731,7 +657,7 @@ describe('no browser history side effects', () => {
 
   beforeEach(() => {
     resetState();
-    (globalThis as any).innerWidth = 375; // mobile
+    (globalThis as any).innerWidth = 375;
     pushStateSpy = vi.spyOn(history, 'pushState').mockImplementation(() => {});
   });
 

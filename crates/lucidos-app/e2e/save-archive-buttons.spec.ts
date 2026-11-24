@@ -16,19 +16,11 @@ test.describe('Section-aware Save/Archive buttons', () => {
 
   type SectionKey = 'saved' | 'archive' | 'current';
 
-  /** Wait until the section's rows near its header are mounted, then return
-   *  whether `threadId` is among them, or null while they are not.
-   *
-   *  The drawer mounts only the rows near its viewport. Once earlier specs
-   *  fill Current, Archive sits below that window with no rows in the DOM.
-   *  So the poll scrolls the header into view. The thread under test is the
-   *  newest in its section, so it is the first row below the header. */
   async function waitForSectionAnswer(page: Page, threadId: string, sectionKey: SectionKey): Promise<boolean> {
     const handle = await page.waitForFunction(
       ({ id, key }) => {
         const titles = Array.from(document.querySelectorAll<HTMLElement>(`[data-flip-id="__section_${key}"]`))
           .filter(t => t.getBoundingClientRect().height > 0);
-        // No section header at all: the section holds nothing.
         if (titles.length === 0) return 'absent';
         for (const title of titles) {
           const section = title.closest('.drawer-section');
@@ -75,16 +67,11 @@ test.describe('Section-aware Save/Archive buttons', () => {
       data: { thread_id: threadId },
     });
     expect(archResp.ok()).toBeTruthy();
-    // Desktop hides the drawer by default. Open it so
-    // waitForThreadInSection can find the section's DOM.
     await openThreadDrawer(page);
     await waitForThreadInSection(page, threadId, 'archive');
 
     await focusThreadFromDrawer(page, threadId);
 
-    // The pin helpers act on the focused thread only: every drawer row carries
-    // its own pin. Archive lives only in the prompt row, so its aria-label is
-    // unambiguous and stays unscoped.
     await expectFocusedPinned(page, false);
     expect(await page.locator('button[aria-label="Archive thread"]:visible').count()).toBe(0);
 
@@ -103,16 +90,12 @@ test.describe('Section-aware Save/Archive buttons', () => {
       data: { thread_id: threadId },
     });
     expect(saveResp.ok()).toBeTruthy();
-    // Desktop hides the drawer by default. Open it so
-    // waitForThreadInSection can find the section's DOM.
     await openThreadDrawer(page);
     await waitForThreadInSection(page, threadId, 'saved');
 
     await focusThreadFromDrawer(page, threadId);
 
     await expect(page.locator('button[aria-label="Archive thread"]:visible').first()).toBeVisible();
-    // A pinned thread always offers Unpin alongside Archive, so the user can
-    // drop back to the regular flow at any time.
     await expectFocusedPinned(page, true);
 
     await page.locator('button[aria-label="Archive thread"]:visible').first().click();
@@ -120,7 +103,6 @@ test.describe('Section-aware Save/Archive buttons', () => {
       page.getByText('Archiving unpins this thread. Move it to the archive?'),
     ).toBeVisible({ timeout: 5_000 });
 
-    // Two Archive buttons exist while the dialog is open — scope to the dialog.
     await page.locator('[data-role="confirm-ok"]:visible').first().click();
 
     await waitForThreadInSection(page, threadId, 'archive');

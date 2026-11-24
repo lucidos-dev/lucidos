@@ -1,22 +1,3 @@
-/**
- * `.prompt-actions-row` declares no `gap`, and the composer's overflow check
- * depends on it.
- *
- * `useFitsInOneRow` decides whether the Diff button can share the bottom row.
- * It sums each `[data-row-item]`'s width plus the gaps the row really spends,
- * and it takes the gap count from the row's one gapped cluster,
- * `.prompt-actions-right`. Everything outside that cluster is charged nothing,
- * which is true only while the row itself declares none.
- *
- * Add a `gap` here and the check under-counts by one per leading icon. The row
- * then reads as fitting when it does not, and overflows instead of lifting.
- * Nothing else in the gate would notice: `tsc` skips CSS and `vite build` fails
- * only on syntax.
- *
- * The mirror failure is what this replaced. The check charged a gap between
- * EVERY pair, so it billed four the row never spends. That lifted Diff off rows
- * with room for it.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readdirSync, readFileSync } from 'node:fs';
@@ -30,7 +11,6 @@ import { rulesTargeting } from './css-rule-helpers';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesRoot: string = resolve(here, '..');
 
-/** Every file under `dir` whose name ends in `ext`, recursively. */
 function filesUnder(dir: string, ext: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

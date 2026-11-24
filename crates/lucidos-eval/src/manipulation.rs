@@ -248,7 +248,7 @@ pub fn preflight(availability: FlagAvailability) -> Fallible<()> {
 }
 
 /// Where the engine declares every preference key it knows.
-pub const CATALOG_SOURCE: &str = "crates/lucidos-engine/src/core/preference_catalog.rs";
+pub const CATALOG_SOURCE: &str = "crates/lucidos-core/src/core/preference_catalog.rs";
 
 /// Whether the engine this harness was built beside knows the flag.
 ///

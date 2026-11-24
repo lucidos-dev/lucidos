@@ -11,14 +11,9 @@ import {
   waitForResponse,
 } from './helpers';
 
-/** A phone in landscape keeps the phone layout (ADR 0342), so rotating never
- *  swaps layouts. Leaving the phone layout and coming back rebinds the dynamic
- *  bars. In landscape every control clears the Dynamic Island and the rounded
- *  corners, while backgrounds still reach the edges. */
 
 const PORTRAIT = { width: 390, height: 844 };
 const LANDSCAPE = { width: 844, height: 390 };
-// A tablet: wide and tall, so the desktop split even under a finger.
 const TABLET = { width: 1180, height: 820 };
 const CONTAINER = '.mobile-swipe-pane .thread-content.visible';
 const PROMPT = '.mobile-swipe-pane .prompt-area';
@@ -28,8 +23,6 @@ async function rotate(page: Page, size: { width: number; height: number }): Prom
   await page.waitForFunction(({ width }) => window.innerWidth === width, size);
 }
 
-/** Poll this after a `rotate`. The layout flips on the `resize` event, which
- *  can fire after `innerWidth` already reads the new width. */
 function layout(page: Page): Promise<{ phone: boolean; split: boolean }> {
   return page.evaluate(() => ({
     phone: !!document.querySelector('.mobile-swipe-wrapper'),
@@ -37,7 +30,6 @@ function layout(page: Page): Promise<{ phone: boolean; split: boolean }> {
   }));
 }
 
-/** A thread tall enough to scroll, parked at the top. */
 async function tallThreadAtTop(page: Page): Promise<void> {
   await navigateToApp(page);
   await sendMessage(page, `Say exactly: "${uniqueMessage('phone-landscape')}"`);
@@ -68,7 +60,6 @@ async function scrollInSteps(page: Page, total: number): Promise<void> {
   }, { sel: CONTAINER, total });
 }
 
-/** How much of the prompt sits below the bottom of its pane, in px. */
 function promptHiddenPx(page: Page): Promise<number> {
   return page.evaluate(({ sel, container }) => {
     const prompt = document.querySelector(sel);
@@ -78,9 +69,6 @@ function promptHiddenPx(page: Page): Promise<number> {
   }, { sel: PROMPT, container: CONTAINER });
 }
 
-/** Scroll up and the prompt returns, down and it glides away: the bars are
- *  bound. In steps, never one jump: a rotation re-anchors the transcript, and
- *  a single event inside that window is rightly not the reader's. */
 async function expectBarsTrackScroll(page: Page): Promise<void> {
   await scrollInSteps(page, -10_000);
   await expect.poll(() => promptHiddenPx(page)).toBeLessThanOrEqual(1);
@@ -128,7 +116,6 @@ test.describe('A phone in landscape', () => {
 
     await rotate(page, PORTRAIT);
     await expect.poll(() => layout(page)).toEqual({ phone: true, split: false });
-    // The thread pane mounted afresh, so its transcript loads again.
     await page.waitForSelector(CONTAINER);
     await page.evaluate((sel) => {
       const container = document.querySelector(sel);
@@ -144,8 +131,6 @@ test.describe('A phone in landscape', () => {
   test('keeps every control clear of the Dynamic Island, with full-bleed bands', async ({ page }) => {
     await tallThreadAtTop(page);
     await rotate(page, LANDSCAPE);
-    // The island on the left only, as some Android cutouts report it. The
-    // inset applies to both sides, so the column stays centred.
     const island = 59;
     await page.evaluate((px) => {
       const s = document.documentElement.style;

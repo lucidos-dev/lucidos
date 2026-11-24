@@ -1,13 +1,3 @@
-/**
- * The composer's side-question route (ADR 0320). In side-question mode, or
- * from the Send button's hold, the box goes to the side-question endpoint and
- * never to `sendFollowup`. Everything else still reaches the normal send.
- *
- * Source-pattern checks for PromptInput, as its sibling tests do: mounting it
- * drags in every chat signal. The routing decision itself is unit-tested in
- * `store/sideQuestions.test.ts`, and the browser flow in
- * `e2e/side-question-all.spec.ts`.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,8 +21,6 @@ describe('PromptInput submit routes a side question before any send', () => {
     expect(submit.indexOf('beginSend')).toBeGreaterThan(routeIdx);
   });
 
-  // In the mode the box asks, so a multi-select card stops taking its text and
-  // a typed box shows the round Ask in place of the card's Submit.
   it('lets side-question mode win over a waiting card', () => {
     expect(promptSource).toMatch(/const hasPendingMultiQ = pendingMultiQ !== null && !sideQuestionMode;/);
     expect(promptSource).toContain('const actionSlot = answersCard ? answerControl');
@@ -55,13 +43,11 @@ describe('PromptInput submit routes a side question before any send', () => {
     const helper = promptSource.match(/function askComposerSideQuestion\([\s\S]*?\n {2}\}/)?.[0] ?? '';
     expect(helper, 'askComposerSideQuestion not found').not.toBe('');
     expect(helper).toContain("updateCompose(threadId, { text: '', image_hashes: [] })");
-    // Before the ask, so it can tell the new card from the ones on screen.
     expect(helper.indexOf('followSideQuestion()')).toBeGreaterThan(-1);
     expect(helper.indexOf('followSideQuestion()')).toBeLessThan(helper.indexOf('askSideQuestion('));
     expect(helper).toContain('askSideQuestion(threadId, question, hashes)');
   });
 
-  // The emptied box turns the button into Stop or a card's Cancel at once.
   it('asking arms the settle window, so a repeat tap cannot cancel', () => {
     const helper = promptSource.match(/function askComposerSideQuestion\([\s\S]*?\n {2}\}/)?.[0] ?? '';
     expect(helper.indexOf('armCancelSettle()')).toBeGreaterThan(-1);
@@ -87,7 +73,6 @@ describe('PromptInput submit routes a side question before any send', () => {
   });
 });
 
-// A typed `/btw` is ordinary text, and nothing hands it back as a side question.
 describe('nothing treats /btw as special', () => {
   it('the command menu neither lists nor intercepts it', () => {
     expect(menuSource).not.toMatch(/btw/i);

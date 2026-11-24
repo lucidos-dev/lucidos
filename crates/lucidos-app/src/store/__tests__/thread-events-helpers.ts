@@ -1,5 +1,3 @@
-// Shared scaffolding for the thread-events tests, split across
-// thread-events-*.test.ts.
 import { exchangeStatus, groupIntoExchanges, handleEvent, type ThreadEvent, type ThreadMeta, type ThreadState } from '../thread-events';
 
 export const TS = '2026-04-17T00:00:00Z';
@@ -31,8 +29,6 @@ export function makeThreadState(events: Map<number, ThreadEvent> = new Map()): T
   return { meta, events, streamingBuffer: '', eventsLoaded: true, eventsLoadFailed: false, lastDbSeq: 0, pendingUserMessages: [] };
 }
 
-/** Helper: build a CC thread state and replay events through handleEvent,
- *  then return exchanges with their statuses. */
 export function buildCCThread(events: Array<{ seq: number; event: ThreadEvent; created: string }>): {
   thread: ThreadState;
   exchanges: ReturnType<typeof groupIntoExchanges>;

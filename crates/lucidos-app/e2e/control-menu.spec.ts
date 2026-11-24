@@ -6,7 +6,6 @@ import {
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
-/** Check if any element matching the selector is physically visible (dual-layout safe). */
 function hasVisibleElement(page: Page, selector: string): Promise<boolean> {
   return page.evaluate((sel) => {
     const els = document.querySelectorAll(sel);
@@ -17,7 +16,6 @@ function hasVisibleElement(page: Page, selector: string): Promise<boolean> {
   }, selector);
 }
 
-/** Wait for at least one element matching the selector to be physically visible. */
 function waitForVisible(page: Page, selector: string, timeout = 10_000) {
   return page.waitForFunction((sel) => {
     const els = document.querySelectorAll(sel);
@@ -28,9 +26,6 @@ function waitForVisible(page: Page, selector: string, timeout = 10_000) {
   }, selector, { timeout });
 }
 
-/** Type "/" into the visible prompt input, triggering the control menu open request.
- *  Uses evaluate + dispatchEvent because Playwright's fill() doesn't trigger
- *  the handleInput code path that detects the "/" prefix. */
 async function typeSlash(page: Page) {
   await page.evaluate(() => {
     const els = document.querySelectorAll('[data-role="prompt-input"]');
@@ -61,11 +56,8 @@ test.describe('Coding-agent control menu', () => {
     await navigateToApp(page);
     await newThread(page);
 
-    // In Lucidos mode — no coding-agent controls button. The Lucidos Agent's
-    // model pick is the rung control's.
     expect(await hasVisibleElement(page, '.commands-btn')).toBe(false);
 
-    // Toggle to Claude mode: the control appears, in the row or behind its ⋯
     await pickComposeDestination(page);
     await expect(await composerControl(page, '.commands-btn')).toBeVisible();
   });
@@ -76,17 +68,13 @@ test.describe('Coding-agent control menu', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    // Wait for coding-agent commands to load (the control gets 'active' when ready)
     await expect.poll(() => codingAgentCommandsReady(page), { timeout: 15_000 }).toBe(true);
 
-    // Type "/" — should open the control command dropdown
     await typeSlash(page);
     await waitForVisible(page, '.control-dropdown');
 
-    // Verify dropdown has command items
     expect(await hasVisibleElement(page, '.control-item')).toBe(true);
 
-    // The prompt input should be cleared (slash consumed)
     const input = await waitForVisibleInput(page);
     const value = await input.inputValue();
     expect(value).toBe('');
@@ -97,15 +85,13 @@ test.describe('Coding-agent control menu', () => {
     let sentBody: Record<string, unknown> | null = null;
     let chatRequestFulfilled = false;
 
-    // The route stub keeps the test from spawning a real backend session. The
-    // request event is the assertion source.
     page.on('request', (req) => {
       const url = req.url();
       if (url.includes('/api/v1/claude-code/commands')) commandUrls.push(url);
       if (url.includes('/api/v1/chat/stream') && req.method() === 'POST') {
         try {
           sentBody = req.postDataJSON() as Record<string, unknown>;
-        } catch { /* ignore */ }
+        } catch {  }
       }
     });
     await page.route('**/api/v1/chat/stream', async (route) => {
@@ -132,8 +118,6 @@ test.describe('Coding-agent control menu', () => {
       page.locator('.compose-coding-agent-chip .dropdown-sizer > :first-child:visible').first(),
     ).toHaveText('Codex');
 
-    // Codex has no slash commands, so it gets no `/` button, standing or
-    // behind the ⋯. Its model pick is the rung control's.
     await openRungList(page);
     await page.keyboard.press('Escape');
     await expect.poll(() => commandUrls.some((u) => {
@@ -174,10 +158,8 @@ test.describe('Coding-agent control menu', () => {
       await newThread(page);
       await pickComposeDestination(page);
 
-      // Wait for coding-agent commands to load
       await expect.poll(() => codingAgentCommandsReady(page), { timeout: 15_000 }).toBe(true);
 
-      // Blur any auto-focused element so header is visible
       await blurActiveElement(page);
       await page.waitForFunction(() => {
         const header = document.querySelector('.app-header');
@@ -186,14 +168,10 @@ test.describe('Coding-agent control menu', () => {
 
       expect(await getHeaderTop(page)).toBeGreaterThanOrEqual(0);
 
-      // Open the coding-agent commands dropdown from its control, standing or
-      // behind the ⋯. A folded one has no button left to press again, so
-      // Escape closes it either way.
       await (await composerControl(page, '.commands-btn')).click();
       await waitForVisible(page, '.control-dropdown');
       await page.keyboard.press('Escape');
 
-      // Wait for dropdown to disappear
       await page.waitForFunction(() => {
         const els = document.querySelectorAll('.control-dropdown');
         return !Array.from(els).some(el => {
@@ -202,7 +180,6 @@ test.describe('Coding-agent control menu', () => {
         });
       }, undefined, { timeout: 5_000 });
 
-      // Header must be visible again after closing the menu
       await page.waitForFunction(() => {
         const header = document.querySelector('.app-header');
         return header ? header.getBoundingClientRect().top >= 0 : false;
@@ -217,19 +194,15 @@ test.describe('Coding-agent control menu', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    // Start a coding-agent session
     const msg = uniqueMessage('cc-slash');
     await sendMessage(page, `Say exactly: "hello ${msg}" and nothing else. Do not create any files.`);
 
-    // Wait for session to finish and idle
     await waitForActionPanel(page, 'Archive', 120_000);
     await ensureOnThreadPane(page);
 
-    // Now type "/" in the existing coding-agent thread — should open command menu
     await typeSlash(page);
     await waitForVisible(page, '.control-dropdown');
 
-    // Verify dropdown has command items
     expect(await hasVisibleElement(page, '.control-item')).toBe(true);
   });
 });

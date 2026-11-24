@@ -4,14 +4,6 @@ import { renderExchanges } from '../CreateThreadView';
 import { cancelingThreadIds, removingQueuedMessageIds, threadMap } from '../../../store/store';
 import type { Exchange, ThreadState } from '../../../store/thread-events';
 
-// Regression: opening a thread that ends with "Change applied" used to jump on
-// FIRST load. The ChangeApplied card's body + footer render only once the per-id
-// `Change` row is fetched, so on first open they popped in late and the open-path
-// scroll-to-bottom re-pinned to the grown bottom (everything shifted up). The fix
-// seeds the body from the in-thread `ChangeProposed` (already loaded with the
-// thread) so the card paints at its final height immediately. This pins the
-// wiring: renderExchanges harvests the proposed description + file count and
-// hands them to the matching ChangeApplied exchange's ChatExchange node.
 
 const TS = '2026-06-17T12:00:00Z';
 
@@ -50,8 +42,6 @@ function makeThread(id: string): ThreadState {
   };
 }
 
-/** A coding-agent turn that proposed `changeId`, carrying the ChangeProposed as
- *  a (non-rendered) step — the only place the description + file list live. */
 function ccTurn(seq: number, step: Record<string, unknown>): Exchange {
   return {
     userEvent: { type: 'MessageReceived', text: 'do it', created: TS, channel: 'claude_code', _eventId: `u-${seq}` } as any,
@@ -99,14 +89,12 @@ describe('change-applied body seeding (open-jump fix)', () => {
     ], 't1', '');
 
     const applied = appliedNode(nodes, 'c1');
-    // Full description is forwarded; ChangeEventRow clamps to the first line itself.
     expect(applied?.props.proposedChangeDesc).toBe('Fix the bug\nbody line');
     expect(applied?.props.proposedChangeFileCount).toBe(3);
   });
 
   it('leaves the seed undefined when no matching ChangeProposed rode the thread', () => {
     threadMap.value = new Map([['t1', makeThread('t1')]]);
-    // ChangeApplied for c2, but the only proposal in-thread was for c1.
     const nodes = renderExchanges([
       ccTurn(1, { change_id: 'c1', description: 'unrelated', files: ['x.ts'] }),
       changeApplied(2, 'c2'),
@@ -120,7 +108,6 @@ describe('change-applied body seeding (open-jump fix)', () => {
   it('ignores per-commit ChangeProposed emits with an empty change_id', () => {
     threadMap.value = new Map([['t1', makeThread('t1')]]);
     const nodes = renderExchanges([
-      // A per-commit emit (empty change_id) precedes the aggregate proposal.
       ccTurn(1, { change_id: '', description: 'per-commit noise', files: ['noise.ts'] }),
       ccTurn(3, { change_id: 'c1', description: 'real summary', files: ['a.ts', 'b.ts'] }),
       changeApplied(4, 'c1'),

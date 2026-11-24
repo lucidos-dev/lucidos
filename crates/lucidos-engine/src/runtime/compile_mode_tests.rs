@@ -195,31 +195,6 @@ fn a_prebuilt_pin_follows_the_lockfile_to_a_new_version() {
     assert_eq!(resolve(&tree, &cache).mode, prebuilt(&new_dir));
 }
 
-/// Pins the wire contract with the seed script, which shell cannot import:
-/// the marker it writes, the lock beside the destination, and its arguments.
-#[test]
-fn the_seed_script_writes_the_marker_and_lock_this_module_reads() {
-    let script = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(SEED_SCRIPT),
-    )
-    .expect("the seed script");
-    for contract in [
-        format!("\"$DEST/{PREBUILT_COMPLETE}\""),
-        format!("\"$STAGE/{PREBUILT_COMPLETE}\""),
-        "LOCK=\"$DEST.lock\"".to_string(),
-        "VERSION=\"${1:?$USAGE}\"".to_string(),
-        "FEATURES=\"${2?$USAGE}\"".to_string(),
-        "DEST=\"${3:?$USAGE}\"".to_string(),
-    ] {
-        assert!(
-            script.contains(&contract),
-            "the seed script lost {contract}"
-        );
-    }
-}
-
 #[test]
 fn the_prebuilt_key_names_the_features_it_was_built_with() {
     let name = prebuilt_dir(Path::new("/c"), VERSION)
@@ -286,4 +261,33 @@ fn with_no_cache_root_there_is_no_mode() {
     let tmp = tempfile::TempDir::new().unwrap();
     let tree = lucidos_tree(tmp.path());
     assert!(env_for_worktree(&tree, None).is_empty());
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Pins the wire contract with the seed script, which shell cannot import:
+    /// the marker it writes, the lock beside the destination, and its arguments.
+    #[test]
+    fn the_seed_script_writes_the_marker_and_lock_this_module_reads() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(SEED_SCRIPT),
+        )
+        .expect("the seed script");
+        for contract in [
+            format!("\"$DEST/{PREBUILT_COMPLETE}\""),
+            format!("\"$STAGE/{PREBUILT_COMPLETE}\""),
+            "LOCK=\"$DEST.lock\"".to_string(),
+            "VERSION=\"${1:?$USAGE}\"".to_string(),
+            "FEATURES=\"${2?$USAGE}\"".to_string(),
+            "DEST=\"${3:?$USAGE}\"".to_string(),
+        ] {
+            assert!(
+                script.contains(&contract),
+                "the seed script lost {contract}"
+            );
+        }
+    }
 }

@@ -3,11 +3,6 @@ import type { Loadable } from '../store/types';
 import { toFailed } from '../store/types';
 import { useVersionedRefresh } from './useVersionedRefresh';
 
-/** One read about a thread, re-read when the thread changes or `version`
- *  bumps. A re-read of the same thread keeps what is shown. A reply for a
- *  thread the page has since left is dropped. `null` reads nothing.
- *
- *  The setter lands a mutation's own answer, which is the same shape. */
 export function useThreadLoadable<T>(
   threadId: string | null,
   version: number,

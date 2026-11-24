@@ -16,22 +16,10 @@ const AUTH_KINDS = [
   { value: 'bearer', label: 'OAuth subscription token' },
 ];
 
-/** Configure the direct-Anthropic provider credential (Settings →
- *  Providers). Stores a credential named `anthropic`; the engine's
- *  AnthropicProvider reads it (preferring it over the ANTHROPIC_API_KEY launch
- *  env var) and picks the header by auth kind (`api_key` → `x-api-key`,
- *  `bearer` → `Authorization: Bearer` + the OAuth beta). The secret
- *  is write-only — once set we show "Configured", never the value.
- *
- *  Renders only the provider block (label/auth/secret/save rows + note); the
- *  enclosing "Providers" `settings-section` is owned by `SettingsView` so this
- *  and `OpenAiProviderSettings` share one section header. */
 export function AnthropicProviderSettings() {
   const credLoadable = credentials.value;
   const existing = findProviderCredential(credLoadable, ANTHROPIC_SERVICE);
 
-  // Server-backed, so "Replace secret" starts on the stored credential's kind
-  // and a replaced OAuth token is saved as an OAuth token.
   const [authKind, setAuthKind] = useServerBackedField<string>(existing?.auth_type ?? 'api_key');
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
@@ -72,10 +60,6 @@ export function AnthropicProviderSettings() {
           </p>
         </>
       }
-      /* `.list-row-details` is `display: flex`, so this span is a block box
-         inside the label's line and renders UNDER it. A manual "·" glue would
-         therefore be stranded at the start of that new line, the same artifact
-         the rule in `.claude/rules/frontend.md` names. */
       detail={existing && (
         <span class="list-row-details">configured ({existing.auth_type})</span>
       )}

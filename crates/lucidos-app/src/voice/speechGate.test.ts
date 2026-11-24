@@ -10,7 +10,6 @@ import {
 const LOUD = SPEECH_GATE_DEFAULTS.threshold * 2;
 const QUIET = SPEECH_GATE_DEFAULTS.threshold / 2;
 
-/** Feed a run of frames and report whether the gate was open after each. */
 function run(rmss: number[], from: SpeechGateState = SPEECH_GATE_SHUT): boolean[] {
   let state = from;
   const open: boolean[] = [];
@@ -25,7 +24,6 @@ function frames(rms: number, count: number): number[] {
   return Array.from({ length: count }, () => rms);
 }
 
-/** A gate already open, reached the only way there is. */
 function opened(): SpeechGateState {
   let state = SPEECH_GATE_SHUT;
   for (const rms of frames(LOUD, SPEECH_GATE_DEFAULTS.framesToOpen)) {
@@ -91,8 +89,6 @@ describe('shutting the gate', () => {
   });
 });
 
-/** An edge is what the reducer reads, so a frame that moves nothing must cost
- *  nothing. Twenty-five of them arrive every second. */
 describe('a frame that changes nothing', () => {
   it('hands back the same state, so a caller can test for an edge by identity', () => {
     const shut = stepSpeechGate(SPEECH_GATE_SHUT, QUIET);

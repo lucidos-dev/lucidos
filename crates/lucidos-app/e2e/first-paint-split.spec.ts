@@ -1,22 +1,8 @@
-/**
- * The first-paint split (ADR 0288), observed in a real browser.
- *
- * The entry chunk is the data layer and startup. The UI is the shell chunk,
- * which loads beside it under the boot splash. Two on-demand surfaces load
- * once the splash lifts. These tests pin the three properties no unit test can
- * see: the order of network and render, the idle loads, and that an idle
- * surface never opens empty.
- */
 import { test, expect } from './fixtures';
 import { navigateToApp } from './helpers';
 
 test.describe('first-paint split', () => {
   test('startup reaches the engine before the shell draws anything', async ({ page }) => {
-    // Recorded in the page, so the two times share one clock. The health probe
-    // is startup's first request, and nothing holds it back, where
-    // `fetchWithDefaults` holds every other GET for engine readiness. A shell drawn
-    // first would mean startup is back inside the UI tree, where every fetch
-    // waits for the whole UI to parse and render.
     await page.addInitScript(() => {
       const w = window as unknown as { __healthFetchAt?: number; __shellAt?: number };
       const realFetch = window.fetch.bind(window);
@@ -46,7 +32,7 @@ test.describe('first-paint split', () => {
     expect(times.fetchAt!).toBeLessThan(times.shellAt!);
   });
 
-  test('the shell chunk is preloaded, and the idle chunks load after the splash', async ({ page }) => {
+  test('the shell chunk is preloaded, and the idle chunk loads after the splash', async ({ page }) => {
     const scripts: string[] = [];
     page.on('request', (r) => {
       if (r.resourceType() === 'script') scripts.push(new URL(r.url()).pathname);
@@ -56,18 +42,12 @@ test.describe('first-paint split', () => {
     await expect(page.locator('.boot-splash')).toHaveCount(0);
 
     const html = await page.evaluate(() => document.head.innerHTML);
-    expect(html, 'index.html must modulepreload the shell chunk').toMatch(/rel="modulepreload"[^>]*App-[\w-]+\.js/);
+    expect(html, 'index.html must modulepreload the shell chunk').toMatch(/rel="modulepreload"[^>]*shell-[\w-]+\.js/);
 
-    // No user action: the idle prefetch alone must fetch both. The switcher
-    // row rides in the brand menu rows' chunk, which imports it statically.
     await expect.poll(() => scripts.some((p) => /\/BrandMenuRows-[\w-]+\.js$/.test(p))).toBe(true);
-    await expect.poll(() => scripts.some((p) => /\/TodoListPanel-[\w-]+\.js$/.test(p))).toBe(true);
   });
 
   test('the brand menu never draws without its workspace row', async ({ page }) => {
-    // A mutation observer runs before the next paint, so it sees every tree a
-    // frame could show. A menu committed without the row is the pop-in the
-    // idle prefetch and the open-after-preload exist to prevent.
     await page.addInitScript(() => {
       const w = window as unknown as { __menuWithoutRow?: boolean };
       new MutationObserver(() => {

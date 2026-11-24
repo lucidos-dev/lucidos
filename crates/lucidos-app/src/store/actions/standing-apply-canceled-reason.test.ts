@@ -1,12 +1,3 @@
-/**
- * The frontend suppresses one standing-apply drop toast: the one the owner
- * caused by cancelling. It tells that drop from the rest by its `reason`, which
- * the engine writes.
- *
- * So the two spellings have to match, and a silent drift here is invisible: the
- * toast simply starts firing on the user's own click. This reads the Rust
- * constant instead of trusting the copy.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

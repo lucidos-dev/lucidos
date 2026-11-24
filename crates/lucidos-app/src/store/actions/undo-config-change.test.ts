@@ -3,6 +3,7 @@ const m = vi.hoisted(() => ({ confirm: vi.fn(), toast: vi.fn(), fetch: vi.fn() }
 vi.mock('../store', () => ({ showConfirm: m.confirm, showToast: m.toast }));
 vi.mock('../../utils/basePath', () => ({ API: '/demo/api/v1' }));
 vi.mock('../../api/client/_core', () => ({
+  API: '/demo/api/v1',
   mutatingFetch: m.fetch,
   throwIfNotOk: async (r: Response) => { if (!r.ok) throw Error('The config has changed since'); },
 }));

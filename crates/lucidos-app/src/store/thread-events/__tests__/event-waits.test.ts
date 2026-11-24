@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   describeWaitSubscription,
+  displayedWaitDeadline,
   eventWaitProjection,
   formatRemaining,
   groupSubscriptions,
@@ -12,8 +13,6 @@ import { awaitedSubject, eventWaitStoppedSummary, waitingFor } from '../thread-e
 import type { EventWaitSummary, ThreadEvent } from '../thread-event-types';
 import { applyAggregateToMeta, type ThreadAggregate, type ThreadMeta } from '../thread-meta';
 
-/** Only the field the projection touches; everything else on ThreadMeta is
- *  irrelevant here and a full fixture would just rot. */
 function meta(waits: EventWaitSummary[] = []): ThreadMeta {
   return { liveEventWaits: waits } as unknown as ThreadMeta;
 }
@@ -26,6 +25,15 @@ const started = (wait_id: string, reason = 'waiting for the release'): ThreadEve
   reason,
   expires_at: '2026-08-06T12:00:00Z',
   watermark: 10,
+});
+
+it('chooses the live deadline from typed timing and preserves manual waits', () => {
+  const expires_at = '2026-08-06T13:00:00Z';
+  const manual = { wait_id: 'manual', on: [], reason: 'a build slot', expires_at };
+  const deadline = '2026-08-06T12:55:00Z';
+  expect(displayedWaitDeadline(manual)).toBe(expires_at);
+  expect(displayedWaitDeadline({ ...manual, background_timing: { state: 'queued' } })).toBe('');
+  expect(displayedWaitDeadline({ ...manual, background_timing: { state: 'running', deadline } })).toBe(deadline);
 });
 
 describe('eventWaitProjection', () => {
@@ -56,11 +64,6 @@ describe('eventWaitProjection', () => {
     expect(m.liveEventWaits.map((w) => w.wait_id)).toEqual(['w2']);
   });
 
-  /** `await_event`'s own result arrives immediately after registration, and it
-   *  must leave the list alone: it is the call's return value, not a state
-   *  change. It used to DETACH the wait, which was the client's half of a
-   *  distinction ADR 0049 removed. Pinned so that branch does not grow back and
-   *  start flickering the indicator on every registration. */
   it('leaves the list alone on the await_event tool result', () => {
     const m = meta();
     eventWaitProjection(m, started('w1'));
@@ -93,8 +96,6 @@ describe('eventWaitProjection', () => {
     expect(eventWaitProjection(m, unrelated)).toBe(false);
   });
 
-  /** Replay must land on exactly the state live SSE built incrementally, or a
-   *  reload would show a different set of subscriptions than the open tab. */
   it('replays to the same set the live stream produced', () => {
     const stream: ThreadEvent[] = [
       started('w1'),
@@ -111,11 +112,21 @@ describe('eventWaitProjection', () => {
   });
 });
 
-/** The status dot reads `meta.liveEventWaitCount`, NOT
- *  `meta.liveEventWaits.length`. The backend derives one from the other and
- *  ships both on the same snapshot, so they agree in production. The aggregates
- *  here carry the count alone, which is what keeps the dot the only thing under
- *  test. These pin that separation. */
+it('reconciles a missed timing update on the same wait ID', () => {
+  const m = meta();
+  eventWaitProjection(m, started('w1', 'a build slot'));
+  const previous = m.liveEventWaits[0];
+  const running = {
+    ...previous,
+    reason: 'the build to finish',
+    background_timing: { state: 'running', deadline: '2026-08-06T11:55:00Z' } as const,
+  };
+  const summary = { liveEventWaits: [running] } as ThreadAggregate;
+  expect(applyAggregateToMeta(m, summary)).toBe(true);
+  expect(m.liveEventWaits).toEqual([running]);
+  expect(applyAggregateToMeta(m, summary)).toBe(false);
+});
+
 describe('liveEventWaitCount', () => {
   const aggregate = (liveEventWaitCount: number): ThreadAggregate =>
     ({ liveEventWaitCount } as unknown as ThreadAggregate);
@@ -135,10 +146,6 @@ describe('liveEventWaitCount', () => {
     expect(resolveVisualStatus('idle', false, false, m.liveEventWaitCount > 0)).toBe('idle');
   });
 
-  /** The count alone must flag the meta as changed, or `threadMap` never
-   *  flushes and the dot does not repaint until some unrelated field moves.
-   *  Settling the meta against the same aggregate first is what makes the
-   *  count the ONLY difference the second call can see. */
   it('flags a meta change on the count alone, and only when it moves', () => {
     const m = { liveEventWaits: [], liveEventWaitCount: 0 } as unknown as ThreadMeta;
     applyAggregateToMeta(m, aggregate(0));
@@ -180,8 +187,6 @@ describe('describeWaitSubscription', () => {
     ).toBe('change proposed or response generated');
   });
 
-  /** The raw operator JSON is developer-facing; the person reading this row is
-   *  whoever is waiting. */
   it('summarises a condition instead of dumping the operator object', () => {
     const text = describeWaitSubscription([
       { event_type: 'ChangeProposed', condition: { file_count: { $gt: 0 } } },
@@ -190,7 +195,6 @@ describe('describeWaitSubscription', () => {
     expect(text).not.toContain('$gt');
   });
 
-  /** One `CodingAgentIdled` per session read as the same name six times. */
   it('names a repeated event type once, with its condition count', () => {
     const on = [1, 2, 3].map((n) => ({ event_type: 'CodingAgentIdled', condition: { n } }));
     expect(describeWaitSubscription([...on, { event_type: 'ChangeProposed' }])).toBe(
@@ -199,9 +203,6 @@ describe('describeWaitSubscription', () => {
   });
 });
 
-/** A person reads the waiting rows, so an event type shows as everyday words.
- *  Event names are past tense, so one phrase fits a waiting row and an arrival
- *  card alike. */
 describe('plainEventName', () => {
   it.each([
     ['BackgroundBashCompleted', 'background job finished'],
@@ -237,8 +238,6 @@ describe('groupSubscriptions', () => {
     ]);
   });
 
-  /** An unfiltered entry matches every event of its type, so a sibling's
-   *  filter narrows nothing and the group must not claim it does. */
   it('drops the conditions of a type that is also watched unfiltered', () => {
     expect(groupSubscriptions([
       { event_type: 'A', condition: { x: 1 } },
@@ -247,10 +246,6 @@ describe('groupSubscriptions', () => {
   });
 });
 
-/** **The stutter this exists to kill.** Both transcript labels supply the verb,
- *  so a reason opening "waiting for" rendered `Stopped waiting: waiting for the
- *  e2e lock`. The reason is the model's free text, so the label drops the word
- *  it duplicates rather than trusting the guidance to keep it out. */
 describe('awaitedSubject', () => {
   it.each([
     ['waiting for the e2e lock', 'the e2e lock'],
@@ -259,30 +254,22 @@ describe('awaitedSubject', () => {
     ['wait for the release build', 'the release build'],
     ['Waiting for tonight\'s e2e run', 'tonight\'s e2e run'],
     ['WAITING FOR the apply', 'the apply'],
-    // Any run of whitespace. `core::awaited_subject` is pinned on this same
-    // input: two implementations of one rule must not disagree.
     ['waiting  for  the lock', 'the lock'],
   ])('drops the duplicated verb in %s', (reason, subject) => {
     expect(awaitedSubject(reason)).toBe(subject);
   });
 
-  /** The reason is the model's own words. Only a leading phrase the label
-   *  already said is removable; everything else survives verbatim, including a
-   *  waiting word that is not at the front. */
   it.each([
     'the release build to finish',
     'tonight\'s E2E suite to pass',
     'the lock, which another run is waiting for too',
     'waiting',
     'waited for the lock',
-    // The preposition must be a whole word.
     'waiting formally',
   ])('leaves %s exactly as written', (reason) => {
     expect(awaitedSubject(reason)).toBe(reason);
   });
 
-  /** A strip that emptied the reason would leave a dangling colon. So the
-   *  phrase-only reason comes back whole, reading as the odd input it is. */
   it.each(['waiting for', 'waiting for ', '  waiting until   '])(
     'returns %s whole rather than emptying it',
     (reason) => {
@@ -291,8 +278,6 @@ describe('awaitedSubject', () => {
   );
 });
 
-/** Every wait label reads `<verb> for <subject>`. A gerund reason keeps a
- *  colon, since "Waiting for watching" reads as a mistake. */
 describe('waitingFor', () => {
   it.each([
     ['the release build to finish', 'Waiting for the release build to finish'],
@@ -309,9 +294,6 @@ describe('waitingFor', () => {
   });
 });
 
-/** One phrasing for one concept: this label is the transcript's stop row AND
- *  the header of the turn a user's **Stop waiting** opens, so both inherit the
- *  strip. A legacy row carries no reason and says the one thing it knows. */
 describe('eventWaitStoppedSummary', () => {
   it('does not say "waiting" twice', () => {
     expect(eventWaitStoppedSummary('waiting for the e2e lock')).toBe(

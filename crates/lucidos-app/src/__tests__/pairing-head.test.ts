@@ -15,7 +15,7 @@ describe('pairing head bootstrap', () => {
     expect(manifest).toContain(`[0-9]{${PAIRING_CODE_DIGITS}}`);
     expect(manifest).toContain(`${DEVICE_PAIRING_SECRET_PREFIX}[a-z2-7]{${PAIRING_SECRET_CHARS}}`);
     expect(capture).toContain(`fragment.has('${PAIR_PARAM}')`);
-    expect(capture).toContain(`localStorage.getItem('${SPENT_KEY}')`);
+    expect(capture).toContain(`localStorage.getItem(peerKey('${SPENT_KEY}'))`);
   });
 
   it('lets an installed app resume normally after spending its fixed launch token', () => {

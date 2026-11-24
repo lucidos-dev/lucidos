@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The confirmation panel's quiet note for a plugin whose manifest declares no
- * `engine` requirement. Visible only: the Install button stays live.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginInstallPanel } from '../PluginInstallPanel';

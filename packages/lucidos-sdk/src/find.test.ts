@@ -5,8 +5,6 @@ import {
   stepIndex,
 } from './find';
 
-// jsdom has no layout. Every range sits at the top of the viewport, which is
-// what a real one-screen page reports too.
 Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 10, 10);
 
 describe('queryPattern', () => {
@@ -258,8 +256,6 @@ describe('find with the highlight API and sdk-iframe.css', () => {
     expect(window.getSelection()?.rangeCount ?? 0).toBe(0);
   });
 
-  // WebKit repaints a range only when its own Highlight drops it. A Highlight
-  // the registry drops while still full stays painted.
   const unregisteredStillFull = () => built.filter(
     (h) => h.size > 0 && ![...highlights.values()].includes(h),
   );

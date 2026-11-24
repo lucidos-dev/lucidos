@@ -4,8 +4,6 @@ import {
   SIDEBAR_DEFAULT_REM, SIDEBAR_MIN_REM, DIFF_PANE_MIN_REM, SIDEBAR_WIDTH_KEY,
 } from './repoPreviewSidebarWidth';
 
-/** The sidebar is sized in rem, so the clamp takes the container in rem too:
- *  one unit end to end, and a UI-scale change needs no conversion here. */
 describe('clampSidebarRem', () => {
   const wide = 100;
 
@@ -21,8 +19,6 @@ describe('clampSidebarRem', () => {
     expect(clampSidebarRem(95, wide)).toBe(wide - DIFF_PANE_MIN_REM);
   });
 
-  // A narrower window re-clamps the RENDERED width; the stored preference is
-  // the caller's to keep, so widening the window again restores it.
   it('re-clamps against a narrower container', () => {
     expect(clampSidebarRem(40, 55)).toBe(55 - DIFF_PANE_MIN_REM);
     expect(clampSidebarRem(40, wide)).toBe(40);
@@ -33,8 +29,6 @@ describe('clampSidebarRem', () => {
     expect(clampSidebarRem(30, 20)).toBe(SIDEBAR_MIN_REM);
   });
 
-  // Before the first measure the container reads 0. Clamping against that
-  // would draw the minimum for a frame and then jump to the stored width.
   it('clamps only to the minimum while the container is unmeasured', () => {
     expect(clampSidebarRem(40, 0)).toBe(40);
     expect(clampSidebarRem(2, 0)).toBe(SIDEBAR_MIN_REM);

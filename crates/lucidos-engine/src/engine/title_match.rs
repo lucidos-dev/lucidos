@@ -24,7 +24,7 @@ pub(crate) enum TitleMatch {
 /// A [`TitleMatch`] plus the query's share of the title. Within one level, a
 /// short title that is mostly the query beats a long one.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-pub(crate) struct TitleRank {
+pub struct TitleRank {
     pub(crate) level: TitleMatch,
     /// Query length over title length, in characters. 0 when `level` is `None`.
     pub(crate) coverage: f64,
@@ -32,7 +32,7 @@ pub(crate) struct TitleRank {
 
 impl TitleRank {
     /// Best first.
-    pub(crate) fn best_first(a: &Self, b: &Self) -> Ordering {
+    pub fn best_first(a: &Self, b: &Self) -> Ordering {
         b.level
             .cmp(&a.level)
             .then_with(|| b.coverage.total_cmp(&a.coverage))
@@ -77,7 +77,7 @@ pub(crate) fn title_match(title: &str, query: &str) -> TitleMatch {
     level(&normalize(title), &normalize(query))
 }
 
-pub(crate) fn title_rank(title: &str, query: &str) -> TitleRank {
+pub fn title_rank(title: &str, query: &str) -> TitleRank {
     let (title, query) = (normalize(title), normalize(query));
     let level = level(&title, &query);
     let coverage = match level {

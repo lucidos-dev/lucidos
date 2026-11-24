@@ -2,8 +2,6 @@ import { currentMobileDynamicBars, setMobileDynamicBars } from '../../store/acti
 import { isIOSPwa } from '../../utils/platform';
 import { Explainer } from '../shared/Explainer';
 
-/** The Dynamic bars switch. The installed iOS app always runs dynamic bars
- *  (ADR 0553), so there it shows on and disabled, with a note why. */
 export function MobileDynamicBarsRow() {
   const alwaysOn = isIOSPwa();
   return (

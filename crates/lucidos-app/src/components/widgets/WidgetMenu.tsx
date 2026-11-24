@@ -14,19 +14,14 @@ import type { WidgetSize } from '../../store/types';
 import { DashboardItem, Item, tileRef, type Run, type WidgetInstance } from './DashboardItem';
 import { offeredSizes, WidgetSizePill } from './WidgetSizePill';
 
-/** The widget instance a menu acts on, in the thread it is shown in. */
 export interface WidgetMenuTarget extends WidgetInstance {
   threadId: string;
-  /** The sizes the widget declares, which the menu's size row offers. */
   sizes: readonly WidgetSize[];
   reusable: boolean;
-  /** Set when a plugin ships the widget, which then stays reusable. */
   originPluginId?: string;
-  /** A built-in widget ships with Lucidos and is always reusable. */
   builtIn: boolean;
 }
 
-/** A tile on one dashboard, as its menu acts on it. */
 export interface DashboardTileTarget extends WidgetInstance {
   dashboard: Dashboard;
 }
@@ -53,8 +48,6 @@ function MakeAppItem({ widget: w, threadId, run }: { widget: WidgetInstance; thr
   );
 }
 
-/** The card's size choice, the menu's first row. A pick resizes the card and
- *  leaves the menu open, so the next size is one tap away. */
 function SizeRow({ widget: w, size }: { widget: WidgetMenuTarget; size: WidgetSize }) {
   const pick = (next: WidgetSize) =>
     void sizeWidgetCards({ appId: w.appId, threadId: w.threadId, params: w.params }, w.name, next);
@@ -69,8 +62,6 @@ function SizeRow({ widget: w, size }: { widget: WidgetMenuTarget; size: WidgetSi
   );
 }
 
-/** The widget menu's items in a thread: a right-click or a long press on a
- *  widget's card opens it. Each item is also an agent action and a CLI verb. */
 export function widgetMenuItems({ run }: OverflowMenuContext, w: WidgetMenuTarget) {
   return (
     <>
@@ -91,9 +82,6 @@ export function widgetMenuItems({ run }: OverflowMenuContext, w: WidgetMenuTarge
   );
 }
 
-/** The widget items on a dashboard tile's menu. A tile names a reusable widget
- *  that no thread holds, so it offers no reuse change. Make app drafts its
- *  prompt in the Home chat. */
 export function dashboardTileMenuItems({ run }: OverflowMenuContext, t: DashboardTileTarget) {
   const home = homeThreadId.value;
   return (
@@ -110,8 +98,6 @@ export function dashboardTileMenuItems({ run }: OverflowMenuContext, t: Dashboar
   );
 }
 
-/** `widgetMenuItems` as a component, for the chunk `widgetMenuChunks.ts`
- *  loads on demand. */
 export function WidgetMenuItems({ ctx, target }: { ctx: OverflowMenuContext; target: WidgetMenuTarget }) {
   return widgetMenuItems(ctx, target);
 }

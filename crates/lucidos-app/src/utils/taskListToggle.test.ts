@@ -21,7 +21,6 @@ describe('toggleTaskListCheckbox', () => {
       '1. [ ] Ordered',
       '2) [ ] Ordered paren',
     ].join('\n');
-    // index 0 Top, 1 Nested one, 2 Nested two, 3 Ordered, 4 Ordered paren
     expect(toggleTaskListCheckbox(src, 3)).toContain('1. [x] Ordered');
     expect(toggleTaskListCheckbox(src, 4)).toContain('2) [x] Ordered paren');
   });
@@ -57,9 +56,6 @@ describe('toggleTaskListCheckbox', () => {
   });
 
   it('skips a CRLF frontmatter block instead of corrupting it', () => {
-    // Pins a real bug: frontmatterLineCount's lines keep a trailing `\r`
-    // (needed so splitting on '\n' alone stays byte-identical), and the
-    // shared fence/key-line regexes must still recognize such a line.
     const src = '---\r\ntitle: My Doc\r\ntodo:\r\n  - [ ] milk\r\n---\r\n- [ ] real task\r\n';
     const updated = toggleTaskListCheckbox(src, 0);
     expect(updated).toBe('---\r\ntitle: My Doc\r\ntodo:\r\n  - [ ] milk\r\n---\r\n- [x] real task\r\n');
@@ -76,7 +72,7 @@ describe('toggleTaskListCheckbox', () => {
     const updated = toggleTaskListCheckbox(src, 0);
     expect(updated).not.toBeNull();
     const lines = updated!.split('\n');
-    expect(lines[2]).toBe('- [ ] not a real task item'); // untouched
+    expect(lines[2]).toBe('- [ ] not a real task item');
     expect(lines[4]).toBe('- [x] First real item');
   });
 
@@ -86,14 +82,13 @@ describe('toggleTaskListCheckbox', () => {
       '> - [x] Quoted two',
       '- [ ] Top-level',
     ].join('\n');
-    // Rendered checkbox order: Quoted one (0), Quoted two (1), Top-level (2).
     expect(toggleTaskListCheckbox(src, 0)).toContain('> - [x] Quoted one');
     expect(toggleTaskListCheckbox(src, 1)).toContain('> - [ ] Quoted two');
     const updated = toggleTaskListCheckbox(src, 2);
     expect(updated).not.toBeNull();
     const lines = updated!.split('\n');
-    expect(lines[0]).toBe('> - [ ] Quoted one'); // untouched
-    expect(lines[1]).toBe('> - [x] Quoted two'); // untouched
+    expect(lines[0]).toBe('> - [ ] Quoted one');
+    expect(lines[1]).toBe('> - [x] Quoted two');
     expect(lines[2]).toBe('- [x] Top-level');
   });
 
@@ -114,7 +109,7 @@ describe('toggleTaskListCheckbox', () => {
     const updated = toggleTaskListCheckbox(src, 1);
     expect(updated).not.toBeNull();
     const lines = updated!.split('\n');
-    expect(lines[2]).toBe('> - [ ] fake'); // untouched
+    expect(lines[2]).toBe('> - [ ] fake');
     expect(lines[4]).toBe('- [x] Top-level');
   });
 
@@ -152,7 +147,7 @@ describe('toggleTaskListCheckbox', () => {
     const after = updated!.split('\n');
     expect(after.length).toBe(before.length);
     for (let i = 0; i < before.length; i++) {
-      if (i === 5) continue; // the toggled line
+      if (i === 5) continue;
       expect(after[i]).toBe(before[i]);
     }
     expect(after[5]).toBe('- [ ] Second');
@@ -170,12 +165,7 @@ describe('countTaskListItems', () => {
   });
 
   it('does not count a line indented 4+ spaces (an indented code block)', () => {
-    // A known gap: `marked` renders this as a code block with no checkbox.
-    // The line-scan has no block parser and still matches it, so this
-    // undercounts relative to what `marked` would show once a real task item
-    // follows. That mismatch is what a caller compares against the DOM count
-    // to detect, rather than toggling the wrong line (see MarkdownDocument.tsx).
     const src = '    - [ ] indented, not really a task\n\n- [ ] Real\n';
-    expect(countTaskListItems(src)).toBe(2); // marked would render only 1 checkbox
+    expect(countTaskListItems(src)).toBe(2);
   });
 });

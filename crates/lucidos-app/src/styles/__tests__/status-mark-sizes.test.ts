@@ -1,11 +1,3 @@
-/**
- * The spinner is the question badge's size, and the pause glyph the dot's.
- *
- * At the dot's size the spinner's open ring read as a small mark sitting low
- * on the title. The rule sits on `.thread-status`, so the waiting panel draws
- * the same sizes. A title, in a drawer row or the thread pane, draws its
- * spinner a step under the badge, and both titles draw the same one.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

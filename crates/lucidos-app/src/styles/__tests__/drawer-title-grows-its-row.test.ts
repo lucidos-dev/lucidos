@@ -1,8 +1,3 @@
-/**
- * A heavier drawer title wraps sooner, so the title and its row must grow with
- * it. Nothing may pin their height or force one line. A theme sets the weight
- * through the `drawer-title` part, so this guard keeps room for the widest one.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

@@ -3,12 +3,8 @@ import { NAVIGATE_TARGETS } from '@lucidos/sdk';
 import type { Tap } from '@lucidos/sdk';
 import { navigateVisitKey, notificationTarget } from './visitKeys';
 
-/** Targets that deliberately name no revisitable place. Every other advertised
- *  target must produce a key. A new one landing as a silent null would quietly
- *  stop its own notifications from ever clearing. */
 const NO_PLACE = new Set<string>(['url', 'new-app', 'new-trigger', 'new-chat', 'dashboard']);
 
-/** Every id-bearing field populated, so each branch finds what it needs. */
 function kitchenSink(target: string) {
   return {
     target,
@@ -42,18 +38,13 @@ describe('navigateVisitKey', () => {
   });
 
   it('drops the detail inside a place', () => {
-    // A fragment picks a spot inside the app the reader is already looking at.
     const bare = navigateVisitKey({ target: 'app', app_id: 'habit-tracker' });
     expect(navigateVisitKey({ target: 'app', app_id: 'habit-tracker', fragment: 'day-1' } as never))
       .toBe(bare);
-    // The event is measured separately, so it must not split the thread's key.
     expect(navigateVisitKey({ target: 'thread', id: 't-1', event_id: 'e-1' })).toBe('thread:t-1');
   });
 
   it('resolves a file path the way the preview overlay stores it', () => {
-    // A prefix-less path is an artifact, and the overlay holds the prefixed
-    // form. Both taps therefore have to reach one key, or the tap and the open
-    // file would disagree about being the same place.
     expect(navigateVisitKey({ target: 'file', file_path: 'x.md' })).toBe('file:artifacts/x.md');
     expect(navigateVisitKey({ target: 'file', file_path: 'artifacts/x.md' }))
       .toBe('file:artifacts/x.md');
@@ -115,8 +106,6 @@ describe('notificationTarget', () => {
   });
 
   it('gives a modal tap no target at all', () => {
-    // Its place IS the notification detail, and opening that already marks it
-    // read. Nothing for the seen rule to add.
     expect(notificationTarget({ kind: 'modal' })).toBeNull();
   });
 

@@ -1,11 +1,3 @@
-/**
- * The client speaks exactly the vocabulary the engine speaks, so the two sides
- * must hold the same frames. This test reads the Rust source and fails when a
- * frame or a field is added on one side only.
- *
- * Same shape as `utils/imageBytes.mirror.test.ts`, which reads a Rust table the
- * same way.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -33,12 +25,10 @@ const WIRE_RS = 'crates/lucidos-engine/src/voice/wire.rs';
 
 const source: string = readFileSync(resolve(REPO_ROOT, WIRE_RS), 'utf8');
 
-/** PascalCase to the `snake_case` serde renames it to. */
 function snake(name: string): string {
   return name.replace(/(?<!^)([A-Z])/g, '_$1').toLowerCase();
 }
 
-/** The body of one `pub enum`, with its doc comments dropped. */
 function enumBody(name: string): string {
   const decl = source.indexOf(`pub enum ${name} {`);
   expect(decl, `${name} not found in ${WIRE_RS}`).toBeGreaterThan(-1);
@@ -50,7 +40,6 @@ function enumBody(name: string): string {
     .join('\n');
 }
 
-/** Each variant of an enum, as its wire tag and its field names. */
 function variants(name: string): Map<string, string[]> {
   const body = enumBody(name);
   const found = new Map<string, string[]>();
@@ -63,14 +52,12 @@ function variants(name: string): Map<string, string[]> {
   return found;
 }
 
-/** The field names of a sample value, which `tsc` checks against the union. */
 function keysOf(sample: object): string[] {
   return Object.keys(sample)
     .filter((k) => k !== 'type')
     .sort();
 }
 
-/** One of every server frame, so the TS types are read rather than restated. */
 const SERVER_SAMPLES: ServerFrame[] = [
   { type: 'session_started', audio: { sample_rate_hz: 24_000, channels: 1, encoding: 'pcm_s16le' } },
   { type: 'user_transcript', text: '' },
@@ -90,8 +77,6 @@ const CLIENT_SAMPLES: ClientControl[] = [
 
 describe('the client and the engine speak one vocabulary', () => {
   it('reads the tag the way serde writes it', () => {
-    // `snake` above stands in for the rename. Drop the attribute and every tag
-    // silently becomes PascalCase, which this catches and set equality cannot.
     for (const name of ['ClientControl', 'ServerFrame']) {
       const decl = source.indexOf(`pub enum ${name} {`);
       const attrs = source.slice(Math.max(0, decl - 400), decl);
@@ -115,9 +100,6 @@ describe('the client and the engine speak one vocabulary', () => {
     expect(SERVER_SAMPLES).toHaveLength(rust.size);
   });
 
-  /** The parser's shape table names those same fields, so it is a second copy
-   *  and gets the same mirror. A field renamed in Rust would otherwise make
-   *  every frame of that type unreadable, silently. */
   it('checks the payload field the engine actually sends', () => {
     const rust = variants('ServerFrame');
     for (const [tag, payload] of Object.entries(SERVER_FRAME_PAYLOAD)) {
@@ -144,16 +126,8 @@ describe('the client and the engine speak one vocabulary', () => {
   });
 });
 
-/**
- * One engine sentence the client matches on, so it must match exactly.
- *
- * The talker refusal is the only reason a call gives that the reader can act
- * on. So it is the only one that earns a button to Settings. The client
- * recognises it by its words, having nothing else to go on, and a reworded
- * engine would take the button away with nothing failing.
- */
 describe('the reason that leads somewhere', () => {
-  const VOICE_RS = 'crates/lucidos-engine/src/api/voice.rs';
+  const VOICE_RS = 'crates/lucidos-agents-api/src/api/voice.rs';
   const handler: string = readFileSync(resolve(REPO_ROOT, VOICE_RS), 'utf8');
 
   it('is worded exactly as the engine sends it', () => {

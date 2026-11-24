@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Opening Settings draws its home list in the same render, with no chunk to
- *  wait for. A lazy component renders nothing until its chunk lands. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -9,7 +9,6 @@ import {
 } from '../../store/store';
 
 describe('refreshRowState', () => {
-  // Args: (clientUpdateAvailable, enginePending)
   it('nothing pending: the plain reload tooltip, no dot', () => {
     const { tooltip, showUpdateBadge } = refreshRowState(false, false);
     expect(tooltip).toBe('Reload the client');
@@ -23,9 +22,6 @@ describe('refreshRowState', () => {
   });
 
   it('client bundle rebuilt but engine still building: dot SUPPRESSED (refresh held until after the switch)', () => {
-    // The mixed-change build window: updateAvailable is true, but an engine
-    // switch is pending, so this row must not advertise a refresh onto the
-    // still-old engine.
     const { tooltip, showUpdateBadge } = refreshRowState(true, true);
     expect(showUpdateBadge).toBe(false);
     expect(tooltip).toBe('Reload the client');
@@ -42,8 +38,6 @@ describe('restartRowState', () => {
   });
 
   it('a new version is ready: the row says what the restart is FOR, in words as well as colour', () => {
-    // The badge is the half that survives without a hover and without knowing
-    // that a blue power glyph means anything, which is every phone.
     expect(restartRowState(true)).toEqual({
       tooltip: 'Restart onto the new version',
       pending: true,
@@ -61,8 +55,6 @@ describe('engineNewVersionReady agrees with the background-build scheme', () => 
   });
 
   it('dev: a freshly-applied restart-requiring change does NOT count until the build is ready', () => {
-    // Apply time in dev: restartRequired flips true, but the background rebuild
-    // hasn't finished, so there is no new version to switch to yet.
     restartRequired.value = true;
     engineVersionReady.value = false;
     expect(engineNewVersionReady()).toBe(false);
@@ -75,7 +67,6 @@ describe('engineNewVersionReady agrees with the background-build scheme', () => 
   });
 
   it('packaged: a newer release (restartRequired from the outdated check) counts immediately', () => {
-    // Packaged has no background build, so engineVersionReady never fires there.
     enginePackaged.value = true;
     restartRequired.value = true;
     engineVersionReady.value = false;

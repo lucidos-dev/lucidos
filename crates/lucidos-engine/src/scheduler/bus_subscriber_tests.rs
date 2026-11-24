@@ -166,6 +166,10 @@ fn event_trigger(id: &str, event_type: &str) -> TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
+        program_grants: vec![],
+        folder_grants: vec![],
+        program_denies: vec![],
+        folder_denies: vec![],
         coding_agent_grant: false,
         context_ceiling: None,
         mcp_servers: vec![],
@@ -263,6 +267,74 @@ fn build_observed(depth: u32) -> BusEvent {
     })
 }
 
+#[tokio::test]
+async fn trigger_group_delayed_frames_and_stale_reload_preserve_inline_writes() {
+    use crate::engine::trigger_group_writes::{
+        create_trigger_group_locked, emit_and_apply_group_event, rename_trigger_group_locked,
+    };
+
+    let (pool, db) = setup_test_db().await;
+    let mut h = Harness::new(&pool, vec![]).await;
+    let lock = tokio::sync::Mutex::new(());
+    let created =
+        create_trigger_group_locked(&h.groups, &h.bus, &lock, "Original", Some(100), None)
+            .await
+            .unwrap();
+    let snapshot = load_trigger_groups(&pool).await.unwrap();
+    rename_trigger_group_locked(&h.groups, &h.bus, &lock, &created.group_id, "Renamed", None)
+        .await
+        .unwrap();
+    emit_and_apply_group_event(
+        &h.groups,
+        &h.bus,
+        SystemEvent::TriggerGroupReordered {
+            group_id: created.group_id.clone(),
+            payload: json!({"group_id":created.group_id,"order":200}),
+            actor: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Deliver every buffered lifecycle frame only after the inline writes.
+    for _ in 0..3 {
+        let received = h.rx.recv().await;
+        assert!(h.subscriber.step(received).await.is_continue());
+        let groups = h.groups.read().unwrap();
+        assert_eq!(groups[&created.group_id].name, "Renamed");
+        assert_eq!(groups[&created.group_id].order, 200);
+    }
+    h.groups.write().unwrap().merge(snapshot.clone());
+    assert_eq!(h.groups.read().unwrap()[&created.group_id].order, 200);
+
+    emit_and_apply_group_event(
+        &h.groups,
+        &h.bus,
+        SystemEvent::TriggerGroupDeleted {
+            group_id: created.group_id.clone(),
+            payload: json!({"group_id":created.group_id}),
+            actor: None,
+        },
+    )
+    .await
+    .unwrap();
+    h.groups.write().unwrap().merge(snapshot);
+    assert!(!h.groups.read().unwrap().contains_key(&created.group_id));
+    h.lag().await;
+    assert!(!h.groups.read().unwrap().contains_key(&created.group_id));
+    let mut rebooted = load_trigger_groups(&pool).await.unwrap();
+    let stale_frame = crate::triggers::TriggerGroupEventRow {
+        seq: 1,
+        event_type: "TriggerGroupCreated".into(),
+        payload: json!({"group_id":created.group_id,"name":"Original","order":100}),
+        created: created.created,
+    };
+    rebooted.apply(&stale_frame);
+    assert!(!rebooted.contains_key(&created.group_id));
+    drop(h);
+    teardown_test_db(&db).await;
+}
+
 async fn emit_build_observed(bus: &EventBus) -> Uuid {
     bus.emit(build_observed(0))
         .await
@@ -271,25 +343,48 @@ async fn emit_build_observed(bus: &EventBus) -> Uuid {
         .event_id
 }
 
-/// I1. The event the trigger listens for is dropped by the lag, and the step
-/// still offers it to the matcher, which wakes the trigger.
 #[tokio::test]
-async fn a_lag_still_fires_a_trigger_for_the_dropped_event() {
+async fn trigger_group_failed_lag_reload_retains_current_projection() {
     let (pool, db) = setup_test_db().await;
-    let mut h = Harness::new(&pool, vec![event_trigger("t-build", "BuildObserved")]).await;
+    let mut h = Harness::new(&pool, vec![]).await;
+    let created = crate::engine::trigger_group_writes::create_trigger_group_locked(
+        &h.groups,
+        &h.bus,
+        &tokio::sync::Mutex::new(()),
+        "Retained",
+        Some(100),
+        None,
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+    h.lag().await;
+    assert_eq!(h.groups.read().unwrap()[&created.group_id].name, "Retained");
+    drop(h);
+    teardown_test_db(&db).await;
+}
 
-    let event_id = emit_build_observed(&h.bus).await;
+/// I1. Lag replay wakes a trigger once for a dropped event, even after a rename.
+#[tokio::test]
+async fn a_lag_replays_a_renamed_role_event_for_a_legacy_subscription() {
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+    let (pool, db) = setup_test_db().await;
+    let mut h = Harness::new(&pool, vec![event_trigger("t-watch", "WorkItemWatched")]).await;
+    let thread_id = crate::test_support::seed_coding_thread(&h.bus, None).await;
+    let event = h
+        .bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::RootThreadWatched { user_id: None },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap()
+        .unwrap();
     h.lag().await;
 
-    let offered = h.recorder.offers_for(event_id);
-    assert_eq!(
-        offered.len(),
-        1,
-        "the dropped event reaches the matcher once"
-    );
-    assert_eq!(offered[0].dispatch.event_type, "BuildObserved");
-    assert_eq!(h.recorder.woken_for(event_id), vec!["t-build".to_string()]);
-
+    assert_eq!(h.recorder.woken_for(event.event_id), ["t-watch"]);
     drop(h);
     teardown_test_db(&db).await;
 }

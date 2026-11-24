@@ -1,16 +1,3 @@
-/**
- * Workspace fonts in the shell: the installed list, and installing or removing
- * one from Settings (ADR 0308).
- *
- * A workspace font is a directory `data/fonts/<slug>/`: the font files, then a
- * `font.json` naming them. Install writes the files first and the manifest last,
- * so a font appears only once it is complete. The engine checks every write,
- * and every font again when it lists them. So this module shows the engine's
- * reasons rather than validating on its own.
- *
- * A leaf: `preferences.ts` reads the list to paint a picked font, and nothing
- * here imports the preference store.
- */
 import { signal } from '@preact/signals';
 import {
   WORKSPACE_FONT_ID_PREFIX,
@@ -52,16 +39,12 @@ export async function loadWorkspaceFonts(): Promise<void> {
   }
 }
 
-/** Reload the list only if something already asked for it: the shell loads it
- *  with the preferences, so in practice this always reloads. */
 export function refreshWorkspaceFontsIfLoaded(): void {
   if (workspaceFontList.value.status !== 'not-loaded') void loadWorkspaceFonts();
 }
 
-/** One font file to install, with the descriptors its face registers under. */
 export interface FontFileChoice {
   file: File;
-  /** One weight, or the `min max` range of a variable file. */
   weight: string;
   style: 'normal' | 'italic';
 }
@@ -75,8 +58,6 @@ export interface FontInstall {
 
 const MAX_SLUG = WORKSPACE_FONT_LIMITS.slug;
 
-/** A directory name from a label: lowercase letters and digits joined by
- *  single hyphens, as the engine requires. Empty when nothing usable is left. */
 export function slugFromLabel(label: string): string {
   return label
     .toLowerCase()
@@ -85,7 +66,6 @@ export function slugFromLabel(label: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-/** A slug no installed or broken font already uses. */
 function freeSlug(base: string, taken: ReadonlySet<string>): string {
   if (!taken.has(base)) return base;
   for (let n = 2; ; n++) {
@@ -95,8 +75,6 @@ function freeSlug(base: string, taken: ReadonlySet<string>): string {
   }
 }
 
-/** A file name the engine accepts: letters, digits, `.`, `_` and `-`, not
- *  starting with a dot, with a lowercase extension. Made unique per font. */
 export function safeFileName(name: string, taken: Set<string>): string {
   const dot = name.lastIndexOf('.');
   const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
@@ -110,9 +88,6 @@ export function safeFileName(name: string, taken: Set<string>): string {
   return candidate;
 }
 
-/** Every directory an installed or broken font holds, from a list read just
- *  now. An install must never pick one of them: its writes would overwrite
- *  that font, and a failed install's cleanup would then delete its files. */
 async function takenSlugs(): Promise<Set<string>> {
   await loadWorkspaceFonts();
   const list = workspaceFontList.value;
@@ -123,11 +98,6 @@ async function takenSlugs(): Promise<Set<string>> {
   return new Set(ids.map(id => id.slice(WORKSPACE_FONT_ID_PREFIX.length)));
 }
 
-/**
- * Install a font: every file, then the manifest. Answers the new font's id. A
- * refused write throws the engine's reason, and removes what this call wrote,
- * so a failed install leaves nothing half-made behind.
- */
 export async function installWorkspaceFont(install: FontInstall): Promise<WorkspaceFontId> {
   const base = slugFromLabel(install.label);
   if (!base) throw new Error('Give the font a name with at least one letter or digit.');
@@ -162,11 +132,6 @@ export async function installWorkspaceFont(install: FontInstall): Promise<Worksp
   return `${WORKSPACE_FONT_ID_PREFIX}${slug}` as WorkspaceFontId;
 }
 
-/** Remove a font, broken or not: every file in its directory, nested ones
- *  included, or a leftover would keep it listed. The manifest goes first, so
- *  the font leaves the list before its files do. A broken font's id holds its
- *  raw directory name, so files are matched by exact prefix, never by a glob
- *  built from it. */
 export async function removeWorkspaceFont(id: string): Promise<void> {
   const dir = `fonts/${id.slice(WORKSPACE_FONT_ID_PREFIX.length)}/`;
   const files = (await listFontFiles()).filter(path => path.startsWith(dir));
@@ -179,8 +144,6 @@ export async function removeWorkspaceFont(id: string): Promise<void> {
   }
 }
 
-/** Weight names as font files spell them, compound spellings first so
- *  `ExtraBold` is not read as `Bold`. */
 const WEIGHT_NAMES: Array<[RegExp, string]> = [
   [/extra-?light|ultra-?light/i, '200'],
   [/semi-?bold|demi-?bold/i, '600'],
@@ -192,8 +155,6 @@ const WEIGHT_NAMES: Array<[RegExp, string]> = [
   [/black|heavy/i, '900'],
 ];
 
-/** A first guess at a file's weight and style from its name, for the install
- *  form to prefill. A variable file covers the whole range. */
 export function guessFace(fileName: string): { weight: string; style: 'normal' | 'italic' } {
   const stem = fileName.replace(/\.[^.]+$/, '');
   const style = /italic|oblique/i.test(stem) ? 'italic' : 'normal';

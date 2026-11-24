@@ -1,11 +1,3 @@
-/**
- * Tests for nestByParent — the helper that reorders a sorted thread list so
- * children appear immediately under their parent, indented by depth.
- *
- * Roots and siblings keep the input's relative order so the section sort still
- * drives the visible top-level sequence; only children get pulled out of their
- * original slot to attach under their parent.
- */
 
 import { describe, it, expect } from 'vitest';
 import { nestByParent } from './ThreadDrawer';
@@ -58,7 +50,6 @@ describe('nestByParent', () => {
     });
 
     it('places a child immediately after its parent at depth 1', () => {
-        // Input order: parent then unrelated then child. Child pulls up under parent.
         const out = nestByParent([
             makeThread('parent'),
             makeThread('other'),
@@ -100,9 +91,6 @@ describe('nestByParent', () => {
     });
 
     it('renders an orphan child at root level when its parent is absent', () => {
-        // The parent thread isn't in this section's slice (filtered, in
-        // another section, or paginated out). The child must still render —
-        // it just falls back to root level so it isn't silently hidden.
         const out = nestByParent([
             makeThread('orphan', 'missing-parent'),
             makeThread('standalone'),

@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** A step from a reloaded thread has its command and result stripped. A modal
- *  that fetched them on open painted a bare head, then grew mid-fade, which
- *  read as a flicker. Pressing the row now starts the fetch, and a modal opened
- *  on a fetched step draws its final body on the first frame. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -38,7 +34,6 @@ const step: Extract<ResponseEvent, { type: 'step' }> = {
 
 let host: HTMLDivElement;
 
-/** Lets a mocked fetch settle, rejection chains included. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 beforeEach(() => {
@@ -79,7 +74,6 @@ it('draws the fetched command and result on the first frame', async () => {
 
   const modalHost = document.createElement('div');
   document.body.appendChild(modalHost);
-  // Rendered once, with no await: this is the frame the modal opens on.
   act(() => { render(<StepDetailModal />, modalHost); });
   const modal = document.querySelector<HTMLElement>('[data-role="step-detail-modal"]')!;
   expect(modal.querySelector('.step-detail-full')?.textContent).toBe('make test');

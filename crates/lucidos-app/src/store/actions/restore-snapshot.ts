@@ -4,18 +4,12 @@ import { ApiError, mutatingFetch, requestGenerationGuard, throwIfNotOk } from '.
 import { errorDetail } from '../../utils/errorDetail';
 import { showConfirm, showToast } from '../store';
 
-/** What to tell the user after a restore request failed. Three failures may
- * still have started a restore: a request that left with no answer, one whose
- * engine lost the gateway's answer, and one the gateway answered while
- * stopping the engine. */
 export function restoreFailureMessage(error: unknown): string {
   const answered = error instanceof ApiError && !error.bootSplash
     && !error.reason.includes('snapshot_restore_delivery_unknown');
   return answered ? errorDetail(error) : 'Restore delivery may be unknown. Check restore status before trying again.';
 }
 
-/** Every Undo surface enters here on a user tap, never on event receipt.
- * The target engine independently checks the gateway binding and owner device. */
 export async function confirmSnapshotRestore(tap: Extract<Tap, { kind: 'restore-snapshot' }>): Promise<void> {
   const checkGeneration = requestGenerationGuard();
   let submitted = false;
@@ -30,8 +24,6 @@ export async function confirmSnapshotRestore(tap: Extract<Tap, { kind: 'restore-
       { title: 'Undo restore', variant: 'danger' },
     ))) return;
     checkGeneration();
-    // No await between the original intent check and transport invocation:
-    // mutatingFetch captures that same generation before its admission waits.
     submitted = true;
     const response = await mutatingFetch(`${API}/snapshots/${encodeURIComponent(tap.handle)}/restore`, {
       method: 'POST',

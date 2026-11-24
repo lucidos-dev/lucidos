@@ -2,6 +2,10 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-31
+- **Amended by**: [0664: Permissions and the pause family](0664-permissions-and-the-pause-family.md).
+  The talker reads both Always-allow scopes back, each naming the line it
+  stores, but still cannot pick one. Only the caller's own transcript, judged
+  sure, settles it.
 
 Supersedes the one-tool clause of ADR 0164, which itself superseded ADR 0149's
 tool-less clause. The rest of both stands, including the guarantee this one

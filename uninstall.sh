@@ -395,11 +395,47 @@ run_uninstall() {
         if [ -n "$LIVE_SERVICE_LEFT" ]; then
             warn "NOT deleting the shared runtime $runtime: a gateway is still running out of it."
         elif [ -e "$runtime" ]; then
+            forget_local_certificate "$runtime/current"
             if rm -rf "$runtime"; then ok "Deleted the shared runtime $runtime"; else warn "Could not delete $runtime"; fi
         fi
     fi
 
     print_summary
+}
+
+# forget_local_certificate <runtime-root>: remove the loopback CA and its trust,
+# through the runtime's own CLI, before the runtime goes. The CA is per user, so
+# it stays while the macOS .app is installed, or while any gateway still runs
+# after this prefix's services stopped: another prefix or a source checkout
+# serves with it. Warn, never die, like every other step after the services
+# stopped.
+forget_local_certificate() {
+    local cli
+    cli="$(service_runtime_cli "$1")"
+    [ -x "$cli" ] || return 0
+    if [ -n "$(service_desktop_app_present "$HOME")" ]; then
+        info "Kept the local certificate: the Lucidos app on this Mac still uses it."
+        return 0
+    fi
+    if another_gateway_may_run; then
+        info "Kept the local certificate: another Lucidos gateway for this user may still use it."
+        info "Once no gateway runs, remove it with: $cli tls forget"
+        return 0
+    fi
+    if "$cli" tls forget; then
+        ok "Removed the local certificate and its trust"
+        info "Another Lucidos install for this user makes a new one at its next start. Run its 'lucidos tls trust' then."
+    else
+        warn "Could not remove the local certificate. Run: $cli tls forget"
+    fi
+}
+
+# another_gateway_may_run: true while a lucidos-gateway process of this user
+# runs. Also true when pgrep is missing or fails, since an unknown keeps the CA.
+another_gateway_may_run() {
+    have pgrep || return 0
+    pgrep -x -u "$(id -u)" lucidos-gateway >/dev/null 2>&1
+    [ $? -ne 1 ]
 }
 
 # The macOS .app, if this machine also has one. It is a DIFFERENT install with

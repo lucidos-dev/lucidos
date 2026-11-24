@@ -1,38 +1,11 @@
-/**
- * The Lucidos tooltip inside an app.
- *
- * The contract an app author gets is two things: load `sdk.js`, write
- * `data-tooltip`. Every fixture below sticks to that. None of their scripts
- * calls an SDK function, which is what "zero config" has to mean.
- *
- * One implementation serves the host shell and every app. The behaviour is
- * `installTooltips()` in `packages/lucidos-sdk/src/tooltip.ts` and the CSS is in
- * `styles/global/shared-components.css`, which the engine appends to the served
- * `/api/v1/sdk-iframe.css`.
- */
 import { test, expect, Page } from './fixtures';
 import { appPath, createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry, isMobileViewport } from './helpers';
 
-/** Long enough to clear the layer's 450ms long-press threshold. */
 const LONG_PRESS_WAIT_MS = 700;
 
-/** The SDK asks for a 2000ms auto-clear after the finger lifts. Wait past it. */
 const AUTO_CLEAR_WAIT_MS = 4000;
 
-/**
- * Dispatch one synthetic touch event on `selector`, offset `dx` px from the
- * element's centre.
- *
- * Plain `Event`s with hand-defined touch lists, not `new TouchEvent()`: that
- * constructor is illegal in WebKit, one of the three projects this spec runs
- * in. The tooltip reads only `touches[0]` and `changedTouches[0]`, which the
- * defined properties supply.
- *
- * Touch is the reveal used by most cases here, because it works on all three
- * projects. The mouse path is deliberately inert on a touch device, so a
- * hover-driven case would pass vacuously on the two mobile projects.
- */
 async function touch(
   page: Page,
   selector: string,
@@ -55,19 +28,11 @@ async function touch(
   }, { sel: selector, kind: type, offset: dx });
 }
 
-/** Press and hold `selector` until the tooltip has had time to appear. */
 async function longPress(page: Page, selector: string): Promise<void> {
   await touch(page, selector, 'touchstart');
   await page.waitForTimeout(LONG_PRESS_WAIT_MS);
 }
 
-/**
- * Long-press `selector`, lift, then fire the click a browser sends after that
- * gesture. Answers true when the click reached the element.
- *
- * The synthetic touch events above produce no click of their own, so the test
- * sends it. The layer swallows it at the document capture phase.
- */
 async function longPressThenClick(page: Page, selector: string): Promise<boolean> {
   await page.evaluate((sel) => {
     const el = document.querySelector<HTMLElement>(sel);
@@ -83,13 +48,11 @@ async function longPressThenClick(page: Page, selector: string): Promise<boolean
   return page.evaluate(() => (window as unknown as { __clicked: boolean }).__clicked);
 }
 
-/** How many `#tooltip` nodes the document holds, and who owns them. */
 async function tooltipOwners(page: Page): Promise<(string | null)[]> {
   return page.evaluate(() =>
     Array.from(document.querySelectorAll('#tooltip')).map((el) => el.getAttribute('data-owner')));
 }
 
-/** Geometry of the live tooltip against the element it points at. */
 async function measure(page: Page, selector: string) {
   return page.evaluate((sel) => {
     const tip = document.querySelector<HTMLElement>('#tooltip');
@@ -114,8 +77,6 @@ async function measure(page: Page, selector: string) {
   }, selector);
 }
 
-// Fixed pixel positions, not rem: the assertions below are geometric, and a rem
-// would move with whatever root font size the served stylesheet resolves to.
 const PROBE_STYLE = `
   body { margin: 0; }
   .probe { position: fixed; width: 4rem; height: 2rem; }
@@ -150,8 +111,6 @@ test.describe('SDK iframe tooltip', () => {
 </body>
 </html>
 `,
-      // The whole app script. It marks the page ready and does nothing else. No
-      // init call, no SDK reference: `sdk.js` installed the layer already.
       js: `document.querySelector('#status').textContent = 'ready';`,
     });
   });
@@ -165,8 +124,6 @@ test.describe('SDK iframe tooltip', () => {
     await gotoWithRetry(page, appPath(APP_ID));
     await expect(page.locator('#status')).toHaveText('ready');
 
-    // Time the reveal from inside the page, so Playwright's own action latency
-    // cannot inflate the number and hide a missing delay.
     await page.evaluate(() => {
       (window as unknown as { __tipDelay: Promise<number> }).__tipDelay = new Promise<number>((resolve) => {
         document.addEventListener('mouseover', function first() {
@@ -197,7 +154,6 @@ test.describe('SDK iframe tooltip', () => {
     const geom = await measure(page, '#mid');
     expect(geom.above, 'above by default, when there is room').toBe(true);
     expect(geom.tipBottom).toBeLessThanOrEqual(geom.targetTop);
-    // Within the 1px border, the arrow sits on the element's centre.
     expect(Math.abs(geom.arrowCentre - geom.targetCentre)).toBeLessThan(2);
 
     await page.mouse.move(5, 5);
@@ -240,8 +196,6 @@ test.describe('SDK iframe tooltip', () => {
     await gotoWithRetry(page, appPath(APP_ID));
     await expect(page.locator('#status')).toHaveText('ready');
 
-    // One delegated document listener, so nothing rescans and the app wires
-    // nothing per element.
     await page.evaluate(() => {
       const btn = document.createElement('button');
       btn.id = 'added-later';
@@ -273,7 +227,6 @@ test.describe('SDK iframe tooltip', () => {
     await gotoWithRetry(page, appPath(APP_ID));
     await expect(page.locator('#status')).toHaveText('ready');
 
-    // A scroll or a swipe must never trail a tooltip behind it.
     await touch(page, '#mid', 'touchstart');
     await touch(page, '#mid', 'touchmove', 60);
     await page.waitForTimeout(LONG_PRESS_WAIT_MS);
@@ -309,8 +262,6 @@ test.describe('SDK iframe tooltip', () => {
 const COLLISION_APP_ID = 'e2e-sdk-tooltip-collision';
 let collisionFixture: { cleanup: () => void };
 
-// An app that hand-rolled a tooltip before the SDK shipped one. Two tooltips on
-// one screen is worse than none, so the layer stands down for it, unprompted.
 test.describe('SDK iframe tooltip: the app owns a #tooltip', () => {
   test.beforeAll(() => {
     collisionFixture = createIframeAppFixture(COLLISION_APP_ID, {
@@ -330,9 +281,6 @@ test.describe('SDK iframe tooltip: the app owns a #tooltip', () => {
 </body>
 </html>
 `,
-      // The node is built at the end of <body>, which runs after sdk.js in
-      // <head>. So an install-time collision check would look too early to see
-      // it, and only a check before every show catches this.
       js: `
 var own = document.createElement('div');
 own.id = 'tooltip';
@@ -373,8 +321,6 @@ let optOutFixture: { cleanup: () => void };
 test.describe('SDK iframe tooltip: markup opt-out', () => {
   test.beforeAll(() => {
     optOutFixture = createIframeAppFixture(OPT_OUT_APP_ID, {
-      // The attribute applies before any script runs, so an app can decline the
-      // layer without loading anything to say so.
       html: `<!DOCTYPE html>
 <html data-lucidos-tooltips="off">
 <head>

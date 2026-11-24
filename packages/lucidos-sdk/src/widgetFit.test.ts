@@ -5,7 +5,6 @@ import { MAX_FIT_FINDINGS, SETTLE_CAP_MS, SETTLE_QUIET_MS, measureFit, settle, t
 const rect = (left: number, top: number, width: number, height: number): Rect =>
   ({ left, top, right: left + width, bottom: top + height });
 
-/** A box of 300 x 200, with each element's and text's rect named by `data-r`. */
 function geometryFor(rects: Record<string, Rect>, box = { width: 300, height: 200 }): FitGeometry {
   const named = (el: Element | null) => (el ? rects[el.getAttribute('data-r') ?? ''] : undefined);
   return {

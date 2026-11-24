@@ -1,28 +1,5 @@
 // @vitest-environment jsdom
-// The sanitizer runs on a real DOM. The default `node` environment has none,
-// and DOMPurify would pass its input straight back.
 
-/**
- * Regression test for "Link to <app> goes to index.html preview instead of app".
- *
- * The user reported this on iOS PWA: tapping a markdown link of the form
- * `[Name](apps/<id>/index.html)` in a chat response opened the file preview
- * (or fell through to a 404/SPA fallback) instead of opening the running
- * app.
- *
- * Two layers fix it (both gated by this test):
- *   1. linkifyPaths.rewriteAppAnchor — turns `<a href="apps/<id>/index.html">`
- *      into `<a href="#" class="app-link" data-app-id="<id>">` at render
- *      time. Verified directly by the linkifyPaths.test.ts suite.
- *   2. handleMarkdownLinkClick fallback (components/shared/markdownLinkClick.ts): intercepts a click on ANY
- *      anchor whose href is `apps/<id>/...` even when the rewriter didn't
- *      run (stale memo, iOS PWA bundle predating the rewriter, apps list
- *      not loaded at first render). Verified here.
- *
- * The codebase deliberately ships no DOM library in tests, so we use small
- * mock element objects that implement just the `closest()` / `getAttribute()`
- * / `dataset` surface the handler touches.
- */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node
 import { readFileSync } from 'node:fs';
@@ -37,8 +14,6 @@ import type { App } from '../../../store/types';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const routerSource = readFileSync(resolve(here, '../../shared/markdownLinkClick.ts'), 'utf-8');
 
-/** The workspace root the mirror resolves disk paths against, standing in for
- *  the `workspacePath` signal the real handler reads. */
 const WORKSPACE = '/Users/me/workspaces/dev';
 
 const APPS: App[] = [
@@ -68,9 +43,7 @@ function mkAnchor(href: string, className = '', dataAttrs: Record<string, string
       return null;
     },
     closest(selector: string): MockAnchor | null {
-      // Tag-name selector
       if (selector === 'a') return el;
-      // Class selector
       if (selector.startsWith('.')) {
         const cls = selector.slice(1);
         return classes.includes(cls) ? el : null;
@@ -90,17 +63,10 @@ function mkEvent(target: MockAnchor): { target: MockAnchor; defaultPrevented: bo
   return e;
 }
 
-/** Mirror of handleMarkdownLinkClick's branch order (markdownLinkClick.ts). Pinned
- *  by the source-regex test below — any structural change in the real
- *  handler must also update this mirror, and the regex assertion will
- *  catch a divergence. */
 type Callbacks = {
   openImage: (src: string, target: any) => void;
   openArtifact: (path: string) => void;
   openApp: (app: App) => void;
-  /** `fragment` is the app fragment the link named, undefined when it named
-   *  none. The real handler passes it as openAppById's third argument, after
-   *  the navigate source this surface never sets. */
   openAppById: (id: string, fragment?: string) => void;
   openTrigger: (id: string) => void;
   openRepoFile: (target: RepoFileHrefTarget) => void;
@@ -117,8 +83,6 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
   const app = t.closest('.app-link');
   if (app) {
     e.preventDefault();
-    // openAppById, not a cache lookup: it re-fetches on a miss, matching the
-    // real handler's fix for the "app exists but cache is stale" bug.
     const id = (app as any).dataset.appId;
     if (id) cb.openAppById(id, (app as any).dataset.appFragment);
     return;
@@ -143,13 +107,10 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
     }
     return;
   }
-  // Defense-in-depth fallback
   const anchor = t.closest('a');
   if (anchor) {
     const href = anchor.getAttribute('href') || '';
     const appRef = extractAppTargetFromHref(href);
-    // Unconditional: openAppById re-fetches on a miss, so a recognized `apps/`
-    // or `app:` shape must never fall through to the terminal guard below.
     if (appRef) {
       e.preventDefault();
       cb.openAppById(appRef.appId, appRef.fragment ?? undefined);
@@ -196,8 +157,6 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       cb.osOpen(localFile);
       return;
     }
-    // Terminal guard: an href the browser cannot act on reaches nothing, so
-    // it must never navigate. Mirrors the router's `deadLinkMessage`.
     if (!browserHandlesHref(href) && !href.startsWith('#')) {
       e.preventDefault();
       if (!href) cb.toast('This link has no destination');
@@ -243,10 +202,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('PRIMARY: .app-link with an id not in the cached apps list still routes to openAppById', () => {
-    // The reported bug: the cache is stale (a suspended iOS PWA missed the
-    // AppCreated SSE frame), so the id is absent even though the app exists.
-    // openAppById re-fetches before concluding it's gone, so this must never
-    // be swallowed.
     const a = mkAnchor('#', 'app-link', { appId: 'unknown-app' });
     const e = mkEvent(a);
     runHandleLinkClick(e, APPS, cb);
@@ -256,7 +211,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('FALLBACK: plain <a href="apps/<id>/index.html"> click → openAppById', () => {
-    // The shape that survives if linkifyPaths didn't rewrite.
     const a = mkAnchor('apps/work-tracker/index.html');
     const e = mkEvent(a);
     runHandleLinkClick(e, APPS, cb);
@@ -271,9 +225,6 @@ describe('chat link click — the bug-report scenario', () => {
     'apps/work-tracker',
     'apps/work-tracker/',
     'apps/work-tracker/index.html?v=2',
-    // `app:<id>` custom-scheme shorthand. The Habit Tracker-app bug report:
-    // LLM wrote `[Habit Tracker app](app:habit-tracker)`, which fell through to the
-    // browser and dead-ended on macOS Chrome.
     'app:work-tracker',
     'app:work-tracker/',
     'app:work-tracker?refresh=1',
@@ -285,13 +236,10 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it.each([
-    // The reported bug. A link naming one item inside a shared app opened it
-    // on whatever the reader saw last: the fragment was thrown away.
     ['app:work-tracker#pr-1645', 'pr-1645'],
     ['apps/work-tracker/index.html#section', 'section'],
     ['apps/work-tracker#section', 'section'],
     ['app:work-tracker?v=2#section', 'section'],
-    // A bare `#` names no place, so it must arrive as absent.
     ['app:work-tracker#', undefined],
   ])('FALLBACK entry-point: %s → openAppById at %s', (href, fragment) => {
     const e = mkEvent(mkAnchor(href));
@@ -308,9 +256,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('REGRESSION: app:<id> not in the cached apps list routes to openAppById, never the dead-link toast', () => {
-    // Exact shape of the reported bug: [Pulse](app:pulse) toasted "uses a
-    // scheme nothing here can open" because `pulse` was missing from the
-    // stale cache. The scheme was understood; only the id lookup failed.
     const e = mkEvent(mkAnchor('app:pulse'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openAppById).toHaveBeenCalledWith('pulse', undefined);
@@ -331,9 +276,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('unknown app id (apps/<id>/index.html shape) → routes to openAppById, never falls through to file preview', () => {
-    // Old behavior fell through to the file preview on a cache miss. The
-    // fix makes this unconditional: openAppById decides "gone" for itself,
-    // after a re-fetch, rather than the click site guessing from the cache.
     const e = mkEvent(mkAnchor('apps/no-such-app/index.html'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openAppById).toHaveBeenCalledWith('no-such-app', undefined);
@@ -348,20 +290,13 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(false);
   });
 
-  // ---------------------------------------------------------------------------
-  // bare app-id/name href — the reported bug. The LLM wrote a link with the app
-  // id as a bare relative href — `[Habit Tracker](habit-tracker)`, no apps/ prefix,
-  // no app: scheme — mirroring `[Notifications](notifications)`. Left alone the
-  // browser navigates to the relative href and the SPA fallback reloads the whole
-  // workspace (the "Opening workspace" splash on iOS PWA).
-  // ---------------------------------------------------------------------------
 
   it.each([
-    'work-tracker',      // bare id
-    '/work-tracker',     // leading slash
-    'work-tracker/',     // trailing slash
-    'work-tracker?v=2',  // query
-    'work-tracker#top',  // fragment
+    'work-tracker',
+    '/work-tracker',
+    'work-tracker/',
+    'work-tracker?v=2',
+    'work-tracker#top',
   ])('BARE app-id href %s → openApp', (href) => {
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
@@ -370,8 +305,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('BARE app-NAME href, percent-encoded (Habit%20Tracker) → openApp', () => {
-    // Markdown renders a spaced destination encoded, so the real DOM href is
-    // `Habit%20Tracker`; extractBareAppRef decodes it back to the raw name.
     const e = mkEvent(mkAnchor('Habit%20Tracker'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openApp).toHaveBeenCalledWith(APPS[1]);
@@ -387,8 +320,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('a bare href that is a nav panel name routes to the panel, not a bare app', () => {
-    // nav check runs before the bare-app-ref branch, so `notifications` keeps
-    // routing to its panel even though it's a bare single-segment href.
     const e = mkEvent(mkAnchor('notifications'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.navigate).toHaveBeenCalledWith({ target: 'notifications' });
@@ -407,7 +338,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('END-TO-END: render → linkify pipeline yields the .app-link the click expects', () => {
-    // The exact markdown shape the LLM wrote in the bug-report thread.
     const md = 'Open it in [Lucidos Work](apps/work-tracker/index.html).';
     const html = linkifyPaths(renderMarkdown(md), [], APPS);
     expect(html).toContain('href="#"');
@@ -417,8 +347,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('END-TO-END: render → linkify pipeline rewrites app:<id> custom scheme', () => {
-    // Exact markdown from the Habit Tracker-app bug-report thread:
-    //   Open the [Habit Tracker app](app:habit-tracker) and switch to the Backtest tab.
     const md = 'Open the [Habit Tracker](app:habit-tracker) and switch to the Backtest tab.';
     const html = linkifyPaths(renderMarkdown(md), [], APPS);
     expect(html).toContain('href="#"');
@@ -428,19 +356,7 @@ describe('chat link click — the bug-report scenario', () => {
     expect(html).not.toContain('href="app:');
   });
 
-  // ---------------------------------------------------------------------------
-  // nav-link bug report — `[Notifications](data/notifications)` was a dead link.
-  // The LLM naturally writes `data/<panel-name>` mirroring the artifact/app
-  // shape; without rewrite + click routing the browser hits the engine's
-  // /data/* static mount and 404s.
-  // ---------------------------------------------------------------------------
 
-  // ---------------------------------------------------------------------------
-  // Trigger deep links. The reported bug: told to link the trigger, the agent
-  // wrote `[name](trigger:<uuid>)`. Nothing claimed the href, and the terminal
-  // guard exempts anything carrying a scheme. The browser has no handler for
-  // `trigger:`, so the click did nothing at all, silently.
-  // ---------------------------------------------------------------------------
 
   it('PRIMARY: pre-rewritten <a class="trigger-link"> click → navigateToTrigger', () => {
     const a = mkAnchor('#', 'trigger-link', { triggerId: '3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63' });
@@ -465,7 +381,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('END-TO-END: render → linkify yields the .trigger-link the click expects', () => {
-    // Exact markdown from the bug-report thread.
     const md = 'Here it is: [Nightly digest](trigger:3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63)';
     const html = linkifyPaths(renderMarkdown(md), [], APPS);
     expect(html).toContain('href="#"');
@@ -474,10 +389,6 @@ describe('chat link click — the bug-report scenario', () => {
     expect(html).toContain('>Nightly digest</a>');
   });
 
-  // ---------------------------------------------------------------------------
-  // Settings page links. A backup notification names "Settings → System →
-  // Backup", and the name has to open that page, the same as the tap.
-  // ---------------------------------------------------------------------------
 
   it('PRIMARY: a rewritten settings nav-link carries its view to the router', () => {
     const a = mkAnchor('#', 'nav-link', { navTarget: 'settings', settingsView: 'backup' });
@@ -576,8 +487,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('END-TO-END: render → linkify yields the .nav-link the click expects (bug-report shape)', () => {
-    // Exact markdown from the bug-report thread:
-    //   Open it: [Notifications](data/notifications) or [Habit Tracker …](apps/habit-tracker/index.html).
     const md = 'Open it: [Notifications](data/notifications).';
     const html = linkifyPaths(renderMarkdown(md), [], APPS);
     expect(html).toContain('href="#"');
@@ -586,13 +495,6 @@ describe('chat link click — the bug-report scenario', () => {
     expect(html).toContain('>Notifications</a>');
   });
 
-  // ---------------------------------------------------------------------------
-  // file:// + absolute-path bug report — the release flow hands the user a
-  // clickable link to a staged .dmg that lives OUTSIDE the workspace (under
-  // ~/…/.lucidos/release-worktrees/<version>/…). Those hrefs must open with the
-  // OS (mount the dmg / reveal the folder), NOT route through the in-app file
-  // preview, openApp, handleNavigationRequest, or the /data/* static mount.
-  // ---------------------------------------------------------------------------
 
   it('OS-OPEN: file:///abs/path.dmg → osOpen, not navigate / openApp / openArtifact', () => {
     const href = 'file:///Users/me/.lucidos/release-worktrees/0.12.3/Lucidos_0.12.3_aarch64.dmg';
@@ -625,8 +527,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it.each([
-    // Absolute workspace routes are claimed by the app/nav extractors BEFORE
-    // the OS-open branch — they must never be handed to the OS as disk paths.
     '/data/artifacts/report.pdf',
     '/data',
     '/apps/work-tracker/styles.css',
@@ -638,8 +538,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('OS-OPEN: an absolute /apps/<id>/index.html still opens the app (not OS-open)', () => {
-    // Regression guard: the app extractor runs first, so an entry-point under
-    // an absolute /apps/ path routes to openAppById, never to the OS opener.
     const e = mkEvent(mkAnchor('/apps/work-tracker/index.html'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', undefined);
@@ -673,9 +571,6 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  // The reported bug: a coding agent linked its artifacts by DISK path. On the
-  // iOS PWA the OS-open branch has no OS to hand it to, so the tap landed on
-  // the gateway. A disk path into this workspace's data/ tree is a data path.
   it.each([
     `${WORKSPACE}/data/artifacts/marketing/phone-100.png`,
     `file://${WORKSPACE}/data/artifacts/marketing/phone-100.png`,
@@ -687,14 +582,6 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  // ---------------------------------------------------------------------------
-  // The reported bug: `lucidos data write` lands an artifact and prints
-  // `[name](artifacts/<path>)` for the agent to paste. The artifacts cache is
-  // SSE-refreshed and does not have the path yet, so linkifyPaths leaves a raw
-  // relative href; with no data-path branch here the browser navigated to
-  // /<slug>/artifacts/... , the SPA fallback served the app shell, and the whole
-  // workspace reloaded.
-  // ---------------------------------------------------------------------------
 
   it.each([
     ['artifacts/pr-review/pr-1582/index.html', 'artifacts/pr-review/pr-1582/index.html'],
@@ -704,8 +591,6 @@ describe('chat link click — the bug-report scenario', () => {
     ['knowhow/myapp/notes.md', 'knowhow/myapp/notes.md'],
     ['triggers/daily/run.md', 'triggers/daily/run.md'],
     ['system-knowhow/js-sdk.md', 'system-knowhow/js-sdk.md'],
-    // The link `lucidos data write themes/harbour.json` prints, and the other
-    // trees the engine serves beside it.
     ['themes/harbour.json', 'themes/harbour.json'],
     ['config/apis.json', 'config/apis.json'],
     ['scripts/auth/login.py', 'scripts/auth/login.py'],
@@ -731,19 +616,13 @@ describe('chat link click — the bug-report scenario', () => {
     expect(cb.openArtifact).toHaveBeenCalledOnce();
   });
 
-  // ---------------------------------------------------------------------------
-  // Terminal guard. The branches above are a whitelist, and a whitelist is open
-  // at the bottom. An unclaimed relative href used to escape to the browser and
-  // reload the workspace; an unclaimed SCHEME used to escape and do nothing at
-  // all. Neither escapes now.
-  // ---------------------------------------------------------------------------
 
   it.each([
     'README',
     'some/unknown/path.md',
     'unknown-panel',
-    'artifacts',          // a bare sub-tree is a directory, not a file
-    'postgres/pg.conf',   // under data/, but the engine never serves it
+    'artifacts',
+    'postgres/pg.conf',
     '/data',
   ])('CLOSED: unclaimed relative href %s is swallowed with a toast', (href) => {
     const e = mkEvent(mkAnchor(href));
@@ -764,9 +643,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('CLOSED: an empty href is swallowed and reported without an empty name', () => {
-    // `[click here]()` renders `<a href="">`, which resolves to the current URL
-    // and reloads exactly like any other unclaimed relative href. It has to be
-    // swallowed, but it cannot be named.
     const e = mkEvent(mkAnchor(''));
     runHandleLinkClick(e, APPS, cb);
     expect(e.defaultPrevented).toBe(true);
@@ -774,8 +650,8 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it.each([
-    '#section',            // in-page markdown anchor: navigates nothing
-    'https://example.com', // real external link
+    '#section',
+    'https://example.com',
     'http://example.com/x',
     'mailto:a@example.com',
     'tel:+4712345678',
@@ -788,14 +664,11 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it.each([
-    'note:abc',            // the shape of the reported bug, before trigger: was claimed
+    'note:abc',
     'change:4f2c1a90',
     'vscode://file/tmp/x',
-    'thread:not-a-uuid',   // malformed, so the markdown rewriter declined it
+    'thread:not-a-uuid',
   ])('CLOSED: unopenable scheme %s is swallowed, never left silent', (href) => {
-    // The reported bug: `trigger:<uuid>` carried a scheme, the guard exempted
-    // every scheme, and the browser had no handler. The click did nothing and
-    // said nothing, which reads as a dead app rather than a dead link.
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
     expect(e.defaultPrevented).toBe(true);
@@ -804,7 +677,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('CLOSED: an unopenable scheme reads differently from an unresolved path', () => {
-    // Different causes, different fixes, so the two must not share wording.
     runHandleLinkClick(mkEvent(mkAnchor('note:abc')), APPS, cb);
     runHandleLinkClick(mkEvent(mkAnchor('some/unknown/path.md')), APPS, cb);
     const [scheme, relative] = cb.toast.mock.calls.map((c: unknown[]) => c[0] as string);
@@ -813,8 +685,6 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   it('the app OWN schemes never reach the guard', () => {
-    // Each is claimed by its extractor first, so closing the guard cannot make
-    // one of them toast.
     for (const href of ['app:habit-tracker', 'trigger:abc-123', 'repo:lucidos:file:README.md', '/Applications/X.app']) {
       cb.toast.mockClear();
       runHandleLinkClick(mkEvent(mkAnchor(href)), APPS, cb);
@@ -831,8 +701,6 @@ describe('chat link click — repository file links', () => {
   };
   beforeEach(() => { for (const f of Object.values(cb)) f.mockClear(); });
 
-  // The reported bug: `repo:<repo>:file:<path>` in a reply went to macOS,
-  // which answered "unsupported scheme". It must open in the app, never the OS.
   it.each([
     ['repo:lucidos:file:crates/lucidos-app/src/main.tsx', 'lucidos', undefined, 'crates/lucidos-app/src/main.tsx'],
     ['repo:6f1c2a90-0000-5000-8000-000000000001:file:README.md', '6f1c2a90-0000-5000-8000-000000000001', undefined, 'README.md'],
@@ -847,25 +715,13 @@ describe('chat link click — repository file links', () => {
   });
 
   it('END-TO-END: a rendered repo link keeps its href for the router', () => {
-    // The sanitizer allows `repo:` and linkify leaves it alone, so the router
-    // reads the exact href the agent wrote.
     const html = linkifyPaths(renderMarkdown('[main](repo:lucidos:file:src/main.rs)'), [], APPS);
     expect(html).toContain('href="repo:lucidos:file:src/main.rs"');
   });
 });
 
 describe('chat link click — handler structure pin', () => {
-  // Catches a future edit that quietly changes the branch structure of the
-  // real handleMarkdownLinkClick, which would let the in-test
-  // mirror (runHandleLinkClick above) drift and give us false confidence.
   it('handleMarkdownLinkClick has the six branches in the documented order, each terminated by return;', () => {
-    // The six branches must appear in this order: image → artifact → app →
-    // trigger → nav → anchor-fallback. Each branch must close with `return;` before
-    // the next `.closest(...)` opens — otherwise a refactor that swaps two
-    // if-bodies (e.g. matches the targets in one order but acts on them
-    // in another) would slip past a simpler text-order pin. The lazy
-    // quantifier guarantees the first `return;` after each selector is the
-    // boundary, so reordering forces a regex break.
     const m = routerSource.match(/function handleMarkdownLinkClick[\s\S]*?\n\}\n/);
     expect(m, 'handleMarkdownLinkClick not found in markdownLinkClick.ts').not.toBeNull();
     const body = m![0];
@@ -890,9 +746,6 @@ describe('chat link click — handler structure pin', () => {
     const m = routerSource.match(/closest\('a'\)[\s\S]*?\n\}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
-    // The extractAppTargetFromHref arm resolves through openAppById, not a
-    // cache lookup. That is the bug fix this file guards. It hands over the
-    // app fragment too, so a link can name a place inside the app.
     expect(body).toContain(
       'openAppById(appTargetRef.appId, source, appTargetRef.fragment ?? undefined)',
     );
@@ -906,33 +759,18 @@ describe('chat link click — handler structure pin', () => {
   });
 
   it('the app extractor arm never gates on the cached apps list before opening', () => {
-    // Pins the fix. A cache gate here would let a miss fall through to the
-    // terminal guard, which blames the href's SCHEME for a stale cache.
     const m = routerSource.match(/const appTargetRef = extractAppTargetFromHref\(rawHref\);[\s\S]*?\n    const triggerId/);
     expect(m, 'extractAppTargetFromHref arm not found').not.toBeNull();
     expect(m![0]).not.toContain('apps.find');
   });
 
   it('the fallback extractors run in order: app, trigger, repo, nav, bare-app-ref, data-path, OS-open', () => {
-    // extractLocalFileTarget must appear after the app/nav extractors, or an
-    // absolute /apps/… or /notifications href could be handed to the OS instead
-    // of routed in-app. extractBareAppRef must run AFTER nav so a reserved panel
-    // name (`notifications`) keeps routing to its panel, and BEFORE the OS-open
-    // so a bare app-id href never falls through to the disk opener.
-    // extractDataPathTarget sits between them: after bare-app-ref (which only
-    // ever claims single-segment hrefs, so they cannot collide) and before
-    // OS-open, so an absolute /artifacts/… is read as a workspace file rather
-    // than a disk path.
-    // The trigger and repo extractors each claim one scheme and nothing else,
-    // so their slots are for narrative order rather than for resolving a collision.
     const appIdx = routerSource.indexOf('extractAppTargetFromHref(rawHref)');
     const trigIdx = routerSource.indexOf('extractTriggerIdFromHref(rawHref)');
     const repoIdx = routerSource.indexOf('extractRepoFileTargetFromHref(rawHref)');
     const navIdx = routerSource.indexOf('extractNavTargetFromHref(rawHref)');
     const bareIdx = routerSource.indexOf('extractBareAppRef(rawHref)');
     const dataIdx = routerSource.indexOf('extractDataPathTarget(rawHref)');
-    // A disk path into the workspace's data/ tree is a data path. The OS-open
-    // branch must not read it as a file outside the workspace.
     const diskIdx = routerSource.indexOf('extractWorkspaceDiskDataPath(rawHref');
     const fileIdx = routerSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
@@ -946,9 +784,6 @@ describe('chat link click — handler structure pin', () => {
   });
 
   it('the terminal guard is LAST and swallows every scheme-less href', () => {
-    // The whole point of the guard is that nothing follows it: it is the
-    // bottom of the whitelist. A new extractor added AFTER it would be dead
-    // code, and, worse, would read as covering a shape the guard already ate.
     const m = routerSource.match(/function handleMarkdownLinkClick[\s\S]*?\n\}\n/);
     expect(m, 'handleMarkdownLinkClick not found in markdownLinkClick.ts').not.toBeNull();
     const body = m![0];
@@ -956,17 +791,11 @@ describe('chat link click — handler structure pin', () => {
     expect(guard, 'terminal guard toast not found').toBeGreaterThan(0);
     expect(body.indexOf('extractLocalFileTarget(rawHref)')).toBeLessThan(guard);
     expect(body.slice(guard)).not.toMatch(/extract[A-Za-z]+\(rawHref\)/);
-    // It must gate on BOTH exemptions: a scheme the browser can act on, and a
-    // pure fragment. `browserHandlesHref` is the shared helper, built on the
-    // shared `hasUrlScheme`, so no router carries its own idea of a scheme.
     expect(body).toContain('!browserHandlesHref(rawHref)');
     expect(body).toContain("!rawHref.startsWith('#')");
   });
 
   it('no router re-implements the URL-scheme test inline', () => {
-    // Four copies of `/^[a-z][a-z0-9+.-]*:/i` existed across the chat handler,
-    // the two extractors, and the preview bridge. They are one exported
-    // `hasUrlScheme` now; an inline copy drifts the routers apart silently.
     const sources = [
       ['markdownLinkClick.ts', routerSource],
       ['linkifyPaths.ts', readFileSync(resolve(here, '../../../utils/linkifyPaths.ts'), 'utf-8')],
@@ -974,7 +803,6 @@ describe('chat link click — handler structure pin', () => {
     ] as const;
     for (const [name, src] of sources) {
       const inline = src.match(/\/\^\[a-z\]\[a-z0-9\+\.-\]\*:\/i/g) ?? [];
-      // linkifyPaths.ts holds the ONE definition inside `hasUrlScheme`.
       const allowed = name === 'linkifyPaths.ts' ? 1 : 0;
       expect(inline.length, `${name} must not inline the scheme regex`).toBe(allowed);
     }

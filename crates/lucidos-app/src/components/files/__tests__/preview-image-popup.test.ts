@@ -16,8 +16,6 @@ const css = readFileSync(resolve(here, '../../../styles/panels/previews.css'), '
 
 const SRC = '/data/artifacts/docs/architecture.png';
 
-/** Hookless, so it can be called as a plain function and its vnode read
- *  (same approach as FilePreviewModal.test.ts). */
 function image(): VNode<Record<string, () => unknown>> {
   return PreviewImage({ src: SRC, alt: 'artifacts/docs/architecture.png' }) as VNode<Record<string, () => unknown>>;
 }
@@ -64,13 +62,10 @@ describe('every file preview renders its image through PreviewImage', () => {
     expect(inlineSource).toMatch(/<PreviewImage\s/);
   });
 
-  // A rendered SVG takes the binary image's path, so one site serves both.
   it('the repository preview does, for a binary image and for a rendered SVG', () => {
     expect(repoSource.match(/<PreviewImage\s/g) ?? []).toHaveLength(1);
   });
 
-  // A blob URL shares the shell's origin, so opening that image in a new tab
-  // would run an SVG's script as the shell. The engine URL is sandboxed.
   it('the repository preview never builds a same-origin blob URL for an image', () => {
     expect(repoSource).not.toMatch(/createObjectURL/);
   });

@@ -12,10 +12,6 @@ import { pluginPanelHeader } from './PluginSection';
 export function PluginUninstallPanel() {
   const form = activeInlineForm.value;
   if (form?.type !== 'plugin-uninstall') return null;
-  // Two components rather than one branching on `removed`, so the confirm
-  // panel's hooks are never conditionally skipped: resolving the uninstall
-  // unmounts the confirm panel and mounts the receipt. Same split as
-  // `EmailConfirmModal`.
   return form.removed
     ? <PluginUninstallReceiptPanel form={form} />
     : <PluginUninstallConfirm form={form} />;
@@ -25,10 +21,6 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
   const [busy, setBusy] = useState(false);
   const req = form.request;
 
-  // The action fns resolve the panel themselves (into a receipt on success,
-  // closed on failure), so busy normally never resets visibly. Reset in a
-  // finally anyway so the buttons re-enable if a future path returns with the
-  // panel still up. setBusy after unmount is a harmless no-op in Preact.
   async function handleConfirm() {
     setBusy(true);
     try {
@@ -110,19 +102,6 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
   );
 }
 
-/** The panel after a confirmed uninstall: a read-only record of what the engine
- *  actually removed, holding the nav-history slot the pending confirm had (see
- *  `markPluginUninstalled`). The lists come off the receipt marker, not off
- *  `request.files_present`, which was only what existed at prepare time.
- *
- *  Deliberately offers NO buttons at all. Confirm and Cancel are gone because
- *  the files are gone and the staged `uninstall_id` is popped. Close is gone
- *  because a receipt is a page in the nav history. The header's back arrow is
- *  how you leave it, same as any other panel page.
- *
- *  Exported for its unit test, which renders it directly: the suite's VNode walk
- *  stops at function components (the confirm branch's hooks would throw), so it
- *  cannot reach this one through the dispatcher. */
 export function PluginUninstallReceiptPanel({ form }: { form: PluginUninstallForm }) {
   const req = form.request;
   const removed = form.removed!;

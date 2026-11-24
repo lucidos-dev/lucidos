@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/prompt_mirror_scan.sh"
 CLI="$SCRIPT_DIR/../check-prompt-mirror.sh"
 
-ENGINE_PATH="crates/lucidos-engine/src/engine/agent_session/prompts.rs"
+ENGINE_PATH="crates/lucidos-agents-api/src/engine/agent_session/prompts.rs"
 
 PASS=0
 FAIL=0

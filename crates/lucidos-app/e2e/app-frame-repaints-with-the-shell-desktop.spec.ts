@@ -3,13 +3,6 @@ import { test, expect } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry } from './helpers';
 
-// An app repaints with the shell, not after the save (the appearance push,
-// docs/glossary.md). The shell saves a scale change on a debounce. An app that
-// waited for the save, the SSE frame and a re-fetch trailed it by all three.
-//
-// Every preference save is held open here, so nothing can reach the app over
-// the network. It must repaint anyway. Desktop only: the zoom shortcut is the
-// keyboard path into a scale change.
 
 const APP_ID = 'e2e-appearance-push';
 
@@ -47,13 +40,8 @@ lucidos.ui.applyPreferences().then(function () {
     fixture?.cleanup();
   });
 
-  /** Open the fixture app in the real shell, with every preference save held
-   *  open so no `PreferencesChanged` can follow one. */
   async function openWatchingApp(page: Page) {
-    // Seeding `app-window-open` makes `loadApps()` restore the app through the
-    // real `AppUiInline`, so the shell pushes to a frame it built itself.
     await page.addInitScript((id) => {
-      // An init script runs in EVERY frame, and the app frame's storage throws.
       if (window.parent !== window) return;
       localStorage.setItem('app-window-open', id);
     }, APP_ID);
@@ -84,16 +72,12 @@ lucidos.ui.applyPreferences().then(function () {
     await expect.poll(() => appFrame.locator('html').evaluate(scaleOf), { timeout: 2_000 }).toBe(after);
   });
 
-  // The app forwards the chord, and the scale panel takes focus from its frame.
-  // That window `focus` runs the resume sync. Its preferences refetch must not
-  // paint the saved scale back before the debounced save goes out.
   test('a zoom step from inside the app never snaps back', async ({ page }) => {
     const appFrame = await openWatchingApp(page);
     await appFrame.locator('#status').click();
     const shell = page.locator('html');
     const before = await shell.evaluate(scaleOf);
 
-    // Every frame's scale, so a snap back that lasts one frame still shows.
     await page.evaluate(() => {
       const seen: string[] = [];
       (window as unknown as { scalesSeen: string[] }).scalesSeen = seen;
@@ -109,7 +93,6 @@ lucidos.ui.applyPreferences().then(function () {
 
     await expect.poll(() => shell.evaluate(scaleOf)).not.toBe(before);
     const after = await shell.evaluate(scaleOf);
-    // Past the 500 ms save debounce, the window that refetch lands in.
     await page.waitForTimeout(1_000);
     const seen = await page.evaluate(() => (window as unknown as { scalesSeen: string[] }).scalesSeen);
     expect(seen).toEqual([before, after]);

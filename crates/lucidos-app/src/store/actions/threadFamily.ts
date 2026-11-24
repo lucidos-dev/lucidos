@@ -1,14 +1,5 @@
 import { threadMap } from '../store';
 
-/** Walk parentThreadId from every thread in the map to collect the target +
- *  every transitive descendant. Mirrors the backend cascade scope, which
- *  archive and delete share, so an optimistic flip covers the whole family in
- *  one stroke.
- *
- *  Delete needs the same set for a harsher reason: archive flips a column on
- *  each member and delete removes the rows. The thread menu walks it to name
- *  the sub-thread that blocks. Its own module, so that derivation need not
- *  import `threads.ts`. */
 export function collectThreadFamily(rootId: string): Set<string> {
   const childrenByParent = new Map<string, string[]>();
   for (const t of threadMap.value.values()) {

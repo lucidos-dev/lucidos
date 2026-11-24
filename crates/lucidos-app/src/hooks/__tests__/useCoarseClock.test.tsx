@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * One interval for every subscriber, and none once the last one leaves.
- *
- * The value it hands out has to keep moving, because a frozen one is the exact
- * bug this hook exists to kill: an eight-hour outage reading "for 2 minutes".
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { COARSE_TICK_MS, useCoarseClock } from '../useCoarseClock';
@@ -16,7 +10,6 @@ function Probe() {
   return null;
 }
 
-/** What the last render of a `Probe` read. */
 function latest(): number {
   return seen[seen.length - 1];
 }
@@ -71,7 +64,6 @@ describe('useCoarseClock', () => {
     render(<Probe />, host);
     render(null, host);
 
-    // Nothing ticked while nobody was reading, so the value is eight hours old.
     vi.setSystemTime(new Date('2026-08-27T14:00:00Z'));
     render(<Probe />, host);
     render(<Probe />, host);

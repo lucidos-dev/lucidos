@@ -1,17 +1,3 @@
-/**
- * The app popout, on the one client where an anchor cannot do it.
- *
- * In a browser the control is a real `<a target="_blank">` and needs no action
- * at all. In the packaged desktop client that anchor is a dead click: the href
- * is root-relative so `onGlobalClick`'s `^https?://` funnel never claims it, and
- * WKWebView then drops the `_blank` navigation because wry installs a
- * new-window delegate only on the in-app browser preview webview, never on the
- * `main` window. `popOutApp` is what stands in there, and the two ways it can go
- * wrong are both invisible from the call site: handing the OS a root-relative
- * path (macOS `open` cannot resolve one), and routing through `openUrl`, which
- * with the experimental in-app browser preference on would mount the
- * url-preview panel INSIDE the shell, over the very app being popped out of it.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   focusedThreadId,
@@ -25,10 +11,6 @@ import {
 import type { App } from '../types';
 import { makeThreadState } from './threads-test-helpers';
 
-// The OS opener (Tauri `open_url_external`, which runs macOS `open`).
-// setTitlebarColor is unused here, but the real preferences module sits in
-// apps.ts's import graph and pulls it from this module, so the mock must
-// provide it.
 const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
   openExternal,
@@ -46,7 +28,14 @@ vi.mock('../../api/client', () => ({
   postAppCapture: vi.fn().mockResolvedValue(undefined),
 }));
 
-const { popOutApp } = await import('./apps');
+const route = vi.hoisted(() => ({ basePath: '/dev', gateway: null as string | null }));
+vi.mock('../../utils/basePath', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/basePath')>()),
+  get BASE_PATH() { return route.basePath; },
+  get REMOTE_GATEWAY() { return route.gateway; },
+}));
+
+const { appPopoutHref, popOutApp } = await import('./apps');
 
 const habitTracker: App = {
   id: 'habit-tracker',
@@ -54,14 +43,10 @@ const habitTracker: App = {
   description: 'Daily habits', reveal: 'on-load', kind: 'app', reusable: false,
 };
 
-/** The page the packaged client is on: the gateway origin, under the workspace
- *  slug. The popout URL has to come out on this origin and port. */
 const PAGE_URL = 'http://localhost:4711/dev/';
 
 describe('popOutApp hands the open app to the OS opener', () => {
   beforeEach(() => {
-    // `currentApp` is a computed over `panelOverlay`, so the app-ui overlay IS
-    // "an app is open" and there is no second signal to fall out of step.
     panelOverlay.value = { type: 'app-ui', app: habitTracker };
     wipPreviewThreadId.value = null;
     threadMap.value = new Map();
@@ -72,6 +57,8 @@ describe('popOutApp hands the open app to the OS opener', () => {
     openExternal.mockClear();
     openExternal.mockResolvedValue(undefined);
     vi.stubGlobal('location', { href: PAGE_URL });
+    route.basePath = '/dev';
+    route.gateway = null;
   });
 
   afterEach(() => {
@@ -81,15 +68,10 @@ describe('popOutApp hands the open app to the OS opener', () => {
   it('opens an ABSOLUTE url, so the gateway origin, port and slug survive', () => {
     popOutApp();
 
-    // Not `/dev/app/habit-tracker/`: macOS `open` cannot resolve a path, and the
-    // engine is not on the default port.
     expect(openExternal).toHaveBeenCalledWith('http://localhost:4711/dev/app/habit-tracker/');
   });
 
   it('carries the WIP preview thread through, so a popped-out preview is still the preview', () => {
-    // The WIP auto-revert effect (actions/wipPreview, installed by apps.ts's
-    // import of it) clears the preview unless the WIP thread is the focused one
-    // and is in the map, so seed both rather than poking the signal alone.
     threadMap.value = new Map([['thread-7', makeThreadState('thread-7')]]);
     threadsLoaded.value = true;
     focusedThreadId.value = 'thread-7';
@@ -103,9 +85,6 @@ describe('popOutApp hands the open app to the OS opener', () => {
   });
 
   it('never mounts the in-app url-preview panel, even with that preference ON', () => {
-    // The whole reason this does not route through `openUrl`. That panel lives
-    // inside the shell, so "pop out" would have replaced the app with a webview
-    // of the same app, in the pane it was already in.
     preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
 
     popOutApp();
@@ -133,5 +112,45 @@ describe('popOutApp hands the open app to the OS opener', () => {
     expect(toasts.value[0].type).toBe('error');
     expect(toasts.value[0].message).toContain('http://localhost:4711/dev/app/habit-tracker/');
     expect(toasts.value[0].message).toContain('no handler for scheme');
+  });
+
+  it('a remote workspace opens its own shell with an #app= landing, never the bare app', () => {
+    route.basePath = '/dev@office';
+    route.gateway = 'office';
+    vi.stubGlobal('location', { href: 'http://localhost:4711/dev@office/' });
+
+    popOutApp();
+
+    expect(openExternal).toHaveBeenCalledWith('http://localhost:4711/dev@office/#app=habit-tracker');
+  });
+});
+
+describe('appPopoutHref, which the browser anchor reads', () => {
+  beforeEach(() => {
+    panelOverlay.value = { type: 'app-ui', app: habitTracker };
+    wipPreviewThreadId.value = null;
+    route.basePath = '/dev';
+    route.gateway = null;
+  });
+
+  it('local: the bare app URL', () => {
+    expect(appPopoutHref()).toBe('/dev/app/habit-tracker/');
+  });
+
+  it('remote: the shell landing, carrying the app fragment', () => {
+    route.basePath = '/dev@office';
+    route.gateway = 'office';
+    panelOverlay.value = { type: 'app-ui', app: habitTracker, fragment: 'pr-1645' };
+
+    const href = appPopoutHref();
+
+    expect(href).toBe('/dev@office/#app=habit-tracker&fragment=pr-1645');
+    expect(href).not.toContain('/app/');
+  });
+
+  it('null when no app is open', () => {
+    panelOverlay.value = null;
+    route.gateway = 'office';
+    expect(appPopoutHref()).toBeNull();
   });
 });

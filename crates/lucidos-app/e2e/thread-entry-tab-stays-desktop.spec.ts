@@ -3,7 +3,6 @@ import { navigateToApp, assertHealthy, openThreadDrawer } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/** Which pane holds DOM focus, named so a failure says where Tab went. */
 async function focusedPaneOf(page: Page): Promise<string> {
   return await page.evaluate(() => {
     const a = document.activeElement;
@@ -15,12 +14,6 @@ async function focusedPaneOf(page: Page): Promise<string> {
   });
 }
 
-// Clicking a drawer row focuses the thread's live question card, so Enter
-// answers at once. The per-pane Tab trap follows the focused-pane marker, and
-// the click left that marker on the drawer. So Tab from the focused option
-// jumped back into the drawer. The thread-entry focus now takes the marker.
-//
-// Desktop-only: mobile navigates panes and has no Tab trap.
 test.describe('Thread entry focus: Tab stays in the thread pane', () => {
   test('Tab from a focused question option stays in the thread pane', async ({ page }) => {
     await assertHealthy(page);

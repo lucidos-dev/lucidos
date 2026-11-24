@@ -158,7 +158,7 @@ pub fn seed_shared_cache_from_legacy(workspace: &Path, active_cache: &Path) -> S
     }
     if let Some(parent) = active_cache.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            log!(
+            log_legacy!(
                 @Memory,
                 "Could not prepare {} for the shared model cache: {}",
                 parent.display(),
@@ -169,7 +169,7 @@ pub fn seed_shared_cache_from_legacy(workspace: &Path, active_cache: &Path) -> S
     }
     match std::fs::rename(&legacy, active_cache) {
         Ok(()) => {
-            log!(
+            log_legacy!(
                 @Memory,
                 "Moved this workspace's model cache to the shared location at {} ({} bytes), so \
                  every workspace on this machine now reads one copy",
@@ -181,7 +181,7 @@ pub fn seed_shared_cache_from_legacy(workspace: &Path, active_cache: &Path) -> S
         Err(e) => {
             // Expected and harmless when another engine seeded first, or when
             // the workspace and the cache live on different filesystems.
-            log!(
+            log_legacy!(
                 @Memory,
                 "Could not move {} to the shared model cache at {}: {}. Falling back to the \
                  normal load",
@@ -206,7 +206,7 @@ pub fn reclaim_legacy_cache(workspace: &Path, active_cache: &Path) -> ReclaimOut
         return ReclaimOutcome::NothingToReclaim;
     }
     if !is_real_dir(&legacy) {
-        log!(
+        log_legacy!(
             @Memory,
             "Leaving {} alone: it is not a plain directory, so somebody put it there deliberately",
             legacy.display()
@@ -219,7 +219,7 @@ pub fn reclaim_legacy_cache(workspace: &Path, active_cache: &Path) -> ReclaimOut
     let bytes = dir_bytes(&legacy);
     match std::fs::remove_dir_all(&legacy) {
         Ok(()) => {
-            log!(
+            log_legacy!(
                 @Memory,
                 "Reclaimed {} bytes: removed this workspace's leftover model cache at {}, \
                  superseded by the shared cache at {}",
@@ -230,7 +230,7 @@ pub fn reclaim_legacy_cache(workspace: &Path, active_cache: &Path) -> ReclaimOut
             ReclaimOutcome::Reclaimed { bytes }
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 @Memory,
                 "Could not remove the leftover model cache at {}: {}. It is unused but still \
                  taking {} bytes",

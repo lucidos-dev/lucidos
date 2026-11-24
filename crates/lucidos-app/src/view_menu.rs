@@ -116,6 +116,7 @@ pub(crate) struct ViewMenu {
 }
 
 /// Build the items, disabled until a page pushes, and keep their handles.
+#[cfg(target_os = "macos")]
 pub(crate) fn build_items(app: &tauri::App) -> tauri::Result<Vec<MenuItem<tauri::Wry>>> {
     let items = ViewMenuPane::ALL
         .into_iter()

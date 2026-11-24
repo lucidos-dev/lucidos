@@ -1,11 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { DiffFile, DiffHunk, DiffLine } from '../../store/store';
 
-// The real `escapeHtml` round-trips through a DOM element, and the test infra
-// has no jsdom (its `document` stub returns '' for `innerHTML`), so every line
-// would come back empty and the mapping assertions below could not fail. A
-// marker escaper keeps them honest AND still proves the text goes through the
-// escaper rather than being injected raw.
 vi.mock('../../utils/escapeHtml', () => ({
   escapeHtml: (text: string) => `esc(${text})`,
   stripHtml: (html: string) => html,
@@ -27,9 +22,6 @@ function hunk(lines: DiffLine[], oldStart = 1, newStart = 1): DiffHunk {
   };
 }
 
-/** The columns line up only if every row has a cell (or a filler) on both
- *  sides, which `sideBySideRows` guarantees by construction; asserted on every
- *  shape below rather than stated once. */
 function numbers(rows: ReturnType<typeof sideBySideRows>) {
   return {
     left: rows.map(r => r.left?.num ?? null),
@@ -76,7 +68,6 @@ describe('sideBySideRows: a pure deletion', () => {
 });
 
 describe('sideBySideRows: a replacement', () => {
-  // The point of the view: the line before and the line after sit on one row.
   it('pairs a balanced run index for index', () => {
     const rows = sideBySideRows(hunk([ctx('a'), del('x'), del('y'), add('X'), add('Y'), ctx('b')], 1, 1));
     expect(numbers(rows)).toEqual({
@@ -103,8 +94,6 @@ describe('sideBySideRows: a replacement', () => {
     });
   });
 
-  // Two runs separated by context must not merge: the second run's deletions
-  // belong beside the second run's additions, not the first's.
   it('closes a run at the context line between two of them', () => {
     const rows = sideBySideRows(hunk([del('a'), add('A'), ctx('keep'), del('b'), add('B')], 1, 1));
     expect(numbers(rows)).toEqual({
@@ -157,7 +146,6 @@ describe('sideBySideColumns', () => {
   it('produces two columns of equal length, header rows included', () => {
     const { left, right } = sideBySideColumns(file([hunk([ctx('a'), del('x'), add('X')])]), 'rs');
     expect(left).toHaveLength(right.length);
-    // One `@@` header plus two paired rows.
     expect(left).toHaveLength(3);
     expect(left[0].cls).toBe('side-by-side-diff-hunk-header');
     expect(right[0].cls).toBe('side-by-side-diff-hunk-header');
@@ -190,18 +178,12 @@ describe('sideBySideColumns', () => {
     expect(left[1]).toEqual({ html: '', num: null, cls: 'side-by-side-diff-filler' });
   });
 
-  // The highlighter runs over the whole hunk at once (so a multi-line construct
-  // survives being split into rows) and each cell indexes back into it. A
-  // mis-indexed cell would show a neighbouring line's text, which is the worst
-  // possible bug in a diff.
   it('gives each side the text of its own line', () => {
     const { left, right } = sideBySideColumns(file([hunk([del('gone'), add('kept')])]), 'txt');
     expect(left[1].html).toBe('esc(gone)');
     expect(right[1].html).toBe('esc(kept)');
   });
 
-  // Off-by-one in the index mapping is the worst bug this view can have: every
-  // row would show a neighbouring line's text and read as a plausible diff.
   it('keeps each cell pointing at its own line across a long run', () => {
     const only = hunk([ctx('a'), del('d1'), del('d2'), del('d3'), add('a1'), add('a2'), ctx('b')]);
     const header = `esc(${hunkHeader(only)})`;

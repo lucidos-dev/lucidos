@@ -17,7 +17,7 @@
 #
 # Scoped to cargo build scripts, deliberately. Compile-time `env!` is right in
 # ordinary crate code, where no cargo variable is set at run time at all (see
-# `repo_root_or_compile_time_fallback` in crates/lucidos-engine/src/paths.rs).
+# `repo_root_or_compile_time_fallback` in crates/lucidos-core/src/paths.rs).
 # Widening this to the whole tree would flag that legitimate site.
 #
 # Background, including the reproduction:
@@ -43,7 +43,7 @@ BUILD_SCRIPT_PATH_ADVICE='Read it at run time instead: std::env::var("CARGO_MANI
 # A build script is a `build.rs` sitting NEXT TO a `Cargo.toml`, which is
 # cargo's own rule, and the sibling test is what keeps this gate off ordinary
 # source. The name alone is not enough: this repo already has an unrelated
-# `crates/lucidos-engine/src/core/store/messages/build.rs`, which cargo never
+# `crates/lucidos-core/src/core/store/messages/build.rs`, which cargo never
 # runs and where compile-time `env!` would be perfectly legal.
 #
 # A crate that renames its script via `package.build` in Cargo.toml is not

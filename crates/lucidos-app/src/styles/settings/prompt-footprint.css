@@ -1,6 +1,3 @@
-/* Settings › System › Workspace Prompt Footprint. The shared overview and
-   card (settings-overview.css), then the sections as meters against their
-   ceiling. Hairlines, not boxes. */
 
 .prompt-footprint-meter {
     flex: 1;

@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** Pan mode lays a file out as one gutter column beside one code column, so a
- *  long file carries a single pinned box. Wrap and caller modes keep each
- *  number inside its row. This pins the markup both rest on; the CSS half is
- *  `styles/__tests__/file-preview-line-wrapping.test.ts`. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -13,7 +9,6 @@ import { createPreviewViewState, lineScrollTarget, selectedLines } from '../../.
 
 let host: HTMLDivElement;
 
-/** The file every preview here shows, as its host provides it. */
 const PATH = 'artifacts/notes.md';
 const at = (line: number) => ({ path: PATH, line });
 
@@ -51,7 +46,6 @@ describe('pan mode', () => {
     expect(pre.querySelectorAll('.code-line .line-number')).toHaveLength(0);
   });
 
-  // Unhidden, a screen reader would read every number before the first line.
   it('hides the gutter column from assistive tech', () => {
     expect(show('pan').querySelector('.line-numbered-gutter')!.getAttribute('aria-hidden')).toBe('true');
   });
@@ -78,9 +72,6 @@ describe('pan mode', () => {
   });
 });
 
-/** A row wider than the view, scrolled into view itself, has its left edge
- *  panned to the scrollport's, under the pinned gutter. So a cited line opens
- *  with its first characters hidden. Its gutter cell never moves sideways. */
 describe('the scroll target in pan mode', () => {
   afterEach(() => { lineScrollTarget.value = null; });
 
@@ -107,9 +98,6 @@ describe('the scroll target in pan mode', () => {
   });
 });
 
-/** A navigate moves the view up or down only. `scrollIntoView` can also pan an
- *  ancestor sideways, which opened the file preview modal with the start of
- *  every line cut off. */
 describe('the navigate scroll is vertical only', () => {
   it('puts back every ancestor scrollLeft that scrollIntoView moved', () => {
     const outer = document.createElement('div');
@@ -134,8 +122,6 @@ describe('the navigate scroll is vertical only', () => {
   });
 });
 
-/** The file preview modal can open over a Files preview. Each reads the view
- *  state its provider gives it, so neither paints or scrolls for the other. */
 describe('each preview reads its own view state', () => {
   afterEach(() => { lineScrollTarget.value = null; });
 
@@ -172,8 +158,6 @@ describe('each preview reads its own view state', () => {
     expect(modalView.lineScrollTarget.value).toBeNull();
   });
 
-  // A second preview of the same file replaces the first: the code stays
-  // mounted, but its provider hands it a new view with a new target.
   it('scrolls for a replacing view on the same mounted code', () => {
     const rows = fileRows(['one', 'two', 'three', 'four']);
     const scrolled: (string | null)[] = [];
@@ -201,10 +185,6 @@ describe('each preview reads its own view state', () => {
   });
 });
 
-/** A navigate to a line in another file writes its target while this file's
- *  rows are still mounted, before the new file renders. Taking it here scrolled
- *  the wrong file, and told Find in file the landing was done before the new
- *  file had any rows to search. */
 describe('the scroll target belongs to the file it names', () => {
   afterEach(() => { lineScrollTarget.value = null; });
 
@@ -239,9 +219,6 @@ describe('wrap mode keeps each number inside its row', () => {
   });
 });
 
-/** Find in file walks the view's text nodes. A number held as text would match
- *  a numeric search, and in pan mode every gutter hit would come before the
- *  code. So the number is generated content, and the only text is the code. */
 describe('the line numbers are not text', () => {
   for (const mode of ['pan', 'wrap', 'caller'] as const) {
     it(`leaves only the code as text in ${mode} mode`, () => {

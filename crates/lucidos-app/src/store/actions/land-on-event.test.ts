@@ -1,12 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ThreadState } from '../thread-events';
 
-/**
- * An event deep link names the event, and the transcript draws only turns and
- * failure cards. So `landOnEvent` hands the scroll layer the turn holding a
- * step. The reported case was a "needs login" notification on a mid-turn
- * `CredentialRequested`, which toasted "That event is not shown in this thread".
- */
 
 const scrollToEventAndPulse = vi.hoisted(() => vi.fn());
 vi.mock('../../components/chat/scrollState', async (importOriginal) => ({
@@ -14,7 +8,6 @@ vi.mock('../../components/chat/scrollState', async (importOriginal) => ({
   scrollToEventAndPulse,
 }));
 
-// The store reaches scrollState through the handle, which the shell fills.
 const { provideScrollState } = await import('../../components/chat/scrollStateHandle');
 provideScrollState(await import('../../components/chat/scrollState'));
 const { threadMap } = await import('../store');
@@ -29,7 +22,6 @@ function threadWith(events: [string, string][], eventsLoaded = true): ThreadStat
   return { events: map, pendingUserMessages: [], eventsLoaded } as unknown as ThreadState;
 }
 
-/** The anchor `landOnEvent` asked the scroll layer to look for, right now. */
 function anchorNow(): string | null | undefined {
   const opts = scrollToEventAndPulse.mock.lastCall?.[1];
   return opts?.anchorFor?.();
@@ -60,7 +52,6 @@ describe('landOnEvent', () => {
     expect(anchorNow()).toBe('start-1');
   });
 
-  // A cold tap: the thread arrives after the link started.
   it('finds the anchor once the thread arrives', () => {
     landOnEvent('t-1', 'cred-1');
     expect(anchorNow()).toBeNull();

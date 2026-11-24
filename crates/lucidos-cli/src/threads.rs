@@ -1,4 +1,4 @@
-use crate::http::{client as http_client, send_and_print};
+use crate::http::{client as http_client, send_and_print, send_or_refusal};
 use crate::workspace::{BoxError, Workspace};
 
 /// Env var carrying the calling thread's id. Read only to resolve
@@ -250,13 +250,8 @@ pub(crate) fn cmd_archive(ws: &Workspace, thread: &str) -> Result<(), BoxError> 
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
-/// `lucidos threads context-ceiling`: set a thread's context ceiling. The
-/// engine parses the value and decides who may set it.
-pub(crate) fn cmd_context_ceiling(
-    ws: &Workspace,
-    ceiling: &str,
-    thread: Option<&str>,
-) -> Result<(), BoxError> {
+/// The thread `--thread` names, or this thread when it names none.
+fn target_thread(thread: Option<&str>) -> Result<String, BoxError> {
     let target = match thread {
         Some(t) => t.trim().to_string(),
         None => source_thread_id_from_env().ok_or(
@@ -267,9 +262,96 @@ pub(crate) fn cmd_context_ceiling(
     if uuid::Uuid::parse_str(&target).is_err() {
         return Err(format!("--thread takes a thread's uuid, and '{target}' is not one.").into());
     }
+    Ok(target)
+}
+
+/// `lucidos threads context-ceiling`: set a thread's context ceiling. The
+/// engine parses the value and decides who may set it.
+pub(crate) fn cmd_context_ceiling(
+    ws: &Workspace,
+    ceiling: &str,
+    thread: Option<&str>,
+) -> Result<(), BoxError> {
+    let target = target_thread(thread)?;
     let url = format!("{}/api/v1/threads/{target}/context-ceiling", ws.base_url());
     let body = serde_json::json!({ "ceiling": ceiling.trim() });
     send_and_print("PUT", &url, http_client()?.put(&url).json(&body))
+}
+
+/// `lucidos threads hold`: put a thread and its sub-threads on hold.
+pub(crate) fn cmd_hold(ws: &Workspace, reason: &str, thread: Option<&str>) -> Result<(), BoxError> {
+    let target = target_thread(thread)?;
+    let url = format!("{}/api/v1/threads/{target}/hold", ws.base_url());
+    let body = serde_json::json!({ "reason": reason.trim() });
+    send_and_print("POST", &url, http_client()?.post(&url).json(&body))
+}
+
+/// `lucidos threads resume`: end a hold. The engine decides who may.
+pub(crate) fn cmd_resume(ws: &Workspace, thread: Option<&str>) -> Result<(), BoxError> {
+    let target = target_thread(thread)?;
+    let url = format!("{}/api/v1/threads/{target}/hold", ws.base_url());
+    send_and_print("DELETE", &url, http_client()?.delete(&url))
+}
+
+/// `lucidos threads create-draft`'s body, sent as written. The engine
+/// validates it and maps the picks onto the composer's selection.
+#[derive(serde::Serialize)]
+pub(crate) struct DraftRequest {
+    pub text: String,
+    pub images: Vec<String>,
+    pub mode: String,
+    pub repo_id: Option<String>,
+    pub app_id: Option<String>,
+    pub coding_agent: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub effort: Option<String>,
+    pub retry_key: String,
+}
+
+pub(crate) fn cmd_create_draft(ws: &Workspace, request: &DraftRequest) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/threads/drafts", ws.base_url());
+    send_and_print("POST", &url, http_client()?.post(&url).json(request))
+}
+
+/// `lucidos threads submit-draft`: send a saved draft by revision and epoch.
+/// The engine resolves the owner's authority and answers with the receipt.
+pub(crate) fn cmd_submit_draft(
+    ws: &Workspace,
+    thread: &str,
+    revision: i64,
+    epoch: i64,
+    retry_key: &str,
+) -> Result<(), BoxError> {
+    let target = thread.trim();
+    if uuid::Uuid::parse_str(target).is_err() {
+        return Err(format!(
+            "--thread takes the draft's thread uuid, and '{target}' is not one. \
+             Run `lucidos threads drafts` to find it."
+        )
+        .into());
+    }
+    let retry_key = retry_key.trim();
+    let body = serde_json::json!({
+        "expected_revision": revision,
+        "expected_epoch": epoch,
+        "retry_key": retry_key,
+    });
+    let url = format!("{}/api/v1/threads/{target}/submit-draft", ws.base_url());
+    let answer = send_or_refusal("POST", &url, http_client()?.post(&url).json(&body))
+        .map_err(|error| naming_the_retry_key(error, retry_key))??;
+    println!("{answer}");
+    Ok(())
+}
+
+/// A send that failed without a refusal may still have landed. The key lets
+/// the caller read its receipt back instead of sending twice.
+fn naming_the_retry_key(error: BoxError, retry_key: &str) -> BoxError {
+    format!(
+        "{error}\nThis send's retry key is {retry_key}. If it may have landed, run the same \
+         command with `--retry-key {retry_key}` to read its receipt."
+    )
+    .into()
 }
 
 /// Default `--event-id` from the spawning event, the way `spawn-thread`
@@ -286,7 +368,7 @@ pub(crate) fn source_thread_id_from_env() -> Option<String> {
     std::env::var(ENV_SOURCE_THREAD_ID).ok()
 }
 
-fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str, String)> {
+pub(crate) fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str, String)> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(a) = filters.active {
         params.push(("active", a.to_string()));
@@ -322,6 +404,14 @@ fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str, String)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed submit-draft keeps its error and names the key to retry with.
+    #[test]
+    fn a_failed_submit_draft_names_its_retry_key() {
+        let error = naming_the_retry_key("connection reset".into(), "key-1").to_string();
+        assert!(error.starts_with("connection reset"), "{error}");
+        assert!(error.contains("--retry-key key-1"), "{error}");
+    }
 
     /// No status flags, so the status axis contributes nothing.
     const NO_STATUS: &[String] = &[];

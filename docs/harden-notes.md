@@ -26,7 +26,7 @@ explains the ones a reader would not guess.
 - **Rust suites follow the reached crates (ADR 0594).** `start` runs
   `cargo metadata` once and records the crate graph. A path maps to its owning
   crates, and the reached set is the reverse closure over the graph. `lint` runs
-  clippy on that set through `CLIPPY_SCOPE`, both feature passes. `crates` runs
+  clippy on that set through `CLIPPY_SCOPE` with `--all-features`. `crates` runs
   the small crates, and `gateway`, `cli`, `app-lib`, `eval` and `engine` run when
   reached. The graph decides how far an edit reaches, so a `lucidos-home` edit
   still reaches most crates.
@@ -34,8 +34,10 @@ explains the ones a reader would not guess.
   `.cargo/**`, `rust-toolchain.toml`, `clippy.toml`, `Makefile` and
   `crates/vendor/**` can change any crate. So can a Rust path no crate owns, or a
   graph that failed to load. The selection fails safe, toward more.
-- **A shell-only diff skips clippy.** `shell-lint` runs the shell, eval,
-  knowhow and fmt linters, because a shell path reaches no crate.
+- **`make lint` runs as its two halves.** `lint-static` (the shell, eval and
+  knowhow linters) finishes before the Cargo lane and never runs Cargo. `lint-rust`
+  (rustfmt, then clippy) runs in the lane. A shell-only diff runs
+  `lint-static` alone, because a shell path reaches no crate.
 - **A file the CLI source includes selects the CLI row, even an engine path.**
   `make test` covers the engine crate alone, and `make lint` compiles CLI tests
   without running them. CLI tests include engine files (the two menu JSONs, and
@@ -66,8 +68,41 @@ explains the ones a reader would not guess.
   that name a string literal the diff removed, and specs the main check's coverage
   map ties to a changed file.
   A backend-only diff selects none, and the fast tier drops the row.
-  A macOS host runs the mobile-webkit ones locally, and a passing suite carries
+  Every host sends the mobile-webkit ones to GitHub, and a passing suite carries
   into the next round (ADR 0616).
+
+## Explicit suite requests
+
+Use `./scripts/harden-suites.sh start --include-suite gateway` when a plan
+requires evidence beyond automatic selection. Repeat `--include-suite <name>`
+to request several canonical suites. Requests are additive and deduplicated in
+both full and fast tiers, including when the main check covers a requested suite.
+Request-free selection stays unchanged. `hs_suite_command` remains the authority
+for suite commands; arbitrary commands and the internal `codegen-step` are rejected.
+Unknown names fail before starting work or replacing existing evidence.
+
+Requests persist for the worktree's lifetime in `.lucidos/harden-included-suites`,
+outside the directory that each start resets. Each run copies them to
+`.lucidos/harden-suites/included-suites`. Ordinary starts, retries and required
+full rounds retain them; there is no removal flag. Existing retries still run
+their failed subset. Adding a new request instead forces a full round with all
+retained requests and the automatic selection.
+
+Included Cargo suites join the first serial lane. Browser suites wait for spec
+selection, and an explicit `driver` waits for the join, like the automatic driver.
+
+## Retry selection
+
+A browser retry recomputes the current touched-spec selection before launching
+any suites. It keeps a failed spec only if the file still exists and is still
+selected. A selection error stops startup and preserves the failure record.
+An unfinished browser suite retries every currently selected spec.
+Other unfinished, missing or invalid suites retry whole; named failures keep their filters.
+
+When no recorded obligations remain relevant, the runner starts the complete current suite set.
+Retries retain completed checks and the original baseline while every remaining obligation stays recorded.
+Passing retries complete hardening only after all obligations finish and the runner verifies exclusively standalone test/spec commits, or no commits.
+Source changes, selection drift or missing baseline evidence still require the full set (ADR 0689).
 
 ## Why `make lint` and not `cargo check`
 
@@ -99,8 +134,9 @@ a failing nightly. Redirect to a log, capture `$?` first, then read the log. A
 A `NO VERDICT` line is never a pass. The reviewer started and returned nothing,
 and the status line quotes its cause. Read the cause before calling it flaky.
 
-- **Codex.** The companion folds the real cause into one generic sentence, and
-  the status line quotes it back from the reviewer's stderr. The CLI once moved
+- **Codex.** The status line names the failed check, then the upstream cause
+  from the `codex exec` event stream. That can be a failed command's output,
+  such as `sandbox-exec: sandbox_apply: Operation not permitted`. The CLI once moved
   its default model to one the local login could not reach, and every review
   then returned a 403. `codex login status` names the login, and a reachable
   `model` in `~/.codex/config.toml` fixes it.

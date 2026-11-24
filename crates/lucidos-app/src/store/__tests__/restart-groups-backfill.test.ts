@@ -32,8 +32,6 @@ beforeEach(() => {
 
 describe('refreshChangesState backfills restart_groups from API', () => {
   it('populates restartGroups from API restart_groups when local groups are empty', async () => {
-    // Page-reload scenario: localStorage was cleared, but the engine still
-    // tracks applied-but-not-restarted changes server-side.
     mockFetchChanges.mockResolvedValueOnce({
       pending: [],
       applied: [],
@@ -56,15 +54,10 @@ describe('refreshChangesState backfills restart_groups from API', () => {
       { threadId: 't2', threadTitle: 'Update scheduler', commits: ['refactor: x'] },
     ]);
 
-    // No toast is surfaced — the engine "New version available" toast is owned by
-    // the poll (engine-update.ts) once the rebuild is `ready`. Backfill's job is to
-    // populate the groups signal so the restart confirm dialog has data to show.
     expect(toasts.value.find(t => t.key === RESTART_FAILURE_TOAST_KEY)).toBeFalsy();
   });
 
   it('clears restartGroups when API returns empty restart_groups', async () => {
-    // Engine restarted (or change reverted) — server is no longer tracking
-    // any pending restart. The frontend must drop the stale groups.
     restartGroups.value = [
       { threadId: 't1', threadTitle: 'Old', commits: ['feat: stale'] },
     ];
@@ -86,8 +79,6 @@ describe('refreshChangesState backfills restart_groups from API', () => {
   });
 
   it('handles missing restart_groups field gracefully (falls back to empty)', async () => {
-    // Older engines may not include the field. Frontend must treat missing as empty,
-    // not crash.
     mockFetchChanges.mockResolvedValueOnce({
       pending: [],
       applied: [],

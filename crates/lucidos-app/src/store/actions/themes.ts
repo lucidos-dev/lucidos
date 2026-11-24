@@ -1,9 +1,3 @@
-/**
- * What the Appearance picker draws: every theme, and the catalog defaults a
- * preview card needs to render a theme on its own. The active theme itself (its
- * maps, its inline layer, its boot cache) lives with the other appearance state
- * in `preferences.ts`.
- */
 import { signal } from '@preact/signals';
 import { sanitizeResolvedTheme, type ThemeModeMaps } from '@lucidos/appearance';
 import { getThemeTokenCatalog, listThemes, type Theme, type ThemeTokenCatalog } from '../../api/client';
@@ -13,8 +7,6 @@ import { currentThemeMode, paintedThemeMode, setTheme, setThemeMode } from './pr
 
 export interface ThemeGallery {
   themes: Theme[];
-  /** Every catalog token at its stylesheet default, per mode. A card sets these
-   *  before the theme's own map, so it never inherits the page's active theme. */
   defaults: ThemeModeMaps;
 }
 
@@ -37,8 +29,6 @@ export async function loadThemeGallery(): Promise<void> {
   try {
     const [themes, catalog] = await Promise.all([listThemes(), getThemeTokenCatalog()]);
     if (seq !== loadSeq) return;
-    // Sanitised once here, since a card lays these maps into an inline style
-    // and a workspace theme is a file any app can write.
     const safe = themes.map(theme => ({ ...theme, resolved: sanitizeResolvedTheme(theme.resolved) }));
     themeGallery.value = { status: 'loaded', data: { themes: safe, defaults: catalogDefaults(catalog) } };
   } catch (e) {
@@ -47,16 +37,9 @@ export async function loadThemeGallery(): Promise<void> {
   }
 }
 
-/**
- * Pick a theme from the picker. A single-mode theme paints the default in its
- * other mode. So picking it from that other mode asks first, then switches the
- * device's theme to the theme's mode. Cancel changes nothing.
- */
 export async function pickTheme(theme: Theme): Promise<void> {
   const only = theme.modes.length === 1 ? theme.modes[0] : null;
   const painted = paintedThemeMode.value;
-  // The picker already holds the theme's maps, so it paints at once. With a
-  // mode switch, both then land in one frame rather than two.
   if (!only || only === painted) return setTheme(theme.id, theme.resolved);
 
   const followsSystem = currentThemeMode() === 'system'
@@ -71,8 +54,6 @@ export async function pickTheme(theme: Theme): Promise<void> {
   await Promise.all([setThemeMode(only), setTheme(theme.id, theme.resolved)]);
 }
 
-/** Re-read after a theme file changed, but only once something asked: nothing
- *  needs the gallery until the picker opens. */
 export function refreshThemesIfLoaded(): void {
   if (themeGallery.value.status !== 'not-loaded') void loadThemeGallery();
 }

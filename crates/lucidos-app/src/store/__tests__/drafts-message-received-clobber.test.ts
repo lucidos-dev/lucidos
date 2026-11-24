@@ -1,13 +1,3 @@
-/**
- * A thread event never touches the draft (ADR 0450). Regression: a typed,
- * unsent follow-up on an ACTIVE thread was blanked by a peer's
- * `MessageReceived` echo while the user was off the thread.
- *
- * A send consumes the compose slot when the engine accepts it, and the engine
- * reports what that left as a *compose report*. So the only thing that clears
- * a draft from outside is a report at a newer revision, with no local edit
- * pending.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { threadMap, focusedThreadId } from '../store';
 import { handleGlobalEvent, handleThreadEvent } from '../actions/thread-sync';
@@ -15,9 +5,6 @@ import { _resetComposeSyncForTesting } from '../composeSync';
 import { getDraft, setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 import type { ThreadState } from '../thread-events';
 
-// handleThreadEvent batches its threadMap flush via requestAnimationFrame; the
-// compose-clear side effect itself is synchronous (clearDraft writes the signal
-// immediately), so the draft assertions need no rAF wait.
 vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 0));
 vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
 

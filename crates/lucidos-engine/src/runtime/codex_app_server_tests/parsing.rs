@@ -1,4 +1,6 @@
+use crate::engine::thread_events::{TurnEndFacts, TurnEndStatus};
 use crate::runtime::agent_runtime::AgentEvent;
+use crate::runtime::codex::UNREQUESTED_INTERRUPT_ERROR;
 use crate::runtime::codex_app_server_parse::*;
 
 fn note(
@@ -7,6 +9,128 @@ fn note(
     params: serde_json::Value,
 ) -> Vec<AgentEvent> {
     tracker.map_notification(method, &params, 42)
+}
+
+#[test]
+fn resumed_startup_usage_is_not_a_new_call() {
+    let mut tracker = AppServerTracker::new(Some("t-resumed".into()));
+    let params = serde_json::json!({
+        "threadId": "t-resumed", "turnId": "old-turn",
+        "tokenUsage": {"last": {"inputTokens": 100, "cachedInputTokens": 60,
+            "cacheWriteInputTokens": 10, "outputTokens": 5}}
+    });
+    let events = note(&mut tracker, "thread/tokenUsage/updated", params);
+    assert_eq!(
+        events.len(),
+        1,
+        "restored usage must still be recorded once"
+    );
+    assert!(matches!(&events[0], AgentEvent::UsageRestored { snapshot }
+        if snapshot.session_id == "t-resumed" && snapshot.turn_id.as_deref() == Some("old-turn")
+            && snapshot.input_tokens == 30 && snapshot.cache_read_tokens == 60
+            && snapshot.cache_creation_tokens == 10 && snapshot.output_tokens == 5));
+}
+
+#[test]
+fn codex_resume_an_empty_trailing_turn_cannot_replace_observed_snapshot_identity() {
+    let mut tracker = AppServerTracker::new(Some("t-1".into()));
+    let usage = serde_json::json!({"threadId": "t-1", "turnId": "last-billed-turn",
+        "tokenUsage": {"last": {"inputTokens": 10, "outputTokens": 2}}});
+    let initial = note(&mut tracker, "thread/tokenUsage/updated", usage.clone());
+    assert!(matches!(&initial[..], [AgentEvent::UsageRestored { .. }]));
+    tracker.note_resume_response(&serde_json::json!({"thread": {"id": "t-1",
+        "turns": [{"id": "last-billed-turn"}, {"id": "empty-interrupted-turn"}]}}));
+    tracker.begin_turn(None);
+    tracker.current_turn_id = Some("new-turn".into());
+    let late = note(&mut tracker, "thread/tokenUsage/updated", usage);
+    assert!(matches!(&late[..], [AgentEvent::UsageRestored { .. }]));
+}
+
+#[test]
+fn codex_resume_late_snapshot_and_identical_new_usage_stay_distinct() {
+    let mut tracker = AppServerTracker::new(Some("t-resumed".into()));
+    tracker.note_resume_response(&serde_json::json!({"thread": {
+        "id": "t-resumed", "turns": [{"id": "old-turn"}]}}));
+    tracker.begin_turn(Some("high".into()));
+    tracker.current_turn_id = Some("new-turn".into());
+    let usage = |thread: &str, turn: &str| {
+        serde_json::json!({
+            "threadId": thread, "turnId": turn,
+            "tokenUsage": {"last": {"inputTokens": 100, "outputTokens": 5}}
+        })
+    };
+    let restored = note(
+        &mut tracker,
+        "thread/tokenUsage/updated",
+        usage("t-resumed", "old-turn"),
+    );
+    assert!(matches!(&restored[..], [AgentEvent::UsageRestored { .. }]));
+    for (thread, turn) in [("t-resumed", "new-turn"), ("child", "old-turn")] {
+        let live = note(
+            &mut tracker,
+            "thread/tokenUsage/updated",
+            usage(thread, turn),
+        );
+        assert!(matches!(
+            &live[..],
+            [AgentEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+                ..
+            }]
+        ));
+    }
+    // A failed resume attaching a different thread cannot inherit old identity.
+    tracker.note_thread_started("fresh-thread".into(), None);
+    tracker.current_turn_id = Some("old-turn".into());
+    let fresh = note(
+        &mut tracker,
+        "thread/tokenUsage/updated",
+        usage("fresh-thread", "old-turn"),
+    );
+    assert!(matches!(&fresh[..], [AgentEvent::Usage { .. }]));
+}
+
+#[test]
+fn codex_current_turn_identity_takes_precedence_over_restored_identity() {
+    let mut tracker = AppServerTracker::new(Some("t-1".into()));
+    tracker.note_resume_response(&serde_json::json!({"thread": {
+        "id": "t-1", "turns": [{"id": "reused-turn"}]}}));
+    tracker.begin_turn(None);
+    tracker.current_turn_id = Some("reused-turn".into());
+    let events = note(
+        &mut tracker,
+        "thread/tokenUsage/updated",
+        serde_json::json!({"threadId": "t-1", "turnId": "reused-turn",
+            "tokenUsage": {"last": {"inputTokens": 10, "outputTokens": 2}}}),
+    );
+    assert!(matches!(&events[..], [AgentEvent::Usage { .. }]));
+}
+
+#[test]
+fn codex_usage_with_no_proven_current_or_restored_turn_stays_unscoped() {
+    for resume in [None, Some("t-1".into())] {
+        let mut tracker = AppServerTracker::new(resume);
+        tracker.begin_turn(None);
+        tracker.current_turn_id = Some("new-turn".into());
+        for turn in [
+            serde_json::Value::Null,
+            serde_json::json!("unidentified-turn"),
+        ] {
+            let events = note(
+                &mut tracker,
+                "thread/tokenUsage/updated",
+                serde_json::json!({
+                    "threadId": "t-1", "turnId": turn,
+                    "tokenUsage": {"last": {"inputTokens": 10, "outputTokens": 2}}
+                }),
+            );
+            assert!(
+                matches!(&events[..], [AgentEvent::UsageUnscoped { snapshot }]
+                if snapshot.input_tokens == 10 && snapshot.output_tokens == 2)
+            );
+        }
+    }
 }
 
 #[test]
@@ -69,19 +193,92 @@ fn thread_started_emits_init_once() {
 }
 
 #[test]
+fn turn_result_prefers_final_answers_and_preserves_streamed_commentary() {
+    assert_turn_messages(
+        &[
+            (Some("commentary"), "Checking"),
+            (Some("final_answer"), "Done"),
+        ],
+        "Done",
+    );
+}
+
+#[test]
+fn turn_result_joins_multiple_final_answers() {
+    assert_turn_messages(
+        &[
+            (Some("commentary"), "Checking"),
+            (Some("final_answer"), "First"),
+            (Some("partial_answer"), "Interim"),
+            (Some("final_answer"), "Second"),
+        ],
+        "First\n\nSecond",
+    );
+}
+
+#[test]
+fn turn_result_without_phases_keeps_all_messages() {
+    assert_turn_messages(&[(None, "Checking"), (None, "Done")], "Checking\n\nDone");
+}
+
+#[test]
+fn turn_result_without_final_answer_keeps_all_messages() {
+    assert_turn_messages(
+        &[
+            (Some("commentary"), "Checking"),
+            (Some("partial_answer"), "Interim"),
+        ],
+        "Checking\n\nInterim",
+    );
+}
+
+fn assert_turn_messages(messages: &[(Option<&str>, &str)], expected: &str) {
+    let mut tracker = AppServerTracker::new(Some("t-1".into()));
+    tracker.begin_turn(None);
+    for (index, (phase, text)) in messages.iter().enumerate() {
+        let id = format!("i{index}");
+        let streamed = note(
+            &mut tracker,
+            "item/agentMessage/delta",
+            serde_json::json!({"itemId": id, "delta": text, "threadId": "t-1", "turnId": "u"}),
+        );
+        assert!(
+            matches!(&streamed[..], [AgentEvent::Message { text: actual, .. }] if actual == text)
+        );
+        let completed = note(
+            &mut tracker,
+            "item/completed",
+            serde_json::json!({"item": {"id": id, "type": "agentMessage", "text": text, "phase": phase}}),
+        );
+        assert!(completed.is_empty(), "streamed text must not be duplicated");
+    }
+    let completed = note(
+        &mut tracker,
+        "turn/completed",
+        serde_json::json!({"turn": {"id": "u", "status": "completed"}}),
+    );
+    assert!(
+        matches!(&completed[..], [AgentEvent::Result { text, .. }] if text == expected),
+        "{completed:?}"
+    );
+    tracker.begin_turn(None);
+    assert_eq!(tracker.turn_text(), "", "a new turn clears prior answers");
+}
+
+#[test]
 fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
     t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/agentMessage/delta",
-        serde_json::json!({"itemId": "i1", "delta": "Hel", "threadId": "t", "turnId": "u"}),
+        serde_json::json!({"itemId": "i1", "delta": "Hel", "threadId": "t-1", "turnId": "u"}),
     );
     assert!(matches!(&evs[..], [AgentEvent::Message { text, .. }] if text == "Hel"));
     note(
         &mut t,
         "item/agentMessage/delta",
-        serde_json::json!({"itemId": "i1", "delta": "lo", "threadId": "t", "turnId": "u"}),
+        serde_json::json!({"itemId": "i1", "delta": "lo", "threadId": "t-1", "turnId": "u"}),
     );
     // Completed item carries the FULL text — only the unstreamed tail may be
     // re-emitted, or the engine's buffer shows the message twice.
@@ -111,7 +308,7 @@ fn only_the_first_delta_of_an_agent_message_opens_a_block() {
         note(
             &mut t,
             "item/agentMessage/delta",
-            serde_json::json!({"itemId": item, "delta": text, "threadId": "t", "turnId": "u"}),
+            serde_json::json!({"itemId": item, "delta": text, "threadId": "t-1", "turnId": "u"}),
         )
     };
     let opens: Vec<bool> = [("i1", "Hel"), ("i1", "lo."), ("i2", "Next"), ("i2", " one")]
@@ -132,7 +329,7 @@ fn a_completed_remainder_continues_its_block_but_an_unstreamed_message_opens_one
     note(
         &mut t,
         "item/agentMessage/delta",
-        serde_json::json!({"itemId": "i1", "delta": "Hel", "threadId": "t", "turnId": "u"}),
+        serde_json::json!({"itemId": "i1", "delta": "Hel", "threadId": "t-1", "turnId": "u"}),
     );
     let remainder = note(
         &mut t,
@@ -167,7 +364,7 @@ fn plan_update_emits_normalized_todo_list_pair() {
         &mut t,
         "turn/plan/updated",
         serde_json::json!({
-            "threadId": "t", "turnId": "u", "explanation": null,
+            "threadId": "t-1", "turnId": "u", "explanation": null,
             "plan": [
                 {"step": "Map the code", "status": "completed"},
                 {"step": "Fix the bug", "status": "inProgress"},
@@ -203,7 +400,7 @@ fn plan_update_emits_normalized_todo_list_pair() {
 #[test]
 fn plan_update_dedupes_identical_snapshots_across_turns() {
     let plan = serde_json::json!({
-        "threadId": "t", "turnId": "u",
+        "threadId": "t-1", "turnId": "u",
         "plan": [{"step": "a", "status": "inProgress"}],
     });
     let mut t = AppServerTracker::new(Some("t-1".into()));
@@ -220,7 +417,7 @@ fn plan_update_dedupes_identical_snapshots_across_turns() {
         &mut t,
         "turn/plan/updated",
         serde_json::json!({
-            "threadId": "t", "turnId": "u",
+            "threadId": "t-1", "turnId": "u",
             "plan": [{"step": "a", "status": "completed"}],
         }),
     );
@@ -237,7 +434,7 @@ fn plan_update_dedupes_identical_snapshots_across_turns() {
     assert!(note(
         &mut t,
         "turn/plan/updated",
-        serde_json::json!({"threadId": "t", "turnId": "u", "plan": []}),
+        serde_json::json!({"threadId": "t-1", "turnId": "u", "plan": []}),
     )
     .is_empty());
 }
@@ -252,19 +449,19 @@ fn reasoning_deltas_emit_thoughts() {
     let evs = note(
         &mut t,
         "item/reasoning/textDelta",
-        serde_json::json!({"itemId": "r1", "delta": "Think", "threadId": "t", "turnId": "u", "contentIndex": 0}),
+        serde_json::json!({"itemId": "r1", "delta": "Think", "threadId": "t-1", "turnId": "u", "contentIndex": 0}),
     );
     assert!(matches!(&evs[..], [AgentEvent::Thought { text }] if text == "Think"));
     let evs = note(
         &mut t,
         "item/reasoning/summaryTextDelta",
-        serde_json::json!({"itemId": "r1", "delta": "ing", "threadId": "t", "turnId": "u", "summaryIndex": 0}),
+        serde_json::json!({"itemId": "r1", "delta": "ing", "threadId": "t-1", "turnId": "u", "summaryIndex": 0}),
     );
     assert!(matches!(&evs[..], [AgentEvent::Thought { text }] if text == "ing"));
     let evs = note(
         &mut t,
         "item/reasoning/textDelta",
-        serde_json::json!({"itemId": "r1", "delta": "", "threadId": "t", "turnId": "u", "contentIndex": 1}),
+        serde_json::json!({"itemId": "r1", "delta": "", "threadId": "t-1", "turnId": "u", "contentIndex": 1}),
     );
     assert!(
         evs.is_empty(),
@@ -279,7 +476,7 @@ fn fully_streamed_agent_message_emits_nothing_at_completion() {
     note(
         &mut t,
         "item/agentMessage/delta",
-        serde_json::json!({"itemId": "i1", "delta": "done", "threadId": "t", "turnId": "u"}),
+        serde_json::json!({"itemId": "i1", "delta": "done", "threadId": "t-1", "turnId": "u"}),
     );
     let evs = note(
         &mut t,
@@ -547,18 +744,262 @@ fn failed_turn_carries_the_error_message() {
     ));
 }
 
+/// The real block, in the app-server's camelCase: the failed turn names the
+/// policy in `codexErrorInfo`.
+fn policy_blocked_turn() -> serde_json::Value {
+    serde_json::json!({"threadId": "t-1", "turn": {
+        "id": "u1", "items": [], "status": "failed",
+        "error": {
+            "message": "This request was blocked by our safety systems. Reason: Potentially unintended activity.",
+            "codexErrorInfo": "misalignmentPolicyViolation"
+        }
+    }})
+}
+
 #[test]
-fn interrupted_turn_emits_error_free_result() {
-    // The engine's user_hit_stop latch turns this into ResponseCanceled —
-    // an error here would mislabel a user cancel as a failure.
+fn a_policy_blocked_turn_carries_its_provider_error() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
     t.begin_turn(None);
+    let evs = note(&mut t, "turn/completed", policy_blocked_turn());
+    let [AgentEvent::Result {
+        error: Some(error),
+        provider_error: Some(provider_error),
+        ..
+    }] = &evs[..]
+    else {
+        panic!("expected a failed Result with a provider error, got {evs:?}");
+    };
+    assert!(error.starts_with("This request was blocked"));
+    assert!(provider_error.is_policy_block());
+}
+
+#[test]
+fn the_same_message_without_a_code_is_no_block() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    let mut turn = policy_blocked_turn();
+    turn["turn"]["error"]
+        .as_object_mut()
+        .unwrap()
+        .remove("codexErrorInfo");
+    let evs = note(&mut t, "turn/completed", turn);
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Result {
+            error: Some(_),
+            provider_error: None,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn an_error_notification_code_survives_to_a_codeless_failed_turn() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    note(
+        &mut t,
+        "error",
+        serde_json::json!({"threadId": "t-1", "error": {
+            "message": "blocked", "codexErrorInfo": "cyberPolicy"
+        }}),
+    );
     let evs = note(
         &mut t,
         "turn/completed",
-        serde_json::json!({"threadId": "t-1", "turn": {"id": "u1", "items": [], "status": "interrupted"}}),
+        serde_json::json!({"threadId": "t-1", "turn": {
+            "id": "u1", "items": [], "status": "failed", "error": {"message": "blocked"}
+        }}),
     );
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Result { provider_error: Some(p), .. }] if p.is_policy_block()
+    ));
+}
+
+#[test]
+fn an_unknown_code_is_relayed_and_is_no_block() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    let mut turn = policy_blocked_turn();
+    turn["turn"]["error"]["codexErrorInfo"] = serde_json::json!("brandNewFailure");
+    let evs = note(&mut t, "turn/completed", turn);
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Result { provider_error: Some(p), .. }]
+            if p.code == "brand_new_failure" && !p.is_policy_block()
+    ));
+}
+
+#[test]
+fn requested_interrupt_emits_error_free_result() {
+    // The engine's user_hit_stop latch turns this into ResponseCanceled.
+    // An error here would mislabel a user cancel as a failure.
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    t.note_interrupt_requested();
+    let evs = interrupted_turn_end(&mut t);
     assert!(matches!(&evs[..], [AgentEvent::Result { error: None, .. }]));
+}
+
+#[test]
+fn unrequested_interrupt_fails_the_turn() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    let evs = interrupted_turn_end(&mut t);
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Result { error: Some(e), .. }] if e == UNREQUESTED_INTERRUPT_ERROR
+    ));
+}
+
+#[test]
+fn an_interrupt_request_does_not_outlive_its_turn() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    t.note_interrupt_requested();
+    interrupted_turn_end(&mut t);
+    t.begin_turn(None);
+    let evs = interrupted_turn_end(&mut t);
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Result { error: Some(e), .. }] if e == UNREQUESTED_INTERRUPT_ERROR
+    ));
+}
+
+fn interrupted_turn_end(t: &mut AppServerTracker) -> Vec<AgentEvent> {
+    note(
+        t,
+        "turn/completed",
+        serde_json::json!({"threadId": "t-1", "turn": {"id": "u1", "items": [], "status": "interrupted"}}),
+    )
+}
+
+fn complete_message(t: &mut AppServerTracker, id: &str, phase: Option<&str>) {
+    note(
+        t,
+        "item/completed",
+        serde_json::json!({"item": {"id": id, "type": "agentMessage", "text": id, "phase": phase}}),
+    );
+}
+
+fn complete_command(t: &mut AppServerTracker, id: &str) {
+    note(
+        t,
+        "item/completed",
+        serde_json::json!({"item": {
+            "id": id, "type": "commandExecution", "command": "true",
+            "commandActions": [], "cwd": "/wt", "status": "completed", "exitCode": 0
+        }}),
+    );
+}
+
+fn turn_end_of(t: &mut AppServerTracker, status: &str) -> TurnEndFacts {
+    let evs = note(
+        t,
+        "turn/completed",
+        serde_json::json!({"threadId": "t-1", "turn": {"id": "u1", "items": [], "status": status}}),
+    );
+    match evs.last() {
+        Some(AgentEvent::Result {
+            turn_end: Some(facts),
+            ..
+        }) => facts.clone(),
+        other => panic!("expected a Result with turn-end facts, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_turn_end_with_a_final_answer_records_it() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    complete_message(&mut t, "m1", Some("commentary"));
+    complete_command(&mut t, "c1");
+    complete_message(&mut t, "m2", Some("final_answer"));
+    assert_eq!(
+        turn_end_of(&mut t, "completed"),
+        TurnEndFacts {
+            status: TurnEndStatus::Completed,
+            final_answer: true,
+            agent_messages: 2,
+            steered_inputs: 0,
+            last_item: Some("agentMessage".to_string()),
+        }
+    );
+}
+
+#[test]
+fn a_commentary_only_turn_end_records_no_final_answer() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    complete_message(&mut t, "m1", Some("commentary"));
+    complete_command(&mut t, "c1");
+    let facts = turn_end_of(&mut t, "completed");
+    assert!(!facts.final_answer);
+    assert_eq!(facts.agent_messages, 1);
+    assert_eq!(facts.last_item.as_deref(), Some("commandExecution"));
+}
+
+#[test]
+fn a_turn_end_counts_the_steers_codex_accepted() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    t.note_steer_accepted();
+    t.note_steer_accepted();
+    assert_eq!(turn_end_of(&mut t, "completed").steered_inputs, 2);
+    t.begin_turn(None);
+    assert_eq!(
+        turn_end_of(&mut t, "completed").steered_inputs,
+        0,
+        "a new turn starts its own count"
+    );
+}
+
+#[test]
+fn a_failed_turn_end_records_its_status() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    assert_eq!(turn_end_of(&mut t, "failed").status, TurnEndStatus::Failed);
+}
+
+#[test]
+fn an_interrupted_turn_end_records_its_status() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    assert_eq!(
+        turn_end_of(&mut t, "interrupted").status,
+        TurnEndStatus::Interrupted
+    );
+}
+
+#[test]
+fn a_synthesized_turn_end_keeps_what_the_turn_did() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    complete_message(&mut t, "m1", Some("commentary"));
+    let facts = t.turn_end_facts(TurnEndStatus::Synthesized);
+    assert_eq!(facts.status, TurnEndStatus::Synthesized);
+    assert_eq!(facts.agent_messages, 1);
+    assert_eq!(facts.last_item.as_deref(), Some("agentMessage"));
+}
+
+#[test]
+fn a_sub_agents_items_never_count_as_the_sessions_last_item() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    complete_message(&mut t, "m1", Some("final_answer"));
+    note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"threadId": "sub-1", "item": {
+            "id": "c9", "type": "commandExecution", "command": "true",
+            "commandActions": [], "cwd": "/wt", "status": "completed", "exitCode": 0
+        }}),
+    );
+    assert_eq!(
+        turn_end_of(&mut t, "completed").last_item.as_deref(),
+        Some("agentMessage")
+    );
 }
 
 #[test]
@@ -576,6 +1017,8 @@ fn turn_started_records_the_interrupt_target() {
 #[test]
 fn token_usage_maps_to_uncached_input_convention() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    t.current_turn_id = Some("u1".into());
     let evs = note(
         &mut t,
         "thread/tokenUsage/updated",
@@ -606,7 +1049,7 @@ fn error_notification_is_recorded_not_terminal() {
     let evs = note(
         &mut t,
         "error",
-        serde_json::json!({"threadId": "t", "turnId": "u", "willRetry": true,
+        serde_json::json!({"threadId": "t-1", "turnId": "u", "willRetry": true,
             "error": {"message": "503 retrying"}}),
     );
     assert!(evs.is_empty(), "transient errors must not end the turn");
@@ -644,7 +1087,7 @@ fn file_change_approval(item_id: &str) -> ApprovalRequest {
     parse_approval_request(
         "item/fileChange/requestApproval",
         &serde_json::json!({
-            "threadId": "t", "turnId": "u", "itemId": item_id,
+            "threadId": "t-1", "turnId": "u", "itemId": item_id,
             "startedAtMs": 1, "reason": null, "grantRoot": null
         }),
     )
@@ -761,6 +1204,7 @@ fn remembered_file_changes_do_not_outlive_their_item_or_their_turn() {
 fn token_usage_carries_the_effort_the_turn_was_sent_with() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
     t.begin_turn(Some("low".into()));
+    t.current_turn_id = Some("u1".into());
     let evs = note(
         &mut t,
         "thread/tokenUsage/updated",
@@ -784,6 +1228,8 @@ fn token_usage_carries_the_effort_the_turn_was_sent_with() {
 #[test]
 fn token_usage_maps_the_cache_write() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    t.current_turn_id = Some("u1".into());
     let evs = note(
         &mut t,
         "thread/tokenUsage/updated",
@@ -809,4 +1255,170 @@ fn token_usage_maps_the_cache_write() {
         ),
         "{evs:?}"
     );
+}
+
+fn foreign_turn_completed() -> serde_json::Value {
+    serde_json::json!({"threadId": "t-sub", "turn": {"id": "u9", "items": [], "status": "completed"}})
+}
+
+#[test]
+fn a_sub_agents_turn_completed_leaves_the_session_turn_running() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    note(
+        &mut t,
+        "item/started",
+        serde_json::json!({"threadId": "t-1", "item": {
+            "id": "i7", "type": "commandExecution", "command": "./harden.sh",
+            "commandActions": [], "cwd": "/wt", "status": "inProgress"
+        }}),
+    );
+    note(
+        &mut t,
+        "turn/started",
+        serde_json::json!({"threadId": "t-1", "turn": {"id": "turn-1"}}),
+    );
+    let evs = note(&mut t, "turn/completed", foreign_turn_completed());
+    assert!(evs.is_empty(), "a foreign turn end emits nothing: {evs:?}");
+    assert!(!t.turn_terminal_seen);
+    assert_eq!(t.current_turn_id.as_deref(), Some("turn-1"));
+    assert!(!t.owns("turn/completed", &foreign_turn_completed()));
+    // The session's own tool still closes normally.
+    let evs = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"threadId": "t-1", "item": {
+            "id": "i7", "type": "commandExecution", "command": "./harden.sh",
+            "commandActions": [], "cwd": "/wt", "status": "completed",
+            "aggregatedOutput": "ok", "exitCode": 0
+        }}),
+    );
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::ToolResult { status, .. }] if status == "success"
+    ));
+}
+
+#[test]
+fn a_sub_agents_items_and_deltas_stay_out_of_the_session_turn() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    let evs = note(
+        &mut t,
+        "item/agentMessage/delta",
+        serde_json::json!({"threadId": "t-sub", "itemId": "x", "delta": "hi"}),
+    );
+    assert!(evs.is_empty());
+    let evs = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"threadId": "t-sub", "item": {"id": "x", "type": "agentMessage", "text": "hi"}}),
+    );
+    assert!(evs.is_empty());
+    assert_eq!(t.turn_text(), "");
+}
+
+#[test]
+fn a_sub_agent_thread_started_never_replaces_the_session_id() {
+    let sub = serde_json::json!({"thread": {"id": "t-sub", "parentThreadId": "t-1"}});
+
+    // Session id already known.
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    assert!(note(&mut t, "thread/started", sub.clone()).is_empty());
+    assert_eq!(t.session_id.as_deref(), Some("t-1"));
+
+    // Session id not yet known: the sub-agent is still not adopted.
+    let mut t = AppServerTracker::new(None);
+    assert!(note(&mut t, "thread/started", sub).is_empty());
+    assert_eq!(t.session_id, None);
+}
+
+#[test]
+fn the_sessions_own_thread_started_is_adopted_on_a_fresh_start() {
+    let mut t = AppServerTracker::new(None);
+    let evs = note(
+        &mut t,
+        "thread/started",
+        serde_json::json!({"thread": {"id": "t-1", "parentThreadId": null}}),
+    );
+    assert!(matches!(&evs[..], [AgentEvent::Init { session_id, .. }] if session_id == "t-1"));
+    assert_eq!(t.session_id.as_deref(), Some("t-1"));
+}
+
+#[test]
+fn a_sub_agents_token_usage_is_recorded_under_its_thread_id() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(Some("xhigh".into()));
+    t.current_turn_id = Some("u1".into());
+    let usage = |thread: &str| {
+        serde_json::json!({"threadId": thread, "turnId": "u1", "tokenUsage": {
+            "last": {"inputTokens": 100, "cachedInputTokens": 60, "outputTokens": 5,
+                     "reasoningOutputTokens": 0, "totalTokens": 105},
+            "total": {"inputTokens": 100, "cachedInputTokens": 60, "outputTokens": 5,
+                      "reasoningOutputTokens": 0, "totalTokens": 105}
+        }})
+    };
+    // The sub-agent's effort is unknown: the session turn's effort is not its.
+    let evs = note(&mut t, "thread/tokenUsage/updated", usage("t-sub"));
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Usage {
+            input_tokens: 40,
+            parent_tool_use_id: Some(p),
+            reasoning_effort: None,
+            ..
+        }] if p == "t-sub"
+    ));
+    let evs = note(&mut t, "thread/tokenUsage/updated", usage("t-1"));
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::Usage {
+            parent_tool_use_id: None,
+            reasoning_effort: Some(effort),
+            ..
+        }] if effort == "xhigh"
+    ));
+}
+
+#[test]
+fn a_sub_agents_file_change_approval_is_given_its_paths() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    let item = |completed: bool| {
+        serde_json::json!({"threadId": "t-sub", "item": {
+            "id": "s1", "type": "fileChange",
+            "status": if completed { "completed" } else { "inProgress" },
+            "changes": [{"path": "/Users/me/sub.txt", "kind": {"type": "add"}, "diff": "-"}]
+        }})
+    };
+    let evs = note(&mut t, "item/started", item(false));
+    assert!(
+        evs.is_empty(),
+        "a sub-agent's item is no session step: {evs:?}"
+    );
+
+    let mut approval = file_change_approval("s1");
+    t.attach_known_file_changes(&mut approval);
+    assert_eq!(approval.input["changes"][0]["path"], "/Users/me/sub.txt");
+
+    assert!(note(&mut t, "item/completed", item(true)).is_empty());
+    let mut late = file_change_approval("s1");
+    t.attach_known_file_changes(&mut late);
+    assert!(
+        late.input.get("changes").is_none(),
+        "completion drops the paths"
+    );
+}
+
+#[test]
+fn a_notification_without_a_thread_id_is_the_sessions_own() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(None);
+    let evs = note(
+        &mut t,
+        "turn/completed",
+        serde_json::json!({"turn": {"id": "u1", "items": [], "status": "completed"}}),
+    );
+    assert!(matches!(&evs[..], [AgentEvent::Result { .. }]));
+    assert!(t.turn_terminal_seen);
 }

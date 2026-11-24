@@ -1,9 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appPseudoFullscreen } from '../store';
 
-// The desktop client fullscreens the WINDOW, whatever way the toggle arrives.
-// The frontend test environment cannot drive WKWebView (ADR 0016), so these pin
-// the page's half: which commands go out, and when.
 
 vi.mock('../../api/client', () => ({}));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
@@ -39,7 +36,6 @@ let origQuerySelectorAll: typeof document.querySelectorAll;
 beforeEach(async () => {
   appPseudoFullscreen.value = false;
   await settle();
-  // The shell's report of the exit the line above caused.
   fullscreenChanged?.({ payload: false });
   origQuerySelectorAll = document.querySelectorAll;
   document.querySelectorAll = (() => [frame]) as unknown as typeof document.querySelectorAll;
@@ -52,7 +48,6 @@ afterEach(() => {
   document.querySelectorAll = origQuerySelectorAll;
 });
 
-// One subscriber for the whole file: the signal keeps it, as it does in the app.
 installAppFullscreenWindowSync();
 
 describe('toggleAppFullscreen in the desktop client', () => {
@@ -99,8 +94,6 @@ describe('toggleAppFullscreen in the desktop client', () => {
 });
 
 describe('a quick toggle pair', () => {
-  // The exit's report arrives after the re-entry, and the re-entry saw a window
-  // still fullscreen. The page's own exit must not read as the user leaving.
   it('keeps pseudo-fullscreen and the window it owns when the exit report arrives late', async () => {
     setWindowFullscreen.mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     toggleAppFullscreen();

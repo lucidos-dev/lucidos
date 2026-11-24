@@ -1,10 +1,3 @@
-/**
- * Tests for `setArchivedRevealed` / `toggleArchivedRevealed` — the action
- * behind a row's "N archived" reveal toggle. Mirrors
- * `focused-thread-family-toggle.test.ts`: per-thread state is
- * localStorage-backed, mirroring `collapsedFamilies`, so we assert via the
- * persisted set rather than a private signal.
- */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { setArchivedRevealed, toggleArchivedRevealed } from './ThreadDrawer';

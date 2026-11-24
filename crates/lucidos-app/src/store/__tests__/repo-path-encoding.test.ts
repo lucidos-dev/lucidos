@@ -33,10 +33,6 @@ describe('encodeRepoPath / parseRepoPath', () => {
     expect(parseRepoPath(enc)).toEqual({ repoId: 'r', mode: 'diff', changeId: 'cid', path: 'src/weird:file.rs' });
   });
 
-  // A git ref may contain `/` (`origin/main`, and every coding-agent branch) and
-  // may contain `#`; what it may NOT contain is `:` (git check-ref-format), which
-  // is exactly what makes the `:` split above safe. Slicing the qualifier at the
-  // FIRST `#` is what keeps the second one part of the ref.
   it('preserves slashes and a second # inside the ref', () => {
     expect(parseRepoPath('repo:r:file#origin/main:src/a.rs'))
       .toEqual({ repoId: 'r', mode: 'file', ref: 'origin/main', path: 'src/a.rs' });
@@ -50,9 +46,6 @@ describe('encodeRepoPath / parseRepoPath', () => {
       .toEqual({ repoId: 'r', mode: 'file', ref: sha, path: 'src/a.rs' });
   });
 
-  // The encoder is the exact inverse of the parser, so a locator that survives a
-  // parse re-encodes to the identical string. This is the property that keeps the
-  // grammar from growing a form only one of the two halves knows about.
   it('re-encodes every parseable locator to itself', () => {
     const locators = [
       'repo:r:file:src/a.rs',
@@ -79,21 +72,15 @@ describe('encodeRepoPath / parseRepoPath', () => {
     expect(parseRepoPath('repo:r:weird#main:a.md')).toBeNull();
   });
 
-  // `file_path` reaches this parser from outside the app (an app iframe's
-  // lucidos.ui.navigate, an LLM navigate_ui), so a structurally incomplete
-  // encoding must be rejected rather than yielding an empty repoId (a repo
-  // selection that is neither null nor a real id), an empty path, or an empty
-  // ref (which would silently mean HEAD rather than the revision the caller
-  // tried to name).
   it('returns null when a segment is empty', () => {
-    expect(parseRepoPath('repo::file:src/a.rs')).toBeNull();   // no repo id
-    expect(parseRepoPath('repo:r1:file:')).toBeNull();         // no path
-    expect(parseRepoPath('repo:r1:file')).toBeNull();          // no path segment at all
+    expect(parseRepoPath('repo::file:src/a.rs')).toBeNull();
+    expect(parseRepoPath('repo:r1:file:')).toBeNull();
+    expect(parseRepoPath('repo:r1:file')).toBeNull();
     expect(parseRepoPath('repo:r1:diff:')).toBeNull();
-    expect(parseRepoPath('repo:r1:diff#:a.md')).toBeNull();    // empty change id
-    expect(parseRepoPath('repo:r1:file#:a.rs')).toBeNull();    // empty ref
-    expect(parseRepoPath('repo:r1:file#main:')).toBeNull();    // ref but no path
-    expect(parseRepoPath('repo:r1::a.rs')).toBeNull();         // no mode segment
+    expect(parseRepoPath('repo:r1:diff#:a.md')).toBeNull();
+    expect(parseRepoPath('repo:r1:file#:a.rs')).toBeNull();
+    expect(parseRepoPath('repo:r1:file#main:')).toBeNull();
+    expect(parseRepoPath('repo:r1::a.rs')).toBeNull();
     expect(parseRepoPath('repo:')).toBeNull();
   });
 });

@@ -13,19 +13,14 @@
  */
 const loadingFrames = new Set<() => void>();
 
-/** A frame mounted and has not loaded. `reload` gives it a fresh element. */
 export function trackFrameLoad(reload: () => void): void {
   loadingFrames.add(reload);
 }
 
-/** The frame's document fired `load`, so every fetch it shared has finished. */
 export function frameLoaded(reload: () => void): void {
   loadingFrames.delete(reload);
 }
 
-/** The frame unmounted. If it had not loaded, it may have taken a shared
- *  fetch with it, so every frame still loading starts again. A reload is not
- *  a leave: the frames it replaces were all still loading, so all reload. */
 export function frameUnmounted(reload: () => void): void {
   if (!loadingFrames.delete(reload)) return;
   for (const other of [...loadingFrames]) other();

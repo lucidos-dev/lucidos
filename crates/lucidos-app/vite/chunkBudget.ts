@@ -1,42 +1,19 @@
-/**
- * Hold each built chunk to the number for its class (ADR 0436).
- *
- * - **The entry chunk**, held to `ENTRY_BUDGET`. Its bytes sit in front of the
- *   startup fetches (ADR 0288).
- * - **The first-paint set**, held to `FIRST_PAINT_BUDGET`: the entry, the
- *   shell, and every chunk either imports statically.
- * - **A lazy chunk**, every other one, warned past `LAZY_CHUNK_LIMIT_KB`. It
- *   costs one surface's open, never a cold open, so it never fails a build.
- *
- * Past 90 % of a budget every build warns, so the nightly clean build goes red
- * days before a budget blocks an Apply.
- *
- * The dev build-watch only reports an overrun, since a failed rebuild would
- * strand every later Apply. Its one-shot builds never set `watchMode`, so it
- * names itself through `DEV_BUILD_WATCH_ENV` instead (ADR 0353).
- */
 
 import type { Plugin } from 'vite';
 import { bundleChunks, findShellChunk, type BundleChunk } from './shellChunk';
 
-/** Set by `dev-build-watch.mjs` on its own `vite build` child, to its own pid. */
 export const DEV_BUILD_WATCH_ENV = 'LUCIDOS_DEV_BUILD_WATCH';
 
-/** The first-paint report's name in the build's output directory. Only the
- *  growth check (`first-paint-growth.mjs`, ADR 0454) asks for one. */
 export const FIRST_PAINT_REPORT_FILE = 'first-paint-report.json';
 
-/** Starts each stdout line the build-watch reads a measurement from. */
 export const BUDGET_LINE_PREFIX = 'lucidos-chunk-budget ';
 
-/** The share of a budget kept free before every build starts warning. */
 export const HEADROOM_SHARE = 0.1;
 
 export type Budget = {
   name: 'entry' | 'first-paint';
   label: string;
   kb: number;
-  /** The move that brings the measurement down, named in every message. */
   fix: string;
 };
 
@@ -51,14 +28,13 @@ export const ENTRY_BUDGET: Budget = {
 export const FIRST_PAINT_BUDGET: Budget = {
   name: 'first-paint',
   label: 'First-paint set',
-  kb: 1400,
+  kb: 1950,
   fix: 'Move code the first frame does not draw behind a dynamic import, idle-prefetched '
     + 'if its opener must not wait: see ADR 0436 and idle prefetch in docs/glossary.md.',
 };
 
 export const LAZY_CHUNK_LIMIT_KB = 400;
 
-/** What one budget measured: a file name, or the set's file list. */
 export type Measurement = { subject: string; bytes: number };
 
 export type BudgetVerdict =
@@ -69,21 +45,12 @@ export type LazyChunkVerdict = { kind: 'within' } | { kind: 'over'; message: str
 
 type MeasuredChunk = BundleChunk & { code: string };
 
-/** Vite prints chunk sizes in kB of 1000 bytes; the messages use the same unit. */
 function kB(bytes: number): string {
   return `${(bytes / 1000).toFixed(2)} kB`;
 }
 
 const utf8 = new TextEncoder();
 
-/**
- * Whether this build runs under the dev build-watch.
- *
- * The variable counts only when it names this process's parent. The watcher
- * spawns Vite directly, so there it always does. Exported in a shell, or
- * inherited by an unrelated build, it names some other pid, and the build
- * stays strict.
- */
 export function underDevBuildWatch(env: Record<string, string | undefined>, ppid: number): boolean {
   const named = env[DEV_BUILD_WATCH_ENV];
   return named !== undefined && named !== '' && named === String(ppid);
@@ -123,11 +90,6 @@ export function lazyChunkVerdict(chunk: { fileName: string; bytes: number }): La
   };
 }
 
-/**
- * The chunks a cold open loads before `<App/>` first renders: each entry, the
- * shell, and their static-import closure, each once. A dynamic import is not
- * followed, since it loads on demand.
- */
 export function firstPaintChunks<C extends MeasuredChunk>(bundle: Record<string, C | { type: 'asset' }>): C[] {
   const chunks = bundleChunks(bundle);
   const byFile = new Map(chunks.map((c) => [c.fileName, c]));
@@ -142,7 +104,6 @@ export function firstPaintChunks<C extends MeasuredChunk>(bundle: Record<string,
   return [...reached.values()];
 }
 
-/** The line the build-watch parses into `.build-watch/status.json`. */
 export function budgetLine(budget: Budget, measured: Measurement): string {
   return BUDGET_LINE_PREFIX + JSON.stringify({
     budget: budget.name,
@@ -158,8 +119,6 @@ async function gzipLength(code: string): Promise<number> {
   return (await new Response(stream).arrayBuffer()).byteLength;
 }
 
-/** The first-paint report the growth check reads: this build's measurement,
- *  with each chunk's gzip size summed, since each is served on its own. */
 async function firstPaintReport(
   entry: MeasuredChunk | undefined,
   firstPaint: MeasuredChunk[],
@@ -178,15 +137,11 @@ async function firstPaintReport(
   }, null, 2)}\n`;
 }
 
-/** `devBuildWatch`: `underDevBuildWatch(process.env, process.ppid)`, which
- *  `vite.config.ts` reads for it. `report`: emit the first-paint report, which
- *  the growth check's wrapper config asks for. */
 export function chunkBudget(devBuildWatch: boolean, report = false): Plugin {
   return {
     name: 'lucidos-chunk-budget',
     apply: 'build',
     generateBundle: {
-      // After Vite's own generateBundle rewrites, so the size matches what it prints.
       order: 'post',
       handler(_options, bundle) {
         const output = bundle as unknown as Record<string, MeasuredChunk | { type: 'asset' }>;

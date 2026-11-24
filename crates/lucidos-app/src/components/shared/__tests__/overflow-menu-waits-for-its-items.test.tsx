@@ -1,16 +1,9 @@
 // @vitest-environment jsdom
-/**
- * A menu whose rows are code-split opens only once they are in memory
- * (`OverflowMenu`'s `itemsChunk`, ADR 0436). The thread menu, the microphone
- * picker and the widget menus all ride it. A press or a host's gesture waits,
- * and a second press takes the waiting open back.
- */
 import { describe, it, expect, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { OverflowMenu, type OverflowMenuOpener } from '../OverflowMenu';
 
-/** A chunk that lands when the test says. */
 function coldChunk() {
   let finish: (loaded: boolean) => void = () => {};
   let loaded = false;

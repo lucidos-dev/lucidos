@@ -10,6 +10,8 @@
 //! decisions built on it unit-testable off macOS, where the tap delegate driving
 //! one of those callers cannot run at all.
 
+pub(crate) use crate::desktop::LiveWindow;
+
 /// A workspace slug the gateway would serve. Mirrors `SLUG_RE` in
 /// `utils/basePath.ts` (lowercase alphanumerics joined by single hyphens, no
 /// leading/trailing hyphen), which is itself `registry::slugify`'s output shape.
@@ -223,33 +225,41 @@ pub(crate) fn target_origin<'a>(caller_url: Option<&'a str>, fallback: &'a str) 
     caller_url.and_then(window_origin).unwrap_or(fallback)
 }
 
-/// The labels of the windows currently in `want`.
+/// The windows currently in `want`.
 ///
 /// Every caller passes the result straight to [`preferred_label`], which is why
 /// the two live together. A chooser filtering by hand would be free to filter
 /// differently from the one next to it.
-pub(crate) fn labels_in<'a>(
-    windows: &'a [(String, String)],
+pub(crate) fn windows_in<'a>(
+    windows: &'a [LiveWindow],
     want: WindowContext<'_>,
-) -> Vec<&'a str> {
+) -> Vec<&'a LiveWindow> {
     windows
         .iter()
-        .filter(|(_, url)| window_context(url) == want)
-        .map(|(label, _)| label.as_str())
+        .filter(|window| window_context(&window.url) == want)
         .collect()
 }
 
 /// The window a caller prefers among equally eligible ones.
 ///
-/// `main` wins when it is in the running: it is the window a trayed client
-/// hides, so reusing it is what the user sees come back. Otherwise the lowest
-/// label wins, which keeps the choice deterministic rather than dependent on
-/// map iteration order.
-pub(crate) fn preferred_label<'a>(labels: &[&'a str]) -> Option<&'a str> {
-    if labels.contains(&crate::app_window::MAIN_WINDOW_LABEL) {
-        return Some(crate::app_window::MAIN_WINDOW_LABEL);
-    }
-    labels.iter().min().copied()
+/// A visible or minimized window wins over a hidden one. Closing an app window
+/// only hides it, and its page stays on the workspace. Fronting that window
+/// would pop it back over the one the user is working in. Among the rest, the
+/// window focused last wins. With no focus on record, `main` wins, since a
+/// trayed client brings it back. Then the lowest label, so map order never
+/// decides.
+pub(crate) fn preferred_label<'a>(windows: &[&'a LiveWindow]) -> Option<&'a str> {
+    windows
+        .iter()
+        .min_by_key(|window| {
+            (
+                !(window.visible || window.minimized),
+                std::cmp::Reverse(window.last_focused),
+                window.label != crate::app_window::MAIN_WINDOW_LABEL,
+                window.label.as_str(),
+            )
+        })
+        .map(|window| window.label.as_str())
 }
 
 /// Where a workspace-row activation should land, on the packaged desktop client.
@@ -293,7 +303,7 @@ pub(crate) enum WorkspaceTarget {
 /// `hashchange`. Without a landing the focus stands: that window may be deep in
 /// a thread, and repointing it at the workspace root would throw that away.
 pub(crate) fn choose_workspace_target(
-    windows: &[(String, String)],
+    windows: &[LiveWindow],
     caller_label: &str,
     workspace: &str,
     origin: &str,
@@ -308,7 +318,7 @@ pub(crate) fn choose_workspace_target(
         landing_fragment(landing.as_ref())
     );
 
-    let on_workspace = labels_in(windows, WindowContext::Workspace(workspace));
+    let on_workspace = windows_in(windows, WindowContext::Workspace(workspace));
     if let Some(label) = preferred_label(&on_workspace) {
         return Some(match landing {
             Some(_) => WorkspaceTarget::Navigate {
@@ -319,9 +329,9 @@ pub(crate) fn choose_workspace_target(
         });
     }
 
-    let caller_is_neutral = windows
-        .iter()
-        .any(|(label, url)| label == caller_label && window_context(url) == WindowContext::Neutral);
+    let caller_is_neutral = windows.iter().any(|window| {
+        window.label == caller_label && window_context(&window.url) == WindowContext::Neutral
+    });
     if caller_is_neutral {
         return Some(WorkspaceTarget::Navigate {
             label: caller_label.to_string(),
@@ -333,7 +343,7 @@ pub(crate) fn choose_workspace_target(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -473,12 +483,124 @@ mod tests {
         );
     }
 
-    /// `(label, url)` pairs in the shape the choosers take.
-    fn windows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    /// Visible windows from `(label, url)` pairs, in the shape the choosers take.
+    pub(crate) fn windows(pairs: &[(&str, &str)]) -> Vec<LiveWindow> {
         pairs
             .iter()
-            .map(|(label, url)| ((*label).to_string(), (*url).to_string()))
+            .map(|(label, url)| LiveWindow {
+                label: (*label).to_string(),
+                url: (*url).to_string(),
+                visible: true,
+                minimized: false,
+                last_focused: None,
+            })
             .collect()
+    }
+
+    pub(crate) fn hidden(mut windows: Vec<LiveWindow>, label: &str) -> Vec<LiveWindow> {
+        for window in windows.iter_mut().filter(|w| w.label == label) {
+            window.visible = false;
+        }
+        windows
+    }
+
+    #[test]
+    fn a_visible_window_beats_a_hidden_main_on_the_same_workspace() {
+        // A closed `main` is hidden, not destroyed, and keeps its page. Fronting
+        // it would pop a window back over the one the user is working in.
+        let open = hidden(
+            windows(&[
+                ("main", "http://localhost:3210/personal/"),
+                ("window-1", "http://localhost:3210/dev/"),
+                ("window-2", "http://localhost:3210/personal/"),
+            ]),
+            "main",
+        );
+        assert_eq!(
+            choose_workspace_target(&open, "window-1", "personal", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("window-2".to_string()))
+        );
+        assert_eq!(
+            choose_workspace_target(
+                &open,
+                "window-1",
+                "personal",
+                ORIGIN,
+                Some(WorkspaceLanding::Notifications)
+            ),
+            Some(WorkspaceTarget::Navigate {
+                label: "window-2".to_string(),
+                url: "http://localhost:3210/personal/#notifications".to_string(),
+            })
+        );
+        // With every candidate hidden, `main` still wins: it is what a trayed
+        // client brings back.
+        let open = hidden(open, "window-2");
+        assert_eq!(
+            choose_workspace_target(&open, "window-1", "personal", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("main".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_minimized_window_beats_a_hidden_main_on_the_same_workspace() {
+        // macOS reports a minimized window as not visible. The user parked it
+        // in the Dock, not closed it, so it still outranks a closed `main`.
+        let mut open = hidden(
+            windows(&[
+                ("main", "http://localhost:3210/personal/"),
+                ("window-1", "http://localhost:3210/dev/"),
+                ("window-2", "http://localhost:3210/personal/"),
+            ]),
+            "main",
+        );
+        let parked = open.iter_mut().find(|w| w.label == "window-2").unwrap();
+        parked.visible = false;
+        parked.minimized = true;
+        assert_eq!(
+            choose_workspace_target(&open, "window-1", "personal", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("window-2".to_string()))
+        );
+    }
+
+    fn focused(mut windows: Vec<LiveWindow>, label: &str, seq: u64) -> Vec<LiveWindow> {
+        for window in windows.iter_mut().filter(|w| w.label == label) {
+            window.last_focused = Some(seq);
+        }
+        windows
+    }
+
+    #[test]
+    fn the_window_focused_last_on_a_workspace_wins() {
+        let open = windows(&[
+            ("main", "http://localhost:3210/personal/"),
+            ("window-1", "http://localhost:3210/dev/"),
+            ("window-2", "http://localhost:3210/personal/"),
+        ]);
+        let open = focused(focused(open, "main", 1), "window-2", 2);
+        assert_eq!(
+            choose_workspace_target(&open, "window-1", "personal", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("window-2".to_string()))
+        );
+        let open = focused(open, "main", 3);
+        assert_eq!(
+            choose_workspace_target(&open, "window-1", "personal", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("main".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_closed_window_never_beats_a_shown_one_however_recent() {
+        let open = windows(&[
+            ("main", "http://localhost:3210/personal/"),
+            ("window-1", "http://localhost:3210/dev/"),
+            ("window-2", "http://localhost:3210/personal/"),
+        ]);
+        let open = hidden(focused(focused(open, "window-2", 1), "main", 2), "main");
+        assert_eq!(
+            choose_workspace_target(&open, "window-1", "personal", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("window-2".to_string()))
+        );
     }
 
     const ORIGIN: &str = "http://localhost:3210";

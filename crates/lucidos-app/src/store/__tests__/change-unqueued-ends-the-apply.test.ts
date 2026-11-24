@@ -1,10 +1,3 @@
-/**
- * A change that leaves the landing lane without landing gets only the thread
- * event `ChangeUnqueued`. Its apply has ended, so its row must stop reading
- * "Apply...". It raises no toast of its own: `LaneBatchFailed` reports a
- * failed batch and `ChangeApplyFailed` a failed landing, and the other
- * reasons are the user's own action.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { toasts, threadMap, applyingChangeIds, applyAllBatch, applyPhases, busyChangeIds } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
@@ -15,7 +8,6 @@ vi.mock('../actions/threads', () => ({
   unfocusThread: vi.fn(),
 }));
 
-// handleThreadEvent batches signal updates on requestAnimationFrame.
 vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 0));
 vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
 

@@ -1,20 +1,3 @@
-/**
- * The Lucidos tooltip has ONE implementation, and this pins that.
- *
- * The CSS lives in `styles/global/shared-components.css`, which the engine
- * appends to the served `/api/v1/sdk-iframe.css`. The behaviour lives in
- * `packages/lucidos-sdk/src/tooltip.ts`, which the host hook calls. So the host
- * shell and every app iframe run the same tooltip.
- *
- * Three things have to stay true, and no single file shows them. The CSS lives
- * in exactly one place. The hook stays a wrapper. Every token the shared rules
- * name resolves in BOTH hosts.
- *
- * That last one is the quiet failure. An app iframe never loads `base.css`, so
- * a token defined only there paints nothing, and nothing breaks loudly.
- *
- * Why not a parity test over two copies: docs/plans/2026-08-21-sdk-iframe-tooltip.md.
- */
 import { describe, it, expect } from 'vitest';
 import postcss, { type Root, type Rule } from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -25,16 +8,14 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-/** Repo root, from `crates/lucidos-app/src/styles/__tests__/`. */
 const REPO_ROOT = resolve(here, '../../../../..');
 
 const SHARED_CSS = 'crates/lucidos-app/src/styles/global/shared-components.css';
 const HOST_CSS = 'crates/lucidos-app/src/styles/global/base.css';
-const IFRAME_CSS = 'crates/lucidos-engine/src/api/sdk_iframe.css';
+const IFRAME_CSS = 'crates/lucidos-agents-api/src/api/sdk_iframe.css';
 const HOOK_TS = 'crates/lucidos-app/src/hooks/useTooltip.ts';
 const APP_SRC = 'crates/lucidos-app/src';
 
-/** Host-only overrides, allowed because an app iframe never matches them. */
 const ALLOWED_OVERRIDES: Record<string, string[]> = {
   'crates/lucidos-app/src/styles/global/modal-overlay.css': [':root[data-ui-blocked] #tooltip'],
 };
@@ -47,7 +28,6 @@ function parse(relPath: string): Root {
   return postcss.parse(read(relPath), { from: resolve(REPO_ROOT, relPath) });
 }
 
-/** Every rule whose selector targets the tooltip's own DOM. */
 function tooltipRules(root: Root): Rule[] {
   const rules: Rule[] = [];
   root.walkRules((rule) => {
@@ -56,7 +36,6 @@ function tooltipRules(root: Root): Rule[] {
   return rules;
 }
 
-/** Every stylesheet the tooltip could be restyled from, minus the shared one. */
 function everyOtherStylesheet(): string[] {
   const found = readdirSync(resolve(REPO_ROOT, APP_SRC), { recursive: true }) as string[];
   const appSheets = found
@@ -65,7 +44,6 @@ function everyOtherStylesheet(): string[] {
   return [...appSheets, IFRAME_CSS].filter((p) => p !== SHARED_CSS);
 }
 
-/** Custom properties a stylesheet DECLARES, wherever it declares them. */
 function declaredTokens(root: Root): Set<string> {
   const names = new Set<string>();
   root.walkDecls((decl) => {
@@ -74,7 +52,6 @@ function declaredTokens(root: Root): Set<string> {
   return names;
 }
 
-/** Custom properties a set of rules READS, mapped to "every read has a fallback". */
 function readTokens(rules: Rule[]): Map<string, boolean> {
   const reads = new Map<string, boolean>();
   for (const rule of rules) {

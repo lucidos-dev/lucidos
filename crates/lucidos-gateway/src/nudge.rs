@@ -73,21 +73,18 @@ pub async fn gateway_pairings(State(state): State<GatewayState>) -> Json<Value> 
 pub async fn nudge_remote_gateways(
     state: &GatewayState,
 ) -> Vec<(String, Result<NudgeAnswer, String>)> {
-    let Some(client) = state.peer_connection().client() else {
-        crate::log!("[Gateway] no relay client, so no remote gateway was nudged");
-        return Vec::new();
-    };
+    let client = state.peer_connection();
     let nudges = state.remote_gateways().list().into_iter().map(|gateway| {
         let client = client.clone();
         async move {
             let answer = nudge(&client, &gateway).await;
             match &answer {
                 Ok(NudgeAnswer::Delivered) => {}
-                Ok(NudgeAnswer::Unsupported) => crate::log!(
+                Ok(NudgeAnswer::Unsupported) => crate::log_legacy!(
                     "[Gateway] remote gateway {} predates the landing nudge; it follows by polling",
                     gateway.name
                 ),
-                Err(e) => crate::log!(
+                Err(e) => crate::log_legacy!(
                     "[Gateway] could not nudge remote gateway {}: {e}",
                     gateway.name
                 ),
@@ -136,12 +133,14 @@ async fn nudge_engine(engine: &EngineAddress, local_token: &str) {
     let sent = engine_hop::send(engine, request, Credential::Local(local_token));
     match tokio::time::timeout(ENGINE_NUDGE_TIMEOUT, sent).await {
         Ok(Ok(response)) if response.status().is_success() => {}
-        Ok(Ok(response)) => crate::log!(
+        Ok(Ok(response)) => crate::log_legacy!(
             "[Gateway] engine at {engine} refused the landing nudge: HTTP {}",
             response.status().as_u16()
         ),
-        Ok(Err(e)) => crate::log!("[Gateway] could not nudge the engine at {engine}: {e}"),
-        Err(_) => crate::log!("[Gateway] the engine at {engine} did not take the nudge in time"),
+        Ok(Err(e)) => crate::log_legacy!("[Gateway] could not nudge the engine at {engine}: {e}"),
+        Err(_) => {
+            crate::log_legacy!("[Gateway] the engine at {engine} did not take the nudge in time")
+        }
     }
 }
 

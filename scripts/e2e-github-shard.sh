@@ -38,20 +38,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # shellcheck source=scripts/lib/e2e_flaky.sh
 source "$SCRIPT_DIR/lib/e2e_flaky.sh"
+# shellcheck source=scripts/lib/e2e_projects.sh
+source "$SCRIPT_DIR/lib/e2e_projects.sh"
 # shellcheck source=scripts/lib/e2e_warm.sh
 source "$SCRIPT_DIR/lib/e2e_warm.sh"
 REQUEST="${E2E_GITHUB_REQUEST:-$PROJECT_DIR/.github/e2e-request.json}"
 OUT_ROOT="${E2E_GITHUB_OUT:-$PROJECT_DIR/e2e-out}"
+# Nothing moves a runner's HEAD, and the restored target/ state and dependency
+# cache live in target/. So every build here compiles live, never in a launch
+# tree, which would compile all of them from scratch (scripts/lib/launch_tree.sh).
+export LUCIDOS_LAUNCH_TREE=off
 
 # Shards per browser project for a full run. 7 + 5 + 5 browser jobs plus the
 # three other suites fill the public repo's 20 concurrent jobs, and macOS is
 # capped at 5 there. Desktop Chromium runs every spec but `-mobile`, the phone
 # projects only `-mobile` and `-all` (project_runs_spec), so it takes the extra
-# shards.
+# shards. desktop-webkit runs a short named list in one shard, which queues
+# behind the mobile-webkit shards on macOS.
 declare_shards() {
     case "$1" in
         chromium) echo 7 ;;
         mobile | mobile-webkit) echo 5 ;;
+        desktop-webkit) echo 1 ;;
     esac
 }
 SPECS_PER_SHARD_FLOOR=8
@@ -152,14 +160,22 @@ cmd_plan() {
     # shellcheck source=scripts/lib/e2e.sh
     source "$SCRIPT_DIR/lib/e2e.sh"
     mkdir -p "$OUT_ROOT/plan"
-    local entries="$OUT_ROOT/plan/entries" linux="" macos="" engine=false suite project count shards i id entry
+    local entries="$OUT_ROOT/plan/entries" linux="" macos="" own="" confinement=false suite project count shards i id entry
     : >"$entries"
     while IFS= read -r suite; do
         case "$suite" in
-            engine)
-                # Its own job: it builds nothing the e2e shards share.
-                echo "engine engine - 1 1" >>"$entries"
-                engine=true
+            engine | crates | scripts | frontend)
+                echo "$suite $suite - 1 1" >>"$entries"
+                own="$own{\"id\":\"$suite\",\"suite\":\"$suite\",\"os\":\"ubuntu-latest\"},"
+                # The frontend suite runs once. The other suites cover both platforms.
+                if [ "$suite" != frontend ]; then
+                    echo "$suite-macos $suite - 1 1" >>"$entries"
+                    own="$own{\"id\":\"$suite-macos\",\"suite\":\"$suite\",\"os\":\"macos-15\"},"
+                fi
+                ;;
+            confinement)
+                echo "confinement confinement - 1 1" >>"$entries"
+                confinement=true
                 ;;
             api | wasm | embedder)
                 echo "$suite $suite - 1 1" >>"$entries"
@@ -177,7 +193,7 @@ cmd_plan() {
                         id="$project-$i-$shards"
                         echo "$id browser $project $i $shards" >>"$entries"
                         entry="{\"id\":\"$id\",\"suite\":\"browser\",\"project\":\"$project\",\"shard\":$i,\"total\":$shards},"
-                        if [ "$project" = mobile-webkit ]; then macos="$macos$entry"; else linux="$linux$entry"; fi
+                        if is_webkit_project "$project"; then macos="$macos$entry"; else linux="$linux$entry"; fi
                     done
                 done <<EOF
 $(request_field 'r["browser"]["projects"]')
@@ -192,7 +208,9 @@ EOF
         echo "macos={\"include\":[${macos%,}]}"
         echo "has_linux=$([ -n "$linux" ] && echo true || echo false)"
         echo "has_macos=$([ -n "$macos" ] && echo true || echo false)"
-        echo "has_engine=$engine"
+        echo "suites={\"include\":[${own%,}]}"
+        echo "has_suites=$([ -n "$own" ] && echo true || echo false)"
+        echo "has_confinement=$confinement"
     } >>"${GITHUB_OUTPUT:-/dev/stdout}"
     cat "$entries"
 }
@@ -228,8 +246,10 @@ E2E_GITHUB_CARGO_PROFILE=e2e
 E2E_ENGINE_CANDIDATES=8
 # How many pages of the artifact list a lookup reads, 100 artifacts each.
 E2E_ARTIFACT_PAGES=5
-# Where the state's own manifest travels inside target/.
-TARGET_STATE_MANIFEST=lucidos-input-manifest
+# Where the state's own manifest travels inside target/. The name carries the
+# state format: a state packed before ADR 0693 held a launch tree build's
+# leftovers under a newer tree's manifest, so it must never be restored.
+TARGET_STATE_MANIFEST=lucidos-target-state-v2
 
 # The platform key each job's runner builds for (engine_manifest_platform).
 github_platform() {
@@ -261,12 +281,14 @@ list_artifacts() {
     done | awk -v p="$prefix" 'index($3, p) == 1' | sort -rn -k1,1
 }
 
-# download_artifact <artifact id> <dir>: unzip one artifact into <dir>.
+# download_artifact <artifact id> <dir>: unpack one artifact into <dir>. Python
+# unpacks it, since the script needs python3 anyway and not every host has unzip.
 download_artifact() {
     local id="$1" dir="$2"
     mkdir -p "$dir" || return 1
     github_api "repos/${GITHUB_REPOSITORY:?}/actions/artifacts/$id/zip" >"$dir.zip" || return 1
-    unzip -q -o "$dir.zip" -d "$dir" && rm -f "$dir.zip"
+    python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+        "$dir.zip" "$dir" && rm -f "$dir.zip"
 }
 
 engine_prekey() { # [<platform>]
@@ -325,16 +347,18 @@ EOF
 # only what changed. Never fails the build: without state it compiles from
 # scratch.
 restore_target_state() {
-    local state="$1/e2e-target.tar.zst" manifest="$PROJECT_DIR/target/$E2E_GITHUB_CARGO_PROFILE/$TARGET_STATE_MANIFEST"
+    local state="$1/e2e-target.tar.zst" profile_dir="$PROJECT_DIR/target/$E2E_GITHUB_CARGO_PROFILE"
     if [ ! -f "$state" ]; then
         echo "Target state: none arrived, compiling from scratch"
         return 0
     fi
-    if zstd -dc "$state" | tar -C "$PROJECT_DIR" -xf - && [ -f "$manifest" ]; then
+    if zstd -dc "$state" | tar -C "$PROJECT_DIR" -xf - && [ -f "$profile_dir/$TARGET_STATE_MANIFEST" ]; then
         echo "Target state: restored"
-        engine_manifest_stamp_mtimes "$PROJECT_DIR" "$manifest"
+        engine_manifest_stamp_mtimes "$PROJECT_DIR" "$profile_dir/$TARGET_STATE_MANIFEST"
     else
-        echo "Target state: could not restore it, compiling from scratch"
+        # Unaged outputs without their manifest prove nothing about this tree.
+        rm -rf "$profile_dir"
+        echo "Target state: could not restore it, or it is from an older format, compiling from scratch"
     fi
 }
 
@@ -529,10 +553,16 @@ warm_apt() {
 # always headless, and headless Chromium runs the headless shell.
 warm_browsers() {
     local -a browsers=(--only-shell chromium)
-    [ "$1" != mobile-webkit ] || browsers=(webkit)
+    ! is_webkit_project "$1" || browsers=(webkit)
     e2e_warm_wait npm || return 1
     (cd "$PROJECT_DIR/crates/lucidos-app" && npx playwright install "${browsers[@]}")
 }
+
+# The frontend suite drives Chromium too (e2e/interactiveDelivery-browser.test.ts).
+needs_browser() { [ "$1" = browser ] || [ "$1" = frontend ]; }
+
+# apt_chain installs the browser's system libraries when told "browser".
+browser_suite_name() { if needs_browser "$1"; then echo browser; else echo "$1"; fi; }
 
 cmd_warm() {
     local suite="$1" project="${2:-}"
@@ -543,11 +573,11 @@ cmd_warm() {
     # A macOS runner has no Docker, and native-postgres starts its own.
     if [ "$(uname -s)" = Linux ]; then
         e2e_warm_start pg-image docker pull -q "$PG_IMAGE"
-        e2e_warm_start apt warm_apt "$suite"
+        e2e_warm_start apt warm_apt "$(browser_suite_name "$suite")"
     fi
     e2e_warm_start npm warm_npm
     e2e_warm_start gcloud warm_gcloud
-    [ "$suite" != browser ] || e2e_warm_start browsers warm_browsers "$project"
+    if needs_browser "$suite"; then e2e_warm_start browsers warm_browsers "$project"; fi
 }
 
 # The engine asks gcloud for a Vertex project at boot. A runner's first gcloud
@@ -614,6 +644,10 @@ cmd_native_postgres() {
     source "$SCRIPT_DIR/lib/workspace_constants.sh"
     # shellcheck source=scripts/lib/pg_secret.sh
     source "$SCRIPT_DIR/lib/pg_secret.sh"
+    # Mint into the e2e root's private/, where every e2e run reads it.
+    # shellcheck source=scripts/lib/e2e_root.sh
+    source "$SCRIPT_DIR/lib/e2e_root.sh"
+    e2e_root_env
     # A restored cache holds the compiled prefix, so this only starts it.
     prefix="$(stage_runtime_fetch_postgres "$PG_VERSION" "$PGVECTOR_VERSION" "$MACOS_PG_TRIPLE" "$work")" || return 1
     data="$work/data"
@@ -623,6 +657,66 @@ cmd_native_postgres() {
         -o "-p $port -c listen_addresses=127.0.0.1 -c max_connections=$PG_MAX_CONNECTIONS" start >/dev/null || return 1
     echo "$prefix/bin" >>"${GITHUB_PATH:-/dev/null}"
     echo "LUCIDOS_EXTERNAL_PG_PORT=$port" >>"${GITHUB_ENV:-/dev/stdout}"
+}
+
+# A macOS runner has no Docker: the engine tests reach the Postgres that
+# native-postgres started, on LUCIDOS_EXTERNAL_PG_PORT.
+use_native_test_postgres() {
+    [ -n "${LUCIDOS_EXTERNAL_PG_PORT:-}" ] || return 0
+    # shellcheck source=scripts/lib/workspace_constants.sh
+    source "$SCRIPT_DIR/lib/workspace_constants.sh"
+    # shellcheck source=scripts/lib/pg_secret.sh
+    source "$SCRIPT_DIR/lib/pg_secret.sh"
+    # shellcheck source=scripts/lib/e2e_root.sh
+    source "$SCRIPT_DIR/lib/e2e_root.sh"
+    e2e_root_env
+    local password
+    password="$(shared_pg_password)" || return 1
+    export LUCIDOS_TEST_DATABASE_URL="postgres://$PG_USER:$password@127.0.0.1:$LUCIDOS_EXTERNAL_PG_PORT/postgres"
+}
+
+# The Rust suites /harden runs per change, each with its own command
+# (hs_suite_command), all run to the end so one failure never hides another.
+run_crate_suites() {
+    local suite rc=0
+    # shellcheck source=scripts/lib/harden_suites.sh
+    source "$SCRIPT_DIR/lib/harden_suites.sh"
+    # The desktop app's tests embed the built frontend.
+    warm_npm && ensure_frontend_built || return 1
+    for suite in $HS_MAIN_CHECK_CRATE_SUITES; do
+        echo "── $suite ──"
+        # The desktop app ships for macOS only, and needs GTK to build on Linux.
+        if [ "$suite" = app-lib ] && [ "$(uname -s)" != Darwin ]; then
+            echo "skipped: the desktop app builds only on macOS"
+            continue
+        fi
+        (cd "$PROJECT_DIR" && eval "$(hs_suite_command "$suite" normal /nonexistent)") || rc=1
+    done
+    return "$rc"
+}
+
+run_frontend_suites() (
+    local rc=0
+    warm_npm || return 1
+    cd "$PROJECT_DIR/crates/lucidos-app" || return 1
+    npm run typecheck || rc=1
+    npm test || rc=1
+    return "$rc"
+)
+
+# The script suites test the libraries as a developer's host runs them, so
+# none may see what this shard set for its own builds, nor GitHub's own
+# variables: each suite sets the ones it tests.
+run_script_suites() {
+    local -a unset_args=()
+    local name
+    for name in $(compgen -e); do
+        case "$name" in
+            GITHUB_* | RUNNER_* | CI | LUCIDOS_* | HOST_LOAD_* | ENGINE_CARGO_PROFILE | CARGO_BUILD_JOBS)
+                unset_args+=(-u "$name") ;;
+        esac
+    done
+    env ${unset_args[@]+"${unset_args[@]}"} "$SCRIPT_DIR/test-scripts.sh"
 }
 
 cmd_run() {
@@ -652,7 +746,27 @@ cmd_run() {
         engine)
             # A cold runner compiles the whole test binary inside the run limit.
             export LUCIDOS_TEST_RUN_LIMIT_SECS="${LUCIDOS_TEST_RUN_LIMIT_SECS:-$ENGINE_RUN_LIMIT_SECS}"
+            use_native_test_postgres
             cmd=("$SCRIPT_DIR/test-engine.sh")
+            ;;
+        crates)
+            # shellcheck source=scripts/lib/e2e.sh
+            source "$SCRIPT_DIR/lib/e2e.sh"
+            cmd=(run_crate_suites)
+            ;;
+        frontend)
+            # shellcheck source=scripts/lib/e2e.sh
+            source "$SCRIPT_DIR/lib/e2e.sh"
+            cmd=(run_frontend_suites)
+            ;;
+        scripts)
+            # codegen_test reads the real checkout's dependency graph with
+            # `cargo metadata --offline`, which needs the registry on disk.
+            run_setup_step "$out" "$id" cargo fetch --locked || return
+            cmd=(run_script_suites)
+            ;;
+        confinement)
+            cmd=("$SCRIPT_DIR/confinement-tests.sh" --here)
             ;;
         api)
             # The gateway chain test's child proves its workspace id, which an
@@ -676,7 +790,7 @@ EOF
             [ -z "${LUCIDOS_E2E_COVERAGE:-}" ] || export LUCIDOS_E2E_COVERAGE_DIR="$out/coverage"
             run_setup_step "$out" "$id" prepare_coding_agent_host || return
             cmd=("$SCRIPT_DIR/e2e-browser.sh")
-            [ "$project" = mobile-webkit ] || cmd+=(--no-webkit)
+            is_webkit_project "$project" || cmd+=(--no-webkit)
             cmd+=(-- "--project=$project" "--shard=$shard/$total")
             local spec a
             while IFS= read -r spec; do

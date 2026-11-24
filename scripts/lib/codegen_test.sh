@@ -70,6 +70,10 @@ while [ $# -gt 0 ]; do
 done
 mkdir -p "$out/crates/lucidos-app/src/generated"
 cp "$root/crates/lucidos-engine/src/lib.rs" "$out/crates/lucidos-app/src/generated/thread-event-wire.ts"
+if [ -n "${SURFACE_FIXTURE:-}" ]; then
+    mkdir -p "$out/docs/generated"
+    cp "$SURFACE_FIXTURE" "$out/docs/generated/agent-surface.json"
+fi
 mkdir -p "$out/.codegen"
 echo '{"schema_version":1,"documents":{"system-knowhow/sample.md":{"Sample":"\n`fresh`\n"}}}' > "$out/.codegen/knowhow-blocks.json"
 STUB
@@ -106,13 +110,17 @@ expect_ne "a deleted input changes it" "$clean" "$(codegen_fingerprint "$R")"
 git -C "$R" checkout -q -- Cargo.lock
 expect_eq "the tree is back to its commit" "$clean" "$(codegen_fingerprint "$R")"
 
-echo "CLI dependency fingerprints"
-for crate in lucidos-cli lucidos-installs lucidos-update-address; do
+echo "local dependency fingerprints"
+for crate in lucidos-core lucidos-cli lucidos-installs lucidos-update-channel lucidos-diagnostic-log lucidos-diagnostic-log-macros; do
     mkdir -p "$R/crates/$crate/src"
     echo 'pub fn flag() {}' > "$R/crates/$crate/src/lib.rs"
     expect_ne "$crate changes the fingerprint" "$clean" "$(codegen_fingerprint "$R")"
     rm "$R/crates/$crate/src/lib.rs"
 done
+mkdir -p "$R/crates/lucidos-core/migrations"
+echo 'SELECT 1;' > "$R/crates/lucidos-core/migrations/fixture.sql"
+expect_eq "an embedded migration keeps the fingerprint" "$clean" "$(codegen_fingerprint "$R")"
+rm "$R/crates/lucidos-core/migrations/fixture.sql"
 mkdir -p "$R/packages/lucidos-sdk/src"
 echo 'export const lucidos = { added };' > "$R/packages/lucidos-sdk/src/index.ts"
 expect_ne "SDK exports change the fingerprint" "$clean" "$(codegen_fingerprint "$R")"
@@ -153,7 +161,43 @@ rm "$R/$WIRE"
 expect_eq "a miss with no outputs fails" "1" "$(codegen_main "$R" --cached-only 2>/dev/null; echo $?)"
 git -C "$R" reset -q --hard
 
+echo "fill-cache"
+echo 'kept' > "$R/$WIRE"
+echo 'pub const A: u32 = 7;' > "$R/crates/lucidos-engine/src/lib.rs"
+sleep 1
+touch "$BIN"
+: > "$TMP/sdk-log"
+expect_eq "a miss renders and succeeds" "0" "$(codegen_main "$R" --fill-cache --bin "$BIN" 2>/dev/null; echo $?)"
+expect_eq "the rendering is cached" "pub const A: u32 = 7;" \
+    "$(cat "$(codegen_cached "$R" "$(codegen_fingerprint "$R")")/$WIRE" 2>/dev/null)"
+expect_eq "the checkout keeps its outputs" "kept" "$(cat "$R/$WIRE")"
+expect_eq "no SDK builds" "" "$(cat "$TMP/sdk-log")"
+expect_eq "a hit succeeds" "0" "$(codegen_main "$R" --fill-cache --bin "$BIN" 2>/dev/null; echo $?)"
+expect_eq "and still writes nothing" "kept" "$(cat "$R/$WIRE")"
+expect_eq "it needs a binary" "2" "$(codegen_main "$R" --fill-cache 2>/dev/null; echo $?)"
+expect_eq "it never mixes with cached-only" "2" \
+    "$(codegen_main "$R" --fill-cache --cached-only --bin "$BIN" 2>/dev/null; echo $?)"
+git -C "$R" reset -q --hard
+rm -f "$R/$WIRE"
+
 echo "dep-info check"
+printf '%s: %s %s %s %s\n' "$R/target/debug/x" \
+    "$R/crates/lucidos-core" \
+    "$R/crates/lucidos-core/migrations" \
+    "$R/crates/lucidos-core/migrations/fixture.sql" \
+    "$R/crates/lucidos-core/src/lib.rs" > "$TMP/core.d"
+expect_eq "core source and embedded migrations are covered" "" \
+    "$(codegen_undeclared_inputs "$R" "$TMP/core.d")"
+printf '%s: %s\n' "$R/target/debug/x" "$R/eval/command-guard/cases.toml" > "$TMP/command-corpus.d"
+expect_eq "test-only command corpus is compile-only" "" \
+    "$(codegen_undeclared_inputs "$R" "$TMP/command-corpus.d")"
+printf '%s: %s %s\n' "$R/target/debug/x" \
+    "$R/crates/crate-tiers.tsv" "$R/crates/engine_crate_paths.rs" > "$TMP/engine-inventory.d"
+expect_eq "engine crate inventory is compile-only" "" \
+    "$(codegen_undeclared_inputs "$R" "$TMP/engine-inventory.d")"
+printf '%s: %s\n' "$R/target/debug/x" "$R/crates/lucidos-app/VERSION" > "$TMP/frontend-version.d"
+expect_eq "embedded frontend version is compile-only" "" \
+    "$(codegen_undeclared_inputs "$R" "$TMP/frontend-version.d")"
 expect_eq "declared inputs pass" "" \
     "$(codegen_undeclared_inputs "$R" "$BIN.d")"
 printf '%s: %s %s %s %s\n' "$R/target/debug/x" \
@@ -248,6 +292,81 @@ if [ -f "$TMP/surface/cli-surface.json" ]; then
 else
     pass "the intermediate CLI file is not synced"
 fi
+
+# Exercise the full render path so the built CLI must be found beside --bin.
+render_with_cli() { # <expected writer> [reused flag]
+    local render_dir="$TMP/cli-render"
+    rm -rf "$render_dir" "$TMP/cli-writer"
+    (
+        source "$SCRIPT_DIR/codegen.sh"
+        codegen_writer() {
+            echo cargo >> "$TMP/cli-writer"
+            cp "$TMP/cli-fixture.json" "$2/cli-surface.json"
+        }
+        export SURFACE_FIXTURE="$TMP/engine-fixture.json"
+        codegen_render_to "$R" "$render_dir" "$BIN" "${2:-}"
+    )
+    expect_eq "render with $1 succeeds" 0 "$?"
+    expect_eq "render selects the $1 writer" "$1" "$(cat "$TMP/cli-writer" 2>/dev/null)"
+    if cmp -s "$TMP/surface/docs/generated/agent-surface.json" "$render_dir/docs/generated/agent-surface.json"; then
+        pass "render writes the same composed surface"
+    else
+        fail "the composed surfaces differ"
+    fi
+}
+test_cli_surface_compiles_without_a_built_cli() {
+    render_with_cli cargo
+}
+test_cli_surface_renders_with_the_built_cli() {
+    local cli="$TMP/lucidos"
+    cat > "$cli" <<'CLI'
+#!/bin/bash
+[ "$1" = cli-surface ] && [ "$2" = --out ] || exit 2
+d=$(dirname "$0")
+echo binary >> "$d/cli-writer"
+cp "$d/cli-fixture.json" "$3/cli-surface.json"
+CLI
+    chmod +x "$cli"
+    printf '%s: %s\n' "$R/target/debug/lucidos" "$R/Cargo.lock" > "$cli.d"
+    render_with_cli binary
+    render_with_cli binary 1
+}
+test_a_stale_built_cli_falls_back_to_the_compile() {
+    touch -t 202001010000 "$TMP/lucidos"
+    render_with_cli cargo
+}
+
+echo '{"tools":{"offered":["current"],"retired":["old"]}}' > "$TMP/engine-fixture.json"
+BIN=$(new_stub_bin "$R" "$R/crates/lucidos-engine/src/lib.rs")
+test_cli_surface_compiles_without_a_built_cli
+test_cli_surface_renders_with_the_built_cli
+test_a_stale_built_cli_falls_back_to_the_compile
+
+echo "renderer crate coverage"
+# A workspace with the renderer, one covered crate, one new crate, a crates.io
+# dependency and a dev-only crate no renderer reaches.
+cat > "$TMP/metadata.json" <<'META'
+{"workspace_root": "/w", "packages": [
+  {"id": "boot", "name": "lucidos-engine-boot", "source": null, "manifest_path": "/w/crates/lucidos-engine-boot/Cargo.toml"},
+  {"id": "home", "name": "lucidos-home", "source": null, "manifest_path": "/w/crates/lucidos-home/Cargo.toml"},
+  {"id": "fresh", "name": "lucidos-fresh", "source": null, "manifest_path": "/w/crates/lucidos-fresh/Cargo.toml"},
+  {"id": "vendored", "name": "ort-sys", "source": null, "manifest_path": "/w/crates/vendor/ort-sys/Cargo.toml"},
+  {"id": "serde", "name": "serde", "source": "registry+https://example.com", "manifest_path": "/c/serde/Cargo.toml"},
+  {"id": "gateway", "name": "lucidos-gateway", "source": null, "manifest_path": "/w/crates/lucidos-gateway/Cargo.toml"}
+], "resolve": {"nodes": [
+  {"id": "boot", "deps": [{"pkg": "home"}, {"pkg": "fresh"}, {"pkg": "vendored"}, {"pkg": "serde"}]},
+  {"id": "home", "deps": []}, {"id": "fresh", "deps": []}, {"id": "vendored", "deps": []},
+  {"id": "serde", "deps": []}, {"id": "gateway", "deps": [{"pkg": "fresh"}]}
+]}}
+META
+expect_eq "a crate outside the fingerprint is reported" "crates/lucidos-fresh" \
+    "$(codegen_uncovered_crates_in < "$TMP/metadata.json")"
+# shellcheck disable=SC2031 # the subshells above re-source codegen.sh; the top-level source defines it here
+expect_eq "a covered crate, a vendored one and a registry one are not" "" \
+    "$(CODEGEN_INPUT_ROOTS+=(crates/lucidos-fresh); codegen_uncovered_crates_in < "$TMP/metadata.json")"
+UNCOVERED=$(codegen_uncovered_crates "$SCRIPT_DIR/../..")
+expect_eq "cargo metadata reads the real checkout" 0 "$?"
+expect_eq "every crate the renderers depend on is in CODEGEN_INPUT_ROOTS" "" "$UNCOVERED"
 
 echo "prune"
 CACHE=$(codegen_cache_root "$R")

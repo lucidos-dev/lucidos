@@ -131,6 +131,18 @@ its parent merges it, once, over all its children's work.
    meant, then `git add` the file. Ask the user when a conflict is ambiguous.
    A conflict left in a registry `.gitattributes` names (ADR 0460) is a real
    one: both sides edited the same entry.
+   **A conflict in TypeScript, JavaScript or CSS beside a deleted comment
+   comes from the comment strip.** Do not resolve it by hand. Run
+   `git merge --abort`, then strip the files this branch changed and commit:
+
+   ```bash
+   git diff --name-only --diff-filter=d "$(git merge-base main HEAD)" \
+     | xargs python3 scripts/comment-strip/strip_tree.py run --write --stripped-only
+   ```
+
+   Then merge again. Both sides now made the same deletions, so git merges
+   them clean. The strip commit takes a `Knowhow-unchanged` trailer for each
+   surface it touches.
 5. Make sure no marker survives. This must print nothing, since `git add`
    accepts a file that still holds markers:
 
@@ -159,6 +171,12 @@ HARDEN_REVIEWED_HEADS="$(lucidos hardened integrated-heads 2>/dev/null)" \
 `HARDEN_REVIEWED_HEADS` names the heads this branch's integrated children
 hardened. Every commit under one counts as reviewed, as a commit on `main`
 does. So a merge of such a child adds only its resolution to the review.
+
+When the main-check setting is `here` or `another-host`, check for a
+clean lane catch-up on a full marker with `--lane-suite-paths <hardened SHA>`.
+If that succeeds, pass `HEAD^2` as the base to the review command above.
+The second parent is the `main` tip the lane actually caught up to, which
+can be newer than local `main`.
 
 The first line is the answer:
 
@@ -199,9 +217,9 @@ The phases then run as follows:
   as its target, and also reads each overlap path. An empty file means a
   clean merge with nothing resolved: note "Phase 1: clean merge" and move on.
 - Phase 2.5 gates on the review target.
-- **Phases 4, 4.5 and 5 run unchanged.** Every suite `harden-suites.sh`
-  selects for the branch still runs, because a merge that mixes sides needs
-  the full suite (`CLAUDE.md`).
+- **Phases 4, 4.5 and 5 use the suite runner.** For a lane with main-check
+  coverage, a clean catch-up directly on a full marker selects suites from
+  the overlap paths. The runner uses the full branch diff for other rounds.
 
 **A `fork-point` line means the branch has no marker of its own.** Its
 children's runs reviewed what they cover, and the listed commits are the
@@ -321,7 +339,9 @@ scope flags conservatively if they cannot be restored.
 Phase 4.5 validates retained suite evidence after the resumed review, using its normal wait and verdict handling.
 Do not route a historical FAIL through the retry boundary again.
 The predecessor already recorded that failure and committed its fixes.
-A missing exit file or interrupted runner requires a new run, and retry-only PASS still owes the full set.
+A missing exit file or interrupted runner leaves the suite owed whole in a new run.
+A passing retry completes hardening only with no commits or exclusively standalone test/spec commits since the last full round started.
+The runner verifies that range; otherwise it requires the full set.
 
 Run the cheap gates again on current HEAD. No marker exists until the resumed review and all
 required verification pass for current HEAD and the expected tier.
@@ -366,16 +386,9 @@ Phase 0.5 names.
 ### Phase 1 kickoff: start the early suite run (Claude Code only)
 
 The Phase 4.5 test suites start now and run alongside the review phases
-(ADR 0292). The cheap gates run first, in the foreground with
-`timeout: 240000`. Each takes seconds, and a failure they catch should not
-cost a suite run:
-
-```bash
-./scripts/harden-gates.sh
-```
-
-On a FAIL, read the log it names, fix, commit, and run it again before the
-suites start. Then format, so the start commit is the one the suites test:
+(ADR 0292). `start` owns the cheap-gate barrier and reports every failure
+before launching compilation. Do not run the barrier separately before it.
+Format first, so the start commit is the one the suites test:
 
 ```bash
 ./scripts/harden-suites.sh stop
@@ -403,15 +416,10 @@ mkdir -p .lucidos && ./scripts/harden-suites.sh start --early > .lucidos/harden-
 
 **While the early run is going, two rules hold until the Phase 4.5 join:**
 
-- **Stop it before the first fix outside `HARDEN_SAFE_PATHS`.** That regex
-  in `scripts/lib/harden_suites.sh` names every markdown file under `docs/`
-  except the glossary, which tests read, and all of the plans and ADR folders.
-  A fix to those docs alone keeps the suites running. Run
-  `./scripts/harden-suites.sh stop` before editing anything else. Tests read
-  the tree while they run, so an edit mid-run tests a mix of old and new code.
-  Each suite records what changed when it exits, so the verdict voids a run
-  whose edit is still there. An edit made and undone mid-run leaves no trace,
-  which is why the stop is the rule.
+- **Stop it before every review fix, including docs.** Run
+  `./scripts/harden-suites.sh stop` before editing. Tests read the tree while
+  they run. Commit the fix, then start a new round so its gates check every
+  added line. Safe paths may preserve suite evidence, but never bypass gates.
 - **Commit with explicit paths, never `git commit -a`.** An engine test
   briefly rewrites the two `VERSION` files and restores them. An `-a` commit
   during the run can capture that temporary content.
@@ -476,6 +484,12 @@ start alone. The script header documents what it guarantees:
 - **It retries a reviewer that returns no verdict once**, and times out each
   attempt. The task timeout covers both attempts, so the status line always
   lands.
+- **A verdict needs proof of read** (ADR 0681). The reviewer must return
+  status `reviewed` and the diff's exact file list. An "unable to review"
+  answer, in any wording, is `NO VERDICT`.
+- **The Codex reviewer runs `codex exec` on a snapshot** of the frozen head.
+  Its own sandbox is read-only where it applies, and off inside the Lucidos
+  sandbox, which still wraps it. With neither, it is `unavailable`.
 - **The Claude reviewer cannot write.** It reads a diff file the script
   writes, with read-only tools, no MCP and no Lucidos credential.
 - **Each reviewer resolves its own CLI**, so never hardcode a path.
@@ -636,7 +650,7 @@ don't need an entry; recurring-shaped ones do.
 
 On the fast tier, merge no `main`. Note the failure for the parent, whose run merges it.
 
-Commit any fixes from this phase before proceeding to Phase 4.5, naming the files. A fix outside `HARDEN_SAFE_PATHS` stops the early suite run first (`./scripts/harden-suites.sh stop`), per the Phase 1 kickoff rules. A fix to a doc on that list, such as a new entry in `docs/code-review-priors.md`, needs no stop.
+Commit any fixes from this phase before proceeding to Phase 4.5, naming the files. Every fix stops the early suite run first (`./scripts/harden-suites.sh stop`), including docs. Start a new round after committing, so the gates check the fix.
 
 Then record the review head. Every line up to it has had this iteration's
 review, so a later iteration starts from it (§ Later iterations review only the fix):
@@ -647,17 +661,17 @@ mkdir -p .lucidos && git rev-parse HEAD > .lucidos/harden-review-head
 
 ## Phase 4.5: Verify Tests Pass
 
+The engine suite includes the deterministic command guard corpus in
+`eval/command-guard/cases.toml`, with stubbed judge answers and no model calls.
+Run `lucidos-eval command-judge` manually for model evidence before changing judge behaviour.
+Model evidence does not replace the deterministic suite.
+
 ### Always first: the cheap gates
 
-```bash
-./scripts/harden-gates.sh
-```
-
-One command runs every gate below, side by side, and prints a PASS or FAIL
-line per gate. It runs for **every** diff, with no fast path. The kickoff ran
-it before the suites started; it runs again here because review fixes may
-have added lines. On a FAIL, read the gate's section below, fix, commit, and
-return to Phase 1. Each section's command runs its gate alone, to check a fix.
+`harden-suites.sh start` runs `harden-gates.sh` for every diff before suites
+or generated drift discovery. It prints a PASS or FAIL line per gate.
+On failure, read its log, fix, commit, and return to Phase 1.
+The commands below check individual fixes; do not repeat the entire barrier.
 
 ### The em-dash gate
 
@@ -682,6 +696,16 @@ in a comment) are in `.claude/rules/prose.md`. A non-zero exit is a hardening
 failure: fix, commit, return to Phase 1. The unchecked rules (20-word imperative
 step, active voice, 3-word noun clusters) are a `code-review` angle in Phase 1.
 
+### Also always: the comment gate
+
+```bash
+./scripts/check-comments.sh
+```
+
+Runs for **every** diff. It fails a changed TypeScript, JavaScript or CSS file
+that holds a comment outside the kept classes. A non-zero exit is a hardening
+failure: move the fact into a name, a type or a test, commit, return to Phase 1.
+
 ### Also always: the whole-tree gates
 
 Each one runs for **every** diff, docs-only included, and reads tracked files.
@@ -691,6 +715,11 @@ Each script header holds the mechanism.
 
 | Command | Fails on | Fix |
 |---|---|---|
+| `python3 scripts/recover-billing_test.py` (when the recovery utility changes) | Exact capture binding, conflict handling or immutable overlay parity regresses. | Fix the recovery utility; never broaden historical proof. |
+| `./scripts/check-crate-tiers.sh` and `./scripts/lib/check_crate_tiers_test.sh` | A workspace crate is missing a tier, adds an upward, sibling or forbidden leaf edge, or breaches the gateway and CLI boundary. | Place the crate in its approved tier and move or invert the edge. |
+| `./scripts/check-crate-size.sh` and `./scripts/lib/check_crate_size_test.sh` | A compilation target exceeds its cap or ceiling, or a ceiling rises past 10% over the crate's largest target. | Split the target, or run `--reset <crate>` to give it 10% headroom (ADR 0738). |
+| `./scripts/check-crate-graph.sh` and `./scripts/lib/check_crate_graph_test.sh` | A crate gains a transitive dependent that exists on `main`, the graph depth increases, or a new crate exceeds the blast radius cap. | Remove the new dependency edge or move code. Run `./scripts/check-crate-graph.sh --baseline` to report the new measurements. |
+| `./scripts/check-codegen-inputs.sh` | A workspace crate the codegen renderers depend on is missing from `CODEGEN_INPUT_ROOTS`. A cache hit never compiles the renderer, so only this check sees a new crate before main's build misses. | Add the crate to `CODEGEN_INPUT_ROOTS` in `scripts/lib/codegen.sh`. |
 | `./scripts/check-adrs.sh` | A duplicate ADR number, an ADR with no index line or the reverse, an index out of order, a missing required section (ADR 0460). | `--fix` repairs order only. Never auto-renumber a duplicate. Create ADRs with `./scripts/adr-new.sh`. |
 | `./scripts/check-context-budget.sh` | The always-loaded set over `CONTEXT_BUDGET_CEILING`, a resident set that differs from the declared list, a path-scoped rule over its ceiling (`--report` prints the set). | Move content: reference to a skill, a convention to a scoped rule, maintainer prose to `docs/agent-config.md`. Raising a ceiling needs a reason in the commit message. |
 | `./scripts/check-prompt-mirror.sh` | The process-safety prohibition (ADR 0025) missing from `CLAUDE.md` or the engine system prompt. | Restore the missing half, never delete the other. A second mirror needs the proof in `scripts/lib/prompt_mirror_scan.sh`. |
@@ -703,8 +732,10 @@ Each script header holds the mechanism.
 | `./scripts/lib/check_audit_scans_test.sh` | An audit-scan regression fixture fails. | Fix the checker, preserving hit, miss and missing-input fixtures. |
 | `./scripts/lib/check_knowhow_refs_test.sh` and `./scripts/lib/check_knowhow_generated_test.sh` | A forward-reference or freshness regression fixture fails. | Fix the checker. Keep hit, miss and missing-input fixtures. |
 | `./scripts/check-default-flows.sh` | A copy of a default coding-agent flow that differs from its knowhow block (ADR 0505). | Copy the block back, or change the default and every copy together. Lucidos's own steps stay outside the markers. |
+| `./scripts/check-workspace-client-contract.sh` and `./scripts/lib/check_workspace_client_contract_test.sh` | The engine `/api/v1` routes, event names or generated wire files differ from `workspace-client-surface.txt`. A peer gateway's client depends on them (trusted pairing). | Breaking for an older client: bump `VERSION` first. Then run the check with `--accept` and commit the record. |
 | `./scripts/lib/check_retired_terms_test.sh` | A retired-term regression fixture fails. | Fix the checker without loosening its tracked-tree contract. |
 | `./scripts/lib/hooks_registered_test.sh` | A `.claude/settings.json` hook that is not valid, missing or not executable. | Fix the mode or path. |
+| `node --test scripts/scoreboard/*.test.mjs` | The stage rules disagree with their fixtures, or an event they read changed shape. | Update the rules and fixtures in the same change as the event. |
 
 The `knowhow-generated` suite runs `./scripts/check-knowhow-generated.sh` for every
 diff, including docs-only and fast-tier changes. It runs `--cached-only`: it
@@ -730,8 +761,8 @@ is routine: re-issue it. Act on its exit status:
 | Exit | Verdict | Do this |
 |---|---|---|
 | 0 | PASS | Proceed to Phase 5. |
-| 1 | FAIL | Read the named log, fix, commit, return to Phase 1. |
-| 2 | RERUN | Format, start a normal run, and `wait` again (below). After a retry round that passed, this run is the full set. |
+| 1 | FAIL | Read the named log, fix, commit, return to Phase 1. A FAIL comes at the first failing suite. When it names suites still running, run `./scripts/harden-suites.sh stop` before the next start. |
+| 2 | RERUN | Format, start a normal run, and `wait` again (below). After passing retries with non-test or unverifiable changes, this run is the full set. |
 | 3 | still running | Re-issue `wait`. It says if the other-model review or the driver tests are what it waits on. |
 
 **Join inline, never in a subagent.** Run `wait` yourself and follow the table.
@@ -748,10 +779,26 @@ a test.
 
 **A FAIL makes the next round a retry of what failed** (ADR 0536). The verdict records the failed
 engine tests and browser specs by name in `.lucidos/harden-retry`, and any
-other failed suite whole. The next `start`, early or normal, runs only those
-and says `a retry of what failed`. Its PASS still reads RERUN: the full set
-then runs once more, and only that run can pass the harden. Never delete the
-record to skip the retry.
+other failed suite whole. It also records unfinished, missing or invalid suites as whole-suite obligations.
+Completed checks and the original baseline survive while every remaining obligation stays recorded.
+Selection drift invalidates that baseline. Whole-browser obligations expand to the current selected specs.
+The next `start`, early or normal, runs only those
+and says `a retry of what failed`. A passing retry completes hardening when every commit since the last full round started changes only standalone test/spec files, including no commits. Its evidence records the judged range and classification. Fixtures, imported shared helpers, source, configuration, uncertain paths or missing baseline evidence require RERUN and the full set. Never delete the record to skip the retry.
+
+**Request additional suites when the plan requires them.** For example, use
+`./scripts/harden-suites.sh start --include-suite gateway`. Repeat
+`--include-suite <name>` to add several canonical suites. Includes only add to
+automatic selection in full and fast tiers, even when a main check covers them.
+Unknown names fail before work starts or existing evidence is replaced.
+Suite commands remain authoritative in `hs_suite_command`; included Cargo suites
+share the first serial lane, browser suites await spec selection, and `driver`
+waits for the join.
+
+Requests persist for this worktree in `.lucidos/harden-included-suites` and are
+copied to each run's `.lucidos/harden-suites/included-suites` evidence.
+Ordinary starts, retries and full reruns retain them, without repeating flags.
+An existing retry keeps its failed subset; adding a new include forces a full
+round with all retained requests. There is no removal flag.
 
 **A passing touched-spec suite carries into the next round** (ADR 0616). The
 verdict records each spec in `.lucidos/harden-carried`. A later round skips a
@@ -759,8 +806,13 @@ spec whose record is valid, and prints `PASS carried from <commit>` when no
 spec is left. A source edit since that commit voids the carry. A retry round
 carries nothing.
 
-**A start that refused shows up as MISSING.** `start` writes to
-`.lucidos/harden-suites-start.log`, so read that log before starting again.
+**A startup refusal reports FAIL.** After cheap gates, start checks host
+prerequisites for the selected suites before generation or suite execution.
+Follow the install commands in its output and rerun start.
+Previous evidence stays intact, but
+`wait` and `verdict` report the refusal rather than an older verdict.
+Read `.lucidos/harden-suites-start.log` before starting again.
+A start rejected before admission may leave no run, reported as MISSING.
 
 **RERUN means the early result no longer describes the branch.** A fix
 outside `HARDEN_SAFE_PATHS` landed, or the run was stopped, or no run exists.
@@ -792,9 +844,26 @@ If Phase 3 abandoned the review, re-issue
 failure as a finding until that module has run alone on a quiet host
 (`docs/harden-notes.md` § Timeouts under load).
 
+**A main check covers most rounds** (ADR 0694). `start` asks the engine for the
+main-check setting and records it. Under `here` or `another-host`, the slow
+suites leave the round, and the main check runs them after landing:
+
+- `engine-touched` replaces the engine suite. It runs guard tests and module
+  filters in the engine libraries the diff touches directly. The broader run
+  covers explicit filters, migration tests, workspace-wide reach and diffs
+  that touch no engine library directly.
+- A small crate runs its suite only when the diff touches it directly.
+  `gateway`, `cli`, `app-lib`, `eval` and the touched browser specs leave.
+- `script-libs` runs each changed script library's own test.
+- The release suite stays: the main check tests the mirror tree, which lacks it.
+
+Under `off`, or when no engine answers, the round keeps every suite. A test that
+reads the source tree at run time belongs in a `mod guard_tests`. A meta-test,
+itself a guard test, fails the round otherwise.
+
 **The fast tier is the script's call, not yours.** `start` asks the engine for the
-tier and records it, and no variable overrides the answer. It keeps `make lint`
-in place of the engine suite, plus tsc, Vitest, `vite build` and the script tests.
+tier and records it, and no variable overrides the answer. It keeps the two lint
+halves in place of the engine suite, plus tsc, Vitest, `vite build` and the script tests.
 It drops every crate's test suite, the installer, the release path, the
 first-paint check and the touched browser specs. The integrating parent runs
 them all.
@@ -812,9 +881,9 @@ These matter when you read a verdict:
   extension.** `CHANGELOG.md` and `sdk_iframe.css` both do.
 - **Rust selection follows the reached crates** (ADR 0594). A Rust-relevant path
   maps to its owning crates, and the reached set is their reverse closure over
-  the `cargo metadata` graph. The suites are `lint` (clippy scoped by
-  `CLIPPY_SCOPE`), `crates` (the small crates), `gateway`, `cli`, `app-lib`,
-  `eval`, `engine` and `engine-filtered`. A gateway edit therefore skips the
+  the `cargo metadata` graph. The suites are `lint-rust` (rustfmt, and clippy
+  scoped by `CLIPPY_SCOPE`), `crates` (the small crates), `gateway`, `cli`, `app-lib`,
+  `eval`, `engine`, `engine-filtered` and `confinement`. A gateway edit therefore skips the
   engine suite.
 - **These paths select every crate:** `Cargo.lock`, the root `Cargo.toml`,
   `.cargo/**`, `rust-toolchain.toml`, `clippy.toml`, `Makefile`,
@@ -824,11 +893,11 @@ These matter when you read a verdict:
 - **A first-paint input runs the growth check** (ADR 0454). On FAIL, move what the
   first frame skips behind a dynamic import. Otherwise add a
   `First-paint-growth:` trailer saying why the first frame needs it.
-- **A frontend change runs the browser specs it can break** (ADR 0502).
+- **A frontend change runs the browser specs it can break** (ADR 0502), unless a
+  main check covers the round.
   `e2e-touched` runs them here on the debug engine in an e2e slot, without
-  mobile-webkit. `e2e-touched-webkit` runs the mobile-webkit ones here on a
-  macOS host, on the `e2e` engine profile, after `e2e-touched` ends. A Linux
-  host sends them to GitHub, pinned to the start commit (ADR 0536, 0616). On
+  mobile-webkit. `e2e-touched-webkit` sends the mobile-webkit ones to GitHub on every
+  host, pinned to the start commit, beside the local suite (ADR 0536, 0616). On
   FAIL, read the log the FAIL line
   names. Either the spec follows the UI change, or the UI change was
   wrong.
@@ -836,6 +905,29 @@ These matter when you read a verdict:
   slot was held, so the specs did not run here. The main check runs them after
   landing. Never wait for the lock and never rerun on a timer. Name the skipped
   specs in your summary.
+- **The `confinement` suite runs the tests that apply the real agent sandbox.**
+  A diff reaching `lucidos-agent-sandbox`, or the engine's sandbox wiring,
+  selects it. A macOS session sandbox cannot nest one, so the engine runs them
+  outside it under the owner's `run-confinement-tests` permission. The suite
+  never raises that card, because a later step would overtake it.
+  On Linux, only a failed sandbox probe routes to the GitHub confinement job.
+  That leg tests the start commit; a local test failure never routes there.
+- **A `confinement` FAIL with exit 75 means no passing verdict.** On Linux,
+  read the GitHub mode reason: unavailable mode or no verdict stays a failure.
+  There is no skip. On macOS, run
+  `lucidos confinement-tests run` yourself, in the foreground with
+  `timeout: 240000`. It holds the owner's card open and follows the run. If the
+  run outlasts the call, follow it with `lucidos background-task wait <task_id>`.
+  A failing run is a test failure: fix it.
+
+  Commit first: a run on a dirty tree cannot certify the retry. After a
+  passing run, the retry round passes on its own, under *Allow once* as well as
+  *Always allow*. The suite answers `passed` and names the earlier run. A new
+  commit or an uncommitted edit voids that, and the next run needs a grant.
+  On a Linux host where the sandbox cannot apply (no Landlock, say), the
+  suite runs the tests on a GitHub runner instead. When
+  that run gives no verdict either, it exits 75: report the suite as not run.
+  `--here` never routes elsewhere, including on the runner.
 - **`make lint` is the per-change lint gate, never `cargo check`.** `/harden` is
   the only stage between a change and `main`. Never restate its flags.
 

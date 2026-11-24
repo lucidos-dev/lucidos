@@ -23,7 +23,6 @@ function appliedIds(): string[] {
   return list.status === 'loaded' ? list.data.applied.map((c) => c.id) : [];
 }
 
-/** A page request the test settles by hand, so it can move the list first. */
 function heldPage(): (value: unknown) => void {
   let release!: (value: unknown) => void;
   mockGetRepoChanges.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
@@ -67,7 +66,6 @@ describe('loadMoreRepoChanges against a list that moves under it', () => {
     });
     const loading = loadMoreRepoChanges();
 
-    // `refreshRepoView` lands after an apply, leading with the new change.
     repoChanges.value = {
       status: 'loaded',
       data: {

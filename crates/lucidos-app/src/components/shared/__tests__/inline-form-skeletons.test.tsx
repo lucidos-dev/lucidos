@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** The inline edit forms draw their own frame while their data loads: the
- *  field labels they know as real text, and each control's box shimmering. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type VNode } from 'preact';
 import { act } from 'preact/test-utils';

@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The changed-files sidebar in the repo file preview resizes from its divider:
- * by pointer drag, by arrow keys, and back to the default on double-click.
- *
- * jsdom has no layout, so the container's width is stubbed and the observer is
- * a no-op. What is under test is the wiring: which width each gesture lands on,
- * and that it persists.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -126,7 +118,6 @@ describe('pointer drag', () => {
     act(() => { el.dispatchEvent(pointer('pointermove', 30 * REM)); });
     expect(repoPreviewSidebarRem.value).toBe(30);
     expect(sidebarBasis()).toBe('30rem');
-    // Nothing persists mid-drag.
     expect(localStorage.getItem(SIDEBAR_WIDTH_KEY)).toBeNull();
 
     act(() => { el.dispatchEvent(pointer('pointermove', 2000 * REM)); });

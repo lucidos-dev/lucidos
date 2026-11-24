@@ -17,7 +17,9 @@ then the reason. One idea per sentence. Say what is true now.
 **The best comment is the one the code made unnecessary.** Before writing or
 keeping one, ask whether the code already says it. If it does, delete the
 comment. If it nearly does, rename the thing and then delete the comment.
-Self-explanatory code beats an explained one, every time.
+
+**TypeScript, JavaScript and CSS take no comment** outside the kept classes
+(`scripts/comment-strip/kept-classes.tsv`). `check-comments.sh` fails one.
 
 What survives states what a reader must not break here. Two other things get
 written as comments and belong elsewhere:
@@ -26,14 +28,10 @@ written as comments and belong elsewhere:
 - **What this used to do, and when it changed.** That is the commit message and
   `docs/plans/`. Git blame already holds it, at no cost to the next reader.
 
-Content that outgrows the block limit below is a doc, an ADR or a plan. Link to
-it instead.
-
 **A comment never defends a shortcut, workaround or known-wrong behaviour.**
 The next reader, human or agent, takes it as settled design and builds on it.
 Fix the root cause. Failing that, register a temporary measure, or record a
-known limitation in a plan or an ADR. An invariant ("callers must hold the
-lock") is still fine.
+known limitation in a plan or an ADR. An invariant belongs in a type or a test.
 
 - Bad: `// Polling each second is fine for now.`
 - Good: `// Polls until SSE covers lists (docs/temporary-measures.md).`

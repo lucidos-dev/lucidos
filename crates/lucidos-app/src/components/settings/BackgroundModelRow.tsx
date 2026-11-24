@@ -9,9 +9,6 @@ import { ModelSelectionRow } from './ModelSelectionRow';
 import { backgroundModelChoices, backgroundRowCaveat } from './backgroundModels';
 import type { BackgroundRows } from './useBackgroundModels';
 
-/** One background task's *model selection* row. While unset it shows the
- *  model the engine resolved, and its picker lists the task's recommended
- *  models first. */
 export function BackgroundModelRow({
   label,
   fieldLabel,
@@ -32,8 +29,6 @@ export function BackgroundModelRow({
   const resolved = background.row(modelKey);
   const stored = storedBackgroundSelection(modelKey, reasoningKey);
   const model = stored.model ?? resolved?.model ?? '';
-  // A stored pick shows without the engine's answer, so a failed read is
-  // news only while the row is unset.
   const caveat = backgroundRowCaveat(resolved, stored.model ? null : background.error);
   return (
     <ModelSelectionRow

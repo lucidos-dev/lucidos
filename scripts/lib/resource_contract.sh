@@ -101,12 +101,13 @@ resource_contract_runtime_required() {
 }
 
 # resource_contract_desktop_names <desktop.rs>: the resource names the PACKAGED
-# launcher USES, read out of spawn_gateway. Sorted and unique. A source scan
+# launcher USES, read out of spawn_gateway_in_scope, shared by both roles.
+# Sorted and unique. A source scan
 # rather than a link, because lucidos-app is a Rust crate and this is shell.
 #
 # Three hops, all inside desktop.rs:
 #
-#   1. spawn_gateway's `.env(…)` lines and its `Command::new(&bundle.…)` program
+#   1. spawn_gateway_in_scope's `.env(…)` and program construction lines
 #      give the BundledResources fields the launcher hands to the gateway.
 #   2. bundled_resources maps each field to a `*_RESOURCE_NAME` constant, through
 #      at most one local binding (`let postgres = resources.join(…)`).
@@ -154,9 +155,12 @@ resource_contract_desktop_names() {
             if (const_ref != "") field_const[field] = const_ref
             next
         }
-        /^fn spawn_gateway\(/ { in_spawn = 1; saw_spawn = 1; next }
+        /^fn spawn_gateway\(/ { in_wrapper = 1; next }
+        in_wrapper && /^}/ { in_wrapper = 0; next }
+        in_wrapper && /spawn_gateway_in_scope\(resources, app_data, port, None\)/ { delegated = 1 }
+        /^fn spawn_gateway_in_scope\(/ { in_spawn = 1; saw_spawn = 1; next }
         in_spawn && /^}/ { in_spawn = 0; next }
-        in_spawn && (/\.env\(/ || /Command::new\(/) {
+        in_spawn && (/\.env\(/ || /Command::new\(/ || /scope.command\(/) {
             rest = $0
             while (match(rest, /bundle\.[a-z_][a-z0-9_]*/)) {
                 used[substr(rest, RSTART + 7, RLENGTH - 7)] = 1
@@ -164,7 +168,8 @@ resource_contract_desktop_names() {
             }
         }
         END {
-            if (!saw_spawn) { print "ERROR: " src ": no top-level spawn_gateway to read"; exit 1 }
+            if (!delegated) { print "ERROR: " src ": persistent launcher does not delegate to spawn_gateway_in_scope"; exit 1 }
+            if (!saw_spawn) { print "ERROR: " src ": no top-level spawn_gateway_in_scope to read"; exit 1 }
             if (!saw_map) { print "ERROR: " src ": no top-level bundled_resources to read"; exit 1 }
             names = ""; count = 0
             for (f in used) {

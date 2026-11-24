@@ -122,7 +122,7 @@ commit
 expect_hit "$(build_script_path_scan "$REPO")" "a build script outside crates/ is covered"
 
 # ── A build.rs under src/ is NOT a build script ──────────────────────────────
-# This repo really has one (crates/lucidos-engine/src/core/store/messages/build.rs).
+# This repo really has one (crates/lucidos-core/src/core/store/messages/build.rs).
 # Cargo never runs it, so compile-time env! there is legal and must not block.
 reset_repo
 crate_with_build "crates/thing" "$RUNTIME"

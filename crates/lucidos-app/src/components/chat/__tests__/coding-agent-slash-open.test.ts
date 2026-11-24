@@ -1,10 +1,3 @@
-/**
- * Tests for the "/" that opens the control command menu from the prompt input.
- *
- * `handleInput` in PromptInput asks `opensSlashMenu` whether this keystroke
- * opens the menu, and clears the box when it does. CodingAgentControlMenu then
- * consumes `codingAgentMenuOpenRequest` and opens.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { inputMode } from '../../../store/store';
 import type { CodingAgent } from '../../../api/types';
@@ -13,7 +6,6 @@ import { effectiveCodingAgentBackend } from '../promptToggleMode';
 import { opensSlashMenu } from '../PromptInput';
 import { _resetComposeDraftsForTesting, setDraft } from '../../../store/composeDrafts';
 
-/** The `handleInput` decision, fed by the same helpers the live code uses. */
 function detectSlash(
   inputValue: string,
   thread: { meta: { id: string; state: 'composing' | 'active'; channel: ThreadMeta['channel']; codingAgent?: CodingAgent } } | undefined,
@@ -46,9 +38,6 @@ describe('slash detection in handleInput', () => {
     expect(detectSlash('/', active('claude_code'))).toBe(true);
   });
 
-  // Regression: the menu opens by clearing the box, and it used to fire on any
-  // value STARTING with "/". The user's text then moved into the menu filter,
-  // and closing the menu lost it for good.
   it('keeps a pasted path as text', () => {
     expect(detectSlash('/Users/me/project/src/foo.ts:12 throws', active('claude_code'))).toBe(false);
   });
@@ -82,9 +71,6 @@ describe('slash detection in handleInput', () => {
   });
 
   it('triggers on a composing draft toggled to Claude even though channel is still chat (regression)', () => {
-    // Draft was started in Lucidos (channel='chat'), then user clicked Claude
-    // on the toggle. composeMode is 'claude_code'; channel won't update until
-    // send. The slash menu must follow composeMode here, same as the send path.
     expect(detectSlash('/', cc('claude_code', 'chat'))).toBe(true);
   });
 

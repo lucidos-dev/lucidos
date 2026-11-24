@@ -55,7 +55,6 @@ describe('focusPromptNow', () => {
       querySelectorAll: vi.fn().mockReturnValue([]),
     };
 
-    // Should not throw
     focusPromptNow();
   });
 });
@@ -90,21 +89,10 @@ describe('isComposeFocusedHere', () => {
     expect(isComposeFocusedHere('t-1')).toBe(false);
   });
 
-  // The bug this guards against: SplitLayout (desktop) and MobileSwipeContainer
-  // (mobile) both render a PromptInput, so two `[data-role="prompt-input"]`
-  // textareas exist in the DOM. During viewport transitions both can be
-  // briefly visible. The previous `getVisiblePromptInput()`-then-compare
-  // implementation picked the FIRST visible one and returned false when the
-  // user was actually focused on the second — at which point an SSE
-  // ThreadComposeChanged would slip through and bounce the cursor to the end.
-  // Checking `document.activeElement` directly avoids the race entirely.
   it('returns true even when there are multiple prompt-input elements (only activeElement matters)', () => {
     const focused = { dataset: { role: 'prompt-input', threadId: 't-1' } };
     (globalThis as any).document = {
       ...document,
-      // Plant additional unfocused prompt-input elements that querySelectorAll
-      // would have returned alongside the focused one. Only activeElement
-      // determines focus — the rest are noise.
       querySelectorAll: vi.fn().mockReturnValue([
         { dataset: { role: 'prompt-input', threadId: 't-1' } },
         focused,
@@ -167,18 +155,14 @@ describe('composeHandlers', () => {
     const action = vi.fn();
     const handlers = composeHandlers(action);
 
-    // Simulate touch first
     handlers.onTouchEnd({ preventDefault: vi.fn() } as any);
     action.mockClear();
 
-    // Then the delayed click fires — should be skipped
     handlers.onClick();
 
     expect(action).not.toHaveBeenCalled();
   });
 
-  // The composer's dead-press probe warns about a row press nobody claimed.
-  // Unclaimed, every tap on a composeHandlers button read as dead.
   it('a touch press claims itself as served', () => {
     mockDoc();
     takePressOutcome(0);
@@ -191,13 +175,12 @@ describe('composeHandlers', () => {
     const action = vi.fn();
     const handlers = composeHandlers(action);
 
-    // Touch → click (skipped) → click (should work)
     handlers.onTouchEnd({ preventDefault: vi.fn() } as any);
-    handlers.onClick(); // skipped
+    handlers.onClick();
     action.mockClear();
     el.focus.mockClear();
 
-    handlers.onClick(); // should work
+    handlers.onClick();
     expect(action).toHaveBeenCalledOnce();
     expect(el.focus).toHaveBeenCalledOnce();
   });
@@ -225,17 +208,11 @@ describe('blurPromptInputIfFocused', () => {
   it('is a no-op when activeElement is null', () => {
     (globalThis as any).document = { ...document, activeElement: null };
 
-    // Should not throw
     blurPromptInputIfFocused();
   });
 });
 
 describe('installActionBtnBlurListener', () => {
-  // Listening on `pointerdown` triggers iOS Safari's animated keyboard
-  // dismissal before the synthesized click fires — the layout shift moves
-  // the button up and the click can be dropped, so the user has to tap
-  // a second time. The listener must run on `click` so the button's own
-  // handler dispatches first and the keyboard dismisses cleanly afterward.
   it('registers on click (not pointerdown) so the click dispatches before keyboard dismissal', async () => {
     vi.resetModules();
     const { installActionBtnBlurListener: install } = await import('../promptFocus');
@@ -254,8 +231,6 @@ describe('installActionBtnBlurListener', () => {
   });
 
   it('blurs prompt on .action-btn click, ignores other targets', async () => {
-    // Re-import a fresh module so the module-scoped install flag is reset —
-    // this test exercises the install plumbing, not just the captured closure.
     vi.resetModules();
     const { installActionBtnBlurListener: install } = await import('../promptFocus');
 

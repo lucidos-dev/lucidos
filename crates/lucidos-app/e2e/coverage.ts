@@ -1,10 +1,3 @@
-/** Per-spec frontend coverage for the main check (ADR 0502, as amended).
- *
- *  Under `LUCIDOS_E2E_COVERAGE_DIR`, each Chromium test records which source
- *  files its pages ran, through the hidden sourcemaps a coverage build emits.
- *  `/harden` reads the merged result to pick the browser specs a diff can break.
- *  Recording never changes a test's outcome: every failure here is a warning.
- */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +18,6 @@ export interface ScriptCoverage {
 
 export interface LoadedMap {
   consumer: SourceMapConsumer;
-  /** The directory the map's `sources` are relative to. */
   dir: string;
 }
 
@@ -41,7 +33,6 @@ function lineStarts(source: string): number[] {
   return starts;
 }
 
-/** 1-based line and 0-based column of `offset`, the shape a sourcemap asks for. */
 function position(starts: number[], offset: number): { line: number; column: number } {
   let lo = 0;
   let hi = starts.length - 1;
@@ -53,12 +44,6 @@ function position(starts: number[], offset: number): { line: number; column: num
   return { line: lo + 1, column: offset - starts[lo] };
 }
 
-/** Repo-relative paths of the source files whose functions ran.
- *
- *  The script root is skipped: it is the whole bundle's top level, runs once
- *  per load, and spans every module in the chunk. Files outside the repo, and
- *  dependencies under node_modules, are dropped.
- */
 export function coveredSourceFiles(
   scripts: ScriptCoverage[],
   loadMap: (url: string) => LoadedMap | null,
@@ -88,7 +73,6 @@ export function coveredSourceFiles(
 
 const loadedMaps = new Map<string, LoadedMap | null>();
 
-/** The hidden sourcemap beside a built asset, by the script's file name. */
 function distMap(Consumer: typeof SourceMapConsumer, url: string): LoadedMap | null {
   let name: string;
   try {
@@ -105,14 +89,12 @@ function distMap(Consumer: typeof SourceMapConsumer, url: string): LoadedMap | n
       const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as RawSourceMap;
       loaded = { consumer: new Consumer(raw), dir: DIST_ASSETS };
     } catch {
-      // No map for this asset: a chunk the coverage build did not emit one for.
     }
     loadedMaps.set(file, loaded);
   }
   return loadedMaps.get(file) ?? null;
 }
 
-/** What one worker has recorded per spec file, so each write is the union. */
 const recorded = new Map<string, Set<string>>();
 
 export function coverageDir(): string | undefined {
@@ -120,12 +102,10 @@ export function coverageDir(): string | undefined {
 }
 
 export interface CoverageRecorder {
-  /** Resolves once `page` records, so its first script is not missed. */
   started(page: Page): Promise<void>;
   flush(testInfo: TestInfo): Promise<void>;
 }
 
-/** Record every page `context` opens, until `flush` writes the spec's file. */
 export function recordCoverage(context: BrowserContext, dir: string): CoverageRecorder {
   const starts = new Map<Page, Promise<void>>();
   const scripts: ScriptCoverage[] = [];
@@ -147,7 +127,6 @@ export function recordCoverage(context: BrowserContext, dir: string): CoverageRe
         console.warn(`[e2e coverage] could not start on a page: ${String(err)}`);
       }),
     );
-    // A test that closes its own page would take the page's coverage with it.
     const close = page.close.bind(page);
     page.close = async (options) => {
       await collect(page);
@@ -166,7 +145,6 @@ export function recordCoverage(context: BrowserContext, dir: string): CoverageRe
         const spec = path.basename(testInfo.file);
         const key = `${spec}@${testInfo.project.name}@w${testInfo.workerIndex}`;
         const files = recorded.get(key) ?? new Set<string>();
-        // Loaded here, so a run without coverage never needs the package.
         const { SourceMapConsumer: Consumer } = await import('source-map-js');
         const loadMap = (url: string) => distMap(Consumer, url);
         for (const file of coveredSourceFiles(scripts, loadMap, REPO_ROOT)) files.add(file);

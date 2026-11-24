@@ -1,10 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { installNoKeyCodeText } from './noKeyCodeText';
 
-// The test env is `node`, so `document` is the stub in `src/test-setup.ts`: it
-// keeps a listener list and dispatches a plain object to it. That pins the
-// wiring: the event name the guard listens on, and the cancel it answers with.
-// The rule itself is tested in the SDK's `textEntry.test.ts`.
 describe('installNoKeyCodeText', () => {
   beforeAll(() => {
     installNoKeyCodeText();

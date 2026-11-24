@@ -3,9 +3,6 @@ import { navigateToApp, assertHealthy, openThreadDrawer } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-// A successor session starts in the same thread behind one card, the card any
-// fresh session gets. It names where the handoff ran and folds the opening. The
-// turns before it stay where they were.
 test.describe('Successor session card', () => {
   test('draws one card with the opening folded, and keeps the earlier turn', async ({ page }) => {
     await assertHealthy(page);
@@ -51,7 +48,6 @@ test.describe('Successor session card', () => {
       await expect(card).toContainText('Handed off');
       await expect(card).toContainText('Carried on from a handoff at phase-commit 4/7.');
 
-      // The opening is folded, and nothing else in the thread repeats it.
       await expect(pane.getByText(opening)).toHaveCount(0);
       await card.locator('.event-row-fold-toggle').click();
       await expect(card.getByText(opening)).toBeVisible();

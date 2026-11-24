@@ -65,6 +65,7 @@ pub(super) async fn seed_artifact(bus: &EventBus, path: &str, commit: &str, writ
         commit: commit.to_string(),
         source: None,
         writer_thread_id: writer,
+        writer: None, // Legacy event fixture.
     }))
     .await
     .expect("seed artifact");
@@ -290,7 +291,9 @@ fn the_ruler_is_exactly_the_node_size() {
 /// The partial index only serves a query whose literal list matches it.
 #[test]
 fn the_workspace_leaf_index_lists_every_leaf_event_type() {
-    let migration = include_str!("../../../../migrations/20261004132639_create_summary_trees.sql");
+    let migration = include_str!(
+        "../../../../../lucidos-core/migrations/20261004132639_create_summary_trees.sql"
+    );
     let index = migration
         .split("idx_events_summary_tree_workspace_leaves")
         .nth(1)

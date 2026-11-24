@@ -1,6 +1,3 @@
-// `expandTriggerSection` opens a collapsed section and never closes an open one.
-// A trigger deep link calls it to mount a row hidden inside a collapsed section.
-// A toggle here would hide the very row the link is revealing.
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   collapsedTriggerSectionIds,

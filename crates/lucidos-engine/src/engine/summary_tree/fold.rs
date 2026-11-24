@@ -236,7 +236,7 @@ impl Fold {
 
 /// The coarsest built nodes covering `[0, end)`, oldest first: the aligned
 /// blocks of [`blocks`], each unbuilt one replaced by its children.
-pub(crate) fn built_cover(end: u64, size: impl Fn(NodeAddr) -> Option<usize>) -> Vec<NodeAddr> {
+pub fn built_cover(end: u64, size: impl Fn(NodeAddr) -> Option<usize>) -> Vec<NodeAddr> {
     let mut tiles = Vec::new();
     for block in blocks(end) {
         push_built(block, &size, &mut tiles);

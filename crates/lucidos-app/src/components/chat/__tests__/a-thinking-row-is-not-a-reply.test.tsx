@@ -6,13 +6,6 @@ import { Disclosure } from '../../shared/Disclosure';
 import { DRAWN_ROW_SELECTOR } from '../scrollState';
 import type { ResponseEvent } from '../../../store/types';
 
-/** A submit's landing holds the reader on the live edge until the agent draws a
- *  row (ADR 0080). The Thinking row is not one: an answer resumes the agent
- *  with it at once, and the reply can come many seconds later. Counted, it
- *  ended the hold and the reply landed under the composer. Reported.
- *
- *  Rendered through the real row and its real `<Disclosure>`, because what is
- *  pinned is the selector and the marker agreeing. */
 
 type Step = Extract<ResponseEvent, { type: 'step' }>;
 

@@ -11,8 +11,8 @@ use std::path::Path;
 use uuid::Uuid;
 
 use super::state::{CheckRange, FailedTest, FlakyFix, RedCheck};
-use crate::engine::successor::Implementer;
 use crate::engine::thread_events::EngineReason;
+use crate::engine::Implementer;
 use crate::runtime::CodingAgent;
 
 /// A change that landed in a check's range, for the fix thread's prompt.

@@ -90,13 +90,10 @@ async fn chat_empty_message_is_rejected() {
     let url = format!("{}/api/v1/chat/stream", base_url());
 
     // A create with nothing to say is refused before any thread exists, for a
-    // human send and for a spawn (`lucidos spawn-thread --to`) alike. A stored
-    // image whose blob is missing is dropped, so it is not something to say.
-    let missing_blob = "0".repeat(64);
+    // human send and for a spawn (`lucidos spawn-thread --to`) alike.
     for body in [
         serde_json::json!({ "message": "", "mode": "human" }),
         serde_json::json!({ "message": "  \n", "mode": "agent", "caller_workspace": "elsewhere" }),
-        serde_json::json!({ "message": "", "mode": "human", "image_hashes": [missing_blob] }),
     ] {
         let resp = client
             .post(&url)
@@ -112,6 +109,35 @@ async fn chat_empty_message_is_rejected() {
                 .as_str()
                 .is_some_and(|e| e.contains("no thread was created")),
             "says nothing was created: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn chat_missing_image_refuses_text_and_image_only_sends() {
+    let client = user_client().await;
+    let url = format!("{}/api/v1/chat/stream", base_url());
+    let missing_blob = "0".repeat(64);
+    for message in ["", "Do not send without the image"] {
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "message": message,
+                "mode": "human",
+                "image_hashes": [missing_blob],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
+        let err: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            err["error"].as_str().unwrap().contains("is missing"),
+            "{err}"
+        );
+        assert!(
+            err["error"].as_str().unwrap().contains("was not sent"),
+            "{err}"
         );
     }
 }
@@ -496,20 +522,16 @@ async fn chat_stream_accepts_large_image_payload() {
     );
 }
 
-/// A `200` from `POST /chat/stream` must mean the follow-up is ALREADY in the
-/// thread, with its sequence assigned, and two sends issued one after the other
-/// must land in that order.
+/// A `200` from `POST /chat/stream` must mean the follow-up is durably accepted,
+/// and two sends issued one after the other must record in that order.
 ///
-/// This is the engine half of the fix for messages arriving reversed
-/// (`docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`). The handler
-/// used to spawn the turn and ack immediately, with `MessageReceived` emitted
-/// inside the spawned task behind a Thread Queue slot wait, so a client that
-/// waited for the ack still had no ordering guarantee: the second request's
-/// task could take the lower sequence. `created` is stamped at emit time and
-/// the request carries no client-side ordering data, so such a reversal is
-/// unrecoverable after the fact.
+/// Acceptance is the transaction that admits the input to the thread's input
+/// order. Recording `MessageReceived` follows in that order, inside the queued
+/// turn (`docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`, ADR 0449).
+/// The ack therefore never waits on the turn, and a reversal cannot happen: the
+/// second send's accepted sequence follows the first's.
 #[tokio::test]
-async fn follow_up_is_persisted_before_the_ack_and_keeps_send_order() {
+async fn follow_up_is_accepted_before_the_ack_and_records_in_send_order() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
@@ -539,37 +561,44 @@ async fn follow_up_is_persisted_before_the_ack_and_keeps_send_order() {
 
     // Two follow-ups, issued strictly one after the other, exactly as the
     // client's per-thread send chain does it.
-    let mut sequences = Vec::new();
+    let mut event_ids = Vec::new();
     for (nth, text) in ["first follow-up", "second follow-up"].iter().enumerate() {
         let body = serde_json::json!({
             "message": format!("{text} {marker}"),
             "mode": "human",
             "thread_id": thread_id.to_string(),
         });
-        let status = client
+        let resp = client
             .post(&url)
             .json(&body)
             .send()
             .await
-            .expect("Follow-up chat request failed")
-            .status();
-        assert_eq!(status, 200, "follow-up {nth} should be accepted");
+            .expect("Follow-up chat request failed");
+        assert_eq!(resp.status(), 200, "follow-up {nth} should be accepted");
+        let ack: serde_json::Value = resp.json().await.expect("Invalid JSON");
+        let event_id: Uuid = ack["event_id"].as_str().unwrap().parse().unwrap();
 
-        // No polling: the ack is the claim under test, so read the event once,
-        // immediately. A miss here means the handler acked before persisting.
-        let seq: Option<i64> = sqlx::query_scalar(
-            "SELECT sequence FROM events \
-             WHERE thread_id = $1 AND event_type = 'MessageReceived' \
-             AND payload->>'text' = $2",
+        // No polling: the ack is the claim under test, so read the acceptance
+        // once, immediately. A miss here means the handler acked before it
+        // committed the acceptance.
+        let accepted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_type = 'OrdinarySubmissionAccepted' \
+             AND payload->'data'->>'message_event_id' = $1)",
         )
-        .bind(thread_id)
-        .bind(format!("{text} {marker}"))
-        .fetch_optional(&pool)
+        .bind(event_id.to_string())
+        .fetch_one(&pool)
         .await
         .expect("events query failed");
-        sequences.push(seq.unwrap_or_else(|| {
-            panic!("follow-up {nth} ({text}) was not persisted by the time the POST returned 200")
-        }));
+        assert!(
+            accepted,
+            "follow-up {nth} ({text}) was not durably accepted by the time the POST returned 200",
+        );
+        event_ids.push(event_id);
+    }
+
+    let mut sequences = Vec::new();
+    for event_id in event_ids {
+        sequences.push(crate::input_order_test::wait_until_recorded(&pool, event_id).await);
     }
 
     assert!(

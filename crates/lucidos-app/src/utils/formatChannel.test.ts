@@ -32,15 +32,11 @@ describe('formatThreadChannelLabel', () => {
   });
 
   it('reads "Lucidos Agent" for plain chat / Lucidos threads', () => {
-    // The LLM driving the thread, paralleling the coding-agent tags.
-    // `formatChannel` still names the channel "Lucidos" for the filter dropdown.
     expect(formatThreadChannelLabel('chat')).toBe('Lucidos Agent');
     expect(formatThreadChannelLabel('lucidos')).toBe('Lucidos Agent');
   });
 
   it('ignores codingAgent for non-coding channels', () => {
-    // A stray backend on a non-CC channel must never relabel it: chat stays
-    // "Lucidos Agent", trigger stays "Trigger".
     expect(formatThreadChannelLabel('chat', 'codex')).toBe('Lucidos Agent');
     expect(formatThreadChannelLabel('trigger', 'codex')).toBe('Trigger');
   });

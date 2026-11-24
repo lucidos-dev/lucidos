@@ -1,9 +1,3 @@
-/**
- * An attached image is never a chip that merely looks finished, and a send
- * that waits on one is visible for its whole life. It ends dispatched,
- * cancelled, or released with the reason, never silently. Plan:
- * `docs/plans/2026-10-02-image-upload-progress-and-resilience.md`.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { effect } from '@preact/signals';
 import { installRestoreAdmission } from '../../../utils/restoreAdmission';
@@ -57,13 +51,10 @@ describe('pendingChipView draws every state differently from a finished chip', (
     const views = waits.map(pendingChipView);
     expect(views.every((v) => v.ring === 'spin' && v.action === 'none')).toBe(true);
     expect(views.map((v) => v.caption)).toEqual(['Waiting', 'Uploading', 'Retrying', 'Offline']);
-    // The reason reaches the tooltip and the accessible name.
     expect(views[2].label).toContain('Lucidos could not be reached');
   });
 
   it('calls the wait after the browser took the body uploading, never finished', () => {
-    // WebKit reports a small image sent before its bytes travel, so on a phone
-    // this state covers nearly the whole upload.
     const view = pendingChipView({ kind: 'finishing' });
     expect(view.caption).toBe('Uploading');
     expect(view.label).not.toMatch(/uploaded|finish/i);
@@ -94,7 +85,6 @@ describe('uploadSendNotice', () => {
 
   it('says nothing with no send waiting and none refused', () => {
     expect(uploadSendNotice(undefined, false, [upload('a', uploading)])).toBeNull();
-    // A refusal mark outlives nothing: with no failed image there is no reason left.
     expect(uploadSendNotice(undefined, true, [upload('a', uploading)])).toBeNull();
   });
 });
@@ -109,17 +99,17 @@ describe('settleQueuedUploadSends', () => {
 
   it('retains a ready queued send until generation admission and reacts when admission opens', () => {
     const dispatch = vi.fn();
-    installRestoreAdmission({ ready: () => false, wait: () => new Promise(() => {}) });
+    installRestoreAdmission({ ready: () => false, phase: () => 'awaiting-hello', wait: () => new Promise(() => {}) });
     queueUploadSend(T, { useCodingAgent: false, context: null });
     const dispose = effect(() => settleQueuedUploadSends(dispatch));
     try {
       expect(dispatch).not.toHaveBeenCalled();
       expect(queuedUploadSends.value.has(T)).toBe(true);
-      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+      installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
       expect(dispatch).toHaveBeenCalledTimes(1);
     } finally {
       dispose();
-      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+      installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     }
   });
 
@@ -155,7 +145,6 @@ describe('settleQueuedUploadSends', () => {
 
     expect(dispatch).not.toHaveBeenCalled();
     expect(queuedUploadSends.value.has(T)).toBe(false);
-    // Send comes back: the optimistic Cancel morph is released.
     expect(submittingThreadIds.value.has(T)).toBe(false);
     expect(uploadBlockedSends.value.has(T)).toBe(true);
     expect(uploadsGate(T)).toBe('failed');

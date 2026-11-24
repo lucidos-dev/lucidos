@@ -1,8 +1,3 @@
-/**
- * The desktop rail that holds the dashboard: its floor is two dashboard cells, a
- * drag stops at both walls, and the width and shown state persist per device.
- * The width it draws at is `computeDrawnLayout`'s (splitHelpers.test.ts).
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

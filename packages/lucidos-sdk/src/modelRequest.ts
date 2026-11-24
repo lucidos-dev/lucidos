@@ -19,7 +19,6 @@ export interface ModelRequest {
   body: Record<string, unknown>;
 }
 
-/** Build a request without sending it or exposing credentials. */
 export async function modelRequest(value: ModelPickerValue, options: ModelRequestOptions): Promise<ModelRequest> {
   const registry = await request<{ models: RegistryModel[] }>('/models');
   const selection = resolveSelection(modelChoices(registry.models, { callableOnly: true }), value);

@@ -1,13 +1,3 @@
-/**
- * Tests for the dismiss flow and mutual exclusivity of applying/dismissing states.
- *
- * Regression: clicking "Archive" on an idle CC thread must not flash through a gap
- * where the WaitingBanner disappears. getWaitingState() checks the in-flight archive
- * before resolveActions, keeping the "Archive..." button visible throughout dismiss.
- *
- * Invariant: applyingNowThreadIds and discardingCCThreadIds
- * must never contain the same thread. Each action guards against the others.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   threadMap,
@@ -21,7 +11,6 @@ import {
 import type { ThreadState } from '../thread-events';
 import { getWaitingState } from '../../components/chat/WaitingBanner';
 
-// Mocks for handleArchiveThread dependencies
 vi.mock('../../api/threads', () => ({
   archiveThread: vi.fn().mockResolvedValue({ archived: [] }),
   saveThread: vi.fn(),
@@ -84,8 +73,6 @@ beforeEach(() => {
 
 describe('Done dismiss does not flash Requesting state', () => {
   it('returns dismiss-in-progress state even after SSE changes status to idle', () => {
-    // Setup: CC thread is idle (ThreadDismissed SSE already arrived) but dismiss API
-    // hasn't returned yet, so the archive is still in flight.
     const thread = makeCCThread('t1', 'idle', 'archived');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -93,20 +80,15 @@ describe('Done dismiss does not flash Requesting state', () => {
 
     const state = getWaitingState();
 
-    // Must NOT return null — that would cause the banner to disappear
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
       expect(state!.isArchiving).toBe(true);
-      // During archive the optimistic section flip empties the close set; the
-      // disabled "Archive..." spinner is rendered from the isArchiving flag by
-      // getBannerActions, not from a selector action.
       expect(state!.actions).toEqual([]);
     }
   });
 
   it('draws no banner when the thread sits in the Archive section', () => {
-    // The composer keeps Send, and the thread menu moves it back (ADR 0573).
     const thread = makeCCThread('t1', 'idle', 'archived');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -115,7 +97,6 @@ describe('Done dismiss does not flash Requesting state', () => {
   });
 
   it('returns actions when thread is waiting+inbox and NOT dismissing', () => {
-    // Normal case: CC idle thread waiting for user action
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -130,9 +111,6 @@ describe('Done dismiss does not flash Requesting state', () => {
   });
 
   it('refuses to archive while an apply runs — states are mutually exclusive', async () => {
-    // The engine owns "applying" (ADR 0437), so there is no stale state to
-    // clear: an archive waits for the apply to end, as an apply waits for an
-    // archive.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.applyInFlight = true;
     threadMap.value = new Map([['t1', thread]]);
@@ -173,8 +151,6 @@ describe('Discard hides Apply and shows "Discard..."', () => {
   });
 
   it('discarding takes priority over action buttons', () => {
-    // Even though resolveActions would return ['discard', 'apply'],
-    // the discarding state should preempt them.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -200,10 +176,8 @@ describe('Discard hides Apply and shows "Discard..."', () => {
 
 describe('WaitingForUserAnswer surfaces Cancel so the user can abandon the question', () => {
   it('shows Cancel (only) when CC is paused on AskUserQuestion', () => {
-    // Save/Archive must NOT show while the question is still pending —
-    // mid-turn work hasn't terminated yet.
     const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
-    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false }; // even with mid-turn work staged
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -217,11 +191,6 @@ describe('WaitingForUserAnswer surfaces Cancel so the user can abandon the quest
   });
 
   it('reflects optimistic isCanceling=true while still in waiting_for_user_answer', () => {
-    // After the user clicks Cancel, handleCancelExchange adds the thread to
-    // cancelingThreadIds before any SSE arrives. Status is still
-    // waiting_for_user_answer. The banner must show "Cancel..." (disabled) so
-    // the user can't double-fire — and the PromptInput cleanup effect must NOT
-    // clear the flag while we're still in this status.
     const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -238,8 +207,6 @@ describe('WaitingForUserAnswer surfaces Cancel so the user can abandon the quest
 
 describe('External repo CC thread shows Done instead of lone Discard', () => {
   it('shows Done when isExternalRepo and proposed (Apply not available)', () => {
-    // External repo: can't Apply (changes are in a different repo).
-    // Must show Done, not a lone Discard button.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     thread.meta.codingAgentIsExternalRepo = true;
@@ -257,8 +224,6 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
   });
 
   it('shows Diff for an external repo whose branch holds unproposed work', () => {
-    // An external repo never proposes, so its work stays unproposed. The
-    // branch still differs from main, so the Diff button stays shown.
     const thread = makeCCThread('t1', 'idle', 'inbox');
     thread.meta.codingAgentChangeState = { kind: 'unproposed', reason: null };
     thread.meta.codingAgentIsExternalRepo = true;
@@ -276,8 +241,6 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
 
 describe('Diff button shows only when the CC thread has a diff', () => {
   it('internal CC thread with a proposal shows Diff even without a Change row', () => {
-    // The thread reads proposed, but the Change row hasn't materialized yet.
-    // Diff is still shown: only a row that lists no files hides it.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     thread.meta.codingAgentIsExternalRepo = false;
@@ -293,9 +256,6 @@ describe('Diff button shows only when the CC thread has a diff', () => {
   });
 
   it('internal CC thread with no changes hides Diff entirely', () => {
-    // Archive-only banner on a CC thread that did no work. The Diff button is
-    // not rendered at all — there is nothing to look at, so the affordance
-    // would only mislead.
     const thread = makeCCThread('t1', 'idle', 'inbox');
     thread.meta.codingAgentChangeState = { kind: 'none' };
     thread.meta.codingAgentIsExternalRepo = false;
@@ -328,12 +288,6 @@ describe('Diff button shows only when the CC thread has a diff', () => {
 
 describe('Pending change with file_count=0 must not show Apply/Discard', () => {
   it('treats a zero-file pending change as no pending change (banner shows Done, not Apply/Discard)', () => {
-    // Regression: agent_recovery used to propose changes for branches with
-    // commits but zero net diff (commit+revert pattern from CC's npm install
-    // lockfile rename). The phantom change row had file_count=0 — Apply/Discard
-    // would render but do nothing useful. Backend now refuses to create such
-    // rows; this guards against any that already exist or sneak in via SSE.
-    // Mirrors the real "Resolving iOS E2E Timeouts" state: idle + inbox.
     const thread = makeCCThread('t1', 'idle', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -412,15 +366,9 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
 });
 
 describe('Apply* marker sources requires_restart from pending change', () => {
-  // Regression: WaitingBanner used to read requiresRestart only from
-  // the thread meta's restart flag. When a stale or fallback write set that
-  // flag to false but the actual pending change had
-  // requires_restart=true (e.g. recovery hardcoded false, or mid-iteration
-  // transition), the button incorrectly showed a plain "Apply" instead of "Apply*".
-  // The change row's own requires_restart is the authoritative file-derived value.
   it('shows requiresRestart when pending change has requires_restart=true even if meta says false', () => {
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false }; // stale meta
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     changes.value = { status: 'loaded', data: [{
@@ -433,7 +381,7 @@ describe('Apply* marker sources requires_restart from pending change', () => {
       description: 'rust change',
       file_count: 1,
       files: ['crates/lucidos-engine/src/main.rs'],
-      requires_restart: true, // authoritative file-derived value
+      requires_restart: true,
       hardened: false,
       needs_hardening: true,
       apply_ready: false,
@@ -451,9 +399,6 @@ describe('Apply* marker sources requires_restart from pending change', () => {
     expect(state).not.toBeNull();
     expect(state!.type).toBe('actions');
     if (state!.type === 'actions') {
-      // A restart-requiring change gets the compact "Apply*" marker (restart is
-      // still the separate switch); requiresRestart also surfaces via the Apply
-      // TaggedAction's tooltip.
       const apply = state!.actions.find((a) => a.kind === 'apply');
       expect(apply?.label).toBe('Apply*');
       expect(apply?.tooltip).toContain('new engine version');
@@ -461,8 +406,6 @@ describe('Apply* marker sources requires_restart from pending change', () => {
   });
 
   it('shows requiresRestart when meta says true even if no pending change row yet', () => {
-    // Symmetric: meta-only signal still works (e.g. before SSE delivers the
-    // changes-updated broadcast).
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: true };
     threadMap.value = new Map([['t1', thread]]);
@@ -481,9 +424,6 @@ describe('Apply* marker sources requires_restart from pending change', () => {
 
 describe('Apply Now — SessionEnded must not clear applying state', () => {
   it('getWaitingState returns applying even after thread status changes to waiting', () => {
-    // Scenario: during Apply Now, backend kills Claude Code session (SessionEnded → status=waiting)
-    // THEN proposes the change (ChangeProposed). Between those two events,
-    // applyingNowThreadIds must stay set so the banner keeps showing "Applying...".
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     threadMap.value = new Map([['t1', thread]]);
@@ -493,23 +433,12 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
     const state = getWaitingState();
     expect(state).not.toBeNull();
     expect(state!.type).toBe('applying');
-    // Must NOT fall through to resolveActions which would return ['discard', 'apply']
   });
 
 });
 
 describe('merge-via-CC apply is cancelable (best-effort) from the thread', () => {
   it('returns canceling when status=running during a merge', () => {
-    // Scenario: user clicked Apply on the Changes panel for a thread with a
-    // live Claude Code session. Tier 1 slow-path emits MergeConflictDetected,
-    // then sends a merge prompt to CC. CC processes the
-    // prompt → CodingAgentPromptSent flips status to 'running'.
-    //
-    // The user must be able to stop a long-running merge: Cancel interrupts the
-    // CC merge session. It's best-effort — if the merge already landed before the
-    // interrupt processes, the engine still emits ChangeApplied; otherwise the
-    // change returns to pending. (This used to be suppressed to a disabled
-    // "Apply...", leaving no way out of a stuck merge.)
     const thread = makeCCThread('t1', 'running', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -520,7 +449,6 @@ describe('merge-via-CC apply is cancelable (best-effort) from the thread', () =>
   });
 
   it('returns canceling when status=waiting_for_user_answer during a merge', () => {
-    // Symmetric: a merge paused on a CC question is still mid-turn and cancelable.
     const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';

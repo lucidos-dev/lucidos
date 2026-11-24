@@ -1,5 +1,3 @@
-/** A context section with no body says why. It offers the Capture context
- *  switch only when turning it on would record that body on later steps. */
 import { describe, expect, it } from 'vitest';
 import type { ContextSection } from '../../../store/types';
 import { missingBodyReason } from '../missingBodyReason';

@@ -3,16 +3,6 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } from './helpers';
 import { psql } from './db-helpers';
 
-/**
- * Authored HTML stays inside its own box (ADR 0114 and its amendment,
- * `.authored-html` in host-components.css). A reply or a question card that
- * writes `position: fixed`, or borrows a full-screen host class, must never
- * cover the header, the composer or an option. A form must not render, and
- * nothing may reach the top layer.
- *
- * Synthetic payloads only. The form posts to the discard port on loopback, and
- * the test types nothing into it.
- */
 
 const FIXED_COVER =
   '<div style="position:fixed;inset:0;z-index:2147483647;background:red">fixed cover</div>';
@@ -77,7 +67,6 @@ async function openThread(page: Page, title: string): Promise<void> {
   await ensureOnThreadPane(page);
 }
 
-/** Whether the topmost element at the centre of `target` is authored HTML. */
 async function authoredOnTop(page: Page, target: Locator): Promise<boolean> {
   const box = await target.boundingBox();
   expect(box, 'the probe target has a box').not.toBeNull();
@@ -86,7 +75,6 @@ async function authoredOnTop(page: Page, target: Locator): Promise<boolean> {
   return page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('.authored-html') != null, [x, y]);
 }
 
-/** Every visible authored container computes its clip, on one block box. */
 async function expectAllContained(page: Page): Promise<void> {
   const styles = await page.locator('.authored-html:visible').evaluateAll((els) =>
     els.map((el) => ({ clip: getComputedStyle(el).clipPath, display: getComputedStyle(el).display })));
@@ -97,8 +85,6 @@ async function expectAllContained(page: Page): Promise<void> {
   }
 }
 
-/** No popover survives, and tapping its would-be invoker opens nothing. A tap
- *  inside a question option would answer it, so that card skips the tap. */
 async function expectNoTopLayer(page: Page, { tap }: { tap: boolean }): Promise<void> {
   await expect(page.locator('.authored-html [popover]')).toHaveCount(0);
   if (tap) await page.locator('.authored-html:visible', { hasText: 'open popover' }).first().click();

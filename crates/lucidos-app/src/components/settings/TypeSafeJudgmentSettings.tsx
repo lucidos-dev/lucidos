@@ -9,12 +9,10 @@ import {
   TYPESAFE_API_KEY_ENV,
 } from './judgmentBackend';
 
-/** The API root the engine's judgment provider posts to. */
 const TYPESAFE_BASE_URL = 'https://api.typesafe.ai/v1';
 
 const SERVICE = SYSTEM_ONE_PROVIDERS.typesafe.credentialService;
 
-/** TypeSafe (Jev), on Settings → Providers. */
 export function TypeSafeJudgmentSettings() {
   const existing = findProviderCredential(credentials.value, SERVICE);
   const [secret, setSecret] = useState('');

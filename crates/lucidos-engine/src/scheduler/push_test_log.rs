@@ -8,7 +8,7 @@
 //! "OS push WAS sent for this notification on this device" without
 //! waiting for actual APNs/FCM delivery.
 //!
-//! See `system-knowhow/notifications.md` §5.4 for the test harness.
+//! See `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac-3.md` §5 for the test harness.
 //!
 //! Production binaries never compile this module.
 

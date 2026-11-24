@@ -1,10 +1,3 @@
-/**
- * A typed answer whose POST gets no answer stays on the question card it
- * answers. It shows "Not sent" with a retry instead of an unsent row below the
- * card. It falls back to that row only when the card was answered some other
- * way, so the text is never lost. A new answer from this device replaces it.
- * Plan: docs/plans/2026-10-03-typed-answer-stays-on-its-card.md.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.hoisted(() => {
@@ -51,8 +44,6 @@ import { computeExchanges, handleEvent, makeOptimisticThreadState, type StoredEv
 
 const mockedSubmitChat = vi.mocked(submitChat);
 
-/** A send that stays in flight until the test lets it go. No unsettled POST
- *  then carries into the next test through the thread's send chain. */
 function holdNextSend(): () => void {
   let release!: () => void;
   mockedSubmitChat.mockImplementationOnce(() => new Promise((resolve) => {
@@ -62,7 +53,6 @@ function holdNextSend(): () => void {
 }
 const TS = '2026-10-03T10:00:00.000Z';
 
-/** Thread `t` with question card `tu-1` open, focused. */
 function threadWaitingOnQuestion() {
   const thread = makeOptimisticThreadState({ id: 't', title: 'Q', channel: 'chat', initiator: 'user', eventsLoaded: true });
   thread.meta = { ...thread.meta, status: 'waiting_for_user_answer' };
@@ -77,7 +67,6 @@ function threadWaitingOnQuestion() {
 const exchanges = () => computeExchanges(threadMap.value.get('t')!);
 const card = () => exchanges().find(ex => ex.userEvent.type === 'UserQuestionAsked')!;
 
-/** A typed answer none of whose attempts gets an answer, quiet retries included. */
 async function answerUnanswered(text: string): Promise<string> {
   mockedSubmitChat.mockRejectedValue(new TypeError('Load failed'));
   const outcome = sendMessage(text, undefined, { threadId: 't' });

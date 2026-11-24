@@ -47,9 +47,10 @@ _mw_top_pid() {
 }
 
 # One tab-separated row: pid, ppid, pgid, uid, start time, command. Empty when
-# the process has gone.
+# the process has gone. The C time format keeps lstart at the five words the
+# split reads, whatever the user's locale.
 _mw_proc_info() {
-    ps -o pid=,ppid=,pgid=,uid=,lstart=,command= -p "$1" 2>/dev/null | awk '
+    env -u LC_ALL LC_TIME=C ps -o pid=,ppid=,pgid=,uid=,lstart=,command= -p "$1" 2>/dev/null | awk '
         {
             printf "%s\t%s\t%s\t%s\t%s %s %s %s %s\t", $1, $2, $3, $4, $5, $6, $7, $8, $9
             for (i = 1; i <= 9; i++) $i = ""

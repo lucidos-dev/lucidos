@@ -1,22 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Regression test for an open trigger DETAIL page that ignores the
- * `TriggerUpdated` frame its own store already applied.
- *
- * Reported after three `update_trigger` calls assigned three triggers to
- * groups from a chat thread. The detail page stayed on the old group until the
- * page was reloaded.
- *
- * The engine emits, `processSSEForReferences` reloads, and the `triggers`
- * signal carries the new value. `TriggerFormInner` then throws it away. It
- * copies every field into `useState` at mount. The key is the trigger id
- * alone, so a change to the SAME trigger reuses the instance and re-seeds
- * nothing.
- *
- * Why no unit test caught it: the fault lives at the mount boundary, not in a
- * function. `triggers.test.ts` asserts the signal, and the signal was always
- * right. Only a rendered surface fed a second frame can see it.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -55,16 +37,10 @@ function trigger(over: Partial<TriggerInfo> = {}): TriggerInfo {
   };
 }
 
-/** Land an SSE-driven store update. `loadTriggers` replaces the whole loadable
- *  with a fresh array, which is what this reproduces: same trigger id, new
- *  object identity, new field. */
 function landFrame(over: Partial<TriggerInfo>): void {
   triggers.value = { status: 'loaded', data: [trigger(over)] };
 }
 
-/** Preact re-renders a signal subscriber on a microtask, so one turn of the
- *  event loop is enough. Polled rather than fixed, because a loaded parallel
- *  run stretches the frames the effects ride on. */
 async function waitFor(done: () => boolean, budgetMs = 1000): Promise<void> {
   for (let waited = 0; waited < budgetMs; waited += 10) {
     if (done()) return;
@@ -75,9 +51,6 @@ async function waitFor(done: () => boolean, budgetMs = 1000): Promise<void> {
 describe('the open trigger detail page repaints from the TriggerUpdated frame', () => {
   let host: HTMLElement;
 
-  /** What the group picker's trigger button currently shows. The first span
-   *  inside `.dropdown-sizer` is the selected label; the rest are the
-   *  aria-hidden sizing copies. */
   function groupLabel(): string | undefined {
     return host
       .querySelector('.trigger-group-select .dropdown-sizer > span')
@@ -94,7 +67,6 @@ describe('the open trigger detail page repaints from the TriggerUpdated frame', 
     document.body.innerHTML = '';
     host = document.createElement('div');
     document.body.appendChild(host);
-    // Loaded, so the form does not fire a model fetch it has no need of here.
     chatModels.value = { status: 'loaded', data: [] };
     triggerGroups.value = {
       status: 'loaded',
@@ -124,7 +96,6 @@ describe('the open trigger detail page repaints from the TriggerUpdated frame', 
     landFrame({ group_id: NIGHTLY });
     await waitFor(() => groupLabel() === 'Nightly CI & Learning');
 
-    // The reported symptom: this read '(No group)' until a reload.
     expect(groupLabel()).toBe('Nightly CI & Learning');
   });
 
@@ -157,8 +128,6 @@ describe('the open trigger detail page repaints from the TriggerUpdated frame', 
     input.dispatchEvent(new Event('input', { bubbles: true }));
     await waitFor(() => nameInput().value === 'My own name');
 
-    // One frame, two fields: it renames the trigger AND groups it. The typed
-    // name must survive; the untouched group must move.
     landFrame({ name: 'Renamed elsewhere', group_id: MACHINE });
     await waitFor(() => groupLabel() === 'Machine & Tooling Health');
 

@@ -7,6 +7,10 @@
 # Checks references and reverse event, CLI and SDK documentation coverage.
 # Reads docs/generated/agent-surface.json without Cargo. Missing inputs fail.
 # Domain examples declare `<!-- domain-event: Name: reason -->` in their file.
+# A `system-knowhow/<file>.md` followed by `§ <section>` must name a file that
+# holds the section, in every tracked file except docs/plans/, docs/adr/,
+# CHANGELOG.md and applied migrations. A section is a heading, the text before
+# its first colon, a `§N` or `N.` number, or a bold lead-in.
 # Semantic currency still needs the review in .claude/rules/system-knowhow.md.
 
 set -uo pipefail
@@ -41,6 +45,7 @@ import glob
 import json
 import pathlib
 import shlex
+import subprocess
 import urllib.parse
 
 import os
@@ -120,21 +125,30 @@ def cli_reference(snippet, line):
         if re.fullmatch(r"[A-Z][A-Za-z0-9]+", name) and name not in known_events and name not in domain_events:
             yield "event %s is not live, legacy or declared" % name
     node = surface["cli"]
+    # A bare `--flag` may take the next token as its value. The surface does
+    # not say which flags take one, so a token that names no subcommand
+    # right after a bare flag counts as its value.
+    after_bare_flag = False
     for token in tokens[1:]:
         if token in ("--", "|", ";", "&&", ">", "2>"):
             break
         if token.startswith(("<", "$", "[", "{", "…")):
+            after_bare_flag = False
             continue
         if token.startswith("--"):
             flag = token[2:].split("=", 1)[0].rstrip(".,;:")
             if flag and flag not in node["flags"]:
                 yield "CLI flag --%s is not on lucidos %s" % (flag, node["name"])
+            after_bare_flag = "=" not in token
             continue
         if token.startswith("-"):
             continue
+        value_of_flag, after_bare_flag = after_bare_flag, False
         children = {name: child for child in node["commands"] for name in [child["name"]] + child["aliases"]}
         if token in children:
             node = children[token]
+        elif value_of_flag:
+            continue
         elif children:
             yield "CLI subcommand %s does not exist below %s" % (token, node["name"])
             break
@@ -366,9 +380,15 @@ def markdown_lines(path):
             yield line
 
 
+def family_lines(path):
+    """A doc over the size cap is an index plus parts in its folder: read them all."""
+    for member in [path] + sorted(glob.glob(path[:-3] + "/**/*.md", recursive=True)):
+        yield from markdown_lines(member)
+
+
 event_doc = "system-knowhow/thread-events.md"
 documented_events = set()
-for line in markdown_lines(event_doc):
+for line in family_lines(event_doc):
     cells = table_cells(line)
     if len(cells) >= 3 and re.fullmatch(r"`[A-Z][A-Za-z0-9]+`", cells[0]):
         documented_events.add(cells[0].strip("`"))
@@ -420,7 +440,7 @@ def cli_heading_paths(snippet, parent=()):
 
 cli_doc = "system-knowhow/lucidos-cli.md"
 documented_commands = set()
-for line in markdown_lines(cli_doc):
+for line in family_lines(cli_doc):
     if re.match(r"^#{2,6}\s", line):
         parent = ()
         previous_end = 0
@@ -439,13 +459,139 @@ for path in sorted(set(command_paths(surface["cli"])) - documented_commands):
 
 sdk_doc = "system-knowhow/js-sdk.md"
 documented_exports = set()
-for line in markdown_lines(sdk_doc):
+for line in family_lines(sdk_doc):
     heading = re.match(r"^## lucidos\.([A-Za-z][A-Za-z0-9_]*)(?=[:\s]|$)", line)
     if heading:
         documented_exports.add(heading[1])
 for name in sorted(sdk_exports - documented_exports):
     problems.append("%s: SDK lucidos.%s has no ## section" % (sdk_doc, name))
 
+
+# --- arm 6: every `§` reference names a file that holds the section --------
+
+SECTION_REF_SKIP = ("docs/plans/", "docs/adr/", "CHANGELOG.md")
+SECTION_REF_IMMUTABLE = re.compile(r"(?:^|/)migrations/.*\.sql$")
+SECTION_REF = re.compile(r"(?<![\w/.-])(system-knowhow/[A-Za-z0-9_./-]+?)(?:\.md)?`?\s+§\s*(?P<rest>.*?)(?=system-knowhow/|$)")
+COMMENT_PREFIX = re.compile(r"^\s*(?://[/!]?|\*|#+|--|<!--|>)?\s*")
+
+
+def anchor_text(text):
+    text = re.sub(r"[`\"“”*]", "", text)
+    return re.sub(r"\s+", " ", text).strip().lower().rstrip(".,;:)")
+
+
+def file_anchors(path, cache={}):
+    """What a `§` reference may cite: headings, their aliases and bold lead-ins."""
+    if path in cache:
+        return cache[path]
+    found = set()
+    fenced = False
+    for line in read(path).splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.*?)\s*#*\s*$", line)
+        if heading:
+            text = heading[1]
+            # A continued section is cited at the part where it starts.
+            if text.endswith("(continued)"):
+                continue
+            found.add(anchor_text(text))
+            if ": " in text:
+                found.add(anchor_text(text.split(": ", 1)[0]))
+            if " (" in text:
+                found.add(anchor_text(text.split(" (", 1)[0]))
+            number = re.match(r"^§?(\d+(?:\.\d+)?)[.:]?\s", text + " ")
+            if number:
+                found.add("#" + number[1])
+            if text.startswith("`"):
+                command = re.split(r"\s[<\[(|-]|`", text.lstrip("`"), maxsplit=1)[0].split()
+                for length in range(2, len(command) + 1):
+                    found.add(anchor_text(" ".join(command[:length])))
+            continue
+        bold = re.match(r"^\s*(?:[-*]\s+|\d+\.\s+)?\*\*(.+?)[.:]?\*\*", line)
+        if bold:
+            found.add(anchor_text(bold[1]))
+    cache[path] = found
+    return found
+
+
+def sibling_holds(file, key):
+    """A numbered section lives in one part, so a sibling part may own it."""
+    return any(
+        "#" + key in file_anchors(other)
+        for other in glob.glob(os.path.dirname(file) + "/*.md")
+        if other != file
+    )
+
+
+def section_resolves(file, citation):
+    anchors = file_anchors(file)
+    numbers = re.match(r"^\d+(?:\.\d+)?(?:\s*(?:,|and|-|\u2013|to)\s*\d+(?:\.\d+)?)*", citation)
+    if numbers:
+        for key in re.findall(r"\d+(?:\.\d+)?", numbers[0]):
+            if "#" + key in anchors:
+                continue
+            major = key.split(".")[0]
+            if key != major and "#" + major in anchors and not sibling_holds(file, key):
+                continue
+            return False
+        return True
+    quoted = re.match(r"^[\"\u201c]([^\"\u201d]+)[\"\u201d]", citation)
+    text = anchor_text(quoted[1] if quoted else citation)
+    if not text:
+        return False
+    for anchor in anchors:
+        if anchor.startswith("#"):
+            continue
+        if text == anchor or (text.startswith(anchor) and not text[len(anchor)].isalnum()):
+            return True
+        # A quoted title may abbreviate the heading it names.
+        if quoted and anchor.startswith(text) and (len(anchor) == len(text) or not anchor[len(text)].isalnum()):
+            return True
+    return False
+
+
+def cited_sections(rest):
+    """The first citation, then each `§` that continues a list of short titles: `, §`, `and §`, `§§`."""
+    citations = []
+    start = 0
+    for marker in re.finditer(r"§+\s*", rest):
+        before = rest[start:marker.start()]
+        if before.strip():
+            citations.append(before)
+            # A list item is a short title. A longer span is prose, and its
+            # next `§` may cite this document.
+            if not re.fullmatch(r"(?:\S+\s+){0,4}\S+\s*(?:,|;|\band|\bor|-|–)\s*", before.strip() + " ") or re.search(r"\.md\b", before):
+                return [c.strip() for c in citations if c.strip()]
+        start = marker.end()
+    citations.append(rest[start:])
+    return [c.strip() for c in citations if c.strip()]
+
+
+tracked = subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0")
+for path in tracked:
+    if not path or path.startswith(SECTION_REF_SKIP) or SECTION_REF_IMMUTABLE.search(path) or not os.path.isfile(path):
+        continue
+    try:
+        lines = read(path).split("\n")
+    except UnicodeDecodeError:
+        continue
+    for number, line in enumerate(lines, 1):
+        for match in SECTION_REF.finditer(line):
+            file = match[1] + ".md"
+            rest = match["rest"]
+            if number < len(lines) and match.end() == len(line):
+                rest += " " + COMMENT_PREFIX.sub("", lines[number], count=1)
+            if not os.path.isfile(file):
+                problems.append("%s:%d: § reference names a file that does not exist: %s" % (path, number, file))
+                continue
+            # `§ A, § B` and `§§1, 4` cite several sections of the one file.
+            for citation in cited_sections(rest):
+                if not section_resolves(file, citation):
+                    problems.append("%s:%d: %s has no section `%s`" % (path, number, file, anchor_text(citation)[:50]))
 
 # --- report ----------------------------------------------------------------
 

@@ -1,14 +1,3 @@
-/**
- * The drawer grouping and the selected ongoing group each have one owner, and the
- * drawer's transition follows the grouping. Two halves pin that:
- *
- *  1. `setDrawerGrouping` and `setSelectedOngoingGroup` are the only writers. Each
- *     signal is module-private and exported read-only, so `tsc` rejects a
- *     direct write. This scan catches the escapes `tsc` cannot: a cast back to
- *     writable, a second signal, or a write to the persisted key.
- *  2. The drawer's navigation cover keys on the grouping, through
- *     `drawerSwapKey`. So no caller of the owner can skip the dip.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';

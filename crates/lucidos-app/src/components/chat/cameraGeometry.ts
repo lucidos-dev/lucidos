@@ -1,11 +1,3 @@
-// iOS Safari `getUserMedia` delivers frames in the device's natural orientation
-// (portrait on iPhone) regardless of how the device is held; Android Chrome
-// rotates the frame to match device orientation. `canvas.drawImage(video)`
-// captures the raw underlying frame, so on iOS a landscape-held phone produces
-// a JPEG rotated 90° from what the user saw. We detect the mismatch by
-// aspect ratio: if the frame's orientation doesn't match the device's, we
-// rotate to compensate. When they already match (Android, or iOS in portrait),
-// no rotation is applied.
 
 export interface CaptureGeometry {
   canvasWidth: number;
@@ -31,11 +23,6 @@ export function computeCaptureGeometry(
   const angle = ((deviceAngleDegrees % 360) + 360) % 360;
   const deviceLandscape = angle === 90 || angle === 270;
   const frameLandscape = videoWidth > videoHeight;
-  // If frame orientation already matches device orientation, the platform
-  // (or the user holding portrait) is doing the right thing — don't rotate.
-  // Only the 180° case is ambiguous (same aspect ratio, but flipped); we still
-  // apply a 180° rotation there so an upside-down hold produces a right-side-up
-  // image.
   if (deviceLandscape === frameLandscape && angle !== 180) {
     return NO_ROTATION(videoWidth, videoHeight);
   }
@@ -75,7 +62,6 @@ export function readDeviceAngle(): number {
   if (orientation && typeof orientation.angle === 'number') {
     return orientation.angle;
   }
-  // Fallback for older Safari (deprecated but still present in iOS PWA).
   const legacy = (window as unknown as { orientation?: number }).orientation;
   return typeof legacy === 'number' ? legacy : 0;
 }

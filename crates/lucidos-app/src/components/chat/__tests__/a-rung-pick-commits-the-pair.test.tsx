@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The prompt bar's rung control opens the rung list. One tap on a rung commits
- * its model and effort together, into the draft's own override and no account
- * preference. Another draft keeps its own pick.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';
@@ -99,7 +94,6 @@ async function openRungList(draft: string): Promise<void> {
   await settle();
 }
 
-/** The compose pill's two steps, ‹ first. */
 function stepButtons(): HTMLButtonElement[] {
   return Array.from(document.querySelectorAll<HTMLButtonElement>('.rung-step'));
 }
@@ -145,7 +139,6 @@ describe('the rung list', () => {
   it('steps one row from the pill, into this draft only, with no toast', async () => {
     render(<RungControl composeThreadId="d1" codingAgent="claude-code" />, host);
     await settle();
-    // Nothing is picked, so the default rung is in force and only the › step is live.
     expect(stepButtons().map((b) => b.getAttribute('aria-disabled'))).toEqual(['true', 'false']);
     stepButtons()[1].click();
     await settle();
@@ -161,7 +154,6 @@ describe('the rung list', () => {
   it('names the rung in the pill as it steps', async () => {
     render(<RungControl composeThreadId="d1" codingAgent="claude-code" />, host);
     await settle();
-    // Nothing picked runs the ladder's default, which is the first rung.
     const face = () => host.querySelector('.rung-label')!.textContent;
     expect(face()).toBe('1.0×Opus 5.6 · medium');
     stepButtons()[1].click();

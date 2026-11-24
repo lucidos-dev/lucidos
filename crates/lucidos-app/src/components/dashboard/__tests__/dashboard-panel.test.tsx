@@ -1,10 +1,5 @@
 // @vitest-environment jsdom
 import { writeWindowItem } from '../../../utils/windowStorage';
-/**
- * The dashboard panel: the phone dashboard over the open thread. Its toggle
- * sits beside the mark in the thread header, on a phone only. Opening never
- * moves focus.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -168,7 +163,6 @@ describe('what ends the panel', () => {
     expect(threadNavHistory.value.stack.some((row) => row.type === 'dashboard')).toBe(false);
   });
 
-  /** Invariant: a cold launch that reads the layout wrong at first still reopens the panel the history points at. */
   it('reopens the panel the history points at when the layout turns phone after startup', () => {
     act(() => { viewportIsMobile.value = false; });
     threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { title: 'A thread', section: 'inbox' }, eventsLoaded: true })]]);
@@ -190,7 +184,6 @@ describe('what ends the panel', () => {
     expect(dashboardPanelOpen.value).toBe(false);
   });
 
-  /** Invariant: the dashboard counts as hidden off the thread pane, so it settles only once that pane has slid in. */
   it('tells its dashboard it is hidden while the thread pane is not the current pane', async () => {
     mountPhone();
     act(() => setMobileView('content'));
@@ -213,8 +206,6 @@ describe('what ends the panel', () => {
 
 describe('the panel module loading late', () => {
   it('keeps a panel the startup already reopened', async () => {
-    // The client starts from the entry chunk, so the shell chunk holding this
-    // module can load after a reload has reopened the panel.
     vi.resetModules();
     const { openDashboardPanel, dashboardPanelOpen: openSignal } = await import('../../../store/dashboards');
     openDashboardPanel();

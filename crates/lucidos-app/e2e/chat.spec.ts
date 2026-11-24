@@ -17,10 +17,8 @@ test.describe('Chat - send and receive messages', () => {
     const msg = uniqueMessage('chat-basic');
     await sendMessage(page, `Say exactly: "hello ${msg}"`);
 
-    // User message should appear in the thread (use first visible one)
     await expect(userMessageBody(page)).toContainText(msg, { timeout: 10_000 });
 
-    // Wait for the LLM response to finish
     const response = await waitForResponse(page);
     const responseText = await response.textContent();
     expect(responseText!.trim().length).toBeGreaterThan(0);
@@ -33,14 +31,11 @@ test.describe('Chat - send and receive messages', () => {
     await sendMessage(page, `Say exactly: "acknowledged ${msg}"`);
     await waitForResponse(page);
 
-    // Open the thread drawer
     await openThreadDrawer(page);
 
-    // A thread row should appear in the sidebar
     const threadRows = page.locator('.thread-row:visible');
     await expect(threadRows.first()).toBeVisible({ timeout: 15_000 });
 
-    // The focused thread should be highlighted
     const focusedRow = page.locator('.thread-row-focused:visible').first();
     await expect(focusedRow).toBeVisible();
   });
@@ -55,31 +50,7 @@ test.describe('Chat - send and receive messages', () => {
     expect(text!.trim().length).toBeGreaterThan(0);
   });
 
-  /**
-   * Pin: WITHIN a single CC turn, a follow-up user message must reach CC's
-   * stdin via the live msg_rx → agent_input_tx pipe. Phase 2 of the resume
-   * architecture made every CC subprocess exit on idle (between turns CC is
-   * dead). This test guards the within-turn path so an over-aggressive
-   * cancel-on-idle (or accidental removal of the msg_rx pipe) cannot
-   * silently regress.
-   *
-   * Failure modes this catches:
-   * - Final response references only the codeword (no bash output): CC
-   *   restarted mid-turn and lost the original task — Phase 2 cancellation
-   *   leaked into the within-turn path.
-   * - Final response references only the bash output (no codeword): msg2
-   *   was dropped — the within-turn stdin pipe is broken.
-   *
-   * The slow bash task (15x echo + sleep 2 = ~30s) gives a wide window for
-   * msg2 to land mid-turn. Detection of "mid-tool-call" polls the events
-   * API for CodingAgentToolCalled — deterministic, not a fixed timer.
-   */
   test.describe('with Bash granted', () => {
-    // A fresh workspace grants no Bash and the command guard ships off, so the
-    // loop would wait on a permission card. msg2 would then sit queued, and the
-    // turn would read as settled. The engine reads this file on every prompt.
-    // The grant file lives under `.lucidos/`, which the e2e reset keeps, so a
-    // restore that fails silently would leak Bash into every later run.
     let apiContext: APIRequestContext | undefined;
     let allowedToolsSnapshot: string | undefined;
     test.beforeEach(async () => {
@@ -115,30 +86,16 @@ test.describe('Chat - send and receive messages', () => {
       await newThread(page);
       await pickComposeDestination(page);
 
-      // msg1: a long bash task, shaped like coding-agent-cancel's
-      // BUSY_BASH_PROMPT (15 iterations of sleep 2 ≈ 30s). The "widgetN" tokens
-      // are easy to assert on. The wide window absorbs scheduling jitter, so
-      // msg2 lands while CC is still inside the bash tool call.
       const slowTask =
         `Run this exact bash command and include the full output verbatim in your final answer: ` +
         `bash -c 'for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do echo widget$i; sleep 2; done'`;
       await sendMessage(page, slowTask);
 
-      // Wait for CC to begin (status label transitions to Working/Requesting).
-      // This proves the exchange is live and the focused thread ID is settled
-      // in localStorage — required for the events-API poll below.
       await waitForCCToStart(page, 60_000);
 
-      // Pull the focused thread ID from the app's localStorage. The store
-      // writes 'lucidos-focused-thread' when it creates the thread, before the
-      // first message. So it is present once CC has started working.
       const threadId = await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'));
       expect(threadId, 'focused thread id not in localStorage').toBeTruthy();
 
-      // Deterministic mid-tool-call signal: poll the events API until a
-      // CodingAgentToolCalled event lands for this thread. The step log is a
-      // stored per-reader setting, so `.inline-step` rendering is not a signal
-      // this spec can rely on. The event store is the source of truth.
       await expect.poll(
         async () => {
           const resp = await page.request.get(`/api/v1/threads/${threadId}/events`);
@@ -152,17 +109,10 @@ test.describe('Chat - send and receive messages', () => {
         { intervals: [500, 1000, 2000], timeout: 60_000 },
       ).toBe(true);
 
-      // msg2: arrives WHILE the bash sleep loop is still running. If Phase 2
-      // killed the process on idle (it shouldn't, mid-turn) or the msg_rx pipe
-      // is gone, this message will not reach CC.
       await sendFollowUp(page, `Also remember the codeword "horseshoe" and include it in your final answer.`);
 
-      // Wait for the whole turn (original task + mid-turn add-on) to settle.
       await waitForCCToFinish(page, 120_000);
 
-      // Pull all visible response text. CC may emit several response chunks
-      // across the turn. The within-turn promise is that the user sees both
-      // pieces of work in their answer, whichever chunk holds which.
       const responseText = await page.evaluate(() => {
         const els = document.querySelectorAll('.response-content');
         const visible = Array.from(els).filter(el => {

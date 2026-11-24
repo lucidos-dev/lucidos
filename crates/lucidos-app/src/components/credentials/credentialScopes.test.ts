@@ -20,10 +20,6 @@ describe('initialScopeRows', () => {
     expect(initialScopeRows(undefined, ['  '])).toEqual(['']);
   });
 
-  /* The reported case: a token saved for a provider's API host, then wanted for
-     its git host. The engine reopens that row seeded with BOTH, so preferring
-     the stored set here would drop the host the form is open to add, and the
-     user would be back to a second credential holding the same secret. */
   it("takes the request's set over the stored one, because the engine unioned it", () => {
     expect(
       initialScopeRows(
@@ -33,8 +29,6 @@ describe('initialScopeRows', () => {
     ).toEqual(['https://api.github.com', 'https://github.com']);
   });
 
-  /* An OAuth repair carries no set. It must read exactly as it did before a
-     widening could reach this function. */
   it('falls back to the stored set when the request names none', () => {
     expect(initialScopeRows(undefined, ['https://api.dropboxapi.com'])).toEqual([
       'https://api.dropboxapi.com',
@@ -57,8 +51,6 @@ describe('editing the rows', () => {
     expect(rows).toEqual(['https://fapi.binance.com']);
   });
 
-  /* Removing the last row must leave a field on screen. Emptying the list
-     would strand the user with no input and only an Add button. */
   it('keeps one field when the last row is removed', () => {
     expect(removeScopeRow(['https://api.binance.com'], 0)).toEqual(['']);
   });
@@ -76,8 +68,6 @@ describe('submittedScopes', () => {
     ).toEqual(['https://api.binance.com', 'https://fapi.binance.com']);
   });
 
-  /* The empty scope is reachable and means the credential goes nowhere, which
-     is what a `secret` carries. */
   it('submits nothing when every row is blank', () => {
     expect(submittedScopes([''])).toEqual([]);
     expect(submittedScopes(['   ', ''])).toEqual([]);

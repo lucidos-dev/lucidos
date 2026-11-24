@@ -1,15 +1,3 @@
-/**
- * No UI may wait on an animation end event that might never come.
- *
- * An element with no animation fires no end event, and reduced motion removes
- * animations. A UI state that clears only on that event then never clears, and
- * an overlay left open inerts the whole shell. The in-app Motion setting makes
- * that path common.
- *
- * So every listener is audited here, with how it completes without its event.
- * A new listener fails this test until it is added, which is the point: the
- * author has to answer the question before it ships.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -21,9 +9,6 @@ import { clientSourcePaths } from '../styles/__tests__/css-rule-helpers';
 
 const srcRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-/** How each listener completes without its event. `requires` must appear in
- *  the code of `fallbackIn`, or of the file itself, so the answer cannot rot
- *  into a claim. */
 const AUDITED: Record<string, { how: string; requires: RegExp | null; fallbackIn?: string }> = {
   'components/layout/Drawer.tsx': {
     how: 'closes at once under reduced motion, and a scaled fallback timer closes a stalled slide-out',
@@ -56,7 +41,6 @@ const AUDITED: Record<string, { how: string; requires: RegExp | null; fallbackIn
   },
 };
 
-/** Code with comments removed, so a doc comment naming an event is not a use. */
 function code(path: string): string {
   return readFileSync(path, 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '')

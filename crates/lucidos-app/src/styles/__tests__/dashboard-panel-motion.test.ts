@@ -1,8 +1,3 @@
-/**
- * The dashboard panel fades in place, on a scaled duration, so reduced motion
- * needs no rule of its own. Source scans of panels/dashboard.css, like the
- * rail's chrome test.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -36,8 +31,6 @@ describe('the dashboard panel motion', () => {
   });
 
   it('holds a compositor layer of its own, so the transcript layer never paints through it', () => {
-    // `.thread-content` is its own layer on the phone (mobile.css). A panel
-    // painted into the pane's layer flickers under it while the strip slides.
     const layer = rule('.dashboard-panel').props;
     expect(layer.get('transform')).toBe('translateZ(0)');
   });
@@ -57,8 +50,6 @@ describe('the dashboard panel motion', () => {
   });
 
   it('stacks above the thread\'s floating scroll chevrons', () => {
-    // Both share the pane's stacking context (mobile.css), so the panel must
-    // clear the chevrons' z-index or they draw over the dashboard.
     const chevrons = cssRules(readFileSync(resolve(stylesDir, 'chat/input-messages.css'), 'utf-8'))
       .filter((r) => r.selector === '.scroll-to-top, .scroll-to-bottom, .follow-toggle' && r.atRules === '');
     expect(chevrons).toHaveLength(1);

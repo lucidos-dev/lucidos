@@ -7,8 +7,6 @@ import {
 } from '../store';
 import type { CredentialRequest } from '../types';
 
-// Spy on pushNavState — we want to verify the call count, not the side effects
-// (real pushNavState dirties localStorage and a module-level signal stack).
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 
@@ -20,7 +18,6 @@ vi.mock('../../api/client', () => ({
   listTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
 }));
 
-// Imports must come after vi.mock so the mocked './navigation' is wired in.
 const {
   openCredentialRequest,
   openAddCredential,
@@ -42,10 +39,6 @@ describe('opening a credential panel pushes exactly one nav state', () => {
     pushNavState.mockClear();
   });
 
-  // The bug: openCredentialRequest used to call switchMenuItem + openSettingsSubview,
-  // each of which pushNavState'd. The credential overlay then pushed a third entry.
-  // Pressing Back from the panel "got stuck" cycling through Settings/Accounts
-  // before returning to where the user was when the panel popped up.
   it('openCredentialRequest from outside settings pushes 1 nav state, not 3', () => {
     openCredentialRequest(helius);
 

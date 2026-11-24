@@ -20,8 +20,7 @@ use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A widget's params for one place it shows: a JSON object.
-pub type WidgetParams = BTreeMap<String, Value>;
+pub use crate::engine::thread_events::WidgetParams;
 
 /// The most bytes a widget's canonical params may take. They ride the frame
 /// URL, so a large value belongs in a file the widget reads.
@@ -82,7 +81,7 @@ pub(crate) fn listed_widget(
         Ok(app) => Ok(Some(app)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            log!("[Widgets] Skipping {app_id}: {e}");
+            log_legacy!("[Widgets] Skipping {app_id}: {e}");
             Ok(None)
         }
         Err(e) => Err(format!("reading widget '{app_id}': {e}").into()),

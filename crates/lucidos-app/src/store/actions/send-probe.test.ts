@@ -11,11 +11,8 @@ vi.mock('../../utils/clientLog', () => ({ postClientLog }));
 
 import { SEND_CONFIRM_MS, probeStreamAfterSend } from './send-probe';
 
-/** Let the probe's awaited refetch settle. */
 const settle = () => vi.advanceTimersByTimeAsync(0);
 
-/** A refetch that finds each thread's confirming event the stream never
- *  brought. Returns that thread's `confirmed` check. */
 function refetchFinds(): (threadId: string) => () => boolean {
   const persisted = new Set<string>();
   refreshThreadEvents.mockImplementation(async (threadId) => {
@@ -25,7 +22,6 @@ function refetchFinds(): (threadId: string) => () => boolean {
   return (threadId) => () => persisted.has(threadId);
 }
 
-/** Each test starts an hour after the last, clear of the restart cooldown. */
 let clock = 0;
 
 describe('probeStreamAfterSend', () => {

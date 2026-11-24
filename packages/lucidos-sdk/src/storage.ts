@@ -1,12 +1,3 @@
-/**
- * `lucidos.storage`: per-app, per-device storage an isolated app frame can use.
- *
- * A frame's own `localStorage` throws, because its origin is opaque. These two
- * stores answer the same `Storage` calls from a mirror the host primes, and
- * write through to the shell's own storage. Await `ready` before the first
- * read. Contract: `system-knowhow/js-sdk.md` § lucidos.storage. Why it works
- * this way: `docs/adr/0372-app-storage-lives-in-the-shell.md`.
- */
 
 import { getBaseUrl } from './_fetch';
 import { isBridged } from './_bridge';
@@ -25,11 +16,9 @@ import {
 } from './appStorage';
 import { parseAppId } from './scroll';
 
-/** A write the host refused after `setItem`, `removeItem` or `clear` returned. */
 export interface StorageFailure {
   op: 'set' | 'remove' | 'clear';
   area: AppStorageArea;
-  /** The key written, or null for `clear`. */
   key: string | null;
   message: string;
 }
@@ -46,8 +35,6 @@ function report(failure: StorageFailure): void {
 
 let warnedEarlyRead = false;
 
-/** A read before the prime answered sees what a first visit sees. Said once,
- *  because it is the bug that makes an app forget its state on reload. */
 function warnIfEarly(area: AppStorageArea, key: string | null): void {
   if (warnedEarlyRead || bridgedStorageSettled()) return;
   warnedEarlyRead = true;
@@ -68,8 +55,6 @@ function notAnApp(): Error {
   return new Error('lucidos.storage needs an app: this page is not served from /app/<id>/');
 }
 
-/** Turn a write's outcome into what a caller sees. A synchronous refusal
- *  throws; a later one from the host goes to the `onError` handlers. */
 function settle(failure: Omit<StorageFailure, 'message'>, outcome: Promise<void> | void): void {
   if (!outcome) return;
   outcome.catch((error: unknown) => {
@@ -77,7 +62,6 @@ function settle(failure: Omit<StorageFailure, 'message'>, outcome: Promise<void>
   });
 }
 
-/** One area of the app's store, with the `Storage` interface. */
 export class AppStore {
   constructor(private readonly area: AppStorageArea) {}
 
@@ -122,29 +106,19 @@ export class AppStore {
 }
 
 export const storage = {
-  /** Kept across reloads and app switches, on this device. */
   local: new AppStore('local'),
-  /** Kept until the Lucidos tab closes, on this device. */
   session: new AppStore('session'),
-  /** Resolves once this frame's stored values are readable. Rejects if the
-   *  host could not hand them over, in which case reads see nothing stored. */
   get ready(): Promise<void> {
     return primeBridgedStorage();
   },
-  /** Hear about a write the host refused after the call returned, such as a
-   *  full browser store. The value is already rolled back. Returns the
-   *  unsubscribe. */
   onError(handler: (failure: StorageFailure) => void): () => void {
     failureHandlers.add(handler);
     return () => { failureHandlers.delete(handler); };
   },
-  /** How much one app may keep in one area, in characters of key plus value. */
   quota: APP_STORAGE_QUOTA,
-  /** The largest single value, in characters. */
   valueMax: APP_STORAGE_VALUE_MAX,
 };
 
-/** Test-only: forget handlers and the one-shot warning. */
 export function _resetStorageForTesting(): void {
   failureHandlers.clear();
   warnedEarlyRead = false;

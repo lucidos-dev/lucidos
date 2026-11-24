@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** A resume draws no header of its own. It is a card at the top of the reply it
- *  resumed, under that reply's agent header. Before, the engine's chip and a
- *  summary line sat over the reply as a second header for one turn.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

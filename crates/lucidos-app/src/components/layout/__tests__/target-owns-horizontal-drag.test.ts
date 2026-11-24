@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A touch whose target drives a horizontal gesture of its own never starts a
- * pane swipe. The dashboard panel sits inside the thread pane, so a tile drag
- * in edit mode reaches the strip's touch listeners too.
- */
 import { afterEach, describe, expect, it } from 'vitest';
 import { targetOwnsHorizontalDrag } from '../MobileSwipeContainer';
 

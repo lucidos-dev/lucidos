@@ -1,11 +1,3 @@
-/**
- * A plain toast raised again while its twin is up bumps a counter on the card
- * instead of stacking a copy. Otherwise nine lazy chunks failing at once would
- * cover the screen with nine identical "Failed to load" cards.
- *
- * Only a toast with nothing to act on merges. Two cards with the same words but
- * their own action or click handler may do different things.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { focusedPane, showToast, toasts, TOAST_AUTO_DISMISS_MS } from '../store';
 import { ToastList } from '../../components/shared/Toast';

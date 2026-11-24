@@ -7,8 +7,6 @@ import { errorDetail } from '../../utils/errorDetail';
 import { Disclosure } from '../shared/Disclosure';
 import { continueStoppedThread } from './continueStoppedThread';
 
-/** What the strip says for each reason a turn end withheld the work (ADR 0400).
- *  `hint` sits on the strip, and a tap toasts `detail`. */
 export const NOT_READY_COPY: Record<StripReason, { label: string; hint: string; detail: string }> = {
   plan_missing: {
     label: 'Not ready: needs a plan',
@@ -16,11 +14,27 @@ export const NOT_READY_COPY: Record<StripReason, { label: string; hint: string; 
     detail:
       'Lucidos held this work back because its branch has no implementation plan. Ask the agent for a plan and approve it. Its next turn end then proposes the change.',
   },
+  plan_changed: {
+    label: 'Not ready: plan changed after approval',
+    hint: 'Ask the agent to restore the approved plan text.',
+    detail:
+      'Restoring the approved plan text keeps your approval. If the plan needs to change, the agent can submit the revision for approval.',
+  },
+  plan_unreadable: {
+    label: 'Not ready: plan check failed',
+    hint: 'Ask the agent to retry the plan check.',
+    detail: 'Lucidos could not verify the implementation plan. Ask the agent to retry the check so it can propose the change.',
+  },
   plan_awaiting_approval: {
     label: 'Not ready: plan awaits approval',
     hint: 'Approve the plan, and the agent finishes the work.',
     detail:
       'Lucidos held this work back because its implementation plan is not approved yet. Approve the plan, and the agent proposes the change once it finishes.',
+  },
+  plan_only_code: {
+    label: 'Not ready: approved for later',
+    hint: 'Code changes need implementation approval.',
+    detail: 'Only plan files may land. Code changes need implementation approval.',
   },
   outside_bound: {
     label: 'Not ready: outside its fix bound',
@@ -54,16 +68,12 @@ export const NOT_READY_COPY: Record<StripReason, { label: string; hint: string; 
   },
 };
 
-/** Every reason but a hand-off. A handed-off thread draws nothing here: the
- *  transcript's closing notice already links its legacy successor thread. */
 type StripReason = Exclude<UnproposedReason, 'carried_by_successor'>;
 
 function isStripReason(reason: UnproposedReason | null): reason is StripReason {
   return reason !== null && reason !== 'carried_by_successor';
 }
 
-/** The strip's label for `reason`. An integrated sub-thread names the parent
- *  it folds into, once the title is known. */
 export function notReadyLabel(reason: StripReason, meta: Pick<ThreadMeta, 'parentThreadTitle'> | undefined): string {
   if (reason === 'integrated_into_parent' && meta?.parentThreadTitle) return `Integrated into ${meta.parentThreadTitle}`;
   return NOT_READY_COPY[reason].label;
@@ -71,14 +81,11 @@ export function notReadyLabel(reason: StripReason, meta: Pick<ThreadMeta, 'paren
 
 type Shown = { threadId: string; reason: StripReason; label: string };
 
-/** What sits above the prompt box when the focused thread's work is not
- *  ready, where Apply would otherwise be offered: the amber strip saying why. */
 export function NotReadyStrip() {
   const threadId = focusedThreadId.value;
   const thread = threadId ? threadMap.value.get(threadId) : undefined;
   const reason = notReadyReason(thread);
   const open = isStripReason(reason);
-  // The last reason shown, so the strip keeps its words while it rolls shut.
   const shown = useRef<Shown | null>(null);
   if (threadId && open) shown.current = { threadId, reason, label: notReadyLabel(reason, thread?.meta) };
   const last = shown.current;
@@ -112,8 +119,6 @@ export function NotReadyStrip() {
   );
 }
 
-/** Start the hardening run the strip offers. A failure toasts, since the
- *  strip stays up and the press can be retried. */
 async function startHardening(threadId: string): Promise<void> {
   try {
     await hardenThread(threadId);

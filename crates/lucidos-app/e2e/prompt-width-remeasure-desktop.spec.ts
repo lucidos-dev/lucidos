@@ -1,39 +1,13 @@
 import { test, expect, type Page } from './fixtures';
 import { assertHealthy, hideDashboardRail, minThreadPane, navigateToApp, newThread, waitForVisibleInput } from './helpers';
 
-/** The composer's height is only ever right for the width it was measured at.
- *  Narrow the Conversation pane and the same paragraph needs more lines; widen
- *  it and it needs fewer. `resizeTextarea` reads the VALUE, which a resize never
- *  touches, so without `useWidthRemeasure` the box keeps the height it had:
- *  clipped after a narrowing, and stuck tall after a widening.
- *
- *  The zero-width stand-down that rides with it is unit-tested
- *  (`components/chat/__tests__/prompt-resize.test.ts`). What only a browser can
- *  say is that the height really does follow the pane, so that is what this
- *  asserts.
- *
- *  Desktop-only: the split layout exists only here. Mobile swipes between
- *  full-screen panes, so the composer has one width. */
 
 test.use({ viewport: { width: 1280, height: 800 } });
 
-// Two divider positions far enough apart that the paragraph below takes a
-// different number of lines at each. The narrow one is past the Conversation
-// pane's floor on purpose: a drag there clamps, so it lands on the wall itself.
 const WIDE_X = 700;
 const NARROW_X = 150;
-// What the wide pane must actually measure. A drag that silently missed the
-// divider would leave the pane put, and the height assertions would then pass
-// for the wrong reason. The narrow end is the pane's own floor.
 const WIDE_FLOOR = 600;
 
-// One paragraph, no newlines, so every line break is the box's own wrapping
-// decision and the line count is a pure function of the width.
-//
-// Long enough that the two widths differ by several lines in any monospace
-// font. `--font-mono` falls back to the platform's `monospace`, whose glyphs
-// are wider on Linux than SF Mono. A draft near a line boundary can then need
-// the same line count at both widths, and the height rightly stays put.
 const PARAGRAPH =
   'This single paragraph carries no newline of its own, so every line break in '
   + 'the composer is one the box chose for the width it currently has. It runs to '
@@ -41,7 +15,6 @@ const PARAGRAPH =
   + 'a single wrapped word, whatever monospace font the platform falls back to, so '
   + 'the line count cannot land on the same number at both widths by luck.';
 
-// The pane geometry settles within var(--duration-slow) (300ms).
 const SETTLE_MS = 600;
 
 async function dragDivider(page: Page, toX: number) {
@@ -54,9 +27,6 @@ async function dragDivider(page: Page, toX: number) {
   await page.waitForTimeout(SETTLE_MS);
 }
 
-/** The box's own height, the height its content wants, and the pane it sits in.
- *  `ch >= sh` means the whole draft is visible; a taller `sh` means the bottom
- *  lines are clipped. `pane` is carried so a drag that went nowhere says so. */
 function metrics(page: Page) {
   return page.locator('[data-role="prompt-input"]:visible').first()
     .evaluate((el: HTMLTextAreaElement) => ({
@@ -101,11 +71,6 @@ test.describe('the composer re-measures when its pane changes width', () => {
     expect(again.ch, 'still showing the whole draft').toBeGreaterThanOrEqual(again.sh - 4);
   });
 
-  // Zero is a width the composer really reaches: a collapsed pane keeps it in
-  // layout rather than unmounting it, and a textarea's `overflow-wrap:
-  // break-word` puts every character on its own line there. So the round trip
-  // has to end at the composer's own height, never at the `max-height: 40vh`
-  // cap a per-character measurement lands on.
   test('collapsing the pane and reopening it leaves the composer its own height', async ({ page }) => {
 
     await newThread(page);
@@ -115,7 +80,6 @@ test.describe('the composer re-measures when its pane changes width', () => {
     const before = await metrics(page);
     expect(before.pane, 'the widening drag moved the divider').toBeGreaterThan(WIDE_FLOOR);
 
-    // Double-click collapses the Conversation pane; a second one restores it.
     await page.locator('.split-divider').dblclick();
     await expect
       .poll(() => page.evaluate(() => document.querySelector('.pane-thread')!.getBoundingClientRect().width))

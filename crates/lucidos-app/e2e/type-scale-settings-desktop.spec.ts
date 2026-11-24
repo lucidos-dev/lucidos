@@ -1,22 +1,3 @@
-/**
- * Settings > System > What's New is on the type scale.
- *
- * This is the surface the whole text-defaults layer was written for: its
- * release notes shipped LARGER than the version heading above them, because
- * `.whats-new-notes` styled its padding and stopped and the block fell all the
- * way through to the root, which is `--font-size-xl`, a section heading.
- *
- * Desktop-only, and the reason is the viewport rather than the engine. The
- * spec pins 1280x900 and walks a settings panel laid out at that width. The
- * `-desktop` name is what keeps it out of the mobile-webkit project.
- *
- * It is NOT the `waitForEventStream` that `POST /api/v1/ui/navigate` needs.
- * That wait works under `mobile-webkit`, as `scroll-memory`, `thread-queue`
- * and `ui-scale-slider-mobile` all show. The engine-agnostic half of the
- * coverage runs on all three projects in `type-scale-all.spec.ts`: the defaults
- * themselves, and the thread-view walk. So nothing about the CSS goes
- * unchecked on WebKit.
- */
 import { test, expect } from './fixtures';
 import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 import { offenders, report } from './typeScaleWalk';
@@ -48,9 +29,6 @@ test.describe('Type scale in Settings', () => {
       { timeout: 15_000 }
     );
 
-    // Open the first release so the markdown notes are actually mounted: the
-    // panel renders each release's notes only when its row is opened, so a
-    // collapsed list would walk right past the surface under test.
     const firstRelease = page.locator('.whats-new-row, .whats-new-toggle').first();
     if (await firstRelease.count()) {
       await firstRelease.click();

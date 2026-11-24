@@ -1,8 +1,3 @@
-/**
- * Find the shell chunk in a built bundle: the chunk holding `<App/>`, which
- * `main.tsx` imports dynamically (ADR 0288). The preload plugin and the chunk
- * budget both start from it.
- */
 
 const SHELL_MODULE = '/src/App.tsx';
 
@@ -14,8 +9,6 @@ export function bundleChunks<C extends BundleChunk>(bundle: Record<string, C | {
 }
 
 export function findShellChunk<C extends BundleChunk>(chunks: C[]): C {
-  // By membership, not `facadeModuleId`: Rollup leaves that null when the chunk
-  // also exports shared code to the chunks that import it.
   const shell = chunks.find((c) => c.moduleIds.some((id) => id.endsWith(SHELL_MODULE)));
   if (!shell) {
     throw new Error(

@@ -340,6 +340,45 @@ pub(crate) fn checkpoint_body(run: &CheckpointRun, kind: CheckpointKind) -> serd
     body
 }
 
+/// Other backends are alternatives to an actionable own-backend handoff.
+fn other_backend_text(body: &serde_json::Value, verdict: &AutomaticVerdict) -> String {
+    if body["can_hand_off"] != true
+        || !matches!(
+            verdict,
+            AutomaticVerdict::HandOff { .. } | AutomaticVerdict::RiskRungOnly { .. }
+        )
+    {
+        return String::new();
+    }
+    let mut out = String::new();
+    for entry in body["handoff"]["other_backends"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(backend @ ("codex" | "claude-code")) = entry["coding_agent"].as_str() else {
+            continue;
+        };
+        let Some(floor) = parse_offered_intelligence_rung(entry.get("floor_rung")) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "\nOther backend {backend}: floor `--coding-agent {backend} {}`.",
+            floor.flags()
+        ));
+        if let Some(risk) = parse_offered_intelligence_rung(entry.get("risk_rung")) {
+            out.push_str(&format!(
+                " Risk `--coding-agent {backend} {}`.",
+                risk.flags()
+            ));
+        }
+    }
+    if !out.is_empty() {
+        out.push_str(" Take an other-backend rung only when the user, the plan or the approval pick named that backend. Otherwise follow the own-backend verdict above.");
+    }
+    out
+}
+
 /// Run a checkpoint: record it with the engine and print what to do. An
 /// offered run prints the card's shape, an automatic one the verdict.
 pub(crate) fn cmd_offer(ws: &Workspace, run: CheckpointRun, kind: CheckpointKind) {
@@ -359,14 +398,20 @@ pub(crate) fn cmd_offer(ws: &Workspace, run: CheckpointRun, kind: CheckpointKind
                 pays,
                 past_ceiling,
                 implementer,
-                ladder: crate::intelligence_ladder::read_own(ws),
+                ladder: crate::intelligence_ladder::read_own(ws).map(Box::new),
             },
             unknown => unknown,
         };
         println!("{}", crate::planned::card_shape(reading, &run.flags()));
     } else {
-        let verdict = body.map_or(AutomaticVerdict::Unknown, |b| parse_verdict(&b));
-        println!("{}", automatic_text(&verdict, &run));
+        let verdict = body
+            .as_ref()
+            .map_or(AutomaticVerdict::Unknown, parse_verdict);
+        let other = body
+            .as_ref()
+            .map(|body| other_backend_text(body, &verdict))
+            .unwrap_or_default();
+        println!("{}{}", automatic_text(&verdict, &run), other);
     }
 }
 
@@ -554,7 +599,7 @@ pub(crate) enum ContextReading {
         /// `None` when the engine did not report one.
         implementer: Option<Implementer>,
         /// This thread's intelligence ladder. `None` when it was not read.
-        ladder: Option<crate::intelligence_ladder::Ladder>,
+        ladder: Option<Box<crate::intelligence_ladder::Ladder>>,
     },
     /// The engine could not be asked, or did not answer.
     Unknown,
@@ -911,7 +956,7 @@ mod tests {
             text.contains("--coding-agent-model risk-model --reasoning-effort e3`"),
             "{text}"
         );
-        assert!(!text.contains("ask-owner-approval"), "{text}");
+        assert!(!text.contains("ask-permission"), "{text}");
     }
 
     /// No automatic checkpoint names an implementer flag or a plan card's
@@ -930,7 +975,7 @@ mod tests {
                     "--reasoning-effort",
                     "Implement in a",
                     "AskUserQuestion",
-                    "ask-owner-approval",
+                    "ask-permission",
                 ] {
                     assert!(!text.contains(banned), "{banned}: {text}");
                 }
@@ -1028,5 +1073,30 @@ mod tests {
             text.contains("`--coding-agent-model risk-model --reasoning-effort e3` instead"),
             "{text}"
         );
+    }
+    #[test]
+    fn automatic_other_backend_flags_need_an_actionable_handoff() {
+        let mut body = serde_json::json!({"can_hand_off":true,"handoff":{"other_backends":[{
+            "coding_agent":"codex", "floor_rung":{"model":"model-a","effort":"medium"},
+            "risk_rung":{"model":"model-b","effort":"high"}
+        }]}});
+        let verdict = AutomaticVerdict::RiskRungOnly {
+            risk_rung: OfferedIntelligenceRung {
+                model: "own".into(),
+                effort: "medium".into(),
+            },
+        };
+        let text = other_backend_text(&body, &verdict);
+        assert!(text.contains(
+            "--coding-agent codex --coding-agent-model model-a --reasoning-effort medium"
+        ));
+        assert!(text
+            .contains("--coding-agent codex --coding-agent-model model-b --reasoning-effort high"));
+        assert!(
+            text.contains("only when the user, the plan or the approval pick named that backend")
+        );
+        assert!(other_backend_text(&body, &AutomaticVerdict::DoesNotPay).is_empty());
+        body["can_hand_off"] = false.into();
+        assert!(other_backend_text(&body, &verdict).is_empty());
     }
 }

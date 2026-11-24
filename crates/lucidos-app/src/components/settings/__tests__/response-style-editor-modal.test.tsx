@@ -1,15 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Editing a response style happens in a MODAL, not in a row that opens in
- * place.
- *
- * The reported surface was a phone. An instruction runs to a thousand
- * characters, and the inline form put it in the leftover half of a settings
- * row: too narrow to read, and grown to its own content, so there was no
- * height left to scroll it in either. The modal answers all three, and these
- * are the structural halves of that. The geometry is pinned beside the rules
- * it lives in, `styles/__tests__/response-style-editor-modal.test.ts`.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 
@@ -34,8 +23,6 @@ const LIBRARY: ResponseStyle[] = [
   style({ id: 'minimal', label: 'Minimal', instruction: '- Answer and stop.' }),
 ];
 
-/** Preact batches a state write into a microtask, so a click's re-render has
- *  not happened when `click()` returns. */
 function settled(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
@@ -95,12 +82,8 @@ describe('the response style editor is a modal', () => {
 
     const open = panel();
     expect(open, 'Edit did not open the modal').not.toBeNull();
-    // `<Overlay>` owns the dismiss contract, and marks the panel it owns. A
-    // form rendered outside one answers neither Escape nor an outside tap.
     expect(open!.hasAttribute('data-overlay-panel')).toBe(true);
     expect(open!.getAttribute('role')).toBe('dialog');
-    // The row it was opened from stays put: the editor no longer replaces one,
-    // so the list does not reshuffle under the modal.
     expect(editRows()).toHaveLength(2);
   });
 
@@ -110,8 +93,6 @@ describe('the response style editor is a modal', () => {
     await settled();
 
     expect(instruction().value).toBe('- Lead with the answer.');
-    // `AutoTextarea` sizes itself to its content, which leaves nothing to
-    // scroll. The class it would carry is the tripwire.
     expect(instruction().className).toBe('style-editor-instruction');
   });
 
@@ -130,7 +111,6 @@ describe('the response style editor is a modal', () => {
     addCard().click();
     await settled();
 
-    // A bare sample in an empty field read as text already filled in.
     const fields = [...panel()!.querySelectorAll('.style-editor-field')];
     expect(fields).toHaveLength(2);
     for (const field of fields) {

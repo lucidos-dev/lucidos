@@ -4,42 +4,7 @@ import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, dis
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/**
- * Pressing a turn control leaves it on the same pixel.
- *
- * `withScrollAnchor` (CreateThreadView) holds the control the reader pressed.
- * Every turn in the transcript changes height around it, and the correction
- * writes the scroll offset that movement asks for.
- *
- * It has to be measured in DOUBLES. The platform rounds `offsetTop` to a whole
- * pixel. A delta built from two of them is wrong by the difference of the two
- * roundings, and that difference FLIPS SIGN between the states. Reported
- * 2026-08-11 as "a slight jump up and down as i toggle the show last answer",
- * with the two clues that pin the mechanism: it happened whether the steps
- * control was on or off, and it did not happen on a thread too short to scroll
- * (with nowhere to scroll there is no offset to be wrong about).
- *
- * Sub-pixel in CSS terms is not sub-pixel on screen: measured at 0.86px on the
- * iOS engine, which is 2.6 device pixels at the phone's 3x scale, and it re-lands
- * every line of text on a different device-pixel row, which is why the reader
- * read it as the spacing changing rather than as a scroll.
- *
- * A BROWSER test and not a unit test, deliberately: the rounding is the
- * platform's, and jsdom has no layout to round.
- *
- * The bound is layout precision, not half a pixel. A scroll offset holds only
- * whole pixels, so the correction carries its sub-pixel rest in a top spacer
- * on the transcript (ADR 0286). A half-pixel rest still re-landed every line on
- * its own device-pixel row, reported as elements twitching on each press.
- *
- * NON-INTEGER ROOT FONT SIZES are the point of the scales below. At a whole-pixel
- * root every rem-authored height is a whole number too, the two roundings cancel
- * and the bug is invisible; the shipped mobile default is 112.5%.
- */
 
-/** How far the reader's content may move on a press. Layout lengths are
- *  multiples of 1/64px, so the hold is exact up to that; this leaves slack for
- *  float noise in the comparison itself. */
 const MAX_DRIFT_PX = 0.05;
 
 const TURNS = 12;
@@ -48,10 +13,6 @@ function q(o: unknown): string {
   return JSON.stringify(o).replace(/'/g, "''");
 }
 
-/** A transcript whose turns each carry prose, tool steps and more prose: the
- *  shape that makes `hidesEarlierProse` true, so the full-response control has
- *  something to reveal and every turn's height really does change. Turn sizes
- *  vary so the two states cannot share a fractional offset by construction. */
 function seedThread(title: string): string {
   const threadId = randomUUID();
   const base = Date.now() - TURNS * 60_000;
@@ -91,17 +52,6 @@ function dropThread(threadId: string): void {
   ].join(';\n'));
 }
 
-/** Press the full-response control on the first turn whose header is on screen.
- *  Reports how far THAT CONTROL moved, and how much the transcript's height
- *  changed, so the case can be shown to be non-vacuous.
- *
- *  The control is what the correction holds, so the control is where its
- *  rounding shows up. `null` when no header is fully on screen, which a turn
- *  taller than the pane produces at some parks.
- *
- *  The press is dispatched INSIDE the page rather than through Playwright's
- *  click, because Playwright scrolls a target into view first and that scroll
- *  would be indistinguishable from the drift being measured. */
 async function pressAndMeasure(page: Page): Promise<{ drift: number; heightChange: number } | null> {
   return page.evaluate(async () => {
     const tc = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
@@ -124,7 +74,6 @@ async function pressAndMeasure(page: Page): Promise<{ drift: number; heightChang
     const before = btn.getBoundingClientRect().top;
     const heightBefore = tc.scrollHeight;
     btn.click();
-    // Past the correction, its next-frame re-check, and any late settle.
     await new Promise(r => setTimeout(r, 600));
     if (!btn.isConnected) return null;
     return {
@@ -134,23 +83,11 @@ async function pressAndMeasure(page: Page): Promise<{ drift: number; heightChang
   });
 }
 
-/** Dismiss any toast before reaching into the drawer.
- *
- *  The toast container sits over the bottom of the pane, and at a phone width
- *  the drawer's rows are under it, so a toast the workspace happens to be
- *  showing (an engine-version notice, a change landing) intercepts the click
- *  that opens the thread and the spec times out with nothing to say about the
- *  anchor. Desktop is wide enough to miss it, which is exactly why this is worth
- *  doing rather than leaving to luck. Dismissing rather than force-clicking: a
- *  real finger cannot reach through a toast either, and `force` would hide a
- *  genuine overlap regression. */
 async function clearToasts(page: Page): Promise<void> {
   await page.evaluate(() => {
     document.querySelectorAll<HTMLButtonElement>('.toast .toast-close').forEach(b => b.click());
   });
   await page.locator('.toast-container .toast').first().waitFor({ state: 'detached', timeout: 5_000 }).catch(() => {
-    // Not every toast is dismissable. The click below retries for 15s anyway,
-    // and an auto-expiring toast clears well inside that.
   });
 }
 
@@ -166,13 +103,6 @@ test.describe('A turn control holds itself still', () => {
     await assertHealthy(page);
     const threadId = seedThread('Turn control anchor');
     try {
-      // This spec is about a reader who has PARKED somewhere and pressed a
-      // control. The follow seed ships armed, so without this the thread opens
-      // riding the live edge. `park()` writes `scrollTop` directly rather than
-      // as a gesture, and a direct write is not what disarms a ride. The
-      // transcript therefore hauls the reader back to the end before the press
-      // is made. What gets measured is that haul, hundreds of pixels of it,
-      // rather than the sub-pixel drift under test.
       await disarmFollowSeed(page);
       await hideDashboardRail(page);
       await navigateToApp(page);
@@ -185,8 +115,6 @@ test.describe('A turn control holds itself still', () => {
       await expect
         .poll(() => tc.evaluate(el => el.querySelectorAll('.chat-exchange').length), { timeout: 25_000 })
         .toBe(TURNS);
-      // Not vacuous: with nothing to scroll there is no offset to be wrong about,
-      // which is exactly the case the reader reported as fine.
       await expect
         .poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight), { timeout: 10_000 })
         .toBeGreaterThan(500);
@@ -202,8 +130,6 @@ test.describe('A turn control holds itself still', () => {
           const m = await pressAndMeasure(page);
           if (!m) continue;
           measured++;
-          // Non-vacuous the other way too: the press must really have changed
-          // the transcript's height, or holding the reader still is free.
           expect(
             Math.abs(m.heightChange),
             `scale ${scale} press ${press}: the toggle changed no height, so the case proves nothing`,

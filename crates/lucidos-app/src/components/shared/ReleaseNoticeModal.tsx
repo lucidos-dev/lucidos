@@ -1,25 +1,20 @@
 import { Overlay } from './Overlay';
+import { ReleaseNoticeActions, ReleaseNoticeCard, releaseNoticeHeading } from './ReleaseNoticeCard';
 import { SurfaceHead } from './Surface';
-import {
-  dismissReleaseNoticeModal,
-  openReleaseNoticesPanel,
-} from '../../store/actions/releaseNotices';
-import { owedReleaseNoticeTitles, releaseNoticeDismissed } from '../../store/releaseNotices';
+import { dismissReleaseNoticeModal } from '../../store/actions/releaseNotices';
+import { releaseNoticeAnswer, releaseNoticeModalView } from '../../store/releaseNotices';
 
-/**
- * Announces the *release notices* this workspace still owes, and points at the
- * Release Notices panel, where they are read and answered.
- *
- * Not the place to answer them. An action starts a thread, and a modal would
- * have to close to show it, taking the notices behind it along. The panel
- * stays put.
- *
- * Every way of closing answers nothing, so the modal returns on the next open
- * until each notice is answered.
- */
 export function ReleaseNoticeModal() {
-  const titles = owedReleaseNoticeTitles();
-  if (titles.length === 0 || releaseNoticeDismissed.value) return null;
+  const view = releaseNoticeModalView();
+  if (!view) return null;
+  const { releases, action_prompt: prompt } = view;
+  const answer = releaseNoticeAnswer(view);
+  if (!answer) return null;
+
+  const owed = releases.filter((release) => !release.resolved);
+  const title = owed.length === 1
+    ? releaseNoticeHeading(owed[0].since, answer.shown_ids.length)
+    : 'Release notices';
 
   return (
     <Overlay
@@ -29,33 +24,25 @@ export function ReleaseNoticeModal() {
       panelClass="surface surface-raised confirm-dialog release-notice protected-surface"
       panelRole="dialog"
       ariaModal
+      panelProps={{ 'aria-label': title }}
     >
       <SurfaceHead
-        title={titles.length === 1 ? '1 release notice' : `${titles.length} release notices`}
+        title={title}
         onClose={dismissReleaseNoticeModal}
         closeLabel="Close, and show the release notices again later"
       />
-      <div class="surface-body dialog-body" tabIndex={-1}>
-        <p>This upgrade changed things you may need to act on.</p>
-        <ul class="release-notice-titles">
-          {titles.map((title) => <li key={title}>{title}</li>)}
-        </ul>
+      <div class="surface-body dialog-body release-notice-groups" tabIndex={-1}>
+        {owed.map((release) => (
+          <ReleaseNoticeCard key={release.since} release={release} showHeading={owed.length > 1} show="owed"
+            onNavigate={dismissReleaseNoticeModal} />
+        ))}
       </div>
       <div class="surface-foot">
-        <button
-          class="action-btn action-btn-secondary"
-          data-role="release-notice-later"
-          onClick={dismissReleaseNoticeModal}
-        >
+        <button type="button" class="action-btn action-btn-secondary"
+          data-role="release-notice-later" onClick={dismissReleaseNoticeModal}>
           Later
         </button>
-        <button
-          class="action-btn"
-          data-role="release-notice-open"
-          onClick={openReleaseNoticesPanel}
-        >
-          Read them
-        </button>
+        <ReleaseNoticeActions answer={answer} prompt={prompt} />
       </div>
     </Overlay>
   );

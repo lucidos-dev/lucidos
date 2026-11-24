@@ -2,6 +2,7 @@ import { test as base, request as pwRequest } from '@playwright/test';
 import type { APIRequestContext, BrowserContext, Page as PlaywrightPage } from '@playwright/test';
 import { coverageDir, recordCoverage, type CoverageRecorder } from './coverage';
 import { HARNESS_DEVICE_ID, registerHarnessDevice } from './harnessDevice';
+import { stampPageRequests, withDeviceStamp } from './harnessStamp';
 import { TAB_WINDOW_ID_KEY } from '../src/utils/windowIdKey';
 
 export { expect } from '@playwright/test';
@@ -9,13 +10,6 @@ export type { APIRequestContext, Locator, Page } from '@playwright/test';
 
 type NewContextOptions = Parameters<typeof pwRequest.newContext>[0];
 
-/** An `APIRequestContext` that identifies itself as the harness device.
- *
- *  A standalone context shares nothing with the page, so it carries no
- *  `x-lucidos-device-id` and `api::mutating_gate` refuses every mutation it
- *  makes (ADR 0169). The one builder behind both the `request` fixture and the
- *  `request.newContext` export below, so the two cannot drift.
- */
 async function newIdentifiedContext(options?: NewContextOptions): Promise<APIRequestContext> {
   const ctx = await pwRequest.newContext({
     ignoreHTTPSErrors: true,
@@ -26,15 +20,26 @@ async function newIdentifiedContext(options?: NewContextOptions): Promise<APIReq
     },
   });
   await registerHarnessDevice(ctx);
-  return ctx;
+  return stampedRequests(ctx, HARNESS_DEVICE_ID);
 }
 
-/** `request.newContext`, pre-identified, under the name specs already import.
- *
- *  Deliberately NOT a spread of Playwright's `request`: `newContext` lives on
- *  the prototype, so `{ ...pwRequest }` copies two private fields and no
- *  methods. Naming the one member we wrap says what is actually available.
- */
+const REQUEST_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'fetch']);
+
+function stampedRequests(ctx: APIRequestContext, deviceId: string): APIRequestContext {
+  return new Proxy(ctx, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop, target);
+      if (typeof value !== 'function') return value;
+      if (typeof prop !== 'string' || !REQUEST_METHODS.has(prop)) return value.bind(target);
+      return (url: unknown, options?: { headers?: Record<string, string> }) =>
+        value.call(target, url, {
+          ...options,
+          headers: withDeviceStamp({ 'x-lucidos-device-id': deviceId, ...options?.headers }),
+        });
+    },
+  });
+}
+
 export const request = { newContext: newIdentifiedContext };
 
 const WEBKIT_CONTEXT_PREFLIGHT_ATTEMPTS = 3;
@@ -49,7 +54,6 @@ type ContextFactory = () => Promise<{
 
 async function closeWithGrace(close: () => Promise<void>): Promise<boolean> {
   const closePromise = close().catch(() => {
-    // Preserve the original preflight failure.
   });
   const timeoutPromise = new Promise<'timeout'>((resolve) => {
     setTimeout(() => resolve('timeout'), WEBKIT_CONTEXT_CLOSE_GRACE_MS);
@@ -63,7 +67,7 @@ async function closePageQuietly(page: PlaywrightPage): Promise<void> {
 }
 
 async function preflightWebKitContext(context: BrowserContext, baseURL: string | undefined): Promise<void> {
-  if (!baseURL) throw new Error('mobile-webkit context preflight requires Playwright baseURL');
+  if (!baseURL) throw new Error('WebKit context preflight requires Playwright baseURL');
 
   const page = await context.newPage();
   try {
@@ -77,9 +81,6 @@ async function preflightWebKitContext(context: BrowserContext, baseURL: string |
 const coverageRecorders = new WeakMap<BrowserContext, CoverageRecorder>();
 
 export const test = base.extend({
-  // Every spec taking `{ request }` gets a context that identifies itself. See
-  // `harnessDevice.ts` for why the harness registers rather than the gate
-  // being narrowed.
   request: async ({ baseURL }, use) => {
     const ctx = await newIdentifiedContext({ baseURL });
     try {
@@ -90,10 +91,9 @@ export const test = base.extend({
   },
   context: async ({ browserName, baseURL, _contextFactory }, use, testInfo) => {
     const createContext = _contextFactory as ContextFactory;
-    const isMobileWebKit = browserName === 'webkit' && testInfo.project.name === 'mobile-webkit';
-
-    if (!isMobileWebKit) {
+    if (browserName !== 'webkit') {
       const ready = await createContext();
+      await stampPageRequests(ready.context);
       const dir = coverageDir();
       const recorder = dir && browserName === 'chromium' ? recordCoverage(ready.context, dir) : undefined;
       if (recorder) coverageRecorders.set(ready.context, recorder);
@@ -119,16 +119,17 @@ export const test = base.extend({
         const closed = await closeWithGrace(candidate.close);
         if (attempt < WEBKIT_CONTEXT_PREFLIGHT_ATTEMPTS) {
           console.warn(
-            `[mobile-webkit context preflight] discarded context after failed localhost commit (${attempt}/${WEBKIT_CONTEXT_PREFLIGHT_ATTEMPTS})`,
+            `[webkit context preflight] discarded context after failed localhost commit (${attempt}/${WEBKIT_CONTEXT_PREFLIGHT_ATTEMPTS})`,
           );
           if (!closed) {
-            console.warn('[mobile-webkit context preflight] failed context close still pending; trying a fresh context');
+            console.warn('[webkit context preflight] failed context close still pending; trying a fresh context');
           }
         }
       }
     }
 
     if (!ready) throw lastErr;
+    await stampPageRequests(ready.context);
 
     try {
       await use(ready.context);
@@ -136,12 +137,6 @@ export const test = base.extend({
       await ready.close();
     }
   },
-  // The test's page waits until coverage records it, so its first script counts.
-  //
-  // Every load also starts as a fresh window (ADR 0585). Specs seed navigation
-  // through the plain localStorage key, the shared seed, and a tab's own copy
-  // from an earlier load would win over it. Writes still reach the seed, so a
-  // reload keeps what the page showed.
   page: async ({ page, context }, use) => {
     await page.addInitScript((idKey: string) => {
       if (window.parent !== window) return;
@@ -150,7 +145,7 @@ export const test = base.extend({
           const key = sessionStorage.key(i);
           if (key?.endsWith(idKey)) sessionStorage.removeItem(key);
         }
-      } catch { /* no sessionStorage: every load is a fresh window already */ }
+      } catch {  }
     }, TAB_WINDOW_ID_KEY);
     await coverageRecorders.get(context)?.started(page);
     await use(page);

@@ -10,14 +10,6 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const drawerCss = readFileSync(resolve(here, '../../../styles/drawer.css'), 'utf-8');
 const mobileCss = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf-8');
 
-/**
- * The title row sits on the page while the transcript rests at its top, and
- * its tinted band fades in once the transcript scrolls. There is no hairline
- * under it on either layout.
- *
- * The band matters most on mobile. The title slides away with the header as
- * one bar. Without a band it drifts like loose transcript text.
- */
 describe('Thread title band, desktop and mobile alike', () => {
   it('desktop: page colour at rest, --bg-secondary once scrolled', () => {
     expect(drawerCss).toMatch(/\n\.thread-view-header \{[^}]*background:\s*transparent/);

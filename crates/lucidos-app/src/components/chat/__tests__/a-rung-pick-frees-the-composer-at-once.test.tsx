@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A rung pick shuts the list at once, before its control request answers. An
- * open list keeps the UI behind inert, so a Send tapped during that round trip
- * only closed the list and the message never went.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';
@@ -42,7 +37,6 @@ vi.mock('../../../store/actions/chat-claude-code', async (importOriginal) => ({
 const { RungControl } = await import('../RungControl');
 const { controlMenuParts } = await import('../controlMenuParts');
 
-// The panel parts are code-split. Warm them, so a press opens at once.
 beforeAll(() => controlMenuParts.preload());
 
 let host: HTMLDivElement;

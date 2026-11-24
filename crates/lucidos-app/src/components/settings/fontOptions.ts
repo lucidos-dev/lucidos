@@ -7,13 +7,6 @@ export const FONT_GROUP_LABELS: Record<FontGroup, string> = {
   mono: 'Mono',
 };
 
-/** Follow the theme first, as in the Mode and Motion rows: it is the default.
- *  Then every catalog font fit for UI text, under a header per group, in font
- *  catalog order, then the workspace fonts. A header is a disabled option, so
- *  it can never be the value. Every workspace font fits UI text (ADR 0308).
- *
- *  A picked workspace font that is no longer installed still gets a row,
- *  saying so, because the device paints the fallback until another pick. */
 export function fontOptions(workspaceFonts: readonly WorkspaceFont[], current?: string): DropdownOption[] {
   const catalog = (Object.keys(FONT_GROUP_LABELS) as FontGroup[]).flatMap(group => [
     { value: `group:${group}`, label: FONT_GROUP_LABELS[group], disabled: true },

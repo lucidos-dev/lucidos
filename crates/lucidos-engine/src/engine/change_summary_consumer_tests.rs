@@ -221,6 +221,7 @@ async fn a_proposal_lost_to_a_lag_still_reaches_the_summarizer() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some(TWO_COMMITS.into()),
             files: vec!["src/main.rs".into()],

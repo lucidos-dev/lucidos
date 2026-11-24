@@ -41,9 +41,6 @@ import {
   type McpRowError,
 } from './mcpCost';
 
-/** A per-server verb in flight. Start and stop are deliberately NOT optimistic:
- *  a start spawns a process and can fail for real reasons, so the row shows
- *  pending and settles on the response. */
 export type McpRowVerb = 'start' | 'stop' | 'remove' | 'auto-approve';
 
 const PENDING_LABEL: Partial<Record<McpRowVerb, string>> = {
@@ -53,10 +50,6 @@ const PENDING_LABEL: Partial<Record<McpRowVerb, string>> = {
 };
 
 export interface McpServerRowProps {
-  /** Skeleton mode. Passed explicitly rather than read from the skeleton
-   *  context, so the row stays a pure function and its states are assertable
-   *  with no DOM. The Sk* leaves inside still read the context that
-   *  `ListSkeletonOf` provides. */
   sk?: boolean;
   server?: McpServerStatus;
   expanded?: boolean;
@@ -69,8 +62,6 @@ export interface McpServerRowProps {
   onSetToolDisabled?: (wireName: string, disabled: boolean) => void;
 }
 
-/** One tool under an expanded server: what the model is offered, what the
- *  server calls it where the two differ, and what it costs. */
 function mcpToolRow(tool: McpToolStatus, props: McpServerRowProps): VNode {
   const wire = tool.wire_name;
   const state = wire === null ? 'uncallable' : tool.disabled ? 'disabled' : 'enabled';
@@ -85,8 +76,6 @@ function mcpToolRow(tool: McpToolStatus, props: McpServerRowProps): VNode {
         <div class="mcp-tool-cost">{mcpToolCostLine(tool)}</div>
       </div>
       <div class="mcp-tool-actions">
-        {/* No switch without a wire name: `disabled_tools` holds wire names, so
-            there is nothing to store, and the tool is already uncallable. */}
         {wire !== null && (
           <LoadableToggle
             loaded
@@ -100,16 +89,12 @@ function mcpToolRow(tool: McpToolStatus, props: McpServerRowProps): VNode {
   );
 }
 
-/** The shared label tone each server state wears. */
 const STATE_TONE: Record<McpServerState, string> = {
   running: 'label-success',
   stopped: 'label-neutral',
   undispatchable: 'label-error',
 };
 
-/** One registered server, as a pure builder. `McpServersPage` calls it with
- *  real data. `ListSkeletonOf` calls it with `sk` inside a skeleton provider,
- *  so the placeholder IS this markup and cannot drift from it. */
 export function mcpServerRow(props: McpServerRowProps): VNode {
   const { sk = false, server } = props;
   const state = server ? mcpServerState(server) : 'stopped';
@@ -117,14 +102,9 @@ export function mcpServerRow(props: McpServerRowProps): VNode {
   const expanded = props.expanded ?? false;
   const toolCount = server?.tools.length ?? 0;
   const busy = pending !== null;
-  // Start is refused for an id that cannot ride the wire, so the Run switch is
-  // absent rather than present and failing. Auto-approve goes with it: nothing
-  // on such a server is ever callable, so Remove is all that is left to offer.
   const showSwitches = sk || state !== 'undispatchable';
 
   return (
-    // Keyed by id so a Remove patches the list rather than shuffling every row
-    // below it. `ListSkeletonOf` overrides the key with the row index.
     <div class="mcp-server-block" key={server?.id} data-state={state}>
       <div class="list-row mcp-server-row">
         <div class="list-row-info">
@@ -215,8 +195,6 @@ export function mcpServerRow(props: McpServerRowProps): VNode {
   );
 }
 
-/** The cost figures, self-skeletonizing: the conditional lines are forced to
- *  appear in skeleton mode so the block does not grow as the data lands. */
 function mcpCostSummary(summary: McpHeaderSummary | null, sk = false): VNode {
   return (
     <div class="mcp-cost-summary">
@@ -248,8 +226,6 @@ export interface McpServersBodyProps {
   onSetToolDisabled: (server: McpServerStatus, wireName: string, disabled: boolean) => void;
 }
 
-/** Everything above the allowlist editor, as a pure function of the `Loadable`.
- *  Exported so all four states are unit-testable without a DOM. */
 export function mcpServersBody(props: McpServersBodyProps): VNode {
   const { data } = props;
   const summary =
@@ -348,8 +324,6 @@ function withoutKey<T>(map: Record<string, T>, key: string): Record<string, T> {
   return next;
 }
 
-/** Settings → MCP Servers: what each registered server offers the agent, what
- *  it costs a thread that enables it, and the switches for both. */
 export function McpServersPage() {
   const [served, setServed] = useState<Loadable<McpServersResponse>>({ status: 'not-loaded' });
   const [intents, setIntentState] = useState<ToolIntents>(new Map());
@@ -357,14 +331,9 @@ export function McpServersPage() {
   const [pending, setPending] = useState<Record<string, McpRowVerb>>({});
   const [errors, setErrors] = useState<Record<string, McpRowError>>({});
   const showLoading = useDelayedLoading(served);
-  /** The pending switches, readable between awaits (ADR 0437). */
   const intentsNow = useRef<ToolIntents>(new Map());
-  /** Every list fetch takes the next epoch as it starts. */
   const fetchEpoch = useRef(0);
-  /** The epoch of the list on screen. An older fetch landing later is
-   *  dropped, so a slow reply never replaces a newer one. */
   const servedEpoch = useRef(0);
-  /** Tools whose switch request is out, by `toolIntentKey`. */
   const sending = useRef(new Set<string>());
 
   function setIntents(next: ToolIntents) {
@@ -372,8 +341,6 @@ export function McpServersPage() {
     setIntentState(next);
   }
 
-  /** Fetch the list, show it unless a newer fetch already landed, and end
-   *  every switch it reflects. */
   async function load(): Promise<void> {
     const epoch = ++fetchEpoch.current;
     const data = await fetchMcpServers();
@@ -385,13 +352,9 @@ export function McpServersPage() {
 
   useEffect(() => {
     setServed({ status: 'loading' });
-    // A newer fetch may have served the list while this one was out.
     load().catch((e) => { if (servedEpoch.current === 0) setServed(toFailed(e)); });
   }, []);
 
-  /** Re-read the list after a mutation. Every figure on the page comes from one
-   *  response, so the header and the rows can never disagree. A failure here
-   *  toasts rather than blanking a list that is merely stale. */
   async function refresh(): Promise<void> {
     try {
       await load();
@@ -400,10 +363,6 @@ export function McpServersPage() {
     }
   }
 
-  // A server the agent registers, or a tool switched off on another device,
-  // repaints this page with no reload (ADR 0118). Held, not dropped, while a
-  // row verb runs, which refreshes when it settles. A pending switch needs no
-  // guard: it is laid over whatever list lands.
   useVersionedRefresh(mcpServersVersion.value, Object.keys(pending).length > 0, () => void refresh());
   usePanelRefresh('MCP servers', Object.keys(pending).length > 0 ? null : refresh);
 
@@ -415,8 +374,6 @@ export function McpServersPage() {
       await refresh();
     } catch (e) {
       const described = describeMcpRowError(e);
-      // A row that no longer exists cannot carry an error: reload instead, and
-      // say what happened where the user will still see it.
       if (described.kind === 'gone') {
         showToast(described.message, 'error');
         await refresh();
@@ -469,20 +426,12 @@ export function McpServersPage() {
     });
   }
 
-  /** Optimistic, unlike start and stop: the switch is a local write with no
-   *  process behind it. It is a pending intent laid over every list that
-   *  lands until a list fetched after the engine's answer shows it (ADR 0437).
-   *  Only the switch moves, never a figure: the refetch brings the engine's
-   *  own totals. */
   function setToolDisabled(server: McpServerStatus, wireName: string, disabled: boolean) {
     const key = toolIntentKey(server.id, wireName);
     setIntents(new Map(intentsNow.current).set(key, { serverId: server.id, wireName, disabled, ackedAt: null }));
     if (!sending.current.has(key)) void sendSwitch(server, key);
   }
 
-  /** Send a tool's latest switch, and send again if the user flipped it while
-   *  the request was out. One request per tool at a time, because off then on
-   *  for one tool does not commute. Switches on different tools do. */
   async function sendSwitch(server: McpServerStatus, key: string) {
     sending.current.add(key);
     try {
@@ -527,6 +476,7 @@ export function McpServersPage() {
         title="MCP tool permissions"
         anchor="mcp:allowed-tools"
         noun="MCP tool permissions"
+        rememberButton="Always allow"
         placeholder="Mcp(slack:*)"
         load={getMcpAllowedTools}
         save={putMcpAllowedTools}

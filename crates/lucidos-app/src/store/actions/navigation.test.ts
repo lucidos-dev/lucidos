@@ -1,9 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { PanelOverlay } from '../store';
 
-// NavEntry and pure functions are tested directly without importing the
-// navigation module (which pulls in store.ts → localStorage at module level).
-// We duplicate the pure logic here to test it in isolation.
 
 interface NavEntry {
   menuItem: string;
@@ -210,7 +207,6 @@ describe('back/forward simulation', () => {
     let stack = [makeEntry()];
     let cursor = 0;
 
-    // Navigate: files → settings → notifications
     let r = pushEntry(stack, cursor, makeEntry({ menuItem: 'settings' }));
     stack = r!.stack; cursor = r!.cursor;
 
@@ -219,23 +215,19 @@ describe('back/forward simulation', () => {
     expect(stack).toHaveLength(3);
     expect(cursor).toBe(2);
 
-    // Back twice
     cursor--;
     expect(stack[cursor].menuItem).toBe('settings');
     cursor--;
     expect(stack[cursor].menuItem).toBe('files');
 
-    // Forward
     cursor++;
     expect(stack[cursor].menuItem).toBe('settings');
 
-    // Push new — truncates 'notifications'
     r = pushEntry(stack, cursor, makeEntry({ menuItem: 'apps' }));
     stack = r!.stack; cursor = r!.cursor;
     expect(stack).toHaveLength(3);
     expect(stack.map(e => e.menuItem)).toEqual(['files', 'settings', 'apps']);
 
-    // Can't go forward anymore
     expect(cursor).toBe(stack.length - 1);
   });
 
@@ -243,17 +235,14 @@ describe('back/forward simulation', () => {
     let stack = [makeEntry()];
     let cursor = 0;
 
-    // Build up 3 entries
     for (const item of ['settings', 'notifications', 'apps'] as const) {
       const r = pushEntry(stack, cursor, makeEntry({ menuItem: item }));
       stack = r!.stack; cursor = r!.cursor;
     }
     expect(stack).toHaveLength(4);
 
-    // Go all the way back
     cursor = 0;
 
-    // Push new entry
     const r = pushEntry(stack, cursor, makeEntry({ menuItem: 'changes' }));
     stack = r!.stack; cursor = r!.cursor;
     expect(stack).toHaveLength(2);
@@ -270,17 +259,13 @@ describe('back/forward simulation', () => {
     let stack = [makeEntry()];
     let cursor = 0;
 
-    // Push MAX_NAV_STACK entries (total = MAX_NAV_STACK + 1 including initial)
     for (let i = 0; i < MAX_NAV_STACK; i++) {
       const r = pushEntry(stack, cursor, makeEntry({ overlay: { type: 'file-preview', path: `file-${i}` } }));
       stack = r!.stack; cursor = r!.cursor;
     }
 
-    // Stack should be capped at MAX_NAV_STACK
     expect(stack).toHaveLength(MAX_NAV_STACK);
-    // Cursor should point to the last entry
     expect(cursor).toBe(MAX_NAV_STACK - 1);
-    // Oldest entry was evicted
     const first = stack[0].overlay;
     const last = stack[MAX_NAV_STACK - 1].overlay;
     expect(first?.type === 'file-preview' && first.path).toBe('file-0');
@@ -323,8 +308,6 @@ describe('back button action selection (webview vs nav stack)', () => {
   });
 
   it('back uses navBack after redirect captured by initial URL update', () => {
-    // After the first panel-url-changed event, webviewInitialUrl is updated
-    // to the actual loaded URL (post-redirect). So both match.
     const redirectedUrl = 'https://www.example.com/';
     const result = shouldUseWebviewBack(true, redirectedUrl, redirectedUrl);
     expect(result).toBe(false);
@@ -377,8 +360,6 @@ describe('an app fragment is a move in place, not a nav entry', () => {
   const app = { id: 'pr-understanding' } as any;
 
   it('opening the same app at a different fragment adds no entry', () => {
-    // Back must never walk a step that changes nothing on screen. Moving
-    // inside an open panel is a mutation in place, like the diff split-view.
     const stack = [
       makeEntry(),
       makeEntry({ overlay: { type: 'app-ui', app, fragment: 'pr-1645' } }),
@@ -390,8 +371,6 @@ describe('an app fragment is a move in place, not a nav entry', () => {
   });
 
   it('a deduped push followed by a replace keeps the NEWEST fragment', () => {
-    // What `openApp` does when the app was already open. Without the replace a
-    // reload would restore the first target the reader followed, not the last.
     const stack = [
       makeEntry(),
       makeEntry({ overlay: { type: 'app-ui', app, fragment: 'pr-1645' } }),
@@ -442,9 +421,6 @@ describe('overlay-only changes are accepted by pushEntry (regression guard)', ()
   });
 });
 
-// Mirrors the pure logic of `replaceNavState` in navigation.ts — used by the
-// diff split-view sidebar so switching files inside the open panel keeps a
-// single history slot with the latest selection winning.
 function replaceEntry(stack: NavEntry[], cursor: number, entry: NavEntry): NavEntry[] | null {
   if (cursor < 0 || cursor >= stack.length) return null;
   const next = [...stack];
@@ -475,8 +451,6 @@ describe('replaceEntry (latest-file-wins for diff split-view)', () => {
     }
     expect(stack).toHaveLength(2);
     expect((stack[1].overlay as { path: string }).path).toBe('d.md');
-    // back from cursor=1 lands on the original entry, not on a previously
-    // visited file inside the panel
     expect(stack[0].overlay).toBeNull();
   });
 
@@ -548,7 +522,6 @@ describe('wipPreviewThreadId is a nav-tracked axis', () => {
   });
 
   it('back/forward walks each WIP toggle', () => {
-    // Simulate: open app → toggle WIP on → toggle WIP off → toggle WIP on
     let stack = [makeEntry({ menuItem: 'apps', overlay: appOverlay, wipPreviewThreadId: null })];
     let cursor = 0;
     for (const tid of ['thread-abc', null, 'thread-abc']) {
@@ -571,18 +544,7 @@ describe('wipPreviewThreadId is a nav-tracked axis', () => {
   });
 });
 
-// Unlike the pure-logic suites above (which duplicate the stack math), this one
-// exercises the REAL restoreState() path: seed the persisted nav stack in
-// localStorage, import the navigation + store modules fresh, then trigger
-// ensureInitialized() → restoreState() by reading a nav computed.
-//
-// Every entry restores its overlay, a PENDING form included. There are no
-// transient navigations (ADR 0127). The guard that used to null a pending form
-// claimed its staged request died with the page. Nothing of the sort is staged:
-// the email and credential forms carry no request id at all, and the plugin
-// ones are staged on the engine, which a reload never touches.
 describe('restoreState restores every entry overlay on reload', () => {
-  // Mirrors NAV_KEY in navigation.ts (the key restoreState reads/writes).
   const NAV_KEY = 'lucidos-nav-history';
 
   beforeEach(() => {
@@ -594,11 +556,6 @@ describe('restoreState restores every entry overlay on reload', () => {
     localStorage.clear();
   });
 
-  /** Seed NAV_KEY with a single-entry stack whose cursor overlay is `overlay`
-   *  (plus optional scalar nav fields), import navigation + store fresh, and
-   *  trigger restore by reading a nav computed (which runs ensureInitialized).
-   *  Returns the freshly-imported store module so the caller can assert on the
-   *  signals restoreState mutated. */
   async function restoreWithOverlay(
     overlay: PanelOverlay,
     scalars: { menuItem?: string; settingsSubview?: string } = {},
@@ -612,7 +569,6 @@ describe('restoreState restores every entry overlay on reload', () => {
     localStorage.setItem(NAV_KEY, JSON.stringify({ stack: [entry], cursor: 0 }));
     const nav = await import('./navigation');
     const store = await import('../store');
-    // Reading a nav computed runs ensureInitialized() → restoreState(cursor entry).
     void nav.canGoBack.value;
     return store;
   }
@@ -635,8 +591,6 @@ describe('restoreState restores every entry overlay on reload', () => {
       },
       { menuItem: 'settings', settingsSubview: 'accounts' },
     );
-    // The staged uninstall lives in the engine's `pending_uninstalls` map, which
-    // a browser reload does not touch, so Confirm still resolves it.
     expect(store.activeInlineForm.value?.type).toBe('plugin-uninstall');
     expect(store.activeMenuItem.value).toBe('settings');
     expect(store.settingsSubview.value).toBe('accounts');
@@ -676,8 +630,6 @@ describe('restoreState restores every entry overlay on reload', () => {
           files_present: ['data/apps/habit-tracker/manifest.json'],
           files_missing: [],
         },
-        // The files are already gone, so the panel is a record rather than a
-        // request. It restores like every other entry, for a second reason.
         removed: {
           at: '2026-08-06T10:00:00.000Z',
           summary: 'Removed Habit Tracker',
@@ -717,9 +669,6 @@ describe('restoreState restores every entry overlay on reload', () => {
     expect(store.activeInlineForm.value?.type).toBe('plugin-install');
   });
 
-  // The bug the user reported, in its reload form. The draft IS the request:
-  // `EmailConfirmRequest` has no id, and Send posts the whole draft. So there is
-  // nothing on either side to go stale.
   it('restores a PENDING email-confirm', async () => {
     const form = {
       type: 'email-confirm' as const,
@@ -751,8 +700,6 @@ describe('restoreState restores every entry overlay on reload', () => {
     expect(store.panelOverlay.value).toEqual({ type: 'form', form });
   });
 
-  // `CredentialRequest` is a pre-fill descriptor and carries no id either. The
-  // form is filled and saved locally, so it survives a reload like any other.
   it('restores an engine-prompted credential request (credential form WITH a request)', async () => {
     const overlay: PanelOverlay = {
       type: 'form',
@@ -774,9 +721,6 @@ describe('restoreState restores every entry overlay on reload', () => {
     expect(store.panelOverlay.value).toEqual(overlay);
   });
 
-  // A repo-encoded preview path must survive a reload byte-for-byte: restoreState
-  // writes the overlay path straight through (no re-normalization), so ContentPane
-  // re-parses it and re-mounts RepoFilePreview on the same repo file.
   it('restores a repo-encoded file preview verbatim', async () => {
     const overlay: PanelOverlay = {
       type: 'file-preview',
@@ -787,8 +731,6 @@ describe('restoreState restores every entry overlay on reload', () => {
     expect(localStorage.getItem('file-preview-open')).toBe(overlay.path);
   });
 
-  // History saved before the in-app browser refused other schemes can hold a
-  // `file:` preview. Restoring it would mount a panel the native webview refuses.
   describe('with the in-app browser on', () => {
     beforeEach(() => {
       vi.doMock('./preferences', async (importOriginal) => ({
@@ -819,11 +761,6 @@ describe('restoreState restores every entry overlay on reload', () => {
   });
 });
 
-// The reported bug, at the layer it lives in. A pending email confirm opened on
-// top of Settings, Access. Walking history back to it showed Access instead: the
-// overlay was nulled while `menuItem` and `settingsSubview` still applied, so
-// the user landed on the bare panel underneath. A SENT confirm walked correctly,
-// which is what isolated the guard.
 describe('walking history reaches a pending email-confirm', () => {
   const NAV_KEY = 'lucidos-nav-history';
 
@@ -841,8 +778,6 @@ describe('walking history reaches a pending email-confirm', () => {
     },
   };
 
-  /** The stack the report describes: Settings/Access bare, the confirm opened on
-   *  top of it, then the user moves on to Files. Cursor starts at Files. */
   const STACK = [
     { menuItem: 'settings', settingsSubview: 'accounts', overlay: null, wipPreviewThreadId: null },
     { menuItem: 'settings', settingsSubview: 'accounts', overlay: PENDING_CONFIRM, wipPreviewThreadId: null },
@@ -880,8 +815,6 @@ describe('walking history reaches a pending email-confirm', () => {
     expect(store.panelOverlay.value).toEqual(PENDING_CONFIRM);
   });
 
-  // The path the user actually took: the nav-history popover, which jumps to an
-  // absolute index rather than stepping.
   it('navGoTo lands on the confirm', async () => {
     const { nav, store } = await seeded(2);
     nav.navGoTo(1);
@@ -896,8 +829,6 @@ describe('walking history reaches a pending email-confirm', () => {
     expect(store.panelOverlay.value).toEqual(PENDING_CONFIRM);
   });
 
-  // Nothing sanitizes the persisted stack at load: no entry is stripped, none is
-  // dropped, and the cursor is exactly what was written.
   it('leaves the persisted stack and cursor untouched at load', async () => {
     const { nav } = await seeded(2);
     expect(nav.navHistory.value.stack).toEqual(STACK);
@@ -905,9 +836,6 @@ describe('walking history reaches a pending email-confirm', () => {
   });
 });
 
-// A close that skips a push (Cancel, Escape, a peer device resolving the
-// panel, a deleted app) folds its row into the one beneath. So Uninstall,
-// Cancel, Install, Back returns to Plugins.
 describe('a change without a push folds into the row at the cursor', () => {
   const uninstallForm: PanelOverlay = {
     type: 'form',
@@ -961,7 +889,6 @@ describe('a change without a push folds into the row at the cursor', () => {
     return { nav, store };
   }
 
-  /** The folding runs once the task that changed the state is over. */
   const settle = () => new Promise<void>((resolve) => queueMicrotask(resolve));
 
   it('Back after cancel, then install, returns to Plugins', async () => {
@@ -1070,8 +997,6 @@ describe('pruneEntries', () => {
   });
 });
 
-// The prune edits the stack in memory, so no later save can write a deleted
-// app's rows back into the saved copy.
 describe('pruneNavHistory edits the live stack', () => {
   const app: PanelOverlay = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', kind: 'app', reusable: false } };
 

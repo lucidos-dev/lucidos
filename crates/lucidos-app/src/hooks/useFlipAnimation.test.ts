@@ -26,7 +26,6 @@ describe('contiguousRuns', () => {
 });
 
 describe('mountDisclosureMask', () => {
-    // jsdom lays nothing out, so the mask's own origin reads as (0, 0).
     const rect = (top: number, height = 40) => ({ top, left: 16, width: 300, height });
 
     it('starts the mask at the reveal line and sizes it to the rows below it', () => {
@@ -79,7 +78,6 @@ describe('crossesViewport', () => {
     const rect = (top: number, height = 40) => ({ top, left: 0, width: 300, height });
 
     it('copies a row that starts below the fold but slides through the screen', () => {
-        // A 40-row block under a header at 100px, in an 800px viewport.
         expect(crossesViewport(rect(1500), 100, 1600, 800)).toBe(true);
     });
 
@@ -101,13 +99,10 @@ describe('rollDistance', () => {
     });
 
     it('cuts a long block after the last row that starts on screen', () => {
-        // The last row to start above 800 starts at 750. Its bottom edge,
-        // 800, is 700 below the line.
         expect(rollDistance(rows(40, 100), 100, 2000, 800)).toBe(700);
     });
 
     it('does not roll once the line has scrolled above the screen', () => {
-        // No parent or header is on screen to roll under, so it lands at once.
         expect(rollDistance(rows(80, -2000), -2000, 4000, 800)).toBe(0);
     });
 
@@ -124,7 +119,6 @@ describe('rowEndScale', () => {
     });
 
     it('narrows to a nested row\'s indent, sharing the right edge', () => {
-        // The row's line starts 20px further in, so it is 180 of the 200px.
         expect(rowEndScale(line, 36)).toBe(0.9);
     });
 
@@ -190,13 +184,10 @@ describe('ghostOf', () => {
         expect(ghost.querySelector('[id], [data-thread-nav], [data-flip-id]')).toBeNull();
         expect(ghost.getAttribute('aria-hidden')).toBe('true');
         expect(ghost.inert).toBe(true);
-        // The real row keeps its own attributes.
         expect(row.querySelector('[data-thread-nav="c1"]')).not.toBeNull();
     });
 });
 
-// Extract the pure logic from useFlipTransitions for testing.
-// These functions mirror the inline logic in the hook.
 
 function buildSectionMap(sections: { name: string; ids: string[] }[]) {
     const map = new Map<string, string>();
@@ -260,7 +251,6 @@ describe('FLIP transition detection', () => {
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned).toEqual(new Set(['b']));
-        // New section header and sections that appeared
         expect(newItems.has('__section_saved')).toBe(true);
     });
 
@@ -298,7 +288,6 @@ describe('FLIP transition detection', () => {
         ]);
         const { transitioned, newItems } = detectChanges(prev, curr);
         expect(transitioned).toEqual(new Set(['a']));
-        // __section_archive was already present, __section_active disappeared
         expect(newItems.size).toBe(0);
     });
 

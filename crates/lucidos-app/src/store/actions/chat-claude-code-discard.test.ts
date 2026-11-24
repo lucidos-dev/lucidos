@@ -1,8 +1,3 @@
-/**
- * Verifies handleDiscardCCChanges fires an optimistic spinning toast keyed by
- * thread, mirroring the Apply Now flow. The SSE-driven ChangeDiscarded handler
- * in thread-sync.ts uses the same key to replace it with the detailed result.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
@@ -30,7 +25,9 @@ vi.mock('./changeToast', () => ({ changeToastMessage }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./send-probe', () => ({ probeStreamAfterSend: vi.fn() }));
 
-const { handleDiscardCCChanges } = await import('./chat-claude-code');
+vi.mock('../composeSync', () => ({ knownComposeEpoch: vi.fn(), parseComposeReport: vi.fn(), acceptComposeReport: vi.fn() }));
+
+const { handleDiscardCCChanges } = await import('./codingAgentChanges');
 
 describe('handleDiscardCCChanges', () => {
   beforeEach(() => {

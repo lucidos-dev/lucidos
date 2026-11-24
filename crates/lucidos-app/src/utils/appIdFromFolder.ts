@@ -1,8 +1,3 @@
-/** Extract the app id from an app coding-agent thread's `coding_agent_folder`.
- *
- *  App CC threads spawn against `<workspace>/data/apps/<id>/`. The id is the
- *  segment immediately after `data/apps/`. Returns null for any other shape so
- *  callers can ignore non-app folders without an extra `kind` check. */
 export function appIdFromFolder(folder: string | null | undefined): string | null {
   if (!folder) return null;
   const segments = folder.split('/').filter(s => s.length > 0);

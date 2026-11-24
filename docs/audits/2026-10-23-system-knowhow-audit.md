@@ -122,7 +122,7 @@ Each reviewer named what it skipped. Phase 1 of the plan reads these before it c
 - `coding-agent-events.md` lines 215-540; `orchestrating-sub-threads.md` lines 63-160.
 - `plugins.md`: media, widgets, marketplaces, private repos, uninstall; `oauth-providers.md` alias, scopes and Entra sections.
 - Whether a user's agent can write the shipped `oauth-providers.json`, as `oauth-providers.md:47` tells it to.
-- `notifications.md` §6, §7, the history section, the Tauri internals.
+- `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac-3.md` §6, §7, the history section, the Tauri internals.
 - `triggers.md` lines 400-700 and 880-940; `thread-queue.md` ordering and restart.
 - `remote-access.md` lines 1-39, 60-84, 206-270, 320-400, 700-830.
 - `workspace-audit/apps.md`, the body of `workspace-audit/prompt-footprint.md`, and a gap sweep for conventions with no check.

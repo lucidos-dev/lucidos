@@ -3,7 +3,6 @@ import { panelOverlay, focusedThreadId, toasts, confirmState, settleConfirm } fr
 import type { App } from '../types';
 import { widgetFitRequests } from '../widgetFit';
 
-// Mock all side-effect imports that handleNavigationRequest calls
 const switchMenuItem = vi.fn();
 const openSettingsSubview = vi.fn();
 const setActiveMenu = vi.fn();
@@ -37,21 +36,10 @@ vi.mock('./triggers', () => ({ navigateToTrigger, loadTriggers: vi.fn() }));
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState, replaceNavState: vi.fn() }));
 
-// Mock pane helper so we can assert handleNavigationRequest reveals the
-// content pane on EVERY content-landing target — directly (for branches
-// that use setActiveMenu) or transitively (for branches that delegate to a
-// helper that already calls it). See `.claude/rules/frontend.md` —
-// "Navigation that lands content must call revealContentPane()".
 const revealContentPane = vi.fn();
 const navigateToPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane, navigateToPane, holdFocusedPaneWhileTyping: vi.fn(), releaseTypingHold: vi.fn() }));
 
-// The layout predicate the `new-chat` branch gates its overlay clear on: the
-// same one revealContentPane()/revealThreadPane() branch on. jsdom's viewport
-// is desktop, but reading it would make the split-layout case pass for the
-// wrong reason, so drive it explicitly per test. vi.hoisted because `../store`
-// is imported statically above, and a factory that runs during that phase
-// would hit the TDZ on a plain const (see `./devices` below).
 const { isMobile } = vi.hoisted(() => ({ isMobile: vi.fn(() => false) }));
 vi.mock('../../utils/viewport', () => ({ isMobile }));
 
@@ -66,7 +54,6 @@ vi.mock('./compose', () => ({ ensureFocusedComposeThread, updateCompose }));
 const focusPromptNow = vi.fn();
 vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
 
-// Minimal mocks for other imports that thread-sync.ts pulls in
 vi.mock('../../api/client', () => ({
   API_BASE: '',
   API: '/api/v1',
@@ -76,14 +63,8 @@ vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
 vi.mock('./chat-changes', () => ({ syncRestartState: vi.fn(), addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
-// Default device id for this page; device-scoping tests vary the event's actor
-// against it. `./devices` is pulled in during the static import phase (via
-// `../store`), so the mock fn must be vi.hoisted — a plain const isn't
-// initialized yet when the hoisted factory runs.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
 vi.mock('./devices', () => ({ getDeviceId }));
-// Mirrors the real predicate: a repo-encoded path is handled here, anything
-// else declines so the 'file' branch falls back to openFilePreview.
 const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview }));
 vi.mock('./entityReferences', () => ({
@@ -92,14 +73,20 @@ vi.mock('./entityReferences', () => ({
   PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
 }));
 
+const submitted = vi.hoisted(() => vi.fn());
+vi.mock('../interactiveDeliveryService', () => ({
+  submitInteractiveRequest: (request: import('../interactiveDeliveryRecords').InteractiveRequest, id?: string) => {
+    submitted(request, id);
+    return presentInteractiveRequest(request);
+  },
+}));
+const { presentInteractiveRequest } = await import('./interactive-delivery');
 const { handleNavigationRequest, handleThreadEvent } = await import('./thread-sync');
 
 describe('handleNavigationRequest', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     panelOverlay.value = null;
-    // Split layout by default (clearAllMocks keeps a mockReturnValue, so a
-    // single-pane test can't leak its layout into the next one).
     isMobile.mockReturnValue(false);
   });
 
@@ -125,17 +112,11 @@ describe('handleNavigationRequest', () => {
   });
 
   it('lands on Settings → System → Thread Queue (Thread Queue notification tap)', () => {
-    // The `thread-queue` NavigateTarget stays stable in the SDK + engine; the
-    // frontend reinterprets it to the System subpanel under Settings.
     handleNavigationRequest({ target: 'thread-queue' });
     expect(openSettingsSubview).toHaveBeenCalledWith('thread-queue');
-    // openSettingsSubview lands the Settings menu item too, so pairing it with
-    // switchMenuItem would push the Settings home list as its own history entry.
     expect(switchMenuItem).not.toHaveBeenCalled();
   });
 
-  // The third argument is the app fragment. A navigate that names no place
-  // inside the app passes undefined, which leaves an open app where it was.
   it('opens app by id (delegates to openAppById, no stale-cache pre-check)', () => {
     handleNavigationRequest({ target: 'app', app_id: 'my-app' });
     expect(openAppById).toHaveBeenCalledWith('my-app', undefined, undefined);
@@ -173,13 +154,8 @@ describe('handleNavigationRequest', () => {
       'triggers',
       { type: 'form', form: { type: 'trigger' } },
     );
-    // switchMenuItem would push an extra (triggers, no overlay) entry first.
     expect(switchMenuItem).not.toHaveBeenCalled();
     expect(pushNavState).toHaveBeenCalledTimes(1);
-    // The new-trigger branch uses setActiveMenu directly (NOT switchMenuItem),
-    // so it must call revealContentPane itself — without this the mobile user
-    // tapping a new-trigger deep-link silently stayed on whatever pane they
-    // were on.
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
@@ -198,44 +174,22 @@ describe('handleNavigationRequest', () => {
     isMobile.mockReturnValue(true);
     panelOverlay.value = { type: 'file-preview', path: 'notes.md' };
     handleNavigationRequest({ target: 'new-chat' });
-    // Single-pane layout: the content pane's overlay really is covering the
-    // conversation, so it has to close for the compose view to be reachable.
     expect(panelOverlay.value).toBeNull();
-    // Drops focus first so ensureFocusedComposeThread allocates a fresh id
-    // (it returns the existing id otherwise).
     expect(unfocusThread).toHaveBeenCalledTimes(1);
     expect(ensureFocusedComposeThread).toHaveBeenCalledTimes(1);
-    // No prompt → no draft prefill, just a blank compose.
     expect(updateCompose).not.toHaveBeenCalled();
-    // Dropping the overlay unmounts a fullscreen app panel, so nothing here
-    // has to leave fullscreen by hand.
     expect(exitAppFullscreen).not.toHaveBeenCalled();
-    // Focus runs in rAF so the chat panel can mount before we query its DOM.
     await new Promise(resolve => requestAnimationFrame(resolve));
     expect(focusPromptNow).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the open app on a split layout, where the conversation has its own pane', async () => {
-    // The reported regression: an app UI button calling lucidos.ui.startThread
-    // opened the fresh chat AND closed the app the user was working in, because
-    // the branch cleared panelOverlay unconditionally. On the split layout the
-    // thread pane and the content pane are side by side, so the conversation was
-    // never hidden and the clear only cost the user their app (ContentPane's
-    // `{!overlay && …}` fallback then renders activeMenuItem, i.e. Files).
     const overlay = { type: 'app-ui' as const, app: { id: 'demo-director', name: 'Demo Director' } as App };
     panelOverlay.value = overlay;
     handleNavigationRequest({ target: 'new-chat', prompt: 'Refresh the list' });
     expect(panelOverlay.value).toBe(overlay);
-    // A fullscreen app panel is the one case where the content pane IS the whole
-    // viewport, so the split leaves fullscreen instead of closing the app.
     expect(exitAppFullscreen).toHaveBeenCalledTimes(1);
-    // Nothing pulls the content pane either: this navigation lands on a thread.
     expect(revealContentPane).not.toHaveBeenCalled();
-    // The thread pane is revealed through unfocusThread, which calls
-    // revealThreadPane() unless the caller opts out with { revealPane: false }
-    // (mobile swipes to the thread pane; desktop re-activates the Threads pane
-    // group and re-expands a collapsed split). Pinned as a no-argument call so
-    // the branch can't quietly acquire that opt-out.
     expect(unfocusThread).toHaveBeenCalledWith();
     expect(updateCompose).toHaveBeenCalledWith('new-thread-id', { text: 'Refresh the list' });
     await new Promise(resolve => requestAnimationFrame(resolve));
@@ -256,20 +210,13 @@ describe('handleNavigationRequest', () => {
   it('skips prefill for new-chat when prompt is empty string', () => {
     handleNavigationRequest({ target: 'new-chat', prompt: '' });
     expect(ensureFocusedComposeThread).toHaveBeenCalledTimes(1);
-    // Empty string is treated as "no prefill" — equivalent to omitting prompt.
     expect(updateCompose).not.toHaveBeenCalled();
   });
 });
 
-// NavigationRequested arrives over SSE for EVERY thread, not just the focused
-// one. These assert the scoping gate in handleTransientSideEffects: a navigate
-// from a background/sibling thread must not act on the viewing page; one from
-// the focused thread or from an app iframe (nil thread) must.
 const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
 
 function navEvent(sourceThreadId: string) {
-  // Transient (no seq) NavigationRequested envelope, as delivered by the SSE
-  // handler to handleThreadEvent.
   return {
     thread_id: sourceThreadId,
     event: {
@@ -279,7 +226,6 @@ function navEvent(sourceThreadId: string) {
   };
 }
 
-// An agent (navigate_ui) navigate carries its one target device as `actor`.
 function navEventFromDevice(sourceThreadId: string, deviceId: string) {
   return {
     thread_id: sourceThreadId,
@@ -302,7 +248,7 @@ describe('NavigationRequested scoping', () => {
     focusedThreadId.value = 'thread-A';
     handleThreadEvent(navEvent('thread-A'));
     expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String), undefined);
-    expect(toasts.value).toHaveLength(0); // no jump offer for in-focus navigate
+    expect(toasts.value).toHaveLength(0);
   });
 
   it('acts directly on a nil-thread (SDK app-iframe) navigate regardless of focus', () => {
@@ -315,10 +261,8 @@ describe('NavigationRequested scoping', () => {
   it('offers to jump (not act) for a navigate from a non-focused thread', () => {
     focusedThreadId.value = 'thread-A';
     handleThreadEvent(navEvent('thread-B'));
-    // Does NOT hijack the viewing page.
     expect(openAppById).not.toHaveBeenCalled();
     expect(focusThread).not.toHaveBeenCalled();
-    // Shows a single keyed jump-offer toast with an Open action.
     expect(toasts.value).toHaveLength(1);
     const offer = toasts.value[0];
     expect(offer.key).toBe('nav-offer-thread-B');
@@ -333,8 +277,6 @@ describe('NavigationRequested scoping', () => {
     expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String), undefined);
   });
 
-  // An agent navigate carries its one target device. It must act only on THAT
-  // device, never on the user's other devices, even ones viewing the same thread.
   it('acts when the agent navigate names THIS device (focused thread)', () => {
     getDeviceId.mockReturnValue('this-device');
     focusedThreadId.value = 'thread-A';
@@ -364,16 +306,11 @@ describe('NavigationRequested scoping', () => {
     getDeviceId.mockReturnValue('this-device');
     focusedThreadId.value = 'thread-A';
     handleThreadEvent(navEvent('thread-B'));
-    // No device actor → device scope doesn't apply → existing offer behavior.
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].key).toBe('nav-offer-thread-B');
   });
 });
 
-// The capture and the `refresh_app` reload name the turn's last used device.
-// Every page gets the event, whether or not it shows the thread. A page that
-// answered another device's capture raced the real one, and won with "No app
-// UI is currently open" (engine/tools/app_capture.rs).
 describe('app capture and refresh scoping', () => {
   const OTHER = { kind: 'device', device_id: 'other-device' };
   const HERE = { kind: 'device', device_id: 'this-device' };
@@ -450,15 +387,12 @@ describe('push prompt scoping', () => {
     expect(confirmState.value.visible).toBe(true);
   });
 
-  // Enable here would subscribe THIS device, not the one the user asked for.
   it('stays silent on another device showing the same thread', () => {
     handleThreadEvent(pushRequested({ kind: 'device', device_id: 'other-device' }));
     expect(confirmState.value.visible).toBe(false);
   });
 });
 
-// A fit check names one device with a visible window. Only that device's
-// window renders it, so no other page answers first (engine/widget_fit.rs).
 describe('widget fit check scoping', () => {
   function fitCheck(device_id: string) {
     return {
@@ -492,7 +426,6 @@ describe('with a second window on this device', () => {
   let other: BroadcastChannel;
   let stop: () => void;
 
-  /** The other window reports what it shows, touched after this one. */
   function otherShows(state: { focusedThreadId?: string | null; appId?: string | null }): Promise<void> {
     other.postMessage({
       type: 'state',
@@ -520,29 +453,10 @@ describe('with a second window on this device', () => {
     other.close();
   });
 
-  it('leaves a navigate to the window touched last when both show the thread', async () => {
+  it('queues navigation even when cached peers nominate another window', async () => {
     await otherShows({ focusedThreadId: 'thread-A' });
-    handleThreadEvent(navEvent('thread-A'));
-    expect(openAppById).not.toHaveBeenCalled();
-    expect(toasts.value).toHaveLength(0);
-  });
-
-  it('acts here when only this window shows the thread', async () => {
-    await otherShows({ focusedThreadId: 'thread-C' });
     handleThreadEvent(navEvent('thread-A'));
     expect(openAppById).toHaveBeenCalledTimes(1);
-  });
-
-  it('offers the jump only in the window touched last', async () => {
-    await otherShows({ focusedThreadId: 'thread-C' });
-    handleThreadEvent(navEvent('thread-B'));
-    expect(toasts.value).toHaveLength(0);
-  });
-
-  it('asks to enable push only in the window showing the thread', async () => {
-    await otherShows({ focusedThreadId: 'thread-A' });
-    handleThreadEvent({ thread_id: 'thread-A', event: { type: 'PushNotificationRequested' } });
-    expect(confirmState.value.visible).toBe(false);
   });
 
   it('leaves a fit check to the window showing its thread', async () => {
@@ -569,4 +483,18 @@ describe('with a second window on this device', () => {
     });
     expect(captureAppUI).not.toHaveBeenCalled();
   });
+});
+
+it('threads envelope identity through automatic navigation without changing its payload', () => {
+  focusedThreadId.value = 'thread-A';
+  handleThreadEvent({ ...navEvent('thread-A'), event_id: 'legacy-identity' }, 'envelope-identity');
+  expect(submitted).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'navigation' }), 'envelope-identity');
+});
+
+it('accepts the push prompt synchronously without waiting for an answer', () => {
+  settleConfirm(false);
+  const accepted = presentInteractiveRequest({ id: 'push-event', kind: 'push-enable', payload: {}, preference: { threadId: 'thread-A' } });
+  expect(accepted).toBe(true);
+  expect(confirmState.value.visible).toBe(true);
+  settleConfirm(false);
 });

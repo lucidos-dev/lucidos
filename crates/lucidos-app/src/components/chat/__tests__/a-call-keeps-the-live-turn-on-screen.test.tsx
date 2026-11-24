@@ -1,15 +1,3 @@
-/** A caller talking across a working turn takes nothing that is the turn's.
- *
- *  Every utterance is an exchange now, so a call puts many of them between the
- *  running turn and the bottom of the transcript. The turn is no longer the
- *  last exchange, and two things had assumed it was.
- *
- *  The live stream belongs to the turn, wherever it sits. The queued group
- *  belongs at the bottom, where the reader left their unsent messages: anchored
- *  on the turn it would climb above words the caller said after typing them.
- *
- *  See `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { renderExchanges } from '../CreateThreadView';
@@ -54,7 +42,6 @@ function runningThread(id: string): ThreadState {
   };
 }
 
-/** The delegated question, mid-turn: it has work under it and no terminator. */
 function runningTurn(seq: number): Exchange {
   return {
     userEvent: {
@@ -70,7 +57,6 @@ function runningTurn(seq: number): Exchange {
   };
 }
 
-/** One thing the caller said, which the talker answered itself. */
 function utterance(seq: number, text: string): Exchange {
   return {
     userEvent: { type: 'SpokenMessageReceived', session_id: 'sess-1', text, created: TS } as never,
@@ -79,7 +65,6 @@ function utterance(seq: number, text: string): Exchange {
   };
 }
 
-/** A typed follow-up the reader sent while the doer worked. */
 function typed(seq: number, id: string): Exchange {
   return {
     userEvent: { type: 'MessageReceived', text: 'and the changelog?', created: TS, channel: 'chat', _eventId: id } as never,
@@ -111,7 +96,6 @@ beforeEach(() => {
 });
 
 describe('the live turn keeps the stream a caller talks over', () => {
-  /** The turn, then six utterances over it. */
   const overTalked = (): Exchange[] => [
     runningTurn(1),
     ...Array.from({ length: 6 }, (_, i) => utterance(10 + i * 2, `Still there? ${i}`)),
@@ -126,11 +110,8 @@ describe('the live turn keeps the stream a caller talks over', () => {
     expect(live[0].isLast).toBe(true);
   });
 
-  // The window edge is write-once and only moves up (`threadWindow.ts`), so
-  // nothing here may widen it. Deriving the floor from the active turn would
-  // unmount turns the reader had been shown, the moment the turn settled.
   it('draws exactly the window it was given, whatever the active turn is', () => {
-    const nodes = renderExchanges(overTalked(), 't1', 'live tokens', /* renderFromIndex */ 4);
+    const nodes = renderExchanges(overTalked(), 't1', 'live tokens',  4);
     const drawn = exchangeNodes(nodes).map(n => (n.props.exchange as Exchange).userSeq);
     expect(drawn).toEqual([16, 18, 20]);
   });
@@ -154,16 +135,13 @@ describe('the queued group rides the bottom of the transcript', () => {
     expect(props.map(p => p.isQueued)).toEqual([false, true]);
   });
 
-  // It draws at the bottom whatever its index, so the window must not judge it
-  // by that index. A long call is what separates the two: the message the
-  // reader is still waiting on would simply vanish.
   it('draws a message the window floor has left behind', () => {
     const exchanges = [
       runningTurn(1),
       typed(3, 'msg-2'),
       ...Array.from({ length: 6 }, (_, i) => utterance(10 + i * 2, `Still there? ${i}`)),
     ];
-    const nodes = renderExchanges(exchanges, 't1', '', /* renderFromIndex */ 5);
+    const nodes = renderExchanges(exchanges, 't1', '',  5);
     const drawn = exchangeNodes(nodes).map(n => (n.props.exchange as Exchange).userSeq);
     expect(drawn).toContain(3);
     expect(drawn[drawn.length - 1]).toBe(3);

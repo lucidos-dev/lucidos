@@ -1,12 +1,6 @@
 import type { ComponentChildren, JSX, Ref } from 'preact';
 import { SearchIcon } from './SearchIcon';
 
-/** The one search box in the host: a soft pill with a search glyph.
- *
- *  `class` goes on the pill, for the host's layout. `inputClass` names the
- *  field itself. `children` render inside the pill after the input, for a
- *  control that acts on the query, such as Clear. A control that closes the
- *  whole search belongs outside the pill. */
 export function SearchField({
   class: pillClass,
   inputClass,

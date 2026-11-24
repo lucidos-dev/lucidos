@@ -1,4 +1,3 @@
-use super::agent_session::CodingAgentKind;
 use super::event_bus::SystemEvent;
 use super::git_ops::{
     any_iframe_bundled_file_changed, full_harden_marker_state, git_cmd, git_ran_ok,
@@ -7,33 +6,36 @@ use super::git_ops::{
 use super::thread_events::{MessageOrigin, UnproposedReason};
 use super::LucidosEngine;
 use crate::core::changes::{ChangeStatus, ChangeStatusData};
+use crate::engine::thread_events::CodingAgentKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
 mod apply;
-pub(crate) mod apply_claim;
+pub mod apply_claim;
 mod discard;
 #[cfg(test)]
 pub(crate) use discard::{revert_on_main, RevertTarget};
 mod proposal_hold;
 mod propose;
 mod set_aside;
-pub(crate) use proposal_hold::{
-    apply_must_harden, read_proposal_hold, PlanFloor, PlanHold, ProposalHold,
-};
+pub use proposal_hold::PlanHold;
 #[cfg(test)]
 pub(crate) use propose::{
     branch_moved_since_last_idle, withhold_for_landing, withhold_unfinished_work, withhold_unready,
     HoldOutcome, OpenChangeAfterHold,
 };
-pub(crate) use propose::{
-    emit_change_withdrawn, emit_proposal_withheld, withhold_handed_off_work, ProposeOutcome,
-    LANE_BRANCH_IS_NOT_A_CHANGE,
-};
 #[cfg(test)]
 pub(crate) use set_aside::withdraw_for_redecision;
-pub(crate) use set_aside::SET_ASIDE_APPLY_REFUSAL;
+pub use set_aside::SET_ASIDE_APPLY_REFUSAL;
+pub use {
+    proposal_hold::apply_must_harden, proposal_hold::held_plan, proposal_hold::read_proposal_hold,
+    proposal_hold::PlanFloor, proposal_hold::ProposalHold,
+};
+pub use {
+    propose::emit_change_withdrawn, propose::emit_proposal_withheld,
+    propose::withhold_handed_off_work, propose::HoldReentry, propose::ProposeOutcome,
+};
 
 #[path = "../change_ops_emitters.rs"]
 mod emitters;
@@ -49,7 +51,7 @@ pub(crate) use super::git_ops::catchup_and_ff_to_main;
 pub(crate) use super::{ApplyResult, ApplyStatus};
 
 /// Information about a live agent session, sufficient for in-place merge.
-pub(crate) struct LiveSessionInfo {
+pub struct LiveSessionInfo {
     pub worktree_path: PathBuf,
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
     /// Last-activity clock for the session (epoch millis), used by the async
@@ -65,7 +67,7 @@ pub(crate) struct LiveSessionInfo {
 /// recovery paths (stale-session, orphan-recovery) can stamp themselves; live
 /// agent callers pass `None` (the surrounding `MessageReceived` carries the
 /// user/agent origin).
-pub(crate) struct ProposeChangeInput<'a> {
+pub struct ProposeChangeInput<'a> {
     pub thread_id: Uuid,
     pub branch_name: &'a str,
     pub repo_root: &'a str,
@@ -77,58 +79,25 @@ pub(crate) struct ProposeChangeInput<'a> {
     pub origin: Option<MessageOrigin>,
 }
 
-/// Trait for coding agents that can interact with change management.
-///
-/// Separate from the user-facing [`crate::runtime::CodingAgent`] enum
-/// (which identifies *which* backend a session uses); this trait is the
-/// engine-internal abstraction over the operations `change_ops` needs to
-/// invoke on a coding-agent runtime (apply, hardening, merge, resume).
-pub(crate) trait CodingAgentChangeOps: Send + Sync {
-    /// `actor` carries the user who initiated the apply that triggered hardening.
-    /// When `auto_apply_change_id` is `Some` and hardening completes successfully,
-    /// the agent re-enters `apply_change(change_id, actor)` so the resulting
-    /// `ChangeApplied` event is stamped with the original user instead of
-    /// collapsing to the engine fallback.
-    fn spawn_hardening(
-        &self,
-        thread_id: Uuid,
-        worktree_path: PathBuf,
-        branch_name: String,
-        auto_apply_change_id: Option<Uuid>,
-        actor: Option<MessageOrigin>,
-    );
-    async fn live_session_info(&self, thread_id: Uuid) -> Option<LiveSessionInfo>;
-    /// The merge session holds `claim` for its whole run, so no second apply
-    /// of the change starts beside it.
-    fn spawn_merge_session(
-        &self,
-        thread_id: Uuid,
-        claim: apply_claim::ApplyClaim,
-        description: &str,
-    );
-    async fn lookup_session_id_for_resume(&self, thread_id: Uuid) -> Option<String>;
-    /// Resume an in-progress merge session via this agent.
-    /// `resume_token` is opaque to the engine; each implementor decides what it
-    /// means (Claude Code: the `session_id` to pass to `claude --resume`).
-    // The merge needs both claims, the worktree, the branch, the prompt's
-    // description and the resume token; a struct would only rename them.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_merge_session_tier2(
-        &self,
-        thread_id: Uuid,
-        claim: &apply_claim::ApplyClaim,
-        // The apply's hold on the thread, which the merge session takes over.
-        thread_hold: crate::engine::agent_session::spawn_claim::SpawnClaim,
-        wt_path: &Path,
-        branch_name: &str,
-        description: &str,
-        resume_token: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+impl LucidosEngine {
+    pub(crate) async fn live_session_info(&self, thread_id: Uuid) -> Option<LiveSessionInfo> {
+        let guard = self.agent_sessions.lock().await;
+        guard.get(&thread_id).and_then(|s| {
+            if !s.is_live() {
+                return None;
+            }
+            Some(LiveSessionInfo {
+                worktree_path: s.worktree_path.clone()?,
+                msg_tx: s.msg_tx.clone(),
+                last_event_at: s.last_event_at.clone(),
+            })
+        })
+    }
 }
 
 /// Where an apply left `main`, for `ChangeApplied` and a later Revert.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppliedMerge {
+pub struct AppliedMerge {
     pub pre: String,
     pub post: String,
     /// Set when the landing lane landed the change as its own merge commit.
@@ -136,7 +105,7 @@ pub(crate) struct AppliedMerge {
 }
 
 impl AppliedMerge {
-    pub(crate) fn new(pre: &str, post: &str) -> Self {
+    pub fn new(pre: &str, post: &str) -> Self {
         Self {
             pre: pre.to_string(),
             post: post.to_string(),
@@ -157,7 +126,7 @@ impl AppliedMerge {
 /// once at the start of `apply_change` so every downstream branch (hardening
 /// gate, restart gating, AppUiRefresh emit) uses the same values.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ApplyKindContext {
+pub struct ApplyKindContext {
     pub kind: CodingAgentKind,
     pub app_id: Option<String>,
 }
@@ -182,7 +151,7 @@ impl super::LucidosEngine {
     /// include anything the iframe bundles. Call right after each
     /// `emit_change_applied` success in `apply_change` so open app iframes
     /// reload to pick up CC's edits.
-    pub(crate) async fn maybe_emit_app_ui_refresh(
+    pub async fn maybe_emit_app_ui_refresh(
         &self,
         ctx: &ApplyKindContext,
         files: &[String],
@@ -213,7 +182,7 @@ impl super::LucidosEngine {
 /// app id as the last segment of `coding_agent_folder` (`<ws>/data/apps/<id>/`)
 /// — kept out of `thread_summaries` as its own column per §4.6 of the design
 /// plan, so we recover it from the folder string here.
-pub(crate) async fn load_apply_kind_context(
+pub async fn load_apply_kind_context(
     pool: &sqlx::PgPool,
     thread_id: Option<Uuid>,
 ) -> ApplyKindContext {
@@ -247,7 +216,7 @@ pub(crate) async fn load_apply_kind_context(
 }
 
 /// Current time as epoch milliseconds (i64). Used for liveness tracking.
-pub(crate) fn now_epoch_millis() -> i64 {
+pub fn now_epoch_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -258,14 +227,14 @@ pub(crate) fn now_epoch_millis() -> i64 {
 /// the Apply-All driver, the `apply_change` LLM tool). Deliberately says the
 /// change still lands on its own, because it does: the resolution session's
 /// completion is what applies it.
-pub(crate) const MERGE_OWNED_BY_RESOLVER_MESSAGE: &str =
+pub const MERGE_OWNED_BY_RESOLVER_MESSAGE: &str =
     "A merge resolution is already in flight for this change. The coding-agent \
      session owns the merge until it finishes; the change applies automatically \
      when it does.";
 
 /// Who is allowed to move `main` for a change right now.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum MergeOwnership {
+pub enum MergeOwnership {
     /// A conflict-resolution session holds the merge. Every other apply path
     /// must refuse: no fast-forward, no worktree reset, no `ChangeApplied`.
     ResolverOwnsIt,
@@ -340,7 +309,7 @@ impl super::LucidosEngine {
     /// that act on a thread rather than a known change (`apply_now`). Asks the
     /// live session which change it is resolving, then checks that pairing, so
     /// an unrelated open pairing on the same thread cannot mislabel it.
-    pub(crate) async fn merge_ownership_for_thread(&self, thread_id: Uuid) -> MergeOwnership {
+    pub async fn merge_ownership_for_thread(&self, thread_id: Uuid) -> MergeOwnership {
         let Some(change_id) = self.live_resolver_change(thread_id).await else {
             return MergeOwnership::CallerMayMerge;
         };
@@ -364,7 +333,7 @@ impl super::LucidosEngine {
         {
             Ok(open) => Some(open),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] conflict_pairing_open({}, {}) failed: {}. Treating the resolution as in flight",
                     thread_id,
                     change_id,
@@ -393,11 +362,7 @@ impl super::LucidosEngine {
     /// registration instead. A missing session is a no-op: the merge prompt is
     /// about to fail to send anyway, and the guard falls back to "nobody is
     /// resolving", which is true.
-    pub(crate) async fn bind_session_to_conflict_resolution(
-        &self,
-        thread_id: Uuid,
-        change_id: Uuid,
-    ) {
+    pub async fn bind_session_to_conflict_resolution(&self, thread_id: Uuid, change_id: Uuid) {
         bind_in_place_conflict_resolution(
             &mut *self.agent_sessions.lock().await,
             thread_id,
@@ -407,7 +372,7 @@ impl super::LucidosEngine {
 }
 
 /// The map half of [`LucidosEngine::bind_session_to_conflict_resolution`].
-pub(crate) fn bind_in_place_conflict_resolution(
+pub fn bind_in_place_conflict_resolution(
     sessions: &mut std::collections::HashMap<Uuid, crate::engine::AgentSession>,
     thread_id: Uuid,
     change_id: Uuid,
@@ -421,7 +386,7 @@ pub(crate) fn bind_in_place_conflict_resolution(
 /// (Fresh or Stale) means CC ran `/harden` at least once and is trusted; if
 /// the marker was consumed by a prior apply (Missing), fall back to the DB
 /// `hardened` flag on the open change row, pending or set aside.
-pub(crate) async fn branch_is_hardened(
+pub async fn branch_is_hardened(
     pool: &sqlx::PgPool,
     changes: &crate::core::changes_projection::ChangesProjection,
     repo_root: &Path,
@@ -433,7 +398,7 @@ pub(crate) async fn branch_is_hardened(
             Ok(Some(c)) => c.hardened,
             Ok(None) => false,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] branch_is_hardened: get_open_by_branch({}): {}; \
                      treating as not hardened (safer than letting a stale check pass)",
                     branch_name,
@@ -447,7 +412,7 @@ pub(crate) async fn branch_is_hardened(
 
 /// `thread_summaries.coding_agent_is_external_repo`. A thread with no
 /// summary row answers `false`.
-pub(crate) async fn thread_is_external_repo(
+pub async fn thread_is_external_repo(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Result<bool, sqlx::Error> {

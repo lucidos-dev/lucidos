@@ -1,13 +1,3 @@
-/**
- * The first-paint growth check (ADR 0454). A change's growth is measured
- * against a build of its merge base, and growth over the threshold needs a
- * reason. The nightly ranking reads main's reflog.
- *
- * Importing the tool is safe: it runs a command only when it IS the entry
- * module. The builds are injected, so nothing here runs Vite. The baseline
- * cases use real git, in throwaway repositories. The registry cases run real
- * `npm config get`, which reads config files and never the network.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as growth from '../../first-paint-growth.mjs';
 import type { Build, FirstPaintReport } from '../../first-paint-growth.mjs';
@@ -133,12 +123,10 @@ describe('the ruler', () => {
   });
 });
 
-// ── the baseline, over real git ─────────────────────────────────────────────
 
 let sandbox: Sandbox;
 const git = (...args: string[]) => sandbox.git(...args);
 
-/** A commit whose app reports `size` bytes, through the stub build below. */
 function commitSize(size: number, message: string) {
   sandbox.write('crates/lucidos-app/src/size.txt', String(size));
   git('add', '-A');
@@ -146,8 +134,6 @@ function commitSize(size: number, message: string) {
   return git('rev-parse', 'HEAD');
 }
 
-/** Stands in for `vite build`: reads the archived tree's size file. A tree
- *  without one writes no report, as a base with nothing to build does. */
 const stubBuild: Build = ({ appDir, reportPath }) => {
   const size = readIfPresent(join(appDir, 'src/size.txt'));
   if (size === null) return;
@@ -183,7 +169,6 @@ afterEach(() => {
   sandbox.remove();
 });
 
-// Each case spawns a few dozen git processes, which outruns the default limit.
 describe('runCheck against the merge base', { timeout: 30_000 }, () => {
   it('fails growth with no reason, and passes once a commit states one', () => {
     commitSize(1_000_000, 'base');
@@ -254,7 +239,6 @@ describe('runCheck against the merge base', { timeout: 30_000 }, () => {
     git('checkout', '-q', 'main');
     git('checkout', '-q', '-b', 'b');
     commitSize(1_001_000, 'feat: b grows 1 kB');
-    // A lands, the way Apply lands a change: main fast-forwards to its tip.
     git('checkout', '-q', 'main');
     git('merge', '-q', '--ff-only', 'a');
     git('checkout', '-q', 'b');
@@ -295,9 +279,6 @@ describe('runCheck against the merge base', { timeout: 30_000 }, () => {
   describe('the registry a base installs from', () => {
     const USER_REGISTRY = 'https://registry.invalid/';
 
-    /** Branch off a base and bump the lockfile, so the base needs its own install.
-     *  The user config and npm_config_registry name a registry outside the repo,
-     *  as a contributor's own setup can. Returns what npm resolves in the base tree. */
     function baseRegistry(onFeature: () => void) {
       git('checkout', '-q', '-b', 'feature');
       onFeature();
@@ -359,10 +340,8 @@ describe('runCheck against the merge base', { timeout: 30_000 }, () => {
   });
 });
 
-// ── the nightly ranking ─────────────────────────────────────────────────────
 
 describe('runReport over main\'s reflog', { timeout: 30_000 }, () => {
-  /** Land a change the way Apply does: main fast-forwards to the branch tip. */
   function land(branch: string, size: number, subject: string, reason?: string) {
     git('checkout', '-q', '-b', branch);
     commitSize(size, subject);
@@ -455,7 +434,6 @@ describe('prepareGenerated', () => {
     writeAt(path, text);
   }
 
-  /** A repo whose codegen.sh answers `--cache-dir` from a table, by revision. */
   function repoWithCache(renderings: Record<string, string>): string {
     const root = tempDir('first-paint-codegen-');
     const cases = Object.entries(renderings)

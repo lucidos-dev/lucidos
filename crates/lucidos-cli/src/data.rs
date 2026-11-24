@@ -234,12 +234,16 @@ pub(crate) fn cmd_write(
         .put(&url)
         .header("Content-Type", "application/octet-stream")
         .body(bytes);
-    send_expect_success("PUT", &url, req)?;
+    let reply = send_expect_success("PUT", &url, req)?;
 
     // Echo the resolved absolute path on stderr so callers see exactly what was
     // written, keeping stdout clean for the clickable link below. The path
-    // stays stderr's LAST line, so the not-shown reminder goes before it.
+    // stays stderr's LAST line, so the notes go before it.
     let mut stderr = io::stderr();
+    if let Some(warning) = write_warning(&reply) {
+        writeln!(stderr, "{warning}")
+            .map_err(|e| format!("Failed to write status to stderr: {}", e))?;
+    }
     if let Some(reminder) = not_shown_yet(&normalized) {
         writeln!(stderr, "{reminder}")
             .map_err(|e| format!("Failed to write status to stderr: {}", e))?;
@@ -253,6 +257,13 @@ pub(crate) fn cmd_write(
     // `artifact:`/`file:` scheme that the frontend has no handler for.
     println!("{}", chat_link(&normalized, size));
     Ok(())
+}
+
+/// The `warning` a data write's reply carries, such as a knowhow file over the
+/// size cap. The write landed either way.
+fn write_warning(reply: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(reply).ok()?;
+    value.get("warning")?.as_str().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -305,7 +316,7 @@ mod tests {
     /// lands where nothing reads it.
     #[test]
     fn every_data_prefix_list_matches_the_engine() {
-        const ENGINE: &str = include_str!("../../lucidos-engine/src/core/data_prefixes.rs");
+        const ENGINE: &str = include_str!("../../lucidos-core/src/core/data_prefixes.rs");
         const FRONTEND: &str = include_str!("../../lucidos-app/src/utils/dataPathPrefixes.ts");
         let engine = quoted_list(ENGINE, "pub const MUTABLE_PREFIXES: &[&str] = &[", '"');
         assert!(engine.contains(&"themes/"), "parsed: {engine:?}");
@@ -537,7 +548,8 @@ mod tests {
     /// when the CLI prints one, so both read the same extensions.
     #[test]
     fn the_card_gate_reads_the_same_picture_extensions() {
-        const GATE: &str = include_str!("../../lucidos-engine/src/engine/question_card_gate.rs");
+        const GATE: &str =
+            include_str!("../../lucidos-agents-api/src/engine/question_card_gate.rs");
         const LIST: &str = r#"&["gif", "jpeg", "jpg", "png", "svg", "webp"]"#;
         assert!(GATE.contains(LIST), "the gate's `is_picture` list drifted");
         assert!(include_str!("data.rs").contains(LIST), "`is_image` drifted");
@@ -570,5 +582,13 @@ mod tests {
             chat_link("artifacts/png-notes.md", None),
             "[png-notes.md](artifacts/png-notes.md)"
         );
+    }
+
+    #[test]
+    fn a_write_reply_warning_is_read_and_its_absence_is_none() {
+        let warned = r#"{"success":true,"path":"knowhow/a.md","warning":"too big"}"#;
+        assert_eq!(write_warning(warned).as_deref(), Some("too big"));
+        assert_eq!(write_warning(r#"{"success":true}"#), None);
+        assert_eq!(write_warning("not json"), None);
     }
 }

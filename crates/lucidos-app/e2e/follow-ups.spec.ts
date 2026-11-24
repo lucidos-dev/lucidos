@@ -40,7 +40,6 @@ test.describe('Follow-ups during and after streaming', () => {
 
     await waitForStreamingToStart(page);
 
-    // Rapid-fire two more messages without waiting
     const msg2 = uniqueMessage('rapid-2');
     const msg3 = uniqueMessage('rapid-3');
     await sendFollowUp(page, `Say exactly: "second ${msg2}"`);
@@ -69,39 +68,27 @@ test.describe('Follow-ups during and after streaming', () => {
     const exchanges = await countExchanges(page);
     expect(exchanges).toBeGreaterThanOrEqual(2);
 
-    // The waitForResponse() above can resolve before the follow-up turn streams
-    // (turn 1's label is already settled), so wait for the end-state first.
     await waitForVisibleResponseCount(page, 2);
     const responseCount = await countVisibleResponses(page);
     expect(responseCount).toBeGreaterThanOrEqual(2);
   });
 
   test('double follow-up near response completion shows no error toast', async ({ page }) => {
-    // Regression: sending follow-ups right as a response finishes caused a 409
-    // "Thread is not active" error toast because the inject API races with the
-    // thread leaving active_threads. The fix falls back to sendMessage on 409.
     await navigateToApp(page);
     await newThread(page);
 
-    // Short prompt → response finishes fast, maximising the race window
     const msg1 = uniqueMessage('race-1');
     await sendMessage(page, `Say exactly: "done ${msg1}"`);
 
-    // Don't wait for streaming — fire follow-ups immediately so at least one
-    // lands right as (or just after) the response completes.
     const msg2 = uniqueMessage('race-2');
     const msg3 = uniqueMessage('race-3');
     await sendFollowUp(page, `Say exactly: "second ${msg2}"`);
     await sendFollowUp(page, `Say exactly: "third ${msg3}"`);
 
-    // Wait for all exchanges to complete
     await waitForResponse(page, 120_000);
 
-    // All three user messages must be visible
     await assertUserMessagesVisible(page, [msg1, msg2, msg3]);
 
-    // No error toast should have appeared (the old bug showed
-    // "Failed to inject prompt: 409 Thread is not active")
     const errorToasts = page.locator('.toast-error');
     await expect(errorToasts).toHaveCount(0);
 
@@ -128,9 +115,6 @@ test.describe('Follow-ups during and after streaming', () => {
 
     await assertUserMessagesVisible(page, markers);
 
-    // The final waitForResponse() in the loop can resolve before the third turn
-    // streams (the prior turn's label is already settled), so wait for the
-    // end-state — three responses with content — before counting.
     await waitForVisibleResponseCount(page, 3);
     const responseCount = await countVisibleResponses(page);
     expect(responseCount).toBeGreaterThanOrEqual(3);

@@ -1,12 +1,3 @@
-/**
- * A right-click over the file-preview body opens the SAME actions the
- * header toolbar offers (ADR 0285), Copy path included. Native right-click
- * keeps working over a link or a selection. See
- * `docs/plans/2026-10-04-file-preview-context-menu.md`.
- *
- * Driven through `page.mouse`, so the press goes through real hit-testing
- * and the browser dispatches its own `contextmenu`.
- */
 import { test, expect, type Page } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
@@ -75,13 +66,6 @@ test.describe('Desktop file-preview context menu', () => {
   test('right-clicking a selection the reader just made defers to the native menu', async ({ page }) => {
     await openNote(page);
     const prose = page.getByText('Ordinary prose a reader can right-click.');
-    // A programmatic Range, not a synthetic triple-click: Chromium's own
-    // click-to-select timing is a flake risk Playwright does not own, where a
-    // Selection object is exactly what the feature itself reads.
-    //
-    // The click point comes from the RANGE's own rect, not the paragraph
-    // element's box: the element's box includes padding the text's line box
-    // does not, so its centre can land outside the selected text.
     const point = await prose.evaluate((el) => {
       const range = document.createRange();
       range.selectNodeContents(el);
@@ -107,7 +91,6 @@ test.describe('Desktop file-preview context menu', () => {
 
     await page.keyboard.press('Escape');
     await expect(menu(page)).toHaveCount(0);
-    // Still the same file, not bounced into edit mode or anywhere else.
     await expect(page.locator('.file-preview-frame-body:visible')).toBeVisible();
     await expect(page.locator('.file-editor-textarea')).toHaveCount(0);
     await expect(prose).toBeVisible();

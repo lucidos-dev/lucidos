@@ -1,18 +1,6 @@
-/**
- * A `<Disclosure>` rolls in a real browser: its height grows under the row
- * above it while the body slides down, and the clip lifts once it lands.
- * Closing rolls it back up, inert, and then unmounts it. The component's
- * contract is unit-tested; this pins what jsdom cannot, real Web Animations
- * driving real layout. Plan: `docs/plans/2026-09-26-one-disclosure-roll.md`.
- *
- * What's New is the surface because every build has releases to unfold. The
- * slider sits at its slowest, so a roll lasts seconds and frames land mid-way.
- * Desktop-only: it pins a 1280x900 viewport, as `type-scale-settings-desktop`.
- */
 import { test, expect, type Page } from './fixtures';
 import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
 const SLOWEST = '-10';
@@ -29,8 +17,6 @@ async function openWhatsNew(page: Page) {
   expect(res.ok(), `POST /api/v1/ui/navigate -> ${res.status()}`).toBeTruthy();
 }
 
-/** One frame of the release's disclosure: the rolling box, its body's
- *  natural height, the body's lift, and whether the body takes input. */
 function sample(page: Page, version: string) {
   return page.evaluate((v) => {
     const box = document.querySelector<HTMLElement>(`[data-release="${v}"] .disclosure`);
@@ -57,13 +43,10 @@ test.describe('the disclosure roll', () => {
       .locator('.whats-new-release:visible:has(> .whats-new-release-row > .whats-new-release-header[aria-expanded="false"])')
       .first();
     await expect(firstShut).toBeVisible({ timeout: 15_000 });
-    // Pinned by version: the shut-row query stops matching once this one opens.
     const version = (await firstShut.getAttribute('data-release'))!;
     const release = page.locator(`.whats-new-release[data-release="${version}"]:visible`);
     const header = release.locator('.whats-new-release-header');
 
-    // A body that would open below the fold snaps with no roll, and a long
-    // release open above can push this row there. So the row goes to the top.
     await header.evaluate((el) => el.scrollIntoView({ block: 'start' }));
     await header.click();
     await expect.poll(async () => {

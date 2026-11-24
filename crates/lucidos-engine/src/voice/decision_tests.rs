@@ -8,8 +8,11 @@ use uuid::Uuid;
 
 use super::*;
 use crate::engine::event_bus::EventBus;
+use crate::engine::permission::legacy::{LegacyCard, LegacyLane, LegacyPick};
+use crate::engine::permission::menu::{ALLOW_ONCE_LABEL, DONT_ALLOW_LABEL};
+use crate::engine::thread_events::GrantOffer;
 use crate::engine::thread_events::ThreadEvent;
-use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
+use crate::test_support::{seed_pre_gate_card, seed_thread_event, setup_test_db, teardown_test_db};
 
 /// Whether anything parks this thread's doer, which is what most cases here
 /// assert. Defined on the reader rather than beside it, so the two cannot
@@ -51,38 +54,68 @@ fn ids(open: &[OpenDecision]) -> Vec<String> {
 // The choice sets
 // ---------------------------------------------------------------------------
 
-/// An owner approval card's Allow once is spendable authority, so only a tap
-/// on screen gives it (ADR 0387). Read aloud, the card keeps Don't allow and
-/// the caller's own words, and its choice ids still name the original options.
+/// A *permission request* is read back whole, but no choice settles it: only
+/// the caller's own transcript does (ADR 0664). One the engine raised parks no
+/// doer, since no agent waits on it. It offers no "their words" choice that
+/// would close it without a pick.
 #[test]
-fn an_owner_approval_card_offers_no_allow_once_aloud() {
-    let options = vec![
-        option("opt-0", crate::api::owner_approval::ALLOW_ONCE_LABEL, None),
-        option("opt-1", crate::api::owner_approval::DONT_ALLOW_LABEL, None),
-    ];
-    let decision =
-        OpenDecision::question("toolu_q0", "Let this thread act?", &options, false, true);
+fn a_permission_request_is_read_back_but_never_picked() {
+    let request = OpenRequest {
+        awaited: false,
+        words_answer: true,
+    };
+    let decision = OpenDecision::permission_request(
+        "toolu_p0",
+        "Continue hardening?",
+        &two_options(),
+        request,
+    );
+    let raised = DecisionKind::PermissionRequest {
+        awaited: false,
+        words_answer: true,
+    };
+    assert_eq!(decision.kind, raised);
+    assert!(!decision.kind.parks_the_doer());
     assert_eq!(
         labels(&decision),
-        vec![
-            crate::api::owner_approval::DONT_ALLOW_LABEL,
-            THEIR_WORDS_LABEL
-        ]
+        vec!["Run the tail now", "Leave it for tonight"]
     );
-    assert_eq!(decision.choices[0].id, "question:toolu_q0#opt1");
+    assert_eq!(decision.their_words_choice(), None);
+    let open = [decision];
+    let (kind, act) = choice_in(&open, "permission:toolu_p0#opt0").expect("its id is issued");
+    assert_eq!(kind, raised);
+    assert_eq!(act, Act::Heard);
+}
+
+/// A permission request an agent prepared parks the doer: the agent's
+/// question tool waits on the answer, so no new turn may start under it.
+/// Its choices are still read back only, Allow once included.
+#[test]
+fn a_prepared_permission_request_parks_the_doer_and_is_never_picked() {
+    let options = vec![
+        option("opt-0", ALLOW_ONCE_LABEL, None),
+        option("opt-1", DONT_ALLOW_LABEL, None),
+    ];
+    let request = OpenRequest {
+        awaited: true,
+        words_answer: false,
+    };
+    let decision = OpenDecision::permission_request(
+        "toolu_p1",
+        "Let it create a workspace?",
+        &options,
+        request,
+    );
+    assert!(decision.kind.parks_the_doer());
+    assert!(decision.choices.iter().all(|c| c.act == Act::Heard));
+    assert_eq!(decision.their_words_choice(), None);
 }
 
 /// The card's own options, plus the one the screen's prompt textarea stands in
 /// for. A free-text answer needs a choice, because the tool takes only an id.
 #[test]
 fn a_question_offers_its_options_and_one_for_their_own_words() {
-    let decision = OpenDecision::question(
-        "toolu_q0",
-        "Do something now?",
-        &two_options(),
-        false,
-        false,
-    );
+    let decision = OpenDecision::question("toolu_q0", "Do something now?", &two_options(), false);
     assert_eq!(
         labels(&decision),
         vec![
@@ -100,7 +133,7 @@ fn a_question_offers_its_options_and_one_for_their_own_words() {
 /// worth reading out.
 #[test]
 fn a_free_text_question_offers_only_their_own_words() {
-    let decision = OpenDecision::question("toolu_q1", "What should I call it?", &[], false, false);
+    let decision = OpenDecision::question("toolu_q1", "What should I call it?", &[], false);
     assert_eq!(labels(&decision), vec![THEIR_WORDS_LABEL]);
 }
 
@@ -108,7 +141,7 @@ fn a_free_text_question_offers_only_their_own_words() {
 /// belongs to before anything looks it up.
 #[test]
 fn every_choice_id_is_rooted_in_its_decisions_id() {
-    let decision = OpenDecision::question("toolu_q0", "Now?", &two_options(), false, false);
+    let decision = OpenDecision::question("toolu_q0", "Now?", &two_options(), false);
     assert_eq!(decision.id, "question:toolu_q0");
     for choice in &decision.choices {
         assert!(choice.id.starts_with("question:toolu_q0#"), "{}", choice.id);
@@ -121,7 +154,7 @@ fn every_choice_id_is_rooted_in_its_decisions_id() {
 #[test]
 fn a_choice_id_numbers_by_position_and_the_answer_carries_the_real_option_id() {
     let awkward = vec![option("weird#id", "Ship it", None)];
-    let decision = OpenDecision::question("toolu_q0", "Ready?", &awkward, false, false);
+    let decision = OpenDecision::question("toolu_q0", "Ready?", &awkward, false);
     assert_eq!(decision.choices[0].id, "question:toolu_q0#opt0");
     assert_eq!(
         decision.choices[0].act,
@@ -138,7 +171,7 @@ fn a_choice_id_numbers_by_position_and_the_answer_carries_the_real_option_id() {
 /// tool takes one id. Its answer still carries the shape that card accepts.
 #[test]
 fn a_multi_select_option_answers_in_the_shape_that_card_takes() {
-    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true, false);
+    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true);
     assert_eq!(
         decision.choices[0].act,
         Act::Answer {
@@ -156,7 +189,7 @@ fn a_multi_select_option_answers_in_the_shape_that_card_takes() {
 /// choice says so. Nothing promises a second id.
 #[test]
 fn picking_more_than_one_is_routed_through_their_own_words() {
-    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true, false);
+    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true);
     let their_words = decision.choices.last().expect("the last choice");
     assert_eq!(
         their_words.act,
@@ -178,7 +211,6 @@ fn the_question_survives_whole_and_a_long_description_does_not() {
         &long,
         &[option("opt-0", "Go", Some(&long))],
         false,
-        false,
     );
     assert_eq!(decision.prompt, long);
     assert!(decision.choices[0]
@@ -188,59 +220,70 @@ fn the_question_survives_whole_and_a_long_description_does_not() {
         .ends_with('…'));
 }
 
-/// Decision 7 of the plan, in each of the three lanes: Allow once, Allow for
-/// this thread, Deny. Both Always-allow scopes stay on screen, because they
-/// widen what every future agent session may do.
+/// Each lane offers every button its card draws (ADR 0664). The caller
+/// hears both Always-allow grants, each naming the line it stores.
 #[test]
-fn a_permission_offers_three_scopes_and_never_an_always_allow() {
+fn a_permission_offers_every_button_its_card_draws() {
     let lanes = [
-        OpenDecision::command_permission("r1", "run_bash", "rm -rf build", "Deletes files."),
-        OpenDecision::mcp_permission("r2", "example-server", "Example", "post_message", "{}"),
-        OpenDecision::coding_agent_permission("r3", Some(&git_offer()), "Bash git push"),
+        stamped_command("r1", "git push origin main", "Pushes."),
+        LegacyCard::mcp("r2", "example-server", "Example", "post_message", "{}"),
+        LegacyCard::coding_agent("r3", Some(git_offer()), "Bash git push"),
     ];
-    for decision in lanes {
+    let expected = [
+        ["Always allow `Bash(git:*)`", "Always allow `Bash`"],
+        [
+            "Always allow `Mcp(example-server:post_message)`",
+            "Always allow `Mcp(example-server:*)`",
+        ],
+        ["Always allow `Bash(git:*)`", "Always allow `Bash`"],
+    ];
+    for (card, [narrow, broad]) in lanes.iter().zip(expected) {
+        let decision = OpenDecision::tool_permission(card);
         assert_eq!(
             labels(&decision),
-            vec!["Allow once", "Allow for this thread", "Deny"],
+            vec!["Allow once", "Allow for this thread", narrow, broad, "Deny"],
             "{:?}",
             decision.kind
         );
-        for choice in &decision.choices {
-            assert!(
-                !choice.label.to_lowercase().contains("always"),
-                "{:?} offered {}",
-                decision.kind,
-                choice.label
-            );
-        }
     }
 }
 
-/// The scopes a caller reaches are exactly what the engine will accept.
+/// A pick settles Allow once, Allow for this thread and Deny. An Always allow
+/// widens what every future session may do, so it is read back but never
+/// picked: only the caller's own words settle it.
 #[test]
-fn the_permission_scopes_are_allow_once_session_and_deny() {
-    let decision = OpenDecision::command_permission("r1", "run_bash", "rm -rf b", "Deletes.");
+fn an_always_allow_is_heard_and_never_picked() {
+    let decision = OpenDecision::tool_permission(&stamped_command("r1", "git push", "Pushes."));
+    let permit = |pick| Act::Permit {
+        lane: LegacyLane::Command,
+        request_id: "r1".to_string(),
+        pick,
+    };
     let acts: Vec<&Act> = decision.choices.iter().map(|c| &c.act).collect();
     assert_eq!(
         acts,
         vec![
-            &Act::Permit {
-                request_id: "r1".to_string(),
-                allowed: true,
-                scope: None
-            },
-            &Act::Permit {
-                request_id: "r1".to_string(),
-                allowed: true,
-                scope: Some(AllowScope::Session)
-            },
-            &Act::Permit {
-                request_id: "r1".to_string(),
-                allowed: false,
-                scope: None
-            },
+            &permit(LegacyPick::Once),
+            &permit(LegacyPick::Session),
+            &Act::Heard,
+            &Act::Heard,
+            &permit(LegacyPick::Deny),
         ]
     );
+    assert_eq!(decision.choices[2].id, "command:r1#always-narrow");
+    assert_eq!(decision.their_words_choice(), None);
+}
+
+/// The first line of a card is its fixed risk phrase and stays whole. The
+/// command after it is cut like everything else read aloud.
+#[test]
+fn a_cards_risk_phrase_stays_whole_and_its_command_is_cut() {
+    let long = "x".repeat(READ_ALOUD_CHARS * 2);
+    let decision =
+        OpenDecision::tool_permission(&LegacyCard::command("r1", "run_bash", &long, "Runs."));
+    let (head, rest) = decision.prompt.split_once('\n').expect("two lines");
+    assert_eq!(head, "Runs.");
+    assert!(rest.ends_with('…'), "{rest}");
 }
 
 /// A card whose "Allow for this thread" would record nothing does not offer
@@ -249,11 +292,11 @@ fn the_permission_scopes_are_allow_once_session_and_deny() {
 /// approvals renders its own card.
 #[test]
 fn a_card_that_cannot_be_granted_for_the_thread_does_not_offer_it() {
-    let decision = OpenDecision::coding_agent_permission(
+    let decision = OpenDecision::tool_permission(&LegacyCard::coding_agent(
         "r3",
-        Some(&GrantOffer::default()),
+        Some(GrantOffer::default()),
         "file_change /tmp/x",
-    );
+    ));
     assert_eq!(labels(&decision), vec!["Allow once", "Deny"]);
 }
 
@@ -261,8 +304,9 @@ fn a_card_that_cannot_be_granted_for_the_thread_does_not_offer_it() {
 /// lane is the first half of every id.
 #[test]
 fn two_lanes_never_issue_the_same_id() {
-    let command = OpenDecision::command_permission("same", "run_bash", "ls", "Runs.");
-    let mcp = OpenDecision::mcp_permission("same", "s", "S", "t", "{}");
+    let command =
+        OpenDecision::tool_permission(&LegacyCard::command("same", "run_bash", "ls", "Runs."));
+    let mcp = OpenDecision::tool_permission(&LegacyCard::mcp("same", "s", "S", "t", "{}"));
     assert_ne!(command.id, mcp.id);
     for a in &command.choices {
         for b in &mcp.choices {
@@ -295,6 +339,7 @@ async fn a_coding_agent_thread(bus: &EventBus) -> Uuid {
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".to_string(),
             branch: "claude-code/test".to_string(),
@@ -327,17 +372,20 @@ fn asks_the_caller(tool_use_id: &str) -> ThreadEvent {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        permission_request: None,
     }
 }
 
 fn asks_to_run(request_id: &str) -> ThreadEvent {
     ThreadEvent::CommandPermissionRequested {
+        decision_trace: None,
         request_id: request_id.to_string(),
         tool_use_id: "toolu_b0".to_string(),
         tool_name: "run_bash".to_string(),
         command: "gh release delete v1".to_string(),
         summary: "Deletes a published release.".to_string(),
         grant_head: None,
+        grant_offer: None,
     }
 }
 
@@ -366,14 +414,25 @@ fn asks_the_coding_agent(request_id: &str) -> ThreadEvent {
 /// What the engine stamps on a Claude Code `git push` card.
 fn git_offer() -> GrantOffer {
     GrantOffer {
+        deny: None,
         broad: Some("Bash".to_string()),
         narrow: Some("Bash(git:*)".to_string()),
         session: Some("Bash(git:*)".to_string()),
+        withheld: None,
     }
+}
+
+/// A command card as the engine stamps it, with the scopes its Always allow
+/// buttons store. An unstamped card draws none (ADR 0664).
+fn stamped_command(request_id: &str, command: &str, summary: &str) -> LegacyCard {
+    let mut card = LegacyCard::command(request_id, "run_bash", command, summary);
+    card.offer = git_offer();
+    card
 }
 
 fn a_command_answer(request_id: &str) -> ThreadEvent {
     ThreadEvent::CommandPermissionResolved {
+        standing_deny: None,
         request_id: request_id.to_string(),
         allowed: true,
         reason: None,
@@ -406,7 +465,8 @@ async fn a_turn_starts(bus: &EventBus, thread_id: Uuid) {
 }
 
 /// The chat surfaces at once, in lane order, each carrying the id that settles
-/// it. A thread rarely holds them all, and the reader must not care.
+/// it. Only a thread upgraded with several open cards holds them all, and the
+/// reader must not care.
 #[tokio::test]
 async fn the_reader_covers_every_chat_lane_at_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -415,8 +475,8 @@ async fn the_reader_covers_every_chat_lane_at_once() {
     a_turn_starts(&bus, thread_id).await;
 
     seed_thread_event(&bus, thread_id, asks_the_caller("toolu_q0")).await;
-    seed_thread_event(&bus, thread_id, asks_to_run("req-cmd")).await;
-    seed_thread_event(&bus, thread_id, asks_to_call_mcp("req-mcp")).await;
+    seed_pre_gate_card(&pool, thread_id, asks_to_run("req-cmd")).await;
+    seed_pre_gate_card(&pool, thread_id, asks_to_call_mcp("req-mcp")).await;
 
     let open = open_on(&pool, thread_id).await;
     assert_eq!(

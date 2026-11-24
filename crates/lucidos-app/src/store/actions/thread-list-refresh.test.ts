@@ -1,17 +1,3 @@
-/**
- * Regression: an installed iOS PWA on cellular showed a sticky
- * `Failed to refresh the thread list: request timed out` card. The gateway log
- * for that window has the engine answering every `GET /api/v1/threads` between
- * 12ms and 2s against a 10s client deadline, so the ten seconds went into the
- * link (5G, a Tailscale tunnel, one HTTP/2 connection shared with the event
- * stream) and the card was reporting the link while blaming the engine.
- *
- * Both surfacing sites (the resume sync in connection.ts, the SSE resync in
- * thread-sync.ts) suppressed `AbortError` and transport errors but deliberately
- * let `TimeoutError` through. These tests pin the reversal, and the three other
- * properties the shared wrapper now owns: the connection gate, the retraction on
- * success, and never rejecting.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { connectionStatus, toasts, showToast, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
 import { ApiError } from '../../api/client';
@@ -35,9 +21,6 @@ beforeEach(() => {
 });
 
 describe('refreshThreadList: a delivery failure is not a verdict', () => {
-  // The reported shape. `AbortSignal.timeout` fires this, and `_core.ts`
-  // re-stamps WebKit's own AbortError as it so the deadline means the same thing
-  // on every engine.
   it('stays silent on a TimeoutError', async () => {
     mockLoadAllThreads.mockRejectedValue(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
     await refreshThreadList();
@@ -89,8 +72,6 @@ describe('refreshThreadList: the connection dot owns a sustained outage', () => 
     expect(card()).toBeUndefined();
   });
 
-  // `'connecting'` is the value before the first health probe lands, so
-  // reachability is unconfirmed rather than confirmed-good.
   it('raises nothing while connecting', async () => {
     connectionStatus.value = 'connecting';
     mockLoadAllThreads.mockRejectedValue(new ApiError(500, 'boom'));
@@ -100,9 +81,6 @@ describe('refreshThreadList: the connection dot owns a sustained outage', () => 
 });
 
 describe('refreshThreadList: a landed refresh retracts the card', () => {
-  // The card is keyed with no `autoDismissMs`, which `scheduleAutoDismiss`
-  // treats as "never expire", so without this it stood above an up-to-date
-  // drawer until the user tapped the X.
   it('removes the card once a refresh succeeds', async () => {
     mockLoadAllThreads.mockRejectedValueOnce(new ApiError(500, 'boom'));
     await refreshThreadList();
@@ -122,10 +100,6 @@ describe('refreshThreadList: a landed refresh retracts the card', () => {
 });
 
 describe('refreshThreadList: never rejects', () => {
-  // `resyncLoadedThreads` awaits it and then refreshes the focused thread, which
-  // is what clears a stuck "Thinking" spinner after an SSE gap. A rejection
-  // propagating out of here would skip that repair, which is the very failure
-  // that function exists to perform.
   it('resolves on a verdict', async () => {
     mockLoadAllThreads.mockRejectedValue(new ApiError(500, 'boom'));
     await expect(refreshThreadList()).resolves.toBeUndefined();
@@ -138,10 +112,6 @@ describe('refreshThreadList: never rejects', () => {
 });
 
 describe('refreshThreadList: a declined load is not a landed one', () => {
-  // `loadAllThreads` resolves FALSE when it declined: the engine is mid-restart,
-  // or another load is already in flight. Nothing was read either way, so the
-  // card's claim is untouched. Flagged independently by two reviewers on
-  // 2026-08-07, when the wrapper retracted on any resolve.
   it('leaves the card standing when the load declined', async () => {
     mockLoadAllThreads.mockRejectedValueOnce(new ApiError(500, 'boom'));
     await refreshThreadList();

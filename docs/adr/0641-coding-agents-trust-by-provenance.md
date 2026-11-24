@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-11-09
+- **Amended by**: [0647](0647-only-a-signed-claim-proves-the-owner.md): closes the token-less paths
 
 ## Context
 

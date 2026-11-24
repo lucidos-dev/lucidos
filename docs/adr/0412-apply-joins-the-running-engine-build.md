@@ -36,6 +36,10 @@ they are tested over a stub build without cargo.
   moved during cargo, which absorbs a peer's Apply while this engine holds the
   checkout lock. The follow-up check reads the published binary's commit, so it
   never repeats work the shell already did.
+
+  **Amended by [ADR 0668](0668-engine-build-compiles-a-pinned-snapshot.md).**
+  The rebuild once is gone. A primary checkout compiles a pinned snapshot,
+  and this follow-up is the only catch-up build.
 - **The explicit Rebuild keeps the escape.** A hung build has no timeout, and
   the user needs one button that kills it.
 
@@ -60,7 +64,8 @@ they are tested over a stub build without cargo.
 - **Hold merges while a build runs.** Every Apply, frontend ones included,
   would wait up to a whole build.
 - **Build a frozen snapshot of the commit.** A second source path makes every
-  build a cache miss (ADR 0392).
+  build a cache miss (ADR 0392). **Amended by ADR 0668**, which builds one at
+  a stable path with its own target dir, so builds stay incremental.
 - **A build timeout instead of the explicit restart.** No good number exists
   for a build that takes 1 to 13 minutes, and the button already works.
 

@@ -1,11 +1,17 @@
-//! `lucidos tls status`: what the gateway serves over HTTPS, and why not when
-//! it does not.
+//! `lucidos tls`: the local certificate, and what the gateway serves over
+//! HTTPS.
+//!
+//! The local certificate is the per-user loopback CA. `trust` and `forget`
+//! act on it here, as the user, since only the user can change their own
+//! certificate store.
 //!
 //! The gateway settles its certificates itself. An operator's
 //! `LUCIDOS_TLS_CERT`/`KEY` serves every name it covers. The tailnet name gets
 //! it only when a phone would accept it there, and otherwise a certificate
 //! tailscaled issues. This command only reads the answer.
 
+use lucidos_loopback_ca::trust::{self, TrustStatus};
+use lucidos_loopback_ca::{CaDir, LoopbackCa};
 use serde_json::Value;
 
 use crate::gateway;
@@ -14,7 +20,36 @@ use crate::workspace::BoxError;
 /// The gateway control route for the TLS state.
 const TLS_PATH: &str = "/~/api/v1/control/tls";
 
+/// The CA directory. `None` only when HOME is unset.
+fn ca_dir() -> Result<CaDir, BoxError> {
+    CaDir::resolve()
+        .ok_or_else(|| "HOME is not set, so Lucidos cannot find its local certificate".into())
+}
+
+pub fn cmd_tls_trust() -> Result<(), BoxError> {
+    let ca = ca_dir()?;
+    LoopbackCa::ensure(&ca)?;
+    trust::ensure_trusted(&ca)?;
+    println!("{}", describe_local(&trust::status(&ca)));
+    Ok(())
+}
+
+pub fn cmd_tls_forget() -> Result<(), BoxError> {
+    if trust::forget(&ca_dir()?)? {
+        println!("Removed the local certificate and its trust.");
+    } else {
+        println!("No local certificate to remove.");
+    }
+    Ok(())
+}
+
 pub fn cmd_tls_status(port: Option<u16>) -> Result<(), BoxError> {
+    let local = match ca_dir() {
+        Ok(ca) if ca.public_cert_path().exists() => trust::status(&ca),
+        Ok(_) => TrustStatus::Untrusted("no gateway has made it yet".to_string()),
+        Err(e) => TrustStatus::Unavailable(e.to_string()),
+    };
+    println!("{}", describe_local(&local));
     let client = gateway::client()?;
     let base = gateway::the_gateway(
         &client,
@@ -39,6 +74,20 @@ pub fn cmd_tls_status(port: Option<u16>) -> Result<(), BoxError> {
     }
     println!("{}", describe(&response.json()?));
     Ok(())
+}
+
+/// The local certificate's line: whether browsers on this machine accept
+/// https://localhost.
+fn describe_local(status: &TrustStatus) -> String {
+    match status {
+        TrustStatus::Trusted => {
+            "Local certificate: trusted. Browsers here open https://localhost.".to_string()
+        }
+        TrustStatus::Untrusted(why) => {
+            format!("Local certificate: not trusted ({why}). Run `lucidos tls trust`.")
+        }
+        TrustStatus::Unavailable(why) => format!("Local certificate: unknown. {why}"),
+    }
 }
 
 /// What a person reads, from the gateway's answer.
@@ -91,6 +140,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn an_untrusted_local_certificate_names_the_cure() {
+        let text = describe_local(&TrustStatus::Untrusted("not in the login keychain".into()));
+        assert!(text.contains("not in the login keychain"));
+        assert!(text.contains("lucidos tls trust"));
+    }
+
+    #[test]
+    fn a_trusted_local_certificate_names_localhost() {
+        assert!(describe_local(&TrustStatus::Trusted).contains("https://localhost"));
+    }
 
     #[test]
     fn a_tailnet_certificate_names_its_origin_and_expiry() {

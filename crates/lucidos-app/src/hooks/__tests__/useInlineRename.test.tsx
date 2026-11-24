@@ -1,19 +1,10 @@
 // @vitest-environment jsdom
-/**
- * What a rename-in-place field rests on, pinned away from any surface. Two
- * surfaces share these now, and a third will copy whichever it finds.
- *
- * Both were inline in one component and untested: the commit-once guard and
- * the focus inside the opening tap, which is the only way iOS raises the
- * keyboard. The ADR 0118 re-seed is pinned per surface as well.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useInlineRename } from '../useInlineRename';
 
 let host: HTMLElement;
 let rename: ReturnType<typeof vi.fn>;
-/** What the last render read, so a test can drive the hook like a surface. */
 let hook: ReturnType<typeof useInlineRename>;
 
 function Probe({ served }: { served: string }) {
@@ -37,8 +28,6 @@ async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** Preact defers an effect past paint, so a re-seed lands a frame later than
- *  the render that triggered it. Poll rather than guess the delay. */
 async function waitFor(done: () => boolean, budgetMs = 1000): Promise<void> {
   for (let waited = 0; waited < budgetMs; waited += 10) {
     if (done()) return;
@@ -60,8 +49,6 @@ describe('useInlineRename', () => {
   });
 
   it('focuses and selects the field inside the call that opens it', () => {
-    // Synchronously, before any render: iOS raises the keyboard only for a
-    // focus() the tap itself makes.
     hook.open();
 
     expect(document.activeElement).toBe(field());
@@ -92,8 +79,6 @@ describe('useInlineRename', () => {
     expect(hook.renaming).toBe(false);
   });
 
-  // The guard latches before the await. With the close after it, a rejected
-  // rename refused every later Enter and blur, and the user's text with it.
   it('closes the field even when the rename rejects', async () => {
     rename.mockRejectedValueOnce(new Error('engine said no'));
     hook.open();

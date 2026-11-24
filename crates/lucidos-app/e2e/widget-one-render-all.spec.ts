@@ -3,16 +3,6 @@ import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, ensureOnThreadPane, isMobileViewport, navigateToApp, openWidgetCardMenu, waitForDashboardReady } from './helpers';
 import { psql } from './db-helpers';
 
-/**
- * A widget renders in one box everywhere a size applies: its thread card and
- * its dashboard tile (the widget box). At one size the two boxes match, they
- * clip alike, the widget is told the same size, and its text computes to the
- * same px. Checked at 100% and 175% UI scale, on desktop and phone.
- *
- * The fixture is written to the old inline contract: natural height, three
- * cards in an auto-fit row. That is the widget that fit its card and clipped
- * in its tile.
- */
 
 const SIZES = ['small', 'medium', 'large'] as const;
 type Size = typeof SIZES[number];
@@ -50,7 +40,6 @@ function seedThreadShowingWidget(threadId: string, appId: string): void {
   ].join(';\n'));
 }
 
-/** Serve every preference read at `scale`, so the shell and the frames boot at it. */
 async function bootAtScale(page: Page, scale: number): Promise<void> {
   await page.addInitScript((s) => {
     if (window.parent !== window) return;
@@ -79,9 +68,6 @@ async function size(box: Locator): Promise<{ width: number; height: number }> {
   return { width: b!.width, height: b!.height };
 }
 
-/** What the widget in `box` is told and draws, once it has been told `s`. The
- *  push and the report that follows it cross a frame boundary, so each is
- *  awaited. The box fades exactly when the widget's content overflows it. */
 async function inside(box: Locator, s: Size) {
   const frame = box.frameLocator('iframe[data-role="app-ui-frame"]');
   await expect(frame.locator('#first')).toBeVisible({ timeout: 15_000 });
@@ -95,7 +81,6 @@ async function inside(box: Locator, s: Size) {
   };
 }
 
-/** Picks `s` in the card menu's Size row, then closes the menu. */
 async function pickCardSize(page: Page, s: Size): Promise<void> {
   const menu = await openWidgetCardMenu(page, card(page));
   const option = menu.locator(`.widget-menu-size [role="radio"][aria-label="${s}"]`);
@@ -149,9 +134,6 @@ test.describe('One widget box', () => {
     for (const path of written) await apiRequest(page).delete(`/api/v1/data/${path}`);
   });
 
-  /** Invariants: an XL box is four cells wide at its true size in a card and a
-   *  tile alike. A host narrower than that clamps the box and scrolls it
-   *  sideways, never widening the page, and the widget is still told `xl`. */
   test('an XL widget keeps four cells inside a clamped card and tile, scrolling sideways', async ({ page }) => {
     await page.goto('/');
     await writeFile(page, `apps/${appId}/index.html`, OLD_CONTRACT_WIDGET);
@@ -195,7 +177,6 @@ test.describe('One widget box', () => {
     await pickCardSize(page, 'xl');
     await card(page).scrollIntoViewIfNeeded();
     const inCard = await xlBox(cardBox(page));
-    // Four cells: two large boxes and the gap between them, less the border.
     const gap = inCard.canvasWidth + 2 - 2 * large.width;
     expect(Math.abs(gap - 0.75 * rem), 'XL is two larges and a gap').toBeLessThanOrEqual(1.5);
     expect(inCard.boxWidth, 'the card never outgrows the viewport').toBeLessThanOrEqual(inCard.viewportWidth);
@@ -211,7 +192,6 @@ test.describe('One widget box', () => {
       const clamped = seen.boxInnerWidth < seen.canvasWidth - 1;
       expect(seen.scrolls, `${place} scrolls exactly when clamped`).toBe(clamped);
     }
-    // A phone has two columns, so its tile is always clamped.
     if (isMobileViewport(page)) expect(inTile.scrolls, 'phone tile scrolls').toBe(true);
   });
 
@@ -245,18 +225,13 @@ test.describe('One widget box', () => {
         const inTile = { box: await size(tile(page, appId)), ...await inside(tile(page, appId), s) };
         await hideDashboard(page);
 
-        // I1: the same box, to 1 px.
         expect(Math.abs(inCard.box.width - inTile.box.width), `${s} width`).toBeLessThanOrEqual(1);
         expect(Math.abs(inCard.box.height - inTile.box.height), `${s} height`).toBeLessThanOrEqual(1);
-        // I2: it clips in one place exactly when it clips in the other.
         expect(inCard.faded, `${s} fade`).toBe(inTile.faded);
-        // I3: told the same size in both places.
         expect(inCard.told, `${s} card is told its size`).toBe(s);
         expect(inTile.told, `${s} tile is told its size`).toBe(s);
-        // I5: no shrinking: the same text computes to the same px.
         expect(inCard.fontSize, `${s} font size`).toBe(inTile.fontSize);
       }
-      // The old contract's three cards wrap in a small box, so it clips there.
       await pickCardSize(page, 'small');
       await expect(cardBox(page).locator('.widget-box-fade[data-edge="bottom"]')).toHaveCount(1);
     });

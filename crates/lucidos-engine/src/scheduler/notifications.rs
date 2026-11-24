@@ -7,218 +7,11 @@ use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
-use crate::gateway_operators::Reader;
+use crate::gateway_users::Reader;
 
-/// Where a tap on this notification (OS push, in-app toast) should land.
-///
-/// Discriminated union — `kind` selects the variant. `Modal` (default) opens
-/// the inbox modal so the user reads the message and chooses what to do next.
-/// `Navigate` delegates to the same target/sub-field router the `navigate_ui`
-/// LLM tool uses, so any UI surface reachable by `navigate_ui` is reachable by
-/// a notification tap with no per-target wrapper variant. Every notification is
-/// openable — there is no passive/button-less kind.
-/// `RestoreSnapshot` is the engine's Undo restore target. It requests the normal
-/// target admission and confirmation flow, never an immediate destructive action.
-///
-/// The old passive `None` kind (`{"kind":"none"}`) is RETIRED: nothing produces
-/// it anymore, and the custom `Deserialize` below coerces any historical
-/// `{"kind":"none"}` event/row to `Modal` (see that impl for why it can't just
-/// be deleted). Removed by `docs/plans/2026-07-02-remove-notification-tap-none.md`.
-///
-/// Wire shape (JSON):
-/// - `{"kind":"modal"}`
-/// - `{"kind":"navigate","to":{"target":"app","app_id":"habit-tracker"}}`
-///
-/// Required sub-fields on `NavigateUi.to` (e.g. `app_id` for `target=app`) are
-/// validated by the page-side router, not by this type: the LLM tool definition
-/// documents them. The ONE exception is a thread target's `id`, which every
-/// producer settles through [`resolve_thread_tap_id`] before the write.
-///
-/// # Strict — no tolerance for the legacy four-string form
-///
-/// Inbound `Tap` deserialization is strict: only the canonical object form
-/// is accepted. The pre-`20260522152123_notification_tap_jsonb.sql` bare
-/// strings (`"modal"` / `"open_app"` / `"open_thread"` / `"none"`) are
-/// rejected by serde with a clear "missing field 'kind'" error — surfacing
-/// as `400 Bad Request` on the HTTP `notifications` POST and as a
-/// `send_notification` LLM tool error on bad LLM output. (The retired
-/// `{"kind":"none"}` OBJECT is the one exception — coerced to `Modal`, not
-/// rejected; the bare string `"none"` is still rejected.)
-///
-/// Workspaces that still have triggers or apps emitting the old strings
-/// must migrate them. `system-knowhow/workspace-audit/triggers.md` finds them, and
-/// its remediation section owns the rewrite. Historical `NotificationCreated`
-/// event payloads with the old form remain in the events table forever
-/// (event-sourcing immutability), but the projection is built once by the
-/// JSONB migration and incremental updates only consume new events with the
-/// canonical shape — normal operation never re-deserializes the old strings.
-/// A force projection rebuild on a pre-migration workspace will fail loudly,
-/// at which point the workspace owner runs that audit's fix path and
-/// rebuilds.
-///
-/// `to` is boxed because `NavigateUi` is one field per navigate target and
-/// keeps growing, while `Modal` carries nothing. Unboxed, every `Tap` in the
-/// program paid the largest target's size, `Notification` and the
-/// `NotificationCreated` event included. The box is invisible on the wire.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Tap {
-    #[default]
-    Modal,
-    Navigate {
-        to: Box<NavigateUi>,
-    },
-    /// Opens normal restore admission and confirmation; never executes a restore.
-    #[serde(rename = "restore-snapshot")]
-    RestoreSnapshot {
-        workspace_id: String,
-        handle: crate::core::snapshot::handle::Handle,
-    },
-    /// Opens a confirmation to undo the config change `event_id` recorded
-    /// (ADR 0623); never undoes on its own.
-    #[serde(rename = "undo-config-change")]
-    UndoConfigChange {
-        event_id: uuid::Uuid,
-    },
-}
-
-// Custom Deserialize (not derived) so the RETIRED `{"kind":"none"}` kind coerces
-// to `Modal` rather than erroring. `Tap::None` (the old passive kind) was removed
-// so every notification is openable — but immutable `NotificationCreated` event
-// payloads, and any `notifications` rows a projection rebuild replays, still carry
-// `{"kind":"none"}` forever. So the read boundary MUST tolerate it. This is
-// PERMANENT old-data tolerance (a parser for a legacy wire shape), NOT a temporary
-// measure — so it carries no `docs/temporary-measures.md` row.
-//
-// It delegates to a private derived helper that keeps serde's full strictness:
-// legacy bare strings ("modal"/"none"/"open_thread") and unknown object kinds are
-// still rejected loudly (the strict-tap guard). ONLY the well-formed
-// `{"kind":"none"}` object is coerced — to `Modal`, which then re-serializes as
-// `{"kind":"modal"}`, so a rebuilt row never re-emits `none`.
-impl<'de> Deserialize<'de> for Tap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "snake_case")]
-        enum TapWire {
-            Modal,
-            None,
-            Navigate {
-                to: Box<NavigateUi>,
-            },
-            #[serde(rename = "restore-snapshot")]
-            RestoreSnapshot {
-                workspace_id: String,
-                handle: crate::core::snapshot::handle::Handle,
-            },
-            #[serde(rename = "undo-config-change")]
-            UndoConfigChange {
-                event_id: uuid::Uuid,
-            },
-        }
-        Ok(match TapWire::deserialize(deserializer)? {
-            TapWire::Modal | TapWire::None => Tap::Modal,
-            TapWire::Navigate { to } => Tap::Navigate { to },
-            TapWire::RestoreSnapshot {
-                workspace_id,
-                handle,
-            } => Tap::RestoreSnapshot {
-                workspace_id,
-                handle,
-            },
-            TapWire::UndoConfigChange { event_id } => Tap::UndoConfigChange { event_id },
-        })
-    }
-}
-
-/// Navigation payload — mirrors the `navigate_ui` LLM tool arg shape. Used
-/// as the `to` of `Tap::Navigate`. Required sub-fields are not enforced at
-/// the Rust layer; the page-side router rejects malformed nav targets.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct NavigateUi {
-    pub target: NavigateTarget,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings_view: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_id: Option<String>,
-    /// The place INSIDE the target to open. With `target: App` it is the app
-    /// iframe's `location.hash`. The page-side router hands it over and never
-    /// inspects it, since only the app knows what its own targets are. An app
-    /// that ignores the hash still opens, exactly as a file opens at the top
-    /// when its cited line has gone stale. With `target: Settings` it names a
-    /// row on the `settings_view` page, and the page toasts one it cannot find.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fragment: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
-    /// First line to select in the file preview, 1-based. Only meaningful with
-    /// `target: File`. The page-side router validates and silently ignores a
-    /// line it can't use (0, negative, past the end of the file) rather than
-    /// refusing to open the file: a citation's line number is the part that
-    /// goes stale, and the file is still what the reader asked for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-    /// Last line of the selected range, 1-based and INCLUSIVE. Omit for a
-    /// single line. Only meaningful alongside `line`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_end: Option<u32>,
-    /// The thread or trigger to open. A thread's is settled to a uuid at the
-    /// producer by [`resolve_thread_tap_id`]. The page dereferences it later,
-    /// with no way to ask what was meant. Decoding stays permissive, so a row
-    /// written before that guard is still readable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    /// The coding agent backend a `NewChat` draft preselects, as
-    /// `CodingAgent::as_str` spells it. A string, not the enum: the page
-    /// validates it, so an unknown value warns instead of failing the tap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coding_agent: Option<String>,
-    /// The coding target a `NewChat` draft preselects: a registered
-    /// repository name or id, or `data/apps/<id>`. The page resolves it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folder: Option<String>,
-}
-
-/// Navigation target enum — every UI surface a notification tap can deep-link
-/// to. Wire format: kebab-case (e.g. `"new-app"`). Mirrors the `navigate_ui`
-/// LLM tool's `target` enum.
-///
-/// Has a `Default` impl (`Thread`) so callers can use the
-/// `NavigateUi { target: …, ..Default::default() }` shorthand. The default
-/// target value is rarely the right pick — `handleNavigationRequest` surfaces
-/// a `Navigation target missing …` toast at runtime when a navigate-kind tap
-/// lacks the required sub-field for whatever target was chosen, which is the
-/// failure mode this would have masked.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum NavigateTarget {
-    Files,
-    Apps,
-    AppStore,
-    Plugins,
-    Triggers,
-    ThreadQueue,
-    Changes,
-    Notifications,
-    Settings,
-    App,
-    File,
-    Trigger,
-    #[default]
-    Thread,
-    NewApp,
-    NewTrigger,
-    NewChat,
-    Url,
-}
+pub use crate::engine::thread_events::notification::{
+    NavigateTarget, NavigateUi, PushGroup, Tap, UNWATCH_PUSH_ACTION,
+};
 
 /// The tap a producer gets when it supplied none.
 ///
@@ -256,7 +49,7 @@ pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
 ///
 /// `caller` is the thread the producer is working in. It resolves the
 /// `current` / `this` alias an agent reaches for, because the sibling `events`
-/// tool takes it. `None` refuses the alias; [`crate::api::resolve_thread_id_arg`]
+/// tool takes it. `None` refuses the alias; [`crate::engine::thread_events::resolve_thread_id_arg`]
 /// says why a surface with no ambient thread must not guess one.
 ///
 /// Scoped to [`NavigateTarget::Thread`], the one target whose id the alias can
@@ -279,7 +72,7 @@ pub fn resolve_thread_tap_id(tap: &mut Tap, caller: Option<Uuid>) -> Result<(), 
                 .to_string(),
         );
     };
-    to.id = Some(crate::api::resolve_thread_id_arg(raw, caller)?.to_string());
+    to.id = Some(crate::engine::thread_events::resolve_thread_id_arg(raw, caller)?.to_string());
     Ok(())
 }
 
@@ -361,113 +154,7 @@ pub async fn verify_event_anchors(
     Ok(Ok(()))
 }
 
-/// One Settings page an engine notification can send the reader to: the route
-/// written the way the UI's breadcrumbs read, and the view id that opens it.
-///
-/// Holding both in one value is what keeps a notification's body and its tap on
-/// the same page. A System subpanel reads "Settings → System → X", not
-/// "Settings → X".
-///
-/// `view` must be one of `NAVIGABLE_SETTINGS_VIEWS` (`llm/tools/misc.rs`), the
-/// set the frontend router renders. Anything else toasts "Unknown settings
-/// section" instead of navigating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SettingsPage {
-    pub path: &'static str,
-    pub view: &'static str,
-}
-
-impl SettingsPage {
-    pub const ACCOUNTS: Self = Self {
-        path: "Settings → Accounts",
-        view: "accounts",
-    };
-    pub const BACKUP: Self = Self {
-        path: "Settings → System → Backup",
-        view: "backup",
-    };
-    pub const DISK_USAGE: Self = Self {
-        path: "Settings → System → Disk Usage",
-        view: "disk-usage",
-    };
-    pub const MEMORY: Self = Self {
-        path: "Settings → System → Memory",
-        view: "memory",
-    };
-
-    /// Every page above, for the test that holds each to a renderable view.
-    #[cfg(test)]
-    pub const ALL: [Self; 4] = [Self::ACCOUNTS, Self::BACKUP, Self::DISK_USAGE, Self::MEMORY];
-
-    /// A tap that deep-links here, the same way the LLM's `navigate_ui` does.
-    pub fn tap(self) -> Tap {
-        Tap::Navigate {
-            to: Box::new(NavigateUi {
-                target: NavigateTarget::Settings,
-                settings_view: Some(self.view.to_string()),
-                ..Default::default()
-            }),
-        }
-    }
-
-    /// The route as a markdown link to this page, for a notification body.
-    ///
-    /// The label is the route itself, so every plain-text surface (OS banner,
-    /// toast, inbox row) still reads the route after markdown is stripped.
-    pub fn link(self) -> String {
-        format!("[{}](settings:{})", self.path, self.view)
-    }
-}
-
-/// The OS push action that stops watching a root thread. `sw.js` carries a
-/// copy, pinned by a test because a service worker served raw cannot import it.
-pub const UNWATCH_PUSH_ACTION: &str = "unwatch";
-
-/// Notifications whose OS pushes share one tag, so a burst replaces one banner
-/// rather than stacking (ADR 0649). Stored on the notification row, because
-/// the wake push rebuilds from it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PushGroup {
-    /// People-only messages in one thread. The push offers Unwatch, except to
-    /// the thread's driver, who cannot unwatch it.
-    PeopleMessages {
-        thread_id: Uuid,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        to_driver: bool,
-    },
-}
-
-impl PushGroup {
-    /// The push tag every notification in the group carries.
-    pub fn tag(&self) -> String {
-        match self {
-            Self::PeopleMessages { thread_id, .. } => format!("people-{thread_id}"),
-        }
-    }
-
-    /// Stamp the group onto a push envelope: its tag, and for people-only
-    /// messages to a watcher an Unwatch action with the thread it leaves.
-    pub fn apply(&self, payload: &mut serde_json::Value) {
-        let notification = &mut payload["notification"];
-        notification["tag"] = serde_json::Value::String(self.tag());
-        match self {
-            Self::PeopleMessages {
-                to_driver: true, ..
-            } => {}
-            Self::PeopleMessages {
-                thread_id,
-                to_driver: false,
-            } => {
-                notification["actions"] = serde_json::json!([
-                    { "action": UNWATCH_PUSH_ACTION, "title": "Unwatch" }
-                ]);
-                notification["data"]["unwatch_thread_id"] =
-                    serde_json::Value::String(thread_id.to_string());
-            }
-        }
-    }
-}
+pub use crate::engine::thread_events::notification::SettingsPage;
 
 /// A notification sent to the user
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -555,6 +242,19 @@ impl NotificationStore {
         })
     }
 
+    /// Whether this reader has already handled a notification.
+    pub async fn is_read(pool: &PgPool, id: Uuid, reader: &Reader) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT {} FROM notifications n WHERE n.id = $1",
+            read_by("$2")
+        ))
+        .bind(id)
+        .bind(reader.devices())
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(true))
+    }
+
     /// Count what `reader` has not read (no cap: the real total).
     pub async fn count_unread(pool: &PgPool, reader: &Reader) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(&format!(
@@ -627,7 +327,7 @@ impl NotificationStore {
                     .execute(pool)
                     .await?
             }
-            Reader::Person { device_id, devices } => {
+            Reader::User { device_id, devices } => {
                 sqlx::query(&format!(
                     "INSERT INTO notification_reads (notification_id, device_id) \
                      SELECT n.id, $2 FROM notifications n WHERE n.id = $1 AND NOT {} \
@@ -656,7 +356,7 @@ impl NotificationStore {
                     .execute(pool)
                     .await?
             }
-            Reader::Person { device_id, devices } => {
+            Reader::User { device_id, devices } => {
                 sqlx::query(&format!(
                     "INSERT INTO notification_reads (notification_id, device_id) \
                      SELECT n.id, $1 FROM notifications n WHERE NOT {} \
@@ -768,9 +468,9 @@ impl NotificationStore {
 }
 
 /// Whether `notifications n` is read, for the reader whose devices bind at
-/// `devices` (a `text[]`, NULL for the team). A person has read what the
+/// `devices` (a `text[]`, NULL for the team). A user has read what the
 /// shared flag marks, what any of their devices read, and what was sent to
-/// other people only.
+/// other users only.
 fn read_by(devices: &str) -> String {
     format!(
         "(CASE WHEN {devices}::text[] IS NULL THEN n.read ELSE ( \
@@ -1188,18 +888,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Per-person read state (ADR 0623)
+    // Per-user read state (ADR 0623)
     // -----------------------------------------------------------------------
 
     fn sam(device_id: &str) -> Reader {
-        Reader::Person {
+        Reader::User {
             device_id: device_id.into(),
             devices: vec!["sam-phone".into(), "sam-laptop".into()],
         }
     }
 
     fn kim() -> Reader {
-        Reader::Person {
+        Reader::User {
             device_id: "kim-phone".into(),
             devices: vec!["kim-phone".into()],
         }
@@ -1285,7 +985,7 @@ mod tests {
         use crate::engine::event_bus::{BusEvent, SystemEvent};
         let (pool, db) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
-        let group = PushGroup::PeopleMessages {
+        let group = PushGroup::UserOnlyMessages {
             thread_id: Uuid::new_v4(),
             to_driver: false,
         };
@@ -1323,7 +1023,7 @@ mod tests {
     }
 
     /// A notification sent to Kim only is never unread for Sam, and one the
-    /// whole team read before operators existed stays read for everyone.
+    /// whole team read before users existed stays read for everyone.
     #[tokio::test]
     async fn a_notification_outside_the_audience_reads_as_read() {
         let (pool, db) = setup_test_db().await;
@@ -1593,7 +1293,7 @@ mod tests {
 
     /// The shipped file, so there is no second copy that can drift.
     const REPAIR_ALIAS_TAPS: &str = include_str!(
-        "../../migrations/20260918051213_repair_alias_notification_tap_thread_ids.sql"
+        "../../../lucidos-core/migrations/20260918051213_repair_alias_notification_tap_thread_ids.sql"
     );
 
     async fn seed_notification(

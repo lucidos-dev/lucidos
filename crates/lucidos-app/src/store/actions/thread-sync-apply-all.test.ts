@@ -124,8 +124,6 @@ describe('handleGlobalEvent — Apply All batch events', () => {
   });
 
   it('ApplyAllBatchCompleted clears canceled (failed) members so a canceled batch leaves no stragglers', () => {
-    // On cancel the queued members never emit a per-change event — they arrive
-    // only in the Completed event's `failed` list with "Apply All canceled".
     applyAllInProgress.value = true;
     applyingChangeIds.value = new Set(['c1', 'c2', 'c3']);
 

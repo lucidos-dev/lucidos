@@ -2,6 +2,9 @@
  *  sampled from the counters `pageHealthLog.ts` installed at boot. A temporary
  *  measure: see `docs/temporary-measures.md` § Page health log. */
 
+import { startCrashMonitor } from './crashMonitor';
+import { pageResources } from './pageResources';
+import { focusedThreadId } from '../store/store';
 import { postClientLog } from './clientLog';
 import { pageHealthCounters } from './pageHealthLog';
 import { keyboardCloseState } from '../components/layout/keyboardCloseRelayout';
@@ -10,7 +13,6 @@ const REPORT_INTERVAL_MS = 30_000;
 const LAG_TICK_MS = 500;
 const FPS_WINDOW_MS = 1000;
 
-/** The largest listener counts, so a growing type stands out. */
 export function topListeners(listeners: Map<string, number>, n = 6): Record<string, number> {
   return Object.fromEntries(Array.from(listeners).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).slice(0, n));
 }
@@ -30,12 +32,11 @@ function framesPerSecond(): Promise<number> {
 
 let started = false;
 
-/** Start the 30 s reporter. Needs the counters, so a desktop starts nothing.
- *  Idempotent. Returns a teardown for a hot update. */
 export function startPageHealthLog(): () => void {
   const counters = pageHealthCounters();
   if (!counters || started) return () => {};
   started = true;
+  const crash = startCrashMonitor();
   const startedAt = performance.now();
   let lagMax = 0;
   let lagSum = 0;
@@ -44,10 +45,10 @@ export function startPageHealthLog(): () => void {
   let lastRafCalls = counters.rafCalls;
   let lastReportAt = performance.now();
   let resumes = 0;
-  // A suspended page runs no tick, so a resume restarts every window. The
-  // suspension would otherwise read as one long main-thread stall.
+  let suspended = document.visibilityState !== 'visible';
   const onVisibilityChange = () => {
-    if (document.visibilityState !== 'visible') return;
+    suspended = document.visibilityState !== 'visible';
+    if (suspended) return;
     resumes += 1;
     dueAt = performance.now() + LAG_TICK_MS;
     lastRafCalls = counters.rafCalls;
@@ -58,15 +59,14 @@ export function startPageHealthLog(): () => void {
     const now = performance.now();
     const lag = Math.max(0, now - dueAt);
     dueAt = now + LAG_TICK_MS;
-    // A hidden page is throttled, so its lag says nothing about the main thread.
-    if (document.visibilityState !== 'visible') return;
+    if (suspended || document.visibilityState !== 'visible') return;
+    crash.stall(lag);
     lagMax = Math.max(lagMax, lag);
     lagSum += lag;
     lagTicks += 1;
   }, LAG_TICK_MS);
   const reportTimer = setInterval(() => {
-    if (document.visibilityState !== 'visible') return;
-    // Read before the fps window, whose own frame requests would count.
+    if (suspended || document.visibilityState !== 'visible') return;
     const rafCalls = counters.rafCalls;
     const windowStart = performance.now();
     const rafPerSec = Math.round((rafCalls - lastRafCalls) / Math.max(1, (windowStart - lastReportAt) / 1000));
@@ -75,6 +75,7 @@ export function startPageHealthLog(): () => void {
         const now = performance.now();
         const listeners = Array.from(counters.listeners.values()).reduce((a, b) => a + b, 0);
         postClientLog('page-health', 'sample', {
+          ...pageResources(focusedThreadId.peek()),
           uptimeMin: Math.round((now - startedAt) / 60_000),
           lagMaxMs: Math.round(lagMax),
           lagMeanMs: lagTicks ? Math.round(lagSum / lagTicks) : null,
@@ -99,11 +100,10 @@ export function startPageHealthLog(): () => void {
         lastReportAt = performance.now();
       }
     }).catch(() => {
-      // Best-effort telemetry with no user intent behind it: a failed sample
-      // costs one line, and the next tick takes a fresh one.
     });
   }, REPORT_INTERVAL_MS);
   return () => {
+    crash.stop();
     document.removeEventListener('visibilitychange', onVisibilityChange);
     clearInterval(lagTimer);
     clearInterval(reportTimer);

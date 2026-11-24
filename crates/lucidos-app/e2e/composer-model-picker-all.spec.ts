@@ -29,27 +29,73 @@ for (const status of ['idle', 'running', 'waiting_for_user_answer'] as const) {
       const trigger = picker.locator('.rung-trigger');
       await expect(picker).toHaveCount(1);
       await expect(picker).not.toHaveAttribute('data-pending');
-      // A running turn keeps the list openable and refuses the pick. A pending
-      // question card disables the pill until it is answered.
-      const answering = status === 'waiting_for_user_answer';
-      await expect(trigger).toHaveAttribute('aria-disabled', String(answering));
+      await expect(trigger).toHaveAttribute('aria-disabled', 'false');
       await expect(trigger).toHaveAttribute('aria-label', /Model.*\S/);
       const before = await picker.boundingBox();
-      if (status === 'running') await expect(trigger).toHaveAttribute('data-tooltip', /turn runs/);
-      if (answering) {
-        await expect(trigger).toHaveAttribute('data-tooltip', /pending question/);
-        await trigger.click({ force: true });
-        await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
-      } else {
-        await trigger.click();
-        await expect(page.locator('.control-dropdown:visible')).toBeVisible();
-        await page.keyboard.press('Escape');
-      }
+      await trigger.click();
+      await expect(page.locator('.control-dropdown:visible')).toBeVisible();
+      await page.keyboard.press('Escape');
       await expect(trigger).toHaveAttribute('aria-expanded', 'false');
       const after = await picker.boundingBox();
       expect(after!.width).toBeCloseTo(before!.width, 1);
       expect(after!.x).toBeCloseTo(before!.x, 1);
       expect(after!.x + after!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+    } finally {
+      cleanupCCThread(threadId);
+    }
+  });
+}
+
+for (const width of [390, 1440]) {
+  test(`a mid-turn rung pick stays pending across reload at ${width}px`, async ({ page, request }) => {
+    await assertHealthy(page);
+    const threadId = randomUUID();
+    const now = new Date().toISOString();
+    const event = (type: string, payload: unknown) =>
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', '${type}', '${JSON.stringify(payload).replace(/'/g, "''")}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`;
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Pending rung regression', 'chat', '${now}', 1, false, true, 'running', 'inbox', 'active', false, 0, 0, 'none', false)`,
+      event('MessageReceived', { text: 'Pending rung regression', channel: 'chat', model: 'claude-opus-5-5', reasoning_effort: 'medium' }),
+      event('ChatTurnSettingsResolved', { channel: 'chat', model: 'claude-opus-5-5', reasoning_effort: 'medium', request_event_id: randomUUID() }),
+    ].join(';\n'));
+    try {
+      await page.setViewportSize({ width, height: 900 });
+      await page.addInitScript(tid => localStorage.setItem('lucidos-focused-thread', tid), threadId);
+      await hideDashboardRail(page);
+      await navigateToApp(page);
+      await ensureOnThreadPane(page);
+      await waitForPaneAtRest(page);
+      const pick = async (effort: string) => {
+        const response = await request.post('/api/v1/chat/settings', {
+          data: { thread_id: threadId, model: 'claude-opus-5-5', reasoning_effort: effort },
+        });
+        expect(response.ok(), await response.text()).toBe(true);
+      };
+      await pick('high');
+      const trigger = page.locator('.rung-trigger:visible').first();
+      await expect(trigger.locator('.rung-next-turn')).toHaveText('*');
+      await expect(trigger).toHaveAttribute('aria-label', /Running:.*medium.*Next turn:.*high/);
+      await page.reload();
+      await ensureOnThreadPane(page);
+      await waitForPaneAtRest(page);
+      await expect(trigger.locator('.rung-next-turn')).toHaveText('*');
+      const box = await trigger.boundingBox();
+      expect(box!.x).toBeGreaterThanOrEqual(0);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(width);
+      await trigger.click();
+      const summary = page.locator('.rung-turn-summary:visible');
+      await expect(summary).toContainText('Running: Opus 5.5 · medium');
+      await expect(summary).toContainText('Next turn: Opus 5.5 · high');
+      await pick('low');
+      await expect(summary).toContainText('Next turn: Opus 5.5 · low');
+      await expect(summary).toContainText('Running: Opus 5.5 · medium');
+      await page.keyboard.press('Escape');
+      psql(`UPDATE thread_summaries SET status = 'idle' WHERE thread_id = '${threadId}'`);
+      await page.reload();
+      await ensureOnThreadPane(page);
+      await waitForPaneAtRest(page);
+      await expect(trigger.locator('.rung-next-turn')).toHaveCount(0);
+      await expect(trigger).toHaveAttribute('aria-label', /Opus 5.5, low/);
     } finally {
       cleanupCCThread(threadId);
     }

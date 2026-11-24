@@ -1,14 +1,3 @@
-/**
- * Every content-pane view keeps the end space below its last element
- * (`docs/glossary.md` § End space). The rule is default-deny, so the two ways
- * to lose it are the ones pinned here:
- *
- * - a view pinned to the pane height, whose content then overflows its own box
- *   and leaves the spacer stranded at the pane's bottom edge;
- * - a new full-bleed opt-out nobody reviewed.
- *
- * `e2e/content-pane-end-space-all.spec.ts` measures the rendered result.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,15 +20,12 @@ const SPACER = '.content-pane-body > :not(.content-view-full-bleed)::after';
 const VIEW_ROOT = new RegExp(`\\.(${CONTENT_VIEW_ROOTS.join('|')})(?![\\w-])`);
 const COLUMN_ROOT = new RegExp(`\\.(${COLUMN_VIEW_ROOTS.join('|')})(?![\\w-])`);
 
-/** A selector's last compound, the element it styles, with every functional
- *  pseudo-class argument dropped so a `:has(...)` cannot pose as the subject. */
 function subject(selector: string): string {
   let flat = selector;
   while (/\([^()]*\)/.test(flat)) flat = flat.replace(/\([^()]*\)/g, '');
   return flat.trim().split(/[\s>+~]+/).pop() ?? '';
 }
 
-/** Each full-bleed view fills the pane and scrolls inside itself, with why. */
 const FULL_BLEED: Record<string, string> = {
   'components/files/FilesView.tsx': 'the whole pane is the import drop zone',
   'components/apps/AppUiInline.tsx': 'the app iframe fills the pane',
@@ -61,8 +47,6 @@ describe('the content pane end space', () => {
     expect(pane?.props.get('--pane-end-space')).toContain('var(--safe-area-bottom)');
   });
 
-  // A pinned height lets a long view overflow its own box, so the spacer
-  // after the box sits under the content instead of below it.
   it('follows content: no sheet pins a column view to a fixed height', () => {
     const pinned = ALL_RULES.filter(rule =>
       rule.props.has('height') &&
@@ -71,8 +55,6 @@ describe('the content pane end space', () => {
     expect(pinned.map(r => `${relative(stylesRoot, r.path)}: ${r.selector}`)).toEqual([]);
   });
 
-  // The phone's flowing file preview is the one sanctioned second rule. It
-  // re-adds the same spacer to a full-bleed view, and nothing else may touch one.
   it('is styled in one place plus the phone opt-in, so no view can cancel it', () => {
     const touching = ALL_RULES.filter(rule => selectorList(rule.selector).some(s =>
       s.endsWith('::after') && (/\.content-pane-body\s*>/.test(s) || VIEW_ROOT.test(subject(s)))));

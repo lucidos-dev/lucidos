@@ -2,30 +2,11 @@ import { test, expect } from './fixtures';
 import type { Page } from '@playwright/test';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer } from './helpers';
 
-/** The mobile drawer row's actions, reached by holding the row.
- *
- * The ⋯ is not rendered here. A 31x27px trigger against the pane's right edge
- * is the hardest place on a phone to hit. So the whole row is the target
- * instead (`useRowActionsGesture`).
- *
- * Driven through `page.mouse` rather than dispatched events, so the gesture
- * goes through real hit-testing and the browser pairs its own click with the
- * lift. Both halves matter. The row has to be reachable where it is drawn. And
- * a fired hold has to swallow that click, or the thread opens too. Playwright
- * cannot hold a touchscreen tap, and `useLongPress` reads no `pointerType`, so
- * a real mouse press exercises the same path. */
 test.describe('Mobile thread row long press', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  /** The first ON-SCREEN drawer row that is not the focused one, as a box.
-   *
-   *  A box with size is not enough here. Mobile lays every pane out at once and
-   *  translates the off-screen ones aside, so a row from another pane still
-   *  measures. `page.mouse` aims at a point, so the row has to be where the
-   *  browser will actually hit-test it. Asking `elementFromPoint` settles both
-   *  halves at once. */
   const otherRow = async (page: Page) => {
     const box = await page.evaluate(() => {
       const focused = document.querySelector('.thread-drawer .thread-row-focused');
@@ -49,7 +30,6 @@ test.describe('Mobile thread row long press', () => {
   const focusedId = (page: Page) => page.evaluate(() =>
     document.querySelector('.thread-drawer .thread-row-focused')?.getAttribute('data-thread-nav') ?? null);
 
-  /** Two threads, the drawer open, the second one focused. */
   const twoThreads = async (page: Page) => {
     await navigateToApp(page);
     await sendMessage(page, `say "${uniqueMessage('long-press-1')}"`);
@@ -63,7 +43,6 @@ test.describe('Mobile thread row long press', () => {
   test('the row draws no ⋯: the hold is the way in', async ({ page }) => {
     await twoThreads(page);
     await expect(page.locator('.thread-drawer button[aria-label="More thread actions"]')).toHaveCount(0);
-    // The pin stays, so the row still reads as actionable.
     await expect(page.locator('.thread-drawer button[aria-label="Pin thread"]').first()).toBeVisible();
   });
 
@@ -78,7 +57,6 @@ test.describe('Mobile thread row long press', () => {
     await page.mouse.up();
 
     await expect(page.locator('.thread-overflow-menu')).toHaveCount(1);
-    // The hold swallows its own paired click, so the row's tap never runs.
     expect(await focusedId(page)).toBe(before);
   });
 
@@ -100,8 +78,6 @@ test.describe('Mobile thread row long press', () => {
 
     await page.mouse.move(row.x, row.y);
     await page.mouse.down();
-    // Past useLongPress's 10px tolerance, then held for longer than the timer
-    // would have needed. A cancelled hold must stay cancelled.
     await page.mouse.move(row.x, row.y - 60, { steps: 6 });
     await page.waitForTimeout(700);
     await page.mouse.up();

@@ -29,9 +29,46 @@
 # Otherwise it prints one line, FULL <reason>. Anything git cannot answer is
 # FULL too: a narrow answer skips unreviewed code, a wrong FULL only costs time.
 #
-# Exit status: 0 for every answer.
+# Exit status: 0 for every review answer. --lane-suite-paths <hardened SHA>
+# prints overlap paths on success and fails when full selection is needed.
 
 set -uo pipefail
+# comm needs input in its own collation order. Pin both sort and comm to byte
+# order, since some coreutils builds disagree under a UTF-8 locale.
+export LC_ALL=C
+
+# Select suite paths only for a clean, overlapping lane catch-up directly on
+# the full marker. The caller checks the marker tier and main-check coverage.
+lane_suite_paths() {
+    local branch parents from main extra base resolution ours theirs paths
+    branch=$(git symbolic-ref --quiet --short HEAD) || return 1
+    [[ "$branch" == lane/* ]] || return 1
+    [ "$(git show -s --format=%s HEAD)" = "Catch up with main" ] || return 1
+    parents=$(git show -s --format=%P HEAD) || return 1
+    read -r from main extra <<< "$parents"
+    [ "$from" = "$1" ] && [ -n "$main" ] && [ -z "$extra" ] || return 1
+    if ! git merge-base --is-ancestor "$main" refs/heads/main 2>/dev/null &&
+        ! git merge-base --is-ancestor "$main" refs/remotes/origin/main 2>/dev/null; then
+        return 1
+    fi
+    resolution=$(git show --remerge-diff --format= HEAD) || return 1
+    [ -z "$resolution" ] || return 1
+    base=$(git merge-base --all "$from" "$main") || return 1
+    [ -n "$base" ] && [[ "$base" != *$'\n'* ]] || return 1
+    ours=$(git diff --no-renames --ignore-submodules=none --name-only "$base" "$from" -- | sort -u) || return 1
+    theirs=$(git diff --no-renames --ignore-submodules=none --name-only "$base" "$main" -- | sort -u) || return 1
+    # The suite selector accepts line-delimited paths. Quoted Git paths need
+    # the full selection so none of them can silently disappear.
+    [[ "$ours$theirs" != *'"'* ]] || return 1
+    paths=$(comm -12 <(printf '%s\n' "$ours") <(printf '%s\n' "$theirs")) || return 1
+    [ -n "$paths" ] || return 1
+    printf '%s\n' "$paths"
+}
+
+if [ "${1:-}" = --lane-suite-paths ]; then
+    lane_suite_paths "${2:-}"
+    exit $?
+fi
 
 sha=${1:-}
 base=${2:-main}
@@ -75,8 +112,8 @@ for m in $merges; do
     first=$(git rev-parse "$m^1") || full "git rev-parse failed for $m"
     for other in $(git rev-parse "$m^@" | tail -n +2); do
         mb=$(git merge-base "$first" "$other") || full "no merge base for $m"
-        ours=$(git diff --name-only "$mb" "$first" | sort -u) || full "git diff failed for $m"
-        theirs=$(git diff --name-only "$mb" "$other" | sort -u) || full "git diff failed for $m"
+        ours=$(git diff --no-renames --ignore-submodules=none --name-only "$mb" "$first" | sort -u) || full "git diff failed for $m"
+        theirs=$(git diff --no-renames --ignore-submodules=none --name-only "$mb" "$other" | sort -u) || full "git diff failed for $m"
         overlap="$overlap$(comm -12 <(printf '%s\n' "$ours") <(printf '%s\n' "$theirs"))
 "
     done

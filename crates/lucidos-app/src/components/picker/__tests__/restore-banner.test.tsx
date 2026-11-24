@@ -1,15 +1,9 @@
-/**
- * The restore banner's contract: a success gets out of the way on its own, a
- * failure has to be acknowledged, and the spinner is never the flexing element.
- */
 
 import { describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { restoreBanner, restoreNeedsReading } from '../RestoreBanner';
 import type { GwRestoreStatus } from '../../../api/client/control';
 
-/** Flatten a vnode tree, keeping the markers we assert on. Mirrors
- *  picker-footer.test.tsx. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -50,10 +44,6 @@ describe('restoreBanner', () => {
   });
 
   it('gives the message its own class, so the spinner is never what flexes', () => {
-    // The regression this pins: `> span:first-of-type` matched the SPINNER in
-    // the running banner and stretched it into a banner-wide ellipse. The CSS
-    // now targets `.ws-picker-restore-text`, which only exists if the message
-    // carries it, and the spinner must not.
     const out = render({ status: 'running', id: 'w1', name: 'personal', phase: 'restoring' });
     expect(out).toContain('<span class="mini-spinner ws-picker-restore-spinner">');
     expect(out).toContain('<span class="ws-picker-restore-text">');
@@ -67,8 +57,6 @@ describe('restoreBanner', () => {
     expect(out).toContain('data-state="completed"');
     expect(out).toContain('Restored');
     expect(out).toContain('personal');
-    // No Open (the restored row is right above) and no Dismiss (the picker
-    // clears the status on a timer instead).
     expect(out).not.toContain('<button');
   });
 

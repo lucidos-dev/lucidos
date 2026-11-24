@@ -6,15 +6,9 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, relative } from 'node:path';
 
-/**
- * A device is named by `deviceFriendlyName` and nothing else, so one device
- * has one name on every screen. This scan fails on the two ways a new surface
- * would bypass the function: building `device-<id>` itself, or printing a
- * turn's recorded label instead of the live name `turnDeviceName` resolves.
- */
 
 const here = dirname(fileURLToPath(import.meta.url));
-const SRC = resolve(here, '../..'); // crates/lucidos-app/src
+const SRC = resolve(here, '../..');
 const THE_FUNCTION = 'utils/deviceFriendlyName.ts';
 
 function sourceFiles(dir: string): string[] {

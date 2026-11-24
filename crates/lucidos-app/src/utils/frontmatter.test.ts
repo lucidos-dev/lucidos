@@ -72,7 +72,6 @@ describe('splitFrontmatter', () => {
 
 describe('frontmatterLineCount', () => {
   it('agrees with splitFrontmatter on where the body starts, for LF files', () => {
-    // 5 lines before the body: ---, title, todo:, "  - a", the closing ---.
     const md = '---\ntitle: Notes\ntodo:\n  - a\n---\nbody\n';
     expect(frontmatterLineCount(md)).toBe(5);
   });
@@ -82,9 +81,6 @@ describe('frontmatterLineCount', () => {
   });
 
   it('detects a CRLF frontmatter block the same way splitFrontmatter does', () => {
-    // Each line of a `'\n'`-split CRLF file keeps a trailing `\r`, which the
-    // shared fence/key-line regexes must still match (the bug this pins: they
-    // silently didn't, so a CRLF file was treated as having no frontmatter).
     const md = '---\r\ntitle: My Doc\r\ntodo:\r\n  - [ ] milk\r\n---\r\n- [ ] real task\r\n';
     expect(frontmatterLineCount(md)).toBe(5);
     expect(splitFrontmatter(md).body).toBe('- [ ] real task\n');

@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The file-preview content pane's right-click menu. It must open with the
- * same actions the header toolbar offers. It must stay out of the way of a
- * selection, a link, or anything else with its own native menu. See
- * `docs/plans/2026-10-04-file-preview-context-menu.md`.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -54,10 +48,6 @@ function show(layout: 'desktop' | 'mobile' = 'desktop') {
   });
 }
 
-/** A right-click at `(x, y)`, over `target`, with no selection under the
- *  pointer before the press — the ordinary case. Dispatched inside `act()`
- *  so the resulting `setMenu` state update renders before the test reads
- *  the DOM, matching the real browser's own paint-before-next-task. */
 function rightClick(target: Element, x = 30, y = 28): MouseEvent {
   let e!: MouseEvent;
   act(() => {
@@ -134,13 +124,10 @@ describe('FilePreviewContextMenu', () => {
       getRangeAt: () => ({ getClientRects: () => [{ left: 10, right: 60, top: 20, bottom: 36 }] }),
     } as unknown as Selection;
     vi.spyOn(window, 'getSelection').mockReturnValue(held);
-    // First, an ordinary right-click lands ON that selection and defers.
     target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 2, clientX: 30, clientY: 28 }));
     target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 30, clientY: 28 }));
     expect(menu()).toBeNull();
 
-    // Then Shift+F10 (or VoiceOver) raises a menu with NO preceding
-    // pointerdown. It must not inherit the earlier press's held selection.
     const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
     act(() => { target.dispatchEvent(e); });
 

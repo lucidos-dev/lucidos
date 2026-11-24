@@ -21,11 +21,11 @@ const REPO_CC_SETTINGS: &str = ".claude/settings.json";
 /// Whatever the engine cannot establish grants nothing and logs why. The
 /// session still starts, and costs the user the cards it cost before. A repo
 /// with no settings file is the common case, and stays quiet.
-pub(crate) async fn resolve(worktree: &Path, workspace_root: &Path) -> Vec<PathBuf> {
+pub async fn resolve(worktree: &Path, workspace_root: &Path) -> Vec<PathBuf> {
     let worktree = match std::fs::canonicalize(worktree) {
         Ok(worktree) => worktree,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[RepoDirectoryGrants] Could not resolve {}: {}",
                 worktree.display(),
                 e
@@ -40,7 +40,7 @@ pub(crate) async fn resolve(worktree: &Path, workspace_root: &Path) -> Vec<PathB
     let protected = match Protected::find(&worktree, workspace_root).await {
         Ok(protected) => protected,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[RepoDirectoryGrants] No main checkout for {} ({}). Not granting {:?}.",
                 worktree.display(),
                 e,
@@ -57,7 +57,7 @@ pub(crate) async fn resolve(worktree: &Path, workspace_root: &Path) -> Vec<PathB
     for entry in entries {
         match reanchor(&entry, &protected) {
             Ok(dir) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[RepoDirectoryGrants] Granting {} for {:?}",
                     dir.display(),
                     entry
@@ -66,7 +66,7 @@ pub(crate) async fn resolve(worktree: &Path, workspace_root: &Path) -> Vec<PathB
                     granted.push(dir);
                 }
             }
-            Err(why) => crate::log!(
+            Err(why) => crate::log_legacy!(
                 "[RepoDirectoryGrants] Not granting {:?} from {}: {}",
                 entry,
                 worktree.join(REPO_CC_SETTINGS).display(),
@@ -85,7 +85,7 @@ fn entries_leaving_the_repo(worktree: &Path) -> Vec<String> {
         Ok(body) => body,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[RepoDirectoryGrants] Could not read {}: {}",
                 path.display(),
                 e
@@ -96,7 +96,7 @@ fn entries_leaving_the_repo(worktree: &Path) -> Vec<String> {
     let settings: serde_json::Value = match serde_json::from_str(&body) {
         Ok(settings) => settings,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[RepoDirectoryGrants] Could not parse {}: {}",
                 path.display(),
                 e
@@ -108,7 +108,7 @@ fn entries_leaving_the_repo(worktree: &Path) -> Vec<String> {
         return Vec::new();
     };
     let Some(entries) = entries.as_array() else {
-        crate::log!(
+        crate::log_legacy!(
             "[RepoDirectoryGrants] {}: additionalDirectories is not a list",
             path.display()
         );
@@ -122,7 +122,7 @@ fn entries_leaving_the_repo(worktree: &Path) -> Vec<String> {
         .filter_map(|entry| {
             let entry = entry.as_str();
             if entry.is_none() {
-                crate::log!(
+                crate::log_legacy!(
                     "[RepoDirectoryGrants] {}: skipping a non-string additionalDirectories entry",
                     path.display()
                 );

@@ -4,28 +4,6 @@ import { assertHealthy, ensureOnThreadPane, navigateToApp } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/**
- * **A reader who has touched nothing sees the whole turn: every prose block and
- * the step log.**
- *
- * Both transcript-wide *turn controls* seed ON (`store.ts`, `seedTurnControl`),
- * and nothing else in the browser suite would notice if that stopped being
- * true: the specs that want a step row call `revealSteps`, which is a no-op on
- * the default and therefore cannot tell the default from a click it made
- * itself. So the first half here is a fresh context with NO clicks at all.
- *
- * The second half is why this spec exists at all rather than being a unit test
- * of the seed. `revealSteps` used to be an unconditional click on the steps
- * toggle, which made it the only browser coverage of that control's click path;
- * once it became conditional, no spec pressed the steps toggle anywhere. Break
- * `onToggleSteps`, or `reveal(stepsExpanded)`, and every other spec still went
- * green. Both controls are therefore driven here in both directions, from the
- * header icons a reader actually presses.
- *
- * Seeded through psql rather than a live send: the shape needed is exact (steps
- * AND two prose chunks, so `hidesEarlierProse` is true and the full-response
- * control has something to drop), and no model has to cooperate to produce it.
- */
 
 const FIRST = 'First I will search the index.';
 const LAST = 'Now I will summarize what I found.';
@@ -34,7 +12,6 @@ function q(o: unknown): string {
   return JSON.stringify(o).replace(/'/g, "''");
 }
 
-/** One turn: prose, a tool step, more prose. */
 function seedThread(title: string): string {
   const threadId = randomUUID();
   const base = Date.now() - 60_000;
@@ -69,8 +46,6 @@ function dropThread(threadId: string): void {
   ].join(';\n'));
 }
 
-/** Land straight on the seeded thread, so nothing is clicked before the
- *  assertion about an unclicked transcript. */
 async function openThread(page: Page, threadId: string): Promise<void> {
   await page.addInitScript((tid: string) => {
     localStorage.setItem('lucidos-focused-thread', tid);
@@ -79,8 +54,6 @@ async function openThread(page: Page, threadId: string): Promise<void> {
   await ensureOnThreadPane(page);
 }
 
-// Scoped to the RESPONSE header's run: the initiator header carries a
-// `.turn-controls` run too, and its lone control is the fold.
 const control = (page: Page, role: 'toggle-steps' | 'toggle-details') =>
   page.locator(`.response-header .turn-controls [data-role="${role}"]:visible`).first();
 
@@ -95,15 +68,12 @@ test.describe('Turn controls default on', () => {
       const exchange = page.locator('.chat-exchange').first();
       await expect(exchange).toBeVisible({ timeout: 30_000 });
 
-      // No clicks have happened. This is the default, not a state a helper put
-      // the page into.
       await expect(steps.first()).toBeVisible({ timeout: 30_000 });
       await expect(exchange).toContainText(FIRST);
       await expect(exchange).toContainText(LAST);
       await expect(control(page, 'toggle-steps')).toHaveAttribute('aria-pressed', 'true');
       await expect(control(page, 'toggle-details')).toHaveAttribute('aria-pressed', 'true');
 
-      // The steps control, both ways.
       await control(page, 'toggle-steps').click();
       await expect(steps).toHaveCount(0);
       await expect(control(page, 'toggle-steps')).toHaveAttribute('aria-pressed', 'false');
@@ -111,9 +81,6 @@ test.describe('Turn controls default on', () => {
       await expect(steps.first()).toBeVisible();
       await expect(control(page, 'toggle-steps')).toHaveAttribute('aria-pressed', 'true');
 
-      // The full-response control, both ways. Off keeps only what follows the
-      // last text block, so the FIRST chunk is what leaves; the last one must
-      // stay, or the turn would read as having said nothing.
       await control(page, 'toggle-details').click();
       await expect(exchange).not.toContainText(FIRST);
       await expect(exchange).toContainText(LAST);

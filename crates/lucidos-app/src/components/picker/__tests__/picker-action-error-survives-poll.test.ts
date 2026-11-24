@@ -1,13 +1,3 @@
-/**
- * A failed picker action keeps its message until the user acts again.
- *
- * The picker polls `fetchWorkspaces` every 2s. That function used to clear the
- * action error line on each success. So a failed Start, Save or Open showed its
- * reason for one tick at most, sometimes for no frame at all.
- *
- * A source scan, like the row-layout suite: the picker owns a control client
- * and many signals, and this suite has no DOM to mount it in.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -19,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const source: string = readFileSync(resolve(here, '../WorkspacePicker.tsx'), 'utf-8');
 
-/** The body of `async function <name>`, up to its closing brace at 2 spaces. */
 function functionBody(name: string): string {
   const start = source.indexOf(`async function ${name}(`);
   expect(start).toBeGreaterThan(-1);

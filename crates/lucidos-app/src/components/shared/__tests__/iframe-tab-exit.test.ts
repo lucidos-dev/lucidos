@@ -2,9 +2,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { onIframeTabExitFocus } from '../IframeTabExit';
 
-// Keys pressed inside an app or preview frame never reach the host. Tab past
-// the frame's last control therefore left the content pane for whatever came
-// next in the document: a toast, the browser chrome, or the header.
 describe('onIframeTabExitFocus', () => {
   afterEach(() => { document.body.innerHTML = ''; });
 

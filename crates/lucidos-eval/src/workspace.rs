@@ -464,77 +464,6 @@ pub struct BootedEngine {
     pub base_url: String,
 }
 
-/// Whether the arm engines serve https, and with which certificate.
-///
-/// The scheme has to match what a dev gateway decided at ITS boot. A gateway
-/// started with certificates probes and proxies https once and for the whole
-/// process, so an arm serving plain http is unreachable through `/eval-lean-1/`.
-/// This mirrors `detect_tls` in `scripts/lib/workspace.sh`, and is the one place
-/// the scheme is decided: the health check, the driver's base URL and the
-/// spawned engine all read it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct EngineTls {
-    certificate: Option<(PathBuf, PathBuf)>,
-}
-
-impl EngineTls {
-    /// Read `LUCIDOS_EVAL_ENGINE_TLS_CERT` and `LUCIDOS_EVAL_ENGINE_TLS_KEY`.
-    ///
-    /// `scripts/eval-context-mode.sh` defaults both to the checkout's `.certs/`
-    /// when they exist there, so the harness follows the dev stack by default.
-    pub fn from_env() -> Fallible<EngineTls> {
-        Self::resolve(
-            std::env::var("LUCIDOS_EVAL_ENGINE_TLS_CERT").ok(),
-            std::env::var("LUCIDOS_EVAL_ENGINE_TLS_KEY").ok(),
-        )
-    }
-
-    /// The rule itself, taking the two values so a test can supply them.
-    ///
-    /// Exactly one set is refused rather than read as off. Reading it as plain
-    /// http produces an arm the gateway cannot reach, hours into a run that
-    /// costs real money.
-    fn resolve(cert: Option<String>, key: Option<String>) -> Fallible<EngineTls> {
-        let present = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        match (present(cert), present(key)) {
-            (Some(cert), Some(key)) => Ok(EngineTls {
-                certificate: Some((PathBuf::from(cert), PathBuf::from(key))),
-            }),
-            (None, None) => Ok(EngineTls::default()),
-            (cert, _) => Err(format!(
-                "LUCIDOS_EVAL_ENGINE_TLS_{} is set and the other is not. The arm engines serve \
-                 one scheme, so set both or neither.",
-                match cert.is_some() {
-                    true => "CERT",
-                    false => "KEY",
-                }
-            )
-            .into()),
-        }
-    }
-
-    /// What the arm engines serve, and what every client of them must speak.
-    pub fn scheme(&self) -> &'static str {
-        match self.certificate.is_some() {
-            true => "https",
-            false => "http",
-        }
-    }
-
-    /// The engine's own `LUCIDOS_TLS_*` pair. Empty clears an inherited one, so
-    /// a plain-http arm stays plain even under a shell that exported certs.
-    fn engine_env(&self) -> [(&'static str, String); 2] {
-        let (cert, key) = match &self.certificate {
-            Some((cert, key)) => (cert.to_string_lossy(), key.to_string_lossy()),
-            None => (std::borrow::Cow::from(""), std::borrow::Cow::from("")),
-        };
-        [
-            ("LUCIDOS_TLS_CERT", cert.into_owned()),
-            ("LUCIDOS_TLS_KEY", key.into_owned()),
-        ]
-    }
-}
-
 /// Create the database exclusively. PostgreSQL refuses a collision atomically;
 /// directory ownership never proves ownership of a same-named database.
 pub fn create_database(pg_base: &str, database: &str) -> Fallible<()> {
@@ -560,21 +489,9 @@ fn quote_ident(name: &str) -> String {
 ///
 /// On a throwaway port, deliberately. This boot exists to run migrations and
 /// dies seconds later, so it must not sit on the port the gateway routes to.
-pub fn migrate_by_booting(
-    engine_bin: &Path,
-    workspace: &Path,
-    database_url: &str,
-    tls: &EngineTls,
-) -> Fallible<()> {
+pub fn migrate_by_booting(engine_bin: &Path, workspace: &Path, database_url: &str) -> Fallible<()> {
     // No capture: this boot exists to run migrations and never calls a model.
-    let engine = boot_engine(
-        engine_bin,
-        workspace,
-        database_url,
-        free_port()?,
-        tls,
-        false,
-    )?;
+    let engine = boot_engine(engine_bin, workspace, database_url, free_port()?, false)?;
     stop_engine(engine)
 }
 
@@ -591,21 +508,14 @@ pub fn boot_engine(
     workspace: &Path,
     database_url: &str,
     port: u16,
-    tls: &EngineTls,
     full_capture: bool,
 ) -> Fallible<BootedEngine> {
     checked_eval_workspace(workspace)?;
     let child = std::process::Command::new(engine_bin)
-        .envs(arm_engine_env(
-            workspace,
-            database_url,
-            port,
-            tls,
-            full_capture,
-        ))
+        .envs(arm_engine_env(workspace, database_url, port, full_capture))
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", engine_bin.display()))?;
-    let base_url = format!("{}://127.0.0.1:{port}", tls.scheme());
+    let base_url = format!("http://127.0.0.1:{port}");
     let mut child = child;
     if let Err(error) = wait_for_health(&mut child, &base_url, Duration::from_secs(120)) {
         // Kill it here or it outlives the failed seed, holding a port and a
@@ -626,7 +536,6 @@ fn arm_engine_env(
     workspace: &Path,
     database_url: &str,
     port: u16,
-    tls: &EngineTls,
     full_capture: bool,
 ) -> Vec<(&'static str, OsString)> {
     let mut env: Vec<(&'static str, OsString)> = vec![
@@ -638,12 +547,12 @@ fn arm_engine_env(
             OsString::from(FORCE_QUERY_CLASSIFICATION_VALUE),
         ),
         (BIND_LOOPBACK_ENV, OsString::from("1")),
+        // A directly launched engine serves plain http on loopback (decision
+        // 13, `docs/plans/2026-11-19-desktop-window-https.md`). Empty clears a
+        // pair a shell exported.
+        ("LUCIDOS_TLS_CERT", OsString::new()),
+        ("LUCIDOS_TLS_KEY", OsString::new()),
     ];
-    env.extend(
-        tls.engine_env()
-            .into_iter()
-            .map(|(key, value)| (key, OsString::from(value))),
-    );
     if full_capture {
         env.push((FULL_CAPTURE_ENV, OsString::from("1")));
     }
@@ -697,11 +606,8 @@ pub fn stop_engine(mut engine: BootedEngine) -> Fallible<()> {
     Ok(())
 }
 
-/// Poll `base_url` until OUR engine answers, or the deadline passes.
-///
-/// `-k` because the loopback certificate is self-signed, matching the driver's
-/// own `danger_accept_invalid_certs`. The scheme is already in `base_url`, from
-/// the single [`EngineTls`] rule.
+/// Poll `base_url`, the arm's plain-http loopback origin, until OUR engine
+/// answers, or the deadline passes.
 ///
 /// **A healthy port is not proof, so `child` is checked too.** The arm now
 /// boots on the port the gateway routes to, and the gateway may already have
@@ -728,7 +634,7 @@ fn wait_for_health(
             .into());
         }
         let healthy = std::process::Command::new("curl")
-            .args(["-skf", "-o", "/dev/null", "--max-time", "2", &url])
+            .args(["-sf", "-o", "/dev/null", "--max-time", "2", &url])
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
@@ -1186,64 +1092,13 @@ mod tests {
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
 
-    // ── One scheme, decided once ─────────────────────────────────────────────
-
-    fn tls(cert: Option<&str>, key: Option<&str>) -> Fallible<EngineTls> {
-        EngineTls::resolve(cert.map(str::to_string), key.map(str::to_string))
-    }
-
-    #[test]
-    fn no_certificate_means_the_arms_serve_plain_http() {
-        assert_eq!(tls(None, None).unwrap().scheme(), "http");
-        // A shell that exported a certificate does not leak into the arm: the
-        // engine's own pair is cleared rather than left inherited.
-        assert_eq!(
-            tls(None, None).unwrap().engine_env(),
-            [
-                ("LUCIDOS_TLS_CERT", String::new()),
-                ("LUCIDOS_TLS_KEY", String::new())
-            ]
-        );
-        // Blank is the same as unset. The launch script exports an empty value
-        // when the checkout has no `.certs/`.
-        assert_eq!(tls(Some("  "), Some("")).unwrap().scheme(), "http");
-    }
-
-    #[test]
-    fn a_certificate_pair_makes_the_arms_serve_https() {
-        let with = tls(Some("/c/cert.pem"), Some("/c/key.pem")).unwrap();
-        assert_eq!(with.scheme(), "https");
-        assert_eq!(
-            with.engine_env(),
-            [
-                ("LUCIDOS_TLS_CERT", "/c/cert.pem".to_string()),
-                ("LUCIDOS_TLS_KEY", "/c/key.pem".to_string())
-            ]
-        );
-    }
-
-    /// Half a pair is refused rather than read as off.
-    ///
-    /// A dev gateway decides `engine_tls` once at its own boot and probes that
-    /// scheme forever after. An arm that quietly fell back to http would be
-    /// unreachable through `/eval-lean-1/`, discovered hours into a paid run.
-    #[test]
-    fn exactly_one_tls_variable_is_a_refusal_naming_the_one_that_is_set() {
-        let err = tls(Some("/c/cert.pem"), None).unwrap_err().to_string();
-        assert!(err.contains("LUCIDOS_EVAL_ENGINE_TLS_CERT"), "{err}");
-        assert!(err.contains("set both or neither"), "{err}");
-        let err = tls(None, Some("/c/key.pem")).unwrap_err().to_string();
-        assert!(err.contains("LUCIDOS_EVAL_ENGINE_TLS_KEY"), "{err}");
-    }
-
     // ── The classifier pin both arms boot with ───────────────────────────────
 
-    fn arm_env(tls: &EngineTls) -> Vec<(&'static str, OsString)> {
+    fn arm_env() -> Vec<(&'static str, OsString)> {
         arm_engine_env(
             Path::new("/tmp/eval-lean-1"),
             "postgres://localhost/lucidos_eval-lean-1",
             3210,
-            tls,
             true,
         )
     }
@@ -1256,24 +1111,19 @@ mod tests {
     /// answer differently and void the pair.
     #[test]
     fn every_arm_boots_with_the_classifier_pinned_to_all() {
-        for engine_tls in [
-            tls(None, None).unwrap(),
-            tls(Some("/c/c"), Some("/c/k")).unwrap(),
-        ] {
-            let env = arm_env(&engine_tls);
-            assert_eq!(
-                value_of(&env, "LUCIDOS_FORCE_QUERY_CLASSIFICATION"),
-                Some(&OsString::from("all")),
-                "the pin is missing from an arm's environment"
-            );
-        }
+        let env = arm_env();
+        assert_eq!(
+            value_of(&env, "LUCIDOS_FORCE_QUERY_CLASSIFICATION"),
+            Some(&OsString::from("all")),
+            "the pin is missing from an arm's environment"
+        );
     }
 
     /// A machine whose gateway binds a tailnet address must not hand that bind
     /// to an arm, or the arm refuses the harness's first request.
     #[test]
     fn every_arm_boots_pinned_to_loopback() {
-        let env = arm_env(&tls(None, None).unwrap());
+        let env = arm_env();
         assert_eq!(
             value_of(&env, BIND_LOOPBACK_ENV),
             Some(&OsString::from("1"))
@@ -1290,7 +1140,7 @@ mod tests {
     /// lost `DATABASE_URL` would come up against the wrong database.
     #[test]
     fn the_pin_did_not_displace_what_the_engine_already_needed() {
-        let env = arm_env(&tls(Some("/c/cert.pem"), Some("/c/key.pem")).unwrap());
+        let env = arm_env();
         assert_eq!(
             value_of(&env, "LUCIDOS_WORKSPACE"),
             Some(&OsString::from("/tmp/eval-lean-1"))
@@ -1303,14 +1153,15 @@ mod tests {
             value_of(&env, "LUCIDOS_API_PORT"),
             Some(&OsString::from("3210"))
         );
-        assert_eq!(
-            value_of(&env, "LUCIDOS_TLS_CERT"),
-            Some(&OsString::from("/c/cert.pem"))
-        );
-        assert_eq!(
-            value_of(&env, "LUCIDOS_TLS_KEY"),
-            Some(&OsString::from("/c/key.pem"))
-        );
+    }
+
+    /// A shell that exported the mkcert pair does not leak into an arm: the
+    /// engine's own pair is cleared, so it serves plain http on loopback.
+    #[test]
+    fn every_arm_serves_plain_http() {
+        let env = arm_env();
+        assert_eq!(value_of(&env, "LUCIDOS_TLS_CERT"), Some(&OsString::new()));
+        assert_eq!(value_of(&env, "LUCIDOS_TLS_KEY"), Some(&OsString::new()));
     }
 
     /// A parallel OpenAI and Vertex run needs both keys live at once.
@@ -1322,7 +1173,7 @@ mod tests {
     /// harness would then decide which provider an arm can reach.
     #[test]
     fn the_arm_environment_names_no_provider_credential() {
-        let env = arm_env(&tls(None, None).unwrap());
+        let env = arm_env();
         for key in [
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",

@@ -1,7 +1,7 @@
 //! Image size hints: a trailing `#<width>x<height>` on a markdown image's
 //! source, in image pixels. The frontend renderer turns one into a reserved
 //! box, so a picture does not grow its card when it loads
-//! (`system-knowhow/glossary.md` § Image size hint).
+//! (`system-knowhow/glossary/core-terms-4.md` § Image size hint).
 
 use std::path::PathBuf;
 use std::sync::LazyLock;

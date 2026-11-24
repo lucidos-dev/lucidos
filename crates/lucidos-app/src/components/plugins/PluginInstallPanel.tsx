@@ -18,17 +18,11 @@ import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 export function PluginInstallPanel() {
   const form = activeInlineForm.value;
   if (form?.type !== 'plugin-install') return null;
-  // Two components rather than one branching on `installed`, so the confirm
-  // panel's hooks are never conditionally skipped: resolving the install
-  // unmounts the confirm panel and mounts the receipt. Same split as
-  // `EmailConfirmModal`.
   return form.installed
     ? <PluginInstallReceiptPanel form={form} />
     : <PluginInstallConfirm form={form} />;
 }
 
-/** Human label for one local-change outcome, in the second person, because the
- *  panel is telling the user what is about to happen to THEIR edit. */
 const LOCAL_CHANGE_LABEL: Record<PluginLocalChangeOutcome, string> = {
   merged: 'Kept, merged into the new version',
   conflict: 'Cannot merge, your version is saved aside',
@@ -37,21 +31,11 @@ const LOCAL_CHANGE_LABEL: Record<PluginLocalChangeOutcome, string> = {
   removed: 'No longer shipped. Removed, your version is saved aside',
 };
 
-/** Outcomes the keep control cannot change. A restore has no edit to keep or
- *  drop. Keeping a removed file in place would leave a stale copy loading. */
 const KEEP_CONTROL_EXEMPT: ReadonlySet<PluginLocalChangeOutcome> = new Set([
   'restored',
   'removed',
 ]);
 
-/** What the panel promises for one edited file, under the current keep control.
- *
- *  Clearing the control makes every row read as replaced, because that is then
- *  what confirming does. Leaving a merged row saying "kept" would promise the
- *  opposite of the request the button is about to send.
- *
- *  Exported for its unit test: the confirm panel holds the control in a hook,
- *  so the suite's VNode walk cannot reach inside it. */
 export function localChangeLabel(
   outcome: PluginLocalChangeOutcome,
   keepLocal: boolean,
@@ -60,9 +44,6 @@ export function localChangeLabel(
   return LOCAL_CHANGE_LABEL.replaced;
 }
 
-/** Paths with no local edit of their own. An edited path gets its own row
- *  stating its own outcome. Listing it again under a blunt "Files to replace"
- *  or "Files to remove" heading would contradict that row. */
 export function pathsWithoutOwnRow(
   paths: string[],
   changes: { path: string }[],
@@ -91,10 +72,6 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   const isUpdate = req.is_update === true;
   const affected = req.affected_triggers ?? [];
 
-  // The action fns resolve the panel themselves (into a receipt on success,
-  // closed on failure), so busy normally never resets visibly. Reset in a
-  // finally anyway so the buttons re-enable if a future path returns with the
-  // panel still up. setBusy after unmount is a harmless no-op in Preact.
   async function handleConfirm() {
     setBusy(true);
     try {
@@ -248,12 +225,6 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   );
 }
 
-/** The plugin's setup steps, folded. They are written for the Lucidos Agent,
- *  which carries them out in a setup thread and asks the user only for what it
- *  needs. Open and unlabelled, they read like a to-do list for the user.
- *
- *  An update whose setup did not change seeds no thread (`setup_run: null`), so
- *  its heading promises no run. */
 function SetupStepsSection({ setup, request, note }: {
   setup: string;
   request: PluginInstallRequest;
@@ -270,10 +241,6 @@ function SetupStepsSection({ setup, request, note }: {
   );
 }
 
-/** The apps an install wrote, as `{ id, name }`, read off each
- *  `apps/<id>/` path. Once the apps list is loaded it also drops what it does
- *  not hold, such as a widget, and supplies the display name. Before that, the
- *  id stands in and `openAppById` loads the list on click. */
 export function installedApps(
   files: string[],
   apps: Loadable<App[]>,
@@ -289,22 +256,6 @@ export function installedApps(
   });
 }
 
-/** The panel after a confirmed install: a read-only record of what the engine
- *  actually wrote, holding the nav-history slot the pending confirm had (see
- *  `markPluginInstalled`). The list comes off the receipt marker, not off
- *  `request.files`, which was only what the install *would* write.
- *
- *  Its header buttons open the apps the plugin installed. Install and Cancel are
- *  gone because the files have landed and the staged `install_id` is popped.
- *  Close is gone because a receipt is a page in the nav history. The header's
- *  back arrow is how you leave it, same as any other panel page.
- *
- *  The plugin's setup steps stay on it, folded, as a record of what the setup
- *  thread works through.
- *
- *  Exported for its unit test, which renders it directly: the suite's VNode walk
- *  stops at function components (the confirm branch's hooks would throw), so it
- *  cannot reach this one through the dispatcher. */
 export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm }) {
   const req = form.request;
   const installed = form.installed!;

@@ -1,14 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel, gotoWithRetry, clickHeaderAction } from './helpers';
 
-/** Open file search from wherever the content header put its action. Waits for
- *  the signal-driven Preact render to apply the open state before returning,
- *  so callers can immediately assert on overlay/input visibility.
- *
- *  Goes through `clickHeaderAction` rather than the bare `.file-search-btn`.
- *  Files carries one context action today, so it rides the row on every
- *  project, but a second one would fold both into the `⋯` menu. Where the
- *  action sits is the layout's business; opening search is this spec's. */
 async function openFileSearch(page: Page): Promise<void> {
   await blurActiveElement(page);
   await page.waitForTimeout(100);
@@ -31,10 +23,6 @@ async function isSearchOpen(page: Page): Promise<boolean> {
 test.describe('File search', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // gotoWithRetry: a bare page.goto can hang the whole 120s test budget on
-    // mobile-webkit when the app-root navigation wedges (see gotoWithRetry).
-    // Hydration is checked explicitly below — the #app check is what guarantees
-    // the SPA is ready.
     await gotoWithRetry(page, '/');
     await page.waitForFunction(() =>
       document.querySelector('#app')?.childElementCount! > 0,
@@ -50,7 +38,6 @@ test.describe('File search', () => {
 
     expect(await isSearchOpen(page)).toBe(true);
 
-    // Input should be focused (triggers keyboard on real iOS)
     await page.waitForFunction(() => {
       const input = document.querySelector('[data-role="file-search-input"]');
       return input !== null && document.activeElement === input;
@@ -62,13 +49,11 @@ test.describe('File search', () => {
     await openFileSearch(page);
     expect(await isSearchOpen(page)).toBe(true);
 
-    // Wait for input to be focused (simulates keyboard-open state)
     await page.waitForFunction(() => {
       const input = document.querySelector('[data-role="file-search-input"]');
       return input !== null && document.activeElement === input;
     }, undefined, { timeout: 3_000 });
 
-    // Close — tap on mobile, click on desktop
     const closeBtn = page.locator('.file-search-close:visible').first();
     await expect(closeBtn).toBeVisible({ timeout: 3_000 });
     if (isMobileViewport(page)) {
@@ -77,7 +62,6 @@ test.describe('File search', () => {
       await closeBtn.click();
     }
 
-    // Should close immediately (not require a second tap)
     await page.waitForFunction(() => {
       const overlay = document.querySelector('.file-search-overlay');
       return overlay?.classList.contains('file-search-closed');
@@ -90,13 +74,11 @@ test.describe('File search', () => {
     await openFileSearch(page);
     expect(await isSearchOpen(page)).toBe(true);
 
-    // Wait for input focus
     await page.waitForFunction(() => {
       const input = document.querySelector('[data-role="file-search-input"]');
       return input !== null && document.activeElement === input;
     }, undefined, { timeout: 3_000 });
 
-    // Tap/click the backdrop (bottom of screen, outside the modal)
     const vp = page.viewportSize()!;
     if (isMobileViewport(page)) {
       await page.touchscreen.tap(vp.width / 2, vp.height - 20);
@@ -115,9 +97,6 @@ test.describe('File search', () => {
     await openFilesPanel(page);
     await openFileSearch(page);
 
-    // Modal should sit just below the header, not centered. The mobile header
-    // carries any banner, so an absolute bound on the modal would fail whenever
-    // a banner wraps onto another line.
     const modalOffset = await page.evaluate(() => {
       const modal = document.querySelector('.file-search-modal');
       const header = document.querySelector('.app-header');

@@ -1,21 +1,5 @@
-/**
- * The cancel action wrapper reports one of three outcomes so the caller
- * (handleCancelExchange) can react correctly:
- *   - 'canceled' — the server canceled live work (a terminal event is coming);
- *     the optimistic `cancelingThreadIds` flag stays until the status transition
- *     releases it.
- *   - 'noop' — the server had nothing to cancel (`{"canceled": false}`); the
- *     client's view is stale, so the flag is released immediately and the thread
- *     re-synced. This is the uncancelable-thread wedge fix: without it, a Stop
- *     click that races a just-finished turn leaves the button disabled forever.
- *   - 'failed' — the API call failed (iOS PWA "Load failed"); the flag rolls
- *     back so the user can retry without reloading.
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// refreshThreadEvents is fired on the heal ('noop') path — mock just that
-// export (keep the rest of thread-loading real, since the module graph imports
-// its other symbols) so the test can assert the re-sync without a real fetch.
 const { refreshThreadEvents } = vi.hoisted(() => ({
   refreshThreadEvents: vi.fn(async (_id: string) => {}),
 }));
@@ -99,8 +83,6 @@ describe('cancelCurrentExchange outcome', () => {
   });
 
   it("returns 'canceled' when the body is absent (legacy engine / no JSON)", async () => {
-    // An older engine (or any 200 with an empty body) is treated as a real
-    // cancel — the pre-existing behavior — so we never spuriously heal.
     mockFetch.mockResolvedValueOnce(new Response(null, { status: 200 }));
     expect(await cancelCurrentExchange()).toBe('canceled');
   });
@@ -112,21 +94,12 @@ describe('cancelCurrentExchange outcome', () => {
     expect(await cancelCurrentExchange()).toBe('noop');
   });
 
-  it("returns 'failed' when both retries fail", async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockRejectedValueOnce(new TypeError('Load failed'));
+  it("returns 'failed' on a transport error without replaying a content-bearing Stop", async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('Load failed'));
     expect(await cancelCurrentExchange()).toBe('failed');
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("returns 'canceled' when the retry succeeds (the iOS PWA case)", async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ canceled: true }), { status: 200 }));
-    expect(await cancelCurrentExchange()).toBe('canceled');
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-  });
 });
 
 describe('handleCancelExchange optimistic flag lifecycle', () => {
@@ -161,9 +134,6 @@ describe('handleCancelExchange optimistic flag lifecycle', () => {
   });
 
   it('heals on a no-op cancel: clears the flag and re-syncs the thread', async () => {
-    // The wedge: the server had nothing to cancel (turn already ended), so the
-    // optimistic flag must NOT stick — release it and re-sync so the missed
-    // terminal event lands and the Cancel button un-disables.
     setCanceledQuestion('t-1', 'q-1');
     mockFetch.mockResolvedValueOnce(
       new Response(JSON.stringify({ canceled: false }), { status: 200 }),

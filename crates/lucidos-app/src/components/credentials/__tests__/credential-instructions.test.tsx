@@ -1,15 +1,3 @@
-/**
- * The credential prompt links the page it names.
- *
- * The engine (or an agent) writes a prompt telling the user where to create the
- * token. That URL used to render as flat text, so the one actionable thing on
- * the card had to be selected and copied.
- *
- * The anchor's missing `onClick` is asserted too, and it is not an omission:
- * `onGlobalClick` claims the click at the document and routes it through
- * `openUrl`. A handler that stopped propagation would leave the link dead in
- * the packaged client, where WKWebView drops a bare `_blank` navigation.
- */
 import { describe, it, expect } from 'vitest';
 import { CredentialInstructions } from '../CredentialModal';
 import { findByType, textOf } from '../../layout/__tests__/vnodeWalk';
@@ -40,8 +28,6 @@ describe('the credential prompt links its URL', () => {
   });
 
   it('keeps the rest of the prompt as text, newlines included', () => {
-    // `.credential-instructions` is `white-space: pre-wrap`, so the blank lines
-    // between the paragraphs are the prompt's own layout.
     expect(textOf(CredentialInstructions({ text: PROMPT }))).toBe(PROMPT);
   });
 });

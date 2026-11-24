@@ -1,40 +1,24 @@
-/** What the engine holds as each thread's draft, and the edits this device has
- *  made that the engine has not yet acknowledged.
- *
- *  The draft follows the server's *compose revision* (ADR 0437,
- *  `docs/plans/2026-10-12-compose-draft-follows-a-server-revision.md`). Every
- *  *compose report* is ordered by its revision alone. A local edit is a
- *  *pending intent* until a write covering it is answered. While one is
- *  pending the visible draft is the local one. Otherwise it is the newest
- *  report, so a peer write that landed after ours shows. */
 
 import { signal } from '@preact/signals';
 import { clearDraft, getDraft, setDraft, type ComposeDraft } from './composeDrafts';
-import { getComposeSelectionOverride, setComposeSelectionFromServer, type ComposeSelectionOverride } from './composeSelections';
-import { sameHashes, type ComposeReport } from './composeReport';
+import { getComposeSelectionOverride, patchComposeSelection, setComposeSelectionFromServer, type ComposeSelectionOverride } from './composeSelections';
+import { sameHashes, type ParsedComposeReport } from './composeReport';
+import { restoreAdmissionProvisional } from '../utils/restoreAdmission';
 
-export type { ComposeReport, ComposeReportWire } from './composeReport';
+export type { ParsedComposeReport, ComposeReportWire } from './composeReport';
 export { parseComposeMode, parseComposeReport, sameHashes } from './composeReport';
 
-const serverCompose = new Map<string, ComposeReport>();
-/** The newest *compose epoch* heard per thread. Monotonic on its own, apart
- *  from `serverCompose`, because a `412` reports it with the write unapplied. */
+const serverCompose = new Map<string, ParsedComposeReport>();
 const composeEpoch = new Map<string, number>();
 const editSeq = new Map<string, number>();
 const ackedSeq = new Map<string, number>();
 
-/** Bumped whenever `serverCompose` moves, so a subscriber learns the engine's
- *  draft changed. The pending-upload store releases a landed image on it. */
 export const serverComposeVersion = signal(0);
 
-/** The newest report this device holds for the thread, or `undefined` when it
- *  has heard none. */
-export function serverComposeOf(threadId: string): ComposeReport | undefined {
+export function serverComposeOf(threadId: string): ParsedComposeReport | undefined {
   return serverCompose.get(threadId);
 }
 
-/** The epoch a compose write is fenced against, or `undefined` for "never
- *  heard", which the engine accepts unfenced. */
 export function knownComposeEpoch(threadId: string): number | undefined {
   return composeEpoch.get(threadId);
 }
@@ -45,52 +29,60 @@ function noteComposeEpoch(threadId: string, epoch: number | null): void {
   if (known === undefined || epoch > known) composeEpoch.set(threadId, epoch);
 }
 
-/** Record a local compose mutation, and return the edit counter a write that
- *  reads the draft from now on covers. */
 export function noteLocalComposeEdit(threadId: string): number {
   const next = (editSeq.get(threadId) ?? 0) + 1;
   editSeq.set(threadId, next);
   return next;
 }
 
-/** The edit counter a write reading the draft right now covers. */
 export function composeEditSeq(threadId: string): number {
   return editSeq.get(threadId) ?? 0;
 }
 
-/** Whether this device holds a compose edit the engine has not acknowledged. */
 export function isComposeIntentPending(threadId: string): boolean {
   return composeEditSeq(threadId) > (ackedSeq.get(threadId) ?? 0);
 }
 
 type DraftBatch = Map<string, ComposeDraft | null>;
 
-/** Record a report the engine made, and show it unless an edit is pending.
- *  Returns false when it was at or below the revision already held, and so
- *  changed nothing. `batch` collects the visible write for a bulk load. */
-export function acceptComposeReport(threadId: string, report: ComposeReport, batch?: DraftBatch): boolean {
+export function acceptComposeReport(threadId: string, report: ParsedComposeReport, batch?: DraftBatch): boolean {
+  if (restoreAdmissionProvisional()) return false;
   noteComposeEpoch(threadId, report.epoch);
   const held = serverCompose.get(threadId);
   const heldRevision = held?.revision ?? null;
   if (report.revision !== null && heldRevision !== null && report.revision <= heldRevision) return false;
+  if (isComposeIntentPending(threadId)) {
+    const additions = (report.restorations ?? []).filter(r => r.epoch > (held?.epoch ?? -1));
+    if (additions.length > 0) {
+      const local = getDraft(threadId);
+      let text = local.text;
+      const images = [...local.image_hashes];
+      for (const addition of additions) {
+        if (addition.text) text = text.trim() ? `${text}\n\n${addition.text}` : addition.text;
+        for (const hash of addition.image_hashes) if (!images.includes(hash)) images.push(hash);
+      }
+      setDraft(threadId, { ...local, text, image_hashes: images });
+      noteLocalComposeEdit(threadId);
+    }
+  }
   serverCompose.set(threadId, {
     ...report,
     revision: report.revision ?? heldRevision,
+    epoch: report.epoch ?? held?.epoch ?? null,
     imageHashes: [...report.imageHashes],
   });
   serverComposeVersion.value = serverComposeVersion.peek() + 1;
-  if (!isComposeIntentPending(threadId)) showServerCompose(threadId, batch);
+  if (!isComposeIntentPending(threadId)) {
+    showServerCompose(threadId, batch);
+  } else if (report.selection?.codingAgent && !getComposeSelectionOverride(threadId).codingAgent) {
+    patchComposeSelection(threadId, { codingAgent: report.selection.codingAgent });
+  }
   return true;
 }
 
-/** A write covering edits up to `seq` was answered, with the report it left.
- *  An answer for a thread this module has forgotten (discarded or deleted
- *  meanwhile) changes nothing. */
-export function acknowledgeComposeEdits(threadId: string, seq: number, report: ComposeReport): void {
+export function acknowledgeComposeEdits(threadId: string, seq: number, report: ParsedComposeReport): void {
   if (!editSeq.has(threadId)) return;
   ackedSeq.set(threadId, Math.max(ackedSeq.get(threadId) ?? 0, seq));
-  // A newer report shows itself. An older one leaves the newest server state
-  // to show, now that nothing is pending.
   if (!acceptComposeReport(threadId, report) && !isComposeIntentPending(threadId)) showServerCompose(threadId);
 }
 
@@ -115,7 +107,6 @@ function showServerCompose(threadId: string, batch?: DraftBatch): void {
   else setDraft(threadId, { text: report.text, image_hashes: [...report.imageHashes], mode: report.mode });
 }
 
-/** Drop every record for a thread that will never be fetched again. */
 export function forgetComposeSync(threadId: string): void {
   serverCompose.delete(threadId);
   composeEpoch.delete(threadId);
@@ -130,8 +121,6 @@ export function _resetComposeSyncForTesting(): void {
   ackedSeq.clear();
 }
 
-/** Test-only: record what the engine holds without showing it, as a test that
- *  models only the server side of a draft needs. */
 export function _recordServerComposeForTesting(threadId: string, text: string, imageHashes: string[]): void {
   const revision = (serverCompose.get(threadId)?.revision ?? 0) + 1;
   serverCompose.set(threadId, { revision, epoch: null, text, imageHashes: [...imageHashes], mode: null, selection: null });

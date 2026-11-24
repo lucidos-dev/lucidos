@@ -54,7 +54,7 @@ impl NotServedRecorder {
         .fetch_one(&self.pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[AuxPurpose] could not check not-served events: {}", e);
+            crate::log_legacy!("[AuxPurpose] could not check not-served events: {}", e);
             true
         })
     }
@@ -114,7 +114,7 @@ impl NotServedReport for NotServedRecorder {
             return;
         };
         let provider = provider.as_str();
-        crate::log!(
+        crate::log_legacy!(
             "[AuxPurpose] {} does not serve {} for {:?}; {}",
             provider,
             model,

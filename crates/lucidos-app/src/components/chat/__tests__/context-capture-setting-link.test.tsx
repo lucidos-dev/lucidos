@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A section with no body, on a step that ran with capture off, links to the
- *  Capture context switch. The link closes the viewer, which would otherwise
- *  cover the settings page it opens. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

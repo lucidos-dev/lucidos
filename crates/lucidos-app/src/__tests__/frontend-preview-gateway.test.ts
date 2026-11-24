@@ -4,11 +4,19 @@ import {
   gateUpgrades,
   isProxiedPath,
   previewAuthMiddleware,
+  previewBindHost,
   previewGatewayFromEnv,
   previewProxy,
+  previewTlsFromEnv,
   sessionAdmits,
+  sniPicksLeaf,
+  PREVIEW_GATEWAY_CA_ENV,
   PREVIEW_GATEWAY_ORIGIN_ENV,
   PREVIEW_PROXIED_PREFIXES,
+  PREVIEW_TLS_CERT_ENV,
+  PREVIEW_TLS_KEY_ENV,
+  PREVIEW_USER_TLS_CERT_ENV,
+  PREVIEW_USER_TLS_KEY_ENV,
   PREVIEW_WORKSPACE_ID_ENV,
   type GateRequest,
   type GateResponse,
@@ -16,24 +24,28 @@ import {
   type UpgradeServer,
 } from '../../vite/frontendPreviewGateway';
 
-/**
- * The frontend preview's gateway wiring (ADR 0267). The module under test is
- * build config under `crates/lucidos-app/vite/`, deliberately out of the app
- * bundle. It is tested from here because Vitest's `include` covers `src/` only.
- */
-const GW: PreviewGateway = { origin: 'https://127.0.0.1:5251', workspaceId: 'dev' };
+const GW: PreviewGateway = {
+  origin: 'https://127.0.0.1:5251',
+  workspaceId: 'dev',
+  caPath: '/home/user/.lucidos/loopback-ca.pem',
+};
+const AGENT = { trusts: 'the loopback CA' };
 
 describe('previewGatewayFromEnv', () => {
-  const env = (origin?: string, slug?: string) => ({
+  const env = (origin?: string, slug?: string, ca = GW.caPath) => ({
     [PREVIEW_GATEWAY_ORIGIN_ENV]: origin,
     [PREVIEW_WORKSPACE_ID_ENV]: slug,
+    [PREVIEW_GATEWAY_CA_ENV]: ca,
   });
 
-  it('is absent without both engine-supplied values, so `npm run dev` is untouched', () => {
+  it('is absent without every engine-supplied value, so `npm run dev` is untouched', () => {
     expect(previewGatewayFromEnv({})).toBeUndefined();
     expect(previewGatewayFromEnv(env(GW.origin, undefined))).toBeUndefined();
     expect(previewGatewayFromEnv(env(undefined, 'dev'))).toBeUndefined();
     expect(previewGatewayFromEnv(env('  ', 'dev'))).toBeUndefined();
+    const { [PREVIEW_GATEWAY_CA_ENV]: _ca, ...noCa } = env(GW.origin, 'dev');
+    expect(previewGatewayFromEnv(noCa)).toBeUndefined();
+    expect(previewGatewayFromEnv(env(GW.origin, 'dev', ' '))).toBeUndefined();
   });
 
   it('refuses a workspace id that is not slug-shaped, so it never becomes a path', () => {
@@ -47,41 +59,83 @@ describe('previewGatewayFromEnv', () => {
   });
 
   it('carries the same env-var names the engine sets', () => {
-    // Mirrored in `engine::frontend_preview`. A drift between the two is
-    // silent: the preview just never appears.
     expect(PREVIEW_GATEWAY_ORIGIN_ENV).toBe('LUCIDOS_FRONTEND_PREVIEW_GATEWAY_ORIGIN');
     expect(PREVIEW_WORKSPACE_ID_ENV).toBe('LUCIDOS_FRONTEND_PREVIEW_WORKSPACE_ID');
+    expect(PREVIEW_GATEWAY_CA_ENV).toBe('LUCIDOS_FRONTEND_PREVIEW_GATEWAY_CA');
   });
 });
 
 describe('previewProxy', () => {
   it('sends the bundle prefixes to the workspace on the gateway, never to the engine', () => {
-    const proxy = previewProxy(GW);
+    const proxy = previewProxy(GW, AGENT);
     for (const prefix of PREVIEW_PROXIED_PREFIXES) {
       expect(proxy[prefix]).toEqual({
         target: 'https://127.0.0.1:5251/dev',
         changeOrigin: true,
-        // The dev gateway serves its own self-signed cert.
-        secure: false,
+        secure: true,
+        agent: AGENT,
       });
     }
   });
 
   it('passes the slug prefix through unchanged, so app frames load', () => {
-    expect(previewProxy(GW)['/dev/']).toEqual({
+    expect(previewProxy(GW, AGENT)['/dev/']).toEqual({
       target: 'https://127.0.0.1:5251',
       changeOrigin: true,
-      secure: false,
+      secure: true,
+      agent: AGENT,
     });
   });
 
   it('forwards exactly those four prefixes and adds no header of its own', () => {
-    const proxy = previewProxy(GW);
+    const proxy = previewProxy(GW, AGENT);
     expect(Object.keys(proxy).sort()).toEqual(['/api', '/app', '/data', '/dev/']);
-    // A `headers` key could carry the machine-local token, which would make
-    // every LAN caller a local process. Only the browser's cookie may travel.
     for (const entry of Object.values(proxy)) {
-      expect(Object.keys(entry).sort()).toEqual(['changeOrigin', 'secure', 'target']);
+      expect(Object.keys(entry).sort()).toEqual(['agent', 'changeOrigin', 'secure', 'target']);
+    }
+  });
+});
+
+describe('previewTlsFromEnv', () => {
+  const LEAF = { cert: '/l/preview-cert.pem', key: '/l/preview-key.pem' };
+  const USER = { cert: '/certs/cert.pem', key: '/certs/key.pem' };
+  const env = (leaf?: typeof LEAF, user?: typeof USER) => ({
+    [PREVIEW_TLS_CERT_ENV]: leaf?.cert,
+    [PREVIEW_TLS_KEY_ENV]: leaf?.key,
+    [PREVIEW_USER_TLS_CERT_ENV]: user?.cert,
+    [PREVIEW_USER_TLS_KEY_ENV]: user?.key,
+  });
+
+  it('needs the leaf, so the preview never serves plaintext', () => {
+    expect(previewTlsFromEnv(env(undefined, USER))).toBeUndefined();
+    expect(previewTlsFromEnv(env({ ...LEAF, key: ' ' }, USER))).toBeUndefined();
+  });
+
+  it('takes the user certificate only as a whole pair', () => {
+    expect(previewTlsFromEnv(env(LEAF))).toEqual({ leaf: LEAF });
+    expect(previewTlsFromEnv(env(LEAF, { ...USER, key: '' }))).toEqual({ leaf: LEAF });
+    expect(previewTlsFromEnv(env(LEAF, USER))).toEqual({ leaf: LEAF, user: USER });
+  });
+
+  it('binds beyond loopback only with a user certificate', () => {
+    expect(previewBindHost({ leaf: LEAF })).toBe('127.0.0.1');
+    expect(previewBindHost({ leaf: LEAF, user: USER })).toBe(true);
+  });
+
+  it('carries the same env-var names the gateway sets', () => {
+    expect(PREVIEW_TLS_CERT_ENV).toBe('LUCIDOS_PREVIEW_TLS_CERT');
+    expect(PREVIEW_TLS_KEY_ENV).toBe('LUCIDOS_PREVIEW_TLS_KEY');
+    expect(PREVIEW_USER_TLS_CERT_ENV).toBe('LUCIDOS_PREVIEW_USER_TLS_CERT');
+    expect(PREVIEW_USER_TLS_KEY_ENV).toBe('LUCIDOS_PREVIEW_USER_TLS_KEY');
+  });
+});
+
+describe('sniPicksLeaf', () => {
+  it('gives the leaf to localhost alone, the one name it covers', () => {
+    expect(sniPicksLeaf('localhost')).toBe(true);
+    expect(sniPicksLeaf('LocalHost')).toBe(true);
+    for (const name of ['my-laptop.tailnet.ts.net', 'lucidos.local', 'localhost.example', 'app.localhost']) {
+      expect(sniPicksLeaf(name)).toBe(false);
     }
   });
 });
@@ -178,7 +232,6 @@ describe('previewAuthMiddleware', () => {
 describe('gateUpgrades', () => {
   type Listener = Parameters<UpgradeServer['on']>[1];
 
-  /** A stand-in for Node's HTTP server holding Vite's HMR upgrade listener. */
   function serverWithViteListener() {
     let listeners: Listener[] = [];
     const reachedVite: string[] = [];

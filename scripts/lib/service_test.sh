@@ -31,6 +31,8 @@ unset LUCIDOS_BIND
 
 # shellcheck source=scripts/lib/service.sh
 source "$SCRIPT_DIR/service.sh"
+# shellcheck source=scripts/lib/loopback_curl.sh
+source "$SCRIPT_DIR/loopback_curl.sh"
 # shellcheck source=scripts/lib/release_staging.sh
 source "$SCRIPT_DIR/release_staging.sh"
 # shellcheck source=scripts/lib/headless_tarball.sh
@@ -201,8 +203,7 @@ got="$(service_systemd_unit_path /home/u test /home/u/.xdg)"
 if [ "$got" = "/home/u/.xdg/systemd/user/lucidos-gateway-test.service" ]; then pass "unit path honors XDG_CONFIG_HOME"; else fail "unit path XDG: $got"; fi
 if [ "$(service_log_dir /opt/x/test)" = "/opt/x/test/logs" ]; then pass "log dir = <data>/logs"; else fail "log dir: $(service_log_dir /opt/x/test)"; fi
 if [ "$(service_runtime_root /opt/x)" = "/opt/x/runtime/current" ]; then pass "runtime root = shared current symlink"; else fail "runtime root: $(service_runtime_root /opt/x)"; fi
-if [ "$(service_health_url 5252)" = "http://localhost:5252/~/api/v1/health" ]; then pass "health url (sigil namespace)"; else fail "health url: $(service_health_url 5252)"; fi
-if [ "$(service_health_url 5252 https)" = "https://localhost:5252/~/api/v1/health" ]; then pass "health url honors the https scheme (TLS instance)"; else fail "health url https: $(service_health_url 5252 https)"; fi
+if [ "$(service_health_url 5252)" = "https://127.0.0.1:5252/~/api/v1/health" ]; then pass "health url (loopback TLS, sigil namespace)"; else fail "health url: $(service_health_url 5252)"; fi
 
 # ── PURE: bind-value validation + network.toml render/parse round-trip ────────
 echo ""
@@ -231,10 +232,10 @@ echo ""
 echo "test: service_write_network_toml writes fresh + preserves an existing inherit=false"
 NTH="$(mktemp -d)"
 service_write_network_toml "$NTH" all || fail "fresh network.toml write failed"
-if [ "$(service_network_toml_bind "$(cat "$NTH/.lucidos/network.toml")")" = "all" ]; then pass "fresh write records bind=all"; else fail "fresh write: $(cat "$NTH/.lucidos/network.toml" 2>/dev/null)"; fi
-service_render_network_toml loopback false > "$NTH/.lucidos/network.toml"
+if [ "$(service_network_toml_bind "$(cat "$NTH/.lucidos/private/network.toml")")" = "all" ]; then pass "fresh write records bind=all"; else fail "fresh write: $(cat "$NTH/.lucidos/private/network.toml" 2>/dev/null)"; fi
+service_render_network_toml loopback false > "$NTH/.lucidos/private/network.toml"
 service_write_network_toml "$NTH" 192.168.1.7 || fail "rewrite failed"
-NTC="$(cat "$NTH/.lucidos/network.toml")"
+NTC="$(cat "$NTH/.lucidos/private/network.toml")"
 if [ "$(service_network_toml_bind "$NTC")" = "192.168.1.7" ]; then pass "rewrite updates bind"; else fail "rewrite bind: $NTC"; fi
 if [ "$(service_network_toml_engine_inherit "$NTC")" = "false" ]; then pass "rewrite preserves inherit=false"; else fail "rewrite lost inherit: $NTC"; fi
 rm -rf "$NTH"
@@ -257,26 +258,26 @@ echo ""
 echo "test: service_write_network_toml sets, keeps and clears one gateway's external address"
 NTE="$(mktemp -d)"
 service_write_network_toml "$NTE" all 5252 https://lucidos.example.com || fail "write with external address failed"
-NTEC="$(cat "$NTE/.lucidos/network.toml")"
+NTEC="$(cat "$NTE/.lucidos/private/network.toml")"
 if [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://lucidos.example.com" ]; then pass "external address written for 5252"; else fail "external write: $NTEC"; fi
 if [ -z "$(service_network_toml_external_address "$NTEC" 5251)" ]; then pass "another port has none"; else fail "leaked to 5251: $NTEC"; fi
 service_write_network_toml "$NTE" 192.168.1.7 || fail "bind-only rewrite failed"
-NTEC="$(cat "$NTE/.lucidos/network.toml")"
+NTEC="$(cat "$NTE/.lucidos/private/network.toml")"
 if [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://lucidos.example.com" ]; then pass "a bind rewrite keeps the external address"; else fail "bind rewrite lost it: $NTEC"; fi
 service_write_network_toml "$NTE" "" 5251 http://10.8.0.2:5251 || fail "second gateway's write failed"
-NTEC="$(cat "$NTE/.lucidos/network.toml")"
+NTEC="$(cat "$NTE/.lucidos/private/network.toml")"
 if [ "$(service_network_toml_bind "$NTEC")" = "192.168.1.7" ]; then pass "an empty bind keeps the stored bind"; else fail "empty bind: $NTEC"; fi
 if [ "$(service_network_toml_external_address "$NTEC" 5251)" = "http://10.8.0.2:5251" ] \
     && [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://lucidos.example.com" ]; then
     pass "two gateways keep one entry each"; else fail "two entries: $NTEC"; fi
 service_write_network_toml "$NTE" "" 5252 https://other.example.com || fail "replace failed"
-NTEC="$(cat "$NTE/.lucidos/network.toml")"
+NTEC="$(cat "$NTE/.lucidos/private/network.toml")"
 if [ "$(service_network_toml_external_entries "$NTEC" | grep -c '^5252')" = "1" ] \
     && [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://other.example.com" ]; then
     pass "a write replaces, never duplicates"; else fail "replace: $NTEC"; fi
 service_write_network_toml "$NTE" "" 5252 "" || fail "clearing rewrite failed"
 service_write_network_toml "$NTE" "" 5251 "" || fail "clearing rewrite failed"
-NTEC="$(cat "$NTE/.lucidos/network.toml")"
+NTEC="$(cat "$NTE/.lucidos/private/network.toml")"
 if [ -z "$(service_network_toml_external_entries "$NTEC")" ] && ! has "$NTEC" '
 [external_address]'; then pass "\"\" clears, and an empty table is not written"; else fail "clear: $NTEC"; fi
 rm -rf "$NTE"
@@ -288,17 +289,28 @@ for lport in 5301 5302 5303 5304 5305 5306; do
     service_write_network_toml "$NTL" "" "$lport" "https://gw$lport.example.com" &
 done
 wait
-NTLC="$(cat "$NTL/.lucidos/network.toml")"
+NTLC="$(cat "$NTL/.lucidos/private/network.toml")"
 if [ "$(service_network_toml_external_entries "$NTLC" | grep -c '^53')" = "6" ]; then
     pass "six racing writers leave six entries"; else fail "lost an entry: $NTLC"; fi
-if [ -z "$(find "$NTL/.lucidos" -name 'network.toml.?*' ! -name "$SERVICE_NETWORK_TOML_LOCK")" ]; then
-    pass "no temp file is left behind"; else fail "leftover temp: $(ls -a "$NTL/.lucidos")"; fi
+if [ -z "$(find "$NTL/.lucidos/private" -name 'network.toml.?*' ! -name "$SERVICE_NETWORK_TOML_LOCK")" ]; then
+    pass "no temp file is left behind"; else fail "leftover temp: $(ls -a "$NTL/.lucidos/private")"; fi
 rm -rf "$NTL"
-if grep -q "NETWORK_TOML_LOCK: &str = \"$SERVICE_NETWORK_TOML_LOCK\"" "$SCRIPT_DIR/../../crates/lucidos-gateway/src/net_config.rs"; then
-    pass "the shell and the gateway take the same lock"; else fail "lock name differs from net_config::NETWORK_TOML_LOCK"; fi
+if grep -q "NETWORK_TOML_LOCK: &str = \"$SERVICE_NETWORK_TOML_LOCK\"" "$SCRIPT_DIR/../../crates/lucidos-home/src/private.rs"; then
+    pass "the shell and the gateway take the same lock"; else fail "lock name differs from lucidos_home::private::NETWORK_TOML_LOCK"; fi
+NTO="$(mktemp -d)"
+mkdir -p "$NTO/.lucidos"
+service_render_network_toml all true > "$NTO/.lucidos/network.toml"
+service_write_network_toml "$NTO" 192.168.1.7 || fail "write over an older copy failed"
+if [ "$(service_network_toml_bind "$(cat "$NTO/.lucidos/network.toml")")" = "192.168.1.7" ] \
+    && [ ! -e "$NTO/.lucidos/private/network.toml" ]; then
+    pass "an older release's copy stays the one written"
+else
+    fail "a second network.toml appeared: $(ls -a "$NTO/.lucidos" "$NTO/.lucidos/private" 2>&1)"
+fi
+rm -rf "$NTO"
 NTF="$(mktemp -d)"
 service_write_network_toml "$NTF" "" || fail "fresh write with no bind failed"
-if [ "$(service_network_toml_bind "$(cat "$NTF/.lucidos/network.toml")")" = "loopback" ]; then pass "no bind anywhere writes loopback"; else fail "fresh empty bind: $(cat "$NTF/.lucidos/network.toml")"; fi
+if [ "$(service_network_toml_bind "$(cat "$NTF/.lucidos/private/network.toml")")" = "loopback" ]; then pass "no bind anywhere writes loopback"; else fail "fresh empty bind: $(cat "$NTF/.lucidos/private/network.toml")"; fi
 rm -rf "$NTF"
 
 # ── PURE: env contract (matches spawn_gateway; shared runtime + per-instance data) ─
@@ -805,7 +817,7 @@ if [ $rc -ne 0 ] && has "$out" "--bind must be"; then
 else
     fail "expected a --bind refusal (rc=$rc): $out"
 fi
-if [ -e "$FAKEHOME/.lucidos/network.toml" ]; then fail "network.toml written despite refusal/--no-launch"; else pass "no network.toml side effect on refusal"; fi
+if [ -e "$FAKEHOME/.lucidos/private/network.toml" ]; then fail "network.toml written despite refusal/--no-launch"; else pass "no network.toml side effect on refusal"; fi
 
 echo ""
 echo "test: a TLS install bakes the pair into the service env and probes https"
@@ -827,9 +839,9 @@ echo "test: --bind all writes the machine-global network.toml (the picker's knob
 FB="$(make_fakebin Darwin 0)"
 out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' LUCIDOS_HEALTH_TIMEOUT=1 \
         bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --name bnd --port 59252 --bind all 2>&1)"; rc=$?
-NTF="$FAKEHOME/.lucidos/network.toml"
+NTF="$FAKEHOME/.lucidos/private/network.toml"
 if [ -f "$NTF" ] && [ "$(service_network_toml_bind "$(cat "$NTF")")" = "all" ]; then
-    pass "--bind all landed in ~/.lucidos/network.toml"
+    pass "--bind all landed in ~/.lucidos/private/network.toml"
 else
     fail "expected bind=all in $NTF: $(cat "$NTF" 2>/dev/null)"
 fi
@@ -1070,6 +1082,57 @@ else
     fail "expected a full purge (rc=$rc): $out"
 fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: uninstall.sh --all --purge forgets the local certificate, unless the .app or a gateway still uses it"
+# The CLI is a stub that records its arguments outside the runtime the purge
+# deletes, so no real keychain or NSS database is touched.
+forget_fixture() {
+    FB="$(make_fakebin "" 1)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+    mkdir -p "$PREFIX/test" "$PREFIX/runtime/$STEM"; printf '5300\n' > "$PREFIX/test/port"
+    ln -s "$PREFIX/runtime/$STEM" "$PREFIX/runtime/current"
+    printf '#!/bin/sh\necho "$*" >> "%s/ran"\n' "$FAKEHOME" > "$PREFIX/runtime/$STEM/lucidos"
+    chmod +x "$PREFIX/runtime/$STEM/lucidos"
+    # pgrep answers from the fixture, never the host's process table.
+    fake_pgrep "${1:-1}"
+}
+# fake_pgrep <exit>: 0 finds a gateway, 1 finds none, 2 fails.
+fake_pgrep() {
+    printf '#!/bin/sh\nexit %s\n' "$1" > "$FB/pgrep"
+    chmod +x "$FB/pgrep"
+}
+forget_fixture
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' bash "$UNINSTALL" --prefix "$PREFIX" --all --purge 2>&1)"
+# This machine may legitimately have /Applications/Lucidos.app, which keeps it.
+if [ -e /Applications/Lucidos.app ]; then
+    pass "skipped: /Applications/Lucidos.app exists here and keeps the certificate"
+elif [ "$(cat "$FAKEHOME/ran" 2>/dev/null)" = "tls forget" ]; then
+    pass "the purge ran lucidos tls forget"
+else
+    fail "expected 'tls forget' before the runtime went: $out"
+fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+forget_fixture
+mkdir -p "$FAKEHOME/Applications/Lucidos.app/Contents"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' bash "$UNINSTALL" --prefix "$PREFIX" --all --purge 2>&1)"
+if [ ! -e "$FAKEHOME/ran" ] && has "$out" "Kept the local certificate"; then
+    pass "a present .app keeps the local certificate"
+else
+    fail "forgot the certificate the .app still uses: $out"
+fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+for answer in 0 2; do
+    forget_fixture "$answer"
+    out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' bash "$UNINSTALL" --prefix "$PREFIX" --all --purge 2>&1)"
+    if [ -e /Applications/Lucidos.app ]; then
+        pass "skipped: /Applications/Lucidos.app exists here and keeps the certificate first"
+    elif [ ! -e "$FAKEHOME/ran" ] && has "$out" "gateway for this user may still use it"; then
+        pass "pgrep exit $answer keeps the local certificate"
+    else
+        fail "pgrep exit $answer forgot the certificate: $out"
+    fi
+    rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+done
 
 # ── INTEGRATION: uninstall --all with ZERO instances (bash 3.2 empty-array) ──
 echo ""

@@ -1,19 +1,4 @@
 #!/usr/bin/env node
-// What a change adds to the first-paint set (ADR 0436), and why (ADR 0454).
-//
-//   node first-paint-growth.mjs check [--base <ref>]
-//   node first-paint-growth.mjs report [--hours <n>] [--top <n>]
-//
-// `check` builds the working tree and the change's merge base with `<ref>`
-// (default `main`), and compares the two sets. Growth over the threshold needs
-// a `First-paint-growth:` trailer on a commit of the change, or it exits 1.
-// `report` ranks the changes main took in the last hours, read from main's
-// reflog: Apply fast-forwards main, so each reflog entry is one change.
-//
-// Every number comes from the report `vite/chunkBudget.ts` emits. Both trees
-// are measured with THIS checkout's copy, through a wrapper config, so the two
-// sides share one ruler. Nothing here measures a chunk itself. The base builds
-// from `git archive` output in a temp directory: no tracked file is touched.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -23,32 +8,21 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Mirrors `vite/chunkBudget.ts`, which this JS cannot import.
-// `first-paint-growth.test.ts` fails when the two drift apart.
 export const FIRST_PAINT_REPORT_FILE = 'first-paint-report.json';
 
-/** The one ruler: this checkout's budget plugin, applied to both trees. */
 const RULER = fileURLToPath(new URL('./vite/chunkBudget.ts', import.meta.url));
 
-/** Growth past this, in raw bytes, needs a stated reason (ADR 0454). */
 export const GROWTH_THRESHOLD_BYTES = 2000;
 
-/** The commit trailer that states the reason. */
 export const GROWTH_TRAILER = 'First-paint-growth';
 
-/** Everything a build reads, relative to the repo root: what a base archive
- *  holds, and the roots of a first-paint input. */
 export const ARCHIVE_PATHS = ['crates/lucidos-app', 'packages', 'package.json', 'package-lock.json', 'system-widgets'];
 
-/** The repo's npm config, which pins the registry. A base archive carries it
- *  too, but it is no first-paint input: the lockfile pins the bytes. */
 const NPM_CONFIG = '.npmrc';
 
 const APP_DIR = 'crates/lucidos-app';
 
-// ── pure helpers, exported for tests ────────────────────────────────────────
 
-/** Signed kB of 1000 bytes, as Vite prints them. */
 export function signedKb(bytes) {
   return `${bytes < 0 ? '-' : '+'}${(Math.abs(bytes) / 1000).toFixed(2)} kB`;
 }
@@ -57,15 +31,12 @@ function kb(bytes) {
   return `${(bytes / 1000).toFixed(2)} kB`;
 }
 
-/** Whether a changed path can change the first-paint set. Broad on purpose:
- *  a path counted wrongly costs one build, a path missed costs the check. */
 export function isFirstPaintInput(path) {
   if (/(^|\/)__tests__\//.test(path) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path)) return false;
   if (path.startsWith(`${APP_DIR}/e2e/`) || /(\.rs|(^|\/)Cargo\.toml)$/.test(path)) return false;
   return ARCHIVE_PATHS.some((root) => path === root || path.startsWith(`${root}/`));
 }
 
-/** The report `chunkBudget.ts` emits, or `null` when it is not one. */
 export function parseReport(text) {
   try {
     const { firstPaint, entry } = JSON.parse(text);
@@ -82,7 +53,6 @@ export function parseReport(text) {
   }
 }
 
-/** The trailer values `git log --format=%(trailers:...,valueonly)` printed. */
 export function parseReasons(output) {
   return output.split('\n').map((line) => line.trim()).filter(Boolean);
 }
@@ -93,11 +63,6 @@ function growthLine(base, head) {
   return `${signedKb(delta)} raw (${signedKb(gzip)} gzip), from ${kb(base.setBytes)} to ${kb(head.setBytes)}`;
 }
 
-/**
- * Judge one change's growth. The whole set's delta is judged, so moving bytes
- * between first-paint chunks is no growth, and moving them behind a dynamic
- * import is a shrink.
- */
 export function growthVerdict(base, head, reasons) {
   const deltaBytes = head.setBytes - base.setBytes;
   const deltaGzipBytes = head.setGzipBytes - base.setGzipBytes;
@@ -123,7 +88,6 @@ export function growthVerdict(base, head, reasons) {
   };
 }
 
-/** Main's moves, newest first, as changes in the order they landed. */
 export function changesFromReflog(output) {
   const tips = output.split('\n').map((l) => l.trim()).filter(Boolean).reverse();
   const changes = [];
@@ -136,8 +100,6 @@ export function changesFromReflog(output) {
 const TOP_ADDERS = 5;
 const TOP_SHRINKS = 3;
 
-/** One change, named by its subject. Past the threshold, "no reason given"
- *  marks a change that skipped the gate. */
 function changeLine(c) {
   let why = '';
   if (c.reasons.length > 0) why = `: ${c.reasons.join(' / ')}`;
@@ -145,7 +107,6 @@ function changeLine(c) {
   return `- ${signedKb(c.deltaBytes)} raw (${signedKb(c.deltaGzipBytes)} gzip) ${c.subject}${why}`;
 }
 
-/** The morning notice's first-paint lines. `changes` holds only measured ones. */
 export function formatReport({ since, latest, changes, top = TOP_ADDERS }) {
   if (changes.length === 0) return `First-paint growth: no change to main touched the first-paint set in the ${since}.`;
   const net = changes.reduce((sum, c) => sum + c.deltaBytes, 0);
@@ -161,21 +122,17 @@ export function formatReport({ since, latest, changes, top = TOP_ADDERS }) {
   return lines.join('\n');
 }
 
-// ── git and builds ──────────────────────────────────────────────────────────
 
 function git(repoRoot, args) {
   const out = spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   return { ok: out.status === 0, stdout: (out.stdout ?? '').trim() };
 }
 
-/** The merge base of HEAD with `baseRef`, or `null` when there is none. */
 export function resolveMergeBase(repoRoot, baseRef) {
   const out = git(repoRoot, ['merge-base', baseRef, 'HEAD']);
   return out.ok && out.stdout ? out.stdout : null;
 }
 
-/** What a cached base result depends on besides its commit: the installed
- *  dependencies, and the ruler with the module it reads chunks through. */
 function measureKey(repoRoot) {
   const hash = createHash('sha256');
   for (const path of [join(repoRoot, 'package-lock.json'), RULER, join(dirname(RULER), 'shellChunk.ts')]) {
@@ -184,7 +141,6 @@ function measureKey(repoRoot) {
   return hash.digest('hex').slice(0, 12);
 }
 
-/** The wrapper config: `appDir`'s own config, plus the ruler in report mode. */
 export function rulerConfigSource(appConfig, ruler = RULER) {
   return [
     `import base from ${JSON.stringify(appConfig)};`,
@@ -197,13 +153,10 @@ export function rulerConfigSource(appConfig, ruler = RULER) {
   ].join('\n');
 }
 
-/** Run `vite build` in `appDir` through the wrapper config, into `outDir`. */
 export function viteBuild({ appDir, outDir }) {
   const appConfig = join(appDir, 'vite.config.ts');
   if (!existsSync(appConfig)) throw new Error(`no vite.config.ts in ${appDir}`);
   const vitePackage = createRequire(join(appDir, 'package.json')).resolve('vite/package.json');
-  // Vite loads the bundled config from beside the wrapper, so the wrapper's
-  // directory needs the app's node_modules to resolve the config's imports.
   const configDir = mkdtempSync(join(tmpdir(), 'first-paint-config-'));
   try {
     symlinkSync(dirname(dirname(vitePackage)), join(configDir, 'node_modules'));
@@ -236,12 +189,6 @@ function measureInto(appDir, build) {
   }
 }
 
-/**
- * Give an extracted commit the generated files its build reads. They are build
- * outputs, so the archive may lack them. The commit's rendering comes from the
- * codegen cache, or with none cached, this tree's. A file the archive already
- * holds stays.
- */
 export function prepareGenerated({ repoRoot, sha, tree }) {
   const codegen = join(repoRoot, 'scripts/codegen.sh');
   if (existsSync(codegen)) {
@@ -269,12 +216,6 @@ function runNpm(cwd, args, env) {
   return (out.stdout ?? '').trim();
 }
 
-/**
- * Run npm in `tree` with the tree's `.npmrc` as its only config, and return
- * its output. User and global config files are empty, and no `npm_config_*`
- * variable gets through, so a contributor's registry cannot reach the install.
- * The cache stays the ambient one, for `--prefer-offline`.
- */
 export function treeNpm(tree, args, env = process.env) {
   const cache = runNpm(tree, ['config', 'get', 'cache'], env);
   const configDir = mkdtempSync(join(tmpdir(), 'first-paint-npmrc-'));
@@ -290,8 +231,6 @@ export function treeNpm(tree, args, env = process.env) {
   }
 }
 
-/** Install `tree`'s own dependencies from its own lockfile, so a base is built
- *  with the versions it pinned. */
 export function npmCi(tree) {
   treeNpm(tree, ['ci', '--ignore-scripts', '--prefer-offline', '--no-audit', '--no-fund']);
 }
@@ -300,17 +239,10 @@ function readBytes(path) {
   return existsSync(path) ? readFileSync(path) : null;
 }
 
-/** Build the working tree and read its report. */
 export function measureWorktree(repoRoot, build = viteBuild) {
   return measureInto(join(repoRoot, APP_DIR), build);
 }
 
-/**
- * Build a commit from its archive and read its report, cached by commit and
- * lockfile. A commit whose lockfile differs from this checkout's gets its own
- * install, so a dependency change measures. `{ error }` when the commit has
- * nothing to build, its install or build fails, or it writes no report.
- */
 export function measureCommit({ repoRoot, sha, cacheDir, build = viteBuild, install = npmCi }) {
   const cached = join(cacheDir, `${sha}-${measureKey(repoRoot)}.json`);
   if (existsSync(cached)) {
@@ -331,7 +263,6 @@ export function measureCommit({ repoRoot, sha, cacheDir, build = viteBuild, inst
     const ownLock = readBytes(join(tree, 'package-lock.json'));
     const repoLock = readBytes(join(repoRoot, 'package-lock.json'));
     if (ownLock && !(repoLock && ownLock.equals(repoLock))) {
-      // A base that pinned no registry installs from ours, never the user's.
       if (!existsSync(join(tree, NPM_CONFIG)) && existsSync(join(repoRoot, NPM_CONFIG))) {
         copyFileSync(join(repoRoot, NPM_CONFIG), join(tree, NPM_CONFIG));
       }
@@ -381,7 +312,6 @@ function reasonsSince(repoRoot, base) {
 
 const MERGE_MAIN = 'Please merge main and run again.';
 
-/** The `check` command. `exitCode` 0 passes; `text` says what was found. */
 export function runCheck({
   repoRoot, baseRef = 'main', cacheDir = join(repoRoot, '.lucidos/first-paint'), build = viteBuild, install = npmCi,
   measureHead = () => measureWorktree(repoRoot, build),
@@ -411,7 +341,6 @@ export function runCheck({
   };
 }
 
-/** Main's moves in the last `hours`, plus the tip before them, newest first. */
 function reflogTips(repoRoot, ref, hours) {
   const since = Date.now() / 1000 - hours * 3600;
   const out = git(repoRoot, ['reflog', 'show', '--date=unix', '--format=%H %gd', `refs/heads/${ref}`]).stdout;
@@ -426,13 +355,11 @@ function reflogTips(repoRoot, ref, hours) {
   return tips;
 }
 
-/** The subject that names a change: its newest feature, fix or perf commit. */
 function changeSubject(repoRoot, from, to) {
   const subjects = git(repoRoot, ['log', '--no-merges', '--format=%s', `${from}..${to}`]).stdout.split('\n').filter(Boolean);
   return subjects.find((s) => /^(feat|fix|perf|refactor)(\(|:)/.test(s)) ?? subjects[0] ?? '(a merge with no commits of its own)';
 }
 
-/** The `report` command, for the nightly. */
 export function runReport({
   repoRoot, ref = 'main', hours = 24, top = TOP_ADDERS, cacheDir = join(repoRoot, '.lucidos/first-paint'), build = viteBuild,
   install = npmCi,
@@ -464,7 +391,6 @@ export function runReport({
   return { exitCode: 0, text: text + unmeasured };
 }
 
-// ── the command line ────────────────────────────────────────────────────────
 
 function option(args, name, fallback) {
   const at = args.indexOf(name);

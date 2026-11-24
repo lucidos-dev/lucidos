@@ -37,16 +37,10 @@ export function removePluginMarketplace(id: string): Promise<RemoveMarketplaceRe
   });
 }
 
-/** The plugin catalog. Two small file reads on the engine, no git work: the
- *  scan runs on the scheduler and this serves what it left behind. So the
- *  default timeout is right, where the old clone-per-request needed 30s. */
 export function fetchPluginCatalog(): Promise<MarketplaceCatalog> {
   return json(`${API}/plugins/catalog`);
 }
 
-/** Ask for a fresh marketplace scan. Returns once the scan is QUEUED, not once
- *  it lands: the result arrives as a `PluginCatalogScanned` frame. A scan
- *  already running absorbs the request engine-side. */
 export function rescanPluginCatalog(): Promise<{ queued: boolean }> {
   return json(`${API}/plugins/catalog/rescan`, {
     method: 'POST',
@@ -55,19 +49,14 @@ export function rescanPluginCatalog(): Promise<{ queued: boolean }> {
   });
 }
 
-/** Installed plugins from the event projection (no marketplace scan). Backs the
- *  Plugins → Installed tab. */
 export function fetchInstalledPlugins(): Promise<{ plugins: InstalledPlugin[] }> {
   return json(`${API}/plugins/installed`);
 }
 
-/** A *plugin media* URL as the engine sends it (`/api/v1/plugins/media/...`),
- *  prefixed with the workspace's base path like every other API URL. */
 export function pluginMediaUrl(url: string): string {
   return `${API_BASE}${url}`;
 }
 
-/** The plugin's `media/README.md`, as raw markdown for the detail page. */
 export function fetchPluginReadme(readmeUrl: string): Promise<string> {
   return text(pluginMediaUrl(readmeUrl));
 }

@@ -14,8 +14,6 @@ describe('handshakeWarningFor', () => {
   });
 
   it('accepts the workspace-relative spelling too', () => {
-    // The Files panel passes a `data/`-relative path; a caller holding the
-    // API's own spelling must not be told the file is unknown.
     expect(handshakeWarningFor('data/scripts/auth/comfort-cloud.py', scripts))
       .toBe('data/scripts/auth/comfort-cloud.py');
   });
@@ -25,8 +23,6 @@ describe('handshakeWarningFor', () => {
   });
 
   it('says nothing about a script that is not on disk', () => {
-    // apis.json names it and the file is missing. That is a 404 from the
-    // runner with its own message, not an approval problem.
     expect(handshakeWarningFor('scripts/auth/gone.py', scripts)).toBeNull();
   });
 
@@ -34,7 +30,6 @@ describe('handshakeWarningFor', () => {
     for (const path of [
       'artifacts/notes.md',
       'config/apis.json',
-      // Under scripts/, but no apis.json entry names it, so nothing runs it.
       'scripts/helpers/tidy.py',
     ]) {
       expect(handshakeWarningFor(path, scripts), path).toBeNull();

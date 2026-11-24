@@ -3,28 +3,6 @@ import { mobileView, threadDrawerOpen, MOBILE_VIEWS, PANE_INDEX, type MobileView
 import { navigateToPane, checkPaneConsistency, toggleThreads } from '../../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS, type MobilePaneConfig } from '../MobileAppHeader';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Mobile pane / dot indicator sync tests
-//
-// The bug: on mobile, toggleThreads() (bound to the toggleThreadDrawer
-// keyboard shortcut; mobile pane nav is otherwise swipe-only) toggled
-// `threadDrawerOpen` instead of navigating to the threads pane. This showed
-// threads via drawer overlay while dots still indicated "thread" pane — a
-// visible desync.
-//
-// The fix: on mobile, toggleThreads() navigates to pane 0 (threads). The
-// thread drawer overlay is a desktop-only concept. threadDrawerOpen must
-// never be the mechanism to show threads on mobile.
-//
-// Structural guarantees:
-//   1. MobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT all derive from
-//      a single PANE_DEFS array — can't add a pane to one without the others.
-//   2. toggleThreads() is the ONLY way to show/hide threads from UI —
-//      routes mobile through navigateToPane('threads') and desktop through
-//      threadDrawerOpen toggle.
-//   3. ThreadDrawer overlay visibility is disabled on mobile — forceVisible
-//      (pane 0) is the only way threads render.
-// ─────────────────────────────────────────────────────────────────────────────
 
 function setMobile() {
   (globalThis as any).innerWidth = 375;
@@ -105,14 +83,14 @@ describe('toggleThreads — mobile vs desktop routing', () => {
     mobileView.value = 'thread';
     toggleThreads();
     expect(mobileView.value).toBe('threads');
-    expect(PANE_INDEX[mobileView.value]).toBe(0); // leftmost dot
+    expect(PANE_INDEX[mobileView.value]).toBe(0);
     expect(threadDrawerOpen.value).toBe(false);
     expect(checkPaneConsistency()).toBeNull();
   });
 
   it('on mobile: cleans up stale threadDrawerOpen', () => {
     setMobile();
-    threadDrawerOpen.value = true; // stale from desktop
+    threadDrawerOpen.value = true;
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(false);
     expect(mobileView.value).toBe('threads');
@@ -123,7 +101,7 @@ describe('toggleThreads — mobile vs desktop routing', () => {
     threadDrawerOpen.value = false;
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(true);
-    expect(mobileView.value).toBe('thread'); // unchanged
+    expect(mobileView.value).toBe('thread');
 
     toggleThreads();
     expect(threadDrawerOpen.value).toBe(false);
@@ -169,16 +147,11 @@ describe('mobile: thread drawer overlay is disabled', () => {
   });
 
   it('drawer overlay visibility formula excludes mobile', () => {
-    // The ThreadDrawer visible formula:
-    //   forceVisible || (threadDrawerOpen.value && splitRatio > 0)
-    // On mobile, splitRatio is 0 and forceVisible is only true in
-    // MobileThreadsPane (pane 0). The overlay path (threadDrawerOpen
-    // on the thread pane) is structurally disabled.
-    const splitRatio = 0; // mobile
-    const forceVisible = false; // not in MobileThreadsPane
+    const splitRatio = 0;
+    const forceVisible = false;
     threadDrawerOpen.value = true;
 
     const visible = forceVisible || (threadDrawerOpen.value && splitRatio > 0);
-    expect(visible).toBe(false); // drawer overlay never shows on mobile
+    expect(visible).toBe(false);
   });
 });

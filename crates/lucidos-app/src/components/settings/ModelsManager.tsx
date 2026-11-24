@@ -22,24 +22,15 @@ import { ModelRoutesEditor } from './ModelRoutesEditor';
 import type { ModelInfo } from '../../api/types';
 import { PROVIDERS, PROVIDERS_SETTINGS_PATH, providerLabel } from '../../store/modelProviders';
 
-/** The route that will serve this model, which is what the row's window
- *  describes. A window is per backend, so naming the row's first would be wrong
- *  the moment the preferred one declares a different one. */
 function served(m: ModelInfo) {
   return resolvedRoute(m.id) ?? m.routes[0];
 }
 
-/** Which row's route editor is open, and how to open or close one. */
 export interface RouteEditing {
   id: string | null;
   open: (id: string | null) => void;
 }
 
-/** One registry row: the model's name and id, then the metadata cluster, and
- *  the route editor under it when open. Shared by the current list and the
- *  collapsed groups, so a retired user model keeps its Delete. `needsProvider`
- *  swaps the route badges for links to the providers that would serve it. With
- *  no model, inside a `SkeletonProvider`, it is the list's loading placeholder. */
 function modelRow(m?: ModelInfo, editing?: RouteEditing, needsProvider = false) {
   const editorOpen = !!m && editing?.id === m.id;
   return (
@@ -62,8 +53,6 @@ function modelRow(m?: ModelInfo, editing?: RouteEditing, needsProvider = false) 
   );
 }
 
-/** "Set up", then one link per backend that can serve the model, in the order
- *  the engine resolves them. Each opens that provider's block. */
 function providerSetupLinks(m: ModelInfo) {
   const providers = [...new Set(m.routes.map((r) => r.provider))];
   return (
@@ -84,16 +73,11 @@ function providerSetupLinks(m: ModelInfo) {
   );
 }
 
-/** A row's backend badges and actions. */
 function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing, needsProvider = false) {
   return (
     <div class="model-manager-meta">
       {needsProvider ? providerSetupLinks(m) : (
         <>
-          {/* One badge per backend that can serve this model, in the order the
-              engine resolves them. The preferred one is marked, since a pick
-              is honoured or refused rather than substituted: reading which
-              backend a turn will reach is the point of the row. */}
           {m.routes.map((r) => (
             <span
               key={r.provider}
@@ -114,9 +98,6 @@ function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing, ne
           )}
         </>
       )}
-      {/* The *vision flag*. Chat sends images and image description runs
-          only on models that read images, so this is where a wrong seed gets
-          fixed. */}
       <ToggleIconButton
         tone="glyph"
         class="model-vision-toggle"
@@ -147,7 +128,6 @@ function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing, ne
   );
 }
 
-/** The two folded groups, which open and close independently. */
 export type ModelGroup = 'needs' | 'retired';
 
 function groupToggle(
@@ -169,16 +149,6 @@ function groupToggle(
   );
 }
 
-/** The registry, split into the models the picker can use, the ones no
- *  configured provider serves, and retired ones.
- *
- *  The folded groups sit behind disclosures, one tap away with their routes and
- *  their Delete intact. A retired builtin keeps its row forever, because that is
- *  why routing still resolves a saved `chat_model`. Left flat, the page is
- *  mostly models nothing will run.
- *
- *  A pure function, so the grouping is testable without a DOM. The component
- *  owns the state; this owns the markup. */
 export function modelManagerList(
   models: readonly ModelInfo[],
   open: Record<ModelGroup, boolean>,
@@ -207,10 +177,6 @@ export function modelManagerList(
   );
 }
 
-/** Settings → Models manager: list every registry model with its provider
- *  badges (builtins are never deleted; user models can be), plus an inline
- *  "Add Model" form. Which models the picker lists is the Lucidos Agent's
- *  intelligence ladder, on Settings → Intelligence. */
 export function ModelsManager() {
   const loadable = chatModels.value;
   const showLoading = useDelayedLoading(loadable);
@@ -224,7 +190,6 @@ export function ModelsManager() {
   const [vision, setVision] = useState(false);
 
   const providerOptions = addModelProviderOptions(configuredProviders.value);
-  // The first option until the user picks one, and again if the pick stops being offered.
   const provider = providerOptions.some((p) => p.value === pickedProvider)
     ? pickedProvider
     : (providerOptions[0]?.value ?? '');
@@ -325,9 +290,6 @@ export function ModelsManager() {
                 </div>
                 <div class="settings-row">
                   <span class="settings-row-label" />
-                  {/* A sentence, not a row of fields, so it takes the prose
-                      modifier: the base class is a flex row whose 0.75rem gap is
-                      the field separator (`.claude/rules/frontend.md`). */}
                   <span class="list-row-details list-row-details-prose">
                     Tokens. Left blank, the engine guesses from the model id. It has
                     no rule for OpenRouter, xAI, Gemini, or local models, so they are

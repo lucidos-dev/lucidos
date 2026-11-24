@@ -1,16 +1,3 @@
-/**
- * The webhook refusal bar: the news that deliveries reached this workspace and
- * were thrown away.
- *
- * Four properties. It shows exactly while a refusal stands, with no fuse of its
- * own. It shows ONCE per viewport, the dual-render rule every app-shell banner
- * obeys. It never sends a switched-off hook's owner to look at the signature.
- * And it reserves its own height, because it can be up beside every other bar.
- *
- * Components are invoked as plain functions and the returned vnode tree is
- * walked, the repo idiom. That is why the markup lives in the hook-free
- * `refusalBannerBody` and the gate in `shouldRenderRefusalBanner`.
- */
 import { describe, expect, it, vi } from 'vitest';
 import {
   REFUSAL_BANNER_HEIGHT_VAR,
@@ -48,8 +35,6 @@ describe('the bar is up for exactly as long as the fault is', () => {
   });
 
   it('shows a standing refusal immediately, with no fuse of its own', () => {
-    // The engine spends a count of real deliveries and a half-hour clock
-    // before it declares. A second delay here would make the user wait twice.
     expect(shouldRenderRefusalBanner({ ...DESKTOP, refusal: refusal() })).toBe(true);
   });
 });
@@ -70,9 +55,6 @@ describe('one instance renders, whichever layout is mounted', () => {
 
 describe('the four banners never share a height reservation', () => {
   it('each publishes its own property', () => {
-    // All four can be up at once, and each measures itself. One shared property
-    // would mean whichever measured last wins, and retracting any of them would
-    // clear the space the others still need.
     const vars = [
       REFUSAL_BANNER_HEIGHT_VAR,
       INGRESS_BANNER_HEIGHT_VAR,
@@ -90,8 +72,6 @@ describe('otherRefusalsPhrase', () => {
   });
 
   it('counts the rest rather than naming them', () => {
-    // One bar, one sentence. Naming every hook would grow the bar without
-    // telling the reader anything the Webhooks page will not.
     expect(otherRefusalsPhrase([refusal(), refusal()])).toBe('1 other webhook is too.');
     expect(otherRefusalsPhrase([refusal(), refusal(), refusal()]))
       .toBe('2 other webhooks are too.');
@@ -114,8 +94,6 @@ describe('refusalBannerBody renders the bar', () => {
   });
 
   it('never sends a switched-off hook to the signature', () => {
-    // The wrong turn this fault already cost once: a hook somebody had turned
-    // off answered 401, and the investigation went looking at the HMAC.
     const text = textOf(body());
     expect(text).toContain('switched off');
     expect(text).toContain('Nothing is wrong with the signature or the secret');
@@ -145,9 +123,6 @@ describe('refusalBannerBody renders the bar', () => {
   });
 
   it('offers the same row the ingress bar does, in the same order', () => {
-    // The two bars mirror each other everywhere else, down to one shared CSS
-    // rule whose own test fails on a second copy. Nothing bound the rows
-    // together until this, so they could drift apart silently.
     const ingress = ingressBannerBody({
       layout: 'desktop',
       outage: {
@@ -167,9 +142,6 @@ describe('refusalBannerBody renders the bar', () => {
   });
 
   it('fires Discuss from the Discuss button, for either cause', () => {
-    // The component decides which record it carries, and the scan in
-    // `webhook-refusal-discuss.test.ts` pins that. What belongs here is that
-    // the button reaches the action at all, and reaches only it.
     for (const r of [refusal(), refusal({ cause: 'verification', enabled: true })]) {
       const onOpenWebhooks = vi.fn();
       const onDiscuss = vi.fn();
@@ -181,8 +153,6 @@ describe('refusalBannerBody renders the bar', () => {
   });
 
   it('promises no repair, because the engine performs none', () => {
-    // It reports and never fixes, exactly as the ingress check does. A button
-    // offering a fix would promise what nothing behind it does.
     for (const button of findByType(body(), 'button')) {
       const label = textOf(button);
       for (const verb of ['Fix', 'Repair', 'Enable', 'Retry', 'Reconnect']) {
@@ -192,23 +162,16 @@ describe('refusalBannerBody renders the bar', () => {
   });
 
   it('cannot be dismissed', () => {
-    // It retracts itself the moment a delivery verifies, so a dismiss would
-    // only offer a way to hide a live loss of data.
     expect(findByClass(body(), 'icon-btn')).toHaveLength(0);
     expect(findByType(body(), 'button')).toHaveLength(2);
   });
 
   it('borrows no word from the connection light', () => {
-    // The .status-dot scale names THIS client's connection. A refusing hook is
-    // a different thing entirely: the app is fine and the data is being lost.
     expect(findByClass(body(), 'status-dot')).toHaveLength(0);
     expect(textOf(body())).not.toContain('offline');
   });
 
   it('announces politely and carries no left-accent stripe hook', () => {
-    // The condition has held for at least half an hour, so it is news rather
-    // than an interruption. The stripe is banned outright by
-    // .claude/rules/frontend-css.md; the wash is the emphasis.
     const bar = findByClass(body(), 'refusal-banner')[0];
     expect(bar.props.role).toBe('status');
     expect(bar.props.onClick).toBeUndefined();

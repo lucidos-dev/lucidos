@@ -34,7 +34,6 @@ describe('arrangement edits', () => {
     expect(inOrder(tiles, [key(tiles[2]), key(tiles[0]), key(tiles[1])]).map((t) => t.app_id)).toEqual(['c', 'a', 'b']);
   });
 
-  /** Invariant: a widget is only offered sizes it declares. */
   it('changes a size the widget declares, and refuses one it does not', () => {
     expect(withTile(tiles, key(tiles[0]), { size: 'small' })[0].size).toBe('small');
     expect(withTile(tiles, key(tiles[0]), { size: 'large' })[0].size).toBe('medium');
@@ -48,7 +47,6 @@ describe('arrangement edits', () => {
     ]);
   });
 
-  /** Invariant: an app shortcut has one size, quarter, and no params. */
   it('leaves an app shortcut unchanged by a size edit', () => {
     const mixed: DashboardTile[] = [tile('a'), shortcut('notes')];
     expect(withTile(mixed, key(mixed[1]), { size: 'small' })).toEqual(mixed);

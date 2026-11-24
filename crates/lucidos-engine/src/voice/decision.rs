@@ -1,7 +1,7 @@
 //! What is waiting on the user on one thread, as one thing a caller can settle.
 //!
-//! Four surfaces resolve to a fixed set of choices: a question card, and a
-//! permission card in each of its three lanes. This module reads them as one
+//! Five surfaces resolve to a fixed set of choices: a question card, a
+//! *permission request*, and a permission card in each of its three lanes. This module reads them as one
 //! [`OpenDecision`] and settles one by a choice id. It lives under `voice/`
 //! because the union exists for the talker, and nothing else consumes it.
 //!
@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::{clip, READ_ALOUD_CHARS};
-use crate::engine::agent_recovery::newest_open_question;
-use crate::engine::claude_code::{AllowScope, GrantOffer};
+use crate::engine::open_question::{open_question, OpenRequest};
+use crate::engine::permission::legacy::{self, LegacyCard, LegacyLane, LegacyPick};
+use crate::engine::permission::PickedBy;
 use crate::engine::thread_events::{AnswerKind, MessageOrigin, QuestionOption};
 use crate::engine::LucidosEngine;
 
@@ -44,6 +45,11 @@ pub enum DecisionKind {
     /// can move to a coding agent while a call is already up. Rare, and not
     /// dead: a caller on that thread still hears the card.
     CodingAgentPermission,
+    /// A *permission request* (ADR 0664). The talker reads it back but never
+    /// settles it. `awaited` when an agent prepared it, so the agent's question
+    /// tool waits on the answer. `words_answer` when the caller's own transcript
+    /// settles it, through `permission::words`. Otherwise only a tap does.
+    PermissionRequest { awaited: bool, words_answer: bool },
 }
 
 impl DecisionKind {
@@ -54,21 +60,33 @@ impl DecisionKind {
             Self::CommandPermission => "command",
             Self::McpPermission => "mcp",
             Self::CodingAgentPermission => "agent",
+            Self::PermissionRequest { .. } => "permission",
         }
     }
 
     /// Whether a decision of this kind parks the thread's doer.
     ///
-    /// Every kind here does, being a card the agent is blocked inside. A
-    /// *change* in review is the shape that would answer false, and it is the
-    /// shape this module deliberately cannot read. The match is exhaustive, so
-    /// adding it has to answer this question.
+    /// Every card an agent is blocked inside does, a permission request the
+    /// agent prepared included. One the engine raised itself does not: no agent
+    /// waits on it. A *change* in review
+    /// would answer false too, and this module deliberately cannot read it. The
+    /// match is exhaustive, so adding it has to answer this question.
     pub const fn parks_the_doer(self) -> bool {
         match self {
             Self::Question
             | Self::CommandPermission
             | Self::McpPermission
             | Self::CodingAgentPermission => true,
+            Self::PermissionRequest { awaited, .. } => awaited,
+        }
+    }
+
+    /// The kind a tool-permission card's lane reads as.
+    const fn of_lane(lane: LegacyLane) -> Self {
+        match lane {
+            LegacyLane::Command => Self::CommandPermission,
+            LegacyLane::Mcp => Self::McpPermission,
+            LegacyLane::CodingAgent => Self::CodingAgentPermission,
         }
     }
 }
@@ -83,13 +101,16 @@ enum Act {
     },
     /// Answer it with the caller's own words, which only the call holds.
     TheirWords { tool_use_id: String },
-    /// Resolve the permission card this choice came from. The lane comes from
-    /// the decision holding it.
+    /// Resolve the tool-permission card this choice came from.
     Permit {
+        lane: LegacyLane,
         request_id: String,
-        allowed: bool,
-        scope: Option<AllowScope>,
+        pick: LegacyPick,
     },
+    /// Nothing: the option is read out, never picked. A permission request's
+    /// options and a card's Always allow are settled only by the caller's own
+    /// transcript, through `permission::words`.
+    Heard,
 }
 
 /// One thing the caller may say back.
@@ -129,19 +150,6 @@ const THEIR_WORDS_DETAIL: &str = "Pick this for anything the choices above do \
                                   It sends what the caller actually said, word \
                                   for word.";
 
-/// The three permission scopes a caller may reach, in the order the card draws
-/// them.
-///
-/// Both Always-allow scopes stay on screen. They widen what every future agent
-/// session may do without asking. A caller saying "always" on a phone usually
-/// means "stop asking me right now".
-const ALLOW_ONCE: (&str, &str) = ("Allow once", "Just this one time.");
-const ALLOW_THREAD: (&str, &str) = (
-    "Allow for this thread",
-    "This and anything like it, for the rest of this conversation.",
-);
-const DENY: (&str, &str) = ("Deny", "Refuse it. Lucidos is told no and carries on.");
-
 impl OpenDecision {
     /// A question card, as the talker meets it.
     ///
@@ -159,15 +167,11 @@ impl OpenDecision {
     /// The choices are the card's own options plus one more, for the caller who
     /// said something they do not cover. A free-text question has only that
     /// one, which is right: it is the whole of what the card takes.
-    ///
-    /// An *owner approval card* keeps its Allow once on screen (ADR 0387). It is
-    /// spendable authority, and the talker reads agent-supplied text aloud.
     pub fn question(
         tool_use_id: &str,
         question: &str,
         options: &[QuestionOption],
         multi_select: bool,
-        owner_approval: bool,
     ) -> Self {
         let id = format!("{}:{}", DecisionKind::Question.tag(), tool_use_id);
         // Numbered by position within THIS card, not by the option's own id,
@@ -176,9 +180,6 @@ impl OpenDecision {
         let mut choices: Vec<DecisionChoice> = options
             .iter()
             .enumerate()
-            .filter(|(_, option)| {
-                !(owner_approval && option.label == crate::api::owner_approval::ALLOW_ONCE_LABEL)
-            })
             .map(|(index, option)| DecisionChoice {
                 id: format!("{}#opt{}", id, index),
                 label: option.label.clone(),
@@ -223,68 +224,74 @@ impl OpenDecision {
         }
     }
 
-    /// A command-guard card. Its summary is a fixed risk phrase, and the
-    /// command itself is cut like everything else read aloud.
-    pub fn command_permission(
-        request_id: &str,
-        tool_name: &str,
-        command: &str,
-        summary: &str,
+    /// A *permission request*, as the talker meets it: every option read back,
+    /// none of them pickable.
+    pub(crate) fn permission_request(
+        tool_use_id: &str,
+        question: &str,
+        options: &[QuestionOption],
+        request: OpenRequest,
     ) -> Self {
-        let grantable = crate::engine::command_permission::derive_command_allow_pattern(
-            tool_name,
-            command,
-            AllowScope::Session,
-        )
-        .is_some();
-        Self::permission(
-            DecisionKind::CommandPermission,
-            request_id,
-            &format!("{}\n{}", summary.trim(), clip(command, READ_ALOUD_CHARS)),
-            grantable,
-        )
+        let kind = DecisionKind::PermissionRequest {
+            awaited: request.awaited,
+            words_answer: request.words_answer,
+        };
+        let id = format!("{}:{}", kind.tag(), tool_use_id);
+        let choices = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| DecisionChoice {
+                id: format!("{}#opt{}", id, index),
+                label: option.label.clone(),
+                description: option
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string),
+                act: Act::Heard,
+            })
+            .collect();
+        Self {
+            id,
+            kind,
+            prompt: question.trim().to_string(),
+            choices,
+        }
     }
 
-    /// An MCP card. The server's human label, the tool, and its arguments.
-    pub fn mcp_permission(
-        request_id: &str,
-        server_id: &str,
-        server_name: &str,
-        tool_name: &str,
-        arguments_summary: &str,
-    ) -> Self {
-        let grantable = crate::engine::mcp_permission::derive_mcp_allow_pattern(
-            server_id,
-            tool_name,
-            AllowScope::Session,
-        )
-        .is_some();
-        Self::permission(
-            DecisionKind::McpPermission,
-            request_id,
-            &format!(
-                "{} wants to use its {} tool.\n{}",
-                server_name.trim(),
-                tool_name.trim(),
-                clip(arguments_summary, READ_ALOUD_CHARS)
-            ),
-            grantable,
-        )
-    }
-
-    /// A coding-agent card. Its summary already names the tool and its target.
-    pub fn coding_agent_permission(
-        request_id: &str,
-        grant_offer: Option<&GrantOffer>,
-        summary: &str,
-    ) -> Self {
-        let grantable = grant_offer.is_some_and(|offer| offer.session.is_some());
-        Self::permission(
-            DecisionKind::CodingAgentPermission,
-            request_id,
-            &clip(summary, READ_ALOUD_CHARS),
-            grantable,
-        )
+    /// A tool-permission card, with every button the card draws.
+    ///
+    /// Allow once, Allow for this thread and Deny settle on the talker's pick.
+    /// An Always allow widens what every future session may do, and a caller
+    /// saying "always" on a phone often means "stop asking me right now". So
+    /// it is read back but never picked: only the caller's own words settle it.
+    pub fn tool_permission(card: &LegacyCard) -> Self {
+        let kind = DecisionKind::of_lane(card.lane);
+        let id = format!("{}:{}", kind.tag(), card.request_id);
+        let choices = card
+            .options()
+            .into_iter()
+            .map(|(pick, option)| DecisionChoice {
+                id: format!("{}#{}", id, choice_suffix(pick)),
+                label: option.label,
+                description: option.description,
+                act: match pick {
+                    LegacyPick::Narrow | LegacyPick::Broad => Act::Heard,
+                    LegacyPick::Once | LegacyPick::Session | LegacyPick::Deny => Act::Permit {
+                        lane: card.lane,
+                        request_id: card.request_id.clone(),
+                        pick,
+                    },
+                },
+            })
+            .collect();
+        Self {
+            id,
+            kind,
+            prompt: read_aloud(&card.question),
+            choices,
+        }
     }
 
     /// The id of the choice that sends the caller's own words, when there is
@@ -303,42 +310,27 @@ impl OpenDecision {
             .find(|choice| matches!(choice.act, Act::TheirWords { .. }))
             .map(|choice| choice.id.as_str())
     }
+}
 
-    /// The shared body of the three permission lanes: one wording and one
-    /// choice set, so the caller hears the same options whichever agent asked.
-    ///
-    /// `grantable` is whether an "Allow for this thread" click would record
-    /// anything. Where it would not, the choice is left out rather than
-    /// offered. The screen hides that button for the same reason, and a caller
-    /// cannot see which buttons are there.
-    fn permission(kind: DecisionKind, request_id: &str, prompt: &str, grantable: bool) -> Self {
-        let id = format!("{}:{}", kind.tag(), request_id);
-        let scope = |suffix, (label, detail): (&str, &str), allowed, persist| DecisionChoice {
-            id: format!("{}#{}", id, suffix),
-            label: label.to_string(),
-            description: Some(detail.to_string()),
-            act: Act::Permit {
-                request_id: request_id.to_string(),
-                allowed,
-                scope: persist,
-            },
-        };
-        let mut choices = vec![scope("allow-once", ALLOW_ONCE, true, None)];
-        if grantable {
-            choices.push(scope(
-                "allow-thread",
-                ALLOW_THREAD,
-                true,
-                Some(AllowScope::Session),
-            ));
-        }
-        choices.push(scope("deny", DENY, false, None));
-        Self {
-            id,
-            kind,
-            prompt: prompt.trim().to_string(),
-            choices,
-        }
+/// A card's question as the talker reads it. The first line is the card's
+/// fixed risk phrase and stays whole. The rest, a command or a tool's
+/// arguments, is cut like everything else read aloud.
+fn read_aloud(question: &str) -> String {
+    match question.split_once('\n') {
+        Some((head, rest)) => format!("{}\n{}", head.trim(), clip(rest, READ_ALOUD_CHARS)),
+        None => clip(question, READ_ALOUD_CHARS),
+    }
+}
+
+/// A tool-permission choice's half of its id. Stable, so a talker holding one
+/// from the opening block can still use it a minute later.
+const fn choice_suffix(pick: LegacyPick) -> &'static str {
+    match pick {
+        LegacyPick::Once => "allow-once",
+        LegacyPick::Session => "allow-thread",
+        LegacyPick::Narrow => "always-narrow",
+        LegacyPick::Broad => "always-broad",
+        LegacyPick::Deny => "deny",
     }
 }
 
@@ -428,103 +420,58 @@ impl DecisionResolver for ThreadDecisions {
     }
 }
 
-/// Everything waiting on the user on this thread, in lane order.
+/// Everything waiting on the user on this thread, in lane order: the question
+/// card, then the newest card in each tool-permission lane.
 ///
-/// One indexed read per lane, all four together, and no payload beyond the
-/// newest of each. The caller is waiting for the first word of a phone call.
+/// Two reads, run together. The caller is waiting for the first word of a
+/// phone call.
 ///
 /// A read that fails contributes nothing and logs. A call that opens knowing
 /// less beats one that does not open. On the answering side a lane it could
 /// not read refuses, rather than settling the wrong card.
 pub async fn open_on(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<OpenDecision> {
-    let (question, command, mcp, agent) = tokio::join!(
-        newest_open_question(pool, thread_id),
-        newest_unresolved(
-            pool,
-            thread_id,
-            "CommandPermissionRequested",
-            "CommandPermissionResolved"
-        ),
-        newest_unresolved(
-            pool,
-            thread_id,
-            "McpPermissionRequested",
-            "McpPermissionResolved"
-        ),
-        newest_unresolved(
-            pool,
-            thread_id,
-            "CodingAgentPermissionRequest",
-            "CodingAgentPermissionResolved"
-        ),
+    let (question, cards) = tokio::join!(
+        open_question(pool, thread_id),
+        legacy::open_cards(pool, thread_id),
     );
 
     let mut open = Vec::new();
     if let Some(q) = question {
-        open.push(OpenDecision::question(
-            &q.tool_use_id,
-            &q.question,
-            &q.options,
-            q.multi_select,
-            q.owner_approval,
-        ));
+        open.push(match q.permission_request {
+            Some(request) => {
+                OpenDecision::permission_request(&q.tool_use_id, &q.question, &q.options, request)
+            }
+            None => OpenDecision::question(&q.tool_use_id, &q.question, &q.options, q.multi_select),
+        });
     }
-    if let Some((payload, request_id)) = requested(command) {
-        open.push(OpenDecision::command_permission(
-            &request_id,
-            &text(&payload, "tool_name").unwrap_or_default(),
-            &text(&payload, "command").unwrap_or_default(),
-            &text(&payload, "summary").unwrap_or_default(),
-        ));
-    }
-    if let Some((payload, request_id)) = requested(mcp) {
-        open.push(OpenDecision::mcp_permission(
-            &request_id,
-            &text(&payload, "server_id").unwrap_or_default(),
-            &text(&payload, "server_name").unwrap_or_default(),
-            &text(&payload, "tool_name").unwrap_or_default(),
-            &text(&payload, "arguments_summary").unwrap_or_default(),
-        ));
-    }
-    if let Some((payload, request_id)) = requested(agent) {
-        let offer = payload
-            .get("grant_offer")
-            .and_then(|offer| serde_json::from_value::<GrantOffer>(offer.clone()).ok());
-        open.push(OpenDecision::coding_agent_permission(
-            &request_id,
-            offer.as_ref(),
-            &text(&payload, "summary").unwrap_or_default(),
-        ));
+    let cards = cards.unwrap_or_else(|e| {
+        log_legacy!("[Voice] Could not read the permission cards on {thread_id}: {e}");
+        Vec::new()
+    });
+    for lane in [
+        LegacyLane::Command,
+        LegacyLane::Mcp,
+        LegacyLane::CodingAgent,
+    ] {
+        // Newest first, so the first card in a lane is its newest.
+        if let Some(card) = cards.iter().find(|card| card.lane == lane) {
+            open.push(OpenDecision::tool_permission(card));
+        }
     }
     open
-}
-
-/// A read payload paired with its `request_id`, which every id below is built
-/// from. A payload carrying none is dropped: nothing could resolve it.
-fn requested(payload: Option<serde_json::Value>) -> Option<(serde_json::Value, String)> {
-    let payload = payload?;
-    let request_id = text(&payload, "request_id")?;
-    Some((payload, request_id))
-}
-
-/// A payload string, trimmed, or `None` when it is missing or blank.
-fn text(payload: &serde_json::Value, key: &str) -> Option<String> {
-    let value = payload.get(key)?.as_str()?.trim();
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// What this thread's doer is parked on, if anything.
 ///
 /// **The same read [`open_on`] makes, and deliberately not a cheaper one.** A
-/// yes/no `EXISTS` over the four lanes would be one query instead of four. It
-/// would also answer a DIFFERENT question, by counting a card this reader drops
-/// as unanswerable: a question carrying no `tool_use_id`, say. The thread would
+/// yes/no `EXISTS` over the four lanes would be one query. It would also
+/// answer a DIFFERENT question, by counting a card this reader drops as
+/// unanswerable: a question carrying no `tool_use_id`, say. The thread would
 /// then refuse every delegation for the rest of the call, while the talker
 /// holds no card to put to the caller. That is the worst state a call can be
-/// in, and it is worth three extra reads to make it unreachable.
+/// in, and it is worth the extra reads to make it unreachable.
 ///
-/// The four run concurrently, so the cost is one read of latency. It lands on a
-/// path that is about to emit an event and start a turn.
+/// It lands on a path that is about to emit an event and start a turn.
 ///
 /// The FIRST parking decision, in [`open_on`]'s lane order, which leads with the
 /// question card. A doer is blocked in one place at a time. Where two lanes
@@ -534,40 +481,6 @@ pub async fn parked_on(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<OpenDecis
         .await
         .into_iter()
         .find(|decision| decision.kind.parks_the_doer())
-}
-
-/// The newest request in one permission lane with no paired resolution.
-async fn newest_unresolved(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-    requested: &str,
-    resolved: &str,
-) -> Option<serde_json::Value> {
-    let sql = "SELECT q.payload FROM events q \
-          WHERE q.thread_id = $1 AND q.event_type = $2 \
-            AND NOT EXISTS ( \
-              SELECT 1 FROM events r \
-              WHERE r.thread_id = $1 AND r.event_type = $3 \
-                AND r.payload->>'request_id' = q.payload->>'request_id' ) \
-          ORDER BY q.sequence DESC LIMIT 1";
-    match sqlx::query_scalar::<_, serde_json::Value>(sql)
-        .bind(thread_id)
-        .bind(requested)
-        .bind(resolved)
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(payload) => payload,
-        Err(e) => {
-            log!(
-                "[Voice] Could not read {} on {}: {}",
-                requested,
-                thread_id,
-                e
-            );
-            None
-        }
-    }
 }
 
 /// Settle one decision, by a choice id the engine issued.
@@ -583,7 +496,7 @@ pub async fn resolve(
     actor: Option<MessageOrigin>,
 ) -> Resolution {
     let open = open_on(engine.pool(), thread_id).await;
-    let Some((kind, act)) = choice_in(&open, choice_id) else {
+    let Some((_, act)) = choice_in(&open, choice_id) else {
         return Resolution::Refused(NOT_WAITING.to_string());
     };
 
@@ -610,12 +523,20 @@ pub async fn resolve(
             }
         }
         Act::Permit {
+            lane,
             request_id,
-            allowed,
-            scope,
-        } => permitted(engine, kind, request_id, allowed, scope, actor).await,
+            pick,
+        } => permitted(engine, lane, request_id, pick, actor).await,
+        Act::Heard => Resolution::Refused(PERMISSION_REQUEST_HEARD.to_string()),
     }
 }
+
+/// What the talker is told when it picks an option only the caller's own
+/// words settle: a permission request's, or a card's Always allow.
+pub const PERMISSION_REQUEST_HEARD: &str = "That did not answer it. Lucidos \
+                                            settles this from what the caller \
+                                            says themselves. Read them the \
+                                            choices and let them say one.";
 
 /// What an id names, among what is open right now.
 ///
@@ -644,7 +565,7 @@ async fn answered(
     match answer_pending_question(engine, thread_id, tool_use_id.to_string(), answer, actor).await {
         AnswerResult::Resumed => Resolution::Settled,
         AnswerResult::Conflict(why) => {
-            log!("[Voice] A spoken answer did not land: {}", why);
+            log_legacy!("[Voice] A spoken answer did not land: {}", why);
             Resolution::Refused(SETTLED_MEANWHILE.to_string())
         }
     }
@@ -654,52 +575,26 @@ async fn answered(
 /// is the one the consent endpoint calls.
 async fn permitted(
     engine: &Arc<LucidosEngine>,
-    kind: DecisionKind,
+    lane: LegacyLane,
     request_id: String,
-    allowed: bool,
-    scope: Option<AllowScope>,
+    pick: LegacyPick,
     actor: Option<MessageOrigin>,
 ) -> Resolution {
-    let settled = match kind {
-        DecisionKind::CommandPermission => {
-            crate::engine::command_permission::resolve_command_permission(
-                engine,
-                request_id,
-                allowed,
-                scope,
-                actor,
-                "[Voice] CommandPermissionResolved",
-            )
-            .await
-        }
-        DecisionKind::McpPermission => {
-            crate::engine::mcp_permission::resolve_mcp_permission(
-                engine,
-                request_id,
-                allowed,
-                scope,
-                actor,
-                "[Voice] McpPermissionResolved",
-            )
-            .await
-        }
-        DecisionKind::CodingAgentPermission => {
-            crate::engine::cc_permission::resolve_coding_agent_permission(
-                engine,
-                request_id,
-                allowed,
-                scope,
-                actor,
-                "[Voice] CodingAgentPermissionResolved",
-            )
-            .await
-        }
-        // Unreachable: only a permission lane issues a `Permit`, and those
-        // three are all of them. Refused rather than panicked, because a live
-        // call must not die over a decision it cannot place.
-        DecisionKind::Question => false,
-    };
-    if settled {
+    if legacy::resolve_pick(
+        engine,
+        lane,
+        request_id,
+        pick,
+        legacy::AnsweredBy {
+            actor,
+            picked_by: PickedBy::Spoken {
+                message_event_id: None,
+            },
+        },
+        "[Voice] tool permission resolved",
+    )
+    .await
+    {
         Resolution::Settled
     } else {
         Resolution::Refused(SETTLED_MEANWHILE.to_string())

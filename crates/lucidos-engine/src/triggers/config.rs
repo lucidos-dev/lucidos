@@ -43,36 +43,7 @@ fn supported_extensions_display() -> String {
         .join(", ")
 }
 
-/// Outcome of a trigger's most recent completed firing. Surfaced on the
-/// trigger row (OK / failed) so a threadless (script) trigger's health is
-/// visible without opening its event stream. Wire values are `"ok"` /
-/// `"failed"`; `None` on the config means "never run / legacy" (a
-/// pre-status-field `TriggerExecuted` event carries no outcome).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TriggerRunStatus {
-    Ok,
-    Failed,
-}
-
-impl TriggerRunStatus {
-    /// Map a run outcome (`execute_user_task`'s `Result`) to a status.
-    pub fn from_success(success: bool) -> Self {
-        if success {
-            Self::Ok
-        } else {
-            Self::Failed
-        }
-    }
-
-    /// Wire string used in the `TriggerExecuted` payload and the trigger-list API.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Failed => "failed",
-        }
-    }
-}
+pub use crate::engine::trigger_context::TriggerRunStatus;
 
 /// What a trigger executes — either an LLM intent or a deterministic script.
 /// The tagged union enforces mutual exclusivity.
@@ -86,6 +57,21 @@ pub enum TriggerRun {
     },
     #[serde(rename = "script")]
     Script { path: String },
+}
+
+/// A program scope using the command guard's permission syntax. Historical
+/// invocation records carry `legacy` and confer no authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerProgramGrant {
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<LegacyInvocationGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyInvocationGrant {
+    pub fingerprint: String,
+    pub category: SideEffectCategory,
 }
 
 /// In-memory representation of a trigger, rebuilt from events on startup.
@@ -127,16 +113,18 @@ pub struct TriggerConfig {
     /// organizational label — does not affect firing. None renders the
     /// trigger under the implicit "Ungrouped" section in the panel.
     pub group_id: Option<String>,
-    /// The trigger's **side-effect grant** (ADR 0002, Phase 5): the set of
-    /// irreversible side-effect categories it's authorized to perform
-    /// unattended. Empty (the default) means the trigger may NOT perform any
-    /// irreversible side-effect — the command guard fails the trigger if its
-    /// intent tries to. Only consulted when the `command_guard` preference is on.
+    /// Retired category grants, kept for event replay and upgrade review.
     pub side_effect_grant: Vec<SideEffectCategory>,
+    pub program_grants: Vec<TriggerProgramGrant>,
+    pub folder_grants: Vec<super::folder_grant::TriggerFolderGrant>,
+    /// The **trigger denies**: program patterns and folders the owner chose
+    /// Always deny for. A run that needs one fails at once, with no card. An
+    /// entry is never both granted and denied (`settle_denies`).
+    pub program_denies: Vec<String>,
+    pub folder_denies: Vec<std::path::PathBuf>,
     /// The trigger's **coding-agent grant**: whether a run it fires may start a
     /// coding-agent thread. False (the default) refuses that spawn at the
-    /// spawn gate (`agent_session::spawn_gate`) and fails the run loudly. It classifies spawns,
-    /// so it sits beside `side_effect_grant`, which classifies commands.
+    /// spawn gate (`agent_session::spawn_gate`) and fails the run loudly.
     pub coding_agent_grant: bool,
     /// The trigger's **context ceiling** (ADR 0629), copied onto each thread it
     /// fires. `None` leaves those threads on the workspace preference.
@@ -433,7 +421,7 @@ pub(crate) fn parse_context_ceiling(
         .ok_or_else(|| format!("a context ceiling is a string (got {value})"))
         .and_then(ContextCeiling::parse)
         .map_err(|e| {
-            log!(
+            log_legacy!(
                 "[Triggers] Ignored context_ceiling on {}: {}",
                 trigger_id,
                 e
@@ -465,15 +453,94 @@ pub(crate) fn parse_mcp_servers(field: Option<&Value>) -> Vec<String> {
     normalize_mcp_servers(arr.iter().filter_map(|v| v.as_str()))
 }
 
+fn parse_program_denies(payload: &Value) -> Vec<String> {
+    serde_json::from_value(payload["program_denies"].clone()).unwrap_or_default()
+}
+
+fn parse_folder_denies(payload: &Value) -> Vec<std::path::PathBuf> {
+    serde_json::from_value(payload["folder_denies"].clone()).unwrap_or_default()
+}
+
+/// The strings a payload lists under `key`.
+fn listed<'a>(payload: &'a Value, key: &str) -> Option<Vec<&'a str>> {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+}
+
+pub(crate) fn parse_program_grants(payload: &Value) -> Vec<TriggerProgramGrant> {
+    payload["program_grants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|grant| serde_json::from_value(grant.clone()).ok())
+        .collect()
+}
+
 impl TriggerConfig {
-    /// Whether the owner gave this trigger a coding-agent grant or any
-    /// side-effect category.
+    /// Whether this trigger holds any grant.
     pub fn holds_a_grant(&self) -> bool {
-        self.coding_agent_grant || !self.side_effect_grant.is_empty()
+        self.coding_agent_grant
+            || !self.side_effect_grant.is_empty()
+            || !self.program_grants.is_empty()
+            || !self.folder_grants.is_empty()
     }
 
-    /// Whether `next` holds a grant this trigger lacks: the coding-agent grant,
-    /// or a side-effect category outside the current set. Only the owner may
+    /// Whether this trigger's Always deny covers `pattern`.
+    pub fn denies_program(&self, pattern: &str) -> bool {
+        self.program_denies.iter().any(|denied| denied == pattern)
+    }
+
+    /// The denied folder that holds `folder`, if any. A deny covers the
+    /// folders inside it too.
+    pub fn denied_folder(&self, folder: &std::path::Path) -> Option<&std::path::Path> {
+        self.folder_denies
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .find(|denied| folder.starts_with(denied))
+    }
+
+    /// Add Always deny for `programs` and `folders`, and drop the grants they
+    /// name.
+    pub fn deny(&mut self, programs: &[String], folders: &[std::path::PathBuf]) {
+        for pattern in programs {
+            if !self.program_denies.contains(pattern) {
+                self.program_denies.push(pattern.clone());
+            }
+        }
+        for folder in folders {
+            if !self.folder_denies.contains(folder) {
+                self.folder_denies.push(folder.clone());
+            }
+        }
+        self.settle_denies(true);
+    }
+
+    /// Keep each entry on one side only. `denies_win` says which side the
+    /// newest write set, so it keeps the entries both sides hold. Two folders
+    /// conflict when either holds the other: a grant over a denied folder
+    /// would let its writes through, so the deny would never fire.
+    fn settle_denies(&mut self, denies_win: bool) {
+        fn nested(a: &std::path::Path, b: &std::path::Path) -> bool {
+            a.starts_with(b) || b.starts_with(a)
+        }
+        if denies_win {
+            let denies = (self.program_denies.clone(), self.folder_denies.clone());
+            self.program_grants
+                .retain(|grant| !denies.0.contains(&grant.pattern));
+            self.folder_grants
+                .retain(|grant| !denies.1.iter().any(|denied| nested(&grant.folder, denied)));
+        } else {
+            let grants = (self.program_grants.clone(), self.folder_grants.clone());
+            self.program_denies
+                .retain(|denied| !grants.0.iter().any(|grant| &grant.pattern == denied));
+            self.folder_denies
+                .retain(|denied| !grants.1.iter().any(|grant| nested(&grant.folder, denied)));
+        }
+    }
+
+    /// Whether `next` holds a grant this trigger lacks. Only the owner may
     /// widen a grant (ADR 0641).
     pub fn widens_a_grant(&self, next: &TriggerConfig) -> bool {
         (next.coding_agent_grant && !self.coding_agent_grant)
@@ -481,9 +548,17 @@ impl TriggerConfig {
                 .side_effect_grant
                 .iter()
                 .any(|c| !self.side_effect_grant.contains(c))
+            || next
+                .program_grants
+                .iter()
+                .any(|grant| !self.program_grants.contains(grant))
+            || next
+                .folder_grants
+                .iter()
+                .any(|grant| !self.folder_grants.contains(grant))
     }
 
-    /// Whether an agent's or app frame's edit to `next` must drop both grants.
+    /// Whether an agent's or app frame's edit to `next` must drop its grants.
     /// The owner granted this trigger's work, so a change to its run, its
     /// events or its MCP servers needs the owner again.
     pub fn unowned_edit_clears_grants(&self, next: &TriggerConfig) -> bool {
@@ -494,10 +569,32 @@ impl TriggerConfig {
             && (next.run != self.run || next.on != self.on || servers(next) != servers(self))
     }
 
-    /// Stamp an update payload so it drops both grants.
+    /// The **definition digest** (ADR 0664): a hex SHA-256 of what this trigger
+    /// runs and when, namely `run`, `on`, the cron, its MCP servers and its
+    /// app. Consent to a grant binds to the digest the owner was shown.
+    /// Computed on read, so a trigger stored before digests has one too.
+    pub fn definition_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let servers: std::collections::BTreeSet<&str> =
+            self.mcp_servers.iter().map(String::as_str).collect();
+        let definition = serde_json::json!({
+            "run": self.run,
+            "on": self.on,
+            "cron": self.schedule,
+            "mcp_servers": servers,
+            "app": self.owning_app_id(),
+        });
+        let canonical = crate::core::snapshot::manifest::canonical_json(&definition)
+            .expect("a trigger definition is plain JSON");
+        crate::core::hex::hex_lower(&Sha256::digest(canonical))
+    }
+
+    /// Stamp an update payload so it drops all grants.
     pub fn clear_grants_in(payload: &mut Value) {
         payload["coding_agent_grant"] = Value::Bool(false);
         payload["side_effect_grant"] = Value::Array(Vec::new());
+        payload["program_grants"] = Value::Array(Vec::new());
+        payload["folder_grants"] = Value::Array(Vec::new());
     }
 
     /// What an agent must tell the user after its edit cleared the grants.
@@ -569,7 +666,7 @@ impl TriggerConfig {
             .filter(|s| {
                 let ok = is_path_safe_trigger_slug(s);
                 if !ok {
-                    log!(
+                    log_legacy!(
                         "[Triggers] Ignored unsafe slug '{}' in TriggerCreated for {}",
                         s,
                         id
@@ -605,7 +702,7 @@ impl TriggerConfig {
         let continue_key = ContinueKeySpec::from_stored(payload.get("continue_key"), &id);
         let actor = ActorField::from_stored(payload.get(ACTOR_FIELD_KEY), &id);
 
-        Ok(TriggerConfig {
+        let mut config = TriggerConfig {
             id,
             name,
             slug,
@@ -620,6 +717,11 @@ impl TriggerConfig {
             go_to_review,
             group_id,
             side_effect_grant,
+            program_grants: parse_program_grants(payload),
+            folder_grants: serde_json::from_value(payload["folder_grants"].clone())
+                .unwrap_or_default(),
+            program_denies: parse_program_denies(payload),
+            folder_denies: parse_folder_denies(payload),
             coding_agent_grant,
             context_ceiling,
             mcp_servers,
@@ -629,7 +731,9 @@ impl TriggerConfig {
             provider,
             continue_key,
             actor,
-        })
+        };
+        config.settle_denies(true);
+        Ok(config)
     }
 
     /// Directory name of the app that owns this trigger, used to stamp notifications.
@@ -649,7 +753,7 @@ impl TriggerConfig {
     /// This trigger's timezone, falling back to UTC on an unparseable name.
     pub(crate) fn timezone_or_utc(&self) -> chrono_tz::Tz {
         self.timezone.parse().unwrap_or_else(|_| {
-            log!(
+            log_legacy!(
                 "[Triggers] Invalid timezone '{}' for trigger {}, using UTC",
                 self.timezone,
                 self.id
@@ -664,9 +768,9 @@ impl TriggerConfig {
         self.schedule
             .iter()
             .filter_map(|expr| {
-                crate::engine::tools::scheduler::parse_standard_cron(expr)
+                crate::scheduler::cron_rules::parse_standard_cron(expr)
                     .map_err(|e| {
-                        log!(
+                        log_legacy!(
                             "[Triggers] Corrupt cron expression '{}' in trigger {}: {}",
                             expr,
                             self.id,
@@ -692,7 +796,7 @@ impl TriggerConfig {
             return Vec::new();
         }
         let schedules = self.parsed_schedules();
-        crate::engine::tools::scheduler::next_occurrences_after(
+        crate::scheduler::cron_rules::next_occurrences_after(
             &schedules,
             self.timezone_or_utc(),
             now,
@@ -720,7 +824,7 @@ impl TriggerConfig {
         let tz = self.timezone_or_utc();
         let mut first_problem: Option<String> = None;
         for expr in &self.schedule {
-            match crate::engine::tools::scheduler::parse_standard_cron(expr) {
+            match crate::scheduler::cron_rules::parse_standard_cron(expr) {
                 Ok(schedule) => {
                     if schedule.upcoming(tz).next().is_some() {
                         return None;
@@ -729,7 +833,7 @@ impl TriggerConfig {
                         format!(
                             "'{}' can never fire: {}",
                             expr,
-                            crate::engine::tools::scheduler::diagnose_never_fires(&schedule)
+                            crate::scheduler::cron_rules::diagnose_never_fires(&schedule)
                         )
                     });
                 }
@@ -771,6 +875,10 @@ impl TriggerConfig {
             "go_to_review": self.go_to_review,
             "group_id": self.group_id,
             "side_effect_grant": self.side_effect_grant,
+            "program_grants": self.program_grants,
+            "folder_grants": self.folder_grants,
+            "program_denies": self.program_denies,
+            "folder_denies": self.folder_denies,
             "coding_agent_grant": self.coding_agent_grant,
             "context_ceiling": self.context_ceiling,
             "mcp_servers": self.mcp_servers,
@@ -802,7 +910,7 @@ impl TriggerConfig {
             if is_valid_trigger_slug(slug) {
                 self.slug = slug.to_string();
             } else {
-                log!(
+                log_legacy!(
                     "[Triggers] Ignored invalid slug '{}' in TriggerUpdated for {}",
                     slug,
                     self.id
@@ -855,7 +963,57 @@ impl TriggerConfig {
         // HTTP layer always sends the whole array on a change, mirroring `on`.
         if payload.get("side_effect_grant").is_some() {
             self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+            self.program_grants.retain(|grant| {
+                grant
+                    .legacy
+                    .as_ref()
+                    .is_none_or(|legacy| self.side_effect_grant.contains(&legacy.category))
+            });
         }
+        if let Some(grants) = payload.get("folder_grants") {
+            self.folder_grants = serde_json::from_value(grants.clone()).unwrap_or_default();
+        }
+        if payload.get("program_grants").is_some() {
+            self.program_grants = parse_program_grants(payload);
+        }
+        if let Some(revoked) = payload
+            .get("revoke_program_grants")
+            .and_then(Value::as_array)
+        {
+            self.program_grants.retain(|grant| {
+                !revoked
+                    .iter()
+                    .any(|pattern| pattern.as_str() == Some(grant.pattern.as_str()))
+            });
+        }
+        if let Some(revoked) = payload
+            .get("revoke_folder_grants")
+            .and_then(Value::as_array)
+        {
+            self.folder_grants.retain(|grant| {
+                let folder = grant.folder.to_string_lossy();
+                !revoked
+                    .iter()
+                    .any(|listed| listed.as_str() == Some(&*folder))
+            });
+        }
+        let denies_set =
+            payload.get("program_denies").is_some() || payload.get("folder_denies").is_some();
+        if payload.get("program_denies").is_some() {
+            self.program_denies = parse_program_denies(payload);
+        }
+        if payload.get("folder_denies").is_some() {
+            self.folder_denies = parse_folder_denies(payload);
+        }
+        if let Some(revoked) = listed(payload, "revoke_program_denies") {
+            self.program_denies
+                .retain(|denied| !revoked.contains(&denied.as_str()));
+        }
+        if let Some(revoked) = listed(payload, "revoke_folder_denies") {
+            self.folder_denies
+                .retain(|denied| !revoked.contains(&&*denied.to_string_lossy()));
+        }
+        self.settle_denies(denies_set);
         if let Some(v) = payload.get("coding_agent_grant").and_then(|v| v.as_bool()) {
             self.coding_agent_grant = v;
         }
@@ -905,7 +1063,7 @@ impl TriggerConfig {
                     // An out-of-set tier is dropped rather than applied, like an
                     // invalid slug above: a bad event must never wedge the
                     // in-memory config into sending a tier no provider knows.
-                    Some(e) if !is_valid_reasoning_effort(&e) => log!(
+                    Some(e) if !is_valid_reasoning_effort(&e) => log_legacy!(
                         "[Triggers] Ignored invalid reasoning_effort '{}' in TriggerUpdated for {}",
                         e,
                         self.id

@@ -5,9 +5,6 @@ import { vnodeToText } from './vnodeToText';
 import { contextViewer } from '../../../store/store';
 import type { ContextCapture, ResponseEvent } from '../../../store/types';
 
-/** The context counter on a step row. In a narrow row the full
- *  "178k / 1M (18%)" does not fit beside the description, and the row is
- *  `nowrap`, so the compact form keeps only the percentage. */
 describe('contextLabel', () => {
   it('full: used, window and percent', () => {
     expect(contextLabel(178_000, 1_000_000, null, false)).toBe('178k / 1M (18%)');
@@ -26,20 +23,12 @@ describe('contextLabel', () => {
     expect(contextLabel(900, null, null, false)).toBe('900 tokens');
   });
 
-  /** A usage over the window means the WINDOW is wrong, and the counter is
-   *  where that shows. Clamping it read as "exactly full", which is how a real
-   *  240k Claude Code prompt sat behind a healthy-looking 100%. */
   it('over the window: reports the real percentage, never a clamped 100%', () => {
     expect(contextLabel(240_919, 200_000, null, false)).toBe('241k / 200k (120%)');
     expect(contextLabel(240_919, 200_000, null, true)).toBe('120%');
   });
 });
 
-/** Which form is SHOWN is a width question the row answers in CSS (the
- *  `step-row` container query in steps.css), so the component's job is to put
- *  both in the DOM under the classes that gate reads. Rendering one of them
- *  from a viewport signal is the regression this pins: it re-gates on the
- *  device, and a desktop thread pane dragged narrow gets the crowded row back. */
 describe('InlineStep context suffix', () => {
   const capture: ContextCapture = {
     producer: 'main_llm',
@@ -69,10 +58,6 @@ describe('InlineStep context suffix', () => {
   });
 });
 
-/** The counter is the context viewer's only door, now that a thinking pass no
- *  longer gets a row of its own to click. So it has to BE a button wherever
- *  there is a snapshot behind it, and must not pretend to be one where there
- *  isn't. */
 describe('StepContext as a click target', () => {
   const capture: ContextCapture = {
     producer: 'main_llm',
@@ -101,8 +86,6 @@ describe('StepContext as a click target', () => {
     expect(counter.type).toBe('button');
     (counter.props.onClick as () => void)();
     expect(contextViewer.value?.snapshot).toBe(capture);
-    // The viewer opens from a row and would otherwise be a wall of sections
-    // with no statement of which call it belongs to.
     expect(contextViewer.value?.description).toBe('Run ls');
   });
 

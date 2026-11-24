@@ -1,14 +1,9 @@
-/** A first page that draws nothing does not make the thread empty.
- *
- *  A terminal verdict needs the whole history loaded, and the skeleton covers
- *  the wait. See docs/glossary.md § Whole history loaded. */
 import { describe, it, expect } from 'vitest';
 import { emptyReason } from '../ThreadView';
 import { wholeHistoryLoaded, threadIsLoadingNow } from '../threadSkeletonGate';
 
 const ID = 'thread-1';
 
-/** ThreadView's own wiring: one predicate feeds both the verdict and the gate. */
 function verdict(opts: { hasOlderEvents: boolean; hasContent?: boolean; turnInFlight?: boolean; disconnected?: boolean }) {
   const historyLoaded = wholeHistoryLoaded(true, opts.hasOlderEvents);
   const disconnected = opts.disconnected ?? false;

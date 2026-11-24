@@ -11,7 +11,6 @@ import {
 
 const SEARCH_FILES = { mod: true, shift: false, alt: false, key: 'p' };
 
-/** The origin the host serves app frames from, as the SDK reads it. */
 const HOST_ORIGIN = 'https://localhost:5251';
 
 describe('matchesHostBinding', () => {
@@ -55,8 +54,6 @@ describe('isForwardableKeydown', () => {
   });
 
   it('does not forward Shift-only chords', () => {
-    // A Shift+letter is just an uppercase keystroke to the app — `shiftKey`
-    // isn't even read, so it can never tip a bare letter into being forwarded.
     expect(isForwardableKeydown({ metaKey: false, ctrlKey: false, altKey: false, key: 'A' })).toBe(false);
   });
 });
@@ -78,8 +75,6 @@ describe('toForwardedKeydown', () => {
 describe('installKeyboardForwarding', () => {
   let cleanup: () => void = () => {};
 
-  // The test env has no `KeyboardEvent`; dispatch a real `Event` carrying the
-  // chord props the forwarder reads (the codebase's no-jsdom convention).
   function fireKeydown(props: Partial<KeyboardEvent>) {
     const e = new Event('keydown');
     Object.assign(e, props);
@@ -130,7 +125,6 @@ describe('installKeyboardForwarding', () => {
   });
 
   it('no-ops when there is no parent window (SDK loaded top-level)', () => {
-    // Self-parenting is the top-level signal — nothing to forward to.
     (window as unknown as { parent: unknown }).parent = window;
     const post = vi.fn();
     (window as unknown as { postMessage: unknown }).postMessage = post;
@@ -144,8 +138,6 @@ describe('installKeyboardForwarding', () => {
     (window as unknown as { parent: unknown }).parent = parent;
     vi.stubGlobal('location', { origin: HOST_ORIGIN });
     cleanup = installKeyboardForwarding();
-    // The host's push, as _bridge.ts receives it: from the parent, on the frame's
-    // origin, on the channel.
     const push = new Event('message');
     Object.assign(push, { source: parent, origin: 'https://localhost:5251', data: { type: 'lucidos:bridge:push', channel: KEYBINDINGS_CHANNEL, data: { bindings: [SEARCH_FILES] } } });
     window.dispatchEvent(push);

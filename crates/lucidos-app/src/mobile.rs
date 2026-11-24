@@ -38,11 +38,13 @@ const SERVE_IDENTITY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bound on `tailscale version`, the one CLI call the status path makes. Answers
 /// in milliseconds when healthy; the ceiling exists for when it does not.
+#[cfg(target_os = "macos")]
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bound on one `ipconfig getifaddr` call. It answers instantly on a healthy
 /// machine. The ceiling is here because this runs on the path a settings pane
 /// awaits, and every other call on that path is already bounded.
+#[cfg(target_os = "macos")]
 const LAN_IP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The port `tailscale serve` fronts, and the one [`tailscale_serve`] configures.
@@ -260,6 +262,7 @@ fn health_instance_id(body: &str) -> Option<String> {
 /// the pipes, so a child that filled a pipe buffer would block instead of
 /// exiting. The `serve` run does NOT use this, because it must read the
 /// child's output while it is still running (see [`supervise_serve`]).
+#[cfg(any(target_os = "macos", test))]
 fn output_with_timeout(
     mut cmd: Command,
     label: &str,
@@ -1013,6 +1016,7 @@ fn tailscale_cli() -> Option<String> {
 /// Pure so the exit-0 liar can be pinned by a test rather than by a Mac. Real
 /// output opens with the version itself (`1.96.4-t41cb72f27`); the GUI
 /// executable opens with an apology and exits 0 all the same.
+#[cfg(any(target_os = "macos", test))]
 fn reports_a_version(stdout: &str) -> bool {
     let first = stdout.lines().next().unwrap_or_default().trim();
     let major = first.split('.').next().unwrap_or_default();

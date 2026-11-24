@@ -11,14 +11,11 @@ test.describe('Empty and error states', () => {
   test('fresh app shows compose view, not loading forever', async ({ page }) => {
     await navigateToApp(page);
 
-    // Go to compose view
     await newThread(page);
 
-    // The input should be visible and ready
     const input = await waitForVisibleInput(page);
     await expect(input).toBeVisible();
 
-    // The placeholder should always be the same nudge
     const placeholder = await input.getAttribute('placeholder');
     expect(placeholder).toBe('What can I help with?');
   });
@@ -26,10 +23,8 @@ test.describe('Empty and error states', () => {
   test('thread drawer can be opened and shows content', async ({ page }) => {
     await navigateToApp(page);
 
-    // Open the thread drawer (openThreadDrawer already waits for drawer visibility)
     await openThreadDrawer(page);
 
-    // Whether there are threads or not, the drawer rendered (not stuck loading)
     const threadCount = await page.locator('.thread-row').count();
     expect(threadCount).toBeGreaterThanOrEqual(0);
   });

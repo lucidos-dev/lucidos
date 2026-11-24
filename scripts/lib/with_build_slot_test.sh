@@ -113,6 +113,57 @@ for broken in 'prune_stale_incremental() { return 7; }' 'prune_stale_incremental
     if [ -f "$TMP/build.ran" ]; then pass "the build ran"; else fail "the build did not run"; fi
 done
 
+cat > "$TMP/bin/lucidos" <<'EOF'
+#!/bin/bash
+[ "$1" = build-slot ] || exit 2
+if [ "$2" = --help ]; then
+    [ -z "${NEW_BROKER:-}" ] || echo 'Script protocol: --lease'
+    exit 0
+fi
+if [ "$4" = --lease ]; then
+    echo 'granted 0 2 10'
+    read -r _
+    exit 0
+fi
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+EOF
+chmod +x "$TMP/bin/lucidos"
+
+# shellcheck source=scripts/lib/build_slot_lease.sh
+source "$SCRIPT_DIR/build_slot_lease.sh"
+leased_body() {
+    "$PROJECT_DIR/scripts/with-build-slot.sh" -- fake-build
+}
+
+test_an_old_broker_falls_back_to_per_step_slots() {
+    (cd "$TMP" && PATH="$SAFE_PATH" PROJECT_DIR="$TMP" build_slot_leased engine leased_body)
+    expect_eq "old broker ran the build" 0 "$?"
+}
+test_no_broker_runs_the_body_unleased() {
+    mv "$TMP/bin/lucidos" "$TMP/bin/lucidos.saved"
+    (cd "$TMP" && PATH="$SAFE_PATH" PROJECT_DIR="$TMP" build_slot_leased engine leased_body)
+    expect_eq "missing broker ran the build" 0 "$?"
+    mv "$TMP/bin/lucidos.saved" "$TMP/bin/lucidos"
+}
+test_lease_runs_the_memory_gate_once() {
+    rm -f "$TMP/gate.calls" "$TMP/build.ran"
+    (cd "$TMP" && PATH="$SAFE_PATH" PROJECT_DIR="$TMP" NEW_BROKER=1 \
+        build_slot_leased engine leased_body)
+    expect_eq "leased build ran" 0 "$?"
+    expect_eq "gate ran once before acquisition" "--label engine" "$(cat "$TMP/gate.calls")"
+    case "$(cat "$TMP/build.ran" 2>/dev/null)" in
+        '' | none | *[!0-9]*) fail "the leased build inherited no pass timestamp" ;;
+        *) pass "the leased build inherited the pass timestamp" ;;
+    esac
+}
+rm -f "$TMP/scripts/lib/stale_incremental.sh"
+unset LUCIDOS_BUILD_SLOT_HELD LUCIDOS_BUILD_SLOT_LEASE_NICE
+test_an_old_broker_falls_back_to_per_step_slots
+test_no_broker_runs_the_body_unleased
+test_lease_runs_the_memory_gate_once
+
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

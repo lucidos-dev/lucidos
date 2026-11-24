@@ -8,21 +8,11 @@ import { formatMessageTimestamp } from '../../utils/formatTime';
 import { AutoTextarea } from '../shared/AutoTextarea';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
-/** Send-flow driver, extracted hook-free for tests. Guards double-submit (an
- *  in-flight send makes further clicks a no-op — repeated clicks used to queue
- *  duplicate sends), toggles the pending flag around the request, and maps the
- *  three outcomes: success → the panel becomes a sent receipt in place (falling
- *  back to a success toast when the panel is gone, see `markSent`); engine
- *  `{success:false}` → error toast, form stays open for retry; thrown error →
- *  same via `errorDetail`. */
 export async function driveSend(io: {
   isSending: () => boolean;
   setSending: (v: boolean) => void;
   send: () => Promise<{ success: boolean; error?: string }>;
   toast: (msg: string, type: 'success' | 'error') => void;
-  /** Flip the open panel to its read-only receipt. Returns false when the panel
-   *  is no longer the active overlay (the user dismissed it mid-send), in which
-   *  case the toast is the only place the success can land. */
   markSent: () => boolean;
 }): Promise<void> {
   if (io.isSending()) return;
@@ -44,17 +34,11 @@ export async function driveSend(io: {
 export function EmailConfirmModal() {
   const form = activeInlineForm.value;
   if (form?.type !== 'email-confirm') return null;
-  // Two components rather than one branching on `sentAt`, so the draft's hooks
-  // are never conditionally skipped: flipping to sent unmounts the editor and
-  // mounts the receipt.
   return form.sentAt
     ? <EmailSentReceipt sent={form.request} sentAt={form.sentAt} />
     : <EmailConfirmDraft form={form} />;
 }
 
-/** Read-only recipients as a compact grouped card so the editable Subject/Body
- *  stay the focus. Shared by the draft and the receipt — on the receipt the
- *  subject joins it, since nothing there is editable any more. */
 function EmailMeta({ request, subject }: { request: EmailConfirmForm['request']; subject?: string }) {
   return (
     <div class="email-confirm-meta">
@@ -105,17 +89,9 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
   const draft = form.request;
   const [subject, setSubject] = useState(draft.subject);
   const [body, setBody] = useState(draft.body);
-  // An SMTP send is non-idempotent and can take tens of seconds (attachment
-  // upload) — repeated Send clicks would deliver duplicate emails. The ref
-  // carries the double-submit guard (a render-captured boolean would let two
-  // rapid clicks in the same render window both read `false`); the state twin
-  // drives the disabled/label rendering. Across a REMOUNT the guard is the
-  // form's own `sentAt` instead: a sent email renders the receipt, which has no
-  // Send button at all.
   const sendingRef = useRef(false);
   const [sending, setSending] = useState(false);
 
-  // `void`: driveSend never rejects — every outcome is handled inside it.
   const handleSend = () => {
     void driveSend({
       isSending: () => sendingRef.current,
@@ -134,12 +110,6 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
         });
       },
       toast: showToast,
-      // Keeps the user on this panel — the send confirmation is the panel
-      // itself, showing what actually went out. No-ops (→ toast) if THIS draft
-      // is no longer the active form: the buttons are disabled while sending,
-      // but Escape still dismisses the panel, and a late success (the send
-      // window is up to ~120s) must not resurrect it over an unrelated
-      // form/overlay the user opened since.
       markSent: () => markEmailSent(form, { subject, body }),
     });
   };
@@ -171,12 +141,6 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
   );
 }
 
-/** The panel after a successful send: the same page, read-only, showing exactly
- *  what went out. It stays on screen instead of closing so the send has a
- *  visible result, and it owns the panel's nav-history slot (relabelled "Email
- *  Sent" by `getFormTitle`) so the user can walk back to it later. Deliberately
- *  offers no Send and no Cancel — the email is gone, the only action left is to
- *  close the panel and return to whatever view was underneath. */
 function EmailSentReceipt({ sent, sentAt }: { sent: EmailConfirmForm['request']; sentAt: string }) {
   return (
     <div class="inline-form email-confirm protected-surface">

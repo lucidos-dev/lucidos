@@ -1,13 +1,3 @@
-/**
- * The one reading of a workspace's health, and the sentence a faulty one owes
- * the user.
- *
- * The distinction the whole module exists for is the pair the gateway cannot
- * tell apart on its own: a workspace that was never started answers `unhealthy`
- * with "not started", which is a calm idle, not a failure. Every surface that
- * draws a dot for a workspace reads this, so the two must not disagree, and
- * nothing may grow a red explanation for a workspace that is simply off.
- */
 import { describe, it, expect } from 'vitest';
 import {
   WORKSPACE_STATE_LABEL,
@@ -17,7 +7,6 @@ import {
 } from './workspaceState';
 import type { WorkspaceStatus } from '../api/client/control';
 
-/** A gateway status row, with only the fields these rules read set. */
 const ws = (health: string, lastError?: string | null): WorkspaceStatus =>
   ({ id: 'w1', name: 'dev', health, last_error: lastError ?? null } as unknown as WorkspaceStatus);
 
@@ -47,8 +36,6 @@ describe('workspaceStateLabel', () => {
 
 describe('workspaceFaultNote', () => {
   it('explains the one state that is a fault', () => {
-    // The state the picker draws in red, and the only one where the row owes an
-    // explanation rather than a label.
     expect(workspaceFaultNote(ws('unhealthy', 'engine exited with code 1')))
       .toBe('engine exited with code 1');
   });
@@ -58,9 +45,6 @@ describe('workspaceFaultNote', () => {
   });
 
   it('stays silent for every state the row already explains', () => {
-    // A stopped workspace is the trap: it reaches us as `unhealthy` with "not
-    // started", and a red sentence under a workspace the user switched off
-    // would be a fault reported where there is none.
     expect(workspaceFaultNote(ws('unhealthy', 'not started'))).toBeNull();
     expect(workspaceFaultNote(ws('healthy'))).toBeNull();
     expect(workspaceFaultNote(ws('booting'))).toBeNull();

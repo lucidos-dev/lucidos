@@ -59,8 +59,9 @@ Friction signals to pull:
 | Signal | Event types |
 |---|---|
 | Tool failures | `ToolResult` payloads with errors; repeated `ToolCalled` to the same target without success. HTTP-tool failures land here too: there is no dedicated HTTP event. |
-| Circuit-breaker trips | Find forced-break text in `ResponseGenerated`, alongside preceding `ToolResult` errors. Warnings exist only in the model's in-memory messages and leave no persisted event. See `system-knowhow/running-python.md` § Anti-patterns that burn context. |
+| Circuit-breaker trips | Find forced-break text in `ResponseGenerated`, alongside preceding `ToolResult` errors. Warnings exist only in the model's in-memory messages and leave no persisted event. See `system-knowhow/running-python/the-per-workspace-venv.md` § Anti-patterns that burn context. |
 | Failed responses | `ResponseFailed` payloads: model errors, timeouts, parse failures. Group by error reason. |
+| Memory extraction failures | `MemoryExtractionFailed`: group by `model` and `reason`. Each event records one exhausted operation; an empty facts array is successful. See `system-knowhow/thread-events.md`. |
 | Aborts / cancels | `ResponseAborted` (system) and `ResponseCanceled` (user). Group both. |
 | Trigger failures | `TriggerCompleted` payloads whose `result_summary` carries an error. The engine never leaves `result_summary` empty. A run with no output falls back to `"<name> completed (no output)"` or `"<name> completed (exit <code>, no output)"`. Those lines are an **expected** idle-detector outcome (broad subscription + cheap internal gate), **not** friction. Never flag them as "produced no useful output". |
 | Interrupted runs | `TriggerRunInterrupted`: group by trigger and `retry` decision, linking the cut thread and any retry. Count once alongside its `ResponseAborted`. |

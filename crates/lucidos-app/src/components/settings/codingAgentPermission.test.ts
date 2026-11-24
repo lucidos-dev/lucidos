@@ -8,8 +8,6 @@ import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 
 describe('coding agent permission mode', () => {
   it('puts the safe default first', () => {
-    // Leading with Auto would invite a click-through into the classifier
-    // without reading what it costs.
     expect(PERMISSION_MODE_OPTIONS[0].value)
       .toBe(PREFERENCE_CATALOG.coding_agent_claude_permission_mode.fallback);
   });

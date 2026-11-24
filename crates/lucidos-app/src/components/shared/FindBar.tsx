@@ -49,10 +49,6 @@ function FindRow({ inputRef, placeholder }: { inputRef: RefObject<HTMLInputEleme
   );
 }
 
-/** The find bar on one surface. It rolls in above what it searches. Escape
- *  closes it from the field and from inside a frame, through the overlay
- *  stack. A new `scope` (another app, file or thread) ends the session, since
- *  its text and highlights belonged to the old one. */
 export function FindBar({ surface, scope, placeholder }: {
   surface: FindSurface;
   scope: string;
@@ -63,15 +59,12 @@ export function FindBar({ surface, scope, placeholder }: {
   const request = findRequest.value;
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Keyed on the request alone: an open that asks for no focus leaves the caret.
   useEffect(() => {
     if (!open) return;
     inputRef.current?.focus({ preventScroll: true });
     inputRef.current?.select();
   }, [focusRequest]);
 
-  // One entry per surface: a hand-off from one bar to the other removes the
-  // closing bar's entry and must not take the opening one with it.
   useEffect(() => {
     if (!open) return;
     const id = `find-bar:${surface}`;
@@ -79,11 +72,8 @@ export function FindBar({ surface, scope, placeholder }: {
     return () => removeOverlay(id);
   }, [open, surface]);
 
-  // Unmount and a scope change both end this surface's session, and take its
-  // highlights with it.
   useEffect(() => () => endFindOn(surface), [surface, scope]);
 
-  // After the cleanup above, so a request opens on a session of its own.
   useEffect(() => {
     if (request) takeFindRequest(surface, scope);
   }, [request, surface, scope]);

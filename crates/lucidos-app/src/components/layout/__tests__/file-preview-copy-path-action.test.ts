@@ -1,14 +1,3 @@
-/**
- * What "Copy path" puts on the clipboard, and what it tells the user.
- *
- * Unlike the popout action, this one does not branch on Tauri vs browser: the
- * clipboard API itself is what decides, via `clipboardAbilities().copy`. Given
- * a clipboard, what varies is only whether an absolute disk path could be
- * resolved, which `previewCopyPath` already answers (see
- * `utils/previewPath.test.ts`). This file pins the wiring: the action reads
- * the live signals, forwards to `copyToClipboard` with the right text and
- * confirmation, and disappears where there is no clipboard to write to.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const clipboard = vi.hoisted(() => ({ copy: true }));
@@ -80,9 +69,6 @@ describe('filePreviewCopyPathAction', () => {
     expect(action?.label).toBe('Copy path');
   });
 
-  // Nothing here shows the path as selectable text, so with no clipboard a tap
-  // could only open the "no clipboard" toast. Hidden instead, like every other
-  // copy button in this codebase (PairDeviceSection's `CopyButton`, PairingGate).
   it('is null off a non-secure origin, where there is no clipboard to write to', () => {
     clipboard.copy = false;
 

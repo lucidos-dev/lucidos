@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A window `focus` that hands focus back from one of the page's own frames is
- * no resume. Each case puts focus in a frame, then taps an answer on the host.
- */
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
 vi.mock('./platform', async (importOriginal) => ({
@@ -37,7 +33,6 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-/** The press that plays the clip: focus leaves the host for the frame. */
 function focusTheFrame(): void {
   window.dispatchEvent(new Event('blur'));
   activeElement = document.querySelector('iframe');
@@ -50,7 +45,6 @@ function hideThePage(): void {
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
 }
 
-/** A tap on the answer that also hands focus back to the host window. */
 function tapTheAnswer(): void {
   activeElement = document.body;
   window.dispatchEvent(new Event('focus'));
@@ -65,14 +59,12 @@ describe('a frame handing focus back', () => {
   });
 
   it('still repaints, once, since a tray restore can hand focus back unseen', () => {
-    // Once: an armed guard would repaint a second time on the tap.
     focusTheFrame();
     tapTheAnswer();
     expect(repaint).toHaveBeenCalledTimes(1);
   });
 
   it('still counts as a resume once the page was hidden in between', () => {
-    // Backgrounded with focus in the frame: the layer may be black on return.
     focusTheFrame();
     hideThePage();
     tapTheAnswer();
@@ -80,7 +72,6 @@ describe('a frame handing focus back', () => {
   });
 
   it('still counts as a resume when the hide lands before the blur is checked', () => {
-    // The press into the frame, then a swipe home before the next tick.
     window.dispatchEvent(new Event('blur'));
     activeElement = document.querySelector('iframe');
     hideThePage();

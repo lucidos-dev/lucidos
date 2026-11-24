@@ -4,9 +4,6 @@ import type { BackupKeys } from '../../../api/client';
 
 const NONE: BackupKeys = { recipient: null, pending: false, legacy_key: false, secs_since_verified: null };
 
-/** The Backup page answers "what seals my backups?" from `/backup/recipient`.
- *  A pending key pair seals nothing until its backup key is pasted back, which
- *  is the paste-back gate seen from the page. */
 describe('backupsCanSeal', () => {
   it('is false before setup, and stays false while a minted key waits', () => {
     expect(backupsCanSeal(NONE)).toBe(false);

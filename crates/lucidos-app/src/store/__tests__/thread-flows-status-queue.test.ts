@@ -22,12 +22,9 @@ describe('Timestamps', () => {
     const exchanges = getExchanges(map, id);
     expect(exchangeTimestamp(exchanges[0])).toBe(userTime);
     expect(exchangeResponseTimestamp(exchanges[0])).toBe(responseTime);
-    // They must be different
     expect(exchangeTimestamp(exchanges[0])).not.toBe(exchangeResponseTimestamp(exchanges[0]));
   });
 
-  // The reported shape: a 42-second reply archived an hour and three quarters
-  // later, whose header read the archive time and so claimed a two-hour turn.
   it('archiving later does not move the response timestamp', () => {
     const { map, id } = makeThread();
     const userTime = '2026-08-07T07:09:02.000Z';
@@ -42,14 +39,10 @@ describe('Timestamps', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // The premise, so the assertion below cannot pass vacuously: the archive
-    // really is folded in as the turn's last step.
     expect(exchanges[0].steps.some(s => s.event.type === 'ThreadArchived')).toBe(true);
     expect(exchangeResponseTimestamp(exchanges[0])).toBe(responseTime);
   });
 
-  // Same class, a different clock: the session ends at the next engine
-  // shutdown, which can be days after the turn it closes.
   it('a later SessionEnded does not move the response timestamp', () => {
     const { map, id } = makeThread();
     const responseTime = '2026-08-07T07:09:44.000Z';
@@ -65,9 +58,6 @@ describe('Timestamps', () => {
     expect(exchangeResponseTimestamp(exchanges[0])).toBe(responseTime);
   });
 
-  // The skip must not invent a timestamp. An exchange whose only steps are
-  // bookkeeping has produced no response, and the header falls back to the
-  // user message's own time.
   it('bookkeeping-only steps leave the response timestamp undefined', () => {
     const { map, id } = makeThread();
 
@@ -94,13 +84,11 @@ describe('Timestamps', () => {
   it('non-last chat exchange with steps shows interrupted when follow-up arrives', () => {
     const { map, id } = makeThread();
 
-    // First exchange is still processing (no ResponseGenerated)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First message', created: '2026-01-01T00:00:00Z' },
       { type: 'ToolCalled', name: 'search', args: {}, created: '2026-01-01T00:00:01Z' },
     ]);
 
-    // Second exchange is pending (user sent follow-up while first is processing)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Follow-up', created: '2026-01-01T00:00:02Z' },
     ]);
@@ -108,16 +96,9 @@ describe('Timestamps', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // First exchange (non-last, has steps, no terminator) → 'interrupted'.
-    // The user moved on with the follow-up; the chat fast-path will fold the
-    // follow-up into the running loop via a PromptInjected, with post-injection events redirected
-    // to the new exchange. Only the last panel shows "Working".
     const firstStatus = exchangeStatus(exchanges[0], '', false);
     expect(firstStatus).toBe('interrupted');
 
-    // Second exchange (last, no steps yet). hasPriorActive is false because
-    // the prior is now 'interrupted' (not in ACTIVE_STATUSES) — the follow-up
-    // is no longer "queued behind" the prior; it's the new active panel.
     const secondStatus = exchangeStatus(exchanges[1], '', true, false);
     expect(secondStatus).toBe('pending');
   });
@@ -139,14 +120,12 @@ describe('Timestamps', () => {
     const now = new Date();
     const t = (offsetMs: number) => new Date(now.getTime() + offsetMs).toISOString();
 
-    // First exchange completes normally
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: t(0) },
       { type: 'TextStreamed', text: 'Response', created: t(100) },
       { type: 'ResponseGenerated', created: t(200) },
     ]);
 
-    // Second exchange is pending (prior finished)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Follow-up', created: t(300) },
     ]);
@@ -154,10 +133,8 @@ describe('Timestamps', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // First exchange is done (completed)
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
 
-    // Second exchange: prior is NOT active (done), so hasPriorActive=false → pending, not queued
     expect(exchangeStatus(exchanges[1], '', true, false)).toBe('pending');
   });
 
@@ -166,14 +143,11 @@ describe('Timestamps', () => {
     const now = new Date();
     const t = (offsetMs: number) => new Date(now.getTime() + offsetMs).toISOString();
 
-    // First exchange still processing
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: t(0) },
       { type: 'ToolCalled', name: 'search', args: {}, created: t(100) },
     ]);
 
-    // Second exchange has steps — even with hasPriorActive, it shouldn't be 'queued'
-    // because the queued check requires steps.length === 0
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Second', created: t(200) },
       { type: 'ToolCalled', name: 'read_file', args: {}, created: t(300) },
@@ -182,28 +156,20 @@ describe('Timestamps', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Second exchange has steps, so hasPriorActive doesn't force it to 'queued'
     const status = exchangeStatus(exchanges[1], '', true, true);
     expect(status).not.toBe('queued');
   });
 
   it('view-layer priorActive computation detects active prior exchange', () => {
-    // This test mirrors how ThreadView/CreateThreadView compute priorActive:
-    //   const priorActive = i > 0 && isStatusActive(exchangeStatus(exchanges[i-1], '', ...));
-    // The bug: passing isLast=false for the prior exchange causes exchangeStatus
-    // to shortcut to 'done' (line: if (isComplete || !isLast) return 'done'),
-    // making priorActive always false.
     const { map, id } = makeThread();
     const now = new Date();
     const t = (offsetMs: number) => new Date(now.getTime() + offsetMs).toISOString();
 
-    // First exchange is still processing (no ResponseGenerated)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First message', created: t(0) },
       { type: 'ToolCalled', name: 'search', args: {}, created: t(100) },
     ]);
 
-    // Second exchange is pending (user sent follow-up while first is processing)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Follow-up', created: t(200) },
     ]);
@@ -211,22 +177,15 @@ describe('Timestamps', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Simulate how the view layer computes priorActive:
-    // For exchange i=1, prior is exchange 0.
-    // The view must pass isLast=true to get the actual live status, not the display status.
     const priorStatus = exchangeStatus(exchanges[0], '', true);
-    expect(isActive(priorStatus)).toBe(true); // prior IS active — it's still streaming
+    expect(isActive(priorStatus)).toBe(true);
 
-    // With priorActive=true, the second exchange should be 'queued'
     const secondStatus = exchangeStatus(exchanges[1], '', true, isActive(priorStatus));
     expect(secondStatus).toBe('queued');
     expect(getLabel(exchanges[1], '', true, isActive(priorStatus))).toBe('Queued');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Backend is authoritative about liveness — no timestamp guessing
-// ---------------------------------------------------------------------------
 describe('Backend-authoritative status: SSE events update meta.status', () => {
   it('Claude Code session with tools in progress → status=running (from MessageReceived event)', () => {
     const { map, id } = makeThread();
@@ -238,7 +197,6 @@ describe('Backend-authoritative status: SSE events update meta.status', () => {
       { type: 'CodingAgentToolCalled', name: 'Bash', args: {}, created: twoMinutesAgo },
     ]);
 
-    // MessageReceived sets meta.status='running', no completion event → still running
     expect(map.get(id)!.meta.status).toBe('running');
   });
 
@@ -251,14 +209,10 @@ describe('Backend-authoritative status: SSE events update meta.status', () => {
       { type: 'ToolCalled', name: 'calculator', args: {}, created: twoMinutesAgo },
     ]);
 
-    // MessageReceived sets status='running', ToolCalled doesn't change it → running
     expect(map.get(id)!.meta.status).toBe('running');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Change events open their own initiator-panel exchanges (auditable system actions)
-// ---------------------------------------------------------------------------
 describe('Change lifecycle events render as initiator panels', () => {
   it('ChangeApplied opens its own exchange', () => {
     const { map, id } = makeThread();
@@ -309,7 +263,6 @@ describe('Change lifecycle events render as initiator panels', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // 1: CC, 2: ChangeApplied, 3: ChangeReverted
     expect(exchanges).toHaveLength(3);
     expect(exchanges[1].userEvent.type).toBe('ChangeApplied');
     expect(exchanges[2].userEvent.type).toBe('ChangeReverted');
@@ -373,10 +326,8 @@ describe('Change lifecycle events render as initiator panels', () => {
       { type: 'ChangeProposed', change_id: 'c-6', description: 'Fix', files: ['f.rs'] },
       { type: 'CodingAgentIdled', has_changes: true },
     ]);
-    // After CodingAgentIdled, thread status is 'idle'
     expect(map.get(id)!.meta.status).toBe('idle');
 
-    // MergeConflictDetected doesn't change status
     insertEvents(map, id, [
       { type: 'MergeConflictDetected', change_id: 'c-6', files: ['f.rs'] },
     ]);
@@ -392,8 +343,6 @@ describe('Change lifecycle events render as initiator panels', () => {
       { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] },
       { type: 'CodingAgentIdled', has_changes: true },
       { type: 'ChangeApplied', change_id: 'c-1' },
-      // CC resumes to process change notification — its events land on the
-      // ChangeApplied exchange (no response panel, so invisible to the user).
       { type: 'CodingAgentPromptSent', text: '' },
       { type: 'CodingAgentIdled' },
     ]);
@@ -401,36 +350,28 @@ describe('Change lifecycle events render as initiator panels', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
     expect(exchanges[1].userEvent.type).toBe('ChangeApplied');
-    // CC exchange ends cleanly — last event is the response text, not a spinner.
     const ccEvents = exchangeResponseEvents(exchanges[0]);
     const lastCC = ccEvents[ccEvents.length - 1];
     expect(lastCC.type).not.toBe('step');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flow: Message queue handling
-// ---------------------------------------------------------------------------
 describe('Flow: Message queue — multiple pending messages', () => {
   it('supports multiple pending messages as synthetic exchanges', () => {
     const { map, id } = makeThread();
 
-    // First message is being processed (has real events)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First message', created: '2026-01-01T00:00:00Z' },
       { type: 'TextStreamed', text: 'Thinking...', created: '2026-01-01T00:00:01Z' },
     ]);
 
-    // Two more messages queued (pending, no backend events yet)
     const thread = map.get(id)!;
     thread.pendingUserMessages = [
       { text: 'Second message', eventId: 'msg-2', created: '2026-01-01T00:00:00Z' },
       { text: 'Third message', eventId: 'msg-3', created: '2026-01-01T00:00:00Z' },
     ];
 
-    // Build exchanges: 1 real + 2 synthetic
     const exchanges = groupIntoExchanges(thread.events);
-    // Append pending messages as synthetic exchanges (simulating activeExchanges computed)
     for (let i = 0; i < thread.pendingUserMessages.length; i++) {
       exchanges.push({
         userEvent: { type: 'MessageReceived', text: thread.pendingUserMessages[i].text },
@@ -448,21 +389,18 @@ describe('Flow: Message queue — multiple pending messages', () => {
   it('last queued exchange shows "Queued" status when prior is active', () => {
     const { map, id } = makeThread();
 
-    // First exchange is active (streaming)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
       { type: 'TextStreamed', text: 'Working...', created: '2026-01-01T00:00:01Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
-    // One queued synthetic exchange (the last in the thread)
     exchanges.push({
       userEvent: { type: 'MessageReceived', text: 'Second' },
       userSeq: -1,
       steps: [],
     });
 
-    // Second exchange: last, has prior active, no steps → 'queued'
     const status1 = exchangeStatus(exchanges[1], '', true, true);
     expect(status1).toBe('queued');
     expect(statusLabel(status1, false).label).toBe('Queued');
@@ -471,14 +409,12 @@ describe('Flow: Message queue — multiple pending messages', () => {
   it('non-last queued exchange keeps the legacy done status fallback outside render', () => {
     const { map, id } = makeThread();
 
-    // First exchange is active (streaming)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
       { type: 'TextStreamed', text: 'Working...', created: '2026-01-01T00:00:01Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
-    // Two queued synthetic exchanges
     exchanges.push({
       userEvent: { type: 'MessageReceived', text: 'Second' },
       userSeq: -1,
@@ -490,16 +426,11 @@ describe('Flow: Message queue — multiple pending messages', () => {
       steps: [],
     });
 
-    // exchangeStatus still only exposes one 'queued' exchange because the
-    // multi-message queued UI is now driven by renderExchanges' queuedRun.
-    // ChatExchange receives isQueued=true for this exchange in the renderer
-    // and suppresses the fallback response panel.
     const status1 = exchangeStatus(exchanges[1], '', false, true);
     expect(status1).not.toBe('queued');
     expect(status1).toBe('done');
     expect(statusLabel(status1, false).label).toBe('Done');
 
-    // Last queued exchange still shows 'queued' through the legacy status path.
     const status2 = exchangeStatus(exchanges[2], '', true, true);
     expect(status2).toBe('queued');
     expect(statusLabel(status2, false).label).toBe('Queued');
@@ -508,14 +439,12 @@ describe('Flow: Message queue — multiple pending messages', () => {
   it('clearing pending messages only removes the one whose real event arrived', () => {
     const { map, id } = makeThread();
 
-    // Simulate thread with two pending messages
     const thread = map.get(id)!;
     thread.pendingUserMessages = [
       { text: 'Message A', eventId: 'msg-a', created: '2026-01-01T00:00:00Z' },
       { text: 'Message B', eventId: 'msg-b', created: '2026-01-01T00:00:00Z' },
     ];
 
-    // Real MessageReceived arrives for 'Message A' — should only remove that one
     handleEvent(map, id, 1, { type: 'MessageReceived', text: 'Message A' }, '2026-01-01T00:00:00Z', 'msg-a');
 
     expect(thread.pendingUserMessages).toHaveLength(1);
@@ -525,15 +454,12 @@ describe('Flow: Message queue — multiple pending messages', () => {
   it('non-last queued exchange returns done through the status fallback', () => {
     const { map, id } = makeThread();
 
-    // First exchange is active
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
       { type: 'ToolCalled', name: 'search', args: {}, created: '2026-01-01T00:00:01Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
-    // Two queued exchanges; renderExchanges marks both as queued, but the
-    // lower-level status fallback still only reports queued for the last one.
     exchanges.push({
       userEvent: { type: 'MessageReceived', text: 'Second' },
       userSeq: -1,
@@ -545,11 +471,9 @@ describe('Flow: Message queue — multiple pending messages', () => {
       steps: [],
     });
 
-    // Exchange[1] is not last → 'done' through exchangeStatus alone.
     const status1 = exchangeStatus(exchanges[1], '', false, true);
     expect(status1).toBe('done');
 
-    // Exchange[2] is last → 'queued'
     const status2 = exchangeStatus(exchanges[2], '', true, true);
     expect(status2).toBe('queued');
   });
@@ -557,13 +481,11 @@ describe('Flow: Message queue — multiple pending messages', () => {
   it('first completed exchange transitions queued messages to pending/streaming', () => {
     const { map, id } = makeThread();
 
-    // First exchange completes
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
       { type: 'ResponseGenerated', text: 'Done!', created: '2026-01-01T00:00:05Z' },
     ]);
 
-    // Second exchange starts (was queued, now has real events)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Second', created: '2026-01-01T00:00:06Z' },
       { type: 'TextStreamed', text: 'Working on second...', created: '2026-01-01T00:00:07Z' },
@@ -572,20 +494,13 @@ describe('Flow: Message queue — multiple pending messages', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Both are real exchanges (positive seqs). Standard isLast computation.
-    // First: done (completed, not last)
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
-    // Second: streaming (last, prior is done → not active, has live streamingBuffer)
-    const priorActive = false; // prior is 'done'
+    const priorActive = false;
     expect(exchangeStatus(exchanges[1], 'Working on second...', true, priorActive)).toBe('streaming');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Bug: Pending CC follow-up exchanges show "CHAT" instead of "CLAUDE CODE"
-// ---------------------------------------------------------------------------
 describe('Bug: Pending CC exchanges must inherit thread channel', () => {
-  /** Helper that mirrors store.ts activeExchanges logic for pending messages */
   function appendPendingExchanges(
     exchanges: Exchange[],
     pendingUserMessages: Array<{ text: string; eventId: string; created: string }>,
@@ -605,7 +520,6 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
     return exchanges;
   }
 
-  /** The channel the synthesis wrote onto a pending exchange's user event. */
   function pendingChannel(exchange: Exchange): string | undefined | false {
     const ev = exchange.userEvent;
     return ev.type === 'MessageReceived' && ev.channel;
@@ -627,7 +541,6 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
     appendPendingExchanges(exchanges, pending, map.get(id)!.meta.channel);
 
     expect(exchanges).toHaveLength(2);
-    // The pending exchange must have channel "claude_code", not default to "chat"
     expect(pendingChannel(exchanges[1])).toBe('claude_code');
   });
 
@@ -651,24 +564,20 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
     const { map, id } = makeThread();
     map.get(id)!.meta.channel = 'claude_code';
 
-    // Initial CC exchange
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'fix bug', channel: 'claude_code' },
       { type: 'SessionStarted', session_id: 's1' },
       { type: 'CodingAgentIdled' },
     ]);
 
-    // Simulate pending follow-up
     const eventId = 'client-uuid-123';
     map.get(id)!.pendingUserMessages.push({ text: 'now fix tests', eventId, created: '2026-01-01T00:00:00Z' });
     expect(map.get(id)!.pendingUserMessages).toHaveLength(1);
 
-    // Simulate SSE event arriving with matching event_id
     handleEvent(map, id, nextSeq(), {
       type: 'MessageReceived', text: 'now fix tests', channel: 'claude_code',
     }, TS, eventId);
 
-    // Pending message must be removed
     expect(map.get(id)!.pendingUserMessages).toHaveLength(0);
   });
 
@@ -682,28 +591,18 @@ describe('Bug: Pending CC exchanges must inherit thread channel', () => {
       { type: 'CodingAgentIdled' },
     ]);
 
-    // Simulate pending follow-up with client UUID
     map.get(id)!.pendingUserMessages.push({ text: 'now fix tests', eventId: 'client-uuid-123', created: '2026-01-01T00:00:00Z' });
 
-    // SSE event arrives with DIFFERENT UUID (the bug: CC loop generates random UUID)
     handleEvent(map, id, nextSeq(), {
       type: 'MessageReceived', text: 'now fix tests', channel: 'claude_code',
     }, TS, 'random-server-uuid-456');
 
-    // BUG: pending message stays because event_id doesn't match
-    // After fix, this should be 0 — the CC loop must forward the client's event_id
     expect(map.get(id)!.pendingUserMessages).toHaveLength(1);
   });
 });
 
-// ---------------------------------------------------------------------------
-// Bug: SSE-born scheduled trigger thread appears under Archive instead of Active
-// ---------------------------------------------------------------------------
 describe('Bug: SSE-born scheduled trigger thread categorization', () => {
   it('SSE-born skeleton thread derives running status after events load', () => {
-    // SSE-born skeletons start with eventsLoaded: false. The drawer guards
-    // status with eventsLoaded, so until loadThreadEvents completes, status
-    // is displayed from the API metadata. After loading, SSE events update it.
     const id = 'scheduled-task-thread';
     const skeleton: ThreadState = {
       meta: {
@@ -731,14 +630,13 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
       },
       events: new Map(),
       streamingBuffer: '',
-      eventsLoaded: false,  // SSE-born skeletons start unloaded
+      eventsLoaded: false,
       eventsLoadFailed: false,
       lastDbSeq: 0,
       pendingUserMessages: [],
     };
     const map = new Map([[id, skeleton]]);
 
-    // SSE delivers events for this thread — handleEvent updates meta.status
     handleEventWithAgg(map, id, nextSeq(), {
       type: 'TriggerStarted', trigger_id: 'task-1', trigger_name: 'Varmepumpe', prompt: 'Run control loop',
     } as any, new Date().toISOString());
@@ -749,10 +647,8 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
 
     const thread = map.get(id)!;
 
-    // After TriggerStarted, meta.status is updated to 'running'
     expect(thread.meta.status).toBe('running');
 
-    // effectiveThreadStatus reads from meta.status
     thread.eventsLoaded = true;
     expect(effectiveThreadStatus(thread)).toBe('running');
   });
@@ -766,31 +662,22 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
       { type: 'ToolCalled', name: 'run_python', args: {}, created: twoMinutesAgo },
     ]);
 
-    // TriggerStarted set 'running', no completion event → still running
     expect(map.get(id)!.meta.status).toBe('running');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Bug: pending message with no real events should still produce exchanges
-// ---------------------------------------------------------------------------
 describe('Bug: first message missing when only pending messages exist', () => {
   it('pending message should produce a synthetic exchange even with no real events', () => {
     const { map, id } = makeThread();
     const thread = map.get(id)!;
 
-    // User sends first message — no SSE events yet, only pending
     thread.pendingUserMessages = [{ text: 'legg inn denne i kalenderen min', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' }];
 
-    // events.size is 0 — no real events from backend yet
     expect(thread.events.size).toBe(0);
 
-    // ThreadView was checking `events.size > 0` to decide whether to show exchanges.
-    // That's wrong — pending messages should also be considered "has data".
     const hasData = thread.events.size > 0 || thread.pendingUserMessages.length > 0;
     expect(hasData).toBe(true);
 
-    // activeExchanges logic: groupIntoExchanges + append pending as synthetic
     const exchanges = groupIntoExchanges(thread.events);
     for (let i = 0; i < thread.pendingUserMessages.length; i++) {
       exchanges.push({
@@ -800,11 +687,9 @@ describe('Bug: first message missing when only pending messages exist', () => {
       });
     }
 
-    // Must show 1 exchange — the pending message
     expect(exchanges).toHaveLength(1);
     expect(exchangeUserMessage(exchanges[0])).toBe('legg inn denne i kalenderen min');
 
-    // Status should be 'pending' (no response yet)
     const status = exchangeStatus(exchanges[0], '', true);
     expect(status).toBe('pending');
   });
@@ -814,34 +699,25 @@ describe('Bug: first message missing when only pending messages exist', () => {
     const thread = map.get(id)!;
     thread.pendingUserMessages = [{ text: 'hello', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' }];
 
-    // effectiveThreadStatus checks pendingUserMessages and returns 'running'
     const status = effectiveThreadStatus(thread);
     expect(status).toBe('running');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Queued follow-ups: typed while the agent is busy, they sort to the end of the
-// timeline (no `created`, synthetic max seq). They must read 'Queued' while the
-// active turn keeps the live stream — regression guard for the bug where the
-// stream rendered under the LAST queued message, the active turn read
-// 'interrupted', and the earlier follow-ups read 'Done'.
-// ---------------------------------------------------------------------------
 describe('Queued follow-ups behind an active turn', () => {
   const pend = (n: number): Exchange =>
     ({ userEvent: { type: 'MessageReceived', text: 'p' + n, _displayCreated: TS } as any, userSeq: -n, steps: [] });
   const real = (): Exchange =>
     ({ userEvent: { type: 'MessageReceived', text: 'a', created: TS } as any, userSeq: 1, steps: [] });
-  /** Which exchange owns the turn, read the way `CreateThreadView` reads it. */
   const activeIndexOf = (list: Exchange[], busy: boolean): number =>
     queuedFollowupRun(list, busy).activeIndex;
 
   it('the active turn owns the stream while busy, and the literal last when idle', () => {
     const list = [real(), pend(1), pend(2)];
-    expect(activeIndexOf(list, /* busy */ true)).toBe(0);  // the active turn
-    expect(activeIndexOf(list, /* busy */ false)).toBe(2); // freshly-sent last
-    expect(activeIndexOf([real(), real()], true)).toBe(0); // first stepless MR is in-flight
-    expect(activeIndexOf([pend(1), pend(2)], true)).toBe(0); // first optimistic MR is in-flight
+    expect(activeIndexOf(list,  true)).toBe(0);
+    expect(activeIndexOf(list,  false)).toBe(2);
+    expect(activeIndexOf([real(), real()], true)).toBe(0);
+    expect(activeIndexOf([pend(1), pend(2)], true)).toBe(0);
   });
 
   it('queuedFollowupRun includes persisted MessageReceived follow-ups before injection', () => {
@@ -856,7 +732,7 @@ describe('Queued follow-ups behind an active turn', () => {
       steps: [],
     };
 
-    const run = queuedFollowupRun([active, persistedFollowup], /* busy */ true);
+    const run = queuedFollowupRun([active, persistedFollowup],  true);
     expect(run.activeIndex).toBe(0);
     expect([...run.queuedIndices]).toEqual([1]);
   });
@@ -878,11 +754,11 @@ describe('Queued follow-ups behind an active turn', () => {
       steps: [],
     };
 
-    const single = queuedFollowupRun([completed, nextTurn], /* busy */ true);
+    const single = queuedFollowupRun([completed, nextTurn],  true);
     expect(single.activeIndex).toBe(1);
     expect(single.queuedIndices.size).toBe(0);
 
-    const stacked = queuedFollowupRun([completed, nextTurn, rapidFollowup], /* busy */ true);
+    const stacked = queuedFollowupRun([completed, nextTurn, rapidFollowup],  true);
     expect(stacked.activeIndex).toBe(1);
     expect([...stacked.queuedIndices]).toEqual([2]);
   });
@@ -910,19 +786,11 @@ describe('Queued follow-ups behind an active turn', () => {
       steps: [],
     };
 
-    const run = queuedFollowupRun([active, queuedBeforeQuestion, question], /* busy */ true);
+    const run = queuedFollowupRun([active, queuedBeforeQuestion, question],  true);
     expect(run.activeIndex).toBe(2);
     expect([...run.queuedIndices]).toEqual([1]);
   });
 
-  // The reported shape. A background task finished, and the delivery re-entered
-  // the thread through its `PromptInjected` re-entry anchor. The turn that
-  // anchor started was 66 seconds into a `run_bash` when the reader typed.
-  //
-  // A re-entry is a turn like any other, so the message queues behind it. Left
-  // off the list, nothing can queue behind it at all. The waiting message was
-  // promoted to active and read "Requesting". The running turn fell to
-  // `interrupted`, reading "Done" beside a step that was still spinning.
   it('a follow-up queues behind a turn a re-entry anchor started', () => {
     const { map, id } = makeThread('reentry-queue', 'running');
     insertEvents(map, id, [
@@ -933,19 +801,15 @@ describe('Queued follow-ups behind an active turn', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // The premise, so the assertions below cannot pass vacuously: the anchor
-    // really did start its own exchange and really does hold the live steps.
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].userEvent.type).toBe('PromptInjected');
     expect(exchanges[0].steps).toHaveLength(2);
 
-    const run = queuedFollowupRun(exchanges, /* busy */ true);
+    const run = queuedFollowupRun(exchanges,  true);
     expect(run.activeIndex).toBe(0);
     expect([...run.queuedIndices]).toEqual([1]);
 
-    // The re-entry keeps the active role, so it never takes the `interrupted`
-    // branch that renders as "Done" with the hand-off arrow.
-    expect(exchangeStatus(exchanges[0], '', /* isLast */ true)).toBe('streaming');
+    expect(exchangeStatus(exchanges[0], '',  true)).toBe('streaming');
     expect(getLabel(exchanges[0])).toBe('Working');
   });
 
@@ -970,21 +834,20 @@ describe('Queued follow-ups behind an active turn', () => {
       }],
     };
 
-    const run = queuedFollowupRun([active, injectedFollowup], /* busy */ true);
+    const run = queuedFollowupRun([active, injectedFollowup],  true);
     expect(run.activeIndex).toBe(1);
     expect(run.queuedIndices.size).toBe(0);
   });
 
   it('queuedFollowupRun leaves CC/Codex follow-ups unqueued', () => {
     const list = [real(), pend(1), pend(2)];
-    const run = queuedFollowupRun(list, /* busy */ true, /* threadIsCC */ true);
+    const run = queuedFollowupRun(list,  true,  true);
     expect(run.activeIndex).toBe(2);
     expect(run.queuedIndices.size).toBe(0);
   });
 
   it('active streaming turn keeps the stream; stacked pending follow-ups are all queued', () => {
     const { map, id } = makeThread('q-stack', 'running');
-    // Confirmed first turn, mid-stream (TextStreamed, no terminator).
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
       { type: 'TextStreamed', text: 'Working...', created: '2026-01-01T00:00:01Z' },
@@ -993,18 +856,14 @@ describe('Queued follow-ups behind an active turn', () => {
       { text: 'follow 1', eventId: 'f1', created: '2026-01-01T00:00:02Z' },
       { text: 'follow 2', eventId: 'f2', created: '2026-01-01T00:00:03Z' },
     ];
-    const exchanges = getExchangesWithPending(map, id, /* useDisplayCreated */ true);
+    const exchanges = getExchangesWithPending(map, id,  true);
     expect(exchanges).toHaveLength(3);
 
-    const run = queuedFollowupRun(exchanges, /* threadBusy */ true);
-    expect(run.activeIndex).toBe(0); // the active turn, not a queued follow-up
+    const run = queuedFollowupRun(exchanges,  true);
+    expect(run.activeIndex).toBe(0);
 
-    // Active turn (played as 'last') reads streaming — NOT 'interrupted' — so the
-    // live response stays under it, not under the last queued message.
-    expect(exchangeStatus(exchanges[0], '', /* isLast */ true, false)).toBe('streaming');
+    expect(exchangeStatus(exchanges[0], '',  true, false)).toBe('streaming');
 
-    // BOTH follow-ups are queued (the engine drains the whole FIFO — none are
-    // superseded), mirroring renderExchanges' isQueued computation.
     for (let i = 1; i < exchanges.length; i++) {
       expect(run.queuedIndices.has(i)).toBe(true);
     }
@@ -1020,7 +879,7 @@ describe('Queued follow-ups behind an active turn', () => {
       { text: 'meanwhile', eventId: 'm1', created: '2026-01-01T00:00:05Z' },
     ];
     const exchanges = getExchangesWithPending(map, id, true);
-    const run = queuedFollowupRun(exchanges, /* threadBusy */ true); // waiting_for_user_answer
+    const run = queuedFollowupRun(exchanges,  true);
     expect(exchanges[run.activeIndex].userEvent.type).toBe('UserQuestionAsked');
     expect(run.queuedIndices.has(exchanges.length - 1)).toBe(true);
   });
@@ -1032,13 +891,9 @@ describe('Queued follow-ups behind an active turn', () => {
     ];
     const exchanges = getExchangesWithPending(map, id, true);
     expect(exchanges).toHaveLength(1);
-    const run = queuedFollowupRun(exchanges, /* threadBusy */ true);
+    const run = queuedFollowupRun(exchanges,  true);
     expect(run.activeIndex).toBe(0);
-    expect(run.queuedIndices.has(0)).toBe(false); // active, not queued
-    expect(exchangeStatus(exchanges[0], '', /* isLast */ true, false, false, /* threadIdle */ false)).toBe('pending');
+    expect(run.queuedIndices.has(0)).toBe(false);
+    expect(exchangeStatus(exchanges[0], '',  true, false, false,  false)).toBe('pending');
   });
 });
-
-// ---------------------------------------------------------------------------
-// Bug: red status dot lingers on a failed thread while dismiss is in flight
-// ---------------------------------------------------------------------------

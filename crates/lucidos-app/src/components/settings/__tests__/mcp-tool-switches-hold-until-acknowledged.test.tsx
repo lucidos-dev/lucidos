@@ -1,13 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A tool switch is a pending intent until the engine acknowledges it, and a
- * list read served before that never moves the switch (ADR 0437).
- *
- * Two regressions this replays. A reload fired by the user's own change could
- * land on top of the next click and bounce it back. And a second click queued
- * behind the first read the page after such a reload, so its write dropped the
- * second tool for good.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -45,7 +36,6 @@ function tool(name: string, disabled: boolean): McpToolStatus {
   };
 }
 
-/** The list as the engine serves it, with these tools switched off. */
 function served(off: string[] = []): McpServersResponse {
   return {
     servers: [{
@@ -78,7 +68,6 @@ describe('MCP tool switches', () => {
       toggle(name).dispatchEvent(new Event('change', { bubbles: true }));
     });
   }
-  /** What the engine has been asked to switch, as `name:off|on`. */
   const switched = () => (client.setMcpToolDisabled as Mock).mock.calls
     .map(([, wire, disabled]) => `${String(wire).replace('mcp__slack__', '')}:${disabled ? 'off' : 'on'}`);
 
@@ -89,7 +78,6 @@ describe('MCP tool switches', () => {
     (client.fetchMcpServers as Mock).mockResolvedValueOnce(served());
     await act(() => render(<McpServersPage />, host));
     await settled();
-    // The tool switches live inside the server's expanded row.
     await act(() => host.querySelector<HTMLButtonElement>('.settings-disclosure-toggle')!.click());
     await settled();
   });

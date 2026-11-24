@@ -1,5 +1,6 @@
 import { threadQueue, showToast, showConfirm } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
+import { loadSlice, type SliceOf } from '../bootstrapSliceLoads';
 import type { CapacityPolicy } from '../types';
 import {
   getThreadQueue,
@@ -9,26 +10,22 @@ import {
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 
-export async function loadThreadQueue(): Promise<void> {
-  setLoadingIfFresh(threadQueue);
-  try {
-    const data = await getThreadQueue();
-    threadQueue.value = { status: 'loaded', data };
-  } catch (error) {
-    threadQueue.value = toFailed(error);
-  }
+export const threadQueueSlice: SliceOf<'thread_queue'> = {
+  begin: () => setLoadingIfFresh(threadQueue),
+  apply: (data) => { threadQueue.value = { status: 'loaded', data }; },
+  fail: (error) => { threadQueue.value = toFailed(error); },
+};
+
+export function loadThreadQueue(): Promise<void> {
+  return loadSlice('thread_queue', threadQueueSlice, () => getThreadQueue());
 }
 
-/** Whether the thread queue holds a spawn for `threadId`, read fresh from the
- *  engine. Such a thread owns no summary row until it starts. Throws when the
- *  queue cannot be read, so a caller never mistakes that for "not queued". */
 export async function threadQueueHolds(threadId: string): Promise<boolean> {
   const data = await getThreadQueue();
   threadQueue.value = { status: 'loaded', data };
   return data.entries.some(entry => entry.thread_id === threadId);
 }
 
-/** Force-admit a queued entry, ignoring capacity caps (panel "Run now"). */
 export async function runQueueEntryNow(entryId: string): Promise<void> {
   try {
     await runThreadQueueEntryNow(entryId);
@@ -38,7 +35,6 @@ export async function runQueueEntryNow(entryId: string): Promise<void> {
   }
 }
 
-/** Drop a queued entry without running it (panel "Drop", with confirm). */
 export async function dropQueueEntry(entryId: string, summary: string): Promise<void> {
   if (!(await showConfirm(`Drop queued spawn "${summary}"? It will not run.`, 'Drop', { variant: 'danger' }))) return;
   try {
@@ -49,7 +45,6 @@ export async function dropQueueEntry(entryId: string, summary: string): Promise<
   }
 }
 
-/** Persist a new capacity policy. Self-toasts both outcomes and never rejects. */
 export async function saveCapacityPolicy(policy: CapacityPolicy): Promise<void> {
   try {
     await putCapacityPolicy(policy);

@@ -48,8 +48,6 @@ test('Settings lists a captured snapshot and confirms its target before restore'
     await row.getByRole('button', { name: 'Unkeep', exact: true }).click();
     await expect(row.getByRole('button', { name: 'Keep', exact: true })).toBeEnabled();
     await row.getByRole('button', { name: 'Restore', exact: true }).click();
-    // The harness attaches a gateway identity only when a gateway lists this
-    // engine (scripts/lib/e2e_gateway.sh). Without one, restore is refused.
     const gatewayIdentity = await page.locator('meta[name="lucidos-workspace-id"]').count() > 0;
     if (gatewayIdentity) {
       const confirmation = page.getByRole('dialog').filter({ hasText: 'Restore workspace' });

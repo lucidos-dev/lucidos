@@ -11,15 +11,9 @@ import {
   waitForResponse,
 } from './helpers';
 
-/** A viewport that leaves the phone layout swaps App to the desktop layout and
- *  back. A phone in landscape keeps the phone layout (ADR 0342), so a tablet's
- *  size stands in for the swap. The header outlives it, and the bars hook it
- *  carries must bind the NEW mobile tree's title bar, prompt and chevrons. Bound to the old ones, the keyboard left the title bar on
- *  screen and the down chevron fell onto Send. `hooks/useHideOnScroll.ts`. */
 
 const CONTAINER = '.mobile-swipe-pane .thread-content.visible';
 
-// Wide and tall, so the desktop split mounts even under a finger.
 const TABLET = { width: 1180, height: 820 };
 
 async function rotate(page: Page): Promise<void> {
@@ -58,8 +52,6 @@ test.describe('Dynamic bars after a rotation', () => {
 
     await rotate(page);
 
-    // A transcript tall enough to scroll, read from its middle, so the down
-    // chevron is up.
     await page.evaluate((sel) => {
       const filler = document.createElement('div');
       filler.style.minHeight = '3000px';
@@ -78,7 +70,6 @@ test.describe('Dynamic bars after a rotation', () => {
 
     await expect.poll(async () => (await box(page, '.mobile-swipe-pane .mobile-thread-title-row'))?.bottom)
       .toBeLessThanOrEqual(0);
-    // Polled, since the prompt and the chevron glide back in from away.
     await expect.poll(async () => {
       const chevron = await box(page, '.mobile-swipe-pane .scroll-to-bottom');
       const prompt = await box(page, '.mobile-swipe-pane .prompt-area .prompt-box');

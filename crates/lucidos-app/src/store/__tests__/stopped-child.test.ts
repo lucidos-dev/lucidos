@@ -1,9 +1,3 @@
-/** A *stopped child* in the transcript and the attention badge (ADR 0252).
- *
- *  On the parent, a `ChildThreadStopped` is a note that wakes nothing: its own
- *  turn, done at once, owning none of the work around it. On the child, the
- *  projection's `isStoppedChild` flag counts toward attention, because the
- *  parent stays asleep until the user acts. */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeStatus, isTurnlessBoundary, type ThreadEvent } from '../thread-events';
@@ -25,9 +19,6 @@ describe('a ChildThreadStopped note on the parent', () => {
     expect(isTurnlessBoundary({ type: 'ChildThreadCompleted' })).toBe(false);
   });
 
-  /** It opens its own turn, and that turn is done whatever the thread is
-   *  doing: no response follows a note that wakes nothing, so it must never
-   *  spin "Requesting" or fall through to the stale detector. */
   it.each([
     ['idle', true],
     ['running', false],
@@ -47,9 +38,6 @@ describe('a ChildThreadStopped note on the parent', () => {
     expect(getLabel(note)).toBe('Done');
   });
 
-  /** A parent mid-turn when its child is stopped keeps writing where it was.
-   *  Folded into the note, its work would draw nothing, since the note's panel
-   *  renders no response body. */
   it('leaves a running parent turn owning its own work', () => {
     const { map, id } = makeThread('thread-1', 'running');
     insertEvents(map, id, [
@@ -106,7 +94,6 @@ describe('a ChildReportFiled note on the parent', () => {
     summary: 'It opens at nine.',
   } as ThreadEvent;
 
-  /** It woke nothing, so no response follows it and it never spins. */
   it('is a turnless boundary that reads as done', () => {
     expect(isTurnlessBoundary(filedNote)).toBe(true);
     const { map, id } = makeThread();

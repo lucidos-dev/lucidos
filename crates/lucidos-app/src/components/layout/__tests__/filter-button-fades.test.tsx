@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The Filter button's glyph fades rather than swaps. It keeps every glyph it
- * can show MOUNTED and flips which one is shown, so the CSS transition runs on
- * nodes that already exist. Under Ongoing the whole button fades out in a slot
- * that keeps its box. The pane title switches word at once, and fades out only
- * when its word no longer fits.
- *
- * These tests pin the DOM the CSS keys on. The frames are covered by
- * `e2e/threads-header-filter-transitions-all.spec.ts`.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -40,14 +30,11 @@ describe('the Filter glyph crossfades', () => {
     show('all');
     expect(layers().map(l => l.dataset.layer)).toEqual(Object.keys(FILTER_BUTTON_GLYPHS));
     expect(current()).toHaveLength(1);
-    // The hidden ones are decoration only.
     for (const l of layers()) {
       expect(l.getAttribute('aria-hidden')).toBe(l.hasAttribute('data-current') ? null : 'true');
     }
   });
 
-  // Outline to solid and back: the same nodes with the shown flag moved, which
-  // is what lets the opacity transition run and reverse.
   it('moves the shown flag between the same nodes on every change', () => {
     show('all');
     const before = layers();
@@ -107,7 +94,6 @@ describe('the grouping button', () => {
   });
 
   it('badges the attention count under Folders only', () => {
-    // Under Ongoing the Blocked group's own header carries it.
     expect(groupingButtonBadgeCount('folders', 3)).toBe(3);
     expect(groupingButtonBadgeCount('ongoing', 3)).toBe(0);
   });

@@ -1,11 +1,5 @@
 // @vitest-environment jsdom
-/**
- * Choosing Tree spends money, so the first time the Tree button only opens a
- * confirm modal with the estimate. `memory_module` is written by its Start
- * button alone, and Start waits for the estimate. Cancel writes nothing. Once
- * a backfill has started, Tree is written at once.
- */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { BackgroundModels, TreeBackfillEstimate } from '../../../api/types';
 
 const {
@@ -66,6 +60,10 @@ const ESTIMATE: TreeBackfillEstimate = {
   }],
 };
 
+beforeAll(async () => {
+  await import('../MemoryModuleSection');
+}, 30_000);
+
 async function mount(host: HTMLElement): Promise<() => void> {
   const { h, render } = await import('preact');
   const store = await import('../../../store/store');
@@ -81,8 +79,6 @@ function button(host: HTMLElement, name: string): HTMLButtonElement {
   return found;
 }
 
-/** Preact runs effects after paint, which jsdom only reaches through the
- *  100 ms fallback timer, so a settle waits past it. */
 async function settle(): Promise<void> {
   await new Promise((r) => setTimeout(r, 150));
 }
@@ -96,8 +92,6 @@ describe('choosing Tree', () => {
     document.body.appendChild(host);
     getTreeBackfillEstimate.mockReset();
     getTreeBackfill.mockReset().mockResolvedValue({ state: 'off', started: false });
-    // The engine's provider-aware default, which the panel prices while the
-    // compactor preferences are unset.
     getBackgroundModels.mockReset().mockResolvedValue({
       model_summary_compaction: {
         model: 'gpt-6.1-sol',
@@ -143,7 +137,6 @@ describe('choosing Tree', () => {
     expect(estimate).toContain('210K to 260K');
     expect(estimate).toContain('$1,100 to $2,300');
     expect(estimate).toContain('Pauses at$2,550');
-    // The chosen tier's own times, from its measured call time.
     expect(estimate).toContain('Usable in30 minutes');
     expect(estimate).toContain('Complete in2 to 3 hours');
     expect(button(host, 'Start Tree').disabled).toBe(false);
@@ -154,7 +147,6 @@ describe('choosing Tree', () => {
     expect(setMemoryModule).toHaveBeenCalledExactlyOnceWith('tree');
   });
 
-  /** A panel in the page left the Classic memory list showing under it. */
   it('opens as a modal dialog, and its X writes nothing', async () => {
     getTreeBackfillEstimate.mockResolvedValue(ESTIMATE);
     unmount = await mount(host);
@@ -167,7 +159,6 @@ describe('choosing Tree', () => {
     expect(dialog?.getAttribute('aria-modal')).toBe('true');
     expect(dialog?.closest('.modal-overlay')).not.toBeNull();
 
-    // In <body> the picker's menu would open behind the dialog.
     dialog!.querySelector<HTMLButtonElement>('.model-selection-field .dropdown-trigger')!.click();
     await settle();
     expect(dialog!.querySelector('.dropdown-menu')).not.toBeNull();
@@ -191,8 +182,6 @@ describe('choosing Tree', () => {
     expect(setMemoryModule).not.toHaveBeenCalled();
   });
 
-  /** Classic runs while unset, and shows pressed, but pressing it answers the
-   *  memory choice, so it still writes. */
   it('writes Classic on a workspace that never chose', async () => {
     const store = await import('../../../store/store');
     unmount = await mount(host);
@@ -224,7 +213,6 @@ describe('choosing Tree', () => {
     expect(button(host, 'Start Tree').disabled).toBe(false);
   });
 
-  /** Every model is offered, but only the measured ones are priced. */
   it('says a model it cannot price has no estimate', async () => {
     getTreeBackfillEstimate.mockResolvedValue({ ...ESTIMATE, costs: [] });
     unmount = await mount(host);
@@ -234,7 +222,6 @@ describe('choosing Tree', () => {
     const estimate = host.querySelector('[data-role="tree-estimate"]')?.textContent ?? '';
     expect(estimate).toContain('No estimate for this model');
     expect(estimate).toContain('No cap for this model');
-    // The times fall back to the default seconds per call.
     expect(estimate).toContain('Complete in6 to 19 hours');
   });
 
@@ -287,7 +274,6 @@ describe('choosing Tree', () => {
       .toContain('$2,200 to $4,600');
   });
 
-  /** Each tier shows its own price and time. */
   it('prices and times the stored tier, not the model', async () => {
     getTreeBackfillEstimate.mockResolvedValue(ESTIMATE);
     const store = await import('../../../store/store');
@@ -304,8 +290,6 @@ describe('choosing Tree', () => {
     expect(estimate).toContain('Complete in2 to 5 hours');
   });
 
-  /** At the recommended tier there is nothing to say. Off it, one click
-   *  saves the tier the engine recommends for the model. */
   it('offers the recommended tier only while another is picked', async () => {
     getTreeBackfillEstimate.mockResolvedValue(ESTIMATE);
     const store = await import('../../../store/store');

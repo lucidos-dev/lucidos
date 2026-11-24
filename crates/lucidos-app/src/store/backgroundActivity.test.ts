@@ -29,25 +29,16 @@ describe('backgroundActivities', () => {
     expect(rest).toEqual([]);
     expect(activity.kind).toBe('engine-build');
     expect(activity.label).toBe('Building new version');
-    // A cargo build reports no progress; inventing a bar would be worse than
-    // the spinner the toast falls back to.
     expect(activity.progress).toBeNull();
   });
 
-  /** The counter advances from the CLIENT anchor, so it moves between the ~4s
-   *  polls (nothing pushes a per-second frame for a build) without ever
-   *  differencing the engine's clock against the browser's. */
   it('counts the build up from the client anchor, not the engine clock', () => {
     const detail = { elapsedMs: 8_000, anchoredAt: 1_000_000, pendingCommits: null };
     expect(backgroundActivities(true, null, null, detail, 1_000_000)[0].detail).toBe('8s');
-    // Six seconds later, with no new poll, the same detail reads six higher.
     expect(backgroundActivities(true, null, null, detail, 1_006_000)[0].detail).toBe('14s');
     expect(backgroundActivities(true, null, null, detail, 1_112_000)[0].detail).toBe('2m 0s');
   });
 
-  /** A build waiting for a build slot is not compiling, so it must not say it
-   *  is. The timer and the commits carry on unchanged: they describe the Apply,
-   *  not the compile. */
   it('names a queued build as queued, keeping its timer and commits', () => {
     const commits = {
       total: 1,
@@ -66,7 +57,6 @@ describe('backgroundActivities', () => {
       'All 3 build slots are busy: make lint, engine tests, engine tests. ' +
         'It takes the next one that frees up.',
     );
-    // The commits stay with the build detail, which the menu lays out.
     expect(activity.note).toBe('You can switch to it once the build finishes.');
 
     const compiling = { ...queued, queuedBehind: undefined };
@@ -98,17 +88,12 @@ describe('backgroundActivities', () => {
     expect(kinds).toEqual(['engine-build', 'frontend-refresh']);
   });
 
-  /** A co-located peer's build spins the badge but reports no elapsed of its
-   *  own. Timing it from when THIS client first noticed would be a made-up
-   *  number, so it shows none. */
   it('shows no timer for a build whose clock is not ours', () => {
     const peer = { elapsedMs: null, anchoredAt: 1_000_000, pendingCommits: null };
     const [activity] = backgroundActivities(true, null, null, peer, 1_030_000);
     expect(activity.detail).toBeUndefined();
   });
 
-  /** What a build brings is laid out by the menu detail from the engine's
-   *  groups. The note is what the detail says when git cannot count them. */
   it('says what follows each build', () => {
     expect(backgroundActivities(true, null)[0].note).toBe('You can switch to it once the build finishes.');
     const refresh = { elapsedMs: 1_000, anchoredAt: 0 };
@@ -124,15 +109,10 @@ describe('backgroundActivities', () => {
     expect(activity.progress).toBeCloseTo(0.5);
   });
 
-  /** The badge exists to show work in flight. Building the ONNX session takes a
-   *  few seconds on EVERY boot, warm cache included, so counting it would flash
-   *  a spinner every time the app opens. */
   it('does not count the post-download ONNX load', () => {
     expect(backgroundActivities(false, model({ kind: 'loading' }))).toEqual([]);
   });
 
-  /** Neither is work in progress, and both already have a notification. An
-   *  offline machine would otherwise spin the badge forever. */
   it('does not count a stalled or abandoned load', () => {
     expect(backgroundActivities(false, model({ kind: 'waiting', attempt: 4 }))).toEqual([]);
     expect(backgroundActivities(false, model({ kind: 'failed', message: 'bad' }))).toEqual([]);
@@ -148,8 +128,6 @@ describe('backgroundActivities', () => {
       false,
       model({ kind: 'downloading', downloaded_bytes: 1024, total_bytes: 0 }),
     );
-    // A frame can arrive before any file has declared its size. Show the bytes
-    // so far and no bar, rather than a bar built on a zero denominator.
     expect(activity.progress).toBeNull();
     expect(activity.detail).toBeTruthy();
   });
@@ -182,7 +160,6 @@ describe('embeddingModelOutcome', () => {
     expect(outcome?.message).toBe('vector(768) does not fit vector(384)');
   });
 
-  /** Work still in progress has no outcome yet. */
   it('says nothing while the model is still coming', () => {
     expect(embeddingModelOutcome({ kind: 'loading' })).toBeNull();
     expect(embeddingModelOutcome(downloading.load_state)).toBeNull();
@@ -194,8 +171,6 @@ describe('embeddingModelOutcome', () => {
   });
 });
 
-/** The Expose run (`tailscale serve`). The link in these tests is the one the
- *  real CLI printed on 2026-08-02 for a tailnet without Serve enabled. */
 const APPROVAL_URL = 'https://login.tailscale.com/f/serve?node=nodeidEXAMPLE1234';
 
 describe('the Expose run on the badge', () => {
@@ -211,13 +186,10 @@ describe('the Expose run on the badge', () => {
       expect(activities, run.phase).toHaveLength(1);
       expect(activities[0].kind).toBe('tailscale-serve');
       expect(activities[0].label, run.phase).not.toBe('');
-      // Not one step of this flow can honestly report a fraction.
       expect(activities[0].progress, run.phase).toBeNull();
     }
   });
 
-  /** The badge shows work IN FLIGHT, so a run that is over must stop it. A
-   *  spinning badge with nothing behind it is the failure this pins. */
   it('stops spinning the moment the run ends', () => {
     for (const run of [
       { phase: 'done', url: 'https://mymac.tailnet-name.ts.net' },
@@ -229,9 +201,6 @@ describe('the Expose run on the badge', () => {
     expect(backgroundActivities(false, null, null)).toEqual([]);
   });
 
-  /** The whole point of the change. The CLI prints this link and then blocks
-   *  polling until someone visits it; the old code killed the child at 20s and
-   *  threw the link away with the pipes. */
   it('offers the approval link the CLI printed, verbatim', () => {
     const activity = tailscaleServeActivity({ phase: 'awaiting-tailnet-approval', url: APPROVAL_URL });
     expect(activity?.label).toContain('Waiting for you to enable Serve');
@@ -240,7 +209,6 @@ describe('the Expose run on the badge', () => {
       label: 'Enable in Tailscale',
       url: APPROVAL_URL,
     });
-    // And a way out of a wait that can legitimately last minutes.
     expect(activity?.secondaryAction?.kind).toBe('cancel-tailscale-serve');
   });
 
@@ -253,9 +221,6 @@ describe('the Expose run on the badge', () => {
     expect(outcome?.tone).toBe('success');
   });
 
-  /** Shown verbatim, with no prefix: every message Rust returns already names
-   *  what failed, and re-framing them here is what once produced "Tailscale
-   *  serve failed: tailscale serve failed: ...". */
   it('reports a failure verbatim, and reads as a failure', () => {
     const message = 'This Mac is not on a tailnet yet. Sign in to Tailscale first.';
     expect(tailscaleServeOutcome({ phase: 'failed', message })).toEqual({
@@ -264,12 +229,9 @@ describe('the Expose run on the badge', () => {
     });
   });
 
-  /** A cancel is the user getting what they asked for, so there is nothing to
-   *  report. The surface simply clears. */
   it('says nothing at all about a cancelled run', () => {
     expect(tailscaleServeOutcome({ phase: 'cancelled' })).toBeNull();
     expect(tailscaleServeOutcome(null)).toBeNull();
-    // Nor about one still in flight.
     expect(tailscaleServeOutcome({ phase: 'configuring' })).toBeNull();
   });
 });

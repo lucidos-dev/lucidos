@@ -2,19 +2,11 @@ import { test, expect, type Page } from './fixtures';
 import type { Route } from '@playwright/test';
 import { assertHealthy, navigateToApp, uniqueMessage, userMessageBody, waitForVisibleInput } from './helpers';
 
-/** An image still uploading when the page reloads comes back as a chip and
- *  lands, and a Send pressed before the reload still goes. Exercises the
- *  real IndexedDB store, which Vitest cannot reach.
- *  Plan: `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`.
- *
- *  Service workers are blocked, as in `image-upload-progress-all.spec.ts`, so
- *  `page.route` sees the upload in WebKit too. */
 
 test.use({ serviceWorkers: 'block' });
 
 const BLOB_ROUTE = '**/api/v1/threads/*/blobs';
 
-/** A real 1x1 PNG: the composer sniffs the bytes before it draws a chip. */
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64',
@@ -30,7 +22,6 @@ const confirmedImage = (page: Page) => page.locator('.image-preview-item:visible
 const uploadNotice = (page: Page) => page.locator('[data-role="upload-send-notice"]:visible');
 const sendButton = (page: Page) => page.locator('button[aria-label="Send message"]:visible').first();
 
-/** Count live uploads or active queued sends, excluding retained source history. */
 function storedCount(page: Page, storeName: 'uploads' | 'queued-source-history'): Promise<number> {
   return page.evaluate(async (storeName) => {
     let count = 0;
@@ -52,19 +43,16 @@ function storedCount(page: Page, storeName: 'uploads' | 'queued-source-history')
   }, storeName);
 }
 
-/** Hold every upload until `release`. A request the reload cut off is gone,
- *  so continuing it fails, and that failure is expected. */
 async function holdUploads(page: Page): Promise<() => void> {
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   await page.route(BLOB_ROUTE, async (route: Route) => {
     await held;
-    await route.continue().catch(() => {});
+    await route.fallback().catch(() => {});
   });
   return release;
 }
 
-/** Type a draft and wait for the engine to store it, so the reload finds it. */
 async function typeStoredDraft(page: Page, message: string): Promise<void> {
   const stored = page.waitForResponse((r) =>
     r.url().endsWith('/compose') && r.request().method() === 'PUT' && r.ok());

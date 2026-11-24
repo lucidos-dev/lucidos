@@ -46,31 +46,7 @@ const LEARN_FLOOR_DAYS: usize = 7;
 /// learned cap on a 5-minute or 1-hour cache.
 const CARD_UNDECIDED: Duration = Duration::from_secs(24 * 3600);
 
-/// The beats a wait of `secs` needs: infinite for an abandoned card.
-fn beats_needed(secs: f64, beat_every_secs: f64) -> f64 {
-    (secs / beat_every_secs).floor().max(0.0)
-}
-
-impl CapOdds {
-    /// How `durations` end against a cap of `cap` beats. A wait of `d` seconds
-    /// needs `floor(d / beat_every_secs)` beats.
-    pub(super) fn of(durations: &[f64], beat_every_secs: f64, cap: u32) -> Self {
-        let mut odds = Self {
-            samples: u32::try_from(durations.len()).unwrap_or(u32::MAX),
-            slots: vec![0; cap as usize + 1],
-            after_cap: 0,
-        };
-        for d in durations {
-            let needed = beats_needed(*d, beat_every_secs);
-            if needed <= f64::from(cap) {
-                odds.slots[needed as usize] += 1;
-            } else {
-                odds.after_cap += 1;
-            }
-        }
-        odds
-    }
-}
+use crate::engine::thread_events::keep_alive_status::beats_needed;
 
 /// The zone the `timezone` preference names. Unset or unparseable reads UTC.
 pub(super) fn preference_zone(timezone: &str) -> Tz {
@@ -342,8 +318,10 @@ impl WaitHistory {
 /// lists what an event wait watched, and is empty for a card.
 /// `is_coding_agent` tells the two agents apart.
 fn durations_sql() -> String {
-    let read_at =
-        crate::engine::successor::first_real_request_started_after_sql("s.thread_id", "a.sequence");
+    let read_at = crate::engine::session_capture_sql::first_real_request_started_after_sql(
+        "s.thread_id",
+        "a.sequence",
+    );
     format!(
         r#"
 WITH kept AS (SELECT thread_id, is_coding_agent FROM thread_summaries
@@ -496,7 +474,7 @@ impl LucidosEngine {
         tokio::spawn(async move {
             match read_wait_durations(&pool, zone).await {
                 Ok(durations) => cache.store(durations),
-                Err(e) => crate::log!("[KeepAlive] Could not read the wait durations: {e}"),
+                Err(e) => crate::log_legacy!("[KeepAlive] Could not read the wait durations: {e}"),
             }
         });
     }

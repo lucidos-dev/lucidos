@@ -1,16 +1,3 @@
-/**
- * A previewed HTML artifact runs at an opaque origin, and its bridges still work.
- *
- * The artifact is untrusted content: an upload, a web page an agent fetched, a
- * file an app wrote. An unsandboxed `<iframe srcDoc>` inherits the shell's
- * origin. Its script could then read the shell's DOM and storage, and call
- * every route as the user. So the frame is sandboxed (ADR 0322), and the link,
- * shortcut and zoom behaviour crosses a `postMessage` bridge instead.
- *
- * Runs on every project: desktop Chromium, mobile Chromium and mobile WebKit.
- * The sandbox and `postMessage` are engine features, and WebKit is the iOS PWA
- * and the packaged desktop client.
- */
 import { test, expect, type Page, type FrameLocator } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
@@ -24,7 +11,6 @@ const FORGER_PATH = 'artifacts/e2e-sandbox/forger.html';
 const DIR = resolve(WORKSPACE, 'data/artifacts/e2e-sandbox');
 const NOTE_TEXT = 'The sibling note the report links to.';
 
-/** A 1x1 PNG, so a relative image ref has something real to load. */
 const PIXEL = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
   'base64',
@@ -32,8 +18,6 @@ const PIXEL = Buffer.from(
 
 const SHELL_KEY = 'e2e-sandbox-secret';
 
-/** The report. Its script probes what it can reach and writes the answers into
- *  its own DOM, which is also the proof that its scripts still run. */
 const REPORT = `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><title>sandbox report</title></head>
@@ -65,8 +49,6 @@ const REPORT = `<!DOCTYPE html>
 </html>
 `;
 
-/** A hostile artifact. It tries every way it has to get a navigation out of
- *  the bridge without a click, and reports what it could see. */
 const FORGER = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>forger</title></head>
 <body><a id="bait" href="note.md">note</a><pre id="forged">pending</pre>
@@ -114,13 +96,10 @@ async function openReport(page: Page): Promise<void> {
   await expect(frame(page).locator('#probe')).toHaveAttribute('data-state', 'done', { timeout: 20_000 });
 }
 
-/** Run a function inside the preview document, where the shell itself cannot. */
 async function inFrame<T>(page: Page, fn: () => T): Promise<T | null> {
   const handle = await page.locator(FRAME).first().elementHandle();
   const inner = await handle?.contentFrame();
   if (!inner) throw new Error('the preview iframe has no frame');
-  // A UI-scale change re-stamps the srcdoc and replaces the document, so a
-  // read can outlive the one it began in. It answers null, and a poll asks again.
   try {
     return await inner.evaluate(fn);
   } catch (e) {
@@ -148,12 +127,9 @@ test.describe('a previewed HTML artifact', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // The zoom test steps the UI to 112.5%. Beside the dashboard rail, the Canvas
-    // that holds the preview cannot fit there and yields (ADR 0495).
     await hideDashboardRail(page);
     await navigateToApp(page);
     await page.evaluate((key) => localStorage.setItem(key, 'the shell only'), SHELL_KEY);
-    // Every navigate below is delivered over SSE, so the stream has to be up first.
     await waitForEventStream(page);
   });
 
@@ -168,13 +144,10 @@ test.describe('a previewed HTML artifact', () => {
     const probe = JSON.parse(await frame(page).locator('#probe').textContent() ?? '{}');
     expect(probe.title, 'wrote the shell document').toBe('blocked');
     expect(probe.parentStorage, 'read the shell storage').toBe('blocked');
-    // An opaque origin has no storage of its own either.
     expect(probe.ownStorage).toBe('blocked');
-    // The engine refuses a cross-site browser request, and CORS hides the rest.
     expect(probe.api, 'called the API as the user').not.toBe('reached');
     expect(await page.title()).toBe(shellTitle);
 
-    // The frame carries the sandbox, with no way back to the shell origin.
     const sandbox = await page.locator(FRAME).first().getAttribute('sandbox');
     expect(sandbox).toContain('allow-scripts');
     expect(sandbox).not.toContain('allow-same-origin');
@@ -194,7 +167,6 @@ test.describe('a previewed HTML artifact', () => {
     await frame(page).locator('#to-far').click();
 
     await expect.poll(() => inFrame(page, () => window.scrollY), { timeout: 10_000 }).toBeGreaterThan(1000);
-    // Still the report, not the Lucidos shell loaded into the pane.
     expect(await inFrame(page, () => document.title)).toBe('sandbox report');
   });
 
@@ -211,12 +183,9 @@ test.describe('a previewed HTML artifact', () => {
     await openFile(page, FORGER_PATH);
     await expect(frame(page).locator('#forged')).not.toHaveText('pending', { timeout: 20_000 });
 
-    // The bridge removed its own markup and assigns nothing a setter can catch.
     const seen = JSON.parse(await frame(page).locator('#forged').textContent() ?? '{}');
     expect(seen).toEqual({ inMarkup: false, stolen: 0 });
 
-    // Nothing it tried opened the note: not the scripted click on the bait, not
-    // the synthetic chord, not the guessed nonce. Give a late message its chance.
     await page.waitForTimeout(1_500);
     await expect(page.locator('.file-preview-inline:visible .markdown-content')).toHaveCount(0);
     await expect(frame(page).locator('#forged')).toBeVisible();
@@ -226,15 +195,11 @@ test.describe('a previewed HTML artifact', () => {
     await openReport(page);
     expect(await inFrame(page, boxWidth)).toBeCloseTo(100, 0);
 
-    // Focus inside the frame, where the shell's own keydown listener never hears.
     await frame(page).locator('#probe').click();
     try {
       await page.keyboard.press('Control+=');
-      // One 12.5% step. The preview re-stamps its zoom, so its px box grows.
       await expect.poll(() => inFrame(page, boxWidth), { timeout: 10_000 }).toBeCloseTo(112.5, 0);
     } finally {
-      // A forwarded chord sends the shell no keyup, so the zoom panel lingers
-      // and its scrim covers the preview. A click then lands on the shell.
       await expect(page.locator('.scale-modal')).toHaveCount(0, { timeout: 5_000 });
       await frame(page).locator('#probe').click();
       await page.keyboard.press('Control+0');

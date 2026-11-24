@@ -75,11 +75,6 @@ describe('threadFilterActive', () => {
   });
 
   it('is true when every VISIBLE trigger is picked but a deleted one is still excluded', () => {
-    // The trigger arm counted against the visible slice, which drops an
-    // unselected deleted trigger while "Include deleted" is off. Picking every
-    // row on screen therefore read as "all", so the Filter button went dark.
-    // `threadPassesChannelFilter` still hides the deleted trigger's threads on
-    // any non-empty selection, so the list WAS narrowed.
     triggers.value = { status: 'loaded', data: [makeTrigger({ id: 'a', name: 'A' })] };
     historicalTriggers.value = {
       status: 'loaded',
@@ -88,7 +83,6 @@ describe('threadFilterActive', () => {
     selectedTriggerIds.value = new Set(['a']);
 
     expect(threadFilterActive.value).toBe(true);
-    // Opting the deleted one back in and picking it too excludes nothing.
     setIncludeDeletedFilterOptions(true);
     selectedTriggerIds.value = new Set(['a', 'gone']);
     expect(threadFilterActive.value).toBe(false);
@@ -125,11 +119,6 @@ describe('threadFilterActive', () => {
   });
 
   it('is true even with every repo selected — app coding-agent threads are still excluded because the filter is two-axis', () => {
-    // Coding Agent has two cross-axis sub-selections (repos + apps).
-    // threadPassesChannelFilter unions repoOk || appOk under the
-    // coding-agent branch, so picking "every repo" still drops every app coding-agent
-    // thread from the drawer — the filter IS narrowing. The per-axis
-    // "selected === total" shortcut from triggers doesn't apply.
     repositories.value = {
       status: 'loaded',
       data: [
@@ -178,10 +167,6 @@ describe('setThreadChannelFilter', () => {
   });
 
   it('writes the signal AND localStorage, so a filter survives a reload', () => {
-    // The persisting writer every channel write goes through (`toggleChannel`),
-    // matching the three selected-id setters. Setting the signal directly is the
-    // bug it exists to make impossible: the filter would look applied and then
-    // vanish on the next boot.
     setThreadChannelFilter(new Set(['chat']));
 
     expect(threadChannelFilter.value).toEqual(new Set(['chat']));

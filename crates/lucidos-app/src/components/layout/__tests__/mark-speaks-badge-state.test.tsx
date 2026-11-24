@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The state badge is click-through, so a pointer or a screen reader lands on
- * the mark. The mark therefore speaks what the badge stands for.
- */
 import { describe, it, expect, afterEach } from 'vitest';
 import { render } from 'preact';
 import { BrandMenuButton, MENU_NAME } from '../HeaderMark';

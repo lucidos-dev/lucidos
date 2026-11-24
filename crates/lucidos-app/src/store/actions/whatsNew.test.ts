@@ -7,11 +7,6 @@ vi.mock('../../api/client', () => ({
   engineChangelog: vi.fn(),
 }));
 
-/**
- * The reported defect: What's New opened while an update restart had the
- * engine down, so the read failed. Nothing asked again, and the panel showed
- * "Failed to load the changelog" until the app was restarted by hand.
- */
 describe('reloadChangelogIfRead', () => {
   const release = { version: '1.0.0', date: null, notes: 'body' };
 
@@ -58,8 +53,6 @@ describe('reloadChangelogIfRead', () => {
 
 describe('hasUnreadWhatsNew', () => {
   it('shows the dot for a client that has never opened the panel', () => {
-    // Including a brand new install: one dot pointing at what is in the
-    // version they just installed, cleared by opening it.
     expect(hasUnreadWhatsNew('0.26.3', null)).toBe(true);
   });
 
@@ -72,8 +65,6 @@ describe('hasUnreadWhatsNew', () => {
   });
 
   it('stays quiet while the running release is still unknown', () => {
-    // The window before /health answers. Treating it as new would flash a dot
-    // on every single reload.
     expect(hasUnreadWhatsNew(null, null)).toBe(false);
     expect(hasUnreadWhatsNew(null, '0.26.3')).toBe(false);
   });
@@ -93,8 +84,6 @@ describe('markWhatsNewSeen', () => {
   });
 
   it('never records an unknown release', () => {
-    // Opening the panel before /health answers must not spend the one
-    // notification the user gets for whatever release they are actually on.
     markWhatsNewSeen(null);
     expect(whatsNewSeenRelease.value).toBe(null);
     expect(localStorage.getItem('lucidos-whats-new-seen-release')).toBe(null);

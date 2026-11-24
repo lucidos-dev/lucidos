@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A widget's frame IS an app frame (ADR 0402, plan invariant 1). An inline one
- * fills its widget box, mounts once it comes on screen and stays a while after
- * it scrolls off. An option one takes its widget's height.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
 import { render } from 'preact';
@@ -29,7 +24,6 @@ let host: HTMLElement;
 beforeEach(() => {
   _resetWidgetHeightsForTesting();
   widgetRefreshKeys.value = new Map();
-  // A frame applies a report on the next animation frame. Run it at once.
   vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => { run(performance.now()); return 0; });
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -96,8 +90,6 @@ describe('WidgetFrame', () => {
     expect(frame.getAttribute('allow')).toBe(APP_FRAME_ALLOW);
     expect(appIdForFrame(frame)).toBe('fare-grid');
     expect(isCanvasAppFrame(frame), 'a widget is never the Canvas app').toBe(false);
-    // The bridge answers only a frame it finds this way, so a widget's
-    // `lucidos.request` and `lucidos.sse` pass exactly as an app's do.
     expect(appFrameFor(frame.contentWindow)).toBe(frame);
   });
 
@@ -125,7 +117,6 @@ describe('WidgetFrame', () => {
     );
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, host); });
     act(() => { reportOnScreen?.(true); });
-    // A `100vh` body with an 8px margin each side reports 16px past the frame.
     for (let px = OPTION_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
     expect(frameBox().style.height, 'back where the creep began').toBe(`${OPTION_WIDGET_HEIGHT_PX}px`);
 
@@ -195,9 +186,6 @@ describe('WidgetFrame', () => {
   });
 });
 
-/** A transcript whose top sits at y=100, scrolled to `scrollTop`. A box laid
- *  out at `offset` in its content measures from that, `height` tall. jsdom
- *  lays nothing out, so the rects are drawn by hand. */
 function transcript(scrollTop: number) {
   const scroller = document.createElement('div');
   scroller.className = 'thread-content';
@@ -221,7 +209,6 @@ describe('WidgetFrame in the transcript', () => {
     host.append(scroller);
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
-    // Its top is 100px above the line, so the reader reads what follows it.
     layOut(frameBox(), 200, boxHeight);
 
     report(600);
@@ -236,9 +223,7 @@ describe('WidgetFrame in the transcript', () => {
     host.append(scroller);
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
-    // Across the reader's line, so the reader is using it in view.
     layOut(frameBox(), 280, boxHeight);
-    // A tap inside the widget focuses its frame.
     frames()[0].tabIndex = 0;
     frames()[0].focus();
 
@@ -248,14 +233,12 @@ describe('WidgetFrame in the transcript', () => {
   });
 
   it('holds the reader still for a widget they used that has scrolled above their line', () => {
-    // A frame stays loaded off screen, and scrolling never blurs it.
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     frames()[0].tabIndex = 0;
     frames()[0].focus();
-    // Its bottom is 60px above the line, so it is wholly off screen.
     layOut(frameBox(), 0, boxHeight);
 
     report(600);
@@ -268,7 +251,6 @@ describe('WidgetFrame in the transcript', () => {
     host.append(scroller);
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="option" />, scroller); });
     act(() => { reportOnScreen?.(true); });
-    // 100px above the line and 800px tall, so it runs past the 600px band.
     act(() => {
       frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: 800 }, bubbles: true }));
     });

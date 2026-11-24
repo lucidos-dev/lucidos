@@ -1,15 +1,4 @@
-/**
- * Slots for the engine calls an app frame makes through the shell.
- *
- * Those calls share the shell's HTTP/1.1 pool to the engine origin, about six
- * connections. With no limit, one busy app fills the pool, and its own clicks,
- * every shell request and every other frame wait behind it. So at most
- * `BRIDGED_FETCH_SLOTS` run at once, and free slots go round robin across
- * frames, to the frame with the fewest calls running.
- */
 
-/** The pool is about six and the shell's event stream holds one. Three bridged
- *  calls leave the shell two connections of its own. */
 export const BRIDGED_FETCH_SLOTS = 3;
 
 interface Queued {
@@ -19,7 +8,6 @@ interface Queued {
   reject: (error: Error) => void;
 }
 
-/** What the lanes are doing now, for a diagnostic. Ages are in milliseconds. */
 export interface LanesSnapshot {
   running: number;
   queued: number;
@@ -27,30 +15,18 @@ export interface LanesSnapshot {
   oldestQueuedMs: number | null;
 }
 
-/** The frame a queue belongs to. A disconnected one has gone. */
 export interface Lane {
   readonly isConnected: boolean;
 }
 
 export class FetchLanes<L extends Lane> {
-  /** Insertion order breaks a tie between lanes. A lane leaves when it empties
-   *  and rejoins at the back when it has more to send. */
   private readonly queues = new Map<L, Queued[]>();
-  /** Calls running, per lane. A lane with none has no entry. */
   private readonly running = new Map<L, number>();
   private inFlight = 0;
-  /** When each running call began. */
   private readonly runStarts = new Set<{ startedAt: number }>();
 
   constructor(private readonly slots: number) {}
 
-  /**
-   * Run `send` in the lane's turn, with the time left before `deadline`.
-   *
-   * A request whose deadline passed while it waited is rejected unsent: the app
-   * has given up on it, and a write it was told failed must not land. A
-   * request from a frame that unmounted is dropped the same way.
-   */
   enqueue<T>(lane: L, deadline: number, send: (remainingMs: number) => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const queued: Queued = {
@@ -85,7 +61,6 @@ export class FetchLanes<L extends Lane> {
     }
   }
 
-  /** Read-only: the diagnostic reads it without moving a call. */
   snapshot(now = Date.now()): LanesSnapshot {
     const oldest = (times: Iterable<number>): number | null => {
       const first = Math.min(...times);
@@ -114,7 +89,6 @@ export class FetchLanes<L extends Lane> {
     else this.running.delete(lane);
   }
 
-  /** The oldest request of the waiting lane with the fewest calls running. */
   private takeNext(): { lane: L; queued: Queued } | null {
     let lane: L | null = null;
     let fewest = Infinity;

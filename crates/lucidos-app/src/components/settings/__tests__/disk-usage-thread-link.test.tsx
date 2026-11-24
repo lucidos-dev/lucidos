@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Disk usage names each worktree by its thread, and the name opens
- *  that thread. The buttons beside it keep their own clicks. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

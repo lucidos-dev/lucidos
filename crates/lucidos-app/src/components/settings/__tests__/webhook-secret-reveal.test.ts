@@ -1,8 +1,3 @@
-/**
- * A webhook's bearer token is shown once and never again, since only its
- * digest is stored. The toast that reveals it must wait for the user, and must
- * not leave on a timer before they can copy it.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { revealSecret } from '../WebhooksPage';
 import { toasts } from '../../../store/store';

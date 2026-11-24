@@ -199,6 +199,27 @@ pub(crate) fn run() -> Result<(), BoxError> {
             println!("{}", build_deny_json(&payload.tool_input.file_path));
             Ok(())
         }
+        Ok(PlannedState::Changed) => {
+            println!(
+                "{}",
+                deny_envelope(
+                    "Edit blocked: the plan changed after approval. Restore and commit the \
+                     approved plan text to reuse the approval. If the plan needs to change, \
+                     mark the revision and ask for approval."
+                )
+            );
+            Ok(())
+        }
+        Ok(PlannedState::Unreadable) => {
+            println!(
+                "{}",
+                deny_envelope(
+                    "Edit blocked: Lucidos could not verify the implementation plan. \
+                     Check the branch and committed plan file, then retry `lucidos planned state`."
+                )
+            );
+            Ok(())
+        }
         Err(e) => {
             // Engine unreachable / git-context / parse failure — fail OPEN so a
             // transient hiccup doesn't block every edit. The Apply-time floor

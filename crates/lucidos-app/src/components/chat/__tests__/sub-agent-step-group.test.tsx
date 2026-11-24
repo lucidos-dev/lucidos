@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** An `Agent` row folds its sub-agent's steps under it. Folded, a running agent
- *  shows its latest step on one line beneath it. Plan:
- *  `docs/plans/2026-10-06-fold-sub-agent-steps-under-agent-row.md`. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -115,7 +112,6 @@ describe('SubAgentStepGroup', () => {
     expect(openSubAgentGroups.value.has('agent-a')).toBe(true);
   });
 
-  // A reader following a running thread must not be scrolled by the growth.
   it('both fold targets hold the pressed control still', () => {
     draw(agent('pending', [child('a1', 'success')]));
     const count = host.querySelector<HTMLButtonElement>('.step-fold-count')!;

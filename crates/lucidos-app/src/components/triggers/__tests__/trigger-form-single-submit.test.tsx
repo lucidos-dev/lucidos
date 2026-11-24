@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Every create POST mints a new trigger. A second Save while the first is in
- * flight must not send another one, or two live copies fire on schedule.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 

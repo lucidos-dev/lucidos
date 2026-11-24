@@ -1,10 +1,5 @@
 // @vitest-environment jsdom
-/**
- * A Search Everywhere text hit asks for a find on the file it opens. The
- * content pane's bar opens it once it shows that file. By then the scope
- * change has ended the previous file's session. The caret moves into the
- * field, unless a finger would raise a keyboard over the file.
- */
+import '../../../utils/renderMarkdown';
 import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -13,7 +8,6 @@ import { findQuery, findSurface, findTargets, openFind, resetFind, setFindQuery 
 import { fileFindScope, requestFind } from '../../../store/actions/find-request';
 import { findRequest } from '../../../store/store';
 
-// The bar's targets are code-split. Warm them, so an open lands at once.
 beforeAll(() => findTargets.preload());
 
 const OLD = fileFindScope('artifacts/old.md');

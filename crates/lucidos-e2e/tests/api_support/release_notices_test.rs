@@ -19,13 +19,7 @@ async fn fetch_list() -> Value {
         .expect("Invalid JSON")
 }
 
-/// The list is the contract both surfaces read, so its shape is what breaks
-/// them. The modal draws `next_id`, the panel draws `notices` with `resolved`
-/// per row, and neither has a second source to fall back on.
-///
-/// Which notices are VISIBLE is decided in `engine::release_notices` and pinned
-/// by its own tests, against a release this build is not on. That cannot be
-/// reproduced over HTTP, where the running release is whatever the engine is.
+/// Grouped and older desktop clients read the same item and answer state.
 #[tokio::test]
 async fn the_list_serves_both_surfaces_from_one_shape() {
     let resp = http_client()
@@ -44,8 +38,35 @@ async fn the_list_serves_both_surfaces_from_one_shape() {
         "next_id names the notice the modal shows, or nothing: {body}"
     );
 
+    let releases = body["releases"].as_array().expect("`releases` array");
+    let grouped: Vec<_> = releases
+        .iter()
+        .flat_map(|release| {
+            let items = release["items"].as_array().expect("release items array");
+            assert!(!items.is_empty());
+            assert!(items.iter().all(|item| item["since"] == release["since"]));
+            assert_eq!(
+                release["resolved"],
+                items.iter().all(|item| item["resolved"] == true)
+            );
+            items
+        })
+        .collect();
+    assert_eq!(
+        grouped.iter().map(|item| &item["id"]).collect::<Vec<_>>(),
+        notices.iter().map(|item| &item["id"]).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        body["owed_through"].as_str(),
+        grouped
+            .iter()
+            .rev()
+            .find(|item| item["resolved"] == false)
+            .and_then(|item| item["id"].as_str())
+    );
+
     for notice in notices {
-        for field in ["id", "since", "title", "body"] {
+        for field in ["id", "since", "title", "summary", "body"] {
             let value = notice[field]
                 .as_str()
                 .unwrap_or_else(|| panic!("every notice needs {field}: {notice}"));
@@ -55,12 +76,11 @@ async fn the_list_serves_both_surfaces_from_one_shape() {
             notice["resolved"].is_boolean(),
             "the panel reads `resolved` per notice: {notice}"
         );
-        // Paired by construction, so a button is never drawn with nothing to
-        // send. Refused at parse time; asserted here on the wire shape.
+        // The parser pairs each button with exactly one action.
         assert_eq!(
             notice["action_label"].is_string(),
             notice["action_prompt"].is_string(),
-            "an action is both fields or neither: {notice}"
+            "a label requires a prompt: {notice}"
         );
     }
 }

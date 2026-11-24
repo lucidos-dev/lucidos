@@ -1,17 +1,6 @@
-/**
- * Mobile: a focused toggle switch never holds off a pane swipe.
- *
- * A tap on a toggle switch focuses its hidden checkbox. Only a field that
- * opens the keyboard may block a swipe, so a swipe from that state still moves
- * the pane. The spec focuses a real switch on the Appearance page without
- * flipping it, so it changes no setting.
- */
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, ensureMobileView, navigateToApp, openSettingsView } from './helpers';
 
-/** A left-to-right swipe across the visible content pane, as a touch sequence.
- *  Generic `Event`s carry the touch lists, because WebKit refuses the
- *  Touch and TouchEvent constructors. */
 async function swipeRightOnContent(page: Page): Promise<void> {
   await page.evaluate(() => {
     const el = Array.from(document.querySelectorAll<HTMLElement>('.content-pane-body')).find(

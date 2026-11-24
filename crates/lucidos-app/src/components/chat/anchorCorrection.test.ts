@@ -3,8 +3,6 @@ import { describe, expect, it } from 'vitest';
 import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
 
 describe('splitAnchorCorrection', () => {
-  // Layout lengths are multiples of 1/64 px in both engines, so sample those,
-  // plus a spread of arbitrary doubles for the float edges.
   const samples = [
     0, 1, 2377, 2377.8, 2498.8, 0.015625, 911.984375, 12.5, 1e-9, 3 - 1e-9,
     ...Array.from({ length: 200 }, (_, i) => (i * 37.3) / 64),

@@ -15,7 +15,6 @@ import {
 
 const THREAD = 'thread-1';
 
-/** Drive a run of inputs and keep the last state plus every effect. */
 function drive(inputs: CallInput[], from: CallState = CALL_IDLE) {
   let state = from;
   const effects: CallEffect[] = [];
@@ -28,31 +27,21 @@ function drive(inputs: CallInput[], from: CallState = CALL_IDLE) {
 }
 
 const PRESS: CallInput = { kind: 'toggle', threadId: THREAD };
-/**
- * The local gate opening and shutting on the caller's own voice.
- *
- * `SPOKE` follows a long silence, so over the talker it takes the floor back.
- * `RESUMED` follows a breath, which is somebody finishing the sentence the
- * talker talked over.
- */
 const SPOKE: CallInput = { kind: 'speech', open: true, quietMs: 4_000 };
 const RESUMED: CallInput = { kind: 'speech', open: true, quietMs: 200 };
 const HUSHED: CallInput = { kind: 'speech', open: false, quietMs: 0 };
 const TIMED_OUT: CallInput = { kind: 'utterance-timeout' };
 const frame = (f: ServerFrame): CallInput => ({ kind: 'frame', frame: f });
-/** The engine reporting the caller's finished words. */
 const HEARD: CallInput = frame({ type: 'user_turn_ended', transcript: 'what is on today' });
 const STARTED = frame({
   type: 'session_started',
   audio: { sample_rate_hz: 24_000, channels: 1, encoding: 'pcm_s16le' },
 });
 
-/** A call that is up and listening. */
 function live(): CallState {
   return drive([PRESS, STARTED]).state;
 }
 
-/** A call with the talker mid-reply. */
 function talking(): CallState {
   return drive([frame({ type: 'talker_transcript', text: 'one moment' })], live()).state;
 }
@@ -65,13 +54,6 @@ function sent(effects: CallEffect[]): string[] {
   return effects.flatMap((e) => (e.kind === 'send' ? [e.control.type] : []));
 }
 
-/**
- * What a barge-in case is about, which is the cut and not the floor.
- *
- * `caller_started_speaking` rides every opening edge, so it lands in most of
- * these and says nothing about whether the talker was cut off. Cases about the
- * opener itself read {@link sent} whole.
- */
 function cuts(effects: CallEffect[]): string[] {
   return sent(effects).filter((type) => type !== 'caller_started_speaking');
 }
@@ -185,8 +167,6 @@ describe('the reason a call could not run', () => {
     expect(effects).toEqual([]);
   });
 
-  /** A refusal carries none, on purpose: the shell is still measuring why, and
-   *  reports it once it knows. A guess here would be shown and then contradicted. */
   it('is left empty by a refused handshake, which is still being measured', () => {
     const { state } = drive([{ kind: 'refused' }], live());
     expect(state.phase).toBe('idle');
@@ -233,9 +213,6 @@ describe('who has the floor', () => {
     expect(effects).toEqual([]);
   });
 
-  /** Both sides are kept, and the fields say which is which. `heard` is the
-   *  caller's FINISHED sentence and `said` is the reply in flight, which the
-   *  engine's own row replaces when the turn ends (ADR 0174). */
   it('keeps the caller\'s finished words and the reply being spoken', () => {
     const words = ['what is on today', 'one moment'];
     const { state } = drive(
@@ -252,8 +229,6 @@ describe('who has the floor', () => {
     expect(state.replyCount).toBe(1);
   });
 
-  /** Every delta builds the reply, not just the first. Only the first moved
-   *  anything while the words were being dropped. */
   it('builds the reply from every delta, and empties it at the turn\'s end', () => {
     const { state } = drive(
       [
@@ -266,17 +241,11 @@ describe('who has the floor', () => {
 
     const ended = drive([frame({ type: 'talker_turn_ended' })], state).state;
     expect(ended.said).toBe('');
-    // The count does NOT reset: the next reply is a new row, not this one.
     expect(ended.replyCount).toBe(1);
   });
 });
 
-/** A frame carries no id and lands well after the caller stopped, so one
- *  arriving mid-word describes something they have already finished saying.
- *  Captioning the current bubble with it would show them an earlier sentence
- *  inside the one they are saying. See ADR 0174. */
 describe('a frame landing mid-word captions nothing', () => {
-  /** Speaking, with the talker having taken the floor over them. */
   const midWord = () => drive([SPOKE], live()).state;
 
   it('withholds the caption while the caller is speaking', () => {
@@ -299,8 +268,6 @@ describe('a frame landing mid-word captions nothing', () => {
     expect(state.heard).toBe('this one');
   });
 
-  /** The rule is about the caller still talking, not about the state name. A
-   *  turn the talker answered is settled, and its own frame still captions it. */
   it('still captions a turn the talker took the floor over', () => {
     const { state } = drive(
       [
@@ -323,8 +290,6 @@ describe('barge-in', () => {
     expect(has(effects, 'stop-playback')).toBe(true);
   });
 
-  /** The gate opens once per utterance, so the reducer cannot be asked twice
-   *  for the same one. The floor it just handed back is the second guard. */
   it('cuts the talker off once, however long the caller keeps talking', () => {
     const { effects } = drive([SPOKE, HUSHED, SPOKE], talking());
     expect(cuts(effects)).toEqual(['barge_in']);
@@ -340,12 +305,6 @@ describe('barge-in', () => {
     expect(has(effects, 'stop-playback')).toBe(true);
   });
 
-  /** **The reported defect.** A caller says "Status", draws breath, and the
-   *  talker answers into the pause. The rest of their sentence is not a
-   *  barge-in: they never handed the floor over.
-   *
-   *  Cutting there threw the speaker's queue away while the talker carried on,
-   *  so the caller heard "Still" ... their own words ... "in it." */
   it('leaves the talker speaking when the caller finishes their sentence', () => {
     const { state, effects } = drive([RESUMED], talking());
     expect(cuts(effects)).toEqual([]);
@@ -353,24 +312,18 @@ describe('barge-in', () => {
     expect(state.phase).toBe('speaking');
   });
 
-  /** Their words are still theirs. Only the CUT is withheld, so the bubble is
-   *  drawn and the row it promises still lands. */
   it('still opens their utterance while the talker keeps the floor', () => {
     const { state } = drive([RESUMED], talking());
     expect(state.utterance).toBe('live');
     expect(state.utteranceCount).toBe(1);
   });
 
-  /** The other half, and the one a fluency fix must not cost. A caller who has
-   *  been quiet through a reply is taking the floor back. */
   it('cuts the talker off for a caller who gave the floor up', () => {
     const { state, effects } = drive([SPOKE], talking());
     expect(cuts(effects)).toEqual(['barge_in']);
     expect(state.phase).toBe('listening');
   });
 
-  /** A caller talking through a whole reply raises an edge per breath. One
-   *  interruption is one cut, whatever the gate does after it. */
   it('cuts once however many breaths the caller takes over it', () => {
     const { effects } = drive([SPOKE, HUSHED, RESUMED, HUSHED, SPOKE], talking());
     expect(cuts(effects)).toEqual(['barge_in']);
@@ -387,13 +340,6 @@ describe('the caller speaking', () => {
     expect(has(effects, 'stop-playback')).toBe(false);
   });
 
-  /**
-   * The engine's floor opens on this, and on nothing a transcriber withholds.
-   *
-   * The Live provider states no such frame, and its talker answers the caller
-   * before its own transcriber reports them (ADR 0211). So their first sentence
-   * was answered into a muted line.
-   */
   it('tells the engine they opened their mouth, on every edge', () => {
     expect(sent(drive([SPOKE], live()).effects)).toEqual(['caller_started_speaking']);
     expect(sent(drive([RESUMED], talking()).effects)).toEqual(['caller_started_speaking']);
@@ -403,14 +349,10 @@ describe('the caller speaking', () => {
     ]);
   });
 
-  /** Nothing to say it on yet. The handshake carries it, with the held audio. */
   it('holds it back until there is a socket', () => {
     expect(sent(drive([SPOKE], drive([PRESS]).state).effects)).toEqual([]);
   });
 
-  /** The barge-in hands the floor straight back, so the caller is using it
-   *  before anything reads the state. Waiting would cost the row 120 ms the
-   *  gate has already spent. */
   it('opens one over the talker too, in the same step as the barge-in', () => {
     expect(drive([SPOKE], talking()).state.utterance).toBe('live');
   });
@@ -419,9 +361,6 @@ describe('the caller speaking', () => {
     expect(drive([SPOKE, HUSHED], live()).state.utterance).toBe('landing');
   });
 
-  /** The gate shuts on 320 ms of quiet and a provider endpoints on longer. A
-   *  breath mid-sentence is still inside the turn the engine will report.
-   *  Counted as a second, its row would wait on words that never come. */
   it('reads a pause as one utterance, not two', () => {
     const { state } = drive([SPOKE, HUSHED, SPOKE], live());
     expect(state.utterance).toBe('live');
@@ -438,18 +377,12 @@ describe('the caller speaking', () => {
     expect(drive([SPOKE]).state.utterance).toBe('none');
   });
 
-  /** The microphone opens before the socket is dialled, and the engine sends
-   *  `session_started` only once the PROVIDER session is up. Gating the row on
-   *  that left the whole connect window drawing nothing, measured at 3.79
-   *  seconds on one call. The audio is held meanwhile, so the row is honest. */
   it('starts the utterance while the call is still connecting', () => {
     const { state } = drive([SPOKE], drive([PRESS]).state);
     expect(state.utterance).toBe('live');
     expect(state.utteranceCount).toBe(1);
   });
 
-  /** The caller may be mid-sentence when the socket comes up, so the handshake
-   *  moves the phase and leaves their utterance exactly as it is. */
   it('sends the held audio when the session opens, keeping the utterance', () => {
     const speaking = drive([SPOKE], drive([PRESS]).state).state;
     const { state, effects } = drive(
@@ -458,21 +391,12 @@ describe('the caller speaking', () => {
     );
     expect(state.phase).toBe('listening');
     expect(state.utterance).toBe('live');
-    // The floor opener rides up with the audio it belongs to. Their opening
-    // edge came before there was a socket, and it is the one the floor most
-    // needs to hear about.
     expect(effects).toEqual([
       { kind: 'flush-audio' },
       { kind: 'send', control: { type: 'caller_started_speaking' } },
     ]);
   });
 
-  /**
-   * A short first sentence fits inside the connect window, gate shut and all.
-   *
-   * Its reply is exactly the one a shut floor eats, so `landing` owes the
-   * opener as much as `live` does.
-   */
   it('still carries the opener for a sentence that ended before the session', () => {
     const finished = drive([SPOKE, HUSHED], drive([PRESS]).state).state;
     expect(finished.utterance).toBe('landing');
@@ -480,15 +404,11 @@ describe('the caller speaking', () => {
     expect(sent(effects)).toEqual(['caller_started_speaking']);
   });
 
-  /** A caller who was quiet through the handshake says nothing on it. */
   it('opens the session without a floor opener when nobody was speaking', () => {
     const { effects } = drive([STARTED], drive([PRESS]).state);
     expect(effects).toEqual([{ kind: 'flush-audio' }]);
   });
 
-  /** The talker answering PROVES the provider ended that turn and read it. It
-   *  also shuts the gate, and a row left `live` behind a shut gate could never
-   *  be retracted: the falling edge that retracts it is spent. */
   it('hands the utterance to the words when the talker takes the floor', () => {
     const speaking = drive([SPOKE], live()).state;
     const { state, effects } = drive([frame({ type: 'talker_transcript', text: 'well' })], speaking);
@@ -499,8 +419,6 @@ describe('the caller speaking', () => {
 });
 
 describe('an utterance that never becomes words', () => {
-  /** `call.rs` refuses to hold a wordless transcript, so an empty one is the
-   *  engine saying the provider heard nothing worth writing down. */
   it('goes at once when the engine reports an empty transcript', () => {
     const { state } = drive(
       [SPOKE, HUSHED, frame({ type: 'user_turn_ended', transcript: '   ' })],
@@ -539,23 +457,16 @@ describe('an utterance the engine has words for', () => {
     expect(state.utterance).toBe('transcribed');
   });
 
-  /** The gate can miss an utterance said too quietly to clear it. Nothing was
-   *  drawn for that one, so there is nothing to keep on screen. */
   it('starts nothing when the gate never heard the caller at all', () => {
     expect(drive([HEARD], live()).state.utterance).toBe('none');
   });
 
-  /** A provider can endpoint mid-breath, so this lands while the caller is
-   *  audibly still going. Withdrawing their bubble then is the one thing this
-   *  row must never do, whatever the provider made of the noise. */
   it('withdraws no bubble while the caller is still speaking', () => {
     const talking = drive([SPOKE], live()).state;
     const { state } = drive([frame({ type: 'user_turn_ended', transcript: '' })], talking);
     expect(state.utterance).toBe('live');
   });
 
-  /** Words are a different matter: the turn is over and a row is coming, so
-   *  whatever they say next is a turn of its own. */
   it('ends the turn on words, even mid-breath', () => {
     const talking = drive([SPOKE], live()).state;
     expect(drive([HEARD], talking).state.utterance).toBe('transcribed');
@@ -584,8 +495,6 @@ describe('reading a phase', () => {
     expect(callStatusLabel(drive([SPOKE], live()).state)).toBe(HEARING_YOU);
   });
 
-  /** Once they stop, the call is back to plain listening. Announcing each wait
-   *  separately would speak three times per utterance. */
   it('goes back to the phase once they stop', () => {
     const waiting = drive([SPOKE, HUSHED], live()).state;
     expect(callStatusLabel(waiting)).toBe(callStatusLabel(live()));
@@ -593,14 +502,6 @@ describe('reading a phase', () => {
   });
 });
 
-/**
- * A blank delta is a real frame, not a hypothetical: both providers forward
- * whatever `delta` carried, and a talker draws breath.
- *
- * Taking the floor on one is three separate wrongs. It retires the caller's
- * bubble mid-sentence and it resets the speech gate under them. The
- * `interrupted` frame behind it then stops playback on their next edge.
- */
 describe('a talker delta with no words', () => {
   it('moves nothing at all while the caller holds the floor', () => {
     const speaking = drive([SPOKE], live()).state;

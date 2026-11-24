@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** Anything waiting on an open question reads as not read yet: dimmed, with a
- *  line saying when the agent reads it. A held callback draws no response panel,
- *  so no empty agent header sits beside it. A queued message dims only while a
- *  question blocks it. See
- *  `docs/plans/2026-10-04-held-callbacks-read-as-not-read-yet.md`.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -58,8 +52,6 @@ beforeEach(() => {
   document.body.appendChild(host);
 });
 
-// Rendering inside act flushes effects before the test ends. A bare render
-// leaves Preact's after-paint timer pending past jsdom's teardown.
 afterEach(() => {
   act(() => { render(null, host); });
   host.remove();

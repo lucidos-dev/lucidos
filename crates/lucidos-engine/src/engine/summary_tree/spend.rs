@@ -11,11 +11,10 @@
 //!
 //! [`COMPACTOR_MODELS`]: super::compactor_models::COMPACTOR_MODELS
 
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use super::compactor_models::{priced, Tokens};
-use super::estimate::{compaction_captures_where, Bounds, EffortCost};
+use super::estimate::compaction_captures_where;
 use crate::llm::ServiceTier;
 
 /// The cap, as a multiple of the estimate's central figure.
@@ -29,23 +28,14 @@ pub(crate) fn cap_for(central: f64) -> f64 {
     central * CAP_MULTIPLE
 }
 
-/// What a backfill from here would cost on the compactor's model, as the
-/// Start dialog shows it. `TreeBackfillStarted` carries it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StartEstimate {
-    pub model: String,
-    pub effort: Option<String>,
-    pub calls: Bounds<u64>,
-    /// `None` for a model the catalog does not price, which gets no cap.
-    pub cost: Option<EffortCost>,
-}
+pub use crate::engine::thread_events::tree_backfill::StartEstimate;
 
 /// The open episode, as the events record it.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Episode {
+pub struct Episode {
     /// The estimate's central figure, `None` for an unpriced model.
     pub(crate) central_usd: Option<f64>,
-    pub(crate) cap_usd: Option<f64>,
+    pub cap_usd: Option<f64>,
     pub(crate) spent_usd: f64,
     /// A `TreeBackfillCapReached` already names the current cap.
     pub(crate) cap_announced: bool,
@@ -59,14 +49,14 @@ impl Episode {
     }
 
     /// The backfill waits for the user: it has spent its cap.
-    pub(crate) fn held(&self) -> bool {
+    pub fn held(&self) -> bool {
         self.cap_usd.is_some_and(|cap| self.spent_usd >= cap)
     }
 
     /// The cap one press of Continue sets: half the estimate past whichever
     /// is higher, the cap or the spend. In-flight calls finish after a hold,
     /// so the spend can pass the cap a little.
-    pub(crate) fn next_cap(&self) -> Option<f64> {
+    pub fn next_cap(&self) -> Option<f64> {
         Some(self.cap_usd?.max(self.spent_usd) + self.central_usd? * RAISE_SHARE)
     }
 
@@ -112,7 +102,7 @@ const SPENT_SQL: &str = concat!(
 );
 
 /// The open episode, or `None` when no backfill episode is open.
-pub(crate) async fn load(pool: &PgPool) -> Result<Option<Episode>, sqlx::Error> {
+pub async fn load(pool: &PgPool) -> Result<Option<Episode>, sqlx::Error> {
     let start: Option<(i64, serde_json::Value, bool)> = sqlx::query_as(NEWEST_START_SQL)
         .fetch_optional(pool)
         .await?;
@@ -179,27 +169,6 @@ mod tests {
         }
     }
 
-    /// The prose that states the cap and the raise reads these constants.
-    /// A pin, since prose cannot import them.
-    #[test]
-    fn every_prose_copy_states_the_cap_and_the_raise() {
-        let doc = |path: &str| {
-            std::fs::read_to_string(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR")))
-                .unwrap_or_else(|e| panic!("{path}: {e}"))
-        };
-        let cap = format!("{CAP_MULTIPLE} times");
-        let raise = match RAISE_SHARE {
-            0.5 => "half the estimate",
-            other => panic!("say how far a raise moves the cap ({other}), then pin it here"),
-        };
-        for path in ["system-knowhow/preferences.md", "docs/glossary.md"] {
-            assert!(doc(path).contains(&cap), "{path} omits {cap}");
-        }
-        for path in ["system-knowhow/thread-events.md", "docs/glossary.md"] {
-            assert!(doc(path).contains(raise), "{path} omits {raise}");
-        }
-    }
-
     #[test]
     fn an_episode_holds_once_it_has_spent_its_cap() {
         assert!(!episode(Some(15.0), 14.99).held());
@@ -256,5 +225,28 @@ mod tests {
             flash.usd(call, None),
             "no Flex rate prices at the standard rate"
         );
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The prose that states the cap and the raise reads these constants.
+        /// A pin, since prose cannot import them.
+        #[test]
+        fn every_prose_copy_states_the_cap_and_the_raise() {
+            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let doc = |path: &str| crate::core::knowhow::doc_family_text(&repo, path);
+            let cap = format!("{CAP_MULTIPLE} times");
+            let raise = match RAISE_SHARE {
+                0.5 => "half the estimate",
+                other => panic!("say how far a raise moves the cap ({other}), then pin it here"),
+            };
+            for path in ["system-knowhow/preferences.md", "docs/glossary.md"] {
+                assert!(doc(path).contains(&cap), "{path} omits {cap}");
+            }
+            for path in ["system-knowhow/thread-events.md", "docs/glossary.md"] {
+                assert!(doc(path).contains(raise), "{path} omits {raise}");
+            }
+        }
     }
 }

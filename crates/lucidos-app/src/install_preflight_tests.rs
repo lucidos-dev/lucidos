@@ -157,6 +157,10 @@ fn parse_release_tolerates_a_gateway_that_carries_no_version() {
         parse_release(r#"{"status":"ok","role":"gateway","release":"0.26.2"}"#).as_deref(),
         Some("0.26.2")
     );
+    assert_eq!(
+        parse_release(r#"{"release":"9.2.0-rc.10"}"#).as_deref(),
+        Some("9.2.0-rc.10")
+    );
     // An older gateway, a non-JSON body, and a blank field all mean "unknown",
     // which the notice renders by saying nothing rather than by guessing.
     assert_eq!(parse_release(r#"{"status":"ok"}"#), None);

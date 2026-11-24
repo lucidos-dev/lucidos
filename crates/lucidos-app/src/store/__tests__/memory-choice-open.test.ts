@@ -1,18 +1,19 @@
-/**
- * The memory choice shows exactly when the workspace has never chosen its
- * memory module, a provider is set up, and no release notice is up. Every
- * answer writes the preference, so a stored choice of either kind hides it.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ReleaseNoticeView } from '../../api/client';
 import { memoryChoiceOpen } from '../memoryChoice';
 import { releaseNoticeDismissed } from '../releaseNotices';
 import { engineStartedAt, llmConfigured, preferences, releaseNoticeView } from '../store';
 
-const NOTHING_OWED: ReleaseNoticeView = { notices: [], next_id: null };
+const NOTHING_OWED: ReleaseNoticeView = { releases: [], owed_through: null, action_prompt: null };
 const ONE_OWED: ReleaseNoticeView = {
-  notices: [{ id: 'a', since: '2.0.0', title: 'Notice a', body: 'Do the thing.', resolved: false, action_deferred: false }],
-  next_id: 'a',
+  releases: [{
+    since: '2.0.0',
+    items: [{ id: 'a', since: '2.0.0', title: 'Notice a', summary: 'Review it.', body: 'Do the thing.', resolved: false }],
+    resolved: false,
+    action_prompt: null,
+  }],
+  owed_through: 'a',
+  action_prompt: null,
 };
 
 describe('memoryChoiceOpen', () => {
@@ -28,7 +29,6 @@ describe('memoryChoiceOpen', () => {
     expect(memoryChoiceOpen()).toBe(true);
   });
 
-  /** An upgraded workspace stores `classic` at upgrade, so it is never asked. */
   it.each(['classic', 'tree'])('hides once %s is stored', (module) => {
     preferences.value = { status: 'loaded', data: { memory_module: module } };
     expect(memoryChoiceOpen()).toBe(false);

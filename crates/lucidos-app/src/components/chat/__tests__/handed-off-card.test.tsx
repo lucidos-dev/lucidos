@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The warning on top of the composer of a thread that handed off to a
- * *legacy successor thread*. It waits for the user to start writing, moves the
- * message on request, and stays hidden after *Send here anyway* until the
- * composer is cleared.
- */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

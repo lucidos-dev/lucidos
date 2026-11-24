@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-// A relative link inside a repo markdown file must open its target through
-// Lucidos' own preview. Never a default `<a>` navigation: the tester-reported
-// gap was `RepoFileText` rendering `MarkdownDocument` with no `onClick` at
-// all.
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -42,7 +38,7 @@ it('routes a relative link in a repo markdown file through the host preview, nev
   await act(async () => {
     render(<RepoFileContent repoId="repo-1" path="docs/notes/start.md" gitRef="main" />, host);
   });
-  await act(async () => {}); // let the resolved fetch's state update flush
+  await act(async () => {});
 
   const link = host.querySelector<HTMLAnchorElement>('a[href="../guide.md"]')!;
   expect(link).not.toBeNull();
@@ -51,8 +47,6 @@ it('routes a relative link in a repo markdown file through the host preview, nev
   act(() => { link.dispatchEvent(event); });
 
   expect(event.defaultPrevented).toBe(true);
-  // Resolved against the file's OWN directory inside the SAME checkout and
-  // ref, never the workspace data root.
   expect(mocks.openFilePreview).toHaveBeenCalledWith('repo:repo-1:file#main:docs/guide.md');
 });
 
@@ -69,8 +63,6 @@ it('anchors a repo-root-relative link at the checkout root, not the workspace da
   expect(mocks.openFilePreview).toHaveBeenCalledWith('repo:repo-1:file:docs/root.md');
 });
 
-// A sibling is a plain file, never another diff entry. A sibling outside the
-// change has no diff entry to resolve to at all (Codex review finding).
 it('opens a sibling link as a file, not a diff entry, while viewing a change\'s whole-file view', async () => {
   await act(async () => {
     render(

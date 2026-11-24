@@ -21,8 +21,6 @@ const dividerDblGate = createDblClickGate();
 export function SplitLayout({ threadPane, contentPane }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // The drawn layout needs the window's width and every floor at every moment.
-  // The Conversation row's height is rem, so a UI-scale change resizes it too.
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -39,8 +37,6 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     };
   }, []);
 
-  // Home leading the header raises the Conversation floor (paneMinimums). It
-  // resizes nothing, so it is measured a frame after the header draws it.
   const homeShown = homeThreadId.value !== null;
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
@@ -59,24 +55,6 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
 
     beginPaneResize();
 
-    // CLAMPED drag: the divider stops at each pane's minimum while the pointer
-    // keeps going, so what the user releases is what persists. Nothing corrects
-    // it afterwards (ADR 0056 replaced the deferred snap with this).
-    //
-    // It is also what keeps the collapse states (data-thread-collapsed /
-    // data-content-collapsed / data-thread-drawer-open) still through a drag,
-    // and more firmly than the snap did: those flip at a ratio of exactly 0 or
-    // 1, and the clamp cannot reach either, since both minimums are well inside.
-    // So the header icon groups they swap cannot dance between hosts as the
-    // pointer wiggles across a pane edge, where the snap merely postponed the
-    // flip to release. The 1px floor/ceiling that stood in for this is gone.
-    // A split too narrow for both floors has no position but collapsed, so
-    // there the drag moves nothing and never draws a squeezed pane.
-    //
-    // Measured ONCE: the bounds derive from the root font size, which a drag
-    // cannot change, and each read is a forced style recalc on the hot path the
-    // data-pane-resizing kill-list exists to keep smooth. The container's own
-    // width is re-read per move, since the window can resize under the drag.
     const bounds = splitBounds();
     const onMove = (e: PointerEvent) => {
       const rect = container.getBoundingClientRect();
@@ -98,9 +76,6 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
   const threadCollapsed = ratio === 0;
   const contentCollapsed = ratio >= 1;
 
-  // Expose split ratio and thread-drawer offset so the header can compute divider position
-  // The drawer yields with the Conversation, and for room, without writing
-  // `threadDrawerOpen`, so it comes back when the room does.
   const drawerVisible = drawnDrawerShown.value;
   const contentOffset = drawerVisible ? drawnDrawerWidth.value : 0;
   document.documentElement.style.setProperty('--split-ratio', String(ratio));
@@ -108,7 +83,6 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
   document.documentElement.toggleAttribute('data-thread-collapsed', threadCollapsed);
   document.documentElement.toggleAttribute('data-content-collapsed', contentCollapsed);
   document.documentElement.toggleAttribute('data-thread-drawer-open', drawerVisible);
-  // Drives the header wash over the focused pane's header segment (shell.css).
   document.documentElement.setAttribute('data-focused-pane', focusedPane.value);
 
   return (
@@ -124,11 +98,6 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
       >
         {threadPane}
       </div>
-      {/* The divider spans the full pane height — anchoring its tooltip to the
-          element border would fling it to the far end of the pane, so it opts into
-          pointer-tracking via data-tooltip-follow-cursor. It's the only element
-          that does; every other element keeps the border anchor so its tooltip
-          always sits fully outside it. */}
       <div
         class={`split-divider ${threadCollapsed || contentCollapsed ? 'collapsed' : ''}`}
         role="separator"

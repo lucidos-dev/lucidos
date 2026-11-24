@@ -30,15 +30,11 @@ import { continueInSuccessor } from '../../store/actions/successor';
 const MAX_RETRIES = 10;
 const RETRY_DELAY_MS = 1000;
 
-/** The row a thread's model shows as: the row with that value, else the
- *  first row other than Default that runs it. A thread records the id Claude
- *  Code reports, which is often no row's own value. */
 export function pickerRowValue(options: readonly CodingAgentCommandOption[], model: string): string {
   if (options.some(o => o.value === model)) return model;
   return options.find(o => o.value !== 'default' && o.resolved_model === model)?.value ?? model;
 }
 
-/** What one commands read says about the thread's rungs. */
 interface RungData {
   commands: CodingAgentCommandDef[];
   currentModel: CodingAgentModelValue | null;
@@ -47,8 +43,6 @@ interface RungData {
   ladderRungs: CodingAgentLadderRung[];
 }
 
-/** The last read per request key. A control that remounts starts from what it
- *  showed and refreshes in place, instead of drawing again from nothing. */
 const lastRead = new Map<string, RungData>();
 
 function cachedRead(requestKey: string): Loadable<RungData> {
@@ -66,28 +60,16 @@ const NO_DATA: RungData = {
 
 export interface RungStateProps {
   threadId?: string;
-  /** The focused COMPOSING draft's id, set only while composing (mutually
-   *  exclusive with `threadId`, the active-session id). Compose picks live in
-   *  this draft's own override, so a pick on one draft cannot leak to another. */
   composeThreadId?: string;
   codingAgent?: CodingAgent | null;
 }
 
-/** What the rung control knows about the coding-agent thread it belongs to:
- *  the ladder's rungs, the pair in force, and how a pick commits.
- *
- *  Compose (`!threadId`) writes the draft's override, or the pending slot
- *  before a draft exists. A started thread records a pick on the engine, which
- *  its next turn runs on. While a turn runs the pick is locked (ADR 0542). */
 export function useRungState({ threadId, composeThreadId, codingAgent }: RungStateProps) {
   const loadSeqRef = useRef(0);
   const retryTimerRef = useRef<number | null>(null);
   const retryCountRef = useRef(0);
   const inCompose = !threadId;
   const agent = menuCodingAgent(codingAgent, threadId, composeThreadId);
-  // Keyed on what the request sends, read in render, so a prop change counts
-  // too. Never a signal effect: it re-runs on signals only, and the control
-  // stays mounted across a draft switch.
   const requestKey = threadId ?? `compose:${scopeToRepoId(resolveScope(composeThreadId)) ?? ''}:${agent}`;
   const read = useSignal<Loadable<RungData>>(cachedRead(requestKey));
   const sending = useSignal(false);
@@ -95,13 +77,10 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     loadedOr(read.value, NO_DATA);
 
   const draftOverride = inCompose ? getComposeSelectionOverride(composeThreadId) : null;
-  /** The pick held under this thread's Successor card, read live so the send
-   *  gate sees the card close without waiting for a render. */
   const heldCardPick = () => threadId && successorCardThreadId.value === threadId
     && successorCardPick.value?.threadId === threadId ? successorCardPick.value : null;
   const cardPick = heldCardPick();
   const effectiveModel = (draftOverride?.ccModel ?? cardPick?.model ?? currentModel) as CodingAgentModelValue | null;
-  // A card pick is a whole pair: its null effort is the successor's default, not this thread's effort.
   const effectiveEffort = (draftOverride?.ccReasoningEffort ?? (cardPick ? cardPick.effort : currentEffort)) as CodingAgentReasoningEffort | null;
   const thread = threadId ? threadMap.value.get(threadId) : undefined;
   const lockedReason = rungLockedReason(thread ? effectiveThreadStatus(thread) : null);
@@ -119,20 +98,12 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
   const selection = useModelSelection({
     models: modelChoices,
     vocabulary: tierVocabulary,
-    // No model picked yet means the backend's own default, which IS the
-    // `default` row. Asking that row keeps the compose view (no session, no
-    // recorded model) offering the universally-accepted tiers.
     model: effectiveModel ? pickerRowValue(modelOptions, effectiveModel) : 'default',
     effort: effectiveEffort,
-    // Claude Code's picker is what Claude Code lists now, so a thread can be
-    // pinned to a model it has dropped. Name it rather than show the bare id.
     labelFor: displayModelName,
     onChange: applySelectionOverride,
   });
 
-  /** Record a compose pick in the draft's override, never an account
-   *  preference. Both halves land together, because the pair is picked whole.
-   *  A started thread's pick goes to the engine instead. */
   function applySelectionOverride(patch: ModelSelectionPatch) {
     if (!inCompose) return;
     const model = patch.model === 'default' ? null : patch.model as CodingAgentModelValue;
@@ -147,25 +118,18 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     }
   }
 
-  /** Show a read and keep it for the next control mounted on this key. */
   function setLoaded(key: string, data: RungData) {
     lastRead.set(key, data);
     read.value = { status: 'loaded', data };
   }
 
-  /** An action, never a dependency: its response writes signals this hook
-   *  reads, so none of them may subscribe the effect that called it. */
   function load() {
     untracked(loadNow);
   }
 
   function loadNow() {
     clearRetryTimer();
-    // A restart outlasts the retry budget. The engineRestarting effect below
-    // reloads once the engine is back.
     if (engineRestarting.value) return;
-    // The compose view scopes the request to the draft's repo, as the `/` menu
-    // does, so the two share one read.
     const repoId = threadId ? undefined : (scopeToRepoId(resolveScope(composeThreadId)) ?? '');
     const requestAgent = threadId ? undefined : agent;
     const seq = ++loadSeqRef.current;
@@ -184,7 +148,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
       })
       .catch((err: unknown) => {
         if (seq !== loadSeqRef.current) return;
-        // A stale iOS PWA connection rejects the first read after a wake.
         if (retryCountRef.current < MAX_RETRIES) {
           retryCountRef.current++;
           retryTimerRef.current = window.setTimeout(load, RETRY_DELAY_MS);
@@ -202,7 +165,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     return clearRetryTimer;
   }, [requestKey]);
 
-  // A session starting or resuming changes the pair in force.
   useSignalEffect(() => {
     if (codingAgentSessionVersion.value > 0) {
       retryCountRef.current = 0;
@@ -221,8 +183,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     }
   });
 
-  // A thread with no model of its own runs the default implementer's model, at
-  // its own effort if it has one. The engine's `fill_pick` does the same.
   const defaultPair = defaultImplementer
     ? { model: defaultImplementer.model, effort: effectiveEffort ?? defaultImplementer.effort }
     : null;
@@ -247,21 +207,15 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     modelLabel: displayModelName,
   });
 
-  /** Record what a control request just recorded on the engine. */
   function patchData(patch: Partial<RungData>) {
     const loadedData = read.value;
     if (loadedData.status === 'loaded') setLoaded(requestKey, { ...loadedData.data, ...patch });
   }
 
-  /** The model a pick runs, as the engine's price table names it. */
   function runModelOf(model: string): string {
     return modelOptions.find(o => o.value === model)?.resolved_model ?? model;
   }
 
-  /** Whether a pick on a started thread goes ahead, whether or not its session
-   *  is live. A switch that keeps the cache is silent. One that rebuilds it
-   *  asks first, and only `switch` lets the caller store the pick. A handoff
-   *  starts a fresh session here. `alwaysAsk` asks even when the cache is kept. */
   async function switchProceeds(
     startedThreadId: string,
     pair: { model: string; effort: string | null },
@@ -295,8 +249,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     return choice === 'switch';
   }
 
-  /** Record a pick on the engine, the model and its effort in one request, so
-   *  a turn starting meanwhile cannot split the pair. */
   async function recordPick(startedThreadId: string, pair: { model: string; effort: string | null }): Promise<boolean> {
     const cmd = commands.find(c => c.subtype === 'set_model');
     if (!cmd) return false;
@@ -307,15 +259,10 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     return true;
   }
 
-  /** Whether a send in this thread owes the rung switch question: the
-   *  *Successor card* shows and holds a pick. The pick aims the successor, so
-   *  the pill shows a pair this thread does not run. */
   function cardPickRidesSend(sendThreadId: string): boolean {
     return sendThreadId === threadId && heldCardPick() !== null;
   }
 
-  /** Ask the question the card pick skipped, even on a cold cache, since the
-   *  pick was meant for the successor. On *Switch* it is recorded here first. */
   async function cardPickSendProceeds(sendThreadId: string): Promise<boolean> {
     const held = heldCardPick();
     if (!held) return true;
@@ -333,11 +280,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     proceeds: (id) => sendGateRef.current.proceeds(id),
   }), []);
 
-  /** Apply a whole *model selection*, the picker's final answer.
-   *
-   *  A started thread asks first when the pick rebuilds its cache, then records
-   *  the pick on the engine. Under the Successor card it only aims the
-   *  successor. While a turn runs the pick is refused with its reason (ADR 0542). */
   async function pickModelSelection(encoded: string, label: string, quiet = false) {
     const cmd = commands.find(c => c.subtype === 'set_model');
     if (!cmd) return;
@@ -347,8 +289,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
       if (!quiet) showToast(`${cmd.label}: ${label}`, 'success');
       return;
     }
-    // Under the Successor card a pick aims the successor, and this thread keeps
-    // its model. The card names the pick.
     if (successorCardThreadId.value === threadId) {
       successorCardPick.value = { threadId, model: pair.model, effort: pair.effort };
       return;
@@ -367,7 +307,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     }
   }
 
-  /** Commit a rung, or follow the ladder link out to the editor. */
   function pickRung(value: string) {
     if (value === LADDER_LINK_VALUE) {
       openIntelligenceLadder(agent);
@@ -379,8 +318,6 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
 
   const steps = stepTargets(rungList.rows, rungList.current);
 
-  /** Move one row up (-1) or down (1) the rung list. The label shows the new
-   *  pair, so a step says nothing more. At either end it does nothing. */
   function step(direction: -1 | 1) {
     const target = direction === -1 ? steps.prev : steps.next;
     if (target === null || sending.value) return;

@@ -11,20 +11,14 @@ import {
   waitForResponse,
 } from './helpers';
 
-/** Dynamic bars move the prompt as well as the header: it glides down on a
- *  scroll down, comes back on a scroll up, and is fully shown at the end of the
- *  thread. With the bars pinned it never moves. `hooks/useHideOnScroll.ts`. */
 
 const CONTAINER = '.mobile-swipe-pane .thread-content.visible';
 const PROMPT = '.mobile-swipe-pane .prompt-area';
 
-/** A thread tall enough to scroll, parked at the top. The filler makes the
- *  height independent of how long the model's reply is. */
 async function tallThreadAtTop(page: Page): Promise<void> {
   await navigateToApp(page);
   await sendMessage(page, `Say exactly: "${uniqueMessage('dynamic-bars')}"`);
   await waitForResponse(page);
-  // The hook holds everything still while an input in the pane has focus.
   await blurActiveElement(page);
   await page.evaluate((sel) => {
     const container = document.querySelector(sel);
@@ -46,9 +40,6 @@ async function tallThreadAtTop(page: Page): Promise<void> {
   await page.waitForFunction((sel) => document.querySelector(sel)?.scrollTop === 0, CONTAINER);
 }
 
-/** Scroll by `total` px in spaced steps, the way a drag does. One jump is one
- *  event, and it can land inside the app's own navigation window and be
- *  ignored (see thread-title.spec.ts). */
 async function scrollInSteps(page: Page, total: number): Promise<void> {
   await page.evaluate(async ({ sel, total }) => {
     const c = document.querySelector(sel);
@@ -63,7 +54,6 @@ async function scrollInSteps(page: Page, total: number): Promise<void> {
   }, { sel: CONTAINER, total });
 }
 
-/** How much of the prompt sits below the bottom of the pane, in px. */
 function promptHiddenPx(page: Page): Promise<number> {
   return page.evaluate(({ sel, container }) => {
     const prompt = document.querySelector(sel);
@@ -76,12 +66,9 @@ function promptHiddenPx(page: Page): Promise<number> {
 test.describe('Dynamic bars: the prompt', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // The follow seed ships armed, and a rider is carried back to the live edge
-    // by any scroll that is not their own gesture. These tests park at the top.
     await disarmFollowSeed(page);
   });
 
-  // The pref is global and the e2e database resets only between projects.
   test.afterEach(async ({ page }) => {
     await disableMobileDynamicBars(page);
   });
@@ -90,7 +77,6 @@ test.describe('Dynamic bars: the prompt', () => {
     await enableMobileDynamicBars(page);
     await tallThreadAtTop(page);
     expect(await promptHiddenPx(page)).toBeLessThanOrEqual(1);
-    // The overlaid prompt takes taps, not the transcript it sits over.
     const hitsPrompt = await page.evaluate((sel) => {
       const input = document.querySelector<HTMLElement>(`${sel} [data-role="prompt-input"]`);
       if (!input) return false;
@@ -109,7 +95,6 @@ test.describe('Dynamic bars: the prompt', () => {
 
     await scrollInSteps(page, 10_000);
     await expect.poll(() => promptHiddenPx(page)).toBeLessThanOrEqual(1);
-    // Nothing at the end of the transcript sits under the prompt.
     const gap = await page.evaluate(({ container, prompt }) => {
       const filler = document.querySelector(`${container} [data-test-filler]`);
       const box = document.querySelector(prompt);

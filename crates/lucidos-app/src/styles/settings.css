@@ -3,6 +3,7 @@
 @import './settings/themes.css';
 @import './settings/workspace-fonts.css';
 @import './settings/accounts.css';
+@import './settings/users.css';
 @import './settings/memory-inspector.css';
 @import './settings/summary-tree-browser.css';
 @import './settings/backup.css';

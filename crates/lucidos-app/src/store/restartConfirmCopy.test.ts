@@ -30,8 +30,6 @@ describe('the plain-restart shape', () => {
   });
 
   it('never describes the version, even when the engine listed a range', () => {
-    // A plain restart brings nothing new, so a commit range would be a claim
-    // about a switch that is not on offer.
     const copy = restartConfirmCopy(false, COMMITS, []);
     expect(copy.details).toBeUndefined();
   });
@@ -78,8 +76,6 @@ describe('the new-version shape', () => {
   });
 
   it('states an all-housekeeping range once rather than twice', () => {
-    // "12 commits, including 12 housekeeping commits" is true and reads like a
-    // mistake, so the count IS the sentence there.
     const chores: PendingCommits = {
       total: 3,
       groups: [{ kind: 'housekeeping', total: 3, descriptions: [] }],
@@ -98,15 +94,11 @@ describe('the new-version shape', () => {
   });
 
   it('falls back to the applied changes when git could not answer', () => {
-    // `null` is UNKNOWN. A packaged build reports it on every poll, and its
-    // applied changes are the only account of what the restart activates.
     const copy = restartConfirmCopy(true, null, APPLIED);
     expect(copy.details?.intro).toBe('These changes will be applied:');
   });
 
   it('reports a genuinely empty range as no list, never as a zero', () => {
-    // `{ total: 0 }` is a real answer, unlike `null`: the range IS empty, so
-    // there is nothing to list and nothing to fall back to.
     const empty: PendingCommits = { total: 0, groups: [] };
     expect(restartConfirmCopy(true, empty, APPLIED).details?.intro).toBe('These changes will be applied:');
     expect(restartConfirmCopy(true, empty, []).details).toBeUndefined();

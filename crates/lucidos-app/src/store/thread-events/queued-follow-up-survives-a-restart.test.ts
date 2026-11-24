@@ -1,18 +1,3 @@
-/**
- * A queued follow-up the engine recovers after a restart stops rendering as
- * "Queued", with no frontend change.
- *
- * When a restart aborts a turn, the resume reads its queued follow-ups back
- * out of the event store. It announces each one with a `PromptInjected`
- * naming it in `injected_message_id`.
- *
- * This pins the client half of that contract. `findAbsorbTarget` folds such a
- * `PromptInjected` into the message's own exchange. That gives the exchange a
- * step, which ends `isUningestedMessage`. Break the absorb and the bubble stays pinned to
- * the bottom of the transcript even though the engine answered it.
- *
- * Plan: docs/plans/2026-09-21-a-queued-follow-up-survives-the-restart.md
- */
 import { describe, it, expect } from 'vitest';
 import { computeExchanges, isWaitingTypedMessage } from './exchange-grouping';
 import type { StoredEvent } from './thread-event-types';
@@ -27,8 +12,6 @@ function at(seq: number): string {
   return `2026-09-21T08:57:${String(seq + 40).padStart(2, '0')}Z`;
 }
 
-/** The reported event sequence, truncated at `upTo` so the before and after of
- *  the recovery can be folded separately. */
 function transcript(upTo: number): Map<number, StoredEvent> {
   const rows: StoredEvent[] = [
     { type: 'MessageReceived', text: 'summarize the tickets', _eventId: TURN, created: at(1) },
@@ -36,15 +19,12 @@ function transcript(upTo: number): Map<number, StoredEvent> {
     { type: 'ResponseAborted', text: '', cause: 'engine_shutdown', request_event_id: TURN, created: at(3) },
     { type: 'ContinuationStarted', branch: '', _eventId: RESUME, created: at(4) },
     { type: 'PromptInjected', text: NOTE, mode: 'engine', request_event_id: RESUME, created: at(5) },
-    // The recovery: names the stranded message, anchored on the resume.
     { type: 'PromptInjected', text: 'wtf r u up to?', mode: 'human', injected_message_id: QUEUED, request_event_id: RESUME, created: at(6) },
     { type: 'ResponseGenerated', text: 'Reading the tickets now.', request_event_id: RESUME, created: at(7) },
   ] as StoredEvent[];
   return new Map(rows.slice(0, upTo).map((event, i) => [i + 1, event]));
 }
 
-/** Folded through the entry point the transcript itself renders from, so the
- *  retraction filter is in play the same way it is on screen. */
 function exchangesOf(events: Map<number, StoredEvent>) {
   return computeExchanges(makeThreadState(events));
 }
@@ -57,8 +37,6 @@ function queuedExchange(upTo: number) {
 
 describe('a queued follow-up recovered after a restart', () => {
   it('reads as Queued while nothing has ingested it', () => {
-    // Through the abort and the resume boundary: the engine note is not about
-    // this message, so the bubble is still waiting. This is the reported state.
     const stranded = queuedExchange(5);
     expect(stranded).toBeDefined();
     expect(isWaitingTypedMessage(stranded!)).toBe(true);
@@ -72,16 +50,11 @@ describe('a queued follow-up recovered after a restart', () => {
   });
 
   it('gathers the resumed reply under the recovered message', () => {
-    // The absorb re-anchors the message to the ingestion point. It redirects
-    // the resume's request id onto that exchange too, so the answer renders
-    // below the bubble rather than above it.
     const answered = queuedExchange(7);
     expect(answered!.steps.map(s => s.event.type)).toContain('ResponseGenerated');
   });
 
   it('keeps a retracted message out, even after the resume', () => {
-    // A retraction that landed while the engine was down wins: the engine
-    // emits no PromptInjected for it, so the exchange is dropped as removed.
     const rows = new Map(transcript(5));
     rows.set(6, { type: 'QueuedMessageRemoved', removed_message_id: QUEUED, created: at(6) } as StoredEvent);
     const ids = exchangesOf(rows).map(ex => ex.userEvent._eventId);

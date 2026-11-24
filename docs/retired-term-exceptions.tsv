@@ -5,6 +5,36 @@ docs/adr/*	history	-	Decision records preserve the original terminology and supe
 docs/plans/*	history	-	Dated plans preserve decisions and the wording they commissioned us to replace.
 docs/investigations/*	history	-	Dated investigations preserve the evidence and terminology they measured.
 docs/audits/2026-10-23-system-knowhow-audit.md	history	-	The original audit findings remain evidence of drift before the corrections.
-crates/lucidos-engine/migrations/*.sql	history	-	Applied migrations are immutable and retain their original checksums and filenames.
-system-knowhow/glossary.md	literal	^### (Successor thread|Build chain|Handoff consent)$	Retired glossary headings retain the searchable spelling; their bodies explain retirement.
+crates/lucidos-core/migrations/*.sql	history	-	Applied migrations are immutable and retain their original checksums and filenames.
+system-knowhow/glossary*	literal	^### (Successor thread|Build chain|Handoff consent|Owner approval)$	Retired glossary headings retain the searchable spelling; their bodies explain retirement.
+system-knowhow/glossary*	literal	^(?:description: Part of |\| `system-knowhow/glossary/).*$	A split glossary lists every heading, retired ones included, in its parts table and part descriptions.
 crates/lucidos-app/src/generated/thread-event-wire.ts	literal	^\s*\| 'spawn-successor';$	The retired owner-approval verb must still parse from stored cards; codegen owns this union.
+crates/lucidos-gateway/src/gateway_event_log.rs	literal	operator_id	The one-time log rewrite names the stored key it renames (ADR 0655).
+crates/lucidos-gateway/src/gateway_event_log_tests.rs	literal	^\{"at":"2026-08-17T00:00:\d\dZ","event":\{"type".*	The fixture is a log as an older gateway wrote it, to test the rewrite (ADR 0655).
+packages/lucidos-sdk/src/threads.ts	literal	temporary-measures\.md, "SDK threadPeople alias"	The deprecated SDK alias points at its registry row.
+packages/lucidos-sdk/src/threadUsers.ts	literal	temporary-measures\.md, "SDK threadPeople alias"	The deprecated SDK alias points at its registry row.
+docs/temporary-measures.md	literal	^### SDK threadPeople alias$	The registry row names the alias it tracks.
+crates/lucidos-engine/src/migration_tests.rs	literal	"(PeopleMessagePosted|mentioned_operator_ids|operator_id|people_messages)"	The migration test seeds rows as an older engine stored them, to test the rename (ADR 0655).
+crates/lucidos-core/src/gateway_users.rs	literal	operator_id|/auth/operators	Wire adapters and fixtures preserve identity from older gateways; tracked by User rename wire aliases.
+crates/lucidos-gateway/src/auth_api.rs	literal	operator_id	The device response retains the previous wire field; tracked by User rename wire aliases.
+crates/lucidos-gateway/src/users_api.rs	literal	operator_id	Legacy HTTP response and request adapters preserve older clients; tracked by User rename wire aliases.
+crates/lucidos-gateway/src/users_api_tests.rs	literal	operator_id|/auth/operators	Fixtures exercise older clients; tracked by User rename wire aliases.
+crates/lucidos-app/src/api/client/control.ts	literal	operator_id	Browser adapters normalize an older local gateway; tracked by User rename wire aliases.
+crates/lucidos-app/src/api/client/gateway-users-compat.test.ts	literal	operator_id|/auth/operators	Fixtures exercise an older local gateway; tracked by User rename wire aliases.
+crates/lucidos-app/src/api/client/gatewayUsersCompat.ts	literal	operator_id	Lazy browser adapter preserves the older wire contract; tracked by User rename wire aliases.
+docs/glossary.md	literal	^### Owner approval$	The retired glossary heading keeps the searchable spelling; its body explains the retirement (ADR 0688).
+system-knowhow/glossary.md	literal	^- Owner approval$	The index points to the retained glossary heading explaining the retirement (ADR 0688).
+system-knowhow/glossary.md	literal	^- (Successor thread|Build chain|Handoff consent)$	The index points to the retained glossary headings documenting historical usage (ADR 0560).
+crates/lucidos-cli/src/main.rs	literal	alias = "ask-owner-approval"	The hidden alias keeps the retired spelling working for one release (docs/temporary-measures.md).
+docs/generated/agent-surface.json	literal	^\s*"ask-owner-approval"$	The generated CLI surface lists the hidden alias of the retired spelling (docs/temporary-measures.md).
+crates/lucidos-agents-api/src/engine/chat/process/workspace_prompt_footprint.rs	literal	!section\.contains\("execute_intent"\)	The prompt test asserts the retired tool name is absent.
+crates/lucidos-app/src/components/chat/__tests__/an-engine-resolved-card-says-so.test.tsx	literal	within its permission wait'	The fixture is the notice an older engine stored on a card.
+crates/lucidos-app/src/store/thread-events/__tests__/retired-tool-labels.test.ts	literal	(describeEngineTool|fullCommandForEngineTool)\('execute_intent'	Stored steps of the retired tool keep their labels (ADR 0534).
+crates/lucidos-app/src/store/thread-events/tool-descriptions.ts	literal	case 'execute_intent':	Stored steps of the retired tool keep their labels (ADR 0534).
+crates/lucidos-core/src/core/mod.rs	literal	"create_app" \| "execute_intent" =>	A stored result of the retired tool still reads as done (ADR 0534).
+crates/lucidos-core/src/core/mod_tests.rs	literal	describe_tool_result\("execute_intent"	A stored result of the retired tool still reads as done (ADR 0534).
+crates/lucidos-core/src/core/store/messages_tests/resume_blocks.rs	literal	"name": "execute_intent"|name == "execute_intent"	The fixture is a stored call of the retired tool, replayed on resume (ADR 0534).
+crates/lucidos-core/src/llm/tool_names.rs	literal	pub const EXECUTE_INTENT: &str = "execute_intent";	The retired tool keeps its name constant so a stored call is refused by name (ADR 0534).
+crates/lucidos-core/src/llm/tools/tests.rs	literal	contains\(&tn::EXECUTE_INTENT	The test asserts the retired tool is not offered.
+crates/lucidos-engine/src/engine/tool_arguments.rs	literal	tn::EXECUTE_INTENT => Err	The retired tool is refused by name (ADR 0534).
+crates/lucidos-engine/src/migration_tests.rs	literal	let old = "command_guard_coding_agents";	The migration test names the stored key it renames (ADR 0644).

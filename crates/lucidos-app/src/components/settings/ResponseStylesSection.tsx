@@ -32,12 +32,6 @@ import {
 } from './responseStyle';
 import type { ResponseStyle } from '../../api/types';
 
-/** The picker's options: every style in the library, each with its own one-line
- *  description. Standard leads, because it is the default and the way back.
- *  An edited shipped style says so, since its description is still the
- *  shipped one.
- *
- *  A pure function, so the row a user reads is testable without a DOM. */
 export function responseStyleOptions(library: readonly ResponseStyle[]): DropdownOption[] {
   return library.map((style) => ({
     value: style.id,
@@ -46,16 +40,12 @@ export function responseStyleOptions(library: readonly ResponseStyle[]): Dropdow
   }));
 }
 
-/** Mirrors `card_label` / `card_line` in `core/technical_literacy.rs`, so
- *  Settings reads exactly like the first-run card. Pinned by the mirror test. */
 const LITERACY_COPY: Record<TechnicalLiteracy, { label: string; description: string }> = {
   'non-technical': { label: 'Keep it plain', description: 'Everyday words, no jargon.' },
   technical: { label: 'Technical', description: 'Technical terms are fine.' },
   developer: { label: 'I write software', description: 'Talk to me like a developer.' },
 };
 
-/** The *technical literacy* picker's options, least technical first, after
- *  "Not set". A pure function, so the rows are testable without a DOM. */
 export function technicalLiteracyOptions(): DropdownOption[] {
   return [
     {
@@ -72,14 +62,6 @@ function onLiteracyPicked(value: string) {
   void setTechnicalLiteracy(level);
 }
 
-/** Settings → Models → Response style: how answers come back. Two independent
- *  picks: the *style* (the shape of an answer) and the *technical literacy*.
- *
- *  The picker and the editor are one component because they read one list.
- *  That list comes from the engine (`GET /api/v1/response-styles`), merged from
- *  what Lucidos ships and what this workspace saved. So the shipped
- *  instructions have a single home and cannot drift out of a copy kept here.
- */
 export function ResponseStylesSection() {
   const loadable = responseStyles.value;
   const selected = currentResponseStyle();
@@ -88,30 +70,16 @@ export function ResponseStylesSection() {
   const showStyleSkeleton = useDelayedLoading(loadable);
 
   const library = loadable.status === 'loaded' ? loadable.data : [];
-  // The style the editor is open on. Re-read from the library each render
-  // rather than captured on Edit, so a landed save repaints the form.
   const editingStyle = editing === null ? undefined : library.find((s) => s.id === editing);
   const editorOpen = adding || editingStyle !== undefined;
 
-  // Reloads whenever a peer device or the agent rewrites the document. The
-  // version counter is the subscription (ADR 0118). The mount load is the
-  // effect below.
-  //
-  // Paused on the editor being OPEN, never on the raw `editing` id: an id the
-  // library no longer answers draws nothing, and pausing on it would leave the
-  // refresh switched off with no way back.
   useVersionedRefresh(responseStylesVersion.value, editorOpen, () => {
     void loadResponseStyles();
   });
-  // In an effect, not the render body: `loadResponseStyles` writes the very
-  // signal this component read above, and a setState during render trips preact
-  // lint. Every other load on this page moved out for the same reason.
   useEffect(() => {
     if (responseStyles.value.status === 'not-loaded') void loadResponseStyles();
   }, []);
 
-  // A selected id the library no longer holds. The engine falls back to
-  // Standard, so the row says so rather than showing a blank trigger.
   const missing = library.length > 0 && !library.some((s) => s.id === selected);
 
   function closeEditor() {
@@ -159,9 +127,6 @@ export function ResponseStylesSection() {
         </Explainer>
       </div>
 
-      {/* Above Style, so the style picker keeps its editor list right under it.
-          It reads a preference rather than the library, so it never waits on
-          the library load. */}
       <div class="settings-row" data-search-anchor="models:technical-literacy">
         <span class="settings-row-label">How technical</span>
         <Dropdown
@@ -177,8 +142,6 @@ export function ResponseStylesSection() {
 
       <div class="settings-row" data-search-anchor="models:response-style-picker">
         <span class="settings-row-label">Style</span>
-        {/* Withheld until the library lands. Before that the trigger could only
-            show the raw id and open an empty menu. */}
         <LoadingFade class="dropdown-slot" showSkeleton={showStyleSkeleton} skeleton={<DropdownSkeleton w="6rem" />}>
           {loadable.status === 'loaded' ? (
             <Dropdown
@@ -225,8 +188,6 @@ export function ResponseStylesSection() {
   );
 }
 
-/** One editable style at rest. Standard never reaches here: it draws no
- *  buttons, because the off switch has nothing to edit or delete. */
 function StyleRow({
   style,
   onEdit,
@@ -234,9 +195,6 @@ function StyleRow({
   style: ResponseStyle;
   onEdit: () => void;
 }) {
-  // Reset and Delete are the same write, and which one it is follows from where
-  // the row came from. Both drop the row's entry from the document: on a
-  // shipped style that entry is the override, on a user style it is the style.
   const shipped = style.source !== 'user';
   async function drop() {
     const question = shipped
@@ -274,8 +232,6 @@ function StyleRow({
   );
 }
 
-/** Shown in the empty instruction field. Several lines, so it reads as a
- *  sample of what to write rather than as text already filled in. */
 const INSTRUCTION_EXAMPLE = [
   'For example:',
   '- Start with the answer. Skip the introduction and the summary at the end.',
@@ -283,17 +239,6 @@ const INSTRUCTION_EXAMPLE = [
   '- Write for a busy manager who is not technical.',
 ].join('\n');
 
-/** The edit form, shared by Edit and Add. `style` absent means Add.
- *
- *  A modal rather than a row that opens in place. An instruction runs to a
- *  thousand characters, and the settings pane on a phone is too narrow to read
- *  one in. The panel takes the width the viewport allows, and hands the
- *  leftover height to the instruction. That field scrolls inside its own box
- *  (`styles/settings/response-style-editor.css`).
- *
- *  The instruction is server-backed. An untouched form repaints when a frame
- *  lands, and a touched one keeps the draft. Seeding a `useState` from the row
- *  is the bug that replaces (`.claude/rules/frontend.md`). */
 function StyleEditorModal({
   style,
   library,
@@ -307,16 +252,10 @@ function StyleEditorModal({
   const [instruction, setInstruction] = useServerBackedField(style?.instruction ?? '');
   const [saving, setSaving] = useState(false);
 
-  // A shipped style keeps its id whatever the label says. Deriving one from the
-  // label would save an edit of Concise as a new style, leaving the original
-  // in place and unedited.
   const taken = style
     ? library.filter((s) => s.id !== style.id).map((s) => s.id)
     : library.map((s) => s.id);
   const id = style ? style.id : nextStyleId(label, taken);
-  // The bound is on the DOCUMENT, so it is measured on what this save would
-  // store. Overriding an untouched shipped style adds a row, which a full
-  // library must refuse before Save rather than after the engine does.
   const nextSize = documentWithEdit(library, { id, label, instruction }).length;
   const problem = describeStyleProblem(
     { id, label, instruction },
@@ -331,15 +270,9 @@ function StyleEditorModal({
     setSaving(true);
     try {
       const ok = await saveStyleDocument((current) => {
-        // Re-derived against the CURRENT library. The render-time id above is
-        // only a validity preview: computed from a stale list it could collide
-        // with a style another device added, which `documentWithEdit` would
-        // then overwrite in place.
         const freshId = style ? style.id : nextStyleId(label, current.map((s) => s.id));
         return documentWithEdit(current, { id: freshId, label, instruction });
       });
-      // Only a landed write closes the form. A refused one keeps the paragraph
-      // on screen beside the toast saying what was wrong with it.
       if (ok) onDone();
     } finally {
       setSaving(false);
@@ -357,8 +290,6 @@ function StyleEditorModal({
       panelProps={{ 'aria-label': title }}
     >
       <SurfaceHead title={title} onClose={onDone} closeLabel={`Close ${title}`} />
-      {/* What a style is for. Above the fields rather than under them, so the
-          reader meets it first. Each field then says what goes in it. */}
       <p class="style-editor-intro">
         A style tells Lucidos how to write its answers. While it is picked, Lucidos
         reads your instructions before every reply.
@@ -373,9 +304,6 @@ function StyleEditorModal({
           onInput={(e) => setLabel((e.currentTarget as HTMLInputElement).value)}
         />
       </label>
-      {/* A plain textarea, never `AutoTextarea`. A field that grows to its own
-          content keeps no height to scroll in, so a long instruction ran off
-          the pane with no way to reach the end. */}
       <label class="style-editor-field style-editor-field-grow">
         <span class="style-editor-field-label">Instructions</span>
         <span class="style-editor-field-hint">

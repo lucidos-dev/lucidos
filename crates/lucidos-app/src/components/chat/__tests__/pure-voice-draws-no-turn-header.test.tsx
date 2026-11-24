@@ -1,12 +1,3 @@
-/** A call with nothing behind it draws no turn header.
- *
- *  Two people talking is a turn nobody executed. A "Lucidos Agent" row between
- *  two speech bubbles names an actor the reader knows. It also dates a sentence
- *  they just heard, and offers three controls over a body of one line.
- *
- *  What keeps its header is the card the DOER is working under. That one holds
- *  a turn, and the header is what says so.
- */
 import { describe, expect, it, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -34,7 +25,6 @@ const step = (event: Partial<StoredEvent> & { type: string }, seq = 1): Sequence
 const spokenReply = (text: string) =>
   step({ type: 'SpokenReplyGenerated', session_id: 'sess-1', text, interrupted: false });
 
-/** The caller's own utterance, in the spelling every call writes today. */
 const heard = (text: string) =>
   ({ type: 'SpokenMessageReceived', session_id: 'sess-1', text }) as unknown as StoredEvent;
 
@@ -53,7 +43,6 @@ describe('a card the talker answered by itself', () => {
     expect(isSpeechOnlyTurn(exchangeWith(heard('what is up'), marks))).toBe(true);
   });
 
-  /** The pre-ADR-0201 spelling: a `MessageReceived` marked with the session. */
   it('reads a legacy row the same way', () => {
     const legacy = {
       type: 'MessageReceived',
@@ -63,8 +52,6 @@ describe('a card the talker answered by itself', () => {
     expect(isSpeechOnlyTurn(exchangeWith(legacy, [spokenReply('Not much.')]))).toBe(true);
   });
 
-  /** The talker spoke before anybody else did, so its greeting opened a
-   *  boundary of its own and draws in the initiator body. */
   it('takes the greeting too', () => {
     const greeting = {
       type: 'SpokenReplyGenerated',
@@ -75,8 +62,6 @@ describe('a card the talker answered by itself', () => {
     expect(isSpeechOnlyTurn(exchangeWith(greeting))).toBe(true);
   });
 
-  /** No engine event backs the caller's pulse: it is a bare `MessageReceived`
-   *  with no session on it, so the mark is the only thing that can answer. */
   it('takes a live row, which no session id marks', () => {
     const pulse = {
       type: 'MessageReceived',
@@ -96,9 +81,6 @@ describe('a card with work behind it keeps its header', () => {
     expect(isSpeechOnlyTurn(exchangeWith(heard('what is waiting'), worked))).toBe(false);
   });
 
-  /** The delegation itself draws nothing, so the steps alone still read as
-   *  speech. `tookTheTurn` is the fact that the doer was asked, and the reader
-   *  is owed the Working badge on this card while it sleeps. */
   it('drops out on a delegation, before the doer has woken', () => {
     const delegated: Exchange = {
       ...exchangeWith(heard('send that email'), [
@@ -141,9 +123,6 @@ describe('the panel that draws it', () => {
     expect(drawn).toContain('Not much at the moment.');
   });
 
-  /** The collapse control is in the row that went, so a fold here would have
-   *  no way back out. A key left in the store by an earlier fold must not
-   *  hide the words where nothing can unfold them. */
   it('never folds without a header, whatever the store remembers', () => {
     const drawn = vnodeToText(panel({ headerless: true, collapsed: true }));
     expect(drawn).toContain('Not much at the moment.');
@@ -155,15 +134,11 @@ describe('ChatExchange wires it in', () => {
     expect(chatExchangeSource).toMatch(/<ResponsePanel[\s\S]*?headerless=\{isSpeechOnly\}/);
   });
 
-  /** A status badge has only the header to sit on. So a card still waiting on
-   *  its reply would draw an empty box under the bubble. */
   it('withholds the panel until there are words in it', () => {
     expect(chatExchangeSource).toMatch(/const speechOnlyHasWords = !isSpeechOnly \|\| canCollapse/);
     expect(chatExchangeSource).toMatch(/showResponsePanel\s*=[^;]*speechOnlyHasWords/);
   });
 
-  /** Neither panel draws a collapse control here, so ⌘↑/⌘↓ plus Enter must not
-   *  offer a fold that nothing can undo. */
   it('offers the keyboard no fold on such a turn', () => {
     expect(chatExchangeSource).toMatch(/const collapseKind = isSpeechOnly \? undefined/);
   });

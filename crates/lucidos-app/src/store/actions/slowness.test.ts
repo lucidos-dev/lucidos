@@ -24,7 +24,6 @@ const unclear = (slow_workspaces: string[]): SlownessStatus => ({
 });
 
 afterEach(async () => {
-  // A success ends any failing streak, so no test inherits one.
   vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ state: 'normal' }))));
   await refreshSlowness();
   vi.unstubAllGlobals();

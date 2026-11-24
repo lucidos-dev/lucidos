@@ -1,10 +1,3 @@
-/** Moving a child thread to top level: the confirmation and the call
- *  (ADR 0278).
- *
- *  The drawer needs no local edit. The engine rebroadcasts the child's
- *  summary with no parent, and `applyAggregateToMeta` un-nests the row on
- *  every device at once.
- */
 
 import { detachThread } from '../../api/threads';
 import { showConfirm, showToast, threadMap } from '../store';
@@ -15,8 +8,6 @@ export interface DetachConfirmation {
   message: string;
 }
 
-/** The dialog for moving `childTitle` out of `parentTitle`. Pure, so the copy
- *  is testable without a dialog. One paragraph per blank-line block. */
 export function detachConfirmation(childTitle: string, parentTitle: string): DetachConfirmation {
   const child = childTitle.trim() || 'this thread';
   const parent = parentTitle.trim() || 'its parent thread';
@@ -31,7 +22,6 @@ export function detachConfirmation(childTitle: string, parentTitle: string): Det
   };
 }
 
-/** Whether the ⋯ menu offers the move: only a thread that has a parent. */
 export function canMoveToTopLevel(threadId: string): boolean {
   return !!threadMap.value.get(threadId)?.meta.parentThreadId;
 }
@@ -43,8 +33,6 @@ export async function handleDetachThread(threadId: string): Promise<void> {
     ?? meta.parentThreadTitle
     ?? '';
   const confirmation = detachConfirmation(meta.title ?? '', parentTitle);
-  // The default button, never the danger one: nothing is destroyed, and red is
-  // reserved for Delete, Discard and Remove. An unset variant draws red.
   const ok = await showConfirm(confirmation.message, 'Move out', {
     title: confirmation.title,
     cancelLabel: 'Cancel',

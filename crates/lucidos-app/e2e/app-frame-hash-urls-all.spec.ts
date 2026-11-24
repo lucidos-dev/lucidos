@@ -2,15 +2,6 @@ import { test, expect } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry, ensureMobileView, waitForPaneAtRest } from './helpers';
 
-// Behind a gateway the engine stamps a `<base href>` carrying the frame
-// capability (ADR 0238), so the base path differs from the document path. A
-// bare `#x` resolves against the base. The frame is sandboxed (ADR 0227), so
-// WebKit refuses `history.replaceState` to another path: iOS Safari threw on
-// `replaceState(null, '', '#30d')`. Chromium moved the frame onto the base URL.
-//
-// The gateway binary refuses to boot from a worktree (ADR 0021), and a direct
-// engine stamps no pass. So the fixture declares the same base the engine
-// stamps, which puts the frame in exactly the state the gateway produces.
 
 const APP_ID = 'e2e-hash-urls-test';
 const CAPABILITY_BASE = `/e2e/~cap/6a0b1c2d~${APP_ID}~00112233445566778899aabbccddeeff/app/${APP_ID}/`;
@@ -65,7 +56,6 @@ document.getElementById('shadow-host').attachShadow({ mode: 'open' }).innerHTML 
     const appFrame = page.frameLocator('iframe[data-role="app-ui-frame"]:visible');
     await expect(appFrame.locator('#ready')).toBeVisible({ timeout: 10_000 });
     await expect(page.locator('.app-ui-cover')).toHaveCount(0, { timeout: 10_000 });
-    // The visible frame's own document, which is the one the click lands in.
     const frame = await page.locator('iframe[data-role="app-ui-frame"]:visible').elementHandle()
       .then((handle) => handle?.contentFrame());
     expect(frame, 'the app frame is attached').toBeTruthy();
@@ -94,9 +84,6 @@ document.getElementById('shadow-host').attachShadow({ mode: 'open' }).innerHTML 
     });
     expect(pushed).toEqual({ error: null, hash: '#pushed', path: before.path });
 
-    // A marker on the window tells a fragment navigation from a reload, which
-    // is what the link did when it resolved against the base. The link is
-    // centred, clear of the host's left edge-swipe zone on a phone.
     await frame!.evaluate(() => { (window as unknown as { marker: number }).marker = 1; });
     await appFrame.locator('#in-page').click();
     await expect.poll(() => frame!.evaluate(() => location.hash)).toBe('#section');
@@ -106,11 +93,9 @@ document.getElementById('shadow-host').attachShadow({ mode: 'open' }).innerHTML 
     }));
     expect(after).toEqual({ path: before.path, marker: 1 });
 
-    // An app's own window listener, added after the SDK, still cancels a link.
     await appFrame.locator('#cancelled').click();
     expect(await frame!.evaluate(() => location.hash)).toBe('#section');
 
-    // A link inside a shadow root is followed on this document too.
     await appFrame.locator('#shadow-link').click();
     await expect.poll(() => frame!.evaluate(() => location.hash)).toBe('#shadow-target');
     const shadowed = await frame!.evaluate(() => ({

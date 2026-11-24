@@ -16,12 +16,12 @@ type StoreResult<T> = Result<T, sqlx::Error>;
 
 /// One stored node, as the compactor and the tests read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredNode {
-    pub(crate) text: String,
+pub struct StoredNode {
+    pub text: String,
     /// `None` for a free node, which no model wrote.
-    pub(crate) model: Option<String>,
-    pub(crate) source_event_id: Option<Uuid>,
-    pub(crate) source_thread_id: Option<Uuid>,
+    pub model: Option<String>,
+    pub source_event_id: Option<Uuid>,
+    pub source_thread_id: Option<Uuid>,
 }
 
 /// A thread is in scope unless it is a trigger run nobody has talked to. A
@@ -40,7 +40,7 @@ struct NodeRow {
     source_thread_id: Option<Uuid>,
 }
 
-pub(crate) async fn load_nodes(
+pub async fn load_nodes(
     pool: &PgPool,
     scope: SummaryScope,
 ) -> StoreResult<HashMap<NodeAddr, StoredNode>> {
@@ -73,7 +73,7 @@ impl NodeRow {
 
 /// Store a built node. A node already at that address wins: two drains of one
 /// scope never overlap, so a conflict is a replay of the same build.
-pub(crate) async fn insert_node(
+pub async fn insert_node(
     pool: &PgPool,
     scope: SummaryScope,
     addr: NodeAddr,
@@ -238,6 +238,7 @@ pub async fn caught_up(pool: &PgPool) -> StoreResult<bool> {
     let thread_log_types: Vec<&str> = log::ENTRY_EVENT_TYPES
         .iter()
         .chain(log::TURN_END_EVENT_TYPES)
+        .chain(crate::engine::consumption_claim::HELD_MESSAGE_RECEIPT_TYPES)
         .copied()
         .collect();
     sqlx::query_scalar(&format!(
@@ -301,7 +302,7 @@ pub(crate) async fn dirty_threads(pool: &PgPool, ready_days: i32) -> StoreResult
 }
 
 /// How many threads have a tree, built or not.
-pub(crate) async fn in_scope_thread_count(pool: &PgPool) -> StoreResult<usize> {
+pub async fn in_scope_thread_count(pool: &PgPool) -> StoreResult<usize> {
     let count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM thread_summaries s WHERE {THREAD_IN_SCOPE_SQL}"
     ))
@@ -394,21 +395,17 @@ async fn thread_events(pool: &PgPool, id: Uuid, through: i64) -> StoreResult<Vec
         .chain(log::TURN_END_EVENT_TYPES)
         .copied()
         .collect();
-    let rows: Vec<(Uuid, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, event_type, payload FROM events \
-         WHERE thread_id = $1 AND event_type = ANY($2) AND sequence <= $3 \
-         ORDER BY sequence",
-    )
-    .bind(id)
-    .bind(&types)
-    .bind(through)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        crate::core::store::EventStore::model_thread_events(pool, id, &types, through).await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(id, event_type, payload)| {
-            let actor = EventMeta::from_payload(&payload).actor;
-            parse_event(id, &event_type, payload).map(|event| StoredEvent { id, event, actor })
+        .filter_map(|row| {
+            let actor = EventMeta::from_payload(&row.payload).actor;
+            parse_event(row.id, &row.event_type, row.payload).map(|event| StoredEvent {
+                id: row.id,
+                event,
+                actor,
+            })
         })
         .collect())
 }
@@ -429,13 +426,13 @@ pub(crate) async fn thread_info(pool: &PgPool, id: Uuid) -> StoreResult<Option<T
 
 /// A node's size and source, as a view's fold weighs it before reading any
 /// text.
-pub(crate) struct NodeShape {
+pub struct NodeShape {
     /// UTF-8 bytes of the text, plus two per line break, which a view indents.
-    pub(crate) bytes: usize,
+    pub bytes: usize,
     pub(crate) source_event_id: Option<Uuid>,
 }
 
-pub(crate) async fn node_shapes(
+pub async fn node_shapes(
     pool: &PgPool,
     scope: SummaryScope,
 ) -> StoreResult<HashMap<NodeAddr, NodeShape>> {
@@ -466,7 +463,7 @@ pub(crate) async fn node_shapes(
 }
 
 /// The stored nodes at `addrs`. An address with no node is left out.
-pub(crate) async fn nodes_at(
+pub async fn nodes_at(
     pool: &PgPool,
     scope: SummaryScope,
     addrs: &[NodeAddr],
@@ -511,7 +508,7 @@ pub(crate) async fn leaf_event_span(
 
 /// One in-scope thread as a tree browser lists it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
-pub(crate) struct TreeThread {
+pub struct TreeThread {
     pub(crate) thread_id: Uuid,
     pub(crate) title: Option<String>,
     pub(crate) last_activity: chrono::DateTime<chrono::Utc>,
@@ -521,11 +518,7 @@ pub(crate) struct TreeThread {
 
 /// A page of in-scope threads, the most recently active first. Only the page's
 /// own threads have their built leaves counted.
-pub(crate) async fn tree_threads(
-    pool: &PgPool,
-    limit: i64,
-    offset: i64,
-) -> StoreResult<Vec<TreeThread>> {
+pub async fn tree_threads(pool: &PgPool, limit: i64, offset: i64) -> StoreResult<Vec<TreeThread>> {
     sqlx::query_as(&format!(
         "WITH page AS ( \
            SELECT s.thread_id, s.title, s.last_activity FROM thread_summaries s \
@@ -621,7 +614,7 @@ fn parse_event(id: Uuid, event_type: &str, payload: serde_json::Value) -> Option
     match ThreadEvent::from_stored(event_type, payload) {
         Ok(event) => Some(event),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Event {} ({}) no longer parses, so the log skips it: {}",
                 id,
                 event_type,
@@ -648,10 +641,7 @@ const FIRST_FAMILY_LEAF_SQL: &str = "(SELECT min(start) FROM summary_tree_nodes 
 /// merge from the first of them onward: positions after it shift, so each of
 /// those merges is rebuilt. Resetting the workspace's progress makes the next
 /// drain, even after a restart, realign and rebuild them.
-pub(crate) async fn delete_family(
-    tx: &mut Transaction<'_, Postgres>,
-    ids: &[Uuid],
-) -> StoreResult<()> {
+pub async fn delete_family(tx: &mut Transaction<'_, Postgres>, ids: &[Uuid]) -> StoreResult<()> {
     let scopes = scope_texts(ids);
     sqlx::query("DELETE FROM summary_tree_nodes WHERE scope = ANY($1)")
         .bind(&scopes)
@@ -683,7 +673,7 @@ pub(crate) async fn delete_family(
 /// How many model-written workspace summaries a delete of `ids` would send
 /// back to the compactor. Free merges cost nothing to rebuild, so they are
 /// not counted.
-pub(crate) async fn family_rebuild_count(
+pub async fn family_rebuild_count(
     tx: &mut Transaction<'_, Postgres>,
     ids: &[Uuid],
 ) -> StoreResult<i64> {

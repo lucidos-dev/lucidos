@@ -1,10 +1,3 @@
-/* Settings → MCP Servers: the registered servers, what each costs every
-   request, and the switches for both. See components/settings/McpServersPage.tsx.
-
-   The list follows the Apps / Triggers geometry, like Accounts before it: the
-   rows pull back out through the panel gutter so `.list-row` re-establishes it
-   as its own padding, which is what puts the content at 1rem while the hover
-   wash reaches the pane edges. */
 
 .mcp-cost-summary {
     display: flex;
@@ -22,16 +15,11 @@
     color: var(--text-secondary);
 }
 
-/* The engine's line once the tools are past or near their ceiling. Not forced
-   into the skeleton: it is rare, and a placeholder for it would read as one. */
 .mcp-cost-warning {
     font-size: var(--font-size-md);
     color: var(--accent-yellow);
 }
 
-/* The two conditional figures: what the stopped servers would add, and what the
-   switched-off tools are keeping out. Quieter than the live total, because
-   neither is what the workspace is paying. */
 .mcp-cost-aside {
     font-size: var(--font-size-sm);
     color: var(--text-muted);
@@ -41,8 +29,6 @@
     margin-inline: calc(-1 * var(--space-lg));
 }
 
-/* The block is row + expanded tool list, so the two share one state attribute
-   and the tools inherit the row's left edge. */
 .mcp-server-block {
     display: flex;
     flex-direction: column;
@@ -71,8 +57,6 @@
     margin-top: 0.125rem;
 }
 
-/* The undispatchable server's own explanation. A raised neutral surface carries
-   the emphasis: no left-accent stripe (.claude/rules/frontend-css.md). */
 .mcp-server-note {
     margin-top: var(--space-sm);
     padding: var(--space-sm);
@@ -83,9 +67,6 @@
     max-width: 40rem;
 }
 
-/* A failed start or stop, on the row that failed. Red for the retryable ones;
-   an unusable id is permanent, so it wears the same tone as its note above
-   rather than inviting another attempt. */
 .mcp-row-error {
     margin-top: var(--space-sm);
     padding: var(--space-sm);
@@ -101,9 +82,6 @@
     color: var(--text-secondary);
 }
 
-/* The disclosure for the tool list is `.settings-disclosure-toggle`, in
-   settings/base.css. It carried a byte-identical copy of that rule until the
-   Models list grew a second one. */
 
 .mcp-row-actions {
     align-items: center;
@@ -111,9 +89,6 @@
     flex-wrap: wrap;
 }
 
-/* A switch and the word for it. Two bare pills side by side say nothing, and
-   the visible word is not a <label> bound to the input, which is why every
-   switch here passes its own aria-label. */
 .mcp-switch {
     display: flex;
     align-items: center;
@@ -126,8 +101,6 @@
     white-space: nowrap;
 }
 
-/* The expanded tool list. Indented under the row's own gutter so a tool reads
-   as belonging to the server above it. */
 .mcp-tool-list {
     display: flex;
     flex-direction: column;
@@ -143,8 +116,6 @@
     border-top: 1px solid var(--border-color);
 }
 
-/* A switched-off tool is still listed, because its cost is what the switch
-   bought back. Dimmed, so the enabled ones read first. */
 .mcp-tool-row[data-state="disabled"],
 .mcp-tool-row[data-state="uncallable"] {
     opacity: 0.6;

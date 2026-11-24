@@ -3,33 +3,11 @@ import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } fr
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/**
- * Answering a question survives a dropped connection.
- *
- * Reported from an iOS PWA: a multi-select answer failed to send twice with
- * "Failed to send answer: unknown error". The third attempt a minute later
- * landed, and each failure emptied the card, so three options were re-picked
- * twice over. That is the half-closed HTTP/2 connection a backgrounded PWA
- * wakes up holding, which WebKit rejects before the request leaves the device.
- * `route.abort('failed')` reproduces the same rejection shape, the transport
- * `TypeError` that `isTransportError` matches.
- *
- * Two halves, one per test: the client retries the POST quietly, and when no
- * attempt saves it the card keeps the answer as Not sent, with a retry icon.
- *
- * Service workers are blocked, following `sdk-iframe-mount.spec.ts`. A
- * controlled page runs every fetch through the worker's own network session in
- * WebKit. `page.route` cannot see it there, so both tests passed vacuously on
- * `mobile-webkit` with the abort never firing. Blocking costs nothing here:
- * `sw.js` intercepts GETs only and has never handled this POST.
- */
 
 test.use({ serviceWorkers: 'block' });
 
 const ANSWER_ROUTE = '**/answer-question';
 
-/** Seed a CC thread parked on a question, the way the sibling question specs
- *  do. Returns the ids the test drives and cleans up with. */
 function seedQuestion(opts: { title: string; question: string; multiSelect: boolean; labels: string[] }) {
   const suffix = randomUUID().slice(0, 8);
   const threadId = randomUUID();
@@ -76,7 +54,7 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
       await page.route(ANSWER_ROUTE, async (route) => {
         attempts += 1;
         if (attempts === 1) await route.abort('failed');
-        else await route.continue();
+        else await route.fallback();
       });
 
       await navigateToApp(page);
@@ -91,7 +69,6 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
         .first();
       await expect(pendingBody).toBeVisible({ timeout: 10_000 });
 
-      // ONE tap. The retry is the client's, not the user's.
       await pendingBody.locator('.question-option').nth(0).click();
 
       await expect.poll(
@@ -99,7 +76,6 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
         { intervals: [400], timeout: 10_000 },
       ).toBe('opt-0');
       expect(attempts).toBe(2);
-      // The retry is silent: the answer landed, so the user is told nothing.
       await expect(page.locator('.toast-error')).toHaveCount(0);
     } finally {
       await page.unroute(ANSWER_ROUTE);
@@ -107,9 +83,6 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
     }
   });
 
-  // When no quiet retry can save it, the user keeps their answer on the card.
-  // The submit clears the toggles as its send gesture, and the reported failure
-  // left the card blank.
   test('a multi-select answer that cannot be sent stays on its card as Not sent', async ({ page }) => {
     await assertHealthy(page);
     const seed = seedQuestion({
@@ -120,10 +93,8 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
     });
 
     try {
-      // The tap and every quiet retry fail, which is the state the user was
-      // actually in.
       let landing = false;
-      await page.route(ANSWER_ROUTE, (route) => (landing ? route.continue() : route.abort('failed')));
+      await page.route(ANSWER_ROUTE, (route) => (landing ? route.fallback() : route.abort('failed')));
 
       await navigateToApp(page);
       await openThreadDrawer(page);
@@ -145,20 +116,16 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
       await expect(submit).toContainText('Submit 2');
       await submit.click();
 
-      // Once the quiet retries give up, the card still holds both picks, with
-      // Not sent and a retry icon on the first. No toast: the card says it.
       await expect(pendingBody.locator('.question-option-selected')).toHaveCount(2, { timeout: 30_000 });
       const notice = pendingBody.locator('.question-unsent-row');
       await expect(notice).toHaveCount(1);
       await expect(notice).toContainText('Not sent');
       await expect(page.locator('.toast-error:visible')).toHaveCount(0);
 
-      // Nothing reached the engine, so nothing was recorded.
       expect(
         psql(`SELECT COUNT(*) FROM events WHERE thread_id = '${seed.threadId}' AND event_type = 'UserQuestionAnswered'`),
       ).toBe('0');
 
-      // The retry icon sends the same answer, so nothing is re-picked.
       landing = true;
       await notice.locator('button[aria-label="Retry sending your answer"]').click();
       await expect.poll(

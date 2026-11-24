@@ -1,11 +1,3 @@
-/**
- * A row of action buttons packs to the right, primary last, as the confirm
- * dialog does (`.claude/rules/frontend-css.md` § Action buttons). A flex row
- * whose class ends in `-actions`, `-buttons`, `-btns`, `-foot` or `-footer`
- * must place its buttons at the end: `justify-content`, or a `margin-left:
- * auto` that sends the row to the right edge. A row whose parent already
- * places it states that with its own `justify-content` and a comment.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -21,13 +13,11 @@ const src: string = resolve(here, '../..');
 
 const ROW_CLASS = /\.[\w-]*-(?:actions|buttons|btns|foot|footer)$/;
 
-/** The selector's subject compound, pseudo-classes stripped. */
 function subject(selector: string): string {
   const last = selector.trim().split(/[\s>+~]+/).pop() ?? '';
   return last.replace(/:[\w-]+(\([^)]*\))?/g, '');
 }
 
-/** Every row selector with every declaration any sheet gives it, merged. */
 function rowDeclarations(): Map<string, Map<string, string>> {
   const rows = new Map<string, Map<string, string>>();
   for (const path of styleSheetPaths(src)) {

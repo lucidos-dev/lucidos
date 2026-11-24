@@ -5,15 +5,6 @@ import {
   uniqueMessage, ensureOnThreadPane, waitForVisibleInput,
 } from './helpers';
 
-/** The composer's one action button while a question card waits.
- *
- *  Reported from iPhone Safari: an empty multi-select card showed the green send
- *  arrow, which actually meant "submit or cancel". Now the button means one
- *  thing at a time. With nothing picked and nothing typed it is a red Cancel
- *  with an X. Once a pick or text makes an answer, it is a green Submit with
- *  a checkmark, distinct from Send. Every project runs it, phones included.
- *
- *  The mock asks the card through a scripted `ask_user_question` call. */
 
 const row = (page: Page): Locator => page.locator('.prompt-actions-row:visible').first();
 const cancelButton = (page: Page): Locator => row(page).locator('button[aria-label="Cancel"]');
@@ -21,7 +12,6 @@ const submitButton = (page: Page): Locator => row(page).locator('button[aria-lab
 const pendingCard = (page: Page): Locator =>
   page.locator('.question-body:not(.question-body-answered):visible').first();
 
-/** The X of `CloseIcon` and the tick of `CheckIcon`. */
 const X_ICON = 'svg path[d="M18 6 6 18"]';
 const CHECK_ICON = 'svg polyline[points="20 6 9 17 4 12"]';
 const SEND_ICON = 'svg polyline[points="4 11 12 3 20 11"]';
@@ -86,26 +76,21 @@ test.describe('The answer button on a question card', () => {
     await askCard(page, true);
     const options = pendingCard(page).locator('.question-option');
 
-    // Nothing picked, nothing typed: Cancel only.
     await expectCancelOnly(page);
 
-    // One pick: Submit with the checkmark, counting the pick.
     await options.nth(0).click();
     const submit = await expectSubmit(page);
     await expect(submit).toContainText('Submit 1');
 
-    // Unpicking it brings Cancel back.
     await options.nth(0).click();
     await expectCancelOnly(page);
 
-    // Typed text alone is an answer too.
     const input = await waitForVisibleInput(page);
     await input.fill('Blue, please');
     await expectSubmit(page);
     await input.fill('');
     await expectCancelOnly(page);
 
-    // Cancel dismisses the card.
     await cancelButton(page).click();
     await expect(page.locator('.question-cancel-picked:visible')).toHaveCount(1, { timeout: 15_000 });
   });

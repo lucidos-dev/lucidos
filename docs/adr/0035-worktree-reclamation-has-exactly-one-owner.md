@@ -175,3 +175,9 @@ own branch first and keeps any branch with commits ahead.
 `git worktree remove --force`. It renames the tree to a `reclaiming-` sibling,
 prunes git's registration, settles the branch, then deletes the directory. A
 crash therefore never leaves a half-deleted tree at the thread path.
+
+## Amendment: reclamation preserves the thread branch
+
+[ADR 0740](0740-reclamation-preserves-thread-branches.md) supersedes the
+branch disposal rule for reclamation. The cleanup worker and Disk Usage keep
+the thread branch so the coding agent can resume after the worktree is removed.

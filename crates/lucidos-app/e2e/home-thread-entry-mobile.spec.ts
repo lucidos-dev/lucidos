@@ -2,14 +2,9 @@ import { test, expect, Page } from './fixtures';
 import { navigateToApp, assertHealthy, ensureMobileView } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
-/** A phone reaches Home from a Home icon in the thread pane's header, left of
- *  the mark, with the dashboard toggle on its right. It lands on Home as a
- *  plain chat (ADR 0496, amended). The thread drawer's header has no Home icon,
- *  so the menu its mark opens keeps a Home row; the thread pane's menu drops it. */
 test.describe('The home thread from the phone header', () => {
   let home: string;
 
-  /** Home is focused, and it is a plain chat with no dashboard face. */
   async function expectHomeOpen(page: Page): Promise<void> {
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem('lucidos-focused-thread')))
@@ -20,7 +15,6 @@ test.describe('The home thread from the phone header', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // A spec before this one may have truncated the threads, home included.
     home = ensureHomeThread();
     await navigateToApp(page);
     await ensureMobileView(page, 'thread');
@@ -42,10 +36,6 @@ test.describe('The home thread from the phone header', () => {
     await expectHomeOpen(page);
   });
 
-  /** Sets the scale and measures the header in ONE synchronous page task. The
-   *  app re-applies the saved scale on every preferences load, and a refetch
-   *  landing between a separate write and read reverts ours. Nothing can land
-   *  inside one task, so a measurement taken at the wrong root size is retried. */
   async function measureAtScale(page: Page, scale: number, rootPx: number) {
     const handle = await page.waitForFunction(
       ([s, px]) => {
@@ -94,8 +84,6 @@ test.describe('The home thread from the phone header', () => {
   }
 
   test('the group spreads out when the row has room, and touches when it has none', async ({ page }) => {
-    // The app writes the scale itself once preferences load, so wait for that
-    // write before ours.
     await page.waitForFunction(() => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 });
     await expect(page.locator('.mobile-thread-header .header-mark-group .home-thread-btn')).toBeVisible();
 
@@ -105,8 +93,6 @@ test.describe('The home thread from the phone header', () => {
 
   test('a preferences apply that reverts the scale between tasks cannot skew the measurement', async ({ page }) => {
     await expect(page.locator('.mobile-thread-header .header-mark-group .home-thread-btn')).toBeVisible();
-    // Stands in for the app's re-apply on a preferences refetch: it undoes any
-    // scale other than 100% as soon as the writing task ends.
     await page.evaluate(() => {
       const root = document.documentElement;
       new MutationObserver(() => {

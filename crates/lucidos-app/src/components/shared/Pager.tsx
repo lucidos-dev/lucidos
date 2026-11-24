@@ -1,4 +1,3 @@
-/** A paged list's foot: which rows show ("51–100 of 1,234") and Prev/Next. */
 export function Pager({ offset, pageSize, total, hasMore, onChange }: {
   offset: number;
   pageSize: number;

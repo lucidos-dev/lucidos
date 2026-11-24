@@ -6,22 +6,15 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// The rung control never resizes: its label has one width per face set. The
-// desktop face shows the full pill, the compact face the intelligence badge
-// alone. The compact face is the phone layout or a narrow composer row, both
-// marked `data-composer-compact` on the row. Lack of room folds the pill, so no
-// width breakpoint lives here.
 const here: string = dirname(fileURLToPath(import.meta.url));
 const css: string = readFileSync(resolve(here, '../chat/rung-control.css'), 'utf-8').replace(/\/\*[\s\S]*?\*\//g, '');
 const PHONE_BLOCK = /@media \(--phone-layout\) \{[\s\S]*?\n\}/g;
 const COMPACT_RULE = /(?:^|\n)((?:\[data-composer-compact\][^{}]*?)) \{([^}]*)\}/g;
 const phone = [...css.matchAll(PHONE_BLOCK)].map((m) => m[0]).join('\n');
-/** The compact rules, with the attribute prefix dropped so `rule` finds them. */
 const compact = [...css.matchAll(COMPACT_RULE)]
   .map((m) => `${m[1].split('[data-composer-compact] ').join('')} {${m[2]}}`).join('\n');
 const desktop = css.replace(PHONE_BLOCK, '').replace(COMPACT_RULE, '');
 
-/** The body of the first rule for exactly `selector` in `source`. */
 function rule(source: string, selector: string): string {
   return source.match(new RegExp(`(?:^|\\n)\\s*${selector.replace(/[.[\]"()>:]/g, '\\$&')} \\{([^}]*)\\}`))?.[1] ?? '';
 }

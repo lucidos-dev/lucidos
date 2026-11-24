@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Settings → Models points at Settings → Providers three ways. A row counts the
- * providers that are set up. A link chip sits on each model no configured
- * provider serves. The Add Model form offers only providers that are set up.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

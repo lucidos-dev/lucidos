@@ -1,9 +1,3 @@
-/**
- * A thread list read that went out before a delete must not bring the deleted
- * thread back. While a read is in flight, `loadAllThreads` declines the refresh
- * that `ThreadsDeleted` asks for. The older response is then the last word, and
- * it still lists the thread.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/threads', () => ({

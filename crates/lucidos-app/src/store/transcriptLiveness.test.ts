@@ -3,9 +3,6 @@ import { signal } from '@preact/signals';
 import { watchTranscriptLiveness } from './transcriptLiveness';
 import type { ThreadState } from './thread-events';
 
-/** The follow's liveness comes from ONE source, the thread projection of the
- *  thread on screen. A reader's scroll turns the follow off only while it
- *  reads live, and parks the follow otherwise (ADR 0064). */
 describe('watchTranscriptLiveness', () => {
   function setup(focusedId: string | null) {
     const quiet = new Set<string>();
@@ -21,7 +18,6 @@ describe('watchTranscriptLiveness', () => {
       isLive: (t) => !quiet.has(t.meta.id),
       setLive: (live) => { pushed.push(live); },
     });
-    /** Mark a thread quiet or streaming, and publish the projection change. */
     const setIdle = (id: string, isQuiet: boolean) => {
       if (isQuiet) quiet.add(id); else quiet.delete(id);
       threads.value = new Map(threads.value);

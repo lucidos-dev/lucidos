@@ -1,11 +1,3 @@
-/**
- * The picker's form rules: what the user is told, and when.
- *
- * The bugs these pin are all "the UI knew something and didn't say it": a
- * disabled Restore with no stated reason, a collision message naming a
- * workspace nobody can see, a cancelled file dialog silently emptying the form,
- * and a create that quietly lands somewhere else than the name suggests.
- */
 
 import { describe, it, expect } from 'vitest';
 import type { WorkspaceStatus } from '../../../api/client/control';
@@ -32,8 +24,6 @@ function file(name: string): File {
   return new File(['x'], name);
 }
 
-/** The reported case: the workspace on screen reads "personaal", but its
- *  address (frozen when it was created as "personal") is still /personal/. */
 const RENAMED = [ws('personal', 'personaal')];
 
 const READY: RestoreDraft = { file: file('backup.enc'), key: 'k', name: 'fresh' };
@@ -51,8 +41,6 @@ describe('restoreBlocker: a disabled Restore always says what is missing', () =>
   });
 
   it('mentions the backup key by the name the user knows it by', () => {
-    // "Enter the key" was the old placeholder-only state: nothing said which
-    // key, or that it was the one saved at backup-setup time.
     expect(restoreBlocker({ ...READY, key: '' }, [])?.message).toContain('backup key');
   });
 });
@@ -61,7 +49,6 @@ describe('collision: the message names a workspace the user can see', () => {
   it('resolves the collision by ADDRESS and reports the display name', () => {
     const blocker = restoreBlocker({ ...READY, name: 'personal' }, RENAMED);
     expect(blocker?.kind).toBe('collision');
-    // The whole point: never assert the existence of a name no row shows.
     expect(blocker?.message).not.toContain('“personal” already exists');
     expect(blocker?.message).toContain('personaal');
     expect(blocker?.message).toContain('/personal/');
@@ -75,14 +62,12 @@ describe('collision: the message names a workspace the user can see', () => {
   it('collides on the slugified name, not on string equality', () => {
     expect(collidingWorkspace('My Work', [ws('my-work', 'Something else')])?.id).toBe('my-work');
     expect(collidingWorkspace('  ', RENAMED)).toBeNull();
-    expect(collidingWorkspace('personaal', RENAMED)).toBeNull(); // free address
+    expect(collidingWorkspace('personaal', RENAMED)).toBeNull();
   });
 });
 
 describe('applyRestoreFile: an empty selection is never a reset', () => {
   it('keeps the chosen file when the dialog is cancelled', () => {
-    // The reported "Restore is disabled and I can't see why": reopening the
-    // dialog and cancelling used to clear both the file and the name.
     const picked = applyRestoreFile(EMPTY_RESTORE_DRAFT, file('lucidos-backup-personal-20260601-040254.enc'));
     expect(picked.file?.name).toContain('personal');
     expect(picked.name).toBe('personal');
@@ -107,16 +92,12 @@ describe('restoreFileNote: warns about a non-archive without blocking it', () =>
   });
 
   it('does not block submission', () => {
-    // A user who renamed their download must still be able to restore it; the
-    // gateway is the authority on whether the archive decrypts.
     expect(restoreBlocker({ ...READY, file: file('renamed') }, [])).toBeNull();
   });
 });
 
 describe('createNote: the silent -2 suffix is stated up front', () => {
   it('predicts the address a colliding create actually gets, without blocking', () => {
-    // The NAME "personal" is free here (the workspace is called "personaal"),
-    // only its address is taken, so the create is allowed and merely explained.
     const note = createNote('personal', RENAMED);
     expect(note?.blocking).toBe(false);
     expect(note?.message).toContain('personaal');
@@ -125,8 +106,6 @@ describe('createNote: the silent -2 suffix is stated up front', () => {
   });
 
   it('counts the suffixed addresses already taken', () => {
-    // Both addresses taken, both by workspaces named something else, so the
-    // name is free and only the address needs explaining.
     const note = createNote('work', [ws('work', 'Alpha'), ws('work-2', 'Beta')]);
     expect(note?.blocking).toBe(false);
     expect(note?.message).toContain('/work-3/');
@@ -140,8 +119,6 @@ describe('createNote: the silent -2 suffix is stated up front', () => {
 
 describe('display names are unique', () => {
   it('blocks a create whose name another workspace already carries', () => {
-    // The reported picker: two rows both reading "personaaa". The address chip
-    // made that legible; it should not have been creatable at all.
     const note = createNote('personaal', RENAMED);
     expect(note?.blocking).toBe(true);
     expect(note?.message).toContain('personaal');
@@ -158,7 +135,6 @@ describe('display names are unique', () => {
   it('lets a workspace keep its own name on rename', () => {
     expect(nameTakenBy('personaal', RENAMED, 'personal')).toBeNull();
     expect(nameTakenBy('PERSONAAL', RENAMED, 'personal')).toBeNull();
-    // Taking a DIFFERENT workspace's name still collides.
     const two = [ws('a', 'Alpha'), ws('b', 'Beta')];
     expect(nameTakenBy('Beta', two, 'a')?.id).toBe('b');
   });
@@ -185,9 +161,6 @@ describe('isFirstRun: only a loaded, empty list', () => {
   });
 
   it('is not the first run while the list is still loading', () => {
-    // A loading list has no data yet for a reason that says nothing about what
-    // the user has. Reading it as the first run flashes the name chips and the
-    // unfolded create form at a user who has five workspaces.
     expect(isFirstRun({ status: 'not-loaded' })).toBe(false);
     expect(isFirstRun({ status: 'loading' })).toBe(false);
     expect(isFirstRun({ status: 'failed', error: 'boom' })).toBe(false);
@@ -211,7 +184,6 @@ describe('showsAddress: quiet unless the address would surprise', () => {
 });
 
 describe('backupNote: silent only when the gateway could not ask', () => {
-  /** A row carrying the engine's backup answer. */
   function backedUp(
     line: WorkspaceStatus['last_successful_backup'],
   ): WorkspaceStatus {
@@ -219,9 +191,6 @@ describe('backupNote: silent only when the gateway could not ask', () => {
   }
 
   it('says nothing when the field is absent', () => {
-    // A stopped or unhealthy workspace, and an engine too old to answer. The
-    // gateway holds no database handle, so it genuinely does not know, and a
-    // guess here would call a nightly-backed-up workspace unprotected.
     expect(backupNote(ws('personal'))).toBeNull();
   });
 
@@ -234,8 +203,6 @@ describe('backupNote: silent only when the gateway could not ask', () => {
   });
 
   it('warns on a backup the ENGINE called stale, without re-deriving why', () => {
-    // The threshold lives once, in core::backup. The same timestamp with
-    // `stale: false` is the case above, so nothing here reads the clock.
     const at = new Date(Date.now() - 3 * 86_400_000).toISOString();
     expect(backupNote(backedUp({ at, stale: true, configured: true }))).toEqual({
       text: 'Backed up 3d ago',
@@ -244,8 +211,6 @@ describe('backupNote: silent only when the gateway could not ask', () => {
   });
 
   it('tells a broken schedule from a workspace nobody set up', () => {
-    // Both are unprotected and both warn, but they are different faults: one
-    // has a schedule that has never produced an archive, the other has none.
     expect(backupNote(backedUp({ at: null, stale: true, configured: true }))).toEqual({
       text: 'Never backed up',
       level: 'warn',

@@ -1,8 +1,7 @@
 import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, newThread, pickComposeDestination } from './helpers';
-import estimates from '../../lucidos-engine/src/llm/rung_estimates.json' with { type: 'json' };
+import estimates from '../../lucidos-core/src/llm/rung_estimates.json' with { type: 'json' };
 
-// Route reads as a fresh workspace without changing the suite's preferences.
 test.use({ serviceWorkers: 'block' });
 
 test('the chat pill shows the shipped default band with unset preferences', async ({ page }) => {

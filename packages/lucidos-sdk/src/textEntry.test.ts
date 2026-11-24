@@ -30,7 +30,6 @@ describe('isTextEntryField', () => {
     for (const type of ['text', 'search', 'email', 'url', 'tel', 'password', 'date']) {
       expect(isTextEntryField(make(`<input type="${type}">`))).toBe(true);
     }
-    // No type attribute is a text input.
     expect(isTextEntryField(make('<input>'))).toBe(true);
   });
 
@@ -43,12 +42,10 @@ describe('isTextEntryField', () => {
   });
 });
 
-// Spelled as codepoints so no unprintable character sits in this file.
 const char = (code: number) => String.fromCodePoint(code);
 
 describe('isKeyCodeTextInsertion', () => {
   it('refuses the control codes the desktop app types for the four arrows', () => {
-    // Left, right, up, down, as a macOS key event carries them.
     for (const code of [0x1c, 0x1d, 0x1e, 0x1f]) {
       expect(isKeyCodeTextInsertion('insertText', char(code))).toBe(true);
     }

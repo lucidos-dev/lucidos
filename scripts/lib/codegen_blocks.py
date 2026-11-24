@@ -73,6 +73,27 @@ def load(path):
         yield name, {key: value.encode('utf-8') for key, value in fragments.items()}
 
 
+def by_file(documents, names, read):
+    """A document split over the size cap keeps its blocks in its parts, so its
+    fragments may sit in `<doc>.md` or any file under `<doc>/`."""
+    assigned = {}
+    for document, fragments in documents.items():
+        family = sorted(n for n in names if n == document or n.startswith(document[:-len('.md')] + '/'))
+        placed = set()
+        for name in family:
+            begun = {m.decode('ascii') for m in re.findall(
+                rb'<!-- generated:begin ([A-Za-z][A-Za-z0-9_-]*) -->', read(name))}
+            here = {key: value for key, value in fragments.items() if key in begun}
+            if placed & here.keys():
+                raise ValueError(f'generated block in two files of {document}: {sorted(placed & here.keys())}')
+            placed |= here.keys()
+            if here or name == document:
+                assigned[name] = here
+        if placed != fragments.keys():
+            raise ValueError(f'missing generated block in {document}: {sorted(fragments.keys() - placed)}')
+    return assigned
+
+
 def run(mode, manifest, root):
     documents = dict(load(manifest))
     if mode == 'check':
@@ -83,16 +104,22 @@ def run(mode, manifest, root):
     else:
         names = {path.relative_to(root).as_posix()
                  for path in (root / 'system-knowhow').rglob('*.md')}
-    updates = []
-    for name in sorted(names | documents.keys()):
-        fragments = documents.get(name, {})
-        path = root / name
+
+    def read(name):
         if mode == 'check':
-            document = subprocess.run(['git', '-C', str(root), 'show', f'HEAD:{name}'],
-                                      check=True, capture_output=True).stdout
+            return subprocess.run(['git', '-C', str(root), 'show', f'HEAD:{name}'],
+                                  check=True, capture_output=True).stdout
+        return (root / name).read_bytes()
+
+    files = by_file(documents, names, read)
+    updates = []
+    for name in sorted(names | files.keys()):
+        fragments = files.get(name, {})
+        path = root / name
+        document = read(name)
+        if mode == 'check':
             check(document, fragments)
         else:
-            document = path.read_bytes()
             rendered = splice(document, fragments)
             if rendered != document:
                 updates.append((path, rendered))

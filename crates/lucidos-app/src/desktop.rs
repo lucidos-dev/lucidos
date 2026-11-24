@@ -19,8 +19,7 @@
 //! no `AppHandle`, reaches what the client's `resource_dir()` would. State
 //! lives under the OS app-data dir, which the updater never replaces.
 
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +33,9 @@ use lucidos_installs::BUNDLE_IDENTIFIER;
 // The launchd labels of the **service agent** (the always-on gateway service)
 // and the **login agent** (the one-shot job that reopens the CLIENT at login).
 // Both key every already-installed plist, so neither may change.
-pub use lucidos_installs::{LOGIN_AGENT_LABEL, SERVICE_AGENT_LABEL};
+#[cfg(target_os = "macos")]
+pub use lucidos_installs::LOGIN_AGENT_LABEL;
+pub use lucidos_installs::SERVICE_AGENT_LABEL;
 
 /// The argument the login agent passes the client, marking a launch as
 /// "started at login, not by a person". Such a launch comes up menu-bar-only:
@@ -172,6 +173,15 @@ struct CrashLoop {
     log: PathBuf,
 }
 
+/// What the pre-gateway splash shows: its line, and the Trust button's label
+/// while the Trust step waits for a press (`crate::loopback_trust`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupReport {
+    pub label: String,
+    pub trust_button: Option<&'static str>,
+}
+
 impl Default for StartupStatus {
     fn default() -> Self {
         Self {
@@ -225,8 +235,17 @@ impl StartupStatus {
         }
     }
 
+    /// What the splash shows right now: the Trust screen while the Trust step
+    /// waits, else the start's own line.
+    pub fn report(&self, trust: &crate::loopback_trust::LoopbackTrust) -> StartupReport {
+        trust.prompt().unwrap_or_else(|| StartupReport {
+            label: self.label(),
+            trust_button: None,
+        })
+    }
+
     /// The line to show on the splash right now.
-    pub fn label(&self) -> String {
+    fn label(&self) -> String {
         match self.inner.lock() {
             Ok(p) => startup_label(
                 p.phase,
@@ -741,13 +760,6 @@ const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 /// stashes an actor and answers 204.
 const RESTART_INTENT_PATH: &str = "/api/v1/internal/restart-intent";
 
-/// The one scheme this announce can speak. The packaged gateway strips
-/// `LUCIDOS_TLS_*` from the engines it spawns, so a packaged engine serves plain
-/// HTTP and says so in its ports file. That value is READ and compared against
-/// this, never assumed. An engine serving TLS is skipped, because the raw
-/// `TcpStream` request below cannot reach it.
-const ENGINE_PLAIN_SCHEME: &str = "http";
-
 /// What a workspace's `.lucidos/ports` means when it names no `PROTO`. Matches
 /// the engine's own `http::workspace_resolver`, so the two readers of that file
 /// cannot disagree about an engine's scheme.
@@ -770,6 +782,8 @@ struct RestartIntentTarget {
     slug: String,
     /// The engine's own loopback port, from its `.lucidos/ports`.
     port: u16,
+    /// The scheme its ports file names.
+    scheme: String,
     /// The id this client is known by in THAT workspace.
     device_id: String,
 }
@@ -814,8 +828,6 @@ fn is_header_safe(value: &str) -> bool {
 enum RestartIntentSkip {
     /// No `.lucidos/ports`, or none naming a usable `API_PORT`.
     NoPort,
-    /// The engine serves TLS, which a bare socket cannot reach.
-    NotPlainHttp,
     /// This client holds no header-safe id for the workspace, so it has never
     /// opened it or the store is corrupt.
     NoDevice,
@@ -826,7 +838,6 @@ impl RestartIntentSkip {
     fn reason(self) -> &'static str {
         match self {
             Self::NoPort => "its ports file names no engine port",
-            Self::NotPlainHttp => "its engine serves TLS, which this client cannot reach",
             Self::NoDevice => "this client holds no device id for it",
         }
     }
@@ -835,7 +846,7 @@ impl RestartIntentSkip {
 /// Which engine to tell for one workspace, or why this client has nothing
 /// honest to say about it.
 ///
-/// None of the three skips is a failure. Each leaves that workspace exactly as
+/// Neither skip is a failure. Each leaves that workspace exactly as
 /// it behaves today, with System attribution and a manual Continue. Absent
 /// attribution stays absent, and the caller says so in the log.
 fn restart_intent_target(
@@ -846,9 +857,6 @@ fn restart_intent_target(
     let (port, scheme) = ports
         .and_then(parse_engine_ports)
         .ok_or(RestartIntentSkip::NoPort)?;
-    if scheme != ENGINE_PLAIN_SCHEME {
-        return Err(RestartIntentSkip::NotPlainHttp);
-    }
     let device_id = device_id
         .map(str::trim)
         .filter(|d| is_header_safe(d))
@@ -856,49 +864,41 @@ fn restart_intent_target(
     Ok(RestartIntentTarget {
         slug: slug.to_string(),
         port,
+        scheme,
         device_id: device_id.to_string(),
     })
 }
 
-/// The raw HTTP/1.0 request announcing a restart intent to `target`.
+/// The request announcing a restart intent to `target`.
 ///
-/// Pure, so what goes on the wire is pinned by a test. Two properties are
-/// load-bearing. It names the device in [`HEADER_DEVICE_ID`], which is the whole
-/// point of the call. And it carries no `x-forwarded-prefix`, which is what the
-/// engine refuses a restart-intent for. That refusal keeps a browser page from
-/// setting an engine's restart actor, so the call reaches the engine's own port
-/// rather than the gateway.
-fn restart_intent_request(target: &RestartIntentTarget) -> String {
-    format!(
-        "POST {RESTART_INTENT_PATH} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
-         {HEADER_DEVICE_ID}: {device}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        port = target.port,
-        device = target.device_id,
-    )
+/// Built apart from sending, so what goes on the wire is pinned by a test. Two
+/// properties are load-bearing. It names the device in [`HEADER_DEVICE_ID`],
+/// which is the whole point of the call. And it carries no
+/// `x-forwarded-prefix`, which is what the engine refuses a restart-intent for.
+/// That refusal keeps a browser page from setting an engine's restart actor, so
+/// the call reaches the engine's own port rather than the gateway.
+fn restart_intent_request(
+    client: &reqwest::blocking::Client,
+    target: &RestartIntentTarget,
+) -> reqwest::blocking::RequestBuilder {
+    client
+        .post(format!(
+            "{}://127.0.0.1:{}{RESTART_INTENT_PATH}",
+            target.scheme, target.port
+        ))
+        .header(HEADER_DEVICE_ID, &target.device_id)
+        .body("")
+        .timeout(RESTART_INTENT_TIMEOUT)
 }
 
 /// Tell one engine who asked for the teardown. `true` when it acknowledged.
-///
-/// Raw HTTP/1.0 over a `TcpStream`, like [`http_ok`] and [`gateway_body`]: the
-/// desktop client carries no HTTP client crate, and this keeps it that way.
-/// [`restart_intent_target`] has already established that this engine serves
-/// plain HTTP, which is the only scheme a bare socket can reach.
 fn post_restart_intent(target: &RestartIntentTarget) -> bool {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", target.port)) else {
+    let Some(client) = loopback_client() else {
         return false;
     };
-    let _ = stream.set_write_timeout(Some(RESTART_INTENT_TIMEOUT));
-    let _ = stream.set_read_timeout(Some(RESTART_INTENT_TIMEOUT));
-    if stream
-        .write_all(restart_intent_request(target).as_bytes())
-        .is_err()
-    {
-        return false;
-    }
-    let mut buf = String::new();
-    let _ = stream.read_to_string(&mut buf);
-    let first = buf.lines().next().unwrap_or_default();
-    first.contains(" 204 ") || first.ends_with(" 204")
+    restart_intent_request(&client, target)
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::NO_CONTENT)
 }
 
 /// Tell each target, stopping at `deadline`. Returns how many were told.
@@ -1219,7 +1219,7 @@ pub fn engine_port() -> u16 {
 /// match [`gateway_capability`]'s URL pattern exactly, and every IPC call from
 /// that window is denied if the two drift.
 pub fn gateway_url(port: u16) -> String {
-    format!("http://localhost:{port}")
+    format!("https://localhost:{port}")
 }
 
 /// Where [`launch`] should point the main window instead of the gateway root.
@@ -1293,6 +1293,33 @@ pub(crate) fn gateway_capability(origin: &str) -> tauri::ipc::CapabilityBuilder 
             .webviews(["main", "window-*"]),
         |capability, permission| capability.permission(*permission),
     )
+}
+
+/// The origin the window held before loopback moved to https (ADR 0745). Its
+/// storage still holds the outbox the hand-off page passes on.
+pub(crate) fn handoff_origin(port: u16) -> String {
+    format!("http://localhost:{port}")
+}
+
+/// Where `main` first goes: `url`, or its twin on [`handoff_origin`] until the
+/// outbox hand-off has run once. The hand-off page there moves the window on to
+/// `url` itself.
+fn first_navigation(url: &str, port: u16, handoff_done: bool) -> String {
+    match url.strip_prefix(&gateway_url(port)) {
+        Some(rest) if !handoff_done => format!("{}{rest}", handoff_origin(port)),
+        _ => url.to_string(),
+    }
+}
+
+/// The ACL capability of the hand-off page on [`handoff_origin`]: the outbox
+/// store command and nothing else, on `main` alone, the one window that runs
+/// the hand-off.
+pub(crate) fn handoff_capability(origin: &str) -> tauri::ipc::CapabilityBuilder {
+    tauri::ipc::CapabilityBuilder::new("outbox-handoff")
+        .local(false)
+        .remote(origin.to_string())
+        .webviews(["main"])
+        .permission("allow-outbox-handoff-store")
 }
 
 // ── Client role: ensure the service is up, then point the window at it ───────
@@ -1405,6 +1432,12 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
                 gateway_url(port)
             );
         }
+        if let Err(e) = handle.add_capability(handoff_capability(&handoff_origin(port))) {
+            eprintln!(
+                "[desktop] FAILED to register the outbox hand-off ACL capability for {}: {e}",
+                handoff_origin(port)
+            );
+        }
 
         // Keep the service up and navigate the moment the gateway is healthy,
         // and NEVER permanently give up. A slow start after a forced shutdown,
@@ -1436,26 +1469,40 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
                 // Whatever went wrong last cycle is over: this wait is ordinary.
                 Ok(()) => status.clear_failure(),
                 Err(e) => {
+                    crate::client_log::record_lifecycle(
+                        crate::client_log::Lifecycle::ServiceStartFailed,
+                    );
                     eprintln!("[desktop] ensure service running failed: {e}");
                     status.note_failure(format!("Could not start the background service: {e}."));
                 }
             }
             status.enter(StartupPhase::WaitingForGateway);
             if wait_for_health(port, HEALTH_ENSURE_CYCLE, &watch) {
+                crate::client_log::record_lifecycle(
+                    crate::client_log::Lifecycle::GatewayHealthReached,
+                );
                 break;
             }
+            crate::client_log::record_lifecycle(crate::client_log::Lifecycle::GatewayHealthRetry);
             eprintln!(
                 "[desktop] gateway not healthy yet on port {port}; re-ensuring service and retrying"
             );
         }
 
+        // The https window loads nothing until the login keychain trusts the
+        // loopback CA, so the splash shows the Trust screen until it does.
+        let origin = gateway_url(port);
+        handle
+            .state::<crate::loopback_trust::LoopbackTrust>()
+            .wait_until_trusted(crate::loopback_trust::check_loopback_trust);
+        let handoff_done = crate::outbox_handoff::handoff_done(&app_data);
+
         // Where the windows go. A notification tap outranks the restored
         // session for `main`: the user asked for that workspace just now, and
         // the session is only what they had last time.
-        let origin = gateway_url(port);
         let restore = crate::window_persist::resolve_window_session_plan();
         let mut plan = launch_plan(take_launch_target(), restore, &origin);
-        navigate_main_window(&handle, &plan.main);
+        navigate_main_window(&handle, &first_navigation(&plan.main, port, handoff_done));
         // A tap that landed between the take above and the navigate would
         // otherwise be stranded on a window already pointed elsewhere. Cheap to
         // re-check, and it closes the only window in which the aim can be lost.
@@ -1465,7 +1512,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         // extras. And the tapped workspace has to leave them, or it opens twice.
         if let Some(url) = take_launch_target() {
             plan = launch_plan(Some(url), restore, &origin);
-            navigate_main_window(&handle, &plan.main);
+            navigate_main_window(&handle, &first_navigation(&plan.main, port, handoff_done));
         }
         // Is a second install in the way? Asked after the window is aimed, so
         // the answer lands over a live app rather than delaying it, and only a
@@ -1677,6 +1724,12 @@ pub(crate) struct LiveWindow {
     pub label: String,
     pub url: String,
     pub visible: bool,
+    /// macOS reports a minimized window as not visible. The choosers still
+    /// treat it as the user's own window, unlike one closed into hiding.
+    pub minimized: bool,
+    /// When the window last took focus, as a rising sequence number. `None`
+    /// means not since launch. The choosers front the latest one.
+    pub last_focused: Option<u64>,
 }
 
 /// What a reopen owes the user.
@@ -2032,6 +2085,174 @@ pub fn run_service() -> i32 {
 
     svc.shutdown(&resources, &app_data);
     0
+}
+
+/// Run the supported disposable package role before Tauri starts.
+pub fn run_disposable_service(args: Vec<std::ffi::OsString>) -> i32 {
+    match disposable_service(args) {
+        Ok(code) => code,
+        Err(e) => service_boot_failed(e),
+    }
+}
+
+fn disposable_service(args: Vec<std::ffi::OsString>) -> io::Result<i32> {
+    if args.len() != 3
+        || (args[0] != "--disposable-service" && args[0] != "--disposable-supervisor")
+    {
+        return Err(io::Error::other(
+            "expected --disposable-service <new-root> <port>",
+        ));
+    }
+    let port = args[2]
+        .to_str()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| io::Error::other("invalid disposable port"))?;
+    let parent = unsafe { libc::getppid() };
+    if parent <= 1 {
+        return Err(io::Error::other("disposable controller is absent"));
+    }
+    install_stop_handlers();
+    if args[0] == "--disposable-service" {
+        let scope = lucidos_home::disposable::Scope::create(Path::new(&args[1]))?;
+        let mut supervisor = scope
+            .command(&std::env::current_exe()?)
+            .arg("--disposable-supervisor")
+            .arg(scope.root())
+            .arg(port.to_string())
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let started = Instant::now();
+        loop {
+            if let Some(status) = supervisor.try_wait()? {
+                return Ok(status.code().unwrap_or(1));
+            }
+            if SERVICE_STOP.load(Ordering::SeqCst)
+                || unsafe { libc::getppid() } != parent
+                || started.elapsed() >= lucidos_home::disposable::LIFETIME
+            {
+                drop(supervisor.stdin.take());
+                return Ok(supervisor.wait()?.code().unwrap_or(1));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let scope = lucidos_home::disposable::Scope::open(Path::new(&args[1]))?;
+    scope.claim_supervisor()?;
+    let resources = resource_dir_from_exe()?;
+    // A controller's process-group cancellation must leave the service time to clean up.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let controller_closed = watch_disposable_controller();
+    let mut svc = spawn_gateway_in_scope(&resources, &scope.app_data(), port, Some(&scope))?;
+    let recorded = match std::fs::write(
+        scope.root().join("gateway.pid"),
+        svc.gateway.id().to_string(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[service] cannot record disposable gateway: {e}");
+            false
+        }
+    };
+    let result = supervise_disposable_group(
+        &mut svc.gateway,
+        parent,
+        lucidos_home::disposable::LIFETIME,
+        || {
+            !recorded
+                || SERVICE_STOP.load(Ordering::SeqCst)
+                || controller_closed.load(Ordering::SeqCst)
+        },
+    );
+    let bundle = bundled_resources(&resources);
+    let data = scope.app_data().join("pgdata");
+    if data.join("postmaster.pid").exists() {
+        let status = embedded_pg_stop_command(&bundle.pg_bin, &bundle.pg_lib, &data)
+            .args(["-t", "10"])
+            .status()?;
+        if !status.success() {
+            let status = embedded_pg_stop_command(&bundle.pg_bin, &bundle.pg_lib, &data)
+                .args(["-m", "immediate", "-t", "10"])
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("disposable Postgres did not stop"));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn watch_disposable_controller() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let controller_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let closed = controller_closed.clone();
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        // EOF, input or a read error all end this single-use lifetime channel.
+        let _ = std::io::stdin().read(&mut byte);
+        closed.store(true, Ordering::SeqCst);
+    });
+    controller_closed
+}
+
+fn supervise_disposable_group(
+    gateway: &mut Child,
+    parent: i32,
+    lifetime: Duration,
+    canceled: impl Fn() -> bool,
+) -> i32 {
+    let started = Instant::now();
+    let mut stop_code = 0;
+    let exited = loop {
+        if canceled() || unsafe { libc::getppid() } != parent {
+            break false;
+        }
+        if started.elapsed() > lifetime {
+            stop_code = 1;
+            break false;
+        }
+        // Keep the group leader unreaped until the last group signal, preventing PID reuse.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                gateway.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if waited != 0 {
+            eprintln!(
+                "[service] disposable gateway wait failed: {}",
+                io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if info.si_signo != 0 {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let group = -(gateway.id() as i32);
+    unsafe {
+        // The gateway's persistent signal contract ignores SIGTERM. Ask its
+        // leader to stop, then terminate every owned engine before escalation.
+        libc::kill(gateway.id() as i32, libc::SIGUSR1);
+        libc::kill(group, libc::SIGTERM);
+    }
+    std::thread::sleep(lucidos_home::disposable::STOP_GRACE);
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
+    }
+    match gateway.wait() {
+        Ok(status) if exited => status.code().unwrap_or(1),
+        Ok(_) => stop_code,
+        Err(e) => {
+            eprintln!("[service] disposable gateway reap failed: {e}");
+            1
+        }
+    }
 }
 
 /// Install SIGTERM/SIGINT handlers that flip [`SERVICE_STOP`] so the supervise
@@ -2576,9 +2797,15 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
     )?;
     Command::new("/bin/sh")
         .arg("-c")
-        .arg(&script)
+        .arg(format!("exec 2>&1; {script}"))
+        .stdout(
+            crate::client_log::relaunch_output(&exe)
+                .map_err(|e| format!("spawn relaunch diagnostic capture: {e}"))?,
+        )
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn the relaunch watcher: {e}"))?;
+    crate::client_log::record_lifecycle(crate::client_log::Lifecycle::RelaunchScheduled);
     Ok(())
 }
 
@@ -2623,9 +2850,9 @@ fn relaunched_exe_forms(exe: &Path) -> Vec<PathBuf> {
 /// without launching anything. So the ask repeats until `pgrep` finds the
 /// client, up to [`RELAUNCH_OPEN_ATTEMPTS`].
 ///
-/// **Every give-up says so** on stderr, which for a packaged client is the log
-/// `client_log` opened. A relaunch that silently failed is exactly the report
-/// nobody could answer.
+/// **Every give-up says so** on stderr, drained by a separate sanitized
+/// diagnostic helper that survives the client exit. A relaunch that silently
+/// failed is exactly the report nobody could answer.
 ///
 /// Errors on a path or argument that is not valid UTF-8: it cannot be quoted
 /// into a shell word without corrupting it, and the caller's fallback passes
@@ -2658,6 +2885,11 @@ fn relaunch_watcher_script(
         }
     }
     let running = sh_quote(&running_pattern(exes, &args)?);
+    // running_pattern already checked that the first executable is UTF-8.
+    let reporter = sh_quote(&exes[0].to_string_lossy());
+    let stayed_running = crate::RelaunchOutcome::PreviousClientStillRunning.arg();
+    let observed = crate::RelaunchOutcome::ClientObserved.arg();
+    let exhausted = crate::RelaunchOutcome::AttemptsExhausted.arg();
     // Every message is one quoted word too. A bundle path may hold a `$` or a
     // backtick, and inside double quotes the shell would run it.
     let stuck = sh_quote(&format!(
@@ -2671,13 +2903,14 @@ fn relaunch_watcher_script(
     Ok(format!(
         "i=0; while [ $i -lt {RELAUNCH_WAIT_PROBES} ] && kill -0 {pid} 2>/dev/null; \
          do sleep {RELAUNCH_POLL_SECONDS}; i=$((i+1)); done; \
-         if kill -0 {pid} 2>/dev/null; then echo {stuck} >&2; exit 1; fi; \
+         if kill -0 {pid} 2>/dev/null; then \
+         echo {stuck} >&2; {reporter} {stayed_running}; exit 1; fi; \
          a=0; while [ $a -lt {RELAUNCH_OPEN_ATTEMPTS} ]; do \
          {launch} || echo {refused} >&2; \
          sleep {RELAUNCH_OPEN_RETRY_SECONDS}; \
-         /usr/bin/pgrep -f {running} >/dev/null 2>&1 && exit 0; \
+         /usr/bin/pgrep -f {running} >/dev/null 2>&1 && {{ {reporter} {observed}; exit 0; }}; \
          a=$((a+1)); done; \
-         echo {gave_up} >&2; exit 1"
+         echo {gave_up} >&2; {reporter} {exhausted}; exit 1"
     ))
 }
 
@@ -3050,6 +3283,16 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         }
     }
 
+    // (e2) Delete Everything also forgets the loopback CA and its trust. Keep
+    //      My Data keeps both, so a reinstall opens without a Trust prompt.
+    if delete_data {
+        if let Err(e) = forget_loopback_ca() {
+            eprintln!("[service] uninstall: {e}");
+            failures.push(e);
+            data_ok = false;
+        }
+    }
+
     // (f) Move the running `.app` bundle to the Trash, best-effort, derived
     //     from the current exe so it trashes wherever the app lives. Done LAST,
     //     so `current_exe()` stays valid for the resource resolution above.
@@ -3082,6 +3325,22 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
     } else {
         Err(failures.join("; "))
     }
+}
+
+/// Remove the loopback CA's trust from the login keychain, then the CA itself.
+#[cfg(target_os = "macos")]
+fn forget_loopback_ca() -> Result<(), String> {
+    use lucidos_loopback_ca::{trust, CaDir};
+    let Some(ca) = CaDir::resolve() else {
+        return Err("cannot resolve the loopback CA directory: HOME is not set".to_string());
+    };
+    if trust::forget(&ca).map_err(|e| format!("forget the loopback CA: {e}"))? {
+        eprintln!(
+            "[service] uninstall: removed the loopback CA at {}",
+            ca.path().display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3153,6 +3412,19 @@ fn app_bundle_root_from_exe(exe: &Path) -> Option<PathBuf> {
     }
 }
 
+pub(crate) fn is_packaged_desktop() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !tauri::is_dev()
+            && std::env::current_exe()
+                .ok()
+                .and_then(|exe| app_bundle_root_from_exe(&exe))
+                .is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 /// Delete a file or directory tree. A missing path is success, since that is
 /// the goal already met. Uses `symlink_metadata`, so a symlink is removed as a
 /// link rather than followed.
@@ -3220,6 +3492,15 @@ fn applescript_escape(s: &str) -> String {
 /// this environment, so the paths set below reach all of them. First run
 /// creates no workspace, and the smart root serves the picker instead.
 fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<GatewayService> {
+    spawn_gateway_in_scope(resources, app_data, port, None)
+}
+
+fn spawn_gateway_in_scope(
+    resources: &Path,
+    app_data: &Path,
+    port: u16,
+    scope: Option<&lucidos_home::disposable::Scope>,
+) -> io::Result<GatewayService> {
     let bundle = bundled_resources(resources);
     lucidos_home::ensure_storage_root(app_data)?;
 
@@ -3230,10 +3511,31 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
     // gateway spawns INHERITS this, so one ~465 MB copy serves the whole install
     // and uninstalling the app takes it with it.
     let fastembed_cache = app_data.join("fastembed");
-    std::fs::create_dir_all(&fastembed_cache)?;
-    std::fs::create_dir_all(app_data.join("config"))?;
-
-    let gateway = Command::new(&bundle.gateway_bin)
+    if scope.is_none() {
+        std::fs::create_dir_all(&fastembed_cache)?;
+        std::fs::create_dir_all(app_data.join("config"))?;
+    }
+    let mut command = match scope {
+        Some(scope) => {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = scope.command(&bundle.gateway_bin);
+            cmd.arg("--disposable")
+                .arg(scope.root())
+                .process_group(0)
+                .env("LUCIDOS_GATEWAY_BIND_ADDR", "127.0.0.1")
+                .env("LUCIDOS_GATEWAY_ENGINE_LOOPBACK", "1")
+                .env("LUCIDOS_HOOK_PORT", "0")
+                .env("LUCIDOS_PUBLIC_PORT", "0");
+            cmd
+        }
+        None => Command::new(&bundle.gateway_bin),
+    };
+    let desktop_data_env = lucidos_diagnostic_log::DESKTOP_GATEWAY_DATA_ENV;
+    command.env_remove(desktop_data_env);
+    if scope.is_none() && is_packaged_desktop() {
+        command.env(desktop_data_env, app_data);
+    }
+    let gateway = command
         .current_dir(app_data)
         .env("LUCIDOS_API_PORT", port.to_string())
         .env("LUCIDOS_GATEWAY_DATA", app_data)
@@ -3258,26 +3560,38 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
     Ok(GatewayService { gateway })
 }
 
-/// Minimal dependency-free HTTP GET that returns true on a `200` status line.
-fn http_ok(port: u16, path: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
-    let mut buf = String::new();
-    let _ = stream.read_to_string(&mut buf);
-    let first = buf.lines().next().unwrap_or_default();
-    first.contains(" 200 ") || first.ends_with(" 200")
+/// The one client for every call this process makes to a loopback listener:
+/// the gateway's health and control routes, and an engine's restart intent.
+///
+/// Built per call, never cached: the client captures the loopback CA when it
+/// is built, and the gateway may create or re-mint the CA after this process
+/// starts. A fresh client also never reuses a socket from a gateway that has
+/// since restarted. It follows no redirect: every target is exact. `None` only
+/// when the TLS stack cannot start, which every caller treats as an
+/// unreachable listener.
+fn loopback_client() -> Option<reqwest::blocking::Client> {
+    lucidos_local_token::client::blocking_client_builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| eprintln!("[desktop] could not start the loopback client: {e}"))
+        .ok()
 }
 
-/// Like [`http_ok`] but returns the response body on a 200 (else `None`). The
-/// desktop client deliberately has no reqwest dependency, so this minimal raw
-/// HTTP/1.0 request serves the dock-badge poll, the pairing mint and the update
-/// relay's heartbeat.
+/// `GET` a gateway route, `true` on a `200`.
+fn http_ok(port: u16, path: &str) -> bool {
+    let Some(client) = loopback_client() else {
+        return false;
+    };
+    client
+        .get(format!("{}{path}", gateway_url(port)))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::OK)
+}
+
+/// Like [`http_ok`] but returns the response body on a 200 (else `None`). It
+/// serves the dock-badge poll, the pairing mint and the update relay's
+/// heartbeat.
 ///
 /// It attaches the machine-local token, which is how this process proves it is
 /// local. That is the whole reason the calls come through here rather than
@@ -3292,45 +3606,33 @@ pub(crate) fn gateway_body(
     path: &str,
     json: Option<&str>,
 ) -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let credential = match lucidos_local_token::read() {
-        Some(token) => format!("{}: {token}\r\n", lucidos_local_token::HEADER_LOCAL_TOKEN),
-        None => String::new(),
-    };
-    // A bodyless POST still needs a length, or the server waits for one.
-    let content = match json {
-        Some(body) => format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
-            body.len()
-        ),
-        None if method == "GET" => String::new(),
-        None => "Content-Length: 0\r\n".to_string(),
-    };
-    let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{credential}{content}Connection: close\r\n\r\n{}",
-        json.unwrap_or_default()
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut buf = String::new();
-    let _ = stream.read_to_string(&mut buf);
-    let (head, body) = buf.split_once("\r\n\r\n")?;
-    let first = head.lines().next().unwrap_or_default();
-    if first.contains(" 200 ") || first.ends_with(" 200") {
-        Some(body.to_string())
-    } else {
-        None
+    let client = loopback_client()?;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).ok()?;
+    let mut request = client
+        .request(method, format!("{}{path}", gateway_url(port)))
+        .timeout(Duration::from_secs(3));
+    if let Some(token) = lucidos_local_token::read() {
+        let token = crate::client_log::secret(token);
+        request = request.header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
     }
+    request = match json {
+        Some(body) => request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string()),
+        // A bodyless POST still needs a length, or the server waits for one.
+        None => request.body(""),
+    };
+    let response = request.send().ok()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    response.text().ok()
 }
 
-/// The fresh aggregate unread total across running workspaces — the dock-badge
-/// value. `None` (no badge change) when the gateway is unreachable or the body
-/// doesn't parse. Reads the gateway's on-demand `unread-total` control endpoint
-/// (a live count fan-out over running engines) rather than the cached
-/// `last_unread`: at nudge time — right after a read — the supervise loop hasn't
-/// re-probed yet, so the cached aggregate would still show the pre-read count.
-/// Using the fresh endpoint for BOTH the periodic tick and the nudge also avoids
-/// a flicker where a stale tick overwrites a freshly nudged value.
+/// The unread total across running workspaces: the dock-badge value. `None`
+/// (no badge change) when the gateway is unreachable or the body does not
+/// parse. The gateway keeps each workspace's count current from that engine's
+/// events, so this read reaches no engine.
 #[cfg(target_os = "macos")]
 fn fetch_unread_total(port: u16) -> Option<u64> {
     let body = gateway_body(port, "GET", "/~/api/v1/control/unread-total", None)?;
@@ -3347,7 +3649,157 @@ fn parse_unread_total(body: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    const DISPOSABLE_FIXTURE: &str = "desktop::tests::disposable_lifecycle_fixture";
+
+    #[test]
+    #[ignore = "subprocess fixture for disposable lifetime tests"]
+    fn disposable_lifecycle_fixture() {
+        use std::os::unix::process::CommandExt;
+        let root = std::path::PathBuf::from(std::env::var_os("DISPOSABLE_FIXTURE_ROOT").unwrap());
+        let role = std::env::var("DISPOSABLE_FIXTURE_ROLE").unwrap();
+        if role == "gateway" {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            std::fs::write(
+                root.join("ready"),
+                listener.local_addr().unwrap().to_string(),
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            return;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", DISPOSABLE_FIXTURE])
+            .env(
+                "DISPOSABLE_FIXTURE_ROLE",
+                if role == "controller" {
+                    "supervisor"
+                } else {
+                    "gateway"
+                },
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        if role == "controller" {
+            if std::env::var_os("DISPOSABLE_FIXTURE_CLOSE").is_some() {
+                while !root.join("ready").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                drop(child.stdin.take());
+            }
+            let _ = child.wait();
+        } else {
+            let closed = super::watch_disposable_controller();
+            super::supervise_disposable_group(
+                &mut child,
+                unsafe { libc::getppid() },
+                std::time::Duration::from_secs(10),
+                || closed.load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
+    }
+
+    #[test]
+    fn disposable_supervisor_cleans_up_after_controller_death_and_pipe_close() {
+        for kill_controller in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--ignored", "--exact", DISPOSABLE_FIXTURE])
+                .env("DISPOSABLE_FIXTURE_ROOT", root.path())
+                .env("DISPOSABLE_FIXTURE_ROLE", "controller")
+                .stdout(std::process::Stdio::null());
+            if !kill_controller {
+                command.env("DISPOSABLE_FIXTURE_CLOSE", "1");
+            }
+            let mut controller = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !root.path().join("ready").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if !root.path().join("ready").exists() {
+                let _ = controller.kill();
+                let _ = controller.wait();
+                panic!("disposable fixture did not start");
+            }
+            let address: std::net::SocketAddr = std::fs::read_to_string(root.path().join("ready"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if kill_controller {
+                controller.kill().unwrap();
+            }
+            while std::net::TcpStream::connect(address).is_ok()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let closed = std::net::TcpStream::connect(address).is_err();
+            let _ = controller.kill();
+            let _ = controller.wait();
+            assert!(closed, "disposable gateway outlived its controller");
+        }
+    }
+
+    #[test]
+    fn disposable_supervisor_stops_owned_group_on_cancel_timeout_and_exit() {
+        use std::os::unix::process::CommandExt;
+        for mode in ["cancel", "timeout", "exit"] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", if mode == "exit" { "true" } else { "sleep 30" }])
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+            let result = super::supervise_disposable_group(
+                &mut child,
+                unsafe { libc::getppid() },
+                std::time::Duration::from_millis(if mode == "exit" { 5000 } else { 100 }),
+                || mode == "cancel",
+            );
+            assert_eq!(result, if mode == "timeout" { 1 } else { 0 });
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn disposable_service_refuses_partial_and_mixed_launch_arguments() {
+        for args in [
+            vec!["--disposable-service"],
+            vec!["--disposable-service", "/tmp/run", "0"],
+            vec!["--disposable-service", "--service", "/tmp/run", "5300"],
+        ] {
+            assert!(super::disposable_service(args.into_iter().map(Into::into).collect()).is_err());
+        }
+    }
+
     use super::*;
+
+    // ── The first navigation ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_first_launch_goes_through_the_hand_off_page_once() {
+        let url = format!("{}/myws/#thread=t", gateway_url(5252));
+        assert_eq!(
+            first_navigation(&url, 5252, false),
+            "http://localhost:5252/myws/#thread=t"
+        );
+        assert_eq!(first_navigation(&url, 5252, true), url);
+        // Only this install's own origin has a twin to hand off from.
+        let foreign = "https://example.com/x";
+        assert_eq!(first_navigation(foreign, 5252, false), foreign);
+    }
+
+    #[test]
+    fn the_trust_screen_outranks_the_start_line() {
+        let status = StartupStatus::default();
+        let trust = crate::loopback_trust::LoopbackTrust::default();
+        assert_eq!(status.report(&trust).label, STARTING_LABEL);
+        assert_eq!(status.report(&trust).trust_button, None);
+        trust.wait_until_trusted(|| lucidos_loopback_ca::trust::TrustStatus::Trusted);
+        assert_eq!(status.report(&trust).label, STARTING_LABEL);
+    }
 
     // ── What a launch reopens ────────────────────────────────────────────────
 
@@ -3648,6 +4100,8 @@ mod tests {
             label: label.to_string(),
             url: url.to_string(),
             visible,
+            minimized: false,
+            last_focused: None,
         }
     }
 
@@ -4955,7 +5409,8 @@ mod tests {
             .expect("it confirms the launch");
         assert!(launch < confirm, "ask, then confirm: {script}");
         assert!(
-            script[confirm..].contains("&& exit 0"),
+            script[confirm..].contains("&& {")
+                && script[confirm..].contains("--record-relaunch-client-observed; exit 0;"),
             "a confirmed client is the only way out of the loop: {script}",
         );
         assert!(
@@ -5168,6 +5623,17 @@ mod tests {
     #[test]
     fn the_watcher_script_parses_as_a_shell_script() {
         assert_eq!(sh_parses(&watcher_script(4242)), Ok(()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_reports_only_fixed_lifecycle_outcomes() {
+        let script = watcher_script(4242);
+        let launch = script.find("/usr/bin/open").unwrap();
+        let confirm = script.find("/usr/bin/pgrep").unwrap();
+        assert!(script[..launch].contains("--record-relaunch-client-still-running; exit 1;"));
+        assert!(script[confirm..].contains("--record-relaunch-client-observed; exit 0;"));
+        assert!(script.ends_with("--record-relaunch-attempts-exhausted; exit 1"));
     }
 
     #[cfg(target_os = "macos")]
@@ -5509,6 +5975,7 @@ mod tests {
         RestartIntentTarget {
             slug: "myws".to_string(),
             port,
+            scheme: "http".to_string(),
             device_id: device_id.to_string(),
         }
     }
@@ -5583,23 +6050,20 @@ mod tests {
             restart_intent_target("myws", Some(PACKAGED_PORTS), None),
             Err(RestartIntentSkip::NoDevice),
         );
-        // An engine serving TLS, which the raw socket below cannot reach.
+    }
+
+    #[test]
+    fn an_engine_serving_tls_is_told_over_tls() {
         let tls = "API_PORT=49213\nPROTO=https\n";
-        assert_eq!(
-            restart_intent_target("myws", Some(tls), Some("device-7")),
-            Err(RestartIntentSkip::NotPlainHttp),
-        );
+        let target = restart_intent_target("myws", Some(tls), Some("device-7")).unwrap();
+        assert_eq!(target.scheme, "https");
     }
 
     // A skip nobody can read is the silent degrade the typed reason prevents,
     // so every arm has to have something to say.
     #[test]
     fn every_skip_explains_itself() {
-        for skip in [
-            RestartIntentSkip::NoPort,
-            RestartIntentSkip::NotPlainHttp,
-            RestartIntentSkip::NoDevice,
-        ] {
+        for skip in [RestartIntentSkip::NoPort, RestartIntentSkip::NoDevice] {
             assert!(!skip.reason().is_empty(), "{skip:?}");
         }
     }
@@ -5621,22 +6085,19 @@ mod tests {
     // the absent forwarded-prefix is what the engine accepts the call on.
     #[test]
     fn the_request_names_the_device_and_claims_no_proxy_hop() {
-        let request = restart_intent_request(&target(49213, "device-7"));
-        assert!(
-            request.starts_with("POST /api/v1/internal/restart-intent HTTP/1.0\r\n"),
-            "{request}",
+        let client = loopback_client().expect("the loopback client");
+        let request = restart_intent_request(&client, &target(49213, "device-7"))
+            .build()
+            .expect("a request");
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "http://127.0.0.1:49213/api/v1/internal/restart-intent"
         );
+        assert_eq!(request.headers()[HEADER_DEVICE_ID], "device-7");
         assert!(
-            request.contains("\r\nx-lucidos-device-id: device-7\r\n"),
-            "{request}"
-        );
-        assert!(
-            request.contains("\r\nHost: 127.0.0.1:49213\r\n"),
-            "{request}"
-        );
-        assert!(
-            !request.to_ascii_lowercase().contains("x-forwarded-prefix"),
-            "a restart intent claiming a proxy hop is refused: {request}",
+            !request.headers().contains_key("x-forwarded-prefix"),
+            "a restart intent claiming a proxy hop is refused",
         );
     }
 
@@ -5690,6 +6151,7 @@ mod tests {
             vec![RestartIntentTarget {
                 slug: "live-ws".to_string(),
                 port: 49213,
+                scheme: "http".to_string(),
                 device_id: "device-7".to_string(),
             }],
         );

@@ -15,19 +15,16 @@ import { changeToastMessage } from './changeToast';
 import { changeHeadline } from '../changeHeadline';
 import { focusThreadOrBootstrap } from './threads';
 
-/** What an apply is doing, as the activity group names it. */
 export const APPLY_PHASE_LABEL: Record<ApplyPhase, string> = {
   merging: 'Merging',
   'resolving-conflict': 'Resolving merge conflict',
   hardening: 'Hardening',
 };
 
-/** The label when nothing says what the apply is doing yet. */
 const UNKNOWN_PHASE_LABEL = 'Applying changes';
 
 const SECS_PER_MIN = 60;
 
-/** A duration as the activity group says it: minutes, then hours. */
 export function formatDuration(secs: number): string {
   const minutes = Math.floor(secs / SECS_PER_MIN);
   if (minutes < 1) return 'under a minute';
@@ -37,22 +34,17 @@ export function formatDuration(secs: number): string {
   return rest ? `${hours} h ${rest} min` : `${hours} h`;
 }
 
-/** The typical duration of a slow phase, or `null` for a plain merge and for
- *  a phase with too few past runs to estimate. */
 function typicalSecs(phase: ApplyPhase, estimates: ApplyEstimates): number | null {
   if (phase === 'hardening') return estimates.hardening?.typical_secs ?? null;
   if (phase === 'resolving-conflict') return estimates.resolving_conflict?.typical_secs ?? null;
   return null;
 }
 
-/** How long the phase has run, or `null` when nothing says when it began. */
 function elapsedSecs(reading: ApplyPhaseReading, nowMs: number): number | null {
   const started = reading.startedAt ? Date.parse(reading.startedAt) : NaN;
   return Number.isFinite(started) ? Math.max(0, (nowMs - started) / 1000) : null;
 }
 
-/** What the apply is doing, and for a slow phase how long it has run and
- *  usually runs: "Resolving merge conflict · 6 min, usually ~18 min". */
 export function phaseLabel(
   reading: ApplyPhaseReading | null,
   estimates: ApplyEstimates,
@@ -67,10 +59,6 @@ export function phaseLabel(
   return `${label} · ${formatDuration(elapsed)}${usually}`;
 }
 
-/** What the apply of `change` on `threadId` is doing, or `null` when nothing
- *  says. A phase event this page saw wins. Otherwise the row answers, which is
- *  all a reloaded page has: a change that needs hardening hardens before it
- *  merges. */
 export function applyPhaseOf(
   threadId: string | null,
   change: Change | undefined,
@@ -85,9 +73,6 @@ export function applyPhaseOf(
   return { phase: 'merging', eventId: null, startedAt: null };
 }
 
-/** The slow phases an apply of `change` has still to run, from `phase` on. A
- *  hardening comes before the merge, and a predicted conflict comes after it.
- *  `null` when the merge is still ahead and git could not predict it. */
 function phasesAhead(change: Change, phase: ApplyPhase): ApplyPhase[] | null {
   if (phase === 'resolving-conflict') return ['resolving-conflict'];
   const prediction = change.predicted_conflict;
@@ -96,14 +81,6 @@ function phasesAhead(change: Change, phase: ApplyPhase): ApplyPhase[] | null {
   return phase === 'hardening' ? ['hardening', ...conflict] : conflict;
 }
 
-/** Roughly how long the batch has left, in seconds, or `null` when a term of
- *  the sum is unknown. A partial sum would promise less time than the batch
- *  needs.
- *
- *  Hardening runs one member at a time, so it adds up. A conflict resolution
- *  runs beside the queue (ADR 0314), so it ends at its own time: when the
- *  queue reached it, plus its typical length. A phase in flight counts its
- *  typical time minus what has run, never below a minute. */
 export function batchSecondsLeft(
   batch: ApplyAllBatch,
   pending: readonly Change[] | null,
@@ -144,32 +121,17 @@ export function batchSecondsLeft(
   return Math.max(queueClock, lastEnd);
 }
 
-/** "about 20 min until all are applied", or `null` when the batch cannot
- *  say, or has under a minute to go. It names the whole batch, so it never
- *  reads as the time of the phase in flight. */
 export function batchTimeLeftLabel(secondsLeft: number | null): string | null {
   return secondsLeft !== null && secondsLeft >= SECS_PER_MIN
     ? `about ${formatDuration(secondsLeft)} until all are applied`
     : null;
 }
 
-/** Members still to resolve, in batch order. A member no longer pending
- *  resolved too, even with no event this page saw: a discard, or an apply
- *  that ended with no thread event. `pendingIds` is `null` while the pending
- *  list is not loaded. */
 function unresolvedMembers(batch: ApplyAllBatch, pendingIds: ReadonlySet<string> | null): string[] {
   const resolved = new Set(batch.resolvedChangeIds);
   return batch.changeIds.filter((id) => !resolved.has(id) && (pendingIds === null || pendingIds.has(id)));
 }
 
-/** The member the Apply All row names: the one the engine is applying.
- *  Before the engine says, it is the first unresolved member that is not
- *  parked, as a batch applies in order. When only parked members are left,
- *  it names the first of them.
- *
- *  `position` counts the members already done or parked, then this one.
- *  `resolved` counts the done ones alone. The row's count and the progress
- *  bar read it, since a parked member has not applied. */
 export function batchMemberInFlight(
   batch: ApplyAllBatch,
   pendingIds: ReadonlySet<string> | null,
@@ -186,7 +148,6 @@ export function batchMemberInFlight(
   return { changeId, position: resolved + othersParked + 1, resolved, total };
 }
 
-/** Parked members the Apply All row does not name. Each gets its own row. */
 export function batchMembersParkedBeside(
   batch: ApplyAllBatch,
   pendingIds: ReadonlySet<string> | null,
@@ -206,8 +167,6 @@ export function threadTitle(threadId: string | null, change: Change | undefined)
   return change?.thread_title ?? null;
 }
 
-/** Where an apply's thread link lands: the event that started the phase, or
- *  the change's own turn when this page never saw one. */
 export function openApplyPhase(
   threadId: string,
   changeId: string | undefined,
@@ -218,7 +177,6 @@ export function openApplyPhase(
     : { targetChangeId: changeId ?? null });
 }
 
-/** The summary an Apply All ends with. */
 export function batchSummary(applied: number, total: number): { message: string; type: 'success' | 'info' } {
   const changes = (n: number) => `${n} change${n === 1 ? '' : 's'}`;
   if (applied === total) return { message: `Applied ${changes(total)}`, type: 'success' };
@@ -229,15 +187,12 @@ export function batchSummary(applied: number, total: number): { message: string;
   };
 }
 
-/** Record what the apply on `threadId` is doing now. */
 export function setApplyPhase(threadId: string, reading: ApplyPhaseReading): void {
   const next = new Map(applyPhases.value);
   next.set(threadId, reading);
   applyPhases.value = next;
 }
 
-/** Forget the thread's phase: its change resolved. Returns what it was, so
- *  the result toast can still land on the event that started it. */
 export function clearApplyPhase(threadId: string): ApplyPhaseReading | undefined {
   const reading = applyPhases.value.get(threadId);
   if (!reading) return undefined;
@@ -247,15 +202,6 @@ export function clearApplyPhase(threadId: string): ApplyPhaseReading | undefined
   return reading;
 }
 
-/** Settle apply progress against the fetched lists, for a terminal event a
- *  suspended page or a dropped stream never saw. Runs on startup and resume.
- *
- *  A phase stays only while the engine says its apply still runs: the change
- *  is pending, and its thread is settling or resolving the conflict. A failed
- *  apply leaves the change pending on an idle thread, so its phase goes too.
- *  When the change the page last saw pending has landed, the result the stream
- *  dropped is reported. Apply Now's own threads read the engine's
- *  `applyInFlight` instead. */
 export function reconcileApplyProgress(
   previousPending: readonly Change[],
   pending: readonly Change[],
@@ -273,10 +219,8 @@ export function reconcileApplyProgress(
 
   for (const [threadId, reading] of settled) {
     if (applyingNowThreadIds.value.has(threadId)) continue;
-    // Match the change this apply was for, never an older one of the thread.
     const changeId = previousPending.find((c) => c.thread_id === threadId)?.id;
     const appliedChange = changeId ? applied.find((c) => c.id === changeId) : undefined;
-    // A batch member's result is the batch summary's to report.
     if (!appliedChange || isBatchMember(applyAllBatch.value, appliedChange.id)) continue;
     showToast(changeToastMessage('Applied', threadId, changeHeadline(appliedChange)), 'success', {
       key: `applying-${threadId}`,

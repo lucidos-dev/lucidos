@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** File previews and diffs draw a placeholder in the shape of what will
- *  replace them, past the delay gate: numbered source lines for code, lines of
- *  text for a rendered document, and diff cards for a diff. Never a spinner. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, type VNode } from 'preact';
 import { act } from 'preact/test-utils';

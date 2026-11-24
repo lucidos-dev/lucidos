@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+# Tauri emits platform schemas during builds; existing tracked schemas stay checked.
+/crates/lucidos-app/gen/schemas/
 # Published launch binaries (ADR 0022 + ADR 0063): the
 # engine / gateway / CLI a workspace actually launches, one dir per
 # (profile, variant). Deliberately outside /target/ so `cargo clean` cannot
@@ -13,6 +15,8 @@
 signers/*/target/
 signers/*/*.wasm
 signers/*/Cargo.lock
+# Python bytecode caches, written when a repo script is imported.
+__pycache__/
 
 # IDE
 .idea/
@@ -95,3 +99,6 @@ crates/*/.version_stamp
 
 # Desktop bundle staging (build-dmg.sh)
 crates/lucidos-app/bundle-resources/
+
+# Tauri writes this on a Linux build. The desktop app ships for macOS only.
+crates/lucidos-app/gen/schemas/linux-schema.json

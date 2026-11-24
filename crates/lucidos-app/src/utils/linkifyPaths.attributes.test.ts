@@ -1,14 +1,8 @@
 // @vitest-environment jsdom
-//
-// A real DOM, because the defect lives in the gap between the HTML serializer
-// and the tag splitter. The serializer writes `<` and `>` raw inside an
-// attribute value, and the splitter must not read a tag boundary there.
 import { describe, expect, it } from 'vitest';
 import { linkifyPaths } from './linkifyPaths';
 import { renderMarkdown } from './renderMarkdown';
 
-/** Every attribute name on every element of `html`, parsed the way the host
- *  document parses it when the chat assigns the linkified markup. */
 function attributeNames(html: string): string[] {
   const host = document.createElement('div');
   host.innerHTML = html;

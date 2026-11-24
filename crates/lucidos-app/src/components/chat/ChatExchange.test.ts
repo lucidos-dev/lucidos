@@ -1,16 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
 import { actorInitiator, describeExecutor, shouldShowResponseStatusBadge } from './ChatExchange';
-import { ClaudeIcon, CodexIcon, PowerIcon, PersonIcon, ApiPlugIcon } from '../shared/icons';
+import { ClaudeIcon, CodexIcon, PowerIcon, UserIcon, ApiPlugIcon } from '../shared/icons';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { LUCIDOS_AGENT_LABEL, type ThreadEvent } from '../../store/thread-events';
 
 describe('describeExecutor', () => {
   it('shows the SHORT Claude label and the icon for CC threads', () => {
-    // "Claude", not "Claude Code": this row is the tightest in the app on a
-    // phone and the coding agent's own name was the longest thing in it. Every
-    // other "Claude Code" in the app names the backend the user is choosing
-    // between and keeps the full product name. See `describeExecutor`.
     const { icon, label } = describeExecutor(true);
     expect(label).toBe('Claude');
     expect((icon as VNode).type).toBe(ClaudeIcon);
@@ -39,13 +35,9 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   it('device → You (the only origin that is unambiguously the user)', () => {
     const { icon, label } = actorInitiator({ kind: 'device', device_id: 'd' });
     expect(label).toBe('You');
-    expect((icon as VNode).type).toBe(PersonIcon);
+    expect((icon as VNode).type).toBe(UserIcon);
   });
   it('api with default mode → API caller (anonymous HTTP, never impersonates the user)', () => {
-    // Regression: a Lucidos agent that POSTed via raw urllib without forwarding
-    // x-lucidos-agent-origin-token used to land as Api{Human} and the chip
-    // rendered "You". The chip now refuses to call any non-device origin
-    // "You"; the popover still discloses the User-Agent.
     const { icon, label } = actorInitiator({ kind: 'api' });
     expect(label).toBe('API caller');
     expect((icon as VNode).type).toBe(ApiPlugIcon);
@@ -132,9 +124,6 @@ describe('shouldShowResponseStatusBadge', () => {
     expect(shouldShowResponseStatusBadge(ev('UserQuestionAsked'), 'error')).toBe(true);
   });
 
-  /** A "Paused by restart" boundary states its own outcome, and the engine has
-   *  promised to resume it. A badge under that panel can only repeat it or
-   *  contradict it, so the boundary gets none whatever the status resolves to. */
   it('hides every badge on a switch-teardown boundary', () => {
     const boundary = ev('ResponseAborted', { cause: 'engine_shutdown', actor: device });
     for (const cls of ['aborted', 'done', 'working', 'canceled', 'error']) {
@@ -142,8 +131,6 @@ describe('shouldShowResponseStatusBadge', () => {
     }
   });
 
-  /** Every other abort boundary keeps its badge: a `safety_net` abort can fire
-   *  over a loop that keeps going, and that live turn needs its "Working". */
   it('keeps the badge on an abort boundary the engine did not promise to resume', () => {
     expect(shouldShowResponseStatusBadge(
       ev('ResponseAborted', { cause: 'safety_net', actor: { kind: 'system' } }), 'working',

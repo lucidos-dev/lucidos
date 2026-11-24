@@ -94,6 +94,7 @@ echo "prose_kind"
 if [ "$(prose_kind a.md)" = "md" ]; then pass "markdown"; else fail "markdown"; fi
 if [ "$(prose_kind a.rs)" = "src" ]; then pass "rust"; else fail "rust"; fi
 if [ "$(prose_kind a.tsx)" = "src" ]; then pass "tsx"; else fail "tsx"; fi
+if [ "$(prose_kind a.mjs)" = "src" ]; then pass "mjs"; else fail "mjs"; fi
 if [ -z "$(prose_kind a.css)" ]; then pass "css is out of scope"; else fail "css is out of scope"; fi
 if [ -z "$(prose_kind a.sh)" ]; then pass "shell is out of scope"; else fail "shell is out of scope"; fi
 if [ -z "$(prose_kind crates/vendor/chromiumoxide/src/lib.rs)" ]; then pass "vendored source is out of scope"; else fail "vendored source is out of scope"; fi
@@ -214,6 +215,38 @@ run_cli --base does-not-exist
 if [ "$CLI_RC" -eq 1 ] && printf '%s' "$CLI_OUT" | grep -q 'cannot run'; then pass "missing base fails closed"; else fail "missing base fails closed"; fi
 run_cli --base
 if [ "$CLI_RC" -eq 1 ]; then pass "--base with no ref is an error"; else fail "--base with no ref is an error"; fi
+
+write 'scope [1].md' "$OVER_SENTENCE"
+write 'scope 1.md' "$OVER_SENTENCE"
+commit "add two files with violations"
+write 'new plan.md' "$OVER_SENTENCE"
+run_cli
+if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"scope [1].md:1:"* && "$CLI_OUT" == *"scope 1.md:1:"* && "$CLI_OUT" == *"new plan.md:1:"* ]]; then
+    pass "unscoped scan sees all violations"
+else
+    fail "expected hits in all three files ($CLI_OUT)"
+fi
+run_cli --path 'scope [1].md'
+if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"scope [1].md:1:"* && "$CLI_OUT" != *"scope 1.md:1:"* && "$CLI_OUT" != *"new plan.md:1:"* ]]; then
+    pass "tracked path scope is literal"
+else
+    fail "expected only the tracked path hit ($CLI_OUT)"
+fi
+run_cli --path 'new plan.md'
+if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"new plan.md:1:"* && "$CLI_OUT" != *"scope "* ]]; then
+    pass "untracked path scope is literal"
+else
+    fail "expected only the untracked path hit ($CLI_OUT)"
+fi
+run_cli --path 'missing.md'
+if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"regular file"* ]]; then
+    pass "missing scoped file fails closed"
+else
+    fail "missing scoped file should fail with a diagnostic ($CLI_OUT)"
+fi
+git -C "$REPO" rm -q -- "scope [1].md" "scope 1.md"
+rm -f "$REPO/new plan.md"
+commit "remove scoped fixtures"
 
 echo "untracked files are scanned whole"
 write "untracked.md" "$OVER_SENTENCE"

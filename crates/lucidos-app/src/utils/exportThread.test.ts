@@ -1,8 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ToastAction } from '../store/types';
 
-// Every collaborator is stubbed: the point of this suite is which side of the
-// Tauri branch runs, and what the resulting toast offers.
 const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOS: false }));
 vi.mock('./platform', () => ({
   isTauri: () => platformMocks.isTauri,
@@ -36,24 +34,18 @@ interface FakeAnchor {
   remove: () => void;
 }
 
-/** The anchors `triggerDownload` built this test. The node env has no real DOM,
- *  so the download is observed through a `document` stub. */
 let anchors: FakeAnchor[];
 
-/** Let a rejected promise's `.catch` run. The share handler is deliberately not
- *  awaitable from the caller, so its toast lands a tick later. */
 function flushMicrotasks(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** The most recent toast, as (message, type, action). */
 function lastToast(): { message: string; type: string; action: ToastAction | undefined } {
   const calls = storeMocks.showToast.mock.calls;
   const call = calls[calls.length - 1];
   return { message: call[0], type: call[1], action: call[2]?.action };
 }
 
-/** Install a `navigator` that accepts (or refuses) a file share. */
 function stubShare(opts: { canShare: boolean; share?: () => Promise<void> }): ReturnType<typeof vi.fn> {
   const share = vi.fn(opts.share ?? (() => Promise.resolve()));
   vi.stubGlobal('navigator', {
@@ -83,7 +75,6 @@ describe('exportThread', () => {
       body: { appendChild: () => {} },
     });
     vi.stubGlobal('URL', { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} });
-    // No share support unless a case asks for it.
     vi.stubGlobal('navigator', {});
   });
 
@@ -106,7 +97,6 @@ describe('exportThread', () => {
       expect(anchors).toHaveLength(0);
     });
 
-    /** The folder in the toast is the one the command reported, never a guess. */
     it('names the folder it was told about, and opens that same folder', async () => {
       saveToDownloads.mockResolvedValue({ dir: '/Users/me/Elsewhere', path: '/x' });
 
@@ -142,7 +132,6 @@ describe('exportThread', () => {
       expect(lastToast().message).toBe('Thread exported to your downloads folder');
     });
 
-    /** No web API opens a folder, so an `Open folder` button here would be dead. */
     it('offers no action where the platform cannot share', async () => {
       await exportThread(THREAD_ID, 'My thread');
 
@@ -206,8 +195,6 @@ describe('exportThread', () => {
       platformMocks.isIOS = true;
     });
 
-    /** The regression: the anchor opened the JSON in a viewer, taking the PWA
-     *  off the thread, and only then did the toast arrive. */
     it('offers the share sheet alone, never the anchor that opens the JSON', async () => {
       const share = stubShare({ canShare: true });
 
@@ -224,7 +211,6 @@ describe('exportThread', () => {
       expect(shared.files[0].name).toBe(FILENAME);
     });
 
-    /** No share sheet means the anchor is the only route left, poor as it is. */
     it('keeps the download where the share sheet refuses the file', async () => {
       stubShare({ canShare: false });
 

@@ -1,6 +1,3 @@
-/** Where the content header draws the open panel's Refresh. Pinned as pure
- *  decisions rather than a mounted header, for the reason app-popout-action's
- *  test gives: collapse decides where the action lands, not whether it exists. */
 import { describe, it, expect } from 'vitest';
 import type { App } from '../../../store/types';
 import { mobileRefreshActionShown } from '../ContentHeaderActions';
@@ -18,8 +15,6 @@ describe('panelRefreshLive', () => {
     expect(panelRefreshLive(null, false)).toBe(false);
   });
 
-  // The preview drops its registration after the render that switched to the
-  // diff. Drawing a live Refresh then as well claimed the `refresh` key twice.
   it('is never live over a diff, even while the file preview is still registered', () => {
     expect(refreshPinnedToDiff(diff)).toBe(true);
     expect(panelRefreshLive(diff, true)).toBe(false);

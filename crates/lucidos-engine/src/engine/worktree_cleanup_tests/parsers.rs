@@ -441,10 +441,10 @@ fn zfs_size_is_the_pool_bounded_by_every_quota_that_applies() {
 fn idle_engine_probe() -> (
     super::EngineActiveThreads,
     Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, crate::engine::AgentSession>>>,
-    crate::engine::tools::bash_background::BackgroundBashRegistry,
+    crate::engine::bash_background::BackgroundBashRegistry,
 ) {
     let sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let registry = crate::engine::tools::bash_background::BackgroundBashRegistry::new();
+    let registry = crate::engine::bash_background::BackgroundBashRegistry::new();
     let probe = super::EngineActiveThreads::new(sessions.clone(), registry.clone());
     (probe, sessions, registry)
 }
@@ -458,11 +458,11 @@ async fn a_claimed_run_makes_its_thread_active_until_it_lets_go() {
     let (probe, sessions, _registry) = idle_engine_probe();
     let thread_id = Uuid::new_v4();
     assert!(!probe.is_active(thread_id).await, "nothing running yet");
-    let claim = crate::engine::agent_session::spawn_claim::claim_thread_for(
+    let claim = crate::engine::session_claim::claim_thread_for(
         &mut *sessions.lock().await,
         thread_id,
         crate::runtime::CodingAgent::ClaudeCode,
-        crate::engine::agent_session::spawn_claim::ClaimFor::Run,
+        crate::engine::session_claim::ClaimFor::Run,
     )
     .unwrap();
     assert!(probe.is_active(thread_id).await, "the run is starting");
@@ -676,7 +676,7 @@ async fn tier_0_removes_clean_worktree_with_no_commits_after_grace() {
     assert_eq!(cleaned.len(), 1, "exactly one Tier 0 event");
     let (_, tier, _, branch_deleted) = cleaned[0];
     assert_eq!(tier, 0);
-    assert!(branch_deleted, "Tier 0 must delete the merged branch");
+    assert!(!branch_deleted, "Tier 0 keeps the merged branch");
     assert!(!worktree.exists(), "Tier 0 must remove the worktree dir");
 
     pool.close().await;
@@ -872,8 +872,8 @@ async fn tier_0_skips_thread_with_live_agent_session() {
     let (_tmp, root) = fresh_workspace().await;
     let thread_id = Uuid::new_v4();
     // Same shape as the production trigger: branch at main HEAD, clean
-    // worktree, no pending change. Without the fix, tier 0 would happily
-    // delete the branch.
+    // worktree, no pending change. Without the live-session guard, Tier 0
+    // would remove the worktree.
     let worktree = add_worktree_at_main_for_thread(&root, thread_id).await;
     insert_thread_summary(&pool, thread_id, false).await;
     insert_old_event(&pool, thread_id, TIER_0_AGE_SECS).await;

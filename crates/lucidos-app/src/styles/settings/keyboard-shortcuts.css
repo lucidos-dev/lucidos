@@ -1,11 +1,9 @@
-/* Settings → Keyboard Shortcuts cheat sheet. */
 
 .shortcut-row-actions {
   align-items: center;
   gap: 0.5rem;
 }
 
-/* Key-combo chip shown next to each shortcut row. */
 .shortcut-keys {
   display: inline-block;
   min-width: 2.5rem;
@@ -19,7 +17,6 @@
   border-radius: calc(var(--radius-control) * 0.75);
 }
 
-/* The chip doubles as the Record button: click it to rebind the shortcut. */
 .shortcut-record-btn {
   cursor: pointer;
   transition:

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A drawer row's ⋯ menu offers Show in Folders under the Ongoing grouping.
- * Under Folders the row already is the thread's place, so the item would
- * point at itself.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -18,7 +13,6 @@ import type { ThreadSearchResult } from '../../../api/threads';
 import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
 import { clearNavFocus } from '../../shared/focusMarker';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 vi.mock('../../../store/actions/thread-loading', () => ({
@@ -46,7 +40,6 @@ function openRowMenu(id: string): HTMLElement[] {
 
 const labels = (items: HTMLElement[]) => items.map(el => el.textContent);
 
-/** The fields a search row reads; the rest of the summary stays unset. */
 function searchHit(id: string): ThreadSearchResult {
     return {
         thread_id: id, title: 'Question', channel: 'chat', status: 'idle', section: 'inbox',
@@ -96,7 +89,6 @@ describe('Show in Folders on a drawer row', () => {
     });
 
     it('marks the row it lands on with the navigation focus marker', () => {
-        // jsdom lays nothing out, and a reveal waits for a list with a height.
         vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(800);
         HTMLElement.prototype.scrollTo = () => {};
         setDrawerGrouping('ongoing');

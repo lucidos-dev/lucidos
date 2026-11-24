@@ -3,24 +3,15 @@ import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { apiRequest, gotoWithRetry, shellDeviceId, waitForEventStream, waitForWorkspaceReady } from './helpers';
+import { stampPageRequests } from './harnessStamp';
 
-// A capture names one device, the turn's last used device, and only that
-// page answers it. Every page gets the event, so a page without the app must
-// never answer a capture meant for another device. See
-// docs/plans/2026-10-08-app-capture-goes-to-the-last-used-device.md.
-//
-// Two browser contexts are two devices: each mints its own device id. The
-// seam stands in for the agent's `capture_app` call; everything after it is
-// the real path, through the sandboxed frame's own capture.
 
 const APP_ID = 'e2e-capture-routing-app';
 const DOM_PROBE = 'Capture routing probe';
-/** The top half of the app, so a blank picture cannot pass for a real one. */
 const SWATCH_RGB = [220, 40, 40];
 
 let fixture: { dir: string; cleanup: () => void } | undefined;
 
-/** Count the capture answers a page posts. */
 function countAnswers(page: Page): { count: number } {
   const seen = { count: 0 };
   page.on('request', (r) => {
@@ -61,7 +52,6 @@ test.describe('an app capture goes to the device it names', () => {
 
   test('the named device answers, and a page without the app stays silent', async ({ page, browser, baseURL }) => {
     await page.addInitScript((id) => {
-      // An init script runs in EVERY frame, and the app frame's storage throws.
       if (window.parent !== window) return;
       localStorage.setItem('app-window-open', id);
     }, APP_ID);
@@ -77,6 +67,7 @@ test.describe('an app capture goes to the device it names', () => {
     await expect(frame.locator('#probe')).toBeVisible({ timeout: 15_000 });
 
     const otherContext = await browser.newContext({ baseURL, ignoreHTTPSErrors: true });
+    await stampPageRequests(otherContext);
     try {
       const other = await otherContext.newPage();
       await gotoWithRetry(other, '/');
@@ -102,8 +93,6 @@ test.describe('an app capture goes to the device it names', () => {
       const result = await ask(withApp);
       expect(result.slice(0, 200), 'the named device sent its capture').toMatch(/^\[APP_CAPTURE:/);
       expect(result, 'the capture carries the DOM').toContain(DOM_PROBE);
-      // The engine replies once the POST lands, and Playwright reports the
-      // request on its own channel, which can trail that reply.
       await expect.poll(() => answersWithApp.count).toBe(1);
       expect(answersWithoutApp.count, 'the page without the app must not answer').toBe(0);
 
@@ -134,8 +123,6 @@ test.describe('an app capture goes to the device it names', () => {
       }
       expect(Math.min(...picture.below), `below the swatch should be white, got ${picture.below}`).toBeGreaterThan(200);
 
-      // Named the other way, the page without the app answers, and its error
-      // says which device it came from. The page with the app stays silent.
       const missed = await ask(withoutApp);
       expect(missed).toMatch(/^Error from ".+", the user's last used device in this turn: No app UI is currently open/);
       await expect.poll(() => answersWithoutApp.count).toBe(1);

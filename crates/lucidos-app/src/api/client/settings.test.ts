@@ -8,21 +8,27 @@ import {
   verifyBackupKey,
   getCredentialValue,
   handOverDevice,
+  listResolvedFormRequests,
 } from './settings';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 
-/**
- * The hand-over's subject is a change of identity. So it must claim the id it
- * is adopting, rather than the one it still stores.
- *
- * `fetchWithDefaults` stamps `x-lucidos-device-id` from `localStorage`, which
- * still holds the OLD id here by design: nothing is written until the row has
- * moved. Left to the default the request contradicts its own body, and the
- * engine refuses it. An up-to-date gateway replaces the header with the
- * authenticated id, so the override changes nothing there. It is what carries
- * the migration everywhere else. See
- * `docs/plans/2026-08-22-device-hand-over-must-not-need-a-fresh-gateway.md`.
- */
+describe('listResolvedFormRequests', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('bounds lookups and combines only proven resolutions', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(['resolved-first'])))
+      .mockResolvedValueOnce(new Response(JSON.stringify(['resolved-last'])));
+    vi.stubGlobal('fetch', fetch);
+    expect(await listResolvedFormRequests([])).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+    const ids = Array.from({ length: 101 }, (_, index) => `request-${index}`);
+    expect(await listResolvedFormRequests(ids)).toEqual(['resolved-first', 'resolved-last']);
+    expect(fetch.mock.calls.map(([url]) => new URL(url, 'https://example.com').searchParams.get('request_ids')?.split(',')))
+      .toEqual([ids.slice(0, 100), ids.slice(100)]);
+  });
+});
+
 describe('handOverDevice', () => {
   const originalFetch = globalThis.fetch;
   let mockFetch: ReturnType<typeof vi.fn>;
@@ -57,8 +63,6 @@ describe('handOverDevice', () => {
   });
 
   it('sends a header the engine will accept, matching the body it carries', async () => {
-    // The engine's guard is `asserted == device_id` (`claims_another_device`), so
-    // the two values this request sends must never drift apart.
     await handOverDevice('before-reinstall', 'paired-again');
 
     const [, init] = mockFetch.mock.calls[0];
@@ -66,15 +70,6 @@ describe('handOverDevice', () => {
   });
 });
 
-/**
- * Regression: a spent reveal token must not surface as a failed Copy.
- *
- * The reveal is two steps and the token is one-shot (ADR 0117). The service
- * worker re-issues a `GET` whose response was lost (`fetchWithRetry` in
- * `public/sw.js`), and the server already redeemed the token on the attempt
- * that vanished. Without the retry here, the mechanism that exists to rescue a
- * flaky connection would turn one into a hard failure instead.
- */
 describe('getCredentialValue', () => {
   const originalFetch = globalThis.fetch;
   let mockFetch: ReturnType<typeof vi.fn>;
@@ -133,18 +128,10 @@ describe('getCredentialValue', () => {
     mockFetch.mockResolvedValue(forbidden());
 
     await expect(getCredentialValue('cred-1')).rejects.toThrow();
-    // Mint, then mint again. The first 403 is the mint's own refusal, so the
-    // read never runs on either attempt.
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });
 
-/**
- * The legacy backup key reveal takes the same two steps as a credential value.
- *
- * It decrypts every `.enc` archive this workspace uploaded, and it used to be
- * one bare GET away from any installed app.
- */
 describe('the legacy backup key reveal', () => {
   const originalFetch = globalThis.fetch;
   let mockFetch: ReturnType<typeof vi.fn>;
@@ -205,7 +192,6 @@ describe('the legacy backup key reveal', () => {
   });
 
   it('lets a 404 through untouched', async () => {
-    // A retry would spend a second token to learn the same thing.
     mockFetch
       .mockResolvedValueOnce(okJson({ token: 'tok-3', expires_in_secs: 30 }))
       .mockResolvedValueOnce(
@@ -220,11 +206,6 @@ describe('the legacy backup key reveal', () => {
   });
 });
 
-/**
- * The backup recipient routes reveal no stored secret, so they spend no token.
- * A pasted backup key travels in the body, never in the URL, where the service
- * worker, a proxy log or the history could keep it.
- */
 describe('the backup recipient routes', () => {
   const originalFetch = globalThis.fetch;
   let mockFetch: ReturnType<typeof vi.fn>;
@@ -271,8 +252,6 @@ describe('the backup recipient routes', () => {
   });
 });
 
-/** Copy from Lucidos Agent names only the coding-agent surface it writes. The
- *  engine reads the chat ladder itself, so the request carries no rungs. */
 describe('copyLadderFromChat', () => {
   const originalFetch = globalThis.fetch;
   afterEach(() => {

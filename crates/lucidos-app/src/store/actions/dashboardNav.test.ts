@@ -1,7 +1,3 @@
-/**
- * On desktop the dashboard lives in its rail. On a phone it is the dashboard
- * panel over the open thread, and revealing it never opens Home.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./homeThread', () => ({ openHomeThread: vi.fn() }));

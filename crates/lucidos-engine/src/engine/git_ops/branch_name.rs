@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 /// Prefix marking a branch as engine-created. The single string every consumer
 /// matches on, so widening it is one edit.
-pub(crate) const LUCIDOS_BRANCH_PREFIX: &str = "lucidos-";
+pub const LUCIDOS_BRANCH_PREFIX: &str = "lucidos-";
 
 /// Legacy prefix for coding-agent branches created before the thread-named
 /// scheme. Still recognised forever: old branches are never renamed, and one may
@@ -57,7 +57,7 @@ const MAX_DUPLICATE_NUMBER: u32 = 99;
 /// segment of its branch. An enum rather than two `Option<String>`s so "both
 /// set" and "neither set" are unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BranchScope {
+pub enum BranchScope {
     /// An *app coding-agent thread*: the app folder id.
     App(String),
     /// A repository thread, Lucidos-source or *external repo*: the registered
@@ -70,7 +70,7 @@ impl BranchScope {
     /// (`LucidosEngine::DEFAULT_REPO_NAME`), slugified. Used when the source
     /// checkout is not in the repo registry at all, so an unregistered checkout
     /// still produces the same branch shape as a registered one.
-    pub(crate) const LUCIDOS_REPO: &'static str = "lucidos";
+    pub const LUCIDOS_REPO: &'static str = "lucidos";
 
     fn segments(&self) -> (&'static str, &str) {
         match self {
@@ -86,30 +86,12 @@ impl BranchScope {
 /// by the orphan-recovery worktree scan to tell its own branches from a user's;
 /// recovery applies the workspace-marker check on top, so this is a filter, not
 /// an authorization.
-pub(crate) fn is_coding_agent_branch(branch: &str) -> bool {
+pub fn is_coding_agent_branch(branch: &str) -> bool {
     branch.starts_with(LUCIDOS_BRANCH_PREFIX) || branch.starts_with(LEGACY_BRANCH_PREFIX)
 }
 
-/// Prefix of a lane batch's *integration branch* (ADR 0463).
-pub(crate) const LANE_BRANCH_PREFIX: &str = "lane/";
-
-/// The integration branch a lane batch's lane thread resolves on.
-pub(crate) fn lane_branch(batch_id: Uuid) -> String {
-    format!("{LANE_BRANCH_PREFIX}{batch_id}")
-}
-
-/// The batch a lane branch belongs to. `None` for any other branch.
-pub(crate) fn lane_branch_batch(branch: &str) -> Option<Uuid> {
-    branch
-        .strip_prefix(LANE_BRANCH_PREFIX)
-        .and_then(|id| Uuid::parse_str(id).ok())
-}
-
-/// Is this a lane batch's integration branch? Orphan recovery scans these
-/// beside the coding-agent branches, since a lane thread works on one.
-pub(crate) fn is_lane_branch(branch: &str) -> bool {
-    lane_branch_batch(branch).is_some()
-}
+pub use crate::core::git::{is_lane_branch, lane_branch};
+pub(crate) use crate::core::git::{lane_branch_batch, LANE_BRANCH_PREFIX};
 
 /// Kebab-case a thread name into the slug segment. Falls back to `thread` when
 /// nothing survives slugification: an emoji-only or CJK title, or a thread with
@@ -205,7 +187,7 @@ pub(crate) fn pick_free_branch_name(
 /// would succeed. So the other "already exists" git can emit here, the one
 /// about the worktree *path*, must not match: re-deriving the name would burn
 /// every attempt on a failure the name has nothing to do with.
-pub(crate) fn branch_name_is_taken(stderr: &str) -> bool {
+pub fn branch_name_is_taken(stderr: &str) -> bool {
     (stderr.contains("a branch named") && stderr.contains("already exists"))
         || stderr.contains("is already used by worktree at")
         || stderr.contains("cannot lock ref 'refs/heads/")
@@ -233,7 +215,7 @@ async fn existing_branches_for(repo_root: &Path, base: &str) -> Option<HashSet<S
     .await
     .ok()?;
     if !out.status.success() {
-        log!(
+        log_legacy!(
             "[Git] for-each-ref for {} returned non-zero in {}: {}",
             base,
             repo_root.display(),
@@ -264,7 +246,7 @@ async fn existing_branches_for(repo_root: &Path, base: &str) -> Option<HashSet<S
 /// caller retries: `FreshBranch::create_worktree` calls back in here when a
 /// create loses, and the fresh listing then sees the winner's branch. The
 /// create is the source of truth, this is only a good first guess.
-pub(crate) async fn allocate_coding_agent_branch(
+pub async fn allocate_coding_agent_branch(
     repo_root: &Path,
     agent: CodingAgent,
     scope: &BranchScope,
@@ -274,7 +256,7 @@ pub(crate) async fn allocate_coding_agent_branch(
     let base = coding_agent_branch_base(agent, scope, &branch_slug(thread_name), thread_id);
     let existing = existing_branches_for(repo_root, &base).await;
     if existing.is_none() {
-        log!(
+        log_legacy!(
             "[Git] Could not list branches matching {} in {} (git gave no answer within {}s). Using a unique suffix rather than assuming the name is free",
             base,
             repo_root.display(),
@@ -366,7 +348,7 @@ mod tests {
             "branch {branch} must end in the short thread id"
         );
         assert!(
-            crate::engine::agent_session::resume::deterministic_worktree_path(workspace, thread_id)
+            crate::engine::session_queries::deterministic_worktree_path(workspace, thread_id)
                 .ends_with(&dir_name),
             "worktree dir must carry the same short id as the branch"
         );

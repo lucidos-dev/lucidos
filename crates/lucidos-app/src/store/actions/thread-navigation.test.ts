@@ -6,11 +6,6 @@ const T = (id: string): ThreadNavEntry => ({ type: 'thread', id });
 
 describe('pushThreadEntry', () => {
   it('seeds an empty stack from cursor=-1 — initial focus on a fresh tab', () => {
-    // Regression: ensureInitialized leaves stack=[] and cursor=-1 when no thread is
-    // focused at startup. The first focusThread() call lands here. Before the
-    // guard, `cursor < stack.length` was `-1 < 0` (true), so entriesEqual read
-    // stack[-1].type and threw, aborting focusThread before navigateToPane ran.
-    // Symptom: tapping a thread on mobile focused it but never switched panes.
     const result = pushThreadEntry([], -1, T('thread-1'));
     expect(result).not.toBeNull();
     expect(result!.stack).toEqual([T('thread-1')]);
@@ -54,9 +49,6 @@ describe('removeEntriesById', () => {
   });
 
   it('removes the cursor entry and shifts cursor back to the previous entry', () => {
-    // Discarding a draft that the user is currently sitting on: cursor should
-    // land on the entry before the removed one so the next Back/Forward feels
-    // contiguous from the user's last "real" position.
     const r = removeEntriesById([T('x'), T('draft')], 1, 'draft');
     expect(r).not.toBeNull();
     expect(r!.stack).toEqual([T('x')]);
@@ -129,9 +121,6 @@ describe('the dashboard panel in the thread history', () => {
   beforeEach(async () => {
     vi.resetModules();
     localStorage.clear();
-    // The real focusThread loads events over the network. This stand-in keeps
-    // the three effects the history depends on: focus moves, the panel closes,
-    // a thread row is pushed.
     vi.doMock('./threads', async () => {
       const s = await import('../store');
       const d = await import('../dashboards');
@@ -183,7 +172,6 @@ describe('the dashboard panel in the thread history', () => {
     expect(dashboards.dashboardPanelOpen.value).toBe(true);
   });
 
-  /** Invariant: toggling the panel never grows the history past one thread row and one dashboard row. */
   it('toggling the panel repeatedly leaves one thread row and one dashboard row', () => {
     for (let i = 0; i < 5; i++) {
       nav.setDashboardPanelOpen(true);
@@ -218,7 +206,6 @@ describe('the dashboard panel in the thread history', () => {
     expect(nav._threadNavStateForTesting().stack).toEqual([]);
   });
 
-  /** Invariant: off the phone layout no dashboard row survives, so every Back step changes the screen. */
   it('folding the live history rewrites it and saves it', () => {
     nav.setDashboardPanelOpen(true);
     nav.setDashboardPanelOpen(false);
@@ -227,7 +214,6 @@ describe('the dashboard panel in the thread history', () => {
     expect(JSON.parse(readWindowItem(KEY)!)).toEqual({ stack: [T('a')], cursor: 0 });
   });
 
-  /** Invariant: an iOS cold launch can read the layout wrong at first, so loading never folds. */
   it('a reload off the phone layout keeps the saved dashboard rows', () => {
     viewport.viewportIsMobile.value = false;
     writeWindowItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));

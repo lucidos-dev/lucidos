@@ -52,9 +52,6 @@ function exchangeOf(events: ThreadEvent[]) {
 const steps = (events: ResponseEvent[]) => events.filter((e): e is StepEvent => e.type === 'step');
 const labels = (list: StepEvent[] | undefined) => (list ?? []).map(s => s.tool_use_id);
 
-/** Two agents running in parallel, their steps interleaved with each other and
- *  with a parent capture, as Claude Code streams them. Each capture lands while
- *  another agent's step is the last one, which is what bound it wrongly. */
 const twoParallelAgents: ThreadEvent[] = [
   { type: 'CodingAgentPromptSent' } as ThreadEvent,
   call('agent-a', 'Agent', { description: 'Correctness review' }),
@@ -107,14 +104,12 @@ describe('sub-agent steps fold under their agent row', () => {
     expect(tokens(agentA.children?.[0])).toBe(42_000);
     expect(tokens(agentA.children?.[1])).toBe(44_000);
     expect(tokens(agentB.children?.[0])).toBe(50_000);
-    // The parent's own capture stays on a parent row.
     expect(tokens(agentB)).toBe(653_000);
   });
 
   it('keeps each sub-agent’s last capture on its Agent row, even one no step owns', () => {
     const top = steps(exchangeResponseEvents(exchangeOf([
       ...twoParallelAgents,
-      // The report-writing call makes no tool call, so no child row takes it.
       capture(47_000, 'agent-a', 'msg_report'),
     ])));
     const [agentA, agentB] = top;
@@ -190,7 +185,6 @@ describe('sub-agent steps fold under their agent row', () => {
     expect(labels(agentA.children)).toEqual(['a1', 'a2', 'a3']);
     expect(agentA.children?.[2].contextCapture).toBeUndefined();
     expect(agentA.children?.[1].contextCapture?.estimated_total_tokens).toBe(375_000);
-    // The follow-up's turn holds only the session's own pending marker.
     expect(steps(exchangeResponseEvents(followUp)).map(s => s.description)).toEqual(['Thinking']);
   });
 
@@ -205,13 +199,10 @@ describe('sub-agent steps fold under their agent row', () => {
   });
 });
 
-/** One API call can make several tool calls. Its capture carries the call's id,
- *  and so does each tool call, which is how every row of the batch finds it. */
 describe('a capture binds to every tool call of its API call', () => {
   const tokens = (s: { contextCapture?: { estimated_total_tokens: number } } | undefined) =>
     s?.contextCapture?.estimated_total_tokens;
 
-  /** The session's own batch: its capture lands after the last call. */
   const sessionBatch: ThreadEvent[] = [
     { type: 'CodingAgentPromptSent' } as ThreadEvent,
     call('agent-a', 'Agent', { description: 'Bug detection' }, undefined, 'msg_own'),
@@ -220,7 +211,6 @@ describe('a capture binds to every tool call of its API call', () => {
     capture(438_000, undefined, 'msg_own'),
   ];
 
-  /** A sub-agent's batch: its capture lands after the FIRST call. */
   const subAgentBatch: ThreadEvent[] = [
     call('agent-a', 'Agent', { description: 'Review' }, undefined, 'msg_own'),
     capture(400_000, undefined, 'msg_own'),
@@ -265,7 +255,6 @@ describe('a capture binds to every tool call of its API call', () => {
   });
 
   it('never moves a capture onto a row from another API call', () => {
-    // A call that only answered in text made no tool call to carry its figure.
     const exchange = exchangeOf([...sessionBatch, capture(439_000, undefined, 'msg_text')]);
 
     expect(steps(exchangeResponseEvents(exchange)).map(tokens)).toEqual([438_000, 438_000, 438_000]);

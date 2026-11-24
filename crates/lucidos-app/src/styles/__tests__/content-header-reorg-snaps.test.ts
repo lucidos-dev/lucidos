@@ -1,11 +1,3 @@
-/**
- * The Canvas header's icons regroup in one frame when the pane resizes.
- *
- * A `left` transition on the ⋯ trigger made it trail the pointer on resize.
- * At the compact breakpoint it also glided across the whole row. A `width`
- * transition on the Refresh slot eased beside that glide. Both read as the
- * icons dancing, so neither may come back.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

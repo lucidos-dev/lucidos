@@ -13,11 +13,6 @@ import { providerAnchor } from '../../store/modelProviders';
 import { ProviderBlock } from './ProviderBlock';
 import { chatGptPlanView, type ChatGptPlanView, type SignedOutNotice } from './chatgptPlanView';
 
-/** Configure the ChatGPT plan provider (Settings → Providers): GPT
- *  models on the user's ChatGPT subscription, through Sign in with ChatGPT.
- *  The wording and the button follow OpenAI's UI/UX guidelines for it.
- *
- *  Renders only the provider block; `ProvidersPage` owns the section. */
 export function ChatGptPlanSettings() {
   const loadable = chatGptPlanStatus.value;
   useEffect(() => {
@@ -78,7 +73,6 @@ export function ChatGptPlanSettings() {
   );
 }
 
-/** What the plan covers, under every state. */
 function CoverageNote() {
   return (
     <p class="settings-row-note">
@@ -88,8 +82,6 @@ function CoverageNote() {
   );
 }
 
-/** The rows under the switch. Before the status loads they draw the
- *  signed-out rows with the button disabled, so nothing moves when it lands. */
 function PlanRows({ view }: { view: ChatGptPlanView | null }) {
   if (view?.kind === 'signed-in') {
     return view.pausedUntil ? (
@@ -117,8 +109,6 @@ function PlanRows({ view }: { view: ChatGptPlanView | null }) {
 }
 
 function LimitRows({ pausedUntil, remainingMs }: { pausedUntil: string; remainingMs: number }) {
-  // No event marks the end of the pause, so re-read the status once it ends.
-  // The engine's remaining time, not this device's clock, sets the timer.
   useEffect(() => {
     const timer = setTimeout(() => void loadChatGptPlanStatus(), remainingMs + 1000);
     return () => clearTimeout(timer);
@@ -197,7 +187,6 @@ function PendingRows({ view }: { view: Extract<ChatGptPlanView, { kind: 'pending
       <p class="settings-row-note">
         A sign-in with ChatGPT is waiting to finish in a browser. It works until {shortTime(view.expiresAt)}.
       </p>
-      {/* Stopping is a sign-out, which would also forget a stored sign-in. */}
       {!view.signedIn && (
         <div class="settings-row">
           <span class="settings-row-label" />
@@ -217,8 +206,6 @@ function shortTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-/** OpenAI's ChatGPT logo, from its Sign in with ChatGPT button assets. The
- *  asset comes in white or black only, so it takes the text colour. */
 function ChatGptLogoIcon() {
   return (
     <svg class="chatgpt-logo" viewBox="0 0 21 21" fill="currentColor" aria-hidden="true">

@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A blind visual viewport still keeps the composer above the keyboard.
- *
- * Replays a phone's own log. The PWA opened from a notification tap with a
- * visual viewport of height 0. It then read 874, the full screen, and stayed
- * there with the keyboard up. The shell kept the full height, so the composer
- * sat under the keys until a relaunch.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { trackAppHeight, KEYBOARD_BAND_STORAGE_KEY } from '../MobileSwipeContainer';
 import { resetKeyboardCloseState } from '../keyboardCloseRelayout';
@@ -87,7 +79,6 @@ describe('trackAppHeight with a blind visual viewport', () => {
     field.blur();
     resizeViewport(PORTRAIT.height);
     field.focus();
-    // Seeing again: the height waits for the viewport's own reading.
     expect(appHeight()).toBe(`${PORTRAIT.height}px`);
   });
 
@@ -106,10 +97,32 @@ describe('trackAppHeight with a blind visual viewport', () => {
     expect(appHeight()).toBe(`${KEYS_UP}px`);
   });
 
-  it('takes a wake zero after a real reading as transient, not blind', () => {
-    // A hardware keyboard never shrinks the viewport, so a blind latch from
-    // a wake would never clear and every focus would shrink the shell.
+  it('goes blind on a zero that follows real readings, before any keyboard was measured', () => {
+    localStorage.setItem(KEYBOARD_BAND_STORAGE_KEY, JSON.stringify({ portrait: PORTRAIT.height - KEYS_UP }));
     launch(PORTRAIT.height);
+    resizeViewport(812);
+    resizeViewport(0);
+    viewport.height = PORTRAIT.height;
+
+    mountField().focus();
+    expect(appHeight()).toBe(`${KEYS_UP}px`);
+  });
+
+  it('goes blind on a negative reading', () => {
+    launch(PORTRAIT.height);
+    resizeViewport(-33554432);
+
+    mountField().focus();
+    expect(appHeight()).toBe(`${PORTRAIT.height - Math.round(PORTRAIT.height * 0.45)}px`);
+  });
+
+  it('takes a wake zero after a measured keyboard as transient, not blind', () => {
+    launch(PORTRAIT.height);
+    const field = mountField();
+    field.focus();
+    resizeViewport(KEYS_UP);
+    field.blur();
+    resizeViewport(PORTRAIT.height);
     viewport.height = 0;
     document.dispatchEvent(new Event('visibilitychange'));
     viewport.height = PORTRAIT.height;

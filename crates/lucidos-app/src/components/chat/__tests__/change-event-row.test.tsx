@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { changeEventRowBody } from '../chat-exchange-parts';
+import { appliedBuildWaitLabel, changeEventRowBody, changeWaitsForBuild } from '../chat-exchange-parts';
 import { CommitList } from '../../shared/CommitList';
 import { EventRowFoldView } from '../EventRow';
 
@@ -51,10 +51,7 @@ const base = {
   tone: 'good' as const,
 };
 
-/** A change resolution wears the event-row card a child thread's return does. */
 describe('change event row', () => {
-  /** The same shape as every other event row: a chip leads the top line, and
-   *  the headline is the sentence under it. */
   it('is an event row: chip, state word, headline, file count', () => {
     const row = changeEventRowBody({ ...base, fileCount: 3 }) as AnyVNode;
     expect(row.props.class).toBe('event-row');
@@ -75,7 +72,6 @@ describe('change event row', () => {
     expect(text(byClass(row, 'event-row-actions'))).toBe('Revert');
   });
 
-  /** Only a verdict earns a glyph. A revert is a state, not a pass or a fail. */
   it.each([
     ['good', true],
     ['bad', true],
@@ -102,8 +98,6 @@ describe('change event row', () => {
     expect(text(fold.props.body as ComponentChildren)).toContain('merge conflict in a.ts');
   });
 
-  /** The headline names the change; the commits it is made of sit one fold
-   *  away, closed, oldest first. */
   it('folds a change of several commits into a closed commit list', () => {
     const row = changeEventRowBody({ ...base, commits: ['feat: first', 'fix: second'] });
     const fold = byType(row, EventRowFoldView)!;
@@ -130,8 +124,6 @@ describe('change event row', () => {
     expect(byType(row, EventRowFoldView)!.props.label).toBe('Error');
   });
 
-  /** A headline still loading keeps its line, so the card does not grow when
-   *  it lands. */
   it('holds the headline line while the headline loads', () => {
     const row = changeEventRowBody({ ...base, headline: undefined, headlinePending: true });
     expect(text(byClass(row, 'event-row-detail'))).toBe('\u00a0');
@@ -144,4 +136,19 @@ describe('change event row', () => {
     expect(byType(row, EventRowFoldView)).toBeNull();
     expect(byClass(row, 'event-row-actions')).toBeNull();
   });
+});
+
+
+it('an applied row explains a held version with the right thread count', () => {
+  expect(appliedBuildWaitLabel(2)).toBe('Applied. New version waits for 2 coding threads.');
+  expect(appliedBuildWaitLabel(1)).toBe('Applied. New version waits for 1 coding thread.');
+});
+
+
+it('only attributes a global hold to the latest known unbuilt applied commit', () => {
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: 'pending' }, 'pending')).toBe(true);
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: 'historical' }, 'pending')).toBe(false);
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: 'pending' }, null)).toBe(false);
+  expect(changeWaitsForBuild({ requires_restart: true, post_merge_sha: null }, null)).toBe(false);
+  expect(changeWaitsForBuild({ requires_restart: false, post_merge_sha: 'pending' }, 'pending')).toBe(false);
 });

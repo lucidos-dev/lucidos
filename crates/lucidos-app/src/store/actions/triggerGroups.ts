@@ -1,6 +1,7 @@
 import { triggerGroups, showToast, showConfirm } from '../store';
 import type { TriggerGroup } from '../types';
 import { toFailed, setLoadingIfFresh } from '../types';
+import { loadSlice, type SliceOf } from '../bootstrapSliceLoads';
 import {
   listTriggerGroups,
   createTriggerGroup as apiCreate,
@@ -11,31 +12,20 @@ import {
 import { errorDetail } from '../../utils/errorDetail';
 import { instantMicros } from '../../utils/isoInstant';
 
-/** Panel order: `order` ascending, oldest first inside a tie. Both sorts below
- *  take it, so the optimistic reorder cannot drift from the upsert. */
 function byPanelOrder(a: TriggerGroup, b: TriggerGroup): number {
   return a.order - b.order || (instantMicros(a.created) ?? 0) - (instantMicros(b.created) ?? 0);
 }
 
-/** Fetch the trigger-group registry from the engine. Called from `startClient`
- *  and re-fetched after group mutations to keep the panel in sync. */
-export async function loadTriggerGroups(): Promise<void> {
-  setLoadingIfFresh(triggerGroups);
-  try {
-    const data = await listTriggerGroups();
-    triggerGroups.value = { status: 'loaded', data: data.groups || [] };
-  } catch (error) {
-    triggerGroups.value = toFailed(error);
-  }
+export const triggerGroupsSlice: SliceOf<'trigger_groups'> = {
+  begin: () => setLoadingIfFresh(triggerGroups),
+  apply: (data) => { triggerGroups.value = { status: 'loaded', data: data.groups || [] }; },
+  fail: (error) => { triggerGroups.value = toFailed(error); },
+};
+
+export function loadTriggerGroups(): Promise<void> {
+  return loadSlice('trigger_groups', triggerGroupsSlice, () => listTriggerGroups());
 }
 
-/** Patch one group into the in-memory registry. Used by the mutation helpers
- *  below, which get the freshly-created/updated group back from the HTTP
- *  handler before the SSE event round-trips, so the panel doesn't wait a
- *  round-trip to show the change. The `TriggerGroup*` SSE arms do NOT come
- *  through here: `entityReferences.ts` re-fetches the whole registry with
- *  `loadTriggerGroups()` instead, since a group event can move member counts
- *  on rows it doesn't name. */
 export function upsertTriggerGroup(group: TriggerGroup): void {
   const current = triggerGroups.value;
   if (current.status !== 'loaded') return;
@@ -47,7 +37,6 @@ export function upsertTriggerGroup(group: TriggerGroup): void {
   triggerGroups.value = { status: 'loaded', data: next };
 }
 
-/** Remove one group from the in-memory registry. */
 export function removeTriggerGroup(groupId: string): void {
   const current = triggerGroups.value;
   if (current.status !== 'loaded') return;
@@ -102,7 +91,6 @@ export async function reorderTriggerGroups(
 ): Promise<void> {
   try {
     await apiReorder(ordering);
-    // Optimistically apply locally so the panel doesn't flicker waiting for SSE.
     const current = triggerGroups.value;
     if (current.status === 'loaded') {
       const byId = new Map(ordering.map(e => [e.id, e.order]));

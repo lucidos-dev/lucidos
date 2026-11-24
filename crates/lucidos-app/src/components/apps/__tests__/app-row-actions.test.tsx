@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * An apps panel row acts like a thread drawer row. A pin toggle is always
- * drawn, in both states. Edit, Add to dashboard and Delete sit in the row's
- * menu: a desktop
- * row draws its ⋯ and a right-click opens the menu too, while a phone row
- * draws no ⋯ and a hold opens it. Nothing but a plain press opens the app.
- * It names no marketplace and no update: those live in the Plugins panel.
- */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -57,14 +49,12 @@ const info = () => row().querySelector<HTMLElement>('.list-row-info')!;
 const pin = () => row().querySelector<HTMLButtonElement>('button[aria-pressed]')!;
 const trigger = () => host.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]');
 const menuItems = () => [...document.querySelectorAll<HTMLElement>('.thread-overflow-menu [role="menuitem"]')];
-/** A row with a hint (Add to dashboard) names itself in its first span. */
 const menuLabel = (el: HTMLElement) => el.querySelector('.widget-menu-label > span')?.textContent ?? el.textContent;
 const menuLabels = () => menuItems().map(menuLabel);
 const item = (label: string) => menuItems().find((el) => menuLabel(el) === label);
 const rowButtonLabels = () =>
   [...row().querySelectorAll('button')].map((b) => b.textContent?.trim() || b.getAttribute('aria-label'));
 
-/** Both dashboards loaded, holding these apps, so no read starts. */
 function dashboardsHolding(appIds: string[]) {
   const tiles = appIds.map((app_id) => ({ kind: 'app' as const, app_id, name: app_id, size: 'quarter' as const }));
   dashboards.value = new Map([
@@ -77,15 +67,11 @@ function setPinned(pinned: boolean) {
   pinnedApps.value = { status: 'loaded', data: pinned ? [{ app_id: APP.id }] : [] } as typeof pinnedApps.value;
 }
 
-/** Pin and Unpin flip the signal the row reads, as the real action does once
- *  the API call lands. */
 function flipPinned(appId: string) {
   setPinned(!isAppPinned(appId));
 }
 
 function pointer(type: string, init: { clientX?: number; clientY?: number } = {}): PointerEvent {
-  // jsdom has no PointerEvent constructor. `useLongPress` reads only `button`
-  // and `clientX/Y`, which a MouseEvent carries.
   return new MouseEvent(type, {
     bubbles: true,
     cancelable: true,
@@ -95,8 +81,6 @@ function pointer(type: string, init: { clientX?: number; clientY?: number } = {}
   }) as unknown as PointerEvent;
 }
 
-/** Press, hold past the long-press threshold, lift, and send the click the
- *  browser pairs with the lift. Swallowing that click is the contract. */
 function hold(target: HTMLElement, moveTo?: { x: number; y: number }) {
   act(() => {
     target.dispatchEvent(pointer('pointerdown'));
@@ -150,7 +134,6 @@ describe.each([['desktop', false], ['phone', true]])('the pin toggle on a %s row
     mount(mobile);
     expect(pin().getAttribute('aria-label')).toBe('Unpin Habit Tracker');
     expect(pin().getAttribute('aria-pressed')).toBe('true');
-    // The `glyph` tone paints the accent, as on a thread row.
     expect(pin().classList.contains('pin-btn')).toBe(true);
     expect(pin().getAttribute('data-tone')).toBe('glyph');
     expect(pin().querySelector('svg')!.getAttribute('fill')).toBe('currentColor');

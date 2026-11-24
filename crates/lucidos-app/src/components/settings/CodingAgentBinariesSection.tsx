@@ -27,14 +27,6 @@ const AGENTS = [
 
 type AgentKey = (typeof AGENTS)[number]['key'];
 
-/**
- * Where this agent's binary resolved from, as a short label. The PATH itself is
- * deliberately NOT in here: it is shown once, in the input below, so the row
- * doesn't print the same long string twice. The two states that have no path to
- * show keep their actionable text (nothing resolved, or the spawn-failure
- * message naming the preference). Pure, unit tested in
- * `codingAgentBinaries.test.ts`.
- */
 export function binaryStatusLine(s: AgentBinaryStatus, binary: string): string {
   switch (s.source) {
     case 'override':
@@ -48,23 +40,14 @@ export function binaryStatusLine(s: AgentBinaryStatus, binary: string): string {
   }
 }
 
-/**
- * The binary's own version as a display token (`v2.1.224`), or '' when the
- * engine reported none. Never a placeholder: an unknown version renders as
- * nothing rather than as "unknown".
- */
 export function binaryVersionLabel(s: AgentBinaryStatus): string {
   return s.version ? `v${s.version}` : '';
 }
 
-/** The override currently stored for this status, or '' when auto-detecting. */
 export function storedOverride(s: AgentBinaryStatus): string {
   return s.source === 'override' ? (s.path ?? '') : '';
 }
 
-/** One agent's binary. With no `status`, inside a `SkeletonProvider`, it
- *  draws itself as the loading placeholder: the agent's name is known before
- *  the read lands, so only what the read decides shimmers. */
 function AgentRow({
   agent,
   status,
@@ -77,8 +60,6 @@ function AgentRow({
   const stored = status ? storedOverride(status) : '';
   const [input, setInput] = useState(stored);
   const [busy, setBusy] = useState(false);
-  // Re-seed the input when a reload changes the stored override (e.g. after
-  // Clear); unrelated reloads keep local edits (`stored` unchanged → no run).
   useEffect(() => {
     setInput(stored);
   }, [stored]);
@@ -128,9 +109,6 @@ function AgentRow({
     <div class="list-row repo-add-form">
       <div class="list-row-info" style={{ gap: '0.5rem' }}>
         <div class="title">{agent.label}</div>
-        {/* Version and source are two FIELDS: `.list-row-details` is a flex
-            row whose gap IS the separator, so no glue character between them
-            (an explicit one would be double-spaced). */}
         {status ? (
           <div
             class={`list-row-details${broken || missing ? ' error-text' : ''}`}
@@ -140,18 +118,11 @@ function AgentRow({
             <span>{binaryStatusLine(status, agent.binary)}</span>
           </div>
         ) : <SkText class="list-row-details" as="div" w="9rem" />}
-        {/* Input and its actions share one row so Save/Clear sit level with the
-            input (not the title). Both action slots are always rendered, disabled
-            when their action isn't available, so the input width never shifts as
-            you type. */}
         <div class="coding-agent-row-controls">
           <SkBlock w="100%" h="2rem" round>
             <input
               class="device-name-input"
               type="text"
-              // The resolved path lives here and nowhere else in the row: as the
-              // placeholder while detection owns it, as the value once the user
-              // overrides it. The status line above says only where it came from.
               placeholder={status?.path ?? `/path/to/${agent.binary}`}
               value={input}
               onInput={(e) => setInput((e.target as HTMLInputElement).value)}
@@ -183,21 +154,8 @@ function AgentRow({
   );
 }
 
-/**
- * Settings → Coding Agents → Binaries: where each coding agent's CLI binary
- * resolves from, with an optional per-agent path override.
- *
- * Detection is LIVE (recomputed by the engine per request) — only an explicit
- * override is persisted (`coding_agent_*_path` preference), so a Homebrew
- * upgrade or installer move self-heals instead of leaving a stale stored
- * path. A saved path that stops resolving fails agent spawns with an error
- * naming the setting, and this section shows the same error.
- */
 export function CodingAgentBinariesSection() {
-  // Bumped after a save/clear so the shared hook refetches (with stale-fetch
-  // cancellation — a slow first response can't clobber the fresher reload).
   const [refresh, setRefresh] = useState(0);
-  // Pull-to-refresh waits here for the re-read it asked for to land.
   const settles = useRef<Array<() => void>>([]);
   const { loadable: info, showLoading } = useLoadableFetch(getCodingAgentBinaries, [refresh], {
     keepLoadedWhileRefetching: true,

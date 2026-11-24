@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Webhooks draws webhook rows as its loading placeholder, past the
- *  delay gate, never a line of "Loading…" text. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

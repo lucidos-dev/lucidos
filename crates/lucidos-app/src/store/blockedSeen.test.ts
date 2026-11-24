@@ -5,7 +5,6 @@ import { makeThreadState } from './actions/threads-test-helpers';
 import type { ThreadStatus } from './thread-events';
 
 const keys = (...xs: string[]) => new Set(xs);
-/** Blocked threads mapped to their block keys, here `<id>1`. */
 const blockedMap = (...ids: string[]) => new Map(ids.map(id => [id, `${id}1`]));
 
 describe('seenBlockedAfter', () => {
@@ -105,8 +104,6 @@ describe('hasUnseenBlocked across a reload', () => {
     return { store, hasUnseenBlocked };
   }
 
-  /** Sees blocked thread `a`, closes it, and reloads onto a list where `a` is
-   *  blocked after the given last agent action. */
   async function reloadAfterSeeing(lastAgentActionAfter: string) {
     const before = await freshPage();
     before.store.threadListFetched.value = true;
@@ -118,7 +115,6 @@ describe('hasUnseenBlocked across a reload', () => {
     vi.resetModules();
     const after = await freshPage();
     expect(after.hasUnseenBlocked.value).toBe(false);
-    // The loader's order: the list lands, then it counts as fetched.
     after.store.threadMap.value = new Map([['a', blocked('a', 'waiting_for_user_answer', lastAgentActionAfter)]]);
     after.store.threadListFetched.value = true;
     return after.hasUnseenBlocked.value;

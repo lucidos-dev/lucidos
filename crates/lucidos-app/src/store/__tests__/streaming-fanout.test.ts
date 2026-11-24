@@ -1,20 +1,3 @@
-/**
- * Contract: SSE event arrivals split fan-out into two signals.
- *
- *   - `threadMap` (wide) fires ONLY when a meta-shape field actually changed
- *     value. `blockedThreadCount`, `ThreadDrawer.ThreadList`, every
- *     subscribed `ChatExchange`, and every `PromptInput` effect read this
- *     signal — they must stop re-executing per CC streaming token.
- *
- *   - `threadEventsBump` (per-thread, in `store/threadActivity.ts`) fires
- *     for every event arrival in that thread. Focused-thread views
- *     (`activeExchanges`, `activeStreamingBuffer`, ThreadView's
- *     `computeExchanges` memo) subscribe to it for the focused id only.
- *
- * An iOS PWA used to lag whenever a long-running CC subprocess
- * streamed ~70 events/min — the wide `threadMap` fire cascaded global
- * re-renders.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { effect } from '@preact/signals';
 import { threadMap, focusedThreadId, blockedThreadCount, activeExchanges } from '../store';
@@ -27,8 +10,6 @@ import {
 } from '../threadActivity';
 import type { ThreadState, ThreadAggregate } from '../thread-events';
 
-// handleThreadEvent uses RAF for batched signal updates; tests step through
-// it with setTimeout 0 like the sibling thread-sync tests.
 vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 0));
 vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
 
@@ -108,8 +89,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     const id = 'thread-stream';
     const map = threadMap.value;
     map.set(id, makeThread(id, { channel: 'claude_code', status: 'running' }));
-    // Don't reassign threadMap.value — we want to assert the SSE handler
-    // doesn't either (the whole point of the patch).
     const mapBefore = threadMap.value;
     const bumpBefore = getThreadEventsBump(id);
 
@@ -142,7 +121,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     });
     flushThreadEventsBumpsNow();
 
-    // threadMap flush is RAF-deferred via setTimeout in this test env.
     setTimeout(() => {
       expect(threadMap.value).not.toBe(mapBefore);
       expect(threadMap.value.get(id)?.meta.title).toBe('A real title');
@@ -151,8 +129,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     }, 10);
   }));
 
-  // The Not ready strip and Blocked read whether the agent still holds a
-  // message. A read or a withdrawal ends that hold without touching meta.
   it.each([
     ['CodingAgentInputRead', { type: 'CodingAgentInputRead', input_event_id: 'm2', started_turn: false }],
     ['QueuedMessageRemoved', { type: 'QueuedMessageRemoved', removed_message_id: 'm2' }],
@@ -181,13 +157,11 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     const map = threadMap.value;
     map.set(streamId, makeThread(streamId, { channel: 'claude_code', status: 'running' }));
     map.set(otherId, makeThread(otherId));
-    // Trigger one flush so the new threads are visible to the computed.
     threadMap.value = new Map(map);
     focusedThreadId.value = otherId;
 
     let runs = 0;
     const dispose = effect(() => {
-      // Read the computed to subscribe; .value is the contract.
       void blockedThreadCount.value;
       runs += 1;
     });
@@ -205,8 +179,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     flushThreadEventsBumpsNow();
 
     dispose();
-    // The baseline `runs` is the initial fire. No streaming event should have
-    // pushed `threadMap`, so the computed must not have re-executed.
     expect(runs).toBe(baseline);
   });
 
@@ -226,7 +198,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     });
     const baseline = runs;
 
-    // Burst on OTHER thread — focused subscriber must stay cold.
     for (let i = 0; i < 10; i++) {
       handleThreadEvent({
         thread_id: otherId,
@@ -239,7 +210,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     flushThreadEventsBumpsNow();
     expect(runs).toBe(baseline);
 
-    // Single event on FOCUSED thread — subscriber must wake.
     handleThreadEvent({
       thread_id: focusedId,
       seq: 300,
@@ -260,7 +230,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     threadMap.value = new Map(map);
     const mapBefore = threadMap.value;
 
-    // Two streaming events with identical aggregates — meta doesn't move.
     for (let i = 0; i < 2; i++) {
       handleThreadEvent({
         thread_id: id,
@@ -279,15 +248,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
   }));
 
   it('optimistic pending-message insertion + per-thread bump wakes activeExchanges', () => {
-    // Regression test for the addPendingMessage / unreachable-engine paths in
-    // chat.ts. Those code paths mutate `thread.pendingUserMessages` (or call
-    // `handleEvent` to insert a synthetic ResponseFailed) and reassign
-    // `threadMap.value = new Map(...)`. Without a paired `bumpThreadEvents`,
-    // `activeExchanges` (which subscribes only to focusedThreadId + the
-    // per-thread bump, then reads `threadMap.peek()`) keeps its cached value
-    // and the synthetic exchange does not render. The test models the same
-    // mutation pattern directly so any future caller forgetting the pairing
-    // trips the assertion.
     const id = 'pending-thread';
     const map = threadMap.value;
     map.set(id, makeThread(id));
@@ -304,8 +264,6 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     const baseline = runs;
     expect(lastLength).toBe(0);
 
-    // Same mutation pattern as `addPendingMessage`: push to pendingUserMessages,
-    // reassign threadMap, fire the per-thread bump.
     const thread = threadMap.value.get(id)!;
     thread.pendingUserMessages.push({
       text: 'hello',

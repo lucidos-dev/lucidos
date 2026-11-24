@@ -1,6 +1,3 @@
-// The thread menu's Archive and Delete rows, per action blocker (ADR 0378).
-// A blocker never removes a row: it shows the row blocked, with its reason and
-// every sub-thread that blocks.
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { threadMap } from '../store';
@@ -28,7 +25,6 @@ afterEach(() => {
 const waiting: MetaPatch = { status: 'waiting_for_user_answer' };
 const pending: MetaPatch = { channel: 'claude_code', codingAgentChangeState: { kind: 'proposed', requires_restart: false }};
 
-/** One family per blocker: the target is `t`, a sub-thread is `c`. */
 const FAMILIES: { blocker: HeldBlocker; threads: ThreadState[] }[] = [
   { blocker: 'home', threads: [thread('t', { home: true })] },
   { blocker: 'running', threads: [thread('t', { status: 'running' })] },
@@ -72,7 +68,6 @@ describe('exitItems', () => {
   });
 
   it('keeps a stored-archived thread its pending change holds in Current, saying why', () => {
-    // The change keeps it in Current, so Archive is shown blocked, never Move to Current.
     seed(thread('t', { section: 'archived', ...pending }));
     expect(exitItems('t')).toMatchObject({
       archive: 'blocked', unarchive: false, delete: 'blocked', reason: BLOCKER_REASON.pending_change,
@@ -80,8 +75,6 @@ describe('exitItems', () => {
   });
 
   it('offers Archive on a stored-archived thread a stale count keeps in Current', () => {
-    // A tester's coordinator: stored archived, every sub-thread archived and idle,
-    // shown in Current by a drifted active count. Archive makes the engine recount.
     seed(
       thread('t', { section: 'archived', activeChildrenCount: 12 }),
       thread('c', { parentThreadId: 't', section: 'archived' }),
@@ -100,13 +93,11 @@ describe('exitItems', () => {
   });
 
   it('leaves the exits enabled when the count says a sub-thread blocks but none is loaded', () => {
-    // The engine's 409 then names the blocker; the client never guesses it.
     seed(thread('t', { blockingDescendantCount: 1 }));
     expect(exitItems('t')).toMatchObject({ archive: 'enabled', delete: 'enabled' });
   });
 });
 
-/** The blocking sub-threads as `id:blocker`, in the order the menu lists them. */
 function listed(threadId: string): string[] {
   return threadBlocker(threadId).subThreads.map((s) => `${s.thread.meta.id}:${s.blocker}`);
 }

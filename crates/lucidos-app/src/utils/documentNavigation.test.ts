@@ -8,8 +8,6 @@ import { fileURLToPath } from 'node:url';
 
 import { isPlainClick, replaceDocument, replaceOnPlainClick } from './documentNavigation';
 
-// The node test env has no window.location (test-setup.ts aliases window to
-// globalThis), so it is installed as a global, matching openExternalUrl.test.ts.
 let fakeLocation: { replace: ReturnType<typeof vi.fn> };
 
 beforeEach(() => {
@@ -53,8 +51,6 @@ describe('isPlainClick', () => {
   });
 });
 
-/** A click of the shape `replaceOnPlainClick` reads, with a recording
- *  `preventDefault`. */
 function clickEvent(over: Partial<MouseEvent> = {}) {
   return {
     button: 0,
@@ -91,24 +87,14 @@ describe('replaceOnPlainClick', () => {
   });
 });
 
-// Source-scan tripwire: no `location.href` assignment outside the one file that
-// deliberately leaves the app.
-//
-// Assigning it PUSHES a history entry. A workspace left on the back stack is
-// what turns a hole in the mobile edge guard into a silent teleport into that
-// workspace. Reads are fine, and common (`new URL(location.href)`), so the scan
-// matches an assignment only.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(here, '..');
 
-/** Leaves the app on purpose, through iOS's `x-safari-` scheme. */
 const ALLOWED = ['utils/openExternalUrl.ts'];
 
 const HREF_ASSIGNMENT = /location\.href\s*=(?!=)/;
 
-/** Every non-test frontend source, comment-stripped so the scan cannot mistake
- *  prose about the ban for code. */
 function frontendSources(): Array<[string, string]> {
   const walk = (dir: string): string[] =>
     readdirSync(dir, { withFileTypes: true }).flatMap((e: any) => {

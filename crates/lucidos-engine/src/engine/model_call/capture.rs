@@ -12,125 +12,15 @@
 
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
-use crate::engine::{ApiUsage, ContextProducer, ContextPurpose, ContextRole, ContextSection};
+use crate::engine::{ApiUsage, ContextPurpose};
 use crate::llm::metered::{CallCost, CallFailed, CostSink, Reported};
 use crate::llm::provider::LlmResponse;
 use uuid::Uuid;
 
-/// Build the `ContextCaptured` for one auxiliary call.
-///
-/// `request_chars` is the size of what was sent, as `llm::metered::CallCost`
-/// defines it. It becomes the capture's one body-less section, which keeps the
-/// "sections sum to the estimate" invariant true.
-///
-/// One section means nothing else counts those chars, so the section's budget
-/// delta is its own size and the two sizes agree. The body is never persisted
-/// here, which does not move `content_chars`: it measures what was sent.
-///
-/// `context_window` is 0. A single-shot auxiliary call spends against no
-/// budget, so any other number would be a plausible-looking invention.
-pub(crate) fn auxiliary_capture(
-    purpose: ContextPurpose,
-    model: &str,
-    request_chars: usize,
-    usage: Option<ApiUsage>,
-    reconstructed: bool,
-) -> ThreadEvent {
-    auxiliary_capture_detailed(
-        purpose,
-        model,
-        request_chars,
-        usage,
-        reconstructed,
-        CallDetail::default(),
-    )
-}
-
-/// What the service knows about one call beyond its usage. Every
-/// [`AuxCapture::chat`] reports both, from the selection and its own clock.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CallDetail {
-    /// The reasoning tier the call ran at.
-    pub(crate) reasoning_effort: Option<String>,
-    /// How long the call took, wall clock.
-    pub(crate) duration_ms: Option<u64>,
-    /// The model the reply named, when it named one.
-    pub(crate) served_model: Option<String>,
-    /// The backend the router sent the call to.
-    pub(crate) provider: Option<String>,
-    /// Time to the first content delta, from the start `duration_ms` counts from.
-    pub(crate) ttft_ms: Option<u64>,
-    /// The provider's id for the response that answered.
-    pub(crate) request_id: Option<String>,
-    pub(crate) stable_prefix_fingerprint: Option<String>,
-}
-
-impl CallDetail {
-    /// What `cost` says about its call beyond the usage.
-    pub(crate) fn of(cost: &CallCost<'_>) -> Self {
-        Self {
-            reasoning_effort: cost.reasoning_effort.map(str::to_string),
-            duration_ms: cost.duration_ms,
-            served_model: cost.reported.served_model().map(str::to_string),
-            provider: cost
-                .reported
-                .provider()
-                .or(cost.provider)
-                .map(|kind| kind.as_str().to_string()),
-            ttft_ms: cost.ttft_ms,
-            request_id: cost.request_id.map(str::to_string),
-            stable_prefix_fingerprint: match cost.reported {
-                Reported::Chat(response) => response.stable_prefix_fingerprint.clone(),
-                _ => None,
-            },
-        }
-    }
-}
-
-/// [`auxiliary_capture`], with what the caller knows about the call.
-pub(crate) fn auxiliary_capture_detailed(
-    purpose: ContextPurpose,
-    model: &str,
-    request_chars: usize,
-    usage: Option<ApiUsage>,
-    reconstructed: bool,
-    detail: CallDetail,
-) -> ThreadEvent {
-    let stable_prefix_fingerprint = detail
-        .stable_prefix_fingerprint
-        .filter(|_| purpose == ContextPurpose::CacheKeepAlive);
-    ThreadEvent::ContextCaptured {
-        producer: ContextProducer::Auxiliary,
-        model: model.to_string(),
-        context_window: 0,
-        sections: vec![ContextSection {
-            name: purpose.section_name().to_string(),
-            content: None,
-            budget_delta_chars: request_chars,
-            content_chars: Some(request_chars),
-            role: ContextRole::User,
-            group: None,
-        }],
-        tools: vec![],
-        estimated_total_tokens: crate::engine::context::estimate_tokens_from_chars(request_chars),
-        usage,
-        trimmed: false,
-        // This path never runs the trimmer, so no pass can have fired.
-        trim_passes: Vec::new(),
-        purpose,
-        reconstructed,
-        parent_tool_use_id: None,
-        api_call_id: None,
-        reasoning_effort: detail.reasoning_effort,
-        duration_ms: detail.duration_ms,
-        served_model: detail.served_model,
-        provider: detail.provider,
-        stable_prefix_fingerprint,
-        ttft_ms: detail.ttft_ms,
-        request_id: detail.request_id,
-        session: None,
-    }
-}
+#[cfg(test)]
+use crate::engine::thread_events::aux_capture::auxiliary_capture;
+pub(crate) use crate::engine::thread_events::aux_capture::auxiliary_capture_detailed;
+pub use crate::engine::thread_events::aux_capture::CallDetail;
 
 /// The `ModelCallFailed` for one failed call. It holds facts only, never the
 /// provider's message.
@@ -195,7 +85,7 @@ pub(crate) fn usage_from_image(
 /// Owns its `EventBus` clone so a spawned task can hold one. Image
 /// description and title generation both run detached from the turn.
 #[derive(Clone)]
-pub(crate) struct AuxCapture {
+pub struct AuxCapture {
     sink: Sink,
     /// `None` records on the home thread.
     thread_id: Option<Uuid>,
@@ -210,17 +100,17 @@ pub(crate) struct AuxCapture {
 #[derive(Clone)]
 enum Sink {
     Bus(EventBus),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Discard,
 }
 
 impl AuxCapture {
-    pub(crate) fn new(bus: &EventBus, thread_id: Uuid, purpose: ContextPurpose) -> Self {
+    pub fn new(bus: &EventBus, thread_id: Uuid, purpose: ContextPurpose) -> Self {
         Self::for_thread_or_home(bus, Some(thread_id), purpose)
     }
 
     /// Records on `thread_id`, or on the home thread when there is none.
-    pub(crate) fn for_thread_or_home(
+    pub fn for_thread_or_home(
         bus: &EventBus,
         thread_id: Option<Uuid>,
         purpose: ContextPurpose,
@@ -237,7 +127,7 @@ impl AuxCapture {
     /// This capture, with each provider call bounded by `deadline`. The bound
     /// covers the call alone: a call that answered in time keeps its answer
     /// and its row, however long the record then takes.
-    pub(crate) fn until(&self, deadline: tokio::time::Instant) -> Self {
+    pub fn until(&self, deadline: tokio::time::Instant) -> Self {
         Self {
             deadline: Some(deadline),
             ..self.clone()
@@ -247,7 +137,7 @@ impl AuxCapture {
     /// This capture, with its rows stamped as `trigger`'s fire. The record
     /// runs on its own task, which the fire's ambient marker never reaches.
     /// So a caller that knows the fire states it here.
-    pub(crate) fn for_trigger_fire(self, trigger: Option<String>) -> Self {
+    pub fn for_trigger_fire(self, trigger: Option<String>) -> Self {
         Self {
             emitting_trigger_id: trigger,
             ..self
@@ -256,8 +146,8 @@ impl AuxCapture {
 
     /// A capture that records nothing, for a test that drives a model call
     /// with no database behind it.
-    #[cfg(test)]
-    pub(crate) fn discarding(purpose: ContextPurpose) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn discarding(purpose: ContextPurpose) -> Self {
         Self {
             sink: Sink::Discard,
             thread_id: None,
@@ -279,7 +169,7 @@ impl AuxCapture {
     async fn emit(&self, event: ThreadEvent) {
         let bus = match &self.sink {
             Sink::Bus(bus) => bus.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Sink::Discard => return,
         };
         let thread_id = self.thread_id;
@@ -291,7 +181,7 @@ impl AuxCapture {
                     match crate::engine::home_thread::ensure_home_thread(&bus, bus.pool()).await {
                         Ok(id) => id,
                         Err(e) => {
-                            crate::log!("[AuxCapture] No home thread to record on: {}", e);
+                            crate::log_legacy!("[AuxCapture] No home thread to record on: {}", e);
                             return;
                         }
                     }
@@ -309,24 +199,19 @@ impl AuxCapture {
             .await;
         });
         if let Err(e) = task.await {
-            crate::log!("[AuxCapture] The capture task failed: {}", e);
+            crate::log_legacy!("[AuxCapture] The capture task failed: {}", e);
         }
     }
 
     /// Record spend reported outside a provider call: a voice talker turn, a
     /// coding agent's side question, a call the proxy forwarded.
-    pub(crate) async fn record_usage(
-        &self,
-        model: &str,
-        request_chars: usize,
-        usage: Option<ApiUsage>,
-    ) {
+    pub async fn record_usage(&self, model: &str, request_chars: usize, usage: Option<ApiUsage>) {
         self.record_usage_detailed(model, request_chars, usage, CallDetail::default())
             .await;
     }
 
     /// [`Self::record_usage`], with what the caller knows about the call.
-    pub(crate) async fn record_usage_detailed(
+    pub async fn record_usage_detailed(
         &self,
         model: &str,
         request_chars: usize,
@@ -347,6 +232,19 @@ impl AuxCapture {
 
 #[async_trait::async_trait]
 impl CostSink for AuxCapture {
+    fn spend_cap_policy(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::llm::spend_cap::SpendCapPolicy>,
+        bool,
+    )> {
+        match &self.sink {
+            Sink::Bus(bus) => Some((std::sync::Arc::new(bus.clone()), false)),
+            #[cfg(any(test, feature = "test-support"))]
+            Sink::Discard => None,
+        }
+    }
+
     /// One row per call, before its caller reads the answer.
     async fn record(&self, cost: CallCost<'_>) {
         let detail = CallDetail::of(&cost);
@@ -357,7 +255,7 @@ impl CostSink for AuxCapture {
                 input_tokens,
                 output_tokens,
             } => usage_from_image(input_tokens, output_tokens),
-            Reported::Usage(usage) => usage,
+            Reported::Search(result) => result.usage,
         };
         self.emit(auxiliary_capture_detailed(
             self.purpose,
@@ -382,6 +280,7 @@ impl CostSink for AuxCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ContextProducer;
 
     fn capture_fields(event: &ThreadEvent) -> (ContextProducer, ContextPurpose) {
         match event {

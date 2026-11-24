@@ -17,35 +17,21 @@ import { JUDGMENT_SITE_LOCATION, SYSTEM_ONE_PROVIDERS } from './judgmentBackend'
 
 const SERVICE = SYSTEM_ONE_PROVIDERS['system-one-custom'].credentialService;
 
-/** A stored preference's value, or empty while preferences load. */
 function stored(key: string): string {
   const prefs = preferences.value;
   return prefs.status === 'loaded' ? prefs.data[key] ?? '' : '';
 }
 
-/** Whether a URL is one the engine will post to: http(s) and nothing else. */
 export function customEndpointUrlValid(url: string): boolean {
   return /^https?:\/\/\S+$/.test(url.trim());
 }
 
-/**
- * A custom System One endpoint on Settings → Providers, such as an
- * open model served on this machine.
- *
- * The URL and the model are preferences, and the key is an optional
- * credential, the shape the Local chat provider already has. The engine reads
- * all three per judgment, so nothing needs a restart.
- */
 export function CustomSystemOneSettings() {
   const existing = findProviderCredential(credentials.value, SERVICE);
   const savedUrl = stored(SYSTEM_ONE_CUSTOM_URL_KEY);
   const savedModel = stored(SYSTEM_ONE_CUSTOM_MODEL_KEY);
-  // Server-backed, so a frame from another device repaints an untouched field
-  // and a draft survives one (ADR 0118).
   const [url, setUrl] = useServerBackedField(savedUrl);
   const [model, setModel] = useServerBackedField(savedModel);
-  // Re-arm each field once our own save lands. This page stays mounted, so
-  // without it the field ignores every later frame.
   useEffect(() => {
     if (url.trim() === savedUrl.trim()) setUrl(savedUrl);
   }, [savedUrl, url]);
@@ -65,7 +51,6 @@ export function CustomSystemOneSettings() {
     try {
       await savePreference(SYSTEM_ONE_CUSTOM_URL_KEY, url.trim());
       await savePreference(SYSTEM_ONE_CUSTOM_MODEL_KEY, model.trim());
-      // The engine sends the key only inside its scope, so it moves with the URL.
       const rescope = providerKeyRescope(existing, url);
       if (rescope && existing) await submitCredentialEdit(existing.id, rescope);
     } finally {

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A picker row for a remote workspace wears the local row's shape. It offers
- * nothing its own gateway owns, and stays shut while that gateway is silent.
- * A middle press means "open this beside", where there is somewhere to.
- */
 import { afterEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -70,7 +65,6 @@ it('names each silent gateway and why', () => {
   expect(notes).toEqual(['timed out']);
 });
 
-/** Press the wheel on a healthy `dev@cloud` row, and return what opened. */
 function middleClick(): ReturnType<typeof vi.fn> {
   const onOpen = mount(cloud());
   const row = container.querySelector<HTMLElement>('.ws-picker-open[role="button"]')!;

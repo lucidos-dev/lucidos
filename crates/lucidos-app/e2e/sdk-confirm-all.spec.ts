@@ -44,24 +44,9 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
   });
 
   async function setupIframe(page: import('@playwright/test').Page) {
-    // Open the app via the real restore-on-load path — this mounts the host's
-    // Preact tree (so <ConfirmDialog /> can render) and renders the app iframe
-    // with its data-role="app-ui-frame" attribute the host listener whitelists.
-    // Seeding `app-window-open` in localStorage BEFORE navigation triggers
-    // loadApps()'s restore branch (apps.ts), which sets panelOverlay to
-    // {type:'app-ui',app:<this id>}. Both SplitLayout (desktop) and
-    // MobileSwipeContainer (mobile) render an iframe simultaneously; pick the
-    // visible one. There is no `?app=<id>` URL parameter — app deep-linking
-    // goes through the structured `tap` flow (notification-deeplink.ts) which
-    // requires a notification id, so the restore path is the cleanest hook.
     await page.addInitScript((id) => {
       localStorage.setItem('app-window-open', id);
     }, APP_ID);
-    // gotoWithRetry: a bare page.goto can hang the whole 120s test budget on
-    // mobile-webkit when the app-root navigation wedges (see gotoWithRetry) —
-    // the `Esc → resolves false` nightly flake timed out here at page.goto with a
-    // blank page. The explicit iframe + #ask visibility checks below are the real
-    // readiness gate.
     await gotoWithRetry(page, '/');
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10000 });
@@ -87,12 +72,10 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
       })
     );
 
-    // Modal must render in the parent (host), not inside the iframe.
     await expect(page.locator('.confirm-dialog')).toBeVisible();
     await expect(page.locator('.confirm-dialog .surface-title')).toHaveText('Delete node?');
     await expect(page.locator('.confirm-message')).toContainText('Reduce CPAC by 50%');
     await expect(page.locator('[data-role="confirm-ok"]')).toHaveText('Delete');
-    // `danger: true` is the only thing that paints the OK red.
     await expect(page.locator('[data-role="confirm-ok"]')).toHaveClass(/\baction-btn-danger\b/);
     await expect(page.locator('[data-role="confirm-cancel"]').first()).toHaveText('Keep');
 
@@ -117,18 +100,6 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
       (window as unknown as { runConfirm: (o: unknown) => Promise<boolean> }).runConfirm({ message: 'Continue?' })
     );
     await expect(page.locator('.confirm-dialog')).toBeVisible();
-    // The confirm is invoked from inside the app iframe, so on WebKit the iframe
-    // keeps the page's keyboard focus. A programmatic .focus() on a host element
-    // does NOT move WebKit's focused-frame pointer, so page.keyboard.press would
-    // route Escape into the iframe document and the host's capture-phase Escape
-    // dispatcher (useKeyboardShortcuts → overlayStack) never fires — leaving the
-    // SDK confirm to resolve false only at its 60s safety timeout (slow, and
-    // occasionally past the 120s test cap → a hard flake). A real pointer
-    // interaction DOES move the focused frame to the host, so click the
-    // non-interactive dialog message first (its click is swallowed by the
-    // dialog's stopPropagation, so it neither resolves nor dismisses), then press
-    // Escape — now the keydown reaches the host and dismissTopOverlay() resolves
-    // false immediately.
     await page.locator('.confirm-message').click();
     await page.keyboard.press('Escape');
     expect(await resultPromise).toBe(false);
@@ -140,17 +111,6 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
       (window as unknown as { runConfirm: (o: unknown) => Promise<boolean> }).runConfirm({ message: 'Continue?', okLabel: 'Yes' })
     );
     await expect(page.locator('.confirm-dialog')).toBeVisible();
-    // Same just-mounted-iframe focus situation as the Esc test above: a
-    // programmatic .focus() on the host OK button does NOT reliably move
-    // WebKit's focused-frame pointer off the app iframe, so
-    // page.keyboard.press('Enter') can route into the iframe and the host never
-    // sees the keystroke — the confirm then hangs to the 60s SDK timeout (slow,
-    // and occasionally past the 120s cap). A real pointer interaction DOES move
-    // the focused frame to the host, so click the non-interactive dialog message
-    // first (its click is swallowed by the dialog's stopPropagation, so it
-    // neither resolves nor dismisses), then press Enter — ConfirmDialog's host
-    // keydown handler resolves true (Enter on a non-button/textarea target), or
-    // the auto-focused OK button activates natively; either way → true.
     await page.locator('.confirm-message').click();
     await page.keyboard.press('Enter');
     expect(await resultPromise).toBe(true);
@@ -162,8 +122,6 @@ test.describe('SDK lucidos.ui.confirm — host renders modal, returns Promise<bo
       (window as unknown as { runConfirm: (o: unknown) => Promise<boolean> }).runConfirm({ message: 'Continue?' })
     );
     await expect(page.locator('.confirm-dialog')).toBeVisible();
-    // Click viewport corner — guaranteed to hit the overlay backdrop, not the
-    // centered dialog (dialog is max-width 27.5rem in a 1280-wide viewport).
     await page.mouse.click(2, 2);
     expect(await resultPromise).toBe(false);
   });

@@ -214,8 +214,9 @@ pub fn is_url_safe_segment(name: &str) -> bool {
 /// Is this `Sec-Fetch-Dest` a nested browsing context?
 ///
 /// Both processes ask it, about the same request, for reasons that must not
-/// drift. The engine mints only for a FRAMED document, since a standalone app
-/// tab has a real origin and keeps the device cookie. The gateway renders a
+/// drift. Local standalone app tabs keep their real origin and device cookie;
+/// remote app tabs are opaque and the engine also mints for those (ADR 0723).
+/// The gateway renders a
 /// refused frame a short page rather than the pairing shell.
 ///
 /// `None` means a client sending no fetch metadata, which is not a browser.

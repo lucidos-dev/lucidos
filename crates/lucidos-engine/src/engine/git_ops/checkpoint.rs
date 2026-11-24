@@ -46,14 +46,14 @@ pub(crate) const CHECKPOINT_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// The safety ref a checkpoint's **pre** image lives on. Deterministic from the
 /// checkpoint id (a UUID), so the undo path re-derives it without storing it.
-pub(crate) fn command_checkpoint_ref(checkpoint_id: &str) -> String {
+pub fn command_checkpoint_ref(checkpoint_id: &str) -> String {
     format!("refs/lucidos/command-checkpoints/{checkpoint_id}")
 }
 
 /// The ref a checkpoint's **post** image lives on. A separate namespace rather
 /// than a suffix under the pre ref, because git cannot hold both
 /// `refs/x/<id>` and `refs/x/<id>/post` at once (a directory/file conflict).
-pub(crate) fn command_post_image_ref(checkpoint_id: &str) -> String {
+pub fn command_post_image_ref(checkpoint_id: &str) -> String {
     format!("refs/lucidos/command-post-images/{checkpoint_id}")
 }
 
@@ -201,14 +201,16 @@ pub(crate) async fn revert_command_effects(
     let removed = match diff_checkpoint_effects(repo_root, checkpoint_id).await {
         Ok(Some(effects)) => {
             let removed = remove_created_files(repo_root, checkpoint_id, &effects.created).await;
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] undo {checkpoint_id}: removed {removed} of {} created",
                 effects.removes()
             );
             removed
         }
         Ok(None) => {
-            crate::log!("[CommandGuard] undo {checkpoint_id}: no post image, restoring only");
+            crate::log_legacy!(
+                "[CommandGuard] undo {checkpoint_id}: no post image, restoring only"
+            );
             0
         }
         Err(e) => return Err(format!("could not diff checkpoint {checkpoint_id}: {e}")),
@@ -243,7 +245,7 @@ pub(crate) async fn restore_command_checkpoint(
 
     let targets = restore_targets(repo_root, checkpoint_id).await?;
     if targets.as_ref().is_some_and(Vec::is_empty) {
-        crate::log!("[CommandGuard] undo {checkpoint_id}: nothing left to restore");
+        crate::log_legacy!("[CommandGuard] undo {checkpoint_id}: nothing left to restore");
         return Ok(());
     }
 
@@ -284,8 +286,10 @@ pub(crate) async fn restore_command_checkpoint(
             }
         }
         match &targets {
-            None => crate::log!("[CommandGuard] undo {checkpoint_id}: restored the pre image"),
-            Some(paths) => crate::log!(
+            None => {
+                crate::log_legacy!("[CommandGuard] undo {checkpoint_id}: restored the pre image")
+            }
+            Some(paths) => crate::log_legacy!(
                 "[CommandGuard] undo {checkpoint_id}: restored {} file(s)",
                 paths.len()
             ),
@@ -337,7 +341,9 @@ async fn restore_targets(
         };
         match std::str::from_utf8(path) {
             Ok(path) => bucket.push(path.to_string()),
-            Err(_) => crate::log!("[CommandGuard] skipping non-UTF-8 path in checkpoint restore"),
+            Err(_) => {
+                crate::log_legacy!("[CommandGuard] skipping non-UTF-8 path in checkpoint restore")
+            }
         }
     }
 
@@ -363,7 +369,7 @@ async fn restore_targets(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound
             );
             if !absent {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] {path} was recreated since the command ran; keeping it"
                 );
             }
@@ -374,7 +380,7 @@ async fn restore_targets(
         if unchanged.contains(&path) {
             targets.push(path);
         } else {
-            crate::log!("[CommandGuard] {path} changed since the command ran; keeping it");
+            crate::log_legacy!("[CommandGuard] {path} changed since the command ran; keeping it");
         }
     }
     Ok(Some(targets))
@@ -410,14 +416,14 @@ impl CheckpointEffects {
 /// `false` covers a checkpoint written before the post image existed, a pair
 /// reclaimed by [`prune_expired_checkpoints`], and one orphaned by a crash
 /// between the two snapshots.
-pub(crate) async fn checkpoint_pair_available(repo_root: &Path, checkpoint_id: &str) -> bool {
+pub async fn checkpoint_pair_available(repo_root: &Path, checkpoint_id: &str) -> bool {
     for ref_name in [
         command_checkpoint_ref(checkpoint_id),
         command_post_image_ref(checkpoint_id),
     ] {
         let exists = git_answer(&["rev-parse", "--verify", "--quiet", &ref_name], repo_root).await;
         if exists.is_unknown() {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] could not probe {}; treating the checkpoint pair as unavailable",
                 ref_name
             );
@@ -513,7 +519,7 @@ fn parse_diff_tree_z(stdout: &[u8]) -> CheckpointEffects {
         match status {
             b'A' => {
                 let Ok(path) = std::str::from_utf8(path) else {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[CommandGuard] skipping non-UTF-8 created path in checkpoint diff"
                     );
                     continue;
@@ -658,7 +664,7 @@ pub(crate) async fn remove_created_files(
     }
     let Some(unchanged) = unchanged_since_post_image(repo_root, checkpoint_id, created).await
     else {
-        crate::log!(
+        crate::log_legacy!(
             "[CommandGuard] could not compare {} created file(s) against the post image; \
              keeping all of them",
             created.len()
@@ -670,14 +676,14 @@ pub(crate) async fn remove_created_files(
     let mut emptied: BTreeSet<PathBuf> = BTreeSet::new();
     for path in created {
         if !unchanged.contains(path) {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] {} changed since the command ran; keeping it",
                 path
             );
             continue;
         }
         let Some(abs) = safe_repo_path(repo_root, path) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] refusing to remove {} (escapes the workspace)",
                 path
             );
@@ -695,7 +701,7 @@ pub(crate) async fn remove_created_files(
                     emptied.insert(parent.to_path_buf());
                 }
             }
-            Err(e) => crate::log!("[CommandGuard] failed to remove {}: {}", path, e),
+            Err(e) => crate::log_legacy!("[CommandGuard] failed to remove {}: {}", path, e),
         }
     }
     prune_empty_dirs(repo_root, emptied);
@@ -741,12 +747,12 @@ pub(crate) async fn delete_command_checkpoint_pair(repo_root: &Path, checkpoint_
     ] {
         match git_cmd(&["update-ref", "-d", &ref_name], repo_root).await {
             Ok(out) if out.status.success() => {}
-            Ok(out) => crate::log!(
+            Ok(out) => crate::log_legacy!(
                 "[CommandGuard] failed to delete checkpoint ref {}: {}",
                 ref_name,
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
-            Err(e) => crate::log!(
+            Err(e) => crate::log_legacy!(
                 "[CommandGuard] failed to delete checkpoint ref {}: {}",
                 ref_name,
                 e
@@ -794,7 +800,7 @@ pub(crate) async fn prune_expired_checkpoints(repo_root: &Path, now_unix: i64, m
         expired += 1;
     }
     if expired > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[CommandGuard] reclaimed {} expired checkpoint pair(s)",
             expired
         );

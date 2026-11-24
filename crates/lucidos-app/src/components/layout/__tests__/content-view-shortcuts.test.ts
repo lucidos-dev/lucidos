@@ -1,10 +1,3 @@
-/** The source, wrap and fullscreen shortcuts act only where the content
- *  header offers the button.
- *
- *  They share the header's own gate, so editing a file, or a pane showing
- *  something else, leaves the keystroke doing nothing.
- *
- *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../../store/actions/apps', async (importOriginal) => {

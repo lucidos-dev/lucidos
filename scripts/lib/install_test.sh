@@ -18,6 +18,7 @@ python3 "$SCRIPT_DIR/linux_dev_install_test.py" || exit 1
 
 bash "$SCRIPT_DIR/stage_runtime_test.sh" || exit 1
 python3 "$SCRIPT_DIR/stage_runtime_linux_test.py" || exit 1
+python3 "$SCRIPT_DIR/stage_runtime_packaged_smoke_test.py" || exit 1
 bash "$SCRIPT_DIR/headless_tarball_test.sh" || exit 1
 
 # Sandbox env-as-flag inputs a live dev workspace exports (its engine carries
@@ -615,7 +616,7 @@ NOCHECKOUT="$(mktemp -d)"
 cp "$INSTALL" "$NOCHECKOUT/install.sh"
 # Every lib install.sh fetches when piped: LUCIDOS_LIBS + the lazily sourced
 # service pair (source_service_lib).
-LIBS_FETCHED="stage_runtime.sh headless_tarball.sh install_common.sh service.sh"
+LIBS_FETCHED="stage_runtime.sh headless_tarball.sh install_common.sh service.sh storage_root.sh loopback_curl.sh"
 for shape in doctype indented-html; do
     LIBDIR="$(mktemp -d)"; PREFIX="$(mktemp -d)"
     # An SPA fallback serves the landing page for EVERY unknown path, so every
@@ -697,6 +698,43 @@ else
 fi
 rm -rf "$HINT_DIR"
 
+echo ""
+echo "test: the installer trusts the local certificate only in a desktop session"
+# Extracted like uninstall_hint. launchctl and uname are stubs, and the CLI
+# records its arguments, so no real keychain or NSS database is touched.
+TRUST_DIR="$(mktemp -d)"
+{
+    sed -n '/^install_has_gui_session()/,/^}/p;/^trust_local_certificate()/,/^}/p' "$INSTALL"
+    sed -n '/^service_runtime_cli()/,/^}/p' "$SCRIPT_DIR/service.sh"
+    printf 'step() { echo "$*"; }\ninfo() { echo "$*"; }\nok() { echo "$*"; }\nwarn() { echo "$*"; }\n'
+} > "$TRUST_DIR/trust.sh"
+mkdir -p "$TRUST_DIR/bin" "$TRUST_DIR/runtime"
+printf '#!/bin/sh\necho Darwin\n' > "$TRUST_DIR/bin/uname"
+# shellcheck disable=SC2016 # the stub expands these when it runs
+printf '#!/bin/sh\necho "$*" >> "$(dirname "$0")/../ran"\n' > "$TRUST_DIR/runtime/lucidos"
+chmod +x "$TRUST_DIR/bin/uname" "$TRUST_DIR/runtime/lucidos"
+run_trust() { # <managername answer>
+    printf '#!/bin/sh\necho %s\n' "$1" > "$TRUST_DIR/bin/launchctl"
+    chmod +x "$TRUST_DIR/bin/launchctl"
+    rm -f "$TRUST_DIR/ran"
+    # shellcheck disable=SC2016 # the inner bash expands $1
+    PATH="$TRUST_DIR/bin:$PATH" LUCIDOS_PORT=5252 \
+        bash -c '. "$1/trust.sh"; trust_local_certificate "$1/runtime"' _ "$TRUST_DIR"
+}
+out="$(run_trust Aqua)"
+if [ "$(cat "$TRUST_DIR/ran" 2>/dev/null)" = "tls trust" ]; then
+    pass "a desktop session runs lucidos tls trust"
+else
+    fail "expected the CLI to run 'tls trust' in Aqua: $out"
+fi
+out="$(run_trust Background)"
+if [ ! -e "$TRUST_DIR/ran" ] && has "$out" "$TRUST_DIR/runtime/lucidos tls trust"; then
+    pass "an SSH session prints the command and trusts nothing"
+else
+    fail "expected only a printed command outside Aqua: $out"
+fi
+rm -rf "$TRUST_DIR"
+
 # ── stop_running_instance: a re-run stops the old stack before it registers ──
 echo ""
 echo "test: a re-run over a running instance stops its service, engines and Postgres"
@@ -749,8 +787,8 @@ echo "test: a fetched uninstaller that is HTML is refused and never exec'd"
 # The lib sniff above guards `.` (source). dispatch_uninstall guards the OTHER
 # place unknown remote content reaches a shell: `exec bash -c "$payload"`. It was
 # unguarded until the 2026-07-30 docs audit, and it was NOT hypothetical: the
-# site publisher uploads install.sh and scripts/lib/*.sh but not uninstall.sh, so
-# <origin>/uninstall.sh soft-404s and a piped `install.sh --uninstall` handed the
+# site publisher then uploaded install.sh and scripts/lib/*.sh but not uninstall.sh,
+# so <origin>/uninstall.sh soft-404ed and a piped `install.sh --uninstall` handed the
 # landing page to bash. Same shape as the lib test: a checkout-less install.sh
 # (so the sibling-uninstall.sh branch is skipped) against a file:// "origin".
 NOCHECKOUT="$(mktemp -d)"
@@ -973,7 +1011,7 @@ for KEEP_OS in Darwin Linux; do
         fail "the bare re-run changed the unit: $(diff <(printf '%s\n' "$first") "$UNIT")"
     fi
     if [ "$(mode_of "$UNIT")" = 600 ]; then pass "the kept provider key stays at mode 600"; else fail "unit mode $(mode_of "$UNIT")"; fi
-    if has "$out" "https://localhost:59261"; then pass "the re-run probes https"; else fail "expected an https probe: $out"; fi
+    if has "$out" "https://localhost:59261"; then pass "the re-run opens https on localhost"; else fail "expected an https local URL: $out"; fi
 
     keep_install sk-new '' --tls-cert "$CERTS/b.crt" --tls-key "$CERTS/b.key" >/dev/null
     now="$(cat "$UNIT" 2>/dev/null)"
@@ -990,7 +1028,7 @@ for KEEP_OS in Darwin Linux; do
 
     out="$(keep_install '' '' --no-tls)"
     now="$(cat "$UNIT" 2>/dev/null)"
-    if ! has "$now" "LUCIDOS_TLS_" && has "$out" "http://localhost:59261"; then
+    if ! has "$now" "LUCIDOS_TLS_" && has "$out" "https://localhost:59261"; then
         pass "--no-tls drops the kept pair"
     else
         fail "--no-tls kept TLS: $out"

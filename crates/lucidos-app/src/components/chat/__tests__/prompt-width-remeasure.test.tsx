@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * `useWidthRemeasure` watches the box, not the mount.
- *
- * The trigger form unmounts its Intent textarea whenever the run type changes.
- * So the ref is null on the render that opens a script trigger, and holds an
- * element only later. A mount-only effect reads that null once and never looks
- * again, leaving the field with no observer for the life of the form.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
@@ -16,8 +8,6 @@ import {
   isTextareaHeightAnimating,
 } from '../promptResize';
 
-/** Every live observer's callback. `deliverResize` is the layout engine jsdom
- *  does not have: it fires them all, as a real resize would. */
 let callbacks: Array<() => void> = [];
 
 class FakeResizeObserver {
@@ -31,7 +21,6 @@ function deliverResize() {
   for (const cb of [...callbacks]) cb();
 }
 
-/** Give a jsdom element the layout it would have in a browser. */
 function shape(el: HTMLTextAreaElement, width: number, contentHeight: number) {
   Object.defineProperty(el, 'getBoundingClientRect', {
     value: () => ({ width }), configurable: true,
@@ -41,8 +30,6 @@ function shape(el: HTMLTextAreaElement, width: number, contentHeight: number) {
   }
 }
 
-/** Preact defers `useEffect` to a frame, and falls back to a 100ms timer where
- *  there are no frames. jsdom is that case, so a microtask is far too short. */
 function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 120));
 }
@@ -90,16 +77,11 @@ describe('useWidthRemeasure', () => {
     shape(el, 300, 50);
     await settle();
 
-    // Our own height write re-enters the observer. Acting on it would loop.
     shape(el, 300, 90);
     deliverResize();
     expect(el.style.height).toBe('');
   });
 
-  // A draft-switch ease is heading for a height measured at the old width, so
-  // a width change invalidates it. Standing down would land the box on that
-  // stale number and leave it there: the observer fires ON the width change,
-  // and by then the width has finished changing.
   it('abandons an in-flight height ease rather than easing to a stale height', async () => {
     render(<Field present />, host);
     const el = host.querySelector('textarea')!;

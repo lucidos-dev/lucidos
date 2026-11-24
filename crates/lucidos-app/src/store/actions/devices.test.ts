@@ -1,13 +1,3 @@
-/**
- * Regression: the device push toggle is a controlled checkbox bound to
- * `device.push_enabled`, so the slider can't move until the `devices` signal
- * updates. `toggleDevicePush` used to flip that signal only after two mutating
- * round-trips AND a full `loadDevices()` re-fetch completed — so the user saw
- * the toggle sit unmoved (or snap back) for the whole network chain ("laggy").
- *
- * These tests pin the optimistic-update contract: the signal flips immediately,
- * and reverts if the network call fails.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const setDevicePush = vi.fn();
@@ -22,12 +12,13 @@ vi.mock('../../api/client', () => ({
   setDevicePush: (...args: unknown[]) => setDevicePush(...args),
   deleteDevice: vi.fn(),
   handOverDevice: (...args: unknown[]) => handOverDeviceMock(...args),
-  getCallerDevice: vi.fn(),
+  getCallerDevice: (...args: unknown[]) => getCallerDeviceMock(...args),
   setPreference: (...args: unknown[]) => setPreference(...args),
 }));
 
 const pairingSession = vi.fn();
 const handOverDeviceMock = vi.fn();
+const getCallerDeviceMock = vi.fn();
 vi.mock('../../api/client/pairing', () => ({
   pairingSession: (...args: unknown[]) => pairingSession(...args),
 }));
@@ -54,8 +45,6 @@ function makeDevice(id: string, push_enabled: boolean) {
   };
 }
 
-/** A promise plus its resolve/reject handles, so a test can assert state
- *  *while* the mocked network call is still in flight. */
 function deferred<T>() {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
@@ -86,8 +75,6 @@ describe('toggleDevicePush optimistic update', () => {
 
     const pending = toggleDevicePush('dev-a', true);
 
-    // Optimistic: the signal already reflects the new value while the network
-    // call is still unresolved — this is what makes the toggle feel instant.
     expect(devices.value.status).toBe('loaded');
     expect(devices.value.status === 'loaded' && devices.value.data[0].push_enabled).toBe(true);
 
@@ -106,7 +93,6 @@ describe('toggleDevicePush optimistic update', () => {
 
     await toggleDevicePush('dev-a', false);
 
-    // Reverted back to the pre-toggle value, and the failure surfaced.
     expect(devices.value.status === 'loaded' && devices.value.data[0].push_enabled).toBe(true);
     expect(showToast).toHaveBeenCalledWith(
       expect.stringContaining('Failed to update push setting'),
@@ -130,17 +116,9 @@ describe('toggleDevicePush optimistic update', () => {
   });
 });
 
-/**
- * Durable per-workspace device id (packaged desktop app). The id used to live only
- * in WKWebView localStorage, which a new DMG bundle re-buckets — so the app
- * registered a brand-new device on every update. `reconcileDeviceIdWithNativeStore`
- * adopts the id from the native store (which survives a reinstall) before the first
- * API call. The function is pure (deps injected), so these tests provide fakes.
- */
 describe('reconcileDeviceIdWithNativeStore', () => {
   const KEY = 'lucidos-device-id';
 
-  /** Minimal in-memory Storage stub with a spied setItem. */
   function makeStorage(init: Record<string, string> = {}) {
     const m = new Map(Object.entries(init));
     return {
@@ -153,9 +131,6 @@ describe('reconcileDeviceIdWithNativeStore', () => {
   }
 
   it('seeds localStorage from the native store after a reinstall (THE fix)', async () => {
-    // Reinstall: WKWebView re-bucketed localStorage so it is empty, but the native
-    // store survives and returns the OLD durable id. We must adopt it, not the fresh
-    // candidate — otherwise a brand-new device registers.
     const { reconcileDeviceIdWithNativeStore } = await import('./devices');
     const storage = makeStorage();
     const randomUUID = vi.fn(() => 'fresh-uuid');
@@ -169,8 +144,6 @@ describe('reconcileDeviceIdWithNativeStore', () => {
   });
 
   it('does not churn an existing install (existing id is adopted as the candidate)', async () => {
-    // First run of the fixed build with a pre-existing localStorage id: get-or-create
-    // returns that same id, so nothing is rewritten and no random uuid is minted.
     const { reconcileDeviceIdWithNativeStore } = await import('./devices');
     const storage = makeStorage({ [KEY]: 'existing-id' });
     const randomUUID = vi.fn(() => 'fresh-uuid');
@@ -211,10 +184,6 @@ describe('reconcileDeviceIdWithNativeStore', () => {
   });
 
   it('seeds the candidate before the await so a concurrent getDeviceId stays consistent', async () => {
-    // Empty storage (reinstall) + a native call that never resolves in time: the
-    // candidate is seeded synchronously, so a getDeviceId() that runs mid-boot
-    // returns this id rather than minting a different throwaway UUID (which would
-    // register a spurious device — the timeout-edge race the seed closes).
     const { reconcileDeviceIdWithNativeStore } = await import('./devices');
     const storage = makeStorage();
     const randomUUID = vi.fn(() => 'fresh-uuid');
@@ -228,10 +197,8 @@ describe('reconcileDeviceIdWithNativeStore', () => {
       randomUUID,
     });
 
-    // Before the IPC resolves, storage already holds the candidate.
     expect(storage.read(KEY)).toBe('fresh-uuid');
 
-    // The native store echoes the candidate (true first run) → no second write.
     resolveIpc('fresh-uuid');
     await pending;
     expect(storage.read(KEY)).toBe('fresh-uuid');
@@ -239,14 +206,6 @@ describe('reconcileDeviceIdWithNativeStore', () => {
   });
 });
 
-/**
- * One device identity, minted at the gateway. The engine keyed its row on a
- * UUID this browser minted. The gateway keyed the pairing on one of its own.
- * So a single phone was two devices, with nothing joining them. Boot now
- * adopts the gateway's id and asks the engine to move the row onto it.
- *
- * Pure (deps injected), so these tests need no DOM and no gateway.
- */
 describe('adoptGatewayDeviceIdentity', () => {
   const KEY = 'lucidos-device-id';
 
@@ -278,8 +237,6 @@ describe('adoptGatewayDeviceIdentity', () => {
   });
 
   it('leaves the localStorage id alone when no gateway answers', async () => {
-    // A browser on a direct engine port. There is no paired-devices list there,
-    // so there is no second identity for this one to be confused with.
     const { adoptGatewayDeviceIdentity } = await import('./devices');
     const storage = makeStorage({ [KEY]: 'minted-locally' });
     const handOver = vi.fn();
@@ -330,9 +287,6 @@ describe('adoptGatewayDeviceIdentity', () => {
   });
 
   it('recovers the id from the native store after a desktop reinstall', async () => {
-    // A reinstall re-buckets the WKWebView container, so localStorage AND the
-    // pairing cookie are gone. The window pairs again under a new name, and the
-    // native store is the only place the old one survived.
     const { adoptGatewayDeviceIdentity } = await import('./devices');
     const storage = makeStorage();
     const handOver = vi.fn().mockResolvedValue(undefined);
@@ -370,9 +324,6 @@ describe('adoptGatewayDeviceIdentity', () => {
   });
 
   it('forgets nothing when the hand-over fails, so the next load retries', async () => {
-    // THE failure that strands a row: commit the new id first and the only
-    // reference to the old one is gone, with its push subscription and its
-    // preferences under it. Nothing is written until the row has moved.
     const { adoptGatewayDeviceIdentity } = await import('./devices');
     const storage = makeStorage({ [KEY]: 'minted-locally' });
     const remember = vi.fn().mockResolvedValue(undefined);
@@ -393,8 +344,6 @@ describe('adoptGatewayDeviceIdentity', () => {
   });
 
   it('keeps the native memory too when the hand-over fails after a reinstall', async () => {
-    // Same rule on the path where localStorage is already empty: the native
-    // store must still name the old row on the next attempt.
     const { adoptGatewayDeviceIdentity } = await import('./devices');
     const storage = makeStorage();
     const remember = vi.fn().mockResolvedValue(undefined);
@@ -413,9 +362,26 @@ describe('adoptGatewayDeviceIdentity', () => {
     expect(remember).not.toHaveBeenCalled();
   });
 
+  it('stores and remembers the id but hands nothing over on a relayed route', async () => {
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'old-bare' });
+    const previousId = vi.fn();
+    const remember = vi.fn().mockResolvedValue(undefined);
+
+    const named = await adoptGatewayDeviceIdentity({
+      session: async () => ({ device_id: 'new-bare' }),
+      storage,
+      previousId,
+      remember,
+    });
+
+    expect(named).toBe(true);
+    expect(storage.read(KEY)).toBe('new-bare');
+    expect(remember).toHaveBeenCalledWith('new-bare');
+    expect(previousId).not.toHaveBeenCalled();
+  });
+
   it('swallows the failure at the production entry, and adopts nothing', async () => {
-    // The caller is boot, so a rejection must not wedge it. It reports "no
-    // gateway adopted us", which is true: the id is unchanged.
     const { adoptGatewayDeviceId } = await import('./devices');
     pairingSession.mockResolvedValue({ paired: true, device_id: 'paired-device', local: false });
     handOverDeviceMock.mockRejectedValue(new Error('engine said 500'));
@@ -426,9 +392,6 @@ describe('adoptGatewayDeviceIdentity', () => {
   });
 
   it('leaves a breadcrumb naming both ids when the hand-over is refused', async () => {
-    // Swallowing it is right, staying silent is not. A hand-over refused on
-    // every load strands the migration, and the only symptom the user sees is
-    // one device rendering as two rows. This puts it in `engine.log`.
     const { adoptGatewayDeviceId } = await import('./devices');
     postClientLog.mockClear();
     pairingSession.mockResolvedValue({ paired: true, device_id: 'paired-device', local: false });
@@ -587,7 +550,7 @@ describe('adoptRelayedDeviceIdentity', () => {
     const { getRelayedDeviceId } = await import('../../utils/deviceIdHeader');
     const storage = makeStorage({ [PLAIN_KEY]: 'plain-id' });
     let finish = () => {};
-    const handOver = vi.fn(() => new Promise<void>((resolve) => (finish = resolve)));
+    const handOver = vi.fn(() => new Promise<undefined>((resolve) => (finish = () => resolve(undefined))));
 
     const adopting = adoptRelayedDeviceIdentity({
       caller: async () => ({ device_id: 'gw:plain-id' }),
@@ -618,14 +581,110 @@ describe('adoptRelayedDeviceIdentity', () => {
     expect(storage.read(RELAYED_KEY)).toBe('gw2:plain-id');
     expect(getDeviceId()).toBe('gw2:plain-id');
   });
+
+  it('hands over from the relayed form of the bare previous id after an update emptied storage', async () => {
+    const { adoptRelayedDeviceIdentity, getDeviceId } = await import('./devices');
+    const storage = makeStorage();
+    const handOver = vi.fn().mockResolvedValue('moved');
+
+    await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'pairing:new-bare' }),
+      storage,
+      handOver,
+      barePrevious: 'old-bare',
+    });
+
+    expect(handOver).toHaveBeenCalledTimes(1);
+    expect(handOver).toHaveBeenCalledWith('pairing:old-bare', 'pairing:new-bare');
+    expect(storage.read(RELAYED_KEY)).toBe('pairing:new-bare');
+    expect(getDeviceId()).toBe('pairing:new-bare');
+  });
+
+  it('falls back to the bare previous id when its relayed form has no row', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const storage = makeStorage();
+    const handOver = vi.fn().mockResolvedValueOnce('no-such-device').mockResolvedValueOnce('moved');
+
+    await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'pairing:new-bare' }),
+      storage,
+      handOver,
+      barePrevious: 'old-bare',
+    });
+
+    expect(handOver.mock.calls).toEqual([
+      ['pairing:old-bare', 'pairing:new-bare'],
+      ['old-bare', 'pairing:new-bare'],
+    ]);
+  });
+
+  it('prefers the last adopted id over any guess from the bare previous id', async () => {
+    const { adoptRelayedDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [RELAYED_KEY]: 'pairing:old-bare' });
+    const handOver = vi.fn().mockResolvedValue('no-such-device');
+
+    await adoptRelayedDeviceIdentity({
+      caller: async () => ({ device_id: 'pairing:new-bare' }),
+      storage,
+      handOver,
+      barePrevious: 'unrelated',
+    });
+
+    expect(handOver.mock.calls).toEqual([['pairing:old-bare', 'pairing:new-bare']]);
+  });
 });
 
-/**
- * Source scan: the adoption must be awaited in boot, before anything registers
- * a device. `registerCurrentDevice` upserts the row, and the engine refuses a
- * hand-over once the new id has one, so the wrong order does not fail loudly.
- * It just means the migration silently never runs.
- */
+describe('adoptRoutedDeviceId', () => {
+  beforeEach(() => {
+    handOverDeviceMock.mockReset();
+    localStorage.clear();
+  });
+
+  afterEach(async () => {
+    const { setRelayedDeviceId } = await import('../../utils/deviceIdHeader');
+    setRelayedDeviceId(null);
+    localStorage.clear();
+    handOverDeviceMock.mockReset();
+  });
+
+  it('never hands bare ids over on a relayed route, and moves the relayed row', async () => {
+    const { adoptRoutedDeviceId } = await import('./devices');
+    localStorage.setItem('lucidos-device-id', 'old-bare');
+    pairingSession.mockResolvedValue({ paired: true, device_id: 'new-bare', local: false });
+    getCallerDeviceMock.mockResolvedValue({ device_id: 'pairing:new-bare' });
+    handOverDeviceMock.mockResolvedValue({ success: true, outcome: 'moved' });
+
+    await expect(adoptRoutedDeviceId({ workspace: null, relayed: true })).resolves.toBe(true);
+
+    expect(handOverDeviceMock.mock.calls).toEqual([['pairing:old-bare', 'pairing:new-bare']]);
+    expect(localStorage.getItem('lucidos-device-id')).toBe('new-bare');
+  });
+
+  it('keeps the old bare id when the relayed hand-over fails, so the next load retries it', async () => {
+    const { adoptRoutedDeviceId } = await import('./devices');
+    localStorage.setItem('lucidos-device-id', 'old-bare');
+    pairingSession.mockResolvedValue({ paired: true, device_id: 'new-bare', local: false });
+    getCallerDeviceMock.mockResolvedValue({ device_id: 'pairing:new-bare' });
+    handOverDeviceMock.mockRejectedValue(new Error('500'));
+
+    await expect(adoptRoutedDeviceId({ workspace: null, relayed: true })).resolves.toBe(false);
+
+    expect(localStorage.getItem('lucidos-device-id')).toBe('old-bare');
+    expect(localStorage.getItem('lucidos-relayed-device-id')).toBeNull();
+  });
+
+  it('hands bare ids over on a direct route', async () => {
+    const { adoptRoutedDeviceId } = await import('./devices');
+    localStorage.setItem('lucidos-device-id', 'old-bare');
+    pairingSession.mockResolvedValue({ paired: true, device_id: 'new-bare', local: false });
+    handOverDeviceMock.mockResolvedValue({ success: true, outcome: 'moved' });
+
+    await adoptRoutedDeviceId({ workspace: null, relayed: false });
+
+    expect(handOverDeviceMock.mock.calls).toEqual([['old-bare', 'new-bare']]);
+  });
+});
+
 describe('boot order', () => {
   it('awaits the gateway adoption in main.tsx, and registers nowhere near it', async () => {
     // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
@@ -634,13 +693,15 @@ describe('boot order', () => {
       new URL('../../main.tsx', import.meta.url),
       'utf8',
     );
-    expect(main).toContain('await adoptGatewayDeviceId(');
+    expect(main).toContain('await adoptRoutedDeviceId(');
     expect(main).not.toContain('registerCurrentDevice');
+    const devices = readFileSync(new URL('./devices.ts', import.meta.url), 'utf8');
+    const step = devices.slice(devices.indexOf('export async function adoptRoutedDeviceId'));
+    expect(step.indexOf('await adoptGatewayDeviceId(')).toBeGreaterThan(-1);
+    expect(step.indexOf('await adoptGatewayDeviceId(')).toBeLessThan(step.indexOf('\n}'));
   });
 });
 
-/** A turn's Origin names its device from the id alone, from the same two lists
- *  the Devices page reads. */
 describe('turnDeviceName', () => {
   beforeEach(() => vi.resetModules());
 
@@ -680,6 +741,16 @@ describe('turnDeviceName', () => {
     expect(mod.turnDeviceName('laptop-1')).toBe('Work laptop');
   });
 
+  it('names a turn recorded under a replaced id by the device it became', async () => {
+    const { mod } = await load();
+    mod.devices.value = {
+      status: 'loaded',
+      data: [{ ...makeDevice('laptop-2', false), name: 'Work laptop', replaced_ids: ['laptop-1'] }],
+    };
+    expect(mod.turnDeviceName('laptop-1')).toBe('Work laptop');
+    expect(mod.turnDeviceName('laptop-1', { knownOnly: true })).toBe('Work laptop');
+  });
+
   it('stays empty while either list loads, rather than flashing a lesser name', async () => {
     const { mod, paired } = await load();
     mod.devices.value = { status: 'loading' };
@@ -687,6 +758,16 @@ describe('turnDeviceName', () => {
     mod.devices.value = { status: 'loaded', data: [] };
     paired.pairedDevices.value = { status: 'loading' };
     expect(mod.turnDeviceName('phone-1')).toBe('');
+  });
+
+  it('keeps an unknown claimed device unnamed while resolving known claims', async () => {
+    const { mod } = await load();
+    mod.devices.value = { status: 'loaded', data: [] };
+    expect(mod.turnDeviceName('typed-id', { knownOnly: true })).toBe('');
+    mod.devices.value = {
+      status: 'loaded', data: [{ ...makeDevice('phone-1', true), name: 'My phone' }],
+    };
+    expect(mod.turnDeviceName('phone-1', { knownOnly: true })).toBe('My phone');
   });
 
   it('gives a device neither list holds its short-id name', async () => {

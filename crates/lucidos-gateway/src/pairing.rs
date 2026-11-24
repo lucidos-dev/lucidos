@@ -6,15 +6,16 @@
 //! - Every pending pairing holds a **long secret**: 130 random bits, pasted or
 //!   carried by a QR or link, never typed. It is accepted on every channel and
 //!   is never throttled.
-//! - A device pairing also holds an 8-digit **short code** for a person who has
+//! - A device pairing also holds an 8-digit **short code** for a user who has
 //!   to type. It is accepted only on a proved-local channel, with a per-source
 //!   budget behind it. A public caller is refused before any compare.
 //! - With nothing pending, a redemption is refused at once and counts nothing.
 //!
-//! Design and its rejected alternatives: ADR 0615.
+//! Design and its rejected alternatives: ADR 0615. A local process's pairing
+//! may also wait for a paired device's Allow ([`crate::pairing_requests`]).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -24,6 +25,7 @@ use lucidos_gateway_constants::{
     DEVICE_PAIRING_SECRET_PREFIX, GATEWAY_PAIRING_SECRET_PREFIX, PAIRING_CODE_DIGITS,
     PAIRING_SECRET_CHARS,
 };
+pub use lucidos_gateway_tls::Peer;
 
 /// How long a pending pairing stays redeemable. Long enough to walk to another
 /// device, short enough that a code read over a shoulder goes stale.
@@ -33,7 +35,7 @@ const PAIRING_TTL: Duration = Duration::from_secs(300);
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// Wrong short codes one local source may send in a window. Forgives the
-/// typos a real person makes, and leaves 8 digits hopeless to guess.
+/// typos a real user makes, and leaves 8 digits hopeless to guess.
 const SHORT_CODE_FAILURES_PER_SOURCE: u32 = 10;
 
 /// Wrong short codes from all local sources together in a window. Sized well
@@ -80,25 +82,6 @@ impl PairingKind {
     /// always pasted, so it never needs one.
     fn has_short_code(self) -> bool {
         matches!(self, PairingKind::Device)
-    }
-}
-
-/// The socket a request arrived on, stamped by the acceptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Peer {
-    pub remote: SocketAddr,
-    pub local: SocketAddr,
-    /// The listener a tunnel or reverse proxy points at. Every request on it
-    /// is public, whatever its headers say.
-    pub public_listener: bool,
-}
-
-impl Peer {
-    /// Did the connection start on this machine? A loopback peer, or one whose
-    /// address is the local address it reached.
-    pub fn is_same_machine(&self) -> bool {
-        let remote = self.remote.ip().to_canonical();
-        remote.is_loopback() || remote == self.local.ip().to_canonical()
     }
 }
 
@@ -206,19 +189,58 @@ pub fn valid_device_pairing_token(raw: &str) -> Option<&str> {
 }
 
 /// One minted pairing: the long secret, plus the short code a device pairing
-/// offers a person who has to type.
+/// offers a user who has to type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintedPairing {
     pub secret: String,
     pub code: Option<String>,
 }
 
-/// What a pairing was minted for: the name the device takes and, for a
-/// device pairing, the operator it joins. `None` operator joins the first.
+/// What a pairing was minted for, and by whom: the name the device takes and,
+/// for a device pairing, the user it joins. `None` user joins the first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PairingIntent {
     pub label: Option<String>,
-    pub operator_id: Option<String>,
+    pub user_id: Option<String>,
+    /// Gateway pairings only: start with the manage grant on (ADR 0656).
+    pub may_manage: bool,
+    pub minter: Minter,
+}
+
+/// Who minted a pairing. A local process's pairing needs a paired device's
+/// Allow before it redeems, once any device is paired (plan invariant 9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Minter {
+    PairedDevice,
+    /// Anything the gateway did not authenticate as a paired device. The
+    /// default, so a forgotten minter fails closed.
+    #[default]
+    LocalProcess,
+}
+
+/// What a redemption checks the minter against, read at redeem time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerGate<'a> {
+    /// No device is paired, so nobody could answer an Allow.
+    NoDevicePaired,
+    /// A device is paired. A local process's pairing waits for it, and the
+    /// request names the redeemer `asking_as`.
+    DevicePaired { asking_as: &'a str },
+}
+
+/// A paired device's answer to a waiting pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingAnswer {
+    Allow,
+    Decline,
+}
+
+/// A redemption waiting for a paired device's answer, as Settings lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRequest {
+    pub id: String,
+    pub label: String,
+    pub expires_in_secs: u64,
 }
 
 #[cfg(test)]
@@ -226,7 +248,7 @@ impl PairingIntent {
     pub fn labelled(label: &str) -> Self {
         Self {
             label: Some(label.to_string()),
-            operator_id: None,
+            ..Self::default()
         }
     }
 }
@@ -243,15 +265,37 @@ pub enum Redemption {
     /// This source sent too many wrong short codes lately, so this one was not
     /// compared. Only the local short-code path can answer this.
     Throttled,
+    /// Good, and waiting for a paired device's Allow. Present it again.
+    /// `started` is true on the redeem that began the wait, the one moment
+    /// the owner's devices are told.
+    AwaitingOwner { started: bool },
+    /// Good, and a paired device declined it. Said once, then it is gone.
+    Declined,
+}
+
+/// Where one outstanding pairing stands with the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Approval {
+    /// Nobody has redeemed it yet.
+    Unclaimed,
+    /// Redeemed while the owner must answer, and not answered yet.
+    Awaiting {
+        id: String,
+        label: String,
+    },
+    Allowed,
+    Declined,
 }
 
 /// One outstanding pairing.
 #[derive(Debug)]
 struct PendingPairing {
-    minted: Instant,
+    /// When its window opened: at the mint, and again when it starts waiting.
+    opened: Instant,
     secret: String,
     code: Option<String>,
     intent: PairingIntent,
+    approval: Approval,
 }
 
 /// Pairings minted and not yet redeemed.
@@ -286,28 +330,44 @@ impl PendingPairings {
                 None
             },
         };
+        lucidos_diagnostic_log::sanitize::register_secret_values(
+            std::iter::once(minted.secret.clone()).chain(minted.code.clone()),
+        );
         self.pending.push(PendingPairing {
-            minted: now,
+            opened: now,
             secret: minted.secret.clone(),
             code: minted.code.clone(),
             intent,
+            approval: Approval::Unclaimed,
         });
         Ok(minted)
     }
 
-    /// Redeem a secret or short code, consuming the whole pairing.
-    pub fn redeem(&mut self, presented: &str, channel: PairingChannel) -> Redemption {
-        self.redeem_at(presented, channel, Instant::now())
+    /// Redeem a secret or short code, consuming the whole pairing once it may
+    /// redeem. A local process's pairing waits for the owner behind `gate`.
+    pub fn redeem(
+        &mut self,
+        presented: &str,
+        channel: PairingChannel,
+        gate: OwnerGate<'_>,
+    ) -> Redemption {
+        self.redeem_at(presented, channel, gate, Instant::now())
     }
 
-    fn redeem_at(&mut self, presented: &str, channel: PairingChannel, now: Instant) -> Redemption {
+    fn redeem_at(
+        &mut self,
+        presented: &str,
+        channel: PairingChannel,
+        gate: OwnerGate<'_>,
+        now: Instant,
+    ) -> Redemption {
         self.drop_expired(now);
         if self.pending.is_empty() {
             return Redemption::Rejected;
         }
         if let Some(secret) = valid_pairing_secret(presented, self.kind) {
-            return match self.take(|p| ct_eq(&p.secret, secret)) {
-                Some(intent) => Redemption::Redeemed(intent),
+            return match self.find(|p| ct_eq(&p.secret, secret)) {
+                Some(index) => self.settle(index, gate, now),
                 None => Redemption::Rejected,
             };
         }
@@ -321,10 +381,10 @@ impl PendingPairings {
         if self.throttle.is_spent(source, now) {
             return Redemption::Throttled;
         }
-        match self.take(|p| p.code.as_deref().is_some_and(|c| ct_eq(c, code))) {
-            Some(intent) => {
+        match self.find(|p| p.code.as_deref().is_some_and(|c| ct_eq(c, code))) {
+            Some(index) => {
                 self.throttle.forgive(source);
-                Redemption::Redeemed(intent)
+                self.settle(index, gate, now)
             }
             None => {
                 self.throttle.record(source, now);
@@ -333,17 +393,86 @@ impl PendingPairings {
         }
     }
 
-    /// Remove the first pending pairing `matches` accepts, answering its intent.
-    /// Every entry is compared, so timing says nothing about which one matched.
-    fn take(&mut self, matches: impl Fn(&PendingPairing) -> bool) -> Option<PairingIntent> {
+    /// The index of the first pending pairing `matches` accepts. Every entry
+    /// is compared, so timing says nothing about which one matched.
+    fn find(&self, matches: impl Fn(&PendingPairing) -> bool) -> Option<usize> {
         let hits: Vec<bool> = self.pending.iter().map(matches).collect();
-        let index = hits.iter().position(|hit| *hit)?;
-        Some(self.pending.remove(index).intent)
+        hits.iter().position(|hit| *hit)
+    }
+
+    /// Redeem the matched pairing, or move it along its wait for the owner.
+    fn settle(&mut self, index: usize, gate: OwnerGate<'_>, now: Instant) -> Redemption {
+        let entry = &mut self.pending[index];
+        let asking_as = match gate {
+            OwnerGate::DevicePaired { asking_as }
+                if entry.intent.minter == Minter::LocalProcess =>
+            {
+                asking_as
+            }
+            _ => return Redemption::Redeemed(self.pending.remove(index).intent),
+        };
+        match entry.approval {
+            Approval::Allowed => Redemption::Redeemed(self.pending.remove(index).intent),
+            Approval::Declined => {
+                self.pending.remove(index);
+                Redemption::Declined
+            }
+            Approval::Awaiting { .. } => Redemption::AwaitingOwner { started: false },
+            Approval::Unclaimed => match mint_request_id() {
+                Ok(id) => {
+                    entry.opened = now;
+                    entry.approval = Approval::Awaiting {
+                        id,
+                        label: asking_as.to_string(),
+                    };
+                    Redemption::AwaitingOwner { started: true }
+                }
+                // No id to answer by, so nobody could ever allow it.
+                Err(_) => Redemption::Rejected,
+            },
+        }
+    }
+
+    /// The redemptions waiting for a paired device's answer.
+    pub fn requests(&self) -> Vec<PairingRequest> {
+        self.requests_at(Instant::now())
+    }
+
+    fn requests_at(&self, now: Instant) -> Vec<PairingRequest> {
+        self.pending
+            .iter()
+            .filter_map(|p| match &p.approval {
+                Approval::Awaiting { id, label } => {
+                    let left = PAIRING_TTL.checked_sub(now.duration_since(p.opened))?;
+                    (!left.is_zero()).then(|| PairingRequest {
+                        id: id.clone(),
+                        label: label.clone(),
+                        expires_in_secs: left.as_secs(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Answer the waiting request `id`. `false` when no request has that id.
+    pub fn answer(&mut self, id: &str, answer: PairingAnswer) -> bool {
+        self.drop_expired(Instant::now());
+        let Some(entry) = self.pending.iter_mut().find(
+            |p| matches!(&p.approval, Approval::Awaiting { id: waiting, .. } if waiting == id),
+        ) else {
+            return false;
+        };
+        entry.approval = match answer {
+            PairingAnswer::Allow => Approval::Allowed,
+            PairingAnswer::Decline => Approval::Declined,
+        };
+        true
     }
 
     fn drop_expired(&mut self, now: Instant) {
         self.pending
-            .retain(|p| now.duration_since(p.minted) < PAIRING_TTL);
+            .retain(|p| now.duration_since(p.opened) < PAIRING_TTL);
     }
 }
 
@@ -401,7 +530,7 @@ impl ShortCodeThrottle {
         self.global.record(now);
     }
 
-    /// A correct code clears its source's budget, so a typo costs that person
+    /// A correct code clears its source's budget, so a typo costs that user
     /// nothing on their next pairing.
     fn forgive(&mut self, source: IpAddr) {
         self.per_source.remove(&source);
@@ -474,6 +603,15 @@ fn mint_secret(kind: PairingKind) -> std::io::Result<String> {
         bits &= (1 << held) - 1;
     }
     Ok(out)
+}
+
+/// The id a paired device answers a waiting request by. It grants nothing:
+/// only a paired device may answer, and the secret still has to be presented.
+fn mint_request_id() -> std::io::Result<String> {
+    Ok(random_bytes::<8>()?
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// A zero-padded decimal short code.

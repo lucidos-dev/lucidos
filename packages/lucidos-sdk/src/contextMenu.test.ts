@@ -12,7 +12,6 @@ function el(html: string, pick = '[data-pick]'): Element {
 const facts = (target: EventTarget | null, over: Partial<{ altKey: boolean; defaultPrevented: boolean }> = {}) =>
   ({ target, altKey: false, defaultPrevented: false, ...over });
 
-/** The decision with text drawn under the pointer, unless told otherwise. */
 const shouldSuppressContextMenu = (f: ReturnType<typeof facts>, selectionAtPress: boolean, text = true) =>
   decide(f, selectionAtPress, () => text);
 
@@ -102,7 +101,6 @@ describe('selectionCovers', () => {
 });
 
 describe('textAt', () => {
-  /** A document whose every text node is drawn in one rect at (10..60, 20..36). */
   const doc = {
     createRange: () => ({
       selectNodeContents: () => {},

@@ -14,7 +14,9 @@
 //! the handshake state machine, and the approval round-trips.
 
 use super::agent_runtime::AgentEvent;
+use super::codex::UNREQUESTED_INTERRUPT_ERROR;
 use super::codex_parse::CodexInput;
+use crate::engine::thread_events::{ProviderError, TurnEndFacts, TurnEndStatus};
 use std::collections::HashMap;
 
 /// One decoded line of `codex app-server` stdout.
@@ -195,11 +197,14 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
 pub(super) struct AppServerTracker {
     /// Codex thread id — the engine's resume handle.
     pub session_id: Option<String>,
+    resume_session_id: Option<String>,
+    submitted_turn: bool,
+    restored_turn_id: Option<String>,
     init_emitted: bool,
     /// Turn id of the in-flight turn — the `turn/interrupt` target.
     pub current_turn_id: Option<String>,
-    /// Assistant text accumulated this turn — becomes `Result.text`.
-    agent_texts: Vec<String>,
+    /// Completed messages; marked final answers take precedence in `Result.text`.
+    agent_texts: Vec<CompletedAgentMessage>,
     /// Per-item text already emitted via `item/agentMessage/delta`, so the
     /// final `item/completed` only emits the (normally empty) remainder
     /// instead of duplicating the whole message.
@@ -207,6 +212,8 @@ pub(super) struct AppServerTracker {
     /// Last error notification — promoted to a failed `Result` only when the
     /// process dies without a turn terminal.
     pub last_error: Option<String>,
+    /// The provider's code for [`Self::last_error`], when it sent one.
+    pub last_provider_error: Option<ProviderError>,
     /// True once the current turn saw its `turn/completed`.
     pub turn_terminal_seen: bool,
     /// Tool-use ids emitted without a matching result yet.
@@ -229,6 +236,18 @@ pub(super) struct AppServerTracker {
     plan_seq: u64,
     /// The effort the driver sent with this turn, stamped on its `Usage`.
     turn_effort: Option<String>,
+    /// Follow-up inputs Codex accepted into this turn as steers.
+    steered_inputs: u32,
+    /// The type of the last item this turn completed.
+    last_item: Option<String>,
+    /// True once the driver sent `turn/interrupt` for this turn.
+    interrupt_requested: bool,
+}
+
+#[derive(Debug)]
+struct CompletedAgentMessage {
+    text: String,
+    phase: Option<String>,
 }
 
 #[derive(Debug)]
@@ -248,6 +267,7 @@ struct DeferredToolUse {
 impl AppServerTracker {
     pub fn new(session_id: Option<String>) -> Self {
         Self {
+            resume_session_id: session_id.clone(),
             session_id,
             ..Self::default()
         }
@@ -256,19 +276,74 @@ impl AppServerTracker {
     /// Reset per-turn accumulation for a turn sent with `effort`.
     /// Session-level state survives.
     pub fn begin_turn(&mut self, effort: Option<String>) {
+        self.submitted_turn = true;
         self.turn_effort = effort;
         self.agent_texts.clear();
         self.streamed.clear();
         self.last_error = None;
+        self.last_provider_error = None;
         self.turn_terminal_seen = false;
         self.current_turn_id = None;
         self.open_tool_ids.clear();
         self.approval_gates.clear();
         self.file_change_items.clear();
+        self.steered_inputs = 0;
+        self.last_item = None;
+        self.interrupt_requested = false;
+    }
+
+    /// Codex accepted a follow-up input into the live turn.
+    pub fn note_steer_accepted(&mut self) {
+        self.steered_inputs += 1;
+    }
+
+    /// The driver sent `turn/interrupt` for the live turn.
+    pub fn note_interrupt_requested(&mut self) {
+        self.interrupt_requested = true;
+    }
+
+    /// How the current turn ended, for the `Result` that closes it.
+    pub fn turn_end_facts(&self, status: TurnEndStatus) -> TurnEndFacts {
+        TurnEndFacts {
+            status,
+            final_answer: self
+                .agent_texts
+                .iter()
+                .any(|message| message.phase.as_deref() == Some("final_answer")),
+            agent_messages: u32::try_from(self.agent_texts.len()).unwrap_or(u32::MAX),
+            steered_inputs: self.steered_inputs,
+            last_item: self.last_item.clone(),
+        }
     }
 
     pub fn turn_text(&self) -> String {
-        self.agent_texts.join("\n\n")
+        let has_final = self
+            .agent_texts
+            .iter()
+            .any(|message| message.phase.as_deref() == Some("final_answer"));
+        self.agent_texts
+            .iter()
+            .filter(|message| !has_final || message.phase.as_deref() == Some("final_answer"))
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Retain the restored turn identity even if its notification arrives late.
+    pub fn note_resume_response(&mut self, result: &serde_json::Value) {
+        if self.restored_turn_id.is_none()
+            && self.resume_session_id.as_deref()
+                == result.pointer("/thread/id").and_then(|v| v.as_str())
+        {
+            self.restored_turn_id = result
+                .pointer("/thread/turns")
+                .and_then(|v| v.as_array())
+                .and_then(|turns| turns.last())
+                .and_then(|turn| turn.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+                .map(String::from);
+        }
     }
 
     /// Record the thread id and emit `Init` exactly once. Fed from the
@@ -279,6 +354,10 @@ impl AppServerTracker {
         thread_id: String,
         model: Option<String>,
     ) -> Vec<AgentEvent> {
+        if self.resume_session_id.as_deref() != Some(thread_id.as_str()) {
+            self.resume_session_id = None;
+            self.restored_turn_id = None;
+        }
         self.session_id = Some(thread_id.clone());
         if self.init_emitted {
             return Vec::new();
@@ -290,6 +369,7 @@ impl AppServerTracker {
             slash_commands: Vec::new(),
             skills: Vec::new(),
             agent_version: None,
+            can_steer: false,
         }]
     }
 
@@ -412,14 +492,68 @@ impl AppServerTracker {
         !self.open_tool_ids.iter().any(|open| open == id)
     }
 
+    /// The thread a notification speaks for. `thread/started` names it in
+    /// `thread.id`, every other notification in `threadId`.
+    fn notified_thread(method: &str, params: &serde_json::Value) -> String {
+        match method {
+            "thread/started" => params
+                .get("thread")
+                .map(|t| str_field(t, "id"))
+                .unwrap_or_default(),
+            _ => str_field(params, "threadId"),
+        }
+    }
+
+    /// Whether a notification belongs to this session's own thread.
+    ///
+    /// Codex runs each sub-agent as a separate thread on the same connection,
+    /// so a sub-agent's turn end, items and deltas arrive beside the session's.
+    /// A notification without a thread id is the session's own. Until the
+    /// session id is known, only a `thread/started` carrying `parentThreadId`
+    /// (a sub-agent) is foreign.
+    pub fn owns(&self, method: &str, params: &serde_json::Value) -> bool {
+        if method == "thread/started"
+            && params
+                .get("thread")
+                .is_some_and(|t| !str_field(t, "parentThreadId").is_empty())
+        {
+            return false;
+        }
+        let thread_id = Self::notified_thread(method, params);
+        match &self.session_id {
+            Some(session_id) if !thread_id.is_empty() => *session_id == thread_id,
+            _ => true,
+        }
+    }
+
     /// Fold one notification into zero or more canonical events.
     /// `turn_duration_ms` is driver-measured elapsed time for the turn.
+    ///
+    /// A sub-agent's notification maps to nothing, except its token usage: that
+    /// is a real model call, so it is recorded under the sub-agent's thread id
+    /// and never read as the session's own context. Its file changes are still
+    /// remembered, since its approvals reach the same permission card.
     pub fn map_notification(
         &mut self,
         method: &str,
         params: &serde_json::Value,
         turn_duration_ms: u64,
     ) -> Vec<AgentEvent> {
+        if !self.owns(method, params) {
+            match method {
+                "thread/tokenUsage/updated" => {
+                    return self.map_token_usage(params, Some(str_field(params, "threadId")));
+                }
+                "item/started" | "item/completed" => {
+                    let item = params.get("item");
+                    if let Some(item) = item.filter(|i| str_field(i, "type") == "fileChange") {
+                        self.note_file_change(item, method == "item/completed");
+                    }
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
         match method {
             "thread/started" => {
                 let thread_id = params
@@ -446,54 +580,40 @@ impl AppServerTracker {
                 let turn = params.get("turn").cloned().unwrap_or_default();
                 let status = str_field(&turn, "status");
                 let mut events = self.close_open_tools();
-                let error = match status.as_str() {
-                    "failed" => Some(
+                let turn_end = self.turn_end_facts(match status.as_str() {
+                    "failed" => TurnEndStatus::Failed,
+                    "interrupted" => TurnEndStatus::Interrupted,
+                    _ => TurnEndStatus::Completed,
+                });
+                let (error, provider_error) = match status.as_str() {
+                    "failed" => (
+                        Some(
+                            turn.get("error")
+                                .map(|e| str_field(e, "message"))
+                                .filter(|m| !m.is_empty())
+                                .unwrap_or_else(|| "turn failed".to_string()),
+                        ),
                         turn.get("error")
-                            .map(|e| str_field(e, "message"))
-                            .filter(|m| !m.is_empty())
-                            .unwrap_or_else(|| "turn failed".to_string()),
+                            .and_then(ProviderError::from_codex_error)
+                            .or_else(|| self.last_provider_error.take()),
                     ),
-                    // `interrupted` is an error-free terminal: the engine's
+                    // A requested interrupt is error-free: the engine's
                     // user_hit_stop latch classifies it as Canceled.
-                    _ => None,
+                    "interrupted" if !self.interrupt_requested => {
+                        (Some(UNREQUESTED_INTERRUPT_ERROR.to_string()), None)
+                    }
+                    _ => (None, None),
                 };
                 events.push(AgentEvent::Result {
                     text: self.turn_text(),
                     duration_ms: turn_duration_ms,
                     error,
+                    provider_error,
+                    turn_end: Some(turn_end),
                 });
                 events
             }
-            "thread/tokenUsage/updated" => {
-                let last = params
-                    .get("tokenUsage")
-                    .and_then(|u| u.get("last"))
-                    .cloned()
-                    .unwrap_or_default();
-                let u64_field = |key: &str| last.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-                let clamp = |v: u64| crate::llm::clamp_provider_token_count(v, "Codex");
-                let input = CodexInput::of_total(
-                    clamp(u64_field("inputTokens")),
-                    clamp(u64_field("cachedInputTokens")),
-                    clamp(u64_field("cacheWriteInputTokens")),
-                );
-                let output = clamp(u64_field("outputTokens"));
-                if input.total() == 0 && output == 0 {
-                    return Vec::new();
-                }
-                vec![AgentEvent::Usage {
-                    model: None,
-                    input_tokens: input.uncached,
-                    output_tokens: output,
-                    cache_read_tokens: input.read,
-                    cache_creation_tokens: input.written,
-                    cache_creation_1h_tokens: None,
-                    parent_tool_use_id: None,
-                    api_call_id: None,
-                    duration_ms: None,
-                    reasoning_effort: self.turn_effort.clone(),
-                }]
-            }
+            "thread/tokenUsage/updated" => self.map_token_usage(params, None),
             "error" => {
                 let message = params
                     .get("error")
@@ -501,6 +621,9 @@ impl AppServerTracker {
                     .unwrap_or_default();
                 if !message.is_empty() {
                     self.last_error = Some(message);
+                    self.last_provider_error = params
+                        .get("error")
+                        .and_then(ProviderError::from_codex_error);
                 }
                 Vec::new()
             }
@@ -538,6 +661,9 @@ impl AppServerTracker {
                 let Some(item) = params.get("item") else {
                     return Vec::new();
                 };
+                if completed {
+                    self.last_item = Some(str_field(item, "type")).filter(|t| !t.is_empty());
+                }
                 self.map_item(item, completed)
             }
             // The plan tool (codex's TodoWrite analog). Normalized to the
@@ -594,6 +720,124 @@ impl AppServerTracker {
         }
     }
 
+    /// Remember a `fileChange` item's stripped `{path, kind}` list while it
+    /// runs, for [`Self::attach_known_file_changes`], and return it.
+    fn note_file_change(
+        &mut self,
+        item: &serde_json::Value,
+        completed: bool,
+    ) -> Vec<serde_json::Value> {
+        let id = str_field(item, "id");
+        // Keep path + kind, drop the inline diffs — a multi-file
+        // patch would balloon the persisted event.
+        let changes: Vec<serde_json::Value> = item
+            .get("changes")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|ch| {
+                        serde_json::json!({
+                            "path": str_field(ch, "path"),
+                            "kind": ch.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if completed {
+            // The approval for this item, if there was one, resolved
+            // before completion, so nothing needs the paths any more.
+            self.file_change_items.remove(&id);
+        } else {
+            // Remembered for the approval request codex raises next
+            // when this patch escapes the sandbox, which carries no
+            // paths of its own.
+            self.file_change_items.insert(id, changes.clone());
+        }
+        changes
+    }
+
+    /// `parent_tool_use_id` is the sub-agent's thread id for a sub-agent's
+    /// call, `None` for the session's own. A sub-agent's effort is unknown.
+    fn map_token_usage(
+        &mut self,
+        params: &serde_json::Value,
+        parent_tool_use_id: Option<String>,
+    ) -> Vec<AgentEvent> {
+        let last = params
+            .get("tokenUsage")
+            .and_then(|u| u.get("last"))
+            .cloned()
+            .unwrap_or_default();
+        let u64_field = |key: &str| last.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        let clamp = |v: u64| crate::llm::clamp_provider_token_count(v, "Codex");
+        let input = CodexInput::of_total(
+            clamp(u64_field("inputTokens")),
+            clamp(u64_field("cachedInputTokens")),
+            clamp(u64_field("cacheWriteInputTokens")),
+        );
+        let output = clamp(u64_field("outputTokens"));
+        if input.total() == 0 && output == 0 {
+            return Vec::new();
+        }
+        let thread_id = str_field(params, "threadId");
+        let turn_id = params
+            .get("turnId")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(String::from);
+        if parent_tool_use_id.is_none()
+            && !thread_id.is_empty()
+            && self.resume_session_id.as_deref() == Some(thread_id.as_str())
+            && (!self.submitted_turn
+                || (turn_id.is_some()
+                    && turn_id == self.restored_turn_id
+                    && turn_id != self.current_turn_id))
+        {
+            if !self.submitted_turn {
+                self.restored_turn_id = turn_id.clone();
+            }
+            return vec![AgentEvent::UsageRestored {
+                snapshot: super::agent_runtime::CodexUsageSnapshot {
+                    session_id: thread_id,
+                    turn_id,
+                    input_tokens: input.uncached,
+                    output_tokens: output,
+                    cache_read_tokens: input.read,
+                    cache_creation_tokens: input.written,
+                },
+            }];
+        }
+        let reasoning_effort = match parent_tool_use_id {
+            None => self.turn_effort.clone(),
+            Some(_) => None,
+        };
+        if parent_tool_use_id.is_none() && (turn_id.is_none() || turn_id != self.current_turn_id) {
+            return vec![AgentEvent::UsageUnscoped {
+                snapshot: super::agent_runtime::CodexUsageSnapshot {
+                    session_id: thread_id,
+                    turn_id,
+                    input_tokens: input.uncached,
+                    output_tokens: output,
+                    cache_read_tokens: input.read,
+                    cache_creation_tokens: input.written,
+                },
+            }];
+        }
+        vec![AgentEvent::Usage {
+            model: None,
+            input_tokens: input.uncached,
+            output_tokens: output,
+            cache_read_tokens: input.read,
+            cache_creation_tokens: input.written,
+            cache_creation_1h_tokens: None,
+            parent_tool_use_id,
+            api_call_id: None,
+            duration_ms: None,
+            reasoning_effort,
+        }]
+    }
+
     fn map_item(&mut self, item: &serde_json::Value, completed: bool) -> Vec<AgentEvent> {
         let id = str_field(item, "id");
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -606,7 +850,13 @@ impl AppServerTracker {
                 if text.is_empty() {
                     return Vec::new();
                 }
-                self.agent_texts.push(text.clone());
+                self.agent_texts.push(CompletedAgentMessage {
+                    text: text.clone(),
+                    phase: item
+                        .get("phase")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                });
                 // Deltas already streamed most (usually all) of this item —
                 // emit only the remainder so the engine's text buffer doesn't
                 // duplicate the message.
@@ -661,26 +911,8 @@ impl AppServerTracker {
                 }
             }
             "fileChange" => {
-                // Keep path + kind, drop the inline diffs — a multi-file
-                // patch would balloon the persisted event.
-                let changes: Vec<serde_json::Value> = item
-                    .get("changes")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|ch| {
-                                serde_json::json!({
-                                    "path": str_field(ch, "path"),
-                                    "kind": ch.get("kind").cloned().unwrap_or(serde_json::Value::Null),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let changes = self.note_file_change(item, completed);
                 if completed {
-                    // The approval for this item, if there was one, resolved
-                    // before completion, so nothing needs the paths any more.
-                    self.file_change_items.remove(&id);
                     if self.should_drop_declined_result(&id) {
                         return Vec::new();
                     }
@@ -693,10 +925,6 @@ impl AppServerTracker {
                         parent_tool_use_id: None,
                     }]
                 } else {
-                    // Remembered for the approval request codex raises next
-                    // when this patch escapes the sandbox, which carries no
-                    // paths of its own (`attach_known_file_changes`).
-                    self.file_change_items.insert(id.clone(), changes.clone());
                     self.maybe_emit_tool_use(DeferredToolUse {
                         name: "file_change".to_string(),
                         input: serde_json::json!({ "changes": changes }),

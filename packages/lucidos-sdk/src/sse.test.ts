@@ -1,11 +1,3 @@
-/**
- * How one frame reaches the listeners an app registered with `lucidos.sse.on`,
- * and how a stream (re)open reaches `lucidos.sse.onOpen`.
- *
- * Each transport is stubbed at its edge: a fake `EventSource` for the direct
- * one, a fake `SharedWorker` port for the shared one, and a fake host behind
- * `_bridge` for the relayed one. The real transport code runs in between.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const host = vi.hoisted(() => ({
@@ -64,8 +56,6 @@ describe('lucidos.sse dispatch', () => {
     vi.unstubAllGlobals();
   });
 
-  // A listener that throws must not stop later listeners, and its error must
-  // still reach the console.
   it('a listener that throws costs no other listener its frame', () => {
     const after = vi.fn();
     const wildcard = vi.fn();
@@ -78,7 +68,6 @@ describe('lucidos.sse dispatch', () => {
     deliver(JSON.stringify({ type: 'PreferencesChanged', data: { key: 'theme' } }));
     expect(after).toHaveBeenCalledWith({ key: 'theme' }, expect.anything());
     expect(wildcard).toHaveBeenCalledOnce();
-    // Rethrown on its own task, so the console still reports it.
     expect(vi.getTimerCount()).toBe(watchdogOnly + 1);
     for (const off of offs) off();
   });
@@ -94,11 +83,6 @@ describe('lucidos.sse dispatch', () => {
   });
 });
 
-/**
- * One transport per case set. Each exposes the three things its upstream can
- * do to the SDK: open, drop, and deliver a frame. A reopen is an open after a
- * drop.
- */
 const hello = JSON.stringify({ type: 'StreamHello', data: {
   restore_generation: '11111111-1111-4111-8111-111111111111',
 } });
@@ -118,8 +102,6 @@ const direct: Transport = {
     vi.stubGlobal('EventSource', FakeEventSource);
     vi.stubGlobal('SharedWorker', undefined);
   },
-  // After a drop the SDK rebuilds the EventSource once the retry delay has
-  // passed, and the open comes from that new one.
   open: () => {
     vi.advanceTimersByTime(EVENT_STREAM_RETRY_MS);
     FakeEventSource.last!.onopen!();
@@ -143,7 +125,6 @@ const shared: Transport = {
     vi.stubGlobal('EventSource', FakeEventSource);
     vi.stubGlobal('SharedWorker', class { port = port; });
   },
-  // The worker also sends this to a port that joins a stream already up.
   open: () => {
     port.onmessage!({ data: { t: 'open' } });
     port.onmessage!({ data: { t: 'frame', data: hello } });
@@ -207,8 +188,6 @@ describe.each([direct, shared, bridged])('lucidos.sse.onOpen over the $name', (t
   });
 
   it('runs once, at once, when it registers after the stream opened', async () => {
-    // The SDK's own theme listener can open the stream before app code runs.
-    // An app that missed the first open must still get its first render.
     const early = sse.onOpen(() => {});
     transport.open();
     const late = vi.fn();
@@ -220,8 +199,6 @@ describe.each([direct, shared, bridged])('lucidos.sse.onOpen over the $name', (t
   });
 
   it('does not run at once when it registers while the stream is down', async () => {
-    // Running then would read data over a dead stream, and run twice on the
-    // real open that follows.
     const early = sse.onOpen(() => {});
     transport.open();
     transport.drop();
@@ -246,9 +223,6 @@ describe.each([direct, shared, bridged])('lucidos.sse.onOpen over the $name', (t
 });
 
 describe('lucidos.sse over a direct EventSource that gave up', () => {
-  // A direct EventSource stops retrying for good on a response that is not a
-  // stream, such as a 503 page while the engine restarts. The SDK rebuilds it,
-  // or `onOpen` would never run again in that tab.
   beforeEach(() => {
     direct.install();
     vi.useFakeTimers();
@@ -310,7 +284,6 @@ describe('lucidos.sse.onOpen isolation', () => {
     const watchdogOnly = vi.getTimerCount();
     direct.open();
     expect(after).toHaveBeenCalledOnce();
-    // Rethrown on its own task, so the console still reports it.
     expect(vi.getTimerCount()).toBe(watchdogOnly + 1);
     for (const off of offs) off();
   });
@@ -321,7 +294,7 @@ describe('lucidos.sse.onOpen isolation', () => {
     const late = vi.fn();
     const off = sse.onOpen(late);
     direct.drop();
-    direct.open(); // lands before the microtask the late registration queued
+    direct.open();
     await Promise.resolve();
     expect(late).toHaveBeenCalledOnce();
     early();
@@ -339,8 +312,6 @@ describe('lucidos.sse.onOpen isolation', () => {
   });
 });
 
-/** Invariant: a frame receives only the event types it listens to. The SDK
- *  names them on open and after each change, so the host can filter. */
 describe('lucidos.sse tells a relaying host what it listens to', () => {
   beforeEach(() => {
     host.bridged = true;
@@ -350,6 +321,28 @@ describe('lucidos.sse tells a relaying host what it listens to', () => {
   afterEach(() => {
     sse.disconnect();
     host.bridged = false;
+  });
+
+  it('delivers a renamed role event to apps listening under its old name', () => {
+    const old = vi.fn();
+    const current = vi.fn();
+    const all = vi.fn();
+    const offs = [
+      sse.on('WorkItemWatched', old),
+      sse.on('RootThreadWatched', current),
+      sse.on('*', all),
+    ];
+    sse.connect();
+    expect(host.calls).toEqual([{
+      op: 'sse.open',
+      args: { types: ['*', 'RootThreadWatched', 'WorkItemWatched'] },
+    }]);
+    const event = { type: 'ThreadEvent', data: { event: { type: 'RootThreadWatched' } } };
+    host.push!({ kind: 'frame', data: JSON.stringify(event) });
+    expect(old).toHaveBeenCalledWith(event.data, event);
+    expect(current).toHaveBeenCalledWith(event.data, event);
+    expect(all).toHaveBeenCalledOnce();
+    for (const off of offs) off();
   });
 
   it('names its types on open, then once per change', async () => {

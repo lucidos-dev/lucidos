@@ -1,5 +1,3 @@
-// Hydration helper for the pinnedApps offline cache: empty/valid JSON → loaded;
-// invalid JSON → failed (must not silently collapse to []).
 import { describe, it, expect, beforeEach } from 'vitest';
 import { hydratePinnedAppsFromStorage } from './pinnedApps';
 import type { PinnedAppEntry } from '../types';
@@ -29,9 +27,6 @@ describe('hydratePinnedAppsFromStorage', () => {
   });
 
   it('returns failed when key holds invalid JSON', () => {
-    // Today (pre-fix) the inline IIFE swallowed the parse error and returned [].
-    // Loadable contract: surface the error so the user sees a real failure
-    // instead of an empty list that masks corruption.
     localStorage.setItem('pinned_apps', '{{not json');
     const out = hydratePinnedAppsFromStorage();
     expect(out.status).toBe('failed');

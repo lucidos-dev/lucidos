@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/** Settings → System → Backup → Backup key: the panel re-reads the key state
- *  after a write the engine does not announce.
- *
- *  A setup only stores a pending key, and a verify only stamps a time, so no
- *  `BackupRecipientSet` arrives. A user who copies a new key and cancels must
- *  see the pending key waiting, not the stale legacy warning. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useState } from 'preact/hooks';
@@ -14,13 +8,11 @@ import * as apiClient from '../../../api/client';
 import type { BackupKeys } from '../../../api/client';
 
 const NONE: BackupKeys = { recipient: null, pending: false, legacy_key: false, secs_since_verified: null };
-/** Synthetic keys: shaped like age keys, made up for this test. */
 const PUBLIC_KEY = 'age1examplepublickeyforthistestonlyqqqqqqqqqqqqqqqqqqqqqqqqqq';
 const SECRET_KEY = 'AGE-SECRET-KEY-1EXAMPLESECRETKEYFORTHISTESTONLYQQQQQQQQQQQQQQQQQQQQQQQQQQ';
 
 let host: HTMLDivElement;
 
-/** Owns the keys the way BackupSection does, so `onKeysChanged` re-renders. */
 function Harness({ initial }: { initial: BackupKeys }) {
   const [keys, setKeys] = useState(initial);
   return <BackupKeyPanel keys={keys} onKeysChanged={setKeys} />;
@@ -38,7 +30,6 @@ function button(label: string): HTMLButtonElement {
   return found!;
 }
 
-/** Clicks, then lets the panel's async action and its re-render finish. */
 async function press(label: string): Promise<void> {
   await act(async () => {
     button(label).click();

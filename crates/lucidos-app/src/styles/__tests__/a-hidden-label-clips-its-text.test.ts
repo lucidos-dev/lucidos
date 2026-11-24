@@ -1,31 +1,4 @@
-/**
- * A visually hidden label may not scroll the surface it sits in.
- * Plan: docs/plans/2026-09-17-a-hidden-label-stops-inflating-the-transcript.md
- *
- * A source scan, because what it pins is a pair of declarations. What they
- * prevent is measured in the browser by
- * e2e/a-hidden-label-adds-no-scroll.spec.ts, on the mobile projects.
- */
 
-/* `.visually-hidden` hides a label from sight and keeps it in layout, because
- * iOS WebKit drops the `change` event on a file input that is `display: none`.
- * Keeping it in layout is the whole point, and it is also the trap.
- *
- * A zero-width box still LAYS ITS TEXT OUT. With no room the line breaks after
- * every character, so a ten-character label becomes ten line boxes hanging
- * below a box that measures nothing. That column is scrollable overflow.
- * `overflow: visible` carries it up to the nearest scroll container, and no
- * element's rect shows it, which is why three rounds of measuring boxes found
- * nothing.
- *
- * A spoken reply draws one: `SpokenReply` puts "Said aloud" beside the phone
- * glyph. Ten characters at the transcript's line height is 135px, and the LAST
- * spoken row sets the bottom of the scrollable region. So the transcript
- * scrolled 135px past where the conversation ended, and the caller saw a hole
- * between their newest voice message and the composer. Measured on the
- * reporter's own thread at 393x852: a 159.7px gap where the transcript
- * reserves 24.75px.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -72,9 +45,6 @@ describe('a visually hidden label clips its own text', () => {
 
   it('stays IN layout, which is why it cannot simply be display:none', () => {
     const rule = rulesFor('visually-hidden').find(r => r.props.has('position'));
-    // iOS WebKit drops a file input's `change` event when the input is
-    // `display: none` or `visibility: hidden`. HiddenFileInput and the
-    // composer's live region both depend on this box still existing.
     expect(rule!.props.get('display')).toBeUndefined();
     expect(rule!.props.get('visibility')).toBeUndefined();
     expect(rule!.props.get('position')).toBe('absolute');

@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A UI scale change moves the rem threshold without moving the row's px width,
- *  so no ResizeObserver fires. The hook re-measures on the font metrics instead.
- *  jsdom lays nothing out, so stubs give the row a width and the root a rem. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -14,7 +11,6 @@ vi.mock('../utils/dom', async (importOriginal) => ({
   getRemPx: () => remPx,
 }));
 
-// Desktop faces at a 16px rem, compact faces at a 20px rem.
 const ROW_WIDTH = COMPOSER_COMPACT_MAX_REM * 18;
 
 let host: HTMLDivElement;

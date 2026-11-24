@@ -16,10 +16,6 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ── Fake DOM ────────────────────────────────────────────────────────────────
-// The controller manipulates the inline splash node (a sibling of #app, owned by
-// no Preact tree). The test-setup stub document returns null for querySelector,
-// so we install a richer fake just for these tests.
 
 function installFakeSplash(present: boolean, initialClasses: string[] = []) {
   const statusClasses = new Set<string>();
@@ -27,10 +23,6 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
     textContent: '',
     classList: { toggle: (c: string, on: boolean) => { on ? statusClasses.add(c) : statusClasses.delete(c); } },
   };
-  // Handlers take the event, because the controller reads `event.target`: the
-  // exit choreography animates the mark and the status inside the splash's own
-  // fade, and `animationend` bubbles, so a child's event must not be mistaken
-  // for the veil finishing.
   const listeners: Record<string, Array<(e: { target: unknown }) => void>> = {};
   let removed = false;
   const classes = new Set<string>(initialClasses);
@@ -43,17 +35,12 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
     remove: () => { removed = true; },
     fire: (type: string, target: unknown) => { for (const fn of [...(listeners[type] ?? [])]) fn({ target }); },
   };
-  // Stands in for the mark / status inside the splash, whose shorter exit
-  // animations end first and bubble their `animationend` through it.
   const childEl = {};
   const prev = (globalThis as any).document.querySelector;
   (globalThis as any).document.querySelector = (sel: string) => {
     if (!present) return null;
     if (sel === '.boot-splash') return splashEl;
     if (sel.includes('.boot-splash-status')) return statusEl;
-    // Compound state selectors (`.boot-splash.boot-splash-formed`) resolve only
-    // when the document actually carries that class, which is how the
-    // controller reads the handover script's decision.
     const state = /^\.boot-splash\.(boot-splash-[a-z-]+)$/.exec(sel);
     if (state) return classes.has(state[1]) ? splashEl : null;
     return null;
@@ -71,12 +58,61 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
   };
 }
 
-// Fresh module per test so the internal `dismissed` latch doesn't leak across
-// cases.
 async function freshController() {
   vi.resetModules();
   return import('./bootSplash');
 }
+
+function installActionSplash() {
+  type FakeButton = {
+    type: string; className: string; textContent: string; removed: boolean;
+    onClick?: () => void; addEventListener: (type: string, fn: () => void) => void; remove: () => void;
+  };
+  const buttons: FakeButton[] = [];
+  const attributes: Record<string, string> = { 'aria-hidden': 'true' };
+  const shown = () => buttons.find((b) => !b.removed) ?? null;
+  const status = { after: (b: FakeButton) => { buttons.push(b); } };
+  const splash = {
+    querySelector: (sel: string) => (sel === '.boot-splash-status' ? status : sel === '.boot-splash-action' ? shown() : null),
+    setAttribute: (name: string, value: string) => { attributes[name] = value; },
+  };
+  const doc = (globalThis as any).document;
+  const prev = { querySelector: doc.querySelector, createElement: doc.createElement };
+  doc.querySelector = (sel: string) => (sel === '.boot-splash' ? splash : null);
+  doc.createElement = () => {
+    const button: FakeButton = {
+      type: '', className: '', textContent: '', removed: false,
+      addEventListener: (_type, fn) => { button.onClick = fn; },
+      remove: () => { button.removed = true; },
+    };
+    return button;
+  };
+  onTestFinished(() => Object.assign(doc, prev));
+  return { buttons, shown, attributes };
+}
+
+describe('setBootAction', () => {
+  it('adds one button under the status, keeps it across re-sends, and removes it', async () => {
+    const fake = installActionSplash();
+    const c = await freshController();
+    const onPress = vi.fn();
+
+    c.setBootAction({ label: 'Trust certificate', onPress });
+    c.setBootAction({ label: 'Trust certificate', onPress });
+    expect(fake.buttons).toHaveLength(1);
+    expect(fake.shown()).toMatchObject({ type: 'button', className: 'boot-splash-action', textContent: 'Trust certificate' });
+    expect(fake.attributes['aria-hidden']).toBe('false');
+    fake.shown()?.onClick?.();
+    expect(onPress).toHaveBeenCalledOnce();
+
+    c.setBootAction({ label: 'Try again', onPress });
+    expect(fake.shown()?.textContent).toBe('Try again');
+    expect(fake.buttons).toHaveLength(2);
+
+    c.setBootAction(null);
+    expect(fake.shown()).toBeNull();
+  });
+});
 
 describe('bootSplash controller', () => {
   let fake: ReturnType<typeof installFakeSplash>;
@@ -104,10 +140,6 @@ describe('bootSplash controller', () => {
   });
 
   it('a multi-line label switches the status into the wrapping report state', async () => {
-    // The packaged desktop sends a crash-loop report (desktop.rs
-    // `crash_loop_label`) as several lines. The one-line rules in index.html
-    // would clip it to its first ellipsized line, taking the reason and the log
-    // path with it.
     fake = installFakeSplash(true);
     const c = await freshController();
     c.setBootStatus(
@@ -118,8 +150,6 @@ describe('bootSplash controller', () => {
     expect(fake.statusIsReport()).toBe(true);
     expect(fake.statusShown()).toBe(true);
 
-    // And back: a service that came up leaves an ordinary one-line status. A
-    // different label crossfades, so the state flips once the old one is out.
     vi.useFakeTimers();
     try {
       c.setBootStatus('Waiting for the background service… (42s)');
@@ -130,8 +160,6 @@ describe('bootSplash controller', () => {
     }
   });
 
-  // A new label is a new width. Swapped instantly, the centred line lurches
-  // sideways, so the words change only while invisible.
   it('crossfades a new label: out, swap while invisible, back in', async () => {
     vi.useFakeTimers();
     try {
@@ -186,7 +214,6 @@ describe('bootSplash controller', () => {
     expect(c.statusChangeFades('Waiting… (59s)', 'Waiting… (1m 00s)')).toBe(true);
     expect(c.statusChangeFades('Waiting… (1m 05s)', 'Waiting… (1m 06s)')).toBe(false);
     expect(c.statusChangeFades('Connecting…', 'Connecting…')).toBe(false);
-    // Appearing and clearing are the shown class's own fade.
     expect(c.statusChangeFades('', 'Connecting…')).toBe(false);
     expect(c.statusChangeFades('Connecting…', '')).toBe(false);
   });
@@ -201,10 +228,6 @@ describe('bootSplash controller', () => {
     expect(fake.isRemoved()).toBe(true);
   });
 
-  // The exit is choreographed (index.html): the status and the mark run their
-  // own, SHORTER animations inside the veil's 0.65s one, and `animationend`
-  // bubbles. Acting on a child's event removes the splash mid-fade, so only the
-  // splash's own fade ends the splash.
   it('ignores an animationend bubbling up from a child of the splash', async () => {
     fake = installFakeSplash(true);
     const c = await freshController();
@@ -221,8 +244,6 @@ describe('bootSplash controller', () => {
       fake = installFakeSplash(true);
       const c = await freshController();
       c.dismissBootSplash();
-      // Still fading: the fallback must outlive the veil's own 0.65s, or it
-      // becomes the thing that removes the splash rather than a backstop.
       vi.advanceTimersByTime(700);
       expect(fake.isRemoved()).toBe(false);
       vi.advanceTimersByTime(200);
@@ -238,23 +259,16 @@ describe('bootSplash controller', () => {
     c.dismissBootSplash();
     fake.fireAnimationEnd();
     expect(c.bootSplashPresent()).toBe(false);
-    // Second call must not throw or re-remove.
     expect(() => c.dismissBootSplash()).not.toThrow();
   });
 
-  // The application faces the same dead end as the pre-hydration document when
-  // its bundle loaded but the engine is unreachable, so it calls through to the
-  // inline document's reveal instead of rebuilding the href rule in TS.
   it('reveals the escape through the inline document, and reports what happened', async () => {
     fake = installFakeSplash(true);
     const c = await freshController();
     const win = globalThis as unknown as { __lucidosGatewayEscape?: () => unknown };
 
-    // No hook: this document is behind the gateway, has no gateway to reach, or
-    // the splash is already gone. Callers stay indifferent to which.
     expect(c.revealBootEscape()).toBe(false);
 
-    // Hook present but nothing to offer.
     win.__lucidosGatewayEscape = () => null;
     expect(c.revealBootEscape()).toBe(false);
 
@@ -263,10 +277,6 @@ describe('bootSplash controller', () => {
     delete win.__lucidosGatewayEscape;
   });
 
-  // The boot script paints the brand gradient on <html>, because iOS fills the
-  // standalone bottom safe-area strip from the canvas and no element reaches
-  // it. That strip must leave WITH the veil, at whatever length the veil runs:
-  // a snap at either end of the fade shows as a band.
   it('dismiss fades the canvas to the app background on the veil curve, then hands it back', async () => {
     fake = installFakeSplash(true);
     const doc = (globalThis as any).document;
@@ -274,8 +284,6 @@ describe('bootSplash controller', () => {
     doc.documentElement.style.background = gradient;
     doc.body = { style: { background: gradient } };
     onTestFinished(() => { delete doc.body; });
-    // The reduced-motion veil: a fixed 0.15s, NOT the collapsed duration scale.
-    // It only exists once the leaving class is on.
     const prevGetComputedStyle = (globalThis as any).getComputedStyle;
     (globalThis as any).getComputedStyle = () => fake.hasLeaving()
       ? { animationDuration: '0.15s', animationTimingFunction: 'ease' }
@@ -288,15 +296,12 @@ describe('bootSplash controller', () => {
       expect(style.transition).toBe('background-color 0.15s ease');
     }
     fake.fireAnimationEnd();
-    // The stylesheet's own `html { background: var(--bg-primary) }` takes over.
     for (const style of [doc.documentElement.style, doc.body.style]) {
       expect(style.background).toBe('');
       expect(style.transition).toBe('');
     }
   });
 
-  // The idle prefetch parses chunks on the main thread, and WebKit has no
-  // requestIdleCallback to defer it with. So it must stay off the fade's frames.
   it('dismiss starts the idle prefetch only once the splash is gone', async () => {
     vi.useFakeTimers();
     try {
@@ -316,11 +321,6 @@ describe('bootSplash controller', () => {
     }
   });
 
-  // The one thing a quiet cover or a gateway handover changes for the controller:
-  // there is no reveal to hold a floor for. This is the predicate the hook calls,
-  // so both no-reveal documents and the launch case are pinned here against the
-  // real names the inline scripts set: a class on the splash for the handover,
-  // and an attribute on <html> for the quiet cover.
   it('reports both no-reveal documents, and a plain launch as playing one', async () => {
     fake = installFakeSplash(true, ['boot-splash-formed']);
     expect((await freshController()).bootSplashPlaysNoReveal(), 'formed').toBe(true);
@@ -353,32 +353,18 @@ describe('bootSplash controller', () => {
 
 describe('index.html inline boot splash', () => {
   const html = readFileSync(resolve(__dirname, '../../index.html'), 'utf-8');
-  /** Every reduced-motion rule in the splash stylesheet, as one string. They key
-   *  on the `data-motion` attribute the boot script sets before first paint. */
   const reducedMotionRules = () => (html.match(/:root\[data-motion="reduce"\][^{]*\{[^}]*\}/g) ?? []).join('\n');
-  /** The shell's half of the shared appearance boot script, which owns the
-   *  `<html>` canvas paint. The Vite plugin inlines its BUILD into the document
-   *  above, so the source is where the rule is readable. */
   const bootHostSrc = readFileSync(
     resolve(__dirname, '../../../../packages/lucidos-sdk/src/boot/host.ts'), 'utf-8',
   );
 
-  /** The two independent marks a retry leaves: sessionStorage, and the URL
-   *  param. Either one must spend the single attempt, so a browser that refuses
-   *  storage cannot reload-loop. */
   type RetryMark = 'none' | 'both' | 'url-only' | 'storage-only';
 
-  /** The document context the watchdog reads. Defaults describe a DIRECT engine
-   *  port with no gateway: no `<base>` (the engine stamps none for `/`) and no
-   *  metas, which is also the legacy no-gateway engine. */
   interface DocContext {
-    /** `<base href>`: null = direct port, `/~/` = picker, `/<slug>/` = gateway. */
     base?: string | null;
     gatewayPort?: string | null;
     workspaceId?: string | null;
-    /** The Cache API. Absent by default, as in a browser without one. */
     caches?: { keys(): Promise<string[]>; delete(name: string): Promise<boolean> };
-    /** `navigator.onLine`. Online by default. */
     online?: boolean;
   }
 
@@ -404,8 +390,6 @@ describe('index.html inline boot splash', () => {
     };
     let click: (() => void) | undefined;
     const splashClasses = new Set<string>();
-    // The escape anchor ships hidden with no href; the watchdog fills both in
-    // only when this document has somewhere to send the user.
     const escape = { href: '', textContent: '', hidden: true };
     const splash = {
       querySelector: (selector: string) =>
@@ -428,8 +412,6 @@ describe('index.html inline boot splash', () => {
       reload: vi.fn(),
     };
     const history = { state: null, replaceState: vi.fn() };
-    // Capture-phase window listeners, so a test can fire the entry module's
-    // load failure the way the browser does.
     const listeners = new Map<string, Set<(e: unknown) => void>>();
     const fakeWindow: Record<string, unknown> = {
       setTimeout: window.setTimeout.bind(window),
@@ -485,26 +467,16 @@ describe('index.html inline boot splash', () => {
     const moduleIdx = html.indexOf('<script type="module"');
     expect(splashIdx).toBeGreaterThan(-1);
     expect(moduleIdx).toBeGreaterThan(-1);
-    // The splash must come before the module script so first paint is the brand,
-    // not an empty #app, regardless of connection speed.
     expect(splashIdx).toBeLessThan(moduleIdx);
   });
 
   it('carries the status line and the brand mark inline', () => {
     expect(html).toContain('boot-splash-status');
     expect(html).toContain('class="boot-splash-mark"');
-    // Decorative — must never intercept pointer events.
     expect(html).toContain('pointer-events: none');
   });
 
   it('paints the brand gradient on both canvas layers so the iOS bottom safe-area strip is covered', () => {
-    // A fixed, viewport-sized .boot-splash does not reach the iOS standalone bottom
-    // safe-area strip, so the boot script paints the brand gradient on <html>
-    // behind it. The body carries the same paint: its light-theme inline
-    // background otherwise owns the uncovered strip and shows white.
-    //
-    // The <html> half lives in the shared boot script's host entry, kept out of
-    // the contract every app iframe runs. The <body> half is this document's.
     expect(bootHostSrc).toMatch(
       /SPLASH_BACKGROUND\s*=\s*\n?\s*['"]#145eb9 radial-gradient\([^'"]*\) no-repeat fixed['"]/,
     );
@@ -515,12 +487,6 @@ describe('index.html inline boot splash', () => {
   });
 
   it('bases the canvas on the gradient colour AT the seam, not on its end stop', () => {
-    // The base colour is the only thing iOS paints into the bottom strip, right
-    // up against the gradient, so a value off the seam reads as a band. Along
-    // the bottom edge the gradient has travelled 0.62 (x=30%) to 0.84 (x=100%)
-    // of the way to its end stop. Both figures are aspect-independent, since
-    // each radius is a percentage of its own axis, so one constant works on
-    // every device. #145eb9 is the gradient at progress 0.70.
     const BASE = '#145eb9';
     const END_STOP = '#0a4ea8';
     const stops = ['#2d83e0', END_STOP];
@@ -532,14 +498,11 @@ describe('index.html inline boot splash', () => {
       start.map((s, i) => Math.round(s + (end[i] - s) * p));
     const base = [1, 3, 5].map(i => parseInt(BASE.slice(i, i + 2), 16));
 
-    // Every colour the gradient takes along the bottom edge is within 10/255 of
-    // the base, so the seam cannot read as a band.
     for (const progress of [0.624, 0.669, 0.7, 0.75, 0.8385]) {
       at(progress).forEach((channel, i) => {
         expect(Math.abs(channel - base[i])).toBeLessThanOrEqual(10);
       });
     }
-    // The gradient's own stops are untouched by this: only the base moved.
     for (const stop of stops) expect(html).toContain(stop);
   });
 
@@ -584,9 +547,6 @@ describe('index.html inline boot splash', () => {
     }
   });
 
-  // Every reload here follows a failed bundle, and the service worker serves
-  // bundles cache-first. A bad cached copy kept the phone on "Tap to retry"
-  // across every tap, until a new build changed the chunk's hash.
   const SHELL_CACHE_ABC = `${SHELL_CACHE_PREFIX}abc`;
   function fakeCaches(names: string[], opts: { hang?: boolean } = {}) {
     const deleted: string[] = [];
@@ -630,8 +590,6 @@ describe('index.html inline boot splash', () => {
     }
   });
 
-  // Offline, nothing could refetch the shell, and the reload would land on the
-  // browser's error page instead of the splash.
   it('keeps the bundle caches when the browser reports offline', async () => {
     vi.useFakeTimers();
     try {
@@ -679,7 +637,6 @@ describe('index.html inline boot splash', () => {
     }
   });
 
-  // Pin test: neither the raw service worker nor this inline script can import.
   it('names the same bundle cache prefix as the service worker', () => {
     const sw = readFileSync(resolve(__dirname, '../../public/sw.js'), 'utf-8');
     const swPrefix = sw.match(/const SHELL_CACHE = '([^']+)' \+ BUILD_ID/)?.[1];
@@ -692,13 +649,9 @@ describe('index.html inline boot splash', () => {
     try {
       const watchdog = runInlineWatchdog();
       watchdog.fireEntryModuleError();
-      // No timer advanced: a bundle that answered "I cannot load" has already
-      // given the answer the 15s wait exists to obtain.
       expect(watchdog.location.replace).toHaveBeenCalledWith(
         'https://example.com/?thread=abc&_boot_retry=1',
       );
-      // And the recovery is still the SAME single attempt: the timer must not
-      // fire a second one behind it.
       vi.advanceTimersByTime(15_000);
       expect(watchdog.location.replace).toHaveBeenCalledOnce();
     } finally {
@@ -723,11 +676,10 @@ describe('index.html inline boot splash', () => {
     vi.useFakeTimers();
     try {
       const watchdog = runInlineWatchdog();
-      watchdog.fireError(undefined); // a runtime exception carries no element
-      watchdog.fireError({ tagName: 'IMG' }); // a broken image is not boot
-      watchdog.fireError({ tagName: 'SCRIPT', type: 'text/javascript' }); // classic script
+      watchdog.fireError(undefined);
+      watchdog.fireError({ tagName: 'IMG' });
+      watchdog.fireError({ tagName: 'SCRIPT', type: 'text/javascript' });
       expect(watchdog.location.replace).not.toHaveBeenCalled();
-      // The timer is still the owner of the hang case.
       vi.advanceTimersByTime(15_000);
       expect(watchdog.location.replace).toHaveBeenCalledOnce();
     } finally {
@@ -738,8 +690,6 @@ describe('index.html inline boot splash', () => {
   it('spends its one retry on the URL mark alone, so a storage-less browser cannot loop', () => {
     vi.useFakeTimers();
     try {
-      // sessionStorage empty (a browser that refuses it, or a fresh session),
-      // but this document IS the retry: the reload put the mark on the URL.
       const watchdog = runInlineWatchdog('url-only');
       vi.advanceTimersByTime(15_000);
       expect(watchdog.location.replace).not.toHaveBeenCalled();
@@ -755,8 +705,6 @@ describe('index.html inline boot splash', () => {
       const watchdog = runInlineWatchdog();
       const loaded = watchdog.fakeWindow.__lucidosBootLoaded as () => void;
       loaded();
-      // A lazily loaded module failing hours into a session is the app's
-      // problem; reloading the page under the user is never the answer.
       watchdog.fireEntryModuleError();
       vi.advanceTimersByTime(15_000);
       expect(watchdog.location.replace).not.toHaveBeenCalled();
@@ -766,10 +714,6 @@ describe('index.html inline boot splash', () => {
     }
   });
 
-  // The dead end this exists for: a per-workspace PWA installed on a DIRECT
-  // engine port. Nothing on that origin lazy-starts a stopped workspace, and the
-  // gateway is a different origin, so without a link out the user is stuck on
-  // the splash with no way to act.
   const GATEWAY = { gatewayPort: '5251' };
 
   it('sends a stopped direct-port workspace to itself on the gateway, which starts it', () => {
@@ -777,16 +721,10 @@ describe('index.html inline boot splash', () => {
     try {
       const watchdog = runInlineWatchdog(true, { ...GATEWAY, workspaceId: 'myws' });
       watchdog.fireEntryModuleError();
-      // The deep link is what makes the gateway lazy-start the workspace; the
-      // picker would be a tap further.
       expect(watchdog.escape.href).toBe('https://example.com:5251/myws/');
       expect(watchdog.escape.hidden).toBe(false);
       expect(watchdog.escape.textContent).toBe('Start this workspace');
-      // The status names the real problem instead of inviting a pointless retry.
       expect(watchdog.status.textContent).toBe("Can't reach this workspace");
-      // The splash is decorative (aria-hidden) until it carries the only action
-      // on screen. Leaving it hidden would silence the status and leave a
-      // focusable link inside an aria-hidden subtree.
       expect(watchdog.splash.setAttribute).toHaveBeenCalledWith('aria-hidden', 'false');
     } finally {
       vi.useRealTimers();
@@ -796,8 +734,6 @@ describe('index.html inline boot splash', () => {
   it('falls back to the workspace list when the shell predates the id stamp', () => {
     vi.useFakeTimers();
     try {
-      // A cached shell from before the engine stamped its slug: the gateway is
-      // still addressable, the workspace is not.
       const watchdog = runInlineWatchdog(true, GATEWAY);
       watchdog.fireEntryModuleError();
       expect(watchdog.escape.href).toBe('https://example.com:5251/~/?pick');
@@ -812,8 +748,6 @@ describe('index.html inline boot splash', () => {
     try {
       const watchdog = runInlineWatchdog(true, { ...GATEWAY, workspaceId: 'myws' });
       watchdog.fireEntryModuleError();
-      // No splash-wide reload handler: one tap must not both reload and
-      // navigate, and a reload cannot start a stopped engine anyway.
       expect(watchdog.splashClasses.has('boot-splash-stalled')).toBe(false);
       watchdog.click();
       expect(watchdog.location.reload).not.toHaveBeenCalled();
@@ -825,8 +759,6 @@ describe('index.html inline boot splash', () => {
   it('offers nothing to escape to when there is no gateway', () => {
     vi.useFakeTimers();
     try {
-      // A legacy no-gateway engine (and the e2e direct engine): no port meta, so
-      // no escape exists and the plain retry stands.
       const watchdog = runInlineWatchdog(true);
       watchdog.fireEntryModuleError();
       expect(watchdog.escape.hidden).toBe(true);
@@ -840,9 +772,6 @@ describe('index.html inline boot splash', () => {
   it('offers no escape from a document already behind the gateway', () => {
     vi.useFakeTimers();
     try {
-      // Behind the gateway (base `/<slug>/`) the origin already IS the gateway,
-      // which lazy-starts on its own; the same goes for the picker. Sending
-      // either one "to the gateway" would be a no-op at best.
       for (const base of ['/myws/', '/~/']) {
         const watchdog = runInlineWatchdog(true, { ...GATEWAY, workspaceId: 'myws', base });
         watchdog.fireEntryModuleError();
@@ -871,9 +800,6 @@ describe('index.html inline boot splash', () => {
   it('exposes the reveal so the application can offer the same escape', () => {
     vi.useFakeTimers();
     try {
-      // The app hits this dead end too when its bundle DID load but the engine
-      // is unreachable (utils/bootSplash.ts revealBootEscape). It must reuse this
-      // implementation, and the handover must NOT delete the hook.
       const watchdog = runInlineWatchdog(false, { ...GATEWAY, workspaceId: 'myws' });
       const loaded = watchdog.fakeWindow.__lucidosBootLoaded as () => void;
       loaded();
@@ -907,15 +833,10 @@ describe('index.html inline boot splash', () => {
   });
 
   it('bakes a default, shown status so it never vanishes across the reload', () => {
-    // The status div ships visible (shown class) with default text, so the
-    // picker→workspace hop never shows an empty/disappearing status line.
     expect(html).toContain('boot-splash-status-shown');
     expect(html).toMatch(/boot-splash-status[^>]*>[^<]*\S[^<]*<\/div>/);
   });
 
-  // The mark is the one in-flow child, so it sits dead centre whatever the
-  // status says. A label that wraps, a revealed escape link, or a new width
-  // grows the foot downward and cannot nudge the mark.
   it('hangs the status and the escape link below the mark, out of flow', () => {
     expect(html).toMatch(/\.boot-splash-foot\s*\{[^}]*position:\s*absolute/);
     expect(html).toMatch(
@@ -924,13 +845,9 @@ describe('index.html inline boot splash', () => {
     const foot = html.split('<div class="boot-splash-foot">')[1]?.split('</div>\n    </div>')[0];
     expect(foot).toContain('class="boot-splash-status');
     expect(foot).toContain('class="boot-splash-escape"');
-    // With no mark to hang from, the quiet cover centres its status instead.
     expect(html).toMatch(
       /:root\[data-boot-splash-quiet\]\s+\.boot-splash-foot\s*\{\s*position:\s*static/,
     );
-    // A fixed box never scrolls, so anything that could hang past the bottom
-    // edge re-centres the group: a failure report, a shown escape link (often
-    // the only way out), and a short window.
     const recentre = /((?:[^{}]*\.boot-splash-foot,?\s*)+)\{\s*position:\s*static;\s*\}/g;
     const selectors = [...html.matchAll(recentre)].map((m) => m[1]).join(' ');
     expect(selectors).toContain('.boot-splash:has(.boot-splash-status-report) .boot-splash-foot');
@@ -944,20 +861,15 @@ describe('index.html inline boot splash', () => {
     const swap = /\.boot-splash-status\.boot-splash-status-swap\s*\{([^}]*)\}/.exec(html)?.[1];
     expect(swap).toBeTruthy();
     expect(swap).toMatch(/opacity:\s*0/);
-    // The fade at 1x is the delay both swappers wait out (STATUS_SWAP_MS here,
-    // the gateway poller's own literal), so the words never change while visible.
     const swapSeconds = String(STATUS_SWAP_MS / 1000).replace('.', '\\.');
     expect(swap).toMatch(
       new RegExp(`transition-duration:\\s*calc\\(${swapSeconds}s \\* var\\(--duration-scale, 1\\)\\)`),
     );
-    // Declared after the shown rule it overrides at the same specificity.
     expect(html.indexOf('.boot-splash-status.boot-splash-status-swap')).toBeGreaterThan(
       html.indexOf('.boot-splash-status.boot-splash-status-shown'),
     );
   });
 
-  // A status box that shrinks to its words leaves the old label's edges painted
-  // on iOS when a shorter one replaces it. A fixed box repaints whole.
   it('keeps the status box one fixed width, centring the words inside it', () => {
     const status = /\n {6}\.boot-splash-status \{([^}]*)\}/.exec(html)?.[1];
     expect(status).toBeTruthy();
@@ -966,32 +878,20 @@ describe('index.html inline boot splash', () => {
   });
 
   it('reserves a constant status size so the escape link never shifts', () => {
-    // A fixed single-line height (not min-height) keeps the box identical whether
-    // the text is present, empty, or invisible.
     expect(html).toMatch(/\.boot-splash-status\s*\{[^}]*height:\s*1\.4em/);
     expect(html).toMatch(/\.boot-splash-status\s*\{[^}]*white-space:\s*nowrap/);
   });
 
   it('pins the splash geometry in px so it cannot ride the UI scale', () => {
-    // This document's <html> font-size is var(--user-ui-scale). The gateway
-    // splash is an isolated document at the browser default. So ANY rem length
-    // here resolves differently across that seam, growing the mark and sliding
-    // the status as the user crosses it.
     expect(html).toMatch(
       /\.boot-splash\s*\{[^}]*--boot-mark-size:\s*min\(46vmin,\s*240px\)/,
     );
     expect(html).toMatch(/\.boot-splash\s*\{[^}]*--boot-splash-gap:\s*24px/);
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*width:\s*var\(--boot-mark-size\)/);
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*height:\s*var\(--boot-mark-size\)/);
-    // Type is declared once on the container, so every line on either surface
-    // (the status here, the gateway's escape link) inherits the same size and
-    // stack. The stack must never be var(--font-ui): a not-yet-downloaded web
-    // font would swap and reflow the splash.
     expect(html).toMatch(/\.boot-splash\s*\{[^}]*font-size:\s*15px/);
     expect(html).toMatch(/\.boot-splash\s*\{[^}]*font-family:\s*ui-monospace/);
     expect(html).not.toMatch(/\.boot-splash[^{]*\{[^}]*font-family:\s*var\(--font-ui\)/);
-    // No rem in any DECLARATION of the splash stylesheet (comments stripped:
-    // they name the rem values these px replaced, and must keep doing so).
     const splashCss = (html.match(/<style>([\s\S]*?)<\/style>/)?.[1] ?? '').replace(
       /\/\*[\s\S]*?\*\//g,
       '',
@@ -1000,13 +900,6 @@ describe('index.html inline boot splash', () => {
     expect(splashCss).not.toMatch(/\d\s*rem/);
   });
 
-  // The gateway splash carries this stylesheet and NOTHING else: it renders
-  // when no engine is reachable, so it cannot link the bundle css. A type
-  // property the shell sets from `body` and this block does not therefore
-  // differs between the two surfaces. That seam is one the user crosses
-  // mid-boot, and smoothing is the property that bites: the line changes
-  // weight on the same frame its text changes. Read the shell's own rule
-  // rather than restating its values, so editing base.css cannot reopen it.
   it('smooths the splash type exactly as the app shell does', () => {
     const baseCss = readFileSync(resolve(__dirname, '../styles/global/base.css'), 'utf-8');
     const shell = /^body \{([^}]*)\}/m.exec(baseCss)?.[1];
@@ -1017,10 +910,6 @@ describe('index.html inline boot splash', () => {
     const declared = (css: string, prop: string) =>
       new RegExp(`(?:^|;|\\*/)\\s*${prop}:\\s*([^;]+);`, 'm').exec(css)?.[1].trim();
 
-    // Every smoothing/rendering property the shell declares must be declared
-    // here too, with the same value. Discovered from the shell rather than
-    // listed, so a fourth one added there fails this test instead of quietly
-    // applying to the app and not to the splash.
     const smoothing = [
       ...shell!.matchAll(/(-webkit-font-smoothing|-moz-osx-font-smoothing|text-rendering):/g),
     ].map((m) => m[1]);
@@ -1030,31 +919,14 @@ describe('index.html inline boot splash', () => {
     }
   });
 
-  // Inline scripts in this document derive the per-workspace key prefix by
-  // hand, because each runs before the app's storage override exists. They read
-  // keys the APP writes, so a copy that normalizes differently reads a key
-  // nobody wrote and fails silently. An absolute `<base href>` is the case that
-  // splits them: `basePath.ts` takes its pathname, a naive slash-strip does
-  // not. Count the guard instead of trusting a prose comment.
   it('normalizes an absolute base href in every hand-rolled key derivation', () => {
-    // Two of them: the picker's and the boot splash's. Both run in this
-    // document before any module. The appearance boot script goes through the
-    // SDK's `_storage.ts`, which derives the slug once for the shell and every
-    // app iframe.
     const guards = html.match(/if\s*\(.*?\/\^https\?:\\\/\\\/\/i\.test\(/g) ?? [];
     expect(guards.length, 'one absolute-base guard per wsKey derivation').toBe(2);
     expect(html.match(/function wsKey\(/g)?.length).toBe(2);
-    // And each strips THEN compares, so a slash-less `~` is null in both rather
-    // than a `ws:~:` namespace in one and null in the other.
     expect(html.match(/\(seg === '' \|\| seg === '~'\) \? null : seg/g)?.length).toBe(2);
   });
 
   it('keeps the markers the gateway splash lifts this stylesheet and mark out by', () => {
-    // The gateway serves its own boot splash on the same url this document
-    // loads at, and it is THIS splash: proxy.rs `include_str!`s this file and
-    // slices between these markers, so neither surface can drift from the
-    // other. Losing a marker unstyles (or empties) the gateway splash, so both
-    // sides pin them; the Rust half is `the_app_splash_stylesheet_and_mark_are_extractable`.
     for (const marker of [
       '/* lucidos-boot-splash-css-start */',
       '/* lucidos-boot-splash-css-end */',
@@ -1063,7 +935,6 @@ describe('index.html inline boot splash', () => {
     ]) {
       expect(html.split(marker).length - 1, marker).toBe(1);
     }
-    // The slices must be in the right order and carry the real content.
     const css = html.split('/* lucidos-boot-splash-css-start */')[1]?.split(
       '/* lucidos-boot-splash-css-end */',
     )[0];
@@ -1077,22 +948,15 @@ describe('index.html inline boot splash', () => {
   });
 
   it('redirects to the last workspace in <head>, before the bundle, to skip the picker render', () => {
-    // The eager redirect must run from an inline <head> script BEFORE the module
-    // bundle, so the picker never paints (no picker→workspace reload seam).
     const redirectIdx = html.indexOf('location.replace');
     const moduleIdx = html.indexOf('<script type="module"');
     expect(redirectIdx).toBeGreaterThan(-1);
     expect(redirectIdx).toBeLessThan(moduleIdx);
-    // Reads the raw last-workspace key, and stands down on the `?pick` escape.
     expect(html).toContain("localStorage.getItem('lucidos-last-workspace')");
     expect(html).toContain("has('pick')");
-    // Only on the picker context (stamped base href), never inside a workspace.
     expect(html).toContain("getAttribute('href') !== '/~/'");
   });
 
-  // An installed iOS app can open on a viewport short of the home-bar strip and
-  // gain the strip later. A splash sized by the viewport then grows, and the mark
-  // and status centred in it drop by half the strip on the last beat.
   describe('height pin', () => {
     function runPin() {
       const source = html
@@ -1101,7 +965,6 @@ describe('index.html inline boot splash', () => {
         ?.split('</script>')[0];
       if (!source) throw new Error('inline splash height pin not found');
       const props = new Map<string, string>();
-      // The box measures the viewport while unpinned, and its pin once pinned.
       const viewport = { width: 390, height: 810 };
       const splash = {
         isConnected: true,
@@ -1147,7 +1010,6 @@ describe('index.html inline boot splash', () => {
       expect(props.get('--boot-splash-height')).toBe('390px');
     });
 
-    // A rotation can report the new width before its final height.
     it('follows the height while a rotation settles, then holds again', () => {
       vi.useFakeTimers();
       try {
@@ -1173,13 +1035,9 @@ describe('index.html inline boot splash', () => {
     it('lays the box out against the pin, falling back to the viewport', () => {
       expect(html).toMatch(/\.boot-splash\s*\{[^}]*inset:\s*0 0 auto;/);
       expect(html).toMatch(/\.boot-splash\s*\{[^}]*height:\s*var\(--boot-splash-height,\s*100%\)/);
-      // A shrinking viewport still shrinks the box, so a stalled splash keeps
-      // its escape link on screen.
       expect(html).toMatch(/\.boot-splash\s*\{[^}]*max-height:\s*100%;/);
     });
 
-    // The pin holds the layout, never the cover. A pinned cover would leave the
-    // gained strip showing the app's own bottom edge under the splash.
     it('covers the whole viewport whatever the pin holds', () => {
       const cover = html.match(/\.boot-splash::before\s*\{([^}]*)\}/)?.[1] ?? '';
       expect(cover).toMatch(/position:\s*fixed;/);
@@ -1190,9 +1048,6 @@ describe('index.html inline boot splash', () => {
   });
 
   describe('gateway handover (boot-splash-formed)', () => {
-    // The gateway 503 splash and this document share one url, so the mark the
-    // gateway already built is on screen when this document takes over. The
-    // handover flag is what stops it from being torn down and rebuilt.
     function runHandover(flag: string | null) {
       const source = html
         .split('<script>')
@@ -1233,8 +1088,6 @@ describe('index.html inline boot splash', () => {
       expect(html).toMatch(
         /\.boot-splash-formed\s+\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-breathe/,
       );
-      // Named among the selectors the reduced-motion rule silences (it is a
-      // list: the two leaving states are silenced there too).
       expect(reducedMotionRules()).toMatch(
         /:root\[data-motion="reduce"\]\s+\.boot-splash-formed\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/,
       );
@@ -1242,33 +1095,21 @@ describe('index.html inline boot splash', () => {
   });
 
   describe('notification tap (boot-splash-quiet)', () => {
-    // A push tap on an installed iOS PWA arrives as a full cross-document load of
-    // `?notification=…` (WebKit offers no reload-free channel), so this splash is
-    // on screen for every tap. It is a navigation inside a session the user was
-    // already in, not a launch, so the document drops the launch ceremony.
     const blockWith = (needle: string) =>
       html
         .split('<script>')
         .find((block: string) => block.includes(needle))
         ?.split('</script>')[0];
-    // The decision, in <head>, and the step that applies it to the markup.
     const source = blockWith("setAttribute('data-boot-splash-quiet'");
     const applySource = blockWith("classList.add('boot-splash-quiet')");
 
-    /** Run the inline quiet scripts against a URL, in document order: the <head>
-     *  decision before the splash exists, then the body step. The fake canvas
-     *  layers start on the brand gradient, as the real ones do. */
     function runQuietBoot(
       url: string,
       opts: {
         bgVar?: string;
         theme?: string;
-        /** The gateway boot splash stood a mark on this url and left its
-         *  one-shot handover flag for this document. */
         formed?: boolean;
         refreshed?: boolean;
-        /** `<base href>`: a `/<slug>/` workspace behind the gateway namespaces the
-         *  flag key; null (direct engine) leaves it raw. */
         base?: string | null;
       } = {},
     ) {
@@ -1301,12 +1142,6 @@ describe('index.html inline boot splash', () => {
         hasAttribute: (key: string) => attributes.has(key),
       };
       const body = { style: { background: GRADIENT } };
-      // `refreshed` is the one-shot flag `refreshClient` stamps before reloading,
-      // stored under the SAME per-workspace key the app's storage override writes.
-      // The expected key is built from the REAL `normalizeBasePath`, not a copy of
-      // it, so this pins the inline script against the app's actual contract
-      // (`WORKSPACE_ID` is `normalizeBasePath(baseHref).slice(1)`, and
-      // workspaceStorage prefixes `ws:<id>:`).
       const basePath = opts.base == null ? '' : normalizeBasePath(opts.base);
       const slug = basePath === '' || basePath === '/~' ? null : basePath.slice(1);
       const flagKey = slug ? `ws:${slug}:lucidos-splash-quiet` : 'lucidos-splash-quiet';
@@ -1319,18 +1154,14 @@ describe('index.html inline boot splash', () => {
         removeItem: (key: string) => stored.delete(key),
       };
       const base = opts.base == null ? null : { getAttribute: () => opts.base };
-      // <head>: the splash markup has not parsed yet, so only <base> resolves.
       new Function('document', 'location', 'sessionStorage', source)(
         { querySelector: (sel: string) => (sel === 'base' ? base : null), documentElement },
         { search: parsed.search, hash: parsed.hash },
         sessionStorage,
       );
-      // The handover script owns its flag. Spent here, it could not keep the
-      // gateway's mark standing.
       const handoverFlagLeft = stored.has(HANDOVER_KEY);
       new Function('document', applySource)({ querySelector: () => splash, documentElement, body });
       const quiet = attributes.has('data-boot-splash-quiet');
-      // One decision: the body step follows the attribute, never decides itself.
       expect(classes.has('boot-splash-quiet'), url).toBe(quiet);
       return {
         quiet,
@@ -1340,27 +1171,18 @@ describe('index.html inline boot splash', () => {
         rootBackground: () => documentElement.style.background,
         bodyBackground: () => body.style.background,
         flagLeft: () => stored.has(flagKey),
-        /** Anything left in storage, so a read of the WRONG key is visible as a
-         *  flag that was never consumed rather than as a silent non-quiet. */
         leftoverKeys: () => [...stored.keys()].filter((key) => key !== HANDOVER_KEY),
         gradient: GRADIENT,
       };
     }
 
-    // WebKit paints a frame the moment the bundle stylesheet lands, and every
-    // body script waits for that stylesheet. A body-side decision is one frame
-    // late, and that frame shows the blue launch splash. So the decision must
-    // live in <head>, ahead of the splash markup.
     it('decides in <head>, before the splash markup can paint', () => {
       const head = html.split('</head>')[0];
       expect(source && head.includes(source)).toBe(true);
-      // The rules that must hold on the first frame key on the <html> attribute,
-      // never on a class a body script adds a frame later.
       expect(html).toMatch(
         /:root\[data-boot-splash-quiet\]\s+\.boot-splash::before\s*\{[^}]*background:\s*var\(--bg-primary/,
       );
       expect(html).toMatch(/:root\[data-boot-splash-quiet\]\s+\.boot-splash-mark\s*\{[^}]*display:\s*none/);
-      // The baked launch status stays hidden until the body step clears it.
       expect(html).toMatch(
         /:root\[data-boot-splash-quiet\]\s+\.boot-splash:not\(\.boot-splash-quiet\)\s+\.boot-splash-status\s*\{[^}]*visibility:\s*hidden/,
       );
@@ -1369,12 +1191,8 @@ describe('index.html inline boot splash', () => {
     it('quiets the splash and flattens both canvas layers on a tap', () => {
       const boot = runQuietBoot('https://host/myws/?notification=n1&thread=t1&tap=%7B%7D');
       expect(boot.quiet).toBe(true);
-      // "Opening your workspace…" is a launch message; this is a navigation.
       expect(boot.status.textContent).toBe('');
       expect(boot.statusShown()).toBe(false);
-      // A fixed, viewport-sized cover never reaches the iOS standalone bottom safe-area
-      // strip, so leaving the gradient on either canvas layer would show a blue
-      // band under a flat cover.
       expect(boot.rootBackground()).toBe('#07172e');
       expect(boot.bodyBackground()).toBe('#07172e');
     });
@@ -1383,9 +1201,6 @@ describe('index.html inline boot splash', () => {
       expect(runQuietBoot('https://host/myws/#notification=n1&thread=t1').quiet).toBe(true);
     });
 
-    // The other continuation: a refresh the user asked for. `refreshClient` stamps
-    // the flag before reloading, so the next document knows it is coming back to
-    // the same session rather than opening one, with no deep link on the URL.
     it('quiets a user-requested refresh, which carries no deep link at all', () => {
       const boot = runQuietBoot('https://host/myws/', { refreshed: true });
       expect(boot.quiet).toBe(true);
@@ -1394,32 +1209,19 @@ describe('index.html inline boot splash', () => {
       expect(boot.bodyBackground()).toBe('#07172e');
     });
 
-    // One-shot, exactly like the gateway handover flag: a refresh whose reload
-    // never happened must not quiet every load for the rest of the session.
     it('consumes the refresh flag as it reads it', () => {
       expect(runQuietBoot('https://host/myws/', { refreshed: true }).flagLeft()).toBe(false);
-      // And a second load with no flag is a normal launch again.
       expect(runQuietBoot('https://host/myws/').quiet).toBe(false);
     });
 
-    // `refreshClient` writes through the app's storage override, whose prototype
-    // patch covers sessionStorage too, so behind the gateway the flag lands at
-    // `ws:<slug>:…`. This script runs before that override exists and must build
-    // the same key by hand. Reading the raw key instead would leave the written
-    // one untouched and the cover would never appear in a real workspace, which
-    // is invisible in a direct-engine test where both keys are the same string.
     it('reads the flag under the SAME per-workspace key the app writes', () => {
       const boot = runQuietBoot('https://host/myws/', { refreshed: true, base: '/myws/' });
       expect(boot.quiet).toBe(true);
       expect(boot.leftoverKeys()).toEqual([]);
-      // Picker and legacy root have no slug, so the override no-ops and so does this.
       for (const base of ['/~/', '/', null]) {
         expect(runQuietBoot('https://host/', { refreshed: true, base }).quiet, String(base))
           .toBe(true);
       }
-      // An ABSOLUTE base href is a supported value (normalizeBasePath tolerates
-      // it), and the app namespaces off its PATHNAME. Stripping slashes off the
-      // whole URL would look for `ws:https:/host/myws:…` and find nothing.
       const abs = runQuietBoot('https://host/myws/', {
         refreshed: true,
         base: 'https://host/myws/',
@@ -1428,24 +1230,15 @@ describe('index.html inline boot splash', () => {
       expect(abs.leftoverKeys()).toEqual([]);
     });
 
-    // The flag is consumed BEFORE any other gate, so a refresh that lands on a
-    // URL the deep-link branch would bail out of cannot leave it behind.
     it('consumes the flag even on a URL the deep-link gate would return early on', () => {
       const boot = runQuietBoot(
         'https://host/myws/#thread=1e6a2f14-0000-4000-8000-000000000000',
         { refreshed: true },
       );
       expect(boot.flagLeft()).toBe(false);
-      // A refresh is a refresh: the landing hash does not un-quiet it.
       expect(boot.quiet).toBe(true);
     });
 
-    // The detection is a hand-written mirror of the page-side router's gate, in a
-    // classic inline script that cannot import it. Pin the two together directly:
-    // a document that goes quiet but then behaves like a cold launch (or the
-    // reverse) is the drift this catches. The oracle is the router's REAL branch
-    // order, `THREAD_HASH_RE` first and `hasDeepLinkParams` second (see
-    // handleHashLocation), not the deep-link gate alone.
     const routerDispatchesDeepLink = (url: string) =>
       !THREAD_HASH_RE.test(new URL(url).hash) &&
       hasDeepLinkParams(parseDeepLinkFromUrl(new URL(url)));
@@ -1455,23 +1248,12 @@ describe('index.html inline boot splash', () => {
         'https://host/myws/?notification=n1',
         'https://host/myws/?notification=n1&thread=t1&event=e1&tap=%7B%22kind%22%3A%22modal%22%7D',
         'https://host/myws/#notification=n1&thread=t1',
-        // A bare thread/event pair resolves to noop page-side, so it is a launch.
         'https://host/myws/?thread=t1&event=e1',
-        // Present but EMPTY: the router dispatches on the value, not the key, so a
-        // key-presence check here would quiet a document that then routes nothing.
         'https://host/myws/?notification=',
         'https://host/myws/#notification=',
-        // The router's `get` is `hash ?? query`, so an empty hash value beats a good
-        // query one. Mirroring key-presence alone gets this pair backwards.
         'https://host/myws/?notification=n1#notification=',
         'https://host/myws/?notification=#notification=n1',
-        // The cross-workspace landing channel keeps the launch splash: that hop
-        // can lazy-start a stopped engine, where "Opening your workspace…" is true.
         'https://host/myws/#thread=1e6a2f14-0000-4000-8000-000000000000',
-        // And it wins over a notification param when both are on the URL, because
-        // the router checks it first. Nothing emits this shape today; the point is
-        // that the mirror follows the router's branch ORDER, not a subset of its
-        // conditions.
         'https://host/myws/?notification=n1#thread=1e6a2f14-0000-4000-8000-000000000000',
         'https://host/myws/',
         'https://host/myws/?_boot_retry=1',
@@ -1480,29 +1262,17 @@ describe('index.html inline boot splash', () => {
       }
     });
 
-    // The one deep-link document that is NOT a continuation of a live session:
-    // a tap on a stopped workspace, which the gateway lazy-starts while serving
-    // its own boot splash on this exact url. By the time this document loads
-    // the user has watched a fully built mark for seconds, and the handover
-    // script keeps it standing. Quieting it there would `display: none` that
-    // mark and snap the gradient flat in one frame.
     it('stands down when the gateway handed over a mark that is already standing', () => {
-      // Both triggers lose to the handover: a refresh during an engine restart
-      // crosses the same gateway splash as a tap on a stopped workspace does.
       for (const opts of [
         { formed: true },
         { formed: true, refreshed: true },
       ]) {
         const boot = runQuietBoot('https://host/myws/?notification=n1&thread=t1', opts);
         expect(boot.quiet, JSON.stringify(opts)).toBe(false);
-        // And it must bail BEFORE the canvas repaint, or the standing mark is left
-        // on a flattened background.
         expect(boot.rootBackground()).toBe(boot.gradient);
         expect(boot.bodyBackground()).toBe(boot.gradient);
         expect(boot.statusShown()).toBe(true);
-        // The flag is still spent, so it cannot quiet a later load.
         expect(boot.flagLeft()).toBe(false);
-        // And the handover flag is left for the script that owns it.
         expect(boot.handoverFlagLeft).toBe(true);
       }
     });
@@ -1517,12 +1287,8 @@ describe('index.html inline boot splash', () => {
     });
 
     it('follows the resolved theme, and falls back to it when the FOUC script could not run', () => {
-      // Normal case: the FOUC script above already resolved --bg-primary.
       expect(runQuietBoot('https://host/?notification=n1', { bgVar: '#ffffff' }).rootBackground())
         .toBe('#ffffff');
-      // A browser that refuses localStorage throws that script out entirely, so
-      // the variable is unset. The canvas must still not keep the gradient under
-      // a flat cover.
       expect(
         runQuietBoot('https://host/?notification=n1', { bgVar: '', theme: 'light' }).rootBackground(),
       ).toBe('#ffffff');
@@ -1531,9 +1297,6 @@ describe('index.html inline boot splash', () => {
       ).toBe('#07172e');
     });
 
-    // Consuming the deep link belongs to handleHashLocation alone. A stray
-    // location/history write here would strip the params before the router ever
-    // sees them, which is exactly how a tap "goes nowhere".
     it('reads the URL and never writes it', () => {
       expect(source).toBeTruthy();
       expect(source).not.toMatch(/location\.(replace|assign|reload)|location\.href\s*=|history\./);
@@ -1545,12 +1308,6 @@ describe('index.html inline boot splash', () => {
       );
     });
 
-    // The splash's foregrounds are hardcoded white because the brand gradient is
-    // always behind them. The quiet cover is the APP background instead, which is
-    // #ffffff in light theme, so without a theme-aware colour the delayed status
-    // and the watchdog's escape link ("Start this workspace", the only way out of
-    // a stopped direct-port workspace) would be white on white at exactly the
-    // moment boot has given up.
     it('keeps the status and the escape legible on a light-theme quiet cover', () => {
       expect(html).toMatch(
         /:root\[data-theme-mode="light"\]\[data-boot-splash-quiet\]\s+\.boot-splash-status\s*\{[^}]*color:/,
@@ -1560,11 +1317,6 @@ describe('index.html inline boot splash', () => {
       );
     });
 
-    // The quiet fade needs two-class specificity to beat the `animation`
-    // shorthand on `.boot-splash-leaving`. The reduced-motion rule restates the
-    // quiet selector, so the 0.2s rule can never outrank the 0.15s an
-    // accessibility preference asked for. Pin the restatement, not just the
-    // plain rule.
     it('does not let the quiet fade outrank reduced motion', () => {
       expect(reducedMotionRules()).toMatch(
         /:root\[data-motion="reduce"\]\s+\.boot-splash-leaving,\s*:root\[data-motion="reduce"\]\[data-boot-splash-quiet\]\s+\.boot-splash-leaving\s*\{[^}]*animation-duration:\s*0\.15s/,
@@ -1573,22 +1325,12 @@ describe('index.html inline boot splash', () => {
   });
 
   it('plays the mark reveal in the final doc but hides the mark in the picker', () => {
-    // One whole-mark reveal, applied to the mark. A per-tile reveal is not an
-    // option: iOS WebKit does not GPU-composite SVG sub-element transforms, so
-    // it janks at boot.
     expect(html).toContain('@keyframes boot-mark-reveal');
     expect(html).toMatch(/\.boot-splash-mark\s*\{[^}]*animation:\s*boot-mark-reveal/);
-    // The picker (boot-splash-reload) hides the mark, so the reveal happens
-    // only in the workspace document. The class comes from the inline
-    // base-href check in the body script.
     expect(html).toMatch(/\.boot-splash-reload\s+\.boot-splash-mark\s*\{[^}]*visibility:\s*hidden/);
     expect(html).toContain("getAttribute('href') !== '/~/'");
   });
 
-  // THE EXIT IS TWO BEATS. The brand (status, then mark) leaves the stage while
-  // the gradient veil is still opaque, and only the veil is left dissolving
-  // over the app. A single uniform fade reads as unsmooth: the mark and the
-  // status ghost over the app's own content for most of the fade.
   describe('leaving choreography', () => {
     it('lets the status and the mark leave inside the veil fade', () => {
       const veil = /\.boot-splash-leaving\s*\{[^}]*animation:\s*boot-splash-out\s+calc\(([\d.]+)s/.exec(html);
@@ -1599,19 +1341,10 @@ describe('index.html inline boot splash', () => {
       expect(html).toContain('@keyframes boot-mark-out');
       const mark = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{[^}]*boot-mark-out\s+calc\(([\d.]+)s/.exec(html);
       expect(mark).toBeTruthy();
-      // Strictly inside, not merely equal: a brand element still fading when the
-      // veil hits zero is the ghost this choreography exists to remove.
       expect(parseFloat(mark![1]) * 1000).toBeLessThan(veilMs);
       expect(parseFloat(status![1]) * 1000).toBeLessThan(veilMs);
     });
 
-    // The exit is APPENDED to the mark's animation list, with the entries ahead
-    // of it restated verbatim. An animation is matched by name and position, so
-    // the reveal keeps its start time and the exit's implicit `from` composites
-    // over the breathe. Declaring the shorthand with the exit alone drops the
-    // breathe and starts from opacity 1, jumping the mark brighter on whichever
-    // frame dismissal lands in. The two states carry different lists: a formed
-    // mark never played a reveal, and putting one back rebuilds it mid-exit.
     it('appends the exit to each mark state list instead of replacing it', () => {
       const leaving = /\.boot-splash-leaving\s+\.boot-splash-mark\s*\{([^}]*)\}/.exec(html)?.[1];
       expect(leaving).toBeTruthy();
@@ -1622,9 +1355,6 @@ describe('index.html inline boot splash', () => {
       expect(formed).not.toMatch(/boot-mark-reveal/);
     });
 
-    // Same trap as the quiet fade above: each exit rule meets a reduced-motion
-    // rule naming its own selector, or an accessibility preference would get the
-    // scale and the fade anyway.
     it('silences the exit under reduced motion', () => {
       const reduced = reducedMotionRules();
       expect(reduced).toMatch(/\.boot-splash-leaving\s+\.boot-splash-mark[^{}]*\{\s*animation:\s*none/);
@@ -1632,13 +1362,9 @@ describe('index.html inline boot splash', () => {
       expect(reduced).toMatch(/\.boot-splash-leaving\s+\.boot-splash-status[^{}]*\{\s*transition:\s*none/);
     });
 
-    // A cover on its way out is not a target. `.boot-splash-escape` takes its own
-    // pointer events back and `.boot-splash-stalled` takes the container's, both
-    // for a splash that is still standing; a click during the hand-off belongs to
-    // the app underneath, and the longer exit widens that window.
     it('stops taking pointer input once it is leaving', () => {
       expect(html).toMatch(
-        /\.boot-splash\.boot-splash-leaving,\s*\.boot-splash-leaving\s+\.boot-splash-escape\s*\{[^}]*pointer-events:\s*none/,
+        /\.boot-splash\.boot-splash-leaving,\s*\.boot-splash-leaving\s+\.boot-splash-escape,\s*\.boot-splash-leaving\s+\.boot-splash-action\s*\{[^}]*pointer-events:\s*none/,
       );
     });
   });

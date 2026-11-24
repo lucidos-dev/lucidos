@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-07
 - **Amends**: [0168: A thread acts in its own subtree](0168-a-thread-acts-in-its-own-subtree.md)
+- **Amended by**: [0688: Every Allow once card is a permission request](0688-every-allow-once-card-is-a-permission-request.md) (the single-use card is now a permission request; the term is retired)
 
 ## Context
 

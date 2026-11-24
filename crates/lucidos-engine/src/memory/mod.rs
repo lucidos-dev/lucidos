@@ -9,7 +9,6 @@ pub(crate) mod query_judgment;
 pub mod reembed;
 
 pub use embedder_slot::{EmbedderSlot, EmbeddingModelLoadState, EmbeddingModelStatus};
-pub(crate) use extractor::{classify_query, extract_facts, fallback_fact, summarize_conversation};
 pub use extractor::{ExtractedFact, QueryClassification, EXTRACTOR_VERSION};
 pub use fastembed::FastEmbedProvider;
 pub use model_download::{
@@ -20,6 +19,8 @@ pub use pgvector::{
     CorrectedMemory, MemoryEntry, MemorySource, MemoryStats, PgVectorIndex, SearchResult,
 };
 pub use provider::EmbeddingProvider;
+pub use {extractor::classify_query, extractor::summarize_conversation};
+pub(crate) use {extractor::extract_facts, extractor::fallback_fact};
 
 /// Drop memory entries below this importance before semantic ranking.
 /// Multilingual-e5 embeddings have a high noise floor (~0.85 cosine for

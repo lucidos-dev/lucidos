@@ -4,8 +4,8 @@
 # index's merge attribute in .gitattributes.
 #
 # Hermetic: every case builds a throwaway git repo under mktemp -d and runs the
-# real scripts inside it. Nothing writes the Lucidos tree, and no process is
-# signalled. Only the three attribute checks read the tree, through
+# real scripts inside it. Nothing writes the Lucidos tree, and only processes
+# the test spawned are signalled. Only the three attribute checks read the tree, through
 # `git check-attr`, so the outcome cannot drift as the repo gains ADRs.
 #
 # The index merges through the keyed `lucidos-sorted-lines` driver (ADR 0460),
@@ -21,6 +21,8 @@ REPO_SRC="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NEW="$REPO_SRC/scripts/adr-new.sh"
 CHECK="$REPO_SRC/scripts/check-adrs.sh"
 ATTRS_LINE="docs/adr/index.md merge=lucidos-sorted-lines"
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$SCRIPT_DIR/flock_test_support.sh"
 
 PASS=0
 FAIL=0
@@ -282,9 +284,9 @@ test_concurrent_allocation_does_not_collide() {
     fi
 }
 
-stale_lock_path() { # <repo>
+alloc_lock_path() { # <repo>
     local lock
-    lock="$(git -C "$1" rev-parse --git-common-dir)/lucidos-adr-alloc.lock"
+    lock="$(git -C "$1" rev-parse --git-common-dir)/lucidos-adr-alloc.flock"
     case "$lock" in
         /*) ;;
         *) lock="$1/$lock" ;;
@@ -292,66 +294,37 @@ stale_lock_path() { # <repo>
     echo "$lock"
 }
 
-# Two minutes old: a session that died holding it.
-age_lock() { touch -t "$(date -v-2M +%Y%m%d%H%M 2> /dev/null || date -d '2 minutes ago' +%Y%m%d%H%M)" "$1"; }
-
-test_stale_lock_claim_is_exclusive() {
-    local dir first second
-    dir="$(mktemp -d "$TMP_ROOT/lock.XXXXXX")/l"
-    mkdir -p "$dir"
-    # The property the stale-lock recovery rests on, tested directly because
-    # the process-level race below is too narrow to reproduce on demand:
-    # renaming ONE directory to two different names succeeds exactly once,
-    # since the source is already gone for the loser. `rm -rf "$LOCK"` has no
-    # such exclusivity, which is how a second waiter could delete the lock a
-    # first waiter had legitimately just acquired, putting both inside the
-    # critical section.
-    if mv "$dir" "$dir.a" 2> /dev/null; then first=ok; else first=no; fi
-    if mv "$dir" "$dir.b" 2> /dev/null; then second=ok; else second=no; fi
-    if [ "$first" = ok ] && [ "$second" = no ]; then
-        pass "claiming a stale lock by rename succeeds for exactly one waiter"
-    else
-        fail "the rename claim was not exclusive: first=$first second=$second"
-    fi
-}
-
-# End-to-end smoke test over the recovery path. It does NOT reliably reproduce
-# the delete-in-place race (that window is a few instructions wide, and this
-# passed against the buggy version 6 runs out of 6); the exclusivity property
-# above is what actually guards it. Kept because it exercises staleness
-# detection, recovery and allocation together.
-test_two_waiters_on_a_stale_lock_still_allocate() {
-    local repo lock distinct total
+test_a_live_holder_is_waited_on() {
+    local repo lock waiter
     repo="$(new_repo)"
-    lock="$(stale_lock_path "$repo")"
-    mkdir -p "$lock"
-    age_lock "$lock"
-    (cd "$repo" && bash "$NEW" "waiter-one" "One" > /dev/null 2>&1) &
-    (cd "$repo" && bash "$NEW" "waiter-two" "Two" > /dev/null 2>&1) &
-    wait
-    total="$(adr_count "$repo")"
-    distinct="$(cd "$repo/docs/adr" && for f in [0-9][0-9][0-9][0-9]-*.md; do
-        echo "${f%%-*}"
-    done | sort -u | grep -c '')"
-    if [ "$total" -eq 3 ] && [ "$distinct" -eq 3 ]; then
-        pass "two waiters past one stale lock both allocate, with different numbers"
+    lock="$(alloc_lock_path "$repo")"
+    start_lock_holder "$TMP_ROOT" "$lock" ex
+    (cd "$repo" && exec bash "$NEW" "intruder" "Intruder" > /dev/null 2>&1) &
+    waiter=$!
+    sleep 3
+    if kill -0 "$waiter" 2> /dev/null && [ "$(adr_count "$repo")" -eq 1 ]; then
+        pass "an allocation waits while another holds the lock"
     else
-        fail "stale-lock recovery: $total files but $distinct numbers"
+        fail "an allocation gave up or went ahead while another held the lock"
     fi
+    kill "$waiter" 2> /dev/null
+    wait "$waiter" 2> /dev/null
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 }
 
-test_a_stale_lock_is_broken() {
+test_a_killed_holders_lock_is_released() {
     local repo lock
     repo="$(new_repo)"
-    lock="$(stale_lock_path "$repo")"
-    mkdir -p "$lock"
-    # Waiting forever on a dead lock would be worse than the race it guards.
-    age_lock "$lock"
-    run_new "$repo" "after-stale" "After a stale lock"
-    if [ "$NEW_RC" -eq 0 ] && [ -f "$repo/docs/adr/0002-after-stale.md" ]; then
-        pass "a stale lock is broken rather than waited on forever"
+    lock="$(alloc_lock_path "$repo")"
+    # Waiting on a dead session's lock would be worse than the race it guards.
+    start_lock_holder "$TMP_ROOT" "$lock" ex
+    kill -9 "$HOLDER_PID"
+    wait "$HOLDER_PID" 2> /dev/null
+    run_new "$repo" "after-kill" "After a killed holder"
+    if [ "$NEW_RC" -eq 0 ] && [ -f "$repo/docs/adr/0002-after-kill.md" ]; then
+        pass "a killed holder's lock is free for the next allocation"
     else
-        fail "stale lock not broken, rc=$NEW_RC: $NEW_OUT"
+        fail "allocation after a killed holder failed, rc=$NEW_RC: $NEW_OUT"
     fi
 }
 
@@ -585,9 +558,8 @@ test_allocates_above_a_sibling_worktree_that_has_not_committed
 test_allocates_correctly_with_no_local_main
 test_allocates_above_a_fetched_remote_branch
 test_concurrent_allocation_does_not_collide
-test_a_stale_lock_is_broken
-test_stale_lock_claim_is_exclusive
-test_two_waiters_on_a_stale_lock_still_allocate
+test_a_live_holder_is_waited_on
+test_a_killed_holders_lock_is_released
 test_new_entry_passes_the_checker
 test_rejects_a_bad_slug_and_an_empty_line
 

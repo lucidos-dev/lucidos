@@ -1,23 +1,9 @@
 // @vitest-environment jsdom
-/**
- * A re-read that was already in flight when the user started typing must drop
- * its reply.
- *
- * The obvious guard is the wrong one. The editor gates whether a re-read
- * STARTS on `dirty`, and reads it at render time. The reply lands between
- * renders, so a read begun one tick before the first keystroke still resolves
- * and overwrites the draft. Silent data loss, and no
- * test saw it: the ordinary path never has a fetch open while the user types.
- *
- * Each case therefore drives the promise by hand, so the keystroke lands in
- * the window that only exists mid-flight.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { AllowlistEditor } from '../settings/AllowlistEditor';
 import { permissionGrantsVersion } from '../../store/store';
 
-/** A promise whose settle time the test owns. */
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
   const promise = new Promise<T>((r) => { resolve = r; });
@@ -54,6 +40,7 @@ describe('the allowlist editor drops a re-read the user typed under', () => {
       description: 'What the coding agent may run unattended.',
       placeholder: 'e.g. Bash(git status)',
       noun: 'tool permissions',
+      rememberButton: 'Always allow',
       load,
       save: vi.fn(async () => {}),
     };
@@ -77,7 +64,6 @@ describe('the allowlist editor drops a re-read the user typed under', () => {
     render(<AllowlistEditor {...editorProps(load)} />, host);
     await waitFor(() => rows().length === 1);
 
-    // A grant lands from the agent, so the editor re-reads. Still in flight.
     const inFlight = deferred<string>();
     next = inFlight.promise;
     permissionGrantsVersion.value++;

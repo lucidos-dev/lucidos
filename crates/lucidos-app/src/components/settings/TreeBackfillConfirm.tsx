@@ -6,12 +6,8 @@ import type { BackgroundRows } from './useBackgroundModels';
 
 const TITLE = 'Start Tree memory';
 
-/** A modal: what choosing Tree would cost, with the compactor model to run it,
- *  and the only button that switches the workspace to Tree. Nothing is spent
- *  before a press of Start, and Start waits for the estimate. */
 export function TreeBackfillConfirm({ background, anchor, onStart, onCancel }: {
   background: BackgroundRows;
-  /** The Tree button, which takes focus back when the modal closes. */
   anchor: HTMLElement | null;
   onStart: () => Promise<void>;
   onCancel: () => void;

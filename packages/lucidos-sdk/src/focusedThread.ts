@@ -1,15 +1,6 @@
-/**
- * The thread the user has open in the host, for `lucidos.ui.focusedThread` and
- * `lucidos.ui.onFocusedThreadChange`.
- *
- * The host owns the answer. A dashboard tile sits beside whatever thread the
- * user is in, so the frame's own origin thread says nothing about it.
- */
 
 import { FOCUSED_THREAD_CHANNEL, callHost, onHostPush } from './_bridge';
 
-/** A thread id or `null` as the host sends it, or `undefined` for any other
- *  shape, which no host sends. */
 function asThreadId(value: unknown): string | null | undefined {
   if (value === null) return null;
   if (typeof value === 'string' && value.length > 0) return value;

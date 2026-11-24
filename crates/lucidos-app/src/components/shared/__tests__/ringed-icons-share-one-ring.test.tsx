@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-// The header draws the waiting clock beside Help, so every ringed glyph in it
-// takes one ring. A clock drawn on a smaller ring with a mitred hand read as
-// uneven next to the question mark.
 import { describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import type { JSX } from 'preact';

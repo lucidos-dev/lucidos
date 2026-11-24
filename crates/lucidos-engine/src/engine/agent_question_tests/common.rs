@@ -1,11 +1,13 @@
 //! Shared test helpers for the agent_question test suites.
 
 use super::*;
+#[cfg(test)]
 use crate::engine::AgentUserInput;
+#[cfg(test)]
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
-pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
+pub fn opt(id: &str, label: &str) -> QuestionOption {
     QuestionOption {
         id: id.into(),
         label: label.into(),
@@ -17,7 +19,7 @@ pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
     }
 }
 
-pub(crate) fn cc_meta() -> EventMeta {
+pub fn cc_meta() -> EventMeta {
     EventMeta {
         channel: Some(EventChannel::ClaudeCode),
         ..EventMeta::NONE
@@ -27,6 +29,7 @@ pub(crate) fn cc_meta() -> EventMeta {
 /// Returns the receiver alongside the session: hold it (`let (s, _rx) = …`) for
 /// the test's lifetime, or the session reads as a phantom and every
 /// `is_live()` check treats it as dead. See `AgentSession::is_live`.
+#[cfg(test)]
 pub(crate) fn make_session(
     process_exited: bool,
 ) -> (
@@ -39,21 +42,24 @@ pub(crate) fn make_session(
     (session, msg_rx)
 }
 
+#[cfg(test)]
 pub(crate) async fn count_continuation_requests(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     count_events_of_type(pool, thread_id, "ContinuationRequested").await
 }
 
-pub(crate) async fn count_response_aborted(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+#[cfg(any(test, feature = "test-support"))]
+pub async fn count_response_aborted(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     count_events_of_type(pool, thread_id, "ResponseAborted").await
 }
 
 /// SessionStarted is the lifecycle precondition for any CC-channel event;
 /// the bus projection rejects ContinuationRequested otherwise (mirrors the
 /// pattern in spawn_dispatcher_tests.rs::continuation_requested_produces_spawn_request).
-pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
+pub async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
@@ -73,6 +79,7 @@ pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     .expect("SessionStarted persisted");
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn count_events_of_type(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -92,7 +99,7 @@ pub(crate) async fn count_events_of_type(
 /// (chat threads bootstrap on it; `SessionStarted` is CC-only per the lifecycle
 /// validator) — and return its event id, which IS the turn's
 /// `request_event_id`.
-pub(crate) async fn seed_chat_thread(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
+pub async fn seed_chat_thread(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
@@ -125,6 +132,7 @@ pub(crate) async fn seed_chat_thread(bus: &EventBus, thread_id: Uuid, text: &str
 /// before the loop blocks on the wait registry, and stamped with the turn's
 /// `request_event_id`. `turn_request_event_id: None` reproduces a legacy row
 /// from before the loop stamped the field.
+#[cfg(test)]
 pub(crate) async fn emit_ask_user_question_call(
     bus: &EventBus,
     thread_id: Uuid,
@@ -149,11 +157,12 @@ pub(crate) async fn emit_ask_user_question_call(
     .event_id
 }
 
+#[cfg(test)]
 pub(crate) async fn count_coding_agent_prompt_sent(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
     count_events_of_type(pool, thread_id, "CodingAgentPromptSent").await
 }
 
-pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
+pub async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAsked {
@@ -164,6 +173,7 @@ pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            permission_request: None,
         },
         meta: cc_meta(),
     })
@@ -177,6 +187,7 @@ pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use
 /// synthesized as `opt-0`, `opt-1`, ... from `option_labels`, matching what
 /// the real hook persists, so a `Selected { option_id }` answer resolves back
 /// to its label the same way in the test as in production.
+#[cfg(test)]
 pub(crate) async fn emit_answered_question(
     bus: &EventBus,
     thread_id: Uuid,
@@ -200,6 +211,7 @@ pub(crate) async fn emit_answered_question(
             worktree_path: None,
             multi_select: matches!(answer, AnswerKind::MultiSelected { .. }),
             owner_approval: None,
+            permission_request: None,
         },
         meta: cc_meta(),
     })
@@ -210,6 +222,7 @@ pub(crate) async fn emit_answered_question(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer,
@@ -231,6 +244,7 @@ pub(crate) async fn emit_answered_question(
 ///     CC stop endpoint can still cancel-stamp the QuestionCard, which
 ///     otherwise leaves clickable answer buttons dangling on the
 ///     archived thread).
+#[cfg(test)]
 pub(crate) async fn assert_terminator_orphans_only_active_lookup<F, Fut>(
     tool_use_id: &str,
     emit_terminator: F,
@@ -263,6 +277,7 @@ pub(crate) async fn assert_terminator_orphans_only_active_lookup<F, Fut>(
     teardown_test_db(&db_name).await;
 }
 
+#[cfg(test)]
 pub(crate) fn questions() -> serde_json::Value {
     serde_json::json!([{
         "question": "Fav color?",
@@ -273,6 +288,7 @@ pub(crate) fn questions() -> serde_json::Value {
     }])
 }
 
+#[cfg(test)]
 pub(crate) fn three_questions() -> serde_json::Value {
     serde_json::json!([
         {

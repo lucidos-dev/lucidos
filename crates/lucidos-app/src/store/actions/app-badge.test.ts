@@ -7,16 +7,10 @@ import type { WorkspaceStatus } from '../../api/client/control';
 const mocks = vi.hoisted(() => ({
   listWorkspaces: vi.fn(),
   listRemoteWorkspaces: vi.fn(),
-  // Stand-ins for basePath's load-time consts: `workspaceId` non-null = served
-  // behind the gateway under `/<slug>/` (one installed icon covers the whole
-  // origin, so the badge is an aggregate); null + not picker = a legacy root /
-  // direct engine port, which badges its own workspace.
   workspaceId: null as string | null,
   isPicker: false,
 }));
 
-// `isTauri` is the one context gate the sync consults at call time (the desktop
-// app drives a native dock badge instead of the web Badging API). Default off.
 vi.mock('../../utils/platform', async (importActual) => ({
   ...(await importActual<typeof import('../../utils/platform')>()),
   isTauri: vi.fn(() => false),
@@ -25,8 +19,6 @@ vi.mock('../../api/client/control', () => ({
   listWorkspaces: mocks.listWorkspaces,
   listRemoteWorkspaces: mocks.listRemoteWorkspaces,
 }));
-// Keep the rest of basePath real: the store pulls in the API client, which
-// reads BASE_PATH at import time.
 vi.mock('../../utils/basePath', async (importActual) => {
   const actual = await importActual<typeof import('../../utils/basePath')>();
   return {
@@ -45,6 +37,7 @@ const {
   syncWorkspaceAppBadge,
   refreshOtherWorkspacesUnread,
   crossWorkspaceUnreadTotal,
+  notificationsMenuUnreadTotal,
   peerWorkspaces,
   remotePeerWorkspaces,
 } = await import('./app-badge');
@@ -53,8 +46,6 @@ const { isTauri } = await import('../../utils/platform');
 let setAppBadge: ReturnType<typeof vi.fn>;
 let clearAppBadge: ReturnType<typeof vi.fn>;
 
-/** Install a fake Badging API on `navigator` (absent in the test runtime, as it
- *  is in every browser that doesn't implement it). */
 function installBadgingApi(): void {
   setAppBadge = vi.fn(() => Promise.resolve());
   clearAppBadge = vi.fn(() => Promise.resolve());
@@ -92,13 +83,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   installBadgingApi();
   (isTauri as ReturnType<typeof vi.fn>).mockReturnValue(false);
-  // Default context: a bare root (legacy engine / direct engine port), which
-  // badges its own workspace and never reaches for the control plane.
   mocks.workspaceId = null;
   mocks.isPicker = false;
   servedUnreadNotifications.value = { status: 'not-loaded' };
-  // Module-level, so a listing left by one case would otherwise be the starting
-  // total of the next.
   peerWorkspaces.value = [];
   remotePeerWorkspaces.value = [];
   mocks.listRemoteWorkspaces.mockResolvedValue([]);
@@ -144,12 +131,6 @@ describe('syncWorkspaceAppBadge', () => {
   });
 
   it('re-asserts unconditionally — the same count written twice writes the icon twice', () => {
-    // Load-bearing, not redundant: the icon badge is an EXTERNALLY written
-    // surface (iOS writes it from the push payload's `app_badge` in its parent
-    // process; the SW `push` handler writes it on Chrome/Android), so the page
-    // has to be able to overwrite a value it never observed changing. A sync
-    // that skipped a write when its own count was unchanged would leave a
-    // push-written icon reading 1 next to a bell reading 0.
     servedUnreadNotifications.value = { status: 'loaded', data: [] };
     syncWorkspaceAppBadge();
     syncWorkspaceAppBadge();
@@ -166,17 +147,13 @@ describe('syncWorkspaceAppBadge', () => {
 });
 
 describe('behind the gateway the icon badges EVERY workspace', () => {
-  // The gateway re-stamps every manifest it serves with `scope: "/"`, so one
-  // installed icon covers the picker and every `/<slug>/` on the origin. Badging
-  // it with whichever workspace is on screen hid every other workspace's
-  // unreads, which is the bug this block pins.
   beforeEach(() => {
     mocks.workspaceId = 'myws';
   });
 
   it('sums this workspace with the others, excluding our own row', async () => {
     mocks.listWorkspaces.mockResolvedValue([
-      workspace('myws', 99), // ignored: our own row is the LIVE count below
+      workspace('myws', 99),
       workspace('other', 3),
       workspace('notes', 1),
     ]);
@@ -193,16 +170,11 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
   });
 
   it('takes OUR half from the live unread set, so a mark-read lands on the same tick', async () => {
-    // Load-bearing: the polled listing still reports our pre-read count for
-    // seconds after an optimistic mark-read (the gateway's supervise loop has
-    // not re-probed us). Reading our own row from it would leave the icon
-    // disagreeing with the bell about the workspace on screen.
     mocks.listWorkspaces.mockResolvedValue([workspace('myws', 5), workspace('other', 3)]);
     servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(5) };
     await refreshOtherWorkspacesUnread();
     expect(setAppBadge).toHaveBeenLastCalledWith(8);
 
-    // One read, no refetch: 4 of ours + the same 3 elsewhere.
     servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(4) };
     syncWorkspaceAppBadge();
     expect(setAppBadge).toHaveBeenLastCalledWith(7);
@@ -215,8 +187,6 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     await refreshOtherWorkspacesUnread();
     expect(setAppBadge).toHaveBeenLastCalledWith(5);
 
-    // Best-effort: a failed refresh must not zero the others' half (which would
-    // read as "everything elsewhere was read") and must not throw.
     mocks.listWorkspaces.mockRejectedValue(new Error('gateway unreachable'));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await expect(refreshOtherWorkspacesUnread()).resolves.toBeUndefined();
@@ -226,10 +196,6 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
   });
 
   it('lets the NEWEST refresh win when two overlap', async () => {
-    // Startup, resume and the interval can all be in flight at once, and the
-    // gateway listing takes as long as its slowest stack lock. Without the seq
-    // guard the slower EARLIER response lands last and pins the icon to stale
-    // counts until the next refresh.
     let releaseStale: (v: WorkspaceStatus[]) => void = () => {};
     const stale = new Promise<WorkspaceStatus[]>((resolve) => { releaseStale = resolve; });
     mocks.listWorkspaces
@@ -243,16 +209,11 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
 
     releaseStale([workspace('other', 8)]);
     await first;
-    // The superseded listing is dropped, not applied.
     syncWorkspaceAppBadge();
     expect(setAppBadge).toHaveBeenLastCalledWith(1);
   });
 
   it('under Tauri still reads the peers, but writes no icon badge', async () => {
-    // Two concerns that used to share one gate. The native tray and dock own
-    // the ICON on desktop, so the page must not write it. The page still draws
-    // the brand badge and the menu's notifications group, and both need these
-    // rows, so the fetch has to run.
     (isTauri as ReturnType<typeof vi.fn>).mockReturnValue(true);
     mocks.listWorkspaces.mockResolvedValueOnce([workspace('other', 4)]);
     servedUnreadNotifications.value = { status: 'loaded', data: [] };
@@ -324,12 +285,6 @@ describe('a bare root context badges its own workspace only', () => {
 
 describe('why the badge needs an explicit re-assert', () => {
   it('an effect on unreadCount does NOT re-run when a reload lands the same count', () => {
-    // The signals cutoff: a computed whose recomputed value is equal does not
-    // notify its subscribers. So the `unreadCount` effect in store/effects.ts
-    // covers only the CHANGE case — a resume-time reload landing the same count
-    // re-runs nothing, and an icon badge written behind the page's back (by a
-    // push) would never be corrected. This test pins the mechanism so nobody
-    // "simplifies" the explicit re-asserts back out.
     servedUnreadNotifications.value = { status: 'loaded', data: [] };
     let runs = 0;
     const dispose = effect(() => {
@@ -338,13 +293,43 @@ describe('why the badge needs an explicit re-assert', () => {
     });
     expect(runs).toBe(1);
 
-    // A fresh array with the same length — the signal changed, the count didn't.
     servedUnreadNotifications.value = { status: 'loaded', data: [] };
     expect(runs).toBe(1);
 
-    // A real change does re-run it.
     servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(1) };
     expect(runs).toBe(2);
     dispose();
+  });
+});
+
+describe('header notification total', () => {
+  it('sums reachable menu rows while preserving the origin icon total', () => {
+    mocks.workspaceId = 'myws';
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    peerWorkspaces.value = [workspace('myws', 99), workspace('notes', 3), workspace('stopped')];
+    remotePeerWorkspaces.value = [
+      { gateway: 'lab', unreachable: null, workspaces: [workspace('notes', 7), workspace('stopped')] },
+      { gateway: 'office', unreachable: null, workspaces: [workspace('notes', 4)] },
+      { gateway: 'offline', unreachable: 'timed out', workspaces: [workspace('notes', 50)] },
+    ];
+    expect(notificationsMenuUnreadTotal.value).toBe(16);
+    expect(crossWorkspaceUnreadTotal.value).toBe(5);
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
+    expect(notificationsMenuUnreadTotal.value).toBe(14);
+    remotePeerWorkspaces.value = [];
+    expect(notificationsMenuUnreadTotal.value).toBe(3);
+  });
+
+  it('replaces the current remote route with live unreads exactly once', () => {
+    mocks.workspaceId = 'notes@lab';
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    peerWorkspaces.value = [workspace('notes', 3)];
+    remotePeerWorkspaces.value = [
+      { gateway: 'lab', unreachable: null, workspaces: [workspace('notes', 99)] },
+      { gateway: 'office', unreachable: null, workspaces: [workspace('notes', 4)] },
+    ];
+    expect(notificationsMenuUnreadTotal.value).toBe(9);
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
+    expect(notificationsMenuUnreadTotal.value).toBe(7);
   });
 });

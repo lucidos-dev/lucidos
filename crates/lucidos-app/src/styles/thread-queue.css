@@ -1,4 +1,3 @@
-/* ===== Thread Queue panel ===== */
 
 .thread-queue-empty {
     padding: var(--space-sm) var(--space-lg);
@@ -37,8 +36,6 @@
     border: 1px solid var(--border-color);
     border-radius: calc(var(--radius-control) * 0.5);
     font: inherit;
-    /* `font` resets font-feature-settings to initial; keep inheriting it
-       so a Fira Code user does not get ligatures back here. */
     font-feature-settings: inherit;
 }
 

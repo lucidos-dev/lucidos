@@ -9,18 +9,11 @@ import { MENU_ITEMS, type MenuItem } from '../types';
 import { SETTINGS_SUBVIEW_ITEMS, type PanelOverlay, type SettingsSubview } from '../store';
 import { SETTINGS_SECTION_REFRESH } from '../../components/settings/settingsSectionRefresh';
 
-/** How one content view takes part in the panel refresh contract. */
 type Coverage =
-  /** These components each call `usePanelRefresh`. Paths are under `components/`. */
   | { registers: string[] }
-  /** A settings section drawn by a function, refreshed from the section table. */
   | { sectionTable: true }
-  /** Shows no fetched data of its own that a refresh would re-read. */
   | { static: string };
 
-/** Every content view, exhaustive by type: a new menu item, overlay or
- *  settings subview fails `tsc` until it has a row, and the key checks below
- *  fail the suite as well. */
 const MENU: Record<MenuItem, Coverage> = {
   files: { registers: ['files/FilesView.tsx'] },
   apps: { registers: ['apps/AppsView.tsx'] },
@@ -53,6 +46,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   appearance: { sectionTable: true },
   memory: { registers: ['settings/MemoryInspector.tsx', 'settings/SummaryTreeBrowser.tsx'] },
   devices: { sectionTable: true },
+  users: { sectionTable: true },
   accounts: { sectionTable: true },
   backup: { registers: ['settings/SnapshotSection.tsx', 'settings/BackupSection.tsx', 'settings/RetainedRestoreSources.tsx'] },
   'coding-agents': { sectionTable: true },
@@ -65,6 +59,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   'keyboard-shortcuts': { static: 'preferences, which stay live over SSE' },
   access: { registers: ['settings/MobileAccessPage.tsx', 'settings/NetworkAccessPage.tsx'] },
   webhooks: { registers: ['settings/WebhooksPage.tsx'] },
+  'event-hooks': { registers: ['settings/EventHooksPage.tsx'] },
   'environment-variables': { registers: ['settings/EnvironmentVariablesPage.tsx'] },
   debugging: { static: 'device-local switches' },
   'communication-surfaces': { static: 'sample banners drawn from local signals' },

@@ -19,7 +19,7 @@ report. Each section carries its own scan, checks and fixes.
 |---|---|---|
 | `triggers` | `system-knowhow/workspace-audit/triggers` | intent vs knowhow split, retired event subscriptions, slugs, notification taps, coding-agent grants |
 | `apps` | `system-knowhow/workspace-audit/apps` | SDK boilerplate, the isolated app frame, escaping, theme names, dashboard names, hand-drawn controls, the ready signal, widgets |
-| `knowhow` | `system-knowhow/workspace-audit/knowhow` | frontmatter, naming, placement, unreachable references, orphans |
+| `knowhow` | `system-knowhow/workspace-audit/knowhow` | frontmatter, naming, placement, size, unreachable references, orphans |
 | `intents` | `system-knowhow/workspace-audit/intents` | frontmatter, knowhow ids, tone |
 | `scripts` | `system-knowhow/workspace-audit/scripts` | CLI usage, machine paths |
 | `plugins` | `system-knowhow/workspace-audit/plugins` | the `engine` requirement |
@@ -28,7 +28,10 @@ report. Each section carries its own scan, checks and fixes.
 | `cross-cutting` | `system-knowhow/workspace-audit/cross-cutting` | credentials in code, broken references, removed flags and fields |
 | `prompt-footprint` | `system-knowhow/workspace-audit/prompt-footprint` | the *workspace prompt footprint*: sections over their ceilings, clipped descriptions, unused items |
 
-Load a section with `load_knowhow` and its id, as for any knowhow.
+Load a section with `load_knowhow` and its id. A section split into parts lists
+them under `## Parts`: load every part to run it.
+
+Thread-progress assessments in the audit need current liveness, rather than earlier replies. The cross-cutting section checks this rule.
 
 ## When to run this
 
@@ -79,6 +82,9 @@ mid-sweep, put the fix in the report instead. Fixes follow § Remediation below.
 
 ## Sources of truth: load these first
 
+The chat system prompt routes exact-data lookups to file tools.
+An unattended trigger artifact remains readable even when excluded from workspace memory; audit recipes must preserve that explicit read.
+
 The audit does **not** restate the rules. Each check names the file that owns
 its rule; load it for the canonical wording.
 
@@ -91,15 +97,14 @@ its rule; load it for the canonical wording.
 | `system-knowhow/building-knowhow.md` | Knowhow doc vs reference: which files a root lists, and where a doc's own supporting files go |
 | `system-knowhow/intent-registry.md` | Which on-disk files become intents in the system prompt (trigger files double as intents, which is easy to miss) |
 | `system-knowhow/thread-events.md` | Every `ThreadEvent` name and which of them a trigger can subscribe to. For the **retired** set, ask the `events` tool rather than reading this file: see the `triggers` section |
-| The active engine system prompt | The intent vs knowhow taxonomy, the trigger worked example |
+| `system-knowhow/agent-sandbox.md` | Private paths, platform enforcement and the policy snapshot for each new process |
+| The active engine system prompt | Intent vs knowhow, the trigger example, version-build readings, and diagnostic logs under AGENT SANDBOX |
 
 "Per `<file>`" means: read the current version of that file and use *its*
 wording, not your memory of it.
 
-**Reach every one of them, this file and its sections, with `load_knowhow`.** Never look for
-a copy in a repo by path. A Lucidos checkout carries gitignored, frozen copies of
-`system-knowhow/` (build staging, abandoned coding-agent worktrees), and `find`
-returns whichever it meets first. `load_knowhow` serves the live file.
+**Reach all of them, this file and its sections, with `load_knowhow`**, never by a
+repo path. A Lucidos checkout holds frozen copies of `system-knowhow/`.
 
 ## What to walk
 
@@ -277,9 +282,9 @@ Each fix takes one of two routes. The section's § Remediation names the route p
 
 **The default is mixed**: inline for the mechanical batch, coding agents for the rest. Give the split in the "Do all suggested fixes" description: how many inline edits, and how many coding-agent threads.
 
-**Verify an inline batch by re-running its scans.** Run the same `scan` lines after the pass. Each fixed category should fall to the hits you judged fine. For an app file, the `[APP LINT]` note in each write's result is a second check (glossary § App lint).
+**Verify an inline batch by re-running its scans.** Run the same `scan` lines after the pass. Each fixed category should fall to the hits you judged fine. For an app file, each write's `[APP LINT]` note is a second check (system-knowhow/glossary/core-terms.md § App lint).
 
-**Worked example.** One full pass found ungated `:hover` rules in about 40 apps, one to six rules each. Sent as one coding-agent thread per app, they filled the Thread Queue and left the user about 30 pending changes, each a wrap in `@media (hover: hover)`. Inline, that is one pass in the audit thread and one re-run of the `touch-hover` scan. The same pass found work that earned its coding agent:
+**Worked example.** One full pass found ungated `:hover` rules in about 40 apps. One coding-agent thread per app filled the Thread Queue with about 30 pending changes, each a wrap in `@media (hover: hover)`. Inline, that is one pass and one re-run of the `touch-hover` scan. The same pass found work that earned its coding agent:
 
 - startup reads moved after `await lucidos.storage.ready`, with the `catch` that hid the old error removed
 - `escapeHtml` swapped for `escapeHtmlAttr`, which needs a read of each call site to see whether the value lands in an attribute
@@ -341,16 +346,16 @@ Each run gets its own timestamped directory. Don't overwrite previous reports: d
 
 ## Maintenance
 
-A change to a referenced source-of-truth file (new SDK call, new convention, deprecation) can make a check stale. Every check lives in one section file, so update that file. A check citing a heading or filename breaks silently when the source renames it. `.claude/rules/system-knowhow.md` § `Maintaining workspace-audit` says when this file must change with its sources. `./scripts/check-knowhow-refs.sh` catches the mechanical half in `/harden`. `./scripts/check-audit-scans.sh` runs every scan line against fixture lines, so a scan change needs a fixture row for the form it must catch.
+A source change (new SDK call, new convention, deprecation) can make a check stale: update the section file that holds it. A check citing a heading or filename breaks silently on a rename. `.claude/rules/system-knowhow.md` § `Maintaining workspace-audit` says when this file must change. `./scripts/check-knowhow-refs.sh` and `./scripts/check-audit-scans.sh` catch the mechanical half in `/harden`. A scan change needs a fixture row.
 
-**Several checks own their detection patterns outright**, rather than citing another file. Change what a check detects, and update its section's scan lines, the check and its § Remediation table in the same change:
+**Several checks own their detection patterns outright.** Change what one detects, and update its section's scan lines, check and § Remediation table together:
 
 - **Old-form `tap`**: a change to the `Tap` type. The rule file above carries this as a row.
-- **The isolated frame**: a change to the app frame's sandbox, or to what the app bridge carries. Its `fetch` half runs as two scan sections, `engine-fetch` (the engine address) and `relative-fetch` (the app's own files). One CORS refusal has two spellings in app code, so a sandbox change reaches both.
+- **The isolated frame**: a change to the app frame's sandbox, or to what the app bridge carries. Its `fetch` half runs as two scans, `engine-fetch` (the engine address) and `relative-fetch` (the app's own files), so a sandbox change reaches both.
 - **Hand-rolled controls**: the SDK or the shared component layer gains a control, so its hand-drawn form becomes drift. Also drop it from the "no SDK counterpart" list.
 - **The ready signal**: the manifest's `reveal` values, the fuse lengths, or `lucidos.ui.ready()`.
 - **The app icon**: what `icon` may name, the allowed file types, or the size cap.
-- **Plugins**: the required manifest fields, the `engine` schema, or the nested event path `system-knowhow/plugins.md` § `PluginInstalled` documents. This check owns the `plugin-manifests` scan and its own reading of `PluginInstalled`.
+- **Plugins**: the required manifest fields, the `engine` schema, or the nested event path `system-knowhow/plugins/local-modifications-the-modified-badge.md` § `PluginInstalled` documents. This check owns the `plugin-manifests` scan and its own reading of `PluginInstalled`.
 
 **A section's `## Scan` is where a pattern RUNS, and its check is where it
 means something.** Some checks also name their forms in words for the report and the

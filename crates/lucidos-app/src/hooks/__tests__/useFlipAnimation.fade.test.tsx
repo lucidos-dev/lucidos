@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Rows a disclosure rolls under their parent dissolve into it rather than
- * meeting a hard edge. The mask's fade reaches only as far as the top copy has
- * slid under the line, so a row at rest is never dimmed.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
@@ -26,7 +21,6 @@ function Drawer({ ids, open }: { ids: string[]; open: boolean }) {
     );
 }
 
-/** A row sits at its index in the list. Anything else has no box. */
 function rowRect(this: HTMLElement): DOMRect {
     const id = this.dataset.flipId;
     const rows = id ? [...this.parentElement!.querySelectorAll<HTMLElement>('[data-flip-id]')] : [];
@@ -79,5 +73,14 @@ describe('the drawer disclosure fade', () => {
         render(<Drawer ids={['a']} open={false} />, host);
         render(<Drawer ids={['a', 'b', 'c']} open />, host);
         expect(maskReach()).toEqual(['100px', '0px']);
+    });
+
+    it('rolls an empty message without inventing a bottom divider', () => {
+        render(<Drawer ids={['__section_tiles']} open={false} />, host);
+        render(<Drawer ids={['__section_tiles', 'empty-review']} open />, host);
+        expect(maskReach()).toEqual(['50px', '0px']);
+        expect(host.querySelector('.flip-disclosure-hairline')).toBeNull();
+        render(<Drawer ids={['__section_tiles']} open={false} />, host);
+        expect(host.querySelector('.flip-disclosure-hairline')).toBeNull();
     });
 });

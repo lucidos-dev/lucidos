@@ -1,6 +1,3 @@
-/** Explicit retained-source review. The caller supplies journal identity only;
- * content always comes from the durable original, never from a rendered view.
- * This module has no send, approval or source-deletion capability. */
 import type { RestoreGeneration } from './restoreGeneration';
 import type { RestoreIntentStore } from './restoreGenerationRecords';
 import type { RestoreDraftRecoveryEffects } from './restoreDraftRecovery';
@@ -21,9 +18,6 @@ export async function readRestoreSourceReview(store: RestoreIntentStore,
   return restoreSourceReview(records, owners);
 }
 
-/** User-requested copying bypasses automatic owner eligibility, including
- * unknown liveness and superseded originals. Its separate durable destination
- * makes retries safe without overwriting an edited automatic reconstruction. */
 export async function copyRestoreSourceForReview(store: RestoreIntentStore, generation: RestoreGeneration,
   reference: RestoreSourceReference, effects: RestoreDraftRecoveryEffects): Promise<string> {
   const current = () => {
@@ -41,7 +35,9 @@ export async function copyRestoreSourceForReview(store: RestoreIntentStore, gene
   const destination = materialization?.drafts.find((d) => d.sourceThreadId === reference.sourceThreadId);
   if (!destination) throw new Error('Restore review generation changed');
   if (materialization!.completed.includes(destination.threadId)) return destination.threadId;
-  await effects.createDraftIfAbsent(destination.threadId, source);
+  const draft = await store.materializeDraft(source);
+  current();
+  await effects.createDraftIfAbsent(destination.threadId, draft);
   current();
   await store.completeRecoveryDraft(record, generation, destination.threadId, true);
   current();

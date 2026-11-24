@@ -1019,8 +1019,9 @@ fn the_catalog_default_is_off() {
 /// upgrade reset turns them off. Replay only that intermediate step here.
 #[tokio::test]
 async fn the_intermediate_merge_converts_retired_modes_to_on() {
-    const MERGE: &str =
-        include_str!("../../../migrations/20261030213124_cache_keep_alive_mode_is_off_or_on.sql");
+    const MERGE: &str = include_str!(
+        "../../../../lucidos-core/migrations/20261030213124_cache_keep_alive_mode_is_off_or_on.sql"
+    );
     let (pool, db_name) = setup_test_db().await;
     let key = crate::core::prefs::CACHE_KEEP_ALIVE_MODE.key();
     let retired = ["break-even", "workspace-data"];
@@ -1072,6 +1073,7 @@ fn each_mode_picks_its_rule() {
 
 fn wait_on(kinds: &[&str], armed_minutes_ago: i64) -> LiveWait {
     LiveWait {
+        background_timing: None,
         wait_id: Uuid::new_v4(),
         thread_id: Uuid::new_v4(),
         tool_use_id: "toolu_test".into(),
@@ -1170,6 +1172,7 @@ fn capture(
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }
@@ -1438,6 +1441,7 @@ fn real_idle() -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -1518,6 +1522,7 @@ async fn a_child_between_successor_sessions_still_works() {
         &bus,
         child,
         ThreadEvent::SessionHandedOff {
+            plan_path: None,
             cause: None,
             starts: crate::engine::thread_events::SessionStart::Now,
             crossing: None,
@@ -2112,6 +2117,7 @@ fn ping_capture(read: u32, api_call_id: &str) -> ThreadEvent {
         stable_prefix_fingerprint,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }
@@ -2399,9 +2405,16 @@ async fn place_pings_and_captures(pool: &sqlx::PgPool, thread_id: Uuid, ages_sec
     .await
     .unwrap();
     assert_eq!(ids.len(), ages_secs.len(), "one age per event");
-    for (id, secs) in ids.into_iter().zip(ages_secs) {
-        age(pool, id, *secs).await;
-    }
+    // One statement reads one `now()`, so a gap between two ages is exact.
+    sqlx::query(
+        "UPDATE events e SET created = now() - make_interval(secs => a.secs) \
+           FROM unnest($1::uuid[], $2::float8[]) AS a(id, secs) WHERE e.id = a.id",
+    )
+    .bind(ids)
+    .bind(ages_secs)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// What the run that began `began_secs` ago ended with, once its events sit at
@@ -2421,15 +2434,17 @@ async fn run_end_of(
     read_run_end(pool, thread_id, since, 118_000).await.unwrap()
 }
 
-/// The saving is claimed only for a warm wake that read the cache. A ping's own
-/// turn is no real request, and a frame of the wake's own call is no refresh
-/// (I7).
+/// The saving is claimed only for a warm wake that read the cache. It is zero
+/// when the cache would not have expired without the pings. A ping's own turn
+/// is no real request, and a frame of the wake's own call is no refresh (I7).
 #[tokio::test]
 async fn the_saving_is_claimed_only_for_a_warm_wake() {
     let priced =
         reread_usd(118_000, "claude-opus-5-5", CacheLifetime::FiveMinutes).expect("priced");
     struct Case {
         label: &'static str,
+        /// The last real request's age, then the first ping's anchor and capture.
+        before_pings: [f64; 3],
         last_ping_age: f64,
         /// The wake's frames as (cache read, age).
         frames: &'static [(u32, f64)],
@@ -2438,6 +2453,7 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
     }
     let case = |label, last_ping_age, frames, saved| Case {
         label,
+        before_pings: [1_200.0, 960.0, 959.0],
         last_ping_age,
         frames,
         input_tokens: 100_000,
@@ -2468,11 +2484,39 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
             &[(100_000, 0.0), (100_000, 2.0)],
             Some(priced),
         ),
+        Case {
+            before_pings: [290.0, 240.0, 239.0],
+            ..case(
+                "a wake the last real request kept warm without the pings",
+                5.0,
+                &[(100_000, 0.0)],
+                Some(0.0),
+            )
+        },
+        Case {
+            before_pings: [300.0, 240.0, 239.0],
+            ..case(
+                "a wake exactly one lifetime after the last real request",
+                5.0,
+                &[(100_000, 0.0)],
+                Some(0.0),
+            )
+        },
+        Case {
+            before_pings: [301.0, 240.0, 239.0],
+            ..case(
+                "a wake just past the last real request's lifetime",
+                5.0,
+                &[(100_000, 0.0)],
+                Some(priced),
+            )
+        },
     ];
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     for Case {
         label,
+        before_pings,
         last_ping_age,
         frames,
         input_tokens,
@@ -2484,7 +2528,8 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
         seed_thread_event(&bus, thread_id, capture_writing(40_000, 0, false)).await;
         seed_ping(&bus, thread_id, 100_000, 1).await;
         seed_ping(&bus, thread_id, 100_000, 1).await;
-        let mut ages = vec![1_200.0, 960.0, 959.0, last_ping_age + 1.0, last_ping_age];
+        let mut ages = before_pings.to_vec();
+        ages.extend([last_ping_age + 1.0, last_ping_age]);
         for (read, age_secs) in frames {
             let mut capture = ping_capture(*read, "wake-call");
             if let ThreadEvent::ContextCaptured {
@@ -3020,8 +3065,9 @@ fn kind_of_warming_or_ended(status: &Option<CacheKeepAliveStatus>) -> &'static s
 // --- The migration to one grammar (I2) ---
 
 /// The shipped file, so there is no second copy that can drift.
-const ONE_GRAMMAR_MIGRATION: &str =
-    include_str!("../../../migrations/20261023203722_keep_alive_status_one_grammar.sql");
+const ONE_GRAMMAR_MIGRATION: &str = include_str!(
+    "../../../../lucidos-core/migrations/20261023203722_keep_alive_status_one_grammar.sql"
+);
 
 /// One stored status event in the shape the engine wrote before the one
 /// grammar, `null` for a clear.
@@ -3221,7 +3267,7 @@ async fn the_migration_says_what_the_old_events_meant() {
 
 /// The follow-up migration, the shipped file.
 const TURNED_OFF_NEVER_ENDS_MIGRATION: &str =
-    include_str!("../../../migrations/20261024061334_keep_alive_status_turned_off_never_ends.sql");
+    include_str!("../../../../lucidos-core/migrations/20261024061334_keep_alive_status_turned_off_never_ends.sql");
 
 /// A turn-off followed by other `not_kept` rows before the clear stays a clear
 /// once both migrations ran. A run that lost its warmth for another reason
@@ -3303,6 +3349,18 @@ fn question_asked() -> ThreadEvent {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        permission_request: None,
+    }
+}
+
+fn question_answered() -> ThreadEvent {
+    ThreadEvent::UserQuestionAnswered {
+        compose: None,
+        tool_use_id: "toolu_ask".to_string(),
+        answer: crate::engine::thread_events::AnswerKind::Selected {
+            option_id: "opt-0".to_string(),
+        },
+        quiet: false,
     }
 }
 
@@ -3450,7 +3508,10 @@ async fn a_parked_session_is_a_candidate_with_its_card() {
     assert_eq!(row.parked_card(), Some(ParkedCard::Question));
     assert!(row.secs_since_turn_request.is_some());
 
+    // One open card per thread: the question closes before the prompt shows.
+    seed_thread_event(&bus, thread_id, question_answered()).await;
     seed_thread_event(&bus, thread_id, permission_requested()).await;
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
     let row = candidate().await.expect("a parked session is a candidate");
     assert_eq!(row.parked_card(), Some(ParkedCard::Permission));
 
@@ -3466,6 +3527,33 @@ async fn a_parked_session_is_a_candidate_with_its_card() {
         .await
         .unwrap();
     assert!(candidate().await.is_none(), "a parked Codex thread");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A thread on hold is never kept warm, even parked on a card. The hold is read
+/// from the database, so a restart keeps it out too (I10).
+#[tokio::test]
+async fn a_held_parked_session_is_not_a_candidate() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/paused", None).await;
+    seed_thread_event(&bus, thread_id, turn_capture(1_000)).await;
+    seed_thread_event(&bus, thread_id, question_asked()).await;
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
+    let is_candidate = || async {
+        read_candidates(&pool, &[])
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.thread_id == thread_id)
+    };
+    assert!(is_candidate().await, "parked and not on hold");
+
+    crate::test_support::seed_hold(&bus, thread_id).await;
+    assert!(!is_candidate().await, "a thread on hold is never kept warm");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -4318,7 +4406,7 @@ async fn a_beat_is_never_a_real_request() {
     let real = || async {
         let sql = format!(
             "SELECT {} AS started",
-            crate::engine::successor::last_real_request_started_sql("$1")
+            crate::engine::session_capture_sql::last_real_request_started_sql("$1")
         );
         sqlx::query_scalar::<_, Option<DateTime<Utc>>>(&sql)
             .bind(thread_id)
@@ -4338,7 +4426,7 @@ async fn a_beat_is_never_a_real_request() {
     assert_eq!(real().await, Some(first), "beats are not real requests");
     let turn_started: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
         "SELECT {} AS started",
-        crate::engine::successor::last_turn_started_sql("$1")
+        crate::engine::session_capture_sql::last_turn_started_sql("$1")
     ))
     .bind(thread_id)
     .fetch_one(&pool)
@@ -4470,6 +4558,7 @@ async fn a_new_session_never_turns_a_re_armed_switch_off_again() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "fresh-session".into(),
             branch: "claude-code/switch-session".into(),
@@ -4512,6 +4601,7 @@ async fn a_pending_handoff_leaves_the_selection() {
         &bus,
         thread_id,
         ThreadEvent::SessionHandedOff {
+            plan_path: None,
             cause: None,
             starts: crate::engine::thread_events::SessionStart::Now,
             crossing: None,
@@ -5218,17 +5308,11 @@ fn beat_usage(input: u32, wrote: u32, output: u32) -> PrefillStub {
 }
 
 fn beat_body() -> PrefillBody {
-    PrefillBody {
-        provider: Some(crate::llm::ProviderKind::Anthropic),
-        model: "claude-opus-5-5".into(),
-        reasoning_effort: Some("high".into()),
-        stable_prefix_fingerprint: Some("0123456789abcdef".into()),
-        output_cap: Some(0),
-        reply: crate::llm::prefill::ReplyShape::Json,
-        wire_model: "claude-opus-5-5".into(),
-        betas: Vec::new(),
-        body: bytes::Bytes::from_static(b"{}"),
-    }
+    let mut body =
+        PrefillBody::for_test(Some(crate::llm::ProviderKind::Anthropic), "claude-opus-5-5");
+    body.reasoning_effort = Some("high".into());
+    body.stable_prefix_fingerprint = Some("0123456789abcdef".into());
+    body
 }
 
 fn remembered_store(thread_id: Uuid) -> super::super::RememberedRequests {
@@ -5276,10 +5360,12 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
         summary_row(&pool, thread_id).await,
     );
 
+    let mut provider = beat_usage(90_000, 0, 0);
+    provider.0.as_mut().unwrap().provider = Some(crate::llm::ProviderKind::Vertex);
     beat_once(
         &bus,
         &store,
-        &beat_usage(90_000, 0, 0),
+        &provider,
         thread_id,
         &store.pair(thread_id, Utc::now()).unwrap(),
         PrefillCut::Stable,
@@ -5293,6 +5379,7 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
     let [capture] = captures.as_slice() else {
         panic!("expected one beat capture, saw {}", captures.len());
     };
+    assert_eq!(capture["provider"], "vertex");
     assert!(capture["duration_ms"].is_u64(), "{capture}");
     assert_eq!(capture["usage"]["cache_read_tokens"], 90_000, "{capture}");
     assert_eq!(capture["model"], "claude-opus-5-5", "{capture}");
@@ -5308,7 +5395,7 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
 
     let refresh: f64 = sqlx::query_scalar(&format!(
         "SELECT EXTRACT(EPOCH FROM now() - {})::float8",
-        crate::engine::successor::last_cache_refresh_started_sql("$1")
+        crate::engine::session_capture_sql::last_cache_refresh_started_sql("$1")
     ))
     .bind(thread_id)
     .fetch_one(&pool)
@@ -6000,4 +6087,57 @@ async fn no_beat_past_the_ceiling() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn copy_beats_record_billing_even_without_an_answer() {
+    use crate::runtime::billing_provider::BillingAttribution;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    for billing in [
+        BillingAttribution::claude_initialize(&serde_json::json!({
+            "account":{"apiProvider":"gateway"}
+        })),
+        BillingAttribution::default(),
+    ] {
+        let reply = crate::runtime::claude_code::SessionCopyReply {
+            answer: Err("turn cap".into()),
+            usage: Some(crate::engine::ApiUsage {
+                input_tokens: 90_000,
+                cache_read_tokens: 90_000,
+                output_tokens: 2,
+                ..Default::default()
+            }),
+            model: Some("test-model".into()),
+            billing,
+        };
+        record_copy_usage(
+            &bus,
+            thread,
+            "test-model",
+            Some("high"),
+            &reply,
+            std::time::Duration::from_millis(15),
+        )
+        .await;
+    }
+    let captures = crate::test_support::aux_captures(&pool, thread, "cache_keep_alive").await;
+    assert_eq!(captures.len(), 2);
+    let mut providers: Vec<_> = captures
+        .iter()
+        .map(|c| c["provider"].as_str().unwrap())
+        .collect();
+    providers.sort();
+    assert_eq!(providers, ["claude-gateway", "unknown"]);
+    for capture in captures {
+        assert_eq!(capture["model"], "test-model");
+        assert_eq!(capture["usage"]["cache_read_tokens"], 90_000);
+        assert_eq!(capture["duration_ms"], 15);
+        assert_eq!(capture["reasoning_effort"], "high");
+        assert_eq!(capture["producer"], "auxiliary");
+        assert_eq!(capture["telemetry_owned_by_cli"], true);
+    }
+    pool.close().await;
+    teardown_test_db(&db).await;
 }

@@ -12,14 +12,10 @@ describe('dialogParagraphs', () => {
   });
 
   it('does NOT split on a single newline, so source-wrapped copy stays one paragraph', () => {
-    // Dialog copy is concatenated across source lines; a lone newline is an
-    // artifact of the source width, not an authored break.
     expect(dialogParagraphs('First line\nsecond line')).toEqual(['First line\nsecond line']);
   });
 
   it('splits a CRLF-authored message too', () => {
-    // An app can hand any string to `lucidos.ui.confirm`, CRLF included; the
-    // lone \r between the two newlines must not defeat the blank-line match.
     expect(dialogParagraphs('First.\r\n\r\nSecond.')).toEqual(['First.', 'Second.']);
   });
 

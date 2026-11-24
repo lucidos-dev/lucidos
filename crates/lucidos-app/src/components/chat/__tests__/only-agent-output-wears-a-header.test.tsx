@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** Only agent output wears a header. A turn the agent did not write (the
- *  engine's, the system's, or your own control press) draws like a change card:
- *  the time above a card, and the time opens the route popover.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -68,7 +64,6 @@ describe('a turn the agent did not write', () => {
     expect(toggle?.textContent).toBe('Details');
     act(() => { toggle!.click(); });
     expect(card?.textContent).toContain('Changes must pass hardening, an automatic review and test run, before they are applied.');
-    // Plain text, so markdown would show raw: the explainer carries none.
     expect(card?.textContent).not.toContain('`');
   });
 
@@ -116,9 +111,6 @@ describe('a turn the agent did not write', () => {
     expect(host.querySelector('.event-row[data-kind="boundary"] .event-row-state')?.textContent).toBe('Done');
   });
 
-  // The reported card: "Prompt to the agent", a raw `PromptInjected`
-  // tooltip, and the model's instructions as the only explanation. It now
-  // tells the story, and the model's words sit one fold deeper.
   it('tells a timed-out wait as a story, with the model\'s words folded deeper', () => {
     mount(starter({
       type: 'PromptInjected',
@@ -146,7 +138,6 @@ describe('a turn the agent did not write', () => {
     expect(toggles[1]?.getAttribute('aria-expanded')).toBe('false');
   });
 
-  // An older row has no origin, so its frozen opening sentence names it.
   it('names an older timed-out wait by its shape', () => {
     mount(starter({ type: 'PromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' }));
     const card = host.querySelector('.event-row[data-kind="boundary"]');
@@ -154,8 +145,6 @@ describe('a turn the agent did not write', () => {
     expect(card?.querySelector('.event-row-meta')).toBeNull();
   });
 
-  // A delivery whose matched event scrolled out of the loaded window has no
-  // structured card to draw, so it falls back to this one: still a story.
   it('names an older arrival whose matched event is not loaded', () => {
     mount(starter({
       type: 'PromptInjected',

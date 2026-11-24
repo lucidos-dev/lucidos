@@ -3,16 +3,6 @@ import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, hideDashboardRail, navigateToApp, setDevicePreference, waitForEventStream } from './helpers';
 import { psql } from './db-helpers';
 
-/**
- * The widget fit check (`docs/plans/2026-11-10-widget-fit-check.md`). The open
- * Lucidos window renders a widget at every size it declares, on the desk tile
- * and the phone column. The engine tells the agent what is cut off.
- *
- * The fixture is the Trip countdown the Demo Director rig's agent built: flight
- * rows that never wrap and end in an ellipsis. The phone column at 125% UI scale
- * is where its large box cut them off. The fixed widget wraps and shows less,
- * so it fits every box.
- */
 
 const SCALE = '125';
 
@@ -54,7 +44,6 @@ function seedThread(threadId: string): void {
   ].join(';\n'));
 }
 
-/** The note `widgets fit` answers, through the HTTP op the CLI calls. */
 async function fit(page: Page, appId: string, threadId: string): Promise<string> {
   const resp = await apiRequest(page).post('/api/v1/widgets/fit', { data: { app_id: appId, thread_id: threadId } });
   expect(resp.ok(), `fit: ${await resp.text()}`).toBeTruthy();
@@ -70,8 +59,6 @@ test.describe('The widget fit check', () => {
     written = [];
     threadId = randomUUID();
     appId = `e2e-trip-${randomUUID().slice(0, 8)}`;
-    // The check renders at the largest scale any device holds, so a scale left
-    // by another spec would change the boxes it measures.
     psql(`DELETE FROM preferences WHERE key = 'ui-scale'`);
     seedThread(threadId);
     await hideDashboardRail(page);

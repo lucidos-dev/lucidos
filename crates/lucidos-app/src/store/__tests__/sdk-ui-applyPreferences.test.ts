@@ -1,10 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { lucidos } from '@lucidos/sdk';
 
-// Theme is stored device-scoped (see crates/lucidos-app/src/store/actions/preferences.ts:141).
-// `lucidos.ui.applyPreferences()` runs in app iframes and must read the SAME device id
-// the parent uses (`lucidos-device-id` in localStorage), otherwise `/api/v1/preferences`
-// returns only globally-scoped prefs (no `theme` key) and the iframe defaults to dark.
 describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
   let originalFetch: typeof globalThis.fetch;
@@ -47,11 +43,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   });
 
   it('keeps inline --bg-primary in sync with the resolved theme', async () => {
-    // The sdk-prefs.js inline FOUC seeds --bg-primary on first paint from
-    // localStorage. applyPreferences runs later (after the SDK loads) and
-    // must update the inline value to match the SSE-resolved theme so the
-    // body's `var(--bg-primary, ...)` paints the right color even though
-    // inline styles win over the stylesheet cascade.
     const inlineProps: Record<string, string> = { '--bg-primary': '#07172e' };
     const realStyle = (document as any).documentElement.style;
     (document as any).documentElement.style = {
@@ -62,7 +53,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     };
 
     try {
-      // beforeEach mocks fetch to return theme=light.
       await lucidos.ui.applyPreferences();
     } finally {
       (document as any).documentElement.style = realStyle;
@@ -72,7 +62,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   });
 
   it('sets inline html.style.background so the iframe paints with a bg before sdk-iframe.css loads', async () => {
-    // See packages/lucidos-sdk/src/ui.ts for why — iOS PWA cold-restart flash.
     const inlineProps: Record<string, string> = {};
     const realStyle = (document as any).documentElement.style;
     const styleMock: any = {
@@ -84,7 +73,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
     (document as any).documentElement.style = styleMock;
 
     try {
-      // beforeEach mocks fetch to return theme=light.
       await lucidos.ui.applyPreferences();
     } finally {
       (document as any).documentElement.style = realStyle;
@@ -94,12 +82,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   });
 
   it('publishes ligatures to the iframe as OFF for text and ON for code', async () => {
-    // The OFF value is the explicit zeros, never `normal`: liga and calt are
-    // default-ON in CSS, so `normal` means "the font's defaults" and renders
-    // byte-identically to `1`, which is how an earlier attempt at this fix
-    // shipped as a no-op. The values render nothing until the two rules in the
-    // engine's api/sdk_iframe.css consume them. Mirrors the host-side
-    // assertion in actions/preferences.test.ts.
     globalThis.fetch = vi.fn(async () => new Response(
       JSON.stringify({ preferences: { 'theme-mode': 'light', 'font-family': 'fira-code' } }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
@@ -125,10 +107,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   });
 
   it('resolves both properties to normal for a font that ships no ligatures', async () => {
-    // A NAMED non-Fira font, not the absent-preference path: Fira Code is the
-    // default now, so "no font-family" is a ligature font and would test the
-    // opposite of what this case is for. Both properties must clear rather than
-    // leave a stale value behind from a previous font.
     globalThis.fetch = vi.fn(async () => new Response(
       JSON.stringify({ preferences: { 'theme-mode': 'light', 'font-family': 'inter' } }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
@@ -175,17 +153,6 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
   );
 });
 
-// The systemic theme bug: `applyPreferences()` ran AFTER sdk-prefs.js (which
-// synchronously seeds data-theme-mode/--font-ui/--user-ui-scale from localStorage),
-// then overwrote that correct value with a hard default whenever the active
-// device had no server-scoped pref. The iPhone-PWA case (only `ui-scale` stored
-// server-side, no `theme`) flipped every app iframe to dark even though the
-// host shell stayed light. The invariant these tests pin: a MISSING server
-// value must never clobber the client value sdk-prefs.js already resolved.
-//
-// The node test env stubs <html> with a no-op setAttribute and an always-''
-// style (src/test-setup.ts has no real DOM), so we record what applyPreferences
-// writes — mirroring the existing --bg-primary test's style swap above.
 describe('lucidos.ui.applyPreferences — client value wins when the server lacks the key', () => {
   let originalFetch: typeof globalThis.fetch;
 
@@ -241,7 +208,6 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
   });
 
   it('keeps the localStorage theme when the server has no device-scoped theme', async () => {
-    // The reported iPhone-PWA case: only ui-scale stored server-side, no theme.
     localStorage.setItem('lucidos-theme-mode', 'light');
     mockPrefs({ 'ui-scale': '125' });
 
@@ -262,7 +228,6 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
   it('falls back to the data-theme-mode attribute sdk-prefs.js applied when localStorage is empty', async () => {
     mockPrefs({});
 
-    // sdk-prefs.js already resolved + applied data-theme-mode=light synchronously.
     const cap = await applyWithCapture('light');
 
     expect(cap.attrs['data-theme-mode']).toBe('light');
@@ -283,9 +248,6 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
 
     const cap = await applyWithCapture();
 
-    // The default is `system`, which the SDK resolves through matchMedia. The
-    // test env's matchMedia answers `matches: false` for every query, so
-    // `prefers-color-scheme: light` is false and this lands on dark.
     expect(cap.attrs['data-theme-mode']).toBe('dark');
   });
 
@@ -308,9 +270,6 @@ describe('lucidos.ui.applyPreferences — client value wins when the server lack
   });
 });
 
-// Theme suggests, user wins: an app frame resolves its UI font exactly as the
-// host does. Each case names its own theme id, because the SDK fetches a theme
-// only when the id changes.
 describe('lucidos.ui.applyPreferences: the font a theme suggests', () => {
   let originalFetch: typeof globalThis.fetch;
   let inlineProps: Record<string, string>;

@@ -25,7 +25,6 @@ test.describe('Claude Code interaction', () => {
 
     await expect(userMessageBody(page)).toContainText(msg, { timeout: 15_000 });
 
-    // Wait for CC to produce some response content
     await page.waitForFunction(() => {
       const els = document.querySelectorAll('.response-content');
       return Array.from(els).some(el => {
@@ -41,8 +40,6 @@ test.describe('Claude Code interaction', () => {
     expect(text!.trim().length).toBeGreaterThan(0);
   });
 
-  // ADR 0491: the branch left the shared system prompt, so a fresh session
-  // learns it from the session context in its first message.
   test('a fresh session names its branch from the session context', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
@@ -94,9 +91,6 @@ test.describe('Claude Code interaction', () => {
     await expect(doneBtn).toBeVisible();
     await doneBtn.click();
 
-    // After dismiss, our thread should no longer be focused — verify our
-    // unique message is gone from the visible content (handleArchiveThread
-    // focuses the next review thread or unfocuses entirely).
     await page.waitForFunction(({ marker, sel }) => {
       return !Array.from(document.querySelectorAll(sel)).some(el => {
         const rect = el.getBoundingClientRect();
@@ -105,12 +99,6 @@ test.describe('Claude Code interaction', () => {
     }, { marker: msg, sel: USER_MSG_SELECTOR }, { timeout: 10_000 });
   });
 
-  // Regression: the prompt toggle must decide routing at SEND time, not at
-  // draft-creation time. Typing first stamps thread.meta.channel from the
-  // current toggle ('chat'), so toggling to Claude afterwards has to update
-  // the channel binding before sendMessage reads it — otherwise the message
-  // routes through Lucidos despite the UI showing Claude. Mirrors the user
-  // report: "I selected Claude Code in the toggle but it started Lucidos".
   test('typing first then toggling to Claude still routes to Claude Code', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
@@ -118,21 +106,14 @@ test.describe('Claude Code interaction', () => {
     const msg = uniqueMessage('cc-toggle-after-type');
     const fullText = `Say exactly: "toggled ${msg}" and nothing else. Do not create any files.`;
 
-    // Type FIRST — this is what creates the optimistic compose thread with
-    // channel='chat' (because the toggle is still Lucidos at this moment).
     const input = await waitForVisibleInput(page, 15_000);
     await input.fill(fullText);
 
-    // Now toggle to Claude. Pre-fix this only updated draft.mode + inputMode
-    // but left thread.meta.channel stale → the send routed through Lucidos.
     await pickComposeDestination(page);
     await expect(page.locator('.compose-destination-picker .dropdown-sizer > :first-child:visible').first()).toHaveText('Lucidos source');
 
     await input.press('Enter');
 
-    // The CC-specific "Archive" action panel only appears for Claude Code
-    // threads — Lucidos chats stream a response and stop, no action panel.
-    // If the bug were back, this would time out waiting for an Archive button.
     await waitForActionPanel(page, 'Archive', 120_000);
   });
 

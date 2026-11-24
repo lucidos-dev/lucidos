@@ -23,10 +23,10 @@ Split the codebase into 8 non-overlapping chunks. Launch ALL 8 agents **in a sin
 
 | Chunk | Directories |
 |-------|-------------|
-| core | `crates/lucidos-engine/src/core/` |
+| core | `crates/lucidos-core/src/core/` |
 | engine | `crates/lucidos-engine/src/engine/` |
-| api | `crates/lucidos-engine/src/api/` + top-level `crates/lucidos-engine/src/*.rs` |
-| llm-infra | `crates/lucidos-engine/src/llm/`, `crates/lucidos-engine/src/mcp/`, `crates/lucidos-engine/src/memory/`, `crates/lucidos-engine/src/runtime/`, `crates/lucidos-engine/src/scheduler/`, `crates/lucidos-engine/src/triggers/` |
+| api | `crates/lucidos-agents-api/src/api/` + top-level `crates/lucidos-engine/src/*.rs` |
+| llm-infra | `crates/lucidos-core/src/llm/`, `crates/lucidos-engine/src/mcp/`, `crates/lucidos-engine/src/memory/`, `crates/lucidos-engine/src/runtime/`, `crates/lucidos-engine/src/scheduler/`, `crates/lucidos-engine/src/triggers/` |
 
 ### Frontend (TypeScript/CSS) — include the frontend checklist
 
@@ -154,7 +154,7 @@ Then sweep the engine + gateway + CLI (`crates/lucidos-engine/src/`, `crates/luc
 
 Run tests based on which file types changed:
 
-- `.rs` files changed → `make lint && make test` (`make lint` is the canonical gate: ShellCheck, a rustfmt-clean check over the tree, and clippy over both feature sets; it supersedes a bare `cargo check`. `make test` = `./scripts/test-engine.sh`, which provisions the Postgres the integration tests need (a bare `cargo test -p lucidos-engine` panics every DB-backed test))
+- `.rs` files changed → `make lint && make test` (`make lint` is the canonical gate: ShellCheck, a rustfmt-clean check over the tree, and clippy with `--all-features`; it supersedes a bare `cargo check`. `make test` = `./scripts/test-engine.sh`, which provisions the Postgres the integration tests need (a bare `cargo test -p lucidos-engine` panics every DB-backed test))
 - `.sh` / `.shellcheckrc` / `Makefile` changed → `make lint`
 - `.ts`/`.tsx` files changed → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - Both → run both

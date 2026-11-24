@@ -1,13 +1,7 @@
 // @vitest-environment jsdom
-//
-// jsdom, not the hand-rolled `document` stub in src/test-setup.ts. The stub has
-// no `implementation`, so `stripHtml` would take its DOM-free fallback and the
-// security property under test here would never be exercised.
 import { describe, it, expect, beforeAll } from 'vitest';
 import { escapeHtml, stripHtml } from './escapeHtml';
 
-/** Every document `stripHtml` builds to parse into. Captured because the whole
- *  point is WHICH document receives the untrusted markup. */
 const parsedInto: Document[] = [];
 
 beforeAll(() => {
@@ -21,10 +15,6 @@ beforeAll(() => {
 
 describe('stripHtml', () => {
   it('parses into a document with no browsing context', () => {
-    // A detached element still belongs to the live document, so an `<img>` or
-    // `<iframe>` written into its innerHTML really fetches and really fires
-    // its handler. A document with no `defaultView` runs no script and loads
-    // no resource, which is what makes the same assignment inert.
     stripHtml('<b>first call</b>');
     expect(parsedInto.length).toBeGreaterThan(0);
     for (const doc of parsedInto) {
@@ -34,10 +24,6 @@ describe('stripHtml', () => {
   });
 
   it('keeps untrusted markup out of the live document', () => {
-    // Guards a different regression from the one above: markup appended to the
-    // live tree rather than parsed off it. jsdom loads no resource and runs no
-    // script, so it cannot demonstrate the fetch itself. The inert-document
-    // test is what pins that half.
     const before = document.body.innerHTML;
     stripHtml('<img src=x onerror="globalThis.__pwned = true">');
     stripHtml('<iframe src="//evil.example/"></iframe>');
@@ -58,8 +44,6 @@ describe('stripHtml', () => {
   });
 
   it('drops the attribute that carried the payload', () => {
-    // The reachable caller renders this as a text child, so what matters is
-    // that only text survives.
     expect(stripHtml('<img src=x onerror="fetch(1)">')).toBe('');
     expect(stripHtml('<span onclick="x()">label</span>')).toBe('label');
   });
@@ -73,7 +57,6 @@ describe('escapeHtml', () => {
   });
 
   it('shares no mutable element with stripHtml', () => {
-    // One element served both, so each call left markup behind for the next.
     stripHtml('<p>left behind</p>');
     expect(escapeHtml('a<b')).toBe('a&lt;b');
     escapeHtml('<script>');

@@ -3,7 +3,7 @@ import type { ComponentChildren, VNode } from 'preact';
 import { brandBadgeState, brandBadgeLabel, brandTooltipRows, BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
 import { GlyphBadge } from '../shared/GlyphBadge';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
-import { crossWorkspaceUnreadTotal, peerWorkspaces } from '../../store/actions/app-badge';
+import { notificationsMenuUnreadTotal, peerWorkspaces, remotePeerWorkspaces } from '../../store/actions/app-badge';
 import type { ActivityRow } from '../../store/actions/activityRows';
 import { connectionNotice } from '../../utils/connectionNotice';
 import type { Notification } from '../../store/types';
@@ -24,9 +24,6 @@ import {
 vi.mock('../shared/GlyphBadge', () => import('../shared/__tests__/glyphBadgeStub'));
 
 describe('brandBadgeState / brandBadgeLabel', () => {
-  /** The badge is driven by the activity group's rows, which the component
-   *  derives via `liveActivityRows`. Their derivation is covered in
-   *  `store/actions/activityRows.test.ts`; here the rows are the input. */
   const build: ActivityRow = {
     key: 'engine-build',
     label: 'Building new version',
@@ -103,9 +100,6 @@ describe('brandBadgeState / brandBadgeLabel', () => {
     expect(brandBadgeLabel([])).toBe('Client update available');
   });
 
-  /** New code in source with nothing built behind it. A state of its own, and
-   *  the quietest of the three, because it is the one the user can do least
-   *  about. */
   it('source ahead with nothing built shows the pending badge', () => {
     engineVersionPending.value = true;
     expect(brandBadgeState(0)).toBe('pending');
@@ -159,8 +153,6 @@ describe('brandTooltipRows', () => {
     expect(brandTooltipRows(0, [], null)).toEqual([]);
   });
 
-  /** The menu names each thread, so the tooltip counts them instead of
-   *  listing every title. */
   it('collapses single-thread applies to one count per phase', () => {
     expect(brandTooltipRows(4, [batch, conflict('a'), conflict('b'), conflict('c')], null)).toEqual([
       { label: 'Unread', value: '4' },
@@ -181,9 +173,6 @@ describe('brandTooltipRows', () => {
   });
 });
 
-/** Walk a vnode tree, returning every node whose className contains `cls`.
- *  Mirrors the helper in `shared/__tests__/toast-progress.test.tsx`: these
- *  components are called as plain functions, with no DOM render. */
 function findByClass(node: ComponentChildren, cls: string, out: VNode[] = []): VNode[] {
   if (node === null || node === undefined || typeof node === 'boolean') return out;
   if (typeof node === 'string' || typeof node === 'number') return out;
@@ -215,26 +204,23 @@ describe('BrandBadge', () => {
     expect(BrandBadge()).toBeNull();
   });
 
-  /** A tap anywhere on the mark opens the Lucidos menu, so the badge must never
-   *  take a tap of its own. Every state renders a plain span. */
   it.each([
     ['busy', () => { engineBuilding.value = true; }],
     ['ready', () => { engineVersionReady.value = true; }],
     ['pending', () => { engineVersionPending.value = true; }],
-  ])('is a GlyphBadge with no handler in the %s state', (_state, arrange) => {
+  ])('is click-through with the correct layout in the %s state', (_state, arrange) => {
     arrange();
     const badge = findByClass(BrandBadge(), 'brand-badge')[0] as VNode<Record<string, unknown>> | undefined;
-    expect(badge?.type).toBe(GlyphBadge);
+    expect(badge?.type).toBe(_state === 'ready' ? GlyphBadge : 'span');
+    expect(String(badge?.props.class).includes('badge-icon')).toBe(_state === 'busy');
     expect(badge?.props.onClick).toBeUndefined();
   });
 
-  /** An Apply All is a job in flight like a build, so the badge spins for it. */
   it('spins while an Apply All runs', () => {
     applyAllInProgress.value = true;
     expect(findByClass(BrandBadge(), 'brand-badge-spinner')).toHaveLength(1);
   });
 
-  /** A queued build is waiting, not working, so the badge must not spin. */
   it('draws a still queued glyph instead of the spinner while the build is queued', () => {
     engineBuilding.value = true;
     engineBuildDetail.value = {
@@ -245,11 +231,10 @@ describe('BrandBadge', () => {
     };
     expect(findByClass(BrandBadge(), 'brand-badge-spinner')).toHaveLength(0);
     expect(findByClass(BrandBadge(), 'brand-badge-queued')).toHaveLength(1);
+    expect(findByClass(BrandBadge(), 'badge-icon')).toHaveLength(1);
     engineBuildDetail.value = null;
   });
 
-  /** The dot draws no glyph: the box is the mark. A `!` here would be a second
-   *  attention mark for the one state with nothing to act on. */
   it('draws no glyph in the pending state', () => {
     engineVersionPending.value = true;
     expect(findByClass(BrandBadge(), 'brand-badge-dot')).toHaveLength(1);
@@ -257,10 +242,6 @@ describe('BrandBadge', () => {
   });
 
 
-  /** The reported bug: on iOS the spinner froze after a swipe to the Threads
-   *  pane. Each mobile header carries its own badge, and the hidden ones are
-   *  `display: none`. WebKit can leave a spin frozen on an element that comes
-   *  back from that, so every pane swap must hand the spinner a new element. */
   it('remounts the spinner whenever the visible mobile pane changes', () => {
     engineBuilding.value = true;
     const spinnerKey = () => findByClass(BrandBadge(), 'brand-badge-spinner')[0]?.key;
@@ -273,14 +254,11 @@ describe('BrandBadge', () => {
   });
 });
 
-/** The unread count, the mark's SECOND badge and the only in-app mirror of the
- *  app-icon badge. A separate component from `BrandBadge` on purpose. Folding a
- *  count into that ladder would hide the rebuild spinner while anything is
- *  unread, which on a dev workspace is most of the time. */
 describe('UnreadBrandBadge', () => {
   beforeEach(() => {
     servedUnreadNotifications.value = { status: 'loaded', data: [] };
     peerWorkspaces.value = [];
+    remotePeerWorkspaces.value = [];
   });
 
   function unread(): VNode<{ 'aria-label'?: string }> | undefined {
@@ -303,17 +281,21 @@ describe('UnreadBrandBadge', () => {
     expect(UnreadBrandBadge()).toBeNull();
   });
 
-  it('shows the same total the app icon carries', () => {
+  it('shows the notification menu total', () => {
     servedUnreadNotifications.value = { status: 'loaded', data: notes(2) };
     expect(unread()).toBeDefined();
-    // The computed is the single source both surfaces read, so asserting the
-    // rendered number IS asserting the icon's.
-    expect(crossWorkspaceUnreadTotal.value).toBe(2);
+    expect(notificationsMenuUnreadTotal.value).toBe(2);
+  });
+
+  it('renders remote unreads when the current workspace has none', () => {
+    remotePeerWorkspaces.value = [{
+      gateway: 'lab', unreachable: null,
+      workspaces: [{ id: 'notes', name: 'Notes', health: 'healthy', unread_count: 9 }],
+    }];
+    expect(vnodeToText(UnreadBrandBadge())).toContain('>9</span>');
   });
 
   it('coexists with the engine state badge rather than replacing it', () => {
-    // The reported failure this pins: a rebuild that shows no spinner because a
-    // notification happens to be unread.
     servedUnreadNotifications.value = { status: 'loaded', data: notes(3) };
     engineBuilding.value = true;
     expect(findByClass(BrandBadge(), 'brand-badge-spinner'),
@@ -322,9 +304,6 @@ describe('UnreadBrandBadge', () => {
   });
 
   it('is purely visual: no name of its own, and no tooltip', () => {
-    // Both would be dead. The badge is `pointer-events: none`, so `useTooltip`
-    // (which walks UP from the hovered element) can never resolve it, and the
-    // hover lands on the mark instead. The MARK speaks the count.
     servedUnreadNotifications.value = { status: 'loaded', data: notes(3) };
     const el = unread() as VNode<Record<string, unknown>> | undefined;
     expect(el?.props['aria-hidden']).toBe('true');
@@ -339,8 +318,6 @@ describe('UnreadBrandBadge', () => {
   });
 
   it('caps at the same number the menu rows do', () => {
-    // One shared `countLabel`, so the mark and the rows cannot start eliding at
-    // different counts.
     servedUnreadNotifications.value = { status: 'loaded', data: notes(100) };
     expect(vnodeToText(UnreadBrandBadge())).toContain('99+');
   });

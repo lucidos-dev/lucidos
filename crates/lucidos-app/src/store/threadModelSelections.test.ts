@@ -1,10 +1,6 @@
-/** Per-thread model/effort memory: a thread resolves `its newest starter or
- *  pick ?? the account default`, and a pick on one thread never touches another
- *  or the account preference. These pin the "this thread only" and
- *  "backend-authoritative fallback" decisions from
- *  docs/plans/2026-07-03-per-thread-model-memory.md. */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  chatTurnSelection,
   lastThreadModel,
   resolveActiveThreadModel,
   resolveActiveThreadProvider,
@@ -15,7 +11,6 @@ import type { StoredEvent } from './thread-events';
 import type { ThreadState } from './thread-events';
 import type { PairStamp } from '../api/threads';
 
-/** Minimal ThreadState carrying only the events the resolvers read. */
 function seedThread(
   id: string,
   events: Array<[number, Partial<StoredEvent>]>,
@@ -27,7 +22,6 @@ function seedThread(
   threadMap.value = next;
 }
 
-/** The account's stored tier for `account-model`. */
 const ACCOUNT_EFFORTS = 'account-model=high';
 
 function resetAccount(): void {
@@ -64,17 +58,12 @@ describe('resolveActiveThreadModel: newest starter or pick ?? account default', 
     currentModel.value = 'account-model';
     seedThread('t-1', [
       [1, { type: 'MessageReceived', model: 'real-model' }],
-      // a later synthetic failed-send row carries no model → must not win
       [-99, { type: 'MessageReceived', text: 'failed' }],
     ]);
     expect(resolveActiveThreadModel('t-1')).toBe('real-model');
   });
 
   it("uses a trigger thread's TriggerStarted model, which is its only starter event", () => {
-    // A trigger fire emits TriggerStarted and no MessageReceived at all, so
-    // reading only MessageReceived would show the account model here however
-    // the trigger was pinned. Mirrors the backend's
-    // `IN ('MessageReceived', 'TriggerStarted')`.
     seedThread('t-trigger', [
       [1, { type: 'TriggerStarted', model: 'gemini-3.8-flash', reasoning_effort: 'low' }],
       [2, { type: 'ResponseGenerated' }],
@@ -149,10 +138,8 @@ describe('a pick is per-thread and never writes the account preference', () => {
   it('picking on thread A leaves thread B and the account default untouched', () => {
     seedThread('A', [[1, { type: 'ChatSettingsChanged', model: 'A-model', reasoning_effort: 'low' }]]);
     expect(resolveActiveThreadModel('A')).toBe('A-model');
-    // Thread B (no events) still resolves the account default.
     expect(resolveActiveThreadModel('B')).toBe('account-model');
     expect(resolveActiveThreadReasoningEffort('B', 'account-model')).toBe('high');
-    // The account preference is untouched.
     expect(currentModel.value).toBe('account-model');
     expect(preferences.value).toEqual({ status: 'loaded', data: { chat_reasoning_efforts: ACCOUNT_EFFORTS } });
   });
@@ -174,7 +161,6 @@ describe('resolveActiveThreadProvider: a backend is remembered with its model', 
       [2, { type: 'ChatSettingsChanged', model: 'opus', provider: 'anthropic' }],
     ]);
     expect(resolveActiveThreadProvider('t-1', 'opus')).toBe('anthropic');
-    // Another thread never sees it.
     expect(resolveActiveThreadProvider('t-2', 'opus')).toBeNull();
   });
 });
@@ -213,5 +199,37 @@ describe('a paged thread reads its pair from the server stamps', () => {
     );
     expect(resolveActiveThreadModel('t-1')).toBe('picked-model');
     expect(resolveActiveThreadReasoningEffort('t-1', 'picked-model')).toBe('low');
+  });
+});
+
+describe('pending chat rung picks', () => {
+  it('ignores injected live stamps and reconstructs the same pair from a paged snapshot', () => {
+    const applied = { type: 'ChatTurnSettingsResolved', model: 'live', reasoning_effort: 'low', request_event_id: 'turn' };
+    const pick = { type: 'ChatSettingsChanged', model: 'next', reasoning_effort: 'high' };
+    seedThread('pending', [[1, applied as never], [2, pick as never],
+      [3, { type: 'MessageReceived', model: 'live', request_event_id: 'turn' } as never]]);
+    expect(resolveActiveThreadModel('pending')).toBe('next');
+    expect(chatTurnSelection('pending').live?.model).toBe('live');
+    expect(chatTurnSelection('pending').pending?.model).toBe('next');
+    seedThread('pending', [], [
+      { sequence: 1, event_type: 'ChatTurnSettingsResolved', request_event_id: 'turn', model: 'live', reasoning_effort: 'low', provider: '' },
+      { sequence: 2, event_type: 'ChatSettingsChanged', model: 'next', reasoning_effort: 'high', provider: '' },
+    ]);
+    expect(resolveActiveThreadModel('pending')).toBe('next');
+    expect(chatTurnSelection('pending').live?.model).toBe('live');
+    expect(chatTurnSelection('pending').pending?.model).toBe('next');
+    seedThread('pending', [[4, { ...pick, type: 'ChatTurnSettingsResolved', request_event_id: 'next-turn' } as never]], threadMap.value.get('pending')!.pairStamps);
+    expect(chatTurnSelection('pending').pending).toBeUndefined();
+    expect(chatTurnSelection('pending').live?.model).toBe('next');
+  });
+
+  it('reads a re-pick of the running pair as no pending pick', () => {
+    seedThread('repick', [
+      [1, { type: 'ChatTurnSettingsResolved', model: 'live', reasoning_effort: 'low', request_event_id: 'turn' } as never],
+      [2, { type: 'ChatSettingsChanged', model: 'next', reasoning_effort: 'high' } as never],
+      [3, { type: 'ChatSettingsChanged', model: 'live', reasoning_effort: 'low', provider: '' } as never],
+    ]);
+    expect(chatTurnSelection('repick').live?.model).toBe('live');
+    expect(chatTurnSelection('repick').pending).toBeUndefined();
   });
 });

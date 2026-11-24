@@ -145,8 +145,14 @@ db-defaults miss url = os.environ["LUCIDOS_DATABASE_URL"]
 EOF
 )
 
-SECTIONS=(system-knowhow/workspace-audit/*.md)
-if [ ! -f "${SECTIONS[0]}" ]; then
+# A section split into parts keeps them in its folder, so read every level,
+# as the other doc-family readers do.
+# bash 3.2 trips `set -u` on an empty array, so the list starts with /dev/null.
+SECTIONS=(/dev/null)
+while IFS= read -r f; do
+    SECTIONS+=("$f")
+done < <(find system-knowhow/workspace-audit -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
+if [ ! -f "${SECTIONS[1]:-}" ]; then
     echo "ERROR: no audit sections under system-knowhow/workspace-audit/, so the audit-scan check cannot run." >&2
     exit 1
 fi

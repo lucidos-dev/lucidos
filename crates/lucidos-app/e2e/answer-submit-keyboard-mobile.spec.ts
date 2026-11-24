@@ -3,36 +3,15 @@ import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isM
 import { psql, createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/**
- * The composer's Submit answers a question while the mobile keyboard is up.
- *
- * A question card parks the thread on `waiting_for_user_answer`, and typing a
- * custom answer swaps the round send morph for a lone green Submit. Reported
- * from an iOS PWA: with the keyboard up, that Submit did nothing, tap after tap,
- * while the transcript still scrolled and the keyboard stayed on screen. The
- * round send morph on an ordinary thread was fine.
- *
- * This builds that row and pins the LAYOUT half. Submit is hittable at its
- * centre and edges. Nothing overlays it. The row never rebuilds it under the
- * finger, and an injected touch tap answers.
- *
- * It never reproduced the failure, and that is the finding. The cause was the
- * scroll-vs-tap gate reading page-viewport coordinates, which no emulator
- * without a keyboard can trip. The gate is covered by
- * `src/utils/tapGesture.test.ts` and `prompt-cancel-tap-gate.test.ts`.
- */
 
 const OPTIONS = [
   { id: 'approve', label: 'Approve it', description: 'Go ahead with the plan as written.' },
   { id: 'keep', label: 'Keep the preference key', description: 'Leave the key alone.' },
 ];
 
-/** Visual-viewport height an open iOS keyboard leaves on this device, which is
- *  what MobileSwipeContainer writes to `--app-height`. */
 const KEYBOARD_APP_HEIGHT_PX = 490;
 
 test.describe('Answer Submit with the mobile keyboard up', () => {
-  // iPhone 15 Pro portrait points, the device the report came from.
   test.use({ viewport: { width: 393, height: 852 } });
 
   test('is hittable where it is painted, and a touch tap runs it', async ({ page, browserName }) => {
@@ -65,14 +44,11 @@ test.describe('Answer Submit with the mobile keyboard up', () => {
       await expect(page.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first())
         .toBeVisible({ timeout: 15_000 });
 
-      // The reported conditions: the user's ui scale, and the app shell shrunk
-      // to what an open keyboard leaves of the visual viewport.
       await page.evaluate((h: number) => {
         document.documentElement.style.setProperty('--user-ui-scale', '112.5%');
         document.documentElement.style.setProperty('--app-height', `${h}px`);
       }, KEYBOARD_APP_HEIGHT_PX);
 
-      // Typing a custom answer is what swaps the lone red Cancel for Submit.
       const input = page.locator('[data-role="prompt-input"]:visible').first();
       await input.focus();
       await input.fill('Its good, but I would like to see the plan visualized and scrutinise it more.');
@@ -83,9 +59,6 @@ test.describe('Answer Submit with the mobile keyboard up', () => {
       await expect(page.locator('.prompt-actions-row button[data-role="thread-diff"]').first())
         .toBeVisible({ timeout: 10_000 });
 
-      // Is the row settled, or is the fit check flipping it between its two
-      // layouts? A reparented button is destroyed and rebuilt, and a touch that
-      // began on the old node produces no click at all.
       const churn = await page.evaluate(async () => {
         const find = () => Array.from(document.querySelectorAll<HTMLElement>('button[aria-label="Submit answer"]'))
           .find(b => b.getBoundingClientRect().width > 0) ?? null;
@@ -155,8 +128,6 @@ test.describe('Answer Submit with the mobile keyboard up', () => {
       expect(probe!.rect.bottom, 'Submit sits below the app shell, behind the keyboard')
         .toBeLessThanOrEqual(probe!.shellBottom + 0.5);
 
-      // Chromium injects real touch input over CDP, so the tap itself is
-      // testable there. WebKit exposes no equivalent on a mobile context.
       if (browserName === 'chromium') {
         const r = probe!.rect;
         const x = Math.round((r.left + r.right) / 2);

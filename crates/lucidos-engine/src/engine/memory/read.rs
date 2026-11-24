@@ -59,7 +59,7 @@ impl LucidosEngine {
     /// matched" from "there was more and you have the top slice". Those want
     /// different next moves, and guessing between them is how one search turns
     /// into a sweep.
-    pub(crate) async fn search_memory_ranked(
+    pub async fn search_memory_ranked(
         &self,
         q: &str,
         limit: Option<i64>,
@@ -125,14 +125,14 @@ impl LucidosEngine {
                         }
                     }
                     Err(e) => {
-                        crate::log!(@Memory, "search: semantic arm failed: {}", e);
+                        crate::log_legacy!(@Memory, "search: semantic arm failed: {}", e);
                         degraded.push("semantic");
                     }
                 },
                 None => degraded.push("semantic"),
             },
             Err(e) => {
-                crate::log!(@Memory, "search: embedding failed, keyword only: {}", e);
+                crate::log_legacy!(@Memory, "search: embedding failed, keyword only: {}", e);
                 degraded.push("semantic");
             }
         }
@@ -185,7 +185,7 @@ impl LucidosEngine {
                     }
                 }
                 Err(e) => {
-                    crate::log!(@Memory, "search: keyword arm failed: {}", e);
+                    crate::log_legacy!(@Memory, "search: keyword arm failed: {}", e);
                     keyword_failed = true;
                 }
             }
@@ -252,7 +252,7 @@ impl LucidosEngine {
     /// source event's. Entry first, and an unknown id falls through to the
     /// event lookup unchanged, so a caller that always passed an event id is
     /// unaffected.
-    pub(crate) async fn memory_source(
+    pub async fn memory_source(
         &self,
         id: Uuid,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {

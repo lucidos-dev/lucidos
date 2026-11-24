@@ -2,7 +2,6 @@ import { dismissTopOverlay } from '../../../crates/lucidos-app/src/store/overlay
 
 const consumed = new WeakSet<KeyboardEvent>();
 let instances = 0;
-/** Called before the iframe forwards a shortcut to its host. */
 export function consumeLocalOverlayEscape(event: KeyboardEvent): boolean {
   if (consumed.has(event)) return true;
   if (instances === 0 || event.key !== 'Escape' || !dismissTopOverlay()) return false;

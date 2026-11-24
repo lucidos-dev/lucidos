@@ -1,16 +1,3 @@
-/**
- * A discard that the engine refuses gives the draft back WHOLE.
- *
- * The rollback used to restore text, images and channel, and nothing else.
- * `forgetComposeState` had already dropped the draft's `composeSelections`
- * entry, so `resolveScope` answered Lucidos for a draft aimed at a repo. The
- * destination row and the drawer chip then said Lucidos source. A Send from
- * there bound `codingAgentKind: 'lucidos'` and ran the coding agent against
- * the wrong tree.
- *
- * Nothing else puts the override back: `stageDraftFromApi` returns early on an
- * unsent local draft, and the DELETE failed so no `ThreadComposeChanged` fires.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.hoisted(() => {

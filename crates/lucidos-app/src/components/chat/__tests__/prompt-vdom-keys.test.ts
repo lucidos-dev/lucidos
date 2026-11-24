@@ -1,21 +1,18 @@
-// Tests that VDOM keys on PromptInput's conditional children prevent
-// Preact from recycling prompt-box's DOM node when toggles mount/unmount.
 import { describe, it, expect } from 'vitest';
 import { h, VNode } from 'preact';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyVNode = VNode<any>;
 
-// Slots mirror PromptInput's JSX children: images, toggles, urlContext, promptBox, camera
 type Slots = { images?: AnyVNode; toggles?: AnyVNode; promptBox?: AnyVNode };
 
 function children(slots: Slots): (AnyVNode | null)[] {
   return [
     slots.images ?? null,
     slots.toggles ?? null,
-    null, // url context
+    null,
     slots.promptBox ?? null,
-    null, // camera
+    null,
   ];
 }
 
@@ -29,7 +26,6 @@ function findMatch(
     if (used.has(j)) continue;
     const old = oldChildren[j];
     if (!old) continue;
-    // Preact matches by key first, then type
     if (newChild.key != null || old.key != null) {
       if (newChild.key === old.key && newChild.type === old.type) return j;
     } else {
@@ -65,7 +61,6 @@ describe('PromptInput VDOM key stability', () => {
 
     const matches = matchChildren(old, next);
 
-    // Bug: toggles (index 1) steals prompt-box's DOM (index 3) — both unkeyed divs
     expect(matches.get(1)).toBe(3);
     expect(matches.get(3)).toBe(-1);
   });
@@ -79,8 +74,8 @@ describe('PromptInput VDOM key stability', () => {
 
     const matches = matchChildren(old, next);
 
-    expect(matches.get(1)).toBe(-1); // toggles: new DOM
-    expect(matches.get(3)).toBe(3);  // prompt-box: preserved
+    expect(matches.get(1)).toBe(-1);
+    expect(matches.get(3)).toBe(3);
   });
 
   it('with keys: prompt-box preserved when toggles unmount (compose → thread)', () => {
@@ -108,8 +103,8 @@ describe('PromptInput VDOM key stability', () => {
 
     const matches = matchChildren(old, next);
 
-    expect(matches.get(0)).toBe(-1); // images: new
-    expect(matches.get(1)).toBe(1);  // toggles: preserved
-    expect(matches.get(3)).toBe(3);  // prompt-box: preserved
+    expect(matches.get(0)).toBe(-1);
+    expect(matches.get(1)).toBe(1);
+    expect(matches.get(3)).toBe(3);
   });
 });

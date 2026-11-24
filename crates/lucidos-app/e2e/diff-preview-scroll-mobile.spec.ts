@@ -8,13 +8,6 @@ import { randomUUID } from 'crypto';
 import { writeFileSync } from 'fs';
 import { resolve } from 'path';
 
-/** A diff on a phone scrolls the content pane itself, so the header hides.
- *
- *  The mobile header watches one scroller per pane, `.content-pane-body`, and
- *  that scroller reserves the header's height in a spacer. The diff used to be
- *  a pane-height box with its own inner scroller under that spacer. A drag on
- *  the diff then scrolled only the inner box and the header never moved. A drag
- *  on the path row scrolled the pane by one header height and stopped dead. */
 test.describe('Diff preview scrolling on a phone', () => {
   let repoId: string;
   let branch: string;
@@ -44,7 +37,7 @@ test.describe('Diff preview scrolling on a phone', () => {
 
   test.afterAll(async () => {
     psql(`DELETE FROM changes WHERE id = '${changeId}'`);
-    try { git(['branch', '-D', branch]); } catch { /* */ }
+    try { git(['branch', '-D', branch]); } catch {  }
   });
 
   test.beforeEach(async ({ page }) => {
@@ -54,7 +47,6 @@ test.describe('Diff preview scrolling on a phone', () => {
     });
     expect(resp.ok()).toBeTruthy();
     repoId = (await resp.json()).id;
-    // The header only hides with dynamic bars on; pinned bars never move.
     await enableMobileDynamicBars(page);
   });
 
@@ -63,8 +55,6 @@ test.describe('Diff preview scrolling on a phone', () => {
     if (repoId) await apiRequest(page).delete(`/api/v1/repositories/${repoId}`);
   });
 
-  /** Open the seeded change's file on its hunks. An added file opens on the
-   *  whole merged file, so the toggle is flipped to reach the diff. */
   async function openHunks(page: Page): Promise<void> {
     await navigateToApp(page);
     await openFilesPanel(page);
@@ -85,8 +75,6 @@ test.describe('Diff preview scrolling on a phone', () => {
     await expect(page.locator('.diff-line:visible').last()).toBeAttached({ timeout: 10_000 });
   }
 
-  /** Class names of every box inside the pane that scrolls vertically on its
-   *  own. Empty means each is as tall as its content, so the pane scrolls. */
   async function innerScrollers(page: Page): Promise<string[]> {
     return page.evaluate(() => {
       const body = document.querySelector('.mobile-swipe-pane .content-pane-body');
@@ -108,8 +96,6 @@ test.describe('Diff preview scrolling on a phone', () => {
     await openHunks(page);
     expect(await innerScrollers(page)).toEqual([]);
 
-    // Scroll the pane the way a drag does, in steps spaced past the app's own
-    // navigation-scroll window (see thread-title.spec.ts for why).
     const scrolled = await page.evaluate(async () => {
       const body = document.querySelector('.mobile-swipe-pane .content-pane-body');
       if (!body) return 0;
@@ -121,7 +107,6 @@ test.describe('Diff preview scrolling on a phone', () => {
       }
       return body.scrollTop;
     });
-    // Far past one header height: the pane is no longer stuck at the spacer.
     expect(scrolled).toBeGreaterThan(1000);
 
     await page.waitForFunction(() => {

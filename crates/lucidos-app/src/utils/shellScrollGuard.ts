@@ -1,6 +1,5 @@
 import { hasCoarsePointer, viewportIsMobile } from './viewport';
 
-/** A box the desktop shell holds still, and the offset it was found at. */
 export interface ShellSnapBack {
   box: 'document' | 'app-shell';
   top: number;
@@ -9,22 +8,6 @@ export interface ShellSnapBack {
 
 const SHELL_SELECTOR = '.app-shell';
 
-/** Hold the desktop shell still: neither the document nor `.app-shell` keeps a
- *  scroll offset. Returns the teardown.
- *
- *  `.app-shell` is the viewport, and every pane scrolls inside itself. An
- *  offset on either box slides the whole shell up the window, header first, and
- *  nothing in the UI can scroll it back. `overflow: hidden` stops the user
- *  scrolling them (`styles/global/base.css`), but script can still scroll a
- *  hidden box, so this snaps any offset back the moment it appears.
- *
- *  Desktop layout, fine pointer only. The phone layout leaves iOS its own
- *  keyboard scroll, and `MobileSwipeContainer` resets that one. An iPad gets
- *  the desktop layout, and iOS scrolls its document to lift a focused field
- *  above the software keyboard. A snap-back would bury the field again.
- *
- *  A scroll event fires before the frame's resize observers, so a snap-back
- *  lands before the traffic-light watch can measure a displaced header. */
 export function installShellScrollGuard(onSnapBack: (snap: ShellSnapBack) => void): () => void {
   const onScroll = (e: Event): void => {
     if (viewportIsMobile.peek() || hasCoarsePointer()) return;

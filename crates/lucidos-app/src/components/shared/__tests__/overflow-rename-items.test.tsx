@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The thread ⋯ menu is the one place to rename, since the title is
- * display-only. It offers Rename… on a sent thread, home included. A draft is
- * titled by its compose text, so it offers none. Suggesting a name lives in
- * the rename dialog, never as a menu item of its own.
- */
 import { beforeAll, describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -19,7 +13,6 @@ import { promptRenameThread } from '../../../store/actions/threadRename';
 import { threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 let host: HTMLElement | null = null;

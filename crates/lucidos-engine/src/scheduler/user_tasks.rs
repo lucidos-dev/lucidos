@@ -1,7 +1,7 @@
 //! User triggers - visible triggers that create notifications and artifacts
 
-use crate::api::SharedEngine;
 use crate::engine::thread_events::TriggerInvocation;
+use crate::engine::types::SharedEngine;
 use crate::scheduler::trigger_id_to_uuid;
 use crate::triggers::continue_key::FireTarget;
 use crate::triggers::{TriggerConfig, TriggerRun};
@@ -27,141 +27,11 @@ const TRIGGER_EVENT_TYPE_ENV: &str = "TRIGGER_EVENT_TYPE";
 const TRIGGER_EVENT_ID_ENV: &str = "TRIGGER_EVENT_ID";
 const TRIGGER_EVENT_THREAD_ID_ENV: &str = "TRIGGER_EVENT_THREAD_ID";
 
-tokio::task_local! {
-    /// Trigger UUID of the currently executing trigger. Used by the
-    /// scheduling-tool guard to identify the running trigger.
-    pub static ACTIVE_TRIGGER_ID: String;
-    /// Current recursion depth for event-triggered chains.
-    /// Set by `fire_matching_triggers` before spawning; read by `emit_domain_event`
-    /// to propagate depth in the `DomainEvent` broadcast.
-    pub static EVENT_TRIGGER_DEPTH: u32;
-    /// Thread ID of the event that fired the currently executing trigger
-    /// (set only when the trigger was matched on a `BusEvent::Thread`).
-    /// Read by `execute_send_notification` so a push tap can deep-link back
-    /// to the originating thread instead of the trigger's own LLM thread.
-    pub static ORIGIN_THREAD_ID: uuid::Uuid;
-}
-
-/// How deep in an event-trigger chain the current task is running.
-///
-/// Zero outside any trigger fire, which is what an ordinary user turn, an HTTP
-/// handler and a cron fire all are. Inside a fire it is the depth the queue
-/// executor scoped. An event this task emits is therefore one link further
-/// along the chain that produced it, and [`super::task_runner`]'s cap can see
-/// that.
-///
-/// One reader, rather than one per site. A caller can only get this wrong one
-/// way: by reading it from a spawned task, where the scope does not reach and
-/// the answer silently becomes zero.
-pub fn current_event_trigger_depth() -> u32 {
-    EVENT_TRIGGER_DEPTH.try_with(|d| *d).unwrap_or(0)
-}
-
-/// Chain depth per thread, for background work whose events are emitted from
-/// tasks no scope can reach.
-///
-/// The task-local above covers work that stays on one await chain. A
-/// coding-agent session does not: its `CodingAgentIdled` comes from a spawn
-/// tree several levels deep, and after a restart from `agent_recovery`. The one
-/// identity every one of those emits holds is the thread id, so that is the
-/// key.
-///
-/// **Keyed by thread, but owned per queue entry.** Two entries can name one
-/// thread, and a plain `thread -> depth` map let the first to finish clear a
-/// binding the other still needed.
-///
-/// A cache, never a source of truth. What survives a restart is the depth on
-/// the persisted request. A row is dropped when its own queue entry completes,
-/// so the depth belongs to the unit of background work rather than to the
-/// thread. Nothing registers on the boot handoff path, where the entry
-/// completes with no in-memory slot. See
-/// `docs/adr/0138-event-trigger-depth-reaches-spawned-work.md`.
-static CHAIN_DEPTHS: std::sync::LazyLock<std::sync::RwLock<ChainDepthOwners>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// Thread id to the live `(queue entry, depth)` bindings on it.
-type ChainDepthOwners = std::collections::HashMap<uuid::Uuid, Vec<(uuid::Uuid, u32)>>;
-
-/// Bind `thread_id`'s events to `depth`, on behalf of queue entry `owner`.
-///
-/// Depth 0 registers nothing: it is the answer an unregistered thread already
-/// gives, and a row per ordinary chat thread would grow without bound.
-/// Re-registering the same owner replaces its row rather than stacking one.
-pub fn register_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid, depth: u32) {
-    if depth == 0 {
-        return;
-    }
-    if let Ok(mut map) = CHAIN_DEPTHS.write() {
-        let owners = map.entry(thread_id).or_default();
-        match owners.iter_mut().find(|(id, _)| *id == owner) {
-            Some(row) => row.1 = depth,
-            None => owners.push((owner, depth)),
-        }
-    }
-}
-
-/// Drop `owner`'s binding when the work that owned it finishes. Another entry's
-/// binding on the same thread is left alone.
-pub fn forget_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid) {
-    if let Ok(mut map) = CHAIN_DEPTHS.write() {
-        let empty = match map.get_mut(&thread_id) {
-            Some(owners) => {
-                owners.retain(|(id, _)| *id != owner);
-                owners.is_empty()
-            }
-            None => false,
-        };
-        if empty {
-            map.remove(&thread_id);
-        }
-    }
-}
-
-/// The chain depth bound to `thread_id`, if it is background chain work.
-///
-/// The DEEPEST of the live bindings, matching how `EventBus::emit` ranks this
-/// against the task-local. Under-counting re-opens the loop silently, and
-/// over-counting suppresses a fire the cap notification names.
-///
-/// A poisoned lock answers `None`, which degrades to the ambient read. That
-/// loses the cap for one emit rather than failing it.
-pub fn chain_depth_for_thread(thread_id: uuid::Uuid) -> Option<u32> {
-    CHAIN_DEPTHS
-        .read()
-        .ok()?
-        .get(&thread_id)?
-        .iter()
-        .map(|(_, depth)| *depth)
-        .max()
-}
-
-/// Which trigger's fire the current task is running, if any.
-///
-/// `None` outside a fire, which is what an ordinary user turn and an HTTP
-/// handler both are. Inside one it is the id the queue executor scoped.
-/// `EventBus::emit` stamps it onto every frame the fire emits, so the scheduler
-/// can drop that trigger from the matches.
-///
-/// Same one-reader rule as [`current_event_trigger_depth`], and the same way to
-/// get it wrong. Read it from a spawned task, where the scope does not reach,
-/// and the answer silently becomes `None`. That direction is deliberate for
-/// work a fire hands off (`docs/adr/0137-a-trigger-never-wakes-itself.md`). A
-/// caller that must state the owner outright uses
-/// [`crate::engine::event_bus::EventBus::emit_as_trigger`] instead.
-pub fn current_trigger_id() -> Option<String> {
-    ACTIVE_TRIGGER_ID.try_with(|id| id.clone()).ok()
-}
-
-/// True when the currently running trigger is deleting itself: the LLM
-/// called `delete_trigger` with its own trigger ID. Config reconciliation
-/// reads this event flag to skip nudging the thread performing the deletion.
-/// Scheduler cancellation is independent: every deletion stops scheduling
-/// while leaving any admitted run alone.
-pub fn is_self_deleting_trigger(trigger_id: &str) -> bool {
-    ACTIVE_TRIGGER_ID
-        .try_with(|active| *active == trigger_id)
-        .unwrap_or(false)
-}
+pub use crate::engine::trigger_context::{
+    chain_depth_for_thread, current_event_trigger_depth, current_trigger_id, forget_chain_depth,
+    is_self_deleting_trigger, register_chain_depth, ACTIVE_TRIGGER_ID, EVENT_TRIGGER_DEPTH,
+    ORIGIN_THREAD_ID,
+};
 
 /// Longest `result_summary` a completed run records, in CHARACTERS. The value
 /// lands in a `TriggerExecuted` payload and on the trigger row, so it is a
@@ -182,6 +52,10 @@ fn clamp_result_summary(summary: &str) -> String {
     } else {
         summary.to_string()
     }
+}
+
+tokio::task_local! {
+    pub(crate) static TRIGGER_DEFINITION: String;
 }
 
 /// The body of a trigger-failure notification, bounded.
@@ -265,13 +139,13 @@ fn transient_failure_message(
 
 /// The title of a trigger's failure notification. The dedup window matches
 /// on its suffix.
-pub(crate) fn trigger_failure_title(trigger_name: &str) -> String {
+pub fn trigger_failure_title(trigger_name: &str) -> String {
     format!("{trigger_name}{ERROR_TITLE_SUFFIX}")
 }
 
 /// Tell the user an agent's or app's edit removed `config`'s grants, so the
 /// next refused run is no surprise.
-pub(crate) async fn notify_trigger_grants_cleared(engine: &SharedEngine, config: &TriggerConfig) {
+pub async fn notify_trigger_grants_cleared(engine: &SharedEngine, config: &TriggerConfig) {
     let title = format!("{} lost its grants", config.name);
     let message = "An agent or app changed what this trigger runs, so Lucidos removed its \
                    coding-agent grant and its allowed side-effects. A run that needs one \
@@ -297,7 +171,7 @@ async fn emit_failure_notification(
     )
     .await
     {
-        log!(
+        log_legacy!(
             "[Scheduler] Failed to emit failure notification for '{}': {}",
             config.name,
             error
@@ -306,7 +180,7 @@ async fn emit_failure_notification(
     notice.send_push(engine);
 }
 
-pub(crate) struct TriggerNotification {
+pub struct TriggerNotification {
     id: uuid::Uuid,
     title: String,
     message: String,
@@ -314,7 +188,7 @@ pub(crate) struct TriggerNotification {
 
 impl TriggerNotification {
     /// Bound untrusted names and error bodies once, before storage or push.
-    pub(crate) fn new(title: &str, message: &str) -> Self {
+    pub fn new(title: &str, message: &str) -> Self {
         Self::with_id(uuid::Uuid::new_v4(), title, message)
     }
 
@@ -330,19 +204,681 @@ impl TriggerNotification {
         &self.title
     }
 
-    pub(crate) fn send_push(&self, engine: &SharedEngine) {
+    pub fn send_push(&self, engine: &SharedEngine) {
         crate::scheduler::push::send_push_to_all(engine, &self.title, &self.message, Some(self.id));
     }
 }
 
+/// A trigger run parked on the owner's grant card. It waits and has not
+/// failed, so it gets no terminator and no failure notice. Allow resumes the
+/// thread through `continue_chat`.
+#[derive(Debug)]
+pub struct TriggerRunAwaitsOwner;
+
+impl std::fmt::Display for TriggerRunAwaitsOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This trigger run waits for the owner's answer on its grant card.")
+    }
+}
+
+impl std::error::Error for TriggerRunAwaitsOwner {}
+
+/// Whether `error` is a trigger run parked on the owner's card.
+pub fn run_awaits_owner(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.is::<TriggerRunAwaitsOwner>()
+}
+
+/// What the owner allowed once. It holds for the rest of the one run it
+/// resumes, and never reaches the trigger's own grants.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TriggerRunGrants {
+    pub programs: Vec<crate::triggers::config::TriggerProgramGrant>,
+    pub folders: Vec<crate::triggers::folder_grant::TriggerFolderGrant>,
+}
+
+tokio::task_local! {
+    static TRIGGER_RUN_GRANTS: TriggerRunGrants;
+}
+
+/// The programs this run may use beyond the trigger's own grants.
+pub(crate) fn run_program_grants() -> Vec<crate::triggers::config::TriggerProgramGrant> {
+    TRIGGER_RUN_GRANTS
+        .try_with(|grants| grants.programs.clone())
+        .unwrap_or_default()
+}
+
+/// The folders this run may write beyond the trigger's own grants.
+pub(crate) fn run_folder_grants() -> Vec<crate::triggers::folder_grant::TriggerFolderGrant> {
+    TRIGGER_RUN_GRANTS
+        .try_with(|grants| grants.folders.clone())
+        .unwrap_or_default()
+}
+
+/// Run `work` as a run of `config`: its emits are the trigger's own, the
+/// guard reads its grants, and `grants` add to them for this run only.
+pub async fn in_trigger_run<F: std::future::Future>(
+    config: &TriggerConfig,
+    grants: TriggerRunGrants,
+    work: F,
+) -> F::Output {
+    ACTIVE_TRIGGER_ID
+        .scope(
+            config.id.clone(),
+            TRIGGER_DEFINITION.scope(
+                config.definition_digest(),
+                TRIGGER_RUN_GRANTS.scope(grants, work),
+            ),
+        )
+        .await
+}
+
+/// The config of the trigger that owns `thread_id`. `None` for a thread no
+/// trigger owns, one whose trigger is gone, or an unreadable owner.
+pub async fn trigger_config_of_thread(
+    engine: &crate::engine::LucidosEngine,
+    thread_id: uuid::Uuid,
+) -> Option<TriggerConfig> {
+    let trigger_id: Option<String> = sqlx::query_scalar(
+        "SELECT trigger_id FROM thread_summaries WHERE thread_id = $1 AND trigger_id IS NOT NULL",
+    )
+    .bind(thread_id)
+    .fetch_optional(engine.pool())
+    .await
+    .unwrap_or_else(|error| {
+        log_legacy!("[Scheduler] The trigger of thread {thread_id} is unreadable: {error}");
+        None
+    });
+    let configs = engine
+        .trigger_configs
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    configs.get(&trigger_id?).cloned()
+}
+
+/// A trigger run parked on a card the owner has answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnsweredPark {
+    /// The `request_event_id` the parked turn's events carry.
+    pub turn: uuid::Uuid,
+    /// Whether the answer granted, rather than refused.
+    pub granted: bool,
+}
+
+/// The run parked on the thread's newest card, once that card is answered.
+/// `None` when the newest card is not an answered engine card, or when a
+/// terminator or the resumed turn's own events followed it.
+pub async fn answered_park(
+    pool: &PgPool,
+    thread_id: uuid::Uuid,
+) -> Result<Option<AnsweredPark>, sqlx::Error> {
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "WITH card AS ( \
+               SELECT q.sequence, q.payload->>'tool_use_id' AS tool_use_id, \
+                      (SELECT NULLIF(e.payload->>'request_event_id', '')::uuid FROM events e \
+                        WHERE e.thread_id = $1 AND e.sequence < q.sequence \
+                          AND NULLIF(e.payload->>'request_event_id', '') IS NOT NULL \
+                        ORDER BY e.sequence DESC LIMIT 1) AS turn \
+                 FROM events q \
+                WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND {engine_raised} \
+                ORDER BY q.sequence DESC LIMIT 1) \
+             SELECT card.turn, EXISTS (SELECT 1 FROM events g WHERE g.thread_id = $1 \
+                                         AND g.event_type = 'PermissionGranted' \
+                                         AND g.payload->>'request_tool_use_id' = card.tool_use_id) \
+               FROM card \
+              JOIN events a ON a.thread_id = $1 AND a.event_type = 'UserQuestionAnswered' \
+                           AND a.payload->>'tool_use_id' = card.tool_use_id \
+              WHERE NOT EXISTS (SELECT 1 FROM events q2 WHERE q2.thread_id = $1 \
+                                  AND q2.event_type = 'UserQuestionAsked' \
+                                  AND q2.sequence > card.sequence) \
+                AND NOT EXISTS (SELECT 1 FROM events t WHERE t.thread_id = $1 \
+                                  AND t.sequence > card.sequence \
+                                  AND (t.event_type IN ('ResponseGenerated', 'ResponseCanceled', \
+                                                        'ResponseAborted', 'ResponseFailed') \
+                                       OR (t.sequence > a.sequence \
+                                           AND t.payload->>'request_event_id' = card.turn::text)))",
+            engine_raised = crate::engine::question_park_sql::engine_raised_card_sql("q"),
+        )
+    });
+    let row: Option<(Option<uuid::Uuid>, bool)> = sqlx::query_as(&SQL)
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|(turn, granted)| {
+        Some(AnsweredPark {
+            turn: turn?,
+            granted,
+        })
+    }))
+}
+
+/// The sentence a run fails with when its trigger's Always deny covers what
+/// `blocked` names. `None` when no deny covers it, so a card may ask.
+fn denied_block_reason(
+    config: &TriggerConfig,
+    pattern: Option<&str>,
+    folder: Option<&std::path::Path>,
+) -> Option<String> {
+    use crate::engine::permission::inline_code;
+    let what = if let Some(folder) = folder {
+        let denied = config.denied_folder(folder)?;
+        format!("write in {}", inline_code(&denied.to_string_lossy()))
+    } else {
+        let pattern = pattern?;
+        config
+            .denies_program(pattern)
+            .then(|| format!("run {}", inline_code(pattern)))?
+    };
+    Some(format!(
+        "You chose Always deny for \u{201c}{}\u{201d} to {what}, so this run ended without \
+         asking. Remove the deny in the trigger's details to be asked again.",
+        crate::engine::permission::one_line(&config.name)
+    ))
+}
+
+/// Raise the grant card for a trigger run the guard or sandbox blocked, in the
+/// run's own thread, and say so in a notification. `true` when the card is
+/// up and the run parks on it. `false` when the block names nothing to grant,
+/// or the run's trigger changed, so the run fails as before. A block the
+/// trigger denies also fails, and leads its reason with the deny.
+pub async fn park_blocked_run(
+    engine: &SharedEngine,
+    blocked: &mut crate::engine::command_guard::TriggerCommandBlocked,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if blocked.pattern.is_none() && blocked.folder.is_none() {
+        return Ok(false);
+    }
+    let Some((trigger_id, digest)) =
+        current_trigger_id().zip(TRIGGER_DEFINITION.try_with(Clone::clone).ok())
+    else {
+        return Ok(false);
+    };
+    let config = {
+        let configs = engine
+            .trigger_configs
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        configs
+            .get(&trigger_id)
+            .filter(|config| config.definition_digest() == digest)
+            .cloned()
+    };
+    let Some(config) = config else {
+        return Ok(false);
+    };
+    let folder = blocked.folder.as_ref().map(|grant| grant.folder.as_path());
+    if let Some(denied) = denied_block_reason(&config, blocked.pattern.as_deref(), folder) {
+        blocked.reason = format!("{denied}\n\n{}", blocked.reason);
+        blocked.pattern = None;
+        blocked.folder = None;
+        return Ok(false);
+    }
+    notify_blocked_trigger(engine, &config, None, blocked).await?;
+    Ok(true)
+}
+
+/// Raise the grant card for one blocked run in `blocked.thread_id`, then link
+/// it from a notification. An intent run (`queue_entry_id` is `None`) waits
+/// on Allow once, Always allow, Always deny or Don't allow. A script fire has
+/// ended, so its card offers the grant and a rerun of that fire, or the deny.
+async fn notify_blocked_trigger(
+    engine: &SharedEngine,
+    config: &TriggerConfig,
+    queue_entry_id: Option<uuid::Uuid>,
+    blocked: &crate::engine::command_guard::TriggerCommandBlocked,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::permission::menu::{
+        ALLOW_ONCE_LABEL, ALWAYS_ALLOW_LABEL, ALWAYS_DENY_LABEL, DONT_ALLOW_LABEL,
+    };
+    use crate::engine::permission::{
+        batch::items_digest, inline_code, one_line, raise_turn_holding_request, Action, Holder,
+        Lifetime, PermissionCardText, PermissionChoice, RequestCard, RequestOption,
+    };
+    use crate::engine::thread_events::permission::batch::{Batch, BatchItem};
+    use crate::engine::thread_events::EventChannel;
+
+    let thread_id = blocked.thread_id;
+    let (item, what, target, header) = if let Some(folder) = &blocked.folder {
+        (
+            BatchItem::TriggerFolderGrant {
+                trigger_id: config.id.clone(),
+                definition_digest: config.definition_digest(),
+                grant: serde_json::to_value(folder)?,
+                queue_entry_id,
+                run_thread_id: thread_id,
+            },
+            format!("write in {}", folder.folder.display()),
+            format!("write in {}", inline_code(&folder.folder.to_string_lossy())),
+            "Folder grant",
+        )
+    } else if let Some(pattern) = &blocked.pattern {
+        (
+            BatchItem::TriggerProgramGrant {
+                trigger_id: config.id.clone(),
+                definition_digest: config.definition_digest(),
+                pattern: pattern.clone(),
+                queue_entry_id,
+                run_thread_id: thread_id,
+            },
+            format!("run {pattern}"),
+            format!("run {}", inline_code(pattern)),
+            "Program grant",
+        )
+    } else {
+        return Err("The block names nothing to grant".into());
+    };
+    let name = one_line(&config.name);
+    let refuse = |label: &str, description: &str| RequestOption {
+        label: label.into(),
+        description: description.into(),
+        choice: PermissionChoice::Refuse,
+    };
+    let always_deny = RequestOption {
+        label: ALWAYS_DENY_LABEL.into(),
+        description: "Deny it for this trigger only. This run ends, and later runs that need it \
+                      end at once, without a card."
+            .into(),
+        choice: PermissionChoice::RefuseStanding,
+    };
+    let (question, options, title, message) = match queue_entry_id {
+        // Who holds the once grant says which option the owner picked: the
+        // run's thread for this run only, the trigger for its own grants. A
+        // batch may pick only a thread's, so it never widens a trigger.
+        None => (
+            PermissionCardText::new(&format!("Let \u{201c}{name}\u{201d} {target}?"))
+                .paragraph("The run waits in its own thread until you answer.")
+                .finish(None),
+            vec![
+                RequestOption {
+                    label: ALLOW_ONCE_LABEL.into(),
+                    description: "This run only. The run carries on, and the trigger's grants \
+                                  stay as they are."
+                        .into(),
+                    choice: PermissionChoice::grant(Lifetime::Once, Holder::Thread { thread_id }),
+                },
+                RequestOption {
+                    label: ALWAYS_ALLOW_LABEL.into(),
+                    description: "Add it to this trigger's grants. The run carries on, and later \
+                                  runs need no card."
+                        .into(),
+                    choice: PermissionChoice::grant(
+                        Lifetime::Once,
+                        Holder::Trigger {
+                            trigger_id: config.id.clone(),
+                        },
+                    ),
+                },
+                always_deny,
+                refuse(
+                    DONT_ALLOW_LABEL,
+                    "End this run. The trigger's grants stay as they are.",
+                ),
+            ],
+            format!("{} waits for you", config.name),
+            format!("This run waits for your answer: may it {what}?"),
+        ),
+        Some(_) => (
+            PermissionCardText::new(&format!(
+                "Let \u{201c}{name}\u{201d} {target}, and run it again?"
+            ))
+            .paragraph("The script stopped there, so this run has ended.")
+            .finish(None),
+            vec![
+                RequestOption {
+                    label: "Grant and run again".into(),
+                    description: "Add it to this trigger's grants and start a new run.".into(),
+                    choice: PermissionChoice::grant(Lifetime::Once, Holder::Thread { thread_id }),
+                },
+                always_deny,
+                refuse("Dismiss", "Keep the trigger's grants as they are."),
+            ],
+            trigger_failure_title(&config.name),
+            format!(
+                "The script could not {what}. Open the permission request to grant it and run \
+                 the trigger again."
+            ),
+        ),
+    };
+    let batch = Batch {
+        digest: items_digest(std::slice::from_ref(&item))?,
+        items: vec![item],
+    };
+    let card_id = raise_turn_holding_request(
+        &engine.event_bus,
+        thread_id,
+        RequestCard {
+            question,
+            header,
+            action: Action::RunBatch,
+            breadth: None,
+            options,
+            batch: Some(batch),
+        },
+        EventChannel::Trigger,
+    )
+    .await?;
+    // A queued card has no posted event yet, so the tap opens the thread.
+    let event_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM events WHERE thread_id = $1 AND event_type = 'UserQuestionAsked' \
+         AND payload->>'tool_use_id' = $2",
+    )
+    .bind(thread_id)
+    .bind(card_id)
+    .fetch_optional(engine.pool())
+    .await?;
+    let notice = TriggerNotification::new(&title, &message);
+    let tap = crate::scheduler::notifications::default_tap(Some(thread_id), event_id);
+    emit_trigger_notification(
+        &engine.event_bus,
+        &config.id,
+        &notice,
+        Some(thread_id),
+        tap.clone(),
+    )
+    .await?;
+    crate::scheduler::push::send_push_to_all_with_app(
+        engine,
+        &notice.title,
+        &notice.message,
+        Some(notice.id),
+        None,
+        Some(thread_id),
+        event_id,
+        tap,
+    );
+    Ok(())
+}
+
+pub(crate) enum TriggerGrantScope<'a> {
+    Program(&'a str),
+    Folder(&'a crate::triggers::folder_grant::TriggerFolderGrant),
+}
+
+/// One owner's Allow on a blocked run's card.
+pub(crate) struct BlockedRunAllow<'a> {
+    pub trigger_id: &'a str,
+    pub definition_digest: &'a str,
+    pub scope: TriggerGrantScope<'a>,
+    pub queue_entry_id: Option<uuid::Uuid>,
+    pub run_thread_id: uuid::Uuid,
+    /// Always allow: the grant joins the trigger's own grants.
+    pub lasting: bool,
+}
+
+/// Act on the owner's Allow. A lasting grant, or any script grant, joins the
+/// trigger's grants first. An intent run then resumes in its own thread,
+/// holding every grant its cards allowed. A script fire has ended, so it runs
+/// again.
+pub(crate) async fn allow_blocked_run(
+    engine: &SharedEngine,
+    allow: BlockedRunAllow<'_>,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<(), String> {
+    if allow.lasting || allow.queue_entry_id.is_some() {
+        record_trigger_grant(engine, &allow, actor.clone()).await?;
+    }
+    if let Some(entry) = allow.queue_entry_id {
+        return rerun_script_fire(engine, allow.trigger_id, entry, allow.run_thread_id, actor)
+            .await;
+    }
+    let grants = allowed_run_grants(engine.pool(), allow.run_thread_id)
+        .await
+        .map_err(|e| format!("The run's grants could not be read: {e}"))?;
+    match engine
+        .agent_host()
+        .continue_chat(engine, allow.run_thread_id, actor, grants)
+        .await
+    {
+        Ok(crate::engine::resume_anchor::ContinueChatOutcome::Resumed) => Ok(()),
+        Ok(_) => Err("The run no longer waits on this card".into()),
+        Err(error) => Err(format!("The run could not resume: {error}")),
+    }
+}
+
+/// Every grant the owner allowed on the parked run's cards since its turn
+/// began. A run that parks again keeps what its earlier answers allowed, so
+/// a command needing two grants never alternates between their cards.
+async fn allowed_run_grants(
+    pool: &PgPool,
+    run_thread_id: uuid::Uuid,
+) -> Result<TriggerRunGrants, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::thread_events::permission::batch::BatchItem;
+
+    let Some(AnsweredPark { turn, .. }) = answered_park(pool, run_thread_id).await? else {
+        return Err("the run no longer waits on this card".into());
+    };
+    let items: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT item FROM events q, \
+                jsonb_array_elements(q.payload->'permission_request'->'batch'->'items') item \
+          WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' \
+            AND q.sequence > (SELECT sequence FROM events WHERE id = $2) \
+            AND EXISTS (SELECT 1 FROM events g WHERE g.thread_id = $1 \
+                          AND g.event_type = 'PermissionGranted' \
+                          AND g.payload->>'request_tool_use_id' = q.payload->>'tool_use_id')",
+    )
+    .bind(run_thread_id)
+    .bind(turn)
+    .fetch_all(pool)
+    .await?;
+    let mut grants = TriggerRunGrants::default();
+    for item in items {
+        match serde_json::from_value(item)? {
+            BatchItem::TriggerProgramGrant {
+                pattern,
+                queue_entry_id: None,
+                ..
+            } => grants
+                .programs
+                .push(crate::triggers::config::TriggerProgramGrant {
+                    pattern,
+                    legacy: None,
+                }),
+            BatchItem::TriggerFolderGrant {
+                grant,
+                queue_entry_id: None,
+                ..
+            } => grants.folders.push(serde_json::from_value(grant)?),
+            _ => {}
+        }
+    }
+    Ok(grants)
+}
+
+async fn record_trigger_grant(
+    engine: &SharedEngine,
+    allow: &BlockedRunAllow<'_>,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<(), String> {
+    let writer = engine.trigger_registry_writer();
+    let granted = match allow.scope {
+        TriggerGrantScope::Program(pattern) => {
+            writer
+                .append_program_grant(
+                    allow.trigger_id,
+                    allow.definition_digest,
+                    crate::triggers::config::TriggerProgramGrant {
+                        pattern: pattern.into(),
+                        legacy: None,
+                    },
+                    actor,
+                )
+                .await
+        }
+        TriggerGrantScope::Folder(folder) => {
+            writer
+                .append_folder_grant(allow.trigger_id, allow.definition_digest, folder, actor)
+                .await
+        }
+    }
+    .map_err(|e| format!("The grant could not be saved: {e}"))?;
+    if granted {
+        Ok(())
+    } else {
+        Err("The trigger changed or the answer did not come from the owner's device".into())
+    }
+}
+
+/// Queue a script fire again, as a retry of the fire the folder refusal
+/// ended. A run already active or queued coalesces the retry away.
+async fn rerun_script_fire(
+    engine: &SharedEngine,
+    trigger_id: &str,
+    queue_entry_id: uuid::Uuid,
+    failed_thread_id: uuid::Uuid,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<(), String> {
+    use crate::engine::thread_events::RetryOf;
+    use crate::engine::thread_queue::ThreadQueueRequest;
+
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload->'data'->'request' FROM events WHERE event_type = 'ThreadQueued' \
+         AND payload->'data'->>'entry_id' = $1 ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(queue_entry_id.to_string())
+    .fetch_one(engine.pool())
+    .await
+    .map_err(|e| format!("The failed trigger run could not be read: {e}"))?;
+    let mut request: ThreadQueueRequest = serde_json::from_value(payload)
+        .map_err(|e| format!("The failed trigger run could not be restored: {e}"))?;
+    if request.trigger_id() != Some(trigger_id) {
+        return Err("The failed run belongs to a different trigger".into());
+    }
+    let retry_of = match &mut request {
+        ThreadQueueRequest::Cron { retry_of, .. }
+        | ThreadQueueRequest::EventTrigger { retry_of, .. } => retry_of,
+        _ => return Err("The failed run was not a trigger fire".into()),
+    };
+    *retry_of = Some(RetryOf {
+        thread_id: failed_thread_id,
+        deadline: chrono::Utc::now() + chrono::Duration::days(1),
+    });
+    wait_for_failed_fire(engine, queue_entry_id).await?;
+    let outcome = engine.thread_queue.submit(request, actor).await;
+    if outcome.coalesced {
+        return Err("The grant was saved. A scheduled run is already active or queued".into());
+    }
+    Ok(())
+}
+
+/// Wait until the failed fire releases its queue entry. The card goes up
+/// while that fire still holds it, and a retry submitted before then
+/// coalesces into the dying fire and never runs.
+async fn wait_for_failed_fire(engine: &SharedEngine, entry_id: uuid::Uuid) -> Result<(), String> {
+    use crate::engine::event_bus::{BusEvent, SystemEvent};
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut events = engine.event_bus.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let active: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM thread_queue WHERE id = $1)")
+                    .bind(entry_id)
+                    .fetch_one(engine.pool())
+                    .await
+                    .map_err(|e| format!("The failed run's queue entry could not be read: {e}"))?;
+            if !active {
+                return Ok(());
+            }
+            match events.recv().await {
+                Ok(event)
+                    if matches!(
+                        event.typed,
+                        BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id: id })
+                            if id == entry_id
+                    ) =>
+                {
+                    return Ok(())
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {
+                    return Err(
+                        "The failed run's queue stopped before it released the entry".into(),
+                    )
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| "The failed run did not release its queue entry".to_string())?
+}
+
+/// End a parked run whose answered card can no longer resume it, such as an
+/// Allow the trigger's edit made stale. A run no longer parked is left alone.
+pub(crate) async fn fail_parked_run(
+    bus: &crate::engine::event_bus::EventBus,
+    run_thread_id: uuid::Uuid,
+    reason: &str,
+) {
+    match answered_park(bus.pool(), run_thread_id).await {
+        Ok(Some(AnsweredPark { turn, .. })) => {
+            crate::engine::failure_terminator::ensure_failure_terminator_emitted(
+                bus,
+                bus.pool(),
+                run_thread_id,
+                turn,
+                Some(crate::engine::thread_events::EventChannel::Trigger),
+                &format!("The run could not carry on: {reason}"),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log_legacy!("[Scheduler] The parked run on {run_thread_id} is unreadable: {error}");
+        }
+    }
+}
+
+/// End a parked run the owner refused. Its turn closes as refused, not
+/// failed. A run that no longer waits on a refused card is left alone.
+pub(crate) async fn refuse_blocked_run(
+    engine: &SharedEngine,
+    run_thread_id: uuid::Uuid,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) {
+    use crate::engine::thread_events::{CancelCause, EventChannel, EventMeta};
+    let turn = match answered_park(engine.pool(), run_thread_id).await {
+        Ok(Some(AnsweredPark {
+            turn,
+            granted: false,
+        })) => turn,
+        Ok(_) => return,
+        Err(error) => {
+            log_legacy!("[Scheduler] The refused run on {run_thread_id} is unreadable: {error}");
+            return;
+        }
+    };
+    crate::engine::thread_events::emit_response_canceled(
+        &engine.event_bus,
+        engine.pool(),
+        run_thread_id,
+        CancelCause::Refused,
+        String::new(),
+        Vec::new(),
+        None,
+        None,
+        EventMeta {
+            request_event_id: Some(turn),
+            channel: Some(EventChannel::Trigger),
+            actor,
+            ..EventMeta::NONE
+        },
+        "[Scheduler] ResponseCanceled (the owner refused the run's grant)",
+    )
+    .await;
+}
+
 /// One bounded emitter for ordinary failures and restart interruption reports.
-pub(crate) async fn emit_trigger_notification(
+pub async fn emit_trigger_notification(
     bus: &crate::engine::event_bus::EventBus,
     trigger_id: &str,
     notice: &TriggerNotification,
     thread_id: Option<uuid::Uuid>,
     tap: crate::scheduler::notifications::Tap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let event_id = match &tap {
+        crate::scheduler::notifications::Tap::Navigate { to } => to.event_id.clone(),
+        _ => None,
+    };
     bus.emit(crate::engine::event_bus::BusEvent::System(
         crate::engine::event_bus::SystemEvent::NotificationCreated {
             id: notice.id.to_string(),
@@ -351,7 +887,7 @@ pub(crate) async fn emit_trigger_notification(
             task_id: Some(trigger_id.to_string()),
             app_id: None,
             thread_id: thread_id.map(|id| id.to_string()),
-            event_id: None,
+            event_id,
             tap,
             actor: None,
             audience: None,
@@ -363,8 +899,8 @@ pub(crate) async fn emit_trigger_notification(
 }
 
 /// `queue_entry_id` is the admitting *Thread Queue* entry (see
-/// `TriggerContext::queue_entry_id`). A script fire creates no thread and
-/// ignores it. Boot can re-queue an interrupted script entry once.
+/// `TriggerContext::queue_entry_id`). A script fire opens a thread only when
+/// it has a folder grant to request. Boot can re-queue an interrupted script entry once.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_user_task(
     engine: SharedEngine,
@@ -375,29 +911,41 @@ pub async fn execute_user_task(
     queue_entry_id: uuid::Uuid,
     retry_of: Option<crate::engine::thread_events::RetryOf>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match &config.run {
-        TriggerRun::Script { path } => {
-            // Canonical traversal guard — same helper every other path-accepting
-            // endpoint uses, so the script-trigger rule can't drift from the rest.
-            if crate::api::is_path_traversal(path) {
-                return Err(format!("Invalid script path: {}", path).into());
+    TRIGGER_DEFINITION
+        .scope(config.definition_digest(), async {
+            match &config.run {
+                TriggerRun::Script { path } => {
+                    // Canonical traversal guard — same helper every other path-accepting
+                    // endpoint uses, so the script-trigger rule can't drift from the rest.
+                    if crate::core::is_path_traversal(path) {
+                        return Err(format!("Invalid script path: {}", path).into());
+                    }
+                    execute_script_task(
+                        engine,
+                        config,
+                        path,
+                        &invocation,
+                        event_payload,
+                        queue_entry_id,
+                    )
+                    .await
+                }
+                TriggerRun::Intent { intent } => {
+                    execute_llm_task(
+                        engine,
+                        pool,
+                        config,
+                        intent,
+                        invocation,
+                        event_payload,
+                        queue_entry_id,
+                        retry_of,
+                    )
+                    .await
+                }
             }
-            execute_script_task(engine, config, path, &invocation, event_payload).await
-        }
-        TriggerRun::Intent { intent } => {
-            execute_llm_task(
-                engine,
-                pool,
-                config,
-                intent,
-                invocation,
-                event_payload,
-                queue_entry_id,
-                retry_of,
-            )
-            .await
-        }
-    }
+        })
+        .await
 }
 
 /// Execute a script trigger — runs the script file directly without LLM.
@@ -407,8 +955,9 @@ async fn execute_script_task(
     script_path: &str,
     invocation: &TriggerInvocation,
     event_payload: Option<&serde_json::Value>,
+    queue_entry_id: uuid::Uuid,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log!(
+    log_legacy!(
         "[Scheduler] Running script trigger '{}': {}",
         config.name,
         script_path
@@ -463,10 +1012,41 @@ async fn execute_script_task(
             engine
                 .record_trigger_completed(&config.id, &config.name, &summary, None)
                 .await?;
-            log!("[Scheduler] Script trigger '{}' completed", config.name);
+            log_legacy!("[Scheduler] Script trigger '{}' completed", config.name);
             Ok(())
         }
-        Err(e) => {
+        Err(mut e) => {
+            if let Some(ScriptRefusal {
+                grant,
+                denied,
+                reason,
+            }) = script_refusal(config, e.as_ref())
+            {
+                match open_script_refusal_thread(&engine, config, invocation, &reason).await {
+                    Ok(_) if denied.is_some() => {}
+                    Ok(thread_id) => {
+                        let blocked = crate::engine::command_guard::TriggerCommandBlocked {
+                            reason: crate::triggers::folder_grant::folder_refusal_reason(&grant),
+                            pattern: None,
+                            folder: Some(grant),
+                            thread_id,
+                        };
+                        if notify_blocked_trigger(&engine, config, Some(queue_entry_id), &blocked)
+                            .await
+                            .is_ok()
+                        {
+                            return Err(e);
+                        }
+                    }
+                    Err(error) => {
+                        log_legacy!("[Scheduler] Could not open folder grant thread: {error}")
+                    }
+                }
+                if denied.is_some() {
+                    e = reason.into();
+                }
+            }
+
             let title = trigger_failure_title(&config.name);
             // Normalize the error reason so a failed run never surfaces a blank
             // message (the "[trigger: id]" prefix keeps the line non-empty even
@@ -478,6 +1058,53 @@ async fn execute_script_task(
             Err(e)
         }
     }
+}
+
+/// A script run the sandbox stopped at a folder outside its grants.
+struct ScriptRefusal {
+    grant: crate::triggers::folder_grant::TriggerFolderGrant,
+    /// The trigger deny that covers the folder, if any. Then no card asks.
+    denied: Option<String>,
+    /// What the run's thread says. A denied folder still opens that thread,
+    /// so its output and the deny stay readable.
+    reason: String,
+}
+
+fn script_refusal(
+    config: &TriggerConfig,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<ScriptRefusal> {
+    let refusal = error.downcast_ref::<crate::triggers::folder_grant::ScriptFolderRefusal>()?;
+    let denied = denied_block_reason(config, None, Some(&refusal.grant.folder));
+    let reason = match &denied {
+        Some(denied) => format!("{denied}\n\n{error}"),
+        None => error.to_string(),
+    };
+    Some(ScriptRefusal {
+        grant: refusal.grant.clone(),
+        denied,
+        reason,
+    })
+}
+
+async fn open_script_refusal_thread(
+    engine: &SharedEngine,
+    config: &TriggerConfig,
+    invocation: &TriggerInvocation,
+    reason: &str,
+) -> Result<uuid::Uuid, Box<dyn std::error::Error + Send + Sync>> {
+    let thread_id = uuid::Uuid::new_v4();
+    let title = trigger_failure_title(&config.name);
+    let message =
+        build_trigger_user_message(&config.name, &config.id, &title, invocation, None, None);
+    let events =
+        crate::triggers::folder_grant::script_refusal_thread_events(message, title, reason);
+    engine
+        .event_bus
+        .emit_atomically(thread_id, events)
+        .await?
+        .ok_or("The script failure thread could not be opened")?;
+    Ok(thread_id)
 }
 
 /// Execute an LLM prompt trigger — sends instructions as prompt to the LLM.
@@ -536,24 +1163,22 @@ async fn execute_llm_task(
         }
     }
 
-    log!(
+    log_legacy!(
         "[Scheduler] Executing LLM trigger '{}': {}",
         config.name,
         user_message.chars().take(50).collect::<String>()
     );
 
-    // No `ACTIVE_TRIGGER_ID` scope here: the Thread Queue executor already
-    // holds one around both trigger arms, so a script fire carries the marker
-    // too.
     let result = engine
+        .agent_host()
         .process_trigger(
+            &engine,
             &config.id,
             &config.name,
             &config.slug,
             &user_message,
             invocation,
             config.go_to_review,
-            config.side_effect_grant.clone(),
             config.mcp_servers.clone(),
             // `None` on either means this trigger follows the account default
             // for that field: the trigger model default, for the model.
@@ -592,11 +1217,30 @@ async fn execute_llm_task(
         Ok(r) => r,
         Err(e) => {
             if is_shutdown_interruption(engine.is_shutting_down(), e.as_ref()) {
-                log!(
+                log_legacy!(
                     "[Scheduler] Trigger '{}' interrupted during shutdown: {}",
                     config.name,
                     e
                 );
+                return Err(e);
+            }
+            if e.is::<crate::llm::spend_cap::SpendCapReached>() {
+                // The single ModelSpendCapReached announcement owns its notice,
+                // so another trigger fire cannot repeat it during this hold.
+                return Err(e);
+            }
+            // The run raised its grant card and notified the owner itself.
+            if run_awaits_owner(e.as_ref()) {
+                return Err(e);
+            }
+            if e.is::<crate::engine::command_guard::TriggerCommandBlocked>() {
+                emit_failure_notification(
+                    &engine,
+                    config,
+                    trigger_failure_title(&config.name),
+                    "The command guard blocked a command this trigger tried to run.".into(),
+                )
+                .await;
                 return Err(e);
             }
             let err_str = e.to_string();
@@ -611,7 +1255,7 @@ async fn execute_llm_task(
             let notification_task_id = uuid::Uuid::parse_str(&config.id)
                 .unwrap_or_else(|_| trigger_id_to_uuid(&config.id));
             if is_transient && has_recent_error_notification(pool, notification_task_id).await {
-                log!(
+                log_legacy!(
                     "[Scheduler] Suppressing duplicate transient error notification for '{}': {}",
                     config.name,
                     err_str
@@ -642,7 +1286,7 @@ async fn execute_llm_task(
         )
         .await?;
 
-    log!("[Scheduler] Trigger '{}' completed", config.name);
+    log_legacy!("[Scheduler] Trigger '{}' completed", config.name);
 
     Ok(())
 }
@@ -701,7 +1345,7 @@ async fn answer_open_question(
         }
         // Answered or overtaken in the meantime: the fire runs as a message.
         AnswerResult::Conflict(reason) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] Trigger '{}' could not answer the question on thread {}: {}",
                 config.name,
                 thread_id,
@@ -887,7 +1531,7 @@ async fn has_recent_error_notification(pool: &PgPool, task_id: uuid::Uuid) -> bo
             // A dedup lookup that could not run is UNKNOWN, not "already
             // notified": fall through to notifying, so a DB hiccup costs a
             // duplicate banner rather than the failure report itself.
-            log!(
+            log_legacy!(
                 "[Scheduler] Error-notification dedup lookup failed for task {}: {}",
                 task_id,
                 e
@@ -911,6 +1555,846 @@ pub(crate) fn is_shutdown_interruption(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_denied_folder_still_opens_the_scripts_thread() {
+        use crate::triggers::folder_grant::{ScriptFolderRefusal, TriggerFolderGrant};
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let grant = TriggerFolderGrant::inspect(outside.path(), workspace.path()).unwrap();
+        let mut config = TriggerConfig::from_created_payload(&json!({
+            "trigger_id": "report",
+            "name": "Report",
+            "run": { "type": "script", "path": "scripts/report.py" },
+        }))
+        .unwrap();
+        let error: Box<dyn std::error::Error + Send + Sync> = Box::new(ScriptFolderRefusal {
+            grant: grant.clone(),
+            output: "partial output".into(),
+        });
+
+        let asks = script_refusal(&config, error.as_ref()).unwrap();
+        assert!(
+            asks.denied.is_none(),
+            "an ungranted folder asks with a card"
+        );
+
+        config.deny(&[], std::slice::from_ref(&grant.folder));
+        let denied = script_refusal(&config, error.as_ref())
+            .expect("a denied folder still opens the run's thread");
+        assert!(denied.denied.is_some());
+        assert!(
+            denied.reason.starts_with("You chose Always deny"),
+            "{}",
+            denied.reason
+        );
+        assert!(
+            denied.reason.contains(&error.to_string()),
+            "the output stays readable"
+        );
+
+        let other: Box<dyn std::error::Error + Send + Sync> = "exit 1".into();
+        assert!(script_refusal(&config, other.as_ref()).is_none());
+    }
+
+    #[tokio::test]
+    async fn trigger_grant_card_retries_the_original_event_once() {
+        assert_trigger_grant_retry("trigger_grant_card_retries_the_original_event_once", false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn trigger_folder_grant_card_retries_the_original_event_once() {
+        assert_trigger_grant_retry(
+            "trigger_folder_grant_card_retries_the_original_event_once",
+            true,
+        )
+        .await;
+    }
+
+    async fn assert_trigger_grant_retry(test_name: &str, use_folder: bool) {
+        use crate::engine::agent_question::{answer_pending_question, AnswerResult};
+        use crate::engine::command_guard::TriggerCommandBlocked;
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::permission::{card_request, PermissionChoice};
+        use crate::engine::thread_events::permission::batch::BatchItemOutcome;
+        use crate::engine::thread_events::{AnswerKind, MessageOrigin, ThreadEvent};
+        use crate::engine::thread_queue::{OverflowPolicy, ThreadQueueRequest};
+        use crate::engine::trigger_writes::TriggerWrite;
+        use crate::test_support::{
+            boot_mock_engine, in_engine_child, seed_coding_thread, seed_thread_event,
+            setup_test_db, teardown_test_db,
+        };
+        use uuid::Uuid;
+
+        let test_path = format!("{}::{test_name}", module_path!());
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let outside = tempfile::tempdir().unwrap();
+        let folder = use_folder.then(|| {
+            crate::triggers::folder_grant::TriggerFolderGrant::inspect(
+                outside.path(),
+                engine.workspace_path(),
+            )
+            .unwrap()
+        });
+        let bus = &engine.event_bus;
+        let trigger_id = Uuid::new_v4().to_string();
+        engine
+            .trigger_registry_writer()
+            .write(
+                TriggerWrite::Created,
+                &trigger_id,
+                json!({
+                    "trigger_id": trigger_id,
+                    "name": "Event trigger",
+                    "run": { "type": "intent", "intent": "Handle the test event" }
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let config = engine.trigger_configs.read().unwrap()[&trigger_id].clone();
+        let thread_id = seed_coding_thread(bus, None).await;
+        let request = ThreadQueueRequest::EventTrigger {
+            retry_of: None,
+            trigger_id: trigger_id.clone(),
+            event_type: "ExampleReceived".into(),
+            event_payload: json!({ "value": [1, 2, 3] }),
+            depth: 2,
+            origin_thread_id: Some(Uuid::new_v4()),
+            source_event_id: Some(Uuid::new_v4()),
+        };
+        // Keep the retry queued so the test can check exactly what it will run.
+        engine.thread_queue.begin_boot_recovery();
+        let first = engine.thread_queue.submit(request.clone(), None).await;
+        assert!(!first.admitted && first.position > 0);
+        engine
+            .thread_queue
+            .drop_entry(first.entry_id, "test fire finished", None)
+            .await
+            .unwrap();
+        let mut policy = engine.thread_queue.policy().await;
+        policy.max_queued_per_trigger = 1;
+        policy.overflow = OverflowPolicy::DropOldest;
+        engine.thread_queue.set_policy(policy, None).await.unwrap();
+        let waiting = engine.thread_queue.submit(request.clone(), None).await;
+        assert!(waiting.position > 0);
+        seed_thread_event(
+            bus,
+            thread_id,
+            ThreadEvent::ResponseFailed {
+                error: "A command needs a program grant".into(),
+                spend_cap: None,
+                agent_exit: None,
+                provider_error: None,
+            },
+        )
+        .await;
+        notify_blocked_trigger(
+            &engine,
+            &config,
+            Some(first.entry_id),
+            &TriggerCommandBlocked {
+                reason: "A command needs a program grant".into(),
+                pattern: (!use_folder).then(|| "Python".into()),
+                folder: folder.clone(),
+                thread_id,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (event_id, card_id): (Uuid, String) = sqlx::query_as(
+            "SELECT id, payload->>'tool_use_id' FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionAsked'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (linked_event, tap): (Option<Uuid>, serde_json::Value) =
+            sqlx::query_as("SELECT event_id, tap FROM notifications WHERE task_id = $1::uuid")
+                .bind(&trigger_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked_event, Some(event_id));
+        assert_eq!(
+            tap,
+            serde_json::to_value(crate::scheduler::notifications::default_tap(
+                Some(thread_id),
+                Some(event_id),
+            ))
+            .unwrap()
+        );
+        let card = card_request(&pool, thread_id, &card_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (option_id, _) = card
+            .choices
+            .iter()
+            .find(|(_, choice)| matches!(choice, PermissionChoice::Grant { .. }))
+            .unwrap();
+        let answer = AnswerKind::Selected {
+            option_id: option_id.clone(),
+        };
+        let owner = Some(MessageOrigin::Device {
+            device_id: "test-device".into(),
+        });
+        let mut events = bus.subscribe();
+        assert!(matches!(
+            answer_pending_question(
+                &engine,
+                thread_id,
+                card_id.clone(),
+                answer.clone(),
+                owner.clone()
+            )
+            .await,
+            AnswerResult::Resumed,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let BusEvent::Thread {
+                    event: ThreadEvent::BatchItemRan { outcome, .. },
+                    thread_id: id,
+                    ..
+                } = &events.recv().await.unwrap().typed
+                {
+                    if *id == thread_id {
+                        assert!(matches!(outcome, BatchItemOutcome::Applied), "{outcome:?}");
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            answer_pending_question(&engine, thread_id, card_id, answer, owner).await,
+            AnswerResult::Conflict(_),
+        ));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        let queued: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload->'data'->'request' FROM events WHERE event_type = 'ThreadQueued' \
+             AND payload->'data'->>'trigger_id' = $1 ORDER BY sequence",
+        )
+        .bind(&trigger_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queued.len(), 3);
+        let mut retry = queued[2].clone();
+        assert_eq!(retry["retry_of"]["thread_id"], thread_id.to_string());
+        retry.as_object_mut().unwrap().remove("retry_of");
+        assert_eq!(retry, serde_json::to_value(request).unwrap());
+        let waiting_still_queued: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM thread_queue WHERE id = $1)")
+                .bind(waiting.entry_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!waiting_still_queued);
+        {
+            let configs = engine.trigger_configs.read().unwrap();
+            let config = &configs[&trigger_id];
+            if let Some(folder) = folder {
+                assert_eq!(config.folder_grants, vec![folder]);
+                assert!(config.program_grants.is_empty());
+            } else {
+                assert_eq!(config.program_grants[0].pattern, "Python");
+                assert!(config.folder_grants.is_empty());
+            }
+        }
+        drop(engine);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A blocked trigger's card queues behind an open card. The notice still
+    /// asks for the grant, and its tap opens the thread.
+    #[tokio::test]
+    async fn a_queued_trigger_grant_card_keeps_its_notice_and_taps_the_thread() {
+        use crate::engine::command_guard::TriggerCommandBlocked;
+        use crate::engine::thread_events::ThreadEvent;
+        use crate::engine::trigger_writes::TriggerWrite;
+        use crate::test_support::{
+            boot_mock_engine, in_engine_child, seed_coding_thread, seed_thread_event,
+            setup_test_db, teardown_test_db,
+        };
+        use uuid::Uuid;
+
+        let test_path = format!(
+            "{}::a_queued_trigger_grant_card_keeps_its_notice_and_taps_the_thread",
+            module_path!()
+        );
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let bus = &engine.event_bus;
+        let trigger_id = Uuid::new_v4().to_string();
+        engine
+            .trigger_registry_writer()
+            .write(
+                TriggerWrite::Created,
+                &trigger_id,
+                json!({
+                    "trigger_id": trigger_id,
+                    "name": "Event trigger",
+                    "run": { "type": "intent", "intent": "Handle the test event" }
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let config = engine.trigger_configs.read().unwrap()[&trigger_id].clone();
+        let thread_id = seed_coding_thread(bus, None).await;
+        seed_thread_event(
+            bus,
+            thread_id,
+            ThreadEvent::UserQuestionAsked {
+                tool_use_id: "open".into(),
+                cc_session_id: String::new(),
+                question: "Open question?".into(),
+                options: vec![],
+                worktree_path: None,
+                multi_select: false,
+                owner_approval: None,
+                permission_request: None,
+            },
+        )
+        .await;
+
+        notify_blocked_trigger(
+            &engine,
+            &config,
+            Some(Uuid::new_v4()),
+            &TriggerCommandBlocked {
+                reason: "A command needs a program grant".into(),
+                pattern: Some("Python".into()),
+                folder: None,
+                thread_id,
+            },
+        )
+        .await
+        .unwrap();
+
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionQueued')",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(queued, "the grant card queues behind the open card");
+        let (message, linked_event, tap): (String, Option<Uuid>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT message, event_id, tap FROM notifications WHERE task_id = $1::uuid",
+            )
+            .bind(&trigger_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(message.contains("run Python"), "{message}");
+        assert_eq!(linked_event, None);
+        assert_eq!(
+            tap,
+            serde_json::to_value(crate::scheduler::notifications::default_tap(
+                Some(thread_id),
+                None,
+            ))
+            .unwrap()
+        );
+        drop(engine);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An intent trigger with one run parked on a blocked command: the
+    /// thread's `TriggerStarted`, then a tool result in that turn.
+    struct ParkedRun {
+        engine: crate::engine::types::SharedEngine,
+        config: TriggerConfig,
+        thread_id: uuid::Uuid,
+        turn: uuid::Uuid,
+    }
+
+    async fn park_a_run(db: &str) -> (ParkedRun, tempfile::TempDir) {
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
+        use crate::engine::trigger_writes::TriggerWrite;
+
+        let (engine, workspace) = crate::test_support::boot_mock_engine(db).await;
+        let trigger_id = uuid::Uuid::new_v4().to_string();
+        engine
+            .trigger_registry_writer()
+            .write(
+                TriggerWrite::Created,
+                &trigger_id,
+                json!({
+                    "trigger_id": trigger_id,
+                    "name": "Report trigger",
+                    "run": { "type": "intent", "intent": "Write the report" }
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let config = engine.trigger_configs.read().unwrap()[&trigger_id].clone();
+        let thread_id = uuid::Uuid::new_v4();
+        let on_trigger = EventMeta {
+            channel: Some(EventChannel::Trigger),
+            ..EventMeta::NONE
+        };
+        let turn = engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::TriggerStarted {
+                    retry_of: None,
+                    trigger_id: trigger_id.clone(),
+                    trigger_name: Some(config.name.clone()),
+                    prompt: Some("Write the report".into()),
+                    invocation: Some(TriggerInvocation::Schedule),
+                    origin: None,
+                    go_to_review: false,
+                    model: None,
+                    reasoning_effort: None,
+                    provider: None,
+                    continue_key: None,
+                },
+                meta: on_trigger.clone(),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .event_id;
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ToolResult {
+                    name: "run_bash".into(),
+                    result: "A command needs a program grant".into(),
+                    images: vec![],
+                    success: false,
+                    tool_called_event_id: None,
+                },
+                meta: EventMeta {
+                    request_event_id: Some(turn),
+                    ..on_trigger
+                },
+            })
+            .await
+            .unwrap();
+        let blocked = crate::engine::command_guard::TriggerCommandBlocked {
+            reason: "A command needs a program grant".into(),
+            pattern: Some("Python".into()),
+            folder: None,
+            thread_id,
+        };
+        notify_blocked_trigger(&engine, &config, None, &blocked)
+            .await
+            .unwrap();
+        let run = ParkedRun {
+            engine,
+            config,
+            thread_id,
+            turn,
+        };
+        (run, workspace)
+    }
+
+    /// The parked run's card: its id, and each option's label and choice.
+    async fn parked_card(
+        run: &ParkedRun,
+    ) -> (
+        String,
+        Vec<(String, crate::engine::permission::PermissionChoice)>,
+    ) {
+        let (card_id, options): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT payload->>'tool_use_id', payload->'options' FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionAsked'",
+        )
+        .bind(run.thread_id)
+        .fetch_one(run.engine.pool())
+        .await
+        .unwrap();
+        let request =
+            crate::engine::permission::card_request(run.engine.pool(), run.thread_id, &card_id)
+                .await
+                .unwrap()
+                .unwrap();
+        let options = options
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| {
+                let id = option["id"].as_str().unwrap();
+                let label = option["label"].as_str().unwrap().to_string();
+                (label, request.choices[id].clone())
+            })
+            .collect();
+        (card_id, options)
+    }
+
+    fn owner() -> Option<crate::engine::thread_events::MessageOrigin> {
+        Some(crate::engine::thread_events::MessageOrigin::Device {
+            device_id: "test-device".into(),
+        })
+    }
+
+    /// An intent run waits in its own thread on Allow once, Always allow,
+    /// Always deny and Don't allow. The thread reads waiting, and a notice
+    /// links the card.
+    #[tokio::test]
+    async fn a_blocked_intent_run_waits_on_four_options_in_its_own_thread() {
+        use crate::engine::permission::menu::{
+            ALLOW_ONCE_LABEL, ALWAYS_ALLOW_LABEL, ALWAYS_DENY_LABEL, DONT_ALLOW_LABEL,
+        };
+        use crate::engine::permission::{Holder, PermissionChoice};
+        use crate::test_support::{in_engine_child, setup_test_db, teardown_test_db};
+
+        let test_path = format!(
+            "{}::a_blocked_intent_run_waits_on_four_options_in_its_own_thread",
+            module_path!()
+        );
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (run, _workspace) = park_a_run(&db).await;
+
+        let (_, options) = parked_card(&run).await;
+        let labels: Vec<&str> = options.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                ALLOW_ONCE_LABEL,
+                ALWAYS_ALLOW_LABEL,
+                ALWAYS_DENY_LABEL,
+                DONT_ALLOW_LABEL
+            ]
+        );
+        let holder = |choice: &PermissionChoice| match choice {
+            PermissionChoice::Grant { holder, .. } => Some(holder.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            holder(&options[0].1),
+            Some(Holder::Thread {
+                thread_id: run.thread_id
+            }),
+            "Allow once is held by this run's thread"
+        );
+        assert_eq!(
+            holder(&options[1].1),
+            Some(Holder::Trigger {
+                trigger_id: run.config.id.clone()
+            }),
+            "Always allow is held by the trigger"
+        );
+        assert_eq!(options[2].1, PermissionChoice::RefuseStanding);
+        assert_eq!(options[3].1, PermissionChoice::Refuse);
+        let item: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload->'permission_request'->'batch'->'items'->0 FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionAsked'",
+        )
+        .bind(run.thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(item["queue_entry_id"].is_null(), "{item}");
+        assert_eq!(item["run_thread_id"], run.thread_id.to_string());
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                .bind(run.thread_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "waiting_for_user_answer");
+        let title: String =
+            sqlx::query_scalar("SELECT title FROM notifications WHERE task_id = $1::uuid")
+                .bind(&run.config.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(title, format!("{} waits for you", run.config.name));
+        drop(run);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Don't allow ends the parked turn refused, never failed, and leaves the
+    /// trigger's grants alone.
+    #[tokio::test]
+    async fn dont_allow_ends_the_parked_run_refused() {
+        use crate::engine::agent_question::{answer_pending_question, AnswerResult};
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::permission::PermissionChoice;
+        use crate::engine::thread_events::{AnswerKind, CancelCause, ThreadEvent};
+        use crate::test_support::{in_engine_child, setup_test_db, teardown_test_db};
+
+        let test_path = format!("{}::dont_allow_ends_the_parked_run_refused", module_path!());
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (run, _workspace) = park_a_run(&db).await;
+        let (card_id, _) = parked_card(&run).await;
+        let request = crate::engine::permission::card_request(&pool, run.thread_id, &card_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (option_id, _) = request
+            .choices
+            .iter()
+            .find(|(_, choice)| matches!(choice, PermissionChoice::Refuse))
+            .unwrap();
+
+        let mut events = run.engine.event_bus.subscribe();
+        let answer = AnswerKind::Selected {
+            option_id: option_id.clone(),
+        };
+        assert!(matches!(
+            answer_pending_question(&run.engine, run.thread_id, card_id, answer, owner()).await,
+            AnswerResult::Resumed,
+        ));
+        let (cause, request_event_id) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if let BusEvent::Thread {
+                        thread_id,
+                        event: ThreadEvent::ResponseCanceled { cause, .. },
+                        meta,
+                    } = &event.typed
+                    {
+                        if *thread_id == run.thread_id {
+                            break (*cause, meta.request_event_id);
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(cause, CancelCause::Refused);
+        assert_eq!(request_event_id, Some(run.turn), "the parked turn ends");
+        let failed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events \
+             WHERE thread_id = $1 AND event_type = 'ResponseFailed')",
+        )
+        .bind(run.thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!failed, "a refused run is not a failed one");
+        assert!(run.engine.trigger_configs.read().unwrap()[&run.config.id]
+            .program_grants
+            .is_empty());
+        drop(run);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An Allow that can no longer apply, because the trigger changed after
+    /// the card went up, ends the parked turn as failed. The run never waits
+    /// on a card that is already answered.
+    #[tokio::test]
+    async fn a_stale_allow_ends_the_parked_run_failed() {
+        use crate::engine::agent_question::{answer_pending_question, AnswerResult};
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
+        use crate::engine::thread_events::{AnswerKind, ThreadEvent};
+        use crate::engine::trigger_writes::TriggerWrite;
+        use crate::test_support::{in_engine_child, setup_test_db, teardown_test_db};
+
+        let test_path = format!(
+            "{}::a_stale_allow_ends_the_parked_run_failed",
+            module_path!()
+        );
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (run, _workspace) = park_a_run(&db).await;
+        let (card_id, options) = parked_card(&run).await;
+        let request = crate::engine::permission::card_request(&pool, run.thread_id, &card_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let allow_once = &options
+            .iter()
+            .find(|(label, _)| label == ALLOW_ONCE_LABEL)
+            .unwrap()
+            .1;
+        let (option_id, _) = request
+            .choices
+            .iter()
+            .find(|(_, choice)| *choice == allow_once)
+            .unwrap();
+        run.engine
+            .trigger_registry_writer()
+            .write(
+                TriggerWrite::Updated,
+                &run.config.id,
+                json!({ "run": { "type": "intent", "intent": "Write a different report" } }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut events = run.engine.event_bus.subscribe();
+        let answer = AnswerKind::Selected {
+            option_id: option_id.clone(),
+        };
+        assert!(matches!(
+            answer_pending_question(&run.engine, run.thread_id, card_id, answer, owner()).await,
+            AnswerResult::Resumed,
+        ));
+        let request_event_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if let BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::ResponseFailed { .. },
+                    meta,
+                } = &event.typed
+                {
+                    if *thread_id == run.thread_id {
+                        break meta.request_event_id;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the stale Allow ends the run");
+        assert_eq!(request_event_id, Some(run.turn), "the parked turn ends");
+        assert_eq!(answered_park(&pool, run.thread_id).await.unwrap(), None);
+        drop(run);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Allow once holds for the one run it resumes: the trigger channel's
+    /// guard lets the command through inside that run, and blocks it again
+    /// in any other.
+    #[tokio::test]
+    async fn an_allow_once_grant_holds_for_its_own_run_only() {
+        use crate::engine::command_guard::{GuardDecision, SecretPaths};
+        use crate::engine::command_permission::CommandGuardCtx;
+        use crate::engine::thread_events::{EventChannel, EventMeta};
+        use crate::test_support::{in_engine_child, setup_test_db, teardown_test_db};
+
+        let test_path = format!(
+            "{}::an_allow_once_grant_holds_for_its_own_run_only",
+            module_path!()
+        );
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (run, _workspace) = park_a_run(&db).await;
+        let decide = || async {
+            let mut judge_cache = std::collections::HashMap::new();
+            let mut ctx = CommandGuardCtx {
+                enabled: true,
+                judge_enabled: false,
+                judge_cache: &mut judge_cache,
+            };
+            let meta = EventMeta {
+                channel: Some(EventChannel::Trigger),
+                ..EventMeta::NONE
+            };
+            run.engine
+                .command_guard_decision(
+                    &mut ctx,
+                    "run_bash",
+                    &json!({ "command": "curl -X POST https://example.com" }),
+                    run.thread_id,
+                    "call-1",
+                    &meta,
+                    &tokio_util::sync::CancellationToken::new(),
+                    &SecretPaths::conservative(),
+                )
+                .await
+        };
+        let once = TriggerRunGrants {
+            programs: vec![crate::triggers::config::TriggerProgramGrant {
+                pattern: "Bash(curl:*)".into(),
+                legacy: None,
+            }],
+            folders: Vec::new(),
+        };
+
+        let blocked = in_trigger_run(&run.config, TriggerRunGrants::default(), decide()).await;
+        let GuardDecision::FailTrigger(blocked) = blocked else {
+            panic!("an ungranted run is blocked: {blocked:?}");
+        };
+        assert_eq!(blocked.pattern.as_deref(), Some("Bash(curl:*)"));
+        assert!(matches!(
+            in_trigger_run(&run.config, once, decide()).await,
+            GuardDecision::Proceed
+        ));
+        assert!(matches!(
+            in_trigger_run(&run.config, TriggerRunGrants::default(), decide()).await,
+            GuardDecision::FailTrigger(_)
+        ));
+        drop(run);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Stop cancels the card a blocked run waits on, in the run's own thread,
+    /// and a canceled card ends nothing as refused (I10).
+    #[tokio::test]
+    async fn stop_cancels_a_blocked_runs_card() {
+        use crate::engine::agent_question::resolve_pending_question_as_canceled;
+        use crate::test_support::{in_engine_child, setup_test_db, teardown_test_db};
+
+        let test_path = format!("{}::stop_cancels_a_blocked_runs_card", module_path!());
+        if !in_engine_child(test_path.trim_start_matches("lucidos_engine::")).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (run, _workspace) = park_a_run(&db).await;
+
+        assert!(resolve_pending_question_as_canceled(&run.engine, run.thread_id, owner()).await);
+        let answer: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload->'answer' FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered'",
+        )
+        .bind(run.thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(answer["kind"], "Canceled", "{answer}");
+        assert_eq!(
+            answered_park(&pool, run.thread_id).await.unwrap(),
+            Some(AnsweredPark {
+                turn: run.turn,
+                granted: false
+            }),
+            "a canceled card grants nothing"
+        );
+        drop(run);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
 
     #[test]
     fn only_shutdown_interruptions_suppress_error_notifications() {
@@ -1229,57 +2713,6 @@ mod tests {
             &format!("{pattern} {constructor}"),
             "ResponseAborted"
         ));
-    }
-
-    /// Source-scan tripwire, in the repo's existing idiom (see
-    /// `engine::trigger_writes::only_the_chokepoint_constructs_a_trigger_lifecycle_event`).
-    ///
-    /// A "the run finished, tell the frontend" broadcast is the most natural
-    /// thing in the world to reach for from the scheduler, and it reads as
-    /// harmless at the call site: the turn really has finished, and the event is
-    /// empty. It is not harmless. It is a second terminator for a turn that
-    /// already has one, anchored on no `request_event_id`, and the case it gets
-    /// wrong is the one nobody writes the code for: the turn that ended because
-    /// the user pressed Stop. `execute_llm_task` carried exactly that from 2026-03
-    /// until 2026-08-07 and put "Done ✓ / the model returned an empty response"
-    /// under every canceled trigger fire.
-    ///
-    /// Nothing here may construct one. The terminator belongs to the agentic
-    /// loop, which owns the turn's `request_event_id`; the scheduler observes.
-    #[test]
-    fn the_scheduler_never_constructs_a_chat_terminator() {
-        use crate::test_support::source_scan::{is_test_path, production_sources};
-
-        // The chat-mode terminator set (`TERMINATOR_EVENT_TYPES`), spelled out
-        // rather than imported so a new variant joining that constant does not
-        // silently widen what this test forbids without a look at this comment.
-        const TERMINATORS: [&str; 4] = [
-            "ResponseGenerated",
-            "ResponseCanceled",
-            "ResponseAborted",
-            "ResponseFailed",
-        ];
-
-        let mut offenders: Vec<String> = Vec::new();
-        for (rel, text) in production_sources() {
-            if !rel.starts_with("scheduler/") || is_test_path(&rel) {
-                continue;
-            }
-            for event in TERMINATORS {
-                if constructs_terminator(&text, event) {
-                    offenders.push(format!("{rel}: {event}"));
-                }
-            }
-        }
-        offenders.sort();
-        assert!(
-            offenders.is_empty(),
-            "the scheduler must not emit a terminator: a trigger turn's terminator \
-             is the agentic loop's, and a second one anchored on no request_event_id \
-             renders as a phantom 'empty response' turn under a cancel and reports a \
-             canceled child to its parent as Success. Constructed in:\n  {}",
-            offenders.join("\n  ")
-        );
     }
 
     #[test]
@@ -1822,5 +3255,59 @@ mod tests {
         assert!(retried.contains("## Retry"));
         assert!(retried.contains(&format!("[interrupted run](thread:{})", retry.thread_id)));
         assert!(retried.contains("before repeating a side effect"));
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// Source-scan tripwire, in the repo's existing idiom (see
+        /// `engine::trigger_writes::only_the_chokepoint_constructs_a_trigger_lifecycle_event`).
+        ///
+        /// A "the run finished, tell the frontend" broadcast is natural to reach for
+        /// from the scheduler, and it reads as harmless: the turn has finished. It
+        /// is not harmless. It is a second terminator for a turn that already has
+        /// one, anchored on no `request_event_id`.
+        ///
+        /// It gets wrong the turn that ended because the user pressed Stop.
+        /// `execute_llm_task` once carried exactly that, and put "Done ✓ / the
+        /// model returned an empty response" under every canceled trigger fire.
+        ///
+        /// Nothing here may construct one. The terminator belongs to the agentic
+        /// loop, which owns the turn's `request_event_id`; the scheduler observes.
+        #[test]
+        fn the_scheduler_never_constructs_a_chat_terminator() {
+            use crate::test_support::source_scan::{is_test_path, production_sources};
+
+            // The chat-mode terminator set (`TERMINATOR_EVENT_TYPES`), spelled out
+            // rather than imported. A new variant joining that constant must not
+            // widen what this test forbids without a look at this comment.
+            const TERMINATORS: [&str; 4] = [
+                "ResponseGenerated",
+                "ResponseCanceled",
+                "ResponseAborted",
+                "ResponseFailed",
+            ];
+
+            let mut offenders: Vec<String> = Vec::new();
+            for (rel, text) in production_sources() {
+                if !rel.starts_with("scheduler/") || is_test_path(&rel) {
+                    continue;
+                }
+                for event in TERMINATORS {
+                    if constructs_terminator(&text, event) {
+                        offenders.push(format!("{rel}: {event}"));
+                    }
+                }
+            }
+            offenders.sort();
+            assert!(
+                offenders.is_empty(),
+                "the scheduler must not emit a terminator: a trigger turn's terminator \
+             is the agentic loop's, and a second one anchored on no request_event_id \
+             renders as a phantom 'empty response' turn under a cancel and reports a \
+             canceled child to its parent as Success. Constructed in:\n  {}",
+                offenders.join("\n  ")
+            );
+        }
     }
 }

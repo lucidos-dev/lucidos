@@ -1,7 +1,66 @@
 use super::*;
-use crate::api::actor::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
+use crate::core::subprocess_origin::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
 use std::time::Duration;
 use tempfile::tempdir;
+
+#[tokio::test]
+async fn failed_venv_creation_removes_only_the_environment_it_created() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let launcher = dir.path().join("python-fixture");
+    fs::write(
+        &launcher,
+        r#"#!/bin/sh
+mkdir -p "$3/bin"
+touch "$3/bin/python"
+echo 'The virtual environment was not created successfully because ensurepip is not available.'
+exit 1
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+
+    for _ in 0..2 {
+        let error = runtime
+            .ensure_venv_with(tokio::process::Command::new(&launcher))
+            .await
+            .unwrap_err();
+        assert!(error.contains("ensurepip is not available"), "{error}");
+        assert!(error.contains("python3-venv"), "{error}");
+        assert!(!runtime.venv_path.exists());
+    }
+}
+
+/// A venv without pip keeps its installed packages through a failed repair.
+#[tokio::test]
+async fn failed_repair_keeps_the_existing_venv() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let launcher = dir.path().join("python-fixture");
+    fs::write(
+        &launcher,
+        "#!/bin/sh\necho 'ensurepip is not available'\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+    let package = runtime.venv_path.join("lib/site-packages/user_pkg.py");
+    fs::create_dir_all(package.parent().unwrap()).unwrap();
+    fs::write(&package, "").unwrap();
+    fs::create_dir_all(runtime.venv_path.join("bin")).unwrap();
+    fs::write(runtime.python_bin(), "").unwrap();
+
+    let error = runtime
+        .ensure_venv_with(tokio::process::Command::new(&launcher))
+        .await
+        .unwrap_err();
+    assert!(error.contains("ensurepip is not available"), "{error}");
+    assert!(package.is_file(), "the failed repair kept user packages");
+    assert!(runtime.python_bin().exists());
+}
 
 /// Regression: `packages` went to `pip install` verbatim, so a pip flag or a
 /// URL installed code from wherever the model named. The refusal comes before
@@ -23,7 +82,10 @@ async fn ensure_packages_refuses_flags_urls_and_paths() {
         "",
     ] {
         let err = runtime
-            .ensure_packages(&["pandas", spec])
+            .ensure_packages(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+                &["pandas", spec],
+            )
             .await
             .expect_err(spec);
         assert!(err.contains("is not a package name"), "{spec}: {err}");
@@ -44,7 +106,12 @@ async fn test_execute_simple_python() {
     let dir = tempdir().unwrap();
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
-    let result = runtime.execute("print('hello')").await;
+    let result = runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "print('hello')",
+        )
+        .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().trim(), "hello");
 }
@@ -54,7 +121,12 @@ async fn test_execute_python_error() {
     let dir = tempdir().unwrap();
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
-    let result = runtime.execute("raise ValueError('test error')").await;
+    let result = runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "raise ValueError('test error')",
+        )
+        .await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("ValueError"));
 }
@@ -65,7 +137,10 @@ async fn test_execute_writes_to_workspace_cwd() {
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
     let result = runtime
-        .execute("open('test_file.txt', 'w').write('ok'); print('done')")
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "open('test_file.txt', 'w').write('ok'); print('done')",
+        )
         .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().trim(), "done");
@@ -78,7 +153,10 @@ async fn test_execute_reads_anywhere() {
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
     let result = runtime
-        .execute("import os; print(os.path.exists('/etc'))")
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "import os; print(os.path.exists('/etc'))",
+        )
         .await;
     assert!(result.is_ok());
 }
@@ -99,7 +177,12 @@ async fn test_execute_writes_outside_workspace_succeed() {
     let target_str = target.to_string_lossy().replace('\\', "\\\\");
     let code = format!("open('{}', 'w').write('hello'); print('done')", target_str);
 
-    let result = runtime.execute(&code).await;
+    let result = runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+        )
+        .await;
     assert!(
         result.is_ok(),
         "outside-workspace write failed: {:?}",
@@ -120,6 +203,7 @@ async fn test_staging_redirects_data_writes() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('a,b\\n1,2'); print('done')",
             vec![],
             &staging,
@@ -146,6 +230,7 @@ async fn test_staging_reads_fall_through_to_workspace() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "content = open('data/artifacts/existing.txt').read(); print(content)",
             vec![],
             &staging,
@@ -166,6 +251,7 @@ async fn test_staging_reads_own_writes() {
     let staging = ws.join(".lucidos/staging/test-run-3");
 
     let result = runtime.execute_staged(
+        &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
         "open('data/output.txt', 'w').write('hello')\ncontent = open('data/output.txt').read()\nprint(content)",
         vec![],
         &staging,
@@ -185,6 +271,7 @@ async fn test_staging_non_data_writes_go_to_workspace() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('scratch.txt', 'w').write('temp'); print('ok')",
             vec![],
             &staging,
@@ -217,6 +304,7 @@ async fn test_staging_data_prefixed_siblings_are_not_diverted() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('database.json', 'w').write('{}')\n\
              open('datasets/rows.csv', 'w').write('a,b')\n\
              open('data_backup/old.txt', 'w').write('x')\n\
@@ -266,6 +354,7 @@ async fn a_symlinked_data_root_still_stages_its_writes() {
     let staging = ws.join(".lucidos/staging/relocated-data-run");
     let out = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('a,b\\n')\n\
              print(open('data/artifacts/report.csv').read().strip())",
             vec![],
@@ -326,7 +415,11 @@ async fn execute_file_runs_the_real_path_not_a_copy() {
     );
 
     let out = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect("execute_file_with_env");
     let reported = out.trim();
@@ -377,7 +470,11 @@ print(data["approved_version"])
     );
 
     let out = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect("execute_file_with_env");
 
@@ -407,7 +504,11 @@ async fn execute_file_writes_audit_logs_without_copying_the_script() {
     );
 
     runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect("execute_file_with_env");
 
@@ -450,7 +551,11 @@ async fn execute_file_shapes_errors_like_run_script() {
     let script = write_trigger_script(&ws, "boom", "raise ValueError('kaboom')\n");
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("script raises");
     assert!(err.starts_with("Python error:"), "got: {err}");
@@ -472,7 +577,11 @@ async fn a_failure_with_empty_stderr_reports_the_end_of_stdout() {
     );
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("script exits 1");
     assert!(err.contains("end of stdout"), "got: {err}");
@@ -498,7 +607,11 @@ async fn a_long_stdout_log_reports_its_end_under_the_label() {
     );
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("script exits 1");
     assert!(err.contains("this is the end of stdout"), "got: {err}");
@@ -508,29 +621,6 @@ async fn a_long_stdout_log_reports_its_end_under_the_label() {
         err.trim_end().ends_with("HTTP 500 from the provider"),
         "got: {err}"
     );
-}
-
-#[test]
-fn script_error_output_prefers_stderr_and_keeps_the_end_of_stdout() {
-    assert_eq!(script_error_output("boom\n", "log\n", 4), "boom\n");
-    assert_eq!(script_error_output(" \n", "\n", 1), "");
-    let long = format!("{}\nthe real error", "x".repeat(10_000));
-    let tail = script_error_output("", &long, long.len() as u64);
-    assert!(tail.ends_with("the real error"), "{tail}");
-    assert!(tail.contains("bytes of stdout omitted"), "{tail}");
-    assert!(tail.len() < 5_000, "{}", tail.len());
-}
-
-/// The omitted count covers what the reader dropped before the end it kept.
-#[test]
-fn the_omitted_count_includes_what_the_reader_dropped() {
-    let tail = script_error_output("", "last line", 1_009);
-    assert_eq!(
-        tail,
-        "(stderr was empty, so this is the end of stdout)\n\
-         [... 1000 bytes of stdout omitted ...]\nlast line"
-    );
-    assert!(!script_error_output("", "last line", 9).contains("omitted"));
 }
 
 /// Env vars reach an in-place script the same way they reach a string-code one.
@@ -550,6 +640,7 @@ async fn execute_file_applies_env_vars() {
 
     let out = runtime
         .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             &script,
             vec![(
                 "TRIGGER_EVENT_TYPE".to_string(),
@@ -571,7 +662,11 @@ async fn execute_with_env_still_runs_from_the_exhaust_copy() {
     let runtime = PythonRuntime::new(ws.clone()).unwrap();
 
     let out = runtime
-        .execute_with_env("import os\nprint(os.path.abspath(__file__))\n", vec![])
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "import os\nprint(os.path.abspath(__file__))\n",
+            vec![],
+        )
         .await
         .expect("execute_with_env");
     let reported = out.trim();
@@ -675,7 +770,13 @@ async fn execute_kills_subprocess_when_future_dropped() {
 
     // Pre-warm the venv so the cancel below races the actual subprocess, not
     // the one-time venv creation, which takes seconds on a fresh tempdir.
-    runtime.execute("print('warmup')").await.expect("warmup");
+    runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "print('warmup')",
+        )
+        .await
+        .expect("warmup");
 
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
@@ -695,9 +796,10 @@ async fn execute_kills_subprocess_when_future_dropped() {
     // execute future is dropped — taking the inner Command future and
     // its Child handle with it. kill_on_drop(true) on the Command
     // makes the OS send SIGKILL to the python process.
+    let sandbox = crate::runtime::agent_sandbox::Sandbox::unsandboxed();
     tokio::select! {
         _ = token.cancelled() => {}
-        r = runtime.execute(&code) => {
+        r = runtime.execute(&sandbox, &code) => {
             panic!("execute completed before cancel: {:?}", r);
         }
     };
@@ -736,36 +838,14 @@ const RUNAWAY_SLEEP_SECS: u64 = 60;
 /// that instead.
 async fn warmed_runtime(workspace: &std::path::Path, ceiling: Duration) -> PythonRuntime {
     let runtime = PythonRuntime::new(workspace.to_path_buf()).unwrap();
-    runtime.execute("print('warmup')").await.expect("warmup");
+    runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "print('warmup')",
+        )
+        .await
+        .expect("warmup");
     runtime.with_execution_timeout(ceiling)
-}
-
-/// The ceiling the rest of the system quotes. `llm/tools/exec.rs` renders it
-/// from the constant. `system-knowhow/running-python.md` is prose and cannot,
-/// so this pins the doc to the constant instead.
-#[test]
-fn the_default_ceiling_is_the_one_the_docs_promise() {
-    let dir = tempdir().unwrap();
-    let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
-    assert_eq!(
-        runtime.execution_timeout,
-        Duration::from_secs(EXECUTION_TIMEOUT_SECS)
-    );
-    let doc = include_str!("../../../../system-knowhow/running-python.md");
-    for quoted in [
-        format!("{EXECUTION_TIMEOUT_SECS} s ceiling"),
-        format!("timed out after {EXECUTION_TIMEOUT_SECS}s"),
-    ] {
-        assert!(
-            doc.contains(&quoted),
-            "system-knowhow/running-python.md must quote the ceiling as {quoted:?}"
-        );
-    }
-    assert_eq!(
-        EXECUTION_TIMEOUT_SECS,
-        crate::llm::tools::MAX_TIMEOUT_SECS,
-        "the python ceiling reads the one bash constant, it does not restate it"
-    );
 }
 
 /// The headline property: a script that outruns the ceiling comes back as an
@@ -779,9 +859,10 @@ async fn sync_execution_is_bounded_by_the_hard_ceiling() {
 
     let started = std::time::Instant::now();
     let err = runtime
-        .execute(&format!(
-            "import time\ntime.sleep({RUNAWAY_SLEEP_SECS})\nprint('ran to completion')"
-        ))
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})\nprint('ran to completion')"),
+        )
         .await
         .expect_err("a script that outruns the ceiling must fail");
     let elapsed = started.elapsed();
@@ -838,7 +919,10 @@ async fn the_execution_timeout_kills_the_python_child() {
     );
 
     let err = runtime
-        .execute(&code)
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+        )
         .await
         .expect_err("the script sleeps past the ceiling");
     assert!(err.contains("timed out"), "got: {err}");
@@ -874,6 +958,7 @@ async fn a_timed_out_staged_run_leaves_data_untouched() {
     let staging = ws.join(".lucidos/staging/timed-out-run");
     let err = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             &format!(
                 "open('data/artifacts/report.csv', 'w').write('half written')\n\
                  import time\n\
@@ -909,7 +994,11 @@ async fn an_in_place_script_gets_the_ceiling_too() {
     );
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("an in-place script must be bounded too");
     assert!(err.contains("timed out after 1s"), "got: {err}");
@@ -928,6 +1017,7 @@ async fn a_fast_script_still_succeeds_and_still_stages() {
     let staging = ws.join(".lucidos/staging/fast-run");
     let out = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('a,b\\n1,2'); print('done')",
             vec![],
             &staging,
@@ -953,7 +1043,10 @@ async fn a_timeout_leaves_a_note_in_the_exhaust_dir() {
     let runtime = warmed_runtime(&ws, Duration::from_secs(1)).await;
 
     runtime
-        .execute(&format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})"))
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})"),
+        )
         .await
         .expect_err("the script sleeps past the ceiling");
 
@@ -1076,261 +1169,6 @@ fn the_sweep_spares_every_entry_it_cannot_name_as_a_run_dir() {
     );
 }
 
-// -----------------------------------------------------------------
-// truncate_python_error, context-trim tests.
-//
-// A retried import failure returns a 30-line ModuleNotFoundError
-// traceback every time. The signal is the exception line and the
-// user frame, so the truncator must always preserve those two.
-// -----------------------------------------------------------------
-
-use super::{truncate_python_error, PY_ERROR_BYTE_BUDGET};
-
-#[test]
-fn short_error_returns_verbatim() {
-    let err = "Traceback (most recent call last):\n  File \"x.py\", line 1, in <module>\n    a = 1/0\nZeroDivisionError: division by zero";
-    assert_eq!(truncate_python_error(err), err);
-}
-
-#[test]
-fn long_traceback_keeps_first_and_last_frame_plus_exception() {
-    // 20-frame chain — comfortably above the 30-line budget so the
-    // truncator engages. Models the kind of recursive descent into
-    // an importer / framework that hides the one user frame the
-    // LLM cares about.
-    let mut tb = String::from("Traceback (most recent call last):\n");
-    for i in 0..20 {
-        tb.push_str(&format!(
-            "  File \"/Users/x/.../mod_{i}.py\", line {line}, in func_{i}\n    helper_{i}()\n",
-            i = i,
-            line = 100 + i
-        ));
-    }
-    tb.push_str("ModuleNotFoundError: No module named 'strategy_params'");
-
-    let trimmed = truncate_python_error(&tb);
-    // Header preserved.
-    assert!(
-        trimmed.starts_with("Traceback "),
-        "header must be preserved: {trimmed:?}"
-    );
-    // First frame survives.
-    assert!(
-        trimmed.contains("mod_0.py"),
-        "first frame must be preserved: {trimmed:?}"
-    );
-    assert!(
-        trimmed.contains("helper_0()"),
-        "first frame's code line must be preserved: {trimmed:?}"
-    );
-    // Last frame survives.
-    assert!(
-        trimmed.contains("mod_19.py"),
-        "last frame must be preserved: {trimmed:?}"
-    );
-    assert!(
-        trimmed.contains("helper_19()"),
-        "last frame's code line must be preserved: {trimmed:?}"
-    );
-    // Middle frames dropped.
-    assert!(
-        !trimmed.contains("mod_10.py"),
-        "middle frame should be dropped: {trimmed:?}"
-    );
-    // Omitted-marker present so the LLM knows trimming happened.
-    assert!(
-        trimmed.contains("frames omitted"),
-        "trim marker required: {trimmed:?}"
-    );
-    // Exception line preserved — this is the ONE line the LLM
-    // most needs to act on.
-    assert!(
-        trimmed.contains("ModuleNotFoundError: No module named 'strategy_params'"),
-        "exception line must be preserved: {trimmed:?}"
-    );
-    // Result is much shorter than the original.
-    assert!(
-        trimmed.len() < tb.len() / 2,
-        "trimmed should be < half the original ({} vs {})",
-        trimmed.len(),
-        tb.len()
-    );
-}
-
-#[test]
-fn short_traceback_under_budget_returns_verbatim() {
-    // Three frames, under the 4-frame threshold, pass through untouched even
-    // though the byte count crosses the line-count budget.
-    let tb = "Traceback (most recent call last):\n\
-              \x20 File \"a.py\", line 1, in <module>\n    f()\n\
-              \x20 File \"b.py\", line 2, in f\n    g()\n\
-              \x20 File \"c.py\", line 3, in g\n    raise RuntimeError('boom')\n\
-              RuntimeError: boom";
-    assert_eq!(truncate_python_error(tb), tb);
-}
-
-#[test]
-fn pre_traceback_noise_is_tail_trimmed() {
-    // A script that prints 50 progress lines then crashes. We
-    // want the LAST few pre-crash lines (most informative) plus
-    // the full traceback structure.
-    let mut s = String::new();
-    for i in 0..50 {
-        s.push_str(&format!("progress: step {i}\n"));
-    }
-    s.push_str("Traceback (most recent call last):\n");
-    for i in 0..6 {
-        s.push_str(&format!(
-            "  File \"/x/mod_{i}.py\", line {i}, in func\n    work()\n"
-        ));
-    }
-    s.push_str("ValueError: bad value");
-
-    let trimmed = truncate_python_error(&s);
-    // Most pre-traceback noise dropped.
-    assert!(
-        trimmed.contains("lines of pre-traceback stderr omitted"),
-        "pre-traceback trim marker required: {trimmed:?}"
-    );
-    // Some recent pre-traceback context kept.
-    assert!(
-        trimmed.contains("progress: step 49") || trimmed.contains("progress: step 48"),
-        "must keep some recent progress lines: {trimmed:?}"
-    );
-    // First progress line gone.
-    assert!(
-        !trimmed.contains("progress: step 0\n"),
-        "early progress should be dropped: {trimmed:?}"
-    );
-    // Traceback structure intact.
-    assert!(trimmed.contains("Traceback "));
-    assert!(trimmed.contains("ValueError: bad value"));
-}
-
-#[test]
-fn pure_stderr_noise_without_traceback_keeps_tail() {
-    // No "Traceback" line — just a flood of stderr prints (e.g.
-    // a deprecation-warning loop). Keep the tail so the most
-    // recent state is visible.
-    let mut s = String::new();
-    for i in 0..50 {
-        s.push_str(&format!("warning {i}\n"));
-    }
-    let trimmed = truncate_python_error(&s);
-    assert!(
-        trimmed.contains("lines of stderr omitted"),
-        "trim marker required: {trimmed:?}"
-    );
-    assert!(
-        trimmed.contains("warning 49"),
-        "tail must be preserved: {trimmed:?}"
-    );
-    assert!(
-        !trimmed.contains("warning 0\n"),
-        "head should be dropped: {trimmed:?}"
-    );
-}
-
-#[test]
-fn empty_stderr_returns_empty() {
-    assert_eq!(truncate_python_error(""), "");
-}
-
-#[test]
-fn exception_preserved_when_last_frame_has_no_source_line() {
-    // Regression: frozen importlib._bootstrap, C-extension boundaries and
-    // some re-raise paths land the exception line at exactly `last_file + 1`,
-    // with no indented source line before it. The exception MUST still be
-    // preserved: it is the single most actionable line.
-    //
-    // Use 40 frames so we exceed the 30-line budget and the truncator
-    // engages. Each File line, no indented code line between frames.
-    let mut tb = String::from("Traceback (most recent call last):\n");
-    for i in 0..40 {
-        tb.push_str(&format!(
-            "  File \"<frozen importlib._bootstrap>\", line {line}, in func_{i}\n",
-            i = i,
-            line = 1000 + i
-        ));
-    }
-    tb.push_str("ModuleNotFoundError: No module named 'strategy_params'");
-
-    let trimmed = truncate_python_error(&tb);
-    assert!(
-        trimmed.contains("ModuleNotFoundError: No module named 'strategy_params'"),
-        "exception MUST be preserved even when no source line follows the last frame: {trimmed:?}"
-    );
-    assert!(
-        trimmed.contains("frozen importlib"),
-        "frame line preserved: {trimmed:?}"
-    );
-    assert!(
-        trimmed.contains("frames omitted"),
-        "trim marker present: {trimmed:?}"
-    );
-}
-
-/// The byte budget binds every branch, not only the early return. A line
-/// count of one is no bound: a script that writes one multi-MB line to stderr
-/// must not persist it in the tool error.
-fn assert_within_byte_budget(input: &str, trimmed: &str) {
-    // The marker text pins the contract system-knowhow/running-python.md quotes.
-    // The omitted count is below the input length, so this marker is the longest.
-    let longest_marker = format!("[... {} bytes of stderr omitted ...]\n", input.len());
-    assert!(
-        trimmed.len() <= PY_ERROR_BYTE_BUDGET + longest_marker.len(),
-        "result must fit the byte budget plus the marker, got {} bytes",
-        trimmed.len()
-    );
-    assert!(
-        trimmed.starts_with("[... ") && trimmed.contains("bytes of stderr omitted ...]\n"),
-        "byte-trim marker required: {:?}",
-        &trimmed[..trimmed.floor_char_boundary(120)]
-    );
-    let tail = &input[input.floor_char_boundary(input.len() - 64)..];
-    assert!(
-        trimmed.ends_with(tail),
-        "the input's tail must survive: {:?}",
-        &trimmed[trimmed.floor_char_boundary(trimmed.len() - 120)..]
-    );
-}
-
-#[test]
-fn one_huge_stderr_line_is_clamped_to_the_byte_budget() {
-    let line: String = (0..100 * 1024)
-        .map(|i| char::from(b'a' + (i % 26) as u8))
-        .collect();
-    assert_within_byte_budget(&line, &truncate_python_error(&line));
-}
-
-#[test]
-fn a_huge_exception_line_is_clamped_to_the_byte_budget() {
-    let mut tb = String::from("Traceback (most recent call last):\n");
-    for i in 0..6 {
-        tb.push_str(&format!(
-            "  File \"/x/mod_{i}.py\", line {i}, in f\n    g()\n"
-        ));
-    }
-    tb.push_str("ValueError: ");
-    // A multi-byte char per step, so the cut must find a char boundary.
-    tb.extend((0..50 * 1024).map(|i| if i % 2 == 0 { 'é' } else { 'x' }));
-    assert_within_byte_budget(&tb, &truncate_python_error(&tb));
-}
-
-#[test]
-fn module_not_found_realistic_shape() {
-    // Reproduces the shape observed in a live `dev`
-    // thread: short-ish stderr but the import chain through
-    // `_bootstrap`, `_find_and_load`, etc. fills the frame list.
-    // Under the 4-frame threshold + under byte budget → return
-    // verbatim. We want the truncator to NOT trim this case.
-    let tb = "Traceback (most recent call last):\n\
-              \x20 File \"/x/data/apps/habit-tracker/scripts/_smoke_abs.py\", line 5, in <module>\n\
-              \x20   import big_candle_backtest as bcb\n\
-              ModuleNotFoundError: No module named 'big_candle_backtest'";
-    assert_eq!(truncate_python_error(tb), tb);
-}
-
 // ── agent-origin shim: auto-token forwarding ────────────────────────────
 //
 // A Lucidos agent that POSTs the engine over raw `urllib.request.urlopen`
@@ -1418,7 +1256,14 @@ print('done')
         port = port,
     );
 
-    let out = runtime.execute_with_env(&code, env).await.expect("execute");
+    let out = runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
     assert!(out.contains("done"), "python output was: {out}");
 
     let headers = capture.await.expect("capture task");
@@ -1476,7 +1321,14 @@ print('done')
         port = port,
     );
 
-    runtime.execute_with_env(&code, env).await.expect("execute");
+    runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
 
     let headers = capture.await.expect("capture task");
     assert!(
@@ -1525,7 +1377,14 @@ print('done')
         port = real_port,
     );
 
-    runtime.execute_with_env(&code, env).await.expect("execute");
+    runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
 
     let headers = capture.await.expect("capture task");
     assert!(
@@ -1596,7 +1455,14 @@ print('done')
         port = port,
     );
 
-    runtime.execute_with_env(&code, env).await.expect("execute");
+    runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
 
     assert!(
         marker.exists(),
@@ -1620,4 +1486,38 @@ fn agent_origin_shim_fills_every_placeholder() {
     );
     assert!(shim.contains(ENV_AGENT_ORIGIN_TOKEN));
     assert!(shim.contains(HEADER_AGENT_ORIGIN_TOKEN));
+}
+
+/// Tests that read a shipped doc at run time.
+mod guard_tests {
+    use super::*;
+
+    /// The ceiling the rest of the system quotes. `llm/tools/exec.rs` renders it
+    /// from the constant. `system-knowhow/running-python.md` is prose and cannot,
+    /// so this pins the doc to the constant instead.
+    #[test]
+    fn the_default_ceiling_is_the_one_the_docs_promise() {
+        let dir = tempdir().unwrap();
+        let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            runtime.execution_timeout,
+            Duration::from_secs(EXECUTION_TIMEOUT_SECS)
+        );
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let doc = crate::core::knowhow::doc_family_text(&repo, "system-knowhow/running-python.md");
+        for quoted in [
+            format!("{EXECUTION_TIMEOUT_SECS} s ceiling"),
+            format!("timed out after {EXECUTION_TIMEOUT_SECS}s"),
+        ] {
+            assert!(
+                doc.contains(&quoted),
+                "system-knowhow/running-python.md must quote the ceiling as {quoted:?}"
+            );
+        }
+        assert_eq!(
+            EXECUTION_TIMEOUT_SECS,
+            crate::llm::tools::MAX_TIMEOUT_SECS,
+            "the python ceiling reads the one bash constant, it does not restate it"
+        );
+    }
 }

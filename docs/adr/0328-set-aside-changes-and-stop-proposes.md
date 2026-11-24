@@ -3,6 +3,7 @@
 - **Status**: Accepted; "a Stop proposes the branch's work" is superseded by
   [ADR 0400](0400-coding-agent-change-state.md). Set aside still holds.
 - **Date**: 2026-09-29
+- **Amended by**: [0805: Hold replaces the automation pause](0805-hold-replaces-the-automation-pause.md) (Hold sets a thread's changes aside, and Resume brings them back. Set aside and Bring back leave the screen. A set-aside change on a live thread always names a hold. Archived work sits on no list, and Unarchive offers it again.)
 
 ## Context
 

@@ -1,8 +1,98 @@
 # Changelog
 
+## v0.59.1 — 2026-11-24
+
+### Added
+
+- An OS sandbox for agents. Every command an agent starts runs in a Seatbelt (macOS) or Landlock (Linux) sandbox. It hides your secrets and keeps Lucidos state read-only. The owner can turn it off for a workspace, and a banner shows while it is not in force.
+- Trigger scripts can write only inside their workspace, the OS temp folders and the folders you grant. On Linux, everything outside that scope is mounted read-only. You can list and revoke folder grants one at a time.
+- Trigger commands are granted by program. You review grants from a trigger's recorded runs, and the release notice starts that review. An agent's edit to a trigger never restores a grant; only you can.
+- Standing denies. A command you set to Always deny is refused in every agent lane, including quoted commands and heredocs. If a coding agent cannot check the list, it asks.
+- The desktop window loads over HTTPS. Lucidos makes a per-user loopback certificate authority, limited to this machine's names, and `lucidos tls trust` and `lucidos tls forget` manage it.
+- Named update channels. Settings offers Stable, Beta, Local and saved Custom channels where supported. Channel identity appears beside versions, and failed feeds and versions ahead of a channel stay visible.
+- With the default plan flow, the approval card offers to build the plan in a fresh session, on any coding-agent backend you can use.
+- Press Up and Down in the composer to recall the prompts you sent.
+- Archive completed sub-threads from a parent thread's menu in one tap.
+- Settings has its own Users page beside Devices. You can manage the users and devices of a paired remote gateway from its workspace, and re-pair a revoked remote gateway in place from Access.
+- An app from a remote workspace pops out through its own shell.
+- Trusted pairing. Turn it on for a paired remote gateway, and that workspace opens in its own client, served from your gateway's address. It is off by default. A banner shows when that client cannot load and your gateway's client takes over.
+- Agents can create, stop, start, rename, delete and restore workspaces with `lucidos workspaces`. You approve each call, except for a workspace the agent made itself.
+- Agents read a cleaned log with `lucidos diagnostic-log`. `--source` picks the engine, the gateway, the desktop app or all three as one timeline. Team members' agents read their gateway's log. In the macOS sandbox, `lucidos ps` replaces `ps`.
+- An agent can send the host's raw logs to one SSH destination after you allow it once. The card names the files and the destination, and warns that raw logs may hold secrets.
+- Agents can save a draft for you without opening it. An agent sends a saved draft only on your word.
+- When Claude Code runs another model than the one you picked, the thread shows it as a step. The picker then stops offering that model.
+- Claude Fable 5.2, GPT-6.2 Astra and Sol, and Gemini 4 Neon in the model lists and on their intelligence ladders.
+- Web search on the ChatGPT plan.
+- Settings > Permissions shows the private paths and whether they are enforced.
+- Agent marks can show each backend's brand colour, and a waiting thread shows a clock.
+- The backup banner says when a backup is overdue.
+- Hold any idle thread and its sub-threads from the thread menu, and pick them up again with Resume. A held thread takes no automatic step until you resume it, and your own messages still go through. Held threads gather in an On hold section in the drawer.
+- After you press Stop, a thread offers Archive.
+- Select and delete several local workspaces at once in the workspace picker. You confirm in the picker, and a workspace an agent made asks only once.
+- Preview, not ready yet: Settings > Event Hooks lists hooks, and arms, disarms and removes them. The API and CLI do the same. Hooks do not run yet.
+
+### Changed
+
+- Device pairings made before HTTPS are revoked once, at the first start of this version. Pair your phone and other devices again. A remote gateway shows as revoked on Access, where you re-pair it.
+- `lucidos update-channel show | list | set | add | remove` replaces `update-address`. Custom slots survive channel switches; `set stable` replaces `reset`.
+- One card at a time. A thread shows one permission card at a time, in the thread itself. Lucidos no longer makes separate review threads for cards.
+- One permission model. Every card that offered only Allow once is now a permission request with its own options. A batch answers tool cards and owner approvals with one confirm, and voice reads every button.
+- A caller that Lucidos cannot verify gets a once-only owner card for an owner-only act. If that card cannot reach you, the coding-agent start fails and says why. It does not wait forever.
+- When you allow an unverified start, the thread is adopted, so its later starts do not ask again. Don't allow gives one refusal, not several.
+- A device session for a workspace that an agent made can carry Always allow, for that device and that exact lifetime.
+- A model pick that you make during a turn applies when the turn ends. The picker marks the pending pick with an asterisk.
+- The context ceiling hands off at the next safe point, also in the middle of a long turn. Sessions that ran past 500k tokens without a handoff now hand off.
+- After a handoff, the successor session starts on its own, also when the ceiling cut a turn short.
+- Codex takes a follow-up in the middle of a turn and keeps the running work, when its app server supports it.
+- Codex runs inside the Lucidos sandbox with its own sandbox off, so it asks before every command and file change, as Claude Code does. Coding-agent auto-answer can settle those cards.
+- The follow toggle sits to the left of the down chevron while the chevron shows.
+- A video player that has not played yet shows a still poster and loads no video until you play, scrub or go full screen.
+- Provider errors are typed. A turn that the provider blocked gets its own failure card with a way forward, and the parent thread learns why. Lucidos never resumes the blocked session.
+- A coding agent's background task can run for up to 4 hours.
+- A parent thread waits for every unfinished child that will wake it, at any depth.
+- A new install keeps its secrets and control files in one private folder, `~/.lucidos/private`, which the sandbox hides. An existing install keeps its files where they are.
+- When you reopen a thread, it returns to the same line, not only to the same turn.
+- An open card blocks its thread. Agent messages and other automatic input wait until you answer the card.
+- When the command guard cannot prove that a command destroys a workspace, it asks you once instead of refusing.
+- An approved plan stays approved while the coding agent hardens it. If the plan text changes after approval, the thread says so.
+- The thread size card offers Continue with context and Stay here.
+- Change rows link to their thread.
+
+### Fixed
+
+- Upgrading no longer floods you with one trigger grant card per trigger at startup.
+- A secret used as a JSON object key is now masked.
+- Worktree cleanup keeps coding-agent branches.
+- A successor session that Stop held at a handoff stays held until your next input, and the thread no longer reads Running.
+- A queued message no longer gets stuck or sends twice. A message is either taken back or used, never both.
+- Stop no longer hangs. After you press Stop, automatic wakes wait until you send a message, press Continue or answer a card.
+- Stop gives back messages that had not started yet. Their text returns to the composer, and it survives a reload.
+- Home no longer stays at "Requesting" before a turn starts.
+- On iPhone, a notification tap opens its thread while local storage still loads, and the workspace recovery toast no longer shows when iOS cancels a fetch on resume.
+- A press that began inside a dialog no longer dismisses it.
+- After an update re-pairs your device, it keeps its owner rights, history and look. Threads start again, and trigger grant review opens.
+- When an owner-only action is refused, the message gives the real reason, for example a device that is not paired yet.
+- In the composer, Up recalls a past prompt with the caret at its start, so pressing Up again walks to the prompt before it. Down puts the caret at the end.
+- The desktop app no longer reloads a window again and again after macOS covers and pauses it.
+- Dropbox Connect no longer asks for `openid`, and the sign-in page reports the real result.
+- A refused backup start shows the engine's reason, and the backup reminder hides once a provider is set.
+- Timed toasts always show a close button, and focus returns to where it was when a toast closes.
+- In a voice call, the rest of a spoken sentence reaches the turn that took its start.
+- A closed lane thread does not hand off and does not replay an old handoff.
+- Token Cost records the billing provider for keep-alive pings and web searches.
+- Scripts in the agent sandbox reach the workspace database again, so Token Cost and other psql scripts work on macOS. The bundled database accepts only password logins.
+- The bundled database now allows enough connections, so `run_bash` and `run_python` are no longer refused in a busy packaged workspace.
+- A typed message no longer sticks in the Thread Queue behind a card that is already closed.
+- Always allow is saved before the agent continues, so its next step is already allowed.
+- The window stays usable while a gateway-hosted engine restarts.
+- In the desktop app, a menu or banner tap for a workspace brings forward the window you used last, and it never opens a hidden window over a visible one.
+- The workspace picker says that deleting a workspace also deletes its database, before you confirm.
+- Permission cards now share one shape. The trigger grant card no longer offers an Allow once that saved for good, a lone lasting choice shows as its own button, and you can deny a trigger's program or folder for good.
 ## v0.58.0 — 2026-11-11
 
 ### Added
+
+- Codex threads take side questions from an ephemeral copy of their saved context, beside any running turn. Older Codex CLIs show update instructions.
 
 - Sign in with ChatGPT. The ChatGPT plan is its own provider: sign in under Settings > Providers or with `lucidos chatgpt-plan`, and chat on your plan's models. Apps and scripts never spend it.
 - Mermaid diagrams render inline in chat and previews, with a toggle to the source.

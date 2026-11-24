@@ -8,7 +8,7 @@ fn utc(s: &str) -> DateTime<Utc> {
 fn cron(exprs: &[&str]) -> Vec<cron::Schedule> {
     exprs
         .iter()
-        .map(|e| crate::engine::tools::scheduler::parse_standard_cron(e).unwrap())
+        .map(|e| crate::scheduler::cron_rules::parse_standard_cron(e).unwrap())
         .collect()
 }
 

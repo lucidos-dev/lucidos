@@ -592,9 +592,10 @@ fn captured_headers(request: &str) -> axum::http::HeaderMap {
 /// would verify. `follow_up_test.rs` records the same limit.
 #[test]
 fn the_cli_carries_the_origin_token_the_engine_minted() {
-    use lucidos_engine::api::actor::{
-        build_message_origin, init_agent_origin_secret, mint_agent_origin_token,
-        ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN,
+    use lucidos_agents_api::api::actor::build_message_origin;
+    use lucidos_engine::core::subprocess_origin::{
+        init_agent_origin_secret, mint_agent_origin_token, ENV_AGENT_ORIGIN_TOKEN,
+        HEADER_AGENT_ORIGIN_TOKEN,
     };
     use lucidos_engine::engine::thread_events::{ActorMode, MessageOrigin};
 
@@ -739,8 +740,12 @@ async fn a_cli_emit_cannot_forge_its_actor() {
 
     let actor = stored_actor(&summary).await;
     assert_eq!(
-        actor["kind"], "api",
+        actor["kind"], "unattested_caller",
         "the CLI's own identity, not the payload's: {actor}"
+    );
+    assert_eq!(
+        actor["claimed_local_token"], true,
+        "the CLI claims the machine-local token and no device: {actor}"
     );
 }
 

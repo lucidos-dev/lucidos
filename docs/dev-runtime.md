@@ -190,9 +190,20 @@ An unavailable executable, HEAD or source-coverage probe reports a verification
 failure with Retry; an unknown observation never authorizes a clean build.
 
 Engine and gateway publish failures fail the build; a CLI publish failure
-remains non-fatal. The script reports persistent stale publication with exit
-75 (`head-moved`). The engine retries for an advanced HEAD, or uses the fresh
-retry budget when HEAD is unchanged. Nothing signals Cargo or deletes locks.
+remains non-fatal. A primary checkout compiles a snapshot of its working tree
+in its *launch tree* (ADR 0668). The snapshot is taken just before cargo, so
+an Apply that lands later is not in it.
+
+The script still exits 0 and prints a note naming both commits. The engine
+then reads the published binary's commit. The snapshot of the start HEAD, or
+a later one, earns one incremental follow-up build if it does not cover HEAD.
+A snapshot that covers HEAD is Ready immediately. Anything older uses the
+fresh retry budget. Nothing signals Cargo or deletes locks.
+
+The first launch-tree build is cold for workspace crates and adds a target
+dir per primary checkout. Existing `target/<profile>` outputs stay on disk
+for hand-run cargo; the launcher does not reclaim them. Linked worktrees
+keep building live in their own target dir.
 
 Build output is copied into `.lucidos/engine-build.log`. **Show build log**
 fetches its last 64 KiB through the workspace-scoped `/api/v1/engine/build-log`
@@ -238,3 +249,30 @@ is the active worker's `BUILD_ID`. Both read `dev` under a live dev server.
 The Client row is deliberately not the engine's CalVer. A baked CalVer froze at
 bundle-build time while the engine version kept bumping, so the page showed two
 disagreeing numbers that no reload fixed. `vite.config.ts` records why.
+
+## Host prerequisites
+
+After the cheap gates, `scripts/harden-suites.sh start` checks the host
+prerequisites for the selected suites before codegen or suite execution.
+Run `./scripts/dev-prerequisites.sh --all` to check the whole set, or use
+`--for lint-static,ts,engine` to name particular suites. A refusal preserves
+previous suite evidence.
+
+The check can fetch ShellCheck and the Playwright Chromium headless shell.
+It prints package-manager commands for missing system packages.
+Set `LUCIDOS_NO_TOOL_DOWNLOAD=1` to disable automatic ShellCheck downloads.
+
+## Shell lint
+
+`scripts/lint-shell.sh` runs ShellCheck in batches, several at once.
+
+- **The job count follows spare memory** (`scripts/lib/lint_shell_jobs.sh`).
+  A further batch starts only while memory has room, and one batch always runs.
+  `LINT_SHELL_JOBS` sets the count and switches the memory check off.
+- **Spare memory leaves out what running ShellChecks will still take.** A
+  ShellCheck takes most of its memory at the end of its run. So each one on the
+  host counts for its full grant, less what it holds. The list comes from `ps`.
+  A host where `ps` cannot run gets one job, as before the parallel run.
+- **A clean run is recorded per checkout**, in `.lucidos/lint-shell-passed`.
+  A run with unchanged inputs reuses it. `LINT_SHELL_NO_CACHE=1` forces a run.
+  A run that sets `SHELLCHECK_OPTS` neither reuses nor records a pass.

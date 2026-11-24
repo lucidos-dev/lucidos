@@ -25,19 +25,27 @@ echo "a first call mints a 64-hex secret, readable by its owner alone"
 export HOME="$TMP/fresh"
 first="$(shared_pg_password)"
 if [[ "$first" =~ ^[0-9a-f]{$((TOKEN_BYTES * 2))}$ ]]; then pass "TOKEN_BYTES of lowercase hex"; else fail "not TOKEN_BYTES of hex: '$first'"; fi
-file="$HOME/.lucidos/$SHARED_PG_PASSWORD_FILE"
-if [ "$(mode_of "$file")" = "600" ]; then pass "mode 0600"; else fail "mode $(mode_of "$file")"; fi
+file="$HOME/.lucidos/private/$SHARED_PG_PASSWORD_FILE"
+if [ "$(mode_of "$file")" = "600" ]; then pass "mode 0600, in the private subtree"; else fail "mode $(mode_of "$file")"; fi
 if [ "$(mode_of "$HOME/.lucidos")" = "700" ]; then pass "the Lucidos home it made is 0700"; else fail "the Lucidos home is mode $(mode_of "$HOME/.lucidos")"; fi
+if [ "$(mode_of "$HOME/.lucidos/private")" = "700" ]; then pass "the private subtree it made is 0700"; else fail "the private subtree is mode $(mode_of "$HOME/.lucidos/private")"; fi
 if [ "$(shared_pg_password)" = "$first" ]; then pass "a second call reads the same secret"; else fail "a second call minted again"; fi
 if [ -z "$(find "$HOME/.lucidos" -name ".$SHARED_PG_PASSWORD_FILE.*.tmp")" ]; then pass "no temp file left behind"; else fail "a temp file was left behind"; fi
 
-echo "an existing secret wins, whoever wrote it"
+echo "a secret an older release left in the home is used where it is"
 export HOME="$TMP/existing"
 mkdir -p "$HOME/.lucidos"
 printf 'from-the-gateway\n' >"$HOME/.lucidos/$SHARED_PG_PASSWORD_FILE"
 chmod 644 "$HOME/.lucidos/$SHARED_PG_PASSWORD_FILE"
 if [ "$(shared_pg_password)" = "from-the-gateway" ]; then pass "kept, trailing newline trimmed"; else fail "replaced an existing secret"; fi
 if [ "$(mode_of "$HOME/.lucidos/$SHARED_PG_PASSWORD_FILE")" = "600" ]; then pass "a loose mode is tightened"; else fail "left a loose mode"; fi
+
+echo "a link at the old path is followed, not minted over"
+export HOME="$TMP/linked"
+mkdir -p "$HOME/.lucidos/private"
+printf 'moved\n' >"$HOME/.lucidos/private/$SHARED_PG_PASSWORD_FILE"
+ln -s "private/$SHARED_PG_PASSWORD_FILE" "$HOME/.lucidos/$SHARED_PG_PASSWORD_FILE"
+if [ "$(shared_pg_password)" = "moved" ]; then pass "kept"; else fail "minted beside the linked secret"; fi
 
 echo "an empty file was never published, so a fresh secret replaces it"
 export HOME="$TMP/blank"

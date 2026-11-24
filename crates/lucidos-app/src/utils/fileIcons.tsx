@@ -1,8 +1,3 @@
-// A deliberately small, shared icon vocabulary: every file reads as a clean
-// page-with-folded-corner, distinguished only by one of three calm inner marks
-// (document lines, code chevrons, image horizon). We avoid per-extension
-// pictograms — at row size they turn busy and heavy; a light outline with a
-// single restrained mark stays legible without the clutter.
 type FileIconKind = 'document' | 'code' | 'image';
 
 const CODE_EXTENSIONS = new Set([

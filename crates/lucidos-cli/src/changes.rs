@@ -1,4 +1,4 @@
-use crate::http::{client as http_client, send_and_print};
+use crate::http::{client as http_client, send_and_print, send_expect_json};
 use crate::workspace::{BoxError, Workspace};
 
 /// `POST /api/v1/changes/<id>/apply`. The CLI's HTTP client auto-forwards
@@ -75,6 +75,16 @@ pub(crate) fn resolve_sub_threads_of(
         )
         .into()),
     }
+}
+
+pub(crate) fn cmd_landing_setting(ws: &Workspace) -> Result<(), BoxError> {
+    let url = list_url(ws);
+    let snapshot = send_expect_json("GET", &url, http_client()?.get(&url))?;
+    let setting = snapshot["landing_lane"]["setting"]
+        .as_str()
+        .ok_or("The engine did not report a landing setting.")?;
+    println!("{setting}");
+    Ok(())
 }
 
 fn list_url(ws: &Workspace) -> String {

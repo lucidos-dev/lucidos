@@ -1,15 +1,5 @@
-/**
- * The floating scroll chevrons take a tap that lands NEAR them. Both sit on
- * the pane's right edge, and so does every step row's context counter. Without
- * a reach, a tap just off the drawn circle lands on the counter underneath,
- * which opens the context viewer instead of scrolling.
- *
- * On touch each chevron carries a transparent `::before` that reaches past its
- * circle (chat/input-messages.css, `--scroll-chevron-reach`). The circle and
- * the glyph stay where they were. A hidden chevron's reach takes no taps.
- */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps, waitForScrollSettled } from './helpers';
+import { assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps, waitForScrollSettled, watchPreferenceReads } from './helpers';
 import { psql, seedThreadOfCounters as seedCounters } from './db-helpers';
 
 test.use({ viewport: { width: 393, height: 852 } });
@@ -27,14 +17,11 @@ interface Box { left: number; right: number; top: number; bottom: number }
 interface Probe {
   box: Box;
   glyph: Box;
-  /** The span around the circle's centre where a tap still reaches it. */
   hit: Box;
-  /** What a tap N px off each side of the circle reaches, keyed `side+N`. */
   offsets: Record<string, string>;
   translate: string;
 }
 
-/** Name whatever a tap at (x, y) would reach. */
 const DESCRIBE = `(x, y) => {
   const el = document.elementFromPoint(x, y);
   if (!el) return 'nothing';
@@ -79,14 +66,11 @@ async function probe(page: Page, sel: string, offsets: number[]): Promise<Probe 
   }, { sel, offsets, describeSrc: DESCRIBE });
 }
 
-/** Scroll the transcript so a step counter's centre sits level with the
- *  chevron's centre, which is the layout the report came from. */
 async function parkCounterUnder(page: Page, sel: string): Promise<void> {
   const b = (await page.locator(sel).boundingBox())!;
   await parkCounterUnderPoint(page, b.y + b.height / 2);
 }
 
-/** Scroll so a step counter's centre sits at viewport height `y`. */
 async function parkCounterUnderPoint(page: Page, y: number): Promise<void> {
   await page.evaluate((y) => {
     const scroller = document.querySelector('.mobile-swipe-pane .thread-content') as HTMLElement;
@@ -97,7 +81,6 @@ async function parkCounterUnderPoint(page: Page, y: number): Promise<void> {
   }, y);
 }
 
-/** Wait out a chevron's glide: it reaches the end it scrolls to, then holds. */
 async function waitForGlideToLand(page: Page, end: 'top' | 'bottom', where: string): Promise<void> {
   await expect.poll(() => page.evaluate((end) => {
     const el = document.querySelector('.mobile-swipe-pane .thread-content') as HTMLElement;
@@ -114,13 +97,12 @@ async function setScale(page: Page, scale: string, rootPx: number): Promise<void
     .toBe(`${rootPx}px`);
 }
 
-/** Open the seeded thread with both chevrons showing: the reader parked
- *  mid-transcript, neither at the top nor at the bottom. */
 async function openMidThread(page: Page, threadId: string): Promise<void> {
   await disarmFollowSeed(page);
   await page.addInitScript((tid: string) => localStorage.setItem('lucidos-focused-thread', tid), threadId);
+  const preferencesSettled = watchPreferenceReads(page);
   await navigateToApp(page);
-  await page.waitForFunction(() => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 });
+  await preferencesSettled();
   await ensureMobileView(page, 'thread');
   await revealSteps(page);
   await expect(page.locator('.mobile-swipe-pane [data-role="step-context"]').first()).toBeVisible({ timeout: 15_000 });
@@ -139,7 +121,6 @@ async function whatIsAt(page: Page, x: number, y: number): Promise<string> {
   { x, y, describeSrc: DESCRIBE });
 }
 
-/** A box's size in px, resolved from a CSS length at the current root. */
 async function lengthPx(page: Page, value: string): Promise<number> {
   return page.evaluate((value) => {
     const probe = document.createElement('div');
@@ -156,7 +137,6 @@ const CONTEXT_MODAL = '[data-role="context-captured-modal"]';
 const STEP_MODAL = '[data-role="step-detail-modal"]';
 const SCALES = [['100%', 16], ['112.5%', 18]] as const;
 
-/** The near misses a finger makes, in px at the 16px root, scaled with it. */
 const NEAR_MISSES = [2, 4, 8];
 
 test.describe('The floating scroll chevrons take a near miss', () => {
@@ -190,23 +170,20 @@ test.describe('The floating scroll chevrons take a near miss', () => {
         console.log(`[${info.project.name}] ${where}: visible ${fmt(p.box)}, glyph ${fmt(p.glyph)}, `
           + `hit ${fmt(p.hit)}, translate ${p.translate}\n  ${JSON.stringify(p.offsets)}`);
 
-        // The circle kept its size and its inset from the pane's right edge,
-        // with the glyph centred in it.
         expect(p.box.right - p.box.left, `${where}: the circle grew`).toBeCloseTo(circle, 0);
         expect(page.viewportSize()!.width - p.box.right, `${where}: the circle moved`).toBeCloseTo(inset, 0);
         expect((p.glyph.left + p.glyph.right) / 2, `${where}: the glyph moved`).toBeCloseTo((p.box.left + p.box.right) / 2, 0);
 
-        // At least 44px at the 16px root on both axes. The half-px walk loses
-        // up to a step at each end.
         const target = (44 * rootPx) / 16;
         expect(p.hit.right - p.hit.left, `${where}: hit width`).toBeGreaterThanOrEqual(target);
         expect(p.hit.bottom - p.hit.top, `${where}: hit height`).toBeGreaterThanOrEqual(target);
 
-        // Below the down chevron, past half the stack gap, is the follow toggle's.
         const halfGap = (await lengthPx(page, 'var(--scroll-chevron-stack-gap)')) / 2;
         for (const d of offsets) {
           for (const side of ['left', 'right', 'above', 'below']) {
-            const owner = c.name === 'down' && side === 'below' && d >= halfGap ? 'follow toggle' : `${c.name} chevron`;
+            const facing = c.name === 'down' && side === 'left';
+            if (facing && d === halfGap) continue;
+            const owner = facing && d > halfGap ? 'follow toggle' : `${c.name} chevron`;
             expect(p.offsets[`${side}+${d}`], `${where}: a tap ${d}px ${side} of the circle`).toBe(owner);
           }
         }
@@ -232,14 +209,11 @@ test.describe('The floating scroll chevrons take a near miss', () => {
           const b = (await page.locator(c.sel).boundingBox())!;
           const cx = b.x + b.width / 2;
           const cy = b.y + b.height / 2;
-          // Half as far below the down chevron, inside its half of the stack gap.
-          const below = c.name === 'down' ? d / 2 : d;
-          const [x, y] = side === 'left' ? [b.x - d, cy] : side === 'above' ? [cx, b.y - d] : [cx, b.y + b.height + below];
+          const left = c.name === 'down' ? d / 2 : d;
+          const [x, y] = side === 'left' ? [b.x - left, cy] : side === 'above' ? [cx, b.y - d] : [cx, b.y + b.height + d];
           const where = `${c.name} at ${scale}, tapped ${side}`;
           await parkCounterUnderPoint(page, y);
           expect((await page.locator(c.sel).boundingBox())!.y, `${where}: the chevron moved on the park`).toBeCloseTo(b.y, 0);
-          // The step row is really there under the tap, not a turn boundary.
-          // Straight above or below, that is the counter itself.
           const under = await page.evaluate(({ x, y, sel }) => {
             const btn = document.querySelector(sel) as HTMLElement;
             btn.style.visibility = 'hidden';
@@ -254,8 +228,6 @@ test.describe('The floating scroll chevrons take a near miss', () => {
           await expect(page.locator(`${c.sel}.visible`), `${where}: the chevron did not fire`).toHaveCount(0, { timeout: 5_000 });
           await expect(page.locator(CONTEXT_MODAL), `${where}: the context viewer opened`).toHaveCount(0);
           await expect(page.locator(STEP_MODAL), `${where}: the step detail opened`).toHaveCount(0);
-          // The glide outlives `.visible`. Left running, it overwrites the next
-          // pass's re-centre and park, and that pass taps whatever it moved in.
           await waitForGlideToLand(page, c.name === 'up' ? 'top' : 'bottom', where);
         }
       }
@@ -271,7 +243,6 @@ test.describe('The floating scroll chevrons take a near miss', () => {
       await expect(page.locator(CONTEXT_MODAL)).toHaveCount(0);
     };
 
-    // A counter in the middle of the pane, clear of both chevrons.
     const mid = await page.evaluate(() => {
       const counters = [...document.querySelectorAll('.mobile-swipe-pane [data-role="step-context"]')] as HTMLElement[];
       const r = counters.map(c => c.getBoundingClientRect()).find(r => Math.abs((r.top + r.bottom) / 2 - innerHeight / 2) < 40)!;
@@ -282,22 +253,22 @@ test.describe('The floating scroll chevrons take a near miss', () => {
     await expect(page.locator(CONTEXT_MODAL), 'a counter away from the chevrons opens the context viewer').toHaveCount(1);
     await closeModal();
 
-    // A hidden chevron's reach goes with it. The bottom cannot scroll a
-    // counter under the down chevron, so hide it where one already is, the
-    // way ScrollControls does: by dropping `.visible`.
     const down = CHEVRONS[1].sel;
     const b = (await page.locator(down).boundingBox())!;
     const reachPoint = { x: b.x + b.width / 2, y: b.y - 6 };
     await parkCounterUnderPoint(page, reachPoint.y);
     expect(await whatIsAt(page, reachPoint.x, reachPoint.y), 'the reach point is not in the reach').toBe('down chevron');
-    await page.evaluate((sel) => document.querySelector(sel)!.classList.remove('visible'), down);
+    await page.evaluate((sel) => {
+      document.querySelector<HTMLElement>('.mobile-swipe-pane .follow-toggle')!.style.visibility = 'hidden';
+      document.querySelector(sel)!.classList.remove('visible');
+    }, down);
     await expect.poll(() => whatIsAt(page, reachPoint.x, reachPoint.y), { message: 'a hidden chevron kept its reach' })
       .toBe('step-context');
     await page.touchscreen.tap(reachPoint.x, reachPoint.y);
     await expect(page.locator(CONTEXT_MODAL), 'the counter under a hidden chevron opens the context viewer').toHaveCount(1);
     await closeModal();
+    await page.evaluate(() => document.querySelector<HTMLElement>('.mobile-swipe-pane .follow-toggle')!.style.removeProperty('visibility'));
 
-    // And the real thing: at the bottom the chevron is gone, reach included.
     await page.evaluate(() => {
       const el = document.querySelector('.mobile-swipe-pane .thread-content') as HTMLElement;
       el.scrollTop = el.scrollHeight;
@@ -313,7 +284,6 @@ test.describe('The floating scroll chevrons take a near miss', () => {
 
     for (const [scale, rootPx] of SCALES) {
       await setScale(page, scale, rootPx);
-      // A hidden chevron takes no tap at all, which would pass this vacuously.
       for (const c of CHEVRONS) await expect(page.locator(`${c.sel}.visible`)).toHaveCount(1);
       const up = (await page.locator(CHEVRONS[0].sel).boundingBox())!;
       const down = (await page.locator(CHEVRONS[1].sel).boundingBox())!;
@@ -333,10 +303,6 @@ test.describe('The floating scroll chevrons take a near miss', () => {
     const up = CHEVRONS[0].sel;
     const resting = (await probe(page, up, []))!;
 
-    // What useHideOnScroll does once the header is scrolled away: it slides
-    // the header up by its own height and writes the same offset on its two
-    // consumers, the title bar and the chevron. Written after the last scroll,
-    // since the hook rewrites all three on every scroll frame.
     await page.evaluate((sel) => {
       const header = document.querySelector('.app-header') as HTMLElement;
       const height = header.getBoundingClientRect().height;
@@ -351,14 +317,11 @@ test.describe('The floating scroll chevrons take a near miss', () => {
     const target = 44;
     expect(hidden.hit.right - hidden.hit.left).toBeGreaterThanOrEqual(target);
     expect(hidden.hit.bottom - hidden.hit.top).toBeGreaterThanOrEqual(target);
-    // Centred on the moved circle, not left behind where it rested. Within
-    // one step of the half-px walk.
     const drift = (hidden.hit.top + hidden.hit.bottom) / 2 - (hidden.box.top + hidden.box.bottom) / 2;
     expect(Math.abs(drift), 'the reach stayed behind the moved circle').toBeLessThanOrEqual(0.5);
     for (const [key, reached] of Object.entries(hidden.offsets)) {
       expect(reached, `with the header hidden, a tap ${key}`).toBe('up chevron');
     }
-    // The title bar rode up with it and still keeps its own taps.
     const titleBottom = await page.evaluate(() =>
       document.querySelector('.mobile-swipe-pane .mobile-thread-title-row')!.getBoundingClientRect().bottom);
     expect(await whatIsAt(page, (hidden.box.left + hidden.box.right) / 2, titleBottom - 1)).not.toMatch(/chevron/);

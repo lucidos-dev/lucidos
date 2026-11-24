@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Confirming over an installed plugin updates it, so the panel says Update.
- * A fresh install says Install, even when it would replace a file on disk.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginInstallPanel } from '../PluginInstallPanel';

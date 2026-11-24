@@ -1,10 +1,3 @@
-/**
- * Only a toast's title is bold. The message never is, whatever its shape.
- *
- * The title is explicit (`showToast(message, type, { title })`), and
- * `.toast-title` is the one element that carries it. A bold rule on the
- * heading box, the text box or the column would make message text bold again.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

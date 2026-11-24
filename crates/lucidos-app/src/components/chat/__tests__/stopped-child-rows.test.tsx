@@ -1,6 +1,3 @@
-/** The two surfaces of a *stopped child* (ADR 0252): the parent's row for the
- *  `ChildThreadStopped` note, and the notice that ends the child's own
- *  transcript. Both render through the shared event row. */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 
@@ -71,8 +68,6 @@ describe('ChildStoppedRow', () => {
     threadMap.value = new Map();
   });
 
-  /** The parent-side row says the child is alive and waiting, never a verdict:
-   *  a canceled pill is what the incident's parent read as "dead". */
   it('says the child stopped and waits for the user, with a link to it', () => {
     loadChild(true);
     const tree = ChildStoppedRow({ childThreadId: 'child-uuid', childThreadTitle: 'Fix the ticket' });
@@ -81,7 +76,6 @@ describe('ChildStoppedRow', () => {
     expect(vnodeText(findByClass(tree, 'event-row-subject'))).toBe('Child thread stopped');
     expect(vnodeText(row)).toContain('Fix the ticket');
     expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Waiting for you');
-    // The same white "still in progress" tone a form request waiting on you wears.
     expect(findByClass(tree, 'event-row-state')!.props['data-tone']).toBe('live');
 
     const link = findByClass(tree, 'accent-link')!;
@@ -89,15 +83,11 @@ describe('ChildStoppedRow', () => {
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('child-uuid');
   });
 
-  /** The incident: the user's queued messages started a new turn seconds
-   *  after the Stop, and the parent's row kept saying "Waiting for you". */
   it('stops claiming the child waits once the child continues', () => {
     loadChild(false);
     expect(stateLabel()).toBe('No longer waiting');
   });
 
-  /** A Cancel on the child's card, then a message: the child ran again while
-   *  the parent's row read "Child thread stopped · No longer waiting". */
   it.each<ThreadStatus>(['running', 'waiting_for_user_answer'])(
     'says the child continued while its new turn is %s',
     (status) => {
@@ -108,16 +98,12 @@ describe('ChildStoppedRow', () => {
     },
   );
 
-  /** A child outside the loaded window has no live state to read. "Stopped"
-   *  is the one thing the event itself proves. */
   it('says only that the child stopped when the child is not loaded', () => {
     expect(stateLabel()).toBe('Stopped');
   });
 });
 
 describe('ChildMovedOutRow', () => {
-  /** The former parent's row for a child moved to top level (ADR 0278): it
-   *  names the child, links to it, and says nothing more is coming. */
   it('says the child moved to top level and the parent no longer waits, with a link to it', () => {
     const tree = ChildMovedOutRow({ childThreadId: 'child-uuid', childThreadTitle: 'Write the notes' });
     const row = findByClass(tree, 'event-row');

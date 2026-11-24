@@ -1,17 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-// Picker integration has its own tests and SDK-specific bundler aliases.
 vi.mock('./modelPicker', () => ({ ModelPicker: {} }));
-// The theme-precedence cases this file used to carry now live beside the rule
-// itself, in `appearance.test.ts`. `resolveThemeModePreference` moved into the
-// shared appearance contract when the four hand-copied versions of it were
-// collapsed into one.
 import { ui, webFontUrl, webFontUrls } from './ui';
 import {
   EMPTY_THEME, FONT_CATALOG, FOLLOW_THEME, PAINTED_THEME_MODE_PUSH_KEY, SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS,
   parseResolvedTheme, resolveFontKey,
 } from './appearance';
 
-/** The origin the host serves app frames from, as the SDK reads it. */
 const HOST_ORIGIN = 'https://localhost:5251';
 
 describe('webFontUrl', () => {
@@ -20,12 +14,10 @@ describe('webFontUrl', () => {
     for (const font of FONT_CATALOG.filter(f => f.source === 'vendored')) {
       const url = webFontUrl(font.id);
       expect(url).toBe(`/api/v1/fonts/${font.id}.css`);
-      // A workspace with no internet must still render it.
       expect(url).not.toContain('googleapis');
     }
   });
 
-  // ADR 0303: the three fonts that once loaded from Google are bundled too.
   it('serves the fonts that once came from Google locally as well', () => {
     for (const key of ['inter', 'jetbrains-mono', 'ibm-plex-mono'] as const) {
       expect(webFontUrl(key)).toBe(`/api/v1/fonts/${key}.css`);
@@ -39,8 +31,6 @@ describe('webFontUrl', () => {
   });
 
   it('has nothing to load for fonts already on the device', () => {
-    // No garbage case: the parameter is a `FontId`, and `resolveFontKey` (the
-    // only producer) cannot hand out a key outside the set.
     expect(webFontUrl('monospace')).toBeUndefined();
     expect(webFontUrl('system')).toBeUndefined();
   });
@@ -56,8 +46,6 @@ describe('webFontUrls', () => {
     expect(webFontUrls('fira-code', EMPTY_THEME)).toEqual(['/api/v1/fonts/fira-code.css']);
   });
 
-  // ADR 0303: a theme may now name Inter or JetBrains Mono, and both load
-  // from the local engine.
   it('a theme naming a font that once came from Google loads it locally', () => {
     const theme = parseResolvedTheme(JSON.stringify({ fonts: { ui: 'inter', mono: 'jetbrains-mono' } }));
     const key = resolveFontKey(FOLLOW_THEME, theme.fonts);
@@ -166,10 +154,6 @@ describe('isIOSAgent', () => {
 });
 
 describe('ui.watchPreferences: live theme reaction wiring', () => {
-  // The iframe half of the host shell's contract, and the same three guards:
-  // the preference follows the OS, the document is visible, and the resolved
-  // value moved. Sampling before re-applying is what keeps a wake that changed
-  // nothing free, since `applyPreferences()` fetches.
   let sseOn: ReturnType<typeof vi.fn>;
   let sseConnect: ReturnType<typeof vi.fn>;
   let getMock: ReturnType<typeof vi.fn>;
@@ -184,9 +168,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   let attrs: Record<string, string>;
   let originalGetAttribute: unknown;
   let originalSetAttribute: unknown;
-  /** `vi.resetModules()` leaves an earlier case's bridge and OS follower
-   *  listening on `window` and `document`, so each case removes the listeners
-   *  it added. A leftover follower would repaint this case's page. */
   let moduleListeners: Array<[EventTarget, string, EventListenerOrEventListenerObject]>;
   let origWindowAdd: typeof window.addEventListener;
   let origDocumentAdd: typeof document.addEventListener;
@@ -195,12 +176,10 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     (document as { visibilityState: string }).visibilityState = state;
   }
 
-  /** Run past both reads, the settle read and the one confirming it. */
   function settle(): void {
     vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS);
   }
 
-  /** Bring the frame up on `system`, painted to whatever the OS says now. */
   async function watchingOnSystem() {
     const { ui: freshUi } = await import('./ui');
     await freshUi.applyPreferences();
@@ -238,8 +217,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     const el = document.documentElement as unknown as Record<string, unknown>;
     originalGetAttribute = el.getAttribute;
     originalSetAttribute = el.setAttribute;
-    // `applyPreferences` writes the resolved theme through the stub's no-op
-    // `setAttribute`, so record it here: the guard reads the value back.
     el.getAttribute = (k: string) => attrs[k] ?? null;
     el.setAttribute = (k: string, v: string) => { attrs[k] = v; };
     vi.doMock('./sse', () => ({ sse: { on: sseOn, connect: sseConnect } }));
@@ -332,8 +309,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   it('repaints nothing a brief wake reads, when the frame hides before the flip holds', async () => {
-    // The shell's case, in the frame: a sub-second iOS wake still reads the
-    // snapshot pass's light after the settle delay.
     await watchingOnSystem();
 
     mqLight = true;
@@ -371,9 +346,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   it('follows the OS before the first applyPreferences() has resolved', async () => {
-    // An app may call `watchPreferences()` first, or not await the fetch. The
-    // boot script already read the preference out of localStorage, so an OS
-    // flip in that window is not dropped.
     localStorage.setItem('lucidos-theme-mode', 'system');
     attrs['data-theme-mode'] = 'dark';
     const { ui: freshUi } = await import('./ui');
@@ -401,9 +373,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   describe('a repaint keeps the painted mode (ADR 0092)', () => {
-    // Only the follower reads the OS for a `system` frame. A fetch answer
-    // repaints for other reasons and must not. The push cases sit in the
-    // shell-push block below.
     afterEach(() => {
       localStorage.removeItem('lucidos-theme-mode');
       delete (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs;
@@ -439,8 +408,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     });
 
     it('the first applyPreferences keeps what the engine seed painted, with no stored mirror', async () => {
-      // An isolated app frame inherits no localStorage, so the seed is all the
-      // boot script had to go on.
       (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs = { 'theme-mode': 'system' };
       attrs['data-theme-mode'] = 'dark';
       const { ui: freshUi } = await import('./ui');
@@ -453,7 +420,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     });
 
     it('a flip before the first paint repaints from the engine seed', async () => {
-      // `applyPreferences` may be unawaited, or its fetch may hang.
       (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs = { 'theme-mode': 'system' };
       attrs['data-theme-mode'] = 'dark';
       const { ui: freshUi } = await import('./ui');
@@ -476,8 +442,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     const { ui: freshUi } = await import('./ui');
     freshUi.watchPreferences();
     freshUi.watchPreferences();
-    // One subscription per event: preferences, and every event that can
-    // change the active theme's file.
     expect(sseOn.mock.calls.map(call => call[0])).toEqual([
       'PreferencesChanged', 'DataFileWritten', 'DataFileEdited', 'DataFileDeleted',
       'PluginInstalled', 'PluginUninstalled',
@@ -527,7 +491,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   describe('the shell pushes what it painted', () => {
-    // This jsdom drops custom properties, so the writes are recorded instead.
     let props: Record<string, string>;
     const style = () => ({ getPropertyValue: (name: string) => props[name] ?? '' });
     const THEME = JSON.stringify({ light: { '--accent': '#123456' }, dark: { '--accent': '#654321' } });
@@ -536,8 +499,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     const SHELL_ORIGIN = 'https://localhost:5251';
     let origParent: unknown;
 
-    /** The shell's push, as `_bridge.ts` receives it: from the parent window,
-     *  on the frame's own origin. */
     function pushAppearance(data: unknown, source: unknown = shell): void {
       const push = new Event('message');
       Object.assign(push, { source, origin: SHELL_ORIGIN, data: { type: 'lucidos:bridge:push', channel: 'appearance', data } });
@@ -667,7 +628,6 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     });
 
     it('a push carrying the mode the shell painted moves a system frame with the shell', async () => {
-      // The shell can catch a flip on a window `focus` this frame never gets.
       await watchingOnSystem();
       pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME, [PAINTED_THEME_MODE_PUSH_KEY]: 'dark' });
       expect(attrs['data-theme-mode']).toBe('dark');
@@ -708,7 +668,6 @@ describe('lucidos.ui.toast', () => {
   beforeEach(() => {
     origParent = (globalThis as { parent?: unknown }).parent;
     postMessage = vi.fn();
-    // A non-self parent so window.parent !== window — drives the postMessage path.
     (globalThis as { parent?: unknown }).parent = { postMessage };
     vi.stubGlobal('location', { origin: HOST_ORIGIN });
   });
@@ -739,8 +698,6 @@ describe('lucidos.ui.toast', () => {
     expect(postMessage.mock.calls[0][0].payload.spinning).toBe(true);
   });
 
-  // Same defensive shape as durationMs/dismissable: a bad value must not cross
-  // the bridge as a truthy non-boolean the host would then treat as `true`.
   it('leaves spinning undefined when omitted or non-boolean', () => {
     ui.toast('No spinner');
     expect(postMessage.mock.calls[0][0].payload.spinning).toBeUndefined();
@@ -784,7 +741,7 @@ describe('lucidos.ui.toast', () => {
   });
 
   it('standalone (no host parent): logs to console, never posts', () => {
-    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    (globalThis as { parent?: unknown }).parent = globalThis;
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     ui.toast('all good', 'success');
@@ -816,8 +773,6 @@ describe('lucidos.ui.ready', () => {
     expect(postMessage).toHaveBeenCalledWith({ type: 'lucidos:ui:ready' }, HOST_ORIGIN);
   });
 
-  // The host ignores a ready for a frame it already revealed. So the SDK keeps
-  // no state, and a second call is just another message.
   it('stays harmless when called again', () => {
     ui.ready();
     expect(() => ui.ready()).not.toThrow();
@@ -855,8 +810,6 @@ describe('lucidos.ui.dismissToast', () => {
     );
   });
 
-  // A missing key is a programming error, not a runtime condition: without one
-  // the host has nothing to look up, so failing loudly beats a silent no-op.
   it('throws TypeError on an empty/non-string key', () => {
     expect(() => ui.dismissToast('')).toThrow(TypeError);
     expect(() => ui.dismissToast(undefined as unknown as string)).toThrow(TypeError);
@@ -865,7 +818,7 @@ describe('lucidos.ui.dismissToast', () => {
   });
 
   it('standalone (no host parent): logs to console, never posts', () => {
-    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    (globalThis as { parent?: unknown }).parent = globalThis;
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     ui.dismissToast('reindex');
     expect(logSpy).toHaveBeenCalled();
@@ -936,12 +889,6 @@ describe('lucidos.ui.prompt', () => {
     vi.unstubAllGlobals();
   });
 
-  // The SDK installs a single `message` listener; replay the host reply by
-  // dispatching a synthetic message event with the id the SDK just posted.
-  //
-  // `source` is the stubbed `window.parent`, and `origin` the host's. The SDK
-  // answers only the window it posted to, on the origin it posted to (see
-  // `fromHost`): a nested frame, or a foreign page framing the app, is a forgery.
   function replyToLastPrompt(value: unknown, origin = HOST_ORIGIN) {
     const calls = postMessage.mock.calls;
     const sent = calls[calls.length - 1][0] as { id: string };
@@ -982,9 +929,6 @@ describe('lucidos.ui.prompt', () => {
     await expect(p).resolves.toBeNull();
   });
 
-  // The host answers when the reader presses OK, however long they type. A
-  // deadline here resolved null under a dialog still open, and the text the
-  // reader then submitted reached nothing.
   it('waits for the reader, however long they take', async () => {
     vi.useFakeTimers();
     try {
@@ -1007,7 +951,7 @@ describe('lucidos.ui.prompt', () => {
   });
 
   it('standalone (no host parent): falls back to native window.prompt', async () => {
-    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    (globalThis as { parent?: unknown }).parent = globalThis;
     const nativePrompt = vi.fn(() => 'Bob');
     vi.stubGlobal('prompt', nativePrompt);
     await expect(ui.prompt({ message: 'Name?', defaultValue: 'd' })).resolves.toBe('Bob');
@@ -1032,9 +976,6 @@ describe('lucidos.ui.previewFile', () => {
     vi.useRealTimers();
   });
 
-  /** Replay the host's answer for the request the SDK just posted. `source` is
-   *  the stubbed `window.parent` and `origin` the host's: the SDK answers only
-   *  that window on that origin (see `fromHost`). */
   function replyToLastPreview(reply: { ok: boolean; error?: string }, origin = HOST_ORIGIN) {
     const calls = postMessage.mock.calls;
     const sent = calls[calls.length - 1][0] as { id: string };
@@ -1078,9 +1019,6 @@ describe('lucidos.ui.previewFile', () => {
     await p;
   });
 
-  // A non-numeric line is dropped here rather than shipped: the host applies the
-  // documented degradation to what it receives, and there is no reason to make
-  // it reject something the SDK can see is not a line.
   it('drops a non-numeric line rather than forwarding it', async () => {
     const p = ui.previewFile({ file_path: 'artifacts/notes.md', line: '12' as unknown as number });
     expect(postMessage.mock.calls[0][0].payload.line).toBeUndefined();
@@ -1101,26 +1039,17 @@ describe('lucidos.ui.previewFile', () => {
     expect(postMessage).not.toHaveBeenCalled();
   });
 
-  // Bounds a lost reply so the pending map can't leak. A second reply arriving
-  // late finds no resolver and is dropped, rather than settling twice.
   it('rejects and forgets the request when the host never answers', async () => {
     vi.useFakeTimers();
     const p = ui.previewFile({ file_path: 'artifacts/notes.md' });
     const rejection = expect(p).rejects.toThrow('did not respond');
     await vi.advanceTimersByTimeAsync(60_000);
     await rejection;
-    // The entry is gone: a late reply resolves nothing and throws nothing.
     expect(() => replyToLastPreview({ ok: true })).not.toThrow();
   });
 
-  // A popped-out app (its own tab) has no host shell around it, so there is no
-  // modal to show. It must NOT quietly fall back to `navigate`: that goes
-  // through the engine and lands in whichever OTHER window is running the
-  // shell, so the reader would see nothing while a different window navigated
-  // its Files panel, and the promise would resolve as if it had worked. The
-  // rejection is what lets the app decide (its documented catch escalates).
   it('standalone (no host parent): rejects instead of driving another window', async () => {
-    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    (globalThis as { parent?: unknown }).parent = globalThis;
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 200 })));
     await expect(ui.previewFile({ file_path: 'artifacts/notes.md', line: 3 }))
       .rejects.toThrow('no host to show the preview');

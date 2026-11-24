@@ -12,18 +12,12 @@ interface Props {
   main: ComponentChildren;
 }
 
-/** The repo file preview's two columns: the changed-files sidebar and the main
- *  pane, with a divider between them that resizes the sidebar. The container
- *  query in panels/content.css hides the sidebar and divider together on a
- *  narrow pane, so a phone never sees either. */
 export function RepoPreviewSplit({ sidebar, main }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const asideRef = useRef<HTMLElement>(null);
   const [containerRem, setContainerRem] = useState(0);
   const endDrag = useRef<(() => void) | null>(null);
 
-  // Observes the sidebar as well as the container: a UI-scale change resizes
-  // the rem-sized sidebar but not the pane, and the rem width must follow it.
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;

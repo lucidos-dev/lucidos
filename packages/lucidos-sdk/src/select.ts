@@ -11,13 +11,11 @@ export interface SelectCreateOptions {
   value?: string;
   placeholder?: string;
   disabled?: boolean;
-  /** Extra class added to the root element. */
   className?: string;
   onChange?: (value: string, option: SelectOption | undefined) => void;
 }
 
 export interface SelectInstance {
-  /** Root <div> — insert into the DOM. */
   readonly element: HTMLElement;
   getValue(): string | undefined;
   setValue(value: string | undefined): void;
@@ -25,7 +23,6 @@ export interface SelectInstance {
   setDisabled(disabled: boolean): void;
   open(): void;
   close(): void;
-  /** Remove listeners and detach the element. */
   destroy(): void;
 }
 
@@ -62,11 +59,6 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
   }
   root.dataset.state = 'closed';
 
-  // The dropdown-*/surface-box classes render this exactly like the host's
-  // own dropdown, from shared-components.css / surface.css — nothing to keep
-  // in sync. See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md.
-  // lucidos-select-* stays as a stable hook for this file's own queries and
-  // for apps that already target it.
   const trigger = document.createElement('button');
   trigger.type = 'button';
   trigger.className = 'lucidos-select-trigger dropdown-trigger';
@@ -247,8 +239,6 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
     isOpen = next;
     root.dataset.state = next ? 'open' : 'closed';
     trigger.setAttribute('aria-expanded', next ? 'true' : 'false');
-    // Flips the glyph in place, like the host's dropdown-chevron. A swapped
-    // glyph can differ in width and resize the trigger.
     chevron.classList.toggle('open', next);
     if (next) {
       const sel = selectedOption();
@@ -326,7 +316,6 @@ function createSelect(opts: SelectCreateOptions): SelectInstance {
   }
 
   function onMenuMouseDown(e: MouseEvent): void {
-    // Keep focus on the trigger so the click that follows fires before any blur logic.
     e.preventDefault();
   }
 

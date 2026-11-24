@@ -1,45 +1,17 @@
 import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer, stampOverlayBuild } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-/**
- * The desktop header's drawer toggle rests in ONE place, the header's corner.
- *
- * It used to travel with the drawer, and Filter took the corner while the
- * drawer was open. A tester looking for the toggle in the corner found Filter.
- * Pinning it moves the risk into the drawer row. As the drawer shuts, Filter
- * and Search ride the row's right edge into the corner. So the row has to clip
- * at the toggle's edge, or they slide under it. Both ENDS of that animation
- * look right, which is why this samples every frame at the shipped timing.
- *
- * The packaged macOS build cannot be driven here (ADR 0016). Its only
- * horizontal difference is `data-titlebar-overlay`, so every case runs with
- * and without it. A Conversation-pane collapse is the one animation left: the
- * Canvas hamburger slides into this corner, so the toggle wipes away in place.
- *
- * Desktop-only (`-desktop`): on mobile the thread list is a swipe pane. The
- * static half is scanned in `src/styles/__tests__/header-drawer-toggle-pinned.test.ts`.
- */
 
 test.use({ viewport: { width: 1280, height: 800 } });
 
-/** Well clear of the drawer's floor (320px at this project's 16px root), so
- *  the row's controls have real distance to travel into the corner. */
 const OPEN_DRAWER_WIDTH = 420;
 
-/** The outer cap on one sampling window. Sampling is armed BEFORE the gesture,
- *  so the cap absorbs Playwright's actionability checks on a loaded machine.
- *  It is only a cap: each case ends its window TAIL_MS after its gesture. */
 const SAMPLE_CAP_MS = 5000;
 
-/** How long a window runs on after its gesture: past `--duration-slow`
- *  (300ms) with room to spare. Extra settled frames cost wall time only,
- *  since every assertion here holds at rest too. */
 const TAIL_MS = 700;
 
-/** Past one `--duration-slow` transition, with room to spare. */
 const SETTLE_MS = 600;
 
 interface Box {
@@ -50,44 +22,25 @@ interface Box {
 
 interface RowControl {
   name: string;
-  /** What the row actually PAINTS of the control: its box, cut to the row's
-   *  resolved clip region. Null when none of it is painted. */
   painted: Box | null;
 }
 
 interface Sample {
-  /** Frames since sampling began, for failure messages. */
   frame: number;
-  /** The toggle button's own left edge, before any clip. */
   toggleLeft: number;
-  /** The toggle button's PAINTED box: its rect, cut to what the slot's clip
-   *  lets through. Zero wide, never null, while the slot is in the header. */
   toggle: Box | null;
-  /** The toggle's painted GLYPH, cut the same way. Null once none of it shows. */
   toggleGlyph: Box | null;
-  /** Effective opacity of the toggle, multiplied down its ancestor chain. */
   toggleOpacity: number;
-  /** How many toggles the desktop header has painted this frame. */
   toggleCount: number;
-  /** Every control the drawer row paints this frame. */
   rowControls: RowControl[];
-  /** The row's resolved `clip-path`, for failure messages. */
   rowClip: string;
-  /** The Canvas pane hamburger's glyph. */
   hamburgerGlyph: Box | null;
 }
 
-/**
- * Start a per-frame sampler in the page and leave its promise on `window`.
- *
- * Installed BEFORE the gesture, so the first frames of the transition are in
- * the record. A round-trip per sample would miss most of a 300ms animation.
- */
 async function startSampling(page: Page): Promise<void> {
   await page.evaluate((capMs) => {
     const header = document.querySelector('.desktop-header')!;
     const w = window as unknown as { __sampleUntil: number; __toggleSamples: Promise<unknown[]> };
-    // An element's own opacity says nothing if an ancestor is fading it.
     const effectiveOpacity = (el: Element | null): number => {
       let o = 1;
       for (let n: Element | null = el; n && n !== document.documentElement; n = n.parentElement) {
@@ -101,9 +54,6 @@ async function startSampling(page: Page): Promise<void> {
       const rt = Math.min(r.right, right);
       return rt > l ? { left: l, right: rt, width: rt - l } : null;
     };
-    // An `inset()` clip's four insets in px (top, right, bottom, left). A clip
-    // that did not resolve reads as zeros, so a broken clip fails the checks
-    // below instead of hiding.
     const insets = (clip: string): number[] => {
       const m = /^inset\(([^)]*)\)/.exec(clip);
       if (!m) return [0, 0, 0, 0];
@@ -160,7 +110,6 @@ async function startSampling(page: Page): Promise<void> {
   }, SAMPLE_CAP_MS);
 }
 
-/** End the running window TAIL_MS from now, and collect it. */
 async function finishSampling(page: Page): Promise<Sample[]> {
   return page.evaluate((tailMs) => {
     const w = window as unknown as { __sampleUntil: number; __toggleSamples: Promise<unknown[]> };
@@ -169,22 +118,16 @@ async function finishSampling(page: Page): Promise<Sample[]> {
   }, TAIL_MS) as Promise<Sample[]>;
 }
 
-/** Click the toggle without waiting on anything, so the sampler is still
- *  running for the frame the transition starts on. */
 async function clickToggle(page: Page): Promise<void> {
   await page.evaluate(() => {
     document.querySelector<HTMLElement>('.desktop-header .thread-toggle-slot .thread-toggle')!.click();
   });
 }
 
-/** Collapse the Conversation pane, or bring it back. A REAL double-click:
- *  SplitLayout gates the divider's dblclick on a pointerdown-recorded interval
- *  (createDblClickGate), so a bare synthetic dblclick event would be refused. */
 async function toggleConversationPane(page: Page): Promise<void> {
   await page.locator('.split-divider').dblclick();
 }
 
-/** Every invariant that must hold in EVERY frame of any header animation. */
 function assertConsistentThroughout(samples: Sample[], what: string): void {
   expect(samples.length, `${what}: no frames sampled`).toBeGreaterThan(5);
   for (const s of samples) {
@@ -197,7 +140,6 @@ function assertConsistentThroughout(samples: Sample[], what: string): void {
       s.toggleCount,
       `${what} frame ${s.frame}: ${s.toggleCount} toggles painted at once`,
     ).toBeLessThanOrEqual(1);
-    // Nothing the drawer row paints may reach under the toggle.
     for (const c of s.rowControls) {
       if (!c.painted || s.toggle!.width === 0) continue;
       expect(
@@ -209,9 +151,6 @@ function assertConsistentThroughout(samples: Sample[], what: string): void {
   }
 }
 
-/** The corner is where the Canvas hamburger arrives, so the two glyphs must
- *  never paint over each other. Glyphs rather than boxes: the buttons' padding
- *  is transparent, and a box overlap there is not one anybody can see. */
 function assertGlyphsApart(samples: Sample[], what: string): void {
   for (const s of samples) {
     if (!s.toggleGlyph || !s.hamburgerGlyph) continue;
@@ -226,7 +165,6 @@ function assertGlyphsApart(samples: Sample[], what: string): void {
   }
 }
 
-/** The toggle's own box never moves, whatever the frame. */
 function assertStaysPut(samples: Sample[], home: number, what: string): void {
   for (const s of samples) {
     expect(
@@ -250,8 +188,6 @@ for (const packaged of [false, true]) {
       await navigateToApp(page);
       await openThreadDrawer(page);
       if (packaged) await stampOverlayBuild(page);
-      // The open animation (and the row's move to the lights reserve) is its
-      // own transition; start each case from rest.
       await page.waitForTimeout(SETTLE_MS);
     });
 
@@ -271,13 +207,9 @@ for (const packaged of [false, true]) {
         expect(Math.abs(s.toggle!.width - home.width), `frame ${s.frame}: the toggle resized`)
           .toBeLessThanOrEqual(1);
       }
-      // The corner it rests in: past the traffic lights on the packaged build,
-      // at the row's own padding on the web.
       if (packaged) expect(home.left, 'the toggle sits on the traffic lights').toBeGreaterThanOrEqual(70);
       else expect(home.left, 'the toggle left the corner').toBeLessThan(20);
 
-      // The row really did carry its controls into the corner, so the overlap
-      // check above had something to catch.
       const lowestFilter = Math.min(...shut.flatMap(s => s.rowControls
         .filter(c => c.name === 'Filter threads' && c.painted)
         .map(c => c.painted!.left)));
@@ -309,10 +241,6 @@ for (const packaged of [false, true]) {
     });
 
     test('a Conversation-pane collapse wipes it away in place, and back, clear of the hamburger', async ({ page }) => {
-      // Both directions, because each frame serves one of them. A clip that
-      // did not transition once lifted on the first frame back. That flashed
-      // the whole icon over the hamburger, and a check of the way out never
-      // saw it.
       await startSampling(page);
       await toggleConversationPane(page);
       const out = await finishSampling(page);
@@ -324,7 +252,6 @@ for (const packaged of [false, true]) {
       assertConsistentThroughout(back, 're-expand');
       assertGlyphsApart(out, 'collapse');
       assertGlyphsApart(back, 're-expand');
-      // It never slides toward the traffic lights on the way.
       assertStaysPut([...out, ...back], out[0].toggleLeft, 'collapse and re-expand');
 
       expect(out[out.length - 1].toggleGlyph, 'the icon is still painting after the collapse')

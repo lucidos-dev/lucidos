@@ -14,12 +14,10 @@ import type { SafeAreaInsets } from './safeAreaFloor';
  *  has painted, so a session costs a handful of lines. */
 
 const SETTLED_DELAY_MS = 3000;
-/** Up to a minute of waiting for the header. */
 const SETTLED_ATTEMPTS = 20;
 
 let last: { key: string; reading: SafeAreaInsets; floor: SafeAreaInsets | null } | null = null;
 
-/** Reset the change filter. Test seam only. */
 export function resetSafeAreaProbe(): void {
   last = null;
 }
@@ -31,8 +29,6 @@ export function reportSafeAreaReading(reading: SafeAreaInsets, floor: SafeAreaIn
   logGeometry('reading', reading, floor);
 }
 
-/** Logs the latest reading again once the header has painted. A slow boot
- *  mounts the header late, so it waits for it, a bounded number of times. */
 export function scheduleSafeAreaSnapshot(attemptsLeft = SETTLED_ATTEMPTS): void {
   setTimeout(() => {
     const headerMounted = document.querySelector('.app-header') !== null;
@@ -59,17 +55,12 @@ function logGeometry(moment: string, reading: SafeAreaInsets, floor: SafeAreaIns
     headerPaddingTop: header ? getComputedStyle(header).paddingTop : null,
     firstButton: rect(header?.querySelector('button')),
   };
-  // The shell writes `--app-height` from its own listener for the same event,
-  // which runs after this one. So the write is read once every listener has run.
   setTimeout(() => {
     const appHeight = document.documentElement.style.getPropertyValue('--app-height');
     postClientLog('safe-area', moment, { ...geometry, appHeight: appHeight || null });
   }, 0);
 }
 
-/** What WebKit's CSS viewport units resolve to, in CSS pixels: `[svh, lvh,
- *  dvh]` at 100 each. Tells a wrong `innerHeight` from a wrong CSS viewport
- *  (ADR 0610). */
 function cssViewportHeights(): [number, number, number] {
   const box = document.createElement('div');
   box.style.cssText = 'position:fixed;top:0;left:0;width:0;visibility:hidden;pointer-events:none';
@@ -82,7 +73,6 @@ function cssViewportHeights(): [number, number, number] {
   return heights;
 }
 
-/** An element's top and height, in CSS pixels. */
 function rect(el: Element | null | undefined): [number, number] | null {
   if (!el) return null;
   const box = el.getBoundingClientRect();

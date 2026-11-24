@@ -1,8 +1,3 @@
-/**
- * An edited dashboard tile drops its clip, so the remove badge can hang past
- * its corner. The widget box's scroller must then clip the frame to the
- * rounded corner, or its square iframe corners show through the dashed outline.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

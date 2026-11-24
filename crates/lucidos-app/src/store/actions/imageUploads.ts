@@ -1,13 +1,3 @@
-/** The upload pipeline for images attached to a draft: one run per pending
- *  entry, from waiting on the draft's thread to a confirmed hash in the draft.
- *  State lives in `store/pendingUploads.ts`; the composer only draws it. Each
- *  entry's bytes are also kept on the device (`store/pendingUploadRecords.ts`),
- *  so a page reload can resume it. An entry lands on its upload's answer or
- *  on the engine's `ImageUploaded` event, whichever comes first.
- *
- *  Plans: `docs/plans/2026-10-02-image-upload-progress-and-resilience.md`,
- *  `docs/plans/2026-10-02-pending-uploads-survive-a-reload.md`,
- *  `docs/plans/2026-10-04-image-upload-lands-on-its-event.md`. */
 
 import { batch, effect } from '@preact/signals';
 
@@ -50,23 +40,14 @@ import type { ThreadState } from '../thread-events';
 import { awaitThreadStarted, isThreadStartPending } from './compose';
 import { unsentMessages } from '../unsentMessages';
 
-/** Backoff before each automatic retry of a transient failure. Its length is
- *  the retry budget: once spent, the entry fails and offers a manual Retry. */
 export const UPLOAD_RETRY_DELAYS_MS: readonly number[] = [1_000, 3_000, 8_000];
 
-/** Said when the upload lands on bytes the draft already holds. See
- *  `addAttachedImageHash`. */
 export const DUPLICATE_IMAGE_TOAST = 'That image is already attached to this message.';
 
-/** Repeated failures collapse into one card rather than one per image. */
 const UPLOAD_FAILED_TOAST_KEY = 'image-upload-failed';
 
-/** The run in progress for each pending entry, keyed by `localId`. Removing
- *  the entry aborts it, and a second Retry cannot start a parallel run. */
 const runs = new Map<string, AbortController>();
 
-/** Show a just-attached image as a chip, keep its bytes on the device, and
- *  upload it. Resolves when the upload run ends. */
 export function attachPendingUpload(args: { threadId: string; file: File; bytes: ArrayBuffer }): Promise<void> {
   const { threadId, file, bytes } = args;
   const localId = generateUuid();
@@ -76,31 +57,21 @@ export function attachPendingUpload(args: { threadId: string; file: File; bytes:
   return runPendingUpload(threadId, localId);
 }
 
-/** Resume an image a previous page load left behind. Its record already
- *  exists and is this page's now. */
 export function resumePendingUpload(threadId: string, localId: string, file: File): Promise<void> {
   addPendingUpload(newPendingUpload(threadId, localId, file));
   nameByContent(threadId, localId, file.arrayBuffer());
   return runPendingUpload(threadId, localId);
 }
 
-/** Give the entry the hash its `ImageUploaded` will carry, alongside the
- *  upload. An event that beats the hash still lands it (`landedImages`). */
 function nameByContent(threadId: string, localId: string, bytes: Promise<ArrayBuffer>): void {
   bytes
     .then(sha256Hex)
     .then((hash) => {
       if (hash) setPendingUploadContentHash(threadId, localId, hash);
     })
-    // Best-effort: without a hash the entry still lands on its upload's own
-    // answer, as every entry did before, so the user loses nothing here.
     .catch((err) => console.warn(`[uploads] could not hash a pending image: ${errorDetail(err)}`));
 }
 
-/** The blob URL is handed off twice: first to the pending entry, for the chip,
- *  then to `sessionBlobUrls` (`promote`), so the confirmed image keeps
- *  rendering from the same in-memory File. Swapping to the server URL re-
- *  fetched over the network on iOS Safari PWA, a brief black flash. */
 function newPendingUpload(threadId: string, localId: string, file: File): PendingUpload {
   return {
     localId,
@@ -112,8 +83,6 @@ function newPendingUpload(threadId: string, localId: string, file: File): Pendin
   };
 }
 
-/** Why an upload failed, in words for the chip, its tooltip and the toast.
- *  An `ApiError` already carries the engine's own normalized sentence. */
 export function describeUploadFailure(err: unknown): string {
   if (err instanceof ApiError) return err.reason;
   if (isTransportError(err)) return 'Lucidos could not be reached';
@@ -126,15 +95,10 @@ export function describeUploadFailure(err: unknown): string {
   return String(err);
 }
 
-/** A 4xx is the engine refusing THIS upload: a format it does not take, or a
- *  draft that is gone. Retrying the same bytes cannot change that answer. */
 function isRefusal(err: unknown): boolean {
   return err instanceof ApiError && err.httpCode >= 400 && err.httpCode < 500;
 }
 
-/** The state after attempt number `failedAttempts` (1-based) failed. Only a
- *  transient failure is retried automatically, and only while connected and
- *  within the budget. A verdict fails at once. Pure, for testing. */
 export function stateAfterFailure(
   err: unknown,
   failedAttempts: number,
@@ -147,9 +111,6 @@ export function stateAfterFailure(
   return { kind: 'retrying', attempt: failedAttempts + 1, reason };
 }
 
-/** Upload one pending entry until it lands, fails, or the user removes it.
- *  Resolves when the run ends, whatever the outcome; it never rejects. A call
- *  while a run is already going for this entry joins nothing and returns. */
 export async function runPendingUpload(threadId: string, localId: string): Promise<void> {
   if (runs.has(localId)) return;
   const controller = new AbortController();
@@ -169,10 +130,7 @@ async function attemptUntilSettled(threadId: string, localId: string, signal: Ab
     try {
       hash = await uploadOnce(entry, signal);
     } catch (err) {
-      // Removed or cancelled while we were away: the user is done with it.
       if (signal.aborted || !hasPendingUpload(threadId, localId)) return;
-      // The draft itself is gone: refused and rolled back, or discarded. Its
-      // composer is not on screen, so the chip has nowhere to say anything.
       if (draftIsGone(threadId)) {
         removePendingUpload(threadId, localId);
         return;
@@ -184,13 +142,10 @@ async function attemptUntilSettled(threadId: string, localId: string, signal: Ab
         showToast(`Image upload failed: ${next.reason}`, 'error', { key: UPLOAD_FAILED_TOAST_KEY });
         return;
       }
-      // Resumed by `resumeOfflineUploads` when the connection comes back.
       if (next.kind === 'offline') return;
       await abortableDelay(UPLOAD_RETRY_DELAYS_MS[failed - 1], signal);
       continue;
     }
-    // Mid-flight cancel: the X dropped the entry and revoked its URL, so the
-    // hash must not reach the draft.
     if (signal.aborted || !hasPendingUpload(threadId, localId)) return;
     promote(entry, hash);
     return;
@@ -199,9 +154,6 @@ async function attemptUntilSettled(threadId: string, localId: string, signal: Ab
 
 async function uploadOnce(entry: PendingUpload, signal: AbortSignal): Promise<string> {
   const { threadId, localId, file } = entry;
-  // The blob endpoint guards on the thread row existing. A fresh draft's
-  // `POST /threads` may still be in flight, or owed after a transient failure,
-  // in which case this wait re-attempts it.
   if (isThreadStartPending(threadId)) {
     setPendingUploadState(threadId, localId, { kind: 'waiting-for-thread' });
   }
@@ -216,19 +168,12 @@ async function uploadOnce(entry: PendingUpload, signal: AbortSignal): Promise<st
   return hash;
 }
 
-/** Hand the blob URL to the session map FIRST, so `getAttachedImages` returns
- *  it the moment the hash lands. Then commit the hash and detach the entry
- *  without revoking, in one batch, so the strip never renders with neither.
- *
- *  The draft refuses a hash it already holds (a second paste of one
- *  screenshot). `rememberSessionBlobUrl` keeps the first URL either way. */
 function promote(entry: PendingUpload, hash: string): void {
   const { threadId, localId, previewUrl } = entry;
   let attached = true;
   batch(() => {
     rememberSessionBlobUrl(hash, previewUrl);
     attached = addAttachedImageHash(threadId, hash);
-    // Before detach, so attached bytes outlive the pending entry.
     markPendingUploadLanded(localId, hash);
     detachPendingUpload(threadId, localId);
   });
@@ -252,12 +197,10 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** The X on a pending chip. Dropping the entry aborts its run. */
 export function cancelPendingUpload(threadId: string, localId: string): void {
   removePendingUpload(threadId, localId);
 }
 
-/** The Retry on a failed chip: a fresh run with a fresh budget. */
 export function retryPendingUpload(threadId: string, localId: string): Promise<void> {
   const state = getPendingUpload(threadId, localId)?.state;
   if (!state || (state.kind !== 'failed' && state.kind !== 'offline')) return Promise.resolve();
@@ -265,7 +208,6 @@ export function retryPendingUpload(threadId: string, localId: string): Promise<v
   return runPendingUpload(threadId, localId);
 }
 
-/** Restart every upload that was waiting for the connection. */
 function resumeOfflineUploads(): void {
   for (const list of pendingUploads.peek().values()) {
     for (const entry of list) {
@@ -274,9 +216,6 @@ function resumeOfflineUploads(): void {
   }
 }
 
-// An `offline` entry exists only while the connection is down, so the moment
-// it comes back is the one moment to resume. Covers a reconnect noticed by the
-// health poll and an iOS wake alike, since both flip `connectionStatus`.
 let wasConnected = isConnected.peek();
 effect(() => {
   const connected = isConnected.value;
@@ -284,10 +223,6 @@ effect(() => {
   wasConnected = connected;
 });
 
-// The engine reported these bytes stored on this draft, so the entry has
-// landed. Its upload's own answer can be lost on the way back, which stalled
-// the chip until the watchdog re-uploaded. Whichever signal comes first lands
-// it. Detaching aborts the run, so the other finds no entry and does nothing.
 effect(() => {
   const landed = landedImages.value;
   for (const list of pendingUploads.value.values()) {
@@ -298,10 +233,6 @@ effect(() => {
   }
 });
 
-/** Whether this page still needs a record's bytes to survive a reload:
- *  - while its entry is pending, yes;
- *  - once it landed, while a local draft or unresolved send references it;
- *  - an entry that ended without landing, no. Pure, for testing. */
 export function recordStillNeeded(
   record: OwnedRecord,
   entryPending: boolean,
@@ -314,7 +245,6 @@ export function recordStillNeeded(
   return localHashes.includes(hash) || unresolvedHashes.includes(hash);
 }
 
-// Reconcile owned records when pending entries, drafts or unresolved sends change.
 effect(() => {
   const entries = pendingUploads.value;
   const attached = [...composeDrafts.value.values()].flatMap((draft) => draft.image_hashes);
@@ -339,9 +269,6 @@ effect(() => {
   }
 });
 
-// A draft that is discarded, or whose row is removed, takes its pending images
-// with it. Only a thread this rule has seen live counts, so an entry whose
-// thread this page never saw is left alone.
 let liveEntryThreads = new Set<string>();
 effect(() => {
   const threads = threadMap.value;

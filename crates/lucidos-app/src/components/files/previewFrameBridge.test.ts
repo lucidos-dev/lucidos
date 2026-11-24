@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import PREVIEW_SOURCE from './FilePreviewInline.tsx?raw';
-import FILE_RESPONSE_RS from '../../../../lucidos-engine/src/api/file_response.rs?raw';
+import FILE_RESPONSE_RS from '../../../../lucidos-agents-api/src/api/file_response.rs?raw';
 
 const mocks = vi.hoisted(() => ({
   openFilePreview: vi.fn(),
@@ -55,7 +55,6 @@ const { PREVIEW_HOST_SCHEMES, classifyPreviewLink, withPreviewBase } = await imp
 const { PREVIEW_FRAME_MESSAGE, PREVIEW_HOST_MESSAGE, askPreviewFind } = await import('../../utils/previewFrameProtocol');
 const { subscribeFrameSwipes } = await import('../../store/actions/frame-swipe-bridge');
 const PREVIEW_SWIPE_SOURCE = (await import('../../../../../packages/lucidos-sdk/dist/preview-swipe.js?raw')).default;
-/** The committed swipe bundle, run as the bridge runs it. */
 const realSwiper = new Function(`${PREVIEW_SWIPE_SOURCE}\nreturn ${PREVIEW_SWIPE_LOCAL};`)() as object;
 
 const TID = '961b9b83-53b7-47cd-8982-3c959d7f1137';
@@ -65,26 +64,19 @@ const MAXIMIZE = { mod: true, shift: true, alt: false, key: 'Enter' };
 const ZOOM_IN = { mod: true, shift: false, alt: false, key: '=' };
 const SEARCH = { mod: true, shift: false, alt: false, key: 'k' };
 
-// ---------------------------------------------------------------------------
-// The sandbox
-// ---------------------------------------------------------------------------
 
 describe('the preview frame sandbox', () => {
   const tokens = ARTIFACT_PREVIEW_SANDBOX.split(/\s+/);
 
   it('lets scripts run but never gives the artifact the shell origin', () => {
     expect(tokens).toContain('allow-scripts');
-    // The fix itself. With this token, `about:srcdoc` runs as the shell.
     expect(tokens).not.toContain('allow-same-origin');
     expect(tokens).not.toContain('allow-top-navigation');
     expect(tokens).not.toContain('allow-top-navigation-by-user-activation');
-    // A window the artifact opens must stay sandboxed too.
     expect(tokens).not.toContain('allow-popups-to-escape-sandbox');
   });
 
   it('is the exact set the engine serves a data file under', () => {
-    // The preview and a served file are the same document on two routes, so an
-    // artifact must get one set of powers on both.
     const rust: string = FILE_RESPONSE_RS;
     const csp = /DOCUMENT_SANDBOX_CSP: &str =\s*"sandbox ([^"]+)"/.exec(rust)?.[1];
     expect(csp, 'DOCUMENT_SANDBOX_CSP not found in file_response.rs').toBeDefined();
@@ -92,8 +84,6 @@ describe('the preview frame sandbox', () => {
   });
 
   it('is what the HTML body frame actually carries', () => {
-    // Source scan: the constant is only safe if the frame uses it, and uses
-    // nothing that re-grants the origin.
     const src: string = PREVIEW_SOURCE;
     const frame = /function HtmlPreviewFrame[\s\S]*?<iframe([\s\S]*?)\/>/.exec(src)?.[1] ?? '';
     expect(frame).toContain('sandbox={ARTIFACT_PREVIEW_SANDBOX}');
@@ -104,16 +94,10 @@ describe('the preview frame sandbox', () => {
   });
 
   it('delegates fullscreen to every origin, or WebKit denies it', () => {
-    // A bare feature means `'src'`, which WebKit never matches against the
-    // frame's opaque origin, so a report's video cannot go fullscreen in the
-    // desktop app. Chromium special-cases the opaque frame.
     expect(ARTIFACT_PREVIEW_ALLOW.split(';').map((f: string) => f.trim())).toContain('fullscreen *');
   });
 });
 
-// ---------------------------------------------------------------------------
-// The in-frame script, run against a fake window
-// ---------------------------------------------------------------------------
 
 type Listener = (e: unknown) => void;
 
@@ -128,13 +112,10 @@ interface FakeFrame {
   scriptRemoved?: boolean;
 }
 
-/** Install the bridge in a fake frame. `ids` are the anchors the document holds,
- *  `baseHref` the `<base>` it carries (`null` for none). */
 function installBridge(opts: {
   ids?: string[]; baseHref?: string | null; topLevel?: boolean; mac?: boolean;
   finder?: { serve(args: unknown): unknown };
   paneSwipe?: boolean;
-  /** How wide the artifact's page lays out, against a 300px frame. */
   pageWidth?: number;
 } = {}): FakeFrame {
   const posted: Record<string, unknown>[] = [];
@@ -308,8 +289,6 @@ describe('the in-frame bridge script', () => {
   });
 
   it('leaves a download the frame can save itself to the browser', () => {
-    // A blob or data URL the artifact built is its own origin's; an external
-    // one is the browser's business, as it always was.
     const frame = installBridge();
     for (const href of ['blob:null/1234', 'data:text/csv,a,b', 'https://example.com/x.csv']) {
       const e = click(href, {}, { download: '' });
@@ -322,7 +301,7 @@ describe('the in-frame bridge script', () => {
   it('cancels a chord bound to a shell shortcut and posts it up', () => {
     const frame = installBridge();
     const maximize = key('Enter', { metaKey: true, shiftKey: true });
-    const zoom = key('+', { ctrlKey: true }); // `+` folds to `=`, as the registry does
+    const zoom = key('+', { ctrlKey: true });
     frame.fire('doc', 'keydown', maximize);
     frame.fire('doc', 'keydown', zoom);
     expect(maximize.defaultPrevented).toBe(true);
@@ -412,9 +391,6 @@ describe('the claim rule and the host router agree', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// The host side
-// ---------------------------------------------------------------------------
 
 describe('the in-frame finder', () => {
   const ask = (args: unknown, id = 'find-1') => ({ type: PREVIEW_HOST_MESSAGE, kind: 'find', id, args });
@@ -449,7 +425,6 @@ describe('the in-frame finder', () => {
 });
 
 describe('the in-frame pane swipe', () => {
-  /** A one-finger touch in screen coordinates, as the user's own. */
   const touch = (points: Array<[number, number]>, over: Record<string, unknown> = {}) => ({
     isTrusted: true,
     defaultPrevented: false,
@@ -590,7 +565,6 @@ describe('previewMayNavigate', () => {
   it('lets a click navigate, and refuses a message with no click behind it', () => {
     expect(previewMayNavigate(true)).toBe(true);
     expect(previewMayNavigate(false)).toBe(false);
-    // A browser that cannot tell keeps the link working.
     expect(previewMayNavigate(null)).toBe(true);
   });
 });
@@ -620,24 +594,23 @@ describe('routePreviewFrameMessage', () => {
     expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/reports/pr-1573.md');
   });
 
-  it('routes a thread, an external page and a repo citation', () => {
+  it('routes a thread, an external page and a repo citation', async () => {
     repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
     route(`thread:dev/${TID}`);
     route('https://example.com/docs');
     route('repo:repo-1:file:src/main.rs#L510-L520');
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('dev', TID);
     expect(mocks.openUrl).toHaveBeenCalledWith('https://example.com/docs');
-    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
       { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
       { source: 'a file preview' },
-    );
+    ));
   });
 
   it('honours the frame\'s base only when the artifact declared its own', () => {
     route('guide.html', true, 'https://example.com/docs/');
     expect(mocks.openUrl).toHaveBeenCalledWith('https://example.com/docs/guide.html');
     vi.clearAllMocks();
-    // A forged base on an artifact that declared none changes nothing.
     route('guide.html', false, 'https://example.com/docs/');
     expect(mocks.openUrl).not.toHaveBeenCalled();
     expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/reports/guide.html');
@@ -655,7 +628,6 @@ describe('routePreviewFrameMessage', () => {
     route('#section-two');
     expect(mocks.openFilePreview).not.toHaveBeenCalled();
     expect(mocks.showToast.mock.calls[0][0]).toContain('without a click');
-    // A scroll inside the document itself needs no click.
     expect(posted).toHaveLength(1);
   });
 
@@ -665,8 +637,6 @@ describe('routePreviewFrameMessage', () => {
     expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me/report.pdf', ARTIFACT);
   });
 
-  // An artifact that declares its own base routes a download like a link, so
-  // it can name a local file too. That arm used to skip the confirm.
   it('sends a download that resolves to a local file through the confirm', () => {
     vi.stubGlobal('navigator', { userActivation: { isActive: true } });
     routePreviewFrameMessage(
@@ -743,9 +713,6 @@ describe('routePreviewFrameMessage', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Stamping
-// ---------------------------------------------------------------------------
 
 describe('the stamped bridge script', () => {
   const cfg = { nonce: NONCE, bindings: [MAXIMIZE], hostSchemes: PREVIEW_HOST_SCHEMES, paneSwipe: true };
@@ -760,8 +727,6 @@ describe('the stamped bridge script', () => {
   });
 
   it('runs before anything the artifact puts ahead of its head', () => {
-    // A script before `<head>`, or a `<head>` inside a comment, would otherwise
-    // run first and watch the bridge arrive.
     for (const html of [
       '<!DOCTYPE html><script>window.early=1</script><html><head></head></html>',
       '<!-- <head> --><script>window.early=1</script><html><head></head></html>',
@@ -769,7 +734,6 @@ describe('the stamped bridge script', () => {
       const out = withPreviewBridge(html, cfg);
       expect(out.indexOf(PREVIEW_FRAME_MESSAGE), html).toBeLessThan(out.indexOf('window.early'));
     }
-    // And never ahead of the doctype, which would drop the page into quirks mode.
     expect(withPreviewBridge('<!DOCTYPE html><p>x</p>', cfg).startsWith('<!DOCTYPE html><script>')).toBe(true);
     expect(withPreviewBridge('<!-- generated -->\n<!DOCTYPE html><p>x</p>', cfg))
       .toMatch(/^<!-- generated -->\n<!DOCTYPE html><script>/);
@@ -784,7 +748,6 @@ describe('the stamped bridge script', () => {
   it('carries the finder and the swipe inside its own function, where the artifact cannot reach them', async () => {
     const out = previewBridgeScript(cfg);
     const finder = (await import('../../../../../packages/lucidos-sdk/dist/preview-find.js?raw')).default;
-    // Pinned: each bundle's own name for its result is what the bridge reads.
     expect(finder).toContain(`var ${PREVIEW_FIND_LOCAL} =`);
     expect(PREVIEW_SWIPE_SOURCE).toContain(`var ${PREVIEW_SWIPE_LOCAL} =`);
     expect(out.startsWith('<script>(function(){')).toBe(true);

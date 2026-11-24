@@ -1,9 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// Pin the running bundle's build id so the fast path can match (or miss) the
-// served sw.js BUILD_ID deterministically — in a real build the
-// `lucidos-sw-stamp` plugin replaces the `__LUCIDOS_BUILD_ID__` placeholder with
-// this exact value. Must be hoisted above the import of the module under test.
 vi.mock('virtual:build-id', () => ({ CLIENT_BUILD_ID: 'build-current' }));
 
 import {
@@ -43,8 +39,6 @@ describe('refreshClient — build-id fast path', () => {
     reload = vi.fn();
     Object.defineProperty(globalThis, 'location', { value: { reload }, configurable: true });
 
-    // A registration with no installing/waiting worker — the "nothing swapping"
-    // branch, so a fall-through to the dance ends in bust + reload.
     getRegistration = vi.fn(() => Promise.resolve({ update: vi.fn(() => Promise.resolve()) }));
     Object.defineProperty(globalThis, 'navigator', {
       value: { serviceWorker: { addEventListener: () => {}, getRegistration } },
@@ -77,19 +71,17 @@ describe('refreshClient — build-id fast path', () => {
   }
 
   it('reloads cache-first (no SW round-trip, no cache bust) when already on the served build', async () => {
-    stubServedBuildId('build-current'); // matches CLIENT_BUILD_ID
+    stubServedBuildId('build-current');
     refreshClient();
     await vi.advanceTimersByTimeAsync(0);
 
     expect(reload).toHaveBeenCalledTimes(1);
-    // The whole point: don't probe the registration and don't drop the asset
-    // cache when the loaded code is already current — that's the cold-load cost.
     expect(getRegistration).not.toHaveBeenCalled();
     expect(cacheDelete).not.toHaveBeenCalled();
   });
 
   it('falls back to the swap + bust dance when the served build is newer', async () => {
-    stubServedBuildId('build-next'); // differs from CLIENT_BUILD_ID — stale
+    stubServedBuildId('build-next');
     refreshClient();
     await vi.advanceTimersByTimeAsync(0);
 
@@ -98,8 +90,6 @@ describe('refreshClient — build-id fast path', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  // A chunk that failed on the served build came out of the cache, so a
-  // cache-first reload would load the same bad copy again.
   it('evicts the cached assets even on the served build when asked to', async () => {
     stubServedBuildId('build-current');
     refreshClient({ evictAssets: true });
@@ -110,8 +100,6 @@ describe('refreshClient — build-id fast path', () => {
     expect(cacheDelete.mock.invocationCallOrder[0]).toBeLessThan(reload.mock.invocationCallOrder[0]);
   });
 
-  // The UI stays locked until the reload, so a Cache API that never settles
-  // must not hold it.
   it('still reloads when the eviction hangs', async () => {
     stubServedBuildId('build-current');
     Object.defineProperty(globalThis, 'caches', {
@@ -127,7 +115,6 @@ describe('refreshClient — build-id fast path', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  // With no service worker there is no bundle cache, and nothing to swap.
   it('reloads plainly when no service worker is registered', async () => {
     globalThis.fetch = vi.fn(() => Promise.reject(new TypeError('Load failed'))) as unknown as typeof fetch;
     getRegistration.mockReturnValue(Promise.resolve(undefined));

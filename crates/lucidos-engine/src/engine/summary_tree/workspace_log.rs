@@ -126,6 +126,7 @@ impl WorkspaceLog {
         };
         let turn_ends = sql_list(TURN_END_EVENT_TYPES);
         let artifact_writes = sql_list(ARTIFACT_WRITE_EVENT_TYPES);
+        let first_human = crate::core::artifact_writer::first_human_message_sql("b.thread_id");
         // A system event keeps its fields under `data`; a few early artifact
         // rows were written flat. A writer that was since deleted reads as none.
         let sql = format!(
@@ -133,7 +134,7 @@ impl WorkspaceLog {
                     COALESCE(b.payload->'data', b.payload)->>'artifact_path', \
                     COALESCE(COALESCE(b.payload->'data', b.payload)->>'commit', \
                              COALESCE(b.payload->'data', b.payload)->>'commit_hash'), \
-                    w.thread_id \
+                    w.thread_id, NULLIF(COALESCE(b.payload->'data', b.payload)->'writer', 'null'::jsonb) \
              FROM events b \
              LEFT JOIN thread_summaries s ON s.thread_id = b.thread_id \
              LEFT JOIN thread_summaries w ON w.thread_id = \
@@ -142,10 +143,7 @@ impl WorkspaceLog {
                AND b.sequence > $1 AND b.sequence <= $2 \
                AND (b.event_type IN ({artifact_writes}) \
                  OR (s.thread_id IS NOT NULL \
-                   AND (s.source <> 'trigger' OR b.sequence > ( \
-                     SELECT min(m.sequence) FROM events m \
-                     WHERE m.thread_id = b.thread_id AND m.event_type = 'MessageReceived' \
-                       AND m.payload->>'mode' = 'human')) \
+                   AND (s.source <> 'trigger' OR b.sequence > ({first_human})) \
                    AND (COALESCE(b.payload->>'text', '') <> '' \
                      OR b.event_type = 'ResponseFailed' \
                      OR EXISTS ( \
@@ -165,6 +163,7 @@ impl WorkspaceLog {
             Option<String>,
             Option<String>,
             Option<Uuid>,
+            Option<sqlx::types::Json<crate::engine::event_bus::ArtifactWriter>>,
         );
         let rows: Vec<Row> = sqlx::query_as(&sql)
             .bind(self.through)
@@ -172,7 +171,7 @@ impl WorkspaceLog {
             .bind(ENTRY_EVENT_TYPES)
             .fetch_all(pool)
             .await?;
-        for (event_id, event_type, thread_id, path, commit, writer_thread_id) in rows {
+        for (event_id, event_type, thread_id, path, commit, writer_thread_id, writer) in rows {
             if let Some(leaf) = leaf_for(
                 event_id,
                 &event_type,
@@ -180,6 +179,7 @@ impl WorkspaceLog {
                 path,
                 commit,
                 writer_thread_id,
+                writer.map(|w| w.0),
             ) {
                 self.leaves.push(leaf);
             }
@@ -196,6 +196,7 @@ fn leaf_for(
     path: Option<String>,
     commit: Option<String>,
     writer_thread_id: Option<Uuid>,
+    writer: Option<crate::engine::event_bus::ArtifactWriter>,
 ) -> Option<WorkspaceLeaf> {
     let verb = match event_type {
         "ArtifactCreated" => "created",
@@ -208,6 +209,9 @@ fn leaf_for(
             })
         }
     };
+    if writer.as_ref().is_some_and(|w| !w.is_workspace_leaf()) {
+        return None;
+    }
     let path = crate::engine::LucidosEngine::canonicalize_artifact_path(&path?).to_string();
     // The memory indexer's filter: binaries and engine bookkeeping files say
     // nothing a summary line could use.

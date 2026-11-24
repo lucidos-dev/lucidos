@@ -27,8 +27,6 @@ describe('foldSafeAreaReading', () => {
     expect(foldSafeAreaReading(undefined, PORTRAIT)).toEqual({ remembered: PORTRAIT, floor: null });
   });
 
-  // The reported state: back from a phone call, every inset reads 0 and the
-  // header sits under the clock.
   it('floors every side to the remembered insets once they all read 0', () => {
     expect(foldSafeAreaReading(PORTRAIT, LOST)).toEqual({ remembered: PORTRAIT, floor: PORTRAIT });
   });
@@ -37,8 +35,6 @@ describe('foldSafeAreaReading', () => {
     expect(foldSafeAreaReading(undefined, LOST)).toEqual({ remembered: undefined, floor: null });
   });
 
-  // Seen with a Live Activity in the Dynamic Island: the header under the
-  // clock. A loss of the top alone must floor it too.
   it('floors the top when only the top drops to 0', () => {
     const topLost = { ...PORTRAIT, top: 0 };
     expect(foldSafeAreaReading(PORTRAIT, topLost)).toEqual({ remembered: PORTRAIT, floor: PORTRAIT });
@@ -49,24 +45,16 @@ describe('foldSafeAreaReading', () => {
     expect(foldSafeAreaReading(LANDSCAPE, notchLost).floor).toEqual(LANDSCAPE);
   });
 
-  // WebKit can pass through a half-lost reading on its way to the all-zero one.
-  // Remembering it would floor the top to 0 for the rest of the session.
   it('never lets a half-lost reading replace the remembered insets', () => {
     const halfLost = foldSafeAreaReading(PORTRAIT, { ...PORTRAIT, top: 0 });
     expect(foldSafeAreaReading(halfLost.remembered, LOST).floor).toEqual(PORTRAIT);
   });
 
-  // The bottom inset may drop on its own, for example while the keyboard is up.
-  // Flooring it would open a gap above the keys.
   it('leaves a lone bottom zero alone', () => {
     const keyboardUp = { ...PORTRAIT, bottom: 0 };
     expect(foldSafeAreaReading(PORTRAIT, keyboardUp)).toEqual({ remembered: keyboardUp, floor: null });
   });
 
-  // Mid-rotation, one frame can file one orientation's insets under the other's
-  // shape. A real loss only takes insets away, so a reading that gains one is
-  // real, and the memory was wrong. Kept, it would floor every later reading,
-  // and storage would keep it across launches.
   it('replaces a memory that belongs to another shape', () => {
     expect(foldSafeAreaReading(PORTRAIT, LANDSCAPE)).toEqual({ remembered: LANDSCAPE, floor: null });
     expect(foldSafeAreaReading(LANDSCAPE, PORTRAIT)).toEqual({ remembered: PORTRAIT, floor: null });
@@ -85,8 +73,6 @@ describe('foldSafeAreaReading', () => {
 describe('createSafeAreaMemory', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  // The PWA is often evicted and relaunched cold. A launch that starts in the
-  // lost state must still find the insets an earlier launch read.
   it('floors a cold launch into the lost state from the insets a previous launch saw', () => {
     const storage = memoryStorage();
     createSafeAreaMemory(storage).set('portrait:393', PORTRAIT);
@@ -130,7 +116,6 @@ describe('createSafeAreaMemory', () => {
     expect(warn).toHaveBeenCalledOnce();
   });
 
-  // An iPad window resize visits many widths, and each width is a shape.
   it('keeps only the most recently seen shapes', () => {
     const storage = memoryStorage();
     const memory = createSafeAreaMemory(storage);

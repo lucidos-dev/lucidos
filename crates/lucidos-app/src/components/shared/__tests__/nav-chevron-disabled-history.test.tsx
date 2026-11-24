@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A disabled chevron opens no history menu.
- *
- * It takes pointer events so its tooltip shows (`.nav-chevron:disabled` in
- * global/host-components.css). Chromium and WebKit then deliver `pointerdown`
- * and `contextmenu` to it, but never `click`. So a hold or a right-click
- * opened a "No history" menu that a second tap on the chevron could not close.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 

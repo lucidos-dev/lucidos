@@ -35,7 +35,6 @@ function sample(pages: number): MemSample {
   return { pages, limit: 19_748_080, gpuCount: 1, gpuRssKb: 2048 };
 }
 
-/** A sampler that hands out the given page counts in order. */
 function samplerOf(...pages: number[]) {
   return vi.fn(async () => sample(pages.shift() ?? 0));
 }
@@ -154,7 +153,6 @@ describe('MemSampleReporter', () => {
   });
 
   it("measures each worker against its own previous sample, and a first test against the start", async () => {
-    // start=100; w0 → 110; w1 → 130; w0 → 135; w1 → 200
     const r = new MemSampleReporter({ platform: 'darwin', env, readSample: samplerOf(100, 110, 130, 135, 200) });
     r.onBegin(config);
     r.onTestEnd(fakeTest('w0-a'), fakeResult(0));

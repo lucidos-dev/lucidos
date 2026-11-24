@@ -36,14 +36,16 @@ fn fresh_session_handoff(flags: &str) -> String {
     )
 }
 
-/// The option that keeps the work in this thread, which the flow names.
-const STAY_OPTION: &str = "your flow's option to stay in this session (`Approve here` for a plan, \
-    else `Continue here`)";
+const IMPLEMENTER_CHOICE: &str = "Follow the flow's backend policy configured in the \
+    repository's checkpoint instructions, or the user's explicit backend choice. Without a policy, keep this thread's backend. \
+    Offer or recommend another backend only when the user requests it or the policy permits it, \
+    and its ladder was read. Intelligence fit takes priority over backend preference. \
+    An installed backend alone never requires an option. ";
 
-/// How the agent picks the successor's implementer. The rung is the agent's
-/// judgement, because only the agent has read the work left (ADR 0486). It
-/// names no model and no effort: those live on the ladder (ADR 0500).
-const IMPLEMENTER_CHOICE: &str = "Recommend the successor's implementer by your judgement of \
+const PLAN_IMPLEMENTER_CHOICE: &str = "At plan approval, always offer a fresh session on each \
+    readable backend. Backend policy chooses the recommendation, never which backends are offered.";
+
+const INTELLIGENCE_FIT: &str = "Choose the successor's implementer by your judgement of \
     the work left, such as a plan, as a rung on the intelligence ladder above. A higher rung is \
     more intelligent, costs more and runs longer. Turn intelligence down for settled work: a \
     fully specified plan with settled decisions suits a lower rung. Turn it up for hard or open \
@@ -52,126 +54,190 @@ const IMPLEMENTER_CHOICE: &str = "Recommend the successor's implementer by your 
     costs on every turn. Say why in one line of your message. Name a rung by its picker label \
     and effort, as the ladder prints them. Name the backend only when it is not this thread's.";
 
-/// The paying card's options: the estimate alone calls for a fresh session.
-fn paying_options() -> String {
-    format!(
-        "Offer, in order: `Implement in a fresh session: <implementer> (Recommended)`; `Implement \
-         in a fresh session: <this thread's implementer>`, only when it differs; {STAY_OPTION}; \
-         then a real fork of the decision if it has one. That is never more than 4 options, and \
-         never `Request changes`."
-    )
+/// At plan approval a fresh session that does not pay leaves staying here as
+/// the recommendation, so `Approve here` carries the label and leads.
+fn approve_here_recommended(plan: bool, paying: bool) -> bool {
+    plan && !paying
 }
 
-/// The card's options when the handoff does not pay. A fresh session then
-/// saves only through a lower rung, so it never offers this thread's own
-/// (ADR 0497). A thread with a rung above it may also raise (ADR 0499).
-fn lower_options(raise: bool) -> String {
-    let lower = format!(
-        "If your pick is a lower rung than this thread's, offer, in order: `Implement in a fresh \
-         session: <implementer> (Recommended)`; {STAY_OPTION}; then a real fork of the decision \
-         if it has one. That is never `Request changes`."
-    );
-    if !raise {
-        return format!("{lower} Otherwise:");
+/// Allocate scarce card slots, then display the recommended option first.
+fn card_slots(
+    plan: bool,
+    other: bool,
+    recommended: bool,
+    on_other: bool,
+    paying: bool,
+    fork: bool,
+) -> String {
+    let has_r = plan || recommended;
+    let candidates = [
+        ('A', true),
+        ('P', plan),
+        ('X', other && !(has_r && on_other)),
+        ('R', has_r),
+        ('F', fork),
+        ('T', paying && recommended),
+    ];
+    let selected: Vec<char> = candidates
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .take(4)
+        .map(|(code, _)| code)
+        .collect();
+    let order = if !has_r || approve_here_recommended(plan, paying) {
+        ['A', 'R', 'X', 'T', 'P', 'F']
+    } else {
+        ['R', 'X', 'T', 'A', 'P', 'F']
+    };
+    order
+        .into_iter()
+        .filter(|code| selected.contains(code))
+        .collect()
+}
+
+fn card_examples(plan: bool, other: bool, recommended: bool, paying: bool) -> String {
+    let mut out = String::new();
+    for on_other in [false, true] {
+        if on_other && (!recommended || !other) {
+            continue;
+        }
+        for fork in [false, true] {
+            let slots = card_slots(plan, other, recommended, on_other, paying, fork);
+            let backend = if on_other {
+                "Other-backend"
+            } else {
+                "Same-backend"
+            };
+            let shape = if !recommended {
+                "No recommendation".to_string()
+            } else if approve_here_recommended(plan, paying) {
+                format!("Stay-here recommendation, {backend} R")
+            } else {
+                format!("{backend} recommendation")
+            };
+            out.push_str(&format!(
+                "\n- {shape}, {} real fork: {}.",
+                if fork { "with a" } else { "without a" },
+                slots
+                    .chars()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            if fork && !slots.contains('F') {
+                out.push_str(" Name the fork in the question as a typed reply.");
+            }
+        }
     }
-    format!(
-        "{lower} Else, if the work is hard or long, a higher rung builds it better: offer \
-         `Implement in a fresh session: <a higher rung> (Recommended)`; {STAY_OPTION}; then a real \
-         fork of the decision if it has one. That is never more than 3 options, and never \
-         `Request changes`. Raise one or two rungs, never to the top for a builder. Otherwise:"
-    )
+    out
 }
 
-/// The card with no fresh session to offer.
-const FLOOR: &str = "Ask the question your flow asks here, with its own options, and offer no \
-    fresh session. A plan's is `Approve` / `Request changes`, where a real fork takes the second \
-    slot. If your flow asks no question here, carry on and ask nothing.";
-
-/// The offered card's shape at the checkpoint run named by `flags`. Three
-/// reasons offer a fresh session. The session is past its *context ceiling*
-/// (ADR 0629), or the engine's *handoff estimate* says it pays. Or, at any
-/// size, the agent picks a lower rung than this thread's (ADR 0497). A thread
-/// with a rung above its own may also raise (ADR 0499).
-/// The engine decides whether it pays and owns the ladder, so this compares
-/// neither itself. An unreadable reply offers the floor and says so.
 pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str) -> String {
-    use crate::intelligence_ladder::Ladder;
-    use crate::successor::{ContextReading, Implementer};
-    let runs_on = |implementer: Option<&Implementer>, ladder: Option<&Ladder>| {
-        let runs = implementer
-            .map(|i| format!("This thread runs on {}.", i.describe()))
-            .unwrap_or_else(|| {
-                "Lucidos could not read this thread's implementer, so name the model you run on."
-                    .to_string()
-            });
-        let ladder = ladder.map(Ladder::render).unwrap_or_else(|| {
-            "Lucidos could not read the intelligence ladder: run `lucidos intelligence-ladder` \
-             before you recommend."
-                .to_string()
-        });
-        format!("{runs}\n\n{ladder}\n\n")
+    use crate::successor::ContextReading;
+    let plan = flags
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair == ["--at", "plan-approval"]);
+    let plan_only = if plan {
+        " P = `Commit plan for later`. That pick runs `lucidos planned approve --plan-only`, commits only the plan, and ends the turn. It never authorizes implementation."
+    } else {
+        ""
     };
-    let size = |tokens: Option<u64>| {
-        tokens
-            .map(|t| format!("{}k tokens", t / 1000))
-            .unwrap_or_else(|| "unmeasured".to_string())
+    let floor = || {
+        if plan {
+            format!("Use your normal user question tool with `Approve`, `Commit plan for later` and a real fork if any. Follow-up questions may choose the successor backend and rung. A typed reply requests changes. Offer no handoff because the engine reading is unavailable or handoff is blocked.{plan_only}")
+        } else {
+            "Use the flow's own question and options if it asks one here; otherwise carry on. Offer no handoff because the engine reading is unavailable or handoff is blocked.".to_string()
+        }
     };
-    match reading {
-        ContextReading::Read {
-            can_hand_off: true,
-            past_ceiling: true,
-            input_tokens,
-            implementer,
-            ladder,
-            ..
-        } => format!(
-            "This session is past its context ceiling: this thread's context is {}, so \
-             recommend a fresh session whatever the handoff estimate says. \
-             {}{IMPLEMENTER_CHOICE} {} {}",
-            size(input_tokens),
-            runs_on(implementer.as_ref(), ladder.as_ref()),
-            paying_options(),
-            fresh_session_handoff(flags)
-        ),
-        ContextReading::Read {
-            can_hand_off: true,
-            pays: true,
-            input_tokens,
-            implementer,
-            ladder,
-            ..
-        } => format!(
-            "The handoff estimate says a fresh session pays here: this thread's context is {}. \
-             {}{IMPLEMENTER_CHOICE} {} {}",
-            size(input_tokens),
-            runs_on(implementer.as_ref(), ladder.as_ref()),
-            paying_options(),
-            fresh_session_handoff(flags)
-        ),
-        ContextReading::Read {
-            can_hand_off: true,
-            input_tokens,
-            implementer,
-            ladder,
-            ..
-        } => format!(
-            "This thread's context is {}, where the handoff estimate says a fresh session does \
-             not pay, so a fresh session pays off only through its implementer. {}\
-             {IMPLEMENTER_CHOICE} {} {FLOOR} {}",
-            size(input_tokens),
-            runs_on(implementer.as_ref(), ladder.as_ref()),
-            lower_options(
-                ladder
-                    .as_ref()
-                    .is_some_and(Ladder::has_higher_intelligence_rung)
-            ),
-            fresh_session_handoff(flags)
-        ),
-        ContextReading::Read { .. } => FLOOR.to_string(),
-        ContextReading::Unknown => format!(
-            "{FLOOR} Lucidos could not read this thread's context, so it offers no fresh session."
-        ),
+    let ContextReading::Read {
+        input_tokens,
+        can_hand_off: true,
+        pays,
+        past_ceiling,
+        implementer,
+        ladder,
+    } = reading
+    else {
+        return floor();
+    };
+    let Some(ladder) = ladder else {
+        return floor();
+    };
+    let paying = pays || past_ceiling;
+    let other = ladder
+        .other_backend_ladders
+        .iter()
+        .find(|l| !l.intelligence_rungs.is_empty());
+    let lead = if past_ceiling {
+        "This session is past its context ceiling: recommend a fresh session whatever the estimate says."
+    } else if pays {
+        "The handoff estimate says a fresh session pays here: recommend a fresh session."
+    } else if plan {
+        "The handoff estimate says a fresh session does not pay here. Offer a fresh session, but recommend staying here."
+    } else {
+        "The handoff estimate says a fresh session does not pay here. Recommend one only for a lower rung that fits the work."
+    };
+    let raise = if !plan && !paying && ladder.has_higher_intelligence_rung() {
+        " If no lower rung fits and hard or long work needs more intelligence, recommend one or two rungs above this thread, never the top."
+    } else {
+        ""
+    };
+    let runs = implementer
+        .map(|i| format!("This thread runs on {}. ", i.describe()))
+        .unwrap_or_default();
+    let size = input_tokens
+        .map(|n| format!("Context: {}k tokens. ", n / 1000))
+        .unwrap_or_default();
+    let alternative = other.map(|l| format!(" X = `Implement in a fresh session: <rung> on {}`. {} Merge it into R when R names this backend. Choose its rung from the other ladder above.", l.surface, if plan { "Always offer X at plan approval." } else { "X is optional: offer it only when the user requests it or the flow's backend policy permits it, and it is relevant to the work." })).unwrap_or_default();
+    let question_flow = "Use your normal user question tool. Offer a short set of relevant choices, not every rung. You may ask multiple questions, such as backend first and rung next. Each question has at most four options. The following shapes are single-question examples, not an exhaustive questionnaire.";
+    let choice_policy = if plan {
+        PLAN_IMPLEMENTER_CHOICE
+    } else {
+        IMPLEMENTER_CHOICE
+    };
+    let (a_label, r_label, order) = if approve_here_recommended(plan, paying) {
+        (
+            "Approve here (Recommended)",
+            "Implement in a fresh session: <rung>",
+            "A, R, X, P, F",
+        )
+    } else {
+        (
+            if plan {
+                "Approve here"
+            } else {
+                "Continue here"
+            },
+            "Implement in a fresh session: <rung> (Recommended)",
+            "R, X, T, A, P, F, with A first when R is absent",
+        )
+    };
+    let mut out = format!("{question_flow}\n\n{lead}{raise} {size}{runs}\n\n{}\n\n{choice_policy} {INTELLIGENCE_FIT}\n\nFor choices sharing a question: A = `{a_label}`.{} R = `{r_label}`; when R uses the other backend, name it in the label and merge X into R.{} F = a real fork, only if there is one.{} Fill slots in priority A, P, X, R, F, T, omitting ineligible options; display them in order {order}. When an option is recommended, it comes first and carries `(Recommended)`; never move the label to another option. A typed reply requests changes; do not spend a slot on it.",
+        ladder.render(), plan_only, alternative,
+        if paying { " T = `Implement in a fresh session: <this thread's rung>`, only when it differs from R." } else { "" });
+    if plan {
+        out.push_str(" Always offer R at plan approval. Choose its rung by intelligence fit for the work left, whether lower, equal or higher. A higher pick takes only one or two rungs above this thread, never the top.");
+        out.push_str("\nDefault option codes, with every readable backend:");
+        out.push_str(&card_examples(true, other.is_some(), true, paying));
+    } else {
+        out.push_str("\nDefault option codes, keeping this thread's backend:");
+        out.push_str(&card_examples(false, false, true, paying));
+        if !paying {
+            out.push_str(&card_examples(false, false, false, false));
+        }
+        if other.is_some() {
+            out.push_str("\nOnly when the flow's backend policy or user request permits another backend, relevant alternatives may use these shapes:");
+            out.push_str(&card_examples(false, true, true, paying));
+            if !paying {
+                out.push_str(&card_examples(false, true, false, false));
+            }
+        }
     }
+    out.push_str(&format!("\n{}", fresh_session_handoff(flags)));
+    out.push_str(&format!("\n\nVerdict: {lead}{raise}"));
+    out
 }
 
 /// Which kind of planning decision is being recorded.
@@ -187,15 +253,14 @@ pub(crate) enum MarkKind<'a> {
     SecurityFix { reason: &'a str, files: Vec<String> },
 }
 
-/// Planned-marker gate state, mirroring the engine's three-way wire `state`
-/// field. `Satisfied` = an approved plan or a `--simple` ack (gate passes);
-/// `Proposed` = a plan awaiting the user's approval (gate blocks, but the path
-/// forward is `approve`, not re-planning); `Missing` = no marker.
+/// Planned-marker gate state from the engine. Only `Satisfied` permits edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlannedState {
     Satisfied,
     Proposed,
     Missing,
+    Changed,
+    Unreadable,
 }
 
 impl PlannedState {
@@ -203,8 +268,9 @@ impl PlannedState {
         match raw.trim() {
             "SATISFIED" => PlannedState::Satisfied,
             "PROPOSED" => PlannedState::Proposed,
-            // Unknown / unreachable engine / empty body => Missing so a
-            // transient error doesn't silently let an unplanned edit through.
+            "CHANGED" => PlannedState::Changed,
+            "UNREADABLE" => PlannedState::Unreadable,
+            // Unknown state labels also block edits.
             _ => PlannedState::Missing,
         }
     }
@@ -214,18 +280,95 @@ impl PlannedState {
             PlannedState::Satisfied => "SATISFIED",
             PlannedState::Proposed => "PROPOSED",
             PlannedState::Missing => "MISSING",
+            PlannedState::Changed => "CHANGED",
+            PlannedState::Unreadable => "UNREADABLE",
         }
     }
 }
 
-pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxError> {
+/// Record the beginning of planning on the signed calling thread.
+pub(crate) fn cmd_start(ws: &Workspace, kind: &str) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/internal/start-plan", ws.base_url());
+    let resp = http_client()?
+        .post(&url)
+        .json(&serde_json::json!({ "kind": kind }))
+        .send_with_connect_retry()?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("planned start returned {}: {}", status, resp.text()?).into());
+    }
+    println!("Planning started ({kind}). This grants no source edit permission.");
+    Ok(())
+}
+
+fn check_plan_prose(cwd: &std::path::Path, head: &str, plan: &str) -> Result<(), BoxError> {
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use std::process::Command;
+
+    let toplevel = run_git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let worktree = Path::new(&toplevel);
+    let mut checked_revision = false;
+    let mut failures = Vec::new();
+    for script in ["scripts/check-prose.sh", "scripts/check-em-dashes.sh"] {
+        match std::fs::symlink_metadata(worktree.join(script)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Could not inspect {script}: {error}").into()),
+        }
+        if !checked_revision {
+            // The gates scan the worktree. The marker records the committed plan.
+            let status = Command::new("git")
+                .current_dir(worktree)
+                .args(["--literal-pathspecs", "diff", "--quiet", head, "--", plan])
+                .status()
+                .map_err(|error| format!("Could not verify the committed plan: {error}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "Could not verify {plan} against the committed plan ({status}). Commit the plan before marking it."
+                )
+                .into());
+            }
+            checked_revision = true;
+        }
+        let output = Command::new("/bin/bash")
+            .current_dir(worktree)
+            .args([script, "--path", plan])
+            .output()
+            .map_err(|error| format!("Could not run {script} for {plan}: {error}"))?;
+        if !output.status.success() {
+            failures.push(format!(
+                "{script} failed for {plan} ({}).\n{}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Plan marker refused. Fix the reported problems, commit the plan and run `lucidos planned mark --plan` again.\n{}",
+        failures.join("\n")
+    )
+    .into())
+}
+
+pub(crate) fn cmd_mark(
+    ws: &Workspace,
+    kind: MarkKind<'_>,
+    plan_kind: &str,
+) -> Result<(), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/mark-planned", ws.base_url());
     let (state, plan_path, reason, files) = match &kind {
-        // A written plan starts AWAITING APPROVAL — the skill records `proposed`,
-        // the user approves in chat, then the agent runs `planned approve`.
-        MarkKind::Plan(p) => ("proposed", Some(*p), None, Vec::new()),
+        // The engine decides whether the committed plan already has approval.
+        MarkKind::Plan(p) => {
+            check_plan_prose(&cwd, &head_sha, p)?;
+            ("proposed", Some(*p), None, Vec::new())
+        }
         MarkKind::Simple(r) => ("acknowledged_simple", None, Some(*r), Vec::new()),
         MarkKind::SecurityFix { reason, files } => {
             ("bounded_security_fix", None, Some(*reason), files.clone())
@@ -236,6 +379,7 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         "branch_name": branch,
         "head_sha": head_sha,
         "state": state,
+        "kind": plan_kind,
         "plan_path": plan_path,
         "reason": reason,
         "files": files,
@@ -255,6 +399,9 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
             .into());
     }
     match kind {
+        MarkKind::Plan(p) if status == reqwest::StatusCode::OK => {
+            println!("Plan approval carried forward: {} ({}). Continue implementation.", branch, p);
+        }
         // Naming the question tool here matters: this line is what the agent
         // reads at the exact moment it turns to present the plan. Told only to
         // "present it", it writes prose and the thread sits idle until the user
@@ -283,17 +430,26 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
     Ok(())
 }
 
-/// Approve the proposed plan on the current branch (in $PWD), flipping the
-/// marker to gate-satisfying `planned` so source edits and Apply unblock. Run
-/// by the coding agent AFTER the user approves the plan in chat. POSTs to the
-/// parent engine's `/api/v1/internal/approve-plan`.
-pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
+/// What a full approval tells the agent to do next. A fresh-session pick also
+/// approves the full scope, so the text names both paths.
+fn implementation_approved_text(branch: &str) -> String {
+    format!(
+        "Plan approved: {branch}. Implementation is unblocked. \
+         If the user picked a fresh session, hand off now. \
+         Otherwise the user approved building in this session: start the first phase now, in this turn. \
+         An earlier instruction to stop for approval is now met."
+    )
+}
+
+/// Approve the recorded plan for the scope the user chose.
+pub(crate) fn cmd_approve(ws: &Workspace, plan_only: bool) -> Result<(), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/approve-plan", ws.base_url());
     let body = serde_json::json!({
         "repo_root": repo_root.to_string_lossy(),
         "branch_name": branch,
+        "plan_only": plan_only,
     });
     let resp = http_client()?
         .post(&url)
@@ -313,7 +469,14 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
         .json()
         .map_err(|e| format!("POST {} returned non-JSON body: {}", url, e))?;
     if body.get("approved").and_then(|v| v.as_bool()) == Some(true) {
-        println!("Plan approved: {}. Implementation is unblocked.", branch);
+        if body.get("plan_only").and_then(|v| v.as_bool()) == Some(true) {
+            println!(
+                "Plan approved for later: {}. Only plan files may land.",
+                branch
+            );
+        } else {
+            println!("{}", implementation_approved_text(&branch));
+        }
         if let Some(plan_path) = body.get("plan_path").and_then(|v| v.as_str()) {
             // The marker is already approved. A failed file edit must not
             // read as a failed approval, so it only warns.
@@ -340,40 +503,24 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
 }
 
 /// The engine's own words when it refuses a marker write the agent can fix:
-/// an approval the user has not given, or a branch the thread's Apply never
-/// lands. The agent then reads what to do, not an HTTP status. `None` for any
+/// an approval the user has not given, a batch approval of plan text that has
+/// changed since, or a branch the thread's Apply never lands. The agent then reads what to do, not an HTTP status. `None` for any
 /// other error body.
 fn marker_refusal(body: &str) -> Option<String> {
     let body: serde_json::Value = serde_json::from_str(body).ok()?;
     let reason = body.get("reason")?.as_str()?;
-    if !matches!(reason, "no-plan-approval" | "marker-off-tracked-branch") {
+    if !matches!(
+        reason,
+        "no-plan-approval" | "plan-changed" | "marker-off-tracked-branch"
+    ) {
         return None;
     }
     Some(body.get("error")?.as_str()?.to_string())
 }
 
-/// The status line the `implementation-plan` skill writes into a new plan.
-pub(crate) const PROPOSED_STATUS: &str = "- **Status**: Proposed";
-/// What `planned approve` rewrites it to.
-pub(crate) const APPROVED_STATUS: &str = "- **Status**: Approved";
-
-/// The plan text with its status line flipped to approved. `None` when it has
-/// no proposed status line, as in a plan written before the line existed.
-pub(crate) fn approved_plan_text(text: &str) -> Option<String> {
-    let mut flipped = false;
-    let out: String = text
-        .split_inclusive('\n')
-        .map(|line| {
-            if !flipped && line.trim_end() == PROPOSED_STATUS {
-                flipped = true;
-                line.replacen(PROPOSED_STATUS, APPROVED_STATUS, 1)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    flipped.then_some(out)
-}
+#[path = "../../lucidos-core/src/core/plan_status.rs"]
+mod plan_status;
+use plan_status::{approved_plan_text, APPROVED_STATUS};
 
 /// Flip the plan file's status line and commit it, so the file on main says
 /// what the marker says. Returns whether it committed anything.
@@ -424,7 +571,7 @@ pub(crate) fn query_state(ws: &Workspace) -> Result<PlannedState, BoxError> {
     Ok(PlannedState::parse(state))
 }
 
-/// Print `SATISFIED`, `PROPOSED`, or `MISSING` for the current branch to stdout.
+/// Print the current branch’s plan marker state to stdout.
 pub(crate) fn cmd_state(ws: &Workspace) -> Result<(), BoxError> {
     let state = query_state(ws)?;
     println!("{}", state.as_str());
@@ -436,6 +583,79 @@ mod tests {
     use super::*;
     use crate::intelligence_ladder::{IntelligenceRung, Ladder};
     use crate::successor::{ContextReading, Implementer};
+
+    #[test]
+    fn plan_checks_skip_absent_scripts() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]).unwrap();
+        check_plan_prose(repo.path(), "unused", "docs/plans/plan.md").unwrap();
+    }
+
+    #[test]
+    fn plan_checks_report_gate_hits_and_unexpected_exit() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        run_git(root, &["init"]).unwrap();
+        let plan = "docs/plans/plan.md";
+        std::fs::create_dir_all(root.join("docs/plans")).unwrap();
+        std::fs::write(root.join(plan), "Plan text.").unwrap();
+        run_git(root, &["add", plan]).unwrap();
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-m",
+                "Add plan",
+            ],
+        )
+        .unwrap();
+        let worktree = root.join("linked");
+        run_git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let cwd = worktree.join("docs");
+        std::fs::create_dir(worktree.join("scripts")).unwrap();
+        std::fs::write(
+            worktree.join("scripts/check-prose.sh"),
+            "test \"$1 $2\" = '--path docs/plans/plan.md' || exit 2\necho 'plan.md:1:too long' >&2\nexit 1",
+        ).unwrap();
+        std::fs::write(
+            worktree.join("scripts/check-em-dashes.sh"),
+            "echo 'scanner crashed'\nexit 42",
+        )
+        .unwrap();
+
+        let error = check_plan_prose(&cwd, "HEAD", plan)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Plan marker refused"), "{error}");
+        assert!(error.contains("plan.md:1:too long"), "{error}");
+        assert!(error.contains("exit status: 42"), "{error}");
+        assert!(error.contains("scanner crashed"), "{error}");
+
+        std::fs::write(worktree.join(plan), "Uncommitted revision.").unwrap();
+        let error = check_plan_prose(&cwd, "HEAD", plan)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Commit the plan before marking it"),
+            "{error}"
+        );
+    }
 
     const FLAGS: &str = "--at plan-approval --progress 0/4";
 
@@ -458,7 +678,15 @@ mod tests {
                 step("m-c", "high"),
             ],
             current,
+            current_pair: current.map(|i| {
+                format!(
+                    "m-{} at {}",
+                    ["a", "b", "c"][i],
+                    ["low", "medium", "high"][i]
+                )
+            }),
             reference: None,
+            other_backend_ladders: Vec::new(),
         }
     }
 
@@ -475,166 +703,252 @@ mod tests {
                     model: Some("m-b".into()),
                     reasoning_effort: Some("medium".into()),
                 }),
-                ladder,
+                ladder: ladder.map(Box::new),
             },
         }
     }
 
-    /// I8: the raise clause needs a readable verdict that does not pay and a
-    /// rung above the thread's own. The lower pick (ADR 0497) stays on every
-    /// card that does not pay.
     #[test]
-    fn the_raise_clause_needs_a_non_paying_thread_with_a_higher_rung() {
-        for (pays, ladder, raise) in [
-            (Some(false), Some(ladder(Some(0))), true),
-            (Some(false), Some(ladder(Some(1))), false),
-            (Some(false), Some(ladder(Some(2))), false),
-            (Some(false), Some(ladder(None)), false),
-            (Some(false), None, false),
-            (Some(true), Some(ladder(Some(0))), false),
-            (None, Some(ladder(Some(0))), false),
-        ] {
-            let shape = card_shape(reading(pays, ladder.clone()), FLAGS);
-            assert_eq!(
-                shape.contains("`Implement in a fresh session: <a higher rung> (Recommended)`"),
-                raise,
-                "{pays:?} {ladder:?}: {shape}"
-            );
-            if raise {
-                assert!(shape.contains("never to the top for a builder"), "{shape}");
-                assert!(shape.contains("never `Request changes`"), "{shape}");
+    fn card_slots_follow_priority_and_display_order() {
+        assert_eq!(card_slots(true, true, true, false, true, true), "RXAP");
+        assert_eq!(card_slots(true, true, true, true, true, true), "RAPF");
+        assert_eq!(card_slots(true, true, false, false, false, true), "ARXP");
+        assert_eq!(card_slots(true, false, true, false, false, true), "ARPF");
+        assert_eq!(card_slots(false, true, true, false, true, true), "RXAF");
+        for plan in [false, true] {
+            for other in [false, true] {
+                for recommended in [false, true] {
+                    for on_other in [false, true] {
+                        for paying in [false, true] {
+                            for fork in [false, true] {
+                                let slots =
+                                    card_slots(plan, other, recommended, on_other, paying, fork);
+                                assert!(slots.len() <= 4);
+                                assert!(slots.contains('A'));
+                                let r_leads = (plan || recommended)
+                                    && !approve_here_recommended(plan, paying);
+                                let lead = if r_leads { 'R' } else { 'A' };
+                                assert_eq!(slots.chars().next(), Some(lead), "{slots}");
+                                assert_eq!(slots.contains('P'), plan);
+                                assert_eq!(
+                                    slots.contains('X'),
+                                    other && !((plan || recommended) && on_other)
+                                );
+                            }
+                        }
+                    }
+                }
             }
-            assert_eq!(
-                shape.contains("If your pick is a lower rung than this thread's"),
-                pays == Some(false),
-                "{pays:?} {ladder:?}: {shape}"
+        }
+    }
+
+    #[test]
+    fn full_approval_names_the_next_action_for_both_picks() {
+        let text = implementation_approved_text("feature");
+        assert!(text.starts_with("Plan approved: feature. Implementation is unblocked."));
+        assert!(text.contains("If the user picked a fresh session, hand off now."));
+        assert!(text.contains("start the first phase now, in this turn"));
+        assert!(text.contains("An earlier instruction to stop for approval is now met."));
+    }
+
+    #[test]
+    fn plan_and_successor_cards_report_current_outside_an_empty_ladder() {
+        let ladder = Ladder::parse(&serde_json::json!({
+            "surface": "codex",
+            "rungs": [],
+            "current": {"model": "custom-model", "effort": "high", "position": null},
+        }))
+        .unwrap();
+        for flags in [FLAGS, "--at phase-commit --progress 1/4"] {
+            let text = card_shape(reading(Some(false), Some(ladder.clone())), flags);
+            assert!(
+                text.contains("This thread runs on custom-model at high (off-ladder)."),
+                "{text}"
+            );
+            assert!(
+                !text.contains("recommend one or two rungs above this thread"),
+                "{text}"
             );
         }
     }
 
-    /// The model and effort names live on the ladder, never in the guidance
-    /// (ADR 0500). Scans the principle and both cards with no ladder
-    /// rendered, for every model the menus list and every effort word.
     #[test]
-    fn the_implementer_guidance_names_no_model_and_no_effort() {
-        let mut texts = vec![
-            IMPLEMENTER_CHOICE.to_string(),
-            lower_options(true),
-            paying_options(),
-        ];
-        for pays in [true, false] {
-            texts.push(card_shape(reading(Some(pays), None), FLAGS));
+    fn plan_only_is_only_offered_at_plan_approval_even_when_unreadable() {
+        for reading in [
+            reading(Some(true), Some(ladder(Some(1)))),
+            ContextReading::Unknown,
+        ] {
+            let plan = card_shape(reading.clone(), FLAGS);
+            assert!(plan.contains("Commit plan for later"));
+            assert!(plan.contains("planned approve --plan-only"));
+            assert!(plan.contains("normal user question tool"));
+            assert!(plan.contains("Follow-up questions") || plan.contains("multiple questions"));
+            assert!(!plan.contains("Request changes"));
+            let repo = card_shape(reading, "--at phase-commit --progress 1/4");
+            assert!(!repo.contains("Commit plan for later"));
+            assert!(!repo.contains("Request changes"));
         }
-        let mut banned: Vec<String> = Vec::new();
+    }
+
+    #[test]
+    fn unread_or_closed_reading_cannot_offer_a_handoff() {
+        let mut closed = reading(Some(true), Some(ladder(Some(1))));
+        if let ContextReading::Read { can_hand_off, .. } = &mut closed {
+            *can_hand_off = false;
+        }
+        for reading in [closed, ContextReading::Unknown] {
+            let text = card_shape(reading, FLAGS);
+            assert!(!text.contains("Implement in a fresh session"));
+            assert!(text.contains("`Approve`"));
+        }
+    }
+
+    #[test]
+    fn plan_approval_always_offers_the_other_readable_backend() {
+        for (current, alternative) in [("codex", "claude-code"), ("claude-code", "codex")] {
+            let mut own = ladder(Some(1));
+            own.surface = current.into();
+            let mut other = ladder(None);
+            other.surface = alternative.into();
+            own.other_backend_ladders.push(other);
+            for (pays, past_ceiling) in [(false, false), (true, false), (false, true)] {
+                let mut context = reading(Some(pays), Some(own.clone()));
+                if let ContextReading::Read {
+                    implementer,
+                    past_ceiling: ceiling,
+                    ..
+                } = &mut context
+                {
+                    implementer.as_mut().unwrap().coding_agent = current.into();
+                    *ceiling = past_ceiling;
+                }
+                let text = card_shape(context, FLAGS);
+                assert!(text.contains("Always offer X"));
+                let examples = text.split("Default option codes,").nth(1).unwrap();
+                assert!(examples.contains(if pays || past_ceiling {
+                    "R, X, A, P"
+                } else {
+                    "A, R, X, P"
+                }));
+                assert!(!examples.contains("Only when the flow's backend policy"));
+                assert!(text.contains(&format!("on {alternative}")));
+            }
+        }
+    }
+
+    #[test]
+    fn other_checkpoints_keep_backend_alternatives_optional() {
+        for flags in ["--at phase-commit --progress 1/4", "--at successor-choice"] {
+            for pays in [false, true] {
+                let mut own = ladder(Some(1));
+                let mut other = ladder(None);
+                other.surface = "codex".into();
+                own.other_backend_ladders.push(other);
+                let text = card_shape(reading(Some(pays), Some(own)), flags);
+                assert!(!text.contains("Always offer R"));
+                assert!(!text.contains("Always offer X"));
+                assert!(text.contains("Without a policy, keep this thread's backend"));
+                let examples = text.split("Default option codes,").nth(1).unwrap();
+                let (defaults, alternatives) = examples
+                    .split_once("Only when the flow's backend policy")
+                    .unwrap();
+                assert!(!defaults.contains("X"));
+                assert!(alternatives.contains("R, X, A"));
+                if !pays {
+                    assert!(defaults.contains("No recommendation, without a real fork: A."));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plan_approval_always_offers_r_with_an_honest_recommendation() {
+        for pays in [false, true] {
+            let text = card_shape(reading(Some(pays), Some(ladder(Some(1)))), FLAGS);
+            assert!(text.contains("Always offer R"));
+            assert_eq!(text.contains("`Approve here (Recommended)`"), !pays);
+            assert_eq!(text.contains("<rung> (Recommended)`"), pays);
+            assert!(text.contains("When an option is recommended, it comes first"));
+            for line in text.lines().filter(|line| line.starts_with("- ")) {
+                assert!(line.contains("R,"));
+                assert_eq!(line.starts_with("- Stay-here recommendation, "), !pays);
+                assert_eq!(line.contains(": A, R"), !pays, "{line}");
+            }
+            assert!(text.contains("only one or two rungs above this thread, never the top"));
+        }
+    }
+
+    #[test]
+    fn offered_shapes_end_with_the_verdict() {
+        for flags in [FLAGS, "--at successor-choice"] {
+            for (pays, past) in [(false, false), (true, false), (false, true)] {
+                let mut context = reading(Some(pays), Some(ladder(Some(0))));
+                if let ContextReading::Read { past_ceiling, .. } = &mut context {
+                    *past_ceiling = past;
+                }
+                let text = card_shape(context, flags);
+                let tail = text.lines().rev().take(10).collect::<Vec<_>>().join("\n");
+                assert!(tail.contains(if past {
+                    "past its context ceiling"
+                } else if pays {
+                    "fresh session pays here"
+                } else {
+                    "fresh session does not pay here"
+                }));
+                if flags != FLAGS && !pays && !past {
+                    assert!(text
+                        .lines()
+                        .last()
+                        .unwrap()
+                        .contains("recommend one or two rungs above this thread, never the top"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successor_choices_allow_short_follow_up_questions() {
+        let text = card_shape(
+            reading(Some(true), Some(ladder(Some(1)))),
+            "--at successor-choice",
+        );
+        assert!(text.contains("normal user question tool"));
+        assert!(text.contains("not every rung"));
+        assert!(text.contains("multiple questions"));
+        assert!(!text.contains("Ask one question"));
+    }
+
+    #[test]
+    fn static_card_guidance_names_no_model_or_effort() {
+        let text = format!(
+            "{} {}",
+            IMPLEMENTER_CHOICE,
+            card_shape(reading(Some(true), Some(ladder(Some(1)))), FLAGS)
+        );
         for menu in [
             crate::spawn_thread::CC_MENU,
             crate::spawn_thread::CODEX_MENU,
         ] {
-            let parsed: serde_json::Value = serde_json::from_str(menu).expect("menu parses");
-            for row in parsed["models"].as_array().expect("models") {
-                let value = row["value"].as_str().expect("value");
-                if value == "default" {
+            let menu: serde_json::Value = serde_json::from_str(menu).unwrap();
+            for row in menu["models"].as_array().unwrap() {
+                if row["value"] == "default" {
                     continue;
                 }
-                let label = row["label"].as_str().expect("label");
-                banned.push(value.to_string());
-                banned.push(label.to_string());
-                banned.push(label.split(' ').next().unwrap_or(label).to_string());
+                for key in ["value", "label"] {
+                    assert!(!text.contains(row[key].as_str().unwrap()));
+                }
             }
         }
-        let words = |text: &str| -> Vec<String> {
-            text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.')
-                .map(|w| w.trim_matches('.').to_string())
-                .collect()
-        };
-        for text in &texts {
-            // The thread's own implementer line quotes what it runs on.
-            let text = text.replace("claude-code with model m-b at medium effort", "");
-            for name in &banned {
-                assert!(!text.contains(name.as_str()), "names {name:?}: {text}");
-            }
-            for word in words(&text) {
-                assert!(
-                    !crate::spawn_thread::EFFORT_LEVELS.contains(&word.as_str()),
-                    "names the effort {word:?}: {text}"
-                );
-            }
-        }
-    }
-
-    /// I8: only a paying verdict recommends a fresh session on this thread's own
-    /// implementer, whatever the size.
-    #[test]
-    fn a_fresh_session_on_this_implementer_needs_a_paying_verdict() {
-        let paying = card_shape(reading(Some(true), Some(ladder(Some(1)))), FLAGS);
-        for needle in [
-            "The handoff estimate says a fresh session pays here",
-            "240k tokens",
-            "This thread runs on claude-code with model m-b at medium effort.",
-            "intelligence ladder, least to most intelligent",
-            "[this thread]",
-            "`Implement in a fresh session: <implementer> (Recommended)`",
-            "`Implement in a fresh session: <this thread's implementer>`, only when it differs",
-            "`Approve here` for a plan",
-            "never more than 4 options, and never `Request changes`",
-            "by your judgement of the work left",
-            "a fully specified plan with settled decisions suits a lower rung",
-            "lucidos successor start --narrative <file> --at plan-approval --progress 0/4`",
-            "the successor session starts in this thread once it ends",
-            "a plan flow approves the plan",
-            "remaining checkpoint instructions",
-            "picking this thread's implementer adds none",
+        // The rendered ladder and implementer may name efforts; the static principle cannot.
+        for guidance in [
+            IMPLEMENTER_CHOICE,
+            PLAN_IMPLEMENTER_CHOICE,
+            INTELLIGENCE_FIT,
         ] {
-            assert!(paying.contains(needle), "missing {needle:?}: {paying}");
-        }
-        let large_but_not_paying = card_shape(reading(Some(false), None), FLAGS);
-        assert!(
-            !large_but_not_paying.contains("<this thread's implementer>"),
-            "{large_but_not_paying}"
-        );
-        assert!(large_but_not_paying.contains("does not pay"));
-    }
-
-    /// ADR 0629: past the context ceiling the card recommends a fresh session
-    /// on this thread's implementer, whatever the estimate says.
-    #[test]
-    fn past_the_ceiling_the_card_recommends_a_fresh_session() {
-        for pays in [true, false] {
-            let mut past = reading(Some(pays), None);
-            if let ContextReading::Read { past_ceiling, .. } = &mut past {
-                *past_ceiling = true;
+            for word in guidance.split(|c: char| !c.is_ascii_alphanumeric()) {
+                assert!(!crate::spawn_thread::EFFORT_LEVELS.contains(&word));
             }
-            let shape = card_shape(past, FLAGS);
-            for needle in [
-                "past its context ceiling",
-                "240k tokens",
-                "`Implement in a fresh session: <implementer> (Recommended)`",
-                "lucidos successor start --narrative <file> --at plan-approval --progress 0/4`",
-            ] {
-                assert!(shape.contains(needle), "missing {needle:?}: {shape}");
-            }
-            assert!(!shape.contains("pays here"), "{shape}");
-            assert!(!shape.contains("does not pay"), "{shape}");
         }
-    }
-
-    #[test]
-    fn a_thread_that_cannot_hand_off_gets_the_floor() {
-        let closed = ContextReading::Read {
-            input_tokens: Some(400_000),
-            can_hand_off: false,
-            pays: true,
-            past_ceiling: true,
-            implementer: None,
-            ladder: None,
-        };
-        let shape = card_shape(closed, FLAGS);
-        assert_eq!(shape, FLOOR);
-        assert!(shape.contains("`Approve` / `Request changes`"));
-        assert!(!shape.contains("Implement in a fresh session"), "{shape}");
-        let unknown = card_shape(ContextReading::Unknown, FLAGS);
-        assert!(unknown.starts_with(FLOOR));
-        assert!(unknown.contains("could not read this thread's context"));
     }
 
     #[test]
@@ -648,6 +962,10 @@ mod tests {
             approved_plan_text("## Old plan\n\nNo status line.\n"),
             None,
             "a plan written before the status line existed is left alone"
+        );
+        assert_eq!(
+            approved_plan_text("- **Status**: Approved\n- **Status**: Proposed\n"),
+            None
         );
     }
 
@@ -679,6 +997,10 @@ mod tests {
         assert_eq!(PlannedState::parse("SATISFIED"), PlannedState::Satisfied);
         assert_eq!(PlannedState::parse("PROPOSED"), PlannedState::Proposed);
         assert_eq!(PlannedState::parse("MISSING"), PlannedState::Missing);
+        assert_eq!(PlannedState::parse("CHANGED"), PlannedState::Changed);
+        assert_eq!(PlannedState::Changed.as_str(), "CHANGED");
+        assert_eq!(PlannedState::parse("UNREADABLE"), PlannedState::Unreadable);
+        assert_eq!(PlannedState::Unreadable.as_str(), "UNREADABLE");
     }
 
     #[test]

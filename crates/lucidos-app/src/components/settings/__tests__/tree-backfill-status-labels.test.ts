@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * What the Tree backfill row says. The tree count holds while one long tree
- * builds, so a detail line counts its summaries. A failed summary says it
- * retries, and a missing model wins over a retry, since nothing moves without
- * one. A spend line shows what the backfill has cost, and a backfill held at
- * its cap offers Continue and a switch to Classic.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { BackfillProgress } from '../../../api/types';
 import { NO_BACKFILL_PROGRESS, treeBackfill } from '../../../store/actions/treeBackfill';
@@ -134,6 +127,20 @@ describe('the Tree backfill row', () => {
     render(h(TreeBackfillStatus, { onPickModel: () => {}, onSwitchToClassic: () => {} }), host);
     unmount = () => render(null, host);
     expect(labels(host)).toEqual(['Ready. some-model is not answering, retrying: pick another model']);
+  });
+
+  it('shows a live spend-cap hold after the backfill finished', async () => {
+    const { h, render } = await import('preact');
+    const { TreeBackfillStatus } = await import('../TreeBackfillStatus');
+    treeBackfill.value = {
+      status: 'loaded',
+      data: { state: 'ready', filling: { ...LAST_TREE, done: 15, ready: true,
+        spend_cap_held_until: '2030-01-01T12:00:00Z', spend_cap_resets_at: null } },
+    };
+    render(h(TreeBackfillStatus, { onPickModel: () => {}, onSwitchToClassic: () => {} }), host);
+    unmount = () => render(null, host);
+    expect(labels(host)).toEqual(['Waiting for the spend cap to reset. Reset time not supplied.']);
+    expect(host.querySelector('[data-role="tree-backfill"]')?.hasAttribute('data-working')).toBe(false);
   });
 
   it('puts a missing model before a retry, and stops looking busy', async () => {

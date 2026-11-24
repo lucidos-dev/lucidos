@@ -7,10 +7,6 @@ import { threadLink } from './ChildCompletionRow';
 import { successorLinkTitle } from './SuccessorNotice';
 import { CardOption } from './SuccessorCard';
 
-/** A warning on top of the composer of a thread that handed off to a
- *  *legacy successor thread*, once the user starts writing there. Commits made here
- *  are set aside once the successor's change lands (ADR 0474). *Send here
- *  anyway* hides it until the composer is cleared. */
 export function HandedOffCard() {
   const threadId = focusedThreadId.value;
   const thread = threadId ? threadMap.value.get(threadId) : undefined;
@@ -24,7 +20,6 @@ export function HandedOffCard() {
   const target = threadId && thread?.meta.successor ? latestSuccessor(threadId) : null;
   const open = target !== null && writing && dismissedFor !== threadId;
 
-  // The last card shown, so it keeps its words while it rolls shut.
   const shown = useRef<{ threadId: string; target: string } | null>(null);
   if (open && threadId && target) shown.current = { threadId, target };
   const last = shown.current;

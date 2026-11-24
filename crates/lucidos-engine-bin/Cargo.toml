@@ -1,0 +1,34 @@
+[package]
+name = "lucidos-engine-bin"
+version.workspace = true
+edition.workspace = true
+default-run = "lucidos-engine"
+
+[[bin]]
+name = "lucidos-engine"
+path = "src/main.rs"
+
+[features]
+e2e-test-hooks = ["lucidos-agents-api/e2e-test-hooks"]
+real-embedder-tests = ["lucidos-agents-api/real-embedder-tests"]
+
+[dependencies]
+lucidos-agents-api = { path = "../lucidos-agents-api" }
+lucidos-engine = { path = "../lucidos-engine" }
+lucidos-engine-boot = { path = "../lucidos-engine-boot" }
+lucidos-event-hooks = { path = "../lucidos-event-hooks" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+lucidos-home = { path = "../lucidos-home" }
+lucidos-owner-lock = { path = "../lucidos-owner-lock" }
+lucidos-engine-socket = { path = "../lucidos-engine-socket" }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+dotenvy = "0.15"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+[dev-dependencies]
+tempfile = "3"

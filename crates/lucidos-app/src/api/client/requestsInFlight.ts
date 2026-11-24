@@ -17,7 +17,6 @@ const pending = new Set<Pending>();
 export interface RequestsInFlight {
   count: number;
   oldestMs: number | null;
-  /** The paths of the oldest few, oldest first, without their query. */
   oldestPaths: string[];
 }
 
@@ -30,7 +29,6 @@ function pathOf(url: string): string {
   }
 }
 
-/** Count a request from now until the returned function runs. */
 export function trackRequest(url: string): () => void {
   const entry: Pending = { path: pathOf(url), startedAt: Date.now() };
   pending.add(entry);

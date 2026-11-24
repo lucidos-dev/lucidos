@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Whatever animates in animates out (`.claude/rules/frontend.md` § Every
- * Expand and Collapse Rolls). A backdrop modal fades in with `modal-in`, so it
- * must fade out however it closes: `open` going false, or its caller
- * unmounting the whole <Overlay>, as `ConfirmDialog` does.
- *
- * The exit is a drawing, never the live dialog held open. So the overlay
- * contracts see an instant close: off the stack, inert-behind released, and
- * nothing in the drawing answers a pointer or a query.
- */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -124,7 +114,7 @@ describe('a backdrop modal fades out', () => {
   });
 
   it('is gone once the fade has run, at the scaled length', () => {
-    animationSpeed.value = -10; // 10x slower
+    animationSpeed.value = -10;
     render(<Dialog />, host);
     render(null, host);
     vi.advanceTimersByTime(MODAL_FADE_MS * 5);
@@ -157,15 +147,12 @@ describe('a backdrop modal fades out', () => {
   });
 
   it('mirrors the length of the entrance it reverses', () => {
-    // A pin, since the CSS token and this timer cannot share one definition.
     const base = readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8');
     const seconds = Number(/--duration-fast:\s*calc\(([\d.]+)s/.exec(base)![1]);
     expect(MODAL_FADE_MS).toBe(seconds * 1000);
   });
 
   it('is styled click-through by the class it wears', () => {
-    // A pin, since CSS cannot import the class name. Without the rule the
-    // drawing would take the clicks meant for the UI behind it.
     const css = readFileSync(resolve(here, '../../../styles/global/modal-overlay.css'), 'utf-8');
     const rule = new RegExp(`\\.modal-overlay\\.${MODAL_EXIT_DRAWING_CLASS}\\s*\\{([^}]*)\\}`).exec(css);
     expect(rule?.[1]).toMatch(/pointer-events:\s*none/);

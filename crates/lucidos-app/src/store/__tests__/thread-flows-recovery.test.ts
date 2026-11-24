@@ -13,17 +13,14 @@ describe('Flow: Interrupted exchanges', () => {
       { type: 'MessageReceived', text: 'Fix bug', created: '2026-01-01T00:00:00Z' },
       { type: 'SessionStarted', session_id: 'cc-1', created: '2026-01-01T00:00:01Z' },
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: '2026-01-01T00:00:02Z' },
-      // User interrupts with follow-up before CC finishes
       { type: 'MessageReceived', text: 'Actually also fix tests', created: '2026-01-01T00:01:00Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:01:01Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // First exchange (CC, not last) → interrupted
     expect(exchangeStatus(exchanges[0], '', false)).toBe('interrupted');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
-    // Second exchange (last, completed) → done
     expect(exchangeStatus(exchanges[1], '', true)).toBe('done');
   });
 
@@ -37,14 +34,12 @@ describe('Flow: Interrupted exchanges', () => {
       { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok', created: '2026-01-01T00:00:03Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:04Z' },
       { type: 'CodingAgentIdled', created: '2026-01-01T00:00:05Z' },
-      // Follow-up from idle — not an interruption, clean handoff
       { type: 'MessageReceived', text: 'Now fix tests too', created: '2026-01-01T00:01:00Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:01:01Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // First CC exchange: went idle normally → Done (not interrupted)
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
   });
@@ -58,7 +53,6 @@ describe('Flow: Interrupted exchanges', () => {
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: '2026-01-01T00:00:02Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:03Z' },
       { type: 'SessionEnded', created: '2026-01-01T00:00:04Z' },
-      // New message after session ended
       { type: 'MessageReceived', text: 'Something else', created: '2026-01-01T00:01:00Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:01:01Z' },
     ]);
@@ -73,37 +67,25 @@ describe('Flow: Interrupted exchanges', () => {
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
-      // Exchange 1: initial CC request, completed normally
       { type: 'MessageReceived', text: 'Center the separator', created: '2026-01-01T00:00:00Z' },
       { type: 'SessionStarted', session_id: 'cc-1', created: '2026-01-01T00:00:01Z' },
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {}, created: '2026-01-01T00:00:02Z' },
       { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok', created: '2026-01-01T00:00:03Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:04Z' },
       { type: 'CodingAgentIdled', created: '2026-01-01T00:00:05Z' },
-      // Exchange 2: follow-up in same Claude Code session (no SessionStarted), interrupted
       { type: 'MessageReceived', text: 'they are still a bit much', created: '2026-01-01T00:01:00Z' },
-      // No ResponseGenerated — user sends another message before response
-      // Exchange 3: another follow-up
       { type: 'MessageReceived', text: 'sorry wrong thread', created: '2026-01-01T00:02:00Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:02:01Z' },
     ]);
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(3);
-    // Exchange 1: CC went idle → done
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
-    // Exchange 2: CC follow-up, no steps, not last → done (CC skipped it, nothing to interrupt)
     expect(exchangeStatus(exchanges[1], '', false, false, true)).toBe('done');
-    // Exchange 3: last, completed → done
     expect(exchangeStatus(exchanges[2], '', true)).toBe('done');
   });
 
   it('CC exchange with only SessionStarted (no body events) before follow-up: interrupted with no visible events', () => {
-    // Reproduces the bug: user sends a message, CC starts (SessionStarted lands)
-    // but produces no tool calls or text before the user fires off another
-    // message. The middle exchange is 'interrupted' with hasSteps=true but
-    // exchangeResponseEvents=[] — ChatExchange must hide the empty
-    // "Done ↳" header, same as it does for empty 'done' exchanges.
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -114,32 +96,13 @@ describe('Flow: Interrupted exchanges', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // Middle exchange has only SessionStarted as a step → status 'interrupted'…
     expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('interrupted');
     expect(getLabel(exchanges[0], '', false, false, true)).toBe('Done');
-    // …but exchangeResponseEvents emits nothing (SessionStarted alone produces
-    // no section_break — hasCCContent is false), so the response panel body
-    // would be empty. The visible-noise placeholder must be hidden.
-    //
-    // `isLast` is passed, matching the status call above and what ChatExchange
-    // does for a middle exchange. It is load-bearing rather than tidiness: the
-    // ACTIVE exchange of a live coding-agent turn derives a `Thinking` row from
-    // a bare `SessionStarted` (that window is a 20 second empty "Working" panel
-    // otherwise, see `needsLiveThinkingRow`), and this exchange is precisely the
-    // one the turn has moved on from.
-    expect(exchangeResponseEvents(exchanges[0], /* isLast */ false)).toEqual([]);
+    expect(exchangeResponseEvents(exchanges[0],  false)).toEqual([]);
     expect(exchangeResponseText(exchanges[0])).toBe('');
   });
 
   it('CC exchange with SessionStarted + Thinking only before follow-up: panel is empty-continued', () => {
-    // Reproduces the bug from the screenshot: user sends a message, CC emits
-    // SessionStarted then a Thinking event (the model began thinking but
-    // produced no tool call or text yet) before the user fires off another
-    // message. exchangeResponseEvents preserves the Thinking step (the data
-    // layer correctly reflects what was emitted), but the rendering layer
-    // must treat a Thinking-only payload the same as no payload — the
-    // single "Thinking" line conveys nothing the next exchange's user
-    // message doesn't already imply.
     const { map, id } = makeThread();
 
     insertEvents(map, id, [
@@ -153,24 +116,14 @@ describe('Flow: Interrupted exchanges', () => {
     expect(exchanges).toHaveLength(2);
     expect(exchangeStatus(exchanges[0], '', false, false, true)).toBe('interrupted');
 
-    // The data layer keeps the Thinking event (auditable record of what happened).
     const events = exchangeResponseEvents(exchanges[0]);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ type: 'step', description: 'Thinking' });
 
-    // The rendering layer must classify this as empty-continued — the panel
-    // is suppressed in ChatExchange for non-last done/interrupted exchanges
-    // whose only events are bare Thinking steps.
     expect(isEmptyContinuedExchange('interrupted', false, events, false)).toBe(true);
   });
 
   it('CC follow-up with whitespace-only CodingAgentTextStreamed + CodingAgentPromptSent before next follow-up: panel is empty-continued', () => {
-    // CC echoes a follow-up prompt as a whitespace-only CodingAgentTextStreamed
-    // ("\n\n" header) + CodingAgentPromptSent (Thinking spinner). When the
-    // user fires another follow-up before CC produces real output, the
-    // "\n\n" text event survives mergeAdjacentTextEvents (textBuf is truthy)
-    // and the predicate must still classify the panel as empty-continued —
-    // otherwise the orphan Thinking spinner panel renders.
     const { map, id } = makeThread();
 
     const reqId = 'cc-session-req-id';
@@ -204,17 +157,11 @@ describe('Flow: Interrupted exchanges', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // Non-CC, not last → done (not interrupted)
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
   });
 
   it('chat exchange interrupted by mid-flight PromptInjected shows interrupted, not Working', () => {
-    // Reproduces the bug from the "Verifying Git Pull Permission Error" thread:
-    // user sends MR1, agent starts processing (steps with req_id=MR1), user sends MR2
-    // mid-flight, engine emits a PromptInjected absorbed into MR2. Both panels showed "Working"
-    // because the prior chat exchange had visible steps and no terminator — falling
-    // through to 'streaming'. Only the LAST panel should be Working.
     const { map, id } = makeThread();
     const mr1Id = 'mr1-event-id';
     const mr2Id = 'mr2-event-id';
@@ -226,8 +173,6 @@ describe('Flow: Interrupted exchanges', () => {
       { type: 'ToolCalled', name: 'Read', args: {}, request_event_id: mr1Id, created: '2026-01-01T00:00:10Z' } as any,
       { type: 'ToolResult', name: 'Read', result: 'ok', request_event_id: mr1Id, created: '2026-01-01T00:00:11Z' } as any,
       { type: 'MessageReceived', text: 'Also use more horizontal space...', created: '2026-01-01T00:00:30Z', event_id: mr2Id },
-      // PromptInjected absorbs into MR2's exchange and sets reqIdRedirect[mr1Id]=E2 —
-      // subsequent req_id=mr1Id events redirect to E2.
       { type: 'PromptInjected', text: 'Also use more horizontal space...', mode: 'human',
         request_event_id: mr1Id, injected_message_id: mr2Id, created: '2026-01-01T00:01:00Z' } as any,
       { type: 'ThoughtStreamed', request_event_id: mr1Id, text: 'more thinking', created: '2026-01-01T00:01:05Z' } as any,
@@ -235,25 +180,17 @@ describe('Flow: Interrupted exchanges', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // E1 (not last) should NOT be 'streaming' / Working — the user has moved on.
-    // It should be 'interrupted' (label "Done ↳") matching the
-    // existing CC pattern for mid-work interruptions.
     expect(exchangeStatus(exchanges[0], '', false)).toBe('interrupted');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
-    // E2 (last) — still actively processing → Working
     expect(exchangeStatus(exchanges[1], '', true)).toBe('streaming');
     expect(getLabel(exchanges[1], '', true)).toBe('Working');
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flow 12: Recovery Claude Code session
-// ---------------------------------------------------------------------------
 describe('Flow: Recovery Claude Code session', () => {
   it('recovery session with tools and idle shows done with change panel data', () => {
     const { map, id } = makeThread();
 
-    // Recovery session event sequence (same as spawn_cc_thread)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'A previous Claude Code session was interrupted...' },
       { type: 'SessionStarted', session_id: 'recovery-1' },
@@ -262,7 +199,6 @@ describe('Flow: Recovery Claude Code session', () => {
       { type: 'CodingAgentToolCalled', name: 'Edit', args: {} },
       { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' },
       { type: 'CodingAgentTextStreamed', text: 'I finished the cleanup.' },
-      // These events MUST be emitted for the change panel to show
       { type: 'ResponseGenerated' },
       { type: 'CodingAgentIdled' },
     ]);
@@ -271,9 +207,7 @@ describe('Flow: Recovery Claude Code session', () => {
     expect(exchanges).toHaveLength(1);
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(getLabel(exchanges[0])).toBe('Done');
-    // Response text should be present
     expect(exchangeResponseText(exchanges[0])).toContain('I finished the cleanup.');
-    // Steps should show the tools
     expect(exchangeSteps(exchanges[0]).length).toBe(2);
   });
 
@@ -297,14 +231,10 @@ describe('Flow: Recovery Claude Code session', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flow 12b: Recovery via ContinuationStarted (auto-recovery of interrupted sessions)
-// ---------------------------------------------------------------------------
 describe('Flow: ContinuationStarted recovery', () => {
   it('ContinuationStarted acts as exchange boundary, thread shows CC content', () => {
     const { map, id } = makeThread();
 
-    // Recovery session: ContinuationStarted for auto-recovered interrupted sessions
     insertEvents(map, id, [
       { type: 'ContinuationStarted', branch: 'claude-code/20260318-122816' },
       { type: 'SessionStarted', session_id: 'cc-1', branch: 'claude-code/20260318-122816' },
@@ -317,24 +247,13 @@ describe('Flow: ContinuationStarted recovery', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
-    // ContinuationStarted is the user event (system-initiated, no user message)
     expect(exchanges[0].userEvent.type).toBe('ContinuationStarted');
-    // Engine-initiated continuation (no actor / engine actor) — the "after
-    // engine restart" wording is only honest when the engine itself drove
-    // the resume (real restart recovery, watchdog auto-recovery). The
-    // user-clicked-Continue case is covered by the next test.
     expect(exchangeUserMessage(exchanges[0])).toBe('Resumed after engine restart');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('done');
     expect(exchangeResponseText(exchanges[0])).toContain('Reviewed and continuing.');
   });
 
   it('ContinuationStarted from user-clicked Continue does NOT say "engine restart"', () => {
-    // Regression: when the user clicked Continue on a safety-net-aborted
-    // thread, the engine emitted ContinuationStarted with actor.kind=device,
-    // but the frontend hardcoded "Resumed after engine restart" — lying
-    // about what happened (the engine was never restarted). The summary
-    // must reflect the user's action, not the engine-restart case it
-    // shares an event type with.
     const { map, id } = makeThread();
     insertEvents(map, id, [
       {
@@ -356,8 +275,6 @@ describe('Flow: ContinuationStarted recovery', () => {
   });
 
   it('ContinuationStarted from api actor renders as user continuation too', () => {
-    // `kind: 'api'` defaults to human mode (non-browser human path —
-    // CLI / SDK caller).
     const { map, id } = makeThread();
     insertEvents(map, id, [
       {
@@ -374,10 +291,6 @@ describe('Flow: ContinuationStarted recovery', () => {
   });
 
   it('ContinuationStarted from api actor with engine mode keeps the engine-restart label', () => {
-    // `kind: 'api', mode: 'engine'` is the engine-driven REST path
-    // (e.g. an internal tool calls Continue on behalf of the engine).
-    // Same shape as the engine-restart recovery path — the wording must
-    // not lie and claim a human clicked Continue.
     const { map, id } = makeThread();
     insertEvents(map, id, [
       {
@@ -396,7 +309,6 @@ describe('Flow: ContinuationStarted recovery', () => {
   it('ContinuationStarted in existing thread (with prior messages) creates new exchange', () => {
     const { map, id } = makeThread();
 
-    // Original thread with a completed exchange
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Fix the bug', channel: 'claude_code' },
       { type: 'SessionStarted', session_id: 'cc-orig', branch: 'claude-code/20260318-122816' },
@@ -404,7 +316,6 @@ describe('Flow: ContinuationStarted recovery', () => {
       { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' },
       { type: 'ResponseGenerated' },
       { type: 'CodingAgentIdled', has_changes: true },
-      // Engine restart → auto-recovery of interrupted session
       { type: 'ContinuationStarted', branch: 'claude-code/20260318-122816' },
       { type: 'SessionStarted', session_id: 'cc-recovery', branch: 'claude-code/20260318-122816' },
       { type: 'CodingAgentTextStreamed', text: 'Continuing work.' },
@@ -436,15 +347,11 @@ describe('Flow: ContinuationStarted recovery', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Flow 13: Edge cases from user reports
-// ---------------------------------------------------------------------------
 describe('Flow: Edge cases', () => {
   it('pendingUserMessages cleared, backend MessageReceived groups events correctly', () => {
     const { map, id } = makeThread();
     map.get(id)!.pendingUserMessages = [{ text: 'My question', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' }];
 
-    // Backend sends MessageReceived with real seq + follow-up events
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'My question' },
       { type: 'ToolCalled', name: 'search', args: {} },
@@ -496,7 +403,7 @@ describe('Flow: Edge cases', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchangeSteps(exchanges[0])).toHaveLength(1);
-    expect(exchangeSteps(exchanges[0])[0].outcome).toBe('pending'); // still pending
+    expect(exchangeSteps(exchanges[0])[0].outcome).toBe('pending');
     expect(getLabel(exchanges[0])).toBe('Working');
   });
 
@@ -524,8 +431,6 @@ describe('Flow: Edge cases', () => {
     expect((stepEvents[0] as { description: string }).description).toBe('Thinking');
   });
 
-  /** One recall turn under whichever raw `event_type` the caller names, so the
-   *  canonical and legacy cases below cannot drift apart. */
   const recallTurn = (type: 'MemoryRecalled' | 'MemorySearched', results: number) => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
@@ -551,7 +456,6 @@ describe('Flow: Edge cases', () => {
     expect(steps[1].description).toBe('Thinking');
 
     expect(stepEvents).toHaveLength(2);
-    // A row from before the engine recorded memories keeps only its queries.
     expect((stepEvents[0] as { recall?: unknown }).recall)
       .toEqual({ memories: [], queries: ['birthday', 'date of birth'] });
   });
@@ -590,9 +494,6 @@ describe('Flow: Edge cases', () => {
     expect((step as { recall?: unknown }).recall).toBeUndefined();
   });
 
-  /** The label must not mirror the `memory` tool's own "Searching memory
-   *  for ..." step: the two used to be one word apart and read as the same
-   *  thing happening twice. Zero and one get their own phrasings. */
   it('recall step label covers zero, one and many, and never says "search"', () => {
     expect(recallTurn('MemoryRecalled', 0).steps[0].description).toBe('No memories recalled');
     expect(recallTurn('MemoryRecalled', 1).steps[0].description).toBe('Recalled 1 memory');
@@ -602,11 +503,7 @@ describe('Flow: Edge cases', () => {
     }
   });
 
-  /** Rows persisted under the pre-rename name must render identically. The
-   *  serde alias on the Rust variant cannot reach them: the snapshot endpoint
-   *  serves the raw `event_type` column straight to the client. */
   it('legacy MemorySearched rows render as a recall step', () => {
-    // The two turns are separate threads, so their rows sit at different seqs.
     const clockless = <T extends object>(rows: T[]) => rows.map((row) => ({ ...row, seq: undefined }));
     for (const n of [0, 1, 12]) {
       expect(recallTurn('MemorySearched', n).steps).toEqual(recallTurn('MemoryRecalled', n).steps);
@@ -639,7 +536,6 @@ describe('Flow: Edge cases', () => {
       { type: 'CodingAgentUserMessageSent', text: 'Run a command' },
       { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'ls' }, tool_use_id: 'tu-1' },
       { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'pwd' }, tool_use_id: 'tu-2' },
-      // Out-of-order results — pairing must follow tool_use_id, not arrival order
       { type: 'CodingAgentToolResult', name: 'Bash', result: '/home/user', tool_use_id: 'tu-2' },
       { type: 'CodingAgentToolResult', name: 'Bash', result: 'a.txt\nb.txt', tool_use_id: 'tu-1' },
       { type: 'CodingAgentIdled' },
@@ -719,7 +615,6 @@ describe('Flow: Edge cases', () => {
       { type: 'MessageReceived', text: 'First', created: '2026-01-01T00:00:00Z' },
       { type: 'SessionStarted', session_id: 's1', created: '2026-01-01T00:00:01Z' },
       { type: 'CodingAgentIdled', created: '2026-01-01T00:00:02Z' },
-      // Second exchange makes first not-last
       { type: 'MessageReceived', text: 'Second', created: '2026-01-01T00:01:00Z' },
       { type: 'TextStreamed', text: 'Response', created: '2026-01-01T00:01:01Z' },
       { type: 'ResponseGenerated', created: '2026-01-01T00:01:02Z' },
@@ -727,17 +622,14 @@ describe('Flow: Edge cases', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // First exchange (non-last CC, went idle) should be done, NOT cc-waiting or interrupted
     expect(exchangeStatus(exchanges[0], '', false)).toBe('done');
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
-    // Second exchange (last) should be done
     expect(exchangeStatus(exchanges[1], '', true)).toBe('done');
   });
 
   it('CC section break only when CC has actual content', () => {
     const { map, id } = makeThread();
 
-    // Exchange with SessionStarted but only regular TextStreamed (no CC events)
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Start CC' },
       { type: 'SessionStarted', session_id: 's1' },
@@ -746,7 +638,6 @@ describe('Flow: Edge cases', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // Should NOT have section_break since no CC tool/text events
     const events = exchangeResponseEvents(exchanges[0]);
     const sectionBreaks = events.filter(e => e.type === 'section_break');
     expect(sectionBreaks).toHaveLength(0);
@@ -758,12 +649,9 @@ describe('Flow: Edge cases', () => {
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Old question', created: '2025-01-01T00:00:00Z' },
       { type: 'TextStreamed', text: 'Old answer', created: '2025-01-01T00:00:01Z' },
-      // No ResponseGenerated — missing from DB (response lost on crash/restart)
     ]);
 
     const exchanges = getExchanges(map, id);
-    // No stale guard — backend emits ResponseAborted on crash/restart.
-    // Without a terminal event, response text exists → streaming.
     expect(exchangeStatus(exchanges[0], '', true)).toBe('streaming');
     expect(exchangeResponseText(exchanges[0])).toBe('Old answer');
     expect(getLabel(exchanges[0])).toBe('Requesting');
@@ -777,7 +665,6 @@ describe('Flow: Edge cases', () => {
     ]);
 
     const exchanges = getExchanges(map, id);
-    // No events, no response, not stale → pending
     expect(exchangeSteps(exchanges[0])).toHaveLength(0);
     expect(exchangeResponseText(exchanges[0])).toBe('');
   });
@@ -785,7 +672,6 @@ describe('Flow: Edge cases', () => {
   it('thread with ResponseGenerated text shows it', () => {
     const { map, id } = makeThread();
 
-    // Some threads have text in ResponseGenerated but not in TextStreamed
     insertEvents(map, id, [
       { type: 'MessageReceived', text: 'Hello' },
       { type: 'ResponseGenerated' },
@@ -796,17 +682,6 @@ describe('Flow: Edge cases', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Post-restart reminder: only when the thread still needs the user
-//
-// A question-parked thread survives a restart with no abort (the engine's
-// preserve guard). Answering it resumes the turn that asked — so the timeline
-// must read exactly as it would have without the restart: no "Continued the
-// response" boundary and no "Reminded the model …" engine note under a card the
-// user already answered. A genuinely interrupted response is the opposite case:
-// it still needs the user to click Continue, and that resume keeps its boundary
-// AND its side-effect reminder.
-// ---------------------------------------------------------------------------
 describe('Flow: post-restart resume reminder', () => {
   it('question answered after restart → no boundary, no reminder, reply under the card', () => {
     const { map, id } = makeThread();
@@ -823,7 +698,6 @@ describe('Flow: post-restart resume reminder', () => {
           { id: 'opt-1', label: 'Option B' },
         ],
       },
-      // --- engine restart here: no abort is emitted, the card stays live ---
       { type: 'UserQuestionAnswered', tool_use_id: 'toolu-1#q0', answer: { kind: 'Selected', option_id: 'opt-0' } },
       {
         type: 'ToolResult',
@@ -832,8 +706,6 @@ describe('Flow: post-restart resume reminder', () => {
         tool_called_event_id: 'call-1',
         request_event_id: 'mr-1',
       },
-      // The resumed turn continues the ORIGINAL request — no ContinuationStarted,
-      // no engine-note PromptInjected.
       { type: 'TextStreamed', text: 'You selected **Option A**.', request_event_id: 'mr-1' },
       { type: 'ResponseGenerated', text: 'You selected **Option A**.', request_event_id: 'mr-1' },
     ] as Array<ThreadEvent & { created?: string; event_id?: string }>);
@@ -842,8 +714,6 @@ describe('Flow: post-restart resume reminder', () => {
     expect(exchanges.map(e => e.userEvent.type)).not.toContain('ContinuationStarted');
     expect(exchanges.every(e => resumeEngineNote(e) === null)).toBe(true);
 
-    // The reply groups under the question card, exactly as an uninterrupted
-    // answer would (the divider owns its post-answer continuation).
     const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
     expect(divider).toBeDefined();
     expect(exchangeResponseText(divider)).toContain('Option A');
@@ -858,8 +728,6 @@ describe('Flow: post-restart resume reminder', () => {
       { type: 'ToolCalled', name: 'send_notification', args: {}, request_event_id: 'mr-2' },
       { type: 'ToolResult', name: 'send_notification', result: 'ok', request_event_id: 'mr-2' },
       { type: 'ResponseAborted', request_event_id: 'mr-2', cause: 'recovery_after_restart' },
-      // The user clicked Continue: the resume opens its own boundary and the
-      // engine note tells them what the model was told about the aborted run.
       { type: 'ContinuationStarted', actor: { kind: 'device', device_id: 'd-1' }, event_id: 'cs-1' },
       {
         type: 'PromptInjected',
@@ -884,19 +752,6 @@ describe('Flow: post-restart resume reminder', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// A resumed turn reads BELOW the boundary that resumed it
-//
-// Read off a live thread the user reported. A pending event wait woke the
-// thread first, half a second before the restart resume opened its boundary.
-// So the resumed turn anchored on the WAKE prompt, not on the resume.
-//
-// The turn then ran for 25 minutes above a card stamped 00:39, while that card
-// spun "Requesting" holding nothing a reader can see. Both halves are one
-// omission: the resume boundary took no ownership of the running turn.
-//
-// See `docs/plans/2026-09-20-the-transcript-reads-by-one-clock.md`.
-// ---------------------------------------------------------------------------
 describe('Flow: an engine-restart resume reads in clock order', () => {
   function resumedAfterRestart() {
     const { map, id } = makeThread('thread-1', 'running');
@@ -905,11 +760,9 @@ describe('Flow: an engine-restart resume reads in clock order', () => {
       { type: 'ToolCalled', name: 'read_file', args: {}, request_event_id: 'mr-1', event_id: 'call-1', created: '2026-01-01T07:55:11Z' },
       { type: 'ToolResult', name: 'read_file', result: 'ok', tool_called_event_id: 'call-1', request_event_id: 'mr-1', created: '2026-01-01T07:55:12Z' },
       { type: 'ResponseAborted', request_event_id: 'mr-1', cause: 'recovery_after_restart', created: '2026-01-01T08:00:09Z' },
-      // The wait wakes the thread first, and the turn anchors on this prompt.
       { type: 'PromptInjected', text: 'A subscribed event arrived.', mode: 'agent', event_id: 'wake-1', created: '2026-01-01T08:00:38Z' },
       { type: 'ContinuationStarted', event_id: 'cs-1', created: '2026-01-01T08:00:39Z' },
       { type: 'PromptInjected', text: '[Engine note] 50 prior tool calls', mode: 'engine', request_event_id: 'cs-1', created: '2026-01-01T08:00:39.400Z' },
-      // Everything the resumed turn emits still carries the wake prompt's id.
       { type: 'TextStreamed', text: 'Picking it back up.', request_event_id: 'wake-1', created: '2026-01-01T08:00:55Z' },
       { type: 'ToolCalled', name: 'read_file', args: {}, request_event_id: 'wake-1', event_id: 'call-2', created: '2026-01-01T08:16:36Z' },
       { type: 'ToolResult', name: 'read_file', result: 'ok', tool_called_event_id: 'call-2', request_event_id: 'wake-1', created: '2026-01-01T08:16:37Z' },
@@ -923,7 +776,6 @@ describe('Flow: an engine-restart resume reads in clock order', () => {
     expect(exchanges.map(e => e.userEvent.type)).toEqual([
       'MessageReceived', 'ResponseAborted', 'PromptInjected', 'ContinuationStarted',
     ]);
-    // The wake prompt opened the card; the resume boundary holds the work.
     expect(exchanges[2].steps).toHaveLength(0);
     expect(exchanges[3].steps.map(s => s.event.type)).toEqual([
       'PromptInjected', 'TextStreamed', 'ToolCalled', 'ToolResult', 'TextStreamed',
@@ -942,7 +794,3 @@ describe('Flow: an engine-restart resume reads in clock order', () => {
     expect(renderOrderViolations(resumedAfterRestart())).toEqual([]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// CC thread follow-up: channel inheritance
-// ---------------------------------------------------------------------------

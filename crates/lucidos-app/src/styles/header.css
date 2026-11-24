@@ -1,4 +1,3 @@
-/* Notifications bell */
 .notifications-bell {
     position: relative;
 }
@@ -7,17 +6,10 @@
     position: absolute;
     top: 0.125rem;
     right: 0.125rem;
-    /* Blue "needs attention" accent. Every count / notification badge shares
-       this blue — notification bell, the needs-attention filter toggle, mobile
-       unread, the brand-label .brand-badge update count, and the .drawer-badge
-       changes count. Semantic status badges (git add/modify/delete) keep their
-       own colors. */
     background: var(--accent);
     color: var(--text-on-accent);
     font-size: var(--font-size-3xs);
     font-weight: bold;
-    /* The design height. styles/badges.css rounds it to whole pixels, which
-       is what keeps the glyph centred, and the width follows that box. */
     --badge-height: 0.875rem;
     min-width: var(--badge-box, var(--badge-height));
     min-height: var(--badge-height);

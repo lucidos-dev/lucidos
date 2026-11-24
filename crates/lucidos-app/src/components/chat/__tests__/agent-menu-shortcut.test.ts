@@ -1,16 +1,8 @@
 // @vitest-environment jsdom
-/** The model-and-effort shortcut presses the composer row's own button.
- *
- *  So the list opens exactly as a click opens it. Only the rung control holds
- *  the model: the row's `/` anchor never opens it. A button laid out at zero
- *  size is not the one on screen.
- *
- *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../../utils/elementVisibility', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../utils/elementVisibility')>();
-  // jsdom lays nothing out, so visibility rides a test attribute.
   return { ...actual, isElementVisible: (el: HTMLElement) => el.dataset.visible === 'yes' };
 });
 

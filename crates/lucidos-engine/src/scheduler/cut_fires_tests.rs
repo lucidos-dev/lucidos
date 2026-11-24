@@ -26,7 +26,7 @@ async fn restore_floor_excludes_archived_transient_cuts_but_keeps_new_fires() {
 use crate::engine::event_bus::EventBus;
 use sqlx::PgPool;
 
-pub(crate) async fn report_all(pool: &PgPool, bus: &EventBus) {
+pub async fn report_all(pool: &PgPool, bus: &EventBus) {
     let queue = boot_queue(pool, bus);
     for fire in find_cut_fires(pool).await.unwrap() {
         let retry = prepare_retry(pool, &queue, Some(&test_config()), &fire)
@@ -72,14 +72,19 @@ async fn finish_report(pool: &PgPool, bus: &EventBus, fire: &CutFire, retry: Fir
     report_cut_fire(pool, bus, fire, retry, None).await.unwrap();
 }
 
+#[cfg(any(test, feature = "test-support"))]
 use crate::engine::event_bus::BusEvent;
+#[cfg(any(test, feature = "test-support"))]
 use crate::engine::thread_events::{
     emit_response_aborted, AbortCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
+#[cfg(test)]
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
+#[cfg(any(test, feature = "test-support"))]
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "test-support"))]
 async fn emit(bus: &EventBus, thread: Uuid, kind: &str, payload: serde_json::Value) {
     bus.emit(BusEvent::Thread {
         thread_id: thread,
@@ -93,6 +98,7 @@ async fn emit(bus: &EventBus, thread: Uuid, kind: &str, payload: serde_json::Val
     .unwrap();
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn start(bus: &EventBus, thread: Uuid, review: bool) {
     emit(
         bus,
@@ -105,6 +111,7 @@ async fn start(bus: &EventBus, thread: Uuid, review: bool) {
     .await;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn abort(bus: &EventBus, thread: Uuid, cause: AbortCause, device: bool) {
     emit_response_aborted(
         bus,
@@ -129,6 +136,7 @@ async fn abort(bus: &EventBus, thread: Uuid, cause: AbortCause, device: bool) {
     .await;
 }
 
+#[cfg(test)]
 async fn state(pool: &PgPool, thread: Uuid) -> (String, String, bool) {
     sqlx::query_as(
         "SELECT status, archive_state, is_saved FROM thread_summaries WHERE thread_id = $1",
@@ -139,6 +147,7 @@ async fn state(pool: &PgPool, thread: Uuid) -> (String, String, bool) {
     .unwrap()
 }
 
+#[cfg(test)]
 async fn negative(case: &str) {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -221,6 +230,7 @@ negative_test!(parked_thread_is_untouched, "parked");
 negative_test!(old_abort_is_untouched, "old");
 negative_test!(nontrigger_is_untouched, "script");
 
+#[cfg(test)]
 async fn positive(pin: bool, review: bool, completed: bool) {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -290,7 +300,7 @@ fn boot_reports_before_registration_and_catchup() {
         .split("pub async fn start(")
         .nth(1)
         .unwrap()
-        .split("log!(\"[Scheduler] Started\")")
+        .split("log_legacy!(\"[Scheduler] Started\")")
         .next()
         .unwrap();
     let replay = start
@@ -301,7 +311,7 @@ fn boot_reports_before_registration_and_catchup() {
         .find("self.register_triggers_from_configs().await?")
         .unwrap();
     assert!(replay < report && report < register);
-    let boot = include_str!("../main.rs");
+    let boot = include_str!("../../../lucidos-engine-bin/src/main.rs");
     assert!(
         boot.find(".begin_boot_recovery()").unwrap()
             < boot.find(".recover_persisted_entries()").unwrap()
@@ -429,6 +439,7 @@ fn test_config() -> crate::triggers::TriggerConfig {
     .unwrap()
 }
 
+#[cfg(test)]
 async fn seed_request(bus: &EventBus, thread: Uuid, request: ThreadQueueRequest) {
     use crate::engine::event_bus::SystemEvent;
     let entry_id = Uuid::new_v4();
@@ -459,6 +470,7 @@ async fn seed_request(bus: &EventBus, thread: Uuid, request: ThreadQueueRequest)
     .unwrap();
 }
 
+#[cfg(test)]
 async fn cut_with_request(pool: &PgPool, bus: &EventBus, event: bool) -> CutFire {
     let thread = Uuid::new_v4();
     let request = if event {
@@ -826,7 +838,8 @@ async fn a_cut_retry_is_reported_but_never_retried_across_more_boots() {
     teardown_test_db(&db).await;
 }
 
-pub(crate) async fn seed_snapshot_cut(bus: &EventBus) -> Uuid {
+#[cfg(any(test, feature = "test-support"))]
+pub async fn seed_snapshot_cut(bus: &EventBus) -> Uuid {
     let id = Uuid::new_v4();
     start(bus, id, false).await;
     abort(bus, id, AbortCause::EngineShutdown, false).await;
@@ -838,7 +851,8 @@ pub(crate) async fn seed_snapshot_cut(bus: &EventBus) -> Uuid {
     id
 }
 
-pub(crate) async fn assert_snapshot_cut_excluded(pool: &PgPool, id: Uuid) {
+#[cfg(any(test, feature = "test-support"))]
+pub async fn assert_snapshot_cut_excluded(pool: &PgPool, id: Uuid) {
     assert!(!find_cut_fires(pool)
         .await
         .unwrap()

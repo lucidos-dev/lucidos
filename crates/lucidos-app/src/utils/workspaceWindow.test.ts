@@ -1,12 +1,3 @@
-/**
- * The one place "what does activating a workspace row do" is decided, asserted
- * on all three client shapes.
- *
- * The platform probes are mocked rather than faked through the user-agent: they
- * resolve at module load from the real environment, so a test that poked
- * `navigator` would be asserting on this machine. `isMac` is mocked as a getter
- * because the real module exports it as a const, not a function.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
@@ -44,8 +35,6 @@ const {
   workspaceTabName,
 } = await import('./workspaceWindow');
 
-/** Every non-test source under `src/`, as `[path relative to src, code]`. The
- *  definition of a production caller for the source scan below. */
 function sources(): Array<[string, string]> {
   const root: string = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const found: Array<[string, string]> = [];
@@ -64,19 +53,14 @@ function sources(): Array<[string, string]> {
   return found;
 }
 
-/** The alternate for a PEER row: this view is on `dev`, the row is `work`. */
 const peer = (state: Parameters<typeof alternateOpenMode>[0] = 'healthy') =>
   alternateOpenMode(state, 'dev', 'work');
-/** The alternate for the row of the workspace this view is already on. */
 const current = () => alternateOpenMode('healthy', 'dev', 'dev');
-/** The alternate on the PICKER, which is inside no workspace at all. */
 const fromPicker = () => alternateOpenMode('healthy', null, 'work');
 
-/** The packaged desktop client. */
 const tauri = () => {
   platform.isTauri = true;
 };
-/** An installed PWA, iOS or macOS. */
 const pwa = () => {
   platform.isStandalone = true;
 };
@@ -110,51 +94,37 @@ describe('the alternate mode', () => {
   });
 
   it('is offered on every state a row can be opened in', () => {
-    // A stopped workspace lazy-starts behind the gateway's boot splash, which
-    // is the good path, so a second view on it is fine.
     for (const state of ['healthy', 'booting', 'stopped'] as const) {
       expect(peer(state)).toBe('separate');
     }
   });
 
-  // A second view on a dead engine is the same dead app shell in a new frame,
-  // which `openOrRetry` and the switcher's unhealthy row refuse.
   it('is withheld from an unhealthy workspace, on every client', () => {
     expect(peer('unhealthy')).toBe(null);
     tauri();
     expect(peer('unhealthy')).toBe(null);
   });
 
-  // There `window.open` hands the URL to the browser, so the "separate view" is
-  // the user leaving the app. The app popout hides itself for the same reason.
   it('is withheld from an installed PWA, whatever the row', () => {
     pwa();
     expect(peer()).toBe(null);
     expect(peer('stopped')).toBe(null);
   });
 
-  // Switching a window to the workspace it is already on does nothing, so the
-  // row would be dead. File > New Window is what serves a second window there.
   it('is withheld from the current workspace on the desktop client', () => {
     tauri();
     expect(current()).toBe(null);
   });
 
-  // A second tab on the workspace you are in is a real want, and unlike the
-  // desktop alternate it is not a no-op.
   it('is kept on the current workspace in a browser', () => {
     expect(current()).toBe('separate');
   });
 
-  // The picker is inside no workspace, so the desktop default ALREADY repoints
-  // that window. "Switch this window" beside it would be a second affordance
-  // on one outcome, and a second window on a workspace that already has one.
   it('is withheld on the picker, on the desktop client', () => {
     tauri();
     expect(fromPicker()).toBe(null);
   });
 
-  // In a browser the picker's alternate is a tab, which is a real second thing.
   it('is kept on the picker in a browser', () => {
     expect(fromPicker()).toBe('separate');
   });
@@ -166,14 +136,10 @@ describe('which rows a middle click may activate', () => {
     expect(middleClickActivates('stopped')).toBe(true);
   });
 
-  // Its primary action is a RESTART, so falling through would answer a wheel
-  // press by rebooting an engine.
   it('never activates an unhealthy row', () => {
     expect(middleClickActivates('unhealthy')).toBe(false);
   });
 
-  // Nowhere to open beside, so falling back to the primary action would
-  // navigate the whole app off a wheel press.
   it('never activates in an installed PWA', () => {
     pwa();
     expect(middleClickActivates('healthy')).toBe(false);
@@ -205,33 +171,22 @@ describe('the mode a click asks for', () => {
     expect(openModeForClick({ button: 1 })).toBe('separate');
   });
 
-  // A macOS Ctrl-click IS the context menu, and some engines dispatch a `click`
-  // beside the `contextmenu`. So the row must do NOTHING rather than fall back
-  // to its default, which would navigate away from the action row it just
-  // unfolded. Off a Mac, Ctrl is the ordinary accelerator.
   it('reads Ctrl on a Mac as no activation, and off a Mac as the accelerator', () => {
     expect(openModeForClick({ button: 0, ctrlKey: true })).toBe(null);
     platform.isMac = false;
     expect(openModeForClick({ button: 0, ctrlKey: true })).toBe('separate');
-    // And the accelerator swaps with the platform, rather than being both.
     expect(openModeForClick({ button: 0, metaKey: true })).toBe('in-place');
   });
 
-  // Ctrl is only the context gesture for a PRIMARY press. A ctrl-held wheel
-  // press is still a wheel press, and must not be read as a right-click.
   it('keeps the middle button an activation even with Ctrl held on a Mac', () => {
     expect(openModeForClick({ button: 1, ctrlKey: true })).toBe('separate');
   });
 
-  // On a link Shift means a new window and Alt means a download. A row offers
-  // neither, so both stay plain.
   it('reads Shift and Alt as plain', () => {
     expect(openModeForClick({ button: 0, shiftKey: true })).toBe('in-place');
     expect(openModeForClick({ button: 0, altKey: true })).toBe('in-place');
   });
 
-  // The gesture is honoured only where a separate view exists at all. Without
-  // this a cmd-click in a PWA would eject the user into the browser.
   it('falls back to the default in an installed PWA', () => {
     pwa();
     expect(openModeForClick({ button: 0, metaKey: true })).toBe('in-place');
@@ -244,22 +199,15 @@ describe('the path and the tab name', () => {
     expect(workspacePath('work')).toBe('/work/');
   });
 
-  // A slug is `[a-z0-9-]`, so this never fires in practice. It is here because
-  // the value reaches an href: encoding it is what keeps that true of a name
-  // the gateway one day slugs differently.
   it('escapes an id that is not a plain slug', () => {
     expect(workspacePath('a b/c')).toBe('/a%20b%2Fc/');
   });
 
-  // The reuse key. Two activations of one workspace must name one tab, or the
-  // browser opens a second instead of fronting the first.
   it('names one tab per workspace', () => {
     expect(workspaceTabName('work')).toBe('lucidos-ws-work');
     expect(workspaceTabName('dev')).not.toBe(workspaceTabName('work'));
   });
 
-  // A landing rides the same path, so a tab and a switch cannot disagree about
-  // where inside the workspace the row was aiming.
   it('carries the landing fragment, and nothing when there is none', () => {
     expect(workspacePath('work', 'notifications')).toBe('/work/#notifications');
     expect(workspacePath('work', undefined)).toBe('/work/');
@@ -273,8 +221,6 @@ describe('opening in place', () => {
     expect(openNewTab).not.toHaveBeenCalled();
     expect(showWorkspaceInNativeWindow).not.toHaveBeenCalled();
 
-    // The desktop client's alternate takes this branch too, so it must not go
-    // back through the shell and open yet another window.
     tauri();
     openWorkspace.mockClear();
     await openWorkspaceIn('in-place', 'work');
@@ -284,8 +230,6 @@ describe('opening in place', () => {
 });
 
 describe('opening separately', () => {
-  // The name is what lets the browser front the tab it already opened for this
-  // workspace rather than stack a duplicate.
   it('opens a NAMED tab in a browser and never touches the shell', async () => {
     await openWorkspaceIn('separate', 'work');
     expect(openNewTab).toHaveBeenCalledWith('/work/', 'lucidos-ws-work');
@@ -293,8 +237,6 @@ describe('opening separately', () => {
     expect(openWorkspace).not.toHaveBeenCalled();
   });
 
-  // WKWebView drops `window.open` entirely, so a tab here would be a click that
-  // does nothing at all. The shell also owns which window it lands in.
   it('asks the shell under Tauri, and never opens a tab', async () => {
     tauri();
     await openWorkspaceIn('separate', 'work');
@@ -303,8 +245,6 @@ describe('opening separately', () => {
     expect(openWorkspace).not.toHaveBeenCalled();
   });
 
-  // The caller owes the user a message either way, so neither branch may
-  // resolve on a failure.
   it('rejects when the browser blocked the tab', async () => {
     openNewTab.mockReturnValue(false);
     await expect(openWorkspaceIn('separate', 'work')).rejects.toThrow(/blocked/i);
@@ -317,15 +257,8 @@ describe('opening separately', () => {
   });
 });
 
-// A notifications row wants the same window rule as every other row PLUS the
-// notifications view, so the landing has to survive all three mechanisms. A
-// mode that drops it lands the user on the workspace's default view, hunting
-// for the bell the row already counted for them.
 describe('the landing', () => {
   it('rides the in-place navigation by name, never as a branch on the value', () => {
-    // Passed THROUGH, so a landing added to the closed set reaches this
-    // mechanism by construction. A branch per landing here would drop the next
-    // one silently, with nothing failing to compile.
     void openWorkspaceIn('in-place', 'work', 'notifications');
     expect(openWorkspace).toHaveBeenCalledWith('work', 'notifications');
   });
@@ -335,32 +268,21 @@ describe('the landing', () => {
     expect(openNewTab).toHaveBeenCalledWith('/work/#notifications', 'lucidos-ws-work');
   });
 
-  // By NAME, never as a fragment: the shell composes the URL (ADR 0028).
   it('crosses to the shell as a name', async () => {
     tauri();
     await openWorkspaceIn('separate', 'work', 'notifications');
     expect(showWorkspaceInNativeWindow).toHaveBeenCalledWith('work', 'notifications');
   });
 
-  // The whole point of the change this test arrived with: a workspace row must
-  // not navigate in place on its own, whatever the client shape. So the
-  // same-window navigation keeps a SHORT allow-list. A surface joining it is a
-  // surface that built its own rule instead of asking for the mode.
   it('leaves the same-window navigation with two callers, both deliberate', () => {
-    // Matched on the IMPORT, so the defining module does not count itself.
     const imports = /^import[^;]*\bopenWorkspace\b[^;]*from '[^']*client\/control'/m;
     const callers = sources().filter(([, code]) => imports.test(code));
     expect(callers.map(([path]) => path).sort()).toEqual([
-      // Its auto-open of the remembered workspace, which is not a row
-      // activation and has no gesture to read a mode from.
       'components/picker/WorkspacePicker.tsx',
       'utils/workspaceWindow.ts',
     ]);
   });
 
-  // The same rule one level up. A row that passes a literal mode has decided
-  // the window for itself, so a desktop click can repoint the window the user
-  // clicked from.
   it('takes its mode from the gesture, never from a literal at the call site', () => {
     const literal = /openWorkspaceIn\(\s*['"`]/;
     const callers = sources().filter(([, code]) => literal.test(code));

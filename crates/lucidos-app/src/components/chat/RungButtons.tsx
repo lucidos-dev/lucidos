@@ -5,28 +5,17 @@ import { keepFocusOnPress } from '../../utils/dom';
 import type { ShownRung } from './rungControlParts';
 
 export interface RungControlProps {
-  /** The thread the control belongs to: a coding agent's active session, or
-   *  the focused Lucidos Agent thread (a draft's id in compose). */
   threadId?: string;
   composeThreadId?: string;
   disabledReason?: string | null;
-  /** Lucidos Agent threads only: true for a composing draft and the fresh
-   *  compose view. */
   composeContext?: boolean;
-  /** The coding-agent backend, or null for a Lucidos Agent thread. */
   codingAgent?: CodingAgent | null;
-  /** True once the composer row has folded the pill into the ⋯ menu: the
-   *  control then draws no box and opens its list against the ⋯. */
   folded?: boolean;
-  /** The row's attributes for the pill, so the composer row can measure and
-   *  fold it like any other member. */
   rowAttrs?: Record<string, string>;
 }
 
-/** The pill's name in the row's fold, which remembers its width. */
 export const RUNG_FOLD_KEY = 'rung';
 
-/** A ladder glyph for the folded pill's ⋯ menu row. */
 export function RungMenuIcon() {
   return (
     <svg class="rung-menu-icon" viewBox="0 0 20 16" aria-hidden="true">
@@ -37,47 +26,42 @@ export function RungMenuIcon() {
   );
 }
 
-/** `1.12× Opus 5.5 · medium`. The desktop face shows the name and effort,
- *  the compact face the intelligence badge alone (`styles/chat/rung-control.css`). */
 function RungLabel({ shown }: { shown: ShownRung }) {
   return (
     <span class="rung-label">
       {shown.intelligence && <span class="rung-intelligence">{shown.intelligence}</span>}
       <span class="rung-name">{shown.name}</span>
       {shown.effort && <span class="rung-effort">{` · ${shown.effort}`}</span>}
+      {shown.nextTurn && <span class="rung-next-turn" aria-hidden="true">*</span>}
     </span>
   );
 }
 
-/** The pair in full, which the label may cut short with an ellipsis. */
 function pairName(shown: ShownRung | null): string {
   if (!shown) return 'Model and effort';
+  if (shown.nextTurn) return `Running: ${shown.name}${shown.effort ? ` · ${shown.effort}` : ''}. Next turn: ${shown.nextTurn}`;
   return shown.effort ? `${shown.name} · ${shown.effort}` : shown.name;
 }
 
-/** The accessible name for the part that opens the list. */
 function openLabel(shown: ShownRung | null): string {
   if (!shown) return 'Choose model and effort';
+  if (shown.nextTurn) return `${pairName(shown)}. Choose another`;
   const rung = shown.position ? `, rung ${shown.position.at} of ${shown.position.of}` : '';
   return shown.effort
     ? `Model and effort: ${shown.name}, ${shown.effort}${rung}. Choose another`
     : `Model: ${shown.name}${rung}. Choose another`;
 }
 
-/** A pill the host gives no row attributes is still measured, never folded. */
 const PINNED_ROW_ATTRS = { 'data-row-item': 'true' };
 
 type RungSteps = { prev: (() => void) | null; next: (() => void) | null };
 
-/** ← and → on any part of the pill step the rung, as ‹ and › do. No
- *  arrow on a button belongs to text editing, so none is taken. */
 function stepOnArrow(step: RungSteps | undefined, e: KeyboardEvent): void {
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
   e.preventDefault();
   (e.key === 'ArrowLeft' ? step?.prev : step?.next)?.();
 }
 
-/** One end of the pill: ‹ steps to the previous rung, › to the next. */
 function RungStep({ dir, step, disabledReason, lockedReason }: {
   dir: 'prev' | 'next';
   disabledReason?: string | null;
@@ -101,26 +85,16 @@ function RungStep({ dir, step, disabledReason, lockedReason }: {
   );
 }
 
-/** The control's boxes, with no data of its own. The real control and the
- *  placeholder shown until its code arrives both draw them, so the box never
- *  changes as it loads. */
 export function RungButtons({
   shown, rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step, disabledReason, lockedReason,
 }: {
   rowAttrs?: Record<string, string>;
   disabledReason?: string | null;
-  /** Why a pick is refused right now. The pill stays live, so the list still
-   *  opens to show the rungs, and the tooltip says why a pick will not land. */
   lockedReason?: string | null;
-  /** What the control names, or null until its face is whole. A null face
-   *  keeps a visible label until the selection arrives. */
   shown: ShownRung | null;
   expanded: boolean;
   triggerRef?: (el: HTMLButtonElement | null) => void;
   onOpen: (e: MouseEvent) => void;
-  /** The pill's two steps through the rung list. A null step is one
-   *  the list has no row for, which leaves its button disabled. Absent until
-   *  the commands have loaded. */
   step?: RungSteps;
 }) {
   return (

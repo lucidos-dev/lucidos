@@ -1,20 +1,3 @@
-/**
- * Bug: when `sendMessage` runs with `focusedThreadId === null` (raw new send),
- * it inserts an optimistic thread into `threadMap` (title = first 40 chars of
- * the message, state='active', status='running'). If `submitChat` then throws
- * — engine restarting, browser offline, transport error — the catch block
- * only removes the pending message; the optimistic thread itself stays in
- * `threadMap` forever. The user sees a phantom row in the Active drawer
- * section that vanishes on refresh because the API has no record of it.
- *
- * Fix: when the failed send was for a thread `sendMessage` itself created
- * (`threadBeforeSend === undefined`), the catch must also drop the thread
- * from `threadMap` — same shape as `compose.ts`'s `rollbackOptimistic`.
- *
- * Established follow-ups (`threadBeforeSend.meta.state === 'active'`) keep
- * their thread row on failure: it has real persisted content the user must
- * not lose just because one send round-trip failed.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.hoisted(() => {
@@ -65,8 +48,6 @@ vi.mock('./thread-navigation', () => ({
 
 vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
-  // The rollback under test removes the row, so it also clears that thread's
-  // entry in the thread-events failure maps.
   forgetThreadEventsFailures: vi.fn(),
 }));
 
@@ -146,11 +127,8 @@ describe('sendMessage rolls back orphan thread on send failure', () => {
 
     await sendMessage('bæsj. google søkks');
 
-    // Without the fix the optimistic thread stays — phantom row in Active.
     expect(threadMap.value.size).toBe(0);
     expect(focusedThreadId.value).toBe(null);
-    // Nav cleanup pairs with the threadMap drop so Back/Forward can't later
-    // restore an id whose threadMap entry no longer exists.
     expect(mockedRemoveThreadNavEntries).toHaveBeenCalledWith(expect.any(String));
   });
 
@@ -160,8 +138,6 @@ describe('sendMessage rolls back orphan thread on send failure', () => {
 
     await sendMessage('hello');
 
-    // Real send: server has the thread, client must keep its optimistic row
-    // for the SSE events to land on.
     expect(threadMap.value.size).toBe(1);
     const tid = focusedThreadId.value!;
     expect(tid).not.toBe(null);
@@ -176,18 +152,12 @@ describe('sendMessage rolls back orphan thread on send failure', () => {
 
     await sendMessage('follow up that fails');
 
-    // The thread predates the send and has real content — it must NOT be
-    // removed just because one round-trip failed.
     expect(threadMap.value.has(tid)).toBe(true);
     expect(threadMap.value.get(tid)!.pendingUserMessages).toHaveLength(0);
     expect(mockedRemoveThreadNavEntries).not.toHaveBeenCalled();
   });
 
   it('failed send on a draft thread (state=composing) keeps the thread row', async () => {
-    // This path is reached when sendCompose's pre-flip is still in flight or
-    // a caller routes a composing thread directly through sendMessage. The
-    // draft thread has a server-side row from POST /api/v1/threads — wiping
-    // it here would diverge the client from a server row that still exists.
     const tid = 'draft-thread';
     threadMap.value = new Map([[tid, makeActiveThread(tid, { state: 'composing', title: '' })]]);
     focusedThreadId.value = tid;

@@ -1,9 +1,60 @@
 ---
 name: update-lucidos-models
-description: Use when the Claude Code model picker looks wrong, a new Claude, Codex or chat model ships, or the intelligence ladder needs a refresh. The picker is discovered from Claude Code itself. Covers discovery, the curated fallback file and its context windows, and the rung estimates refresh for every ladder surface.
+description: Required for every Lucidos model addition across chat, Claude Code and Codex. Covers registration, routes, prices, reasoning, menus, comparable benchmark estimates, availability-aware ladders and cost-justified defaults. Also use for picker diagnosis or estimate refreshes.
 ---
 
-# The Lucidos Claude Code model picker
+# Update Lucidos models
+
+Every model addition ships registration, estimates, ladder review and default review together (ADR 0732).
+Use this ordered workflow across chat, Claude Code and Codex.
+A picker repair can use its conditional section; a model addition must complete every shared step.
+
+## Required workflow
+
+1. **Establish the contract.** Read the provider's model documentation and each affected CLI's discovery response.
+   Record sources, supported ids, context windows, route-specific capabilities and documented effort defaults.
+   Leave an undocumented API default effort absent; distinguish it from a CLI's model-only default.
+2. **Register and route.** Update `llm/model_registry.rs` and the affected provider's wire-id and capability mappings.
+   Preserve account-specific eligibility, explicit provider pins and older model selections.
+3. **Price and reason.** Add dated cards in `llm/model_prices.json` from official prices, including cache and long-context tiers.
+   Update route-specific reasoning support and request serialization, with protocol regressions.
+4. **Update menus.** Update `runtime/codex_menu_options.json` for Codex and the conditional Claude Code section below when affected.
+   Keep catalogue discovery separate from whether the workspace can run the model.
+5. **Refresh comparable evidence.** Follow **Refreshing the rung estimates** below for every affected ladder surface.
+   Archive source records privately, validate the cohort and regenerate bands plus dominance metadata.
+   Missing coding observations use the documented estimation path and remain explicitly estimated.
+   Never invent measurements or copy scores between efforts.
+
+   Missing cost or token evidence can leave pairs unbanded; report that coverage and review their ladder behavior explicitly.
+   Missing observations never waive ladder or default review.
+6. **Review available frontiers.** Check all-provider and single-provider setups, account exclusions and route-specific effort support.
+   The Lucidos Agent default frontier uses available pairs and their generated dominators, retaining an available default rung.
+   Resolve the route the router actually chooses before inspecting its availability; never substitute around a refusal or provider pin.
+   Keep catalogue entries and stored overrides independent of automatic frontier filtering.
+7. **Justify current defaults.** Compare capability evidence and input, output, cache and long-context prices against each existing default.
+   Prefer the current supported generation when capability and cost justify it; release recency alone never authorizes an upgrade.
+   Keep a substantially costlier successor as a premium option unless the owner chooses otherwise.
+   Record the comparison and rationale whether the default changes or stays.
+
+   Audit automatic chat selection, both default implementers and generic background fallbacks.
+   Keep historical evaluation rosters and usage seeds attached to the models actually measured.
+   Preserve stored model/effort preferences, explicit older-model pins and recorded thread selections; never migrate them to a new default.
+8. **Verify and document.** Add protocol, provider-subset, frontier and default-preservation regressions for the affected surfaces.
+   Update knowhow and glossaries, run the estimator tests, then complete `/harden` over the entire change.
+
+### Completion checklist
+
+- Registration, routes, prices, reasoning and affected menus agree on each supported model and effort.
+- Active benchmark observations have comparable cohort evidence; missing measurements remain explicit estimates or documented unbanded coverage.
+- Generated bands and all dominator identities pass subset parity and privacy checks; unrelated calibration changes are deliberate.
+- Available frontiers, default retention, catalogue visibility and stored overrides pass their shared-reader tests.
+- Every affected default has a capability and cost rationale, including any decision to retain its predecessor.
+- Fresh-workspace choices and existing preference/thread pins pass regressions without preference rewrites.
+- Knowhow matches the behavior, and the finished branch has a hardened marker.
+
+## Claude Code discovery and picker
+
+Read this section when Claude Code is affected.
 
 The Claude Code `/model` picker in Lucidos is **discovered from Claude Code
 itself** (ADR 0325), and the curated file fills what it omits (ADR 0488).
@@ -38,7 +89,13 @@ tool, the `chat_submit` route and the picker all read this list.
 3. Check the engine log for `[CcModels]` lines.
 4. A list that follows the user's pins is correct. `ANTHROPIC_DEFAULT_SONNET_MODEL`
    and friends change what `sonnet` resolves to, and the picker says so.
-5. To force a re-probe, delete the cache file and restart the engine.
+5. A curated row missing from the picker may be a *learned refusal*.
+   `.lucidos/cc-refused-models.json` holds each model Claude Code ran another
+   model in place of, with the version and account that did it (ADR 0674).
+   It clears when Claude Code lists the model, a probe finds another version,
+   or a session reports another live account.
+6. To force a re-probe, delete the cache file and restart the engine. Delete
+   the refusals file too to drop the refusals.
 
 ## The curated file
 
@@ -48,7 +105,7 @@ cannot supply. Keep its rows roughly current.
 
 - Set `"offered": false` on a model that should leave the picker. The row stays
   as overlay only, so a thread already on it keeps its window, and a new spawn
-  refuses it. Opus 5 and the Fable rows are overlay only.
+  refuses it. Opus 5, Fable 5 and Fable 5.1 are overlay only.
 - A curated row never carries a `resolvedModel`. An alias shows "runs X" only
   from a discovered row.
 
@@ -83,11 +140,12 @@ answer for Lucidos's own calls.
 
 ## Refreshing the rung estimates
 
-`crates/lucidos-engine/src/llm/rung_estimates.json` holds the *rung
+`crates/lucidos-core/src/llm/rung_estimates.json` holds the *rung
 estimates* (ADR 0525). It bands every estimated (model, effort) pair, and
 lists each *ladder surface*'s shipped pairs (chat, Claude Code, Codex) in
 order, each with `on`. Each pair carries a `general_band` and a `coding_band`,
-one per *intelligence profile*, plus token, cost and time bands. It holds no
+one per *intelligence profile*, plus token, cost and time bands. It also records every dominating pair identity for each surface pair.
+Lucidos Agent runtime filters these identities by route availability. It holds no
 raw figure: Artificial Analysis (AA) forbids republishing its content, and the
 file ships to the public mirror. An intelligence band is a score in steps of
 2 points, rounded half up (ADR 0527).
@@ -107,16 +165,24 @@ README names each file's source.
    `medium`. Chat: every
    builtin registry model that is not retired, at the tiers
    `llm::reasoning::supported_efforts` gives it on any of its routes. Add each
-   model to `MODELS` in the script, with its Epoch name and each surface's
-   efforts.
+   model to `MODELS` in the script, with its AA release name and each
+   surface's efforts.
 2. **Pull AA's Intelligence Index figures into `aa_rungs.csv`.** AA has one
    page per model and effort, `https://artificialanalysis.ai/models/<slug>-<effort>`,
-   and the bare slug is the top effort. Any page embeds every model's record.
+   and the bare slug is the top effort. A page embeds only some models'
+   records, so fetch every cohort model's pages.
+   - **Re-pull every row from one snapshot, never only the new model.** AA
+     re-versions its index, and a version change moves every score and cost.
+     Rows from two versions make one model look far cheaper or costlier.
+   - A model AA no longer scores has no row figures, and its pairs go
+     unbanded. Keeping its old figures would mix versions again. Drop it from
+     `FIT_MODELS` when it was there.
    Take the score as AA displays it, the cost per task, the time per task, the
    total output tokens and the output speed. The record names them
    `intelligenceIndex`, `intelligenceIndexCostPerTask.cost.total`,
    `intelligenceIndexTimePerTask`, `canonicalIntelligenceIndexTokenCount.output`
    and `timescaleData.medianOutputSpeed`.
+   Newer pages expose first-party speed as `headline.outputSpeed` instead.
    - Leave a figure AA did not publish empty. A pair with no cost or no
      tokens is skipped, and stays unbanded.
    - A `(Non-reasoning)` variant is the `none` pair.
@@ -124,17 +190,23 @@ README names each file's source.
      With no default effort, leave it out.
 3. **Pull AA's Coding Agent Index into `aa_coding.csv`**, from
    `https://artificialanalysis.ai/agents/coding-agents`: each row's
-   `indexScore` by its `displayLabel`. It does not cover every effort. A pair
+   `indexScore` by its explicit model and effort. Retain complete source records
+   in `coding-provenance.json`, using `coding_snapshot(records, source_url, extracted)`.
+   It validates one evaluation cohort and preserves each harness version.
+   Archive previous inputs before replacing the active snapshot.
+   The generator checks CSV scores against this evidence before calibration.
+
+   It does not cover every effort. A pair
    it lacks takes its general score plus its model's mean measured gap
    (coding minus general), flagged `coding_estimated`. A model with no
    measured pair has gap zero.
 4. **Pull the other inputs.**
-   - `eci_scores.csv`: `https://epoch.ai/data/eci_scores.csv` (CC BY 4.0).
    - `openrouter_speed.csv`: each model's standard-tier throughput from
      OpenRouter's endpoints API. Take the endpoint whose tag is the vendor,
-     and skip the pricier `fast` ones. The call needs the workspace's
-     OpenRouter key. Read it into a shell variable with `psql`, and never
-     print it or put it in a command line. A model it lacks takes AA's speed.
+     and skip the pricier `fast` ones. Public endpoints can be read without a key.
+     If authentication is required, read the workspace key into a shell variable
+     with `psql`; never print it or put it in a command line.
+     Missing or null throughput falls back to AA's speed.
 5. **Check the prices.** The script reads each model's output price from
    the shipped *price table*, `llm/model_prices.json`, on the card in force
    today. A model with no card stops it. Add or update cards there first,
@@ -160,8 +232,9 @@ README names each file's source.
    The hardening gate runs these import and normalization regressions too.
  `./scripts/test-engine.sh -- -- runtime::intelligence_ladder`
    checks every pair's fields and that each surface's on pairs form a
-   frontier. The script keeps each surface's shipped default on, so the
-   frontier check skips it and a pin test checks it is an on rung. The tests
+   frontier. The generated flags retain each shipped default.
+   Lucidos Agent runtime flags use available dominators and retain its available current default.
+   Test provider subsets, route refusals, default retention and stored overrides alongside the offline frontier. The tests
    also check that the file ships integer bands only. Its expected-ladder tests name
    the shipped rungs, so a refresh that moves them updates the tests in the
    same change.
@@ -170,6 +243,9 @@ Not covered yet:
 
 - codex-cli 0.163.0 offers an `ultra` effort that no menu row offers, so it
   has no rung.
+- AA's current index no longer scores GPT-6 Sol below max, GPT-5.6 Sol,
+  GPT-5.6 Terra and Luna below max, Gemini 3.1 Pro or Grok 4.6. Their pairs
+  stay unbanded.
 - AA publishes no cost for GLM 5.2 or Grok 4.20 at an effort chat offers,
   and does not list Laguna S 2.1 or Ox Alpha. It measures Muse Spark 1.2
   only at xhigh, which chat does not offer. The other free models have no

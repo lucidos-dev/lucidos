@@ -34,6 +34,42 @@ async fn a_repo_without_origin_lands_on_local_main() {
     assert!(!base.origin.needs_push(&local));
 }
 
+#[tokio::test]
+async fn landing_queue_probe_leaves_main_and_the_queue_unchanged() {
+    let f = OriginFixture::new().await;
+    let origin_main = f.origin_main().await;
+    probe_origin_landing_queue(&f.repo).await.unwrap();
+    let queue = git_ok(&f.origin, &["for-each-ref", "refs/lucidos/queue/"]).await;
+    assert!(queue.is_empty(), "{queue}");
+    assert_eq!(f.origin_main().await, origin_main);
+}
+
+#[tokio::test]
+async fn landing_queue_probe_refuses_an_origin_that_hides_queue_refs() {
+    let f = OriginFixture::new().await;
+    git_ok(
+        &f.origin,
+        &["config", "receive.hideRefs", "refs/lucidos/queue/"],
+    )
+    .await;
+    let error = probe_origin_landing_queue(&f.repo).await.unwrap_err();
+    assert!(error.contains("hidden ref"), "{error}");
+}
+
+#[tokio::test]
+async fn landing_queue_probe_refuses_a_write_only_queue_and_cleans_up() {
+    let f = OriginFixture::new().await;
+    git_ok(
+        &f.origin,
+        &["config", "uploadpack.hideRefs", "refs/lucidos/queue/"],
+    )
+    .await;
+    let error = probe_origin_landing_queue(&f.repo).await.unwrap_err();
+    assert!(error.contains("not visible"), "{error}");
+    let queue = git_ok(&f.origin, &["for-each-ref", "refs/lucidos/queue/"]).await;
+    assert!(queue.is_empty(), "{queue}");
+}
+
 /// Another gateway pushed first: the base is `origin/main`, ahead of local.
 #[tokio::test]
 async fn origin_ahead_of_local_main_is_the_base() {

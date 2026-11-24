@@ -3,7 +3,6 @@ import { beforeAll, describe, it, expect, vi, beforeEach, afterEach } from 'vite
 
 vi.mock('./app-bridge', () => ({ askFrame: vi.fn(), tellFrame: vi.fn() }));
 vi.mock('./apps', () => ({ getVisibleAppFrame: vi.fn() }));
-// jsdom lays nothing out, so every element would read as hidden.
 vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/elementVisibility')>()),
   isElementVisible: () => true,
@@ -26,7 +25,6 @@ const frame = { contentWindow: {} } as unknown as HTMLIFrameElement;
 const APP = { type: 'app-ui', app: { id: 'habit-tracker' } } as unknown as typeof panelOverlay.value;
 const file = (path: string) => ({ type: 'file-preview', path }) as typeof panelOverlay.value;
 
-// jsdom has no layout. Every range sits at the top of the viewport.
 Range.prototype.getBoundingClientRect = () => new DOMRect(0, 0, 10, 10);
 
 beforeEach(() => {
@@ -46,14 +44,11 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** Type a query and let the typing pause run it. */
 async function typeQuery(query: string) {
   setFindQuery(query);
   await vi.runAllTimersAsync();
 }
 
-// The bar's targets are code-split, and it opens once they are in memory.
-// Warm them, so an open lands at once.
 beforeAll(() => findTargets.preload());
 
 describe('parseFindReply', () => {
@@ -241,7 +236,6 @@ describe('the find bar over a text preview', () => {
     const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {});
     openFind('content');
     await typeQuery('apple');
-    // The match's box is at the top of the viewport, under the bar's 100px.
     expect(scrollBy).toHaveBeenCalledWith(0, 0 - 100 - (window.innerHeight - 100 - 10) / 2);
     scrollBy.mockRestore();
   });
@@ -261,7 +255,6 @@ describe('a find a navigation asked for', () => {
   const PATH = 'artifacts/notes.md';
   const SCOPE = fileFindScope(PATH);
 
-  /** The source view of a file, one `.code-line` per line, as `LineNumberedCode` draws it. */
   function showSource(lines: string[]) {
     panelOverlay.value = file(PATH);
     filePreviewSource.value = true;
@@ -396,7 +389,6 @@ describe('findStatusText', () => {
     expect(findStatusText({ status: 'found', total: 0, current: 0, capped: false })).toBe('No matches');
     expect(findStatusText({ status: 'found', total: 12, current: 3, capped: false })).toBe('3 of 12');
     expect(findStatusText({ status: 'found', total: 2000, current: 1, capped: true })).toBe('1 of 2000+');
-    // The transcript counts first, and moves only on a step.
     expect(findStatusText({ status: 'found', total: 3, current: 0, capped: false })).toBe('3 matches');
     expect(findStatusText({ status: 'found', total: 1, current: 0, capped: false })).toBe('1 match');
   });

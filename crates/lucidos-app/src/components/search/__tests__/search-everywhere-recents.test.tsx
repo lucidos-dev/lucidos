@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** A thread recent survives a palette opened before the thread list loads.
- *  `threadMap` holds only the loaded window, and it is empty on a cold start,
- *  so its membership never proves a thread is gone. Only the engine does: a
- *  delete, or a tap the engine answers with "not found". */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

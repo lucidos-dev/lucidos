@@ -1,11 +1,3 @@
-/**
- * The Search Everywhere categories wrap onto more lines instead of panning
- * sideways. A panning strip hid the later categories past the palette's edge.
- * On an iPhone the pan never landed, so they could not be reached at all.
- *
- * A source scan rather than a browser test: the emulators panned the strip
- * fine, so what can be pinned is which declarations are written.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -14,8 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// `rulesTargeting` rather than the first-match string helpers, so a copy of the
-// rule inside a media block cannot slip past.
 import { cssRules, rulesTargeting, selectorList, type CssRule } from '../../styles/__tests__/css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -24,14 +14,12 @@ const css = readFileSync(resolve(here, './SearchEverywhere.css'), 'utf-8');
 const STRIP = 'search-everywhere-tabs';
 const TAB = 'search-everywhere-tab';
 
-/** Every rule styling the element, media copies and compound selectors alike. */
 function rulesFor(className: string): CssRule[] {
   const rules = rulesTargeting(css, className);
   expect(rules.length, `no rule targets .${className}`).toBeGreaterThan(0);
   return rules;
 }
 
-/** The value the sheet lands on for `prop`: the last rule in it that sets one. */
 function effective(className: string, prop: string): string | undefined {
   let value: string | undefined;
   for (const rule of rulesFor(className)) {
@@ -66,7 +54,6 @@ describe('the Search Everywhere categories are all on screen', () => {
 
 describe('the first chip holds its width as the query starts', () => {
   const WIDEST = 'search-everywhere-widest';
-  // `rulesTargeting` skips pseudo-elements and children, and both are used here.
   const prop = (selector: string, name: string): string | undefined =>
     cssRules(css)
       .filter(r => selectorList(r.selector).includes(selector))

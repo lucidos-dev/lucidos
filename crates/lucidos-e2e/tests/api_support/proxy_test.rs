@@ -1,7 +1,7 @@
 //! E2E coverage for the generic API proxy at `/api/v1/proxy/...`.
 //!
 //! Path-traversal and method-validation guards are exercised by the
-//! in-module unit tests in `crates/lucidos-engine/src/api/proxy.rs::tests`.
+//! in-module unit tests in `crates/lucidos-agents-api/src/api/proxy.rs::tests`.
 //! Note that we can't reach those guards via reqwest in an e2e test —
 //! `url::Url` (and most HTTP clients) normalize `..` segments before the
 //! request leaves the process, so the bytes that hit the engine no longer

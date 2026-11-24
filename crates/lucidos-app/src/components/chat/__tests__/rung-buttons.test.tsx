@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The rung control's boxes: a pill whose middle opens the list and never
- * sends. Compose and a started thread draw the same pill, with ‹ and › at its
- * ends, which step the rung and open no list.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

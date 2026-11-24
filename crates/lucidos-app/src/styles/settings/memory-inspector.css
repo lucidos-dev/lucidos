@@ -1,4 +1,3 @@
-/* Memory Inspector */
 .memory-stats-bar {
     display: flex;
     align-items: center;
@@ -52,11 +51,6 @@
 
 .memory-importance-segment.dimmed { opacity: 0.2; }
 
-/* An ordered escalation ramp, NOT a set of state markers: each step must read
-   as hotter than the one before it. That is why `high` is warm (--accent-orange)
-   rather than the cool --accent-notable used for neutral markers elsewhere —
-   a cool hue here lands between the grey and blue steps and flattens the ramp.
-   Don't "consistency-fix" this onto --accent-notable. */
 .memory-importance-segment.low { background: var(--text-muted); }
 .memory-importance-segment.medium { background: var(--accent); }
 .memory-importance-segment.high { background: var(--accent-orange); }
@@ -148,7 +142,6 @@
     flex-shrink: 0;
 }
 
-/* Same ordered ramp as .memory-importance-segment above — keep the two in step. */
 .memory-importance-dot.low { background: var(--text-muted); }
 .memory-importance-dot.medium { background: var(--accent); }
 .memory-importance-dot.high { background: var(--accent-orange); }
@@ -168,7 +161,6 @@
     background: color-mix(in srgb, var(--accent-green) 15%, transparent);
 }
 
-/* Provenance, not severity — "came from an artifact" is a neutral fact. */
 .memory-source-badge.artifact {
     color: var(--accent-notable);
     background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
@@ -194,8 +186,6 @@
     flex-shrink: 0;
 }
 
-/* Copyable, targetable id — same uuid the agent sees as `[id: <uuid>]` in the
-   [Long-term Memory] block and accepts in the correct_memory_by_id tool. */
 .memory-id-value {
     font-family: var(--font-mono);
     font-size: var(--font-size-xs);
@@ -252,8 +242,6 @@
     overflow-wrap: anywhere;
 }
 
-/* Settings → System → Memory: the Tree confirm modal and the backfill bar.
-   The body scrolls, so a short phone screen still reaches Start in the foot. */
 .memory-tree-confirm {
     width: min(32rem, calc(100vw - 2rem));
     max-height: calc(var(--app-height, 100dvh) - 2rem - var(--safe-area-top) - var(--safe-area-bottom));
@@ -270,8 +258,6 @@
     overscroll-behavior: contain;
 }
 
-/* The memory choice: two cards side by side, stacked on a phone, then what
-   Tree costs a month. The body scrolls, like the Tree confirm's. */
 .memory-choice {
     width: min(40rem, calc(100vw - 2rem));
     max-height: calc(var(--app-height, 100dvh) - 2rem - var(--safe-area-top) - var(--safe-area-bottom));
@@ -327,13 +313,11 @@
     color: var(--text-secondary);
 }
 
-/* The buttons line up at the foot of both cards, however long the copy. */
 .memory-choice-card .action-btn {
     align-self: flex-start;
     margin-top: auto;
 }
 
-/* The compactor model row heads the cost panel: the title, with the picker. */
 .memory-choice-cost > .settings-row {
     padding: 0;
 }
@@ -342,7 +326,6 @@
     font-weight: 600;
 }
 
-/* Three across, or one a row where three do not fit: never two and an orphan. */
 .memory-choice-cost {
     container: memory-choice-cost / inline-size;
 }
@@ -377,7 +360,6 @@
     color: var(--text-secondary);
 }
 
-/* Holds a line while the price loads, so nothing moves when it lands. */
 .memory-choice-tile-usd {
     min-height: 1.25em;
     font-size: var(--font-size-2xl);
@@ -429,7 +411,6 @@
     color: var(--text-secondary);
 }
 
-/* Holds a line while the value loads, so nothing moves when it lands. */
 .memory-tree-estimate dd {
     margin: 0;
     min-height: 1.25em;
@@ -456,10 +437,6 @@
     font-size: var(--font-size-2xs);
 }
 
-/* A sheen runs along the fill while the compactor works, so one long tree
-   still reads as busy between counts. An activity cue, so its duration stays
-   literal. The sheen repaints every frame, so the fill owns its layer
-   (an-endless-repaint-owns-its-layer.test.ts). */
 .memory-tree-status[data-working] .progress-bar-fill {
     background: linear-gradient(
         90deg,

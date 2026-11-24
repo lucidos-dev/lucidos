@@ -30,9 +30,6 @@ describe('createDblClickGate', () => {
   });
 
   it('allows two clicks landing in the same millisecond — synthetic double-clicks do', () => {
-    // Test drivers (Playwright dblclick) and HTMLElement.click() can dispatch
-    // both pointerdowns within one Date.now() tick; a strict current > prev
-    // check silently swallowed those double-clicks.
     const gate = createDblClickGate(400);
     vi.spyOn(Date, 'now').mockReturnValue(1000);
     gate.record();
@@ -52,9 +49,9 @@ describe('createDblClickGate', () => {
   it('resets tracking after a slow third click', () => {
     const gate = createDblClickGate(400);
     vi.spyOn(Date, 'now')
-      .mockReturnValueOnce(1000)   // click 1
-      .mockReturnValueOnce(1200)   // click 2 — 200ms gap, allowed
-      .mockReturnValueOnce(2000);  // click 3 — 800ms gap, rejected
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1200)
+      .mockReturnValueOnce(2000);
     gate.record();
     gate.record();
     expect(gate.allow()).toBe(true);

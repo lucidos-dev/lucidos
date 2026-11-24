@@ -21,8 +21,6 @@ describe('isPageActive', () => {
     isIOS.mockReset().mockReturnValue(false);
     setVisibility('visible');
     setHasFocus(true);
-    // Default native-window state is active; flipped per-test below. (Always
-    // true in the browser / PWA where no native bridge ever fires.)
     setNativeWindowActive(true);
   });
 
@@ -54,10 +52,6 @@ describe('isPageActive', () => {
   });
 
   it('Tauri: false when the native window is inactive (trayed / unfocused), even when visible+focused', () => {
-    // The WKWebView still reports visible+focused while trayed via orderOut: —
-    // the native-active bridge is what makes it report not-in-use. The reported
-    // bug: a trayed/unfocused desktop client got a suppressed, invisible toast
-    // instead of an OS native banner.
     setNativeWindowActive(false);
     expect(isPageActive()).toBe(false);
   });

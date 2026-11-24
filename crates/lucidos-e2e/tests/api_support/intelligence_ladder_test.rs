@@ -1,7 +1,8 @@
 //! API e2e for the *intelligence ladder* (ADR 0500, ADR 0525): the route that
 //! serves each *ladder surface*, and the refusal of an agent's pick off it.
 
-use crate::support::{base_url, local_process_client, user_client};
+use crate::support::{as_stamped_workspace_call, base_url, local_process_client, user_client};
+use lucidos_engine::engine::thread_events::SpawnVerdict;
 use serde_json::json;
 
 async fn get_ladder(query: &str) -> serde_json::Value {
@@ -78,7 +79,8 @@ async fn the_coding_agent_route_still_serves_the_ladder() {
 }
 
 /// The chat ladder names no backend. Its bands count from the account's chat
-/// default, and every served pair has one row.
+/// default when that has an estimate, else from Claude Code's default rung.
+/// Every served pair has one row.
 #[tokio::test]
 async fn the_route_serves_the_chat_ladder() {
     let ladder = get_ladder("?surface=chat").await;
@@ -93,7 +95,16 @@ async fn the_route_serves_the_chat_ladder() {
             "one row per model and effort: {ladder}"
         );
     }
-    assert_eq!(ladder["reference"], ladder["default_rung"], "{ladder}");
+    // The e2e engine runs the mock model, which has no row and so no estimate.
+    let default_estimated = rungs
+        .iter()
+        .any(|r| r["is_default"] == true && r["estimated"] == true);
+    let expected = if default_estimated {
+        ladder["default_rung"].clone()
+    } else {
+        get_ladder("?surface=claude-code").await["default_rung"].clone()
+    };
+    assert_eq!(ladder["reference"], expected, "{ladder}");
 }
 
 const TRIGGER_NAME: &str = "ladder e2e off-ladder trigger";
@@ -154,8 +165,18 @@ fn off_ladder_spawn(mode: &str) -> serde_json::Value {
 }
 
 async fn post_chat(client: &reqwest::Client, body: serde_json::Value) -> (u16, serde_json::Value) {
-    let resp = client
-        .post(format!("{}/api/v1/chat/stream", base_url()))
+    send_chat(
+        client.post(format!("{}/api/v1/chat/stream", base_url())),
+        body,
+    )
+    .await
+}
+
+async fn send_chat(
+    request: reqwest::RequestBuilder,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let resp = request
         .json(&body)
         .send()
         .await
@@ -169,12 +190,21 @@ async fn post_chat(client: &reqwest::Client, body: serde_json::Value) -> (u16, s
 }
 
 /// An agent's pick off the ladder is refused, naming the ladder. An agent
-/// request needs provenance, here a cross-workspace caller.
+/// request needs attested provenance, here a stamped cross-workspace caller:
+/// an unstamped one is refused earlier, as unattested.
 #[tokio::test]
 async fn an_agents_off_ladder_pick_is_refused() {
     let mut spawn = off_ladder_spawn("agent");
     spawn["caller_workspace"] = "ladder-e2e-caller".into();
-    let (status, body) = post_chat(&local_process_client(), spawn).await;
+    let (status, body) = send_chat(
+        as_stamped_workspace_call(
+            local_process_client().post(format!("{}/api/v1/chat/stream", base_url())),
+            "ladder-e2e-caller",
+            &SpawnVerdict::Allowed,
+        ),
+        spawn,
+    )
+    .await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["reason"], "off-intelligence-ladder", "{body}");
     assert!(
@@ -259,4 +289,42 @@ async fn sorting_a_climbing_ladder_restates_it_and_stores_nothing() {
     let after = get_ladder("?surface=claude-code").await;
     assert_eq!(after["customised"], false, "{after}");
     assert_eq!(after["climbs"], true, "{after}");
+}
+
+/// A thread's alternative ladders use its reference and never repeat its backend.
+#[tokio::test]
+async fn thread_ladder_serves_other_installed_backends_on_a_common_reference() {
+    let pool = sqlx::PgPool::connect(&crate::support::db_url())
+        .await
+        .unwrap();
+    let thread = uuid::Uuid::new_v4();
+    crate::support::seed_cc_thread_summary(&pool, thread, "idle").await;
+    let ladder = get_ladder(&format!("?thread_id={thread}")).await;
+    let other = ladder["other_backend_ladders"]
+        .as_array()
+        .expect("alternative ladders");
+    let installed = lucidos_engine::runtime::installed_coding_agents(&pool).await;
+    let expected = installed
+        .iter()
+        .filter(|a| serde_json::to_value(a).unwrap() != ladder["coding_agent"])
+        .count();
+    assert_eq!(other.len(), expected, "{ladder}");
+    for alternative in other {
+        assert_ne!(alternative["coding_agent"], ladder["coding_agent"]);
+        assert_eq!(alternative["reference"], ladder["reference"]);
+    }
+}
+
+#[tokio::test]
+async fn setting_an_unknown_ladder_default_is_refused() {
+    let before = get_ladder("?surface=codex").await;
+    let response = user_client()
+        .await
+        .post(format!("{}/api/v1/intelligence-ladder/default", base_url()))
+        .json(&json!({"surface": "codex", "model": "unknown-model", "effort": "medium"}))
+        .send()
+        .await
+        .expect("default request failed");
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(get_ladder("?surface=codex").await, before);
 }

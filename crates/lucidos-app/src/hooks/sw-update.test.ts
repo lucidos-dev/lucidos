@@ -1,10 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// The toast dismissal now reads/writes the GLOBAL `preferences` signal (store)
-// and persists via the API client, instead of per-device localStorage. Mock both
-// so these unit tests neither load the full store graph nor hit HTTP — and so the
-// unrelated blocks below (refreshClient, getServedBuildId, …) stay isolated the
-// way they were before sw-update started importing the store.
 vi.mock('../store/store', async () => {
   const { signal } = await import('@preact/signals');
   return { preferences: signal({ status: 'not-loaded' }), showToast: vi.fn() };
@@ -35,7 +30,6 @@ describe('toast dismissal — workspace-global, build-id-keyed (engine switch + 
     preferences.value = { status: 'loaded', data: { [SWITCH_KEY]: 'disk-a', [CLIENT_KEY]: 'served-a' } };
     expect(wasEngineVersionDismissed('disk-a')).toBe(true);
     expect(wasSwUpdateDismissed('served-a')).toBe(true);
-    // A genuinely newer build (different id) is NOT dismissed → re-surfaces.
     expect(wasEngineVersionDismissed('disk-b')).toBe(false);
     expect(wasSwUpdateDismissed('served-b')).toBe(false);
   });
@@ -50,11 +44,7 @@ describe('toast dismissal — workspace-global, build-id-keyed (engine switch + 
     preferences.value = { status: 'loaded', data: { theme: 'dark' } };
     noteAnnouncedEngineVersion('disk-x');
     markEngineVersionDismissed();
-    // Global write is exactly (key, id) — the OMITTED 3rd arg (device id) is what
-    // makes the dismiss workspace-wide (defers on every device).
     expect(mockSetPreference).toHaveBeenCalledWith(SWITCH_KEY, 'disk-x');
-    // Optimistic local update so THIS device suppresses on its next poll without
-    // waiting for its own PreferencesChanged round-trip; unrelated keys preserved.
     expect(preferences.value).toMatchObject({ status: 'loaded', data: { theme: 'dark', [SWITCH_KEY]: 'disk-x' } });
     expect(wasEngineVersionDismissed('disk-x')).toBe(true);
   });
@@ -72,7 +62,6 @@ describe('toast dismissal — workspace-global, build-id-keyed (engine switch + 
     noteAnnouncedEngineVersion('disk-a');
     markEngineVersionDismissed();
     expect(wasEngineVersionDismissed('disk-a')).toBe(true);
-    // The version poll passes the CURRENTLY on-disk id; a newer one re-surfaces.
     expect(wasEngineVersionDismissed('disk-b')).toBe(false);
   });
 });
@@ -88,20 +77,15 @@ describe('shouldReloadForStaleChunk loop guard', () => {
 
   it('blocks a second reload inside the window', () => {
     expect(shouldReloadForStaleChunk(1_000_000)).toBe(true);
-    expect(shouldReloadForStaleChunk(1_005_000)).toBe(false); // 5s later — still guarded
+    expect(shouldReloadForStaleChunk(1_005_000)).toBe(false);
   });
 
   it('allows another reload once the window elapses', () => {
     expect(shouldReloadForStaleChunk(1_000_000)).toBe(true);
-    expect(shouldReloadForStaleChunk(1_031_000)).toBe(true); // 31s later — window cleared
+    expect(shouldReloadForStaleChunk(1_031_000)).toBe(true);
   });
 
   it('returns false (no auto-reload) when sessionStorage is unavailable', () => {
-    // Spy on the live global — the object `shouldReloadForStaleChunk` actually
-    // calls — not on `Storage.prototype`. The prototype route only worked while
-    // the test env happened to hand us a real `Storage` instance; test-setup.ts
-    // now always installs a plain in-memory stub (so touching Node's built-in
-    // Web Storage can't warn), which no longer inherits from that prototype.
     const spy = vi.spyOn(globalThis.sessionStorage, 'getItem').mockImplementation(() => {
       throw new Error('opaque origin');
     });
@@ -138,7 +122,7 @@ describe('requestServiceWorkerBuildId', () => {
     const postMessage = vi.fn();
     stubNavigator({ controller: null, ready: Promise.resolve({ active: { postMessage } }) });
     requestServiceWorkerBuildId();
-    await Promise.resolve(); // let the ready promise settle
+    await Promise.resolve();
     expect(postMessage).toHaveBeenCalledWith({ type: 'lucidos:get-build-id' });
   });
 
@@ -202,11 +186,6 @@ describe('refreshClient', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  // A refresh is a continuation of the session the user is already in, so the
-  // next document must paint the quiet cover instead of replaying the cold-launch
-  // brand animation. The flag has to be stamped SYNCHRONOUSLY here: the no-SW
-  // branch reloads on the very next line, and the fast path reloads a microtask
-  // later, so a deferred write would lose the race with its own reload.
   it('marks the next document as a refresh before any reload can happen', () => {
     const setItem = vi.fn();
     Object.defineProperty(globalThis, 'sessionStorage', {
@@ -216,12 +195,9 @@ describe('refreshClient', () => {
     stubNavigator(undefined);
     refreshClient();
     expect(setItem).toHaveBeenCalledWith('lucidos-splash-quiet', '1');
-    // Stamped before the reload, not after it.
     expect(setItem.mock.invocationCallOrder[0]).toBeLessThan(reload.mock.invocationCallOrder[0]);
   });
 
-  // Storage can be refused (private mode / opaque origin). Losing the cover is
-  // cosmetic; losing the refresh is not.
   it('still refreshes when sessionStorage refuses the flag', () => {
     Object.defineProperty(globalThis, 'sessionStorage', {
       value: { setItem: () => { throw new Error('denied'); } },
@@ -233,8 +209,6 @@ describe('refreshClient', () => {
   });
 
   it('blocks the UI immediately by raising clientRefreshing', () => {
-    // The block must flip synchronously, before any async SW work, so the
-    // UiBlockingOverlay dims the screen the instant a refresh is requested.
     stubNavigator({
       addEventListener: () => {},
       getRegistration: () => Promise.resolve({ update: vi.fn(() => Promise.resolve()), installing: {} }),
@@ -249,20 +223,17 @@ describe('refreshClient', () => {
     const update = vi.fn(() => Promise.resolve());
     stubNavigator({
       addEventListener: (type: string, fn: Function) => { (listeners[type] ??= []).push(fn); },
-      // A new build is installing — refreshClient must wait for the swap.
       getRegistration: () => Promise.resolve({ update, installing: {} }),
     });
 
     refreshClient();
-    await vi.advanceTimersByTimeAsync(0); // flush getRegistration().then(update)
+    await vi.advanceTimersByTimeAsync(0);
     expect(update).toHaveBeenCalledTimes(1);
-    expect(reload).not.toHaveBeenCalled(); // new worker installing — don't reload stale
+    expect(reload).not.toHaveBeenCalled();
 
-    // New worker skipWaiting()s and claims the page.
     for (const fn of listeners['controllerchange'] ?? []) fn();
     expect(reload).toHaveBeenCalledTimes(1);
 
-    // The safety timeout must not fire a second reload (reloaded guard + cleared timer).
     await vi.advanceTimersByTimeAsync(5000);
     expect(reload).toHaveBeenCalledTimes(1);
   });
@@ -271,15 +242,13 @@ describe('refreshClient', () => {
     const update = vi.fn(() => Promise.resolve());
     stubNavigator({
       addEventListener: () => {},
-      getRegistration: () => Promise.resolve({ update }), // no installing/waiting worker
+      getRegistration: () => Promise.resolve({ update }),
     });
     const { del } = stubCaches(['lucidos-shell-abc123', 'lucidos-blob-v1', 'unrelated']);
 
     refreshClient();
     await vi.advanceTimersByTimeAsync(0);
 
-    // Only the shell cache is dropped — the immutable blob cache + anything
-    // unrecognized is left intact.
     expect(del).toHaveBeenCalledTimes(1);
     expect(del).toHaveBeenCalledWith('lucidos-shell-abc123');
     expect(reload).toHaveBeenCalledTimes(1);
@@ -288,22 +257,20 @@ describe('refreshClient', () => {
   it('busts the shell cache then reloads if a detected new worker never claims', async () => {
     const update = vi.fn(() => Promise.resolve());
     stubNavigator({
-      addEventListener: () => {}, // controllerchange never fires
+      addEventListener: () => {},
       getRegistration: () => Promise.resolve({ update, waiting: {} }),
     });
     const { del } = stubCaches(['lucidos-shell-old']);
 
     refreshClient();
     await vi.advanceTimersByTimeAsync(0);
-    expect(reload).not.toHaveBeenCalled(); // waiting for the swap
+    expect(reload).not.toHaveBeenCalled();
 
-    await vi.advanceTimersByTimeAsync(4000); // safety timeout → bust + reload
+    await vi.advanceTimersByTimeAsync(4000);
     expect(del).toHaveBeenCalledWith('lucidos-shell-old');
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
-  // The UI stays locked until a reload. A probe that never answers (a stalled
-  // connection) must not hold that lock with no way out.
   it('busts the shell cache and reloads when the refresh stalls past its deadline', async () => {
     stubNavigator({
       addEventListener: () => {},

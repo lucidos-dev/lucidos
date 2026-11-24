@@ -1,0 +1,7 @@
+# Comment-strip commits: comments only, proven by two parsers. See docs/glossary.md, pre-comment-strip.
+79e0df937ea74c349784c65283ac03f13a6e2c77 # refactor(comment-strip): strip comments from src/components
+6fcabea5ffbb7e6d45f12c10c592dde057db5973 # refactor(comment-strip): strip comments from src/store
+61f205ac1411dcacc94be26b63b76b35ef1aa26a # refactor(comment-strip): strip comments from the rest of the app's src
+53fe400f1cef13d3dd87bfb90ff3ad1bd60d8e9b # refactor(comment-strip): strip comments from the app's e2e, vite and config files
+ed57a95f271e30f61195fe3b8636768bbdb44606 # refactor(comment-strip): strip comments from the SDK package
+5702b46934e101fc4c59f7e9f24c7a4788092c5b # refactor(comment-strip): strip comments from the remaining JavaScript and CSS

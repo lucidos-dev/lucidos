@@ -11,16 +11,11 @@ import { Explainer } from '../shared/Explainer';
 import { PREF_TITLE_STYLE } from '@lucidos/preference-catalog';
 import { titleStyleCommit, titleStyleOneLine } from './titleStyle';
 
-/** Settings → Models → Background tasks → Title generation → Title style: one
- *  instruction the title model follows when it names a thread. Commits on blur
- *  or Enter. Reset deletes the row, which restores the standard titles. */
 export function TitleStyleRow() {
   const stored = storedTitleStyle();
   const [draft, setDraft] = useServerBackedField(stored);
   const maxChars = PREF_TITLE_STYLE.maxChars;
   const field = useAutoResizeTextarea(draft);
-  // Re-arm once a save, a Reset or another device lands the draft's own text.
-  // The row stays mounted, so without it the field ignores every later frame.
   useEffect(() => {
     if (draft.trim() === stored.trim()) setDraft(stored);
   }, [stored, draft]);

@@ -1,6 +1,3 @@
-/* The overview look Settings pages share: a headline figure, a bar and its
-   key, and a hairline card that leads to an action. Disk Usage and Workspace
-   Prompt Footprint draw it. Every border is a 0.5px hairline. */
 
 .settings-overview-headline {
     display: flex;
@@ -21,7 +18,6 @@
     color: var(--text-secondary);
 }
 
-/* Each segment is a flex child sized by its inline `flex-grow`. */
 .settings-overview-bar {
     display: flex;
     width: 100%;
@@ -71,8 +67,6 @@
     font-variant-numeric: tabular-nums;
 }
 
-/* The recommended cleanup. A hairline box, the figure one step above body, and
-   the button beside the text until the pane is too narrow to hold both. */
 .settings-overview-card {
     display: flex;
     align-items: center;

@@ -1,16 +1,6 @@
-/** The delete dialog offers Archive, and choosing it archives instead.
- *
- *  Two things are load-bearing here. The offer is read off the same tagged
- *  actions the thread's action list renders, so an archived thread is never
- *  told to archive. And the button only records the choice: `ConfirmDialog`
- *  closes the visible dialog after the handler returns, so an archive confirm
- *  opened from inside it would be answered "no" on the way out.
- */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level.
-// vi.hoisted runs before any imports are resolved.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -54,7 +44,6 @@ vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   focusPromptNow: vi.fn(),
 }));
 
-/** Nothing to warn about, nothing blocking: the plain dialog. */
 function cleanPreflight() {
   return {
     thread_count: 1,
@@ -80,14 +69,11 @@ beforeEach(() => {
   (globalThis as any).innerWidth = 1024;
 });
 
-/** Let the preflight settle so the dialog is up. */
 async function openedDialog() {
   await vi.waitFor(() => expect(confirmState.value.visible).toBe(true));
   return confirmState.value;
 }
 
-/** What `ConfirmDialog` does on a click: run the extra action, then close the
- *  dialog with a `false`, which is the answer the OK button did not give. */
 function chooseExtraAction() {
   const state = confirmState.value;
   state.extraAction?.onClick();

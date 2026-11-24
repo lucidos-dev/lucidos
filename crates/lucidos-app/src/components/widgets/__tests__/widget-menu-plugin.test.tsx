@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** A widget a plugin ships stays reusable until the plugin is uninstalled, so
- *  its menu offers no Stop reusing (ADR 0414, invariant I14). */
 import { describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { widgetMenuItems, type WidgetMenuTarget } from '../WidgetMenu';

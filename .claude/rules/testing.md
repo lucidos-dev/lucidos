@@ -4,6 +4,8 @@ paths:
   - "crates/lucidos-app/src/**/*.rs"
   - "crates/lucidos-app/src/**/*.test.ts"
   - "crates/lucidos-engine/tests/**"
+  - "crates/lucidos-agents-api/tests/**"
+  - "crates/lucidos-engine-bin/tests/**"
   - "crates/lucidos-e2e/tests/**"
   - "crates/lucidos-app/src/generated/**"
   - "scripts/e2e*.sh"
@@ -12,9 +14,10 @@ paths:
 
 # E2E Testing
 
-Six test suites. The API and browser suites run against the e2e workspace (`~/workspaces/e2e-test`). The wasm and embedder suites are pure Rust integration tests that need external setup (built WASM artifacts, a downloaded ML model). The packaged-build smoke test boots the macOS `.app`. Contract tests run inline as part of `cargo test`. Rationale for the harness: `docs/e2e-test-decisions.md`.
+The suite layout and harness rationale live in `docs/e2e-test-decisions.md`.
+Run both suites only in disposable e2e workspaces.
 
-**The e2e engine builds and runs in RELEASE by default** (`scripts/lib/e2e.sh` sets `RELEASE=1`; `docs/plans/2026-06-28-e2e-always-release-build.md`). A local *filtered run* takes the debug engine and skips mobile-webkit, unless `--webkit` or a Playwright `--project` asks for it (ADR 0536). `LUCIDOS_E2E_DEBUG=1` also picks the debug build. A test-only seam production must not expose (`POST /api/v1/internal/seed-change-for-test`) is gated on `cfg!(any(debug_assertions, feature = "e2e-test-hooks"))`. The release e2e build passes `--features e2e-test-hooks`. A plain `cargo build --release` does not.
+**The e2e engine builds and runs in RELEASE by default** (`scripts/lib/e2e.sh` sets `RELEASE=1`; `docs/plans/2026-06-28-e2e-always-release-build.md`). A local *filtered run* takes the debug engine and skips WebKit, unless `--webkit` or a Playwright `--project` asks for it (ADR 0536). `LUCIDOS_E2E_DEBUG=1` also picks the debug build. A test-only seam production must not expose (`POST /api/v1/internal/seed-change-for-test`) is gated on `cfg!(any(debug_assertions, feature = "e2e-test-hooks"))`. The release e2e build passes `--features e2e-test-hooks`. A plain `cargo build --release` does not.
 
 **The e2e workspace database is rebuilt from zero on every run.** `reset_e2e_database` (`scripts/lib/e2e.sh`) drops and recreates it, so the engine's next boot runs the whole migration chain, seeds included. A test may assert on seeded data, such as the builtin model registry.
 
@@ -33,16 +36,20 @@ Every e2e script sends a whole suite to GitHub's runners when it can (ADRs 0382,
   - `--local`, or a local-only flag (`--no-reset`, `--headed`, `--ios`, `--packaged`).
   - A local-only variable: `THREAD_SHOTS` and the other screenshot switches, or `LUCIDOS_E2E_DEBUG`.
   - An unmet precondition: a dirty tree, no release libraries, no `lucidos` remote, no `gh`, or no named account (`GH_ACCOUNT_GITHUB_COM`). The fallback prints its reason.
-- **A busy host sends a filtered run to GitHub instead of waiting** (ADR 0584). The run is eligible when nothing pinned it here and GitHub is available. `e2e_github_handoff` records HEAD and runs the local leg as a child with `LUCIDOS_BUILD_MEMORY_WAIT_SECS`, `HOST_LOAD_MAX_WAIT_SECS` and `LUCIDOS_E2E_MEMORY_RESUMES` at 0. Exit 71, 72 or 75 (`scripts/lib/host_busy_exits.sh`) reruns the selection with `--commit <recorded HEAD>`. Any other exit is the verdict, and a failing test is never retried on GitHub.
+- **A busy host sends a filtered run to GitHub instead of waiting** (ADR 0584). The run is eligible when nothing pinned it here and GitHub is available. `e2e_github_handoff` records HEAD and runs the local leg as a child with every host wait at 0. Exit 71, 72 or 75 (`scripts/lib/host_busy_exits.sh`) reruns the selection with `--commit <recorded HEAD>`. Any other exit is the verdict, and a failing test is never retried on GitHub.
 - **`--github` insists.** It sends a filtered run too, and fails instead of falling back.
-- **`/harden`'s touched WebKit leg runs on a macOS host** with `ENGINE_CARGO_PROFILE=e2e` (ADR 0616).
+- **Every local run uses the *e2e root*, sandboxed or not** (`scripts/lib/e2e_root.sh`, ADR 0661). It holds the two e2e slots, the run's `LUCIDOS_PRIVATE_DIR` and nothing a gateway registers, so an agent's sandbox leaves it writable. The run reaches its own `lucidos-pg-e2e` cluster (`LUCIDOS_E2E_PG_PORT`, default 5511), never the live shared one. `LUCIDOS_E2E_ROOT` moves the root; the script header lists what it refuses.
+- **`/harden`'s touched WebKit leg always runs on GitHub**, pinned to the start commit, beside the local non-WebKit suite (ADR 0616).
 - **A local run takes an *e2e slot*** (`acquire_e2e_slots`, `scripts/lib/e2e_lock.sh`). A Chromium-only run takes the first free of `e2e-test` and `e2e-test-2`. A WebKit run or the umbrella takes both.
+- **Confinement goes to GitHub only when Linux cannot apply the sandbox**,
+  pinned to the start commit. A local failure stays local; no verdict exits 75.
+  macOS keeps the owner permission (ADRs 0690, 0692).
 - **A GitHub run reuses a built engine** whose *engine input manifest* (`scripts/lib/engine_manifest.sh`) matches the tree. A miss builds under the `e2e` cargo profile.
 - **`LUCIDOS_E2E_LOCAL=1` keeps nested scripts local**, so a caller inside a run never pushes a second run.
-- **What runs where.** Linux runs API, WASM, embedder, `chromium` and `mobile`. macOS runs `mobile-webkit`. A spec with a `@real-claude-code` test runs on this host as the local leg. Every other spec meets the *fake Claude Code*.
-- **Tag a test `@real-claude-code` when it needs real model behaviour**: resume memory, interrupts, mid-turn messages, side questions, tool use. An untagged test gets only `Say exactly: "X"` answered and the fake's `no rule` reply otherwise (ADR 0388).
+- **What runs where.** Linux runs API, WASM, embedder, `chromium` and `mobile`. macOS runs the WebKit projects. A spec with a `@real-claude-code` test runs on this host as the local leg. Every other spec meets the *fake Claude Code*.
+- **Tag a test `@real-claude-code` when it needs real model behaviour**: resume memory, interrupts, mid-turn messages, session recall in side questions, tool use. An untagged test gets only `Say exactly: "X"` answered and the fake's `no rule` reply otherwise (ADR 0388). A side-question card test may script its answer through the fake (ADR 0687).
 - **What gets pushed.** HEAD, or the commit `--commit <sha>` names, stripped and scanned like a release, as a parentless commit on an `e2e/<run-id>` branch of the mirror. A named commit runs no local leg.
-- **The main check is the one engine-driven run.** `e2e-github.sh main-check --commit <sha>` adds the engine suite and has no local fallback. An unmet precondition is no verdict: **exit 76** (ADR 0464).
+- **Main check.** The engine runs `e2e-github.sh main-check --commit <sha>` with no local fallback. Exit 76 means no verdict (ADR 0464). ADR 0748 lists the frontend checks.
 - **No secrets in the workflow, ever.** `./scripts/check-e2e-workflow.sh` enforces its limits.
 - **Harness changes stay runner-safe.** A shard reaches Postgres only through `shared_pg_psql` and `LUCIDOS_EXTERNAL_PG_PORT`, since macOS runners have no Docker. Shell must work under GNU and BSD tools.
 
@@ -57,9 +64,9 @@ Tests in `crates/lucidos-app/e2e/`: chat, streaming, cancellation, CC sessions, 
 ./scripts/e2e-browser.sh --ios                  # iOS Simulator with Safari (requires Xcode)
 ```
 
-Three projects: `chromium` (1280x800), `mobile` (375x812, mobile Chromium) and `mobile-webkit` (390x844, iOS Safari emulation).
+Four projects: `chromium` (1280x800), `mobile` (375x812, mobile Chromium), `desktop-webkit` (1280x800) and `mobile-webkit` (390x844, iOS Safari emulation).
 
-**One browser by default.** A spec with no suffix (or `-desktop`) runs on `chromium` only. `-mobile` runs on the two phone projects, `-all` on all three. Name a spec `-all` when it also asserts a phone or WebKit path (`e2e/project-rules.test.ts`, ADR 0531).
+**One browser by default.** A spec with no suffix (or `-desktop`) runs on `chromium` only. `-mobile` runs on the two phone projects, `-all` on those three. `desktop-webkit` runs only what `e2e/desktop-webkit-specs.txt` names. Name a spec `-all` when it also asserts a phone or WebKit path (`e2e/project-rules.test.ts`, ADR 0531).
 
 Serial, 2 min timeout, traces on failure. **Calm motion by default:** every project emulates reduced motion. A spec that tests motion opts back in with `test.use({ reducedMotion: 'no-preference' })` (`e2e/motion-stance.test.ts`). Helpers: `e2e/helpers.ts` (`sendMessage()`, `waitForResponse()`, `switchToClaudeMode()`), `e2e/db-helpers.ts` (`psql()`, `git()`).
 
@@ -80,21 +87,21 @@ Tests in `crates/lucidos-e2e/tests/api_support/` (member crate `lucidos-e2e`): H
 
 `e2e-api.sh` also runs the **gateway chain test** (`crates/lucidos-gateway/src/chain_tests.rs`) and **isolated snapshot round trip** (`crates/lucidos-gateway/src/snapshot_roundtrip_tests.rs`). Both put a real gateway router in front of real engines. They are `#[ignore]`d because `make test` has no built engine, and the script runs each BY NAME. The snapshot fixture owns a private HOME and Postgres instance; never restore the shared API/browser workspace. Its optional Chromium Settings check is documented in `crates/lucidos-app/e2e/snapshot-settings-roundtrip.mjs`.
 
-The gateway BINARY refuses to boot from a coding-agent worktree, with no opt-out (ADR 0021). Do not work around that to write a gateway test.
+The persistent gateway refuses coding-agent worktree binaries, with no environment opt-out (ADR 0021). Packaged tests use the explicit disposable service, fresh storage and owned supervisor (ADR 0702). Never bypass the persistent guard.
 
-**GitHub API and browser shards do run the binary** (`LUCIDOS_E2E_GATEWAY=own`, ADR 0385). In every mode the e2e engine's `LUCIDOS_GATEWAY_PORT` and `LUCIDOS_WORKSPACE_ID` come from a gateway that lists it at the engine's port, never from the caller.
+**GitHub API and browser shards do run the binary** (`LUCIDOS_E2E_GATEWAY=own`, ADR 0385). A local run has no gateway: the e2e root is in no gateway's registry. With `own`, the e2e engine's `LUCIDOS_GATEWAY_PORT` and `LUCIDOS_WORKSPACE_ID` come from that gateway listing it at the engine's port, never from the caller.
 
 ## Contract Tests (Rust ↔ TypeScript)
 
 Rust is the source of truth. TS is generated, so never hand-edit `src/generated/`.
 
-`./scripts/codegen.sh` writes every generated file: the Rust-rendered TS, CSS and JSON (`lucidos_engine::codegen::render_all`), then the SDK bundles in `packages/lucidos-sdk/dist/`. `npm test`, `npm run typecheck`, `npm run build` and every Vite run call it first. A bare `npx tsc --noEmit` does not, so after a Rust change run `npm run typecheck`. `make test` renders every file in memory.
+`./scripts/codegen.sh` writes every generated file: the Rust-rendered TS, CSS and JSON (`lucidos_engine_boot::codegen::render_all`), then the SDK bundles in `packages/lucidos-sdk/dist/`. `npm test`, `npm run typecheck`, `npm run build` and every Vite run call it first. A bare `npx tsc --noEmit` does not, so after a Rust change run `npm run typecheck`. `make test` renders every file in memory.
 
 **Regenerate** after a change to `available_thread_actions()`, `display_section()`, the `ThreadEvent` enum or any payload type it reaches, `engine/title_match.rs`, or any other source a renderer reads.
 
 ### ThreadEvent payload types (generated, ADR 0166)
 
-The `syn` reader in `crates/lucidos-engine/src/engine/thread_events/ts_codegen.rs` generates the payload shapes into `src/generated/thread-event-wire.ts`. `store/thread-events/thread-event-types.ts` re-exports them and keeps only what the wire does not decide (labels, summary helpers, fingerprints).
+The `syn` reader in `crates/lucidos-wire-codegen` generates the payload shapes into `src/generated/thread-event-wire.ts`. `store/thread-events/thread-event-types.ts` re-exports them and keeps only what the wire does not decide (labels, summary helpers, fingerprints).
 
 It emits the **wire** shape: `variant + EventMeta fields + API stamps - API strips`. `#[serde(default…)]` or `skip_serializing_if` makes a property optional. `Option<T>` is `T`, never `T | null`.
 
@@ -131,26 +138,29 @@ cargo test -p lucidos-engine --features real-embedder-tests   # All lib tests + 
 
 ## Packaged Build Smoke Test (macOS)
 
-`scripts/e2e-packaged.sh` boots the **packaged** macOS build and asserts the chain dev e2e never touches: staged Resources, the bundled gateway and engine, embedded Postgres, a per-workspace database, the engine spawn and static serving through the gateway.
+`scripts/e2e-packaged.sh` checks packaged macOS boot, resources, embedded Postgres and serving through the gateway.
 
 ```bash
-./scripts/e2e-packaged.sh            # reuse an existing .app, else build it
-./scripts/e2e-packaged.sh --rebuild  # force a fresh build-dmg.sh build first
+./scripts/e2e-packaged.sh            # rebuild this checkout's signed package
+./scripts/e2e-packaged.sh --rebuild  # compatibility alias; always rebuilds
 ./scripts/e2e.sh --packaged          # run it as a final phase of the full suite
 ```
 
-It runs the bundle's headless service role (`Lucidos --service`) under a temp `HOME`, and asserts over HTTP and on disk. It does **not** drive the WKWebView UI (ADR 0016). The Tauri layer's non-UI logic is unit-tested in `crates/lucidos-app` (`cargo test -p lucidos-app`, which needs a built `crates/lucidos-app/dist/`).
+It runs `Lucidos --disposable-service <new-root> <port>` with fresh owned storage and a bounded supervisor (ADR 0702), including from coding-agent worktrees. Each run needs `APPLE_SIGNING_IDENTITY` for a Developer ID Application certificate; the dev signing fallback cannot pass. It checks authenticated proxy/Python round trips plus normal shutdown, cancellation and controller loss with real bundled Postgres and closed engine/gateway listeners. Failure retains the disposable scope and logs. It does **not** drive the WKWebView UI (ADR 0016). The Tauri layer's non-UI logic is unit-tested in `crates/lucidos-app` (`cargo test -p lucidos-app`, which needs a built `crates/lucidos-app/dist/`).
 
 **macOS-only** and **heavy**: standalone and NOT in the default `e2e.sh` run. The nightly opts in with `--packaged` or `LUCIDOS_E2E_PACKAGED=1`.
+
+ADR 0016 also defines the signed proxy/script assertions and failure diagnostics.
 
 **When to write:** changes to the packaged boot chain: `build-dmg.sh` resource staging, `desktop.rs` service and gateway wiring, embedded Postgres provisioning, or the gateway's boot and control surface.
 
 ## The Codex driver tests fail under load
 
-`runtime::codex::driver_tests` and `runtime::codex_app_server::driver_tests` spawn a `/bin/sh` stub and carry 30 s and 60 s event timeouts. Under host load they fail, and the failures look like real breakage in code the branch never touched (ADR 0292).
-
-- **`/harden` runs these two modules alone, after the other-model review ends** (`scripts/harden-suites.sh`).
-- **Never accept a driver-test failure as a finding** until you re-run the module alone on a quiet host: `./scripts/test-engine.sh -- -- runtime::codex::driver_tests runtime::codex_app_server::driver_tests`.
+`/harden` runs `runtime::codex::driver_tests` and `runtime::codex_app_server::driver_tests`
+alone after the other-model review (ADR 0292).
+Accept timeouts only if they recur alone on a quiet host.
+See `docs/harden-notes.md` § Timeouts under load.
+Retry alone: `./scripts/test-engine.sh --engine -- -- runtime::codex::driver_tests runtime::codex_app_server::driver_tests`.
 
 ## Test Level Selection
 

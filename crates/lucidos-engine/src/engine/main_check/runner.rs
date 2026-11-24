@@ -31,6 +31,8 @@ pub(crate) struct MainCheckCommand {
 
 /// Must match `MAIN_CHECK_RUN_PREFIX` in `scripts/lib/main_check.sh`.
 const RUN_PREFIX: &str = "main-check run ";
+/// Must match `MAIN_CHECK_TESTS_STARTED_LINE` in `scripts/lib/main_check.sh`.
+const TESTS_STARTED_LINE: &str = "main-check tests-started";
 /// Must match `MAIN_CHECK_VERDICT_PREFIX` in `scripts/lib/main_check.sh`.
 const VERDICT_PREFIX: &str = "main-check verdict ";
 /// How long the script's own cleanup gets after the stop: one `gh run cancel`
@@ -82,11 +84,15 @@ pub(crate) enum RunTarget<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProtocolLine {
     RunStarted(RunLink),
+    TestsStarted,
     Verdict(RunReport),
 }
 
 /// Read one stdout line. Anything else the script prints is not protocol.
 pub(crate) fn parse_line(line: &str) -> Option<ProtocolLine> {
+    if line == TESTS_STARTED_LINE {
+        return Some(ProtocolLine::TestsStarted);
+    }
     if let Some(rest) = line.strip_prefix(RUN_PREFIX) {
         let mut words = rest.split_whitespace();
         let (Some(run_url), Some(branch), None) = (words.next(), words.next(), words.next()) else {
@@ -118,7 +124,8 @@ struct RunnerHandle {
     /// The check's run is on record, so a stop detaches instead of cancelling.
     linked: Arc<AtomicBool>,
     cancel: CancellationToken,
-    done: tokio::task::JoinHandle<()>,
+    /// Ends true when the child was stopped before it gave a verdict.
+    done: tokio::task::JoinHandle<bool>,
 }
 
 /// The running check's child, held so engine shutdown can stop it. It holds
@@ -168,6 +175,34 @@ impl RunnerSlot {
         }
     }
 
+    /// Cancel `check_id`'s run, linked or not, and wait for its child to go.
+    /// True when the cancel stopped it, and then it reports nothing. False
+    /// when its verdict came first or another check's child holds the slot.
+    pub(crate) async fn cancel(&self, check_id: Uuid) -> bool {
+        let handle = {
+            let mut slot = self.lock();
+            if slot.as_ref().is_none_or(|held| held.check_id != check_id) {
+                return false;
+            }
+            slot.take()
+        };
+        let Some(handle) = handle else { return false };
+        handle.linked.store(false, Ordering::SeqCst);
+        handle.cancel.cancel();
+        match tokio::time::timeout(self.grace * 2, handle.done).await {
+            Ok(Ok(stopped)) => stopped,
+            Ok(Err(_)) => true,
+            // A stopped child is reaped within `grace`, so one still running
+            // had read its verdict and will report it.
+            Err(_) => {
+                log_legacy!(
+                    "[MainCheck] the cancelled check's child had its verdict; letting it report"
+                );
+                false
+            }
+        }
+    }
+
     /// Stop the running check's child and wait for it to go. It reports
     /// nothing: the next start finds the check running, and reattaches to a
     /// run on record or abandons the check.
@@ -180,7 +215,7 @@ impl RunnerSlot {
             .await
             .is_err()
         {
-            log!("[MainCheck] the check's child did not stop in time");
+            log_legacy!("[MainCheck] the check's child did not stop in time");
         }
     }
 }
@@ -199,7 +234,7 @@ pub(crate) fn spawn_runner(
     // first and leave a finished handle behind.
     let mut held = slot.lock();
     if let Some(running) = held.as_ref() {
-        log!(
+        log_legacy!(
             "[MainCheck] check {}'s child still runs; check {} starts no second one",
             running.check_id,
             check_id
@@ -257,7 +292,7 @@ async fn run_child(
     tx: UnboundedSender<MainCheckMsg>,
     cancel: CancellationToken,
     slot: Arc<RunnerSlot>,
-) {
+) -> bool {
     let RunningChild {
         mut child,
         check_id,
@@ -274,14 +309,18 @@ async fn run_child(
             }
         };
         tokio::select! {
-            () = cancel.cancelled() => {
+            // Once the verdict is read, the child is done: let it report.
+            () = cancel.cancelled(), if report.is_none() => {
                 let detach = linked.load(Ordering::SeqCst);
                 stop_child(&mut child, pid, slot.grace, detach).await;
-                return;
+                return true;
             }
             line = next => match line.as_deref().and_then(parse_line) {
                 Some(ProtocolLine::RunStarted(link)) => {
                     let _ = tx.send(MainCheckMsg::RunLinked { check_id, link });
+                }
+                Some(ProtocolLine::TestsStarted) => {
+                    let _ = tx.send(MainCheckMsg::TestsStarted { check_id });
                 }
                 Some(ProtocolLine::Verdict(verdict)) => report = Some(verdict),
                 None if line.is_none() => break,
@@ -298,6 +337,7 @@ async fn run_child(
         })
     });
     let _ = tx.send(MainCheckMsg::Ended { check_id, report });
+    false
 }
 
 /// Signal the child's group, SIGUSR2 to `detach` and SIGTERM to cancel, and
@@ -320,7 +360,7 @@ async fn stop_child(
         crate::runtime::spawn_env::terminate_child_process_group(pid);
     }
     if tokio::time::timeout(grace, child.wait()).await.is_err() {
-        log!("[MainCheck] the check's child outlived its grace; killing it");
+        log_legacy!("[MainCheck] the check's child outlived its grace; killing it");
         crate::runtime::spawn_env::kill_child_process_group_now(pid);
         let _ = child.wait().await;
     }
@@ -380,6 +420,15 @@ mod tests {
     }
 
     #[test]
+    fn the_tests_started_line_is_protocol_alone() {
+        assert_eq!(
+            parse_line("main-check tests-started"),
+            Some(ProtocolLine::TestsStarted)
+        );
+        assert_eq!(parse_line("main-check tests-started now"), None);
+    }
+
+    #[test]
     fn other_output_and_a_garbled_verdict_are_not_protocol() {
         assert_eq!(parse_line("[e2e-github] run x: remote engine"), None);
         assert_eq!(parse_line("main-check verdict {not json"), None);
@@ -389,15 +438,22 @@ mod tests {
         );
     }
 
-    /// The prefixes are the shell library's, word for word.
-    #[test]
-    fn the_prefixes_match_the_shell_library() {
-        let lib = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../scripts/lib/main_check.sh"),
-        )
-        .expect("scripts/lib/main_check.sh");
-        assert!(lib.contains(&format!("MAIN_CHECK_RUN_PREFIX=\"{RUN_PREFIX}\"")));
-        assert!(lib.contains(&format!("MAIN_CHECK_VERDICT_PREFIX=\"{VERDICT_PREFIX}\"")));
+    mod guard_tests {
+        use super::*;
+
+        /// The prefixes are the shell library's, word for word.
+        #[test]
+        fn the_prefixes_match_the_shell_library() {
+            let lib = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/lib/main_check.sh"),
+            )
+            .expect("scripts/lib/main_check.sh");
+            assert!(lib.contains(&format!("MAIN_CHECK_RUN_PREFIX=\"{RUN_PREFIX}\"")));
+            assert!(lib.contains(&format!("MAIN_CHECK_VERDICT_PREFIX=\"{VERDICT_PREFIX}\"")));
+            assert!(lib.contains(&format!(
+                "MAIN_CHECK_TESTS_STARTED_LINE=\"{TESTS_STARTED_LINE}\""
+            )));
+        }
     }
 }

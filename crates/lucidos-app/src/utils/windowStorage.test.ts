@@ -15,7 +15,6 @@ import { TAB_WINDOW_ID_KEY } from './windowIdKey';
 
 const KEY = 'lucidos-focused-thread';
 
-/** Boot as another window: a fresh tab id, as a second window would have. */
 function becomeAnotherWindow(): void {
   sessionStorage.clear();
   _resetWindowStorageForTests();

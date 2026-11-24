@@ -1,26 +1,22 @@
 import { Page, APIResponse, expect, Locator, Request } from '@playwright/test';
 import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
+import { withDeviceStamp } from './harnessStamp';
 import { MODAL_EXIT_DRAWING_CLASS } from '../src/components/shared/overlayExitClass';
 import { computeMinThreadPaneWidth, THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
 import { DASHBOARD_RAIL_SHOWN_KEY } from '../src/store/dashboardRailKeys';
 import { DEVICE_ID_KEY } from '../src/utils/deviceIdKey';
 import { ANCHOR_GAP } from '../src/hooks/anchorGap';
 import { rungSwitchCopy } from '../src/components/chat/rungSwitchCopy';
-import { homeThreadIdInDb } from './db-helpers';
+import { homeThreadIdInDb, psql } from './db-helpers';
 
-/** The device id this page registered at boot, or null before it navigates. */
 async function pageDeviceId(page: Page): Promise<string | null> {
   try {
     return await page.evaluate((key) => localStorage.getItem(key), DEVICE_ID_KEY);
   } catch {
-    // No document yet (a spec that calls the API before its first goto), so
-    // there is no id to borrow.
     return null;
   }
 }
 
-/** The device id the shell writes during boot, once it is there. A read right
- *  after navigation can run before the shell has written it. */
 export async function shellDeviceId(page: Page): Promise<string> {
   let id: string | null = null;
   await expect.poll(async () => {
@@ -30,21 +26,6 @@ export async function shellDeviceId(page: Page): Promise<string> {
   return id as unknown as string;
 }
 
-/** `page.request`, identifying itself the way the page does.
- *
- *  `page.request` shares the browser context's cookies but NOT its
- *  `localStorage`, so it carries no `x-lucidos-device-id` and
- *  `api::mutating_gate` refuses every mutation it makes (ADR 0169). The
- *  harness is a legitimate external client, so it presents a credential rather
- *  than the gate being narrowed.
- *
- *  It borrows the PAGE's own id. A call the harness makes is then attributed to
- *  the device the test is driving, and device-scoped preferences stay per-test.
- *  Before the first navigation there is no id to borrow, so it registers one.
- *
- *  Shape-preserving on purpose: `apiRequest(page).put(url, opts)` takes exactly
- *  what `page.request.put(url, opts)` took, and a caller's own `headers` win.
- */
 export function apiRequest(page: Page) {
   type Opts = Parameters<Page['request']['post']>[1];
   const withDevice = async (opts: Opts): Promise<Opts> => {
@@ -53,13 +34,9 @@ export function apiRequest(page: Page) {
       await registerHarnessDevice(page.request);
       id = HARNESS_DEVICE_ID;
     } else {
-      // The page has the id in localStorage, but the app registers it
-      // server-side fire-and-forget, so it may not be in `devices` yet. Make
-      // sure it is before a mutating call borrows it, or the gate 401s it
-      // (ADR 0169). See ensurePageDeviceRegistered.
       await ensurePageDeviceRegistered(page.request, id);
     }
-    return { ...opts, headers: { 'x-lucidos-device-id': id, ...opts?.headers } };
+    return { ...opts, headers: withDeviceStamp({ 'x-lucidos-device-id': id, ...opts?.headers }) };
   };
   return {
     post: async (url: string, opts?: Opts): Promise<APIResponse> =>
@@ -73,8 +50,6 @@ export function apiRequest(page: Page) {
   };
 }
 
-/** Set a device-scoped preference for the device this page registered, the
- *  way Settings does. Waits for the shell to have registered one. */
 export async function setDevicePreference(page: Page, key: string, value: string): Promise<void> {
   let device: string | null = null;
   await expect.poll(async () => (device = await pageDeviceId(page)), {
@@ -85,10 +60,6 @@ export async function setDevicePreference(page: Page, key: string, value: string
   expect((await res.json()).success, `${key}=${value}`).toBe(true);
 }
 
-/** Open a Settings page through the navigate API, as the agent does.
- *  `view` is a `settings_view` value such as `appearance` or `system`.
- *  Waits for the event stream first: the navigation is a transient event, so a
- *  page still connecting never sees it and stays where it was. */
 export async function openSettingsView(page: Page, view: string): Promise<void> {
   await waitForEventStream(page);
   const nav = await apiRequest(page).post('/api/v1/ui/navigate', {
@@ -98,29 +69,17 @@ export async function openSettingsView(page: Page, view: string): Promise<void> 
   expect(nav.ok(), `POST /api/v1/ui/navigate -> ${nav.status()}`).toBeTruthy();
 }
 
-/** CSS selector for the body of a rendered user message (initiator panel).
- *  Centralized so a UI rename only requires changing this one constant. */
 export const USER_MSG_SELECTOR = '.initiator-panel-user .initiator-body';
 
-/** Drawer rows for compose drafts share the `.thread-row` class and a
- *  `data-thread-nav` attr with real thread rows. A test that wants a real
- *  thread must filter drafts out: the draft variants also carry
- *  `compose-draft-row` and `data-draft-id`. */
 export const REAL_THREAD_ROW = '.thread-row:not(.compose-draft-row)';
 export const REAL_THREAD_NAV = '[data-thread-nav]:not([data-draft-id])';
 
-/** Start of the thread-drawer toggle's `aria-label`. Always match it as a
- *  PREFIX. `ThreadToggleButton` appends " (N blocked)" whenever the
- *  thread list is hidden and a thread awaits the user, so an exact-match
- *  selector silently stops resolving. */
 export const DRAWER_TOGGLE_LABEL = 'Show or hide thread drawer';
 
-/** Locator for the first physically visible user-message body (dual-layout safe). */
 export function userMessageBody(page: Page): Locator {
   return page.locator(`${USER_MSG_SELECTOR}:visible`).first();
 }
 
-/** Check if viewport is mobile-sized (matches CSS breakpoint at 768px) */
 export function isMobileViewport(page: Page): boolean {
   const vp = page.viewportSize();
   return vp ? vp.width < 769 : false;
@@ -130,11 +89,6 @@ type TouchStep =
   | { type: 'touchStart' | 'touchMove'; x: number; y: number }
   | { type: 'touchEnd' };
 
-/** Drive one CDP touch press, every step sent in a single burst. Chromium only.
- *
- *  Awaiting each step lets a loaded host stretch the press past
- *  `LONG_PRESS_DELAY_MS`, and a long-pressable control then reads a hold
- *  instead of a tap. */
 export async function touchPress(page: Page, steps: TouchStep[]): Promise<void> {
   const cdp = await page.context().newCDPSession(page);
   await Promise.all(steps.map((s) => cdp.send('Input.dispatchTouchEvent', {
@@ -143,21 +97,8 @@ export async function touchPress(page: Page, steps: TouchStep[]): Promise<void> 
   })));
 }
 
-/** Distinguishes one settle wait from the next, for `ensureMobileView`'s pane
- *  and `openThreadDrawer`'s drawer. Both compare a measurement against the
- *  frame before, and both keep that frame on `window`. Without a token the
- *  PREVIOUS call's verdict would answer this call's first frame. */
 let settleToken = 0;
 
-/** Navigate to a mobile pane by name. No-op on desktop, or when already there.
- *  Re-clicks the dot inside the wait loop, so a click absorbed by a concurrent
- *  re-render is retried. `polling: 250` caps re-clicks at 4/sec instead of the
- *  rAF default, to avoid event-storming Preact while the pane settles.
- *
- *  It returns on the SIGNAL, not on the pane arriving: the header attribute is
- *  written the instant the dot is clicked. A caller that then measures pane
- *  geometry wants `waitForPaneAtRest` after it. `openThreadDrawer` is the one
- *  that does, and it says why. */
 export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads' | 'content'): Promise<void> {
   if (!isMobileViewport(page)) return;
   await page.waitForFunction((target) => {
@@ -169,31 +110,12 @@ export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads
   }, viewName, { timeout: 10_000, polling: 250 });
 }
 
-/** Wait until the mobile pane track has STOPPED MOVING.
- *
- *  `.mobile-swipe-track` slides for `--duration-slow` (300ms) after the view
- *  signal flips, and `ensureMobileView` returns on the signal. Its click
- *  happens inside a 250ms poll, so a caller measuring straight afterwards reads
- *  geometry about 290ms in, every time. A drawer row is then a fraction of a
- *  pixel off the left edge. That is why an on-screen test over one failed
- *  deterministically rather than flakily.
- *
- *  Index-free on purpose: at rest exactly one pane sits at viewport left 0, and
- *  mid-slide none does. Except at the start: the LEAVING pane still reads left
- *  0 for the slide's first frames, so the track must also have no transition
- *  running. Held across two frames, as the transition starts on a style flush.
- *
- *  **Called by `openThreadDrawer` alone, deliberately.** Inside
- *  `ensureMobileView` it would hand every mobile spec up to 300ms of extra
- *  settling. One of them measures a sub-pixel invariant that the shift
- *  disturbs: `turn-control-holds-the-reader-still` went from 0 failures in 24
- *  runs to 3. A spec that needs the pane still asks for it. */
 export async function waitForPaneAtRest(page: Page): Promise<void> {
   if (!isMobileViewport(page)) return;
   const token = ++settleToken;
   await page.waitForFunction((token) => {
     const panes = Array.from(document.querySelectorAll('.mobile-swipe-pane'));
-    if (panes.length === 0) return true; // desktop layout, nothing slides
+    if (panes.length === 0) return true;
     const track = document.querySelector('.mobile-swipe-track');
     const sliding = !!track && track.getAnimations().length > 0;
     const atRest = !sliding && panes.some(p => Math.abs(p.getBoundingClientRect().left) < 0.5);
@@ -204,17 +126,12 @@ export async function waitForPaneAtRest(page: Page): Promise<void> {
   }, token, { timeout: 5_000 });
 }
 
-/** On mobile, navigate to the thread pane (pane 1). No-op on desktop. */
 export async function ensureOnThreadPane(page: Page): Promise<void> {
   await ensureMobileView(page, 'thread');
 }
 
 export { getBaseUrl } from './address';
 
-/** Wait for a physically visible prompt input (dual-layout safe).
- *  At mobile viewports the desktop layout is `display: none`, so `.first()` can
- *  pick the hidden one. Wait for any prompt input to become visible, then
- *  return the visible locator. */
 export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise<Locator> {
   await page.waitForFunction(() => {
     const els = document.querySelectorAll('[data-role="prompt-input"]');
@@ -227,21 +144,6 @@ export async function waitForVisibleInput(page: Page, timeout = 30_000): Promise
   return page.locator('[data-role="prompt-input"]:visible').first();
 }
 
-/** Navigate to `url` (main-document commit) with a BOUNDED per-attempt timeout
- *  and a retry. THE canonical way to load the app in e2e: specs route their
- *  `page.goto` through this rather than calling `page.goto` directly.
- *
- *  On the `mobile-webkit` project the FIRST navigation in a fresh context
- *  intermittently wedges. Both causes, and everything ruled out, are in
- *  docs/e2e-test-decisions.md § "mobile-webkit navigation wedge". The primary
- *  one is fixed at the source in playwright.config.ts, and a pre-commit
- *  cold-context stall is handled by the preflight in e2e/fixtures.ts.
- *
- *  What is left for this helper: CAP any later pre-commit hang, failing at
- *  ATTEMPTS*timeout rather than the full test budget, and re-navigate once.
- *  Waiting only for the response commit keeps a post-commit lifecycle stall
- *  from reading as a failed app load, so callers assert real readiness
- *  afterwards. */
 export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
   const ATTEMPTS = 2;
   const PER_ATTEMPT_TIMEOUT_MS = 30_000;
@@ -252,8 +154,6 @@ export async function gotoWithRetry(page: Page, url = '/'): Promise<void> {
       return;
     } catch (err) {
       lastErr = err;
-      // Stalled before the main response committed. Re-navigate once; a sticky
-      // freeze still falls through to the whole-test fresh-context retry.
     }
   }
   throw lastErr;
@@ -267,18 +167,9 @@ export async function navigateToApp(page: Page): Promise<void> {
   await leaveColdStartHome(page);
 }
 
-/** A fresh browser context stores no focus, so the cold start opens Home
- *  (ADR 0411). Most specs start from the compose view, so step off Home
- *  through New thread. A spec about Home opens it on purpose, or uses
- *  `gotoWithRetry` to keep the cold start's landing.
- *
- *  No Home row means a spec truncated it, and then nothing opens Home. A spec
- *  that seeded a focus keeps it: the cold start leaves a stored focus alone. */
 export async function leaveColdStartHome(page: Page): Promise<void> {
   const home = homeThreadIdInDb();
   if (!home) return;
-  // Polled, because the cold start decides once the thread list lands. It
-  // never fails: a stored focus for a thread that is gone ends with none.
   const focusKey = 'lucidos-focused-thread';
   let focused: string | null = null;
   for (let waited = 0; waited < 10_000 && focused === null; waited += 100) {
@@ -287,19 +178,11 @@ export async function leaveColdStartHome(page: Page): Promise<void> {
   }
   if (focused !== home) return;
   await newThread(page);
-  // New thread focuses the prompt, and a phone reads that as an open keyboard,
-  // which takes the header out of reach. A cold load focuses nothing, so the
-  // spec starts where it would have.
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
   await expect(page.locator('html[data-keyboard-active]')).toHaveCount(0);
-  // With dynamic bars on, the header glides back from the keyboard hide.
   await waitForHeaderAtRest(page);
 }
 
-/** Wait until the phone header has stopped gliding. With dynamic bars on it
- *  slides on `translate` for `--duration-slow`, and a spec that measures it
- *  mid-glide reads a fraction of a pixel off. Held across two frames, since a
- *  transition starts on a style flush. No-op on desktop. */
 export async function waitForHeaderAtRest(page: Page): Promise<void> {
   if (!isMobileViewport(page)) return;
   const token = ++settleToken;
@@ -314,23 +197,12 @@ export async function waitForHeaderAtRest(page: Page): Promise<void> {
   }, token, { timeout: 5_000 });
 }
 
-/** Wait until a dashboard can take a press: its live content has mounted and
- *  settled, and no skeleton covers it.
- *
- *  The live content is waited for by presence. Before the dashboard's view
- *  loads, no grid is mounted and no skeleton has passed its delay gate. So a
- *  check for "no settling grid, no skeleton" passes at once. The skeleton then
- *  shows over the grid for its minimum hold, and a press lands on it. */
 export async function waitForDashboardReady(dashboard: Locator): Promise<void> {
   const live = dashboard.locator('.loading-fade > .loading-fade-content > :is(.dashboard-grid:not(.is-settling), .dashboard-empty)');
   await expect(live).toHaveCount(1);
   await expect(dashboard.locator('.loading-fade-skeleton:not(.loading-fade-out)')).toHaveCount(0);
 }
 
-/** Wait until the workspace has reported ready, which is when the boot splash
- *  starts to leave. The shell is live under the splash from its first frame,
- *  but nobody can see it, and its layout is still settling. A fresh e2e
- *  workspace boots in about 100ms, well inside the splash's hold. */
 export async function waitForWorkspaceReady(page: Page): Promise<void> {
   await page.waitForFunction(
     () => document.querySelector('.boot-splash:not(.boot-splash-leaving)') === null,
@@ -339,52 +211,44 @@ export async function waitForWorkspaceReady(page: Page): Promise<void> {
   );
 }
 
-/** Wait until every closed backdrop modal has finished fading out.
- *
- *  A closing modal leaves an inert drawing of its last frame for the fade
- *  (`overlayExitDrawing.ts`). The drawing keeps the dialog's classes. So until
- *  it goes, a class locator matches it beside the live UI, and strict mode
- *  fails. Call this after a close, before the next class-based assertion. */
 export async function waitForModalExitFade(page: Page): Promise<void> {
   await expect(page.locator(`.${MODAL_EXIT_DRAWING_CLASS}`)).toHaveCount(0);
 }
 
-/** Start this page with the *follow seed* DISARMED, before the app boots.
- *
- *  The seed ships ARMED and every test gets a fresh context. So a spec that
- *  says nothing rides every thread it opens. One about the toggle's own journey
- *  has to start from the other side. Otherwise its first `click()` disarms
- *  where it meant to arm. Every "the reader was left where the landing put
- *  them" assertion then reads the ride instead.
- *
- *  `addInitScript` rather than an `evaluate` after navigating, because
- *  `scrollState` reads the seed ONCE at module load. A write after boot is a
- *  write the signal has already gone past.
- *
- *  The key is written out, as every other localStorage seed in these specs is:
- *  `FOLLOW_SEED_KEY` is module-private, and the string runs in the page rather
- *  than in the test. */
 export async function disarmFollowSeed(page: Page): Promise<void> {
   await page.addInitScript(() => {
     localStorage.setItem('lucidos-follow-live-edge', 'false');
   });
 }
 
-/** Hide the desktop dashboard rail before the app boots. It shows by default and
- *  takes width from the panes (ADR 0466). A spec that measures pane geometry
- *  at a fixed window therefore opts out of it.
- *
- *  An init script for the same reason as `disarmFollowSeed`: `dashboardRailShown`
- *  reads the key once at module load. */
 export async function hideDashboardRail(page: Page): Promise<void> {
   await page.addInitScript((key) => {
     localStorage.setItem(key, 'false');
   }, DASHBOARD_RAIL_SHOWN_KEY);
 }
 
-/** The Conversation pane's floor, by the app's own function, from what the
- *  page shows: the root font size, the lights reserve and the controls leading
- *  the row. Home joining the row raises it. */
+export async function mockChangesState(
+  page: Page,
+  state: unknown,
+  opts: { changesDelayMs?: number } = {},
+): Promise<{ reads: () => number }> {
+  let reads = 0;
+  await page.route('**/api/v1/changes*', async (route) => {
+    reads++;
+    if (opts.changesDelayMs) await new Promise((r) => setTimeout(r, opts.changesDelayMs));
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state) });
+  });
+  await page.route('**/api/v1/bootstrap', async (route) => {
+    const response = await route.fetch();
+    const snapshot = await response.json();
+    snapshot.changes_state = { data: state };
+    const headers = { ...response.headers() };
+    delete headers.etag;
+    await route.fulfill({ response, headers, json: snapshot });
+  });
+  return { reads: () => reads };
+}
+
 export async function minThreadPane(page: Page): Promise<number> {
   const row = await page.evaluate((selector) => {
     const root = getComputedStyle(document.documentElement);
@@ -397,30 +261,11 @@ export async function minThreadPane(page: Page): Promise<number> {
   return computeMinThreadPaneWidth(row.remPx, row.reservePx, row.leadControls);
 }
 
-/** Put the WHOLE thread in the DOM, the way a reader does: press the up
- *  chevron, which renders every exchange and then scrolls to the true top
- *  (`threadWindow.scrollToTopNeedsRenderAll`).
- *
- *  A transcript opens WINDOWED, showing only a trailing slice sized by the step
- *  budget. Two kinds of spec ask past it: one measuring a seeded thread's full
- *  height, and one hunting a row in an early turn. Press first, and the rest of
- *  the spec sees what it seeded.
- *
- *  Returns with the reader at the top and the chevron gone. A spec that parks
- *  the reader somewhere sets `scrollTop` itself afterwards. No-op on a thread
- *  small enough to render whole, where the chevron never appears. */
 export async function renderWholeTranscript(page: Page): Promise<void> {
   const chevron = page.locator('.scroll-to-top.visible').first();
   if (await chevron.count() === 0) return;
   await chevron.click();
-  // Under calm motion the jump lands before the older history does, and a
-  // reader at the top of a partial thread still sees the chevron. It hides
-  // only once nothing is left above.
   await expect(chevron).toBeHidden({ timeout: 30_000 });
-  // With motion the chevron GLIDES, and its easing sits near zero for several
-  // frames before it lands. A caller that parked the reader while the tween
-  // still had frames to write would have its own `scrollTop` overwritten on
-  // the next one. So wait for two settled frames at the top.
   await expect.poll(() => page.evaluate(() => new Promise<boolean>(resolve => {
     const el = document.querySelector('.thread-content') as HTMLElement | null;
     if (!el) return resolve(false);
@@ -431,27 +276,12 @@ export async function renderWholeTranscript(page: Page): Promise<void> {
   }))).toBe(true);
 }
 
-/** Wait until the page's SSE event stream is open.
- *  Required before tests emit transient engine events that are delivered only
- *  over SSE, such as `/api/v1/ui/navigate` NavigationRequested events. */
 export async function waitForEventStream(page: Page, timeout = 10_000): Promise<void> {
   await page.waitForFunction(() => {
     return document.documentElement.dataset.lucidosEventStream === 'connected';
   }, undefined, { timeout });
 }
 
-/** Watch the shell's preference reads. Call it before the page navigates.
- *
- *  Every read ends in `applyUiScale`, which rewrites `--user-ui-scale`. The
- *  shell reads once at startup and again when its event stream opens, in
- *  either order. A read that lands after a spec writes a scale replaces it.
- *
- *  The returned wait resolves once the stream is open and this document has
- *  two successful reads, with none still out. A failed read applies nothing,
- *  so it never counts.
- *
- *  A new document starts a new count. It keys on the document request,
- *  because `framenavigated` also fires on the shell's own `replaceState`. */
 export function watchPreferenceReads(page: Page): () => Promise<void> {
   let documentSeq = 0;
   let answered = 0;
@@ -483,7 +313,6 @@ export function watchPreferenceReads(page: Page): () => Promise<void> {
         message: 'the shell\'s startup preference reads never all landed',
       })
       .toBe(true);
-    // The network answer lands before the shell parses and applies the body.
     await page.evaluate(() => new Promise<void>(resolve => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
     }));
@@ -493,8 +322,6 @@ export function watchPreferenceReads(page: Page): () => Promise<void> {
 export async function sendMessage(page: Page, text: string): Promise<void> {
   const input = await waitForVisibleInput(page, 15_000);
   await input.fill(text);
-  // On mobile viewports (<=768px), PromptInput disables Enter-to-submit
-  // (Enter inserts newline for the on-screen keyboard). Click the send button instead.
   if (isMobileViewport(page)) {
     await clickVisibleElement(page, 'button[aria-label="Send message"]');
   } else {
@@ -502,11 +329,6 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   }
 }
 
-/** Send a message and return the thread id the chat POST carried.
- *
- *  The "Requesting" label is optimistic: the POST waits behind the device
- *  registration first, so a listener read right after the label sees no
- *  request yet. This waits for the POST itself. */
 export async function sendMessageCapturingThreadId(page: Page, text: string): Promise<string> {
   const posted = page.waitForRequest(
     (req) => req.url().includes('/api/v1/chat/stream') && req.method() === 'POST',
@@ -518,13 +340,9 @@ export async function sendMessageCapturingThreadId(page: Page, text: string): Pr
   return threadId as string;
 }
 
-/** A turn's reply. The compose view's welcome card shares the class but is no
- *  reply. A wait that counted it passed on a send that never went out. */
 const TURN_RESPONSE_SELECTOR = '.response-content:not(.welcome-message)';
 
-/** Wait for a response to appear and finish streaming (handles dual-layout) */
 export async function waitForResponse(page: Page, timeout = 90_000): Promise<Locator> {
-  // Dual-layout: find a physically visible response-content element
   await page.waitForFunction((sel) => {
     const els = document.querySelectorAll(sel);
     return Array.from(els).some(el => {
@@ -543,7 +361,6 @@ export async function waitForResponse(page: Page, timeout = 90_000): Promise<Loc
     }
   }
 
-  // Wait for exchange status labels to stop showing "Working"/"Requesting"
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');
     if (labels.length === 0) return true;
@@ -559,17 +376,6 @@ export async function waitForResponse(page: Page, timeout = 90_000): Promise<Loc
   return response;
 }
 
-/** Leave the step log ON, which is the door to everything a step row carries.
- *
- *  Steps SHOW by default (`stepsExpanded`, persisted in localStorage), so on a
- *  fresh context this is a no-op. It asks for the control in any state and
- *  clicks conditionally: an unconditional click would TURN STEPS OFF on the
- *  ordinary run, and a locator pinned to `aria-pressed="false"` would time out
- *  there.
- *
- *  It does NOT wait for a step to exist. Every response turn carries the
- *  control, whatever it holds, so keep asserting on the step row itself
- *  afterwards. */
 export async function revealSteps(page: Page, timeout = 30_000): Promise<void> {
   const toggle = page
     .locator('.turn-controls [data-role="toggle-steps"]:visible')
@@ -579,7 +385,6 @@ export async function revealSteps(page: Page, timeout = 30_000): Promise<void> {
   await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 }
 
-/** Wait for at least one physically visible element matching a selector (dual-layout safe). */
 export async function waitForVisibleElement(page: Page, selector: string, timeout = 5_000): Promise<void> {
   await page.waitForFunction((sel) => {
     const els = document.querySelectorAll(sel);
@@ -587,16 +392,11 @@ export async function waitForVisibleElement(page: Page, selector: string, timeou
   }, selector, { timeout });
 }
 
-/** Wait for a visible element then click it (dual-layout safe). */
 export async function waitAndClick(page: Page, selector: string, text?: string, timeout = 5_000): Promise<void> {
   await waitForVisibleElement(page, selector, timeout);
   await clickVisibleElement(page, selector, text);
 }
 
-/** Wait out the glide into the picker's current step. The panel pins its
- *  children and clips them while it runs, then scrolls the active row into view
- *  the moment it ends. A click pressed inside that window can be released over a
- *  different row, which fires no click and leaves the step as it was. */
 async function pickerStepSettled(row: Locator): Promise<void> {
   await expect
     .poll(() => row.evaluate(el => el.closest('[data-overlay-panel]')?.getAnimations({ subtree: true }).length ?? 0),
@@ -604,13 +404,6 @@ async function pickerStepSettled(row: Locator): Promise<void> {
     .toBe(0);
 }
 
-/** Drive the open model picker: a model, then one of its tiers when it has any.
- *
- *  A step-1 row carries the model id. A row that opens a step draws the
- *  drill-down glyph. One without it (a model with no tiers, like Haiku)
- *  commits on the first click, as `modelStepCommit` does. A step-2 row carries
- *  the encoded pair, which is what the pick reports. Returns that pair. Omit
- *  `tier` to take the first the model offers. */
 export async function pickModelPair(page: Page, model: string, tier?: string): Promise<string> {
   const modelRow = page.locator(`.control-option[data-value="${model}"]:visible`).first();
   await expect(modelRow).toBeVisible({ timeout: 10_000 });
@@ -632,8 +425,6 @@ export async function pickModelPair(page: Page, model: string, tier?: string): P
   return pair;
 }
 
-/** One row of the prompt bar's rung list: a ladder rung, model and effort
- *  together. `value` is the row's `data-value`, an encoded pair. */
 export interface RungRow {
   value: string;
   model: string;
@@ -641,8 +432,6 @@ export interface RungRow {
   current: boolean;
 }
 
-/** Split a rung row's `data-value` at its last `|`, as the app does. An empty
- *  tail is no effort. */
 export function splitRungValue(value: string): { model: string; effort: string | null } {
   const at = value.lastIndexOf('|');
   if (at === -1) return { model: value, effort: null };
@@ -651,11 +440,6 @@ export function splitRungValue(value: string): { model: string; effort: string |
 
 const RUNG_PICKABLE = '.control-dropdown .control-option:visible:not([data-value="ladder-link"])';
 
-/** Open the rung list and return the panel. A row with room opens it from the
- *  pill's trigger, which names no rung until the commands have loaded. A row
- *  too narrow for the pill folds it into the ⋯ menu, and that menu's row opens
- *  the same list. Which one a row gets depends on the pane and the font, so
- *  neither is assumed. */
 export async function openRungList(page: Page): Promise<Locator> {
   const trigger = page.locator('.rung-trigger[aria-label^="Model"]:visible').first();
   const more = page.locator('.prompt-actions-row:visible [data-fold-key=""]').first();
@@ -679,8 +463,6 @@ export async function openRungList(page: Page): Promise<Locator> {
   return panel;
 }
 
-/** The open rung list's ladder rungs, in order. The ladder link is left out,
- *  and a thread's off-ladder pair stays in. */
 export async function readRungRows(page: Page): Promise<RungRow[]> {
   await expect(page.locator(RUNG_PICKABLE).first()).toBeVisible({ timeout: 5_000 });
   const rows = await page.locator(RUNG_PICKABLE).evaluateAll((els) =>
@@ -691,17 +473,36 @@ export async function readRungRows(page: Page): Promise<RungRow[]> {
   return rows.map((r) => ({ ...r, ...splitRungValue(r.value) }));
 }
 
-/** The `data-value` of the open rung list's checked row. */
 export async function currentRungValue(page: Page): Promise<string> {
   const current = page.locator('.control-dropdown .control-option-current:visible');
   await expect(current).toHaveCount(1, { timeout: 5_000 });
   return (await current.getAttribute('data-value')) ?? '';
 }
 
-/** Tap a row of the open rung list. One tap commits the model and the effort
- *  together and closes the list. A pick on a live thread whose cache is warm
- *  asks first, and this switches the thread: the "Switch this thread" card
- *  where a handoff is offered, else "Switch anyway". A cold cache asks nothing. */
+export function modelSubstitutions(threadId: string): { requested: string; served: string }[] {
+  const rows = psql(
+    `SELECT payload FROM events WHERE thread_id = '${threadId}' ` +
+    `AND event_type = 'CodingAgentModelSubstituted' ORDER BY id`,
+  );
+  return rows.split('\n').filter(Boolean).map((row) => JSON.parse(row));
+}
+
+export async function expectPickRanOrSubstituted(page: Page, threadId: string, picked: RungRow): Promise<void> {
+  await openRungList(page);
+  const current = await currentRungValue(page);
+  await page.keyboard.press('Escape');
+  const substitutions = modelSubstitutions(threadId);
+  if (substitutions.length === 0) {
+    expect(current).toBe(picked.value);
+    return;
+  }
+  expect(substitutions).toHaveLength(1);
+  expect(substitutions[0].requested).toBe(picked.model);
+  expect(splitRungValue(current).model).not.toBe(picked.model);
+  expect(splitRungValue(current).effort).toBeTruthy();
+  await expect(page.locator('.step-description', { hasText: 'this account cannot use' })).toHaveCount(1);
+}
+
 export async function pickRung(page: Page, value: string): Promise<void> {
   const row = page.locator(`.control-dropdown .control-option[data-value="${value}"]:visible`).first();
   await expect(row).toBeVisible({ timeout: 5_000 });
@@ -711,9 +512,6 @@ export async function pickRung(page: Page, value: string): Promise<void> {
   await answerRungSwitchIfAsked(page, 2_000);
 }
 
-/** Choose to switch this thread when a rung pick asks what to do with its
- *  cache. The question waits on an estimate, so a slow run can ask after
- *  `pickRung` returned; a caller waiting on the pick calls this again. */
 export async function answerRungSwitchIfAsked(page: Page, timeout: number): Promise<void> {
   const confirm = page.locator('.confirm-dialog');
   const asked = await confirm.waitFor({ state: 'visible', timeout }).then(() => true, () => false);
@@ -725,24 +523,8 @@ export async function answerRungSwitchIfAsked(page: Page, timeout: number): Prom
   await expect(confirm).toHaveCount(0, { timeout: 5_000 });
 }
 
-/** Click a content-header action by its ACTION class (`.file-edit-btn`,
- *  `.diff-whole-file-toggle`) wherever progressive collapse put it.
- *
- *  The content header folds its leading actions into a `⋯` overflow menu when
- *  the row runs out of room for the title (`useHeaderActionCollapse`). On a
- *  phone an ordinary long title can fold EVERY action behind `⋯`. A test
- *  waiting on the bare header button then times out on a layout behaving
- *  exactly as designed. Placement is the layout's business; the test's
- *  business is that the action works.
- *
- *  Both renderings carry the action class, so one selector finds it either way.
- *  This still fails loudly when the action is genuinely absent: neither
- *  placement appears and the wait times out. */
 export async function clickHeaderAction(page: Page, actionSelector: string, timeout = 10_000): Promise<void> {
   const menuRow = `.thread-overflow-item${actionSelector}`;
-  // Settled = the action has a placement: its own header button, or the `⋯`
-  // trigger that would hold it. Waiting on either avoids racing the collapse
-  // hook's layout-effect measurement.
   await page.waitForFunction(({ sel }) => {
     const anyVisible = (s: string) =>
       Array.from(document.querySelectorAll(s)).some(el => el.getBoundingClientRect().width > 0);
@@ -760,36 +542,18 @@ export async function clickHeaderAction(page: Page, actionSelector: string, time
   }
 }
 
-/** Is a content-header action OFFERED to the reader, in EITHER placement?
- *
- *  The reading counterpart of `clickHeaderAction`, and the sharper half of the
- *  same problem. A folded action has no header button, so a bare
- *  `expect('.the-action').toHaveCount(0)` is satisfied by a folded action
- *  exactly as by an absent one. A "this surface does not offer that control"
- *  assertion written that way stops being able to fail.
- *
- *  Leaves no state behind: the `⋯` menu is only opened when the action has no
- *  header button, and is closed again through its own trigger before returning. */
 export async function headerActionOffered(page: Page, actionSelector: string, timeout = 10_000): Promise<boolean> {
-  // Settle first, for the reason clickHeaderAction settles: the collapse hook
-  // measures in a layout effect, so before it has run neither placement exists
-  // and every answer here would be a false negative.
   await page.waitForFunction(({ sel }) => {
     const anyVisible = (s: string) =>
       Array.from(document.querySelectorAll(s)).some(el => el.getBoundingClientRect().width > 0);
     return anyVisible(sel) || anyVisible('.content-header-more');
   }, { sel: actionSelector }, { timeout }).catch(() => {
-    // Neither placement ever appeared, which IS the answer when a caller is
-    // asking whether an action is offered. Fall through to the reads below.
   });
 
   if (await page.locator(`${actionSelector}:visible`).count() > 0) return true;
   if (!await clickVisibleElement(page, '.content-header-more')) return false;
   await waitForVisibleElement(page, '.thread-overflow-item', timeout);
   const offered = await page.locator(`.thread-overflow-item${actionSelector}`).count() > 0;
-  // Close through the trigger rather than Escape: the trigger is the menu's
-  // anchor, so its own handler toggles the menu shut, and nothing else on the
-  // Escape stack is disturbed.
   await clickVisibleElement(page, '.content-header-more');
   await page.waitForFunction(
     () => document.querySelectorAll('.thread-overflow-item').length === 0,
@@ -798,45 +562,16 @@ export async function headerActionOffered(page: Page, actionSelector: string, ti
   return offered;
 }
 
-/** The id of the thread the app currently has focused, read from the same
- *  `localStorage` key the app persists it under.
- *
- *  This is the identity-safe way to answer "which thread did I just create?"
- *  after a `sendMessage` + `waitForResponse`. Reading it off the drawer with a
- *  positional `.first()` is unsafe, for the reason `threadRowFor` documents
- *  below. Throws when nothing is focused, since a caller asking for the id
- *  always believes a thread is. */
 export async function focusedThreadId(page: Page): Promise<string> {
   const id = await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'));
   if (!id) throw new Error('focusedThreadId: no thread is focused (lucidos-focused-thread is unset)');
   return id;
 }
 
-/** Selector for ONE specific thread's drawer row.
- *
- *  Use this, never `REAL_THREAD_ROW` plus a positional `.first()`, whenever a
- *  test means "the thread I just created". Positional row selection is unsafe
- *  in this suite: `clearAllThreads()` truncates only the `thread_summaries`
- *  PROJECTION, so a coding-agent session left running by an EARLIER spec
- *  re-inserts its own row with `last_activity = NOW()`. That sorts it ABOVE the
- *  row this test just made. `.first()` then clicks a foreign thread, and every
- *  later assertion silently measures the wrong one.
- *
- *  Keys on `data-flip-id`, which `ThreadDrawer.tsx` stamps on every row wrapper
- *  for its FLIP animation and keyboard nav. That is the one stable per-thread
- *  hook the list carries, so a rename there must move this with it. */
 export function threadRowFor(threadId: string): string {
   return `[data-flip-id="${threadId}"] .thread-row`;
 }
 
-/** Click a SPECIFIC thread's drawer row (dual-layout safe, identity-based).
- *  Waits for that row to render, then clicks it through the same touch-routing
- *  bypass `clickVisibleElement` uses. Never falls back to another row: a row
- *  that does not appear is itself the bug, and it throws naming the thread.
- *
- *  The wait is a PRECONDITION, not the assertion a caller is testing, so it is
- *  deliberately generous. A WebContent paint stall must not turn "click my row"
- *  into a flake. */
 export async function clickThreadRow(page: Page, threadId: string, timeout = 10_000): Promise<void> {
   const selector = threadRowFor(threadId);
   try {
@@ -849,8 +584,6 @@ export async function clickThreadRow(page: Page, threadId: string, timeout = 10_
   }
 }
 
-/** Click the first physically visible element matching a selector (dual-layout safe).
- *  Optionally filter by text content. Returns whether an element was clicked. */
 export async function clickVisibleElement(page: Page, selector: string, text?: string): Promise<boolean> {
   return page.evaluate(({ sel, txt }) => {
     const els = document.querySelectorAll(sel);
@@ -866,10 +599,6 @@ export async function clickVisibleElement(page: Page, selector: string, text?: s
   }, { sel: selector, txt: text });
 }
 
-/** Switch the thread drawer to a grouping through the threads header's
- *  grouping button, the same component on both layouts, so this is dual-layout
- *  safe. A no-op when that grouping is already shown. Throws if the button is
- *  not visible. */
 export async function showGrouping(page: Page, grouping: 'folders' | 'ongoing'): Promise<void> {
   const label = grouping === 'ongoing' ? 'Show Ongoing' : 'Show Folders';
   const other = grouping === 'ongoing' ? 'Show Folders' : 'Show Ongoing';
@@ -880,11 +609,6 @@ export async function showGrouping(page: Page, grouping: 'folders' | 'ongoing'):
   await expect(page.locator(`.grouping-btn:visible[aria-label^="${other}"]`)).toHaveCount(1);
 }
 
-/** Switch the thread drawer to the Ongoing grouping and select one ongoing
- *  group by its tile label. The labels are "Blocked", "Review",
- *  "Drafts" and "In flight". The tiles render in the thread drawer pane, which
- *  is the same component on both layouts, so this is dual-layout safe. Every
- *  tile is always drawn, empty or not. */
 export async function showOngoingGroup(page: Page, label: string): Promise<void> {
   await showGrouping(page, 'ongoing');
   const tile = page.locator('.drawer-ongoing-tiles .ongoing-tile:visible')
@@ -894,22 +618,6 @@ export async function showOngoingGroup(page: Page, label: string): Promise<void>
   await expect(tile).toHaveAttribute('aria-current', 'true');
 }
 
-/** Click compose button to start a new thread (dual-layout safe).
- *  On mobile the compose button navigates to thread pane automatically.
- *
- *  The two layouts reach it differently. The desktop thread-pane header carries
- *  New thread as an icon button. Both mobile headers have no room for it and
- *  keep it inside the Lucidos menu as a `.brand-menu-item`.
- *
- *  The menu route is gated on the mobile viewport, because that is the only
- *  place the menu HAS that item. Running it on desktop would open the Lucidos
- *  menu, find nothing, and leave it standing over the app for the rest of the
- *  spec.
- *
- *  The menu opens only once its rows' chunk has loaded (`usePendingOpen` in
- *  HeaderMark.tsx), so the row is awaited rather than looked up once. A menu
- *  that never shows the row throws: skipping it would leave the old draft on
- *  screen and fail the caller far from the cause. */
 export async function newThread(page: Page): Promise<void> {
   const clicked = await clickVisibleElement(page, 'button[aria-label="New thread"]');
   if (!clicked && isMobileViewport(page)
@@ -918,7 +626,7 @@ export async function newThread(page: Page): Promise<void> {
     try {
       await row.waitFor({ state: 'visible', timeout: 5_000 });
     } catch (err) {
-      await page.keyboard.press('Escape'); // never leave the menu standing open
+      await page.keyboard.press('Escape');
       throw new Error(`the Lucidos menu never showed its New thread row: ${(err as Error).message}`);
     }
     if (!await clickVisibleElement(page, '.brand-menu-item', 'New thread')) {
@@ -926,7 +634,6 @@ export async function newThread(page: Page): Promise<void> {
     }
   }
   await ensureOnThreadPane(page);
-  // Wait for compose/create view (no existing messages visible)
   await page.waitForFunction((sel) => {
     return !Array.from(document.querySelectorAll(sel)).some(el => {
       const rect = el.getBoundingClientRect();
@@ -936,7 +643,6 @@ export async function newThread(page: Page): Promise<void> {
   await waitForVisibleInput(page, 5_000);
 }
 
-/** Open the thread list — on mobile navigates to threads pane, on desktop toggles the drawer */
 export async function openThreadDrawer(page: Page): Promise<void> {
   if (isMobileViewport(page)) {
     await ensureMobileView(page, 'threads');
@@ -944,47 +650,25 @@ export async function openThreadDrawer(page: Page): Promise<void> {
       const drawer = document.querySelector('.mobile-threads-pane .thread-drawer');
       return drawer && drawer.getBoundingClientRect().width > 0;
     }, undefined, { timeout: 5_000 });
-    // A drawer with WIDTH is not a drawer that has ARRIVED: the pane is still
-    // sliding, so its rows sit a hair off the left edge. Callers hunt rows by
-    // geometry and by hit-testing right after this. So the mobile branch
-    // settles its pane, exactly as the desktop branch below settles its width.
     await waitForPaneAtRest(page);
     return;
   }
-  const isOpen = await page.evaluate(() => {
+  const drawerShown = () => {
     const drawers = document.querySelectorAll('.thread-drawer:not(.thread-drawer-collapsed)');
     return Array.from(drawers).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     });
-  });
+  };
+  const restoredOpen = await page.evaluate(
+    () => localStorage.getItem('lucidos-thread-drawer-open') === 'true',
+  );
+  const isOpen = restoredOpen
+    ? await page.waitForFunction(drawerShown, undefined, { timeout: 5_000 }).then(() => true, () => false)
+    : await page.evaluate(drawerShown);
   if (!isOpen) {
-    // Scoped to the desktop header's own slot rather than bare, because the
-    // mobile header's copy stays mounted under a desktop viewport.
-    //
-    // Match the label as a PREFIX, never exact. ThreadToggleButton appends the
-    // Blocked count to its own aria-label, exactly while the thread
-    // list is hidden. That is every case this branch runs in, so an `=` match
-    // finds nothing the moment any thread awaits the user.
     await page.locator(`.thread-toggle-slot button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`).click();
   }
-  // Wait for the drawer's open width-transition to SETTLE, not merely to be
-  // non-zero. Returning at width > 0 catches the drawer mid-slide, where the
-  // still-narrow title column wraps a long title to one character per line.
-  // Geometry assertions then read a degenerate layout.
-  //
-  // **The running transition is ASKED FOR, not inferred from two equal
-  // samples.** A tolerance of half a pixel across two frames was the earlier
-  // test, and it let a drawer through at two thirds open: the poll can sample
-  // twice inside one compositor frame and read one width twice, mid-slide.
-  //
-  // What that cost is not cosmetic. The conversation pane is the drawer's flex
-  // sibling, so the composer is still being resized. The composer's own
-  // `ResizeObserver` then ABANDONS an in-flight height ease whose target the
-  // new width has invalidated. Clicking a drawer row there lands the new
-  // draft's height with no animation, which is the `prompt-flip-height` flake.
-  // Driven deliberately it reproduced three times out of three, while a settled
-  // drawer animated three out of three.
   const token = ++settleToken;
   await page.waitForFunction((token) => {
     const drawer = Array.from(document.querySelectorAll('.thread-drawer:not(.thread-drawer-collapsed)'))
@@ -1006,24 +690,16 @@ export function uniqueMessage(prefix = 'e2e-test'): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Blur the currently focused element — useful when auto-focus hides the mobile header. */
 export async function blurActiveElement(page: Page): Promise<void> {
   await page.evaluate(() => {
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   });
 }
 
-/** Give the page the packaged macOS build's one horizontal difference: the
- *  `data-titlebar-overlay` attribute, which steps the header's leading control
- *  past the traffic lights. `titlebar_inset_script` also stamps
- *  `--titlebar-inset`, which only lifts the bar vertically, and the lights' x,
- *  whose CSS fallback is the value it stamps. No WebDriver reaches the real
- *  build (ADR 0016), so a spec simulates it this way. */
 export async function stampOverlayBuild(page: Page): Promise<void> {
   await page.evaluate(() => document.documentElement.setAttribute('data-titlebar-overlay', ''));
 }
 
-/** Get the top position of the app header (dual-layout safe). Returns -999 if not found. */
 export async function getHeaderTop(page: Page): Promise<number> {
   return page.evaluate(() => {
     const header = document.querySelector('.app-header');
@@ -1031,26 +707,6 @@ export async function getHeaderTop(page: Page): Promise<number> {
   });
 }
 
-/** Turn on the "Dynamic bars" mobile preference, so the header's
- *  and prompt's hide-on-scroll, and the header's hide-on-keyboard-open, are
- *  exercisable. With the bars pinned, nothing slides off and the hide
- *  assertions time out. Set the GLOBAL pref to 'true' BEFORE navigating so the
- *  page boots with hide enabled: with `device_id` omitted, the app's
- *  device-scoped preference load merges the global value. Must be called
- *  before `navigateToApp`.
- *
- *  A spec about the reader's own EDGE calls it for a second reason. That edge is
- *  the bottom of the sticky thread title. A pinned header holds it still, so the
- *  spec stops covering the half where chrome slides over the transcript. Being
- *  global, the pref is otherwise whatever the previous spec left.
- *
- *  PUT IT BACK. Every caller pairs this with `disableMobileDynamicBars` in an
- *  `afterEach`, because the pref is global and the e2e database resets only
- *  between projects. A later spec then runs with live hide-on-scroll it never
- *  asked for, and a header moving mid-click is not a layout it was written
- *  against. That cost `trigger-groups` its save. The mousedown landed on the
- *  button and the header then shifted the form, so the mouseup landed on the
- *  wrapper. No click reached the button, and the form never submitted. */
 export async function enableMobileDynamicBars(page: Page): Promise<void> {
   const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_dynamic_bars', {
     data: { value: 'true' },
@@ -1058,11 +714,6 @@ export async function enableMobileDynamicBars(page: Page): Promise<void> {
   expect(res.ok()).toBeTruthy();
 }
 
-/** Force pinned bars ("Dynamic bars" off), the e2e baseline. The product
- *  default is on, but `reset_e2e_database` (`scripts/lib/e2e.sh`) seeds the
- *  GLOBAL pref off for every project. A test depending on the pinned bars calls
- *  this in its beforeEach BEFORE navigating, so it boots pinned whatever the
- *  order. Pairs with `enableMobileDynamicBars`. */
 export async function disableMobileDynamicBars(page: Page): Promise<void> {
   const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_dynamic_bars', {
     data: { value: 'false' },
@@ -1070,16 +721,6 @@ export async function disableMobileDynamicBars(page: Page): Promise<void> {
   expect(res.ok()).toBeTruthy();
 }
 
-/** Arm or disarm the experimental voice switch. Voice ships OFF, so the call
- *  toggle is absent from every prompt input until a spec turns it on. The
- *  composer's leading cluster is one box narrower without it. Call this BEFORE
- *  navigating: the app reads its preferences at boot.
- *
- *  PUT IT BACK. `voice_enabled` is GLOBAL, and the e2e database resets only
- *  between projects. A spec that left voice on would hand every later one a
- *  control the product does not ship. Pair every `true` with a `false` in an
- *  `afterAll`. Never assume the previous spec's value: a spec that needs voice
- *  off sets it off, so it passes alone and in any order. */
 export async function setVoiceEnabled(page: Page, on: boolean): Promise<void> {
   const res = await apiRequest(page).put('/api/v1/preferences?key=voice_enabled', {
     data: { value: String(on) },
@@ -1087,19 +728,8 @@ export async function setVoiceEnabled(page: Page, on: boolean): Promise<void> {
   expect(res.ok()).toBeTruthy();
 }
 
-/** The composer row's ⋯ trigger, present only while something is folded. */
 export const COMPOSER_FOLD_TRIGGER = '.prompt-actions-row .prompt-actions-more:visible';
 
-/** A composer control, wherever the row's fold has put it.
- *
- *  The prompt row folds its middle into a ⋯ menu when it runs short of room.
- *  Both renderings carry the same `data-role` and the same `extraClass`, so one
- *  selector finds the control either way. What differs is that the menu has to
- *  be open first, which is what this does.
- *
- *  A toggle reports its state differently on each side: the row button says
- *  `aria-pressed`, the menu row says `aria-checked`. Ask the one you were
- *  handed rather than assuming which it is. */
 export async function composerControl(page: Page, selector: string): Promise<Locator> {
   const inRow = page.locator(`.prompt-actions-row ${selector}:visible`).first();
   if (await inRow.count() > 0) return inRow;
@@ -1111,14 +741,11 @@ export async function composerControl(page: Page, selector: string): Promise<Loc
   return page.locator(`.thread-overflow-menu ${selector}`).first();
 }
 
-/** Close the composer row's ⋯ menu, if `composerControl` left it open. Asks the
- *  trigger, so an Escape never reaches the prompt, where it stops the turn. */
 export async function closeComposerFold(page: Page): Promise<void> {
   const open = page.locator(`${COMPOSER_FOLD_TRIGGER}[aria-expanded="true"]`);
   if (await open.count() > 0) await page.keyboard.press('Escape');
 }
 
-/** Read a composer control wherever the fold put it, and close the ⋯ after. */
 async function readComposerControl<T>(
   page: Page, selector: string, read: (control: Locator) => Promise<T>,
 ): Promise<T> {
@@ -1130,27 +757,19 @@ async function readComposerControl<T>(
   }
 }
 
-/** Whether the coding-agent menu has its commands, standing or folded. Its ⋯
- *  row wears the button's classes, so a folded one is read behind the ⋯. */
 export function codingAgentCommandsReady(page: Page): Promise<boolean> {
   return readComposerControl(page, '.commands-btn',
     (control) => control.evaluate((el) => el.classList.contains('commands-btn-active')));
 }
 
-/** A composer toggle's state, `'true'` or `'false'`, standing or folded. A row
- *  button says `aria-pressed`, a menu row `aria-checked`. */
 export function composerToggleState(page: Page, selector: string): Promise<string | null> {
   return readComposerControl(page, selector,
     async (toggle) => {
-      // Short, so a control that is not there yet fails one poll, not the test.
       const quick = { timeout: 2_000 };
       return await toggle.getAttribute('aria-pressed', quick) ?? await toggle.getAttribute('aria-checked', quick);
     });
 }
 
-/** Press a composer control wherever the row's fold has put it. A row still
- *  settling can fold the control away after it was found, so each try finds it
- *  again. */
 export async function pressComposerControl(page: Page, selector: string): Promise<void> {
   await expect(async () => {
     await closeComposerFold(page);
@@ -1158,18 +777,14 @@ export async function pressComposerControl(page: Page, selector: string): Promis
   }).toPass({ timeout: 15_000 });
 }
 
-/** The follow toggle. It floats over the composer's top edge, in the down
- *  chevron's slot, so it never folds into the row's ⋯. */
 export function followToggle(page: Page): Locator {
   return page.locator('.prompt-area > [data-role="follow-live-edge"]:visible').first();
 }
 
-/** The follow toggle's state, `'true'` or `'false'`. */
 export function followToggleState(page: Page): Promise<string | null> {
   return followToggle(page).getAttribute('aria-pressed', { timeout: 2_000 });
 }
 
-/** Press the follow toggle. */
 export async function pressFollowToggle(page: Page): Promise<void> {
   await followToggle(page).click();
 }
@@ -1181,26 +796,11 @@ export async function assertHealthy(page: Page): Promise<void> {
   expect(body.status).toBe('ok');
 }
 
-/** Every open menu's option rows. The shared `Dropdown` portals its panel to
- *  <body> (clearing the header's stacking context), so an option is NOT under
- *  the trigger's wrapper. Addressing them globally is safe because the overlay
- *  dismiss contract allows only one open menu at a time. */
 const MENU_OPTION = '.dropdown-menu .dropdown-option';
 
-/** Drive a shared `Dropdown` (components/shared/Dropdown.tsx): open the
- *  trigger inside `rootSelector`, click the option containing `optionLabel`,
- *  and wait for the menu to close. Failures throw at the pick, because silently
- *  proceeding with the previous value sends the test down a minutes-long
- *  wrong-path timeout. Waiting on menu CLOSE rather than on the trigger label
- *  is deliberate: the trigger's hidden .dropdown-sizer spans contain EVERY
- *  option label, so a label assertion would always pass.
- *
- *  Only the TRIGGER lives under `rootSelector`; the options come from
- *  `MENU_OPTION` above. */
 export async function pickDropdownOption(page: Page, rootSelector: string, optionLabel: string): Promise<void> {
   const opened = await clickVisibleElement(page, `${rootSelector} .dropdown-trigger`);
   if (!opened) throw new Error(`pickDropdownOption: no visible ${rootSelector} .dropdown-trigger`);
-  // The menu renders on the next Preact commit — wait for the option to land.
   await page.waitForFunction(({ sel, label }) => {
     const opts = document.querySelectorAll(sel);
     return Array.from(opts).some(el => {
@@ -1219,10 +819,6 @@ export async function pickDropdownOption(page: Page, rootSelector: string, optio
   }, MENU_OPTION, { timeout: 3_000 });
 }
 
-/** Make the compose `/` menu hold slash commands. The engine learns them from a
- *  coding-agent session's init. A fresh workspace has none until a session has
- *  run in the repo, so the button stays inert. This runs one when none has.
- *  A route stub would not do: WebKit does not route the page's own reads. */
 export async function ensureSlashCommandsReported(page: Page): Promise<void> {
   const reported = async () => {
     const res = await page.request.get('/api/v1/claude-code/commands?repo_id=');
@@ -1237,15 +833,11 @@ export async function ensureSlashCommandsReported(page: Page): Promise<void> {
   await expect.poll(reported).toBeGreaterThan(0);
 }
 
-/** Pick an option in the compose destination picker (dual-layout safe).
- *  Defaults to 'Lucidos source', which spawns a Lucidos-internal coding-agent
- *  thread on the next send. Pass another option label to target it instead. */
 export async function pickComposeDestination(page: Page, optionLabel = 'Lucidos source'): Promise<void> {
   await ensureOnThreadPane(page);
   await pickDropdownOption(page, '.compose-destination-picker', optionLabel);
 }
 
-/** Send a follow-up message in an existing thread */
 export async function sendFollowUp(page: Page, text: string): Promise<void> {
   const input = await waitForVisibleInput(page, 15_000);
   await input.fill(text);
@@ -1256,7 +848,6 @@ export async function sendFollowUp(page: Page, text: string): Promise<void> {
   }
 }
 
-/** Count visible exchanges (user message + response pairs) — handles dual-layout */
 export async function countExchanges(page: Page): Promise<number> {
   return page.evaluate(() => {
     const exchanges = document.querySelectorAll('.chat-exchange');
@@ -1267,7 +858,6 @@ export async function countExchanges(page: Page): Promise<number> {
   });
 }
 
-/** Wait for at least N visible exchanges to appear */
 export async function waitForExchangeCount(page: Page, minCount: number, timeout = 30_000): Promise<void> {
   await page.waitForFunction((min) => {
     const exchanges = document.querySelectorAll('.chat-exchange');
@@ -1278,7 +868,6 @@ export async function waitForExchangeCount(page: Page, minCount: number, timeout
   }, minCount, { timeout });
 }
 
-/** Wait for the WaitingBanner action panel to appear with specific button text */
 export async function waitForActionPanel(page: Page, buttonText: string, timeout = 120_000): Promise<Locator> {
   await ensureOnThreadPane(page);
   await page.waitForFunction((text) => {
@@ -1291,27 +880,17 @@ export async function waitForActionPanel(page: Page, buttonText: string, timeout
   return page.locator('.thread-action-buttons:visible').first();
 }
 
-/** Click a banner action by label, across the action slot's shapes. Its face
- *  is a direct button on the desktop layout, and the rest live in its menu. On
- *  a phone every action, the face included, lives in the round button's menu.
- *  Tries the direct button first; otherwise opens the menu and clicks the
- *  matching item. */
 export async function clickChangeAction(
   page: Page,
   label: 'Apply' | 'Discard' | 'Diff' | 'Archive',
   timeout = 15_000,
 ): Promise<void> {
-  // A phone's round button names its face in a hidden label, and a tap only
-  // opens its menu. So it is never the direct button.
   const direct = page.locator(
     `.thread-action-buttons:visible button.action-btn:not(.split-button-whole):has-text("${label}")`,
   ).first();
-  // The action lives in the menu: behind the caret, or the round button.
   const opener = page.locator(
     '.thread-action-buttons:visible .split-button-caret, .thread-action-buttons:visible .split-button-whole',
   ).first();
-  // Wait for the slot to render before choosing a branch, so a slow panel
-  // never sends a desktop face into the menu.
   await expect(direct.or(opener)).toBeVisible({ timeout });
   if (await direct.isVisible()) {
     await direct.click();
@@ -1321,23 +900,12 @@ export async function clickChangeAction(
   await page.locator(`.split-button-menu:visible button:has-text("${label}")`).first().click();
 }
 
-/** Resolve only on the LAST visible turn status leaving Working/Requesting.
- *  Earlier turns may still show idle Done/Diff panels mid-stream of a later
- *  turn, so a "any panel exists" check would return early.
- *
- *  Only a response panel carries a turn's status. A user bubble's Sent, Read
- *  or Queued tag shares the label class, and a queued message sits last.
- *
- *  Resolve only once a turn is on screen: an empty transcript is not a
- *  finished one. */
 export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<void> {
   await page.waitForFunction(() => {
     const shown = (el: Element) => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0;
     };
-    // On desktop the transcript draws nothing while the first send's prompt
-    // slides into place.
     if (!Array.from(document.querySelectorAll('.response-panel')).some(shown)) return false;
     const visible = Array.from(document.querySelectorAll('.response-panel .exchange-status-label')).filter(shown);
     if (visible.length === 0) return true;
@@ -1347,11 +915,6 @@ export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<
   }, undefined, { timeout });
 }
 
-/** Wait for streaming to start (visible response-content with text above minLength).
- *
- *  The turn is producing output, scaffolding included. Reach for this when the
- *  test needs the turn ALIVE, e.g. to hit Cancel while it still runs. Waiting
- *  for prose instead can miss a short mock answer entirely. */
 export async function waitForStreamingToStart(page: Page, minLength = 5, timeout = 30_000): Promise<void> {
   await page.waitForFunction(({ sel, min }) => {
     const els = document.querySelectorAll(sel);
@@ -1362,17 +925,6 @@ export async function waitForStreamingToStart(page: Page, minLength = 5, timeout
   }, { sel: TURN_RESPONSE_SELECTOR, min: minLength }, { timeout });
 }
 
-/** Wait until the turn holds output a cancel would KEEP: the same measure, with
- *  the `Thinking` marker taken out.
- *
- *  That row is DERIVED by the projection (ADR 0066), not carried by an event.
- *  It opens the moment the session starts, before the agent has produced
- *  anything, and a cancel keeps nothing of it. Counting it let
- *  `coding-agent-cancel` stop a turn that had said nothing, then assert the
- *  turn kept partial output. Every other row here is event-backed and survives.
- *
- *  Deliberately NOT the default. A short answer can finish between the first
- *  prose and this returning, which takes the Cancel button away with it. */
 export async function waitForKeptOutputToStart(page: Page, minLength = 1, timeout = 30_000): Promise<void> {
   await page.waitForFunction(({ sel, min }) => {
     const els = document.querySelectorAll(sel);
@@ -1389,7 +941,6 @@ export async function waitForKeptOutputToStart(page: Page, minLength = 1, timeou
   }, { sel: TURN_RESPONSE_SELECTOR, min: minLength }, { timeout });
 }
 
-/** Wait for CC to start working (status label shows Working/Requesting) */
 export async function waitForCCToStart(page: Page, timeout = 60_000): Promise<void> {
   await page.waitForFunction(() => {
     const labels = document.querySelectorAll('.exchange-status-label');
@@ -1402,10 +953,6 @@ export async function waitForCCToStart(page: Page, timeout = 60_000): Promise<vo
   }, undefined, { timeout });
 }
 
-/** Poll the commands API until the CC session is active (in the session map).
- *  The frontend shows "Requesting" optimistically before the backend has fully
- *  created the session (worktree setup, DB lookups, etc.). Without polling,
- *  queries hit the cache fallback which returns stale values. */
 export async function waitForActiveSession(page: Page, threadId: string, timeout = 30_000): Promise<Record<string, unknown>> {
   let cmdData: Record<string, unknown> = {};
   await expect(async () => {
@@ -1417,13 +964,6 @@ export async function waitForActiveSession(page: Page, threadId: string, timeout
   return cmdData;
 }
 
-/** Assert that all given markers appear in visible user-message body elements.
- *  POLLS until every marker is visible rather than snapshotting once. A
- *  just-confirmed follow-up swaps its optimistic pending row for the persisted
- *  exchange on the next Preact flush. A single evaluate() can therefore read
- *  the one-frame gap before that body repaints. A genuinely missing message
- *  still fails loudly when the poll times out, and the recomputed `missing`
- *  set names which markers. */
 export async function assertUserMessagesVisible(page: Page, markers: string[], timeout = 15_000): Promise<void> {
   await expect(async () => {
     const missing = await page.evaluate(({ sel, ms }) => {
@@ -1438,8 +978,6 @@ export async function assertUserMessagesVisible(page: Page, markers: string[], t
   }).toPass({ timeout });
 }
 
-/** Assert the markers' user messages are all visible and read top to bottom
- *  in the given order. Polls, for the same reason as the check above. */
 export async function assertUserMessagesInOrder(page: Page, markers: string[], timeout = 15_000): Promise<void> {
   await expect(async () => {
     const positions = await page.evaluate(({ sel, ms }) => {
@@ -1457,7 +995,6 @@ export async function assertUserMessagesInOrder(page: Page, markers: string[], t
   }).toPass({ timeout });
 }
 
-/** Count visible response-content elements with non-empty text */
 export async function countVisibleResponses(page: Page): Promise<number> {
   return page.evaluate((sel) => {
     const els = document.querySelectorAll(sel);
@@ -1468,11 +1005,6 @@ export async function countVisibleResponses(page: Page): Promise<number> {
   }, TURN_RESPONSE_SELECTOR);
 }
 
-/** Wait until at least `count` visible response-content elements have non-empty
- *  text. Prefer this over waitForResponse() before a "got N responses"
- *  assertion in a multi-turn test. waitForResponse() only checks that no status
- *  label reads Working or Requesting. Just after a prior turn settles it can
- *  therefore resolve before the next turn streams, leaving the count short. */
 export async function waitForVisibleResponseCount(
   page: Page,
   count: number,
@@ -1487,7 +1019,6 @@ export async function waitForVisibleResponseCount(
   }, { sel: TURN_RESPONSE_SELECTOR, n: count }, { timeout });
 }
 
-/** Trimmed text of the last visible response-content element, or '' if none. */
 export async function getLatestVisibleResponseText(page: Page): Promise<string> {
   return page.evaluate((sel) => {
     const els = document.querySelectorAll(sel);
@@ -1499,7 +1030,6 @@ export async function getLatestVisibleResponseText(page: Page): Promise<string> 
   }, TURN_RESPONSE_SELECTOR);
 }
 
-/** Count visible thread-row elements (handles dual-layout) */
 export async function countVisibleThreadRows(page: Page): Promise<number> {
   return page.evaluate(() => {
     const rows = document.querySelectorAll('.thread-row');
@@ -1510,13 +1040,6 @@ export async function countVisibleThreadRows(page: Page): Promise<number> {
   });
 }
 
-/** Wait for the prompt-area Cancel button, click it, then wait for Canceled
- *  status. Clicking the stop button cancels immediately, with no confirm
- *  dialog, on both chat and Claude Code threads.
- *
- *  The Send-to-Cancel morph is identified by its `aria-label="Cancel"`. The
- *  disabled canceling state shares that label, so `:not(:disabled)` is
- *  load-bearing to hit the actionable stop state. */
 export async function cancelStreamingResponse(page: Page): Promise<void> {
   await waitAndClick(page, 'button.send-cancel-morph[aria-label="Cancel"]:not(:disabled)', undefined, 30_000);
 
@@ -1530,14 +1053,10 @@ export async function cancelStreamingResponse(page: Page): Promise<void> {
   }, undefined, { timeout: 30_000 });
 }
 
-/** Navigate to the Files panel — handles mobile pane navigation */
 export async function openFilesPanel(page: Page): Promise<void> {
   if (isMobileViewport(page)) {
-    // On mobile, the drawer is only accessible from the content pane (via hamburger).
-    // Navigate to content pane first, open the drawer, then click 'Files'.
     await ensureMobileView(page, 'content');
     await clickVisibleElement(page, '.hamburger-panel');
-    // Wait for the drawer to open and items to be visible
     await page.waitForFunction(() => {
       const items = document.querySelectorAll('.drawer-item');
       return Array.from(items).some(el => {
@@ -1556,16 +1075,10 @@ export async function openFilesPanel(page: Page): Promise<void> {
   }, undefined, { timeout: 5_000 });
 }
 
-/** The triggers panel's "Add Trigger" card (dual-layout safe, visible copy). */
 export function addTriggerCard(page: Page): Locator {
   return page.locator('.list-row-add-card:visible', { hasText: 'Add Trigger' }).first();
 }
 
-/** Navigate to the Triggers panel. The nav drawer (with the menu items) is
- *  hidden by default on BOTH layouts and opened via the `.hamburger-panel`
- *  toggle, so open it first, then click 'Triggers'. On mobile the hamburger
- *  lives on the content pane, so swipe there first. Finally waits for the
- *  panel's "Add Trigger" card so callers never click a still-loading list. */
 export async function openTriggersPanel(page: Page): Promise<void> {
   await ensureMobileView(page, 'content');
   await clickVisibleElement(page, '.hamburger-panel');
@@ -1577,26 +1090,19 @@ export async function openTriggersPanel(page: Page): Promise<void> {
     });
   }, undefined, { timeout: 5_000 });
   await clickVisibleElement(page, '.drawer-item', 'Triggers');
-  // The Add Trigger card only renders once the triggers list has loaded — wait
-  // for it so the create flow doesn't race the projection fetch.
   await expect(addTriggerCard(page)).toBeVisible({ timeout: 10_000 });
 }
 
-/** Best-effort dismiss of an idle CC session by clicking Done (dual-layout safe) */
 export async function dismissCCSession(page: Page): Promise<void> {
   try {
     await ensureOnThreadPane(page);
     await clickVisibleElement(page, '.thread-action-buttons button.action-btn', 'Archive');
   } catch {
-    // CC session may have already ended — not an error
   }
 }
 
-/** Where the focused thread's title shows: the thread pane's title row, on
- *  both layouts and whether or not the drawer is open. */
 export const VISIBLE_TITLE_SELECTOR = '.thread-title';
 
-/** Wait for a visible thread title with non-empty text (dual-layout safe). */
 export async function waitForThreadTitle(page: Page, timeout = 30_000): Promise<void> {
   await page.waitForFunction((sel) => {
     const els = document.querySelectorAll(sel);
@@ -1607,13 +1113,10 @@ export async function waitForThreadTitle(page: Page, timeout = 30_000): Promise<
   }, VISIBLE_TITLE_SELECTOR, { timeout });
 }
 
-/** The focused thread's desktop pin toggle in the title row, labelled
- *  `label`. A phone's title row draws no pin: see `toggleFocusedPin`. */
 function focusedPinSelector(label: string): string {
   return `.thread-view-header-actions button[aria-label="${label}"]:visible`;
 }
 
-/** The phone's thread title, which is its own menu button. */
 const MOBILE_TITLE_MENU = '.mobile-thread-title-row .thread-title-menu:visible';
 
 function isPhoneLayout(page: Page): boolean {
@@ -1624,9 +1127,6 @@ function threadMenuItem(page: Page, label: string): Locator {
   return page.locator('.thread-overflow-menu').getByRole('menuitem', { name: label, exact: true });
 }
 
-/** Pin or unpin the focused thread: the title row's button on desktop, the
- *  title menu's item on a phone. Unpinning asks to confirm, and the caller
- *  answers that. */
 export async function toggleFocusedPin(page: Page, to: 'pinned' | 'unpinned'): Promise<void> {
   if (!isPhoneLayout(page)) {
     await page.locator(focusedPinSelector(to === 'pinned' ? 'Pin thread' : 'Remove thread from Pinned section')).first().click();
@@ -1636,8 +1136,6 @@ export async function toggleFocusedPin(page: Page, to: 'pinned' | 'unpinned'): P
   await threadMenuItem(page, to === 'pinned' ? 'Pin thread' : 'Unpin thread').click();
 }
 
-/** Assert the focused thread's pin state. A phone reads it off the title
- *  menu's item, then closes the menu again. */
 export async function expectFocusedPinned(page: Page, pinned: boolean, timeout = 10_000): Promise<void> {
   if (!isPhoneLayout(page)) {
     await expect(page.locator(focusedPinSelector(pinned ? 'Remove thread from Pinned section' : 'Pin thread')).first())
@@ -1655,9 +1153,6 @@ export async function expectFocusedPinned(page: Page, pinned: boolean, timeout =
   }).toPass({ timeout });
 }
 
-/** Rename the focused thread through the thread menu's Rename… dialog. Opens
- *  the menu on whichever surface shows it: the thread title on either layout,
- *  or the drawer row's ⋯. */
 export async function renameThreadViaMenu(page: Page, title: string): Promise<void> {
   const opened = await clickVisibleElement(page, '.thread-title-menu, .thread-row-focused [aria-label="More thread actions"]');
   if (!opened) throw new Error('no visible thread menu to rename from');
@@ -1668,8 +1163,6 @@ export async function renameThreadViaMenu(page: Page, title: string): Promise<vo
   await page.locator('[data-role="prompt-ok"]').click();
 }
 
-/** Height (px) of the visible mobile thread title, ignoring the desktop copy.
- *  Returns 0 if neither layout's title is rendered. */
 export async function getMobileTitleHeight(page: Page): Promise<number> {
   return page.evaluate(() => {
     const els = document.querySelectorAll('.mobile-thread-title-row .thread-title');
@@ -1681,8 +1174,6 @@ export async function getMobileTitleHeight(page: Page): Promise<number> {
   });
 }
 
-/** Visible thread title text from wherever it currently shows (dual-layout
- *  safe; see VISIBLE_TITLE_SELECTOR). */
 export async function getVisibleTitleText(page: Page): Promise<string> {
   return page.evaluate((sel) => {
     const els = document.querySelectorAll(sel);
@@ -1696,28 +1187,14 @@ export async function getVisibleTitleText(page: Page): Promise<string> {
   }, VISIBLE_TITLE_SELECTOR);
 }
 
-// =====================================================================
-// Test-only push-log assertions.
-// Backed by GET /api/v1/_test/push-log, which is only mounted when the engine
-// is built with the `e2e-test-hooks` cargo feature (see
-// system-knowhow/notifications.md §5.4). Used by the §5.3 scenarios in
-// notifications-all.spec.ts to assert "OS push WAS / WAS NOT sent" without
-// waiting for actual APNs/FCM delivery.
-// =====================================================================
 
 export interface PushLogEntry {
   device_id: string;
   notification_id: string;
   sent_at: string;
-  /** The JSON string the real transport would have encrypted and sent. Lets
-   *  §5.3 scenarios assert the Declarative Web Push envelope shape as well as
-   *  delivery. */
   payload?: string | null;
 }
 
-/** Page-scoped fetch, through Playwright's APIRequestContext. Required so the
- *  engine's self-signed localhost cert is trusted via the browser context that
- *  already accepts it. Node's stricter fetch rejects it. */
 async function fetchPushLog(
   page: Page,
   params: {
@@ -1737,10 +1214,6 @@ async function fetchPushLog(
   return (await res.json()) as PushLogEntry[];
 }
 
-/** Poll the push-log until a row appears for `notificationId` (optionally
- *  scoped to `deviceId`). Returns the row so callers can inspect the
- *  recorded payload (Declarative Web Push envelope shape). Throws if no
- *  row arrives within `timeoutMs`. */
 export async function expectPushSent(
   page: Page,
   notificationId: string,
@@ -1763,11 +1236,6 @@ export async function expectPushSent(
   );
 }
 
-/** Wait `waitMs` (give the engine time to NOT push), then assert the
- *  push-log has no row for `notificationId`. Use this when the §2 matrix
- *  says push is suppressed; absence-of-evidence is fine because the
- *  engine's decision is synchronous (PresenceCheck deadline + write or
- *  return). */
 export async function expectNoPushSent(
   page: Page,
   notificationId: string,
@@ -1783,22 +1251,6 @@ export async function expectNoPushSent(
   }
 }
 
-/** Wait until the transcript has stopped moving under the reader.
- *
- *  A turn control changes the height of every turn. `withScrollAnchor` then
- *  writes its correction across the frames after the render commits: a restore,
- *  then a next-frame re-assert. A fixed sleep stood in for that and was the one
- *  flaky reading in the scroll specs. On a loaded WebKit host a frame runs long,
- *  so the correction landed after the sleep and a measurement caught the reader
- *  mid-flight.
- *
- *  Three equal readings in a row, so a settle is a position the layout has KEPT
- *  rather than one frame that happened to match. A host that never settles
- *  fails on the timeout, instead of on a measurement nobody can trust.
- *
- *  It reads the VISIBLE transcript. Mobile mounts every pane at once, and the
- *  compose view reuses the class. So a bare `querySelector` can answer with a
- *  box nobody is looking at. Mirrors `findVisibleThreadContent`. */
 export async function waitForScrollSettled(page: Page): Promise<void> {
   const read = () => page.evaluate(() => {
     const el = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
@@ -1815,10 +1267,6 @@ export async function waitForScrollSettled(page: Page): Promise<void> {
   }, { timeout: 15_000, intervals: [50, 50, 100] }).toBeGreaterThanOrEqual(2);
 }
 
-/** Right-clicks a point inside a widget's frame, so the SDK in it forwards the
- *  event, and returns the object menu it opened. The menu must open at the
- *  pointer: its top or bottom edge, whichever way it flipped, sits the anchor
- *  gap from the point. Its left edge may be clamped into the viewport. */
 export async function rightClickInsideFrame(page: Page, frame: Locator): Promise<Locator> {
   const b = (await frame.boundingBox())!;
   const at = { x: b.x + Math.min(40, b.width / 2), y: b.y + Math.min(30, b.height / 2) };
@@ -1834,10 +1282,6 @@ export async function rightClickInsideFrame(page: Page, frame: Locator): Promise
   return menu;
 }
 
-/** Opens an inline widget's menu, which is the only way to its actions: the
- *  card draws no bar. It focuses the card and presses Shift+F10, the keyboard
- *  path, which works at every width. `rightClickInsideFrame` covers a
- *  right-click forwarded from the frame. */
 export async function openWidgetCardMenu(page: Page, card: Locator): Promise<Locator> {
   await card.focus();
   await page.keyboard.press('Shift+F10');

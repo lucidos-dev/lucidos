@@ -5,11 +5,6 @@ import { readAppsById } from '../../store/actions/appsById';
 import { WIDGET_UNAVAILABLE_TEXT } from './InlineWidget';
 import { WidgetFrame, defaultWidgetHeight } from './WidgetFrame';
 
-/** The frame an option's *widget embed* draws inside its box: its widget, with
- *  its params, once the widget's manifest is read. The engine checked the
- *  embed before the card was asked, so a missing or non-widget id is all that
- *  reads "This widget is not available". A reply's embed is an inline widget
- *  instead, which also says why (`useWidgetEmbedSlots.tsx`). */
 export function OptionWidgetFrame({ embed }: { embed: WidgetEmbed }) {
   const read = appById(embed.app_id);
   useEffect(() => {
@@ -24,7 +19,6 @@ export function OptionWidgetFrame({ embed }: { embed: WidgetEmbed }) {
       {app ? (
         <WidgetFrame appId={embed.app_id} params={embed.params} reveal={app.reveal} place="option" />
       ) : (
-        // The frame waits on the manifest's `reveal`. Its box holds the room.
         <div class="widget-frame widget-frame-option" style={{ height: `${defaultWidgetHeight('option')}px` }} />
       )}
     </div>

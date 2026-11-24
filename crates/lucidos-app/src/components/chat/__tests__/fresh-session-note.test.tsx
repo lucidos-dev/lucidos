@@ -6,9 +6,6 @@ import type { Exchange, StoredEvent } from '../../../store/thread-events';
 import type { SessionContinuity } from '../../../generated/thread-event-wire';
 import type { ResponseEvent } from '../../../store/types';
 
-// A session that starts without the thread's earlier context says so, once, at
-// the start of its turn. A first session and a resume draw nothing, and neither
-// does an older event that predates the field.
 
 function turnStartingWith(continuity?: SessionContinuity): Exchange {
   const started = { type: 'SessionStarted', session_id: 's1', channel: 'claude_code', ...(continuity ? { continuity } : {}) };
@@ -31,6 +28,13 @@ describe('a fresh session is noted in the thread', () => {
     const at = events.findIndex(e => e.type === 'fresh_session');
     expect(events[at]).toMatchObject({ type: 'fresh_session', reason: 'branch-gone' });
     expect(at).toBeLessThan(events.findIndex(e => e.type === 'text'));
+  });
+
+  it('draws the note for a session started because the provider blocked the last one', () => {
+    const events = exchangeResponseEvents(turnStartingWith({ kind: 'fresh', reason: 'provider-blocked' }));
+    expect(events.find(e => e.type === 'fresh_session')).toMatchObject({ reason: 'provider-blocked' });
+    const s = JSON.stringify(FreshSessionRow({ event: { type: 'fresh_session', reason: 'provider-blocked' } }));
+    expect(s).toContain('The provider blocked the previous session');
   });
 
   it.each([

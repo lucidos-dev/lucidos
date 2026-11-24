@@ -3,8 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installShellScrollGuard, type ShellSnapBack } from './shellScrollGuard';
 import { viewportIsMobile } from './viewport';
 
-/** jsdom lays nothing out, so its scroll offsets are always 0 and ignore
- *  writes. Give the box real, writable offsets. */
 function scrollable(el: Element, top: number, left: number): void {
   let t = top;
   let l = left;

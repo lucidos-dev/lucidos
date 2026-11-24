@@ -1,9 +1,3 @@
-/**
- * One Escape does one thing. The central dispatcher blurs a focused input and
- * calls `preventDefault`, but lets the keydown bubble on to the document. The
- * inline form's listener must treat that Escape as spent. Otherwise Escape in
- * the composer also closes the form beside it and drops its edits.
- */
 import { afterEach, describe, expect, it } from 'vitest';
 import { closeInlineFormOnEscape } from '../InlineForm';
 import { panelOverlay } from '../../../store/store';

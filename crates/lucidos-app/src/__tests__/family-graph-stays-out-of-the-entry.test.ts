@@ -1,12 +1,3 @@
-/**
- * The drawer's family graph ships in the shell chunk, never the entry. The
- * store reads the drawer's order through `store/drawerOrderHandle.ts`, which
- * `startShell` provides. One static import of the graph from anything
- * `main.tsx` reaches puts it back on first paint, about 8 kB.
- *
- * This walks the static import graph from `main.tsx`, as Rollup does for the
- * entry chunk (`staticImportGraph.ts`).
- */
 import { describe, it, expect } from 'vitest';
 import { chainTo, srcPath, staticGraph } from './staticImportGraph';
 

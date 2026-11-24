@@ -1,7 +1,3 @@
-/** The Refresh shortcut runs the open panel's refresh where the header's
- *  Refresh can, and nowhere else.
- *
- *  Plan: `docs/plans/2026-10-02-shortcut-coverage-and-search-landing.md`. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { panelOverlay } from '../../../store/store';
 import { registerPanelRefresh } from '../../../store/panelRefresh';

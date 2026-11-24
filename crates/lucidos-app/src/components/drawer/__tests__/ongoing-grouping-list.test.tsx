@@ -1,18 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The Ongoing grouping as the drawer renders it:
- * - four tiles, always, in one fixed order, whatever their counts;
- * - exactly one selected, and only its threads listed below the tiles;
- * - a press only selects, and never opens a thread, even a group's sole one;
- * - a press on the selected In flight tile lists only running, then only waiting, then all,
- *   skipping a part with no rows;
- * - a press on the selected Review tile does the same with changes and unread;
- * - a selected group that is empty says so, and nothing is claimed before load;
- * - every thread type, whatever the thread-type filter says;
- * - no Idle group, and no Archive all.
- * The header's grouping button carries the Blocked count under
- * Folders, where it offers Ongoing.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -23,7 +9,7 @@ import {
 } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { _resetComposeDraftsForTesting, patchDraft } from '../../../store/composeDrafts';
-import { handleArchiveAll } from '../../../store/actions/archive-all';
+import { archiveAllPhase, handleArchiveAll } from '../../../store/actions/archive-all';
 import { ThreadGroupingButton } from '../../layout/ThreadsHeaderControls';
 
 vi.mock('../../../store/actions/thread-loading', () => ({
@@ -34,7 +20,10 @@ vi.mock('../../../store/actions/thread-loading', () => ({
     ensureThreadInMap: vi.fn(),
     refreshStaleThreadEvents: vi.fn(),
 }));
-vi.mock('../../../store/actions/archive-all', () => ({ handleArchiveAll: vi.fn() }));
+vi.mock('../../../store/actions/archive-all', async () => {
+    const { signal } = await import('@preact/signals');
+    return { archiveAllPhase: signal('idle'), handleArchiveAll: vi.fn() };
+});
 
 let host: HTMLDivElement;
 const tiles = () => Array.from(host.querySelectorAll<HTMLElement>('.drawer-ongoing-tiles .ongoing-tile'));
@@ -52,6 +41,7 @@ function mount(): void {
 
 beforeEach(() => {
     vi.clearAllMocks();
+    archiveAllPhase.value = 'idle';
     vi.stubGlobal('IntersectionObserver', class { observe() {} disconnect() {} });
     vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
     _resetComposeDraftsForTesting();
@@ -235,7 +225,6 @@ describe('the Ongoing grouping', () => {
             expect(rowIds()).toEqual(['unread']);
             expect(listed()).toEqual([]);
             expect(emptyState()).toBeUndefined();
-            // The returning rows roll in, and jsdom has no Web Animations.
             Element.prototype.animate = (() => ({ finished: new Promise(() => {}), startTime: null, pause() {}, play() {}, cancel() {} })) as unknown as typeof Element.prototype.animate;
             try {
                 act(() => { threadMap.value = before; });
@@ -320,6 +309,21 @@ describe('the Ongoing grouping', () => {
         expect(emptyState()).toBeUndefined();
     });
 
+    it('gives empty groups distinct transition rows when switching tiles', () => {
+        mount();
+        act(() => { tile('Review').click(); });
+        const review = host.querySelector<HTMLElement>('.ongoing-grouping .empty-state')!;
+        const reviewId = review.dataset.flipId;
+        expect(reviewId).toBeTruthy();
+        expect(reviewId).not.toMatch(/^__section_/);
+        act(() => { tile('Drafts').click(); });
+        const drafts = host.querySelector<HTMLElement>('.ongoing-grouping .empty-state')!;
+        expect(drafts.dataset.flipId).toBeTruthy();
+        expect(drafts.dataset.flipId).not.toBe(reviewId);
+        act(() => { tile('Blocked').click(); });
+        expect(emptyState()).toBeUndefined();
+    });
+
     it('has no Idle group, and a thread matching no status shows in none', () => {
         setSelectedOngoingGroup('in-flight');
         mount();
@@ -333,22 +337,18 @@ describe('the Ongoing grouping', () => {
         const highlighted = () => host.querySelector('.ongoing-tile-highlighted .ongoing-tile-label')?.textContent;
         act(() => { moveHighlight(1); });
         expect(highlighted()).toBe('Blocked');
-        // → and ← step along the tiles without selecting.
         act(() => { expandHighlighted(); });
         expect(highlighted()).toBe('Review');
         act(() => { collapseHighlighted(); });
         expect(highlighted()).toBe('Blocked');
         expect(selectedOngoingGroup.value).toBe('blocked');
-        // Enter presses the highlighted tile: it selects, and opens nothing.
         act(() => { moveHighlight(1); moveHighlight(1); moveHighlight(1); });
         expect(highlighted()).toBe('In flight');
         act(() => { selectHighlighted(); });
         expect(selectedOngoingGroup.value).toBe('in-flight');
         expect(focusedThreadId.value).toBeNull();
-        // ↓ from the last tile reaches the selected group's row.
         act(() => { moveHighlight(1); });
         expect(host.querySelector('.thread-row-highlighted')?.getAttribute('data-thread-nav')).toBe('run');
-        // ← from the row returns to its tile.
         act(() => { collapseHighlighted(); });
         expect(highlighted()).toBe('In flight');
     });
@@ -383,6 +383,27 @@ describe('the Ongoing grouping', () => {
         act(() => { current.querySelector<HTMLButtonElement>('.drawer-archive-all')!.click(); });
         expect(handleArchiveAll).toHaveBeenCalledTimes(1);
         expect(current.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    it('keeps archive progress visible across drawer remounts and prevents repeat clicks', () => {
+        setDrawerGrouping('folders');
+        act(() => { archiveAllPhase.value = 'checking'; });
+        mount();
+        const button = host.querySelector<HTMLButtonElement>('.drawer-archive-all')!;
+        expect(button.disabled).toBe(true);
+        expect(button.textContent).toContain('Checking…');
+        expect(button.getAttribute('aria-busy')).toBe('true');
+        act(() => { button.click(); });
+        expect(handleArchiveAll).not.toHaveBeenCalled();
+        act(() => { archiveAllPhase.value = 'confirming'; });
+        expect(button.textContent).toContain('Awaiting confirmation…');
+        expect(button.getAttribute('aria-busy')).toBe('false');
+        act(() => { archiveAllPhase.value = 'archiving'; });
+        expect(button.textContent).toContain('Archiving…');
+        expect(button.getAttribute('aria-busy')).toBe('true');
+        act(() => { archiveAllPhase.value = 'idle'; });
+        expect(button.disabled).toBe(false);
+        expect(button.textContent).toContain('Archive all');
     });
 
     it('gives way to search, which shows its own results', () => {

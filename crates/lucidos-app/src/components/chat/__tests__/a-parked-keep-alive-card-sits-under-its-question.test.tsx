@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A keep-alive run that began while the turn waited on a question card draws
- *  its card under that card, inside the turn. The question keeps its buttons
- *  (ADR 0563). A turnless card redraws as its run updates in place. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

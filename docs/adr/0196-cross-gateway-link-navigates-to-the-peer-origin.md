@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-16
+- **Amended by**: [0745: Loopback serves HTTPS from a per-user, name-constrained CA](0745-loopback-serves-tls-from-a-per-user-ca.md), under which every current gateway serves https on loopback
 
 ## Context
 
@@ -58,6 +59,10 @@ the dev checkout serves https from mkcert certs. TLS comes from
 `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY` at launch, and is recorded nowhere on
 disk. Swapping only the port composes a URL that never loads, and the failure
 reads as a broken link rather than a scheme mismatch.
+
+Since ADR 0745 every current gateway serves https on loopback from the loopback
+CA, so dev checkouts need no mkcert for `localhost`. The probe stays, because an
+older peer still serves plain http.
 
 **Probing beats publishing, because the peer that matters is old.** The
 alternative was each gateway writing its own port and scheme to disk at boot, in

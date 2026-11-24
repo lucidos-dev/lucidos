@@ -43,7 +43,6 @@ describe('modelStepOptions', () => {
   });
 
   it('reads a bare name on every other model', () => {
-    // Printing a tier on all thirty is the flat list this step replaced.
     const rows = modelStepOptions([OPUS, HAIKU], IN_FORCE);
     expect(rows[1].label).toBe('Haiku 4.5');
   });
@@ -95,7 +94,6 @@ describe('tierStepOptions', () => {
     expect(tierStepOptions(IMAGEN, () => 'Default')).toEqual([]);
   });
 
-  /** The recommended tier wears the badge; a model with none badges nothing. */
   it('badges the tier the model choice recommends, and only that one', () => {
     const choice = { value: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', reasoningEfforts: ['low', 'medium', 'high'] };
     const badges = (recommendedEffort?: string) => {
@@ -129,9 +127,6 @@ describe('pickerKeyAction', () => {
   });
 
   it('never takes Escape, which belongs to the overlay stack', () => {
-    // The Escape dispatcher runs in the capture phase and stops propagation,
-    // so a keydown handler here would never see the key. Stepping back from
-    // the tier list is a stack registrant instead.
     expect(pickerKeyAction('Escape')).toBeNull();
   });
 
@@ -143,8 +138,6 @@ describe('pickerKeyAction', () => {
 
 describe('pickerShowsFilter', () => {
   it('draws no box on a freshly opened desktop panel', () => {
-    // The user opened it to click a row. A caret blinking in an empty box is
-    // the thing this replaced.
     expect(pickerShowsFilter({ searching: false, touch: false, keyboard: false })).toBe(false);
   });
 
@@ -153,15 +146,10 @@ describe('pickerShowsFilter', () => {
   });
 
   it('always draws it on a touch device, where no keystroke can reveal it', () => {
-    // The capability, never the mobile width breakpoint. A phone in landscape
-    // is wider than 768px, and has no more keyboard than it had upright. A
-    // width test would leave it a box it can never summon.
     expect(pickerShowsFilter({ searching: false, touch: true, keyboard: false })).toBe(true);
   });
 
   it('draws it for a host opened mid-typing, so the keystrokes have a home', () => {
-    // A phone-width window under a mouse is no touch device, yet the prompt
-    // held focus as the menu opened.
     expect(pickerShowsFilter({ searching: false, touch: false, keyboard: true })).toBe(true);
   });
 });
@@ -171,8 +159,6 @@ describe('pickerFocusTarget', () => {
     pickerFocusTarget({ tierStep: false, searching: false, touch: false, keyboard: false, ...over });
 
   it('gives the list the keystrokes before the search starts', () => {
-    // The list's own handler turns a printable key into the query, so it holds
-    // focus while there is no box to type into.
     expect(target()).toBe('list');
   });
 
@@ -185,30 +171,24 @@ describe('pickerFocusTarget', () => {
   });
 
   it('leaves focus alone on a touch device with no keyboard up', () => {
-    // Focusing the list takes focus from the prompt, and on iOS the keyboard
-    // then slides away under the open panel.
     expect(target({ touch: true })).toBeNull();
     expect(target({ touch: true, tierStep: true })).toBeNull();
   });
 
   it('gives the box the keyboard a touch host opened mid-typing', () => {
-    // Typing then filters the models instead of going into the prompt.
     expect(target({ touch: true, keyboard: true })).toBe('filter');
   });
 
   it('gives the box focus for any host opened mid-typing, a mouse one included', () => {
-    // A phone-width window leaves the prompt focused under a mouse too.
     expect(target({ keyboard: true })).toBe('filter');
     expect(target({ keyboard: true, tierStep: true })).toBe('list');
   });
 
   it('hands the keyboard back to its holder on the tier step, which has no box', () => {
-    // Focus left on nothing would drop the keyboard, and the panel would jump.
     expect(target({ touch: true, keyboard: true, tierStep: true })).toBe('holder');
   });
 });
 
-/** A row with a real choice of backend. OpenRouter has no `xhigh`. */
 const DUAL: ModelRow = {
   value: 'claude-opus-5-6',
   label: 'Opus 5.6',

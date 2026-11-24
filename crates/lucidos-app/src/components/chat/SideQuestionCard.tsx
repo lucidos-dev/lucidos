@@ -11,18 +11,12 @@ import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { ChevronDownIcon, RetryIcon } from '../shared/icons';
 import { MarkdownBlock, UserMessageBody } from './chat-exchange-parts';
 
-/** One shared empty list, so a turn without cards keeps a stable prop. */
 export const NO_SIDE_QUESTIONS: readonly SideQuestion[] = [];
 
-/** Said on every card, so nobody mistakes the answer for part of the thread. */
 export const SIDE_QUESTION_NOTE = 'Not added to the conversation';
 
-/** How long a pending card waits before it says "Thinking". A live answer
- *  often lands sooner, and a flash of the word reads as a glitch. */
 export const SIDE_QUESTION_THINKING_DELAY_MS = 600;
 
-/** The live step row's own "Thinking" label and shimmer, so a pending side
- *  question reads as working exactly the way a turn does. */
 function Thinking() {
   const shown = useDelayedFlag(true, SIDE_QUESTION_THINKING_DELAY_MS);
   return (
@@ -32,13 +26,8 @@ function Thinking() {
   );
 }
 
-/** One card whose head folds it to a line at its moment and unfolds it
- *  again, with the disclosure roll. Folding records the dismissal; unfolding
- *  a folded card shows it again on this device only. */
 export function SideQuestionCard({ item }: { item: SideQuestion }) {
   const open = !item.dismissed;
-  // The card sits outside the turn body, so it carries the router itself.
-  // Without it the webview follows a `repo:` link to the OS.
   const routeLinks = (e: MouseEvent) => handleMarkdownLinkClick(e, loadedOr(appsList.value, []));
   return (
     <div
@@ -81,9 +70,6 @@ export function SideQuestionCard({ item }: { item: SideQuestion }) {
   );
 }
 
-/** Cards asked at the same point in the thread, stacked in one box. The box
- *  is what lets it sit between two turns (`childAtLine` in scrollAnchor.ts)
- *  or between two sections of one turn's body. */
 export function SideQuestionGroup({ items }: { items: readonly SideQuestion[] }) {
   return (
     <div class="side-questions" data-role="side-questions">
@@ -92,12 +78,6 @@ export function SideQuestionGroup({ items }: { items: readonly SideQuestion[] })
   );
 }
 
-/** The feed's turn nodes with the side questions no turn owns
- *  (`sideQuestionOwners`), each placed before the first node later than its
- *  `afterSeq`. Every later turn draws below it, even past a card pinned out
- *  of order (ADR 0284). A node that is not one exchange (the queued group)
- *  counts as later. A card asked above the render window stays out until the
- *  window walks up to it. */
 export function placeSideQuestions(
   nodes: VNode[],
   exchanges: readonly Exchange[],
@@ -118,8 +98,6 @@ export function placeSideQuestions(
   const out: VNode[] = [];
   for (let i = 0; i <= nodes.length; i++) {
     const group = groups.get(i);
-    // Keyed by the turn above, which neither a dismissal nor a later turn
-    // changes, so a pending card keeps its state instead of remounting.
     const above = i === 0 ? 'start' : String(nodes[i - 1].key);
     if (group) out.push(<SideQuestionGroup key={`side-questions:after:${above}`} items={group} />);
     if (i < nodes.length) out.push(nodes[i]);
@@ -127,10 +105,6 @@ export function placeSideQuestions(
   return out;
 }
 
-/** The turn each card belongs to: the latest one begun at or before its
- *  `afterSeq` that draws as a turn of its own. A queued message or a folded
- *  restart pause never does. The card then sits inside that turn at its moment
- *  (`placeInBody`). A card with no such turn stays in the feed. */
 export function sideQuestionOwners(
   exchanges: readonly Exchange[],
   items: readonly SideQuestion[],
@@ -151,24 +125,14 @@ export function sideQuestionOwners(
   return { owned, unowned };
 }
 
-/** One piece of a turn's drawn body: a `.response-content` section, or the
- *  side questions asked at that point. */
 export type BodyPiece =
   | { kind: 'section'; key: string; rows: BodyRow[] }
   | { kind: 'cards'; key: string; items: SideQuestion[] };
 
-/** A turn's body with its side questions at their moments: each goes before
- *  the first row later than its `afterSeq`, splitting a step run if it must. A
- *  row with no seq (the live Thinking row) counts as later.
- *
- *  A card is a sibling of the sections, never a row inside one, so nothing
- *  counts it as something the agent drew (`DRAWN_ROW_SELECTOR`). It is keyed
- *  by the row above it, which later rows never change. */
 export function placeInBody(sections: readonly BodySection[], items: readonly SideQuestion[]): BodyPiece[] {
   let pending = [...items];
   const out: BodyPiece[] = [];
   let above = 'start';
-  // The cards a row at `seq` comes after, in asking order.
   const dueBefore = (seq: number | undefined): SideQuestion[] => {
     const due = pending.filter((item) => seq === undefined || seq > (item.afterSeq ?? Infinity));
     if (due.length > 0) pending = pending.filter((item) => !due.includes(item));
@@ -203,7 +167,6 @@ export function placeInBody(sections: readonly BodySection[], items: readonly Si
         above = String(rest.key);
         continue;
       }
-      // A run keeps its own key for its first part, which the clamp may have cut.
       const part = (from: number, to?: number): BodyRow => (
         from === 0 && to === undefined ? row
           : { ...row, key: from === 0 ? row.key : row.steps[from].index, steps: row.steps.slice(from, to) }
@@ -230,9 +193,6 @@ export function placeInBody(sections: readonly BodySection[], items: readonly Si
 
 type TextRow = Extract<BodyRow, { kind: 'text' }>;
 
-/** Splits a merged text chunk for the earliest of `items` whose question
- *  falls inside it, or null when none does yet. `offset` is where `row`
- *  starts in the chunk it was cut from, so the tail's key never moves. */
 function textSplit(row: TextRow, items: readonly SideQuestion[], offset: number):
   { head: TextRow; tail: TextRow; due: SideQuestion[] } | null {
   const { md, pieces } = row.event;
@@ -248,7 +208,6 @@ function textSplit(row: TextRow, items: readonly SideQuestion[], offset: number)
   if (at === null) return null;
   const split = at;
   const headPieces = pieces.filter((p) => p.at < split);
-  // The piece the break falls in, or one starting exactly on it.
   const tailSeq = pieces.filter((p) => p.at <= split).pop()?.seq;
   const tailPieces = [
     { at: 0, seq: tailSeq },
@@ -266,10 +225,6 @@ function textEvent(md: string, pieces: { at: number; seq?: number }[]): TextRow[
   return { type: 'text', md, seq: pieces[0]?.seq, ...(pieces.length > 1 ? { pieces } : {}) };
 }
 
-/** Where a chunk may split for a question asked after `afterSeq`: the first
- *  paragraph break at or after the first piece written later, outside a code
- *  fence and with text after it. A chunk begun after the question is not split
- *  here: the whole row already sits below the card. */
 function paragraphBreakAfter(md: string, pieces: readonly { at: number; seq?: number }[], afterSeq: number): number | null {
   const later = pieces.find((p) => p.seq === undefined || p.seq > afterSeq);
   if (!later || later.at === 0) return null;

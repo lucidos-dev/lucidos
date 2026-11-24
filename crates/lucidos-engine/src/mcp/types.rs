@@ -86,15 +86,7 @@ pub struct ServerInfo {
     pub version: Option<String>,
 }
 
-/// MCP tool definition from `tools/list`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpTool {
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(rename = "inputSchema", default)]
-    pub input_schema: Option<serde_json::Value>,
-}
+pub use crate::engine::thread_events::McpTool;
 
 /// MCP `tools/list` response result.
 #[derive(Debug, Deserialize)]

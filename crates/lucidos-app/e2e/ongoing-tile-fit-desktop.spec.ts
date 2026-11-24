@@ -1,10 +1,3 @@
-/**
- * An Ongoing tile keeps its count, breakdown and icon inside its own box. The
- * breakdown sits beside the count while there is room, and wraps under it when
- * the tile is too narrow for all three. The drawer's floor at a large ui-scale
- * is the narrowest a tile gets: at 200% the icon used to land past the tile's
- * right edge.
- */
 import { test, expect, type Page } from './fixtures';
 import { randomUUID } from 'crypto';
 import { navigateToApp, openThreadDrawer, assertHealthy } from './helpers';
@@ -12,7 +5,6 @@ import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 import { DRAWER_GROUPING_KEY, SELECTED_ONGOING_GROUP_KEY, THREAD_DRAWER_WIDTH_KEY } from '../src/store/drawerKeys';
 import { DEVICE_ID_KEY } from '../src/utils/deviceIdKey';
 
-/** Enough running threads for a two-digit "12 running", the widest one-line breakdown. */
 const RUNNING_COUNT = 12;
 const UI_SCALE = '200';
 
@@ -22,8 +14,6 @@ interface TileFit {
   breakdownWrapped: boolean;
 }
 
-/** Each tile's worst overflow past its content edge, and whether its breakdown
- *  starts below its count. */
 async function tileFits(page: Page): Promise<TileFit[]> {
   return page.locator('.drawer-ongoing-tiles .ongoing-tile').locator('visible=true').evaluateAll(tiles => tiles.map(tile => {
     const edge = tile.getBoundingClientRect().right - parseFloat(getComputedStyle(tile).paddingRight);
@@ -77,7 +67,6 @@ test.describe('Ongoing tile fit', () => {
   });
 
   test('at the drawer floor, the breakdown wraps under the count and nothing leaves the tile', async ({ page, request }) => {
-    // Below the floor, so the load clamps it to exactly the floor.
     await openOngoing(page, 1, request);
     const fits = await tileFits(page);
     for (const fit of fits) expect(fit.overflowPx, `${fit.label} overflows its tile`).toBeLessThanOrEqual(0.5);

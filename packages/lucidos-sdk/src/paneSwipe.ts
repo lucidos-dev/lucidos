@@ -1,35 +1,15 @@
-/**
- * The pane swipe: one gesture model for the host shell and for app iframes.
- *
- * The host tracks sideways drags on its mobile swipe container. An app frame
- * captures every touch it covers, so the SDK bundle tracks drags inside the
- * frame and posts them up. The host moves the panes either way, so this module
- * moves nothing.
- *
- * Vertical scrolling stays native. The frame cancels a `touchmove` only once
- * the drag has locked horizontal, as the host does. A gesture the app already
- * claimed is left alone, which is how an app with its own sideways drag opts
- * out (see `horizontalDragClaimed`).
- */
 
 import { isTextEntryField } from './textEntry';
 import { postToHost } from './_bridge';
 
-// Direction lock threshold (px) — below this, direction is undecided
 const LOCK_THRESHOLD = 8;
-// Minimum distance for a fast swipe (px)
 const MIN_SWIPE_DISTANCE = 30;
-// Minimum velocity for a fast swipe (px/ms)
 const FAST_SWIPE_VELOCITY = 0.3;
 
-/** Posted by an app frame with the drag's `dx` while a sideways drag is live. */
 export const APP_SWIPE_MESSAGE_TYPE = 'lucidos:app:swipe';
 
-/** Posted by an app frame when a sideways drag ends, with its `paneDelta`. */
 export const APP_SWIPE_END_MESSAGE_TYPE = 'lucidos:app:swipe-end';
 
-/** Pure touch gesture handler for horizontal pane swiping.
- *  No DOM dependencies — fully testable. */
 export class SwipeTouch {
   private _startX = 0;
   private _startY = 0;
@@ -37,13 +17,8 @@ export class SwipeTouch {
   private _tracking = false;
   private _direction: 'horizontal' | 'vertical' | null = null;
   private _dx = 0;
-  /** Which way the finger was going when the direction locked. Frozen there,
-   *  because the threshold compensation below is one fixed offset for the whole
-   *  gesture. Re-reading the sign per frame flips the offset the moment the
-   *  finger drags back past its start, which reports +7 for a 1px move LEFT. */
   private _lockSign = 0;
 
-  /** Record start of a new touch. */
   start(x: number, y: number): void {
     this._startX = x;
     this._startY = y;
@@ -54,8 +29,6 @@ export class SwipeTouch {
     this._lockSign = 0;
   }
 
-  /** Process a touch move. Returns the horizontal delta (px) if tracking
-   *  horizontally, or null if vertical/undecided/not tracking. */
   move(x: number, y: number): number | null {
     if (!this._tracking) return null;
 
@@ -65,22 +38,16 @@ export class SwipeTouch {
     if (this._direction === null) {
       if (Math.abs(dx) < LOCK_THRESHOLD && Math.abs(dy) < LOCK_THRESHOLD) return null;
       this._direction = Math.abs(dx) >= Math.abs(dy) ? 'horizontal' : 'vertical';
-      // A horizontal lock needs `|dx| >= |dy|` and one of them past the
-      // threshold, so `|dx| >= LOCK_THRESHOLD` here and the sign is decided.
       this._lockSign = Math.sign(dx);
     }
 
     if (this._direction === 'vertical') return null;
 
-    // Subtract the lock threshold so visible drag starts from 0 instead of
-    // jumping ±LOCK_THRESHOLD on the first frame after lock.
     const adjusted = dx - this._lockSign * LOCK_THRESHOLD;
     this._dx = adjusted;
     return adjusted;
   }
 
-  /** End the touch. Returns the pane delta: -1 (prev), 0 (snap back), +1 (next).
-   *  Only non-zero when the gesture was a confirmed horizontal swipe. */
   end(paneWidth: number): number {
     if (!this._tracking || this._direction !== 'horizontal') {
       this._tracking = false;
@@ -101,12 +68,10 @@ export class SwipeTouch {
     return 0;
   }
 
-  /** Whether a horizontal swipe is currently being tracked. */
   get isHorizontal(): boolean {
     return this._tracking && this._direction === 'horizontal';
   }
 
-  /** Cancel tracking without producing a result. */
   cancel(): void {
     this._tracking = false;
     this._direction = null;
@@ -115,27 +80,19 @@ export class SwipeTouch {
   }
 }
 
-/** Whether a computed `touch-action` keeps the horizontal pan from the browser.
- *  A carousel declares `pan-y` and a canvas `none`, then handles the sideways
- *  drag itself. Such an element owns the gesture, so it is no pane swipe. */
 export function claimsHorizontalPan(touchAction: string): boolean {
   if (touchAction === '' || touchAction === 'auto' || touchAction === 'manipulation') return false;
   return !touchAction.split(/\s+/).includes('pan-x');
 }
 
-/** Whether a `touch-action` keeps the vertical pan. */
 function keepsVerticalPan(touchAction: string): boolean {
   return touchAction.split(/\s+/).some((v) => v === 'pan-y' || v === 'pan-up' || v === 'pan-down');
 }
 
-/** Whether a page root's `touch-action` claims the sideways drag. A page-wide
- *  `pan-y` only stops the page panning sideways, so only one that also drops
- *  the vertical pan, such as `none`, claims it. */
 function pageClaimsHorizontalPan(touchAction: string): boolean {
   return claimsHorizontalPan(touchAction) && !keepsVerticalPan(touchAction);
 }
 
-/** The part of an element the claim check reads. */
 export interface DragNode {
   localName?: string;
   type?: string;
@@ -144,11 +101,8 @@ export interface DragNode {
   parentElement: DragNode | null;
 }
 
-/** The computed styles the claim check reads, or null where none apply. */
 export type StyleOf = (node: DragNode) => { overflowX: string; touchAction: string } | null;
 
-/** Whether anything from `target` up to the root owns a sideways drag: a range
- *  input's knob, a `touch-action` claim, or an element that scrolls sideways. */
 export function horizontalDragClaimed(target: DragNode | null, styleOf: StyleOf): boolean {
   for (let node = target; node; node = node.parentElement) {
     if (node.localName === 'input' && node.type === 'range') return true;
@@ -163,13 +117,11 @@ export function horizontalDragClaimed(target: DragNode | null, styleOf: StyleOf)
   return false;
 }
 
-/** The live computed style of a real element. */
 const computedStyleOf: StyleOf = (node) => {
   if (typeof getComputedStyle !== 'function' || typeof Element === 'undefined') return null;
   return node instanceof Element ? getComputedStyle(node) : null;
 };
 
-/** Whether the user is typing in this document, so a drag must not navigate. */
 function textFieldFocused(): boolean {
   const el = typeof document === 'undefined' ? null : document.activeElement;
   if (!el) return false;
@@ -177,52 +129,35 @@ function textFieldFocused(): boolean {
 }
 
 export interface PaneSwipeHandlers {
-  /** A sideways drag moved by `dx` px from where it locked. */
   onDrag: (dx: number) => void;
-  /** A sideways drag ended: -1 (prev), 0 (snap back) or +1 (next). */
   onRelease: (paneDelta: number) => void;
 }
 
 export interface PaneSwipeEnv {
-  /** The width a far drag is measured against. */
   paneWidth: () => number;
   textFieldFocused: () => boolean;
   styleOf: StyleOf;
-  /** Whether the page itself pans sideways, so it owns every sideways drag. */
   pageScrollsSideways: () => boolean;
 }
 
-/** The part of a document the page-scroll check reads. */
 export interface PageNode {
   scrollingElement: { scrollWidth: number; clientWidth: number } | null;
   documentElement: Element | null;
   body: Element | null;
 }
 
-/** Whether a page is wider than its frame, so a sideways drag pans it. Its
- *  root or body at `overflow-x: hidden` or `clip` stops that pan. */
 export function pageScrollsSideways(doc: PageNode, overflowXOf: (el: Element) => string): boolean {
   const root = doc.scrollingElement;
   if (!root || root.scrollWidth <= root.clientWidth) return false;
   return [doc.documentElement, doc.body].every((el) => !el || !/^(hidden|clip)$/.test(overflowXOf(el)));
 }
 
-/** How a touch continues: its moves, its lift and its cancel. */
 export interface TouchTail {
   move: (e: Event) => void;
   end: (e: Event) => void;
   cancel: (e: Event) => void;
 }
 
-/**
- * Follow the rest of a touch on the node it began on, for when that node
- * leaves the DOM mid-drag. Every event of a touch fires on that node. Detached,
- * it has no ancestors, so nothing reaches `surface` and the drag never ends.
- * An app that re-renders its list under the finger does exactly that.
- *
- * While the node stays attached its events reach `surface`, which handles
- * them, so these listeners skip them. Returns the cleanup.
- */
 export function followStrandedTouch(start: Event, surface: EventTarget, tail: TouchTail): () => void {
   const node = start.target as Partial<EventTarget> | null;
   if (!node || node === surface || typeof node.addEventListener !== 'function') return () => {};
@@ -245,15 +180,10 @@ function onlyTouch(e: Event): Touch | null {
   return touches && touches.length === 1 ? touches[0] : null;
 }
 
-/** Screen coordinates, never client ones. The host moves the frame WITH the
- *  drag, so a client coordinate loses each step the panes already moved. The
- *  panes then jitter or crawl behind the finger. */
 function screenPoint(t: Touch): [number, number] {
   return [t.screenX, t.screenY];
 }
 
-/** Track sideways drags on `surface`. Returns the cleanup that removes the
- *  listeners. Every live drag ends in exactly one `onRelease`. */
 export function trackPaneSwipe(
   surface: EventTarget,
   handlers: PaneSwipeHandlers,
@@ -274,7 +204,6 @@ export function trackPaneSwipe(
   };
 
   const onStart = (e: Event) => {
-    // A drag still live here never got its touchend, so it snaps back.
     abandon();
     const t = onlyTouch(e);
     if (!t || e.defaultPrevented || env.textFieldFocused()) return;
@@ -291,13 +220,10 @@ export function trackPaneSwipe(
     }
     const dx = touch.move(...screenPoint(t));
     if (dx === null) return;
-    // An uncancelable move means the browser already owns a native pan. A pane
-    // swipe now would move the panes and scroll the page at once.
     if (!e.cancelable) {
       abandon();
       return;
     }
-    // Stops the page drifting vertically under a sideways drag.
     e.preventDefault();
     handlers.onDrag(dx);
   };
@@ -307,8 +233,6 @@ export function trackPaneSwipe(
     finish();
   };
 
-  // Only the user's own events drive a drag. The HTML preview runs untrusted
-  // script, which can dispatch touch events of its own.
   const passive: AddEventListenerOptions = { passive: true };
   const active: AddEventListenerOptions = { passive: false };
   const trusted = (fn: (e: Event) => void) => (e: Event) => { if (e.isTrusted) fn(e); };
@@ -317,7 +241,6 @@ export function trackPaneSwipe(
     ['touchmove', trusted(onMove), active],
     ['touchend', trusted(onEnd), passive],
     ['touchcancel', trusted(abandon), passive],
-    // A frame that reloads mid-drag never sends its touchend.
     ['pagehide', trusted(abandon), passive],
   ];
   for (const [type, fn, options] of listeners) surface.addEventListener(type, fn, options);
@@ -327,24 +250,12 @@ export function trackPaneSwipe(
   };
 }
 
-/**
- * Track sideways drags in a frame that fills its pane. Shared by an app frame
- * and the HTML artifact preview's bridge, whose handlers wrap the drag in their
- * own message shapes.
- *
- * `yieldToWidePage` gives every sideways drag to a page wider than the frame.
- * The preview passes it, since an artifact is arbitrary HTML, often a fixed
- * layout or a wide table. An app is written against the claim rules instead.
- * `hostPansSideways` gives every sideways drag to a host scroller around the
- * frame, so the browser's native pan reaches it.
- */
 export function installFramePaneSwipe(
   win: Window,
   handlers: PaneSwipeHandlers,
   { yieldToWidePage, hostPansSideways = () => false }: { yieldToWidePage: boolean; hostPansSideways?: () => boolean },
 ): () => void {
   return trackPaneSwipe(win, handlers, {
-    // The frame is full-bleed in its pane, so its width is the pane's.
     paneWidth: () => win.innerWidth,
     textFieldFocused,
     styleOf: computedStyleOf,
@@ -353,14 +264,6 @@ export function installFramePaneSwipe(
   });
 }
 
-/**
- * Install pane-swipe tracking in an app frame. Call once on SDK load. Posts
- * the drag and the release to the host, which moves the panes.
- *
- * No-op when there is no parent window: the SDK loaded at the top level has no
- * host to swipe. `hostPansSideways` says the frame sits in a box the host
- * scrolls sideways, such as an XL widget box.
- */
 export function installAppPaneSwipe(hostPansSideways?: () => boolean): () => void {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
   return installFramePaneSwipe(window, {

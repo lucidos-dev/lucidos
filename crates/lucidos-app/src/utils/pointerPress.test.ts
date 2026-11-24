@@ -1,9 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { afterPressSettles, notePressOwesClick, primaryPointerIsDown } from './pointerPress';
 
-/** Drives the document stub from `test-setup.ts`, which dispatches to every
- *  listener of a type regardless of phase. That is enough here: the module
- *  installs one listener per type. */
 function dispatch(type: string, fields: Record<string, unknown> = {}): void {
   const e = { type, isTrusted: true, isPrimary: true, button: 0, ...fields };
   (document as unknown as { dispatchEvent: (e: unknown) => boolean }).dispatchEvent(e);
@@ -29,10 +26,6 @@ describe('primaryPointerIsDown', () => {
     expect(primaryPointerIsDown()).toBe(false);
   });
 
-  /** The whole reason the trust check exists. A dispatched PointerEvent gets no
-   *  paired click, so an overlay opened by one must keep dismissing on the next
-   *  synthetic click. `e2e/overlay-dismiss-swallow-all.spec.ts` drives exactly
-   *  that. */
   it('ignores an untrusted press', () => {
     dispatch('pointerdown', { isTrusted: false });
     expect(primaryPointerIsDown()).toBe(false);
@@ -50,8 +43,6 @@ describe('primaryPointerIsDown', () => {
   });
 });
 
-/** A relayout on focus loss waits for the press that moved the focus, so the
- *  release is hit-tested against the layout the press landed on. */
 describe('afterPressSettles', () => {
   afterEach(() => {
     dispatch('pointerup');
@@ -81,7 +72,6 @@ describe('afterPressSettles', () => {
   });
 
   it('runs after the click an already-lifted press still owes', () => {
-    // A widget frame's finger lifted there, so this document saw no pointerup.
     vi.useFakeTimers();
     const fn = vi.fn();
     notePressOwesClick();

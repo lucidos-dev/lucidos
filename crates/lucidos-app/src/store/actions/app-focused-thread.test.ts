@@ -4,7 +4,6 @@ import { installAppFocusedThreadSync } from './app-focused-thread';
 import { setFocusedThread } from '../store';
 import { BRIDGE_PUSH_TYPE, FOCUSED_THREAD_CHANNEL } from '../../../../../packages/lucidos-sdk/src/_bridge';
 
-/** Mount an app frame the way `AppFrame` does, and record what it is sent. */
 function mountFrame(): unknown[] {
   const frame = document.createElement('iframe');
   frame.setAttribute('data-role', 'app-ui-frame');

@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** The webhook signature's saved-credential picker wears its own box while the
- *  credential list loads, past the delay gate, never a line of "Loading…". */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

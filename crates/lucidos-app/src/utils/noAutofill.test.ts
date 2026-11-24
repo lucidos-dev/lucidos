@@ -6,10 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// The test env is `node` (no jsdom), so stub the elements stampNoAutofill reads,
-// matching the dom.test.ts pattern. Each stub carries a real attribute map so
-// hasAttribute/setAttribute behave like the DOM, and the `localName` that
-// `isTextEntryField` keys off.
 class AttrEl {
   private attrs = new Map<string, string>();
   hasAttribute(n: string) { return this.attrs.has(n); }
@@ -74,9 +70,9 @@ describe('stampNoAutofill', () => {
 
   it('respects a locally-declared attribute and only fills the absent ones', () => {
     const el = input('text');
-    el.setAttribute('autocomplete', 'username'); // component opted in explicitly
+    el.setAttribute('autocomplete', 'username');
     stampNoAutofill(el);
-    expect(el.getAttribute('autocomplete')).toBe('username'); // not clobbered
+    expect(el.getAttribute('autocomplete')).toBe('username');
     expect(el.getAttribute('autocorrect')).toBe('off');
     expect(el.getAttribute('autocapitalize')).toBe('off');
   });
@@ -118,10 +114,6 @@ describe('PROSE_TEXT_ATTRS', () => {
   it('leaves a prose field at the browser defaults — no attribute at all', () => {
     const el = prose();
     stampNoAutofill(el);
-    // Absent, NOT "on"/"sentences": the browser's own default for a text field
-    // is already autocorrect-on + sentence capitalization, so the correct state
-    // is the un-stamped one. Asserting a value would route through Preact's
-    // property path, which is what inverted AllowlistEditor's "off" into "on".
     expect(el.getAttribute('autocorrect')).toBeNull();
     expect(el.getAttribute('autocapitalize')).toBeNull();
   });
@@ -129,16 +121,11 @@ describe('PROSE_TEXT_ATTRS', () => {
   it('still lets the autofill dropdown be suppressed', () => {
     const el = prose();
     stampNoAutofill(el);
-    // The popup + its white→dark flash is what the global stamp exists for, and
-    // keeping the keyboard defaults must not opt back into it.
     expect(el.getAttribute('autocomplete')).toBe('off');
     expect(PROSE_TEXT_ATTRS).not.toHaveProperty('autocomplete');
   });
 
   it('marks via a data-* attribute, which Preact cannot route as a property', () => {
-    // The determinism is the point: `data-prose` is never an IDL property, so
-    // Preact always emits it with setAttribute. An `autocorrect`/`autocapitalize`
-    // key here would reintroduce the property-path seam this replaced.
     expect(Object.keys(PROSE_TEXT_ATTRS)).toEqual(['data-prose']);
   });
 
@@ -150,8 +137,6 @@ describe('PROSE_TEXT_ATTRS', () => {
   });
 });
 
-// The device's Autocorrect switch. Off is the fix for the dead Send button on
-// iOS: UIKit's autocorrect keeps the tap on a control below the last word.
 describe('the autocorrect switch', () => {
   it('turns autocorrect off on a prose field when the switch is off', () => {
     const el = prose();
@@ -160,8 +145,6 @@ describe('the autocorrect switch', () => {
   });
 
   it('keeps sentence capitalization and spell-check on a prose field', () => {
-    // Only autocorrect follows the switch. Typos stay underlined, and a
-    // sentence still starts with a capital.
     const el = prose();
     stampNoAutofill(el, false);
     expect(el.getAttribute('autocapitalize')).toBeNull();
@@ -175,8 +158,6 @@ describe('the autocorrect switch', () => {
   });
 
   it('re-stamps every mounted field when the switch flips, both ways', () => {
-    // iOS reads the attribute when a field takes focus, so a field stamped
-    // before the flip would otherwise keep the old behavior.
     const proseField = prose();
     const configField = textarea();
     const root = { querySelectorAll: () => [proseField, configField] } as any;
@@ -193,17 +174,9 @@ describe('the autocorrect switch', () => {
   });
 });
 
-// Source-scan guard. The prose fields are the ones a user writes sentences in;
-// they were silently stripped of autocorrect + sentence capitalization for a
-// month by the global stamp (commit 7c61270ac bundled two attributes into a fix
-// that only needed autocomplete). Pin them so a rewrite of one of these fields
-// can't drop the opt-out again.
 const here: string = dirname(fileURLToPath(import.meta.url));
 const read = (p: string): string => readFileSync(resolve(here, p), 'utf-8');
 
-/** Every component source, as [path, comment-stripped contents] — for the JSX
- *  tripwire below. Comments are stripped so prose *about* the banned attribute
- *  (including the one explaining the ban) isn't mistaken for markup. */
 function componentSources(): Array<[string, string]> {
   const root = resolve(here, '../components');
   const walk = (dir: string): string[] =>
@@ -218,20 +191,19 @@ function componentSources(): Array<[string, string]> {
 }
 
 const PROSE_FIELDS = [
-  '../components/chat/PromptInput.tsx',        // the chat prompt
-  '../components/shared/AutoTextarea.tsx',     // app description, new-app description, email body
-  '../components/shared/PromptDialog.tsx',     // free-text answer to the LLM
-  '../components/email/EmailConfirmModal.tsx', // email subject
-  '../components/triggers/TriggerDetails.tsx', // trigger name, group name, intent
-  '../components/settings/ResponseStylesSection.tsx', // a response style's instruction
-  '../components/settings/MarketplacesSection.tsx', // a marketplace's display name
-  '../components/settings/TitleStyleRow.tsx', // the title style instruction
+  '../components/chat/PromptInput.tsx',
+  '../components/shared/AutoTextarea.tsx',
+  '../components/shared/PromptDialog.tsx',
+  '../components/email/EmailConfirmModal.tsx',
+  '../components/triggers/TriggerDetails.tsx',
+  '../components/settings/ResponseStylesSection.tsx',
+  '../components/settings/MarketplacesSection.tsx',
+  '../components/settings/TitleStyleRow.tsx',
 ];
 
-// Config / code / secret surfaces: an iOS auto-capital here corrupts the value.
 const NON_PROSE_FIELDS = [
   '../components/files/FilePreviewInline.tsx',
-  '../components/settings/AllowlistEditor.tsx',
+  '../components/shared/AllowlistRow.tsx',
   '../components/shared/SecretInput.tsx',
 ];
 
@@ -249,12 +221,6 @@ describe('prose fields opt back into autocorrect', () => {
     expect(read(path)).not.toContain('PROSE_TEXT_ATTRS');
   });
 
-  // Turning autocorrect off from JSX INVERTS it: `autocorrect` is not in
-  // Preact's property-path exclusion list, so it assigns `el.autocorrect =
-  // "off"`, and the boolean IDL attribute coerces that non-empty string to
-  // true — reflecting `autocorrect="on"`. Worse, the now-present attribute
-  // makes setIfAbsent skip the field, so the stamp can never repair it. Only
-  // the stamp's setAttribute writes the literal keyword.
   it('no component declares autocorrect="off" in JSX — that turns it ON', () => {
     const offenders = componentSources().filter(([, src]) => /autocorrect=["']off["']/.test(src));
     expect(offenders.map(([p]) => p)).toEqual([]);

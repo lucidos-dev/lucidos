@@ -1,12 +1,3 @@
-/**
- * Every Settings row that carries a search anchor is findable in Search
- * everywhere. Models → Voice once rendered its anchors with no search entry,
- * so typing "voice" found nothing, and nothing failed.
- *
- * An entry covers an anchor when it lands on it. It also covers it when it
- * takes the anchor as its id and lands on an ancestor that always renders.
- * That is how a row shown only while a switch is on lands on the switch.
- */
 import { describe, it, expect } from 'vitest';
 import { settingsSearchCovers } from './searchIndex';
 import {

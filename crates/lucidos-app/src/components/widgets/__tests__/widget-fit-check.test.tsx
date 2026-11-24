@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The widget fit check renders the real widget box at every size, on the desk
- * tile and the phone column, at the check's UI scale. It answers once.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -54,7 +50,6 @@ afterEach(() => {
 
 const surface = (name: string) => host.querySelector<HTMLElement>(`.widget-fit-surface[data-surface="${name}"]`);
 const frameOn = (name: string) => surface(name)?.querySelector('iframe') ?? null;
-/** The token the frame on `name` was last asked to measure for. */
 const lastMeasure = (name: string): string | undefined => {
   const frame = frameOn(name);
   const pushes = postToAppFrame.mock.calls.filter((c) => c[0] === frame && c[1] === WIDGET_CHANNEL);
@@ -62,13 +57,11 @@ const lastMeasure = (name: string): string | undefined => {
 };
 const fits = (token: string): WidgetFit => ({ token, box: { width: 1, height: 1 }, findings: [], total: 0 });
 
-/** `scaleDevice` null: the workspace-wide scale is the largest. */
 function check(sizes: Array<'small' | 'medium' | 'large' | 'xl'>, scaleDevice: string | null = 'the-phone') {
   act(() => { requestWidgetFit({ requestId: 'r1', appId: 'trip', sizes, scale: 125, scaleDevice: scaleDevice ?? undefined }); });
   for (const name of ['desk-tile', 'phone-column']) act(() => { frameOn(name)!.dispatchEvent(new Event('load')); });
 }
 
-/** Answer the size the frame on `name` measures now. */
 function answer(name: string, fit: (token: string) => WidgetFit = fits) {
   const token = lastMeasure(name)!;
   act(() => { frameOn(name)!.dispatchEvent(new CustomEvent(APP_FRAME_FIT_EVENT, { detail: fit(token), bubbles: true })); });
@@ -95,7 +88,6 @@ describe('the widget fit check', () => {
     }
   });
 
-  /** Invariant: every declared size on both surfaces. */
   it('walks every size on both surfaces, then reports each box once', async () => {
     check(['small', 'large', 'xl']);
     for (const name of ['desk-tile', 'phone-column']) {
@@ -125,7 +117,6 @@ describe('the widget fit check', () => {
     expect(boxes[0]).toEqual({ surface: 'desk-tile', size: 'small', error: 'boom' });
   });
 
-  /** Invariant: an unknown is never a pass. */
   it('tells every size a silent widget leaves, at the first deadline', async () => {
     vi.useFakeTimers();
     check(['small', 'large']);
@@ -140,8 +131,6 @@ describe('the widget fit check', () => {
     expect(boxes.filter((b) => b.surface === 'phone-column').every((b) => b.error === undefined)).toBe(true);
   });
 
-  /** The engine waits `WIDGET_FIT_BOX_BUDGET` per size. A page that may take
-   *  longer than that would answer a check the engine already gave up on. */
   it('takes no longer over a box than the engine waits for one', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const rust: string = readFileSync(resolve(here, '../../../../../lucidos-engine/src/engine/widget_fit.rs'), 'utf8');

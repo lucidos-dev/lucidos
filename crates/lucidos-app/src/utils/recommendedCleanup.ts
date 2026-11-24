@@ -10,7 +10,6 @@ export interface RecommendedCleanupOutcome {
   freedBytes: number;
 }
 
-/** The toast for a finished recommended cleanup. */
 export function describeRecommendedCleanupOutcome({
   removedCount,
   cleanedCount,

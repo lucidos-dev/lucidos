@@ -22,21 +22,25 @@ imagesize = "0.13"
 libc = "0.2"
 lucidos-build-slot = { path = "../lucidos-build-slot" }
 lucidos-claude-code-managed = { path = "../lucidos-claude-code-managed" }
-lucidos-engine-socket = { path = "../lucidos-engine-socket" }
 lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 # The two default gateway ports `lucidos pair` probes. Its only dependency is
 # serde, which this crate already takes.
 lucidos-installs = { path = "../lucidos-installs" }
 lucidos-home = { path = "../lucidos-home" }
-lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-local-token = { path = "../lucidos-local-token", features = ["blocking"] }
+# `lucidos tls trust` and `forget` act on the per-user loopback CA, as the
+# desktop app's Trust screen and uninstall do.
+lucidos-loopback-ca = { path = "../lucidos-loopback-ca" }
+# `spawn-thread --to` names a workspace call's route and its hand-back reasons.
+lucidos-gateway-stamp = { path = "../lucidos-gateway-stamp" }
 # `lucidos pair --qr` draws the code in the terminal, and needs a hostname a
 # phone can reach to put in it. Tailscale answers that from the interface list
 # with no subprocess. It picks a name to print and never touches the auth
 # decision (ADR 0094).
 lucidos-tailscale = { path = "../lucidos-tailscale" }
-# The update address rule and its gateway routes, so `lucidos update-address`
+# The channel and address rules and gateway routes, so `lucidos update-channel`
 # refuses what the gateway would refuse, before any request.
-lucidos-update-address = { path = "../lucidos-update-address" }
+lucidos-update-channel = { path = "../lucidos-update-channel" }
 # The same encoder the gateway uses, so the two QRs cannot differ. No default
 # features: `image` is the crate's only dependency and it is gated off, and the
 # unicode renderer this needs is behind no feature at all.

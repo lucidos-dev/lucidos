@@ -2,17 +2,10 @@ import { test, expect } from './fixtures';
 import { appPath, createIframeAppFixture } from './db-helpers';
 import { gotoWithRetry } from './helpers';
 
-// Verifies that the SDK preserves an app's scrollY across iframe unmount/remount.
-// The parent destroys/recreates the iframe element on every app switch
-// (AppUiInline.tsx uses key={refreshKey}), so without intervention the user
-// loses their place every time. The SDK saves on `pagehide` and restores on
-// load, keyed by app id in sessionStorage.
 
 const APP_ID = 'e2e-sdk-scroll-test';
 let fixture: { cleanup: () => void };
 
-// Sandbox attrs must mirror AppUiInline.tsx — keep them identical so the test
-// exercises the real iframe environment.
 const iframeHtml = (appId: string) => `<!DOCTYPE html>
 <html><body>
 <iframe id="app-frame" src="${appPath(appId)}"
@@ -54,9 +47,6 @@ for (let i = 0; i < 200; i++) {
   });
 
   test('restores scrollY when sessionStorage already has a value for this app', async ({ page }) => {
-    // Pre-seed the per-app key from the parent (same-origin iframe shares
-    // sessionStorage with parent). This isolates the restore path from the
-    // save path, which is independently exercised in the next test.
     await gotoWithRetry(page, '/');
     await page.evaluate((id) => {
       sessionStorage.setItem(`lucidos-scroll-app-${id}`, '1000');
@@ -67,8 +57,6 @@ for (let i = 0; i < 200; i++) {
     const appFrame = page.frameLocator('#app-frame');
     await expect(appFrame.locator('.row').nth(199)).toBeVisible({ timeout: 5000 });
 
-    // SDK restore is async (waits for body to grow via MutationObserver).
-    // Poll until restored or timeout.
     await expect.poll(async () => {
       return await page.evaluate(() => {
         const iframe = document.querySelector('#app-frame') as HTMLIFrameElement;
@@ -79,7 +67,6 @@ for (let i = 0; i < 200; i++) {
 
   test('saves scrollY on pagehide so the next mount restores it', async ({ page }) => {
     await gotoWithRetry(page, '/');
-    // Clear any stored value from a previous test.
     await page.evaluate((id) => {
       sessionStorage.removeItem(`lucidos-scroll-app-${id}`);
     }, APP_ID);
@@ -88,8 +75,6 @@ for (let i = 0; i < 200; i++) {
 
     await expect(page.frameLocator('#app-frame').locator('.row').nth(199)).toBeVisible({ timeout: 5000 });
 
-    // Scroll the iframe content from inside the iframe (avoids cross-frame
-    // scrollTo flakiness). Read scrollY back to confirm.
     const observedScrollY = await page.evaluate(() => {
       const iframe = document.querySelector('#app-frame') as HTMLIFrameElement;
       const win = iframe.contentWindow!;
@@ -98,9 +83,6 @@ for (let i = 0; i < 200; i++) {
     });
     expect(observedScrollY).toBeGreaterThan(500);
 
-    // Remove iframe — SDK's pagehide listener fires and writes scrollY
-    // to sessionStorage. The exact value depends on observedScrollY (may be
-    // clamped if content is shorter than expected).
     await page.evaluate(() => {
       document.querySelector('#app-frame')?.remove();
     });
@@ -133,17 +115,13 @@ for (let i = 0; i < 200; i++) {
 
     try {
       await gotoWithRetry(page, '/');
-      // Seed scroll memory for the FIRST app only.
       await page.evaluate((id) => {
         sessionStorage.setItem(`lucidos-scroll-app-${id}`, '1000');
       }, APP_ID);
 
-      // Mount the OTHER app's iframe — its own key has nothing saved, so it
-      // must start at 0 even though the first app's key is in storage.
       await page.setContent(iframeHtml(otherId));
 
       await expect(page.frameLocator('#app-frame').locator('.row').nth(199)).toBeVisible({ timeout: 5000 });
-      // Give any (incorrect) deferred restore a chance to fire.
       await page.waitForTimeout(500);
 
       const otherY = await page.evaluate(() => {

@@ -4,11 +4,6 @@ import { resolve } from 'path';
 import { WORKSPACE } from './db-helpers';
 import { apiRequest, assertHealthy, navigateToApp, openSettingsView, waitForEventStream } from './helpers';
 
-/** A short content view fits under the phone header, so it does not scroll.
- *
- *  The pane reserves the header's room with a spacer above the view. A view
- *  that also fills the whole pane overflows it by exactly that room. The
- *  reader can then drag the view's top up behind the header. */
 
 const ROOT = 'artifacts/e2e-pane-fit';
 const SHORT_NOTE = `${ROOT}/short-note.md`;
@@ -56,13 +51,10 @@ test.describe('a short content view on a phone', () => {
     await expect.poll(() => paneOverflow(page, '.file-preview-content .markdown-content'), { timeout: 5_000 }).toBeLessThanOrEqual(1);
   });
 
-  // The pane is what the header's hide-on-scroll follows, so a long document
-  // must scroll the pane rather than a box inside it.
   test('a long file preview scrolls the pane itself', async ({ page }) => {
     await openFile(page, LONG_NOTE);
     const doc = page.locator('.content-pane-body .file-preview-content .markdown-content:visible').first();
     await expect(doc).toContainText('Paragraph 79', { timeout: 15_000 });
-    // Polled, since the document settles as it fades in over its skeleton.
     await expect.poll(() => doc.evaluate((el) => {
       const pane = el.closest('.content-pane-body') as HTMLElement;
       const inner = el.closest('.file-preview-content') as HTMLElement;

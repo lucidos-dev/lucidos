@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** Parity: every passage thread find counts is the text its element draws.
- *  Each turn renders through the real `ChatExchange`, so a card or a step row
- *  whose wording drifts from its passage fails here. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

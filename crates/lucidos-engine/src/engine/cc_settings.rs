@@ -22,7 +22,7 @@ pub(crate) fn cc_settings_path_for_workspace(workspace_root: &Path) -> PathBuf {
 /// `MCP_TOOL_TIMEOUT` and `MCP_TIMEOUT`, Codex's `tool_timeout_sec`, and the
 /// `yield_time_ms` its prompt tells a question's `exec` cell to use. A
 /// shorter one forces a retry, which surfaces a duplicate card.
-pub(crate) const USER_ANSWER_WAIT_SECS: u64 = 86_400;
+pub const USER_ANSWER_WAIT_SECS: u64 = 86_400;
 
 /// The one working directory a CC session gets beyond its own worktree:
 /// [`crate::core::DATA_DIR`], holding the artifacts, knowhow, apps and triggers
@@ -50,7 +50,7 @@ fn widened_directories(workspace_root: &Path) -> Vec<PathBuf> {
         Some(dir)
             if crate::runtime::codex::grants_more_than_the_data_tree(&dir, workspace_root) =>
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[CcSettings] {} resolves to {}, which contains the workspace. Refusing to \
                  grant it: Claude Code will keep asking before it reaches the workspace's \
                  data/ tree.",
@@ -61,7 +61,7 @@ fn widened_directories(workspace_root: &Path) -> Vec<PathBuf> {
         }
         Some(dir) => vec![dir],
         None => {
-            crate::log!(
+            crate::log_legacy!(
                 "[CcSettings] {} is not a reachable directory. Claude Code will keep asking \
                  before it reaches the workspace's data/ tree.",
                 data_dir.display()
@@ -103,7 +103,7 @@ fn os_tmp_directories_with(tmpdir: Option<std::ffi::OsString>) -> Vec<PathBuf> {
     let mut granted: Vec<PathBuf> = Vec::new();
     for literal in std::iter::once(PathBuf::from(OS_TMP_DIR)).chain(tmpdir) {
         let Ok(resolved) = std::fs::canonicalize(&literal) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[CcSettings] {} is not a reachable directory. Claude Code will keep asking \
                  before it writes a throwaway file there.",
                 literal.display()
@@ -149,7 +149,9 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
                     "matcher": "Bash",
                     "hooks": [{
                         "type": "command",
-                        "command": "lucidos cc-bash-guard"
+                        "command": "lucidos cc-bash-guard",
+                        "onFailure": "block",
+                        "timeout": 10
                     }]
                 },
                 {
@@ -179,6 +181,13 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
                         "type": "command",
                         "command": "lucidos cc-plan-gate"
                     }]
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": question_guard_command()
+                    }]
                 }
             ],
             "Stop": [{
@@ -191,7 +200,21 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
     });
     grant_directories(&mut settings, additional_directories);
     hide_unused_skills(&mut settings);
+    turn_off_own_sandbox(&mut settings);
     settings.to_string()
+}
+
+/// The hook refusing every other tool call while the agent's own question is
+/// open (ADR 0803). It reads the session transcript, so it costs a process
+/// start and no engine call.
+fn question_guard_command() -> String {
+    use crate::engine::question_park_sql::OPEN_QUESTION_TOOL_REFUSAL;
+    format!(
+        "lucidos cc-question-guard --refusal '{OPEN_QUESTION_TOOL_REFUSAL}' \
+         --question-tool {} --question-tool {}",
+        crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL,
+        crate::runtime::CC_MCP_ASK_USER_QUESTION_TOOL,
+    )
 }
 
 /// Claude Code's own skills that Lucidos has no use for, so their listing stays
@@ -214,6 +237,14 @@ fn hide_unused_skills(settings: &mut serde_json::Value) {
         .map(|skill| (skill.to_string(), serde_json::json!("off")))
         .collect::<serde_json::Map<_, _>>()
         .into();
+}
+
+/// Turn Claude Code's own sandbox off, whatever the user's settings say. Its
+/// seatbelt cannot nest inside Lucidos's (ADR 0645), so every sandboxed Bash
+/// call would fail. Both files carry it, since CC names its sandbox in the
+/// prompt, and a side question must share its session's prefix.
+fn turn_off_own_sandbox(settings: &mut serde_json::Value) {
+    settings["sandbox"] = serde_json::json!({ "enabled": false });
 }
 
 /// Add the `permissions.additionalDirectories` grant, or nothing for an empty
@@ -262,7 +293,7 @@ pub(crate) async fn write_cc_settings(
         build_cc_settings_json(&granted_directories(workspace_root)),
     )
     .await?;
-    crate::log!("[CcSettings] wrote {}", path.display());
+    crate::log_legacy!("[CcSettings] wrote {}", path.display());
     Ok(())
 }
 
@@ -280,7 +311,7 @@ pub(crate) fn build_cc_side_question_settings_json(additional_directories: &[Pat
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason":
-                crate::engine::agent_session::side_question::SIDE_QUESTION_TOOL_REFUSAL,
+                crate::engine::side_question_policy::SIDE_QUESTION_TOOL_REFUSAL,
         }
     });
     let mut settings = serde_json::json!({
@@ -296,6 +327,7 @@ pub(crate) fn build_cc_side_question_settings_json(additional_directories: &[Pat
     });
     grant_directories(&mut settings, additional_directories);
     hide_unused_skills(&mut settings);
+    turn_off_own_sandbox(&mut settings);
     settings.to_string()
 }
 
@@ -347,6 +379,17 @@ mod tests {
 
     /// The skill listing is part of the prompt prefix, so the side-question copy
     /// must hide exactly what the session hides, and nothing beyond the four.
+    #[test]
+    fn both_files_turn_off_claude_codes_own_sandbox() {
+        for body in [
+            build_cc_settings_json(&[]),
+            build_cc_side_question_settings_json(&[]),
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["sandbox"]["enabled"], false, "{body}");
+        }
+    }
+
     #[test]
     fn skill_overrides_hide_only_the_unused_skills_in_both_files() {
         for json in [
@@ -421,10 +464,8 @@ mod tests {
             bash_entry["hooks"][0]["command"], "lucidos cc-bash-guard",
             "must invoke the cc-bash-guard subcommand the engine ships",
         );
-        assert!(
-            bash_entry["hooks"][0]["timeout"].is_null(),
-            "guard is fast — should not need an explicit timeout override",
-        );
+        assert_eq!(bash_entry["hooks"][0]["onFailure"], "block");
+        assert_eq!(bash_entry["hooks"][0]["timeout"], 10);
     }
 
     #[test]
@@ -493,6 +534,35 @@ mod tests {
                     .iter()
                     .any(|h| h["command"] == "lucidos cc-edit-preread"),
                 "{tool} matcher must NOT carry the removed cc-edit-preread hook",
+            );
+        }
+    }
+
+    /// Every tool passes the question guard, which names both question tools
+    /// and carries the refusal in one single-quoted shell word (ADR 0803).
+    #[test]
+    fn json_registers_the_question_guard_on_every_tool() {
+        use crate::engine::question_park_sql::OPEN_QUESTION_TOOL_REFUSAL;
+        let parsed: serde_json::Value = serde_json::from_str(&build_cc_settings_json(&[])).unwrap();
+        let entries = parsed["hooks"]["PreToolUse"].as_array().expect("array");
+        let guard = entries
+            .iter()
+            .find(|e| e["matcher"] == "*")
+            .expect("must register a * matcher");
+        let command = guard["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            command.starts_with("lucidos cc-question-guard "),
+            "{command}"
+        );
+        assert!(command.contains(&format!("'{OPEN_QUESTION_TOOL_REFUSAL}'")));
+        assert!(!OPEN_QUESTION_TOOL_REFUSAL.contains('\''));
+        for tool in [
+            crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL,
+            crate::runtime::CC_MCP_ASK_USER_QUESTION_TOOL,
+        ] {
+            assert!(
+                command.contains(&format!("--question-tool {tool}")),
+                "{command}"
             );
         }
     }

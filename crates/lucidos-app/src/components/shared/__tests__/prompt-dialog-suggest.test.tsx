@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A prompt opened with `suggest` draws a Suggest link beside its message. A tap
- * spins the link and locks the field and OK until the suggestion lands, then
- * fills the field with it, selected. The Rename dialog is the caller.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -16,14 +11,12 @@ function settled(): Promise<void> {
   return act(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
 }
 
-/** A suggestion the test answers by hand, so the in-flight state is visible. */
 function deferredSuggestion() {
   let answer: (value: string | null) => void = () => {};
   const run = () => new Promise<string | null>((resolve) => { answer = resolve; });
   return { run, answer: (value: string | null) => answer(value) };
 }
 
-/** Inside the live dialog, never the inert copy a closing one leaves behind. */
 const live = <T extends Element>(selector: string) =>
   document.querySelector<T>(`.confirm-dialog:not([inert], [inert] *) ${selector}`);
 const field = () => live<HTMLInputElement>('.prompt-input')!;

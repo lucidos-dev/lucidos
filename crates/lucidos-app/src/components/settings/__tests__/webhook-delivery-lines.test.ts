@@ -1,11 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { lastDeliveryLine, lastRefusalLine } from '../webhookDelivery';
 
-/**
- * The split these two lines carry is the whole diagnostic value of the row.
- * A hook that never accepted anything and a hook refusing every delivery look
- * identical from the events table. Only these say which one is happening.
- */
 
 const NOW = new Date('2026-08-27T12:00:00Z');
 
@@ -20,13 +15,10 @@ describe('lastDeliveryLine', () => {
   });
 
   it('says so plainly when nothing has ever verified', () => {
-    // The outage's own symptom. Silence with no stamp behind it is the reading
-    // the page owes, rather than an empty row that looks configured and fine.
     expect(lastDeliveryLine({ last_accepted_at: null }, NOW)).toBe('No delivery has verified yet');
   });
 
   it('drops the clause on a stamp it cannot read', () => {
-    // Rendering it as "never" would hide a bug in whatever wrote the stamp.
     expect(lastDeliveryLine({ last_accepted_at: 'not a timestamp' }, NOW)).toBeNull();
   });
 });
@@ -52,8 +44,6 @@ describe('lastRefusalLine', () => {
   });
 
   it('is independent of the accepted stamp', () => {
-    // A hook can be accepting one sender and refusing another, so the two lines
-    // are shown together rather than one replacing the other.
     const hook = {
       last_accepted_at: ago(1),
       last_refused_at: ago(0.05),

@@ -123,7 +123,7 @@ async fn dimension_mismatch(
         Err(e) => {
             // Could not ask. Do NOT invent a mismatch: refusing to install over
             // a transient DB hiccup would disable memory for the whole session.
-            log!(@Memory, "Could not read the embedding column width, skipping the dimension check: {}", e);
+            log_legacy!(@Memory, "Could not read the embedding column width, skipping the dimension check: {}", e);
             return None;
         }
     };
@@ -248,7 +248,7 @@ impl LucidosEngine {
                         // shared cache. Not a failure, so the attempt counter
                         // and the degraded notification both stay put.
                         peer_wait = true;
-                        log!(
+                        log_legacy!(
                             @Memory,
                             "Another engine is downloading the embedding model into the shared \
                              cache; checking again in {}s",
@@ -262,7 +262,7 @@ impl LucidosEngine {
                         // insert and every re-embed UPDATE fails on a
                         // dimension mismatch with nothing said out loud.
                         if let Some(message) = dimension_mismatch(&engine, &provider).await {
-                            log!(
+                            log_legacy!(
                                 "[Memory] {}. Giving up; memory stays disabled until the model \
                                  or the column changes",
                                 message
@@ -279,7 +279,7 @@ impl LucidosEngine {
                         // `install` sets the slot to Ready; broadcast that.
                         engine.embedder().install(provider);
                         broadcast_status(&engine);
-                        log!(
+                        log_legacy!(
                             "[Memory] Embedding model loaded (attempt #{}) — memory features active",
                             attempt
                         );
@@ -295,7 +295,7 @@ impl LucidosEngine {
                             if let Err(e) =
                                 crate::memory::reembed::reembed_stale(&index, embedder).await
                             {
-                                log!(@Memory, "Re-embed task failed: {}", e);
+                                log_legacy!(@Memory, "Re-embed task failed: {}", e);
                             }
                         }
                         // Only announce recovery if the user was previously told
@@ -313,7 +313,7 @@ impl LucidosEngine {
                     }
                     Ok(Err(e)) if is_model_fetch_failure(e.as_ref()) => {
                         attempts = attempt;
-                        log!(
+                        log_legacy!(
                             "[Memory] Embedding model load attempt #{} failed (fetch): {} — retrying in the background",
                             attempt,
                             e
@@ -336,7 +336,7 @@ impl LucidosEngine {
                         // Non-fetch failure (corrupt cached model, bad config):
                         // retrying can't fix it — stop and say so loudly. The
                         // workspace stays usable; only memory is disabled.
-                        log!(
+                        log_legacy!(
                             "[Memory] Embedding model init failed with a NON-network error: {} — \
                              giving up (fix the model cache / config and restart)",
                             e
@@ -362,7 +362,7 @@ impl LucidosEngine {
                     }
                     Err(join_err) => {
                         attempts = attempt;
-                        log!(
+                        log_legacy!(
                             "[Memory] Embedding model load task panicked: {} — retrying",
                             join_err
                         );
@@ -393,7 +393,7 @@ async fn notify(engine: &Arc<LucidosEngine>, title: &str, message: &str) {
         )
         .await
     {
-        log!("[Memory] Failed to emit embedder notification: {}", e);
+        log_legacy!("[Memory] Failed to emit embedder notification: {}", e);
     }
 }
 

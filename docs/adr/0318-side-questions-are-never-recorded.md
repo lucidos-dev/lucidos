@@ -54,8 +54,7 @@ nothing (`the_side_question_module_never_emits_an_event`).
   is a gap against ADR 0242, which asks every model call to record its cost.
   It stays until Claude Code reports usage for side questions. The cold path's
   likely prompt-cache miss goes uncounted too.
-- Codex threads get a plain refusal: Codex's protocols have no side-question
-  call, and nothing is ever sent to the Codex session.
+- Codex originally refused side questions. Superseded by [ADR 0684](0684-codex-side-questions-use-ephemeral-forks.md): an ephemeral app-server fork reads the session without writing it.
 - The normal chat route refuses `/btw` in a coding-agent thread, so a caller
   that bypasses the composer gets an error instead of a main-session turn.
 

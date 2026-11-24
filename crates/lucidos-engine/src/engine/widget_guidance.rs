@@ -131,8 +131,32 @@ pub fn widget_line(widget: &App) -> String {
     text
 }
 
-fn app_description(text: &str) -> String {
-    crate::engine::chat::process::workspace_prompt_footprint::app_description(text)
+/// Ceiling on an app `description` as rendered into the Available Apps list.
+/// Half the knowhow ceiling because this line answers a narrower question:
+/// which app the user means, and whether `navigate_ui` should open it.
+pub const APP_DESCRIPTION_MAX_CHARS: usize = 200;
+
+/// Cut `text` to at most `max_chars` characters on a word boundary and mark
+/// the cut with an ellipsis.
+///
+/// Use the boundary only in the last quarter of the budget. This still
+/// truncates a long unbroken URL or base64 string. Count characters to preserve
+/// UTF-8 boundaries.
+pub fn truncate_on_word_boundary(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    let cut = match head.rfind(char::is_whitespace) {
+        Some(idx) if head[..idx].chars().count() >= max_chars * 3 / 4 => idx,
+        _ => head.len(),
+    };
+    format!("{}…", head[..cut].trim_end())
+}
+
+/// An app or widget `description` as its list line shows it.
+pub fn app_description(description: &str) -> String {
+    truncate_on_word_boundary(description, APP_DESCRIPTION_MAX_CHARS)
 }
 
 #[cfg(test)]
@@ -239,10 +263,14 @@ mod tests {
     /// prompt can be built without an engine.
     #[test]
     fn both_agents_call_this_one_builder() {
-        let chat = include_str!("chat/process/workspace_prompt_footprint.rs");
+        let chat = include_str!(
+            "../../../lucidos-agents-api/src/engine/chat/process/workspace_prompt_footprint.rs"
+        );
         assert!(chat.contains("crate::engine::widget_guidance::build_widgets_section("));
         assert!(chat.contains("WidgetAudience::Chat { automatic }"));
-        let spawn = include_str!("agent_session/run_session/spawn_context.rs");
+        let spawn = include_str!(
+            "../../../lucidos-agents-api/src/engine/agent_session/run_session/spawn_context.rs"
+        );
         assert!(spawn.contains("crate::engine::widget_guidance::build_widgets_section("));
         assert!(spawn.contains("WidgetAudience::CodingAgent"));
         assert!(spawn.contains("self.coding_agent_widgets()"));

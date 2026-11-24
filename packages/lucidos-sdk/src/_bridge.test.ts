@@ -1,11 +1,3 @@
-/**
- * The app half of the bridge.
- *
- * Two things are worth pinning here. Whether this frame is isolated at all,
- * because every seam branches on it and the two obvious tests are both wrong.
- * And the two wire conversions, because a `Response` and a `FormData` cannot
- * cross a structured clone and every SDK caller expects them back intact.
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   isBridged,
@@ -61,7 +53,6 @@ describe('isBridged', () => {
   });
 
   it('is false in an ordinary same-origin frame, which needs no bridge', () => {
-    // The trap: a parent check alone is true here too.
     setFrame({ hasParent: true, origin: 'https://localhost:5251' });
     expect(isBridged()).toBe(false);
   });
@@ -113,8 +104,6 @@ describe('a host request', () => {
   }
 
   it('from a parent on another origin leaves the frame where it is', async () => {
-    // A foreign page that frames an engine-served app IS its parent, so the
-    // source check alone admits it.
     await parentSays('https://foreign.example');
     expect(loc.replace).not.toHaveBeenCalled();
     expect(loc.href).toBe(APP_DOC);
@@ -152,7 +141,6 @@ describe('the host origin', () => {
   });
 
   describe('when the frame URL has an opaque origin', () => {
-    // A srcdoc preview reads "null", and postMessage throws on that target.
     beforeEach(() => vi.stubGlobal('location', { origin: 'null' }));
 
     it('drops a post rather than throwing', () => {
@@ -194,9 +182,6 @@ describe('toWireBody', () => {
   });
 
   it('carries a typed-array VIEW by its own window, not the whole buffer', () => {
-    // A subarray is a view onto part of a larger buffer. Copying the buffer
-    // would send bytes either side of it, which for an upload is somebody
-    // else's data.
     const backing = new Uint8Array([1, 2, 3, 4, 5, 6]);
     const view = backing.subarray(2, 4);
     const wire = toWireBody(view) as { kind: string; value: ArrayBuffer };
@@ -211,9 +196,6 @@ describe('toWireBody', () => {
 });
 
 describe('headersToRecord', () => {
-  // `HeadersInit` is three shapes and only the record survives a spread. The
-  // other two used to vanish without a word, which on a proxy call meant an
-  // Authorization header silently not sent.
   it('carries a plain record', () => {
     expect(headersToRecord({ 'X-A': '1' })).toEqual({ 'x-a': '1' });
   });
@@ -251,9 +233,6 @@ describe('fromWireResponse', () => {
   });
 
   it('drops the body on a status the Response constructor refuses one for', () => {
-    // A DELETE answering 204 is the one the SDK meets. Passing a body here
-    // throws a TypeError, which would surface as a broken call rather than as
-    // the successful delete it was.
     expect(() => fromWireResponse(wire(204))).not.toThrow();
     expect(fromWireResponse(wire(204)).status).toBe(204);
   });

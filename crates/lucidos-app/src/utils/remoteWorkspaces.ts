@@ -1,30 +1,18 @@
-/**
- * The picker's view of remote workspaces: each remote gateway's workspaces,
- * kept through a gateway's silence so its rows grey out instead of vanishing.
- *
- * Shared merging, routing and device cache for the picker and switcher.
- */
 
 import type { ListedWorkspace, RemoteGatewayListing } from '../api/client/control';
 import { workspaceState } from './workspaceState';
 import { parseWorkspaceRoute, isWorkspaceSlug, workspaceRouteSegment } from './basePath';
 
-/** One remote gateway as the picker draws it. */
 export interface RemoteGatewayView {
   gateway: string;
   host?: string;
   pairingId?: string;
   lastSeenAt?: string | null;
   reasonKind?: string | null;
-  /** The newest workspaces the gateway listed. Empty until it first answers. */
   workspaces: ListedWorkspace[];
-  /** Why the gateway did not answer the newest ask, or null when it did. */
   unreachable: string | null;
 }
 
-/** Fold a fresh listing onto the previous view. A gateway that answered
- *  replaces its rows. One that did not keeps its last rows, marked unreachable.
- *  A gateway missing from `next` was removed, so its rows go. */
 export function mergeRemoteListings(
   previous: readonly RemoteGatewayView[],
   next: readonly RemoteGatewayListing[],
@@ -42,7 +30,6 @@ export function mergeRemoteListings(
   );
 }
 
-/** The route a remote workspace opens at on this gateway: `<slug>@<gateway>`. */
 export function remoteWorkspaceRoute(view: RemoteGatewayView, workspace: ListedWorkspace): string {
   return workspaceRouteSegment({ slug: workspace.id, gateway: view.gateway });
 }
@@ -80,5 +67,5 @@ export function recallRemoteListings(): RemoteGatewayView[] {
 }
 
 export function rememberRemoteListings(views: readonly RemoteGatewayView[]): void {
-  try { localStorage.setItem(REMOTE_WORKSPACES_CACHE_KEY, JSON.stringify(views)); } catch { /* Storage can be disabled. */ }
+  try { localStorage.setItem(REMOTE_WORKSPACES_CACHE_KEY, JSON.stringify(views)); } catch {  }
 }

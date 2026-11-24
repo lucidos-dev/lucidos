@@ -21,8 +21,6 @@ describe('repoFilterOptions — only repos with CC sessions', () => {
     threadMap.value = new Map();
     selectedRepoIds.value = new Set();
     filterFacets.value = { status: 'not-loaded' };
-    // These cases assert deleted-entry labeling/sorting, which is independent
-    // of the include-deleted toggle — opt in so deleted rows are listed.
     includeDeletedFilterOptions.value = true;
   });
 
@@ -39,7 +37,6 @@ describe('repoFilterOptions — only repos with CC sessions', () => {
         { id: 'r2', name: 'Repo 2', path: '/r2' },
       ],
     };
-    // Only r1 has a thread.
     threadMap.value = new Map([['t1', ccThread('r1')]]);
     const ids = repoFilterOptions.value.map(o => o.id);
     expect(ids).toEqual(['r1']);
@@ -60,9 +57,6 @@ describe('repoFilterOptions — only repos with CC sessions', () => {
   });
 
   it('labels a deleted repo from the facet name (no loaded thread)', () => {
-    // The repo is gone from the live registry and has no thread in threadMap,
-    // so only the facet supplies it. The server-resolved facet.name (from the
-    // repo_names projection) must surface as the label — not the raw UUID.
     repositories.value = { status: 'loaded', data: [] };
     filterFacets.value = {
       status: 'loaded',

@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
+use uuid::Uuid;
 
 const DAY: f64 = 86_400.0;
 const MIN: f64 = 60.0;

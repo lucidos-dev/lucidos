@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { shouldSuppressDragStart } from './noDrag';
 
-// A minimal element stand-in: `closest` returns a truthy match when the target
-// is inside an opted-in drag source, else null — mirroring DOM `closest`.
 const elem = (match: unknown) => ({ closest: (_sel: string) => match });
 
 describe('shouldSuppressDragStart', () => {

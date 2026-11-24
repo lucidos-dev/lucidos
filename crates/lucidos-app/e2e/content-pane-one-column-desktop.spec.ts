@@ -1,23 +1,11 @@
-/**
- * Every content-pane view, tab or overlay, renders as one column: the same
- * left edge, width and top as the Apps view. The plugin detail page and the
- * inline forms once rendered full width and left-aligned. The column was
- * opt-in, and only the tab views opted in.
- *
- * The source scan `styles/__tests__/content-pane-one-column.test.ts` pins the
- * rule. This measures what renders, on a pane wide enough for the cap to bite.
- */
 import { test, expect, type Page } from './fixtures';
 import { addTriggerCard, apiRequest, assertHealthy, navigateToApp, openSettingsView, waitForEventStream } from './helpers';
 
-// The plugin catalog read is mocked, and a read the service worker makes
-// skips the route mock.
 test.use({ serviceWorkers: 'block', viewport: { width: 2560, height: 900 } });
 
 interface Column {
   left: number;
   width: number;
-  /** Where the first content can start: the view's top plus its top padding. */
   top: number;
   paneWidth: number;
 }

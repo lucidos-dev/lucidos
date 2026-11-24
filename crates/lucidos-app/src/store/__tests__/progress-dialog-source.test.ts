@@ -1,19 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-/**
- * `activeProgressDialog` is the one thing that decides whether a modal is over
- * the app, so these pin the two properties that keep it safe.
- *
- * It is DERIVED. A flow raises the dialog by setting the signal that says it is
- * running, and every existing clear of that signal closes it. Nothing writes
- * the dialog by hand, so no path can forget to take it down.
- *
- * And it is EXCLUSIVE. Two modals at once is not a state that exists, so a
- * precedence picks one rather than leaving it to whichever wrote last.
- *
- * The version below is a fixed synthetic value, deliberately not a real
- * release, so it can never collide with the `RELEASE` file being shipped.
- */
 
 const mockCancelAppUpdate = vi.fn();
 vi.mock('../../utils/tauri', async () => {
@@ -51,8 +37,6 @@ describe('activeProgressDialog', () => {
   });
 
   it('closes the instant the restart flag clears, wherever that happened', () => {
-    // Reconnect, the safety timeout and a spawn failure all reach the dialog
-    // this way, and none of them knows the dialog exists.
     engineRestarting.value = true;
     expect(activeProgressDialog.value.visible).toBe(true);
 
@@ -98,7 +82,6 @@ describe('activeProgressDialog', () => {
     };
     expect(activeProgressDialog.value.cancel!.label).toBe('Close preview');
 
-    // A real run still outranks the preview.
     engineRestarting.value = true;
     expect(activeProgressDialog.value.title).toBe('Restarting engine');
   });

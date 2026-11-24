@@ -89,7 +89,7 @@ fn start_merge_and_get_prompt_signature_and_prompt_match() {
     // `build_merge_prompt` produces for the same arguments. This is what
     // the three call sites depend on after we route them through the
     // helper in Tasks 2-4.
-    let prompt = crate::engine::agent_session::build_merge_prompt(
+    let prompt = crate::engine::merge_prompts::build_merge_prompt(
         "main",
         None,
         Some("Some description"),

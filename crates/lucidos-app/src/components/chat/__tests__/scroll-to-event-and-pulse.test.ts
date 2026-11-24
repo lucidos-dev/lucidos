@@ -1,21 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-// The engine-log breadcrumb channel. Mocked so the outcome line is assertable,
-// and so no test fires a real POST at an engine that is not there.
 const { postClientLog } = vi.hoisted(() => ({ postClientLog: vi.fn() }));
 vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
-// Whether a failed markdown image has a re-request scheduled. Mocked so a test
-// can put an image in the complete-but-retrying state the browser reports.
 const { isImageRetryPending } = vi.hoisted(() => ({ isImageRetryPending: vi.fn(() => false) }));
 vi.mock('../../../utils/markdownImageRetry', () => ({ isImageRetryPending }));
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, honourAnchoredMutation, markAnchorScroll, clearPendingEventScroll, followingLiveEdge, followSurvivesScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
+import { awayFromBottom, showScrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, honourAnchoredMutation, markAnchorScroll, clearPendingEventScroll, followingLiveEdge, classifyScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
 import { navFocusElement, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
-/** Is a marker the CURRENT landing? Asked the way `scrollState` asks it. */
 const hasNavFocus = (): boolean => navFocusElement() !== null;
 
-/** The one `[Client/deeplink] outcome` payload this test drove, or null. */
 function outcomeLine(): Record<string, unknown> | null {
   const calls = postClientLog.mock.calls.filter(
     ([category, message]) => category === 'deeplink' && message === 'outcome',
@@ -24,12 +18,6 @@ function outcomeLine(): Record<string, unknown> | null {
   return calls.length === 1 ? (calls[0][2] as Record<string, unknown>) : null;
 }
 
-/** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
- *  writing scrollTop on the active container), NOT native scrollIntoView. Tests
- *  that assert the landing register this fake container and advance fake timers.
- *  Its getBoundingClientRect top is 0, so an element whose rect top is
- *  `absTop − container.scrollTop` (see makeTargetEl) yields a STABLE target of
- *  `absTop`, and the tween lands scrollTop exactly there. */
 function makeContainer(scrollTop = 0) {
   return {
     parentElement: null,
@@ -53,10 +41,6 @@ class FakeMutationObserver {
   takeRecords() { return []; }
 }
 
-/** The deep link's second watch: the boxes keeping a match unmeasurable. A real
- *  ResizeObserver delivers an initial observation per `observe` call, and that
- *  is what makes re-observing one box a loop. The fake stays silent instead, so
- *  a test drives every delivery itself. */
 type ROCallback = () => void;
 const roObserved: any[] = [];
 let roCallback: ROCallback | null = null;
@@ -85,16 +69,11 @@ function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[]
   (globalThis.document as any).body = fakeBody;
   (globalThis.document as any).querySelectorAll = (sel: string) => {
     if (sel === '.thread-content') return opts.threadContents ?? [];
-    // Both deep-link selectors resolve from the same fixture list so a single
-    // installFakeDom call serves event-id and change-id scrolls alike.
     if (sel.startsWith('[data-event-id') || sel.startsWith('[data-change-id')) return opts.dataEventMatches ?? [];
     return [];
   };
   (globalThis as any).MutationObserver = FakeMutationObserver;
   (globalThis as any).CSS = { escape: (s: string) => s };
-  // smoothScrollToElement reads the target's scroll-margin-top; the fake targets
-  // aren't real Elements, so stub a zero margin (real getComputedStyle throws on
-  // a plain object).
   (globalThis as any).getComputedStyle = () => ({ scrollMarginTop: '0px' });
 
   return () => {
@@ -107,9 +86,6 @@ function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[]
   };
 }
 
-/** Put a visible match at `absTop` in the fake document, for both deep-link
- *  selectors. Its rect top is relative to the container, so the tween lands
- *  `scrollTop` exactly on `absTop` (see `makeContainer`). */
 function showMatch(container: any, absTop: number) {
   const el = {
     parentElement: null,
@@ -126,13 +102,11 @@ function showMatch(container: any, absTop: number) {
   return el;
 }
 
-/** A node was added that IS the target: the retry's tree path. */
 function fireChildListMutation() {
   const node = { nodeType: 1, matches: () => true, querySelector: () => null } as any;
   lastMoCallback?.([{ addedNodes: [node], type: 'childList' } as unknown as MutationRecord], {} as MutationObserver);
 }
 
-/** A row already in the DOM gained the attribute the selector addresses it by. */
 function fireAttributeMutation(attributeName: string) {
   lastMoCallback?.(
     [{ type: 'attributes', attributeName, addedNodes: [] } as unknown as MutationRecord],
@@ -148,9 +122,6 @@ beforeEach(() => {
   roDisconnects = 0;
   postClientLog.mockClear();
   isImageRetryPending.mockReturnValue(false);
-  // Reset module-level deep-link claim state so a held claim (a sync resolve now
-  // holds it across the smooth-scroll settle; an unresolved async path holds it
-  // until its deadline) can't leak into the next test.
   clearPendingEventScroll();
 });
 
@@ -159,10 +130,6 @@ describe('scrollToEventAndPulse — MutationObserver setup', () => {
   afterEach(() => { restore?.(); restore = null; });
 
   it('observes document.body, not the loading-state .thread-content (which gets detached on ThreadView loading→loaded swap)', () => {
-    // ThreadView's loading branch and loaded branch are structurally different
-    // children of .thread-view (1 vs 2), so Preact's positional diff cannot
-    // preserve the loading-branch .thread-content across the swap. An observer
-    // scoped to it would strand. iOS PWA cold-start hits this every time.
     const loadingThreadContent = { tagName: 'DIV', className: 'thread-content' };
     restore = installFakeDom({ threadContents: [loadingThreadContent] });
 
@@ -229,7 +196,6 @@ describe('scrollToEventAndPulse — MutationObserver callback filter', () => {
     const unrelatedElement = makeNode({ matchesSelector: false, querySelectorResult: null });
     fireMutation([streamingTextNode, unrelatedElement]);
 
-    // No call into document.querySelectorAll past the initial setup.
     expect(docQsaCalls).toBe(docQsaCallsAfterSetup);
   });
 
@@ -265,15 +231,6 @@ describe('scrollToEventAndPulse — MutationObserver callback filter', () => {
 });
 
 describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
-  // Regression: tapping a notification that targets a specific event in a
-  // thread that is NOT already focused used to land at the thread bottom
-  // instead of the event. Focusing an unfocused thread lazily loads its
-  // events, and the scroll-to-bottom that fired on the eventsLoaded false→true
-  // transition overrode the deep-link scroll the moment they rendered. The fix
-  // was a "pending event scroll" claim those callers consult. Those particular
-  // callers are gone, but the claim is not: `useScrollMemory`'s restore (and
-  // its open-at-the-top reset) wake on that same render and would win the same
-  // way, so the landing is still held until the deep-link settles.
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -290,9 +247,6 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     restore = null;
   });
 
-  /** A DOM element that passes isElementVisible (non-zero rect, no clipping
-   *  ancestor). Its rect top is `absTop − container.scrollTop`, so the animateScroll
-   *  tween lands container.scrollTop exactly at `absTop`. */
   function makeVisibleEl(absTop = 3000) {
     const el: any = {
       parentElement: null,
@@ -317,57 +271,39 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
 
     scrollToEventAndPulse('e-7');
 
-    // The claim is NOT released synchronously — the deep-link tween is still
-    // settling, and a competing scroll (a saved-position restore waking on the
-    // same render, a panel close) in that window would override the landing.
-    // It's held until scrollend / the fallback timer.
     expect(hasPendingEventScroll()).toBe(true);
-    // Resolved before ever observing — no need to wait for lazily-loaded events.
     expect(moObservations).toHaveLength(0);
 
-    // The rAF tween runs and lands scrollTop on the event's position. 800ms is
-    // past the tween's duration (≤ SCROLL_MAX_MS) but before the claim fallback.
     vi.advanceTimersByTime(800);
     expect(container.scrollTop).toBe(3000);
-    expect(hasPendingEventScroll()).toBe(true); // claim still held
+    expect(hasPendingEventScroll()).toBe(true);
 
-    // Fallback timer fires (no scrollend in jsdom) → claim released.
-    vi.advanceTimersByTime(300); // total 1100, past SCROLL_SETTLE_FALLBACK_MS (1000)
+    vi.advanceTimersByTime(300);
     expect(hasPendingEventScroll()).toBe(false);
   });
 
   it('stays pending while the lazily-loaded event has not rendered (unfocused-thread path), lands on resolve, and HOLDS the claim until the deadline', () => {
-    restore = installFakeDom({}); // target not in the DOM yet
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7');
-    // This is the flag `useScrollMemory` consults to defer its restore (and its
-    // open-at-the-top reset) so neither can override the upcoming deep-link
-    // scroll. It used to guard a fleet of auto-scroll-to-bottom callers too,
-    // which no longer exist.
     expect(hasPendingEventScroll()).toBe(true);
     expect(moObservations).toHaveLength(1);
 
-    // Events render: the target card appears and is visible.
     const visibleEl = makeVisibleEl();
     (globalThis.document as any).querySelectorAll = (sel: string) =>
       sel.startsWith('[data-event-id') ? [visibleEl] : [];
     fireMutation([makeTargetNode()]);
 
-    vi.advanceTimersByTime(800); // run the tween → lands on the event
+    vi.advanceTimersByTime(800);
     expect(container.scrollTop).toBe(3000);
-    // The claim is HELD past the scroll: the same render that revealed the
-    // event is what wakes the saved-scroll restore observers, which the claim
-    // must keep suppressed. It releases only at the deadline.
     expect(hasPendingEventScroll()).toBe(true);
 
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
+    vi.advanceTimersByTime(5000);
     expect(hasPendingEventScroll()).toBe(false);
   });
 
   it('clearPendingEventScroll() cancels an in-flight claim (a plain focus superseding a deep-link)', () => {
-    // A plain thread focus cancels a prior deep-link's claim so its suppression
-    // can't leak onto the newly-focused thread's load.
-    restore = installFakeDom({}); // target never appears → claim stays pending
+    restore = installFakeDom({});
     scrollToEventAndPulse('e-7');
     expect(hasPendingEventScroll()).toBe(true);
 
@@ -376,11 +312,7 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   });
 
   it('scrollToBottom() supersedes an in-flight claim (the down chevron, tapped mid-resolve)', () => {
-    // The chevron is the reader saying "take me to the live edge", which
-    // overrides a landing they are no longer waiting for. It is now the ONLY
-    // caller of scrollToBottom, so there is no automatic variant that has to
-    // defer to the claim instead.
-    restore = installFakeDom({}); // target never appears → claim stays pending
+    restore = installFakeDom({});
     scrollToEventAndPulse('e-7');
     expect(hasPendingEventScroll()).toBe(true);
 
@@ -389,36 +321,18 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   });
 
   it('clears the pending flag when the deadline passes without the event', () => {
-    restore = installFakeDom({}); // target never appears
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7');
     expect(hasPendingEventScroll()).toBe(true);
 
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
+    vi.advanceTimersByTime(5000);
 
     expect(hasPendingEventScroll()).toBe(false);
   });
 });
 
 describe('a deep-link landing retires a standing follow only when it lands OFF the live edge', () => {
-  /** Going to a link is the reader asking to be at ONE place, so the ride ends
-   *  there. Unless the place IS the live edge: the two asks agree, and there is
-   *  nothing to end. `stepThreadTurn` already asks that of its own landing, and
-   *  the deep link was the one navigation that never did.
-   *
-   *  The disarm in `onScroll` cannot answer it. That wants the reader off the
-   *  live edge AND away from the follow's last write, and a landing at the edge
-   *  is neither.
-   *
-   *  It is measured on the LANDING, not on the pixels moved. A link carrying a
-   *  scrolled-up rider TO the live edge moves them a long way. It keeps the
-   *  ride, having put them where the ride wanted them.
-   *
-   *  Retiring is not gated on the thread being LIVE, unlike the scroll disarm,
-   *  the up chevron and turn stepping. A link names one event and expects to
-   *  still be on it later, so the ask survives the thread waking. That half is
-   *  the block below. What ARMS the same follow is pinned in
-   *  `scroll-follow-the-live-edge.test.ts`. */
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -436,8 +350,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     restore = null;
   });
 
-  /** As in the block above: a rect top of `absTop − container.scrollTop` gives
-   *  the tween a stable target of `absTop`. */
   function makeVisibleEl(absTop: number) {
     return {
       parentElement: null,
@@ -449,39 +361,27 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   }
 
   it('keeps the ride when the link lands ON the live edge', () => {
-    // The reported case. The target is the thread's newest turn, so the landing
-    // rests exactly where the ride was already holding the reader. Nothing
-    // moved, so there is nothing for the ride to be inconsistent with.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
     const { onResize } = makeScrollObservers(container);
 
-    setFollowLiveEdge(true);          // the reader arms the follow
-    vi.advanceTimersByTime(1500);     // its glide settles on the live edge
-    // 9200, the MAX offset, and the same place the link below resolves to,
-    // which is the whole point of this test. (It read 10000 while the arming
-    // was the chevron's, because `scrollToBottom` writes the raw `scrollHeight`
-    // and leans on the browser's clamp, which this fake container has not got.)
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
     expect(container.scrollTop).toBe(9200);
 
-    scrollToEventAndPulse('e-7');     // and then taps a notification
-    vi.advanceTimersByTime(1500);     // the landing settles
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
     expect(container.scrollTop).toBe(9200);
     expect(followingLiveEdge.value).toBe(true);
 
-    container.scrollHeight = 20000;   // they answer, and the agent replies
+    container.scrollHeight = 20000;
 
     onResize();
 
     expect(container.scrollTop).toBe(19200);
-    // Recorded as the live edge, not as the offset the landing produced. So
-    // coming back to the thread resumes the ride instead of parking them.
-    expect(followSurvivesScroll(container)).toBe(true);
+    expect(classifyScroll(container).followSurvives).toBe(true);
   });
 
   it('ends the ride when the link lands ABOVE the live edge', () => {
-    // The other side of the same measurement. The link names a place the ride
-    // disagrees with, so the ride ends where it puts them. Left armed, the next
-    // token would carry them off the very event they asked to see.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(3000)] });
     const { onResize } = makeScrollObservers(container);
 
@@ -498,8 +398,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(3000);
   });
 
-  /** A match whose place in the content can move, as it does when turns above
-   *  it finish drawing or older history folds in. */
   function makeMovableEl(start: number) {
     const at = { top: start };
     const el = {
@@ -514,9 +412,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   }
 
   it('holds a landed question on its landing line when content grows above it', () => {
-    // THE REPORTED CASE. The link lands, the glide ends, and only then do the
-    // turns above the question finish drawing. Nothing moved the reader with
-    // them, so they were left reading older turns above the question.
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
@@ -525,16 +420,13 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     vi.advanceTimersByTime(1500);
     expect(container.scrollTop).toBe(3000);
 
-    at.top = 4200;                    // 1200px drew above the question
+    at.top = 4200;
     onResize();
 
     expect(container.scrollTop).toBe(4200);
   });
 
   it('adds nothing when another correction already put the question back', () => {
-    // Older history folds in above, and the fold's own hold moves the reader
-    // down by exactly what arrived. The growth round that follows must not
-    // move them a second time.
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
@@ -542,16 +434,14 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500);
 
-    at.top = 11000;                            // 8000px folded in above
-    markAnchorScroll(container, 11000);        // and the fold's hold followed it
+    at.top = 11000;
+    markAnchorScroll(container, 11000);
     onResize();
 
     expect(container.scrollTop).toBe(11000);
   });
 
   it('adds up shifts too small to act on alone', () => {
-    // An animated expansion above the question grows a pixel a round. Each
-    // round is under the write threshold, so only their sum can be acted on.
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
@@ -568,9 +458,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('moves nobody when content grows BELOW a landed question', () => {
-    // A landing near the bottom is clamped to the live edge. A streaming reply
-    // below the question moves the edge but not the question. So the hold must
-    // not carry the reader down with the reply (ADR 0064).
     let top = 0;
     Object.defineProperty(container, 'scrollTop', {
       configurable: true,
@@ -592,8 +479,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('lets go of a landed question once the reader presses a turn control', () => {
-    // The press holds the control still (ADR 0147). A hold on the link's
-    // target writing after it would slide the control away.
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
@@ -616,7 +501,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500);
 
-    readerGestureForTest(container);  // the reader's own hand on the transcript
+    readerGestureForTest(container);
     container.scrollTop = 2500;
     onScroll();
     at.top = 4200;
@@ -626,8 +511,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('keeps holding a landed question while growth above it keeps arriving', () => {
-    // An image above the question reserves no height, and on a phone the ones
-    // above keep decoding for seconds. Each correction restarts the quiet window.
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
@@ -636,7 +519,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     vi.advanceTimersByTime(1500);
 
     for (let i = 1; i <= 4; i++) {
-      vi.advanceTimersByTime(2500);   // each gap is inside the quiet window
+      vi.advanceTimersByTime(2500);
       at.top = 3000 + i * 300;
       onResize();
     }
@@ -651,6 +534,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
+    onResize();
 
     at.top = 4200;
     onResize();
@@ -658,9 +542,20 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(3000);
   });
 
+  it.each([4100, 10_000])('corrects a landed question on its first growth round at %d ms', delay => {
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + delay);
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
+  });
+
   it('lets go of a landed question at the cap, even while growth keeps arriving', () => {
-    // A transcript that never stops growing above the target cannot pin the
-    // reader for good.
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
     const { onResize } = makeScrollObservers(container);
@@ -682,7 +577,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(heldAt);
   });
 
-  /** An image before the target in the transcript, loading until `complete`. */
   function imageAbove(loading: 'auto' | 'lazy' = 'auto') {
     const DOCUMENT_POSITION_FOLLOWING = 4;
     const img = { complete: false, loading, DOCUMENT_POSITION_FOLLOWING, compareDocumentPosition: () => DOCUMENT_POSITION_FOLLOWING };
@@ -691,8 +585,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   }
 
   it('keeps holding past the quiet window while an image above the question loads', () => {
-    // A slow image on a phone: nothing moves for longer than the window, then
-    // it decodes and pushes the question down.
     const img = imageAbove();
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
@@ -707,7 +599,8 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     expect(container.scrollTop).toBe(4200);
 
-    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS);   // quiet again, and loaded
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS);
+    onResize();
     at.top = 4600;
     onResize();
 
@@ -715,8 +608,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('keeps holding while an image above the question waits to retry', () => {
-    // A failed image reports complete, but its re-request is scheduled and its
-    // height is still on its way.
     const img = imageAbove();
     img.complete = true;
     isImageRetryPending.mockReturnValue(true);
@@ -727,7 +618,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + 8000);
 
-    isImageRetryPending.mockReturnValue(false);   // the retry went out and loaded
+    isImageRetryPending.mockReturnValue(false);
     at.top = 4200;
     onResize();
 
@@ -735,7 +626,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('waits for an image inserted above the question after the last reading', () => {
-    // A turn above renders later, bringing an image the saved reading never saw.
     container.querySelectorAll = () => [];
     const { el, at } = makeMovableEl(3000);
     restore = installFakeDom({ dataEventMatches: [el] });
@@ -744,8 +634,8 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + 8000);
 
-    imageAbove();                     // inserted, still loading
-    at.top = 3100;                    // its insertion's own growth
+    imageAbove();
+    at.top = 3100;
     onResize();
 
     expect(container.scrollTop).toBe(3100);
@@ -759,6 +649,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
+    onResize();
 
     at.top = 4200;
     onResize();
@@ -767,8 +658,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('lets the quiet window run out when the browser clamps every correction', () => {
-    // A correction that cannot move the container is not the transcript
-    // settling, so it must not keep the hold alive to the cap.
     let top = 0;
     Object.defineProperty(container, 'scrollTop', {
       configurable: true,
@@ -781,20 +670,18 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500);
-    at.top = 9900;                    // it drops, and the edge will not follow
+    at.top = 9900;
     for (let i = 0; i < 4; i++) {
       vi.advanceTimersByTime(1500);
       onResize();
     }
-    container.scrollHeight = 10400;   // an image above it, after the window
+    container.scrollHeight = 10400;
     at.top = 10300;
     onResize();
 
     expect(container.scrollTop).toBe(9200);
   });
 
-  /** Record the container's listeners, so a test can fire the focus a Tab or a
-   *  focused control lands inside the transcript. */
   function listenOn(c: any): Record<string, (e: unknown) => void> {
     const listeners: Record<string, (e: unknown) => void> = {};
     c.addEventListener = (type: string, fn: (e: unknown) => void) => { listeners[type] = fn; };
@@ -829,9 +716,9 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500);
 
-    listeners.focusin({ target: {} });          // the card's first choice
+    listeners.focusin({ target: {} });
     inside = false;
-    listeners.focusin({ target: container });   // desktop pane focus
+    listeners.focusin({ target: container });
     at.top = 4200;
     onResize();
 
@@ -839,9 +726,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('keeps a question landed at the live edge on screen as images above it decode', () => {
-    // THE REPORTED PUSH TAP. The question is the newest turn, so the landing is
-    // clamped to the live edge with the card near the bottom of the viewport.
-    // Every image above it that decodes later pushes it further below the fold.
     let top = 0;
     Object.defineProperty(container, 'scrollTop', {
       configurable: true,
@@ -857,7 +741,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(9200);
 
     for (let i = 1; i <= 3; i++) {
-      vi.advanceTimersByTime(2500);   // images decode seconds apart
+      vi.advanceTimersByTime(2500);
       container.scrollHeight = 10000 + i * 400;
       at.top = 9800 + i * 400;
       onResize();
@@ -868,10 +752,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('measures the landing, so a target just short of the edge still ends it', () => {
-    // The retirement and the scroll read ONE target (`landingTargetOf`), which
-    // is what stops them disagreeing about where the reader is going to end up.
-    // 9100 is inside the last viewport and well outside the edge's 2px slack,
-    // so it is a place like any other.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9100)] });
 
     setFollowLiveEdge(true);
@@ -884,15 +764,12 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('supersedes a tween that was taking the reader somewhere else', () => {
-    // The link owns the viewport. Otherwise an up-chevron glide tapped a frame
-    // earlier survives it, and carries the reader away from the link's marker.
-    // The chevron itself ended the ride.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
     makeScrollObservers(container);
 
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
-    scrollToTop();                // and its glide is in flight, having moved nobody yet
+    scrollToTop();
     expect(container.scrollTop).toBe(9200);
 
     scrollToEventAndPulse('e-7');
@@ -903,9 +780,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('keeps the ride when the link CARRIES a scrolled-up rider to the live edge', () => {
-    // Pixels moved is the wrong question. The platform left this armed reader
-    // 6200px up, with no gesture, so the ride survived. The link takes them all
-    // the way back down, which is where the ride wanted them.
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(9200)] });
     const { onResize } = makeScrollObservers(container);
 
@@ -918,9 +792,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     expect(container.scrollTop).toBe(9200);
     expect(followingLiveEdge.value).toBe(true);
-    // The ride's OWN motion took them there, so its frames are held writes and
-    // the position still records as the live edge.
-    expect(followSurvivesScroll(container)).toBe(true);
+    expect(classifyScroll(container).followSurvives).toBe(true);
 
     container.scrollHeight = 20000;
     onResize();
@@ -929,47 +801,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('answers to WHERE a superseded call landed, that being where the reader is', () => {
-    // A superseded call still lands, and still acts on the ride. So the place it
-    // rested is what a later resume has to answer to. Let the newer claim speak
-    // for it and the resume glides the reader off the event they are looking at.
-    const matches: any[] = [];
-    restore = installFakeDom({ dataEventMatches: matches });
-    makeScrollObservers(container);
-
-    setFollowLiveEdge(true);
-    vi.advanceTimersByTime(1500);
-    scrollToEventAndPulse('e-old');   // still resolving, so its observer is armed
-
-    matches.push(makeVisibleEl(9200));
-    scrollToEventAndPulse('e-new');   // a second tap, landing ON the edge
-    vi.advanceTimersByTime(50);
-    expect(followingLiveEdge.value).toBe(true);
-
-    // The older call finds its target late, well above the edge.
-    matches.length = 0;
-    matches.push(makeVisibleEl(3000));
-    lastMoCallback?.(
-      [{ addedNodes: [{ nodeType: 1, matches: () => true, querySelector: () => null }] }] as any,
-      {} as any,
-    );
-    // Long enough for its glide, short of the newer claim's own settle release.
-    vi.advanceTimersByTime(800);
-    expect(container.scrollTop).toBe(3000);
-    expect(followingLiveEdge.value).toBe(false);
-
-    // The resume must decline: the reader is on the older call's event.
-    resumeFollowingBottom(container, 'in-place');
-
-    expect(followingLiveEdge.value).toBe(false);
-    expect(container.scrollTop).toBe(3000);
-  });
-
-  it('honours a superseded landing while the NEWER link is still resolving', () => {
-    // The newer claim has no resolve to report yet. Asking whether IT landed
-    // therefore says nothing about the reader, who is sitting where the older
-    // call put them. Re-arming there hands the ride back over a landing that
-    // ended it. A newer link that then turns out dead leaves them following
-    // from the older one's event.
     const matches: any[] = [];
     restore = installFakeDom({ dataEventMatches: matches });
     makeScrollObservers(container);
@@ -977,8 +808,38 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     scrollToEventAndPulse('e-old');
-    const oldCallback = lastMoCallback;   // captured before the newer link takes the slot
-    scrollToEventAndPulse('e-new');       // still resolving, and it may never land
+
+    matches.push(makeVisibleEl(9200));
+    scrollToEventAndPulse('e-new');
+    vi.advanceTimersByTime(50);
+    expect(followingLiveEdge.value).toBe(true);
+
+    matches.length = 0;
+    matches.push(makeVisibleEl(3000));
+    lastMoCallback?.(
+      [{ addedNodes: [{ nodeType: 1, matches: () => true, querySelector: () => null }] }] as any,
+      {} as any,
+    );
+    vi.advanceTimersByTime(800);
+    expect(container.scrollTop).toBe(3000);
+    expect(followingLiveEdge.value).toBe(false);
+
+    resumeFollowingBottom(container, 'in-place');
+
+    expect(followingLiveEdge.value).toBe(false);
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('honours a superseded landing while the NEWER link is still resolving', () => {
+    const matches: any[] = [];
+    restore = installFakeDom({ dataEventMatches: matches });
+    makeScrollObservers(container);
+
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
+    scrollToEventAndPulse('e-old');
+    const oldCallback = lastMoCallback;
+    scrollToEventAndPulse('e-new');
 
     matches.push(makeVisibleEl(3000));
     oldCallback?.(
@@ -995,18 +856,33 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(3000);
   });
 
+  it('offers the down chevron while a deep link pauses an in-place ride, and after it lets go', () => {
+    restore = installFakeDom({ dataEventMatches: [] });
+    const { onScroll } = makeScrollObservers(container);
+    container.scrollTop = 3000;
+    scrollToEventAndPulse('e-pending');
+    resumeFollowingBottom(container, 'in-place');
+    onScroll();
+
+    expect(hasPendingEventScroll()).toBe(true);
+    expect(followingLiveEdge.value).toBe(true);
+    expect(awayFromBottom.value).toBe(true);
+    expect(showScrollToBottom.value).toBe(true);
+
+    clearPendingEventScroll();
+    expect(followingLiveEdge.value).toBe(true);
+    expect(container.scrollTop).toBe(3000);
+    expect(showScrollToBottom.value).toBe(true);
+  });
+
   it('leaves a ride alone when the link never lands', () => {
-    // Retiring belongs to the LANDING, not to the tap. A dead link moves the
-    // reader nowhere, so there is nothing for the ride to be inconsistent with,
-    // and taking it away would be the app dropping a request over a navigation
-    // that never happened.
-    restore = installFakeDom({}); // the target never renders
+    restore = installFakeDom({});
     const { onResize } = makeScrollObservers(container);
 
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     scrollToEventAndPulse('e-7');
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
+    vi.advanceTimersByTime(5000);
 
     container.scrollHeight = 20000;
     onResize();
@@ -1015,10 +891,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('ends a ride armed IN PLACE when the link it waited for never lands', () => {
-    // The in-place resume arms off the edge while the link owns the position.
-    // A dead link moves nobody, so the ride ends with it rather than leaving
-    // the toggle lit over a reader it does not hold.
-    restore = installFakeDom({}); // the target never renders
+    restore = installFakeDom({});
     makeScrollObservers(container);
     container.scrollTop = 3000;
 
@@ -1026,33 +899,30 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     resumeFollowingBottom(container, 'in-place');
     expect(followingLiveEdge.value).toBe(true);
 
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
+    vi.advanceTimersByTime(5000);
 
     expect(followingLiveEdge.value).toBe(false);
     expect(container.scrollTop).toBe(3000);
   });
 
   it('wakes a PARKED follow when the link that held it back expires on a live thread', () => {
-    // A scroll on a waiting thread parks the follow (ADR 0064, the user's
-    // instruction). The thread going live wakes it, except while a link owns
-    // the position. A dead link must not leave it parked on a live thread.
-    restore = installFakeDom({}); // the target never renders
+    restore = installFakeDom({});
     const { onScroll } = makeScrollObservers(container);
     setTranscriptLive(false);
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
     onScroll();
     readerGestureForTest(container);
-    container.scrollTop = 3000;   // the reader scrolls up on the waiting thread
+    container.scrollTop = 3000;
     onScroll();
     expect(followingLiveEdge.value).toBe(true);
 
     scrollToEventAndPulse('e-7');
-    setTranscriptLive(true);      // the thread goes live while the link resolves
+    setTranscriptLive(true);
     expect(container.scrollTop).toBe(3000);
 
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS
-    vi.advanceTimersByTime(1500); // and the wake's glide
+    vi.advanceTimersByTime(5000);
+    vi.advanceTimersByTime(1500);
 
     expect(container.scrollTop).toBe(9200);
     expect(followingLiveEdge.value).toBe(true);
@@ -1061,26 +931,18 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
   });
 
   it('does not write the live edge over a link that is still resolving', () => {
-    // The follow puts an armed reader back on the live edge when the PLATFORM
-    // scrolls them off it (`keepTheLiveEdge`, pinned in
-    // `scroll-follow-the-live-edge.test.ts`). A deep link owns the position for
-    // its whole resolve window, and for most of that window there is no tween to
-    // stand down for: the thread is still loading and the target has not
-    // rendered. So the claim is the guard, exactly as it is for the box-change
-    // branch, and without it the reader would be hauled to the bottom by any
-    // scroll arriving while their tap was still being answered.
-    restore = installFakeDom({}); // the target has not rendered yet
+    restore = installFakeDom({});
     const { onScroll } = makeScrollObservers(container);
 
     setFollowLiveEdge(true);
     vi.advanceTimersByTime(1500);
-    onScroll();                   // the glide's own event, recording them on the edge
+    onScroll();
     expect(container.scrollTop).toBe(9200);
 
-    scrollToEventAndPulse('e-7'); // the tap, still resolving
+    scrollToEventAndPulse('e-7');
     expect(hasPendingEventScroll()).toBe(true);
 
-    container.scrollTop = 0;      // and the platform moves the container meanwhile
+    container.scrollTop = 0;
     onScroll();
 
     expect(container.scrollTop).toBe(0);
@@ -1088,13 +950,6 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 });
 
 describe('a deep-link landing ends the ride on a thread parked on a question', () => {
-  /** A "needs your answer" notification points at a thread parked on a
-   *  question card, which is quiescent. A LINK names ONE event and expects to
-   *  still be on it later. So a landing off the live edge ends the ride,
-   *  whatever the thread is doing. The follow asks nothing about liveness.
-   *
-   *  A DEAD link still keeps the ride (the block above): retiring belongs to the
-   *  landing, not to the tap. */
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -1106,7 +961,7 @@ describe('a deep-link landing ends the ride on a thread parked on a question', (
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
-    setFollowLiveEdge(false); // un-press, so the *follow seed* does not leak
+    setFollowLiveEdge(false);
     setActiveScrollElement(null);
     restore?.();
     restore = null;
@@ -1122,15 +977,14 @@ describe('a deep-link landing ends the ride on a thread parked on a question', (
     } as any;
   }
 
-  /** Arm the follow, then land a link on an old turn, both settled. */
   function armThenLandOnAnOldTurn() {
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(3000)] });
     const observers = makeScrollObservers(container);
-    setFollowLiveEdge(true);      // the reader arms the follow
-    vi.advanceTimersByTime(1500); // its glide settles on the live edge
+    setFollowLiveEdge(true);
+    vi.advanceTimersByTime(1500);
     expect(container.scrollTop).toBe(9200);
-    scrollToEventAndPulse('e-7'); // then follows a link to an older turn
-    vi.advanceTimersByTime(1500); // the landing settles, and the claim releases
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500);
     expect(container.scrollTop).toBe(3000);
     return observers;
   }
@@ -1141,23 +995,15 @@ describe('a deep-link landing ends the ride on a thread parked on a question', (
   });
 
   it('is not undone by the growth the link itself causes', () => {
-    // The deep-link renders the FULL exchange list so a windowed-out target can
-    // be found, which is a large resize arriving right around the landing. It
-    // must not teleport the reader to the bottom one beat after they tapped the
-    // notification.
     const { onResize } = armThenLandOnAnOldTurn();
 
-    container.scrollHeight = 20000; // the window growing, a decoded image, markdown settling
+    container.scrollHeight = 20000;
     onResize();
 
     expect(container.scrollTop).toBe(3000);
   });
 
   it('and the reader STAYS on the event when the thread wakes', () => {
-    // The report, as a test. A question card is a quiescent thread that is about
-    // to run: the reader answers, the agent picks it up, and this resize is the
-    // first thing the woken turn produces. With the ride still armed it wrote
-    // them to the live edge here. Now nothing does.
     const { onResize } = armThenLandOnAnOldTurn();
 
     container.scrollHeight = 20000;
@@ -1168,18 +1014,6 @@ describe('a deep-link landing ends the ride on a thread parked on a question', (
 });
 
 describe('deep-link deadline: a dead link reports without moving the transcript', () => {
-  // The deadline used to expire in silence: claim released, nothing scrolled,
-  // nothing said. A notification tap that hit an event this thread doesn't show
-  // therefore looked simply broken. It reports the dead link through the
-  // caller's `onUnresolved` (the words live in `store/actions/threads.ts`, which
-  // owns the toast; scrollState stays free of the `store` import).
-  //
-  // The report is the WHOLE recovery. It used to also scroll to the thread's
-  // most recent turn, guarded by a `watchUserAction` watcher so a reader who had
-  // scrolled away meanwhile was not yanked 4s later. The user asked to go to a
-  // place; the place does not exist, and the bottom is not it. So the scroll is
-  // gone, and with it the watcher it needed: leaving the reader where they are
-  // is the rule now, not the exception.
   let restore: (() => void) | null = null;
   let container: any;
   let onUnresolved: Mock<() => void>;
@@ -1214,47 +1048,43 @@ describe('deep-link deadline: a dead link reports without moving the transcript'
   }
 
   it('reports the failure and leaves the transcript exactly where it was', () => {
-    restore = installFakeDom({}); // target never appears
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7', { onUnresolved });
     expect(container.scrollTop).toBe(0);
 
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
+    vi.advanceTimersByTime(5000);
 
-    expect(container.scrollTop).toBe(0); // this used to land on the bottom
+    expect(container.scrollTop).toBe(0);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
-    // No pulse: there is no specific element to highlight, and marking the last
-    // turn would claim the deep-link landed on it.
     expect(hasNavFocus()).toBe(false);
     expect(hasPendingEventScroll()).toBe(false);
   });
 
   it('leaves a reader who scrolled away during the wait exactly where they went', () => {
-    // The case the retired `watchUserAction` guard existed for. It now holds
-    // without a guard, because the deadline moves nobody at all.
-    restore = installFakeDom({}); // target never appears
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7', { onUnresolved });
     container.scrollTop = 1234;
 
     vi.advanceTimersByTime(5000);
 
-    expect(container.scrollTop).toBe(1234); // untouched: no late yank
-    expect(onUnresolved).toHaveBeenCalledTimes(1); // still told, since nothing else says so
+    expect(container.scrollTop).toBe(1234);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
   });
 
   it('a synchronous resolve does not report', () => {
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl()] });
 
     scrollToEventAndPulse('e-7', { onUnresolved });
-    vi.advanceTimersByTime(6000); // well past the deadline the async path would have set
+    vi.advanceTimersByTime(6000);
 
-    expect(container.scrollTop).toBe(3000); // the event, not the bottom
+    expect(container.scrollTop).toBe(3000);
     expect(onUnresolved).not.toHaveBeenCalled();
   });
 
   it('an observer resolve does not report, though its deadline still fires', () => {
-    restore = installFakeDom({}); // not in the DOM yet: the async path
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7', { onUnresolved });
     expect(moObservations).toHaveLength(1);
@@ -1264,16 +1094,14 @@ describe('deep-link deadline: a dead link reports without moving the transcript'
       sel.startsWith('[data-event-id') ? [visibleEl] : [];
     fireMutation();
 
-    // The deadline timer is still armed after an observer resolve (it doubles as
-    // the claim's release), so it MUST distinguish "resolved" from "gave up".
     vi.advanceTimersByTime(6000);
 
-    expect(container.scrollTop).toBe(3000); // the event, not the bottom
+    expect(container.scrollTop).toBe(3000);
     expect(onUnresolved).not.toHaveBeenCalled();
   });
 
   it('runs the recovery exactly once, with the observer still attached at expiry', () => {
-    restore = installFakeDom({}); // target never appears, so the observer is live at expiry
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7', { onUnresolved });
     expect(moObservations).toHaveLength(1);
@@ -1281,40 +1109,29 @@ describe('deep-link deadline: a dead link reports without moving the transcript'
     vi.advanceTimersByTime(5000);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
 
-    // Nothing re-arms it: later timer work must not produce a second recovery.
     vi.advanceTimersByTime(20000);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
     expect(container.scrollTop).toBe(0);
   });
 
   it('re-tapping the SAME notification mid-wait does not let the older deadline recover over it', () => {
-    // The claim is identified per CALL, not by what it points at. Two taps on
-    // one notification inside the 4s window produce an identical target, so a
-    // target-keyed claim let the first deadline mistake the second call's claim
-    // for its own: it released the live claim, snapped to the bottom and
-    // reported a dead link while the second attempt was still waiting, and the
-    // second deadline then went silent because the claim no longer looked like
-    // its own.
-    restore = installFakeDom({}); // target never appears for either call
+    restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7', { onUnresolved });
     vi.advanceTimersByTime(3000);
-    scrollToEventAndPulse('e-7', { onUnresolved }); // same notification, tapped again
+    scrollToEventAndPulse('e-7', { onUnresolved });
 
-    // The FIRST call's deadline (t=4000) must stand down: the claim is the
-    // second call's now, and that navigation is still live.
-    vi.advanceTimersByTime(1500); // t=4500
+    vi.advanceTimersByTime(1500);
     expect(onUnresolved).not.toHaveBeenCalled();
     expect(hasPendingEventScroll()).toBe(true);
 
-    // The SECOND call's own deadline (t=3000+4000) is what reports, once.
-    vi.advanceTimersByTime(3000); // t=7500
+    vi.advanceTimersByTime(3000);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
     expect(hasPendingEventScroll()).toBe(false);
   });
 
   it('the change deep-link reports the same way, off the same deadline', () => {
-    restore = installFakeDom({}); // no matching turn in this thread
+    restore = installFakeDom({});
 
     scrollToChangeAndPulse('c-1', { onUnresolved });
     vi.advanceTimersByTime(5000);
@@ -1325,16 +1142,6 @@ describe('deep-link deadline: a dead link reports without moving the transcript'
 });
 
 describe('deep-link deadline: the report is a verdict, not a stopwatch', () => {
-  // Reported from a phone: tapping a Changes row said "That change is not shown
-  // in this thread" while the change was right there, Apply button and all.
-  //
-  // The deadline was flat wall-clock from the tap, and shorter than the load it
-  // was racing: retries behind a 1s then 2s backoff, a watchdog restart at 2s,
-  // and ThreadView's own "Taking too long?" fuse at 8s. It gave up mid-fetch,
-  // and the transcript painted a second later.
-  //
-  // A target's absence only means anything once the thread has finished
-  // arriving, so `stillArriving` holds the report until then.
   let restore: (() => void) | null = null;
   let container: any;
   let onUnresolved: Mock<() => void>;
@@ -1355,14 +1162,12 @@ describe('deep-link deadline: the report is a verdict, not a stopwatch', () => {
   });
 
   it('says nothing while the thread is still arriving', () => {
-    restore = installFakeDom({}); // events still in flight, nothing rendered yet
+    restore = installFakeDom({});
 
     scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => true });
 
-    // Three deadlines' worth, all of them inside the load.
     vi.advanceTimersByTime(3 * EVENT_RESOLVE_DEADLINE_MS + 500);
     expect(onUnresolved).not.toHaveBeenCalled();
-    // The claim is held with it: the link still owns where the reader lands.
     expect(hasPendingEventScroll()).toBe(true);
   });
 
@@ -1371,34 +1176,33 @@ describe('deep-link deadline: the report is a verdict, not a stopwatch', () => {
     let arriving = true;
 
     scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => arriving });
-    vi.advanceTimersByTime(6000); // past the flat 4s that used to report
+    vi.advanceTimersByTime(6000);
 
     showMatch(container, 3000);
     fireChildListMutation();
     arriving = false;
 
     vi.advanceTimersByTime(6000);
-    expect(container.scrollTop).toBe(3000); // landed on the change
+    expect(container.scrollTop).toBe(3000);
     expect(onUnresolved).not.toHaveBeenCalled();
   });
 
   it('reports on the first deadline after the thread finishes arriving', () => {
-    restore = installFakeDom({}); // the change genuinely is not in this thread
+    restore = installFakeDom({});
     let arriving = true;
 
     scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => arriving });
     vi.advanceTimersByTime(9000);
     expect(onUnresolved).not.toHaveBeenCalled();
 
-    arriving = false; // the load landed, and the change is not among the events
+    arriving = false;
     vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
     expect(hasPendingEventScroll()).toBe(false);
-    expect(container.scrollTop).toBe(0); // still no late yank
+    expect(container.scrollTop).toBe(0);
   });
 
   it('reports at the cap when the thread never finishes', () => {
-    // A wedged load must not hold the link open for the life of the page.
     restore = installFakeDom({});
 
     scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => true });
@@ -1411,7 +1215,6 @@ describe('deep-link deadline: the report is a verdict, not a stopwatch', () => {
   });
 
   it('reports on the flat deadline when no caller answers for the thread', () => {
-    // Every other deep-link caller passes no predicate, and keeps the old shape.
     restore = installFakeDom({});
 
     scrollToEventAndPulse('e-7', { onUnresolved });
@@ -1422,9 +1225,6 @@ describe('deep-link deadline: the report is a verdict, not a stopwatch', () => {
 });
 
 describe('deep-link retry: a turn STAMPED with the change id resolves', () => {
-  // The aggregate `ChangeProposed` renders nothing, so a turn already on screen
-  // gains its `data-change-id` as an ATTRIBUTE. A childList-only watch never
-  // woke for it, and the link died on a change the reader was looking at.
   let restore: (() => void) | null = null;
   let container: any;
   let onUnresolved: Mock<() => void>;
@@ -1462,11 +1262,10 @@ describe('deep-link retry: a turn STAMPED with the change id resolves', () => {
   });
 
   it('lands on a turn stamped after the link started waiting', () => {
-    restore = installFakeDom({}); // the turn is on screen, but carries no id yet
+    restore = installFakeDom({});
 
     scrollToChangeAndPulse('c-1', { onUnresolved });
     showMatch(container, 2400);
-    // No node was added: the id landed on a row already in the DOM.
     fireAttributeMutation('data-change-id');
 
     vi.advanceTimersByTime(6000);
@@ -1476,9 +1275,6 @@ describe('deep-link retry: a turn STAMPED with the change id resolves', () => {
 });
 
 describe('deep-link anchor: an event that draws nothing lands on its turn', () => {
-  // Reported as a "needs login" notification tap that toasted "That event is
-  // not shown in this thread". Its `CredentialRequested` was a step inside a
-  // turn, and a step stamps no element. The turn holding it does.
   let restore: (() => void) | null = null;
   let container: any;
   let onUnresolved: Mock<() => void>;
@@ -1498,7 +1294,6 @@ describe('deep-link anchor: an event that draws nothing lands on its turn', () =
     restore = null;
   });
 
-  /** Only the turn root carries an id: `start-1`. */
   function showTurn(absTop: number) {
     const el = showMatch(container, absTop);
     (globalThis.document as any).querySelectorAll = (sel: string) =>
@@ -1516,8 +1311,6 @@ describe('deep-link anchor: an event that draws nothing lands on its turn', () =
     expect(onUnresolved).not.toHaveBeenCalled();
   });
 
-  // The anchor is computed from the thread's events, which a cold tap has not
-  // fetched yet. So it is asked again on every look.
   it('asks for the anchor again once the thread has arrived', () => {
     restore = installFakeDom({});
     let anchor: string | null = null;
@@ -1532,8 +1325,6 @@ describe('deep-link anchor: an event that draws nothing lands on its turn', () =
     expect(onUnresolved).not.toHaveBeenCalled();
   });
 
-  // The turn is already on screen when a catch-up adds the step. The node that
-  // arrives is the step's row, inside the turn, so it matches nothing itself.
   it('looks again when the anchor moves to a turn already on screen', () => {
     restore = installFakeDom({});
     let anchor: string | null = null;
@@ -1560,15 +1351,6 @@ describe('deep-link anchor: an event that draws nothing lands on its turn', () =
 });
 
 describe('deep-link retry: a target that gains a BOX lands', () => {
-  // Reported as a notification tap that kept the reader's position and
-  // highlighted nothing. Both the scroll and the pulse live in `tryResolve`, so
-  // losing both means it never ran.
-  //
-  // `isElementVisible` rejects a target with no box, and gaining one is a
-  // LAYOUT change: no node is added and no attribute changes, so the
-  // childList/attribute watch never wakes. `focusThread` calls
-  // `revealThreadPane()` and the deep link in the same task, so the re-expand
-  // has not committed when the one synchronous attempt runs.
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -1578,9 +1360,6 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
     setActiveScrollElement(container);
   });
   afterEach(() => {
-    // Run out the mobile header pin and the claim's settle release, both of
-    // which a landing arms. `clearAllTimers` alone would leave the pin latched
-    // for the next block, which asserts it starts off.
     vi.advanceTimersByTime(2000);
     clearNavFocus();
     vi.clearAllTimers();
@@ -1590,9 +1369,6 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
     restore = null;
   });
 
-  /** A match whose own box is `boxed` or nothing, sitting at `absTop`. Its rect
-   *  top is relative to the container, so the tween lands `scrollTop` exactly
-   *  on `absTop` (see `makeContainer`). */
   function makeMatch(absTop: number, boxed: () => boolean, parent: any = null) {
     return {
       parentElement: parent,
@@ -1615,8 +1391,6 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
 
     scrollToEventAndPulse('e-7');
 
-    // Nothing landed, and the tree watch has nothing to wait for: the target is
-    // already in the DOM. The box is what the link is waiting on.
     expect(container.scrollTop).toBe(0);
     expect(roObserved).toEqual([target]);
 
@@ -1629,9 +1403,6 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
   });
 
   it('watches the CLIPPING ancestor when the match keeps a box of its own', () => {
-    // An ancestor clipped to nothing shows none of the match while the match
-    // itself measures full size throughout. Watching the match would therefore
-    // never fire, so the walk names the ancestor instead.
     let expanded = false;
     const clipper: any = {
       parentElement: null,
@@ -1655,8 +1426,6 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
   });
 
   it('watches one box once, however many times the link misses', () => {
-    // A real ResizeObserver delivers an initial observation per `observe`, so an
-    // ungated re-watch would call `tryResolve` forever.
     const target = makeMatch(3000, () => false);
     restore = installFakeDom({ dataEventMatches: [target] });
 
@@ -1690,13 +1459,10 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
 
     expect(onUnresolved).toHaveBeenCalledTimes(1);
     expect(roDisconnects).toBe(1);
-    // A box arriving after the verdict moves nobody: the reader has read the
-    // toast and may have gone elsewhere.
     expect(container.scrollTop).toBe(0);
   });
 
   it('waits for a box in an environment with no ResizeObserver, rather than throwing', () => {
-    // Not every WebView has one. The link keeps its tree watch and its deadline.
     restore = installFakeDom({ dataEventMatches: [makeMatch(3000, () => false)] });
     (globalThis as any).ResizeObserver = undefined;
 
@@ -1706,10 +1472,6 @@ describe('deep-link retry: a target that gains a BOX lands', () => {
 });
 
 describe('a deep link says how it ended', () => {
-  // A tap that appears to do nothing was unanswerable after the fact. The
-  // dispatch breadcrumb records that a navigate was ROUTED and stops there. So
-  // "not in this thread", "present but unmeasurable" and "landed and then
-  // undone" all read alike in engine.log.
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -1767,8 +1529,6 @@ describe('a deep link says how it ended', () => {
     });
   });
 
-  // The two landings are told apart, because the wait is the interesting half:
-  // it means the transcript was not showing the target when the tap arrived.
   it('says it landed AFTER WAITING when the target arrived late', () => {
     restore = installFakeDom({});
 
@@ -1781,9 +1541,6 @@ describe('a deep link says how it ended', () => {
     expect(outcomeLine()).toMatchObject({ outcome: 'landed-after-wait', to_top: 3000 });
   });
 
-  // THE reading this whole breadcrumb exists for. One match with no box is a
-  // covered or collapsed transcript, and reads nothing like an event that is
-  // genuinely not in this thread.
   it('separates a target that is missing from one that has no box', () => {
     restore = installFakeDom({ dataEventMatches: [makeBoxlessEl()] });
 
@@ -1817,12 +1574,9 @@ describe('a deep link says how it ended', () => {
     restore = installFakeDom({ dataEventMatches: matches });
 
     scrollToEventAndPulse('e-old');
-    // A second apart, so the two deadlines land in different advances and the
-    // newer link's own verdict cannot be mistaken for the older one's.
     vi.advanceTimersByTime(1000);
     scrollToEventAndPulse('e-new');
 
-    // The older link's deadline, with the claim no longer its own.
     vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS - 900);
 
     expect(outcomeLine()).toMatchObject({ outcome: 'superseded' });
@@ -1836,16 +1590,9 @@ describe('a deep link says how it ended', () => {
 
     vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
 
-    // `outcomeLine` asserts at most one line, so reaching this point IS the
-    // check. Reading it again keeps the intent visible.
     expect(outcomeLine()).toMatchObject({ outcome: 'landed' });
   });
 
-  // `to_top` is where the reader ENDS UP, so it is clamped the way the browser
-  // clamps a `scrollTop` write. A raw landing target falls outside `0 ..
-  // liveEdgeTop` at both ends: a turn near the top carries a
-  // `scroll-margin-top` that takes it negative, and the newest turn overshoots
-  // the edge. An unclamped field would name a position that never existed.
   it('reports where the reader ends up, not the raw target, above the top', () => {
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl(-200)] });
 
@@ -1859,7 +1606,6 @@ describe('a deep link says how it ended', () => {
 
     scrollToEventAndPulse('e-7');
 
-    // 9200 is the container's max offset (scrollHeight 10000, clientHeight 800).
     expect(outcomeLine()).toMatchObject({ outcome: 'landed', to_top: 9200 });
   });
 
@@ -1877,12 +1623,6 @@ describe('a deep link says how it ended', () => {
 });
 
 describe('scrollToEventAndPulse — mobile header pin', () => {
-  // Regression: on mobile a deep-link landed the event behind a half-hidden app
-  // header ("covered a bit"). The deep-link scroll lands the event at the
-  // container top minus its STATIC scroll-margin-top — only exact if the header's
-  // visible portion is deterministic. The scroll therefore (a) reveals the header
-  // now and (b) pins it visible for a short window so the smooth scroll-down can't
-  // half-hide it.
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -1919,19 +1659,14 @@ describe('scrollToEventAndPulse — mobile header pin', () => {
     expect(isHeaderPinnedForScroll()).toBe(false);
     scrollToEventAndPulse('e-7');
 
-    // Reveal + pin happen synchronously on resolve, before the tween runs.
     expect(revealed).toBe(true);
     expect(isHeaderPinnedForScroll()).toBe(true);
 
-    // The tween lands on the event within its (< HEADER_PIN_MS) duration, so the
-    // header is still pinned when it arrives.
-    vi.advanceTimersByTime(700); // tween done (≤ SCROLL_MAX_MS), still < HEADER_PIN_MS (800)
+    vi.advanceTimersByTime(700);
     expect(container.scrollTop).toBe(3000);
     expect(isHeaderPinnedForScroll()).toBe(true);
 
-    // Pin is short-lived — it covers the smooth scroll, not the full deep-link
-    // claim, so normal hide-on-scroll resumes once the user reads on.
-    vi.advanceTimersByTime(200); // total 900, past HEADER_PIN_MS (800)
+    vi.advanceTimersByTime(200);
     expect(isHeaderPinnedForScroll()).toBe(false);
 
     document.removeEventListener('reveal-mobile-bars', onReveal);
@@ -1939,15 +1674,6 @@ describe('scrollToEventAndPulse — mobile header pin', () => {
 });
 
 describe('deep-link pulse — scoped to the subject panel, not the whole exchange', () => {
-  // Regression: both data-event-id and data-change-id sit on the .chat-exchange
-  // wrapper, which holds BOTH the .initiator-panel (the user message / event) AND
-  // the .response-panel (the agent response) of the turn. Pulsing the whole
-  // wrapper highlighted both. Each deep-link scopes the pulse to the panel that
-  // holds its subject: an event → .initiator-panel (the event, not the response
-  // below it); a change → .response-panel on a proposing CC turn (where the
-  // ChangeProposed step lives), but .initiator-panel on a resolution card (which
-  // carries the change body, recognised by its initiator-panel-change-* accent
-  // class). A missing panel falls back to the whole target.
   let restore: (() => void) | null = null;
 
   beforeEach(() => { vi.useFakeTimers(); });
@@ -1967,14 +1693,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
     };
   }
 
-  /** An exchange element with a tracked classList and optional `.initiator-panel`
-   *  / `.response-panel` children returned by querySelector — the two panels a
-   *  deep-link pulse scopes to. `resolutionCard` makes the initiator match the
-   *  `initiator-panel-change-*` accent probe, so the change picker treats it as a
-   *  resolution card (→ .initiator-panel) instead of a proposing turn
-   *  (→ .response-panel). No active scroll container is registered in this block,
-   *  so the deep-link tween is a no-op here — these tests assert only the
-   *  pulse-marker scoping. */
   function makeExchangeEl(
     { initiator = null, response = null, resolutionCard = false }:
       { initiator?: any; response?: any; resolutionCard?: boolean } = {},
@@ -1983,13 +1701,8 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
       parentElement: null,
       getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
       classList: makeClassList(),
-      // The event picker narrows to `.initiator-panel` only for a match that IS
-      // the turn wrapper, so the fake has to answer the same question the real
-      // element does. A step-level card (makeStepCardEl below) answers `false`
-      // and is pulsed whole.
       matches: (sel: string) => sel === '.chat-exchange',
       querySelector: (sel: string) => {
-        // The change picker probes for the resolution-card accent class first.
         if (sel.includes('initiator-panel-change-')) return resolutionCard ? initiator : null;
         if (sel === '.initiator-panel') return initiator;
         if (sel === '.response-panel') return response;
@@ -1999,8 +1712,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
     return el;
   }
 
-  // A re-targeted link landed on the turn because the event is a step in its
-  // reply. The user's message is not what the link was about.
   it('a link re-targeted to its turn marks the .response-panel', () => {
     const initiatorPanel = { classList: makeClassList() };
     const responsePanel = { classList: makeClassList() };
@@ -2025,7 +1736,7 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
   });
 
   it('event deep-link falls back to the whole exchange when no .initiator-panel is found', () => {
-    const exchangeEl = makeExchangeEl(); // querySelector('.initiator-panel') → null
+    const exchangeEl = makeExchangeEl();
     restore = installFakeDom({ dataEventMatches: [exchangeEl] });
 
     scrollToEventAndPulse('e-7');
@@ -2042,15 +1753,11 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
     scrollToChangeAndPulse('c-1');
 
     expect(responsePanel.classList._classes.has('nav-focus-stuck')).toBe(true);
-    // NOT the user message that started the turn, NOT the whole exchange wrapper.
     expect(initiatorPanel.classList._classes.has('nav-focus-stuck')).toBe(false);
     expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(false);
   });
 
   it('change deep-link on a resolution card marks the .initiator-panel (change body), not a folded-in continuation .response-panel', () => {
-    // A ChangeApplied/Discarded/Reverted/Failed card carries the change body in
-    // its .initiator-panel (accent class), and may fold post-apply continuation
-    // work into a .response-panel. The pulse must land on the change body.
     const initiatorPanel = { classList: makeClassList() };
     const responsePanel = { classList: makeClassList() };
     const exchangeEl = makeExchangeEl({ initiator: initiatorPanel, response: responsePanel, resolutionCard: true });
@@ -2064,7 +1771,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
   });
 
   it('change deep-link falls back to the whole exchange when the target panel is absent', () => {
-    // Degenerate proposing turn: no .response-panel to scope to → whole target.
     const exchangeEl = makeExchangeEl({ initiator: { classList: makeClassList() } });
     restore = installFakeDom({ dataEventMatches: [exchangeEl] });
 
@@ -2073,13 +1779,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
     expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(true);
   });
 
-  /** A step-level card: the rendered surface for an event that is folded into an
-   *  exchange as a STEP rather than starting one (the `ResponseFailed` failure
-   *  card, `.exchange-error`). It carries its own `data-event-id`, so it is what
-   *  the deep-link matches, and it is NOT a `.chat-exchange`. The `querySelector`
-   *  deliberately answers a panel for every probe: a card that gets narrowed
-   *  anyway must fail loudly here rather than pass on "there was nothing inside
-   *  to narrow to". */
   function makeStepCardEl(inner: any) {
     return {
       parentElement: null,
@@ -2091,12 +1790,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
   }
 
   it('a ResponseFailed folded in as a step pulses its OWN card, with no narrowing into it', () => {
-    // `ResponseFailed` is a terminal routed into the owning exchange by
-    // request_event_id, not an EXCHANGE_START_TYPE, so the turn's root carries a
-    // different event's id and the failure was unreachable. `ChatExchange` now
-    // stamps the failure card itself, and the pulse must land on THAT card: not
-    // the whole turn (a failure buried in a long turn is not "the turn"), and
-    // not a descendant.
     const innerPanel = { classList: makeClassList() };
     const failureCard = makeStepCardEl(innerPanel);
     restore = installFakeDom({ dataEventMatches: [failureCard] });
@@ -2108,9 +1801,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
   });
 
   it('the exchange-start events that already navigated still resolve to the exchange root', () => {
-    // Regression guard for the four event types whose deep-links worked before
-    // step-level addressing existed. They are EXCHANGE_START_TYPES, so each
-    // stamps `.chat-exchange` and must keep narrowing to its `.initiator-panel`.
     for (const eventId of [
       'user-question-asked',
       'coding-agent-permission-request',
@@ -2131,14 +1821,9 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
   });
 
   it('dual-mount: the hidden layout copy of a failure card is skipped, the visible one is pulsed', () => {
-    // Desktop and mobile each render the transcript, so BOTH copies carry the
-    // new attribute exactly as they carry the exchange root's. The hidden one
-    // reports a 0×0 rect and must lose the match, or the pulse runs invisibly.
     const hiddenCard = makeStepCardEl(null);
     hiddenCard.getBoundingClientRect = () => ({ width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 });
     const visibleCard = makeStepCardEl(null);
-    // Document order puts the hidden (desktop) copy first, which is what made
-    // this worth pinning: a first-match resolve would take it.
     restore = installFakeDom({ dataEventMatches: [hiddenCard, visibleCard] });
 
     scrollToEventAndPulse('failed-evt');
@@ -2149,11 +1834,6 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
 });
 
 describe('isEventInViewport for a step-level card', () => {
-  // The notification §4 in-app matrix asks "is the user already looking at the
-  // thing this notification points at?" and silently marks it read when so. It
-  // resolves the source event through the same `data-event-id`, so stamping the
-  // failure card is what makes the question answerable for a `ResponseFailed`;
-  // before, the query found nothing and the answer was always false.
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -2167,7 +1847,6 @@ describe('isEventInViewport for a step-level card', () => {
     restore = null;
   });
 
-  /** A failure card whose rect sits `top` px down the 0..800 scroll container. */
   function makeCardAt(top: number) {
     return {
       parentElement: null,
@@ -2182,8 +1861,6 @@ describe('isEventInViewport for a step-level card', () => {
   });
 
   it('false when the failure card is scrolled out of the transcript band', () => {
-    // Inside window.innerHeight is not enough: the band is the transcript
-    // container's (0..800 here), so a card below it is not on screen.
     restore = installFakeDom({ dataEventMatches: [makeCardAt(2400)] });
     expect(isEventInViewport('failed-evt')).toBe(false);
   });
@@ -2197,12 +1874,6 @@ describe('isEventInViewport for a step-level card', () => {
 });
 
 describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => {
-  // An applied change appears twice in the thread: the proposing CC turn
-  // (ChangeProposed rides it as a step) earlier, and the ChangeApplied
-  // resolution card later. Both carry the same data-change-id, so first-match
-  // would land on the CC turn — the reported "doesn't scroll to the change
-  // applied event" bug. scrollToChangeAndPulse must prefer the last (resolution
-  // card); a pending change has only the one (proposing) match.
   let restore: (() => void) | null = null;
   let container: any;
   beforeEach(() => {
@@ -2218,8 +1889,6 @@ describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => 
     restore = null;
   });
 
-  // Each match lands the tween at its own absTop, so the resulting container
-  // scrollTop tells us WHICH match was chosen.
   function makeVisibleEl(absTop: number) {
     const el: any = {
       parentElement: null,
@@ -2232,19 +1901,14 @@ describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => 
   it('applied change → lands on the resolution card (last), not the proposing turn (first)', () => {
     const proposingTurn = makeVisibleEl(1000);
     const appliedCard = makeVisibleEl(5000);
-    // Document order: proposing turn first, resolution card last.
     restore = installFakeDom({ dataEventMatches: [proposingTurn, appliedCard] });
 
     scrollToChangeAndPulse('c-1');
 
-    // The tween lands on the appliedCard's position (5000), not the proposing
-    // turn's (1000) — preferLast picked the resolution card.
-    vi.advanceTimersByTime(800); // past the tween duration (≤ SCROLL_MAX_MS)
+    vi.advanceTimersByTime(800);
     expect(container.scrollTop).toBe(5000);
-    // Synchronous resolve now holds the claim across the smooth-scroll settle,
-    // then releases on the fallback timer (same contract as the event deep-link).
     expect(hasPendingEventScroll()).toBe(true);
-    vi.advanceTimersByTime(300); // total 1100, past SCROLL_SETTLE_FALLBACK_MS (1000)
+    vi.advanceTimersByTime(300);
     expect(hasPendingEventScroll()).toBe(false);
   });
 
@@ -2260,30 +1924,16 @@ describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => 
 });
 
 describe('chat deep-link applies the shared navigation focus marker', () => {
-  // The chat deep-link routes its highlight through the shared focus marker
-  // (components/shared/focusMarker.ts): a sticky background wash with a spotlight
-  // glow. The marker's own behaviors (supersede, gesture-clear semantics) are
-  // covered in focusMarker.test.ts, and its paint by nav-focus-marker-paint.test.ts.
-  // These tests pin the CHAT integration: the
-  // marker is applied on resolve, survives the landing scroll, clears on
-  // clearPendingEventScroll, and (the chat-specific bit) its gesture-clear is
-  // gated on the deep-link claim (settleGuard = hasPendingEventScroll) so the
-  // landing scroll can't self-clear it.
   let restore: (() => void) | null = null;
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => {
-    clearNavFocus(); // tear down any armed document gesture listeners
+    clearNavFocus();
     vi.clearAllTimers();
     vi.useRealTimers();
     restore?.();
     restore = null;
   });
 
-  /** A visible element with a tracked classList and a querySelector that returns
-   *  null, so scrollToEventAndPulse's `.initiator-panel` lookup falls back to the
-   *  element itself (the marker lands on it). No active scroll container is
-   *  registered here, so the deep-link tween is a no-op — these tests assert only
-   *  the marker lifecycle. */
   function makeMarkerEl() {
     const classes = new Set<string>();
     const el: any = {
@@ -2323,28 +1973,17 @@ describe('chat deep-link applies the shared navigation focus marker', () => {
     scrollToEventAndPulse('e-7');
     expect(hasNavFocus()).toBe(true);
 
-    // Claim still held (the sync resolve holds it across the smooth-scroll settle)
-    // → an action is the programmatic landing scroll, not the user, so it's ignored.
     document.dispatchEvent(new Event('wheel'));
     expect(hasNavFocus()).toBe(true);
     expect(el.classList._classes.has('nav-focus-fading')).toBe(false);
 
-    vi.advanceTimersByTime(1100); // past SCROLL_SETTLE_FALLBACK_MS (1000) → claim released
+    vi.advanceTimersByTime(1100);
     expect(hasPendingEventScroll()).toBe(false);
 
-    // Past the marker's hold too, so what this test observes is the
-    // CLAIM gating the dismissal and not the hold standing in for it. The two defer
-    // for different reasons and only the claim is under test here.
     vi.advanceTimersByTime(NAV_FOCUS_RAMP_MS + NAV_FOCUS_HOLD_MS);
 
-    // THE assertion that makes this test about the claim. The guarded wheel above has
-    // to have been DISCARDED, not banked: the hold banks a real dismissal and runs it
-    // when it expires, which the advance just crossed, so without this line deleting
-    // the settleGuard wiring entirely leaves the whole spec green (verified). What the
-    // guard uniquely buys is that a landing scroll never enters the bank at all.
     expect(el.classList._classes.has('nav-focus-fading')).toBe(false);
 
-    // Now an action is the user engaging → marker dissolves, then is removed.
     document.dispatchEvent(new Event('wheel'));
     expect(el.classList._classes.has('nav-focus-fading')).toBe(true);
     vi.advanceTimersByTime(NAV_FOCUS_FADE_MS);

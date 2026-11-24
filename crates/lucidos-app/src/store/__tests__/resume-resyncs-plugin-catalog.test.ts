@@ -6,8 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// A Plugins refresh waits on a scan frame that SSE never replays. The resume
-// sync's re-read is what settles it for a device that slept through the scan.
 const here: string = dirname(fileURLToPath(import.meta.url));
 const connection = readFileSync(resolve(here, '../actions/connection.ts'), 'utf-8');
 

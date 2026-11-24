@@ -17,13 +17,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkText, SkeletonProvider } from '../shared/Skeleton';
 
-// The body of the context viewer: what the model was actually sent for one LLM
-// call. Lives in its own module because it is reached from the step row's
-// context counter (`ContextViewerModal`) rather than from the step detail, and
-// a panel this size sitting inside another modal's file is how the counter's
-// view and the step's view would drift.
 
-/** What every row in the tree needs to know about the capture it belongs to. */
 type CaptureFacts = { tokens: TokenScale; missingBody: MissingBodyReason };
 
 function formatChars(n: number): string {
@@ -31,8 +25,6 @@ function formatChars(n: number): string {
   return `${n}`;
 }
 
-/** The viewer is a modal over the content pane, so it closes before the
- *  settings page lands behind it. */
 function goToCaptureSetting() {
   contextViewer.value = null;
   openCaptureContextSetting();
@@ -57,14 +49,6 @@ function MissingBodyNote({ reason }: { reason: MissingBodyReason }) {
   }
 }
 
-/** `tokens` is the scale from `sectionTokenScale`: a share of the capture's
- *  headline total, threaded down from `ContextSectionsArea` so every row in
- *  the tree divides the same measured (or same estimated) pie. `missingBody`
- *  comes down the same way, since it is a fact about the whole capture.
- *
- *  The measurement reads as bare numbers rather than "N chars · ≈N tokens":
- *  the role header above every section states the units once, and repeating
- *  them on each of a few dozen rows is what made the tree read as a wall. */
 function ContextSectionRow({ section, tokens, missingBody }: CaptureFacts & { section: ContextSection }) {
   const [open, setOpen] = useState(false);
   return (
@@ -108,13 +92,6 @@ function ContextInnerGroup({ group, ...facts }: CaptureFacts & { group: InnerGro
   );
 }
 
-/** The role rows are the only ones that name the units, once per block, for
- *  every compact number under them. The words sit in their own spans (with
- *  their leading space inside) because a narrow modal cannot afford them: they
- *  are what pushed a role label into four wrapped lines on a phone, and CSS
- *  drops them there (see `.context-unit`). */
-/** One role's sections. With no `role`, inside a `SkeletonProvider`, it draws
- *  its header as the loading placeholder. */
 function ContextRoleGroup({ role, facts }: { role?: RoleGroup; facts?: CaptureFacts }) {
   const [open, setOpen] = useState(true);
   if (!role || !facts) {
@@ -160,17 +137,7 @@ const CONTEXT_SECTIONS_SKELETON = (
   </SkeletonProvider>
 );
 
-/** Sections + tools area. Lazy-fetches when the server stripped them on the
- *  snapshot endpoint (see `api/threads.rs :: strip_context_capture_sections`).
- *  Renders loading/error/loaded states from a `Loadable<ContextCapturePayload>`
- *  per `.claude/rules/frontend.md`'s "Async Data Loading" rule. The
- *  surrounding inline-chip fields (tokens, model, usage) render synchronously
- *  from `snap` either way; only the sections + tools detail block needs the
- *  async hydration. */
 function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
-  // Synchronous inline-rendered captures (live SSE, legacy synth, or any
-  // path where the server didn't strip) resolve to a `loaded` Loadable with
-  // the existing fields, so the render path below is uniform.
   const inlineLoadable: Loadable<ContextCapturePayload> = useMemo(() => ({
     status: 'loaded',
     data: { sections: snap.sections, tools: snap.tools },
@@ -179,10 +146,6 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
     needsLazyFetch(snap) ? { status: 'loading' } : inlineLoadable,
   );
 
-  // Deps include `inlineLoadable` (a useMemo keyed on `snap`, already in deps):
-  // its identity is stable across the in-flight fetch, and the `cancelled` flag
-  // guards the async write so a late resolve can't clobber a newer snapshot.
-  // Keep both invariants if you ever refactor this dependency list.
   useEffect(() => {
     if (!needsLazyFetch(snap)) {
       setLoadable(inlineLoadable);
@@ -190,11 +153,6 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
     }
     const eventId = snap.event_id;
     if (!eventId) {
-      // Stripped marker without an event id is an upstream contract break.
-      // Toast is wrong here: the inline `failed` Loadable below already
-      // surfaces the issue in the open viewer where the user is looking,
-      // and the next open of the same step would re-trigger the same fetch
-      // attempt (self-recovering once the upstream fix lands).
       console.warn('[ContextCapturePanel] ContextCapture is sections_stripped but has no event_id; cannot lazy-fetch.');
       setLoadable(toFailed<ContextCapturePayload>(new Error('missing event id')));
       return;
@@ -225,9 +183,6 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
 
   function loadedSections(data: ContextCapturePayload) {
     const hydrated = mergeContextCaptureSections(snap, data);
-    // Built from the HYDRATED capture, never from `snap`: a stripped snapshot
-    // carries no sections, so a scale derived before the lazy fetch would divide
-    // by zero and flatten every row to 0 tokens.
     const facts: CaptureFacts = {
       tokens: sectionTokenScale(hydrated),
       missingBody: missingBodyReason(hydrated, currentCaptureContext()),
@@ -251,15 +206,11 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
   }
 }
 
-/** Budget bar + section list + (when usage is present) cache breakdown. */
 export function ContextCapturePanel({ snap }: { snap: ContextCapture }) {
-  // Same function `sectionTokenScale` divides up, so the tree below cannot
-  // disagree with this bar. Do not inline the expression here.
   const used = headlineTokens(snap);
   const pct = contextPercent(used, snap.context_window);
   const cacheRead = snap.usage?.cache_read_tokens ?? 0;
   const cacheWrite = snap.usage?.cache_creation_tokens ?? 0;
-  // Real input minus what was cached: what the user paid full price for.
   const cacheMiss = snap.usage
     ? Math.max(0, snap.usage.input_tokens - cacheRead - cacheWrite)
     : 0;
@@ -274,10 +225,6 @@ export function ContextCapturePanel({ snap }: { snap: ContextCapture }) {
           {snap.trimmed && <span class="context-budget-trimmed">trimmed</span>}
         </div>
         <div class="progress-bar">
-          {/* `pct` is unclamped, so a capture over its window sets a width
-              above 100%. The track clips it (`.progress-bar` is
-              `overflow: hidden`), which is all a bar can say: the reading
-              above is what reports the overshoot. */}
           <div class="progress-bar-fill" style={`width: ${pct}%`} />
         </div>
       </div>

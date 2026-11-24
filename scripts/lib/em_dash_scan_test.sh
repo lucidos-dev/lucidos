@@ -281,6 +281,40 @@ test_unresolvable_base_fails_closed() {
     fi
 }
 
+test_path_scope() {
+    write 'scope [1].md' "New${EM}prose."
+    write 'scope 1.md' "New${EM}prose."
+    commit "add two files with violations"
+    write 'new plan.md' "New${EM}prose."
+    run_cli
+    if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"scope [1].md:1:"* && "$CLI_OUT" == *"scope 1.md:1:"* && "$CLI_OUT" == *"new plan.md:1:"* ]]; then
+        pass "unscoped scan sees all violations"
+    else
+        fail "expected hits in all three files ($CLI_OUT)"
+    fi
+    run_cli --path 'scope [1].md'
+    if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"scope [1].md:1:"* && "$CLI_OUT" != *"scope 1.md:1:"* && "$CLI_OUT" != *"new plan.md:1:"* ]]; then
+        pass "tracked path scope is literal"
+    else
+        fail "expected only the tracked path hit ($CLI_OUT)"
+    fi
+    run_cli --path 'new plan.md'
+    if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"new plan.md:1:"* && "$CLI_OUT" != *"scope "* ]]; then
+        pass "untracked path scope is literal"
+    else
+        fail "expected only the untracked path hit ($CLI_OUT)"
+    fi
+    run_cli --path 'missing.md'
+    if [ "$CLI_RC" -eq 1 ] && [[ "$CLI_OUT" == *"regular file"* ]]; then
+        pass "missing scoped file fails closed"
+    else
+        fail "missing scoped file should fail with a diagnostic ($CLI_OUT)"
+    fi
+    git -C "$REPO" rm -q -- "scope [1].md" "scope 1.md"
+    rm -f "$REPO/new plan.md"
+    commit "remove scoped fixtures"
+}
+
 # ── Write-time hook ──────────────────────────────────────────────────────
 
 test_hook_blocks_edit_adding_a_dash() {
@@ -478,6 +512,7 @@ test_flags_one_sided_and_mixed_lines
 test_en_dash_is_not_flagged
 test_uncommitted_and_untracked_are_scanned
 test_clean_branch_exits_zero
+test_path_scope
 test_untracked_enumeration_failure_is_not_clean
 test_unresolvable_base_fails_closed
 

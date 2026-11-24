@@ -28,18 +28,9 @@ const MEMORY_MODULE_OPTIONS = PREF_MEMORY_MODULE.values.map((value) => ({
   label: MEMORY_MODULE_LABELS[value],
 }));
 
-/** The anchor of the compactor's model row on Settings → Models. */
 const SUMMARY_COMPACTION_ANCHOR = 'models:summary-compaction';
 
-/** Heads Settings → System → Memory: how a turn gets its past (ADR 0362).
- *
- *  Classic is written at once, even while unset. Tree costs money, so the first time its button
- *  only opens the confirm modal: the estimate and the compactor model, and the
- *  Start button that writes `memory_module`. Once a backfill has started,
- *  Tree is written at once too, and the compactor resumes it. */
 export function MemoryModuleSection() {
-  // Nothing reads as pressed until preferences load, so a Tree workspace never
-  // shows Classic first.
   const loaded = preferences.value.status === 'loaded';
   const chosen = loaded ? currentMemoryModule() : null;
   const [confirming, setConfirming] = useState(false);
@@ -48,7 +39,6 @@ export function MemoryModuleSection() {
   const compactor = storedBackgroundSelection('model_summary_compaction', 'reasoning_summary_compaction').model
     ?? background.row('model_summary_compaction')?.model
     ?? null;
-  // Read on Classic too: it says whether choosing Tree resumes a backfill.
   useEffect(() => { void loadTreeBackfill(); }, []);
   useVersionedRefresh(treeBackfillVersion.value, false, () => void loadTreeBackfill());
   usePanelRefresh('Tree memory', chosen === 'tree' ? loadTreeBackfill : null);
@@ -68,7 +58,6 @@ export function MemoryModuleSection() {
       return;
     }
     setConfirming(false);
-    // Unset runs Classic, but pressing it is still the workspace's answer.
     if (storedMemoryModule() !== 'classic') void setMemoryModule('classic');
   }
 

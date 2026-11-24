@@ -10,20 +10,6 @@ import { dirname, resolve } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = resolve(here, 'app-frame-messages.ts');
 
-/**
- * The app-facing toast bridge reaches the handler at all.
- *
- * `lucidos.ui.dismissToast(key)` posts a payload carrying a key and NO message.
- * Two filters in `onAppFrameMessage` would each swallow it silently: the
- * message-type allow-list at the top, and the "confirm and prompt carry a
- * message" early return further down. Neither leaves an error anywhere. From
- * the app's side the dismiss does nothing, and its spinner spins forever.
- *
- * What the bridge DOES once reached is behaviour, tested as behaviour in
- * `components/shared/__tests__/toast-app-bridge.test.tsx`. Only the two ordering
- * facts that live in this file are pinned here, for the same reason as the
- * guards in `startup.test.ts`: the routing needs a real frame to reach.
- */
 describe('app frame toast bridge wiring', () => {
   const src = stripComments(readFileSync(SOURCE, 'utf8'));
   const body = handlerBody(src, 'function onAppFrameMessage(');
@@ -42,8 +28,6 @@ describe('app frame toast bridge wiring', () => {
   });
 
   it('keeps the frame-authenticity check ahead of both', () => {
-    // An unattributed frame gets no host chrome, whatever it asked for: a nested
-    // embed must not be able to clear a toast the real app is showing.
     const frameAt = body.indexOf('isKnownAppFrame(source)');
     expect(frameAt).toBeGreaterThan(-1);
     expect(body.indexOf('handleAppToastMessage(')).toBeGreaterThan(frameAt);

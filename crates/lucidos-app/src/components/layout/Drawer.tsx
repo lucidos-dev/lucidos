@@ -17,9 +17,6 @@ import { GlyphBadge } from '../shared/GlyphBadge';
 import { AppIcon } from '../shared/AppIcon';
 import { CategoryIcon } from '../shared/CategoryIcon';
 
-/** The rows this drawer lists in order. Not every menu item: Changes and
- *  Settings are rendered below with a badge of their own, and Notifications is
- *  reached from the bell rather than from here. */
 const menuItems: MenuItem[] = ['files', 'apps', 'plugins', 'triggers'];
 
 interface PinnedUi {
@@ -28,8 +25,6 @@ interface PinnedUi {
   appIcon?: string;
 }
 
-/** Render rows only when both Loadables are `loaded` — falling through to
- *  `[]` mid-load would look like "user unpinned" instead of "still loading". */
 function resolvedPinnedUis(): PinnedUi[] {
   const pinned = pinnedApps.value;
   const loaded = appsList.value;
@@ -44,7 +39,6 @@ function resolvedPinnedUis(): PinnedUi[] {
   return result;
 }
 
-/** A fixed row's glyph, so a pinned app's icon never stands alone. */
 function DrawerGlyph({ category }: { category: string }) {
   return (
     <span class="drawer-item-glyph" aria-hidden="true">
@@ -64,11 +58,6 @@ export function Drawer() {
 
   const changeBadge = actionableChangeCount.value;
 
-  // Only surface the Changes entry when the user actually has changes to see —
-  // pending OR applied/reverted history. Most users never make changes to
-  // Lucidos, so this keeps the drawer uncluttered for them. Keep it visible
-  // while the Changes view is the active menu item so a user viewing it isn't
-  // stranded when the last change clears.
   const changesLoadable = changes.value;
   const appliedLoadable = appliedChanges.value;
   const hasPendingChanges = changesLoadable.status === 'loaded' && changesLoadable.data.length > 0;
@@ -78,12 +67,6 @@ export function Drawer() {
     hasPendingChanges || hasAppliedChanges || activeMenuItem.value === 'changes';
 
   return (
-    // The `.drawer-backdrop` wrapper stays the caller's own (it dims the chat
-    // pane and carries the slide-out `closing` class); <Overlay backdrop={false}>
-    // renders the `.drawer` panel inside it and owns the dismiss/swallow/Escape
-    // contract. Anchor is the hamburger that opened this drawer (stamped in
-    // openDrawer), so re-clicking it routes through its own toggle. closeDrawer
-    // returns false mid-animation so the dismiss hook stops eating neighbor taps.
     <div class={`drawer-backdrop ${drawerClosing.value ? 'closing' : ''}`}>
       <Overlay
         open
@@ -101,7 +84,6 @@ export function Drawer() {
           },
         }}
       >
-        {/* Pinned app UIs first */}
         {pinned.map((p) => (
           <div
             key={`pin-${p.appId}`}
@@ -119,7 +101,6 @@ export function Drawer() {
         ))}
         {pinned.length > 0 && <div class="drawer-menu-divider" aria-hidden="true" />}
 
-        {/* Menu items */}
         {menuItems.map((item) => (
           <div
             key={item}
@@ -134,11 +115,6 @@ export function Drawer() {
           </div>
         ))}
 
-        {/* The only entry point to the experimental in-app browser, so it is
-            gated on the same availability the feature has. Gating on isTauri()
-            alone shipped the row with the toggle off, where openUrl routes to
-            the OS opener: a row labelled "Browser" just launched the system
-            browser on google.com. */}
         {inAppBrowserAvailable() && (
           <div
             class={`drawer-item ${panelOverlay.value?.type === 'url-preview' ? 'active' : ''}`}
@@ -146,9 +122,6 @@ export function Drawer() {
               if (panelOverlay.value?.type !== 'url-preview') {
                 openUrl('https://www.google.com');
               } else {
-                // Already the mounted panel, so `openUrl`'s own reveal never
-                // runs. Without this the tap only shuts the drawer, and a
-                // mobile user stays on the thread pane looking at nothing.
                 revealContentPane();
               }
               closeDrawer();
@@ -175,10 +148,6 @@ export function Drawer() {
           </div>
         )}
 
-        {/* The second step of the path into What's New, after the button that
-            opened this menu drawer. The mark alone, with no words: this row is
-            a role-less `<div>`, so it is no control in the accessibility tree
-            to name. That button has already said the sentence. */}
         <div
           class={`drawer-item ${activeMenuItem.value === 'settings' ? 'active' : ''}`}
           onClick={() => {

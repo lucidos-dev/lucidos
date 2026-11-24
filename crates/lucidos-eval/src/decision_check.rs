@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use lucidos_engine::engine::OpeningSource;
+use lucidos_agents_api::engine::turn_end::OpeningSource;
 use lucidos_engine::llm::judgment::{ChatJudgmentProvider, JudgmentProvider, SystemOneEndpoint};
 use lucidos_engine::llm::LlmProvider;
 use serde::Serialize;

@@ -1,14 +1,6 @@
-/** The account's chat tier per model: the `chat_reasoning_efforts` preference,
- *  `model=tier` pairs separated by commas. A model not listed runs at its
- *  *default effort*.
- *
- *  Mirrors the engine's `parse_model_efforts`, except that a pair the engine
- *  would refuse is skipped rather than failing the whole value: the engine
- *  validates every write, so only a hand-edited row can hold one. */
 
 import { EFFORT_LADDER } from './modelSelection';
 
-/** Each listed model's tier. A model named twice keeps its last tier. */
 export function parseChatEfforts(value: string | null | undefined): Map<string, string> {
   const efforts = new Map<string, string>();
   for (const item of (value ?? '').split(',')) {
@@ -21,8 +13,6 @@ export function parseChatEfforts(value: string | null | undefined): Map<string, 
   return efforts;
 }
 
-/** `value` with `model`'s tier set to `tier`, or removed for `null`, every
- *  other model kept. An empty result reads as unset. */
 export function withChatEffort(
   value: string | null | undefined,
   model: string,

@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** A Settings model field ends on a link to the ladder that decides its list.
- *  The link navigates and never picks a model. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

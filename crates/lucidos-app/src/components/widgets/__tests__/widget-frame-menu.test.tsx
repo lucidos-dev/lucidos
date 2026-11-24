@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A widget frame forwards its right-click only when its surface opens a menu
- * for it (plan invariants I1 and I5).
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -76,7 +72,6 @@ describe('WidgetFrame and the widget menu', () => {
   });
 
   it('a widget box whose scroller overflows tells its frame it pans', () => {
-    // jsdom lays nothing out, so the scroller answers as a host too narrow for XL.
     const scroll = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(684);
     const client = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(375);
     try {

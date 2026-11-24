@@ -11,8 +11,6 @@ afterEach(() => vi.restoreAllMocks());
 
 describe('capture', () => {
   it('degrades to the DOM snapshot when the screenshot fails, never rejecting', async () => {
-    // Inject the failure explicitly: jsdom has no pseudo-element style or
-    // image decoding support, neither of which is the fallback contract.
     const render = vi.spyOn(rasterizer, 'rasterize').mockRejectedValueOnce(new Error('image decode failed'));
     document.body.innerHTML = '<div class="card"><h1>Hello</h1></div>';
     const result = await capture();

@@ -3,7 +3,6 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 const isTauri = vi.fn(() => true);
 vi.mock('./platform', () => ({ isTauri: () => isTauri() }));
 
-// The Rust `get_native_window_active` seed command + the transition listener.
 const getNativeWindowActive = vi.fn((): Promise<boolean> => Promise.resolve(false));
 let listenHandler: ((e: { payload: boolean }) => void) | null = null;
 const listenUnlisten = vi.fn();
@@ -25,7 +24,7 @@ import {
 describe('startNativeWindowActiveTracking — seed before listen', () => {
   beforeEach(() => {
     isTauri.mockReturnValue(true);
-    setNativeWindowActive(true); // reset cache to its `true` default
+    setNativeWindowActive(true);
     getNativeWindowActive.mockReset();
     getNativeWindowActive.mockResolvedValue(false);
     listen.mockClear();
@@ -33,14 +32,11 @@ describe('startNativeWindowActiveTracking — seed before listen', () => {
   });
 
   it('seeds the cache from the command, correcting the true default', async () => {
-    // The "only sometimes" fix: a backgrounded/trayed window reports inactive;
-    // without the seed the cache stays at its `true` default and the device
-    // wrongly pongs active, so the engine suppresses the banner.
     const changes: boolean[] = [];
     await startNativeWindowActiveTracking((a) => changes.push(a));
     expect(getNativeWindowActive).toHaveBeenCalledTimes(1);
     expect(isNativeWindowActive()).toBe(false);
-    expect(changes).toContain(false); // onChange fired with the seeded value
+    expect(changes).toContain(false);
     expect(listen).toHaveBeenCalledWith('native-window-active', expect.any(Function));
   });
 
@@ -57,7 +53,7 @@ describe('startNativeWindowActiveTracking — seed before listen', () => {
     getNativeWindowActive.mockRejectedValueOnce(new Error('ipc down'));
     setNativeWindowActive(true);
     await startNativeWindowActiveTracking();
-    expect(isNativeWindowActive()).toBe(true); // unchanged default (best-effort)
+    expect(isNativeWindowActive()).toBe(true);
     expect(listen).toHaveBeenCalled();
   });
 

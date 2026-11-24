@@ -44,6 +44,10 @@
 //! process, and in dev an engine restart reaps it often enough.
 
 use super::LucidosEngine;
+use lucidos_local_token::loopback_cert::{
+    self, TlsPair, PREVIEW_TLS_CERT_ENV, PREVIEW_TLS_KEY_ENV, PREVIEW_USER_TLS_CERT_ENV,
+    PREVIEW_USER_TLS_KEY_ENV,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -69,17 +73,13 @@ const READY_POLL: Duration = Duration::from_millis(250);
 /// is serving a directory that no longer exists.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The two env vars that switch Vite into preview mode: the gateway to forward
-/// to, and this workspace's slug on it. Absent, Vite has no proxy and no gate,
-/// so a manual `npm run dev` behaves exactly as before. Mirrored in
-/// `vite/frontendPreviewGateway.ts`.
+/// The env vars that switch Vite into preview mode: the gateway to forward to,
+/// this workspace's slug on it, and the loopback CA copy Vite trusts it by.
+/// Absent, Vite has no proxy and no gate, so a manual `npm run dev` behaves
+/// exactly as before. Mirrored in `vite/frontendPreviewGateway.ts`.
 pub const PREVIEW_GATEWAY_ORIGIN_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_GATEWAY_ORIGIN";
 pub const PREVIEW_WORKSPACE_ID_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_WORKSPACE_ID";
-
-/// The gateway's own cert and key, handed on by `lucidos-gateway` `stack.rs`.
-/// This engine never serves with them: it reads only `LUCIDOS_TLS_*`.
-pub const GATEWAY_TLS_CERT_ENV: &str = "LUCIDOS_GATEWAY_TLS_CERT";
-pub const GATEWAY_TLS_KEY_ENV: &str = "LUCIDOS_GATEWAY_TLS_KEY";
+pub const PREVIEW_GATEWAY_CA_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_GATEWAY_CA";
 
 /// Override for the preview's listen port.
 pub const PREVIEW_PORT_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_PORT";
@@ -94,6 +94,8 @@ pub struct RunningPreview {
     pub worktree: PathBuf,
     pub port: u16,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// No user certificate came with it, so Vite binds loopback alone.
+    pub loopback_only: bool,
     child: tokio::process::Child,
 }
 
@@ -109,6 +111,9 @@ pub struct FrontendPreviewStatus {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Only this machine can open it: see [`RunningPreview::loopback_only`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback_only: bool,
 }
 
 impl FrontendPreviewStatus {
@@ -119,6 +124,7 @@ impl FrontendPreviewStatus {
             port: None,
             started_at: None,
             worktree: None,
+            loopback_only: false,
         }
     }
 
@@ -129,6 +135,7 @@ impl FrontendPreviewStatus {
             port: Some(p.port),
             started_at: Some(p.started_at),
             worktree: Some(p.worktree.display().to_string()),
+            loopback_only: p.loopback_only,
         }
     }
 }
@@ -185,6 +192,7 @@ pub enum PreviewRefusal {
     NotTheLucidosFrontend(String),
     NoNodeModules(String),
     NoGateway,
+    NoPreviewCertificate,
 }
 
 impl std::fmt::Display for PreviewRefusal {
@@ -213,6 +221,10 @@ impl std::fmt::Display for PreviewRefusal {
             Self::NoGateway => write!(
                 f,
                 "The frontend preview authenticates through the workspace gateway, and no gateway launched this engine (LUCIDOS_GATEWAY_PORT or LUCIDOS_WORKSPACE_ID is unset)."
+            ),
+            Self::NoPreviewCertificate => write!(
+                f,
+                "The gateway handed this engine no frontend preview certificate ({PREVIEW_TLS_CERT_ENV} or {PREVIEW_TLS_KEY_ENV} is unset). The gateway log says why it could not write one."
             ),
         }
     }
@@ -321,39 +333,40 @@ pub fn liveness_action(worktree_exists: bool, child_exited: Option<bool>) -> Liv
     LivenessAction::Keep
 }
 
-/// Where the preview's Vite forwards, and the scheme it serves on.
+/// Where the preview's Vite forwards, and what it serves with (ADR 0267).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewUpstream {
     pub gateway_port: u16,
     pub workspace_id: String,
-    /// The gateway's cert and key, when the gateway serves TLS.
-    pub tls: Option<(String, String)>,
+    /// The preview leaf from the loopback CA, for `localhost`.
+    pub leaf: TlsPair,
+    /// The gateway's user certificate, for every other name.
+    pub user: Option<TlsPair>,
 }
 
 impl PreviewUpstream {
-    /// The gateway's scheme, which is also the preview's: Vite serves with the
-    /// gateway's own cert. The device cookie is `Secure` on a TLS gateway, so a
-    /// plain-HTTP preview would never receive it off `localhost`.
-    pub fn scheme(&self) -> &'static str {
-        match self.tls {
-            Some(_) => crate::net_config::SCHEME_HTTPS,
-            None => crate::net_config::SCHEME_HTTP,
-        }
+    /// The gateway on loopback, which always serves the loopback CA's leaf.
+    pub fn gateway_origin(&self) -> String {
+        lucidos_local_token::client::origin(self.gateway_port)
     }
 
-    pub fn gateway_origin(&self) -> String {
-        format!("{}://127.0.0.1:{}", self.scheme(), self.gateway_port)
+    fn tls_files(&self) -> impl Iterator<Item = &str> {
+        self.leaf
+            .files()
+            .into_iter()
+            .chain(self.user.iter().flat_map(TlsPair::files))
     }
 }
 
 /// Resolve the upstream from the values the gateway handed this engine. A
 /// missing port or slug means no gateway launched us, and then the preview has
-/// nothing to authenticate against.
+/// nothing to authenticate against. A missing leaf means the preview could
+/// serve only plaintext, which it never does.
 pub fn resolve_preview_upstream(
     gateway_port: Option<&str>,
     workspace_id: Option<&str>,
-    tls_cert: Option<&str>,
-    tls_key: Option<&str>,
+    leaf: Option<TlsPair>,
+    user: Option<TlsPair>,
 ) -> Result<PreviewUpstream, PreviewRefusal> {
     let gateway_port = gateway_port
         .and_then(|p| p.trim().parse::<u16>().ok())
@@ -364,33 +377,31 @@ pub fn resolve_preview_upstream(
         .filter(|s| !s.is_empty())
         .ok_or(PreviewRefusal::NoGateway)?
         .to_string();
-    let tls = match (tls_cert, tls_key) {
-        (Some(c), Some(k))
-            if crate::net_config::tls_scheme_from(tls_cert, tls_key)
-                == crate::net_config::SCHEME_HTTPS =>
-        {
-            Some((c.to_string(), k.to_string()))
-        }
-        _ => None,
-    };
     Ok(PreviewUpstream {
         gateway_port,
         workspace_id,
-        tls,
+        leaf: leaf.ok_or(PreviewRefusal::NoPreviewCertificate)?,
+        user,
     })
 }
 
-/// What the Vite child is told. `LUCIDOS_TLS_*` here is Vite's own serving
-/// pair (`vite.config.ts`), set to the gateway's so the two schemes match.
-pub fn preview_vite_env(upstream: &PreviewUpstream, port: u16) -> Vec<(&'static str, String)> {
+/// What the Vite child is told (`vite.config.ts`).
+pub fn preview_vite_env(
+    upstream: &PreviewUpstream,
+    port: u16,
+    gateway_ca: &Path,
+) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("VITE_PORT", port.to_string()),
         (PREVIEW_GATEWAY_ORIGIN_ENV, upstream.gateway_origin()),
         (PREVIEW_WORKSPACE_ID_ENV, upstream.workspace_id.clone()),
+        (PREVIEW_GATEWAY_CA_ENV, gateway_ca.display().to_string()),
+        (PREVIEW_TLS_CERT_ENV, upstream.leaf.cert.clone()),
+        (PREVIEW_TLS_KEY_ENV, upstream.leaf.key.clone()),
     ];
-    if let Some((cert, key)) = &upstream.tls {
-        env.push(("LUCIDOS_TLS_CERT", cert.clone()));
-        env.push(("LUCIDOS_TLS_KEY", key.clone()));
+    if let Some(user) = &upstream.user {
+        env.push((PREVIEW_USER_TLS_CERT_ENV, user.cert.clone()));
+        env.push((PREVIEW_USER_TLS_KEY_ENV, user.key.clone()));
     }
     env
 }
@@ -398,40 +409,11 @@ pub fn preview_vite_env(upstream: &PreviewUpstream, port: u16) -> Vec<(&'static 
 /// [`resolve_preview_upstream`] over this process's environment.
 pub fn preview_upstream_from_env() -> Result<PreviewUpstream, PreviewRefusal> {
     resolve_preview_upstream(
-        crate::api::base_path::gateway_port().as_deref(),
-        crate::api::base_path::workspace_id().as_deref(),
-        std::env::var(GATEWAY_TLS_CERT_ENV).ok().as_deref(),
-        std::env::var(GATEWAY_TLS_KEY_ENV).ok().as_deref(),
+        crate::core::base_path::gateway_port().as_deref(),
+        crate::core::base_path::workspace_id().as_deref(),
+        loopback_cert::preview_leaf_from_env(),
+        loopback_cert::preview_user_from_env(),
     )
-}
-
-/// The preview's URL as seen by whoever asked, built by swapping the port of
-/// the `Host` they reached us on.
-///
-/// The engine cannot know this on its own: the same workspace is `localhost`
-/// from the laptop and a Tailscale name from the phone, and a `localhost` link
-/// handed to a phone is dead. So the answer is a function of the requester's
-/// own `Host`, computed per request, and the SSE event carries only the port so
-/// the page can do the same from its `location`.
-///
-/// `None` for a missing or bracket-mismatched `Host`; the caller reports the
-/// port instead of guessing a hostname.
-pub fn preview_url_for_host(host: Option<&str>, scheme: &str, port: u16) -> Option<String> {
-    let host = host.map(str::trim).filter(|h| !h.is_empty())?;
-    // An IPv6 literal is bracketed and its address is full of colons, so the
-    // port separator is the colon AFTER the closing bracket, not the first one.
-    let hostname = if let Some(rest) = host.strip_prefix('[') {
-        // `rest` is offset by the `[`, so the closing bracket sits at
-        // `close + 1` in `host` and the literal ends one past it.
-        let close = rest.find(']')?;
-        &host[..close + 2]
-    } else {
-        host.split(':').next()?
-    };
-    if hostname.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{hostname}:{port}/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +429,7 @@ fn write_sidecar(workspace: &Path, sidecar: &PreviewSidecar) {
     let json = match serde_json::to_string(sidecar) {
         Ok(j) => j,
         Err(e) => {
-            log!("[FrontendPreview] failed to serialize sidecar: {}", e);
+            log_legacy!("[FrontendPreview] failed to serialize sidecar: {}", e);
             return;
         }
     };
@@ -455,7 +437,7 @@ fn write_sidecar(workspace: &Path, sidecar: &PreviewSidecar) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(&path, json) {
-        log!(
+        log_legacy!(
             "[FrontendPreview] failed to write {}: {}",
             path.display(),
             e
@@ -468,7 +450,7 @@ fn remove_sidecar(workspace: &Path) {
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[FrontendPreview] failed to remove {}: {}",
             path.display(),
             e
@@ -484,7 +466,7 @@ fn take_sidecar(workspace: &Path) -> Option<PreviewSidecar> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            log!("[FrontendPreview] failed to read {}: {}", path.display(), e);
+            log_legacy!("[FrontendPreview] failed to read {}: {}", path.display(), e);
             return None;
         }
     };
@@ -492,7 +474,7 @@ fn take_sidecar(workspace: &Path) -> Option<PreviewSidecar> {
     match serde_json::from_slice::<PreviewSidecar>(&bytes) {
         Ok(s) => Some(s),
         Err(e) => {
-            log!("[FrontendPreview] malformed sidecar discarded: {}", e);
+            log_legacy!("[FrontendPreview] malformed sidecar discarded: {}", e);
             None
         }
     }
@@ -522,26 +504,24 @@ fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
-/// Poll the preview's own port until it answers. The self-signed dev cert is
-/// accepted here for the same reason every other intra-host hop accepts it.
+/// Poll the preview's own port, a loopback listener, until it answers.
 ///
 /// Any HTTP answer counts, not only a 2xx: this probe carries no device cookie,
 /// so the preview's own gate refuses it with a 401. A 401 still proves Vite is
-/// up and speaking the scheme the link will use.
-async fn wait_until_ready(scheme: &str, port: u16) -> bool {
-    let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .no_proxy()
+/// up and serving the leaf. The probe names `localhost`, the one name Vite
+/// answers with the leaf, so the loopback client can verify it.
+async fn wait_until_ready(port: u16) -> bool {
+    let client = match lucidos_local_token::client::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            log!("[FrontendPreview] could not build probe client: {}", e);
+            log_legacy!("[FrontendPreview] could not build probe client: {}", e);
             return false;
         }
     };
-    let url = format!("{scheme}://127.0.0.1:{port}/");
+    let url = format!("https://localhost:{port}/");
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if client.get(&url).send().await.is_ok() {
@@ -586,7 +566,7 @@ impl LucidosEngine {
         let workspace = self.workspace_path.clone();
         let worktrees = workspace.join(crate::paths::WORKTREES_SUBPATH);
         let worktree =
-            super::agent_session::resume::deterministic_worktree_path(&workspace, thread_id);
+            crate::engine::session_queries::deterministic_worktree_path(&workspace, thread_id);
         let vite_bin = worktree.join("node_modules").join(".bin").join("vite");
 
         classify_worktree(
@@ -603,6 +583,10 @@ impl LucidosEngine {
         )
         .map_err(|r| r.to_string())?;
         let upstream = preview_upstream_from_env().map_err(|r| r.to_string())?;
+        let gateway_ca = loopback_cert::public_cert_path().ok_or(
+            "The preview cannot trust the gateway: there is no home directory, so no \
+             loopback CA certificate.",
+        )?;
 
         // Replace any running preview BEFORE taking a port, so restarting the
         // same thread's preview reuses its port instead of walking past itself.
@@ -623,14 +607,36 @@ impl LucidosEngine {
             )
         })?;
 
-        let scheme = upstream.scheme();
-        let mut cmd = tokio::process::Command::new(&vite_bin);
+        // Vite runs the worktree's `vite.config.ts`, which the agent may have
+        // written, so it runs in the agent sandbox (ADR 0645).
+        let sandbox = crate::runtime::agent_sandbox::Sandbox::resolve(self.pool(), &workspace)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(hidden) = upstream
+            .tls_files()
+            .find(|file| sandbox.hides(Path::new(file)))
+        {
+            return Err(format!(
+                "The preview cannot serve HTTPS: the certificate file {hidden} \
+                 is in a folder the agent sandbox hides, so Vite cannot read it."
+            ));
+        }
+        if sandbox.hides(&gateway_ca) {
+            return Err(format!(
+                "The preview cannot trust the gateway: the loopback CA certificate {} \
+                 is in a folder the agent sandbox hides, so Vite cannot read it.",
+                gateway_ca.display()
+            ));
+        }
+        let mut cmd = sandbox
+            .command(&vite_bin)
+            .map_err(|e| format!("Could not prepare Vite at {}: {e}", vite_bin.display()))?;
         cmd.current_dir(worktree.join("crates").join("lucidos-app"))
             // Whatever TLS this engine inherited is not the preview's: it serves
-            // with the gateway's pair, or with none.
+            // the pairs the gateway handed on.
             .env_remove("LUCIDOS_TLS_CERT")
             .env_remove("LUCIDOS_TLS_KEY")
-            .envs(preview_vite_env(&upstream, port))
+            .envs(preview_vite_env(&upstream, port, &gateway_ca))
             // The build-watch's staging dance is a `vite build` concern and must
             // not follow us into `vite serve`.
             .env_remove("LUCIDOS_ATOMIC_DIST")
@@ -644,7 +650,7 @@ impl LucidosEngine {
         let pid = child.id().unwrap_or(0);
         let stderr = child.stderr.take();
 
-        if !wait_until_ready(scheme, port).await {
+        if !wait_until_ready(port).await {
             let tail = drain_stderr_tail(stderr).await;
             crate::runtime::spawn_env::kill_child_process_group_now(pid);
             let _ = child.kill().await;
@@ -677,6 +683,7 @@ impl LucidosEngine {
             worktree: worktree.clone(),
             port,
             started_at: chrono::Utc::now(),
+            loopback_only: upstream.user.is_none(),
             child,
         };
         let status = FrontendPreviewStatus::of(&running);
@@ -691,13 +698,13 @@ impl LucidosEngine {
         );
         *self.frontend_preview.lock().await = Some(running);
 
-        log!(
+        log_legacy!(
             "[FrontendPreview] started for thread {} on port {} ({})",
             thread_id,
             port,
             worktree.display()
         );
-        self.emit_frontend_preview_started(thread_id, port).await;
+        self.emit_frontend_preview_started(&status).await;
         Ok(status)
     }
 
@@ -742,7 +749,7 @@ impl LucidosEngine {
             let _ = running.child.wait().await;
         }
         remove_sidecar(&self.workspace_path);
-        log!(
+        log_legacy!(
             "[FrontendPreview] {} for thread {} (port {})",
             reason,
             running.thread_id,
@@ -752,13 +759,17 @@ impl LucidosEngine {
         FrontendPreviewStatus::stopped()
     }
 
-    async fn emit_frontend_preview_started(&self, thread_id: uuid::Uuid, port: u16) {
+    async fn emit_frontend_preview_started(&self, status: &FrontendPreviewStatus) {
+        let (Some(thread_id), Some(port)) = (status.thread_id, status.port) else {
+            return;
+        };
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::System(
                     crate::engine::event_bus::SystemEvent::FrontendPreviewStarted {
                         thread_id,
                         port,
+                        loopback_only: status.loopback_only,
                         sent_at_ms: crate::engine::now_epoch_millis(),
                     },
                 ),
@@ -817,12 +828,12 @@ impl LucidosEngine {
         // why the verdict has to carry whether the group may still be signalled.
         let child_exited = match running.child.try_wait() {
             Ok(Some(status)) => {
-                log!("[FrontendPreview] vite exited on its own: {}", status);
+                log_legacy!("[FrontendPreview] vite exited on its own: {}", status);
                 Some(true)
             }
             Ok(None) => Some(false),
             Err(e) => {
-                log!("[FrontendPreview] could not check on vite: {}", e);
+                log_legacy!("[FrontendPreview] could not check on vite: {}", e);
                 None
             }
         };
@@ -867,7 +878,7 @@ async fn log_stderr_lines(stderr: tokio::process::ChildStderr, thread_id: uuid::
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
         if !line.is_empty() {
-            log!("[FrontendPreview] [{}] {}", thread_id, line);
+            log_legacy!("[FrontendPreview] [{}] {}", thread_id, line);
         }
     }
 }
@@ -881,13 +892,13 @@ fn reap_orphaned_preview(workspace: &Path) {
     let self_pid = std::process::id();
     let cmd = process_command_line(sidecar.pid);
     if !sidecar_pid_is_reapable(sidecar.pid, self_pid, cmd.as_deref(), &sidecar.worktree) {
-        log!(
+        log_legacy!(
             "[FrontendPreview] not reaping pid {}, it is not the preview we recorded",
             sidecar.pid
         );
         return;
     }
-    log!(
+    log_legacy!(
         "[FrontendPreview] reaping orphaned preview pid {} (port {})",
         sidecar.pid,
         sidecar.port
@@ -1098,26 +1109,25 @@ mod tests {
         assert_eq!(liveness_action(true, None), LivenessAction::Keep);
     }
 
-    const CERT: &str = "/certs/cert.pem";
-    const KEY: &str = "/certs/key.pem";
+    const GATEWAY_CA: &str = "/home/user/.lucidos/loopback-ca.pem";
+    const LEAF_CERT: &str = "/home/user/.lucidos/preview-tls/dev/preview-cert.pem";
+    const LEAF_KEY: &str = "/home/user/.lucidos/preview-tls/dev/preview-key.pem";
+    const USER_CERT: &str = "/certs/cert.pem";
+    const USER_KEY: &str = "/certs/key.pem";
 
-    #[test]
-    fn a_tls_gateway_gives_an_https_upstream_and_preview() {
-        let up =
-            resolve_preview_upstream(Some("5251"), Some("dev"), Some(CERT), Some(KEY)).unwrap();
-        assert_eq!(up.scheme(), "https");
-        assert_eq!(up.gateway_origin(), "https://127.0.0.1:5251");
-        assert_eq!(up.workspace_id, "dev");
+    fn leaf() -> Option<TlsPair> {
+        TlsPair::from_values(Some(LEAF_CERT), Some(LEAF_KEY))
+    }
+
+    fn user() -> Option<TlsPair> {
+        TlsPair::from_values(Some(USER_CERT), Some(USER_KEY))
     }
 
     #[test]
-    fn a_plain_http_gateway_gives_a_plain_http_upstream_and_preview() {
-        // Half a pair is no pair, the same rule the engine's own TLS follows.
-        for (cert, key) in [(None, None), (Some(CERT), None), (Some(CERT), Some(" "))] {
-            let up = resolve_preview_upstream(Some("5251"), Some("dev"), cert, key).unwrap();
-            assert_eq!(up.scheme(), "http", "{cert:?} / {key:?}");
-            assert_eq!(up.gateway_origin(), "http://127.0.0.1:5251");
-        }
+    fn the_preview_forwards_to_the_gateway_over_https() {
+        let up = resolve_preview_upstream(Some("5251"), Some("dev"), leaf(), None).unwrap();
+        assert_eq!(up.gateway_origin(), "https://127.0.0.1:5251");
+        assert_eq!(up.workspace_id, "dev");
     }
 
     #[test]
@@ -1132,7 +1142,7 @@ mod tests {
             (Some("0"), Some("dev")),
         ] {
             assert_eq!(
-                resolve_preview_upstream(port, slug, Some(CERT), Some(KEY)),
+                resolve_preview_upstream(port, slug, leaf(), user()),
                 Err(PreviewRefusal::NoGateway),
                 "{port:?} / {slug:?}"
             );
@@ -1140,82 +1150,77 @@ mod tests {
         assert!(PreviewRefusal::NoGateway.to_string().contains("gateway"));
     }
 
+    #[test]
+    fn without_a_leaf_there_is_no_preview() {
+        // The preview never serves plaintext (ADR 0267), so a missing leaf
+        // refuses even when a user certificate exists.
+        assert_eq!(
+            resolve_preview_upstream(Some("5251"), Some("dev"), None, user()),
+            Err(PreviewRefusal::NoPreviewCertificate)
+        );
+        let said = PreviewRefusal::NoPreviewCertificate.to_string();
+        assert!(said.contains("LUCIDOS_PREVIEW_TLS_CERT"), "{said}");
+    }
+
     fn env_of(up: &PreviewUpstream) -> std::collections::HashMap<&'static str, String> {
-        preview_vite_env(up, 6173).into_iter().collect()
+        preview_vite_env(up, 6173, Path::new(GATEWAY_CA))
+            .into_iter()
+            .collect()
     }
 
     #[test]
-    fn vite_forwards_to_the_gateway_and_serves_with_its_pair() {
-        let up =
-            resolve_preview_upstream(Some("5251"), Some("dev"), Some(CERT), Some(KEY)).unwrap();
+    fn vite_forwards_to_the_gateway_and_serves_both_certificates() {
+        let up = resolve_preview_upstream(Some("5251"), Some("dev"), leaf(), user()).unwrap();
         let env = env_of(&up);
         assert_eq!(env["VITE_PORT"], "6173");
         assert_eq!(env[PREVIEW_GATEWAY_ORIGIN_ENV], "https://127.0.0.1:5251");
         assert_eq!(env[PREVIEW_WORKSPACE_ID_ENV], "dev");
-        assert_eq!(env["LUCIDOS_TLS_CERT"], CERT);
-        assert_eq!(env["LUCIDOS_TLS_KEY"], KEY);
+        assert_eq!(env[PREVIEW_GATEWAY_CA_ENV], GATEWAY_CA);
+        assert_eq!(env["LUCIDOS_PREVIEW_TLS_CERT"], LEAF_CERT);
+        assert_eq!(env["LUCIDOS_PREVIEW_TLS_KEY"], LEAF_KEY);
+        assert_eq!(env["LUCIDOS_PREVIEW_USER_TLS_CERT"], USER_CERT);
+        assert_eq!(env["LUCIDOS_PREVIEW_USER_TLS_KEY"], USER_KEY);
+        // Vite serves a manual `npm run dev` with `LUCIDOS_TLS_*`, never this.
+        assert!(env.keys().all(|k| !k.starts_with("LUCIDOS_TLS_")));
     }
 
     #[test]
-    fn a_plain_http_preview_is_handed_no_serving_pair() {
-        let up = resolve_preview_upstream(Some("5251"), Some("dev"), None, None).unwrap();
+    fn without_a_user_certificate_vite_gets_the_leaf_alone() {
+        let up = resolve_preview_upstream(Some("5251"), Some("dev"), leaf(), None).unwrap();
         let env = env_of(&up);
-        assert!(!env.contains_key("LUCIDOS_TLS_CERT"));
-        assert!(!env.contains_key("LUCIDOS_TLS_KEY"));
+        assert_eq!(env["LUCIDOS_PREVIEW_TLS_CERT"], LEAF_CERT);
+        assert!(!env.contains_key("LUCIDOS_PREVIEW_USER_TLS_CERT"));
+        assert!(!env.contains_key("LUCIDOS_PREVIEW_USER_TLS_KEY"));
     }
 
     /// Only the browser's cookie may authorize a preview request. Handing Vite
     /// the machine-local token would make every LAN caller a local process.
+    /// The token's crate also holds the loopback client, origin and the
+    /// certificate paths, which carry no credential, so only those may be named.
     #[test]
     fn the_preview_never_hands_vite_the_local_token() {
+        const CRATE: &str = "lucidos_local_token::";
+        const ALLOWED: [&str; 3] = [
+            "client::client_builder(",
+            "client::origin(",
+            "loopback_cert",
+        ];
         let code = executable_lines();
-        for forbidden in ["lucidos_local_token", "local-token", "local_token"] {
+        for (at, _) in code.match_indices(CRATE) {
+            let rest = &code[at + CRATE.len()..];
             assert!(
-                !code.contains(forbidden),
+                ALLOWED.iter().any(|item| rest.starts_with(item)),
+                "the frontend preview names {CRATE}{} (ADR 0267)",
+                rest.lines().next().unwrap_or_default()
+            );
+        }
+        let without_crate = code.replace(CRATE, "");
+        for forbidden in ["local-token", "local_token", "gateway_auth", "LOCAL_TOKEN"] {
+            assert!(
+                !without_crate.contains(forbidden),
                 "the frontend preview must not reference {forbidden} (ADR 0267)"
             );
         }
-    }
-
-    #[test]
-    fn the_preview_url_keeps_the_host_the_requester_used() {
-        // The whole point: a phone on Tailscale must not be handed localhost.
-        assert_eq!(
-            preview_url_for_host(Some("my-laptop.tailnet.ts.net:5173"), "https", 6173).as_deref(),
-            Some("https://my-laptop.tailnet.ts.net:6173/")
-        );
-        assert_eq!(
-            preview_url_for_host(Some("localhost:5173"), "https", 6173).as_deref(),
-            Some("https://localhost:6173/")
-        );
-        // A Host with no port at all (default 80/443) still yields a hostname.
-        assert_eq!(
-            preview_url_for_host(Some("lucidos.local"), "http", 6173).as_deref(),
-            Some("http://lucidos.local:6173/")
-        );
-    }
-
-    #[test]
-    fn an_ipv6_host_keeps_its_brackets_and_loses_only_the_port() {
-        // The address is full of colons, so splitting on the FIRST one would
-        // yield "[" and build a URL nothing can resolve.
-        assert_eq!(
-            preview_url_for_host(Some("[::1]:5173"), "https", 6173).as_deref(),
-            Some("https://[::1]:6173/")
-        );
-        assert_eq!(
-            preview_url_for_host(Some("[fd7a:115c::1]"), "https", 6173).as_deref(),
-            Some("https://[fd7a:115c::1]:6173/")
-        );
-    }
-
-    #[test]
-    fn an_unusable_host_yields_no_url_rather_than_a_guess() {
-        assert_eq!(preview_url_for_host(None, "https", 6173), None);
-        assert_eq!(preview_url_for_host(Some("   "), "https", 6173), None);
-        assert_eq!(preview_url_for_host(Some(":5173"), "https", 6173), None);
-        // Unclosed bracket: malformed, so there is no hostname to extract.
-        assert_eq!(preview_url_for_host(Some("[::1"), "https", 6173), None);
     }
 
     #[test]

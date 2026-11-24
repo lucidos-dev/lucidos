@@ -6,15 +6,6 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, relative } from 'node:path';
 
-/**
- * Every host element that receives sanitizer output carries `.authored-html`,
- * whose clip keeps authored paint and hit-testing inside its box
- * (`styles/global/host-components.css`). Without it, an inline
- * `position: fixed` or a host class like `modal-overlay` covers the whole app.
- *
- * Default-deny: every `dangerouslySetInnerHTML` in `components/` names the
- * class in its own opening tag, or takes an exemption below with its reason.
- */
 
 const here = dirname(fileURLToPath(import.meta.url));
 const COMPONENTS = resolve(here, '../..');
@@ -32,8 +23,6 @@ function sourceFiles(dir: string): string[] {
   return out;
 }
 
-/** Sites whose HTML is escaped by construction, never sanitizer output, or
- *  contained by an ancestor. Keyed by file and opening tag name. */
 const EXEMPT: Record<string, string> = {
   'files/DiffView.tsx span': 'highlighter spans over escaped source text',
   'files/LineNumberedCode.tsx span': 'highlighter spans over escaped source text',

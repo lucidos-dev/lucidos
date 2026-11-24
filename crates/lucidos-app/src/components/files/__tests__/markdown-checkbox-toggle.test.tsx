@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Clicking a GFM task-list checkbox in the rendered markdown preview toggles
- * it in place, for a surface that opts in via `editable`/`onToggleCheckbox`.
- * Everywhere else (no `editable` prop, e.g. a read-only repo-file preview),
- * the checkbox stays exactly as `marked` renders it: disabled.
- */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render } from 'preact';
 import { MarkdownDocument } from '../MarkdownDocument';
@@ -24,18 +18,12 @@ function checkboxes(el: HTMLElement): HTMLInputElement[] {
   return Array.from(el.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'));
 }
 
-/** `MarkdownDocument`'s checkbox-wiring effect runs on preact's after-paint
- *  queue, which jsdom ticks on a real timer (see `test-setup.ts` and
- *  `useVersionedRefresh.test.tsx`'s own `waitForCalls`). Polls rather than a
- *  fixed delay, so a loaded parallel run never flakes on a short wait. */
 async function flushEffects(check: () => boolean): Promise<void> {
   for (let waited = 0; waited < 1000 && !check(); waited += 10) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
-/** A promise plus its own resolver, so a test can control exactly when the
- *  toggle's save settles. */
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((res) => { resolve = res; });
@@ -60,16 +48,10 @@ describe('MarkdownDocument task-list checkboxes', () => {
   });
 
   it('fails closed when the rendered count disagrees with the write-side scan', async () => {
-    // An indented (not fenced) code block: marked renders it as <pre><code>
-    // with no checkbox, but taskListToggle.ts's line-scan has no block
-    // parser and still counts its "- [ ] ..." line as a task item. Rather
-    // than toggle the wrong line on click, every checkbox here must stay
-    // disabled.
     const content = '    - [ ] indented, not really a task\n\n- [ ] Real\n';
     const onToggleCheckbox = vi.fn(() => Promise.resolve(true));
     const boxes = checkboxes(mount(content, { editable: true, onToggleCheckbox }));
-    expect(boxes).toHaveLength(1); // marked renders only the real one
-    // Give the effect a chance to run; it must choose NOT to enable it.
+    expect(boxes).toHaveLength(1);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(boxes[0].disabled).toBe(true);
     boxes[0].click();
@@ -96,8 +78,8 @@ describe('MarkdownDocument task-list checkboxes', () => {
     await flushEffects(() => !boxes[0].disabled);
     expect(boxes[0].checked).toBe(false);
     boxes[0].click();
-    expect(boxes[0].checked).toBe(true); // the browser's own default action
-    expect(boxes[0].disabled).toBe(true); // disabled for the round trip
+    expect(boxes[0].checked).toBe(true);
+    expect(boxes[0].disabled).toBe(true);
   });
 
   it('keeps the optimistic state and re-enables on a successful save', async () => {
@@ -107,7 +89,7 @@ describe('MarkdownDocument task-list checkboxes', () => {
     boxes[0].click();
     resolve(true);
     await promise;
-    await Promise.resolve(); // flush the handler's own .then()
+    await Promise.resolve();
     expect(boxes[0].checked).toBe(true);
     expect(boxes[0].disabled).toBe(false);
   });
@@ -118,19 +100,14 @@ describe('MarkdownDocument task-list checkboxes', () => {
     const boxes = checkboxes(mount(content, { editable: true, onToggleCheckbox: () => promise }));
     await flushEffects(() => !boxes[0].disabled);
     boxes[0].click();
-    expect(boxes[0].disabled).toBe(true); // disabled for the round trip
+    expect(boxes[0].disabled).toBe(true);
 
-    // Same content, same host: a parent re-render that hands MarkdownDocument
-    // a brand-new (unmemoized) onToggleCheckbox function identity. Only the
-    // callback identity differs; `html` is unchanged.
     render(<MarkdownDocument content={content} location={NOTES} editable onToggleCheckbox={() => Promise.resolve(true)} />, host);
 
-    expect(boxes[0].disabled).toBe(true); // still mid-flight, not re-enabled
+    expect(boxes[0].disabled).toBe(true);
   });
 
   it('shows a raw authored <input type=checkbox> as text, and keeps indices correct around it', async () => {
-    // The sanitizer escapes every authored input, so it can neither become
-    // clickable nor shift the real items' indices.
     const content = 'before <input type="checkbox"> after\n\n- [ ] First\n- [ ] Second\n';
     const onToggleCheckbox = vi.fn(() => Promise.resolve(true));
     const host = mount(content, { editable: true, onToggleCheckbox });
@@ -139,8 +116,8 @@ describe('MarkdownDocument task-list checkboxes', () => {
     expect(host.textContent).toContain('before <input type="checkbox"> after');
     await flushEffects(() => !all[0].disabled);
 
-    expect(all[0].disabled).toBe(false); // First
-    expect(all[1].disabled).toBe(false); // Second
+    expect(all[0].disabled).toBe(false);
+    expect(all[1].disabled).toBe(false);
 
     all[1].click();
     expect(onToggleCheckbox).toHaveBeenCalledExactlyOnceWith(1);
@@ -152,11 +129,11 @@ describe('MarkdownDocument task-list checkboxes', () => {
     await flushEffects(() => !boxes[0].disabled);
     expect(boxes[0].checked).toBe(true);
     boxes[0].click();
-    expect(boxes[0].checked).toBe(false); // optimistic uncheck
+    expect(boxes[0].checked).toBe(false);
     resolve(false);
     await promise;
     await Promise.resolve();
-    expect(boxes[0].checked).toBe(true); // reverted to the pre-click state
+    expect(boxes[0].checked).toBe(true);
     expect(boxes[0].disabled).toBe(false);
   });
 
@@ -200,7 +177,7 @@ describe('MarkdownDocument task-list checkboxes', () => {
     const label = boxes[0].closest('label')!;
     label.click();
     await Promise.resolve();
-    await Promise.resolve(); // the save settles and re-enables the box
+    await Promise.resolve();
     expect(boxes[0].disabled).toBe(false);
     label.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 2 }));
     expect(boxes[0].checked).toBe(true);
@@ -212,12 +189,6 @@ describe('MarkdownDocument task-list checkboxes', () => {
     expect(el.querySelector('label')).toBeNull();
   });
 
-  // A successful save adopts the new text as the `content` prop right away
-  // (see `handleToggleCheckbox` in FilePreviewInline.tsx). That swaps this
-  // whole subtree for a freshly rendered one, and `marked` renders every
-  // checkbox `disabled` by default. The fix is a layout effect, which runs
-  // before paint. A plain effect would leave one visible frame where the
-  // fresh box is disabled, which read as the checkbox blinking.
   it('never shows a disabled frame when the content prop swaps in the saved text', async () => {
     const onToggleCheckbox = () => Promise.resolve(true);
     const boxes = checkboxes(mount('- [ ] One\n', { editable: true, onToggleCheckbox }));
@@ -226,8 +197,8 @@ describe('MarkdownDocument task-list checkboxes', () => {
     render(<MarkdownDocument content="- [x] One\n" location={NOTES} editable onToggleCheckbox={onToggleCheckbox} />, host);
     const freshBoxes = checkboxes(host);
 
-    expect(freshBoxes[0]).not.toBe(boxes[0]); // the subtree really was replaced
-    expect(freshBoxes[0].disabled).toBe(false); // never disabled, not even for a frame
+    expect(freshBoxes[0]).not.toBe(boxes[0]);
+    expect(freshBoxes[0].disabled).toBe(false);
     expect(freshBoxes[0].checked).toBe(true);
   });
 });

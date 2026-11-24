@@ -70,16 +70,16 @@ async fn serve_status_json() -> Option<String> {
     let output = match tokio::time::timeout(SERVE_STATUS_TIMEOUT, child).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
-            log!("[WebhookIngress] tailscale serve status did not run: {e}");
+            log_legacy!("[WebhookIngress] tailscale serve status did not run: {e}");
             return None;
         }
         Err(_) => {
-            log!("[WebhookIngress] tailscale serve status timed out");
+            log_legacy!("[WebhookIngress] tailscale serve status timed out");
             return None;
         }
     };
     if !output.status.success() {
-        log!(
+        log_legacy!(
             "[WebhookIngress] tailscale serve status exited {}",
             output.status
         );

@@ -2,8 +2,6 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 import type { PresenceCheckPayload } from './presence-pong';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdKey';
 
-// The order of calls across the two collaborators is the contract: the page
-// acts first, then answers. One log records both.
 const calls: string[] = [];
 const presentMock = vi.fn((_input: unknown) => {
   calls.push('present');
@@ -62,8 +60,6 @@ describe('handlePresenceCheck', () => {
     expect(submitPongMock).toHaveBeenCalledWith('n-1', { device_id: 'dev-test', outcome: 'not_shown' });
   });
 
-  // An iOS PWA buffers SSE while JS is suspended. After a push tap the queued
-  // check flushes long past its deadline, when the engine has already pushed.
   test('past its deadline it acts on nothing and answers nothing', () => {
     const outcome = handlePresenceCheck(check({ sent_at_ms: Date.now() - 250 - 1 }));
     expect(outcome).toBeNull();
@@ -71,7 +67,6 @@ describe('handlePresenceCheck', () => {
     expect(submitPongMock).not.toHaveBeenCalled();
   });
 
-  // A root thread's push names its driver's and watchers' devices (ADR 0623).
   test('outside the audience it shows nothing and answers not_shown at once', () => {
     localStorage.setItem(DEVICE_ID_KEY, 'dev-test');
     const outcome = handlePresenceCheck(check({ audience: ['someone-else'] }));

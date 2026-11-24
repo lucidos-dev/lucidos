@@ -1,30 +1,3 @@
-/**
- * The Settings information architecture, guarded at the level the bugs actually
- * happen: PLACEMENT and REACHABILITY, not predicates.
- *
- * Replaces `external-links-row-reachable.test.ts`, which pinned one symptom of a
- * general fault. The bug there: the external-link-target row's own visibility
- * predicate (`externalLinkTargetConfigurable`, iOS-PWA-only) was correct and
- * unit-tested, and the row was still unreachable, because it rendered inside the
- * **Experimental** subview whose nav entry was filtered to `isTauri()`. Nothing
- * failed. On a desktop browser the predicate hid the row; on an installed iOS
- * PWA the nav entry hid the whole subview. The setting existed and no user could
- * open it.
- *
- * The fix at the time was a new top-level `Links` category, itself gated on the
- * same iOS predicate, which moved the fault rather than removing it. The
- * structural fix is the rule this file enforces: **no top-level Settings
- * category is platform-gated**; gating lives on a row or section inside one, so
- * an absent control just means one fewer row on a page that still has others.
- *
- * A predicate test cannot catch any of this: it asks "would this row render?",
- * never "can anyone navigate to where it renders?".
- *
- * Source-scan rather than a mounted render: `SettingsView` pulls in the whole
- * store, the model registry, OAuth and device state, so standing it up to
- * observe one section's position would pin the mechanism instead of the
- * requirement (the same reasoning as `startup.test.ts`).
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -45,12 +18,10 @@ const SYSTEM_SUBMENU = readFileSync(resolve(here, '..', 'SystemSubmenu.tsx'), 'u
 const NAV_ROW = readFileSync(resolve(here, '..', 'SettingsNavRow.tsx'), 'utf8');
 const SETTINGS_HOME = readFileSync(resolve(here, '..', 'SettingsHome.tsx'), 'utf8');
 
-/** Strip comments so the prose explaining a call can never stand in for it. */
 function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^\\:])\/\/.*$/gm, '$1');
 }
 
-/** The body of a `function <name>()` declaration, by brace matching. */
 function functionBody(src: string, declaration: string): string {
   const stripped = stripComments(src);
   const start = stripped.indexOf(declaration);
@@ -64,13 +35,6 @@ function functionBody(src: string, declaration: string): string {
   throw new Error(`unbalanced braces in \`${declaration}\``);
 }
 
-/** No `key` comparison stands between a list's `.map(` and the row it renders.
- *
- *  That is where a platform gate would go, and a gated row hides a whole page
- *  from the device that needs it. A decoration the row hangs off its own label
- *  is not one. The slice ends at the element name, so a `badge={key === …}`
- *  prop stays out of scope: the System attention badge picks its category that
- *  way and hides nothing. */
 function expectRowGatedOnNothing(src: string, mapCall: string): void {
   const map = src.indexOf(mapCall);
   const row = src.indexOf('<SettingsNavRow', map);
@@ -82,10 +46,6 @@ function expectRowGatedOnNothing(src: string, mapCall: string): void {
 
 describe('Settings nav structure', () => {
   it('renders every nav item on every platform: no category is platform-gated', () => {
-    // The home list maps SETTINGS_NAV_ITEMS directly. A `.filter(...)` over it,
-    // or a predicate deciding whether the ROW renders, is the regression: it
-    // gives the app a different nav shape per device and hides a whole page
-    // from the platform that needs it.
     const home = stripComments(SETTINGS_HOME);
     expect(home).toMatch(/SETTINGS_NAV_ITEMS\.map\(/);
     expect(home).not.toMatch(/SETTINGS_NAV_ITEMS\.filter\(/);
@@ -93,10 +53,6 @@ describe('Settings nav structure', () => {
   });
 
   it('lists every System sub-page in the submenu, gated on nothing', () => {
-    // The System submenu is the only way into a sub-page, so it maps
-    // SETTINGS_SYSTEM_SUBPANEL_ITEMS directly. Same rule as the home list
-    // above, and the same regression: a filter or a key comparison in front of
-    // the row hides a page from whoever needs it.
     const submenu = stripComments(SYSTEM_SUBMENU);
     expect(submenu).toMatch(/SETTINGS_SYSTEM_SUBPANEL_ITEMS\.map\(/);
     expect(submenu).not.toMatch(/SETTINGS_SYSTEM_SUBPANEL_ITEMS\.filter\(/);
@@ -104,10 +60,6 @@ describe('Settings nav structure', () => {
   });
 
   it('opens every drilldown row with a real button, in the one row both lists share', () => {
-    // Reachability is the BUTTON: a clickable div puts the page it opens, and
-    // every control on it, out of keyboard reach. Both lists render
-    // `SettingsNavRow`, so the check lives where the element does rather than
-    // once per caller.
     const row = stripComments(NAV_ROW);
     expect(row).toContain('<button');
     expect(row).toContain('type="button"');
@@ -122,14 +74,6 @@ describe('Settings nav structure', () => {
   });
 
   it('keeps both link settings in one section inside Appearance & Behavior, gated per ROW', () => {
-    // One user question ("where does a link open?"), one section, two
-    // platform-conditional rows. Splitting them back into two categories is
-    // what the top comment describes.
-    // Assert the predicates GATE their rows, not merely that they are called:
-    // computing `showExternalTarget` and then dropping the `&&` wrapper would
-    // satisfy a call-site check while rendering the iOS-only dropdown
-    // everywhere. That is the shape the deleted
-    // `external-links-row-reachable.test.ts` pinned via its early return.
     const links = functionBody(SETTINGS_VIEW, 'function linksSection()');
     expect(links).toMatch(/showExternalTarget\s*=\s*externalLinkTargetConfigurable\(\)/);
     expect(links).toMatch(/showInAppBrowser\s*=\s*isTauri\(\)/);
@@ -141,14 +85,8 @@ describe('Settings nav structure', () => {
   });
 
   it('lets the Links section vanish, but never the page around it', () => {
-    // linksSection may return null (neither row applies), which is only safe
-    // because Appearance & Behavior renders Theme + Typography
-    // unconditionally. If those ever become conditional, the page can come up
-    // empty.
     const iface = functionBody(SETTINGS_VIEW, 'function appearanceSection()');
     expect(functionBody(SETTINGS_VIEW, 'function linksSection()')).toContain('return null');
-    // Theme and Typography carry no guard: they are what keeps the page from
-    // being empty when neither link row applies.
     for (const anchor of ['appearance:theme', 'appearance:typography']) {
       const guarded = new RegExp(`\\S\\s*&&\\s*\\(\\s*<div class="settings-section">\\s*<div class="settings-section-title" data-search-anchor="${anchor}"`);
       expect(iface).toContain(`data-search-anchor="${anchor}"`);
@@ -160,14 +98,11 @@ describe('Settings nav structure', () => {
 describe('the Motion section', () => {
   it('follows the Theme section, on every client, and writes the preference', () => {
     const iface = functionBody(SETTINGS_VIEW, 'function appearanceSection()');
-    // Unconditional: reduced motion matters on every client, not one platform.
     expect(iface).toMatch(/<div class="settings-section-title" data-search-anchor="appearance:motion">Motion<\/div>/);
     expect(iface).not.toMatch(/&&\s*\(\s*<div class="settings-section">\s*<div class="settings-section-title" data-search-anchor="appearance:motion"/);
-    // A section of its own, after Theme and its effects, before Typography.
     const motionAt = iface.indexOf('appearance:motion');
     expect(motionAt).toBeGreaterThan(iface.indexOf('appearance:theme-effects'));
     expect(motionAt).toBeLessThan(iface.indexOf('appearance:typography'));
-    // Each option writes through setMotion, and the active one reads the signal.
     expect(iface).toContain('{MOTION_PREFS.map((m) => (');
     expect(iface).toContain('onClick={() => void setMotion(m)}');
     expect(iface).toContain('const motion = motionPreference.value;');
@@ -206,9 +141,7 @@ describe('the Font dropdown', () => {
 
   it('groups the fonts under Sans, Serif and Mono headers, in that order', () => {
     const headers = options.filter(o => o.disabled);
-    // A header must never be selectable, or it would save as a font value.
     expect(headers.map(o => o.label)).toEqual(['Sans', 'Serif', 'Mono']);
-    // Every group has fonts to list, so no header stands alone.
     for (const group of ['sans', 'serif', 'mono'] as const) {
       expect(FONT_CATALOG.some(f => f.group === group && f.kind !== 'mono')).toBe(true);
     }
@@ -218,9 +151,6 @@ describe('the Font dropdown', () => {
 describe('Settings leaf-setting reachability', () => {
   const anchors = renderedSearchAnchors();
 
-  // Each setting that MOVED in the 2026-08-05 restructure, with the anchor it
-  // must still render under. A moved control that renders nowhere is exactly
-  // the failure this suite exists for, and it is silent.
   const MOVED: Array<[string, string]> = [
     ['iOS external-link target', 'appearance:external-link-target'],
     ['Tauri in-app browser', 'appearance:in-app-browser'],
@@ -236,10 +166,6 @@ describe('Settings leaf-setting reachability', () => {
   });
 
   it('keeps the MCP allowlist on the MCP page, cross-linked from Permissions', () => {
-    // The allowlist is meaningless without the server list beside it: a
-    // pattern names a server and a tool. Permissions therefore points at the
-    // page rather than holding a third editor. The pointer is a real
-    // navigation, not a sentence telling the user to go looking.
     expect(anchors.has('mcp:allowed-tools')).toBe(true);
     expect(anchors.has('permissions:mcp')).toBe(true);
     expect(functionBody(SETTINGS_VIEW, 'function permissionsSection()'))
@@ -258,8 +184,6 @@ describe('Settings leaf-setting reachability', () => {
   });
 
   it('keeps each search entry gated on the same platform as the row it lands on', () => {
-    // The flags exist so search never offers a result that lands on nothing.
-    // These three rows are the platform-conditional ones in Settings.
     expect(findSettingsEntry('appearance:external-link-target')?.iosPwaOnly).toBe(true);
     expect(findSettingsEntry('appearance:in-app-browser')?.tauriOnly).toBe(true);
     expect(findSettingsEntry('debugging:autocorrect')?.iosOnly).toBe(true);

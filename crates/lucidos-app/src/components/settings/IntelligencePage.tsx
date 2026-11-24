@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
-  copyLadderFromChat, deletePreference, getChatLadder, getCodingAgentLadder, getModelPrices, setPreference, sortLadder,
+  copyLadderFromChat, deletePreference, getChatLadder, getCodingAgentLadder, getModelPrices, setLadderDefault, setPreference, sortLadder,
 } from '../../api/client';
 import { createTrigger } from '../../api/client/triggers';
 import type {
@@ -9,7 +9,6 @@ import type {
 } from '../../api/types';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
-import { setChatModelSelection } from '../../store/actions/preferences';
 import { loadTriggers, navigateToTrigger } from '../../store/actions/triggers';
 import { CHAT_LADDER_PREF, LADDER_PREFS, LONG_PROMPT_SHARE_PREF } from '../../store/intelligenceLadderPrefs';
 import { intelligenceLadderVersion, showConfirm, showToast, triggers } from '../../store/store';
@@ -24,13 +23,12 @@ import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton
 import { ToggleIconButton } from '../shared/ToggleIconButton';
 import {
   draggedRung, keepPricesCurrentTrigger, KEEP_PRICES_CURRENT_SLUG, LADDER_SURFACES, ladderAnchor, ladderOverride,
-  movedRung, percent, toggledRung, type PriceCheckCadence,
+  movedRung, percent, starredLadder, toggledRung, type PriceCheckCadence,
 } from './intelligenceLadder';
 import { useRowDrag } from '../../hooks/useRowDrag';
 
 interface PageData {
   ladders: Record<LadderSurface, IntelligenceLadder>;
-  /** The day the prices in force were last checked. */
   pricesChecked: string;
 }
 
@@ -44,7 +42,6 @@ async function loadPage(): Promise<PageData> {
   return { ladders: { chat, 'claude-code': claudeCode, codex }, pricesChecked: prices.checked };
 }
 
-/** Run one write, toasting a refusal. True when it landed. */
 async function write(what: string, request: Promise<ApiResult>): Promise<boolean> {
   try {
     const result = await request;
@@ -59,28 +56,34 @@ async function write(what: string, request: Promise<ApiResult>): Promise<boolean
   }
 }
 
-/** The preference that stores `surface`'s override. */
 function ladderPref(surface: LadderSurface): string {
   return surface === 'chat' ? CHAT_LADDER_PREF : LADDER_PREFS[surface].ladder;
 }
 
-/**
- * Settings → Intelligence: the prices every cost band reads, then each
- * *intelligence ladder*, the Lucidos Agent's first (ADR 0500, ADR 0525). A
- * ladder says which rungs an agent may pick, in what order, and the default.
- *
- * The engine owns every band and the place of each rung that is off. This
- * view renders what `GET /api/v1/intelligence-ladder` serves, and re-reads it
- * on every `PreferencesChanged` for a key it reads. A list equal to the
- * shipped one is stored as unset, so a later refresh of the shipped ladder
- * still reaches this workspace.
- */
 export function IntelligencePage() {
   const [refresh, setRefresh] = useState(0);
+  const refreshSequence = useRef(0);
+  const refetch = () => {
+    const next = ++refreshSequence.current;
+    setRefresh(next);
+    return next;
+  };
+  const [stars, setStars] = useState<Partial<Record<LadderSurface, {
+    ladder: IntelligenceLadder;
+    afterRefresh?: number;
+  }>>>({});
   const settles = useRef<Array<() => void>>([]);
   const { loadable, showLoading } = useLoadableFetch(loadPage, [refresh, intelligenceLadderVersion.value], {
     keepLoadedWhileRefetching: true,
     onSettled: () => {
+      setStars((current) => {
+        const remaining = { ...current };
+        for (const { surface } of LADDER_SURFACES) {
+          const after = remaining[surface]?.afterRefresh;
+          if (after !== undefined && refresh >= after) delete remaining[surface];
+        }
+        return remaining;
+      });
       const waiting = settles.current;
       settles.current = [];
       for (const settle of waiting) settle();
@@ -88,12 +91,26 @@ export function IntelligencePage() {
   });
   usePanelRefresh('intelligence', () => new Promise<void>((resolve) => {
     settles.current.push(resolve);
-    setRefresh((n) => n + 1);
+    refetch();
   }));
 
-  // A row change shows at once, and the re-read it causes replaces it.
   const [edits, setEdits] = useState<Partial<Record<LadderSurface, IntelligenceLadder>>>({});
   useEffect(() => setEdits({}), [loadable]);
+
+  const star = async (ladder: IntelligenceLadder, rung: ServedIntelligenceRung, name: string) => {
+    const { surface } = ladder;
+    if (rung.is_default || stars[surface]) return;
+    const next = starredLadder(ladder, rung);
+    setStars((current) => ({ ...current, [surface]: { ladder: next } }));
+    const saved = await write(`the ${name} default`, setLadderDefault(surface, rung));
+    if (saved) {
+      const afterRefresh = refetch();
+      setStars((current) => ({ ...current, [surface]: { ladder: next, afterRefresh } }));
+    } else {
+      setStars((current) => ({ ...current, [surface]: undefined }));
+      refetch();
+    }
+  };
 
   if (loadable.status === 'failed') {
     return (
@@ -124,8 +141,10 @@ export function IntelligencePage() {
               <LadderBlock
                 key={surface}
                 name={name}
-                ladder={edits[surface] ?? served}
-                pending={edits[surface] !== undefined}
+                ladder={stars[surface]?.ladder ?? edits[surface] ?? served}
+                pending={edits[surface] !== undefined || stars[surface] !== undefined}
+                starring={stars[surface] !== undefined}
+                onStar={(rung) => void star(edits[surface] ?? served, rung, name)}
                 setLadder={(next) => setEdits((all) => ({ ...all, [surface]: next }))}
                 header={surface === 'claude-code' && served.long_prompt_share
                   ? <LongPromptShareRow share={served.long_prompt_share} />
@@ -139,7 +158,6 @@ export function IntelligencePage() {
   );
 }
 
-/** A row on another settings page that leads here. */
 export function IntelligenceLinkRow({ children }: { children: ComponentChildren }) {
   return (
     <SettingsPageLinkRow view="intelligence" button="Open Intelligence">
@@ -148,16 +166,12 @@ export function IntelligenceLinkRow({ children }: { children: ComponentChildren 
   );
 }
 
-/** A `YYYY-MM-DD` day as the reader's locale writes a date. */
 function formatDay(day: string): string {
   return new Date(`${day}T00:00:00`).toLocaleDateString(undefined, {
     day: 'numeric', month: 'short', year: 'numeric',
   });
 }
 
-/** When the prices were last checked, and the offer to keep them current.
- *  The trigger exists only once the owner presses the button: Lucidos never
- *  creates it by itself. With no `checked`, it draws its own skeleton. */
 function PricesSection({ checked }: { checked?: string }) {
   const [cadence, setCadence] = useState<PriceCheckCadence>('weekly');
   const [creating, setCreating] = useState(false);
@@ -265,7 +279,6 @@ function LongPromptShareRow({ share }: { share: LongPromptShare }) {
           }}
         />
         <span class="ladder-band ladder-share-value">{draft}%</span>
-        {/* Always drawn, disabled when unset, so setting an override never moves the slider. */}
         <button
           type="button"
           class="action-btn action-btn-secondary ladder-small-btn"
@@ -279,10 +292,6 @@ function LongPromptShareRow({ share }: { share: LongPromptShare }) {
   );
 }
 
-/** What a ladder's explainer says its rungs decide. */
-/** Whether the ladder is in its compact layout, where a held row drags. The
- *  stylesheet decides it with a container query and sets a custom property on
- *  each row, so the breakpoint lives in the CSS alone. */
 function isCompact(row: Element): boolean {
   return getComputedStyle(row).getPropertyValue('--ladder-compact').trim() === '1';
 }
@@ -296,9 +305,6 @@ function ladderPurpose(surface: LadderSurface, name: string): string {
       + 'intelligent. Agents can only pick rungs that are on. Your own picker still offers everything.';
 }
 
-/** The section frame: title, header controls, any header row, the column
- *  heads and any footnote under the rows. The compact layout hides the
- *  heads, since its cells carry their own labels. */
 function LadderSection({
   surface,
   name,
@@ -353,8 +359,6 @@ function LadderSection({
   );
 }
 
-/** The default rung as a sentence, when no rung that is on is it. `null`
- *  when the default is on the ladder or there is none. */
 export function offLadderDefault(ladder: IntelligenceLadder): string | null {
   const pair = ladder.default_rung;
   if (!pair || ladder.rungs.some((r) => r.on && r.is_default)) return null;
@@ -366,13 +370,16 @@ function LadderBlock({
   name,
   ladder,
   pending,
+  starring,
+  onStar,
   setLadder,
   header,
 }: {
   name: string;
   ladder: IntelligenceLadder;
-  /** An edit is showing that the engine has not re-read yet, so `ladder.climbs` describes the old order. */
   pending: boolean;
+  starring: boolean;
+  onStar: (rung: ServedIntelligenceRung) => void;
   setLadder: (next: IntelligenceLadder) => void;
   header: ComponentChildren;
 }) {
@@ -382,7 +389,6 @@ function LadderBlock({
   const ladderWhat = `the ${name} intelligence ladder`;
   const offDefault = offLadderDefault(ladder);
 
-  // A refused write brings no re-read, so it puts back the rows it replaced.
   const saveRungs = async (rungs: ServedIntelligenceRung[]) => {
     setLadder({ ...ladder, rungs });
     const value = ladderOverride(rungs, ladder.shipped_rungs);
@@ -394,26 +400,13 @@ function LadderBlock({
   };
 
   const { listRef, drag, rowProps, gripProps } = useRowDrag((from, to) => {
+    if (starring) return;
     const next = draggedRung(ladder.rungs, from, to);
     if (next) void saveRungs(next);
   }, isCompact);
 
-  /** Make `rung` the default. The star on the default does nothing. */
-  const star = async (rung: ServedIntelligenceRung) => {
-    if (rung.is_default) return;
-    if (surface === 'chat') {
-      await setChatModelSelection({ model: rung.model, reasoningEffort: rung.effort });
-      return;
-    }
-    const prefs = LADDER_PREFS[surface];
-    const what = `the ${name} default`;
-    if (await write(what, setPreference(prefs.model, rung.model))) {
-      await write(what, setPreference(prefs.effort, rung.effort));
-    }
-  };
-
   const controls = (
-    <span class="ladder-title-controls">
+    <span class="ladder-title-controls" inert={starring}>
       {offCount > 0 && (
         <label class="ladder-show-off">
           <input
@@ -458,16 +451,17 @@ function LadderBlock({
             key={`${rung.model}=${rung.effort}`}
             rung={rung}
             index={i}
-            dragProps={rung.on ? rowProps : undefined}
-            gripProps={rung.on ? gripProps : undefined}
+            dragProps={rung.on && !starring ? rowProps : undefined}
+            gripProps={rung.on && !starring ? gripProps : undefined}
             lift={drag?.from === i ? drag.dy : undefined}
             dropAt={drag && drag.to === i && drag.to !== drag.from ? (drag.to > drag.from ? 'after' : 'before') : undefined}
-            onStar={() => void star(rung)}
+            onStar={starring ? undefined : () => onStar(rung)}
             onMove={(step) => {
+              if (starring) return null;
               const next = movedRung(ladder.rungs, i, step);
               return next && (() => void saveRungs(next));
             }}
-            onToggle={() => void saveRungs(toggledRung(ladder.rungs, i))}
+            onToggle={starring || rung.is_default ? undefined : () => void saveRungs(toggledRung(ladder.rungs, i))}
           />
         ))}
       </div>
@@ -475,8 +469,6 @@ function LadderBlock({
   );
 }
 
-/** The notice above a ladder whose rungs that are on do not climb in intelligence.
- *  The saved order stays the owner's: only the button re-sorts it. */
 function SortNotice({ surface, name }: { surface: LadderSurface; name: string }) {
   const [sorting, setSorting] = useState(false);
   const sort = async () => {
@@ -504,9 +496,6 @@ function SortNotice({ surface, name }: { surface: LadderSurface; name: string })
   );
 }
 
-/** Copy from Lucidos Agent: a one-time copy of the Lucidos Agent's rungs that
- *  `agent` runs, ordered on its coding profile. The Lucidos Agent's own
- *  ladder never changes. */
 function CopyFromChatButton({ agent, name }: { agent: CodingAgent; name: string }) {
   const [copying, setCopying] = useState(false);
   const copy = async () => {
@@ -539,12 +528,6 @@ function CopyFromChatButton({ agent, name }: { agent: CodingAgent; name: string 
   );
 }
 
-/** One rung. With no `rung` it draws its own skeleton. `onMove` answers the
- *  action for a step, or `null` when the rung cannot move that way. The arrows
- *  show only under keyboard focus. A rung reorders by dragging its grip
- *  (`gripProps`), or by press and drag in the compact layout (`dragProps`).
- *  `lift` is how far a lifted rung has travelled, and `dropAt` marks the edge
- *  of the row it would land on. An off rung has neither, and no grip. */
 function LadderRow({
   rung,
   index,
@@ -591,6 +574,7 @@ function LadderRow({
               tone="glyph"
               pressed={!!rung?.is_default}
               aria-label={rung?.is_default ? `${name} is the default` : `Make ${name} the default`}
+              disabled={!onStar}
               onClick={onStar}
             >
               <StarIcon filled={!!rung?.is_default} />
@@ -610,7 +594,7 @@ function LadderRow({
           </span>
           <SkBlock w="2.25rem" h="1.25rem" round>
             <label class="toggle-switch">
-              <input type="checkbox" aria-label={`${name} on the ladder`} checked={!!rung?.on} onChange={onToggle} />
+              <input type="checkbox" aria-label={`${name} on the ladder`} checked={!!rung?.on} disabled={!onToggle} onChange={onToggle} />
               <span class="toggle-slider" />
             </label>
           </SkBlock>
@@ -620,8 +604,6 @@ function LadderRow({
   );
 }
 
-/** One band under its own label. The label shows only in the compact layout,
- *  where the column heads are gone. */
 function BandCell({ label, band, loaded }: { label: string; band?: Band | null; loaded: boolean }) {
   return (
     <span class="ladder-cell">

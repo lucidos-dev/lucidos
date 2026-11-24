@@ -43,12 +43,7 @@ impl Gateway {
             .ok()
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty())?;
-        let client = reqwest::Client::builder()
-            // The loopback pair `.claude/rules/rust.md` prescribes. The dev
-            // gateway's certificate is self-signed, and `no_proxy` keeps an
-            // `HTTPS_PROXY` out of a hop that never leaves this machine.
-            .no_proxy()
-            .danger_accept_invalid_certs(true)
+        let client = lucidos_local_token::client::client_builder()
             .timeout(TIMEOUT)
             .build()
             .ok()?;

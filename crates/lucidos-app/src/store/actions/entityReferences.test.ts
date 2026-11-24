@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, marketplaceScanning, mcpServersVersion, webhooksVersion, permissionGrantsVersion, memoryEntriesVersion } from '../store';
+import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, marketplaceScanning, mcpServersVersion, webhooksVersion, eventHooksVersion, permissionGrantsVersion, memoryEntriesVersion } from '../store';
 import type { App, PluginInstallRequest, PluginInstallReceipt } from '../types';
 
-// Mock loader functions to prevent API calls
 vi.mock('./apps', () => ({ loadApps: vi.fn() }));
 vi.mock('./thread-loading', () => ({ reloadFilterFacetsIfLoaded: vi.fn() }));
 vi.mock('./triggers', () => ({ loadTriggers: vi.fn(), loadHistoricalTriggers: vi.fn() }));
@@ -12,9 +11,6 @@ vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }))
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn(), handleOAuthAccountConnected: vi.fn() }));
 vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
 vi.mock('./plugin-marketplaces', () => ({ pluginCatalogScanned: vi.fn(), refreshPluginCatalogAfterMutation: vi.fn() }));
-// Partial-mock the HTTP client so the credential-event /health re-probe is
-// observable without a real network call (keeps every other export real for the
-// modules below that legitimately use them, e.g. pinnedApps).
 const mockCheckHealth = vi.fn();
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
@@ -28,8 +24,6 @@ vi.mock('./devices', async () => {
     getDeviceId: vi.fn(() => 'this-device'),
   };
 });
-// Keep removePinnedAppLocal real (the AppDeleted test asserts on its effect),
-// stub loadPinnedApps so the PinnedApp* arms don't hit the network.
 vi.mock('./pinnedApps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./pinnedApps')>()),
   loadPinnedApps: vi.fn(),
@@ -76,8 +70,6 @@ describe('processSSEForReferences', () => {
     localStorage.clear();
     panelOverlay.value = null;
     pinnedApps.value = { status: 'loaded', data: [] };
-    // Reset settings caches between tests so the gated-handler assertions
-    // can't leak `status: 'loaded'` across describe blocks.
     credentials.value = { status: 'not-loaded' };
     environmentVariables.value = { status: 'not-loaded' };
     oauthAccounts.value = { status: 'not-loaded' };
@@ -86,13 +78,9 @@ describe('processSSEForReferences', () => {
     artifacts.value = { status: 'not-loaded' };
     marketplaceCatalog.value = { status: 'not-loaded' };
     vi.clearAllMocks();
-    // Safe default for the credential-event /health re-probe so the other
-    // Credential* tests (which don't care about it) don't hit `undefined.status`.
-    // `failed` leaves `llmConfigured` untouched, so it can't leak across tests.
     mockCheckHealth.mockResolvedValue({ status: 'failed', error: '' });
   });
 
-  // ── Deleted app ──────────────────────────────────────────────────────────
 
   describe('an App event re-reads the filter facets, which carry app labels', () => {
     it.each(['AppCreated', 'AppUpdated', 'AppDeleted'])('%s', (type) => {
@@ -115,7 +103,6 @@ describe('processSSEForReferences', () => {
     });
 
     it('clears the app storage the deleted app kept on this device', () => {
-      // No workspace in tests, so the stored keys are the bare layout.
       localStorage.setItem('appbridge:habit-tracker:app:room', 'kitchen');
       sessionStorage.setItem('appbridge:habit-tracker:sdk:scroll', '420');
       localStorage.setItem('appbridge:demo-director:app:room', 'studio');
@@ -177,7 +164,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Deleted trigger ──────────────────────────────────────────────────────
 
   describe('TriggerDeleted', () => {
     it('prunes trigger from recents', () => {
@@ -214,7 +200,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Trigger lifecycle events ────────────────────────────────────────────
 
   describe('trigger lifecycle events', () => {
     it('TriggerCreated calls loadTriggers', () => {
@@ -243,7 +228,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── AppCreated ──────────────────────────────────────────────────────────
 
   describe('AppCreated', () => {
     it('calls loadApps', () => {
@@ -252,7 +236,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── ArtifactImported ────────────────────────────────────────────────────
 
   describe('ArtifactImported', () => {
     it('calls loadArtifacts', () => {
@@ -261,9 +244,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Artifact*  (gated, emitted from CC apply) ────────────────────────────
-  // Whether a refresh fetches is `refreshArtifacts`' call, tested beside it:
-  // a list nobody asked for stays unfetched, and one mid-load gets one more.
   describe('Artifact* events from change-apply', () => {
     it('asks for a list refresh on each event', () => {
       processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
@@ -273,17 +253,11 @@ describe('processSSEForReferences', () => {
       expect(loadArtifacts).not.toHaveBeenCalled();
     });
 
-    // `artifact_path` is relative to `artifacts/`; the preview addresses a file
-    // the data-relative way. Hand it the bare path and it matches nothing, so
-    // an agent overwriting the open file would never refresh it.
     it('offers the preview the data-relative path, not the bare artifact path', () => {
       processSSEForReferences('ArtifactUpdated', { artifact_path: 'clips/demo.mp4', commit: 'c' });
       expect(invalidateFilePreview).toHaveBeenCalledWith('artifacts/clips/demo.mp4');
     });
 
-    // The list and the preview are independent. A preview can be open on a
-    // file this device never listed, so the list's own gate must not swallow
-    // the one signal that file has to re-read.
     it('offers the preview its path whatever the list holds', () => {
       artifacts.value = { status: 'not-loaded' };
       processSSEForReferences('ArtifactUpdated', { artifact_path: 'clips/demo.mp4', commit: 'c' });
@@ -291,7 +265,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── PluginMarketplace* (the live marketplace list) ───────────────────────
 
   describe('PluginMarketplace* events', () => {
     const loadedCatalog = {
@@ -316,10 +289,6 @@ describe('processSSEForReferences', () => {
       expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
     });
 
-    // The reported bug: an agent re-registered an already-registered source
-    // under a new name and the open panel kept showing the old one. The rename
-    // rides the same upsert event as the create, so an arm that only handled
-    // "new marketplace" would leave this case broken.
     it('refreshes the catalog when a marketplace is renamed', () => {
       marketplaceCatalog.value = loadedCatalog;
       processSSEForReferences('PluginMarketplaceRegistered', {
@@ -338,8 +307,6 @@ describe('processSSEForReferences', () => {
       expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
     });
 
-    // The scan git-clones every registered marketplace, so a device that never
-    // opened the Plugins panel must not be made to do that work.
     it('does not scan when the catalog was never loaded', () => {
       marketplaceCatalog.value = { status: 'not-loaded' };
       processSSEForReferences('PluginMarketplaceRegistered', {
@@ -354,9 +321,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // The two frames that replaced the per-request clone. The scan runs on the
-  // engine's scheduler now. So these are the only way a client learns one is
-  // under way, including one another device started.
   describe('PluginCatalogScan* events', () => {
     beforeEach(() => {
       marketplaceScanning.value = false;
@@ -367,7 +331,6 @@ describe('processSSEForReferences', () => {
       expect(marketplaceScanning.value).toBe(true);
     });
 
-    // What a landing scan does is `pluginCatalogScanned`'s, tested beside it.
     it('hands a landed scan to the catalog store, failed or not', () => {
       processSSEForReferences('PluginCatalogScanned', { failed: false });
       processSSEForReferences('PluginCatalogScanned', { failed: true });
@@ -375,7 +338,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Updated app with name ────────────────────────────────────────────────
 
   describe('AppUpdated', () => {
     it('patches recents title in localStorage', () => {
@@ -393,7 +355,6 @@ describe('processSSEForReferences', () => {
       setRecents([{ id: 'habit-tracker', category: 'apps', title: 'Same Name' }]);
       const before = localStorage.getItem(RECENTS_KEY);
       processSSEForReferences('AppUpdated', { app_id: 'habit-tracker', name: 'Same Name' });
-      // localStorage.setItem should not be called when title already matches
       expect(localStorage.getItem(RECENTS_KEY)).toBe(before);
     });
 
@@ -410,7 +371,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── ThreadTitleGenerated / ThreadTitleRenamed ─────────────────────────────
 
   describe('ThreadTitleGenerated', () => {
     it('patches thread recents title', () => {
@@ -455,7 +415,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Surfaces that fetch their own data (ADR 0118) ────────────────────────
 
   describe('version counters for the pages that fetch their own data', () => {
     it('bumps mcpServersVersion for every McpServer frame', () => {
@@ -479,6 +438,14 @@ describe('processSSEForReferences', () => {
       expect(webhooksVersion.value).toBe(before + 3);
     });
 
+    it('bumps eventHooksVersion for every arming frame', () => {
+      const before = eventHooksVersion.value;
+      for (const type of ['EventHookArmed', 'EventHookDisarmed', 'EventHookRemoved']) {
+        processSSEForReferences(type, { slug: 'deploy-guard' });
+      }
+      expect(eventHooksVersion.value).toBe(before + 3);
+    });
+
     it('bumps memoryEntriesVersion when a memory is corrected', () => {
       const before = memoryEntriesVersion.value;
       processSSEForReferences('MemoryCorrected', { wrong_fact: 'x', removed: [] });
@@ -494,7 +461,7 @@ describe('processSSEForReferences', () => {
     it('leaves the counters alone for an unrelated frame', () => {
       const counters = () => [
         mcpServersVersion.value, webhooksVersion.value, permissionGrantsVersion.value,
-        memoryEntriesVersion.value,
+        memoryEntriesVersion.value, eventHooksVersion.value,
       ];
       const before = counters();
       processSSEForReferences('AppCreated', { app_id: 'x' });
@@ -551,9 +518,6 @@ describe('processSSEForReferences', () => {
     });
 
     it('leaves the panel alone when THIS device is the actor', () => {
-      // The engine emits before it answers the confirm POST, so this frame can
-      // arrive while the panel is still pending. Closing on it would beat
-      // `markPluginInstalled` to the overlay and lose the receipt.
       openInstallPanel();
       processSSEForReferences('PluginInstalled', {
         id: 'habit-tracker',
@@ -574,8 +538,6 @@ describe('processSSEForReferences', () => {
     it('leaves a receipt standing, actor or not', () => {
       openInstallPanel(receipt);
       processSSEForReferences('PluginInstalled', { id: 'habit-tracker' });
-      // A receipt is a `plugin-install` form too, so the id still matches. It
-      // survives because the panel it would replace has already been resolved.
       expect(panelOverlay.value).not.toBeNull();
     });
 
@@ -588,8 +550,6 @@ describe('processSSEForReferences', () => {
 
   describe('historical triggers', () => {
     it('reloads the historical registry when a trigger is deleted', () => {
-      // A deleted trigger JOINS that registry, and it backs the thread
-      // filter's trigger options. Nothing else reloads it.
       processSSEForReferences('TriggerDeleted', { trigger_id: 'gone' });
       expect(loadHistoricalTriggers).toHaveBeenCalled();
     });
@@ -600,7 +560,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Graceful no-ops ──────────────────────────────────────────────────────
 
   describe('graceful no-ops', () => {
     it('does not crash for unknown SSE type', () => {
@@ -624,7 +583,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Corrupted localStorage ───────────────────────────────────────────────
 
   describe('corrupted localStorage', () => {
     it('does not crash when recents is invalid JSON', () => {
@@ -643,7 +601,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Nav stack cursor adjustment ──────────────────────────────────────────
 
   describe('nav stack cursor adjustment', () => {
     it('adjusts cursor when pruned entry is before cursor', () => {
@@ -670,9 +627,6 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  // ── Settings-page caches (gated on `loaded`) ────────────────────────────
-  // The matching loader fires only when the matching cache is already loaded
-  // so cross-device events don't warm caches the user hasn't visited.
 
   describe('Credential* events', () => {
     it('does not reload when credentials cache is not-loaded', () => {
@@ -692,11 +646,6 @@ describe('processSSEForReferences', () => {
     });
 
     it('re-probes /health on each event so llmConfigured reflects a runtime provider swap', () => {
-      // Independent of the credentials-list cache state: the backend hot-swaps
-      // the active LLM provider on a credential change, so onboarding must clear
-      // (or reappear) without a manual refresh. Fake timers so the delayed
-      // re-check (a 600ms backstop probe) doesn't dangle past the test; we assert
-      // the immediate probe (one /health call per event).
       vi.useFakeTimers();
       mockCheckHealth.mockResolvedValue({ status: 'loaded', data: { llm_configured: true } });
       credentials.value = { status: 'not-loaded' };
@@ -737,16 +686,6 @@ describe('processSSEForReferences', () => {
       expect(loadOAuthAccounts).toHaveBeenCalled();
     });
 
-    // The connect half is the one that was missing: the engine wrote the
-    // account row straight from the OAuth callback and emitted nothing, so
-    // every device except the one running the flow sat on a stale list.
-    //
-    // It now routes to `handleOAuthAccountConnected` rather than reloading
-    // inline, because connecting does more than refresh a list: on the device
-    // that STARTED the flow it also closes the callback page, toasts, and
-    // fronts the window. That handler owns the reload (and its own device
-    // scoping) and is tested in oauth-connected.test.ts; what belongs here is
-    // that the event reaches it, payload intact.
     it('routes a connect to the OAuth-connected handler with the payload', () => {
       oauthAccounts.value = { status: 'loaded', data: [] };
       const payload = {
@@ -754,9 +693,8 @@ describe('processSSEForReferences', () => {
         provider: 'google',
         actor: { kind: 'device', device_id: 'device-aaa' },
       };
-      processSSEForReferences('OAuthAccountConnected', payload);
-      expect(handleOAuthAccountConnected).toHaveBeenCalledWith(payload);
-      // And NOT a second, unscoped reload from this arm.
+      processSSEForReferences('OAuthAccountConnected', payload, 'oauth-envelope');
+      expect(handleOAuthAccountConnected).toHaveBeenCalledWith(payload, 'oauth-envelope');
       expect(loadOAuthAccounts).not.toHaveBeenCalled();
     });
   });
@@ -800,9 +738,6 @@ describe('processSSEForReferences', () => {
       expect(refreshArtifacts).not.toHaveBeenCalled();
     });
 
-    // The preview reaches wider than the list. A `config/` or `knowhow/` write
-    // changes no artifact list, and may still be the file on screen. The agent's
-    // file tools announce these too, which is how an agent edit reaches it.
     it('offers the preview every data path, artifacts or not', () => {
       artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
@@ -845,8 +780,6 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('DeviceRenamed', { device_id: 'd1', name: 'phone' });
       processSSEForReferences('DevicePushChanged', { device_id: 'd1', push_enabled: true });
       processSSEForReferences('DeviceDeleted', { device_id: 'd1' });
-      // A hand-over renames the row every open page is keyed on, so it is the
-      // one Device event a stale list cannot survive.
       processSSEForReferences('DeviceHandedOver', { device_id: 'd2', old_device_id: 'd1' });
       expect(loadDevices).toHaveBeenCalledTimes(5);
     });

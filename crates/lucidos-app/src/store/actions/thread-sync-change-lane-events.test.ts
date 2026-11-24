@@ -1,9 +1,3 @@
-/**
- * A change's own thread events move the lane and the pending list at once.
- * The `ChangesUpdated` snapshot trails them by a merge prediction per change,
- * and a row would read Apply until it arrived. The snapshot still replaces
- * both whole (ADR 0463).
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/client', () => ({ API_BASE: '', API: '/api/v1', postMcpConsent: vi.fn() }));

@@ -532,3 +532,172 @@ async fn empty_answers_never_open_the_breaker() {
     assert_eq!(failing_model(&c), None);
     teardown_test_db(&db_name).await;
 }
+
+#[tokio::test]
+async fn spend_caps_park_without_lane_breaker_or_flex_pressure() {
+    struct Capped {
+        calls: AtomicUsize,
+        refuse: AtomicBool,
+        echo: EchoProvider,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Capped {
+        fn default_model(&self) -> &str {
+            COMPACTOR_MODEL
+        }
+        fn resolved_provider_kind(
+            &self,
+            _: &crate::llm::ModelSelection<'_>,
+        ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(Some(crate::llm::ProviderKind::OpenAi))
+        }
+        async fn chat(
+            &self,
+            messages: Vec<Message>,
+            tools: Vec<crate::llm::provider::ToolDefinition>,
+            selection: crate::llm::ModelSelection<'_>,
+            system: Option<&str>,
+            tokens: Option<crate::llm::TokenCallback>,
+            call: crate::llm::metered::CallToken,
+        ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(crate::llm::spend_cap::SpendCapReached {
+                    provider: crate::llm::ProviderKind::OpenAi,
+                    resets_at: None,
+                    message: "spent".into(),
+                }
+                .into());
+            }
+            self.echo
+                .chat(messages, tools, selection, system, tokens, call)
+                .await
+        }
+    }
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let provider = Arc::new(Capped {
+        calls: AtomicUsize::new(0),
+        refuse: AtomicBool::new(true),
+        echo: EchoProvider::new(),
+    });
+    let deps = SwitchDeps::on_flex(COMPACTOR_MODEL, provider.clone());
+    let c = compactor_owing(&pool, &bus, 1, deps.clone(), waits(15, 30)).await;
+    let lane = c.lane(&format!("test/{COMPACTOR_MODEL}"));
+    let initial = lane.limit();
+    c.seed().await.unwrap();
+    let outcomes = drain_to_rest(&c).await;
+    assert!(outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, Drained::SpendCapped(..))));
+    assert_eq!(lane.limit(), initial);
+    assert!(failing_model(&c).is_none());
+    assert_eq!(deps.notices(), 0);
+    assert!(c
+        .backfill_progress()
+        .unwrap()
+        .spend_cap_held_until
+        .is_some());
+    let calls = provider.calls.load(Ordering::SeqCst);
+    assert!(
+        c.drain_next().await.is_none(),
+        "a capped scope is parked, not queued for retry"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+    provider.refuse.store(false, Ordering::SeqCst);
+    crate::engine::model_call::spend_cap::clear(
+        &bus,
+        crate::llm::ProviderKind::OpenAi,
+        crate::engine::thread_events::MessageOrigin::Device {
+            device_id: "test-device".into(),
+        },
+    )
+    .await;
+    c.spend_cap_hold_ended().await;
+    run_to_rest(&c).await;
+    assert!(failing_model(&c).is_none());
+    assert!(c
+        .backfill_progress()
+        .is_none_or(|progress| progress.spend_cap_held_until.is_none()));
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_model_change_during_a_call_never_parks_on_its_late_spend_cap() {
+    struct DelayedCap {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for DelayedCap {
+        fn default_model(&self) -> &str {
+            "model-a"
+        }
+        fn resolved_provider_kind(
+            &self,
+            _: &crate::llm::ModelSelection<'_>,
+        ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(Some(crate::llm::ProviderKind::OpenAi))
+        }
+        async fn chat(
+            &self,
+            _: Vec<Message>,
+            _: Vec<crate::llm::provider::ToolDefinition>,
+            _: crate::llm::ModelSelection<'_>,
+            _: Option<&str>,
+            _: Option<crate::llm::TokenCallback>,
+            _: crate::llm::metered::CallToken,
+        ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+            self.started.notify_one();
+            assert!(self.release.acquire().await.is_err());
+            Err(crate::llm::spend_cap::SpendCapReached {
+                provider: crate::llm::ProviderKind::OpenAi,
+                resets_at: None,
+                message: "spent".into(),
+            }
+            .into())
+        }
+    }
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let old = Arc::new(DelayedCap {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let good = FlakyProvider::up();
+    let deps = SwitchDeps::on("model-a", old.clone());
+    let c = compactor_with_waits(&pool, &bus, deps.clone(), Waits::new(SLOW, SLOW));
+    c.seed().await.unwrap();
+    let draining = {
+        let c = c.clone();
+        tokio::spawn(async move { drain_to_rest(&c).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), old.started.notified())
+        .await
+        .expect("the old provider's call started");
+    deps.switch_to("model-b", good.clone());
+    c.model_changed().await;
+    old.release.close();
+    tokio::time::timeout(Duration::from_secs(10), draining)
+        .await
+        .expect("the old call returns")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), run_to_rest(&c))
+        .await
+        .expect("the healthy model drains without the old hold expiring");
+    assert_every_scope_complete(&pool, &fixture).await;
+    assert!(good.calls() > 0);
+    assert!(bus
+        .spend_cap_holds()
+        .lock()
+        .await
+        .refusal(crate::llm::ProviderKind::OpenAi)
+        .is_some());
+    assert!(c
+        .backfill_progress()
+        .is_none_or(|progress| progress.spend_cap_held_until.is_none()));
+    teardown_test_db(&db).await;
+}

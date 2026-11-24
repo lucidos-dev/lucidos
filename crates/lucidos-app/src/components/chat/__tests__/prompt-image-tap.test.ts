@@ -8,12 +8,9 @@ import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
-// openImagePopupFromGroup lives in its own module (re-exported from store.ts).
 const storeSource = readFileSync(resolve(here, '../../../store/imagePopup.ts'), 'utf-8');
 
 describe('image-preview-thumb tap opens popup with strip traversal', () => {
-  // Strip thumbnails render through BlobImage (self-healing) so a transiently
-  // failed preview load re-fetches instead of staying a broken box.
   const stripImgs = promptSource.match(/<BlobImage[\s\S]*?class="image-preview-thumb"[\s\S]*?\/>/g) ?? [];
 
   it('every <BlobImage class="image-preview-thumb"> in PromptInput has an onClick', () => {

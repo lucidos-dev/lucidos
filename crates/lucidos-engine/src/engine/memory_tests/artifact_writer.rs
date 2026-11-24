@@ -32,6 +32,7 @@ async fn write(bus: &EventBus, commit: &str, writer: Option<Uuid>) {
         commit: commit.to_string(),
         source: Some("run_python".to_string()),
         writer_thread_id: writer,
+        writer: None, // Legacy event fixture.
     }))
     .await
     .expect("seed the artifact write");

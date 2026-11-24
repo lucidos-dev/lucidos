@@ -457,3 +457,57 @@ async fn an_app_file_with_lint_findings_is_written_and_its_result_names_them() {
         std::fs::remove_dir(&app_dir).unwrap();
     }
 }
+
+/// A write that leaves a knowhow file over the size cap lands, and its reply
+/// carries a warning: on the data route and in the agent's tool result.
+#[tokio::test]
+async fn a_knowhow_write_over_the_size_cap_lands_with_a_warning() {
+    let tree = workspace_tree_lock().read().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let client = user_client().await;
+    let dir = format!("knowhow/e2e-size-cap-{}", uuid::Uuid::new_v4().simple());
+    let routed = format!("{dir}/routed.md");
+    let tooled = format!("{dir}/tooled.md");
+    let big = "a knowhow line that repeats\n".repeat(1000);
+
+    let resp = client
+        .put(format!("{}/api/v1/data/{routed}", base_url()))
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the write is not refused");
+    let reply: serde_json::Value = resp.json().await.unwrap();
+    let warning = reply["warning"].as_str().expect("an oversized write warns");
+    assert!(warning.contains("over the 24 KB knowhow cap"), "{warning}");
+    let on_disk = workspace_path().join("data").join(&routed);
+    assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), big);
+
+    let written = call_tool(
+        &pool,
+        "write_file",
+        json!({ "path": tooled, "content": big }),
+    )
+    .await;
+    assert!(
+        written.starts_with(&format!("[ACTION COMPLETED] CREATED: {tooled}")),
+        "got: {written}"
+    );
+    assert!(
+        written.contains(&format!("[KNOWHOW SIZE] {tooled} is")),
+        "got: {written}"
+    );
+
+    let small = client
+        .put(format!("{}/api/v1/data/{routed}", base_url()))
+        .body("short now\n")
+        .send()
+        .await
+        .unwrap();
+    let reply: serde_json::Value = small.json().await.unwrap();
+    assert!(reply.get("warning").is_none(), "got: {reply}");
+
+    // The cleanup takes the tree lock itself.
+    drop(tree);
+    crate::support::remove_data_fixtures(&client, &dir, &[routed, tooled]).await;
+}

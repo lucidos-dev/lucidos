@@ -23,12 +23,12 @@ use uuid::Uuid;
 use crate::core::changes::ChangeStatus;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{MessageOrigin, ThreadEvent, UnproposedReason};
-use crate::engine::thread_lifecycle::{CodingAgentChangeState, ThreadStatus};
+use crate::engine::thread_lifecycle::CodingAgentChangeState;
 use crate::engine::types::AgentSession;
 use crate::engine::LucidosEngine;
 
 /// The engine's in-memory agent sessions, keyed by thread.
-pub(crate) type AgentSessions = tokio::sync::Mutex<HashMap<Uuid, AgentSession>>;
+pub type AgentSessions = tokio::sync::Mutex<HashMap<Uuid, AgentSession>>;
 
 /// One armed standing apply, as stored.
 #[derive(Debug, Clone)]
@@ -45,7 +45,7 @@ pub struct StandingApply {
 /// What the armed change looks like right now, resolved against the arm's
 /// binding before the verdict is taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ArmedChange {
+pub enum ArmedChange {
     /// Still pending, with files to merge.
     Ready(Uuid),
     /// It resolved, vanished, or emptied out, so this arm can never fire.
@@ -57,7 +57,7 @@ pub(crate) enum ArmedChange {
 /// The thread-state facts the verdict reads. One struct so the decision is
 /// testable without a database.
 #[derive(Debug, Clone)]
-pub(crate) struct SettleFacts {
+pub struct SettleFacts {
     /// `thread_summaries.status`.
     pub status: String,
     /// The thread is parked on an unanswered question, read from the events.
@@ -80,7 +80,7 @@ pub(crate) struct SettleFacts {
 /// merge a branch still being written. Every resolve reads this, whatever
 /// triggered it, so no path can fire in that window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TurnSettle {
+pub enum TurnSettle {
     /// No agent turn sits between its terminal and its idle.
     Settled,
     /// A live session sent its terminal and is on its way to the idle.
@@ -106,7 +106,7 @@ fn classify_turn_settle(terminal_is_newest: bool, session_live: bool) -> TurnSet
 
 /// What the resolver should do with an arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StandingVerdict {
+pub enum StandingVerdict {
     /// The thread is still settling, or its change has not landed yet.
     Wait,
     Fire(Uuid),
@@ -129,25 +129,8 @@ pub(crate) const TURN_CUT_OFF: &str = "The session stopped before its turn finis
 /// cancelling the sweep that armed it.
 pub const DISARMED_BY_OWNER: &str = "Canceled.";
 
-/// A *settling* `thread_summaries` row: one that will settle by itself.
-/// Running, paused, or watching an event without a question card open.
-///
-/// Exactly the thread states [`standing_verdict`] waits on. Every place that
-/// offers or arms a standing apply reads this. So an arm always has a settle
-/// to wait for, rather than dropping the moment it is set (ADR 0266).
-///
-/// Unqualified, like [`LUCIDOS_APPLIES_SQL`], so `thread_summaries` must be the
-/// only source of these columns in the query using it.
-static SETTLING_THREAD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        "(status IN ({running}, {paused}) \
-         OR (live_event_wait_count > 0 AND status NOT IN ({waiting_for_user_answer}, {failed})))",
-        running = ThreadStatus::Running.sql_literal(),
-        paused = ThreadStatus::Paused.sql_literal(),
-        waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
-        failed = ThreadStatus::Failed.sql_literal(),
-    )
-});
+pub use crate::core::changes::settling_thread_ids;
+use crate::core::changes::SETTLING_THREAD_SQL;
 
 /// A `thread_summaries` row whose change Lucidos would apply. The standing
 /// apply IS an Apply, one settle later, so it is offered exactly where Apply
@@ -202,7 +185,7 @@ impl DisarmScope {
 ///
 /// A change that can never be applied ends the arm whatever the thread is
 /// doing. Waiting for a turn to finish cannot bring a discarded change back.
-pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
+pub fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
     if let ArmedChange::Gone(reason) = facts.armed_change {
         return StandingVerdict::Drop(reason);
     }
@@ -251,7 +234,7 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
 ///
 /// An agent session's settle needs no skip here. [`TurnSettle`] holds the arm
 /// until the idle, on this path and on every resolve with no event behind it.
-pub(crate) fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
+pub fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
     match event {
         BusEvent::Thread {
             event: ThreadEvent::EventWaitDelivered { .. } | ThreadEvent::EventWaitExpired { .. },
@@ -265,10 +248,15 @@ pub(crate) fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
 /// What the owner hears when the settle withheld the thread's work.
 fn withheld(reason: UnproposedReason) -> &'static str {
     match reason {
+        UnproposedReason::PlanChanged => {
+            "The plan changed after approval. Ask the agent to restore the approved text."
+        }
         UnproposedReason::PlanMissing => "The work is not ready: it needs an implementation plan.",
+        UnproposedReason::PlanUnreadable => "Lucidos could not verify the implementation plan. Try again.",
         UnproposedReason::PlanAwaitingApproval => {
             "The work is not ready: its implementation plan awaits approval."
         }
+        UnproposedReason::PlanOnlyCode => "The plan was approved for later, but the branch also changes code.",
         UnproposedReason::OutsideBound => {
             "The work is not ready: it reaches past the files its security fix named."
         }
@@ -585,7 +573,7 @@ async fn read_settle_facts(
         Ok(Some(row)) => row,
         Ok(None) => return FactsProbe::ThreadGone,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[StandingApply] thread lookup for {} failed: {}",
                 arm.thread_id,
                 e
@@ -599,10 +587,11 @@ async fn read_settle_facts(
     let parked_on_question = if matches!(status.as_str(), "running" | "paused") {
         false
     } else {
-        match crate::engine::agent_recovery::thread_parked_on_question(pool, arm.thread_id).await {
+        match crate::engine::question_park_sql::thread_parked_on_question(pool, arm.thread_id).await
+        {
             Ok(parked) => parked,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[StandingApply] question lookup for {} failed: {}",
                     arm.thread_id,
                     e
@@ -653,7 +642,7 @@ const AGENT_TURN_CLOSER_SQL: &str = "(event_type = 'CodingAgentIdled' \
 /// before it broadcasts it, so a resolve that the idle triggered already sees
 /// the idle. The session map is read only when the terminal is newest, so a
 /// settled thread never takes the lock.
-pub(crate) async fn read_turn_settle(
+pub async fn read_turn_settle(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     sessions: &AgentSessions,
@@ -669,7 +658,7 @@ pub(crate) async fn read_turn_settle(
     let terminal_is_newest = match newest {
         Ok(event_type) => event_type.is_some_and(|t| t != "CodingAgentIdled"),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[StandingApply] turn closer lookup for {} failed: {}",
                 thread_id,
                 e
@@ -723,7 +712,7 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
         Ok(None) if arm.change_id.is_none() => Some(ArmedChange::Unproposed),
         Ok(row) => Some(classify_bound_change(row)),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[StandingApply] change lookup for {} failed: {}",
                 arm.thread_id,
                 e
@@ -800,31 +789,6 @@ async fn check_arm_has_a_settle(
         FactsProbe::Unknown => return Ok(()),
     };
     Err(format!("{reason} There is nothing to wait for, so nothing was armed.").into())
-}
-
-/// Of the given threads, the *settling* ones, so a standing apply on them has
-/// a settle to wait for.
-///
-/// `PendingThreadState::settling` is filled from this. It stops the Changes panel
-/// offering an arm on a thread parked on a question, which would drop the
-/// moment it was pressed.
-pub async fn settling_thread_ids(
-    pool: &sqlx::PgPool,
-    thread_ids: impl Iterator<Item = Uuid>,
-) -> Result<HashSet<Uuid>, sqlx::Error> {
-    let ids: Vec<Uuid> = thread_ids.collect();
-    if ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
-        "SELECT thread_id FROM thread_summaries \
-          WHERE thread_id = ANY($1) AND is_coding_agent = TRUE AND {settling}",
-        settling = &*SETTLING_THREAD_SQL,
-    ))
-    .bind(&ids)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// The armed threads one [`DisarmScope`] covers.
@@ -904,7 +868,7 @@ impl LucidosEngine {
                 "[StandingApply] StandingApplyArmed",
             )
             .await;
-        log!(
+        log_legacy!(
             "[StandingApply] armed thread {} (change {:?}, batch {:?})",
             arm.thread_id,
             arm.change_id,
@@ -957,7 +921,7 @@ impl LucidosEngine {
         let rows = match read_sweep_candidates(self.pool()).await {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[StandingApply] sweep lookup failed: {}", e);
+                log_legacy!("[StandingApply] sweep lookup failed: {}", e);
                 return 0;
             }
         };
@@ -974,7 +938,7 @@ impl LucidosEngine {
             };
             match self.arm_standing_apply(arm).await {
                 Ok(()) => armed += 1,
-                Err(e) => log!("[StandingApply] sweep arm for {} failed: {}", thread_id, e),
+                Err(e) => log_legacy!("[StandingApply] sweep arm for {} failed: {}", thread_id, e),
             }
         }
         armed
@@ -1050,7 +1014,7 @@ impl LucidosEngine {
                 Some(loaded.arm)
             }
             Err(e) => {
-                log!("[StandingApply] delete for {} failed: {}", thread_id, e);
+                log_legacy!("[StandingApply] delete for {} failed: {}", thread_id, e);
                 None
             }
         }
@@ -1066,7 +1030,7 @@ impl LucidosEngine {
         reason: &str,
         actor: Option<MessageOrigin>,
     ) {
-        log!(
+        log_legacy!(
             "[StandingApply] dropped thread {} ({})",
             arm.thread_id,
             reason
@@ -1093,7 +1057,7 @@ impl LucidosEngine {
         let loaded = match load_arm(self.pool(), thread_id).await {
             Ok(arm) => arm,
             Err(e) => {
-                log!("[StandingApply] load for {} failed: {}", thread_id, e);
+                log_legacy!("[StandingApply] load for {} failed: {}", thread_id, e);
                 return;
             }
         };
@@ -1113,7 +1077,7 @@ impl LucidosEngine {
                 return;
             }
             Err(error) => {
-                log!("[StandingApply] restore boundary unavailable: {}", error);
+                log_legacy!("[StandingApply] restore boundary unavailable: {}", error);
                 return;
             }
         }
@@ -1142,7 +1106,7 @@ impl LucidosEngine {
             match settle_restored_arm(self.pool(), &self.event_bus, loaded).await {
                 Ok(true) => self.standing_applies.remove(loaded.arm.thread_id),
                 Ok(false) => {}
-                Err(error) => log!("[StandingApply] restore settlement failed: {}", error),
+                Err(error) => log_legacy!("[StandingApply] restore settlement failed: {}", error),
             }
             return;
         }
@@ -1164,7 +1128,7 @@ impl LucidosEngine {
         let Some(arm) = self.consume_generation(loaded.arm.thread_id, taken) else {
             return; // a re-arm or another resolution won the race
         };
-        log!(
+        log_legacy!(
             "[StandingApply] thread {} settled, applying change {}",
             arm.thread_id,
             change_id
@@ -1173,7 +1137,7 @@ impl LucidosEngine {
         let actor = arm.actor.clone();
         tokio::spawn(async move {
             if let Err(e) = engine.apply_change(change_id, actor).await {
-                log!(
+                log_legacy!(
                     "[StandingApply] apply_change({change_id}) returned Err: {e}. \
                      The apply path emits ChangeApplyFailed, which reports to the owner",
                 );
@@ -1191,7 +1155,7 @@ impl LucidosEngine {
         let mut rx = self.event_bus.subscribe();
         let engine = self.clone();
         tokio::spawn(async move {
-            log!("[StandingApply] resolver started");
+            log_legacy!("[StandingApply] resolver started");
             loop {
                 match rx.recv().await {
                     Ok(emitted) => {
@@ -1203,7 +1167,7 @@ impl LucidosEngine {
                         // The skipped batch may hold the settle an arm was
                         // waiting for, so re-resolve them all rather than
                         // stranding the owner's instruction.
-                        log!(
+                        log_legacy!(
                             "[StandingApply] subscriber lagged by {} events, re-resolving",
                             n
                         );
@@ -1212,7 +1176,7 @@ impl LucidosEngine {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log!("[StandingApply] EventBus closed, resolver stopping");
+                        log_legacy!("[StandingApply] EventBus closed, resolver stopping");
                         break;
                     }
                 }
@@ -1239,14 +1203,14 @@ impl LucidosEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[StandingApply] recovery query failed: {}", e);
+                log_legacy!("[StandingApply] recovery query failed: {}", e);
                 return;
             }
         };
         if rows.is_empty() {
             return;
         }
-        log!("[StandingApply] recovering {} armed thread(s)", rows.len());
+        log_legacy!("[StandingApply] recovering {} armed thread(s)", rows.len());
         let ids: HashSet<Uuid> = rows.iter().map(|(id,)| *id).collect();
         self.standing_applies.replace(ids.clone());
         for thread_id in ids {
@@ -1406,6 +1370,7 @@ mod db_tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         }
     }
 
@@ -2550,6 +2515,7 @@ mod tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         });
         let permission_card = on_thread(ThreadEvent::CodingAgentPermissionRequest {
             request_id: "req-1".into(),

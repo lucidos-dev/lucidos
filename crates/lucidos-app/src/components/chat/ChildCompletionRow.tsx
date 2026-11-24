@@ -10,30 +10,14 @@ interface Props {
   childThreadTitle?: string;
   status: ChildCompletionStatus;
   summary: string;
-  /** Changes the child left pending, if it left any. Absent on a row written
-   *  before the field existed, which is why the count is omitted rather than
-   *  rendered as zero: a row states no fact its event does not carry. */
   pendingChangeIds?: string[];
-  /** Changes pending anywhere below the child, kept apart from its own. An
-   *  orchestrator's children hold the work while it holds none. */
   subThreadPendingChanges?: SubThreadPendingChange[];
-  /** Set while the report waits behind an open question (`EventRowProps`). */
   heldNote?: string;
-  /** A `ChildReportFiled`: the report reached this thread without waking it. */
   filed?: boolean;
 }
 
-/** The line a filed report adds, so a reader knows no turn answered it. */
 export const FILED_REPORT_LINE = 'Filed without waking this thread';
 
-/** How each completion reads on the row. This is the one event row that
- *  legitimately shows a pass or a fail, because the verdict it reports is the
- *  CHILD's outcome rather than the row's own.
- *
- *  They appear together in one stream, so each word has to be distinguishable
- *  from the others. `canceled` is warm rather than the cool neutral, so it is
- *  not a near-twin of the untinted `no changes` word beside it. `interrupted`
- *  shares the warm tone: the child stopped short, and its word tells why. */
 const CHILD_STATE: Record<ChildCompletionStatus, { label: string; tone: EventRowTone }> = {
   success: { label: 'Success', tone: 'good' },
   failure: { label: 'Failure', tone: 'bad' },
@@ -42,8 +26,6 @@ const CHILD_STATE: Record<ChildCompletionStatus, { label: string; tone: EventRow
   interrupted: { label: 'Interrupted', tone: 'halted' },
 };
 
-/** A link that opens `threadId`, labelled with its title. Routed through
- *  `focusThreadOrBootstrap` so a thread outside the loaded window still opens. */
 export function threadLink(threadId: string, title: string | undefined | null) {
   return (
     <button
@@ -57,15 +39,6 @@ export function threadLink(threadId: string, title: string | undefined | null) {
   );
 }
 
-/** A child thread reporting back to its parent, as an **event row**. It wears
- *  the card an event wait, an event wake and a trigger fire use. All of them say
- *  one thing: something happened outside this thread. See
- *  `docs/plans/2026-08-10-one-event-row-for-the-transcript.md`.
- *
- *  Flat, with no chrome of its own: the surrounding `InitiatorPanel` owns that.
- *  The title link is the row's origin affordance, which is why the panel's actor
- *  chip is not clickable (see the `ChildThreadCompleted` arm of
- *  `describeInitiator`). */
 export function ChildCompletionRow(props: Props) {
   const { label, tone } = CHILD_STATE[props.status];
   const summaryHtml = props.summary.trim() ? renderMarkdown(props.summary) : '';
@@ -112,10 +85,6 @@ interface StoppedProps {
   childThreadTitle?: string;
 }
 
-/** What a stopped row's state says, read from the child's live state. The event
- *  is immutable, but its state word is a present-tense claim. So it follows the
- *  child: still stopped, running again, or moved on. An unloaded child has no
- *  live state, and the row then says only what the event proves. */
 function childStoppedState(childThreadId: string): { label: string; tone: EventRowTone } {
   const child = threadMap.value.get(childThreadId);
   if (!child) return { label: 'Stopped', tone: 'halted' };
@@ -124,10 +93,6 @@ function childStoppedState(childThreadId: string): { label: string; tone: EventR
   return { label: 'No longer waiting', tone: 'none' };
 }
 
-/** A user Stop paused one of this thread's children, as an event row
- *  (ADR 0252). It is the parent-side half of a *stopped child*: the child is
- *  alive and waits for the user, and this thread was not woken. So the state
- *  says who the child is waiting for, until the child moves on. */
 export function ChildStoppedRow(props: StoppedProps) {
   const { label, tone } = childStoppedState(props.childThreadId);
   return eventRowBody({
@@ -141,9 +106,6 @@ export function ChildStoppedRow(props: StoppedProps) {
   });
 }
 
-/** One of this thread's children was moved to top level (ADR 0278). It is no
- *  longer this thread's child and will send it nothing, so the state says
- *  nothing is coming. */
 export function ChildMovedOutRow(props: StoppedProps) {
   return eventRowBody({
     kind: 'child',

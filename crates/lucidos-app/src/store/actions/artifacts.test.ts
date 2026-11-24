@@ -1,15 +1,12 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { normalizeDataPath } from './artifacts';
 
-// Mock the API client so loadArtifacts() returns a controlled artifact list.
 const mockListArtifacts = vi.fn();
 vi.mock('../../api/client', () => ({
   listArtifacts: (...args: unknown[]) => mockListArtifacts(...args),
   uploadFile: vi.fn(),
 }));
 
-// openFilePreview (called by the restore path) reveals the content pane and
-// pushes nav state — stub both so the test exercises only the restore decision.
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
 
@@ -50,7 +47,6 @@ describe('normalizeDataPath', () => {
     );
   });
 
-  // Every tree the engine's data route accepts keeps its own path.
   it.each([
     'themes/harbour.json',
     'config/apis.json',
@@ -68,9 +64,6 @@ describe('normalizeDataPath', () => {
     expect(normalizeDataPath('notes.md')).toBe('artifacts/notes.md');
   });
 
-  // A repo-encoded preview path addresses a registered local repo clone, not
-  // the workspace data tree — prefixing it would make parseRepoPath reject it
-  // and ContentPane would dead-end it in the /data/* mount.
   it('leaves a repo-encoded file path unchanged', () => {
     const encoded = 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:src/main/resources/transforms/x.jslt';
     expect(normalizeDataPath(encoded)).toBe(encoded);
@@ -84,8 +77,6 @@ describe('normalizeDataPath', () => {
     expect(normalizeDataPath('repo:r1:diff#change-7:src/a.rs')).toBe('repo:r1:diff#change-7:src/a.rs');
   });
 
-  // Keyed off parseRepoPath, not a bare `repo:` prefix test: a string that only
-  // LOOKS repo-encoded is an ordinary data path and still normalizes.
   it('normalizes a malformed repo: path like any other data path', () => {
     expect(normalizeDataPath('repo:r1:weird:a.md')).toBe('artifacts/repo:r1:weird:a.md');
   });
@@ -95,8 +86,6 @@ const PDF = 'artifacts/projects/reports/cover-letter.pdf';
 
 describe('loadArtifacts — previously-open file preview restore', () => {
   beforeEach(() => {
-    // Fresh module graph each test so the once-per-page-load restore flag
-    // resets (simulates a real page reload).
     vi.resetModules();
     localStorage.clear();
     mockListArtifacts.mockReset();
@@ -115,19 +104,15 @@ describe('loadArtifacts — previously-open file preview restore', () => {
   });
 
   it('does NOT re-open the saved file preview on a later SSE-driven refresh while an app is open', async () => {
-    // Page reload: the file preview was open, so the first load re-hydrates it.
     localStorage.setItem('file-preview-open', PDF);
     const { panelOverlay } = await import('../store');
     panelOverlay.value = null;
 
     const { loadArtifacts } = await import('./artifacts');
-    await loadArtifacts(); // first load consumes the one-shot restore
+    await loadArtifacts();
 
-    // The user then opens an app, so the content pane is now an app-ui.
     panelOverlay.value = { type: 'app-ui', app: { id: 'demo-director' } as never };
 
-    // An agent run edits artifacts/plans/index.json → DataFileEdited → another
-    // loadArtifacts(). This must NOT yank the pane back to the last PDF.
     await loadArtifacts();
 
     expect(panelOverlay.value).toEqual({ type: 'app-ui', app: { id: 'demo-director' } });
@@ -135,7 +120,7 @@ describe('loadArtifacts — previously-open file preview restore', () => {
 
   it('drops a stale saved path that no longer exists, on the first load', async () => {
     localStorage.setItem('file-preview-open', 'artifacts/deleted.md');
-    mockListArtifacts.mockResolvedValue({ artifacts: [PDF] }); // saved path gone
+    mockListArtifacts.mockResolvedValue({ artifacts: [PDF] });
     const { panelOverlay } = await import('../store');
     panelOverlay.value = null;
 
@@ -147,11 +132,6 @@ describe('loadArtifacts — previously-open file preview restore', () => {
   });
 });
 
-// Both file previews render `selectedLines`, so a range picked in one file must
-// not survive into the next: it would highlight whatever rows happen to sit at
-// those numbers. Same for a pending scroll that never found its file (a load
-// error, a format with no source view), which would otherwise fire later on an
-// unrelated file.
 describe('openFilePreview clears the previous file line state', () => {
   beforeEach(async () => {
     const { panelOverlay } = await import('../store');
@@ -194,9 +174,6 @@ describe('openFilePreview clears the previous file line state', () => {
   });
 });
 
-// The revision stamp is the preview URL's cache-buster, and the URL is the
-// `src` of the video it renders. A bare counter here was bumped by every
-// `loadArtifacts()`, so any write under `data/` restarted a watched video.
 describe('invalidateFilePreview: only the file on screen re-reads', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -228,8 +205,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     expect(store.filePreviewRevision.value).toBeNull();
   });
 
-  // The reported bug in one sequence. A stamp that fell back when a different
-  // file changed would itself be a URL change, one write later.
   it('keeps a bumped stamp stable across a write to a different file', async () => {
     const { store, actions } = await showing('artifacts/clip.mp4');
     actions.invalidateFilePreview('artifacts/clip.mp4');
@@ -248,8 +223,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     expect(store.filePreviewRevision.value).toBeNull();
   });
 
-  // An `artifacts/` write announces twice, as its `Artifact*` event and as the
-  // file tool's `ToolResult`. Two reloads for one write is what this stops.
   it('coalesces a burst of announcements into one bump', async () => {
     const { store, actions } = await showing('artifacts/clip.mp4');
     actions.invalidateFilePreview('artifacts/clip.mp4');
@@ -266,8 +239,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     expect(store.filePreviewRevision.value).toEqual({ path: 'knowhow/ops/deploy.md', rev: 1 });
   });
 
-  // The panel refresh contract: the header spinner stops when the refresh
-  // settles, so it must settle once the re-read landed, and never hang.
   it('settles a media refresh as soon as its bump is applied', async () => {
     const { actions } = await showing('artifacts/clip.mp4');
     let settled = false;
@@ -285,7 +256,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     vi.runAllTimers();
     await Promise.resolve();
     expect(settled).toBe(false);
-    // A read of the previous revision landing late does not answer it.
     actions.reportPreviewTextSettled(0);
     await Promise.resolve();
     expect(settled).toBe(false);
@@ -316,9 +286,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     expect(settled).toBe(true);
   });
 
-  // A repo preview is handed a parsed locator, never the encoded `repo:` string
-  // the overlay holds. So it reads `openFilePreviewRevision` rather than
-  // matching the stamp itself, and without that its Refresh button was inert.
   it('answers the open repo preview through openFilePreviewRevision', async () => {
     const encoded = 'repo:r1:file:src/main.rs';
     const { store, actions } = await showing(encoded);
@@ -338,8 +305,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
     expect(store.openFilePreviewRevision.value).toBe(0);
   });
 
-  // The Files list and the preview are separate concerns now. A list refresh
-  // carries no path, so it cannot know whether the open file changed.
   it('loadArtifacts refreshes the list and leaves the stamp alone', async () => {
     mockListArtifacts.mockResolvedValue({ artifacts: ['artifacts/clip.mp4'] });
     const { store, actions } = await showing('artifacts/clip.mp4');
@@ -350,10 +315,6 @@ describe('invalidateFilePreview: only the file on screen re-reads', () => {
   });
 });
 
-// A write announced while the list is loading must still reach the list. The
-// e2e flake that found this: a file PUT during the page's first load never
-// appeared, because the announcement was dropped while the status was
-// `loading`.
 describe('loadArtifacts keeps the newest answer', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -361,7 +322,6 @@ describe('loadArtifacts keeps the newest answer', () => {
     mockListArtifacts.mockReset();
   });
 
-  /** A listing the test answers by hand, in whatever order it likes. */
   function deferredListing() {
     let answer!: (paths: string[]) => void;
     const promise = new Promise<{ artifacts: string[] }>(resolve => {
@@ -428,9 +388,6 @@ describe('loadArtifacts keeps the newest answer', () => {
     expect(mockListArtifacts).toHaveBeenCalledTimes(2);
   });
 
-  // `loadArtifacts` writes `toFailed` on error, which discards the loaded
-  // list. A refresh that skipped `failed` would latch: one timed-out fetch and
-  // no later announcement could bring the list back, short of a reload.
   it('retries a list whose last load failed', async () => {
     mockListArtifacts.mockResolvedValue({ artifacts: ['artifacts/a.md'] });
     const { artifacts } = await import('../store');
@@ -441,8 +398,6 @@ describe('loadArtifacts keeps the newest answer', () => {
     expect(artifacts.value).toEqual({ status: 'loaded', data: ['artifacts/a.md'] });
   });
 
-  // Every transcript message re-linkifies when the list changes identity, so an
-  // unchanged refresh must not wake them. Agent writes refresh in bursts.
   it('keeps the loaded value when a refresh lists the same paths', async () => {
     mockListArtifacts
       .mockResolvedValueOnce({ artifacts: ['artifacts/a.md', 'artifacts/b.md'] })

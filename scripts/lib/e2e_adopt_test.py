@@ -27,8 +27,8 @@ class AdoptionTests(unittest.TestCase):
         return {"workspaces": self.listed} if request.method == "GET" else self.response
 
     def run_adopt(self):
-        adopt("http://127.0.0.1:1", self.directory, "e2e-test", 5341,
-              self.token, self.request)
+        adopt("https://127.0.0.1:1", self.directory, "e2e-test", 5341,
+              self.token, "/nonexistent/loopback-ca.pem", self.request)
 
     def test_new_slot_publishes_private_owner_and_provenance(self):
         self.run_adopt()

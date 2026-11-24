@@ -9,15 +9,9 @@
 //! here starts at that column.
 
 use crate::engine::git_ops::HardenTier;
-use crate::engine::thread_events::IntegratedBranch;
 use uuid::Uuid;
 
-/// The newest session's branch for a thread, as a lateral join on `t`.
-const SESSION_BRANCH_JOIN: &str = "JOIN LATERAL ( \
-         SELECT payload->>'branch' AS branch FROM events e \
-         WHERE e.event_type = 'SessionStarted' AND e.thread_id = t.thread_id \
-         ORDER BY e.sequence DESC LIMIT 1 \
-     ) s ON TRUE";
+use crate::core::store::integrated::SESSION_BRANCH_JOIN;
 
 /// The thread whose newest session named branch `$1`, joined as `p`.
 const BRANCH_THREAD: &str = "SELECT p.* FROM events e \
@@ -27,35 +21,28 @@ const BRANCH_THREAD: &str = "SELECT p.* FROM events e \
 
 /// Whether `thread_id` is an integrated sub-thread. A failed read answers no:
 /// the work is then held for hardening or proposed, never handed up unseen.
-pub(crate) async fn thread_is_integrated(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
+pub async fn thread_is_integrated(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    read_thread_is_integrated(pool, thread_id)
+        .await
+        .unwrap_or_else(|e| {
+            crate::log_legacy!("[Integrated] integrated flag for {}: {}", thread_id, e);
+            false
+        })
+}
+
+/// Read the durable integration flag. Callers that gate side effects can
+/// refuse on a read error instead of treating the thread as independent.
+pub async fn read_thread_is_integrated(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, bool>(
         "SELECT coding_agent_integrated FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_optional(pool)
-    .await
-    .unwrap_or_else(|e| {
-        crate::log!("[Integrated] integrated flag for {}: {}", thread_id, e);
-        None
-    })
-    .unwrap_or(false)
-}
-
-/// Whether the Thread Queue holds an integrated spawn request for
-/// `thread_id`. The `ThreadQueued` event wrote that request, and its row lives
-/// until the spawn's work ends. So the child's first message, which that work
-/// emits, always finds it.
-pub(crate) async fn queued_spawn_is_integrated(
-    conn: &mut sqlx::PgConnection,
-    thread_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM thread_queue \
-         WHERE thread_id = $1 AND (request->>'integrated')::boolean)",
-    )
-    .bind(thread_id)
-    .fetch_one(conn)
-    .await
+    .await?
+    .unwrap_or(false))
 }
 
 /// The tier `/harden` runs on `branch_name`: fast while an integrated
@@ -63,7 +50,7 @@ pub(crate) async fn queued_spawn_is_integrated(
 /// pending or set-aside change of its own is applied directly, so Apply's
 /// full marker must be reachable. A branch no session names, or a failed
 /// read, is full.
-pub(crate) async fn expected_harden_tier(pool: &sqlx::PgPool, branch_name: &str) -> HardenTier {
+pub async fn expected_harden_tier(pool: &sqlx::PgPool, branch_name: &str) -> HardenTier {
     let integrated: Option<bool> = sqlx::query_scalar(&format!(
         "SELECT p.coding_agent_integrated AND NOT EXISTS (SELECT 1 FROM changes c \
          WHERE c.branch_name = $1 AND c.status IN ($2, $3)) FROM ({BRANCH_THREAD}) p"
@@ -74,7 +61,7 @@ pub(crate) async fn expected_harden_tier(pool: &sqlx::PgPool, branch_name: &str)
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[Integrated] expected tier for {}: {}", branch_name, e);
+        crate::log_legacy!("[Integrated] expected tier for {}: {}", branch_name, e);
         None
     });
     if integrated == Some(true) {
@@ -88,7 +75,7 @@ pub(crate) async fn expected_harden_tier(pool: &sqlx::PgPool, branch_name: &str)
 /// certified. Every commit under one was reviewed by its child's run, so the
 /// parent's review skips it (`scripts/harden-scope.sh`). A marker of either
 /// tier counts, stale or fresh: the head it names was reviewed either way.
-pub(crate) async fn integrated_child_heads(
+pub async fn integrated_child_heads(
     pool: &sqlx::PgPool,
     branch_name: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
@@ -105,57 +92,25 @@ pub(crate) async fn integrated_child_heads(
     .await
 }
 
-/// The branch an integrated child hands up on its report: its own, at the
-/// head its `/harden` certified. `None` unless the child's work waits as
-/// `integrated_into_parent`, which the proposal hold writes only for a fresh
-/// marker.
-pub(crate) async fn handed_up_branch(
-    pool: &sqlx::PgPool,
-    child_thread_id: Uuid,
-) -> Option<IntegratedBranch> {
-    sqlx::query_as::<_, (String, String)>(&format!(
-        "SELECT s.branch, h.head_sha FROM thread_summaries t {SESSION_BRANCH_JOIN} \
-         JOIN hardened_branches h ON h.branch_name = s.branch \
-         WHERE t.thread_id = $1 AND t.coding_agent_integrated \
-           AND t.coding_agent_unproposed_reason = 'integrated_into_parent' \
-         ORDER BY h.hardened_at DESC LIMIT 1"
-    ))
-    .bind(child_thread_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or_else(|e| {
-        crate::log!(
-            "[Integrated] handed-up branch for {}: {}",
-            child_thread_id,
-            e
-        );
-        None
-    })
-    .map(|(branch_name, head_sha)| IntegratedBranch {
-        branch_name,
-        head_sha,
-    })
-}
-
 /// What an integrated spawn request names, for [`integrated_spawn_refusal`].
-pub(crate) struct IntegratedSpawn {
-    pub(crate) has_parent: bool,
-    pub(crate) coding_agent: bool,
+pub struct IntegratedSpawn {
+    pub has_parent: bool,
+    pub coding_agent: bool,
     /// The child targets the Lucidos source repo: no app folder, no external
     /// repo.
-    pub(crate) lucidos_source: bool,
+    pub lucidos_source: bool,
     /// The parent is a Lucidos-source coding-agent thread.
-    pub(crate) parent_is_lucidos_coding_agent: bool,
-    pub(crate) thread_exists: bool,
+    pub parent_is_lucidos_coding_agent: bool,
+    pub thread_exists: bool,
     /// A `mode=human` send. It starts at once rather than through the Thread
     /// Queue, and only the queued request carries the flag.
-    pub(crate) human_mode: bool,
+    pub human_mode: bool,
 }
 
 /// Why an integrated spawn is refused, or `None` when it may go ahead. An
 /// integrated child merges into its parent's branch, so both must be
 /// Lucidos-source coding-agent threads, and the child must be new.
-pub(crate) fn integrated_spawn_refusal(spawn: &IntegratedSpawn) -> Option<&'static str> {
+pub fn integrated_spawn_refusal(spawn: &IntegratedSpawn) -> Option<&'static str> {
     if spawn.thread_exists {
         return Some("`integrated` starts a new thread. It cannot change an existing one.");
     }

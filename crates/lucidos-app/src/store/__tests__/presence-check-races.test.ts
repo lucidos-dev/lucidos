@@ -1,10 +1,3 @@
-/**
- * The two interleavings that used to leave the reader with no surface at all.
- *
- * Each test drives the SSE dispatch in the order the frames arrive, with the
- * page's state changing between them in an explicit step. No timer decides the
- * order. See system-knowhow/notifications.md §3 and §4.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { EventStream } from '@lucidos/event-stream';
 import { toasts, focusedThreadId } from '../store';
@@ -39,6 +32,8 @@ vi.mock('../../utils/tauri', () => ({
   takePendingNativeTaps: vi.fn(() => Promise.resolve([])),
   getNativeWindowActive: vi.fn(() => Promise.resolve(true)),
   listen: vi.fn(() => Promise.resolve(() => {})),
+  setTitlebarColor: vi.fn(() => Promise.resolve()),
+  windowReadyToShow: vi.fn(),
 }));
 vi.mock('../../utils/liveness', () => ({ postClientLog: vi.fn() }));
 
@@ -72,7 +67,6 @@ function setVisibility(state: 'visible' | 'hidden'): void {
 
 const toastKeys = () => toasts.value.map((t) => t.key);
 
-/** A transport that records which toasts were on screen as each pong left. */
 function recordingTransport() {
   const onScreenAtPong: Array<Array<string | undefined>> = [];
   const submitPong = vi.fn(() => {
@@ -108,7 +102,6 @@ describe('the page acts on a PresenceCheck before it answers', () => {
     expect(submitPong.mock.calls[0]).toEqual(['n-race', { device_id: 'dev-test', outcome: 'shown' }]);
     expect(onScreenAtPong[0]).toContain('notification-n-race');
 
-    // The window the engine's decision used to leave open.
     setVisibility('hidden');
 
     expect(toastKeys()).toContain('notification-n-race');
@@ -123,7 +116,6 @@ describe('the page acts on a PresenceCheck before it answers', () => {
     expect(submitPong.mock.calls[0]).toEqual(['n-desk', { device_id: 'dev-test', outcome: 'not_shown' }]);
     expect(toastKeys()).toEqual([]);
 
-    // The reader brings the window forward before the push-allowed frame lands.
     setNativeWindowActive(true);
     handleGlobalEvent('NativePushRequested', content('n-desk'));
     await new Promise((r) => setTimeout(r, 0));

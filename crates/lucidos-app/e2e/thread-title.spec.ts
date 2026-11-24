@@ -14,9 +14,6 @@ import {
   renameThreadViaMenu,
 } from './helpers';
 
-/** The mobile title row: display-only, renamed through its ⋯ menu, and
- *  hiding with the header on scroll. Desktop rename lives in
- *  thread-title-rename-desktop.spec.ts. */
 
 async function newThread(page: import('@playwright/test').Page, tag: string): Promise<void> {
   await navigateToApp(page);
@@ -44,24 +41,16 @@ test.describe('Thread title and rename: mobile', () => {
   });
 
   test('title hides with header on scroll down', async ({ page }) => {
-    // The follow seed ships ARMED, and a rider is carried back to the live edge
-    // by any scroll that is not their own gesture. This test parks the reader at
-    // the top and drags down from there, so it starts them disarmed.
     await disarmFollowSeed(page);
-    // The e2e baseline pins the header. This test asserts the header (and
-    // sticky title bar) scroll off, so turn dynamic bars on before the page
-    // boots.
     await enableMobileDynamicBars(page);
     await navigateToApp(page);
 
-    // Send multiple messages to create scrollable content
     const msg = uniqueMessage('scroll-title');
     await sendMessage(page, `Say exactly: "${msg}" and then write a very long paragraph with at least 200 words about anything`);
     await waitForResponse(page);
 
     await waitForThreadTitle(page);
 
-    // Verify title is visible initially
     const titleVisibleBefore = await page.evaluate(() => {
       const els = document.querySelectorAll('.mobile-thread-title-row .thread-title');
       return Array.from(els).some(el => {
@@ -71,18 +60,12 @@ test.describe('Thread title and rename: mobile', () => {
     });
     expect(titleVisibleBefore).toBe(true);
 
-    // Blur any focused input: useHideOnScroll skips the header hide while a
-    // text input in the same pane has focus, so typing never hides it.
     await blurActiveElement(page);
 
-    // Inject extra content to guarantee the container is scrollable, since LLM
-    // output length is unpredictable and may be too short on a small viewport.
     await page.evaluate(() => {
       const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
       if (container) {
         const filler = document.createElement('div');
-        // min-height with flex-shrink:0 keeps the flex container from
-        // collapsing the filler. A plain height shrinks to fit the layout.
         filler.style.minHeight = '2000px';
         filler.style.flexShrink = '0';
         filler.dataset.testFiller = 'true';
@@ -90,18 +73,11 @@ test.describe('Thread title and rename: mobile', () => {
       }
     });
 
-    // Wait until the container is scrollable (filler appended + layout settled)
     await page.waitForFunction(() => {
       const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
       return container ? container.scrollHeight > container.clientHeight : false;
     }, undefined, { timeout: 5_000 });
 
-    // Park the reader at the top FIRST, so what follows is a real scroll down.
-    // The filler above grew the transcript, and growth leaves the reader at the
-    // bottom. A scroll to where we already are gives hide-on-scroll no delta to
-    // act on. This write sticks only because the test disarmed the follow. An
-    // armed follow answers growth by writing the reader back to the live edge,
-    // and only a reader GESTURE retires it (scrollState.ts `onScroll`).
     await page.evaluate(() => {
       const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
       if (container) container.scrollTop = 0;
@@ -113,13 +89,6 @@ test.describe('Thread title and rename: mobile', () => {
         && !!header && header.getBoundingClientRect().bottom > 0;
     }, undefined, { timeout: 5_000 });
 
-    // Scroll down the way a drag does, in spaced steps, NOT in one write.
-    // `useHideOnScroll` skips any scroll event inside the app's own 64ms
-    // navigation-scroll window (`isNavigationScroll`), and landing at the top
-    // can open that window. One jump to the bottom is ONE event. If it lands
-    // inside the window, it is swallowed and no later event comes, so the
-    // header stays up at the live edge. A real drag emits events across
-    // hundreds of ms, and each step here is spaced past the window likewise.
     await page.evaluate(async () => {
       const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
       if (!container) return;
@@ -132,15 +101,12 @@ test.describe('Thread title and rename: mobile', () => {
       }
     });
 
-    // Wait for the header to glide off the top.
     await page.waitForFunction(() => {
       const header = document.querySelector('.app-header');
       if (!header) return false;
       return header.getBoundingClientRect().bottom <= 0;
     }, undefined, { timeout: 5_000 });
 
-    // The title bar is sticky inside the scroll container and glides out
-    // together with the header, on its own transition. Poll it off-screen.
     await expect.poll(() => page.evaluate(() => {
       const els = document.querySelectorAll('.mobile-thread-title-row');
       for (const el of els) {
@@ -149,7 +115,7 @@ test.describe('Thread title and rename: mobile', () => {
           return rect.bottom <= 0;
         }
       }
-      return true; // not rendered = off-screen
+      return true;
     }), { timeout: 5_000 }).toBe(true);
   });
 });

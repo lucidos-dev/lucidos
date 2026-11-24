@@ -16,14 +16,15 @@
 //! `MEMORY_CORRECTION_THRESHOLD` are re-exported here so existing
 //! `engine::memory::<name>` paths keep resolving.
 
-pub(crate) mod correction;
+pub mod correction;
 mod embedder_retry;
 mod extract;
 mod read;
 mod rebuild;
 mod scoring;
 
-pub(crate) use scoring::{
-    age_in_days, jaccard_similarity, keywords_for, relevance_score, KEYWORD_BOOST,
-    KEYWORD_SIMILARITY_PROXY, MEMORY_CORRECTION_THRESHOLD,
+pub use scoring::MEMORY_CORRECTION_THRESHOLD;
+pub(crate) use {
+    scoring::age_in_days, scoring::jaccard_similarity, scoring::keywords_for,
+    scoring::relevance_score, scoring::KEYWORD_BOOST, scoring::KEYWORD_SIMILARITY_PROXY,
 };

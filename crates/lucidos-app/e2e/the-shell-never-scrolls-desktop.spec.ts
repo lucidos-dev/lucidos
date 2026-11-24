@@ -1,26 +1,7 @@
 import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp } from './helpers';
 
-/**
- * The desktop shell never scrolls as a whole.
- *
- * Reported from the packaged macOS app: the shell slid up its window, header
- * first, until only the page background showed. Scrolling or a reopen put it
- * back. The traffic lights followed the shrinking band, so the page saw the
- * shift itself, and on desktop only two boxes can carry it: the document and
- * `.app-shell`. Both are meant to hold still, and neither had a guard.
- *
- * Nothing in the shell makes either box overflow today, so the spec makes them
- * overflow on purpose. A 100vw box under a classic scrollbar, or an escaped
- * absolute box, is all it takes. It then asserts what the fix promises:
- * `styles/global/base.css` locks the root against wheel and rubber-band, and
- * `utils/shellScrollGuard.ts` snaps a scripted offset back.
- *
- * The overlay build is stamped, not run: no WebDriver reaches WKWebView (ADR
- * 0016). It matters here because the band is what the lights centre on.
- */
 
-/** What `titlebar_inset_script` stamps. */
 const TITLEBAR_INSET_PX = 28;
 
 async function stampOverlayBuild(page: Page): Promise<void> {
@@ -30,7 +11,6 @@ async function stampOverlayBuild(page: Page): Promise<void> {
   }, TITLEBAR_INSET_PX);
 }
 
-/** Both boxes' offsets, and the band's painted bottom edge. */
 async function readShell(page: Page) {
   return page.evaluate(() => {
     const root = document.scrollingElement!;
@@ -44,7 +24,6 @@ async function readShell(page: Page) {
   });
 }
 
-/** Give a box far more content than it shows, so it has room to scroll. */
 async function overflow(page: Page, selector: string): Promise<void> {
   await page.evaluate((sel) => {
     const spacer = document.createElement('div');
@@ -69,8 +48,6 @@ test.describe('the desktop shell never scrolls as a whole', () => {
     expect(root).toEqual({ overflow: 'hidden', overscroll: 'none' });
 
     await overflow(page, 'body');
-    // Over whichever pane holds the middle of the window. Each one ends its
-    // own scroll, so the rest of the wheel chains on towards the root.
     const vp = page.viewportSize()!;
     await page.mouse.move(vp.width / 2, vp.height / 2);
     for (let i = 0; i < 8; i++) await page.mouse.wheel(600, 600);

@@ -1,7 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
 
-// A file of its own: nothing here may provide the drawer order at module load,
-// because the case under test is a focus that lands before `startShell` does.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -45,10 +43,8 @@ describe('handleArchiveThread: a thread focused before the shell landed', () => 
     ]);
     setDrawerGrouping('ongoing');
     setSelectedOngoingGroup('blocked');
-    // A cold open restores the focus while the shell chunk is still loading.
     focusThread('a2');
 
-    // What `startShell` does once the shell chunk resolves.
     provideDrawerOrder(drawerOrder);
     rememberFocusedViewRows();
 

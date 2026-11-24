@@ -9,10 +9,6 @@ import type { DiffFile } from '../../store/store';
 
 const REM = 16;
 
-/** Two columns of unwrapped code need real width. The threshold is measured off
- *  the diff's own container rather than the viewport, because the content pane
- *  is resizable: a desktop user can drag the split until two columns no longer
- *  fit, and a phone never has room at all. */
 describe('fitsSideBySide', () => {
   it('fits at the threshold', () => {
     expect(fitsSideBySide(SIDE_BY_SIDE_MIN_REM * REM, REM)).toBe(true);
@@ -30,26 +26,17 @@ describe('fitsSideBySide', () => {
     expect(fitsSideBySide(390, REM)).toBe(false);
   });
 
-  // The threshold is in `rem`, so a user who has scaled the UI up needs
-  // proportionally more pixels for the same two columns.
   it('scales with the root font size', () => {
     const width = SIDE_BY_SIDE_MIN_REM * REM;
     expect(fitsSideBySide(width, REM)).toBe(true);
     expect(fitsSideBySide(width, REM * 1.5)).toBe(false);
   });
 
-  // Before the ResizeObserver has run, the container reports 0. Reading that as
-  // "no room" would render unified for one frame and then swap, flashing the
-  // wrong view at every open.
   it('treats an unmeasured container as room, so the first paint does not flash', () => {
     expect(fitsSideBySide(0, REM)).toBe(true);
   });
 });
 
-/** The side-by-side columns must be the file preview's own renderer, not a third
- *  implementation of line numbering and row markup, and they must not
- *  participate in the file-level line selection (their numbers are the OLD
- *  file's on the left and the NEW file's on the right). */
 describe('SideBySideDiff renders both columns through LineNumberedCode', () => {
   const file: DiffFile = {
     path: 'src/main.rs',
@@ -63,8 +50,6 @@ describe('SideBySideDiff renders both columns through LineNumberedCode', () => {
     }],
   };
 
-  // Hookless at its own level, so it can be invoked directly and its vnode tree
-  // walked (the same approach as ThreadFilterPanel.test.tsx).
   const root = SideBySideDiff({ file }) as VNode<{ children: VNode<Record<string, unknown>>[] }>;
   const sides = root.props.children;
 
@@ -87,12 +72,6 @@ describe('SideBySideDiff renders both columns through LineNumberedCode', () => {
   });
 });
 
-/** `diffFitsSideBySide` is a single global, and `DiffView` is NOT a
- *  single-instance component: `InlineDiffList` stacks one per changed file. Only
- *  the file-preview diff (the surface the header's toggle acts on) may measure
- *  and publish, or the rest become redundant ResizeObservers racing to set the
- *  same value off containers the toggle does not act on. The gate is a
- *  `useLayoutEffect`, so this is a source scan rather than a render. */
 describe('exactly one DiffView publishes the measured fit', () => {
   const dir = new URL('.', import.meta.url);
   const diffView = readFileSync(new URL('DiffView.tsx', dir), 'utf8');

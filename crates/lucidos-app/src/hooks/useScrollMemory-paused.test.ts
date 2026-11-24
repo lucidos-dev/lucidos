@@ -5,12 +5,6 @@ import { useRef } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { useScrollMemory } from './useScrollMemory';
 
-/**
- * A pause takes effect from the render that asks for it. The effect that
- * detaches the memory runs only after paint. The swap that paused it clamps
- * the offset first: the Ongoing grouping replacing Folders, or a shut drawer
- * emptying its list. That clamp's scroll must not overwrite the saved place.
- */
 
 const KEY = 'scroll-memory-paused-test';
 
@@ -27,8 +21,6 @@ function Harness({ paused }: { paused: boolean }) {
     });
 }
 
-/** Give the jsdom element the scroll box it lacks: a writable offset over a
- *  tall content. */
 function scrollable(el: HTMLDivElement) {
     let top = 0;
     Object.defineProperty(el, 'scrollTop', { get: () => top, set: (v: number) => { top = v; }, configurable: true });
@@ -41,7 +33,6 @@ function scrollTo(el: HTMLDivElement, top: number) {
     el.dispatchEvent(new Event('scroll'));
 }
 
-/** Past the memory's save debounce. */
 const pastSave = () => new Promise(resolve => setTimeout(resolve, 250));
 
 describe('useScrollMemory pause', () => {
@@ -68,8 +59,6 @@ describe('useScrollMemory pause', () => {
         await pastSave();
         expect(localStorage.getItem(KEY)).toBe('900');
 
-        // The paused render lands, then the swapped-in view clamps the offset
-        // before the detaching effect has run.
         render(h(Harness, { paused: true }), container);
         scrollTo(element!, 0);
         await pastSave();

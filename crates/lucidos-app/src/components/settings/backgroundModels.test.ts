@@ -8,8 +8,6 @@ import {
   RECOMMENDED_SECTION,
 } from './backgroundModels';
 
-/** Recommended models with no recommended tier, as every row but the
- *  compactor's sends them. */
 function untiered(...models: string[]) {
   return models.map((model) => ({ model, effort: null }));
 }
@@ -48,8 +46,6 @@ describe('backgroundModelChoices', () => {
     configuredProviders.value = null;
   });
 
-  /** Every model the chat picker offers, the reachable recommended ones first
-   *  in their order. The Vertex model is recommended, but nothing configured serves it. */
   it('offers the chat picker list, recommended first, unreachable ones left out', () => {
     const choices = backgroundModelChoices(
       untiered('cheap-vertex-model', 'cheap-anthropic-model'),
@@ -61,7 +57,6 @@ describe('backgroundModelChoices', () => {
     ]);
   });
 
-  /** The recommended order wins over the registry's, and no model repeats. */
   it('keeps the recommended order and lists each model once', () => {
     configuredProviders.value = ['anthropic', 'vertex'];
     const choices = backgroundModelChoices(untiered('cheap-anthropic-model', 'cheap-vertex-model'), null);
@@ -72,15 +67,12 @@ describe('backgroundModelChoices', () => {
     ]);
   });
 
-  /** With nothing recommended to show, a lone "Other models" heading would
-   *  name a section with no sibling, so the list has none. */
   it('draws no sections when no recommended model is offered', () => {
     const choices = backgroundModelChoices([], null);
     expect(choices.every((c) => c.section === undefined)).toBe(true);
     expect(choices.map((c) => c.value)).toEqual(['flagship-model', 'cheap-anthropic-model']);
   });
 
-  /** A task that sends images offers only models that read them. */
   it('offers only image-reading models when the task needs vision', () => {
     chatModels.value = {
       status: 'loaded',
@@ -91,28 +83,22 @@ describe('backgroundModelChoices', () => {
     };
     const choices = backgroundModelChoices(untiered('cheap-anthropic-model'), null, true);
     expect(choices.map((c) => c.value)).toEqual(['flagship-model']);
-    // Other rows are unchanged.
     expect(backgroundModelChoices(untiered('cheap-anthropic-model'), null).map((c) => c.value)).toEqual([
       'cheap-anthropic-model',
       'flagship-model',
     ]);
   });
 
-  /** A stored pick that cannot read images stays listed, so the row shows
-   *  what is set, beside its caveat. */
   it('keeps a stored text-only pick on a task that needs vision', () => {
     const choices = backgroundModelChoices([], 'cheap-anthropic-model', true);
     expect(choices.map((c) => c.value)).toEqual(['cheap-anthropic-model']);
   });
 
-  /** A stored pick nothing serves still renders as selected. */
   it('keeps a stored pick the registry does not offer', () => {
     const choices = backgroundModelChoices(untiered('cheap-anthropic-model'), 'cheap-vertex-model');
     expect(choices.map((c) => c.value)).toContain('cheap-vertex-model');
   });
 
-  /** The engine names a recommended tier only on the compactor's row. A model
-   *  carries the tier it was sent, and no other model carries one. */
   it('carries the recommended tier the engine sends, and only that', () => {
     const choices = backgroundModelChoices(
       [{ model: 'cheap-anthropic-model', effort: 'low' }],
@@ -168,15 +154,12 @@ describe('backgroundRowCaveat', () => {
     expect(backgroundRowCaveat(row(true, { needs_vision: true, vision: true }), null)).toBeNull();
   });
 
-  /** An unreachable model is the louder problem, so it wins. */
   it('names an unreachable model before an image-blind one', () => {
     expect(backgroundRowCaveat(row(false, { needs_vision: true }), null)).toBe(
       'No configured provider serves this model',
     );
   });
 
-  /** A provider refusing the pick is not a missing credential, and adding
-   *  one would not help, so it gets its own sentence (ADR 0403). */
   it('says when the provider no longer serves the pick', () => {
     expect(
       backgroundRowCaveat(row(false, { not_served: ['cheap-vertex-model'] }), null),
@@ -198,7 +181,6 @@ describe('backgroundRowCaveat', () => {
     ).toBe('Retired, so this runs its successor newer-model');
   });
 
-  /** The step back outranks the not-served list: it says what runs. */
   it('names the earlier version a refused pick runs', () => {
     expect(
       backgroundRowCaveat(
@@ -212,7 +194,6 @@ describe('backgroundRowCaveat', () => {
     ).toBe('newer-model is not served here, so this runs older-model, an earlier version');
   });
 
-  /** A default can both pass over a refused model and run a successor. */
   it('keeps what a default moved past beside the generation it runs', () => {
     expect(
       backgroundRowCaveat(
@@ -240,7 +221,6 @@ describe('backgroundRowCaveat', () => {
     ).toBe('Retired, but newer-model is not served here, so this keeps running older-model');
   });
 
-  /** The wake decision asks nothing then, so its parents always wake. */
   it('says when no measured model is reachable', () => {
     expect(
       backgroundRowCaveat(row(true, { source: 'chat-model', asks_no_model: true }), null),

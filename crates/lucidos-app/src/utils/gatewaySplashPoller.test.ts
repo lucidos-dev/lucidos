@@ -6,11 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// The gateway's boot splash (crates/lucidos-gateway/src/proxy.rs) advances its
-// status by polling its own url, not by reloading. A reload repaints the
-// whole splash and swaps the words with no transition, so a new boot phase
-// must never reload. The script lives in Rust as a string, so
-// it is lifted out of the source and run here against a fake document.
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const proxySource = readFileSync(
   resolve(__dirname, '../../../lucidos-gateway/src/proxy.rs'),
@@ -20,17 +15,14 @@ const poller = proxySource
   .split('const SPLASH_POLLER: &str = r##"<script>')[1]
   ?.split('</script>"##;')[0];
 
-/** What a fetched page says, standing in for its HTML. The fake DOMParser reads it. */
 interface Page {
   splash: boolean;
-  /** HTTP success. Defaults to true for the app and false for a splash, which is a 503. */
   ok?: boolean;
   poll?: string;
   escape?: boolean;
   label?: string;
 }
 
-/** The status the app document bakes, which the gateway stamps as `data-ready-label`. */
 const READY = 'Opening your workspace…';
 
 function runPoller(opts: { poll?: string | null; escape?: boolean; motion?: string } = {}) {
@@ -120,10 +112,6 @@ describe('gateway boot splash poller', () => {
     expect(page.swapping()).toBe(false);
   });
 
-  // The app document opens on its own baked status. Reloading straight from a
-  // boot phase would snap the words at the seam, the one status change on
-  // either surface that did not crossfade. So the old words fade out, the
-  // app's fade in, and only then does the page reload into identical text.
   it("crossfades to the app's own status, then reloads into the app", async () => {
     vi.useFakeTimers();
     const page = runPoller();

@@ -1,14 +1,4 @@
-/** The shared cap on mounted widget frames (ADR 0415).
- *
- *  Each widget frame costs renderer memory. Chrome may give it a process of
- *  its own (ADR 0227); WebKit keeps every frame in the page's one content
- *  process. Inline widgets, option widgets and dashboard tiles
- *  mount once they come on screen, and stay a while after they scroll off.
- *  This one budget caps how many are mounted at once. Past it, the frame
- *  furthest from view unmounts first and draws again when it next comes on
- *  screen. Frames in view are never evicted. */
 
-/** How many widget frames may be mounted at once, across every placement. */
 export const MAX_MOUNTED_WIDGET_FRAMES = 8;
 
 interface Claim {
@@ -18,7 +8,6 @@ interface Claim {
 
 const claims = new Set<Claim>();
 
-/** How far an element sits outside the viewport, in pixels; 0 when on it. */
 function distanceFromView(el: HTMLElement): number {
   const rect = el.getBoundingClientRect();
   const height = window.innerHeight;
@@ -27,10 +16,6 @@ function distanceFromView(el: HTMLElement): number {
   return 0;
 }
 
-/** Claim a mounted frame for `host`. Past the cap, the frame furthest from
- *  view is evicted: its `evict` runs and its claim ends. A frame in view is
- *  never evicted, since it would draw an empty box nothing re-mounts. Returns
- *  the release for an unmount. */
 export function claimWidgetFrame(host: HTMLElement, evict: () => void): () => void {
   const claim: Claim = { host, evict };
   claims.add(claim);
@@ -53,7 +38,6 @@ export function claimWidgetFrame(host: HTMLElement, evict: () => void): () => vo
   };
 }
 
-/** How many frames hold a claim now. */
 export function mountedWidgetFrameCount(): number {
   return claims.size;
 }

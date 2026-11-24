@@ -16,9 +16,6 @@ import {
 import { minDrawerWidth, minThreadPanePx, minContentPanePx, type PaneFloors } from '../../store/paneMinimums';
 
 const TOTAL = 1000;
-// The pane floors are derived from the root font size now (paneMinimums.ts), so
-// read them rather than restating the retired 300 / 360 constants. The harness
-// answers a 16px root, where they are 338 and 360.
 const MIN_THREAD = minThreadPanePx();
 const MIN_CONTENT = minContentPanePx();
 const BOUNDS = { minThreadPx: MIN_THREAD, minContentPx: MIN_CONTENT };
@@ -31,8 +28,6 @@ describe('clampToRange', () => {
   });
 
   it('keeps the LEADING side whole when the range is empty', () => {
-    // hi < lo: the container cannot hold both minimums. A bare
-    // min-then-max would answer `hi` and hand the space to the trailing pane.
     expect(clampToRange(0, 300, 200)).toBe(300);
     expect(clampToRange(1000, 300, 200)).toBe(300);
   });
@@ -48,7 +43,6 @@ describe('computeDrawnSplitRatio: the Canvas yields instead of squeezing', () =>
   });
 
   it('holds both floors when there is room for both', () => {
-    // 300px was the old Conversation floor, and is where the reported overlap sat.
     expect(computeDrawnSplitRatio(300 / TOTAL, TOTAL, BOUNDS, null)).toBe(MIN_THREAD / TOTAL);
     expect(computeDrawnSplitRatio(0.99, TOTAL, BOUNDS, null)).toBe((TOTAL - MIN_CONTENT) / TOTAL);
   });
@@ -88,17 +82,13 @@ describe('computeDrawnSplitRatio: the Canvas yields instead of squeezing', () =>
   });
 
   it('holds the collapse state it is given, for a drag in flight', () => {
-    // Open at drag start: the room ran out under the pointer, but no
-    // attribute flips until release. Strictly inside (0, 1), as a drag needs.
     const squeezed = computeDrawnSplitRatio(0.4, BOTH - 100, BOUNDS, false);
     expect(squeezed).toBeGreaterThan(0);
     expect(squeezed).toBeLessThan(1);
-    // Yielded at drag start: the room came back, still drawn collapsed.
     expect(computeDrawnSplitRatio(0.4, TOTAL * 2, BOUNDS, true)).toBe(1);
   });
 
   it('returns the stored ratio once the room comes back', () => {
-    // The stored ratio is never rewritten, so re-widening restores it.
     const stored = 0.45;
     expect(computeDrawnSplitRatio(stored, BOTH - 1, BOUNDS, null)).toBe(1);
     expect(computeDrawnSplitRatio(stored, 1600, BOUNDS, null)).toBe(stored);
@@ -143,11 +133,6 @@ describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
   });
 
   it('holds that guarantee even when the container is SMALLER than a minimum', () => {
-    // The case the pane-minimum clamp alone gets wrong, and it is reachable: a
-    // drawer width persisted from a wider window can leave the split at 520px
-    // while a 175% root puts the thread minimum at 525. `clampToRange` hands
-    // back 525, and 525/520 rounds to exactly 1, collapsing the content pane
-    // under the pointer. ADR 0056's whole argument depends on this not happening.
     const bounds = { minThreadPx: 525, minContentPx: 630 };
     for (const total of [520, 400, 100, 10, 3]) {
       for (const px of [-500, 0, total / 2, total, 5000]) {
@@ -165,7 +150,6 @@ describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
   });
 
   it('degrades deterministically when the container cannot fit both minimums', () => {
-    // 175% ui-scale on a narrow split: thread 525 + content 630 against 800.
     const total = 800;
     const bounds = { minThreadPx: 525, minContentPx: 630 };
     for (const px of [-100, 0, 400, 800, 5000]) {
@@ -174,7 +158,6 @@ describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
       expect(r, `pointer ${px}`).toBeLessThanOrEqual(1);
       expect(Number.isFinite(r), `pointer ${px}`).toBe(true);
     }
-    // The leading pane keeps its minimum; the trailing one takes what is left.
     expect(clampSplitRatio(0, total, bounds)).toBe(525 / total);
   });
 
@@ -185,18 +168,12 @@ describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
 
 describe('the drawer divider drag, which clamps through the same two helpers', () => {
   it('stops at the drawer floor and at the thread pane ceiling', () => {
-    // DrawerDivider clamps the pointer into [its floor, row - threadMin - content].
     expect(clampToRange(300, 200, 500)).toBe(300);
     expect(clampToRange(-9999, 200, 500)).toBe(200);
     expect(clampToRange(9999, 200, 500)).toBe(500);
   });
 
   it('keeps the split off ZERO when the row cannot hold the drawer AND both panes', () => {
-    // The empty-range case from the drawer's side: the ceiling drops below the
-    // floor, the drawer holds its floor, and the space left for the split can
-    // come out at or below the content pane's held width. The remainder the
-    // divider hands to `clampSplitRatio` is then <= 0, which used to write a
-    // ratio of exactly 0 and collapse the thread pane under the pointer.
     const bounds = { minThreadPx: 525, minContentPx: 630 };
     for (const remainder of [0, -1, -400]) {
       const r = clampSplitRatio(remainder, 900, bounds);
@@ -217,7 +194,6 @@ describe('computeStepRatio — keyboard resize of the split divider', () => {
   it('clamps immediately at the thread-pane minimum instead of collapsing', () => {
     const nearMin = (MIN_THREAD + 10) / TOTAL;
     expect(computeStepRatio(nearMin, TOTAL, -STEP, BOUNDS)).toBe(MIN_THREAD / TOTAL);
-    // Already at the minimum: nothing to do.
     expect(computeStepRatio(MIN_THREAD / TOTAL, TOTAL, -STEP, BOUNDS)).toBeNull();
   });
 
@@ -229,9 +205,7 @@ describe('computeStepRatio — keyboard resize of the split divider', () => {
   });
 
   it('reopens a collapsed pane at its minimum when stepping back in', () => {
-    // Thread pane collapsed; widening reopens it at MIN_THREAD.
     expect(computeStepRatio(0, TOTAL, STEP, BOUNDS)).toBe(MIN_THREAD / TOTAL);
-    // Content pane collapsed; narrowing the thread pane reopens content at its minimum.
     expect(computeStepRatio(1, TOTAL, -STEP, BOUNDS)).toBe((TOTAL - MIN_CONTENT) / TOTAL);
   });
 
@@ -250,8 +224,6 @@ describe('computeDrawerStepWidth — keyboard resize of the thread drawer', () =
   const STEP = KEYBOARD_RESIZE_STEP_PX;
   const MAX = 900;
 
-  // The floor is a CALLER measurement now (derived from the root font size and
-  // the desktop build), passed in like maxPx so this module stays pure math.
   const MIN = minDrawerWidth();
 
   it('steps the width by the given delta in both directions', () => {
@@ -275,7 +247,6 @@ describe('computeDrawerStepWidth — keyboard resize of the thread drawer', () =
 });
 
 describe('computeDrawnLayout: the Conversation is never squeezed below its floor', () => {
-  // Floors at 100%, with New thread and Home leading the Conversation row.
   const FLOORS: PaneFloors = { drawerPx: 320, minThreadPx: 498, minContentPx: 360, railPx: 364 };
   const DIVIDER = 3;
   const FREE: HeldSideYields = { drawer: null, rail: null };
@@ -342,8 +313,6 @@ describe('computeDrawnLayout: the Conversation is never squeezed below its floor
   });
 
   it('holds the rail to leave the drawn drawer, the Conversation and the Canvas their floors', () => {
-    // Decision 5: the hold counts the drawn drawer. Without a drawer the same
-    // rail would draw wider.
     const withDrawer = computeDrawnLayout(room(1800), open(400), open(1100), FREE);
     expect(withDrawer.rail.widthPx).toBe(1800 - 400 - DIVIDER - FLOORS.minThreadPx - FLOORS.minContentPx);
     const alone = computeDrawnLayout(room(1800), shut, open(1100), FREE);
@@ -369,11 +338,9 @@ describe('computeDrawnLayout: the Conversation is never squeezed below its floor
   });
 
   it('holds a pinned yield through a change of room, for a drag in flight', () => {
-    // Drawn at drag start: the room ran out under the pointer, and both stay.
     const squeezed = computeDrawnLayout(room(DRAWER_ONLY), open(400), open(450), { drawer: false, rail: false });
     expect(squeezed.drawer.drawn).toBe(true);
     expect(squeezed.rail.drawn).toBe(true);
-    // Yielded at drag start: the room came back, and both stay yielded.
     const roomy = computeDrawnLayout(room(2400), open(400), open(450), { drawer: true, rail: true });
     expect(roomy.drawer.drawn).toBe(false);
     expect(roomy.rail.drawn).toBe(false);

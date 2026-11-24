@@ -1,13 +1,3 @@
-/**
- * The Claude gateway sign-in as Settings shows it: the stored account, the
- * sign-in in progress, and the gateway Claude Code's managed settings suggest.
- *
- * The engine owns the sign-in. This module reads its status and sends intent.
- * Every change reaches it as an SSE event (`ClaudeGatewaySignedIn`,
- * `ClaudeGatewaySignedOut`, `ClaudeGatewaySignInStarted`,
- * `ClaudeGatewaySignInCanceled`, `ClaudeGatewaySignInFailed`,
- * `ClaudeGatewayManagedSettingsChanged`), which reloads it.
- */
 import { signal } from '@preact/signals';
 import {
   getClaudeGatewayStatus,
@@ -36,13 +26,10 @@ export async function loadClaudeGatewayStatus(): Promise<void> {
   }
 }
 
-/** Reload only if Settings already asked for it. */
 export function refreshClaudeGatewayStatusIfLoaded(): void {
   if (claudeGatewayStatus.value.status !== 'not-loaded') void loadClaudeGatewayStatus();
 }
 
-/** Start a sign-in to `url`, storing it as the gateway URL. The status then
- *  holds the code to enter. */
 export async function submitClaudeGatewaySignIn(url: string): Promise<void> {
   try {
     await startClaudeGatewaySignIn(url);

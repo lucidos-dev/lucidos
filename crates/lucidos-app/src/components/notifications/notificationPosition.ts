@@ -5,9 +5,6 @@ export interface NotificationPosition {
   hasOlder: boolean;
 }
 
-/** Where a notification sits in the loaded inbox list, which is newest first.
- *  "Older" stays live at the last loaded row while `hasMore` is set, because the
- *  step pulls the next page before it moves. */
 export function notificationPosition(
   items: Notification[],
   id: string,

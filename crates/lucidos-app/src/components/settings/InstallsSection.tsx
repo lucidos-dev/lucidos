@@ -17,13 +17,6 @@ import { ListSkeletonOf, SkText } from '../shared/Skeleton';
 import { Explainer } from '../shared/Explainer';
 import { copyToClipboard } from '../../utils/clipboard';
 
-/** What the machine carries. One read, when this page is opened.
- *
- *  No version counter and no poll: installs change when somebody runs an
- *  installer in a terminal, which emits no event this app could subscribe to.
- *  The gateway rescans on every request, so reopening the page or pulling to
- *  refresh re-reads it, with the last list kept on screen meanwhile.
- */
 const installInventory = signal<Loadable<InstallInventory>>({ status: 'not-loaded' });
 
 async function loadInstalls(): Promise<void> {
@@ -35,25 +28,12 @@ async function loadInstalls(): Promise<void> {
   }
 }
 
-/** How each vehicle reads to a person. Mirrors `InstallKind::label` in
- *  `crates/lucidos-installs/src/lib.rs`; the wire carries the kind, never the
- *  label, so the closed union type is what keeps the two in step. */
 const KIND_LABEL: Record<InstallKind, string> = {
   'desktop-app': 'Desktop app',
   'headless-installer': 'Installer',
   'source-checkout': 'Source checkout',
 };
 
-/** One install, as a row.
- *
- *  A plain builder rather than a component, so its output is testable without a
- *  render. Skeleton mode is the `sk` flag plus the `SkText` leaves, which read
- *  the provider `ListSkeletonOf` wraps them in. Same markup either way, so the
- *  placeholder mirrors the row by construction.
- *
- *  `contended` adds how to remove it. Only an install sharing a port gets that:
- *  elsewhere there is nothing to fix, and the steps are noise.
- */
 export function installRow(install?: InstallRecord, sk = false, contended = false): VNode {
   const path = install?.root ?? install?.data_dir ?? null;
   return (
@@ -64,13 +44,9 @@ export function installRow(install?: InstallRecord, sk = false, contended = fals
           {install?.running_here && <span class="install-live"> serving this workspace</span>}
         </SkText>
         <SkText class="list-row-details" as="div" w="40%">
-          {/* A kind this build has no label for falls back to the WIRE value,
-              never to a blank. A newer gateway can name a vehicle this client
-              predates, and an empty cell would read as "no kind". */}
           <span class="list-row-type">
             {install && (KIND_LABEL[install.kind] ?? install.kind)}
           </span>
-          {/* An unreadable version says so. A blank would read as zero. */}
           <span>version {install?.version ?? 'unknown'}</span>
           <span>port {install?.port ?? 'unknown'}</span>
         </SkText>
@@ -91,8 +67,6 @@ export function installRow(install?: InstallRecord, sk = false, contended = fals
   );
 }
 
-/** How to remove one install. Only the installer's removal is a shell command,
- *  so only it is set as code with a Copy. The others are steps to follow. */
 function removalLine(install: InstallRecord): VNode {
   return (
     <div class="list-row-details list-row-details-prose">
@@ -111,11 +85,6 @@ function removalLine(install: InstallRecord): VNode {
   );
 }
 
-/** The warning for one contended port.
- *
- *  Only a contended port earns one. Two installs on two ports are a supported
- *  setup, and warning about that would be a nag on every developer machine.
- */
 export function installConflictNotice(conflict: InstallPortConflict): VNode {
   return (
     <div class="system-notice">
@@ -129,7 +98,6 @@ export function installConflictNotice(conflict: InstallPortConflict): VNode {
   );
 }
 
-/** Every Lucidos install on this machine, and a warning when two want one port. */
 export function InstallsSection() {
   const loadable = installInventory.value;
   const showSkeleton = useDelayedLoading(loadable);
@@ -168,10 +136,6 @@ export function InstallsSection() {
         <LoadableError noun="the installs on this machine" error={loadable.error} />
       )}
 
-      {/* `cloneElement` for the key rather than a wrapper div: these are flex
-          children of their container, and an unstyled box between the two
-          would take the child's place in that layout. Same idiom
-          `ListSkeletonOf` uses to key its fanned-out rows. */}
       {inventory?.conflicts.map((conflict) =>
         cloneElement(installConflictNotice(conflict), { key: conflict.port }),
       )}
@@ -196,9 +160,6 @@ export function InstallsSection() {
               )}
             </div>
           ) : (
-            // Loaded and empty is not the same as still loading, and it is not
-            // nothing: this page is being served BY an install, so finding
-            // none means the scan could not read the machine.
             <div class="empty-state">
               No installs found. Something is serving this page, so the scan could
               not read this machine.

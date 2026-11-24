@@ -1,20 +1,3 @@
-/**
- * Tests the reveal animation eligibility logic for ThreadView.
- *
- * shouldRevealThread determines eligibility — the actual animation also
- * requires revealOnFocus to be true (checked in the layout effect, not here).
- *
- * Eligible when:
- * - Thread ID is set
- * - Not currently animating (FLIP)
- * - Content is available
- * - Thread hasn't already been revealed
- *
- * Not eligible:
- * - On same-thread re-renders
- * - While FLIP animation is in progress
- * - While events haven't loaded yet
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { shouldRevealThread, commitReveal, resetRevealTracking } from '../ThreadView';
 
@@ -42,14 +25,14 @@ describe('thread reveal animation eligibility', () => {
   it('eligible on thread switch after unmount', () => {
     expect(shouldRevealThread('thread-a', false, true)).toBe(true);
     commitReveal('thread-a');
-    resetRevealTracking(); // simulates unmount
+    resetRevealTracking();
     expect(shouldRevealThread('thread-b', false, true)).toBe(true);
   });
 
   it('eligible when returning to same thread after unmount', () => {
     expect(shouldRevealThread('thread-a', false, true)).toBe(true);
     commitReveal('thread-a');
-    resetRevealTracking(); // simulates unmount
+    resetRevealTracking();
     expect(shouldRevealThread('thread-a', false, true)).toBe(true);
   });
 

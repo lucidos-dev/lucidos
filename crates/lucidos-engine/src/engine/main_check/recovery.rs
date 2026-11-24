@@ -38,14 +38,15 @@ pub(super) struct Recovered {
     /// The check that was running when the engine stopped, with its run on
     /// record. It stays running, and the next start reattaches to the run.
     pub(super) reattach: Option<(CheckRange, RunLink)>,
-    /// The open red whose fix landed before a restart cut its close off.
-    pub(super) fix_landed: Option<Uuid>,
+    /// Fix closures inferred at landing that still need a recorded
+    /// acknowledgment: each red's check id and its repair owner.
+    pub(super) fix_landed: Vec<(Uuid, Uuid)>,
 }
 
 /// Fold the records, oldest first. Nothing here starts a check.
 pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
     let mut check = MainCheck::default();
-    let mut fix_landed = None;
+    let mut fix_landed = Vec::new();
     let mut linked: Option<(Uuid, RunLink)> = None;
     for record in records {
         match record {
@@ -59,7 +60,7 @@ pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
             }
             MainCheckRecord::RedClosed(check_id) => {
                 check.replay_red_closed(*check_id);
-                fix_landed = fix_landed.filter(|red| red != check_id);
+                fix_landed.retain(|(red, _)| red != check_id);
             }
             MainCheckRecord::Landed { thread_id, pre_sha } => {
                 if let Some(thread) = thread_id {
@@ -67,7 +68,11 @@ pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
                 }
                 if let Some(red) = check.red() {
                     if *thread_id == Some(red.fix_thread_id) {
-                        fix_landed = Some(red.range.check_id);
+                        let check_id = red.range.check_id;
+                        let owner = red.fix_thread_id;
+                        fix_landed.push((check_id, owner));
+                        check.mark_running_before_fix(owner);
+                        check.replay_red_closed(check_id);
                     }
                 }
                 check.replay_landed(pre_sha.as_deref());
@@ -83,7 +88,6 @@ pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
     } else {
         check.take_interrupted()
     };
-    let fix_landed = fix_landed.filter(|red| check.red().is_some_and(|r| r.range.check_id == *red));
     Recovered {
         check,
         interrupted,
@@ -201,7 +205,7 @@ mod tests {
         let red = recovered.check.red().expect("red");
         assert_eq!(red.fix_thread_id, id(9));
         assert!(recovered.interrupted.is_none());
-        assert!(recovered.fix_landed.is_none());
+        assert!(recovered.fix_landed.is_empty());
         assert!(
             recovered.check.dirty(),
             "the landing during the run is unchecked"
@@ -216,12 +220,84 @@ mod tests {
             ended(1, failed(9)),
             landed(Some(9), "b"),
         ];
-        assert_eq!(fold(&records).fix_landed, Some(id(1)));
+        assert_eq!(fold(&records).fix_landed, vec![(id(1), id(9))]);
         let mut closed = records;
         closed.push(MainCheckRecord::RedClosed(id(1)));
         let recovered = fold(&closed);
-        assert_eq!(recovered.fix_landed, None);
+        assert!(recovered.fix_landed.is_empty());
         assert!(recovered.check.red().is_none());
+    }
+
+    #[test]
+    fn a_late_healed_close_never_supersedes_the_newer_run() {
+        for late_close in [false, true] {
+            let mut records = vec![
+                started(1, "a", "b"),
+                ended(1, failed(9)),
+                started(2, "b", "c"),
+                landed(Some(9), "c"),
+                ended(2, Verdict::SupersededFailure),
+                started(3, "c", "d"),
+                run_linked(3),
+            ];
+            if late_close {
+                records.push(MainCheckRecord::RedClosed(id(1)));
+            }
+            let mut recovered = fold(&records);
+            assert_eq!(recovered.check.superseded_by_fix(Some("d")), None);
+            recovered.check.ended(id(3), failed(8), Some("d"), id(4));
+            assert_eq!(recovered.check.red().unwrap().range.check_id, id(3));
+        }
+    }
+
+    #[test]
+    fn a_replayed_fix_marks_only_the_run_already_in_flight() {
+        let mut recovered = fold(&[
+            started(1, "a", "b"),
+            ended(1, failed(9)),
+            started(2, "b", "c"),
+            run_linked(2),
+            landed(Some(9), "c"),
+        ]);
+        assert_eq!(recovered.check.superseded_by_fix(Some("d")), Some(id(9)));
+        recovered.check.ended(id(2), failed(8), Some("d"), id(3));
+        assert!(recovered.check.red().is_none());
+        assert_eq!(recovered.check.running().unwrap().check_id, id(3));
+    }
+
+    #[test]
+    fn a_recorded_current_tip_failure_survives_a_missing_or_delayed_close() {
+        let mut live = MainCheck::default();
+        live.landed(Some("a"), false, Some("b"), id(1));
+        live.ended(id(1), failed(9), Some("b"), id(2));
+        live.landed(Some("b"), false, Some("d"), id(2));
+        live.landed(Some("c"), true, Some("d"), id(3));
+        live.ended(id(2), failed(8), Some("d"), id(4));
+        for late_close in [false, true] {
+            let mut records = vec![
+                started(1, "a", "b"),
+                ended(1, failed(9)),
+                started(2, "b", "d"),
+                landed(Some(9), "c"),
+                ended(2, failed(8)),
+            ];
+            if late_close {
+                records.push(MainCheckRecord::RedClosed(id(1)));
+            }
+            let recovered = fold(&records);
+            assert_eq!(recovered.check.red(), live.red());
+            assert_eq!(recovered.check.repair_owner(), live.repair_owner());
+            assert_eq!(recovered.check.running(), live.running());
+            assert_eq!(recovered.check.red_notice_id(), Some(id(2)));
+            assert_eq!(
+                recovered.fix_landed,
+                if late_close {
+                    vec![]
+                } else {
+                    vec![(id(1), id(9))]
+                }
+            );
+        }
     }
 
     #[test]
@@ -283,5 +359,68 @@ mod tests {
         assert!(restored.check.red().is_some());
         records.push(landed(None, "c"));
         assert!(fold(&records).check.dirty(), "new work remains owed");
+    }
+}
+
+#[cfg(test)]
+mod continued_red_tests {
+    use super::*;
+
+    #[test]
+    fn a_continued_failure_keeps_its_owner_and_a_pass_closes_red() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let failed = |fix_thread_id| Verdict::Failed {
+            summary: "Failed: engine".into(),
+            tail: String::new(),
+            failures: Vec::new(),
+            run_url: None,
+            fix_thread_id,
+        };
+        let mut records = vec![
+            MainCheckRecord::Started(CheckRange {
+                check_id: first,
+                from_sha: "a".into(),
+                to_sha: "b".into(),
+            }),
+            MainCheckRecord::Ended {
+                check_id: first,
+                verdict: failed(owner),
+            },
+            MainCheckRecord::Started(CheckRange {
+                check_id: second,
+                from_sha: "b".into(),
+                to_sha: "c".into(),
+            }),
+            MainCheckRecord::Ended {
+                check_id: second,
+                verdict: failed(owner),
+            },
+        ];
+        let recovered = fold(&records);
+        assert_eq!(recovered.check.red().unwrap().fix_thread_id, owner);
+        assert_eq!(recovered.check.red().unwrap().range.check_id, second);
+        let third = Uuid::new_v4();
+        records.extend([
+            MainCheckRecord::Started(CheckRange {
+                check_id: third,
+                from_sha: "c".into(),
+                to_sha: "d".into(),
+            }),
+            MainCheckRecord::Ended {
+                check_id: third,
+                verdict: Verdict::Passed,
+            },
+            MainCheckRecord::RedClosed(second),
+        ]);
+        assert!(fold(&records).check.red().is_none());
+        assert!(matches!(
+            records[1],
+            MainCheckRecord::Ended {
+                verdict: Verdict::Failed { .. },
+                ..
+            }
+        ));
     }
 }

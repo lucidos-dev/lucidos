@@ -103,14 +103,14 @@ async fn resolve_one_type(
         let body = match response {
             Ok(r) if r.status().is_success() => r.text().await,
             Ok(r) => {
-                log!(
+                log_legacy!(
                     "[WebhookIngress] {endpoint} answered {} for {host}",
                     r.status()
                 );
                 continue;
             }
             Err(e) => {
-                log!("[WebhookIngress] {endpoint} could not be reached: {e}");
+                log_legacy!("[WebhookIngress] {endpoint} could not be reached: {e}");
                 continue;
             }
         };
@@ -122,11 +122,11 @@ async fn resolve_one_type(
                 // neighbour resolves is the flap this walk exists to survive.
                 Some(_) => {
                     answered += 1;
-                    log!("[WebhookIngress] {endpoint} named no public address for {host}");
+                    log_legacy!("[WebhookIngress] {endpoint} named no public address for {host}");
                 }
-                None => log!("[WebhookIngress] {endpoint} did not answer for {host}"),
+                None => log_legacy!("[WebhookIngress] {endpoint} did not answer for {host}"),
             },
-            Err(e) => log!("[WebhookIngress] {endpoint} answer could not be read: {e}"),
+            Err(e) => log_legacy!("[WebhookIngress] {endpoint} answer could not be read: {e}"),
         }
     }
     (answered > 0 && answered == endpoints.len()).then(Vec::new)

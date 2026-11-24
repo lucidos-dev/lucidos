@@ -1,18 +1,10 @@
 import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openTriggersPanel, clickVisibleElement, isMobileViewport } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-// A content-pane navigation fades its view in from behind the navigation cover,
-// while the header title switches word at once, with no fade of its own. The
-// drawer's Threads/Filters swap dips instead
-// (threads-header-filter-transitions.spec).
-// Unsuffixed, so it runs on desktop Chromium, phone Chromium and iPhone WebKit.
 
-/** The slider's slowest position: 0.1x, so --duration-normal lasts 2s. */
 const SLOWEST = '-10';
-/** A slowed arrival, plus its fuse and room for the frame it lands on. */
 const SLOW_FADE_MS = 2_900;
 
 interface Frame { veil: number; text: string; opacity: number }
@@ -23,8 +15,6 @@ function titleSelector(page: Page): string {
     : '.desktop-header .pane-header-content-title .pane-header-title-text';
 }
 
-/** Opens the nav drawer, then picks `label` and samples the frames after the
- *  click on the page's own clock. */
 async function navigateAndSample(page: Page, label: string): Promise<{ frames: Frame[]; starts: number[] }> {
   await clickVisibleElement(page, '.hamburger-panel');
   await expect(page.locator('.drawer-item:visible', { hasText: label }).first()).toBeVisible();

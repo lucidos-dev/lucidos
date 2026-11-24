@@ -1,26 +1,3 @@
-/**
- * Shared reader for the CSS source scans. Several suites pin a geometry
- * contract by asserting on the declarations a rule actually carries (the
- * below-header anchor, the toast corner, the transcript fades), and
- * each had grown its own byte-identical copy of the two string functions.
- *
- * Two readers here, and picking the wrong one is the trap this header exists
- * for. `styleSheetPaths` feeds either one when the scan is over every sheet
- * rather than a named file.
- *
- * `block` + `decl` resolve the FIRST TEXTUAL match, which is right for the
- * common case: one rule you can name, and a handful of its declarations. It is
- * wrong the moment a sheet can override that rule elsewhere, because a first
- * match reads neither an `@media` copy below it nor a compound selector that
- * beats it on specificity, and both look like a passing scan.
- *
- * `cssRules` + `rulesTargeting` parse with postcss instead, and are the tool
- * when the assertion is about a rule NOT being overridden anywhere, or about
- * the at-rules a rule is nested inside. Nesting depth, comments and strings
- * come out correct for free rather than by counting braces.
- * (`engine-served-css-parses.test.ts` uses postcss directly, as a parse gate
- * rather than a reader.)
- */
 import { expect } from 'vitest';
 import postcss, { type AtRule, type Container, type Declaration, type Document } from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -30,24 +7,15 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-/** Repo root, from `crates/lucidos-app/src/styles/__tests__/`. */
 export const REPO_ROOT: string = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..');
 
-/** Stylesheets the engine serves to app frames, relative to the repo root.
- *  The generated frame sheet holds the same rules the engine renders at
- *  runtime. Add a new one here in the same change that adds the
- *  `include_str!`. */
 export const ENGINE_SERVED_CSS = [
-  'crates/lucidos-engine/src/api/sdk_iframe.css',
-  'crates/lucidos-engine/src/api/sdk_iframe_shapes.css',
-  'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css',
+  'crates/lucidos-agents-api/src/api/sdk_iframe.css',
+  'crates/lucidos-agents-api/src/api/sdk_iframe_shapes.css',
+  'crates/lucidos-agents-api/src/api/sdk_iframe_control_theme_parts.css',
   'crates/lucidos-app/src/styles/generated/theme-parts-frame.css',
 ] as const;
 
-/** Every stylesheet under `root`, recursively, as absolute paths. It skips
- *  `__tests__` so a fixture never reads as shipping CSS. Shared because a scan
- *  asking "does any sheet do X" has to see all of them, and three suites had
- *  grown the same walk. */
 export function styleSheetPaths(root: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(root)) {
@@ -62,9 +30,6 @@ export function styleSheetPaths(root: string): string[] {
   return out;
 }
 
-/** Every shipping TS/TSX source under `root`, recursively: tests, `__tests__`
- *  and `generated/` skipped. The script-side twin of `styleSheetPaths`, for a
- *  scan asking "does any source do X". */
 export function clientSourcePaths(root: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(root)) {
@@ -79,9 +44,6 @@ export function clientSourcePaths(root: string): string[] {
   return out;
 }
 
-/** Body of the first rule/at-rule block whose header matches `needle`, starting
- *  the search at `from`. Brace-matched, so a nested block (a `:root` inside a
- *  `@media`) is returned whole instead of being cut at the first `}`. */
 export function block(css: string, needle: string, from = 0): string {
   const at = css.indexOf(needle, from);
   expect(at, `"${needle}" not found`).toBeGreaterThanOrEqual(0);
@@ -94,34 +56,36 @@ export function block(css: string, needle: string, from = 0): string {
   throw new Error(`unterminated block for "${needle}"`);
 }
 
-/** A declaration's value, or null when the block doesn't set that property. */
 export function decl(body: string, prop: string): string | null {
   const m = body.match(new RegExp(`(?:^|[;{]|\\*/)\\s*${prop}:\\s*([^;]+);`));
   return m ? m[1].replace(/\s+/g, ' ').trim() : null;
 }
 
-/** The focus ring's band in rem, from `--focus-ring-width` in base.css's text.
- *  A clip that must let the ring out compares its slack against this. */
 export function focusRingWidthRem(baseCss: string): number {
   const m = /--focus-ring-width:\s*([\d.]+)rem;/.exec(baseCss);
   expect(m, '--focus-ring-width is no longer a rem token in base.css').not.toBeNull();
   return parseFloat(m![1]);
 }
 
-/** One style rule, with the at-rule preludes it is nested inside. */
 export interface CssRule {
-  /** The rule's own selector list, whitespace-collapsed. */
   selector: string;
-  /** `@media …` ancestors, outermost first, space-joined; empty at top level. */
   atRules: string;
-  /** Declarations in source order as `prop: value`, joined by `; `. */
   body: string;
-  /** The same declarations keyed by property, last one within the rule winning. */
   props: Map<string, string>;
 }
 
-/** Every style rule in the sheet, in source order. */
+const parsedSheets = new Map<string, CssRule[]>();
+
 export function cssRules(css: string): CssRule[] {
+  let rules = parsedSheets.get(css);
+  if (!rules) {
+    rules = parseRules(css);
+    parsedSheets.set(css, rules);
+  }
+  return [...rules];
+}
+
+function parseRules(css: string): CssRule[] {
   const out: CssRule[] = [];
   postcss.parse(css).walkRules(rule => {
     const at: string[] = [];
@@ -142,46 +106,25 @@ export function cssRules(css: string): CssRule[] {
   return out;
 }
 
-/** The root the client publishes reduced motion on (`utils/motion.ts`). */
 export const REDUCED_MOTION_ROOT = ':root[data-motion="reduce"]';
 
-/** Whether every member of a rule's selector list applies only under reduced
- *  motion. The stylesheets key on the attribute, never on the media query, so
- *  the in-app Motion setting reaches them in both directions. */
 export function isReducedMotionRule(rule: CssRule): boolean {
   return selectorList(rule.selector).every(s => s.startsWith(REDUCED_MOTION_ROOT));
 }
 
-/** The classes a content-pane column view root carries, as ContentPane mounts them. */
 export const COLUMN_VIEW_ROOTS = [
   'content-view', 'panel-content', 'settings-panel', 'apps-view', 'plugins-view',
   'notification-detail', 'plugin-detail', 'inline-form',
 ] as const;
 
-/** Every content-pane view root: the columns plus the full-bleed views. */
 export const CONTENT_VIEW_ROOTS = [
   ...COLUMN_VIEW_ROOTS, 'file-preview-frame', 'app-ui-inline', 'url-preview-inline',
 ] as const;
 
-/**
- * A rule's selector list, one member per entry, trimmed.
- *
- * Use this rather than `selector.split(',')` for the same reason
- * `rulesTargeting` does below: a plain split cannot tell a selector-list comma
- * from one inside `:is(.a, .b)`, so it hands back two halves of one member and
- * a scan asking "does this rule name `.x`" answers against a selector nobody
- * wrote. Exported because asserting on the MEMBERS of a grouped rule is its own
- * common shape, separate from asking which rules target a class.
- */
 export function selectorList(selector: string): string[] {
   return postcss.list.comma(selector).map(s => s.trim());
 }
 
-/**
- * Top-level combinators replaced by spaces, so the subject split below can be
- * a plain space split. Depth-aware, so `:is(.a > .b)` keeps its inner
- * combinator and `[class~="x"]` keeps its `~`.
- */
 function flattenCombinators(selector: string): string {
   let depth = 0;
   let out = '';
@@ -193,22 +136,6 @@ function flattenCombinators(selector: string): string {
   return out;
 }
 
-/**
- * `:has(…)` arguments removed, parens balanced by depth so a nested one goes
- * with its owner.
- *
- * Every other functional pseudo-class matches its argument against the SUBJECT
- * (`:is(.a, .b)`, `:where(…)`, `:not(…)` all still describe the element the
- * rule styles), so their contents must stay. `:has()` is the one that matches
- * against something ELSE: `.turn:has(.header)` styles the turn precisely
- * BECAUSE it contains a header, and styles the header not at all. Left in, a
- * class named there reads as the subject, and a scan asking "what styles
- * `.header`" answers with a rule that never touches it. That is not
- * hypothetical: the transcript's tail room was reserved on
- * `.chat-exchange:last-child:has(.response-header)`, and its `min-height` was
- * read as the response header's own. (That rule is gone, the room with it, but
- * the trap it sprang is a property of `:has()` and stays.)
- */
 function stripHas(selector: string): string {
   let out = '';
   for (let i = 0; i < selector.length; i++) {
@@ -222,22 +149,6 @@ function stripHas(selector: string): string {
   return out;
 }
 
-/**
- * Every rule that styles the ELEMENT carrying `className`, in source order.
- *
- * The subject of a selector is its last compound, so this keeps
- * `.a .target`, `.target.state` and a bare `.target` (all of which style the
- * element) and drops `.target .child` (which styles a descendant),
- * `.target::-webkit-scrollbar` (which styles a pseudo-element, not the box)
- * and `.other:has(.target)` (which styles whatever CONTAINS the target; see
- * `stripHas`).
- * That distinction is the whole point: a scan asserting "nothing re-enables X"
- * has to see the compound and descendant-combinator forms that outrank the
- * bare rule, and must not trip over rules aimed at children.
- *
- * Split with postcss's own list tokenizers rather than `String.split`, which
- * cannot tell a selector-list comma from one inside `:is(.a, .b)`.
- */
 export function rulesTargeting(css: string, className: string): CssRule[] {
   const token = new RegExp(`\\.${className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`);
   return cssRules(css).filter(rule =>

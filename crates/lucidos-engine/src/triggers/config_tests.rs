@@ -1175,6 +1175,29 @@ fn apply_update_replaces_and_clears_side_effect_grant() {
     assert!(config.side_effect_grant.is_empty());
 }
 
+#[test]
+fn apply_update_revokes_one_folder_grant_and_keeps_the_others() {
+    let mut config = created_with(json!({}));
+    config.apply_update(&json!({
+        "trigger_id": "t-model",
+        "folder_grants": [
+            { "folder": "/outside/one", "device": 1, "inode": 10 },
+            { "folder": "/outside/two", "device": 1, "inode": 20 },
+        ],
+    }));
+    assert_eq!(config.folder_grants.len(), 2);
+    config.apply_update(&json!({
+        "trigger_id": "t-model",
+        "revoke_folder_grants": ["/outside/one", "/outside/unknown"],
+    }));
+    let left: Vec<_> = config
+        .folder_grants
+        .iter()
+        .map(|g| g.folder.clone())
+        .collect();
+    assert_eq!(left, vec![std::path::PathBuf::from("/outside/two")]);
+}
+
 // --- Coding-agent grant ---
 
 /// Absent reads as no grant, so a trigger stored before the field existed
@@ -1802,4 +1825,201 @@ fn a_created_payload_reads_back_to_the_same_config_by_create_and_by_update() {
     .unwrap();
     updated.apply_update(&payload);
     assert_eq!(json!(updated), json!(config));
+}
+
+/// The definition digest hashes what a trigger runs and when: `run`, `on`, the
+/// cron, its MCP servers and its app (I17). Key and server order never move
+/// it, and neither do its name, pause or grants.
+#[test]
+fn the_definition_digest_binds_what_runs_and_nothing_else() {
+    let base = || {
+        TriggerConfig::from_created_payload(&json!({
+            "trigger_id": "t1", "name": "Digest", "schedule": ["0 0 8 * * *"],
+            "timezone": "UTC",
+            "run": { "type": "intent", "intent": "Summarise the inbox." },
+            "on": [{ "event_type": "X", "condition": { "a": 1, "b": { "c": 2, "d": 3 } } }],
+            "mcp_servers": ["slack", "github"],
+            "app_id": "habit-tracker",
+        }))
+        .unwrap()
+    };
+    let digest = base().definition_digest();
+    assert_eq!(digest.len(), 64, "a hex SHA-256: {digest}");
+    assert_eq!(digest, base().definition_digest(), "stable across reads");
+
+    let mut same = base();
+    same.mcp_servers.reverse();
+    same.on[0].condition = Some(json!({ "b": { "d": 3, "c": 2 }, "a": 1 }));
+    same.name = "Renamed".into();
+    same.paused = true;
+    same.coding_agent_grant = true;
+    same.side_effect_grant = vec![SideEffectCategory::Email];
+    same.model = Some("mock".into());
+    assert_eq!(
+        same.definition_digest(),
+        digest,
+        "only the definition counts"
+    );
+
+    type Edit = fn(&mut TriggerConfig);
+    let edits: [(&str, Edit); 5] = [
+        ("run", |c| {
+            c.run = TriggerRun::Intent {
+                intent: "Delete the inbox.".into(),
+            }
+        }),
+        ("on", |c| c.on[0].event_type = "Y".into()),
+        ("cron", |c| c.schedule = vec!["0 0 9 * * *".into()]),
+        ("mcp", |c| c.mcp_servers.push("gmail".into())),
+        ("app", |c| c.app_id = None),
+    ];
+    for (what, edit) in edits {
+        let mut changed = base();
+        edit(&mut changed);
+        assert_ne!(
+            changed.definition_digest(),
+            digest,
+            "{what} is in the digest"
+        );
+    }
+}
+
+fn deny_fixture() -> TriggerConfig {
+    TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "report",
+        "name": "Report",
+        "run": { "type": "intent", "intent": "Post the report" },
+        "program_grants": [{ "pattern": "Bash(curl:*)" }, { "pattern": "Bash(gh:*)" }],
+        "folder_grants": [{ "folder": "/outside/reports", "device": 1, "inode": 10 }],
+    }))
+    .unwrap()
+}
+
+fn patterns(config: &TriggerConfig) -> Vec<&str> {
+    config
+        .program_grants
+        .iter()
+        .map(|grant| grant.pattern.as_str())
+        .collect()
+}
+
+#[test]
+fn a_config_stored_before_denies_reads_none() {
+    let config = deny_fixture();
+    assert!(config.program_denies.is_empty());
+    assert!(config.folder_denies.is_empty());
+}
+
+#[test]
+fn a_deny_adds_only_its_entries_and_drops_the_matching_grant() {
+    let mut config = deny_fixture();
+    config.deny(
+        &["Bash(curl:*)".to_string()],
+        &[std::path::PathBuf::from("/outside/reports")],
+    );
+    assert_eq!(config.program_denies, ["Bash(curl:*)"]);
+    assert_eq!(
+        config.folder_denies,
+        [std::path::PathBuf::from("/outside/reports")]
+    );
+    assert_eq!(patterns(&config), ["Bash(gh:*)"]);
+    assert!(config.folder_grants.is_empty());
+}
+
+#[test]
+fn an_update_never_leaves_an_entry_both_granted_and_denied() {
+    let mut config = deny_fixture();
+    config.apply_update(&json!({
+        "program_denies": ["Bash(curl:*)"],
+        "folder_denies": ["/outside/reports"],
+    }));
+    assert_eq!(patterns(&config), ["Bash(gh:*)"]);
+    assert!(config.folder_grants.is_empty());
+
+    // Granting it again lifts the deny.
+    config.apply_update(&json!({
+        "program_grants": [{ "pattern": "Bash(gh:*)" }, { "pattern": "Bash(curl:*)" }],
+        "folder_grants": [{ "folder": "/outside/reports", "device": 1, "inode": 10 }],
+    }));
+    assert!(config.program_denies.is_empty());
+    assert!(config.folder_denies.is_empty());
+    assert_eq!(patterns(&config), ["Bash(gh:*)", "Bash(curl:*)"]);
+
+    // A stored payload holding both reads as the deny.
+    let mut both = config.to_created_payload();
+    both["program_denies"] = json!(["Bash(gh:*)"]);
+    let read = TriggerConfig::from_created_payload(&both).unwrap();
+    assert_eq!(patterns(&read), ["Bash(curl:*)"]);
+    assert_eq!(read.program_denies, ["Bash(gh:*)"]);
+}
+
+#[test]
+fn a_revoke_lifts_only_the_named_deny() {
+    let mut config = deny_fixture();
+    config.deny(
+        &["Bash(curl:*)".to_string(), "Bash(jq:*)".to_string()],
+        &[std::path::PathBuf::from("/outside/reports")],
+    );
+    config.apply_update(&json!({
+        "revoke_program_denies": ["Bash(jq:*)"],
+        "revoke_folder_denies": ["/outside/reports"],
+    }));
+    assert_eq!(config.program_denies, ["Bash(curl:*)"]);
+    assert!(config.folder_denies.is_empty());
+    assert_eq!(patterns(&config), ["Bash(gh:*)"], "a revoke grants nothing");
+}
+
+#[test]
+fn a_folder_deny_covers_the_folders_inside_it() {
+    let mut config = deny_fixture();
+    config.deny(&[], &[std::path::PathBuf::from("/outside/reports")]);
+    let inside = std::path::Path::new("/outside/reports/2026");
+    assert_eq!(
+        config.denied_folder(inside),
+        Some(std::path::Path::new("/outside/reports"))
+    );
+    assert_eq!(
+        config.denied_folder(std::path::Path::new("/outside/reports-old")),
+        None
+    );
+    assert!(!config.denies_program("Bash(curl:*)"));
+}
+
+#[test]
+fn a_folder_deny_and_a_grant_that_nest_cannot_both_stand() {
+    // A deny inside a granted folder drops the grant, or the grant would let
+    // the writes through and the deny would never fire.
+    let mut config = deny_fixture();
+    config.deny(&[], &[std::path::PathBuf::from("/outside/reports/private")]);
+    assert!(config.folder_grants.is_empty());
+
+    // A grant inside a denied folder lifts that deny.
+    config.apply_update(&json!({
+        "folder_grants": [{ "folder": "/outside/reports/private/2026", "device": 1, "inode": 11 }],
+    }));
+    assert!(config.folder_denies.is_empty());
+    assert_eq!(config.folder_grants.len(), 1);
+
+    // A sibling folder that only shares a prefix is not nested.
+    config.deny(
+        &[],
+        &[std::path::PathBuf::from("/outside/reports/private-old")],
+    );
+    assert_eq!(config.folder_grants.len(), 1);
+    let read = TriggerConfig::from_created_payload(&config.to_created_payload()).unwrap();
+    assert_eq!(
+        read.folder_grants.len(),
+        1,
+        "a reload keeps the settled lists"
+    );
+    assert_eq!(read.folder_denies.len(), 1);
+}
+
+#[test]
+fn denies_survive_the_undo_payload() {
+    let mut config = deny_fixture();
+    config.deny(&["Bash(curl:*)".to_string()], &[]);
+    let read = TriggerConfig::from_created_payload(&config.to_created_payload()).unwrap();
+    assert_eq!(read.program_denies, config.program_denies);
+    assert_eq!(patterns(&read), patterns(&config));
 }

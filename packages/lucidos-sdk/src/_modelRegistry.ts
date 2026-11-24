@@ -5,7 +5,6 @@ import { REASONING_LEVELS } from '../../../crates/lucidos-app/src/store/reasonin
 export type ModelProxyProtocol = 'anthropic-messages' | 'openai-responses'
   | 'openai-chat-completions' | 'vertex-anthropic' | 'vertex-google';
 
-/** Safe projection served by GET /models. No credentials or private origins. */
 export interface RegistryRoute {
   provider: string;
   id: string;
@@ -49,7 +48,6 @@ export function callableRoute(route: RegistryRoute): boolean {
   return !!route.proxy?.name && protocols.includes(route.proxy.protocol);
 }
 
-/** Filter first, then resolve defaults exclusively inside the offered routes. */
 export function modelChoices(rows: readonly RegistryModel[], filter: ModelPickerFilter = {}): ModelChoice[] {
   const choices: ModelChoice[] = [];
   for (const row of rows) {
@@ -80,7 +78,6 @@ export function modelChoices(rows: readonly RegistryModel[], filter: ModelPicker
   ];
 }
 
-/** Explicit unavailable selections are errors; only null requests the default. */
 export function resolveSelection(choices: readonly ModelChoice[], value: ModelPickerValue): ModelPickerValue {
   const model = choices.find(row => row.value === value.model);
   if (!model) throw new Error(`Model is unavailable: ${value.model}`);

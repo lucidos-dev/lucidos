@@ -67,11 +67,9 @@ use uuid::Uuid;
 use super::register::MAX_LIVE_WAITS_PER_THREAD;
 use super::{LiveWait, LiveWaits};
 use crate::core::event_subscription::EventSubscription;
+use crate::engine::bash_background::{BackgroundBashRegistry, RunningTaskHandle, UnreadResult};
 use crate::engine::event_bus::EventBus;
-use crate::engine::thread_events::EventWaitCancelCause;
-use crate::engine::tools::bash_background::{
-    BackgroundBashRegistry, RunningTaskHandle, UnreadResult,
-};
+use crate::engine::thread_events::{BackgroundWaitTiming, EventWaitCancelCause};
 use crate::engine::LucidosEngine;
 
 /// The event a background task's completion lands as.
@@ -104,7 +102,7 @@ const LABELS_SHOWN: usize = 3;
 /// agent waits on it in-turn and reads the result itself. Once the turn ends,
 /// nobody polls, so the engine covers it like any other task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OwnerTurn {
+pub enum OwnerTurn {
     /// Mid-turn, as at the coding-agent `background-tasks` route. Polled tasks
     /// stay uncovered, or one completion would reach the agent twice.
     Running,
@@ -123,7 +121,7 @@ impl LucidosEngine {
     /// and the tail moves on. That is a real regression back to the stall this
     /// prevents, which is why the log line says so explicitly rather than
     /// noting a skip.
-    pub(crate) async fn arm_wait_for_running_background_tasks(
+    pub async fn arm_wait_for_running_background_tasks(
         &self,
         thread_id: Uuid,
         turn: OwnerTurn,
@@ -221,7 +219,7 @@ pub(super) async fn arm_wait_for_running_tasks(
     let watermark = match super::register::read_watermark(pool, thread_id).await {
         Ok(w) => w,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Could not read the watermark for thread {thread_id}: {e}. \
                  Any background work it owns will finish unwatched."
             );
@@ -259,7 +257,9 @@ pub(super) async fn arm_wait_for_running_tasks(
     let recent = super::register::recent_subscriptions(pool, thread_id)
         .await
         .inspect_err(|e| {
-            crate::log!("[EventWait] Subscription-count read failed for thread {thread_id}: {e}.");
+            crate::log_legacy!(
+                "[EventWait] Subscription-count read failed for thread {thread_id}: {e}."
+            );
         })
         .ok();
 
@@ -270,7 +270,7 @@ pub(super) async fn arm_wait_for_running_tasks(
         // Every refusal is a real regression back to the stall this
         // prevents, so it says so rather than reading as a routine skip.
         ArmingPlan::Refused(why) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Thread {thread_id} has unwatched background work and \
                  nothing will re-open it when that finishes: {why}"
             );
@@ -300,34 +300,38 @@ pub(super) async fn arm_wait_for_running_tasks(
     let watermark = match below_completions(pool, thread_id, &unread_ids, watermark).await {
         Ok(w) => w,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Could not find the unread completions of thread {thread_id}: {e}. \
                  Its background work will finish unwatched."
             );
             return unarmed;
         }
     };
-    let wait = super::register::build_wait_at(
+    let background_timing = background_wait_timing(&uncovered.running);
+    let mut wait = super::register::build_wait_at(
         thread_id,
         &engine_tool_use_id(),
         on,
-        &armed_reason(&uncovered.labels()),
+        &background_wait_reason(background_timing, &uncovered.labels()),
         timeout_secs,
         watermark,
     );
+    wait.background_timing = background_timing;
+    wait.expires_at =
+        deadline_for(&uncovered.running, wait.armed_at).max(wait.armed_at + Duration::seconds(1));
     // No arming lookback. It lets a MODEL that checked state before calling
     // `await_event` hear about a match that landed in between. It works by
     // reporting that match back into the same turn. There is no
     // turn here to report into. The equivalent gap is closed structurally
     // instead, by reading the watermark before the registry.
     if let Err(e) = super::register::persist_wait(bus, live_waits, &wait).await {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Could not arm a background-task wait for thread {thread_id}: {e}. \
              Its background work will finish unwatched."
         );
         return unarmed;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[EventWait] Armed wait {} for thread {thread_id} over {} unwatched background \
          task(s), expiring in {timeout_secs}s",
         wait.wait_id,
@@ -590,13 +594,13 @@ pub(super) fn plan_stand_down(
 
 /// What stopping one background task did, for the caller to report.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StoppedTask {
-    pub(crate) task_id: String,
+pub struct StoppedTask {
+    pub task_id: String,
     /// The task by its description, or its command, as the waiting row named it.
-    pub(crate) label: String,
+    pub label: String,
     /// Reasons of model-armed waits that watched more than this task and
     /// ended whole. The agent may want to re-arm the rest.
-    pub(crate) ended_with_others: Vec<String>,
+    pub ended_with_others: Vec<String>,
 }
 
 /// A stop and its stand-down, before the engine runs the replacements'
@@ -658,10 +662,10 @@ pub(super) async fn stop_and_stand_down(
             StandDown::EndWithOthers => outcome.stopped.ended_with_others.push(wait.reason.clone()),
             StandDown::Narrow(rest) => {
                 let replacement = narrowed(&wait, rest, &running, owner);
-                // The replacement commits BEFORE the cancel, so a waiting
-                // child never reads as finished in between (ADR 0254).
+                // The replacement commits BEFORE the cancel, so a child holding
+                // the wait never reads as finished in between (ADR 0254).
                 if let Err(e) = super::register::persist_wait(bus, live_waits, &replacement).await {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventWait] Could not narrow wait {} on thread {issuer}: {e}. It stays \
                          live, so the stopped task's completion will still reach it.",
                         wait.wait_id,
@@ -678,7 +682,7 @@ pub(super) async fn stop_and_stand_down(
         {
             // Nothing was written, so the wait is still live in the store and
             // goes back in the cache. The stopped task will then reach it.
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Stand-down of wait {} on thread {issuer} failed: {e}. Re-arming it.",
                 wait.wait_id,
             );
@@ -709,7 +713,7 @@ async fn withdraw(bus: &EventBus, live_waits: &LiveWaits, wait_id: Uuid) {
     )
     .await
     {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Could not withdraw replacement wait {wait_id}: {e}. It and the \
              original both stay live, so a remaining task may be delivered twice.",
         );
@@ -728,15 +732,15 @@ fn narrowed(
     running: &[RunningTaskHandle],
     owner: Option<Uuid>,
 ) -> LiveWait {
-    let still: Vec<String> = running
+    let still: Vec<_> = running
         .iter()
         .filter(|h| wait_covers_task(&on, &h.task_id, owner))
-        .map(|h| task_label(h.description.as_deref(), &h.command))
         .collect();
+    let background_timing = background_wait_timing(&still);
     let reason = if still.is_empty() {
         old.reason.clone()
     } else {
-        armed_reason(&still)
+        background_wait_reason(background_timing, &running_labels(&still))
     };
     LiveWait {
         wait_id: Uuid::new_v4(),
@@ -746,6 +750,7 @@ fn narrowed(
         reason,
         armed_at: Utc::now(),
         expires_at: old.expires_at,
+        background_timing: background_timing.or(old.background_timing.filter(|_| still.is_empty())),
         watermark: old.watermark,
     }
 }
@@ -753,7 +758,7 @@ fn narrowed(
 impl LucidosEngine {
     /// Stop one background task for `issuer`, so that its completion does not
     /// re-open `issuer`. See [`stop_and_stand_down`].
-    pub(crate) async fn stop_background_task_as(
+    pub async fn stop_background_task_as(
         &self,
         issuer: Uuid,
         task_id: &str,
@@ -774,7 +779,7 @@ impl LucidosEngine {
 
     /// Stop every running background task of `thread_id`, as the thread
     /// itself. See [`stop_all_and_stand_down`].
-    pub(crate) async fn stop_background_tasks_of(&self, thread_id: Uuid) -> Vec<StoppedTask> {
+    pub async fn stop_background_tasks_of(&self, thread_id: Uuid) -> Vec<StoppedTask> {
         let outcomes = stop_all_and_stand_down(
             &self.bash_background,
             &self.event_bus,
@@ -860,6 +865,86 @@ fn one_short_line(text: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+fn background_wait_timing(tasks: &[&RunningTaskHandle]) -> Option<BackgroundWaitTiming> {
+    let deadline = tasks
+        .iter()
+        .filter(|task| !task.queued_for_build_slot)
+        .map(|task| task.watchdog_deadline)
+        .max();
+    match deadline {
+        Some(deadline) => Some(BackgroundWaitTiming::Running { deadline }),
+        None if !tasks.is_empty() => Some(BackgroundWaitTiming::Queued),
+        None => None,
+    }
+}
+
+fn background_wait_reason(timing: Option<BackgroundWaitTiming>, labels: &[String]) -> String {
+    if timing == Some(BackgroundWaitTiming::Queued) {
+        "a build slot".to_string()
+    } else {
+        armed_reason(labels)
+    }
+}
+
+fn running_labels(tasks: &[&RunningTaskHandle]) -> Vec<String> {
+    tasks
+        .iter()
+        .map(|task| task_label(task.description.as_deref(), &task.command))
+        .collect()
+}
+
+impl LucidosEngine {
+    /// Refresh engine-owned waits from their watchdogs before checking expiry.
+    pub(super) async fn refresh_background_wait_timing(&self, wait: &mut LiveWait) {
+        if !is_engine_armed(wait) {
+            return;
+        }
+        let running = self
+            .bash_background
+            .running_for_thread(wait.thread_id)
+            .await;
+        let tasks: Vec<_> = running
+            .iter()
+            .filter(|task| wait_covers_task(&wait.on, &task.task_id, Some(wait.thread_id)))
+            .collect();
+        let Some(timing) = background_wait_timing(&tasks) else {
+            return;
+        };
+        let reason = background_wait_reason(Some(timing), &running_labels(&tasks));
+        let expires_at = deadline_for(&tasks, wait.armed_at);
+        if Some(timing) == wait.background_timing
+            && reason == wait.reason
+            && expires_at == wait.expires_at
+        {
+            return;
+        }
+        if self
+            .event_bus
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id: wait.thread_id,
+                event: crate::engine::thread_events::ThreadEvent::EventWaitTimingUpdated {
+                    wait_id: wait.wait_id,
+                    reason: reason.clone(),
+                    expires_at,
+                    background_timing: timing,
+                },
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            })
+            .await
+            .is_ok()
+        {
+            self.live_waits
+                .update_timing(wait.wait_id, reason.clone(), expires_at, timing)
+                .await;
+        }
+        // Even if the write failed, a live watchdog can still prove this
+        // snapshot should not expire. The next sweep retries the write.
+        wait.reason = reason;
+        wait.expires_at = expires_at;
+        wait.background_timing = Some(timing);
+    }
+}
+
 /// Seconds until the wait should expire: past the last watchdog deadline among
 /// the covered tasks, plus [`DEADLINE_MARGIN`], clamped to the ordinary ceiling
 /// and floored at one second.
@@ -872,14 +957,18 @@ fn one_short_line(text: &str) -> String {
 /// a saturated host), and the right answer is a wait that gives up almost
 /// immediately rather than one that never expires.
 fn timeout_for(tasks: &[&RunningTaskHandle], now: DateTime<Utc>) -> i64 {
-    let latest = tasks
-        .iter()
-        .map(|h| h.watchdog_deadline)
-        .max()
-        .unwrap_or(now);
-    ((latest + DEADLINE_MARGIN) - now)
+    (deadline_for(tasks, now) - now)
         .num_seconds()
         .clamp(1, super::register::MAX_TIMEOUT_SECS)
+}
+
+fn deadline_for(tasks: &[&RunningTaskHandle], armed_at: DateTime<Utc>) -> DateTime<Utc> {
+    let latest = tasks
+        .iter()
+        .map(|task| task.watchdog_deadline + DEADLINE_MARGIN)
+        .max()
+        .unwrap_or(armed_at + DEADLINE_MARGIN);
+    latest.min(armed_at + Duration::seconds(super::register::MAX_TIMEOUT_SECS))
 }
 
 #[cfg(test)]

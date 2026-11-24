@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** A family chip re-lays the theme strip out. Every piece moves from where it
- *  was to where it lands, and nothing appears or vanishes in one frame. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { motionPreference } from '../../../utils/motion';
 import { playStripMove, snapshotStrip } from '../themeStripMotion';
@@ -9,14 +7,12 @@ interface Box { left: number; top: number; width: number; height: number }
 
 const boxes = new Map<Element, Box>();
 let played: { target: Element; frames: Keyframe[] }[] = [];
-/** Ends every animation played so far, as the browser would at its end. */
 let finishAll: () => void = () => {};
 
 function rect({ left, top, width, height }: Box): DOMRect {
   return { left, top, width, height, right: left + width, bottom: top + height, x: left, y: top } as DOMRect;
 }
 
-/** A strip 300px wide at the viewport's origin, holding one piece per key. */
 function strip(height: number, pieces: Record<string, Box>): HTMLElement {
   const el = document.createElement('div');
   boxes.set(el, { left: 0, top: 0, width: 300, height });
@@ -107,7 +103,6 @@ it('fades a piece that leaves out where it stood, as an inert copy, and clears i
   const ghost = el.querySelector<HTMLElement>('.theme-strip-ghost')!;
   expect(ghost.textContent).toBe('family:Warm');
   expect([ghost.style.left, ghost.style.top, ghost.style.width, ghost.style.height]).toEqual(['120px', '4px', '80px', '16px']);
-  // A copy is never a piece, a radio or a grid item of its own.
   expect(ghost.hasAttribute('data-strip-key')).toBe(false);
   expect(ghost.hasAttribute('role')).toBe(false);
   expect(ghost.style.gridColumn).toBe('');

@@ -1,15 +1,3 @@
-/**
- * The read-only receipts the plugin panels become once a confirm resolves. They
- * are what makes a completed install / uninstall a real page in the content nav
- * history instead of a row that resolves to the bare menu item underneath.
- *
- * The receipts are rendered DIRECTLY rather than through their dispatcher: the
- * VNode walk below stops at function components, because descending into a
- * confirm branch would invoke its render-time hooks outside a real render. The
- * dispatcher's own job (route on the marker) is asserted separately, by which
- * component type it returns. `PluginFileList` is likewise asserted on by its
- * props rather than invoked.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { PluginInstallPanel, PluginInstallReceiptPanel, installedApps } from '../PluginInstallPanel';
@@ -22,13 +10,9 @@ import type { InlineForm, PluginInstallForm, PluginUninstallForm } from '../../.
 type AnyVNode = VNode<Record<string, unknown>>;
 
 interface Walked {
-  /** Every text node, in order. */
   text: string[];
-  /** Every intrinsic <button>. */
   buttons: AnyVNode[];
-  /** Props of every <PluginFileList>, in order. */
   fileLists: { label: string; files: string[] }[];
-  /** Function-component types reached and deliberately not descended into. */
   components: Set<unknown>;
 }
 
@@ -55,7 +39,7 @@ function walk(node: ComponentChildren, acc: Walked): void {
         files: v.props.files as string[],
       });
     }
-    return; // never invoke: a confirm branch's hooks would throw out here
+    return;
   }
   if (v.type === 'button') acc.buttons.push(v);
   walk(v.props?.children as ComponentChildren, acc);
@@ -144,9 +128,6 @@ describe('plugin uninstall receipt', () => {
       form: uninstallForm({
         at: '2026-08-06T10:00:00.000Z',
         summary: 'Removed Habit Tracker',
-        // One of the two staged paths had gone by itself before the confirm
-        // ran. A receipt reading off `request.files_present` would claim both
-        // were deleted.
         files_deleted: ['apps/habit-tracker/manifest.json'],
         files_missing: ['apps/habit-tracker/index.html'],
       }),
@@ -170,9 +151,6 @@ describe('plugin uninstall receipt', () => {
       }),
     }));
 
-    // Not even a Close: it blanked `panelOverlay` without touching the nav
-    // stack, leaving the cursor on an entry for a panel no longer on screen.
-    // The header's back arrow leaves the receipt.
     expect(buttonLabels(acc)).toEqual([]);
   });
 });

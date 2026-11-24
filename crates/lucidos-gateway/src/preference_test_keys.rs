@@ -1,7 +1,7 @@
 //! Read wire keys from the engine catalog without linking the engine into the gateway.
 
 pub(crate) fn key(handle: &str) -> &'static str {
-    let catalog = include_str!("../../lucidos-engine/src/core/preference_catalog.rs");
+    let catalog = include_str!("../../lucidos-core/src/core/preference_catalog.rs");
     let declaration = format!("pub const {handle}: Pref<");
     let (_, rest) = catalog
         .split_once(&declaration)

@@ -124,7 +124,9 @@ in `--allowedTools`. The engine never sees those.
 
 **Follow-up: an OS sandbox.** The real boundary for path 3 is a sandbox around
 subprocesses (Seatbelt on macOS, Landlock or bubblewrap on Linux), or a
-separate OS user. It is not built.
+separate OS user. Built as
+[ADR 0645](0645-agent-subprocesses-run-in-an-os-sandbox.md): Seatbelt and
+Landlock around every agent-steered spawn.
 
 **Known holes in value masking stay.** A token split across two
 `bash_background` drain windows, `Stream::push` trimming a token's front, and

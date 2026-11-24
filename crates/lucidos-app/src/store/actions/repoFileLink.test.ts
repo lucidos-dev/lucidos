@@ -1,6 +1,3 @@
-// A `repo:` link in chat opens the repository file preview. It may name the
-// repository by id or by name, and says so in the app when it can't open. The
-// reported bug: macOS got the link and answered "unsupported scheme".
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Repository } from '../store';
 
@@ -10,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   showToast: vi.fn(),
 }));
 
-vi.mock('./navigation-request', () => ({ handleNavigationRequest: mocks.handleNavigationRequest }));
+vi.mock('./navigation-dispatch', () => ({ handleNavigationRequest: mocks.handleNavigationRequest }));
 vi.mock('./repositoriesLoader', () => ({ refreshRepositories: mocks.refreshRepositories }));
 vi.mock('../store', async () => {
   const actual = await vi.importActual<typeof import('../store')>('../store');
@@ -80,8 +77,6 @@ describe('openRepoFileLink', () => {
   });
 
   it('opens on the click itself when the cache has the repository', () => {
-    // No await: a cache hit must navigate in the click's own task, so the
-    // navigation pushes its history row before any fold can run.
     void openRepoFileLink(link(`repo:${LUCIDOS.id}:file:README.md`));
     expect(mocks.handleNavigationRequest).toHaveBeenCalledTimes(1);
   });
@@ -94,8 +89,6 @@ describe('openRepoFileLink', () => {
     );
   });
 
-  // A link in agent prose opens the file preview modal instead. The registry
-  // match, and the id it resolves to, are the same either way.
   it('hands the resolved file and lines to the opener it is given', async () => {
     const open = vi.fn();
     await openRepoFileLink(link('repo:lucidos:file:src/a.rs', 5, 9), 'a chat', open);
@@ -112,7 +105,6 @@ describe('openRepoFileLink', () => {
   });
 
   it('re-reads the registry before calling a repository missing', async () => {
-    // Registered moments ago by a sibling thread: the cache has not caught up.
     const fresh: Repository = { id: '6f1c2a90-0000-5000-8000-000000000009', name: 'fresh', path: '/src/fresh' };
     mocks.refreshRepositories.mockImplementation(async () => {
       repositories.value = { status: 'loaded', data: [LUCIDOS, EXAMPLE, fresh] };

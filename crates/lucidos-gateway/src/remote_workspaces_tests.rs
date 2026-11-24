@@ -3,9 +3,9 @@ use crate::auth;
 use crate::gateway_protocol::GatewayRedemption;
 use crate::gateway_protocol::HEADER_GATEWAY_CREDENTIAL;
 use crate::registry::Workspace;
-use crate::remote_gateways::tests::{localhost_cert, serve_https};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use lucidos_local_token::test_support::serve_https;
 use serde_json::{json, Value};
 use tower::ServiceExt as _;
 
@@ -30,26 +30,28 @@ async fn pair() -> Pair {
         "Dev".to_string(),
         40_123,
     ));
-    let cert = localhost_cert();
-    let port = serve_https(
-        crate::remote_gateways::tests::proxy_guard(crate::server::gateway_router(b.clone())),
-        &cert,
-    )
-    .await;
+    let port = serve_https(crate::remote_gateways::tests::proxy_guard(
+        crate::server::gateway_router(b.clone()),
+    ))
+    .port();
     let b_address = format!("https://localhost:{port}");
-    let code = b.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
         credential,
-    } = b.paired_gateways().redeem(&code, None).unwrap()
+    } = b
+        .paired_gateways()
+        .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
+        .unwrap()
     else {
         panic!("a fresh code redeems");
     };
 
     let a_dir = tempfile::tempdir().unwrap();
     let a = GatewayState::for_tests_with_static_dir(Some(a_dir.path().to_path_buf()));
-    a.peer_connection()
-        .trust_for_test(cert.cert.pem().as_bytes());
     add_remote(&a, "cloud", &b_address, &credential);
     a.seed_device_for_test(auth::PairedDevice {
         id: "device-1".into(),
@@ -72,6 +74,7 @@ async fn pair() -> Pair {
 fn add_remote(a: &GatewayState, name: &str, address: &str, credential: &str) {
     a.remote_gateways()
         .add(RemoteGateway {
+            gateway_id: None,
             name: name.to_string(),
             address: address.to_string(),
             pairing_id: "pairing".to_string(),
@@ -80,6 +83,8 @@ fn add_remote(a: &GatewayState, name: &str, address: &str, credential: &str) {
             gateway_protocol: 1,
             added_at: "2020-01-01T00:00:00Z".to_string(),
             rotation: Default::default(),
+            return_access: None,
+            trusted_pairing: false,
         })
         .unwrap();
 }
@@ -108,6 +113,36 @@ async fn listed_on_a(p: &Pair) -> (StatusCode, Value) {
         .body(Body::empty())
         .unwrap();
     send(&p.a, req).await
+}
+
+#[tokio::test]
+async fn remote_counts_match_the_namespaced_inbox_instead_of_the_shared_count() {
+    let p = pair().await;
+    let reader = crate::relay::namespaced_device_id(&p.pairing_id, "device-1");
+    let _engine = crate::notification_count_tests::install_inbox(&p.b, reader.clone()).await;
+    let (status, rows) = listed_on_a(&p).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows[0]["workspaces"][0]["unread_count"], 0);
+    assert_eq!(p.b.list_status().await[0].unread_count, Some(12));
+    assert!(p
+        .b
+        .directory()
+        .relayed
+        .iter()
+        .any(|d| d.device_id == reader));
+}
+
+#[tokio::test]
+async fn a_failed_remote_inbox_probe_keeps_the_workspace_but_omits_its_shared_count() {
+    let p = pair().await;
+    let _engine = crate::notification_count_tests::install_inbox(&p.b, "unused".into()).await;
+    let dead = crate::engine_hop::test_engine::scratch();
+    p.b.set_route_for_test("dev", crate::engine_hop::test_engine::unreachable(&dead));
+    let (status, rows) = listed_on_a(&p).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows[0]["state"], "reachable");
+    assert_eq!(rows[0]["workspaces"][0]["id"], "dev");
+    assert!(rows[0]["workspaces"][0].get("unread_count").is_none());
 }
 
 #[tokio::test]

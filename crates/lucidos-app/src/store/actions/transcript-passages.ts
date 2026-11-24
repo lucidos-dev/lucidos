@@ -1,10 +1,3 @@
-/**
- * What thread find counts: every text the transcript draws, read from the
- * thread's data with the code that draws it. Each passage names the element it
- * draws into and what hides that element, so a step can unfold it.
- *
- * Plan: `docs/plans/2026-10-25-find-all-thread-text.md`.
- */
 
 import { render, type ComponentChildren } from 'preact';
 import { collectPageText } from '@lucidos/find';
@@ -22,44 +15,30 @@ import { getCollapsedVisibleEvents, headClampApplies, isMeaningfulText } from '.
 import { markdownEngine, renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { QUESTION_SUPERSEDED_NOTE, typedAnswerText } from '../../components/chat/QuestionCard';
 import {
-  engineResolutionNote, renderCommandQuestion, renderMcpQuestion, renderQuestion,
+  engineAnswerNote, engineResolutionNote, renderCommandQuestion, renderMcpQuestion, renderQuestion,
 } from '../../components/chat/PermissionCard';
 import { stepRowText, waitDetail } from '../../components/chat/chat-exchange-parts';
 import { agentExitReason } from '../../components/chat/agentExitCopy';
 
-/** What a step to a passage unfolds before the passage is drawn. */
 export interface Unfold {
-  /** In the turn's initiator panel, which the reader can fold. */
   initiator?: true;
-  /** Drawn only with the full response on. */
   details?: true;
-  /** A step row, drawn only with steps on. */
   steps?: true;
-  /** Inside this sub-agent group, which starts folded. */
   subAgent?: string;
-  /** In this side question card, which the reader can fold. */
   sideQuestion?: string;
 }
 
-/** One searchable stretch of the transcript, as the plain text it draws. */
 export interface TranscriptPassage {
-  /** The turn's exchange key, which the render request names. */
   key: string;
   userSeq: number;
-  /** Where it draws: every live match of the selector in its turn, or only
-   *  the `nth`. `inFeed` searches the whole feed, for a side question drawn
-   *  between turns. */
   where: { selector: string; nth?: number; inFeed?: true };
   unfold: Unfold;
   text: string;
 }
 
-/** How a passage's text is read. A run caches it, since the thread is
- *  searched on every keystroke and its settled passages do not change. */
 export interface PassageText {
   markdown(md: string): string;
   inlineMarkdown(md: string): string;
-  /** `key` names the drawing, for the cache. */
   drawing(key: string, draw: () => ComponentChildren): string;
 }
 
@@ -70,16 +49,12 @@ function parseRoot(): HTMLElement {
   return parseDoc.body;
 }
 
-/** Text read from markup in a document never shown. Blocks are told apart as
- *  the drawn transcript tells them. */
 function htmlText(html: string): string {
   const root = parseRoot();
   root.innerHTML = html;
   return collectPageText(root, 'markup').text;
 }
 
-/** A drawing's text. Only plain markup comes here, never a component with
- *  effects: rendering it must change nothing outside the hidden document. */
 function drawingText(draw: ComponentChildren): string {
   const root = parseRoot();
   root.replaceChildren();
@@ -91,15 +66,12 @@ function drawingText(draw: ComponentChildren): string {
 
 export const markdownText = (md: string): string => htmlText(renderMarkdown(md));
 
-/** Reads every text afresh. */
 export const freshText: PassageText = {
   markdown: markdownText,
   inlineMarkdown: (md) => htmlText(renderMarkdownInline(md)),
   drawing: (_key, draw) => drawingText(draw()),
 };
 
-/** Reads each text once into `cache`. A markdown text read before the markdown
- *  engine landed is plain, so its key says which it is. */
 export function cachedText(cache: Map<string, string>): PassageText {
   const once = (key: string, read: () => string) => {
     let text = cache.get(key);
@@ -115,15 +87,10 @@ export function cachedText(cache: Map<string, string>): PassageText {
 
 const formatted = (): boolean => markdownEngine.peek() !== null;
 
-/** A value as a quoted CSS attribute string. */
 const css = (value: string | number) => `"${String(value).replace(/["\\]/g, '\\$&')}"`;
 
-/** A user's message, drawn as a bubble or as a plain panel (an API caller's
- *  or an agent's message). Never a side question or a card's typed answer. */
 const USER_MESSAGE = '.initiator-panel .initiator-body .markdown-content';
 
-/** Every passage of the thread, in reading order. Pure over the thread's
- *  data, so it counts history the transcript has not drawn. */
 export function transcriptPassages(
   thread: ThreadState,
   read: PassageText,
@@ -156,6 +123,10 @@ function initiatorPassages(exchange: Exchange, read: PassageText, add: Add): voi
   }
   switch (ev.type) {
     case 'UserQuestionAsked': {
+      if (ev.permission_request && !ev.multi_select) {
+        engineQuestionPassages(exchange, ev, read, add);
+        return;
+      }
       const card = '.initiator-body .question-body';
       add({ selector: `${card} .question-text` }, INITIATOR, read.markdown(ev.question));
       const options = ev.options ?? [];
@@ -186,6 +157,21 @@ function initiatorPassages(exchange: Exchange, read: PassageText, add: Add): voi
         () => renderMcpQuestion(ev.server_name, ev.tool_name, ev.arguments_summary), add);
       return;
   }
+}
+
+function engineQuestionPassages(
+  exchange: Exchange,
+  ev: Extract<Exchange['userEvent'], { type: 'UserQuestionAsked' }>,
+  read: PassageText,
+  add: Add,
+): void {
+  const card = `.initiator-body .permission-body[data-tool-use-id=${css(ev.tool_use_id)}]`;
+  add({ selector: `${card} > .permission-text .question-text` }, INITIATOR, read.markdown(ev.question));
+  const answer = findQuestionAnswer(exchange, ev.tool_use_id)?.answer;
+  const typed = answer ? typedAnswerText(answer) : exchange.typedAnswer?.text;
+  if (typed) add({ selector: `${card} .question-freetext-text` }, INITIATOR, read.markdown(typed));
+  const note = engineAnswerNote(answer);
+  if (note) add({ selector: `${card} > .permission-resolution-note` }, INITIATOR, note);
 }
 
 function permissionPassages(
@@ -225,14 +211,12 @@ function responsePassages(exchange: Exchange, read: PassageText, add: Add): void
   const limit = exchangeEngineLimitDetail(exchange);
   if (limit) add({ selector: '.exchange-engine-limit > .authored-html' }, {}, read.markdown(limit));
   const error = exchangeError(exchange);
-  // Every shape of the failure card opens on its message.
   if (error) add({ selector: '.exchange-error > p', nth: 0 }, {}, error.message);
   if (error?.agentExit) add({ selector: '.exchange-error-reason' }, {}, agentExitReason(error.agentExit));
 }
 
 const findRow = (seq: number) => `[data-find-row=${css(seq)}]`;
 
-/** A transcript marker, drawn whatever the turn settings say. */
 function markerPassages(event: ResponseEvent, row: string, add: Add): void {
   if (event.type === 'checkpoint') {
     add({ selector: `${row} .step-note-summary` }, {}, event.summary);
@@ -252,8 +236,6 @@ function stepPassages(step: StepEvent, unfold: Unfold, add: Add): void {
   add({ selector: `${row} > .step-detail` }, unfold, detail);
 }
 
-/** Each side question under the turn it follows: the latest one begun at or
- *  before it. One asked before every turn goes with the first. */
 function sideQuestionsByTurn(exchanges: Exchange[], cards: readonly SideQuestion[]): Map<number, SideQuestion[]> {
   const byTurn = new Map<number, SideQuestion[]>();
   if (exchanges.length === 0) return byTurn;

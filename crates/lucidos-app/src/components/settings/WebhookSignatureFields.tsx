@@ -1,11 +1,3 @@
-/**
- * The signature editor, shared by the create form and by an existing row.
- *
- * One component so the presets and the raw fields cannot drift between the two
- * surfaces. It owns no server state: the parent holds a `SignatureDraft` and
- * gets it back on every change, which keeps the whole thing testable through
- * the pure helpers in `webhookSignature.ts`.
- */
 
 import { Dropdown, DropdownSkeleton } from '../shared/Dropdown';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -22,24 +14,14 @@ import {
   type WebhookScheme,
 } from './webhookSignature';
 
-/** What the user has picked so far, before it becomes a request.
- *
- *  `credential` means two things by design, and which one depends on `source`.
- *  For `saved` it names a row that exists. For the other two it names the row
- *  about to be written. Both end up as `hmac.credential`, so one field carries
- *  it either way. */
 export interface SignatureDraft {
   scheme: WebhookScheme;
   source: SecretSource;
   credential: string;
-  /** The pasted value. Untrimmed on purpose: the engine refuses surrounding
-   *  whitespace by name rather than silently stripping it. */
   secret: string;
-  /** Only read under the custom scheme, which pins nothing. */
   custom: CustomFields;
 }
 
-/** The raw `HmacConfig` fields, as strings the form can hold. */
 export interface CustomFields {
   signature_header: string;
   algorithm: 'sha256' | 'sha1';
@@ -66,7 +48,6 @@ function emptyCustomFields(): CustomFields {
   };
 }
 
-/** A draft for a hook that does not sign yet. */
 export function newSignatureDraft(hookName: string): SignatureDraft {
   const scheme: WebhookScheme = 'github';
   return {
@@ -78,11 +59,6 @@ export function newSignatureDraft(hookName: string): SignatureDraft {
   };
 }
 
-/** A draft that reopens what a hook already stores.
- *
- *  The source starts at `saved`, whatever the scheme's default is. The hook
- *  already has a secret, so proposing a new one would be proposing to replace
- *  a working credential nobody asked about. */
 export function draftFromHmac(hmac: WebhookHmac, scheme: WebhookScheme): SignatureDraft {
   return {
     scheme,
@@ -103,7 +79,6 @@ export function draftFromHmac(hmac: WebhookHmac, scheme: WebhookScheme): Signatu
   };
 }
 
-/** The `hmac` block a draft becomes, or `null` when it is not ready to send. */
 export function draftToHmac(draft: SignatureDraft): WebhookHmac | null {
   const credential = draft.credential.trim();
   if (!credential) return null;
@@ -127,16 +102,12 @@ export function draftToHmac(draft: SignatureDraft): WebhookHmac | null {
   };
 }
 
-/** The `signing_secret` a draft becomes, or `undefined` to name a saved one. */
 export function draftToSigningSecret(draft: SignatureDraft): WebhookSigningSecret | undefined {
   if (draft.source === 'generate') return { mode: 'generate' };
-  // Sent verbatim. The engine refuses surrounding whitespace by name, which
-  // beats trimming a value that may legitimately need it.
   if (draft.source === 'paste') return { mode: 'provided', value: draft.secret };
   return undefined;
 }
 
-/** Why this draft cannot be saved yet, or `null` when it can. */
 export function draftBlocker(draft: SignatureDraft): string | null {
   if (!draft.credential.trim()) return 'Name the credential this hook verifies with';
   if (draft.source === 'paste' && !draft.secret) return 'Paste the secret the sender issued';
@@ -152,12 +123,6 @@ const SOURCE_LABELS: Record<SecretSource, string> = {
   paste: 'Paste the sender’s secret',
 };
 
-/** The credential picker, or what to say instead of one.
- *
- *  All four `Loadable` states get their own answer. Collapsing them read as
- *  "you have none saved" while the list was merely in flight, and stayed on
- *  screen for good when the fetch failed. In flight, past the delay gate, it
- *  wears the picker's own box. */
 function SavedCredentialControl({ credentials, draft, patch }: {
   credentials: Loadable<CredentialInfo[]>;
   draft: SignatureDraft;
@@ -189,8 +154,6 @@ function SavedCredentialControl({ credentials, draft, patch }: {
 
 interface Props {
   draft: SignatureDraft;
-  /** The whole `Loadable`, so the picker can tell "none saved" from "not
-   *  loaded yet" and from "the fetch failed". */
   credentials: Loadable<CredentialInfo[]>;
   onChange: (draft: SignatureDraft) => void;
 }
@@ -206,8 +169,6 @@ export function WebhookSignatureFields({ draft, credentials, onChange }: Props) 
     onChange({ ...draft, custom: { ...draft.custom, ...change } });
   }
 
-  /** Switching scheme re-picks the source, because which sources are even
-   *  possible depends on the sender. A Slack hook cannot generate. */
   function pickScheme(scheme: WebhookScheme) {
     const next = presetFor(scheme);
     const source = next.secretSources.includes(draft.source)

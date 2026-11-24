@@ -2,13 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { panelOverlay, currentApp, appsList, appPseudoFullscreen, inputMode, appRefreshKey, splitRatio, toasts, wipPreviewThreadId, threadMap, focusedThreadId, threadsLoaded } from '../store';
 import type { App } from '../types';
 import { makeOptimisticThreadState } from '../thread-events';
-// Importing the wipPreview module installs the auto-revert effect that
-// clears WIP when focusedThreadId / threadMap / currentApp drift out of
-// sync. The preserveWip tests need that effect installed so they exercise
-// the same coordination the live app does.
 import '../actions/wipPreview';
 
-// Mock API client
 const mockPostAppCapture = vi.fn().mockResolvedValue(undefined);
 const mockListAppsApi = vi.fn().mockResolvedValue([]);
 const mockGetAppApi = vi.fn();
@@ -56,7 +51,6 @@ describe('captureAppUI', () => {
     };
     mockPostAppCapture.mockClear();
 
-    // Stub DOM queries to simulate "no iframe in DOM"
     origQuerySelector = document.querySelector;
     origQuerySelectorAll = document.querySelectorAll;
     document.querySelector = vi.fn().mockReturnValue(null);
@@ -69,17 +63,12 @@ describe('captureAppUI', () => {
   });
 
   it('does NOT auto-open a different app when no iframe exists (the no-iframe bug)', async () => {
-    // panelOverlay starts null (set in beforeEach) — no app-ui iframe in DOM.
-    // LLM calls capture_app(app_id="notes-app") — no iframe in DOM.
-    // BUG: captureAppUI used to call openApp(notesApp), replacing the user's panel state.
     const { captureAppUI } = await import('./apps');
     await captureAppUI('notes-app', 'test-request-id');
 
-    // FIX: panelOverlay must NOT be changed by capture.
     expect(panelOverlay.value).toBeNull();
     expect(currentApp.value).toBeNull();
 
-    // Verify the API was called with an error (no iframe to capture)
     expect(mockPostAppCapture).toHaveBeenCalledWith(
       'test-request-id',
       '',
@@ -88,13 +77,11 @@ describe('captureAppUI', () => {
   });
 
   it('does NOT auto-open an app when user has a different panel open', async () => {
-    // User is viewing file preview — no app-ui iframe in DOM
     panelOverlay.value = { type: 'file-preview', path: 'artifacts/notes.md' };
 
     const { captureAppUI } = await import('./apps');
     await captureAppUI('notes-app', 'test-request-id');
 
-    // Panel should NOT be changed to app-ui
     expect(panelOverlay.value).toEqual({ type: 'file-preview', path: 'artifacts/notes.md' });
 
     expect(mockPostAppCapture).toHaveBeenCalledWith(
@@ -104,13 +91,9 @@ describe('captureAppUI', () => {
     );
   });
 
-  // A hidden tab shares its device id with the visible one, which may have the
-  // app open. Its quick "no app" answer would win the race, so it stays silent.
 });
 
 describe('refreshApps', () => {
-  // The panel refresh contract: a pull shows data at least as new as the pull.
-  // A list read already in flight began before it, so it may not answer it.
   it('waits out a read already in flight, then sends its own', async () => {
     const { loadApps, refreshApps } = await import('./apps');
     let releaseFirst!: (apps: App[]) => void;
@@ -143,7 +126,6 @@ describe('refreshAppUI', () => {
       data: [notesApp, tripPlanner],
     };
     mockListAppsApi.mockResolvedValue([notesApp, tripPlanner]);
-    // Stub DOM queries — not needed for signal-based tests
     origQuerySelectorAll = document.querySelectorAll;
     document.querySelectorAll = vi.fn().mockReturnValue([]);
   });
@@ -165,9 +147,6 @@ describe('refreshAppUI', () => {
   });
 
   it('debounces multiple rapid calls into a single reload', async () => {
-    // Three AppUiRefreshRequested events firing in quick succession (e.g. the agentic
-    // loop emits one per modified app + an explicit refresh_app) must collapse
-    // into ONE iframe reload — otherwise the iframe is bombarded mid-navigation.
     panelOverlay.value = { type: 'app-ui', app: notesApp };
 
     const { refreshAppUI } = await import('./apps');
@@ -175,7 +154,6 @@ describe('refreshAppUI', () => {
     await refreshAppUI();
     await refreshAppUI();
 
-    // Before debounce timer fires, no increment yet
     expect(appRefreshKey.value).toBe(0);
 
     await vi.advanceTimersByTimeAsync(200);
@@ -202,12 +180,10 @@ describe('refreshAppUI', () => {
     await refreshAppUI('trip-planner-2026');
     await vi.advanceTimersByTimeAsync(200);
 
-    // Wrong app — should not refresh
     expect(appRefreshKey.value).toBe(0);
   });
 
   it('does NOT increment when no app is open and no appId given', async () => {
-    // No app open, no ID — nothing to refresh
     const { refreshAppUI } = await import('./apps');
     await refreshAppUI();
     await vi.advanceTimersByTimeAsync(200);
@@ -216,11 +192,6 @@ describe('refreshAppUI', () => {
   });
 
   it('does NOT open the app when appId given but app not open (no surprise pop-ups)', async () => {
-    // BUG: when the LLM edited a file under apps/finn-jobs/ in a chat thread,
-    // the post-loop AppUiRefreshRequested surprised the user by opening the FINN app.
-    // AppUiRefreshRequested must mean "reload if currently open", never "open from
-    // closed". User-initiated opens go through openApp / app-link clicks /
-    // navigate_ui — refresh is for already-open iframes only.
     expect(currentApp.value).toBeNull();
 
     const { refreshAppUI } = await import('./apps');
@@ -239,13 +210,10 @@ describe('refreshAppUI', () => {
     await vi.advanceTimersByTimeAsync(200);
 
     expect(appRefreshKey.value).toBe(1);
-    // Should not have changed the open app
     expect(currentApp.value?.id).toBe('trip-planner-2026');
   });
 
   it('cancels a pending debounce when a different app is opened', async () => {
-    // Pending AppUiRefreshRequested for app A must not fire after the user switches to
-    // app B — otherwise B's iframe gets a stray refresh keyed to A's edit.
     panelOverlay.value = { type: 'app-ui', app: notesApp };
 
     const { refreshAppUI, openApp } = await import('./apps');
@@ -278,9 +246,6 @@ describe('refreshAppUI', () => {
       wipPreviewThreadId.value = null;
       threadMap.value = new Map();
       threadsLoaded.value = true;
-      // The wipPreview effect clears WIP whenever focusedThreadId drifts from
-      // the WIP thread id. Each test pins focused to its WIP thread so the
-      // effect's auto-revert doesn't shadow whatever refreshAppUI does.
       focusedThreadId.value = null;
     });
 
@@ -314,7 +279,6 @@ describe('refreshAppUI', () => {
       await vi.advanceTimersByTimeAsync(200);
 
       expect(wipPreviewThreadId.value).toBe('wip-thread-2');
-      // And still bumps the refresh key so the iframe reloads.
       expect(appRefreshKey.value).toBe(1);
     });
 
@@ -366,7 +330,6 @@ describe('openAppById', () => {
     expect(panelOverlay.value).toBeNull();
     const errors = toasts.value.filter((t) => t.type === 'error');
     expect(errors).toHaveLength(1);
-    // After the disk re-scan still misses, the toast names the id + that it's gone.
     expect(errors[0].message).toMatch(/trip-planner-2026/);
     expect(errors[0].message).toMatch(/no longer exists/i);
   });
@@ -416,12 +379,6 @@ describe('openApp carries an app fragment', () => {
   let frameLocation: { href: string; replace: ReturnType<typeof vi.fn> };
   let framePosts: unknown[] = [];
 
-  /** One mounted app iframe whose live URL can drift, the way a real app moves
-   *  itself with `history.replaceState`. */
-  /** An app frame is isolated, so the host asks it to move rather than driving
-   *  its `location`. What these cases check is therefore WHETHER a delivery was
-   *  sent. Where the frame then lands is its own arithmetic, covered in
-   *  `packages/lucidos-sdk/src/hostOps.test.ts`. */
   function mountFrame(hash: string): void {
     framePosts = [];
     frameLocation = {
@@ -439,7 +396,6 @@ describe('openApp carries an app fragment', () => {
     document.querySelectorAll = vi.fn().mockReturnValue([frame]);
   }
 
-  /** The fragment of every `hash` delivery sent to the mounted frame. */
   function deliveredFragments(): unknown[] {
     return framePosts
       .filter((m): m is { op: string; args: { fragment: unknown } } =>
@@ -479,10 +435,6 @@ describe('openApp carries an app fragment', () => {
   });
 
   it('puts the fragment after the WIP-preview query', async () => {
-    // Only the fragment survives the engine's WIP-preview rewrite, so the
-    // order is what makes a target reach an app served from a worktree.
-    // Seeded the way the preserveWip tests are: the wipPreview effect clears
-    // WIP for a thread the map does not hold.
     const thread = makeOptimisticThreadState({
       id: 'wip-thread-9',
       title: 'fix it',
@@ -508,8 +460,6 @@ describe('openApp carries an app fragment', () => {
   });
 
   it('does not touch a mounted frame on a COLD open', async () => {
-    // A cold open navigates the frame to a src that already carries the
-    // fragment. Moving it here as well would be a second, pointless move.
     mountFrame('#pr-1700');
     const { openApp } = await import('./apps');
     openApp(notesApp, 'pr-1645');
@@ -519,8 +469,6 @@ describe('openApp carries an app fragment', () => {
   });
 
   it('hands the fragment to the live frame when the app was ALREADY open', async () => {
-    // The same link clicked twice. The app reflected its own selection back, so
-    // the src is unchanged and no render-driven delivery would ever fire.
     const { openApp } = await import('./apps');
     openApp(notesApp, 'pr-1645');
     mountFrame('#pr-1700');
@@ -531,8 +479,6 @@ describe('openApp carries an app fragment', () => {
   });
 
   it('moves nobody when the second open names no target', async () => {
-    // A plain app link leaves an open app on whatever the reader was reading.
-    // That is why an absent fragment is not the empty string.
     const { openApp } = await import('./apps');
     openApp(notesApp, 'pr-1645');
     mountFrame('#pr-1700');
@@ -544,8 +490,6 @@ describe('openApp carries an app fragment', () => {
   });
 
   it('refreshes the kept nav entry instead of adding one for a move in place', async () => {
-    // `pushNavState` dedupes on app id, so without the replace the stack would
-    // keep the FIRST fragment and a reload would land on a stale report.
     const { openApp } = await import('./apps');
     openApp(notesApp, 'pr-1645');
     expect(mockReplaceNavState).not.toHaveBeenCalled();
@@ -604,7 +548,6 @@ describe('openApp expands the content pane on desktop', () => {
   });
 
   it('expands a collapsed content pane so the click is not silently absorbed', async () => {
-    // Desktop: chat full-width, content pane collapsed.
     splitRatio.value = 1;
 
     const { openApp } = await import('./apps');
@@ -615,7 +558,6 @@ describe('openApp expands the content pane on desktop', () => {
   });
 
   it('preserves a custom split ratio when the pane is already visible', async () => {
-    // User has dragged the divider to a non-default ratio — don't snap it.
     splitRatio.value = 0.7;
 
     const { openApp } = await import('./apps');
@@ -626,8 +568,6 @@ describe('openApp expands the content pane on desktop', () => {
 });
 
 describe('exitAppFullscreen', () => {
-  // The `document` stub in test-setup.ts is a plain object, so the fullscreen
-  // surface is whatever a test puts on it. Restore per test.
   const doc = document as unknown as Record<string, unknown>;
 
   beforeEach(() => {
@@ -668,8 +608,6 @@ describe('exitAppFullscreen', () => {
   });
 
   it('exits native fullscreen through the webkit spelling, which returns void not a promise', async () => {
-    // A bare `.then` on the prefixed call throws a TypeError synchronously, so
-    // the void return is the case worth pinning.
     doc.webkitFullscreenElement = {};
     const exit = vi.fn();
     doc.webkitExitFullscreen = exit;
@@ -679,11 +617,8 @@ describe('exitAppFullscreen', () => {
   });
 });
 
-// Last in the file: it resets the module graph, which later tests holding the
-// top-level store imports would not survive.
 describe('a reload restore of the open app', () => {
   it('posts nothing when a reload restores the open app', async () => {
-    // A fresh module, so the one-shot restore has not run yet.
     vi.resetModules();
     mockRecordAppOpenedApi.mockClear();
     localStorage.setItem('app-window-open', notesApp.id);

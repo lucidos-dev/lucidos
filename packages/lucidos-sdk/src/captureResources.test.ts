@@ -32,13 +32,9 @@ describe('bridgePathFor', () => {
   });
 
   it('refuses what the bridge cannot reach', () => {
-    // Another host.
     expect(path('https://cdn.example/x.png')).toBeNull();
-    // Another workspace on the same gateway.
     expect(path('/other/data/x.png')).toBeNull();
-    // A WIP preview reads a worktree, and the live copy would be the wrong file.
     expect(path('/ws/app/habit-tracker/logo.png?thread_id=t1')).toBeNull();
-    // Not a URL at all.
     expect(path('http://[bad')).toBeNull();
   });
 });

@@ -35,16 +35,12 @@ describe('parseSecret', () => {
   });
 
   it('drops a stored scopes key when an old client is saved again', () => {
-    // The form once saved a "Default Scopes" value that no flow read. An old
-    // blob still edits cleanly, and the rebuilt one no longer carries it.
     const old = '{"client_id":"id","token_url":"https://t","scopes":"read write"}';
     const rebuilt = JSON.parse(buildSecret('oauth_client', parseSecret('oauth_client', old)));
     expect(rebuilt).toEqual({ client_id: 'id', token_url: 'https://t' });
   });
 
   it('leaves clientSecret blank for a public-client credential', () => {
-    // No client_secret stored = public client (engine uses PKCE). The blank
-    // must survive the round trip, not be confused with "unset endpoint".
     const f = parseSecret('oauth_client', '{"client_id":"id","token_url":"https://t"}');
     expect(f.clientId).toBe('id');
     expect(f.clientSecret).toBe('');
@@ -115,10 +111,6 @@ describe('buildSecret', () => {
   });
 
   it('omits client_secret entirely for a public client', () => {
-    // A blank secret is a choice, not an omission — the engine reads its
-    // absence as "public client, authenticate with PKCE". Writing
-    // `client_secret: ""` would work too, but omitting it keeps the stored
-    // blob honest about which shape was chosen.
     const f = { ...emptyFields(), clientId: 'id', tokenUrl: 'https://t' };
     const blob = JSON.parse(buildSecret('oauth_client', f));
     expect(blob).not.toHaveProperty('client_secret');
@@ -132,9 +124,6 @@ describe('buildSecret', () => {
     expect(JSON.parse(rebuilt)).toEqual(JSON.parse(stored));
   });
 
-  // `userinfo_method` exists for Dropbox, whose userinfo endpoint is POST-only.
-  // GET is the default, so it must NOT be written: a key on every credential
-  // saying what its absence already says is drift waiting to happen.
   it('stores userinfo_method only when it differs from the GET default', () => {
     const base = { ...emptyFields(), clientId: 'id' };
     expect(JSON.parse(buildSecret('oauth_client', base))).not.toHaveProperty('userinfo_method');

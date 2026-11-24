@@ -7,56 +7,91 @@ use crate::gateway_protocol::{
 use crate::peers::GATEWAY_HEALTH_PATH;
 use crate::remote_gateways::{ExtraHeaders, RemoteGateway};
 use std::time::Duration;
-const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What B answered a pairing secret with.
+#[derive(Debug)]
+pub enum PairReply {
+    Paired(PairAnswer),
+    /// B waits for a device paired with B to allow it. Sending the same
+    /// secret again pairs once it has.
+    AwaitingOwner,
+}
 
 /// A's client for B: `https` only, certificates checked, no redirects.
+///
+/// A loopback B gets the loopback client, which trusts only the loopback CA
+/// that every gateway on this machine serves on loopback. So another process
+/// squatting B's port gets no credential.
 #[derive(Clone)]
 pub struct PeerConnection {
-    http: std::sync::Arc<std::sync::RwLock<reqwest::Client>>,
+    http: reqwest::Client,
+    loopback: reqwest::Client,
 }
 
 impl PeerConnection {
     pub fn new() -> Result<Self, String> {
-        Self::build(None)
-    }
-
-    /// A client that also trusts `pem`, for a test's self-signed stand-in.
-    #[cfg(test)]
-    pub fn trusting(pem: &[u8]) -> Self {
-        Self::build(Some(reqwest::Certificate::from_pem(pem).unwrap())).unwrap()
-    }
-
-    fn build(extra_root: Option<reqwest::Certificate>) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder()
+        let unavailable =
+            |e: reqwest::Error| format!("could not start the remote gateway client: {e}");
+        let http = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(PEER_TIMEOUT);
-        if let Some(root) = extra_root {
-            builder = builder.add_root_certificate(root);
-        }
-        let http = builder
+            .connect_timeout(PEER_TIMEOUT)
             .build()
-            .map_err(|e| format!("could not start the remote gateway client: {e}"))?;
-        Ok(Self {
-            http: std::sync::Arc::new(std::sync::RwLock::new(http)),
-        })
+            .map_err(unavailable)?;
+        let loopback = lucidos_local_token::client::client_builder()
+            .connect_timeout(PEER_TIMEOUT)
+            .build()
+            .map_err(unavailable)?;
+        Ok(Self { http, loopback })
     }
 
-    fn transport(&self) -> Result<reqwest::Client, String> {
-        self.http
-            .read()
-            .map(|client| client.clone())
-            .map_err(|_| "the peer connection is unavailable".to_string())
-    }
-
-    pub(crate) fn client(&self) -> Option<Self> {
-        self.transport().ok().map(|_| self.clone())
-    }
-
+    /// A connection whose loopback client trusts `root_pem` instead of the CA
+    /// this build resolves. A fixture whose gateways serve a private HOME's
+    /// loopback CA needs it: the `test-support` client trusts another CA.
     #[cfg(test)]
-    pub fn trust_for_test(&self, pem: &[u8]) {
-        let trusted = Self::trusting(pem);
-        *self.http.write().unwrap() = trusted.transport().unwrap();
+    pub(crate) fn trusting_loopback_root(root_pem: &str) -> Result<Self, String> {
+        let mut connection = Self::new()?;
+        connection.loopback = reqwest::Client::builder()
+            .no_proxy()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(PEER_TIMEOUT)
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(root_pem.as_bytes()).map_err(|e| e.to_string())?,
+            )
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(connection)
+    }
+
+    /// The client for `origin`, and the origin to call. A loopback origin gets
+    /// the loopback client over https. One stored as `http://` before every
+    /// loopback listener served TLS is read as `https://`.
+    fn endpoint(&self, origin: &str) -> (reqwest::Client, String) {
+        if crate::remote_gateways::is_loopback_origin(origin) {
+            let https = match origin.strip_prefix("http://") {
+                Some(rest) => format!("https://{rest}"),
+                None => origin.to_string(),
+            };
+            return (self.loopback.clone(), https);
+        }
+        (self.http.clone(), origin.to_string())
+    }
+
+    /// Send callback hints to the registered routing origin without credentials.
+    pub(crate) fn return_request(
+        &self,
+        origin: &str,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let origin = crate::remote_gateways::valid_address(origin)?;
+        if !path.starts_with('/') || path.starts_with("//") {
+            return Err("A return request requires an origin-relative path.".into());
+        }
+        let (client, origin) = self.endpoint(&origin);
+        Ok(client.post(format!("{origin}{path}")))
     }
 
     /// Build a request to this remote's origin, with its gateway credential.
@@ -72,9 +107,10 @@ impl PeerConnection {
         }
         let credential = auth::sensitive_credential(&gateway.credential)
             .ok_or("the remote gateway credential is not a header value")?;
+        let (client, address) = self.endpoint(&gateway.address);
         Ok(gateway.headers.apply(
-            self.transport()?
-                .request(method, format!("{}{path}", gateway.address))
+            client
+                .request(method, format!("{address}{path}"))
                 .header(HEADER_GATEWAY_CREDENTIAL, credential),
         ))
     }
@@ -90,15 +126,29 @@ impl PeerConnection {
         origin: &str,
         headers: &ExtraHeaders,
     ) -> Result<serde_json::Value, String> {
-        let response = headers
-            .apply(
-                self.transport()?
-                    .get(format!("{origin}{GATEWAY_HEALTH_PATH}")),
-            )
+        self.client_health(origin, headers)
+            .await
+            .map_err(|(_, reason)| reason)
+    }
+
+    pub async fn client_health(
+        &self,
+        origin: &str,
+        headers: &ExtraHeaders,
+    ) -> Result<serde_json::Value, (crate::remote_workspaces::ReasonKind, String)> {
+        use crate::remote_workspaces::ReasonKind;
+        let (client, called) = self.endpoint(origin);
+        let mut response = headers
+            .apply(client.get(format!("{called}{GATEWAY_HEALTH_PATH}")))
             .timeout(PEER_TIMEOUT)
             .send()
             .await
-            .map_err(|e| format!("could not reach {origin}: {}", reached_error(&e)))?;
+            .map_err(|e| {
+                (
+                    crate::remote_workspaces::transport_reason(&e),
+                    format!("could not reach {origin}: {}", reached_error(&e)),
+                )
+            })?;
         let status = response.status();
         let html = response
             .headers()
@@ -110,17 +160,36 @@ impl PeerConnection {
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_owned))
                 .unwrap_or_default();
-            return Err(format!("this address answered with a sign-in page at {host}; add proxy headers or use the tailnet address"));
+            return Err((ReasonKind::Incompatible, format!("this address answered with a sign-in page at {host}; add proxy headers or use the tailnet address")));
         }
         if !status.is_success() {
-            return Err(format!(
-                "{origin} answered with HTTP {}, not with Lucidos's health",
-                response.status().as_u16()
+            return Err((
+                ReasonKind::Incompatible,
+                format!(
+                    "{origin} answered with HTTP {}, not with Lucidos's health",
+                    response.status().as_u16()
+                ),
             ));
         }
-        read_json(response)
-            .await
-            .map_err(|_| format!("{origin} answered, but not with Lucidos's health"))
+        let invalid = || {
+            (
+                ReasonKind::Incompatible,
+                format!("{origin} answered with invalid or oversized Lucidos health"),
+            )
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+            if bytes.len() + chunk.len() > crate::remote_browser::MAX_CLIENT_HEALTH_BYTES {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            (
+                ReasonKind::Incompatible,
+                format!("{origin} answered, but not with Lucidos's health"),
+            )
+        })
     }
 
     /// Redeem `code` at B.
@@ -130,23 +199,25 @@ impl PeerConnection {
         code: &str,
         label: &str,
         headers: &ExtraHeaders,
-    ) -> Result<PairAnswer, String> {
+    ) -> Result<PairReply, String> {
+        let (client, called) = self.endpoint(origin);
         let response = headers
-            .apply(
-                self.transport()?
-                    .post(format!("{origin}{GATEWAY_API_PREFIX}{PAIR_PATH}")),
-            )
+            .apply(client.post(format!("{called}{GATEWAY_API_PREFIX}{PAIR_PATH}")))
             .timeout(PEER_TIMEOUT)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(serde_json::json!({ "code": code, "label": label }).to_string())
             .send()
             .await
             .map_err(|e| format!("could not reach {origin}: {}", reached_error(&e)))?;
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            return Ok(PairReply::AwaitingOwner);
+        }
         if !response.status().is_success() {
             return Err(refusal(response).await);
         }
         read_json(response)
             .await
+            .map(PairReply::Paired)
             .map_err(|e| format!("{origin} paired, but its answer was unreadable: {e}"))
     }
 
@@ -230,6 +301,36 @@ impl PeerConnection {
         rotation_protocol(&identity)
     }
 
+    /// Read the destination identity through this saved grant's trusted origin.
+    /// Older peers may omit it, but must still identify the caller's pairing.
+    pub async fn destination_identity(
+        &self,
+        gateway: &RemoteGateway,
+    ) -> Result<Option<String>, String> {
+        let response = self
+            .request(
+                gateway,
+                reqwest::Method::GET,
+                &format!("{GATEWAY_API_PREFIX}{PAIRING_PATH}"),
+            )?
+            .timeout(PEER_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| "could not read the remote gateway identity")?;
+        if !response.status().is_success() {
+            return Err(refusal(response).await);
+        }
+        let body: serde_json::Value = read_json(response).await?;
+        if body.get("pairing_id").and_then(|v| v.as_str()) != Some(&gateway.pairing_id) {
+            return Err("remote identity did not match this pairing".into());
+        }
+        match body.get("gateway_id") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(id)) if !id.trim().is_empty() => Ok(Some(id.clone())),
+            _ => Err("remote gateway identity was invalid".into()),
+        }
+    }
+
     /// Ask B to forget this pairing.
     pub async fn leave(&self, gateway: &RemoteGateway) -> Result<(), String> {
         let request = self
@@ -289,6 +390,31 @@ fn rotation_protocol(identity: &serde_json::Value) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn gateway_health_refuses_oversized_chunked_json() {
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            let json = serde_json::to_vec(&serde_json::json!({"padding": "x".repeat(crate::remote_browser::MAX_CLIENT_HEALTH_BYTES + 1)})).unwrap();
+            let chunks: Vec<_> = json.chunks(1024).map(|c| Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(c))).collect();
+            axum::body::Body::from_stream(futures::stream::iter(chunks)).into_response()
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = super::PeerConnection::new()
+            .unwrap()
+            .client_health(
+                &format!("http://{address}"),
+                &super::ExtraHeaders::default(),
+            )
+            .await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "untrusted gateway health must have a body limit"
+        );
+    }
+
     #[test]
     fn rotation_preserves_the_remote_protocol() {
         assert_eq!(

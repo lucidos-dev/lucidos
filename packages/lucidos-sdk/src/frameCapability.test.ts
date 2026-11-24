@@ -13,13 +13,6 @@ const PASS = '6a0b~site-publisher~00112233445566778899aabbccddeeff';
 
 const originalQuerySelector = globalThis.document.querySelector;
 
-/**
- * Stand a `<base href>` up for the module to read and write.
- *
- * The suite runs without jsdom (`src/test-setup.ts`), so the element is a stub
- * with the two methods this module uses. `null` is a document the engine
- * stamped nothing into, which is every direct-to-engine load.
- */
 function stampBase(href: string | null): { href: string | null } {
   const element = { href };
   globalThis.document.querySelector = ((): Element | null =>
@@ -41,7 +34,6 @@ afterEach(() => {
   delete (globalThis as { location?: unknown }).location;
 });
 
-/** Where the document itself sits. The suite has no `location` of its own. */
 function placeDocument(href = DOCUMENT_HREF): void {
   (globalThis as { location?: unknown }).location = { href };
 }
@@ -78,7 +70,6 @@ describe('the pass is read from the base the engine stamped', () => {
   it('answers nothing direct to an engine, where no base is stamped', () => {
     stampBase(null);
     expect(currentCapability()).toBeNull();
-    // `''` rather than null, so every URL builder needs no branch of its own.
     expect(capabilityCarrier()).toBe('');
   });
 
@@ -94,7 +85,6 @@ describe('a renewal replaces the pass in place', () => {
     const base = stampBase(`/dev/~cap/${PASS}/app/site-publisher/`);
     expect(adoptCapability('fresh~site-publisher~ff')).toBe(true);
     expect(base.href).toBe('/dev/~cap/fresh~site-publisher~ff/app/site-publisher/');
-    // Read live, so a URL built after the renewal carries the new one.
     expect(currentCapability()).toBe('fresh~site-publisher~ff');
   });
 

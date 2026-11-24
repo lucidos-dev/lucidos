@@ -1,19 +1,6 @@
-/**
- * `lucidos.ui.openExternal` and the delegated anchor handler behind it.
- *
- * The load-bearing property is that the "Ask" mode's `navigator.share` runs
- * INSIDE the app iframe, synchronously, on the click that triggered it. The Web
- * Share API requires transient user activation, and activation survives neither
- * a `postMessage` hop nor an `await`, so a host-side share (or one behind a
- * preference fetch) would be refused on every single app link while chat links
- * kept working. A plain browser tab opens from the frame for the same reason.
- * Everything else routes to the host.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-// Keep link tests independent of the picker's host-side Vitest aliases.
 vi.mock('./modelPicker', () => ({ ModelPicker: {} }));
 
-/** Stands in for `requestVoid`, so it takes the path and the decoded body. */
 const navigate = vi.hoisted(
   () => vi.fn<(path: string, body?: unknown) => Promise<void>>(() => Promise.resolve()),
 );
@@ -23,7 +10,6 @@ const { adoptHostExternalLinks, SAFARI_SCHEME_PREFIX } = await import('./externa
 
 const TARGET = 'https://example.com/docs';
 
-/** An installed-iOS-PWA navigator: iPhone UA plus standalone display mode. */
 function stubIOSPwa(share?: (data: { url?: string }) => Promise<void>): void {
   vi.stubGlobal('navigator', {
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15',
@@ -45,8 +31,6 @@ function stubDesktopBrowser(): void {
   vi.stubGlobal('matchMedia', () => ({ matches: false }));
 }
 
-/** Drive the cache the way `applyPreferences` does, since `openExternal` must
- *  read it without awaiting a fetch. */
 async function setCachedTarget(target: string | undefined): Promise<void> {
   await ui.applyPreferences();
   if (target !== undefined) prefsResponse.external_link_target = target;
@@ -55,8 +39,6 @@ async function setCachedTarget(target: string | undefined): Promise<void> {
 }
 
 let prefsResponse: Record<string, string>;
-/** Indirected so a test can count fetches or make one fail. Reset per test to
- *  simply resolve `prefsResponse`. */
 let prefsGet: () => Promise<Record<string, string>>;
 
 vi.mock('./preferences', () => ({
@@ -72,9 +54,7 @@ vi.mock('./_fetch', () => ({
     navigate(path, init.body ? JSON.parse(init.body) : undefined);
     return Promise.resolve();
   },
-  // `ui.ts` builds the locally-served Fira Code stylesheet URL with this.
   apiUrl: (suffix: string) => `/api/v1${suffix}`,
-  // ...and a workspace font's face URLs with this.
   dataMountUrl: (path: string) => `/data/${path}`,
 }));
 
@@ -155,22 +135,12 @@ describe('ui.openExternal', () => {
     prefsResponse.external_link_target = 'ask';
 
     return ui.applyPreferences().then(() => {
-      // No await between the call and the assertion: an intervening microtask
-      // would have spent the click's transient activation and the OS would
-      // refuse the sheet.
       void ui.openExternal(TARGET);
       expect(share).toHaveBeenCalledTimes(1);
     });
   });
 
   it('falls back to the host when the mode has not been cached yet', async () => {
-    // A tap before applyPreferences() has ever run. Guessing "ask" here would
-    // burn the activation on a sheet the user may not have asked for; the host
-    // path always works.
-    //
-    // The cache is module state, so this needs a module instance no other test
-    // has warmed. Re-importing after resetModules is the only honest way to
-    // reach the cold branch.
     vi.resetModules();
     const { ui: coldUi } = await import('./ui');
     const share = vi.fn(() => Promise.resolve());
@@ -239,13 +209,7 @@ describe('ui.openExternal', () => {
   });
 });
 
-/**
- * The host said this frame may open web pages itself. WebKit gives a tab only
- * to a `window.open` made inside the tap. So the open must run before the
- * handler returns, and the host route must not be asked as well.
- */
 describe('ui.openExternal: the frame opens the tab itself', () => {
-  /** A `window` whose `open` hands back `opened`, or null when blocked. */
   function stubWindowOpen(opened: { closed: boolean; opener: unknown } | null) {
     const open = vi.fn((_url: string, _target: string) => opened);
     vi.stubGlobal('window', { open });
@@ -268,7 +232,6 @@ describe('ui.openExternal: the frame opens the tab itself', () => {
     const open = stubWindowOpen(opened);
 
     const done = ui.openExternal(TARGET);
-    // No await before this: the open must happen inside the click task.
     expect(open).toHaveBeenCalledWith(TARGET, '_blank');
     await done;
 
@@ -347,11 +310,6 @@ describe('ui.openExternal: the frame opens the tab itself', () => {
   });
 });
 
-/**
- * In an installed iOS PWA set to Safari, the host asks the frame to hand web
- * pages to the Safari app itself. The hand-off is a `window.open` of the
- * `x-safari-` URL, which iOS only honours inside the tap.
- */
 describe('ui.openExternal: the frame hands off to Safari itself', () => {
   function stubWindowOpen(opened: { closed: boolean; opener: unknown } | null) {
     const open = vi.fn((_url: string, _target: string) => opened);
@@ -413,12 +371,7 @@ describe('ui.openExternal: the frame hands off to Safari itself', () => {
   });
 });
 
-/**
- * An app opened as its own tab has no host to push an answer. In a plain
- * browser it opens the page itself, inside the tap, as a framed app does.
- */
 describe('ui.openExternal: a top-level app page opens the tab itself', () => {
-  /** A top-level `window` (its own parent) whose `open` hands back `opened`. */
   function stubTopLevelWindow(
     opened: { closed: boolean; opener: unknown } | null,
     extra: Record<string, unknown> = {},
@@ -481,13 +434,6 @@ describe('ui.openExternal: a top-level app page opens the tab itself', () => {
   });
 });
 
-/**
- * `applyPreferences()` is optional: the app-authoring guidance tells apps that
- * ship their own complete visual identity to skip Lucidos theming entirely. But
- * `browser.ts` installs the delegated link handler for EVERY app that loads
- * sdk.js, so if the cache warmed only through theming, those apps would hold a
- * null mode forever and quietly ignore the user's "Ask" choice on every link.
- */
 describe('primeDevicePreferences: the cache cannot depend on theming', () => {
   beforeEach(() => {
     prefsResponse = {};
@@ -543,7 +489,6 @@ describe('primeDevicePreferences: the cache cannot depend on theming', () => {
     const mod = await import('./ui');
     const share = vi.fn(() => Promise.resolve());
     stubIOSPwa(share);
-    // The prime's read hangs until released; applyPreferences answers first.
     let releasePrime: (prefs: Record<string, string>) => void = () => {};
     prefsGet = () => new Promise((resolve) => { releasePrime = resolve; });
     const primed = mod.primeDevicePreferences();

@@ -43,14 +43,7 @@ function serializeNode(el: Node, depth: number, state: { len: number }, foldY: n
   return out;
 }
 
-/** The viewport's picture and DOM text. With a `format` (a MIME subtype such
- *  as `png`), the picture is a file at the device pixel ratio
- *  (`renderingFor`). */
 export async function capture(format?: string): Promise<{ screenshot: string; dom: string }> {
-  // Built FIRST, independently of the screenshot, so a rasterizer failure never
-  // costs the agent this textual layout too. A blind agent ships UI it cannot
-  // see and claims it renders fine. This walk only reads geometry and classes,
-  // so it cannot fail on anything the page paints.
   const foldY = Math.min(window.innerHeight || 800, CAPTURE_MAX_HEIGHT) + 200;
   const state = { len: 0 };
   const domSnapshot = serializeNode(document.body, 0, state, foldY);
@@ -58,10 +51,6 @@ export async function capture(format?: string): Promise<{ screenshot: string; do
     ? `\n[DOM snapshot truncated at ~${Math.round(DOM_MAX / 1000)}KB]` : '';
   const dom = domSnapshot + truncated;
 
-  // The screenshot is best-effort. On any failure, degrade to DOM-only: an
-  // empty screenshot and a note, resolving rather than rejecting. The engine's
-  // `format_capture_result` drops the image marker for an empty screenshot and
-  // passes the DOM text through, so the agent still sees element positions.
   try {
     return { screenshot: await rasterize(document, format), dom };
   } catch (err) {

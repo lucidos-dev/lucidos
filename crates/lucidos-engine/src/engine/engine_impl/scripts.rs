@@ -4,8 +4,8 @@
 
 use super::super::*;
 
-/// Wall-clock budget for a scheduled `.sh` task before its child is killed.
-const SHELL_SCRIPT_TIMEOUT_SECS: u64 = 300;
+/// Wall-clock budget for a scheduled `.sh` task: the tool call limit, which the Seatbelt watcher covers.
+const SHELL_SCRIPT_TIMEOUT_SECS: u64 = crate::llm::tools::MAX_TIMEOUT_SECS;
 
 impl LucidosEngine {
     /// Record a trigger completion.
@@ -104,25 +104,30 @@ impl LucidosEngine {
     /// workspace's secrets. A task it starts through the engine must not
     /// either, or the route would hand them over. The compile env follows the
     /// agent's rule, so a build that works in its shell works here too.
-    pub(crate) async fn build_agent_task_env_vars(
+    pub async fn build_agent_task_env_vars(
         &self,
         thread_id: Uuid,
         worktree: &std::path::Path,
-    ) -> Vec<(String, String)> {
+        sandbox: crate::runtime::spawn_env::AgentSandbox,
+    ) -> Result<Vec<(String, String)>, String> {
         let depth =
             crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
         let mut env_vars = self
             .build_env_without_secrets(Some(thread_id), depth, None)
             .await;
         env_vars.extend(
-            crate::runtime::spawn_env::agent_compile_env(
-                crate::runtime::spawn_env::AgentSandbox::Unsandboxed,
-                worktree,
-            )
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value)),
+            crate::runtime::spawn_env::agent_compile_env(sandbox, worktree)
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value)),
         );
-        env_vars
+        let class = crate::engine::main_check::repair_build_class(&self.pool, thread_id)
+            .await
+            .map_err(|error| format!("Could not read repair build class: {error}"))?;
+        env_vars.push((
+            lucidos_build_slot::ENV_CLASS.to_string(),
+            class.as_str().to_string(),
+        ));
+        Ok(env_vars)
     }
 
     /// Everything a Lucidos-spawned subprocess gets except the secrets.
@@ -138,8 +143,15 @@ impl LucidosEngine {
         // in order, so an engine-owned var always wins a collision. `env_pairs`
         // also drops reserved names, as a second backstop.
         let mut env_vars = EnvironmentVariableStore::spawn_pairs(&self.pool, "Python").await;
+        let ps_shim_dir = crate::runtime::agent_sandbox::ps_shim_dir_for_workspace(
+            &self.pool,
+            self.workspace_path(),
+            crate::runtime::lucidos_cli::lucidos_cli_dir(),
+        )
+        .await;
         env_vars.extend(engine_owned_script_env(
             self.workspace_path(),
+            ps_shim_dir.as_deref(),
             thread_id,
             chain_depth,
             emitting_trigger_id,
@@ -154,7 +166,7 @@ impl LucidosEngine {
     /// Reading `ACTIVE_TRIGGER_ID` is right for exactly that reason. A spawn
     /// that starts a new thread passes `None` instead, and says so at its own
     /// call site.
-    pub(crate) async fn build_tool_env_vars(
+    pub async fn build_tool_env_vars(
         &self,
         thread_id: Uuid,
         mentions: &crate::core::credentials::SecretMentions,
@@ -162,6 +174,35 @@ impl LucidosEngine {
         let trigger = crate::scheduler::user_tasks::current_trigger_id();
         self.build_script_env_vars(Some(thread_id), trigger.as_deref(), mentions)
             .await
+    }
+
+    pub fn trigger_execution_sandbox(
+        &self,
+        sandbox: &crate::runtime::agent_sandbox::Sandbox,
+        trigger_id: &str,
+    ) -> crate::runtime::agent_sandbox::Sandbox {
+        let workspace = self.workspace_path();
+        use crate::scheduler::user_tasks::TRIGGER_DEFINITION;
+
+        let grants = TRIGGER_DEFINITION
+            .try_with(|digest| {
+                self.trigger_configs
+                    .read()
+                    .unwrap()
+                    .get(trigger_id)
+                    .filter(|config| config.definition_digest() == *digest)
+                    .map(|config| config.folder_grants.clone())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let folders: Vec<_> = grants
+            .into_iter()
+            .chain(crate::scheduler::user_tasks::run_folder_grants())
+            .filter(|grant| grant.still_valid(workspace))
+            .map(|grant| grant.folder)
+            .collect();
+        sandbox.for_trigger(workspace, &folders)
     }
 
     /// Execute a script file by workspace-relative path. Used by scheduled script tasks.
@@ -216,7 +257,7 @@ impl LucidosEngine {
             )
             .await;
         if let Some(note) = &script_env.secret_note {
-            log!("[Script] {script_path}: {note}");
+            log_legacy!("[Script] {script_path}: {note}");
         }
         env_vars.extend(script_env.vars.iter().cloned());
         env_vars.extend(extra_env.iter().cloned());
@@ -229,6 +270,13 @@ impl LucidosEngine {
         let secrets =
             crate::core::subprocess_secret_values(&env_vars, crate::core::inherited_secret_env());
 
+        let sandbox =
+            crate::runtime::agent_sandbox::Sandbox::resolve(self.pool(), self.workspace_path())
+                .await?;
+        let sandbox = match emitting_trigger_id {
+            Some(id) => self.trigger_execution_sandbox(&sandbox, id),
+            None => sandbox,
+        };
         let result = match extension {
             // A script runs IN PLACE, from its real on-disk path — never from
             // a copy. `__file__`-relative resolution is the whole
@@ -242,10 +290,13 @@ impl LucidosEngine {
             // supplies code as a string with no home on disk.
             "py" => self
                 .python_runtime
-                .execute_file_with_env(&full_path, env_vars)
+                .execute_file_with_env(&sandbox, &full_path, env_vars)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() }),
-            "sh" => self.execute_shell_script(&full_path, env_vars).await,
+            "sh" => {
+                self.execute_shell_script(&sandbox, &full_path, env_vars)
+                    .await
+            }
             _ => {
                 let msg = match crate::triggers::validate_script_extension(script_path) {
                     Err(e) => e,
@@ -262,7 +313,12 @@ impl LucidosEngine {
         let output = match result {
             Ok(output) => crate::core::redact_subprocess_output(&output, &secrets),
             Err(e) => {
-                return Err(crate::core::redact_subprocess_output(&e.to_string(), &secrets).into())
+                let diagnostic = crate::core::redact_subprocess_output(&e.to_string(), &secrets);
+                return Err(crate::triggers::folder_grant::script_failure(
+                    &sandbox,
+                    self.workspace_path(),
+                    diagnostic,
+                ));
             }
         };
 
@@ -275,12 +331,17 @@ impl LucidosEngine {
 
     async fn execute_shell_script(
         &self,
+        sandbox: &crate::runtime::agent_sandbox::Sandbox,
         script_path: &std::path::Path,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         use crate::core::sanitize_for_jsonb;
 
-        let output = run_shell_script_with_timeout(
+        // Typed for the same reason as the bash tools: `code().unwrap_or(-1)`
+        // reported a script killed by SIGSEGV as "exit -1", a number that reads
+        // like an ordinary status. `describe()` names the signal instead.
+        let (output, outcome, denial) = run_shell_script_with_timeout(
+            sandbox,
             script_path,
             self.workspace_path(),
             &env_vars,
@@ -292,17 +353,18 @@ impl LucidosEngine {
         let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
 
-        // Typed for the same reason as the bash tools: `code().unwrap_or(-1)`
-        // reported a script killed by SIGSEGV as "exit -1", a number that reads
-        // like an ordinary status. `describe()` names the signal instead.
-        let outcome = crate::core::shell::TaskOutcome::from_status(output.status);
         if outcome.is_success() {
             Ok(stdout)
         } else {
+            let error = crate::core::script_output::script_error_output(
+                &stderr,
+                &stdout,
+                stdout.len() as u64,
+            );
+            let denial = denial.map(|d| format!("\n{d}")).unwrap_or_default();
             Err(format!(
-                "Shell script error ({}):\n{}",
-                outcome.describe(),
-                crate::runtime::python::script_error_output(&stderr, &stdout, stdout.len() as u64)
+                "Shell script error ({}):\n{error}{denial}",
+                outcome.describe()
             )
             .into())
         }
@@ -310,7 +372,7 @@ impl LucidosEngine {
 
     /// Commit all dirty data/ files with a 30s timeout, logging success/failure.
     /// Shared by all code paths that may produce dirty files (scripts, Claude Code, run_python).
-    pub(crate) async fn commit_dirty_logged(&self, message: &str, context: &str) {
+    pub async fn commit_dirty_logged(&self, message: &str, context: &str) {
         // `commit_all_dirty` takes the workspace repo lock itself and moves it
         // into its blocking closure, so a caller must not hold it here. The
         // timeout therefore bounds waiting for the lock as well as the snapshot.
@@ -323,21 +385,21 @@ impl LucidosEngine {
         .await
         {
             Ok(Ok(Some(commit))) => {
-                log!(
+                log_legacy!(
                     "[Engine] Auto-committed dirty data files after {} ({})",
                     context,
                     &commit[..commit.floor_char_boundary(7)]
                 );
             }
             Ok(Err(e)) => {
-                log!(
+                log_legacy!(
                     "[Engine] Failed to commit dirty data files after {}: {}",
                     context,
                     e
                 );
             }
             Err(_) => {
-                log!(
+                log_legacy!(
                     "[Engine] commit_all_dirty timed out (30s) after {}",
                     context
                 );
@@ -350,15 +412,15 @@ impl LucidosEngine {
 /// A chat or script subprocess's env, and the note for any secret name its
 /// text mentioned that the workspace does not have.
 #[derive(Debug, Default)]
-pub(crate) struct ScriptEnv {
-    pub(crate) vars: Vec<(String, String)>,
-    pub(crate) secret_note: Option<String>,
+pub struct ScriptEnv {
+    pub vars: Vec<(String, String)>,
+    pub secret_note: Option<String>,
 }
 
 impl ScriptEnv {
     /// `result` with the secret-names note appended, when there is one. The
     /// one place a tool result gains it.
-    pub(crate) fn with_note(&self, mut result: String) -> String {
+    pub fn with_note(&self, mut result: String) -> String {
         if let Some(note) = &self.secret_note {
             if !result.is_empty() {
                 result.push_str("\n\n");
@@ -394,7 +456,7 @@ pub(crate) async fn named_secret_env_vars(
             }
             Err(e) => {
                 lookup_failed = true;
-                log!("[Script] Failed to load credentials for env injection: {e}");
+                log_legacy!("[Script] Failed to load credentials for env injection: {e}");
             }
         }
     }
@@ -410,7 +472,7 @@ pub(crate) async fn named_secret_env_vars(
                         continue;
                     }
                     if let Err(e) = oauth::refresh_oauth_if_needed(pool, &mut account).await {
-                        log!(
+                        log_legacy!(
                             "[Script] OAuth refresh failed for {}: {e}",
                             account.provider
                         );
@@ -421,7 +483,7 @@ pub(crate) async fn named_secret_env_vars(
             }
             Err(e) => {
                 lookup_failed = true;
-                log!("[Script] Failed to load OAuth accounts for env injection: {e}");
+                log_legacy!("[Script] Failed to load OAuth accounts for env injection: {e}");
             }
         }
     }
@@ -453,7 +515,7 @@ pub(crate) async fn named_secret_env_vars(
 /// read. A value rotated since the output was written is not here either.
 /// An `Err` means the list is incomplete, so the caller must not hand the
 /// output on.
-pub(crate) async fn stored_secret_values(pool: &sqlx::PgPool) -> Result<Vec<String>, String> {
+pub async fn stored_secret_values(pool: &sqlx::PgPool) -> Result<Vec<String>, String> {
     use crate::core::credentials::credential_env_vars_for;
     use crate::core::{oauth, CredentialStore, EnvironmentVariableStore, OAuthStore};
 
@@ -485,7 +547,7 @@ pub(crate) async fn stored_secret_values(pool: &sqlx::PgPool) -> Result<Vec<Stri
 /// Each reader that hands stored rows out, to the model or over HTTP, calls
 /// this. An `Err` means the rows are not masked, so the caller must withhold
 /// them.
-pub(crate) async fn mask_stored_events(
+pub async fn mask_stored_events(
     pool: &sqlx::PgPool,
     events: &mut [crate::core::EventRow],
 ) -> Result<(), String> {
@@ -503,6 +565,7 @@ pub(crate) async fn mask_stored_events(
 /// the database handle, origin attribution and host protection.
 fn engine_owned_script_env(
     workspace: &std::path::Path,
+    ps_shim_dir: Option<&std::path::Path>,
     thread_id: Option<Uuid>,
     chain_depth: u32,
     emitting_trigger_id: Option<&str>,
@@ -513,8 +576,12 @@ fn engine_owned_script_env(
     // to the script PATH so `psql "$LUCIDOS_DATABASE_URL"` resolves; it's not
     // on the launchd minimal PATH. Unset in dev (docker PG on PATH).
     let pg_bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from);
-    let mut env_vars =
-        workspace_script_env_vars(workspace, lucidos_cli_dir(), pg_bin_dir.as_deref());
+    let mut env_vars = workspace_script_env_vars(
+        workspace,
+        lucidos_cli_dir(),
+        ps_shim_dir,
+        pg_bin_dir.as_deref(),
+    );
 
     // The read-only database handle, and no `PG*` vars: an empty connection
     // string must reach nothing (ADR 0481).
@@ -530,9 +597,13 @@ fn engine_owned_script_env(
     // script's `lucidos events emit` stay on the fire's chain instead of
     // restarting it at 0 on the axum request task.
     env_vars.extend(
-        crate::api::actor::subprocess_origin_env_vars(thread_id, chain_depth, emitting_trigger_id)
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v)),
+        crate::core::subprocess_origin::subprocess_origin_env_vars(
+            thread_id,
+            chain_depth,
+            emitting_trigger_id,
+        )
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v)),
     );
 
     // Host-process kill-guard env (LUCIDOS_HOST_PID + optional
@@ -540,7 +611,7 @@ fn engine_owned_script_env(
     // a python/bash tool that shells out to `web-dev.sh` or `ports.sh` could
     // free up the engine's port by killing the engine itself.
     env_vars.extend(
-        crate::api::actor::host_protection_env_vars()
+        crate::core::subprocess_origin::host_protection_env_vars()
             .into_iter()
             .map(|(k, v)| (k.to_string(), v)),
     );
@@ -549,7 +620,8 @@ fn engine_owned_script_env(
 
 /// Spawn the script under the engine's `pipefail` shell (see `core::shell`) in
 /// `workspace_dir` with `env_vars` and without the `inherited` secrets,
-/// waiting up to `timeout` for it to finish.
+/// waiting up to `timeout` for it to finish. A failed script also returns any
+/// Seatbelt write denial the log holds for it.
 /// `kill_on_drop(true)` is the load-bearing part: on timeout the
 /// `wait_with_output` future is dropped, taking the owned child with it, and
 /// the OS sends SIGKILL — so a hung scheduled script can't leak an orphaned
@@ -557,13 +629,21 @@ fn engine_owned_script_env(
 /// pipefail guarantee: a `… | tee log` inside a trigger script would otherwise
 /// report the last stage's status and hide the real failure.
 async fn run_shell_script_with_timeout(
+    sandbox: &crate::runtime::agent_sandbox::Sandbox,
     script_path: &std::path::Path,
     workspace_dir: &std::path::Path,
     env_vars: &[(String, String)],
     inherited: &crate::core::InheritedSecretEnv,
     timeout: std::time::Duration,
-) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
-    let mut cmd = crate::core::shell::command_shell().script(script_path);
+) -> Result<
+    (
+        std::process::Output,
+        crate::core::shell::TaskOutcome,
+        Option<String>,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let mut cmd = crate::core::shell::command_shell().script(sandbox, script_path)?;
     cmd.current_dir(workspace_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -575,12 +655,18 @@ async fn run_shell_script_with_timeout(
         crate::core::InheritedSecrets::Strip(inherited),
     );
 
+    let started = chrono::Utc::now();
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn shell script: {}", e))?;
 
+    let pid = child.id();
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(output),
+        Ok(Ok(output)) => {
+            let outcome = crate::core::shell::TaskOutcome::from_status(output.status);
+            let denial = sandbox.seatbelt_write_refusal(pid, started, &outcome).await;
+            Ok((output, outcome, denial))
+        }
         Ok(Err(e)) => Err(format!("Error executing shell script: {}", e).into()),
         Err(_) => Err(format!("Shell script timed out after {}s", timeout.as_secs()).into()),
     }
@@ -597,7 +683,7 @@ mod tests {
     fn a_script_env_gets_the_read_only_handle_and_no_libpq_defaults() {
         crate::test_support::install_agent_database_url();
         let workspace = tempfile::TempDir::new().expect("tempdir");
-        let env = engine_owned_script_env(workspace.path(), Some(Uuid::new_v4()), 0, None);
+        let env = engine_owned_script_env(workspace.path(), None, Some(Uuid::new_v4()), 0, None);
         for name in [
             "PGUSER",
             "PGPASSWORD",
@@ -619,47 +705,6 @@ mod tests {
         assert!(
             handle.ends_with(lucidos_pg_url::READ_ONLY_OPTION),
             "{handle}"
-        );
-    }
-
-    /// A scheduled script's output leaves through the redaction, not around it.
-    ///
-    /// Sibling of `the_bash_tool_result_leaves_through_the_secret_redaction` in
-    /// `engine/tools/bash.rs`, and the same invariant. `execute_script` injects
-    /// the secrets the script names, then hands stdout to the trigger
-    /// summary and stderr to the failure notification. The scheduler persists
-    /// both.
-    ///
-    /// A source scan because driving the composition needs an engine and a
-    /// database, where the wiring is what actually regresses.
-    /// `core::subprocess_secrets` covers the redaction itself.
-    #[test]
-    fn a_scheduled_script_result_leaves_through_the_secret_redaction() {
-        let src = crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("engine/engine_impl/scripts.rs"),
-        );
-        let at = src
-            .find("crate::core::subprocess_secret_values(&env_vars,")
-            .expect(
-                "execute_script must read the injected secrets before the env is moved \
-                 into a runtime",
-            );
-        // Bound to the end of `execute_script`, so a later redaction elsewhere
-        // in the file cannot satisfy this count and a moved one cannot hide.
-        let end = src[at..]
-            .find("// Auto-commit any files the script touched")
-            .expect("execute_script still commits dirty artifacts after the script returns");
-        let body = &src[at..at + end];
-        assert_eq!(
-            body.matches("crate::core::redact_subprocess_output(")
-                .count(),
-            2,
-            "both arms must redact. A script that dies mid-request prints the request it \
-             was making, so the error path is the likelier leak of the two."
-        );
-        assert!(
-            src.contains("crate::core::InheritedSecrets::Strip(inherited)"),
-            "a scheduled shell script must not inherit the engine's secrets"
         );
     }
 
@@ -695,7 +740,8 @@ mod tests {
         let path = dir.path().join("task.sh");
         std::fs::write(&path, script).unwrap();
         let env = named_secret_env_vars(pool, &SecretMentions::of_script_file(&path)).await;
-        let output = run_shell_script_with_timeout(
+        let (output, _, _) = run_shell_script_with_timeout(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             &path,
             dir.path(),
             &env.vars,
@@ -817,6 +863,7 @@ mod tests {
         .unwrap();
 
         let err = run_shell_script_with_timeout(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             &script,
             &dir,
             &[],
@@ -834,5 +881,62 @@ mod tests {
             !sentinel.exists(),
             "sentinel was created — the timed-out shell child leaked (kill_on_drop missing)"
         );
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        #[test]
+        fn script_environment_handles_stay_reachable_in_the_sandbox() {
+            crate::test_support::install_agent_database_url();
+            let workspace = tempfile::tempdir().unwrap();
+            let env =
+                engine_owned_script_env(workspace.path(), None, Some(Uuid::new_v4()), 0, None);
+            crate::runtime::agent_sandbox::env_guard_tests::assert_spawn_env_reachable(
+                workspace.path(),
+                env,
+            );
+        }
+
+        /// A scheduled script's output leaves through the redaction, not around it.
+        ///
+        /// Sibling of `the_bash_tool_result_leaves_through_the_secret_redaction` in
+        /// `engine/tools/bash.rs`, and the same invariant. `execute_script` injects
+        /// the secrets the script names, then hands stdout to the trigger
+        /// summary and stderr to the failure notification. The scheduler persists
+        /// both.
+        ///
+        /// A source scan because driving the composition needs an engine and a
+        /// database, where the wiring is what actually regresses.
+        /// `core::subprocess_secrets` covers the redaction itself.
+        #[test]
+        fn a_scheduled_script_result_leaves_through_the_secret_redaction() {
+            let src = crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::engine_source("engine/engine_impl/scripts.rs"),
+            );
+            let at = src
+                .find("crate::core::subprocess_secret_values(&env_vars,")
+                .expect(
+                    "execute_script must read the injected secrets before the env is moved \
+                 into a runtime",
+                );
+            // Bound to the end of `execute_script`, so a later redaction elsewhere
+            // in the file cannot satisfy this count and a moved one cannot hide.
+            let end = src[at..]
+                .find("self.commit_dirty_logged(\"Script task output\", script_path)")
+                .expect("execute_script still commits dirty artifacts after the script returns");
+            let body = &src[at..at + end];
+            assert_eq!(
+                body.matches("crate::core::redact_subprocess_output(")
+                    .count(),
+                2,
+                "both arms must redact. A script that dies mid-request prints the request it \
+             was making, so the error path is the likelier leak of the two."
+            );
+            assert!(
+                src.contains("crate::core::InheritedSecrets::Strip(inherited)"),
+                "a scheduled shell script must not inherit the engine's secrets"
+            );
+        }
     }
 }

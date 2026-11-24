@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use chrono::Utc;
 
-use crate::api::SharedEngine;
 use crate::core::git_auth::GitCredentials;
 use crate::core::plugin_catalog_cache::{self, SCAN_STALL_CUTOFF_SECS};
 use crate::core::plugin_marketplaces::{
@@ -24,7 +23,7 @@ use crate::core::plugin_marketplaces::{
 };
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::release_notices::running_release;
-use crate::engine::tools::plugins::installed_plugin_summaries;
+use crate::engine::types::SharedEngine;
 use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
 
 pub(crate) const MARKETPLACE_UPDATE_CHECK_CRON: &str = "0 */5 * * * *";
@@ -36,7 +35,7 @@ pub(crate) const MARKETPLACE_UPDATE_CHECK_CRON: &str = "0 */5 * * * *";
 const UPDATE_NOTICE_MARKER: &str = ".lucidos/plugin-update-notice.json";
 
 #[derive(Debug, Default)]
-pub(crate) struct PluginUpdateCheckReport {
+pub struct PluginUpdateCheckReport {
     pub marketplaces: usize,
     pub candidates: usize,
     pub notified: bool,
@@ -63,7 +62,7 @@ impl PluginUpdateCheckReport {
 /// Why a scan was asked for. Decides what a caller does when another scan
 /// already holds the single-flight guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanCause {
+pub enum ScanCause {
     /// The scheduler's tick, or a reader wanting current data. Joining the
     /// running scan is good enough: there is no change to be newer than.
     Routine,
@@ -120,7 +119,7 @@ impl UpdateCheckGuard {
                 .is_ok()
             {
                 if held != 0 {
-                    log!("[PluginUpdateCheck] Taking over a scan slot held since {held}");
+                    log_legacy!("[PluginUpdateCheck] Taking over a scan slot held since {held}");
                 }
                 return Some(Self(now));
             }
@@ -152,7 +151,7 @@ impl Drop for UpdateCheckGuard {
 /// The log line is the whole point of the wrapper. Every caller discards the
 /// report, so a marketplace whose git fetch fails, or a corrupt
 /// `marketplaces.json`, used to leave the five-minute check running in silence.
-pub(crate) async fn run_plugin_marketplace_update_check(
+pub async fn run_plugin_marketplace_update_check(
     engine: SharedEngine,
     pool: sqlx::PgPool,
     cause: ScanCause,
@@ -182,7 +181,7 @@ async fn run_one_pass(
 ) -> (PluginUpdateCheckReport, bool) {
     let (report, scanned) = check_marketplaces_for_updates(engine.clone(), pool.clone()).await;
     for line in report.failure_log_lines() {
-        log!("[PluginUpdateCheck] {line}");
+        log_legacy!("[PluginUpdateCheck] {line}");
     }
     (report, scanned)
 }
@@ -195,7 +194,7 @@ async fn run_one_pass(
 /// just queued. On a workspace with nothing cached that reads as "No plugins
 /// found", at the exact moment the user registered their first marketplace.
 /// Every site that spawns a scan calls this first, synchronously.
-pub(crate) fn note_scan_queued(workspace: &Path) {
+pub fn note_scan_queued(workspace: &Path) {
     plugin_catalog_cache::mark_scan_started(workspace, Utc::now());
 }
 
@@ -206,6 +205,7 @@ pub(crate) fn note_scan_queued(workspace: &Path) {
 /// `errors` and still produce a result. Either way the cache settles here, so
 /// no caller can leave a start stamp behind and pin the cue on.
 async fn scan_into_cache(
+    engine: &SharedEngine,
     pool: &sqlx::PgPool,
     workspace: &Path,
     guard: &UpdateCheckGuard,
@@ -237,7 +237,11 @@ async fn scan_into_cache(
         return Some(empty);
     }
 
-    let installed = match installed_plugin_summaries(pool, workspace).await {
+    let installed = match engine
+        .agent_host()
+        .installed_plugin_summaries(engine, pool)
+        .await
+    {
         Ok(installed) => installed,
         Err(e) => return fail(format!("read installed plugins: {e}")),
     };
@@ -269,7 +273,7 @@ fn record_scan_if_live(workspace: &Path, guard: &UpdateCheckGuard, catalog: &Mar
         plugin_catalog_cache::record_scan(workspace, catalog, Utc::now());
         crate::core::plugin_marketplaces::prune_media_for(workspace, catalog);
     } else {
-        log!("[PluginUpdateCheck] Discarding a scan whose slot was taken over");
+        log_legacy!("[PluginUpdateCheck] Discarding a scan whose slot was taken over");
     }
 }
 
@@ -295,7 +299,7 @@ async fn check_marketplaces_for_updates(
         return (PluginUpdateCheckReport::default(), false);
     }
     let Some(guard) = UpdateCheckGuard::try_acquire(Utc::now().timestamp()) else {
-        log!("[PluginUpdateCheck] Skipping run; another marketplace sync is active");
+        log_legacy!("[PluginUpdateCheck] Skipping run; another marketplace sync is active");
         return (PluginUpdateCheckReport::default(), false);
     };
     // Cleared here, at the top of the pass that holds the slot, so everything
@@ -314,7 +318,7 @@ async fn check_marketplaces_for_updates(
     note_scan_queued(&workspace);
     announce_scan(&engine, SystemEvent::PluginCatalogScanStarted {}, "Started").await;
 
-    let scanned = scan_into_cache(&pool, &workspace, &guard, &mut report).await;
+    let scanned = scan_into_cache(&engine, &pool, &workspace, &guard, &mut report).await;
 
     // A slot taken over mid-scan means a newer pass owns the cache and the
     // scanning state. Announcing here would lower that pass's state, and send
@@ -368,7 +372,7 @@ async fn check_marketplaces_for_updates(
         // Persist the (possibly shrunk) set so applied updates drop out of the
         // marker — nothing to notify here, so there's no notification at risk.
         write_notified_signature(&workspace, &current);
-        log!(
+        log_legacy!(
             "[PluginUpdateCheck] {} update(s) available; already notified",
             candidates.len()
         );
@@ -396,7 +400,7 @@ async fn check_marketplaces_for_updates(
             // transient emit failure retries on the next scan instead of being
             // silently swallowed by the marker.
             write_notified_signature(&workspace, &current);
-            log!(
+            log_legacy!(
                 "[PluginUpdateCheck] Notified user of {} available plugin update(s)",
                 candidates.len()
             );
@@ -472,7 +476,7 @@ fn write_notified_signature(workspace: &Path, signature: &BTreeSet<String>) {
     let path = marker_path(workspace);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            log!("[PluginUpdateCheck] create marker dir failed: {e}");
+            log_legacy!("[PluginUpdateCheck] create marker dir failed: {e}");
             return;
         }
     }
@@ -480,10 +484,10 @@ fn write_notified_signature(workspace: &Path, signature: &BTreeSet<String>) {
     match serde_json::to_string(&entries) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
-                log!("[PluginUpdateCheck] write update marker failed: {e}");
+                log_legacy!("[PluginUpdateCheck] write update marker failed: {e}");
             }
         }
-        Err(e) => log!("[PluginUpdateCheck] serialize update marker failed: {e}"),
+        Err(e) => log_legacy!("[PluginUpdateCheck] serialize update marker failed: {e}"),
     }
 }
 

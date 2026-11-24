@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 /// What the plan floor says about a branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlanFloor {
+pub enum PlanFloor {
     /// Not Lucidos source. App and external-repo threads do not plan.
     Exempt,
     /// The marker satisfies the gate.
@@ -29,19 +29,7 @@ pub(crate) enum PlanFloor {
     Held(PlanHold),
 }
 
-/// Why the floor holds a branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlanHold {
-    /// No marker at all.
-    Missing,
-    /// A plan is recorded but the user has not approved it.
-    AwaitingApproval,
-    /// A plan awaits approval and the branch lands plan files alone. The
-    /// decision is the user's, so the agent is not sent back to ask again.
-    PlanOnlyAwaitingApproval,
-    /// A bounded security fix whose work reaches past the files it named.
-    OutsideBound,
-}
+pub use crate::engine::thread_events::change_hold::{PlanHold, ProposalHold};
 
 impl PlanFloor {
     pub(crate) fn decide(kind: &ApplyKindContext, state: PlanMarkerState) -> Self {
@@ -49,9 +37,14 @@ impl PlanFloor {
             return PlanFloor::Exempt;
         }
         match state {
+            PlanMarkerState::Present(PlanMarkerKind::PlanOnly) => {
+                PlanFloor::Held(PlanHold::PlanOnlyCode)
+            }
             PlanMarkerState::Present(k) if k.satisfies_gate() => PlanFloor::Clear(k),
             PlanMarkerState::Present(_) => PlanFloor::Held(PlanHold::AwaitingApproval),
+            PlanMarkerState::Changed => PlanFloor::Held(PlanHold::Changed),
             PlanMarkerState::Missing => PlanFloor::Held(PlanHold::Missing),
+            PlanMarkerState::Unreadable => PlanFloor::Held(PlanHold::Unreadable),
         }
     }
 }
@@ -59,8 +52,16 @@ impl PlanFloor {
 impl PlanFloor {
     /// Re-judge an awaiting-approval hold against the files that would land.
     /// An empty list keeps the hold: it is no evidence of a plan-only branch.
-    pub(crate) fn with_landing(self, landing: &[String]) -> Self {
+    pub fn with_landing(self, landing: &[String]) -> Self {
         match self {
+            PlanFloor::Held(PlanHold::PlanOnlyCode)
+            | PlanFloor::Clear(PlanMarkerKind::PlanOnly) => {
+                if lands_plan_files_only(landing) {
+                    PlanFloor::Clear(PlanMarkerKind::PlanOnly)
+                } else {
+                    PlanFloor::Held(PlanHold::PlanOnlyCode)
+                }
+            }
             PlanFloor::Held(PlanHold::AwaitingApproval) if lands_plan_files_only(landing) => {
                 PlanFloor::Held(PlanHold::PlanOnlyAwaitingApproval)
             }
@@ -72,122 +73,13 @@ impl PlanFloor {
 /// Whether Apply must harden a branch before it merges. Both Apply routes ask
 /// it. Apps own their hardening, and a `None` landing list (git could not
 /// answer) counts as work that needs it.
-pub(crate) fn apply_must_harden(
+pub fn apply_must_harden(
     kind: &ApplyKindContext,
     hardened: bool,
     landing: Option<&[String]>,
 ) -> bool {
     !kind.is_app() && needs_hardening(hardened, landing.unwrap_or_default())
 }
-
-impl PlanHold {
-    /// What a refused Apply tells the user.
-    pub(crate) fn apply_refusal(self) -> &'static str {
-        match self {
-            PlanHold::AwaitingApproval | PlanHold::PlanOnlyAwaitingApproval => {
-                "The implementation plan on this branch is awaiting approval. The user must \
-                 approve the plan, after which the coding agent runs `lucidos planned approve` \
-                 to unblock implementation. Approve the plan, then apply."
-            }
-            PlanHold::Missing => {
-                "No implementation-plan marker on this branch. Before applying, the coding \
-                 agent must run the `implementation-plan` skill (records a plan for the user to \
-                 approve) or `lucidos planned mark --simple \"<reason>\"` (acknowledges a local \
-                 fix). Re-run the session to set the marker, then apply."
-            }
-            PlanHold::OutsideBound => {
-                "This branch carries a bounded security-fix marker and changes files outside the \
-                 bound it named. Drop the extra files, re-run `lucidos planned mark --security-fix` \
-                 with the full list, or write a plan and have the user approve it."
-            }
-        }
-    }
-
-    /// What the engine tells a live agent whose turn-end proposal it held.
-    pub(crate) fn agent_nudge(self) -> &'static str {
-        match self {
-            PlanHold::AwaitingApproval | PlanHold::PlanOnlyAwaitingApproval => {
-                "Lucidos did not propose this branch's change. Its implementation plan still \
-                 awaits the user's approval, so Apply would refuse it. Ask for approval with your \
-                 question tool, `Approve` first. Once the user approves, run \
-                 `lucidos planned approve` and end your turn: Lucidos then proposes the change. \
-                 If nobody can be asked (an unattended run), do not ask: end your turn with the \
-                 `BLOCKED ON PLAN DECISION:` line the `implementation-plan` skill describes."
-            }
-            PlanHold::Missing => {
-                "Lucidos did not propose this branch's change. The branch has commits but no \
-                 implementation-plan marker, so Apply would refuse it. A marker is consumed when a \
-                 change applies, so work after an Apply needs a new one. If the work is complex, \
-                 run the `implementation-plan` skill and ask for approval with your question tool. \
-                 If it is a genuinely local fix, run `lucidos planned mark --simple \"<one-line \
-                 reason>\"`. Then end your turn: Lucidos then proposes the change. If nobody can \
-                 be asked (an unattended run), follow that skill's unattended lanes instead."
-            }
-            PlanHold::OutsideBound => {
-                "Lucidos did not propose this branch's change. Its bounded security-fix marker \
-                 names fewer files than the branch changes, so Apply would refuse it. Drop the \
-                 extra files, or re-run `lucidos planned mark --security-fix` with the full list. \
-                 If the fix is wider than the lane allows, take the blocked lane in the \
-                 `implementation-plan` skill. Then end your turn."
-            }
-        }
-    }
-}
-
-/// Why a turn end's work may not become a change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProposalHold {
-    /// The plan floor holds the branch.
-    Plan(PlanHold),
-    /// The work never ran `/harden`, so Apply would harden it first.
-    HardeningMissing,
-    /// An integrated sub-thread's hardened work. It hands its branch up to
-    /// its parent, whose agent merges it, so it never becomes a change.
-    IntegratedIntoParent,
-    /// The thread handed off to a legacy successor thread. Its branch work rides on
-    /// the successor's branch, so this thread never proposes it.
-    CarriedBySuccessor,
-}
-
-impl ProposalHold {
-    /// What a refused Apply tells the user.
-    pub(crate) fn apply_refusal(self) -> &'static str {
-        match self {
-            ProposalHold::Plan(hold) => hold.apply_refusal(),
-            ProposalHold::HardeningMissing => {
-                "This branch's work has not been hardened, so Lucidos did not propose it. \
-                 Press Harden on the thread: the hardening run proposes the change when it \
-                 finishes."
-            }
-            ProposalHold::IntegratedIntoParent => INTEGRATED_HAS_NO_APPLY,
-            ProposalHold::CarriedBySuccessor => CARRIED_HAS_NO_APPLY,
-        }
-    }
-
-    /// What the engine tells a live agent whose turn-end proposal it held.
-    pub(crate) fn agent_nudge(self) -> &'static str {
-        match self {
-            ProposalHold::Plan(hold) => hold.agent_nudge(),
-            ProposalHold::HardeningMissing => {
-                "Lucidos did not propose this branch's change. The branch never ran `/harden`, \
-                 so Apply would have to harden it first. Run `/harden` now over the whole \
-                 batch of commits, then end your turn: Lucidos then proposes the change."
-            }
-            ProposalHold::IntegratedIntoParent => INTEGRATED_HAS_NO_APPLY,
-            ProposalHold::CarriedBySuccessor => CARRIED_HAS_NO_APPLY,
-        }
-    }
-}
-
-/// Why an integrated sub-thread's work has no Apply.
-const INTEGRATED_HAS_NO_APPLY: &str =
-    "This thread is integrated into its parent. Lucidos never proposes its work: the parent's \
-     agent merges its branch, and the parent's change carries it.";
-
-/// Why a thread that handed off has no Apply.
-const CARRIED_HAS_NO_APPLY: &str =
-    "This thread continued in a legacy successor thread, whose branch carries its work. Lucidos \
-     never proposes it here: the successor's change carries it to Apply.";
 
 /// The plan floor for a branch whose thread kind is already loaded. Skips the
 /// marker read for an exempt thread.
@@ -251,14 +143,14 @@ async fn read_proposal_floor(
 /// files only. A fresh marker of either tier hands it up to the parent;
 /// without one it waits for hardening. Every other branch counts only a full
 /// marker, fresh or stale.
-pub(crate) async fn read_proposal_hold(
+pub async fn read_proposal_hold(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     repo_root: &Path,
     branch_name: &str,
     files: &[String],
 ) -> Option<ProposalHold> {
-    if crate::engine::successor::handed_off(pool, thread_id).await {
+    if crate::engine::handoff_state::handed_off(pool, thread_id).await {
         return Some(ProposalHold::CarriedBySuccessor);
     }
     match read_proposal_floor(pool, thread_id, repo_root, branch_name, files).await {
@@ -278,6 +170,34 @@ pub(crate) async fn read_proposal_hold(
     }
 }
 
+/// The plan hold `thread_id`'s last withheld proposal met. A later reason,
+/// or none, sends the agent back for nothing.
+pub async fn held_plan(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<PlanHold> {
+    use crate::engine::thread_events::UnproposedReason;
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'reason' FROM events \
+         WHERE thread_id = $1 AND event_type = 'ProposalWithheld' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        crate::log_legacy!("[Changes] Could not read the plan hold of {thread_id}: {e}");
+        None
+    })
+    .flatten();
+    match reason.as_deref().and_then(UnproposedReason::parse)? {
+        UnproposedReason::PlanChanged => Some(PlanHold::Changed),
+        UnproposedReason::PlanMissing => Some(PlanHold::Missing),
+        UnproposedReason::PlanUnreadable => Some(PlanHold::Unreadable),
+        UnproposedReason::PlanAwaitingApproval => Some(PlanHold::AwaitingApproval),
+        UnproposedReason::OutsideBound => Some(PlanHold::OutsideBound),
+        UnproposedReason::PlanOnlyCode => Some(PlanHold::PlanOnlyCode),
+        _ => None,
+    }
+}
+
 /// An integrated sub-thread's hold: handed up once a fresh marker covers its
 /// work, held for hardening until then. A branch of plan files alone needs no
 /// hardening and has no marker to hand up, so it proposes like any other.
@@ -292,7 +212,7 @@ fn integrated_hold(fresh_marker: bool, files: &[String]) -> Option<ProposalHold>
 }
 
 impl LucidosEngine {
-    pub(crate) async fn plan_floor(
+    pub async fn plan_floor(
         &self,
         kind: &ApplyKindContext,
         repo_root: &Path,
@@ -305,7 +225,7 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::agent_session::CodingAgentKind;
+    use crate::engine::thread_events::CodingAgentKind;
 
     fn kind(kind: CodingAgentKind) -> ApplyKindContext {
         ApplyKindContext { kind, app_id: None }
@@ -322,6 +242,10 @@ mod tests {
             PlanFloor::decide(&lucidos, PlanMarkerState::Present(PlanMarkerKind::Proposed)),
             PlanFloor::Held(PlanHold::AwaitingApproval)
         );
+        assert_eq!(
+            PlanFloor::decide(&lucidos, PlanMarkerState::Changed),
+            PlanFloor::Held(PlanHold::Changed)
+        );
         for k in [
             PlanMarkerKind::Planned,
             PlanMarkerKind::AcknowledgedSimple,
@@ -332,6 +256,28 @@ mod tests {
                 PlanFloor::Clear(k)
             );
         }
+    }
+
+    #[test]
+    fn plan_only_approval_never_opens_the_edit_gate_or_lands_code() {
+        let marker = PlanMarkerKind::parse("plan_only");
+        assert!(
+            !marker.satisfies_gate(),
+            "approval for later cannot permit source edits"
+        );
+        let floor = PlanFloor::decide(
+            &kind(CodingAgentKind::Lucidos),
+            PlanMarkerState::Present(marker),
+        );
+        let plan = vec!["docs/plans/example.md".to_string()];
+        assert_eq!(floor.with_landing(&plan), PlanFloor::Clear(marker));
+        assert!(matches!(floor.with_landing(&[]), PlanFloor::Held(_)));
+        let mixed = vec![plan[0].clone(), "src/main.rs".to_string()];
+        assert!(matches!(floor.with_landing(&mixed), PlanFloor::Held(_)));
+        assert!(matches!(
+            floor.with_landing(&plan).with_landing(&mixed),
+            PlanFloor::Held(_)
+        ));
     }
 
     #[test]
@@ -452,6 +398,35 @@ mod tests {
             propose(&["docs/plans/x.md", "src/main.rs"]).await,
             PlanFloor::Held(PlanHold::AwaitingApproval)
         );
+        mark(PlanMarkerKind::PlanOnly)
+            .await
+            .expect("mark plan-only");
+        assert_eq!(floor().await, PlanFloor::Held(PlanHold::PlanOnlyCode));
+        assert_eq!(
+            propose(&["docs/plans/x.md"]).await,
+            PlanFloor::Clear(PlanMarkerKind::PlanOnly)
+        );
+        assert_eq!(
+            propose(&["docs/plans/x.md", "src/main.rs"]).await,
+            PlanFloor::Held(PlanHold::PlanOnlyCode)
+        );
+        assert_eq!(
+            crate::engine::git_ops::plan_marker_state(&pool, repo.path(), "work").await,
+            PlanMarkerState::Present(PlanMarkerKind::PlanOnly)
+        );
+        sqlx::query("UPDATE planned_branches SET kind = 'design' WHERE branch_name = 'work'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::engine::git_ops::carry_planned(&pool, repo.path(), "work", "next")
+            .await
+            .unwrap();
+        let copied_kind: String =
+            sqlx::query_scalar("SELECT kind FROM planned_branches WHERE branch_name = 'next'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(copied_kind, "design");
         mark(PlanMarkerKind::AcknowledgedSimple)
             .await
             .expect("mark simple");
@@ -464,6 +439,7 @@ mod tests {
         bus.emit(BusEvent::Thread {
             thread_id: app_thread,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: String::new(),
                 branch: "app-work".into(),

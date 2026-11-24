@@ -10,7 +10,6 @@ import {
 import '../effects';
 import type { Change, RepoChangesState } from '../../api/client';
 
-// Mock the API client
 vi.mock('../../api/client', async () => {
   const actual = await vi.importActual<typeof import('../../api/client')>('../../api/client');
   return {
@@ -184,7 +183,6 @@ describe('viewChangeDiff', () => {
     (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
     (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
 
-    // Simulate a file-preview overlay left open from a previous drill-down
     panelOverlay.value = { type: 'file-preview', path: 'repo:repo-1:diff:src/main.rs' };
 
     await viewChangeDiff(mockChange);
@@ -192,10 +190,6 @@ describe('viewChangeDiff', () => {
     expect(panelOverlay.value).toBeNull();
   });
 
-  // App coding-agent changes use the workspace root as repo_root (not a
-  // registered Repository), as do changes whose repo was later removed. Both
-  // render the diff inline instead of bailing — the All-Files tab needs a
-  // registered repo, but the diff itself does not.
   it('renders the diff inline when no registered repo matches', async () => {
     repositories.value = {
       status: 'loaded',
@@ -216,7 +210,6 @@ describe('viewChangeDiff', () => {
     expect(repoSelectedChangeId.value).toBe('change-1');
     expect(repoViewMode.value).toBe('changes');
     expect(repoDiff.value.status).toBe('loaded');
-    // No threadMap entry → no app-id suffix, just the change description.
     expect(repoPending.value?.description).toBe('Fix the widget');
   });
 
@@ -242,7 +235,6 @@ describe('viewChangeDiff', () => {
 
     await viewChangeDiff(mockChange);
 
-    // A diff never opens a single file directly; unregistered ones render inline.
     expect(panelOverlay.value).toBeNull();
     expect(repoViewMode.value).toBe('changes');
     expect(repoSource.value).toBeNull();
@@ -302,7 +294,7 @@ describe('viewChangeDiff', () => {
 
     const modes: string[] = [];
     const stop = effect(() => { modes.push(repoViewMode.value); });
-    modes.length = 0; // drop the value the effect read on subscribe
+    modes.length = 0;
     await viewChangeDiff(mockChange);
     stop();
 
@@ -343,7 +335,7 @@ describe('viewChangeDiff', () => {
     (listRepoFiles as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
     const first = viewChangeDiff(mockChange);
-    await new Promise(r => setTimeout(r, 0)); // first is now waiting on its diff
+    await new Promise(r => setTimeout(r, 0));
     await viewChangeDiff(mockAppliedChange);
     resolveFirst({ files: [{ path: 'first.rs', status: 'modified', hunks: [] }] });
     await first;
@@ -374,9 +366,6 @@ describe('viewChangeDiff', () => {
 });
 
 describe('viewThreadCcDiff', () => {
-  // The thread-level Diff button (WaitingBanner / standalone CC diff button)
-  // routes here, NOT through viewChangeDiff, so the file-list landing must
-  // hold here too.
   it('lands on the file list even for a single-file branch diff', async () => {
     repositories.value = {
       status: 'loaded',
@@ -426,7 +415,7 @@ describe('viewThreadCcDiff', () => {
     (listRepoFiles as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
     const pending = viewThreadCcDiff('thread-1');
-    await new Promise(r => setTimeout(r, 0)); // now waiting on the thread diff
+    await new Promise(r => setTimeout(r, 0));
     await switchRepoSource('repo-2');
     resolveDiff({
       repo_root: '/test/repo',
@@ -555,8 +544,6 @@ describe('restoreRepoSelectionFromStorage', () => {
   });
 
   it('keeps saved ID on transient failures (network down, 5xx)', async () => {
-    // Without this guard, a momentary engine outage would silently lose the
-    // user's diff-view selection across the next reload.
     writeWindowItem(SELECTED_CHANGE_KEY, 'change-still-there');
     (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Network down'));
 
@@ -566,8 +553,6 @@ describe('restoreRepoSelectionFromStorage', () => {
   });
 
   it('skips when a file-preview overlay already encodes the same change', async () => {
-    // RepoFilePreview's useEffect handles this case — duplicating the fetch
-    // here doubles the round-trip on every reload of a diff file preview.
     writeWindowItem(SELECTED_CHANGE_KEY, 'change-1');
     panelOverlay.value = {
       type: 'file-preview',

@@ -18,70 +18,38 @@ import { decideHeight, initialHeightGuard } from './widgetHeightGuard';
 import { postClientLog } from '../../utils/clientLog';
 import { widgetFrameState, type FrameState } from './widgetFrameState';
 
-/** The frame's height before the widget reports one, in CSS pixels. */
 export const DEFAULT_WIDGET_HEIGHT_PX = 240;
 
-/** An option's widget starts one control row tall: an option holds a small
- *  widget, and a card of four options must not jump by a screen as each one
- *  reports. */
 export const OPTION_WIDGET_HEIGHT_PX = 48;
 
-/** How long a frame stays loaded after it scrolls off screen. Scrolling back
- *  inside it finds the widget as it was, a playing clip included. */
 export const OFF_SCREEN_HOLD_MS = 120_000;
 
 export type { WidgetPlace };
 
-/** Where a frame sits. A thread card and a dashboard tile are widget boxes,
- *  so they always take a size, and the other places never do. */
 export type WidgetFramePlacement =
   | { place: 'inline' | 'dashboard'; size: WidgetSize }
   | { place: Exclude<WidgetPlace, 'inline' | 'dashboard'>; size?: undefined };
 
-/** Makes a frame a *widget fit check* probe. It loads at once and stays
- *  loaded, outside the shared frame budget, so it never evicts a frame the
- *  user sees. Each new `measure` token asks the widget to settle and report
- *  what its box cuts off, and `onFit` hears that report. `device` names whose
- *  appearance the frame's first paint carries, instead of this window's.
- *  `null` carries the workspace-wide appearance. */
 export interface WidgetFitProbe {
   measure: string;
   device: string | null;
   onFit: (fit: WidgetFit) => void;
 }
 
-/** A frame's height before its widget reports one. */
 export function defaultWidgetHeight(place: WidgetPlace): number {
   return place === 'option' ? OPTION_WIDGET_HEIGHT_PX : DEFAULT_WIDGET_HEIGHT_PX;
 }
 
-/** The last size each widget instance reported. An instance opened again
- *  starts at its own size, and a widget box starts its fade from it. */
 const lastSizes = new Map<string, ContentSize>();
 
-/** Test-only: forget every remembered size. */
 export function _resetWidgetHeightsForTesting(): void {
   lastSizes.clear();
 }
 
-/** The box a frame takes up in the transcript: its widget box, else the frame
- *  itself. */
 function transcriptBox(host: HTMLElement): HTMLElement {
   return host.closest<HTMLElement>('.widget-box') ?? host;
 }
 
-/** Hold what follows `box` still while it changes height across or above the
- *  reader's line, the transcript's top edge. A frame mounts as it comes on
- *  screen and then reports, so a reader scrolling up meets it at that line.
- *  The transcript turns off browser scroll anchoring, so nothing else holds it.
- *
- *  A frame the reader is using keeps its place instead, as anything pressed
- *  does (ADR 0147), but only while it is on screen. Scrolling never blurs a
- *  frame, and one held off screen still reports. A box with nothing after it on
- *  screen keeps its place too.
- *
- *  Returns the correction to run once the new height is laid out, or null when
- *  the change cannot move what the reader is reading. */
 function holdWhatFollows(box: HTMLElement): (() => void) | null {
   const scroller = box.closest<HTMLElement>('.thread-content');
   if (!scroller) return null;
@@ -92,20 +60,15 @@ function holdWhatFollows(box: HTMLElement): (() => void) | null {
   const bottomBefore = before.bottom - band.top;
   return () => {
     const shift = box.getBoundingClientRect().bottom - scroller.getBoundingClientRect().top - bottomBefore;
-    // A write stops an iOS fling, so a sub-pixel shift is left alone.
     if (Math.abs(shift) >= 1) holdAcrossRelayout(scroller, scroller.scrollTop + shift);
   };
 }
 
-/** Watch whether `el` crosses the viewport. A dashboard tile scrolls in its
- *  own pane, never the transcript, so the transcript's band cannot answer. */
 function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): () => void {
   if (typeof IntersectionObserver !== 'function') {
     onChange(true);
     return () => {};
   }
-  // The observer's own answer counts every clipping ancestor and a pane slid
-  // sideways off screen, which a rect against the window does not.
   const observer = new IntersectionObserver((entries) => {
     const latest = entries[entries.length - 1];
     if (latest) onChange(latest.isIntersecting);
@@ -114,38 +77,6 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
   return () => observer.disconnect();
 }
 
-/** A widget's app frame (ADRs 0402, 0432). `probe` makes it a fit check's
- *  frame (`WidgetFitProbe`).
- *
- *  An `inline` or `dashboard` frame given a `size` fills its *widget box*,
- *  a thread card's or a dashboard tile's (`WidgetBox`). A report never sizes
- *  it, and only reaches `onSize`, for the box's fade.
- *
- *  Each frame is a renderer process of its own. An inline or `option` frame
- *  mounts once it first comes on screen in the transcript. Scrolled off, one
- *  stays for `OFF_SCREEN_HOLD_MS` and then unloads. A dashboard frame mounts
- *  once in the viewport, and a hidden dashboard holds it the same way. Every
- *  place shares one cap on mounted frames (`widgetFrameBudget.ts`).
- *
- *  `params` are the instance's *widget params*, carried in the frame URL.
- *  `visible` is false while a loaded frame is out of sight. It, the size and
- *  the place are pushed to the frame on load and on each change.
- *
- *  An option frame takes its widget's height, through the widget
- *  height guard (`widgetHeightGuard.ts`), at most once per animation frame.
- *  `onHeight` hears the frame's height on mount and on each applied report,
- *  and `onSize` the whole size, saying whether the widget reported it.
- *
- *  `onFrameState` hears where the frame stands (`widgetFrameState.ts`) on mount
- *  and on each change. A dashboard waits on it to show once its frames have
- *  loaded.
- *
- *  `onMenu` opens the widget's menu. Given one, the frame is marked `menu`, so
- *  an unclaimed right-click inside it lands there, at its point in the
- *  viewport. A frame with no menu leaves its right-click alone.
- *
- *  `pans` says the box around the frame scrolls sideways, so the frame leaves
- *  a sideways drag to it rather than swiping the panes. */
 export function WidgetFrame({
   appId, params, reveal, place, size, visible = true, pans = false, probe, onHeight, onSize, onFrameState, onMenu,
 }: WidgetFramePlacement & {
@@ -163,18 +94,13 @@ export function WidgetFrame({
   const [host, setHost] = useState<HTMLDivElement | null>(null);
   const frame = useRef<HTMLIFrameElement | null>(null);
   const boxed = size !== undefined;
-  // Set on screen, cleared by the off-screen hold or by eviction.
   const [held, setHeld] = useState(false);
   const probing = probe !== undefined;
   const loaded = held || probing;
   const instanceKey = widgetInstanceKey(appId, params);
   const [height, setHeight] = useState(() => lastSizes.get(instanceKey)?.height ?? defaultWidgetHeight(place));
-  // Only `onReport` changes the height, and it sets this first.
   const pendingHold = useRef<(() => void) | null>(null);
 
-  // The card clips a tall frame, so the box to watch is the clip it draws in.
-  // An answer belongs to the visibility it was given under: a frame shown again
-  // watches afresh, and until the new answer lands its place is unknown.
   const [observed, setObserved] = useState<{ visible: boolean; inView: boolean } | null>(null);
   useEffect(() => {
     if (!host) return undefined;
@@ -192,7 +118,6 @@ export function WidgetFrame({
     return () => clearTimeout(release);
   }, [showing]);
 
-  // Lives for the mount, so a remount follows its widget afresh.
   const guard = useRef(initialHeightGuard(height));
   const onSizeRef = useRef(onSize);
   onSizeRef.current = onSize;
@@ -235,7 +160,6 @@ export function WidgetFrame({
       const reported = pending;
       pending = null;
       if (boxed) {
-        // A probe lays out at another scale, so its size is no card's.
         if (!probeRef.current) lastSizes.set(instanceKey, reported);
         onSizeRef.current?.(reported, true);
         return;
@@ -250,7 +174,6 @@ export function WidgetFrame({
       }
       const size = { ...reported, height: decision.height };
       lastSizes.set(instanceKey, size);
-      // Taken while the old height is laid out.
       pendingHold.current = holdWhatFollows(transcriptBox(host));
       setHeight(size.height);
       onSizeRef.current?.(size, true);
@@ -273,8 +196,6 @@ export function WidgetFrame({
 
   useLayoutEffect(() => onHeight?.(height), [height, onHeight]);
 
-  // The remembered size, so a frame opens at it before the first report.
-  // Only on mount: each later report reaches `onSize` itself.
   const initialSize = useRef(lastSizes.get(instanceKey) ?? { height });
   useLayoutEffect(() => onSize?.(initialSize.current, false), []);
 
@@ -290,18 +211,11 @@ export function WidgetFrame({
     if (frame.current) mark(frame.current);
   }, [place, size, visible, hasMenu, pans, measure]);
 
-  // Evicted by the shared cap: drawn again when it next comes on screen.
   useEffect(() => {
     if (!held || !host || probing) return undefined;
     return claimWidgetFrame(host, () => setHeld(false));
   }, [held, host, probing]);
-  // A change to the widget's files bumps this, which remounts the frame on a
-  // fresh URL, as the Canvas pane's refresh key does. A probe mounts after the
-  // write it checks, and a reload mid-check could answer from the old page.
   const refreshKey = probing ? 0 : widgetRefreshKey(appId);
-  // Each fresh document gets a fresh guard: a reload or a redraw after
-  // eviction may be a fixed widget, so an old lock must not hold it. It is
-  // covered anew too.
   useEffect(() => {
     setRevealed(false);
     if (loaded) guard.current = initialHeightGuard(height);
@@ -317,7 +231,6 @@ export function WidgetFrame({
           reveal={reveal}
           label={{ app: appId, place }}
           onRevealed={() => setRevealed(true)}
-          // The mark that makes the SDK report the content size.
           onLoad={(el) => {
             frame.current = el;
             mark(el);

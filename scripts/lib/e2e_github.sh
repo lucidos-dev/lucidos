@@ -36,13 +36,17 @@ E2E_GITHUB_SWEEP_AGE_SECS=86400
 # check reads it, and needs both to reattach after an engine restart.
 # shellcheck disable=SC2034 # read by scripts/e2e-github.sh and scripts/lib/main_check.sh
 E2E_GITHUB_LINKED_MARK="[e2e-github] linked "
+# The line a wait prints once, when the run's first test job starts. The main
+# check reads it: a newer main cancels a check only before it (ADR 0694).
+# shellcheck disable=SC2034 # read by scripts/lib/main_check.sh
+E2E_GITHUB_TESTS_STARTED_MARK="[e2e-github] test jobs started"
 # A run that never produced a verdict: a refused push, a workflow that never
 # started, a cancelled run, a shard with no output. Distinct from 71, 72, 75.
 E2E_GITHUB_NO_VERDICT_EXIT=76
-# What the main check runs: the engine suite, then every e2e suite. Only the
-# main check asks for the engine suite (ADR 0386's limits, as amended).
+# The main check adds the engine, crates and script suites on Linux and macOS,
+# plus the frontend suite on Linux, to the ordinary e2e suites.
 # shellcheck disable=SC2034 # read by scripts/e2e-github.sh after it sources this
-E2E_GITHUB_MAIN_CHECK_SUITES=(engine api wasm embedder browser)
+E2E_GITHUB_MAIN_CHECK_SUITES=(engine crates scripts frontend api wasm embedder browser)
 
 # Each call resolves the configured identity, including standalone downloads.
 e2e_github_gh() (
@@ -111,8 +115,8 @@ e2e_github_is_filtered() {
 
 # e2e_github_lean_local <suite>: shape a filtered run that stays here, editing
 # E2E_ARGS. It builds a debug engine, which compiles incrementally, and skips
-# mobile-webkit. `--webkit`, or a `--project` for Playwright, keeps WebKit and
-# the release engine. An explicit LUCIDOS_E2E_DEBUG or RELEASE wins.
+# the WebKit projects. `--webkit`, or a `--project` for Playwright, keeps
+# WebKit and the release engine. An explicit LUCIDOS_E2E_DEBUG or RELEASE wins.
 e2e_github_lean_local() {
     local suite="$1" arg
     for arg in ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}; do
@@ -125,7 +129,7 @@ e2e_github_lean_local() {
     fi
     if [ "$suite" = browser ] && [[ " ${E2E_ARGS[*]} " != *" --no-webkit "* ]]; then
         E2E_ARGS=(--no-webkit "${E2E_ARGS[@]}")
-        echo "[e2e] mobile-webkit is skipped on this host. Pass --webkit to run it." >&2
+        echo "[e2e] The WebKit projects are skipped on this host. Pass --webkit to run them." >&2
     fi
 }
 
@@ -317,19 +321,39 @@ e2e_github_unavailable_reason() {
     fi
 }
 
-# e2e_github_preflight <repo> [<commit>]: refuse what GitHub mode cannot test
-# honestly.
+# e2e_github_preflight <repo> [<commit>] [no-local]: refuse what GitHub mode
+# cannot test honestly. no-local names a suite that has no --local fallback.
 e2e_github_preflight() {
     local reason
     reason="$(e2e_github_unavailable_reason "$1" "${2:-}")"
     [ -n "$reason" ] || return 0
     echo "ERROR: GitHub mode cannot run: $reason." >&2
-    echo "       Fix that, or run the suite with --local." >&2
+    if [ "${3:-}" = no-local ]; then
+        echo "       Fix that: this suite has no local fallback." >&2
+    else
+        echo "       Fix that, or run the suite with --local." >&2
+    fi
     return 1
 }
 
 # The browser specs, relative to the repository root.
 E2E_GITHUB_SPEC_DIR="crates/lucidos-app/e2e"
+
+# Print the projects of <project...> that <commit> can run, one per line. A
+# commit from before desktop-webkit holds no spec list and no shard plan for
+# it. An empty <commit> is the working tree, which runs every project.
+e2e_github_commit_projects() {
+    local repo="$1" commit="$2" project
+    shift 2
+    for project in "$@"; do
+        if [ "$project" = desktop-webkit ] && [ -n "$commit" ] &&
+            ! git -C "$repo" cat-file -e "$commit:$E2E_GITHUB_SPEC_DIR/desktop-webkit-specs.txt" 2>/dev/null; then
+            echo "[e2e-github] $commit predates desktop-webkit, so that project does not run" >&2
+            continue
+        fi
+        echo "$project"
+    done
+}
 
 # e2e_github_split_specs <repo> <commit> [<spec>...]: route each browser spec.
 # Prints "local <name>" for a spec with a @real-claude-code test and "remote
@@ -534,17 +558,34 @@ E2E_GITHUB_POLL_SLOW_SECS=30
 E2E_GITHUB_POLL_FAST_SECS=5
 E2E_GITHUB_RATE_FLOOR=500
 
-# e2e_github_poll_secs <run-state>: how long to sleep before the next poll. A
-# test job is any job but plan and the build-* jobs.
+# What starts the name of each e2e test job: the linux and macos jobs, which
+# wait for a build. check-e2e-workflow.sh holds e2e.yml to it.
+E2E_GITHUB_TEST_JOB_PREFIX="e2e "
+
+# e2e_github_tests_started <run-state>: true once an e2e test job runs or ran.
+# The suites and confinement jobs need no build, so they do not count: until
+# a test job starts, the run is still building (ADR 0694). A job skipped
+# after a failed build completes without running, so it does not count.
+e2e_github_tests_started() {
+    python3 -c '
+import json, sys
+state, prefix = json.loads(sys.argv[1]), sys.argv[2]
+sys.exit(0 if any(j.get("status") in ("in_progress", "completed")
+                  and j.get("conclusion") != "skipped"
+                  for j in state.get("jobs") or []
+                  if (j.get("name") or "").startswith(prefix)) else 1)
+' "$1" "$E2E_GITHUB_TEST_JOB_PREFIX"
+}
+
+# e2e_github_poll_secs <run-state>: how long to sleep before the next poll:
+# fast once an e2e test job started, unless the rate limit is near.
 e2e_github_poll_secs() {
+    e2e_github_tests_started "$1" || { echo "$E2E_GITHUB_POLL_SLOW_SECS"; return 0; }
     python3 -c '
 import json, sys
 state, slow, fast, floor = json.loads(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 remaining = state.get("rate_remaining")
-started = any(j.get("status") in ("in_progress", "completed")
-              for j in state.get("jobs") or []
-              if j.get("name") != "plan" and not (j.get("name") or "").startswith("build-"))
-print(fast if started and (remaining is None or remaining >= floor) else slow)
+print(fast if remaining is None or remaining >= floor else slow)
 ' "$1" "$E2E_GITHUB_POLL_SLOW_SECS" "$E2E_GITHUB_POLL_FAST_SECS" "$E2E_GITHUB_RATE_FLOOR"
 }
 
@@ -557,7 +598,7 @@ print(fast if started and (remaining is None or remaining >= floor) else slow)
 # run still going, so each new gh error is printed, and the give-up names it.
 e2e_github_wait() {
     local run_id="$1" limit="${E2E_GITHUB_RUN_WAIT_SECS:-21600}"
-    local state status line last="" err="" deadline poll errf
+    local state status line last="" err="" deadline poll errf tests_started=""
     deadline=$(($(e2e_github_now) + limit))
     errf="$(mktemp)" || return "$E2E_GITHUB_NO_VERDICT_EXIT"
     echo "[e2e-github] watching $(e2e_github_run_url "$run_id")" >&2
@@ -567,6 +608,10 @@ e2e_github_wait() {
             err=""
             line="$(e2e_github_run_progress "$state")"
             [ "$line" = "$last" ] || { echo "[e2e-github] $line" >&2; last="$line"; }
+            if [ -z "$tests_started" ] && e2e_github_tests_started "$state"; then
+                echo "$E2E_GITHUB_TESTS_STARTED_MARK" >&2
+                tests_started=1
+            fi
             status="$(printf '%s' "$state" | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])')"
             if [ "$status" = "completed" ]; then
                 rm -f "$errf"
@@ -688,7 +733,7 @@ e2e_github_record_timings() {
     mkdir -p "$(dirname "$log")" 2>/dev/null
     python3 -I - "$dir" "$run_db_id" "$suite" "$pushed_at" "$(e2e_github_now)" "$rc" "$state" \
         "$(e2e_github_run_url "$run_db_id")" "$log" <<'PY' || echo "[e2e-github] timings not recorded" >&2
-import json, os, sys
+import json, os, statistics, sys
 from datetime import datetime, timezone
 
 dir, run_db_id, suite, pushed_at, now, rc, state, url, log = sys.argv[1:10]
@@ -705,6 +750,30 @@ def span(a, b):
 
 def clock(secs):
     return "?" if secs is None else f"{secs // 60}m{secs % 60:02d}s"
+
+
+# A build job over twice the median of its last BUILD_HISTORY successful runs
+# prints a notice, once BUILD_HISTORY_MIN of them exist.
+BUILD_HISTORY, BUILD_HISTORY_MIN = 20, 5
+
+
+def build_history(log):
+    """Successful build-job run times per job name, oldest first."""
+    history = {}
+    try:
+        with open(log) as f:
+            for line in f:
+                try:
+                    past_jobs = json.loads(line).get("jobs") or []
+                except (ValueError, AttributeError):
+                    continue
+                for j in past_jobs:
+                    if str(j.get("name", "")).startswith("build-") and j.get("conclusion") == "success" \
+                            and isinstance(j.get("run_secs"), int):
+                        history.setdefault(j["name"], []).append(j["run_secs"])
+    except OSError:
+        pass
+    return history
 
 
 engines = {}
@@ -734,8 +803,18 @@ record = {
 }
 with open(os.path.join(dir, "timings.json"), "w") as f:
     json.dump(record, f, indent=2)
+history = build_history(log)
 with open(log, "a") as f:
     f.write(json.dumps(record) + "\n")
+for job in jobs:
+    past = history.get(job["name"], [])[-BUILD_HISTORY:]
+    if job["conclusion"] != "success" or job["run_secs"] is None or len(past) < BUILD_HISTORY_MIN:
+        continue
+    median = statistics.median(past)
+    if job["run_secs"] > 2 * median:
+        print(f"[e2e-github] NOTICE: {job['name']} took {clock(job['run_secs'])}, over twice its median "
+              f"of {clock(int(median))} over the last {len(past)} builds. "
+              "Look for a build regression: scripts/scoreboard.sh prints the trend.", file=sys.stderr)
 reuse = "; ".join(f"{os_} engine {'reused from run ' + run if run else 'built'}"
                   for os_, run in sorted(engines.items()))
 slowest = max((j for j in jobs if j["run_secs"] is not None), key=lambda j: j["run_secs"], default=None)
@@ -895,15 +974,15 @@ e2e_github_report() {
         return "$E2E_GITHUB_NO_VERDICT_EXIT"
     fi
 
-    for suite in engine api wasm embedder; do
+    for suite in engine crates scripts frontend confinement api wasm embedder; do
         while read -r id s _; do
             [ "$s" = "$suite" ] || continue
             echo ""
-            echo "══ $suite (GitHub) ══"
+            echo "══ $id (GitHub) ══"
             log="$(e2e_github_shard_log "$dir" "$id")"
-            cat "$log" 2>/dev/null || echo "ERROR: no output from the $suite shard"
+            cat "$log" 2>/dev/null || echo "ERROR: no output from the $id shard"
             rc="$(e2e_github_shard_rc "$dir" "$id")"
-            echo "── $suite exit code: $rc ──"
+            echo "── $id exit code: $rc ──"
             overall="$(e2e_github_worse_rc "$overall" "$rc")"
         done <"$entries"
     done

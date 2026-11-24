@@ -9,6 +9,7 @@ import {
 import { isBridged, tellHost } from './_bridge';
 import { runIsolated } from './_isolate';
 import { openBridgedEventStream } from './sseBridge';
+import { ROOT_THREAD_ROLE_ALIASES } from './generated/engine-constants';
 
 export interface SseThreadEvent {
   type: 'ThreadEvent';
@@ -30,26 +31,30 @@ export type SseEvent = SseThreadEvent | SseSystemEvent;
 
 type SseCallback = (data: unknown, raw: SseEvent) => void;
 
+const rootThreadAliases = new Map<string, string>([
+  ...ROOT_THREAD_ROLE_ALIASES,
+  ...ROOT_THREAD_ROLE_ALIASES.map(([legacy, current]) => [current, legacy] as const),
+]);
+
 let stream: EventStream | null = null;
 const listeners = new Map<string, Set<SseCallback>>();
 const openListeners = new Set<() => void>();
-/** Whether the stream is up RIGHT NOW, so a late `onOpen` can run at once. */
 let streamOpen = false;
-/** Counts opens, so a late `onOpen` that a real open overtook runs only once. */
 let openCount = 0;
-/** A rebuild pending for a transport that does not retry for itself. */
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-/** The listened types the host last heard, so a change is sent once. */
 let toldTypes = '';
 let typesScheduled = false;
 
 function listenedTypes(): string[] {
-  return [...listeners.keys()].sort();
+  const types = new Set(listeners.keys());
+  for (const type of listeners.keys()) {
+    const alias = rootThreadAliases.get(type);
+    if (alias) types.add(alias);
+  }
+  return [...types].sort();
 }
 
-/** Tell the host which event types this document listens to, once per change
- *  and batched to a microtask. Only a bridged stream has a host to tell. */
 function scheduleTypesUpdate(): void {
   if (typesScheduled || !stream || !isBridged()) return;
   typesScheduled = true;
@@ -68,8 +73,6 @@ function clearRetry(): void {
   retryTimer = null;
 }
 
-/** Where this app's SDK reaches the engine. Derived per call rather than at
- *  module load, so `lucidos.configure({ baseUrl })` still takes effect. */
 function targets() {
   return eventStreamTargets(apiBase());
 }
@@ -91,17 +94,12 @@ function admitOpen(): void {
   for (const cb of [...openListeners]) runIsolated(cb);
 }
 
-/** Route one frame's `data` payload to its listeners.
- *
- *  The one place both transports converge: a direct frame and a relayed frame
- *  land here identically, which is what makes them indistinguishable to a
- *  listener. `eventStream.test.ts` pins the relay half of that. */
 function handleFrame(data: string): void {
   let parsed: SseEvent | null;
   try {
     parsed = JSON.parse(data) as SseEvent | null;
   } catch {
-    return; // malformed SSE data
+    return;
   }
   const outerType = parsed?.type;
   if (!parsed || !outerType) return;
@@ -109,41 +107,27 @@ function handleFrame(data: string): void {
   if (outerType === 'StreamHello' && !isBridged()) {
     directRestoreGeneration.observe(parsed.data?.restore_generation);
     try { directRestoreGeneration.capture().assertCurrent(); }
-    catch { streamOpen = false; return; } // Old page intent stays closed.
+    catch { streamOpen = false; return; }
     if (!streamOpen) admitOpen();
   }
 
   if (outerType === 'ThreadEvent') {
-    // Thread events: { type: "ThreadEvent", data: { thread_id, event: { type, ... } } }
     const threadEvent = parsed as SseThreadEvent;
     const innerType = threadEvent.data?.event?.type;
     if (innerType) {
       dispatch(innerType, threadEvent.data, parsed);
+      const alias = rootThreadAliases.get(innerType);
+      if (alias) dispatch(alias, threadEvent.data, parsed);
     }
-    // Also dispatch to "ThreadEvent" listeners (for generic thread watchers)
     dispatch('ThreadEvent', threadEvent.data, parsed);
   } else {
-    // System events: { type: "NotificationCreated", data: { ... } }
     dispatch(outerType, parsed.data ?? parsed, parsed);
   }
 
-  // Wildcard listeners get the full raw envelope
   dispatch('*', parsed, parsed);
 }
 
 export const sse = {
-  /**
-   * Subscribe to a specific event type.
-   *
-   * Works for both thread events and system events — the SDK unwraps
-   * the wire format so you subscribe by the inner event name:
-   *
-   *   lucidos.sse.on('NavigationRequested', (data) => { ... })
-   *   lucidos.sse.on('NotificationCreated', (data) => { ... })
-   *   lucidos.sse.on('*', (raw) => { ... })  // wildcard — all events
-   *
-   * Returns an unsubscribe function.
-   */
   on(eventType: string, callback: SseCallback): () => void {
     let set = listeners.get(eventType);
     if (!set) {
@@ -162,17 +146,6 @@ export const sse = {
     };
   },
 
-  /**
-   * Run `callback` after generation admission: the first hello and every
-   * reopen after a drop. Events that landed while the stream was down are not
-   * replayed, so this is where an app re-reads its data.
-   *
-   * If the stream is already open, `callback` runs once on the next microtask.
-   * So `lucidos.sse.onOpen(render)` alone covers first load and reconnect.
-   *
-   * Direct transports wait for hello; bridged frames use host admission.
-   * Connects the stream. Returns an unsubscribe function.
-   */
   onOpen(callback: () => void): () => void {
     openListeners.add(callback);
     sse.connect();
@@ -187,12 +160,6 @@ export const sse = {
     };
   },
 
-  /** Open the SSE connection to the Lucidos event stream.
-   *
-   *  Idempotent, and one connection fans out to every `on(...)` listener in
-   *  this document. Given `SharedWorker`, the connection is shared with every
-   *  other document of this workspace. Ten open apps then cost one stream
-   *  rather than ten. */
   connect(): void {
     if (stream) return;
     clearRetry();
@@ -203,9 +170,6 @@ export const sse = {
       onError: () => {
         streamOpen = false;
         if (!opened || stream !== opened || opened.ownsReconnect) return;
-        // A direct EventSource stops retrying for good on a response that is
-        // not a stream, such as a 503 page mid-restart. So rebuild it, on the
-        // schedule the shell keeps.
         opened.close();
         stream = null;
         retryTimer = setTimeout(() => {
@@ -214,9 +178,6 @@ export const sse = {
         }, EVENT_STREAM_RETRY_MS);
       },
     };
-    // An isolated frame can open neither transport below: both reach the engine
-    // from an opaque origin, and CORS refuses that. The host relays instead,
-    // off the one connection it already holds.
     if (isBridged()) {
       const types = listenedTypes();
       toldTypes = types.join('\n');
@@ -226,14 +187,10 @@ export const sse = {
     stream = opened = openEventStream(
       targets(),
       handlers,
-      // An app has no presence voice, exactly as it has none today. It holds a
-      // port and never answers a PresenceCheck, so the worker does not count it
-      // among the documents it waits for.
       { pongs: false },
     );
   },
 
-  /** Close the SSE connection. */
   disconnect(): void {
     streamOpen = false;
     toldTypes = '';

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Sub-threads can hold Archive and Delete back. The thread ⋯ menu then lists
- * each one by title and state, strongest blocker first, and a tap opens it
- * (ADR 0378). Past `LISTED_SUB_THREADS` it counts the rest.
- */
 import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -21,7 +16,6 @@ import type { ThreadMeta } from '../../../store/thread-events';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { BLOCKER_REASON, SUB_THREAD_STATE, blockedBySubThreads, moreSubThreads } from '../../../store/actions/blockerCopy';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 let host: HTMLElement | null = null;

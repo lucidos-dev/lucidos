@@ -12,23 +12,6 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');
 const css = readFileSync(resolve(here, '../../../styles/chat/response.css'), 'utf-8');
 
-/**
- * When the chat agent hits the per-turn tool-call cap, the engine emits a
- * ResponseGenerated whose text starts with "[ENGINE-LIMIT]". The cap arrives
- * with NO preceding TextStreamed — so the prefix never lands in the streamed
- * text concatenation. Without a dedicated side channel that reads
- * ResponseGenerated.text directly, the agent appears to silently stop mid-task.
- *
- * The fix has two halves:
- * 1. `exchangeEngineLimitDetail(exchange)` scans steps for the latest
- *    ResponseGenerated and returns the "[ENGINE-LIMIT] …" body (minus the
- *    prefix) — or empty string. This is the side channel.
- * 2. ChatExchange renders an .exchange-engine-limit yellow banner OUTSIDE
- *    both the (hasSections) and (!hasSections) render branches, so the
- *    banner appears at the bottom of the response panel regardless of how
- *    many tool steps are above it (cap fires at iteration N+1 with N
- *    successful steps — hasEvents is always true in that case).
- */
 describe('ENGINE-LIMIT cap detection helper', () => {
   function fakeExchange(steps: Array<{ event: { type: string; text?: string } }>): Exchange {
     return { steps } as unknown as Exchange;
@@ -68,22 +51,12 @@ describe('ENGINE-LIMIT cap detection helper', () => {
 
 describe('ENGINE-LIMIT banner', () => {
   it('detects the cap via exchangeEngineLimitDetail, not via streamed text', () => {
-    // The cap arrives only on ResponseGenerated.text, which exchangeResponseText
-    // does NOT read. The component must call the dedicated helper instead of
-    // grepping responseTextRaw.
     expect(source).toMatch(/engineLimitDetail\s*=\s*!streamingBuffer\s*\?\s*exchangeEngineLimitDetail\(exchange\)\s*:\s*['"]['"]/);
     expect(source).toMatch(/isEngineLimit\s*=\s*!!engineLimitDetail/);
     expect(source).not.toMatch(/responseTextRaw\.startsWith\(['"]\[ENGINE-LIMIT\]['"]\)/);
   });
 
   it('renders the banner outside the hasSections / hasEvents render branches', () => {
-    // The banner must be a sibling of the response-content ternary, not nested
-    // inside the !hasEvents branch — the cap always fires with 100+ tool steps,
-    // so hasEvents is always true when isEngineLimit is true.
-    //
-    // Asserted by locating the banner JSX and confirming the body expression
-    // closes (`)}` or `]}`) immediately before it. The banner then sits at the
-    // same depth as the body, not inside one of its branches.
     const bannerIdx = source.indexOf('{isEngineLimit && (');
     expect(bannerIdx, 'banner JSX not found').toBeGreaterThan(0);
     const before = source.slice(0, bannerIdx).trimEnd();

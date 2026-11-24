@@ -34,12 +34,19 @@ layout stay shared.
   empty own value, a tombstone, so a window that went back to Home does not
   fall through to another window's seed. A window unseen for 30 days is pruned.
 - **Window peers.** The windows announce what they show over a
-  `BroadcastChannel` named per workspace (`store/windowPeers.ts`). Each one runs
-  the same pure `chooseWindow` over the same peer list, so all agree on one
-  winner without a round trip. Each page load holds a Web Lock for its life,
+  `BroadcastChannel` named per workspace (`store/windowPeers.ts`). Cached peer lists serve captures and renderer selection.
+  Interactive presentation uses shared claims (ADR 0721), since announcements
+  can arrive after the next request. Each page load holds a Web Lock for its life,
   and its peers wait on it, so a window that crashes drops out. A window still
   counts for what it showed for two seconds after a change. The winner often
   changes what it shows at once, and a slower peer must still see it win.
+- **Interactive eligibility.** Native peers announce their own hide/show intent,
+  separately from focus. Interactive requests prefer shown peers before thread,
+  authorization and recency preferences. Current eligibility precedes previous-view
+  grace, so a hidden window cannot regain eligibility through its old view.
+  If all peers are hidden, existing routing still applies. Browser/PWA routing,
+  captures and widget-fit renderer selection retain their existing targeting,
+  including hidden peers.
 - **Restore guard.** The marker also names the window that armed it. A window
   that found another window's marker through the seed releases the thread once
   that window shows it is alive.

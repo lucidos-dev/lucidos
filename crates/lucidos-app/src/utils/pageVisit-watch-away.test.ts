@@ -23,7 +23,6 @@ describe('watchPageAway', () => {
   });
 
   it('remembers a hide the page has since come back from', () => {
-    // The iOS freeze: hidden mid-probe, visible again by the time it settles.
     const away = watchPageAway();
     setVisibility('hidden');
     setVisibility('visible');

@@ -31,6 +31,7 @@ fn wait_at(
     on: Vec<EventSubscription>,
 ) -> LiveWait {
     LiveWait {
+        background_timing: None,
         wait_id: Uuid::nil(),
         thread_id: Uuid::nil(),
         tool_use_id: "toolu_x".into(),

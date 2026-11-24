@@ -12,7 +12,6 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesRoot: string = resolve(here, '../../../styles');
 const drawerCss = readFileSync(resolve(stylesRoot, 'drawer.css'), 'utf-8');
 
-/** Body of the first rule whose selector list matches `selector` exactly. */
 function ruleBody(css: string, selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const m = css.match(new RegExp(`(^|})\\s*${escaped}\\s*\\{([^}]*)\\}`, 'm'));
@@ -20,7 +19,6 @@ function ruleBody(css: string, selector: string): string {
   return m[2];
 }
 
-/** Every rule in every stylesheet that styles the element carrying `className`. */
 function rulesFor(className: string): CssRule[] {
   return styleSheetPaths(stylesRoot)
     .flatMap(path => rulesTargeting(readFileSync(path, 'utf-8'), className));
@@ -28,24 +26,11 @@ function rulesFor(className: string): CssRule[] {
 
 const CLIPS = /^(hidden|clip|auto|scroll)$/;
 
-/**
- * Regression: a long thread title in the desktop header was hard-cut mid-word
- * at the pane's right edge with NO ellipsis.
- *
- * The title is one flex item of `.thread-view-header`. It must shrink below its
- * text (`min-width: 0` with a shrinking `flex`), so its own box gets narrower
- * than the text and `text-overflow` applies. A `width: max-content` box is
- * always exactly as wide as its text, so the ellipsis never fires.
- *
- * Layout can't be measured in jsdom, so this pins the CSS shape; the rendered
- * behaviour is covered by e2e/thread-title-resize-desktop.spec.ts.
- */
 describe('Desktop header title truncates with an ellipsis', () => {
   const base = ruleBody(drawerCss, '.thread-title');
   const desktop = ruleBody(drawerCss, '.thread-view-header .thread-title');
   const text = ruleBody(drawerCss, '.thread-view-header .thread-title-text');
 
-  /* Its cap leaves room for the pin. */
   it('shrinks below its text, so the text can overflow it', () => {
     expect(base).toMatch(/min-width:\s*0/);
     expect(desktop).toMatch(/flex:\s*0 1 auto/);
@@ -60,9 +45,6 @@ describe('Desktop header title truncates with an ellipsis', () => {
     expect(text).toMatch(/overflow:\s*hidden/);
   });
 
-  /* The title is a menu button, and `.thread-title-menu` rounds its corners for
-   * the focus ring. A rounded box clips to its corner arc. The title has no
-   * padding, so the arc shaved the top-left off the first glyph. */
   it('clips on a square box, never on the rounded button', () => {
     for (const className of ['thread-title', 'thread-title-menu']) {
       for (const rule of rulesFor(className)) {

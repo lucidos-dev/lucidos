@@ -95,6 +95,9 @@ suite must pass there.
 
 ## Consequences
 
+- Linux checks `MemAvailable` and memory pressure. It bounds memory and headroom
+  by the visible cgroup v2 limits and treats inactive file cache as reclaimable.
+  A cgroup with no headroom refuses new builds even without pressure readings.
 - A cargo build on this host can wait up to 15 minutes before it starts. An
   Apply rebuild refused here shows its ERROR line in the build-failed toast.
 - `/harden` reports a gate-refused suite as `VOID`, which asks for a rerun,

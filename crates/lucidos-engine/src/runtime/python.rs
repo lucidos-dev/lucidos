@@ -1,5 +1,9 @@
 use crate::core::sanitize_for_jsonb;
+use crate::core::script_output::{
+    script_error_output, truncate_python_error, PY_ERROR_BYTE_BUDGET,
+};
 use crate::core::shell::{finalize_stream, KEPT_BYTES_CAP};
+use crate::runtime::agent_sandbox::Sandbox;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -87,7 +91,7 @@ const AGENT_ORIGIN_SHIM_PY: &str = r#"# Lucidos venv bootstrap — auto-attribut
 # "Lucidos Agent".
 #
 # Inert (no patch installed) if LUCIDOS_AGENT_ORIGIN_TOKEN or
-# LUCIDOS_API_PORT is missing. See crates/lucidos-engine/src/api/actor.rs
+# LUCIDOS_API_PORT is missing. See crates/lucidos-agents-api/src/api/actor.rs
 # for the engine-side token resolution and crates/lucidos-cli/src/http.rs
 # for the parallel CLI implementation.
 import os as _os
@@ -139,7 +143,7 @@ if _TOKEN and _PORT:
 /// spliced in. Python cannot import them, so each `{NAME}` placeholder stands
 /// for the `api::actor` constant of that name.
 fn agent_origin_shim_py() -> String {
-    use crate::api::actor::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
+    use crate::core::subprocess_origin::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
     AGENT_ORIGIN_SHIM_PY
         .replace("{ENV_AGENT_ORIGIN_TOKEN}", ENV_AGENT_ORIGIN_TOKEN)
         .replace("{HEADER_AGENT_ORIGIN_TOKEN}", HEADER_AGENT_ORIGIN_TOKEN)
@@ -150,6 +154,7 @@ pub struct PythonRuntime {
     exhaust_path: PathBuf,
     venv_path: PathBuf,
     python_bin: PathBuf,
+    venv_setup: tokio::sync::Mutex<()>,
     /// Hard ceiling every synchronous child is bounded by, see
     /// [`EXECUTION_TIMEOUT_SECS`]. A field rather than a call-site argument
     /// because both callers get the same budget; a caller that ever needs a
@@ -174,7 +179,7 @@ impl PythonRuntime {
         })?;
         let exhaust_path = workspace_path.join(".lucidos").join("exhaust");
         if let Err(e) = fs::create_dir_all(&exhaust_path) {
-            log!(
+            log_legacy!(
                 "[Python] Failed to create exhaust dir at {}: {}",
                 exhaust_path.display(),
                 e
@@ -188,7 +193,7 @@ impl PythonRuntime {
         let staging_root = workspace_path.join(".lucidos/staging");
         if staging_root.exists() {
             if let Err(e) = fs::remove_dir_all(&staging_root) {
-                log!(
+                log_legacy!(
                     "[Python] Failed to clean up orphaned staging dir {}: {}",
                     staging_root.display(),
                     e
@@ -204,6 +209,7 @@ impl PythonRuntime {
             exhaust_path,
             venv_path,
             python_bin,
+            venv_setup: tokio::sync::Mutex::new(()),
             execution_timeout: Duration::from_secs(EXECUTION_TIMEOUT_SECS),
         })
     }
@@ -243,7 +249,7 @@ impl PythonRuntime {
             }
             let path = entry.path();
             if let Err(e) = fs::remove_dir_all(&path) {
-                log!(
+                log_legacy!(
                     "[Python] Failed to reclaim stale exhaust dir {}: {}",
                     path.display(),
                     e
@@ -255,8 +261,8 @@ impl PythonRuntime {
     /// Shorten the hard ceiling. Test-only: the regression coverage for the
     /// timeout has to prove the child dies, and waiting 300 real seconds per
     /// assertion is not a suite anyone runs.
-    #[cfg(test)]
-    pub(crate) fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_execution_timeout(mut self, timeout: Duration) -> Self {
         self.execution_timeout = timeout;
         self
     }
@@ -275,7 +281,13 @@ impl PythonRuntime {
     /// directly by `run_python_background` before handing the venv-rooted
     /// python invocation to the background bash registry.
     pub async fn ensure_venv(&self) -> Result<(), String> {
-        if self.python_bin.exists() {
+        self.ensure_venv_with(tokio::process::Command::new("python3"))
+            .await
+    }
+
+    async fn ensure_venv_with(&self, mut command: tokio::process::Command) -> Result<(), String> {
+        let _setup = self.venv_setup.lock().await;
+        if self.python_bin.exists() && self.venv_path.join("bin/pip").is_file() {
             // Always re-install the agent-origin shim even on a pre-existing
             // venv — a Lucidos upgrade that changes the bootstrap (e.g. new
             // header, tightened gate, the sitecustomize→.pth migration) must
@@ -285,7 +297,7 @@ impl PythonRuntime {
             return Ok(());
         }
 
-        log!(
+        log_legacy!(
             "[Python] Creating virtual environment at {}",
             self.venv_path.display()
         );
@@ -296,23 +308,64 @@ impl PythonRuntime {
             .ok_or_else(|| format!("venv path has no parent: {}", self.venv_path.display()))?;
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
 
-        let output = tokio::process::Command::new("python3")
-            .args(["-m", "venv", self.venv_path.to_string_lossy().as_ref()])
+        // A venv missing pip is repaired in place, so its packages survive.
+        let venv_existed = self.venv_path.exists();
+        let output = command
+            .args(["-m", "venv"])
+            .arg(&self.venv_path)
             .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
             .output()
-            .await
-            .map_err(|e| format!("Failed to create venv: {}", e))?;
+            .await;
 
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to create venv:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+        let error = match output {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let mut error = format!(
+                    "Failed to create venv ({}):\n{stdout}{stderr}",
+                    output.status
+                );
+                if stdout.contains("ensurepip is not available")
+                    || stderr.contains("ensurepip is not available")
+                {
+                    error.push_str("\nOn Debian or Ubuntu, install python3-venv (or python3.X-venv for your Python version).");
+                }
+                Some(error)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(format!(
+                "Failed to launch {:?}: {error}. Install Python 3 with venv and ensurepip.",
+                command.as_std().get_program()
+            )),
+            Err(error) => Some(format!("Failed to create venv: {error}")),
+        };
+        if let Some(mut error) = error {
+            if venv_existed {
+                log_legacy!(
+                    "[Python] Kept the existing venv at {} after a failed repair",
+                    self.venv_path.display()
+                );
+            } else if let Err(cleanup) = self.remove_partial_venv() {
+                error.push_str(&format!("\n{cleanup}"));
+            }
+            return Err(error);
         }
 
-        log!("[Python] Virtual environment created");
+        log_legacy!("[Python] Virtual environment created");
         self.install_agent_origin_shim()?;
         Ok(())
+    }
+
+    fn remove_partial_venv(&self) -> Result<(), String> {
+        match fs::remove_dir_all(&self.venv_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Failed to remove partial venv at {}: {error}",
+                self.venv_path.display()
+            )),
+        }
     }
 
     /// Drop the agent-origin shim into the venv's `site-packages/` so every
@@ -396,9 +449,8 @@ impl PythonRuntime {
 
     /// Shared execution core: writes preamble + user code to a script, runs it, returns output.
     /// The preamble is empty for `execute_with_env` (no monkey-patching) and the staging-redirect
-    /// `builtins.open` shim for `execute_staged`. Scripts run with full host write access — the
-    /// previous outside-workspace write-guard was removed for consistency with `run_bash`,
-    /// `run_bash_background`, and `run_python_background`, none of which sandbox writes.
+    /// `builtins.open` shim for `execute_staged`. Scripts run in the agent sandbox, the same
+    /// one `run_bash`, `run_bash_background` and `run_python_background` get (ADR 0645).
     ///
     /// This is the *string-code* path (`run_python`, via `execute_staged`),
     /// where the LLM supplies code that has no home on disk — so the copy under
@@ -409,6 +461,7 @@ impl PythonRuntime {
     /// exists on disk must go through `execute_file_with_env` instead.
     async fn run_script(
         &self,
+        sandbox: &Sandbox,
         preamble: &str,
         code: &str,
         env_vars: Vec<(String, String)>,
@@ -420,7 +473,8 @@ impl PythonRuntime {
         let script_path = run_dir.join("script.py");
         fs::write(&script_path, &full_code).map_err(|e| e.to_string())?;
 
-        self.spawn_python(&script_path, &run_dir, env_vars).await
+        self.spawn_python(sandbox, &script_path, &run_dir, env_vars)
+            .await
     }
 
     /// Execute an EXISTING Python file **in place**, from its real on-disk path.
@@ -442,12 +496,14 @@ impl PythonRuntime {
     /// env, output sanitizing, exhaust audit logs, error shaping).
     pub async fn execute_file_with_env(
         &self,
+        sandbox: &Sandbox,
         script_path: &std::path::Path,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
         self.ensure_venv().await?;
         let run_dir = self.new_run_dir()?;
-        self.spawn_python(script_path, &run_dir, env_vars).await
+        self.spawn_python(sandbox, script_path, &run_dir, env_vars)
+            .await
     }
 
     /// Spawn `python <script_path>` in the workspace, capture output, drop the
@@ -468,11 +524,14 @@ impl PythonRuntime {
     /// removes its staging tree and commits nothing, exactly like a crash.
     async fn spawn_python(
         &self,
+        sandbox: &Sandbox,
         script_path: &std::path::Path,
         run_dir: &std::path::Path,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
-        let mut cmd = tokio::process::Command::new(&self.python_bin);
+        let mut cmd = sandbox
+            .command(&self.python_bin)
+            .map_err(|e| format!("Failed to execute Python: {}", e))?;
         cmd.arg(script_path)
             .current_dir(&self.workspace_path)
             .stdin(std::process::Stdio::null())
@@ -508,9 +567,11 @@ impl PythonRuntime {
         );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let started = chrono::Utc::now();
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to execute Python: {}", e))?;
+        let pid = child.id();
         let (stdout_pipe, stderr_pipe) = (child.stdout.take(), child.stderr.take());
         let run = async {
             tokio::join!(
@@ -529,13 +590,14 @@ impl PythonRuntime {
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&err.kept));
 
         if let Err(e) = fs::write(run_dir.join("stdout.txt"), &stdout) {
-            log!("[Python] Failed to write stdout debug log: {}", e);
+            log_legacy!("[Python] Failed to write stdout debug log: {}", e);
         }
         if let Err(e) = fs::write(run_dir.join("stderr.txt"), &stderr) {
-            log!("[Python] Failed to write stderr debug log: {}", e);
+            log_legacy!("[Python] Failed to write stderr debug log: {}", e);
         }
 
-        if status.success() {
+        let outcome = crate::core::shell::TaskOutcome::from_status(status);
+        if outcome.is_success() {
             Ok(stdout)
         } else {
             // Stripping middle frames + tail-clipping pre-traceback noise
@@ -544,7 +606,12 @@ impl PythonRuntime {
             let stdout_end = sanitize_for_jsonb(&String::from_utf8_lossy(&out.end));
             let error =
                 script_error_output(&truncate_python_error(&stderr), &stdout_end, out.total);
-            Err(format!("Python error:\n{}", error))
+            let denial = sandbox
+                .seatbelt_write_refusal(pid, started, &outcome)
+                .await
+                .map(|d| format!("\n{d}"))
+                .unwrap_or_default();
+            Err(format!("Python error:\n{error}{denial}"))
         }
     }
 
@@ -565,7 +632,7 @@ impl PythonRuntime {
             self.execution_timeout.as_secs(),
             crate::llm::tools::BG_MAX_TIMEOUT_SECS,
         );
-        log!("[Python] {}", message);
+        log_legacy!("[Python] {}", message);
         // Marked as engine-written: every other line in this file is the
         // child's own stderr, and an empty run dir would leave a reader with
         // no way to tell a timeout from a spawn that never happened.
@@ -573,7 +640,7 @@ impl PythonRuntime {
             run_dir.join("stderr.txt"),
             format!("[lucidos] {}\n", message),
         ) {
-            log!(
+            log_legacy!(
                 "[Python] Failed to write timeout note to stderr debug log: {}",
                 e
             );
@@ -658,31 +725,37 @@ impl PythonRuntime {
 
     pub async fn execute_with_env(
         &self,
+        sandbox: &Sandbox,
         code: &str,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
-        self.run_script("", code, env_vars).await
+        self.run_script(sandbox, "", code, env_vars).await
     }
 
     /// Execute Python with staging: writes under data/ are redirected to the staging directory.
     /// Reads check staging first (for files written this run), then fall through to workspace.
     pub async fn execute_staged(
         &self,
+        sandbox: &Sandbox,
         code: &str,
         env_vars: Vec<(String, String)>,
         staging_dir: &std::path::Path,
     ) -> Result<String, String> {
         fs::create_dir_all(staging_dir).map_err(|e| e.to_string())?;
         let preamble = self.staging_preamble(staging_dir);
-        self.run_script(&preamble, code, env_vars).await
+        self.run_script(sandbox, &preamble, code, env_vars).await
     }
 
-    pub async fn execute(&self, code: &str) -> Result<String, String> {
-        self.execute_with_env(code, vec![]).await
+    pub async fn execute(&self, sandbox: &Sandbox, code: &str) -> Result<String, String> {
+        self.execute_with_env(sandbox, code, vec![]).await
     }
 
     /// Install multiple packages in a single pip invocation.
-    pub async fn ensure_packages(&self, packages: &[&str]) -> Result<(), String> {
+    pub async fn ensure_packages(
+        &self,
+        sandbox: &Sandbox,
+        packages: &[&str],
+    ) -> Result<(), String> {
         if packages.is_empty() {
             return Ok(());
         }
@@ -694,7 +767,9 @@ impl PythonRuntime {
         let mut args = vec!["-m", "pip", "install", "--quiet", "--"];
         args.extend(packages);
 
-        let mut cmd = tokio::process::Command::new(&self.python_bin);
+        let mut cmd = sandbox
+            .command(&self.python_bin)
+            .map_err(|e| format!("Failed to install packages: {}", e))?;
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
             // pip install can hang on a slow network — kill_on_drop ensures
@@ -765,15 +840,6 @@ fn check_requirement_spec(spec: &str) -> Result<(), String> {
     }
 }
 
-/// Hard cap on lines/bytes we'll send back as a Python error. Above this,
-/// the truncator kicks in. 30 lines + 4 KB is enough room for a full
-/// 5-frame traceback, the exception line, and a couple of pre-crash
-/// stderr prints — below that, the agent rarely benefits from more
-/// context (the kept stderr tail is on disk at exhaust_path/<id>/stderr.txt
-/// either way).
-const PY_ERROR_LINE_BUDGET: usize = 30;
-const PY_ERROR_BYTE_BUDGET: usize = 4096;
-
 /// Which end of an oversized stream a reader keeps.
 #[derive(Clone, Copy)]
 enum Keep {
@@ -823,7 +889,7 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
                 append_keeping_tail(&mut captured.end, &chunk[..n], PY_ERROR_BYTE_BUDGET);
             }
             Err(e) => {
-                log!("[Python] Output pipe read failed: {}", e);
+                log_legacy!("[Python] Output pipe read failed: {}", e);
                 break;
             }
         }
@@ -845,175 +911,6 @@ fn append_keeping_tail(buf: &mut Vec<u8>, bytes: &[u8], cap: usize) {
     if buf.len() > 2 * cap {
         buf.drain(..buf.len() - cap);
     }
-}
-
-/// Strip middle frames out of a Python traceback and tail-clip
-/// pre-traceback stderr noise so the LLM-facing tool result stays
-/// useful without bloating context. Preserves: any text before the
-/// `Traceback (...)` line (up to a small cap), the traceback header,
-/// the first and last `File "..."` frames (with the indented code line
-/// below each), and the final `ExceptionClass: message` line.
-///
-/// Why this exists: a live chat agent, observed in
-/// `dev` thread `9d44e81c…`, returned 19 errors in 500 events, most of
-/// them ~30-line `ModuleNotFoundError` tracebacks dominated by
-/// interpreter / importer frames the LLM doesn't act on. Trimming the
-/// middle here cuts each error's context cost without dropping the
-/// signal (exception line + the user frame where it fired).
-///
-/// The line trim cannot bound bytes: one multi-MB line counts as one line.
-/// So the result is then clamped to its last [`PY_ERROR_BYTE_BUDGET`] bytes,
-/// because a traceback ends in the exception line.
-pub(crate) fn truncate_python_error(stderr: &str) -> String {
-    clamp_to_byte_budget(trim_python_error_lines(stderr))
-}
-
-/// What a failed script reports: its stderr, or the end of its stdout when
-/// stderr is empty, since many scripts log their errors to stdout.
-/// `stdout_end` is the end of a stream that carried `stdout_total` bytes.
-pub(crate) fn script_error_output(stderr: &str, stdout_end: &str, stdout_total: u64) -> String {
-    if !stderr.trim().is_empty() {
-        return stderr.to_string();
-    }
-    let end = stdout_end.trim_end();
-    if end.trim().is_empty() {
-        return String::new();
-    }
-    let cut = end.ceil_char_boundary(end.len().saturating_sub(PY_ERROR_BYTE_BUDGET));
-    let omitted = stdout_total.saturating_sub(stdout_end.len() as u64) + cut as u64;
-    let omitted = if omitted > 0 {
-        format!("[... {omitted} bytes of stdout omitted ...]\n")
-    } else {
-        String::new()
-    };
-    format!(
-        "(stderr was empty, so this is the end of stdout)\n{omitted}{}",
-        &end[cut..]
-    )
-}
-
-fn clamp_to_byte_budget(text: String) -> String {
-    let excess = text.len().saturating_sub(PY_ERROR_BYTE_BUDGET);
-    if excess == 0 {
-        return text;
-    }
-    let cut = text.ceil_char_boundary(excess);
-    format!("[... {cut} bytes of stderr omitted ...]\n{}", &text[cut..])
-}
-
-fn trim_python_error_lines(stderr: &str) -> String {
-    let line_count = stderr.lines().count();
-    if line_count <= PY_ERROR_LINE_BUDGET && stderr.len() <= PY_ERROR_BYTE_BUDGET {
-        return stderr.to_string();
-    }
-    let lines: Vec<&str> = stderr.lines().collect();
-    let traceback_start = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with("Traceback "));
-
-    if let Some(tb) = traceback_start {
-        // Collect File-frame indices inside the traceback.
-        let file_idxs: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .skip(tb)
-            .filter(|(_, l)| l.trim_start().starts_with("File \""))
-            .map(|(i, _)| i)
-            .collect();
-
-        // Find the exception line: last non-empty, non-whitespace line that
-        // doesn't start with a space (frames are indented; the exception
-        // line is flush-left and looks like `ClassName: message`).
-        let exception_idx = lines
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(i, l)| {
-                *i > tb
-                    && !l.is_empty()
-                    && !l.starts_with(' ')
-                    && !l.starts_with('\t')
-                    && !l.trim_start().starts_with("File \"")
-            })
-            .map(|(i, _)| i);
-
-        if file_idxs.len() > 4 {
-            let mut out = String::new();
-            // Pre-traceback stderr noise (warnings, print(file=sys.stderr)
-            // calls) — keep the last few lines so the LLM still sees what
-            // the script logged before crashing.
-            if tb > 0 {
-                let pre_keep = tb.saturating_sub(3);
-                if pre_keep > 0 {
-                    out.push_str(&format!(
-                        "[... {} lines of pre-traceback stderr omitted ...]\n",
-                        pre_keep
-                    ));
-                }
-                for line in &lines[pre_keep..tb] {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            }
-            // Traceback header.
-            out.push_str(lines[tb]);
-            out.push('\n');
-            // First user frame + its indented code line if present.
-            let first_file = file_idxs[0];
-            out.push_str(lines[first_file]);
-            out.push('\n');
-            if let Some(code_line) = lines.get(first_file + 1) {
-                if (code_line.starts_with("    ") || code_line.starts_with("\t"))
-                    && !code_line.trim_start().starts_with("File \"")
-                {
-                    out.push_str(code_line);
-                    out.push('\n');
-                }
-            }
-            // Omitted middle.
-            let omitted = file_idxs.len() - 2;
-            out.push_str(&format!("  [... {} frames omitted ...]\n", omitted));
-            // Last user frame + its indented code line if present.
-            let last_file = *file_idxs.last().unwrap();
-            out.push_str(lines[last_file]);
-            out.push('\n');
-            if let Some(code_line) = lines.get(last_file + 1) {
-                if (code_line.starts_with("    ") || code_line.starts_with("\t"))
-                    && !code_line.trim_start().starts_with("File \"")
-                {
-                    out.push_str(code_line);
-                    out.push('\n');
-                }
-            }
-            // Exception line. `> last_file` (not `> last_file + 1`) so
-            // we still emit when Python omitted the indented source line
-            // below the last frame — frozen importlib._bootstrap frames,
-            // C-extension frames, and some re-raise paths leave the
-            // exception immediately at last_file + 1, and the code-line
-            // if-let above won't have pushed it (exception is flush-left,
-            // not indented). The two paths are mutually exclusive: at the
-            // same index, a line is either indented (code) or flush-left
-            // (exception) — never both.
-            if let Some(ex) = exception_idx {
-                if ex > last_file {
-                    out.push_str(lines[ex]);
-                    out.push('\n');
-                }
-            }
-            return out.trim_end_matches('\n').to_string();
-        }
-    }
-
-    // No traceback (or traceback was already short) — pure stderr noise
-    // overrun, e.g. a script that printed 200 progress lines before
-    // crashing. Keep the tail.
-    let drop = line_count.saturating_sub(PY_ERROR_LINE_BUDGET);
-    let mut out = String::new();
-    if drop > 0 {
-        out.push_str(&format!("[... {} lines of stderr omitted ...]\n", drop));
-    }
-    out.push_str(&lines[drop..].join("\n"));
-    out
 }
 
 #[cfg(test)]
@@ -1041,6 +938,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/append-run");
         let out = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "open('data/artifacts/log.jsonl', 'a').write('three\\n')\nprint('done')",
                 vec![],
                 &staging,
@@ -1074,6 +972,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/truncate-run");
         runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "open('data/artifacts/report.csv', 'w').write('fresh\\n')",
                 vec![],
                 &staging,
@@ -1101,6 +1000,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/update-run");
         let out = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "with open('data/artifacts/notes.txt', 'r+') as f:\n    print(f.read().strip())",
                 vec![],
                 &staging,
@@ -1123,6 +1023,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/huge-run");
         let out = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "import sys\nsys.stdout.write('x' * 3_000_000)",
                 vec![],
                 &staging,
@@ -1150,6 +1051,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/flood-run");
         let err = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "import sys\nsys.stderr.write('w' * 2_000_000)\nraise ValueError('the real cause')",
                 vec![],
                 &staging,
@@ -1160,6 +1062,51 @@ mod staging_seed_tests {
             err.contains("the real cause"),
             "{}",
             &err[..err.len().min(300)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_regression_tests {
+    use super::*;
+    use crate::runtime::agent_sandbox::Sandbox;
+
+    #[tokio::test]
+    #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
+    async fn reopened_workspace_runs_python_and_reports_hidden_read_errors() {
+        if let lucidos_agent_sandbox::Availability::Unavailable(why) =
+            lucidos_agent_sandbox::probe()
+        {
+            panic!("the real sandbox is unavailable: {why}");
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let gateway = std::fs::canonicalize(scratch.path())
+            .unwrap()
+            .join("gateway");
+        let ws = gateway.join("workspaces/ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(gateway.join("secret"), "secret").unwrap();
+        let runtime = PythonRuntime::new(ws).unwrap();
+        runtime.ensure_venv().await.unwrap();
+        let sandbox = Sandbox::enforced_for_test(lucidos_agent_sandbox::Policy {
+            hidden: vec![gateway.clone()],
+            open_within_hidden: vec![gateway.join("workspaces")],
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime
+                .execute(&sandbox, "print('ready')")
+                .await
+                .unwrap()
+                .trim(),
+            "ready"
+        );
+        let code = format!("open({:?}).read()", gateway.join("secret"));
+        let error = runtime.execute(&sandbox, &code).await.unwrap_err();
+        assert!(error.contains("PermissionError"), "{error}");
+        assert!(
+            error.contains("Operation not permitted") || error.contains("Permission denied"),
+            "{error}"
         );
     }
 }

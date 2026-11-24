@@ -9,11 +9,6 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const settingsView: string = readFileSync(resolve(here, '../SettingsView.tsx'), 'utf-8');
 
-/** The Notifications section carries two switches at two different scopes, and
- *  the scope decides where each one may be rendered. Push is per device and
- *  reads the device list. In-app toasts is one workspace-wide preference and
- *  reads `preferences`, so a device list that failed to load says nothing about
- *  it. */
 describe('Settings → Notifications: the In-app toasts row', () => {
   const toastRow = settingsView.indexOf('data-search-anchor="appearance:in-app-toasts"');
   const deviceError = settingsView.indexOf('<LoadableError noun="devices"');
@@ -24,9 +19,6 @@ describe('Settings → Notifications: the In-app toasts row', () => {
   });
 
   it('renders outside the device-list branch, so a failed list cannot hide it', () => {
-    // The push half lives in a fragment that the failed branch replaces
-    // wholesale. The toast row must sit after that fragment closes, or someone
-    // who came to Settings to silence the pop-up finds no switch.
     const fragmentClose = settingsView.indexOf('</>', deviceError);
     expect(fragmentClose).toBeGreaterThan(-1);
     expect(toastRow).toBeGreaterThan(fragmentClose);

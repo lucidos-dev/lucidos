@@ -1,7 +1,3 @@
-/**
- * The picker footer's contract: the two entry points are always reachable, one
- * form at a time, and a Restore that cannot start always says why.
- */
 
 import { describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
@@ -10,20 +6,15 @@ import type { WorkspaceStatus } from '../../../api/client/control';
 import { restoreBlocker, EMPTY_RESTORE_DRAFT, type RestoreDraft } from '../workspaceForms';
 import { EMPTY_REMOTE_GATEWAY_DRAFT, TRUST_NOTE } from '../../settings/remoteGatewayForm';
 
-/** A closed form rolls away, so the walks below read it as absent. */
 function isClosedDisclosure(v: VNode<Record<string, unknown>>): boolean {
   return typeof v.type === 'function' && v.type.name === 'Disclosure' && !v.props?.open;
 }
 
-/** Flatten a vnode tree, keeping the markers we assert on. Mirrors
- *  network-access-popover.test.tsx. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
   if (Array.isArray(node)) return node.map(vnodeToText).join('');
   const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
-  // Component vnodes render as their own name (nothing here renders them), so a
-  // test can assert on the shared components the footer delegates to.
   const tag =
     typeof v.type === 'string' ? v.type : typeof v.type === 'function' ? v.type.name : '';
   if (isClosedDisclosure(v)) return '';
@@ -37,13 +28,13 @@ function vnodeToText(node: ComponentChildren): string {
 
 const NOOP = () => {};
 
-/** The remote gateway form's props, empty and inert. */
 const REMOTE_DEFAULTS = {
   remoteDraft: EMPTY_REMOTE_GATEWAY_DRAFT,
   onRemoteDraft: NOOP,
   onAddRemote: NOOP,
   onCancelRemote: NOOP,
   pairedRemote: null,
+  remoteAwaitingOwner: false,
 };
 
 function ws(id: string, name = id): WorkspaceStatus {
@@ -83,9 +74,6 @@ const MODES: FooterMode[] = ['none', 'create', 'restore', 'remote'];
 
 describe('both entry points are always on screen', () => {
   it('renders New workspace AND Restore from backup in every mode', () => {
-    // The first-run bug: with zero workspaces the create form REPLACED the
-    // footer, so the only path to restore was cancelling a form the user never
-    // opened, in exactly the state restore exists for.
     for (const mode of MODES) {
       const text = render({ mode });
       expect(text, `mode=${mode}`).toContain('+ New workspace');
@@ -120,8 +108,6 @@ describe('the quick-fill chips', () => {
   });
 
   it('drops the whole row, label included, when there are none', () => {
-    // The picker sends no chips once the user has a workspace. A bare "Try"
-    // with nothing after it is what a `suggestions.length` gate prevents.
     const text = render({ mode: 'create', suggestions: [] });
     expect(text).not.toContain('ws-picker-suggestions');
     expect(text).toContain('ws-picker-input');
@@ -136,8 +122,6 @@ describe('the restore form explains itself', () => {
   const ready: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'fresh' };
 
   it('says what is missing whenever Restore is disabled', () => {
-    // Reported as "the button is disabled, is it because the PWA is running?".
-    // Nothing on screen said "choose a file".
     const text = render({ mode: 'restore' });
     expect(text).toContain('Choose the .age or .enc backup file to restore.');
   });
@@ -156,16 +140,10 @@ describe('the restore form explains itself', () => {
   });
 
   it('never constrains the file input by extension', () => {
-    // `.enc` has no registered UTI, so an accept filter greys out every file in
-    // the iOS Files picker and there is no way to restore from a phone.
     expect(render({ mode: 'restore' })).not.toContain('accept=');
   });
 
   it('picks the file through the shared off-screen input, not a display:none one', () => {
-    // `display: none` (a bare `hidden` attribute) drops the change event on iOS
-    // in standalone PWA mode, so the chosen file never arrives and the form sits
-    // there looking half-filled. HiddenFileInput keeps it in layout, and must
-    // stay inside the label so the tap is one native gesture.
     const text = render({ mode: 'restore' });
     expect(text).toContain('<HiddenFileInput>');
     expect(text).toMatch(/<label class="ws-picker-restore-drop[^"]*"[^>]*><HiddenFileInput>/);
@@ -221,14 +199,10 @@ describe('a collision offers the workspace holding the address', () => {
     const button = findButton(node, 'Delete');
     (button?.props as { onClick?: () => void }).onClick?.();
     expect(onDeleteColliding).toHaveBeenCalledWith('personal');
-    // The restore action itself never deletes: removing a workspace drops its
-    // database, so it stays behind the row's type-the-name confirmation.
     expect(onDeleteColliding).toHaveBeenCalledTimes(1);
   });
 });
 
-/** The form's submitting field: the one `<input>` carrying an Enter handler (the
- *  create name, or the restore workspace-name). */
 function findSubmittingInput(node: ComponentChildren): VNode<Record<string, unknown>> | null {
   if (node === null || node === undefined || typeof node !== 'object') return null;
   if (Array.isArray(node)) {
@@ -244,7 +218,6 @@ function findSubmittingInput(node: ComponentChildren): VNode<Record<string, unkn
   return findSubmittingInput(v.props?.children);
 }
 
-/** First `<button>` in the tree whose text starts with `label`. */
 function findButton(node: ComponentChildren, label: string): VNode<Record<string, unknown>> | null {
   if (node === null || node === undefined || typeof node !== 'object') return null;
   if (Array.isArray(node)) {
@@ -261,8 +234,6 @@ function findButton(node: ComponentChildren, label: string): VNode<Record<string
 }
 
 describe('Enter cannot do what the button refuses', () => {
-  /** Build the footer, press Enter in the first text input, report whether the
-   *  submit handler fired. */
   function pressEnter(over: Partial<PickerFooterProps>, onSubmit: () => void): boolean {
     let fired = false;
     const node = pickerFooter({
@@ -294,8 +265,6 @@ describe('Enter cannot do what the button refuses', () => {
   }
 
   it('does not create a workspace whose name is already taken', () => {
-    // Found in review: the Create button was disabled but Enter still submitted,
-    // so the only thing catching a duplicate was the gateway's 409.
     const blocked = { message: 'You already have a workspace called “work”.', blocking: true };
     expect(pressEnter({ mode: 'create', name: 'work', createNote: blocked }, NOOP)).toBe(false);
     expect(pressEnter({ mode: 'create', name: '  ' }, NOOP)).toBe(false);
@@ -306,8 +275,6 @@ describe('Enter cannot do what the button refuses', () => {
   it('does not start a restore that is still blocked', () => {
     const ready: RestoreDraft = { file: new File(['x'], 'b.enc'), key: 'k', name: 'fresh' };
     const blocker = restoreBlocker(EMPTY_RESTORE_DRAFT, []);
-    // The restore form's own name field is the third input, so drive the whole
-    // form instead: blocked draft, then a complete one.
     expect(pressEnter({ mode: 'restore', draft: EMPTY_RESTORE_DRAFT, blocker }, NOOP)).toBe(false);
     expect(pressEnter({ mode: 'restore', draft: ready, blocker: null }, NOOP)).toBe(true);
   });
@@ -329,8 +296,6 @@ describe('the remote gateway form', () => {
     expect(text).toMatch(/ws-picker-btn-confirm" disabled="true">Pair/);
   });
 
-  /** A paired gateway's pages run as this gateway's own, so the form says
-   *  so before anyone fills it in. */
   it('warns to add only a gateway you run', () => {
     expect(render({ mode: 'remote' })).toContain(TRUST_NOTE);
   });
@@ -357,7 +322,6 @@ describe('the remote gateway form', () => {
   });
 });
 
-/** Every prop, inert, in `mode`. */
 function propsFor(mode: FooterMode): PickerFooterProps {
   return {
     mode,

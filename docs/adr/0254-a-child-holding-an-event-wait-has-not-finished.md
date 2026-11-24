@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-23
+- **Amended by**: [0672](0672-a-parent-waits-on-what-will-wake-it.md), where a
+  parent waits on every unfinished child whose finish wakes it, at any depth
 
 ## Context
 

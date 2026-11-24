@@ -1,7 +1,6 @@
 import { exchangeResponseEvents, exchangeSteps, exchangeStatus } from './exchange-render';
 import type { Exchange } from './exchange';
 
-/** What `exchangeStatus` takes besides the exchange and the two thread flags. */
 export interface FlagSensitivityInputs {
   streamingBuffer: string;
   isLast: boolean;
@@ -11,8 +10,6 @@ export interface FlagSensitivityInputs {
   behindOpenQuestion: boolean;
 }
 
-/** `threadIdle` flips first: it is the likelier difference, so a live turn
- *  settles the check after one extra drawing. */
 const FLAG_COMBINATIONS: readonly (readonly [threadIdle: boolean, threadAwaitingAnswer: boolean])[] = [
   [false, false],
   [true, false],
@@ -25,12 +22,8 @@ interface Verdict {
   sensitive: boolean;
 }
 
-/** One verdict per turn, replaced when its inputs move. An in-place fold bumps
- *  `revision`; a rebuild allocates a new Exchange and so misses on its own. */
 const verdicts = new WeakMap<Exchange, Verdict>();
 
-/** Structural equality. A shared reference answers at once, so the nested
- *  objects the two drawings take from the same event cost nothing. */
 function sameValue(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
   if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return false;
@@ -71,20 +64,10 @@ function verdictKey(exchange: Exchange, inputs: FlagSensitivityInputs): string {
     inputs.hasPriorActive,
     inputs.threadIsCC,
     inputs.behindOpenQuestion,
-    // `exchangeStatus` reads only whether a stream is running.
     inputs.streamingBuffer !== '',
   ].join('|');
 }
 
-/** Whether a flip of `threadIdle` or `threadAwaitingAnswer` can change how this
- *  turn draws. The status, steps and response rows are rendered under every
- *  flag combination and compared.
- *
- *  A turn that reads the same under all four is settled as far as the flags
- *  go. The caller hands it one fixed value, so its memo holds.
- *
- *  A queued turn is always sensitive: `ChatExchange` holds its panel on
- *  `threadAwaitingAnswer` directly (`panelHeld`), outside these three functions. */
 export function threadFlagsChangeDrawing(exchange: Exchange, inputs: FlagSensitivityInputs): boolean {
   if (inputs.isQueued) return true;
   const key = verdictKey(exchange, inputs);

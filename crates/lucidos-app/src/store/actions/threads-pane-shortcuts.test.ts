@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** The thread filter, thread search and menu drawer shortcuts.
- *
- *  Plan: `docs/plans/2026-10-02-shortcut-coverage-and-search-landing.md`. */
 import { beforeAll, describe, it, expect, beforeEach } from 'vitest';
 import { mobileView, threadDrawerOpen, splitRatio, focusedPane, threadSearchQuery } from '../store';
 import { threadFilterPanelOpen, closeThreadFilterPanel, openThreadFilterPanel } from '../threadFilterPanel';
@@ -11,8 +8,6 @@ import { toggleMenuDrawer } from '../../components/layout/ContentNav';
 import { toggleThreadFilter, startThreadSearch } from './pane';
 import { DrawerChunk } from '../../components/layout/drawerState';
 
-// The drawer is code-split and opens once it is in memory. Warm it, so an
-// open lands at once.
 beforeAll(() => DrawerChunk.preload());
 
 function setViewport(px: number): void {
@@ -50,8 +45,6 @@ describe('toggleThreadFilter', () => {
   });
 
   it('shows the filter rather than shutting it when the list was hidden', () => {
-    // A filter left open behind a collapsed Conversation side is what the
-    // user expects to see, not to close unseen.
     openThreadFilterPanel();
     splitRatio.value = 0;
     toggleThreadFilter();

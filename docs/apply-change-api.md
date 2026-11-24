@@ -21,6 +21,9 @@ POST /api/v1/changes/{change_id}/apply
 - No request body.
 - No query parameters.
 
+An Apply attempt on a pending change records `ChangeApplyRequested` on its thread.
+Use the response and subsequent change events to determine the outcome.
+
 ## Response shape
 
 Always JSON, with four HTTP statuses.
@@ -46,6 +49,8 @@ interface ApplyChangeResult {
   thread_id: string | null;   // owning thread; null for headless imports
   message: string;            // human-readable summary
   restart_required: boolean;
+  version_build: 'started' | 'deferred' | 'none';
+  deferred_coding_threads: number; // zero unless a build is held
   applied_commit?: string;    // 40-char SHA on main AFTER the merge
   previous_commit?: string;   // 40-char SHA on main BEFORE the merge
   commits_applied: number;    // commits added to main (0 for non-`applied`)
@@ -54,6 +59,16 @@ interface ApplyChangeResult {
   review_thread_id?: string;   // set when status === 'hardening'
 }
 ```
+
+### Version build outcome
+
+`version_build` reports the build request made by this Apply: `started` means started or joined; `deferred` means held by active coding threads. `none` means Apply requested no version build, including non-applied results. Older engines can omit these fields.
+
+With `defer_version_builds=while-coding`, a held Apply still returns `status: "applied"`. Its `message` reads, for example, "Applied. The new version waits for 2 coding threads to finish." `deferred_coding_threads` gives the count from the same request that held the build. `lucidos changes apply` preserves this JSON and message without a new flag. Apply does not switch versions.
+
+`GET /api/v1/engine/version-status` reports `build_state: "deferred"` while held. `build_deferred` carries `coding_threads`, `threads` (up to three `{id, title, state}` entries), and `deferred_ms`. It also appears beside `build_state: "ready"` when a finished version can switch while a newer build waits. **Build now** calls the explicit rebuild endpoint and overrides the hold. Build-slot waiting remains `build_queued`.
+
+A source build watches its own version status while a page is connected, and emits `EngineVersionStatusChanged` when it changes. Clients re-read the endpoint on that event instead of polling. The endpoint then serves at least what the event announced, including the pending commits. Packaged builds run no watcher.
 
 ### Status values
 
@@ -235,7 +250,7 @@ This is why the CLI exists: a `run_python` block calling
 and no subprocess-origin headers, so the resulting `ChangeApplied`
 misattributes to "You". The `lucidos changes apply <id>` subcommand
 forwards the headers automatically; see
-`system-knowhow/lucidos-cli.md` § `lucidos changes apply` for the
+`system-knowhow/lucidos-cli/subcommands-10.md` § `lucidos changes apply` for the
 worked example.
 
 ## Common failure modes

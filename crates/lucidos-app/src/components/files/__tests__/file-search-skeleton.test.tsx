@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** File search keeps its field live while the file list loads, and draws
- *  result rows as the placeholder past the delay gate. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

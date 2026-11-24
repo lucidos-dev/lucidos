@@ -1,9 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { isKnownAppFrame } from './appFrame';
 
-// The test env has no real DOM, so stub the iframe lookup. isKnownAppFrame's
-// own logic — null guard + "is `source` the contentWindow of some app frame" —
-// is what's under test, not the browser's querySelectorAll.
 function withFrames(...frames: Array<{ contentWindow: unknown }>) {
   return vi.spyOn(document, 'querySelectorAll').mockReturnValue(frames as unknown as NodeListOf<Element>);
 }

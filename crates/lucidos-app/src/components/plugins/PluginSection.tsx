@@ -4,11 +4,6 @@ import { Disclosure } from '../shared/Disclosure';
 import { ChevronRightIcon } from '../shared/icons';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 
-/** The top of every plugin panel and receipt: what is happening, then which
- *  plugin. A receipt passes `receiptAt`, which turns the status into a badge
- *  beside the time it happened. A confirm panel passes its buttons as
- *  `actions`: they sit top right, and wrap above the text on a narrow pane.
- *  It holds no hooks, so it is a plain function. */
 export function pluginPanelHeader({ status, receiptAt, name, version, description, actions }: {
   status: string;
   receiptAt?: string;
@@ -34,9 +29,6 @@ export function pluginPanelHeader({ status, receiptAt, name, version, descriptio
   );
 }
 
-/** A panel section whose body folds away under its heading. The note and the
- *  footer stay outside the fold: they say what confirming does to the whole
- *  list, so they must read even when it is shut. */
 export function PluginSection({
   label,
   detail,
@@ -48,14 +40,11 @@ export function PluginSection({
   children,
 }: {
   label: string;
-  /** A muted aside after the label, readable while the section is shut. */
   detail?: string;
   count?: number;
   defaultOpen?: boolean;
-  /** `danger` marks a section whose files confirming destroys. */
   tone?: 'danger';
   note?: ComponentChildren;
-  /** A control under the note, such as the keep-my-edits switch. */
   footer?: ComponentChildren;
   children: ComponentChildren;
 }) {

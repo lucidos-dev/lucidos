@@ -1,22 +1,3 @@
-/**
- * Modules the shell chunk must reach only through a dynamic `import()`. Each
- * one spent first-paint budget (ADR 0436) on something the first frame never
- * draws, so a static import that pulls it back fails here first.
- *
- * - The HTML preview's frame bridge carries two raw iframe scripts. "Open in
- *   new tab" takes its URL helper from `store/actions/frame-capability.ts`.
- * - The composer's press probe is a diagnostic. `startShell` loads it on its
- *   own, keeping only its cover sample (`pressCover.ts`), which must install
- *   before any overlay's listener.
- * - Menus and dialogs that open on demand.
- *
- * What a cold open can draw at once stays eager (ADR 0288). The progress
- * dialog stays too: it is the engine restart's surface, so no chunk fetch may
- * stand in its way.
- *
- * This walks the static import graph from `App.tsx`, as Rollup does for the
- * shell chunk (`staticImportGraph.ts`).
- */
 import { describe, it, expect } from 'vitest';
 import { chainTo, srcPath, staticGraph } from './staticImportGraph';
 
@@ -52,7 +33,7 @@ const EAGER = [
   'components/shared/ProgressDialog.tsx',
 ];
 
-describe('the shell chunk leaves its lazy modules out', () => {
+describe('source imports preserve lazy initialization gates', () => {
   const graph = staticGraph(srcPath('App.tsx'));
 
   it('reaches shell startup and the header actions, so the walk itself works', () => {

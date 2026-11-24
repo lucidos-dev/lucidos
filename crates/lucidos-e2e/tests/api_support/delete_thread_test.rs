@@ -1,7 +1,7 @@
 //! End-to-end API tests for deleting a thread.
 //!
 //! The transaction itself is covered in
-//! `crates/lucidos-engine/src/api/threads/delete_tests.rs`, and the caller gate
+//! `crates/lucidos-agents-api/src/api/threads/delete_tests.rs`, and the caller gate
 //! in `api/actor_tests.rs`, where an origin token can be minted. What is tested
 //! here is the WIRING: real HTTP into a booted workspace, through the owner
 //! gate, the shared cascade classifier and the one destructive transaction.

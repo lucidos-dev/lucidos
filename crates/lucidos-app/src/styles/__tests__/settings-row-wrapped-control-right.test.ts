@@ -1,14 +1,3 @@
-/**
- * A settings control stays on the right when it wraps under its label.
- *
- * The row wraps once the control no longer fits beside the label. With
- * `justify-content: space-between`, a control alone on its line sat at the
- * LEFT edge: Appearance → Motion on a phone put its segmented control under
- * "Motion", flush left, while every other row's control sat on the right.
- *
- * Packing to the end fixes that and changes nothing on a shared line, because
- * the label grows to fill it. So both halves are pinned here.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -38,16 +27,11 @@ describe('settings row alignment', () => {
     expect(flex?.split(/\s+/)[0]).toBe('1');
   });
 
-  // A fixed floor reserved as much room for "Mode" as for a long label. So a
-  // short label dropped its control onto a new line with room to spare.
   it('bases the label on its own text, so a short label keeps its control', () => {
     const flex = rule('.settings-row > .settings-row-label').props.get('flex');
     expect(flex?.split(/\s+/)[2]).toBe('auto');
   });
 
-  // The label's padding-top lines it up with a dropdown or segmented control.
-  // A .settings-option button is shorter, so pinned to the top it sat above
-  // the label's text ("Install font", the UI scale readout).
   it('centres a lone option button on its label', () => {
     const row = '.settings-row:has(> .settings-row-label + .settings-option)';
     expect(rule(row).props.get('align-items')).toBe('center');

@@ -365,6 +365,15 @@ test_the_handoff_falls_back_only_without_github() {
         "$(handoff_outcome "the tree is dirty" api --github -f x)"
 }
 
+# shellcheck disable=SC2030,SC2031 # each export is scoped to its own $(...) on purpose
+test_an_agent_sandbox_runs_locally_like_any_host() {
+    echo "test: inside an agent sandbox a local run stays local, as anywhere else"
+    expect_outcome "--local runs here" "*local -f health*env=1" \
+        "$(export LUCIDOS_AGENT_SANDBOXED=1; handoff_outcome "" api --local -f health)"
+    expect_outcome "a fallback runs here and says why" "*running on this host: the tree is dirty*local  env=1" \
+        "$(export LUCIDOS_AGENT_SANDBOXED=1; handoff_outcome "the tree is dirty" api)"
+}
+
 # lean_outcome <suite> [args]: the hand-off with exec stubbed and no engine
 # profile chosen by the caller, unless LEAN_KEEP_DEBUG keeps LUCIDOS_E2E_DEBUG.
 # LEAN_REASON stubs the precondition check. A filtered run needs it non-empty to
@@ -556,6 +565,26 @@ test_the_unavailable_reason_names_each_precondition() {
     unset -f gh
 }
 
+# shellcheck disable=SC2317,SC2329 # the reason is stubbed so only the advice is tested
+test_the_preflight_offers_local_only_where_it_exists() {
+    echo "test: a refused preflight offers --local only to a suite that has it"
+    local out
+    out="$(
+        e2e_github_unavailable_reason() { echo "the gh CLI is not installed"; }
+        e2e_github_preflight "$REPO" "" 2>&1
+    )"
+    expect_outcome "an ordinary suite is told about --local" "*run the suite with --local*" "$out"
+    out="$(
+        e2e_github_unavailable_reason() { echo "the gh CLI is not installed"; }
+        e2e_github_preflight "$REPO" "" no-local 2>&1
+    )"
+    expect_outcome "a suite without a local run says so" "*has no local fallback*" "$out"
+    case "$out" in
+        *--local*) fail "a suite without a local run was told to pass --local" ;;
+        *) pass "a suite without a local run is never told to pass --local" ;;
+    esac
+}
+
 # Since the gh guard blocks a bare call, every main check reported "no run
 # started" for a run that had started. The lookup must say what gh said.
 test_the_run_lookup_reports_what_gh_said() {
@@ -688,6 +717,21 @@ test_the_report_counts_the_engine_suite() {
     if [ "$rc" = 101 ] && [[ "$out" == *"── engine exit code: 101 ──"* ]] \
         && [ "$(printf '%s\n' "$out" | grep -n '══ engine' | cut -d: -f1)" -lt "$(printf '%s\n' "$out" | grep -n '══ api' | cut -d: -f1)" ]; then
         pass "engine reports before api and fails the run with its code"
+    else
+        fail "rc=$rc: $out"
+    fi
+}
+
+test_the_report_counts_the_frontend_suite() {
+    echo "test: the frontend shard prints its log and fails the report"
+    local d="$SANDBOX/report-frontend" out rc=0
+    mkdir -p "$d/e2e-plan"
+    echo 'frontend frontend - 1 1' >"$d/e2e-plan/entries"
+    fake_shard "$d" frontend 1 "frontend typecheck failed"
+    out="$(e2e_github_report "$d" 2>&1)" || rc=$?
+    if [ "$rc" = 1 ] && [[ "$out" == *"── frontend exit code: 1 ──"* ]] \
+        && [[ "$out" == *"frontend typecheck failed"* ]]; then
+        pass "the report includes the frontend log and exit code"
     else
         fail "rc=$rc: $out"
     fi
@@ -896,11 +940,11 @@ fake_api_answer() {
 }
 
 # run_state_fixture <run-status> <test-job-status> [<remaining>]: a run state as
-# e2e_github_run_state prints it, with a plan job, a skipped build and one test
-# job.
+# e2e_github_run_state prints it: a plan job, a running build, the suites and
+# confinement jobs already running, and one e2e test job.
 run_state_fixture() {
-    printf '{"status": "%s", "conclusion": null, "jobs": [{"name": "plan", "status": "completed"}, {"name": "build-linux", "status": "in_progress"}, {"name": "chromium-1-1", "status": "%s"}], "rate_remaining": %s}' \
-        "$1" "$2" "${3:-4000}"
+    printf '{"status": "%s", "conclusion": null, "jobs": [{"name": "plan", "status": "completed"}, {"name": "build-linux", "status": "in_progress"}, {"name": "engine-macos", "status": "in_progress"}, {"name": "confinement", "status": "completed"}, {"name": "%schromium-1-1", "status": "%s"}], "rate_remaining": %s}' \
+        "$1" "$E2E_GITHUB_TEST_JOB_PREFIX" "$2" "${3:-4000}"
 }
 
 # shellcheck disable=SC2317,SC2329 # gh is stubbed, and the run state calls it
@@ -932,7 +976,7 @@ test_the_poll_speeds_up_once_a_test_job_starts() {
     echo "test: the poll waits 30 s until a test job starts, then 5 s, and 30 s again near the rate limit"
     local got
     got="$(e2e_github_poll_secs "$(run_state_fixture in_progress queued)")"
-    if [ "$got" = 30 ]; then pass "plan and build jobs alone keep the slow poll"; else fail "before tests: $got"; fi
+    if [ "$got" = 30 ]; then pass "plan, build, suites and confinement jobs keep the slow poll"; else fail "before tests: $got"; fi
     got="$(e2e_github_poll_secs "$(run_state_fixture in_progress in_progress)")"
     if [ "$got" = 5 ]; then pass "a running test job makes it fast"; else fail "tests running: $got"; fi
     got="$(e2e_github_poll_secs "$(run_state_fixture in_progress completed 500)")"
@@ -941,6 +985,40 @@ test_the_poll_speeds_up_once_a_test_job_starts() {
     if [ "$got" = 30 ]; then pass "below 500 remaining calls it slows down"; else fail "below the floor: $got"; fi
     got="$(e2e_github_poll_secs "$(run_state_fixture in_progress in_progress null)")"
     if [ "$got" = 5 ]; then pass "an answer without the header does not slow it"; else fail "no header: $got"; fi
+    local skipped
+    skipped="$(run_state_fixture in_progress completed | sed 's/"status": "completed"}\]/"status": "completed", "conclusion": "skipped"}]/')"
+    if e2e_github_tests_started "$skipped"; then
+        fail "a test job skipped after a failed build counted as started"
+    else
+        pass "a skipped test job does not count as started"
+    fi
+}
+
+# shellcheck disable=SC2317,SC2329 # the run state and sleep are stubbed for the function under test
+test_the_wait_marks_the_start_of_the_tests_once() {
+    echo "test: e2e_github_wait prints the tests-started mark once, when the first test job starts"
+    local polls="$SANDBOX/wait-polls" out
+    echo 0 >"$polls"
+    out="$(
+        e2e_github_run_state() {
+            local n
+            n=$(($(cat "$polls") + 1))
+            echo "$n" >"$polls"
+            case "$n" in
+                (1) run_state_fixture in_progress queued ;;
+                (2 | 3) run_state_fixture in_progress in_progress ;;
+                (*) run_state_fixture completed completed ;;
+            esac
+        }
+        sleep() { :; }
+        e2e_github_wait 4242 2>&1 >/dev/null
+    )"
+    if [ "$(grep -cxF "$E2E_GITHUB_TESTS_STARTED_MARK" <<<"$out")" = 1 ] \
+        && [ "$(grep -n -xF "$E2E_GITHUB_TESTS_STARTED_MARK" <<<"$out" | cut -d: -f1)" -gt 2 ]; then
+        pass "one mark, after the build-only poll"
+    else
+        fail "out: $out"
+    fi
 }
 
 # shellcheck disable=SC2317,SC2329 # gh, the clock and sleep are stubbed for the function under test
@@ -1043,6 +1121,39 @@ print(r["push_to_verdict_secs"], r["push_to_complete_secs"], r["engine_reused_fr
     fi
     out="$(LUCIDOS_E2E_TIMINGS_LOG="$log" e2e_github_record_timings "$dir" 4242 browser 1767225600 0 'not json' 2>&1)"
     if [[ "$out" == *"timings not recorded"* ]]; then pass "a broken state is one line, not a failure"; else fail "broken state: $out"; fi
+}
+
+# record_build <log> <build-linux run secs>: record one run whose only build
+# job took that long, and print the driver's stderr.
+record_build() {
+    local dir="$SANDBOX/build-timings" state
+    mkdir -p "$dir"
+    state="{\"status\": \"completed\", \"conclusion\": \"success\", \"updated_at\": \"2026-01-01T01:00:00Z\", \"jobs\": [
+        {\"name\": \"build-linux\", \"conclusion\": \"success\", \"created_at\": \"2026-01-01T00:00:00Z\",
+         \"started_at\": \"2026-01-01T00:00:00Z\", \"completed_at\": \"$(printf '2026-01-01T00:%02d:%02dZ' $(($2 / 60)) $(($2 % 60)))\"}]}"
+    (
+        e2e_github_now() { echo 1767229200; }
+        LUCIDOS_E2E_TIMINGS_LOG="$1" e2e_github_record_timings "$dir" 4242 browser 1767225600 0 "$state" 2>&1
+    )
+}
+
+# The launch tree tripled every GitHub build for two days, and nothing said so.
+test_a_build_over_twice_its_median_prints_a_notice() {
+    echo "test: a build job over twice its trailing median prints a notice"
+    local log="$SANDBOX/build-timings.jsonl" i out
+    rm -f "$log"
+    for i in 1 2 3 4; do record_build "$log" 300 >/dev/null; done
+    out="$(record_build "$log" 700)"
+    if [[ "$out" == *NOTICE* ]]; then fail "four builds are too few for a median: $out"; else pass "no notice on a short history"; fi
+    record_build "$log" 300 >/dev/null
+    out="$(record_build "$log" 500)"
+    if [[ "$out" == *NOTICE* ]]; then fail "a build under twice the median warned: $out"; else pass "no notice under twice the median"; fi
+    out="$(record_build "$log" 700)"
+    if [[ "$out" == *"NOTICE: build-linux took 11m40s, over twice its median of 5m00s"* ]]; then
+        pass "the notice names the job, its time and the median"
+    else
+        fail "no notice for a slow build: $out"
+    fi
 }
 
 # detach_outcome <run-db-id>: what the driver's real SIGUSR2 trap leaves.
@@ -1201,25 +1312,162 @@ test_the_coverage_map_is_replaced_only_when_every_chromium_shard_reported() {
     fi
 }
 
-test_the_plan_gives_the_engine_suite_its_own_job() {
-    echo "test: the plan runs the engine suite in its own job, and only when asked"
-    local req="$SANDBOX/engine-request.json" out="$SANDBOX/engine-plan" ghout="$SANDBOX/engine-gh-output"
-    echo '{"suites": ["engine", "api"], "api_args": [], "browser": {"projects": [], "specs": [], "pw_args": []}}' >"$req"
+test_confinement_has_its_own_job_and_keeps_the_verdict() {
+    echo "test: confinement needs no engine and preserves a not-run verdict"
+    local req="$SANDBOX/confinement-request.json" out="$SANDBOX/confinement-plan" ghout="$SANDBOX/confinement-output" rc=0
+    echo '{"suites": ["confinement"], "browser": {"projects": []}}' >"$req"
     : >"$ghout"
     E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
         "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
-    if grep -q '^has_engine=true$' "$ghout" && grep -q "^engine engine - 1 1$" "$out/plan/entries" \
-        && ! grep '^linux=' "$ghout" | grep -q engine; then
-        pass "the engine suite gets its own job and stays out of the Linux matrix"
+    if grep -qx 'has_confinement=true' "$ghout" && grep -qx 'has_linux=false' "$ghout" \
+        && grep -qx 'confinement confinement - 1 1' "$out/plan/entries"; then
+        pass "confinement gets a separate job without an engine build"
     else
-        fail "gh output: $(tr '\n' ';' <"$ghout") entries: $(tr '\n' ';' <"$out/plan/entries")"
+        fail "confinement plan: $(cat "$ghout")"
+    fi
+    echo '{"suites": ["api"], "browser": {"projects": []}}' >"$req"
+    : >"$ghout"
+    E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
+    if grep -qx 'has_confinement=false' "$ghout"; then
+        pass "only a request runs confinement"
+    else
+        fail "unrequested confinement"
+    fi
+    mkdir -p "$out/stubs"
+    # shellcheck disable=SC2016 # This is the stub script, not this shell.
+    printf '%s\n' '#!/bin/bash' '[ "$1" = --here ] || exit 2' 'exit 75' >"$out/stubs/confinement-tests.sh"
+    chmod +x "$out/stubs/confinement-tests.sh"
+    E2E_GITHUB_OUT="$out/run" bash -c '
+        source "$1"
+        SCRIPT_DIR="$2"
+        run_setup_step() { return 0; }
+        export_coverage_request() { :; }
+        use_e2e_profile() { :; }
+        stand_down_shared_host_guards() { :; }
+        cmd_run confinement confinement
+    ' _ "$SCRIPT_DIR/../e2e-github-shard.sh" "$out/stubs" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 75 ] && [ "$(cat "$out/run/confinement/confinement.rc")" = 75 ]; then
+        pass "the shard runs here and records exit 75"
+    else
+        fail "the confinement shard returned $rc"
+    fi
+    rc=0
+    mkdir -p "$out/e2e-plan"
+    echo 'confinement confinement - 1 1' >"$out/e2e-plan/entries"
+    fake_shard "$out" confinement 75 "the real sandbox is unavailable"
+    e2e_github_report "$out" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 75 ]; then
+        pass "not-run is never a pass"
+    else
+        fail "report returned $rc"
+    fi
+}
+
+# A shard turns its runner's guards off for its own builds. The launch tree
+# and load guard suites then saw them, and failed on every runner.
+test_the_scripts_job_hides_the_runner_settings() {
+    echo "test: the script suites never see the shard's settings or GitHub's variables"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" fake="$SANDBOX/fake-scripts" seen
+    mkdir -p "$fake"
+    printf '#!/bin/sh\nenv\n' >"$fake/test-scripts.sh"
+    chmod +x "$fake/test-scripts.sh"
+    # shellcheck disable=SC2016 # the child bash expands its own arguments
+    seen="$(GITHUB_OUTPUT=/tmp/x CI=true HOST_LOAD_GUARD_DISABLE=1 bash -c \
+        'source "$1"; stand_down_shared_host_guards; SCRIPT_DIR="$2"; run_script_suites' _ "$shard" "$fake")"
+    if printf '%s\n' "$seen" | grep -q -E '^(LUCIDOS_|GITHUB_|HOST_LOAD_|CI=)'; then
+        fail "the suites saw: $(printf '%s\n' "$seen" | grep -E '^(LUCIDOS_|GITHUB_|HOST_LOAD_|CI=)' | tr '\n' ' ')"
+    elif printf '%s\n' "$seen" | grep -q '^PATH='; then
+        pass "only the host's own environment reaches the suites"
+    else
+        fail "the suites lost PATH too"
+    fi
+}
+
+test_the_crates_job_runs_every_crate_suite_past_a_failure() {
+    echo "test: the crates job runs each crate suite /harden would, and a failure fails it without stopping it"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" stub="$SANDBOX/crate-stub" ran="$SANDBOX/crate-ran" rc=0 want
+    # shellcheck disable=SC2016 # the stub expands its own argument
+    printf '#!/bin/sh\necho "$1" >>"%s"\n[ "$1" != cli ]\n' "$ran" >"$stub"
+    chmod +x "$stub"
+    : >"$ran"
+    # shellcheck disable=SC2016 # the child bash expands its own arguments
+    HS_STUB_CMD="$stub" bash -c 'source "$1"; warm_npm() { :; }; ensure_frontend_built() { :; }
+        uname() { echo Darwin; }; run_crate_suites' _ "$shard" >/dev/null 2>&1 || rc=$?
+    want="$(bash -c 'source "$1"; echo $HS_MAIN_CHECK_CRATE_SUITES' _ "$SCRIPT_DIR/harden_suites.sh")"
+    if [ "$rc" -ne 0 ] && [ "$(tr '\n' ' ' <"$ran")" = "$want " ]; then
+        pass "every suite ran on macOS, and the failing cli suite failed the job"
+    else
+        fail "rc=$rc ran: $(tr '\n' ' ' <"$ran") want: $want"
+    fi
+    : >"$ran"
+    # shellcheck disable=SC2016 # the child bash expands its own arguments
+    HS_STUB_CMD="$stub" bash -c 'source "$1"; warm_npm() { :; }; ensure_frontend_built() { :; }
+        uname() { echo Linux; }; run_crate_suites' _ "$shard" >/dev/null 2>&1
+    if grep -q -x app-lib "$ran"; then
+        fail "Linux ran the desktop app's tests, which need GTK"
+    elif [ "$(grep -c . "$ran")" -eq "$(($(printf '%s\n' "$want" | wc -w) - 1))" ]; then
+        pass "Linux runs every crate suite but the desktop app's"
+    else
+        fail "Linux ran: $(tr '\n' ' ' <"$ran")"
+    fi
+}
+
+test_the_frontend_job_runs_both_checks_past_a_failure() {
+    echo "test: either failed frontend check fails the job, and both checks run"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" failed rc out want
+    want="$(printf '%s\n' 'run typecheck' test)"
+    for failed in 'run typecheck' test; do
+        rc=0
+        # shellcheck disable=SC2016 # the child bash expands its own arguments
+        out="$(bash -c 'source "$1"; warm_npm() { :; }
+            npm() {
+                [ "$PWD" = "$PROJECT_DIR/crates/lucidos-app" ] || return 2
+                echo "$*"
+                [ "$*" != "$failed" ]
+            }
+            failed="$2"
+            run_frontend_suites' _ "$shard" "$failed" 2>&1)" || rc=$?
+        if [ "$rc" = 1 ] && [ "$out" = "$want" ]; then
+            pass "both checks ran when npm $failed failed"
+        else
+            fail "npm $failed: rc=$rc output: $out"
+        fi
+    done
+}
+
+test_the_plan_runs_the_main_check_suites_on_both_platforms() {
+    echo "test: the plan runs the engine, crates and script suites on Linux and macOS, and only when asked"
+    local req="$SANDBOX/engine-request.json" out="$SANDBOX/engine-plan" ghout="$SANDBOX/engine-gh-output" s missing=""
+    echo '{"suites": ["engine", "crates", "scripts", "frontend", "api"], "api_args": [], "browser": {"projects": [], "specs": [], "pw_args": []}}' >"$req"
+    : >"$ghout"
+    E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
+    for s in engine crates scripts; do
+        grep -q "^$s $s - 1 1$" "$out/plan/entries" || missing="$missing $s"
+        grep -q "^$s-macos $s - 1 1$" "$out/plan/entries" || missing="$missing $s-macos"
+        grep '^suites=' "$ghout" | grep -q "\"id\":\"$s\",\"suite\":\"$s\",\"os\":\"ubuntu-latest\"" || missing="$missing $s/linux-job"
+        grep '^suites=' "$ghout" | grep -q "\"id\":\"$s-macos\",\"suite\":\"$s\",\"os\":\"macos-15\"" || missing="$missing $s/macos-job"
+    done
+    if [ -z "$missing" ] && grep -q '^has_suites=true$' "$ghout" \
+        && ! grep -E '^(linux|macos)=' "$ghout" | grep -q -E 'engine|crates|scripts'; then
+        pass "each suite gets a Linux and a macOS job, outside the browser matrices"
+    else
+        fail "missing:$missing gh output: $(tr '\n' ';' <"$ghout") entries: $(tr '\n' ';' <"$out/plan/entries")"
+    fi
+    if [ "$(awk '$2 == "frontend"' "$out/plan/entries")" = 'frontend frontend - 1 1' ] \
+        && grep '^suites=' "$ghout" | grep -q '"id":"frontend","suite":"frontend","os":"ubuntu-latest"' \
+        && ! grep -q 'frontend-macos' "$ghout"; then
+        pass "the frontend suite gets one Linux job"
+    else
+        fail "frontend suite matrix: $(sed -n 's/^suites=//p' "$ghout")"
     fi
     echo '{"suites": ["api"], "api_args": [], "browser": {"projects": [], "specs": [], "pw_args": []}}' >"$req"
     : >"$ghout"
     E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
         "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
-    if grep -q '^has_engine=false$' "$ghout"; then
-        pass "a request without it runs no engine job"
+    if grep -q '^has_suites=false$' "$ghout"; then
+        pass "a request without them runs no suites job"
     else
         fail "gh output: $(tr '\n' ';' <"$ghout")"
     fi
@@ -1251,19 +1499,69 @@ test_the_plan_puts_webkit_on_macos_and_respects_test_ignore() {
     fi
 }
 
+test_the_plan_gives_desktop_webkit_one_macos_shard() {
+    echo "test: the shard plan sends desktop-webkit to macOS, in one shard of its listed specs"
+    local req="$SANDBOX/dw-request.json" out="$SANDBOX/dw-out" ghout="$SANDBOX/dw-gh-output" listed specs=""
+    while IFS= read -r listed; do specs="$specs\"$listed\","; done <<EOF
+$(grep -v '^#' "$E2E_DESKTOP_WEBKIT_SPECS")
+EOF
+    echo "{\"suites\": [\"browser\"], \"api_args\": [], \"browser\": {\"projects\": [\"desktop-webkit\"], \"specs\": [${specs}\"plain.spec.ts\", \"other-all.spec.ts\"], \"pw_args\": []}}" >"$req"
+    : >"$ghout"
+    E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
+    if [ "$(cat "$out/plan/entries")" = "desktop-webkit-1-1 browser desktop-webkit 1 1" ] \
+        && grep -q '^has_linux=false$' "$ghout" && grep -q '^macos=.*"project":"desktop-webkit"' "$ghout"; then
+        pass "one macOS shard, and nothing on Linux"
+    else
+        fail "entries: $(tr '\n' ';' <"$out/plan/entries"); gh output: $(tr '\n' ';' <"$ghout")"
+    fi
+    echo "{\"suites\": [\"browser\"], \"api_args\": [], \"browser\": {\"projects\": [\"desktop-webkit\"], \"specs\": [\"plain.spec.ts\", \"other-all.spec.ts\"], \"pw_args\": []}}" >"$req"
+    : >"$ghout"
+    E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
+    if [ ! -s "$out/plan/entries" ]; then
+        pass "no shard when the selection holds none of its specs"
+    else
+        fail "entries: $(tr '\n' ';' <"$out/plan/entries")"
+    fi
+}
+
 test_only_tagged_specs_stay_on_the_local_leg() {
     echo "test: a spec stays local only when a test in it is tagged @real-claude-code"
     local spec_dir="$SCRIPT_DIR/../../crates/lucidos-app/e2e" spec wrong=""
-    for spec in chat coding-agent-cancel coding-agent-resume-after-exit side-question-all; do
+    for spec in chat coding-agent-cancel coding-agent-resume-after-exit; do
         e2e_spec_needs_real_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(untagged)"
     done
     for spec in coding-agent coding-agent-follow-ups coding-agent-mid-session-settings \
         coding-agent-model-preselect coding-agent-reasoning-preselect model-switching \
-        control-menu control-menu-over-header-mobile; do
+        control-menu control-menu-over-header-mobile side-question-all; do
         e2e_spec_spawns_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(spawns-nothing)"
         ! e2e_spec_needs_real_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(tagged)"
     done
-    if [ -z "$wrong" ]; then pass "four files local, eight on GitHub against the fake"; else fail "misrouted:$wrong"; fi
+    if [ -z "$wrong" ]; then pass "three files local, nine on GitHub against the fake"; else fail "misrouted:$wrong"; fi
+}
+
+test_a_commit_from_before_desktop_webkit_does_not_get_that_project() {
+    echo "test: under --commit, desktop-webkit runs only where the commit holds its spec list"
+    local repo="$SANDBOX/project-repo" dir old new out
+    dir="$repo/$E2E_GITHUB_SPEC_DIR"
+    git init -q "$repo"
+    mkdir -p "$dir"
+    echo "test('send', () => {})" >"$dir/chat.spec.ts"
+    git -C "$repo" add -A
+    git -C "$repo" -c user.email=dev@example.com -c user.name=Dev commit -qm specs
+    old="$(git -C "$repo" rev-parse HEAD)"
+    echo "chat.spec.ts" >"$dir/desktop-webkit-specs.txt"
+    git -C "$repo" add -A
+    git -C "$repo" -c user.email=dev@example.com -c user.name=Dev commit -qm list
+    new="$(git -C "$repo" rev-parse HEAD)"
+
+    out="$(e2e_github_commit_projects "$repo" "$old" chromium desktop-webkit mobile-webkit 2>/dev/null | tr '\n' ';')"
+    if [ "$out" = "chromium;mobile-webkit;" ]; then pass "an older commit loses only desktop-webkit"; else fail "an older commit loses only desktop-webkit: $out"; fi
+    out="$(e2e_github_commit_projects "$repo" "$new" chromium desktop-webkit mobile-webkit | tr '\n' ';')"
+    if [ "$out" = "chromium;desktop-webkit;mobile-webkit;" ]; then pass "a commit with the list keeps it"; else fail "a commit with the list keeps it: $out"; fi
+    out="$(e2e_github_commit_projects "$repo" "" desktop-webkit | tr '\n' ';')"
+    if [ "$out" = "desktop-webkit;" ]; then pass "the working tree keeps it"; else fail "the working tree keeps it: $out"; fi
 }
 
 test_a_named_commit_routes_the_specs_it_holds() {
@@ -1460,6 +1758,21 @@ test_the_build_job_stands_down_the_shared_host_guards() {
     fi
 }
 
+# A runner checkout is a primary checkout. In a launch tree its build ignored
+# the restored target/ state and the dependency cache, and compiled every crate.
+test_a_runner_build_compiles_live() {
+    echo "test: every shard command builds in the runner checkout, never a launch tree"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" repo="$SANDBOX/runner-checkout"
+    git init -q "$repo"
+    # shellcheck disable=SC2016 # the child bash expands its own arguments
+    if env -u LUCIDOS_LAUNCH_TREE bash -c 'source "$1"; source "$2"; launch_tree_wanted "$3"' \
+        _ "$shard" "$SCRIPT_DIR/launch_tree.sh" "$repo"; then
+        fail "a shard build compiles in target/launch-tree/, away from the restored state"
+    else
+        pass "a shard build compiles where the target/ state was restored"
+    fi
+}
+
 # A stub of GitHub's artifact API for the engine lookup. ARTIFACT_FIXTURE holds
 # one "<id> <run id> <name>" line per artifact, as list_artifacts's --jq prints
 # them, and $ARTIFACT_DIR/<id>/manifest is what artifact <id> unzips to.
@@ -1521,9 +1834,10 @@ test_the_engine_lookup_names_the_newest_matching_build() {
 
 test_restored_target_state_ages_its_unchanged_inputs() {
     echo "test: a build restores the target/ state it was handed and ages from its manifest"
-    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" root="$SANDBOX/state-root" out
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" root="$SANDBOX/state-root" out manifest
+    manifest="$(bash -c 'source "$1"; echo "$TARGET_STATE_MANIFEST"' _ "$shard")"
     mkdir -p "$root/target/e2e"
-    printf 'lucidos-engine-input-manifest\t1\n' >"$root/target/e2e/lucidos-input-manifest"
+    printf 'lucidos-engine-input-manifest\t1\n' >"$root/target/e2e/$manifest"
     echo artefact >"$root/target/e2e/libx.rlib"
     mkdir -p "$SANDBOX/state-in"
     tar -C "$root" -cf - target | zstd -q -o "$SANDBOX/state-in/e2e-target.tar.zst"
@@ -1532,11 +1846,32 @@ test_restored_target_state_ages_its_unchanged_inputs() {
         mkdir -p "$2"; restore_target_state "$3"; restore_target_state "$4"' \
         _ "$shard" "$SANDBOX/state-checkout" "$SANDBOX/state-in" "$SANDBOX/no-state")"
     if [ -f "$SANDBOX/state-checkout/target/e2e/libx.rlib" ] \
-        && [[ "$out" == *"stamp $SANDBOX/state-checkout $SANDBOX/state-checkout/target/e2e/lucidos-input-manifest"* ]] \
+        && [[ "$out" == *"stamp $SANDBOX/state-checkout $SANDBOX/state-checkout/target/e2e/$manifest"* ]] \
         && [[ "$out" == *"none arrived, compiling from scratch"* ]]; then
         pass "the state is unpacked and aged, and a missing one compiles from scratch"
     else
         fail "restore printed: $out"
+    fi
+}
+
+# Until ADR 0693 a build compiled in a launch tree but packed target/e2e/ from
+# the checkout: an older build's outputs under a newer tree's manifest.
+test_a_state_from_before_the_runner_fix_is_not_restored() {
+    echo "test: a target/ state packed under the old manifest name compiles from scratch"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" root="$SANDBOX/old-state-root" out
+    mkdir -p "$root/target/e2e" "$SANDBOX/old-state-in"
+    printf 'lucidos-engine-input-manifest\t1\n' >"$root/target/e2e/lucidos-input-manifest"
+    echo stale >"$root/target/e2e/libx.rlib"
+    tar -C "$root" -cf - target | zstd -q -o "$SANDBOX/old-state-in/e2e-target.tar.zst"
+    out="$(bash -c 'source "$1"; PROJECT_DIR="$2"; E2E_GITHUB_CARGO_PROFILE=e2e
+        engine_manifest_stamp_mtimes() { echo stamped; }
+        mkdir -p "$2"; restore_target_state "$3"' \
+        _ "$shard" "$SANDBOX/old-state-checkout" "$SANDBOX/old-state-in")"
+    if [ ! -e "$SANDBOX/old-state-checkout/target/e2e/libx.rlib" ] && [[ "$out" != *stamped* ]] \
+        && [[ "$out" == *"compiling from scratch"* ]]; then
+        pass "the stale outputs are gone and nothing is aged"
+    else
+        fail "restore printed: $out; left: $(ls "$SANDBOX/old-state-checkout/target/e2e" 2>&1)"
     fi
 }
 
@@ -1587,6 +1922,18 @@ test_each_job_warms_only_what_it_needs() {
         pass "later steps learn the warm-up directory"
     else
         fail "GITHUB_ENV holds: $(cat "$SANDBOX/warm-env" 2>/dev/null)"
+    fi
+}
+
+test_the_suites_job_installs_the_browser_the_frontend_suite_drives() {
+    echo "test: the suites job warms the browser before it runs the frontend suite"
+    local wf="$SCRIPT_DIR/../../.github/workflows/e2e.yml" warm run
+    warm="$(grep -n "e2e-github-shard.sh warm frontend" "$wf" | head -1 | cut -d: -f1)"
+    run="$(grep -n 'e2e-github-shard.sh run .*suite }}"$' "$wf" | head -1 | cut -d: -f1)"
+    if [ -n "$warm" ] && [ -n "$run" ] && [ "$warm" -lt "$run" ]; then
+        pass "the frontend leg of the suites job warms first"
+    else
+        fail "no warm step before the suites run step (warm=${warm:-none} run=${run:-none})"
     fi
 }
 
@@ -1754,7 +2101,7 @@ test_the_apt_cache_key_names_the_runner_image_and_playwright() {
 }
 
 test_a_shard_installs_only_its_own_browser() {
-    echo "test: Chromium shards install the headless shell alone, and the WebKit shard WebKit alone"
+    echo "test: Chromium shards install the headless shell alone, and a WebKit shard WebKit alone"
     local shard="$SCRIPT_DIR/../e2e-github-shard.sh" got
     browsers_for() {
         bash -c 'source "$1"; e2e_warm_wait() { :; }; npx() { echo "$*"; }; warm_browsers "$2"' _ "$shard" "$1"
@@ -1763,8 +2110,11 @@ test_a_shard_installs_only_its_own_browser() {
     if [ "$got" = "playwright install --only-shell chromium" ]; then pass "chromium: $got"; else fail "chromium installed '$got'"; fi
     got="$(browsers_for mobile)"
     if [ "$got" = "playwright install --only-shell chromium" ]; then pass "mobile: $got"; else fail "mobile installed '$got'"; fi
-    got="$(browsers_for mobile-webkit)"
-    if [ "$got" = "playwright install webkit" ]; then pass "mobile-webkit: $got"; else fail "mobile-webkit installed '$got'"; fi
+    local project
+    for project in $(e2e_webkit_projects); do
+        got="$(browsers_for "$project")"
+        if [ "$got" = "playwright install webkit" ]; then pass "$project: $got"; else fail "$project installed '$got'"; fi
+    done
 }
 
 test_the_macos_cache_keys_name_the_pinned_builds() {
@@ -1788,17 +2138,19 @@ if [ -n "$HAVE_RELEASE_TREE" ]; then
     test_the_scan_refuses_a_planted_token
     test_an_unloadable_denylist_refuses
     test_a_named_commit_is_what_gets_stripped
+    # The sweep lists branches through release_tree.sh.
+    test_the_sweep_removes_only_old_finished_run_branches
 else
-    echo "skipped: the commit tests need scripts/lib/release_tree.sh, which the mirror does not ship"
+    echo "skipped: the commit and sweep tests need scripts/lib/release_tree.sh, which the mirror does not ship"
 fi
 test_only_run_branches_qualify
 test_delete_refuses_anything_but_a_run_branch
 test_stopping_a_run_survives_a_broken_stderr
 test_the_push_goes_through_the_mirror_door
-test_the_sweep_removes_only_old_finished_run_branches
 test_the_handoff_defaults_to_github
 test_the_handoff_stays_local_when_asked_or_inherited
 test_the_handoff_falls_back_only_without_github
+test_an_agent_sandbox_runs_locally_like_any_host
 test_a_filtered_run_stays_here_and_runs_lean
 test_an_eligible_run_never_waits_on_a_busy_host
 test_a_real_verdict_is_never_retried_on_github
@@ -1808,6 +2160,7 @@ test_the_local_leg_seam_reruns_the_script_with_the_leg_environment
 test_an_unreachable_github_keeps_its_waits
 test_an_unfiltered_run_still_goes_to_github
 test_the_unavailable_reason_names_each_precondition
+test_the_preflight_offers_local_only_where_it_exists
 test_the_run_lookup_reports_what_gh_said
 test_the_main_check_selection_has_no_fallback
 test_attach_takes_a_run_and_its_branch_for_the_main_check_only
@@ -1820,6 +2173,7 @@ test_a_rerun_starts_a_new_attempt_before_the_driver_waits
 test_a_rerun_report_reads_the_shards_of_both_attempts
 test_the_run_state_reads_both_answers_and_the_rate_limit
 test_the_poll_speeds_up_once_a_test_job_starts
+test_the_wait_marks_the_start_of_the_tests_once
 test_the_wait_gives_up_with_no_verdict
 test_the_wait_polls_its_own_run_adaptively
 test_the_timings_record_reuse_and_job_times
@@ -1829,17 +2183,28 @@ test_a_second_download_replaces_a_partial_one
 test_only_a_coverage_request_turns_coverage_on
 test_every_suite_sees_the_coverage_request
 test_the_coverage_map_is_replaced_only_when_every_chromium_shard_reported
-test_the_plan_gives_the_engine_suite_its_own_job
+test_the_plan_runs_the_main_check_suites_on_both_platforms
+test_the_crates_job_runs_every_crate_suite_past_a_failure
+test_the_frontend_job_runs_both_checks_past_a_failure
+test_the_report_counts_the_frontend_suite
+test_the_scripts_job_hides_the_runner_settings
+test_confinement_has_its_own_job_and_keeps_the_verdict
 test_the_plan_puts_webkit_on_macos_and_respects_test_ignore
+test_the_plan_gives_desktop_webkit_one_macos_shard
 test_only_tagged_specs_stay_on_the_local_leg
+test_a_commit_from_before_desktop_webkit_does_not_get_that_project
 test_a_named_commit_routes_the_specs_it_holds
 test_a_spec_file_among_playwright_args_is_a_selection
+test_the_suites_job_installs_the_browser_the_frontend_suite_drives
 test_the_plan_refuses_a_real_claude_code_spec
 test_the_fake_installs_only_on_a_runner_and_never_over_a_claude
 test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves
 test_every_suite_that_spawns_a_coding_agent_prepares_the_host
 test_the_api_shard_gives_the_engine_a_gateway_identity
 test_the_build_job_stands_down_the_shared_host_guards
+test_a_runner_build_compiles_live
+test_a_state_from_before_the_runner_fix_is_not_restored
+test_a_build_over_twice_its_median_prints_a_notice
 test_the_pinned_postgres_versions_resolve
 test_the_engine_lookup_names_the_newest_matching_build
 test_a_failed_lookup_lets_the_build_run

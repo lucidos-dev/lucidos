@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A *widget fit check* frame loads at once, though nothing shows it. It asks
- * the widget to measure for each token, and hears only its own answer.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -20,7 +16,6 @@ beforeEach(() => {
   postToAppFrame.mockReset();
   _resetWidgetHeightsForTesting();
   vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => { run(performance.now()); return 0; });
-  // Nothing on screen: a probe sits where no reader sees it.
   vi.stubGlobal('IntersectionObserver', class {
     constructor(private readonly report: (entries: Array<{ isIntersecting: boolean }>) => void) {}
     observe() { this.report([{ isIntersecting: false }]); }

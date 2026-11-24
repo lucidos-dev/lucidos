@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { runWithConcurrency } from './concurrentPool';
 
-/** A promise plus the handles to settle it, so a test can hold tasks open and
- *  observe how many the pool is willing to run at once. */
 function deferred(): { promise: Promise<void>; resolve: () => void; reject: (e: unknown) => void } {
   let resolve!: () => void;
   let reject!: (e: unknown) => void;
@@ -25,7 +23,6 @@ describe('runWithConcurrency', () => {
       inFlight--;
     });
 
-    // Only the first `limit` may start before anything settles.
     await Promise.resolve();
     expect(started).toEqual([0, 1, 2]);
 
@@ -53,7 +50,6 @@ describe('runWithConcurrency', () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    // Item 3 is still open, so the pool must not have resolved.
     expect(settled).toBe(false);
 
     last.resolve();
@@ -70,8 +66,6 @@ describe('runWithConcurrency', () => {
       if (i === 1) throw new Error('boom');
     });
 
-    // A rejection here would have stranded items 2 through 4, which on the
-    // resync fan-out means threads left on a stale status after a reconnect.
     expect(ran.sort()).toEqual([0, 1, 2, 3, 4]);
   });
 

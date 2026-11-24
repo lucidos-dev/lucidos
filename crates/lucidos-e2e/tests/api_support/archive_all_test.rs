@@ -199,3 +199,73 @@ async fn archive_all_refuses_an_unattributed_caller() {
     cleanup(&pool, &[id]).await;
     pool.close().await;
 }
+
+/// Scope is recursive, never includes the parent or siblings, and a cascade
+/// cannot take unfinished or newly-created work outside the counted targets.
+#[tokio::test]
+async fn archive_completed_sub_threads_is_scoped_and_rechecks_safety() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let ids: Vec<Uuid> = (0..10).map(|_| Uuid::new_v4()).collect();
+    let (parent, busy, grandchild, finished, nested, empty, sibling, changed, pinned, parked) = (
+        ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7], ids[8], ids[9],
+    );
+    seed(&pool, parent, None, "").await;
+    seed(&pool, busy, Some(parent), "status = 'running'").await;
+    seed(&pool, grandchild, Some(busy), "").await;
+    seed(&pool, finished, Some(parent), "").await;
+    seed(&pool, nested, Some(finished), "").await;
+    seed(&pool, empty, Some(finished), "has_response = FALSE").await;
+    seed(&pool, sibling, None, "").await;
+    seed(&pool, changed, Some(parent), "").await;
+    seed(&pool, pinned, Some(parent), "is_saved = TRUE").await;
+    seed(&pool, parked, Some(parent), "live_event_wait_count = 1").await;
+    let preflight: serde_json::Value = client
+        .get(format!(
+            "{}/api/v1/threads/archive-all-preflight?parent_thread_id={parent}",
+            base_url()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let safe = ids_in(&preflight, "safe");
+    assert_eq!(safe.len(), 4, "{preflight:?}");
+    assert_eq!(preflight["safe_thread_count"], 4);
+    for id in [grandchild, finished, nested, changed] {
+        assert!(safe.contains(&id.to_string()), "{preflight:?}");
+    }
+    sqlx::query("UPDATE thread_summaries SET compose_text = 'unsent' WHERE thread_id = $1")
+        .bind(changed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Include overlapping ids and deliberately out-of-scope ids in the press.
+    let mut confirmed = safe;
+    confirmed.extend([nested.to_string(), parent.to_string(), sibling.to_string()]);
+    let response = client
+        .post(format!("{}/api/v1/threads/archive-all", base_url()))
+        .json(&json!({"thread_ids": confirmed, "parent_thread_id": parent}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let archived = ids_in(&body, "archived");
+    assert_eq!(archived.len(), 3, "{body:?}");
+    for id in &ids {
+        assert_eq!(
+            section(&pool, *id).await,
+            if [grandchild, finished, nested].contains(id) {
+                "archived"
+            } else {
+                "inbox"
+            }
+        );
+    }
+    assert_eq!(ids_in(&body, "kept").len(), 3, "changed, parent, sibling");
+    cleanup(&pool, &ids).await;
+    pool.close().await;
+}

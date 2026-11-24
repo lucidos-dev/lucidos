@@ -1,11 +1,12 @@
-import { describe, it, expect } from 'vitest';
-import { archiveAllConfirmation, archiveAllResultMessage, changedSinceConfirm, idBatches, nothingToArchiveMessage, undoAction } from './archive-all';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { archiveAllPhase, handleArchiveAll, archiveAllConfirmation, archiveAllResultMessage, changedSinceConfirm, idBatches, nothingToArchiveMessage, undoAction } from './archive-all';
+import * as threadApi from '../../api/threads';
+import * as store from '../store';
 import { BLOCKER_REASON } from './blockerCopy';
 import { ARCHIVE_ALL_MAX_IDS, ARCHIVE_ALL_PINNED_SUB_THREAD, ARCHIVE_ALL_SAME_FAMILY } from '@lucidos/engine-constants';
 import { toastTap } from '../../components/shared/toastTap';
 import type { ArchiveAllPreflight } from '../../api/threads';
 
-/** `safe` family roots whose archives take `safeThreads` inbox threads. */
 function preflight(safe: number, kept: Record<string, number>, safeThreads = safe): ArchiveAllPreflight {
   return {
     safe: Array.from({ length: safe }, (_, i) => ({ thread_id: `t${i}`, title: `Thread ${i}` })),
@@ -53,7 +54,6 @@ describe('the Archive all confirm', () => {
   });
 
   it("words a kept reason the menu also shows in the menu's own words", () => {
-    // ADR 0378: the confirm and the thread menu say the same thing.
     const c = archiveAllConfirmation(preflight(1, { question: 1, pending_change: 1 }))!;
     expect(BLOCKER_REASON.descendant_question).toContain('waiting for your answer');
     expect(c.message).toContain('1 waiting for your answer');
@@ -103,6 +103,37 @@ describe('the Archive all result', () => {
 });
 
 describe('the Archive all requests', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('publishes progress immediately, blocks concurrent presses and resets after cancellation', async () => {
+    let checked!: (value: ArchiveAllPreflight) => void;
+    const check = vi.spyOn(threadApi, 'archiveAllPreflight').mockReturnValue(new Promise(resolve => { checked = resolve; }));
+    vi.spyOn(store, 'showConfirm').mockImplementation(async () => {
+      expect(archiveAllPhase.value).toBe('confirming');
+      return false;
+    });
+    const run = handleArchiveAll();
+    expect(archiveAllPhase.value).toBe('checking');
+    await handleArchiveAll();
+    expect(check).toHaveBeenCalledTimes(1);
+    checked(preflight(1, {}));
+    await run;
+    expect(archiveAllPhase.value).toBe('idle');
+  });
+
+  it('shows archiving only after confirmation and clears progress after an error', async () => {
+    vi.spyOn(threadApi, 'archiveAllPreflight').mockResolvedValue(preflight(1, {}));
+    vi.spyOn(store, 'showConfirm').mockResolvedValue(true);
+    vi.spyOn(threadApi, 'archiveAll').mockImplementation(async () => {
+      expect(archiveAllPhase.value).toBe('archiving');
+      throw new Error('Archive unavailable');
+    });
+    const toast = vi.spyOn(store, 'showToast').mockImplementation(() => {});
+    await handleArchiveAll();
+    expect(archiveAllPhase.value).toBe('idle');
+    expect(toast).toHaveBeenCalledWith(expect.stringContaining('Archive unavailable'), 'error');
+  });
+
   it('split a large Current into batches the engine accepts', () => {
     const ids = Array.from({ length: ARCHIVE_ALL_MAX_IDS * 2 + 1 }, (_, i) => `t${i}`);
     const batches = idBatches(ids);

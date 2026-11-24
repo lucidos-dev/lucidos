@@ -61,7 +61,7 @@ prose_kind() {
     case "$1" in
         crates/vendor/* | */crates/vendor/*) printf '\n' ;;
         *.md) printf 'md\n' ;;
-        *.rs | *.ts | *.tsx | *.js | *.jsx) printf 'src\n' ;;
+        *.rs | *.ts | *.tsx | *.js | *.jsx | *.mjs) printf 'src\n' ;;
         *) printf '\n' ;;
     esac
 }
@@ -238,11 +238,12 @@ prose_filter_diff() {
     tmp="$(mktemp "${TMPDIR:-/tmp}/prose-diff.XXXXXX")" || return 1
 
     # Pass 1: flatten to `path<TAB>lineno<TAB>text` for added lines only.
-    awk '
+    SCAN_PATH="${1:-}" awk '
         # `+++ b/<path>` opens a file. Checked before the generic `^\+` rule,
         # which it would otherwise match.
         /^\+\+\+ / {
             p = substr($0, 5)
+            sub(/\t$/, "", p)
             if (p == "/dev/null") { path = "" } else { sub(/^b\//, "", p); path = p }
             next
         }
@@ -257,7 +258,7 @@ prose_filter_diff() {
             next
         }
         /^\+/ {
-            if (path != "") printf "%s\t%d\t%s\n", path, ln, substr($0, 2)
+            if (path != "" && (ENVIRON["SCAN_PATH"] == "" || path == ENVIRON["SCAN_PATH"])) printf "%s\t%d\t%s\n", path, ln, substr($0, 2)
             ln++
             next
         }
@@ -274,22 +275,24 @@ prose_filter_diff() {
     # The diff compares the base against the WORKING TREE, so an added line's
     # number is that file's real line number and a fence mask taken from disk
     # lines up exactly.
-    local mask
+    local mask paths
+    paths="$(awk -F'\t' '!seen[$1]++ { print $1 }' "$tmp")" || { rm -f "$tmp"; return 1; }
     mask="$(mktemp "${TMPDIR:-/tmp}/prose-mask.XXXXXX")" || { rm -f "$tmp"; return 1; }
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         kind="$(prose_kind "$path")"
         [ -n "$kind" ] || continue
-        prose_fenced_lines "${PROSE_REPO_ROOT:-.}/$path" > "$mask"
+        prose_fenced_lines "${PROSE_REPO_ROOT:-.}/$path" > "$mask" || { rc=1; break; }
         awk -F'\t' -v p="$path" '$1 == p { line = $0; sub(/^[^\t]*\t/, "", line); print line }' "$tmp" \
             | prose_drop_fenced "$mask" \
-            | prose_check_lines "$kind" | awk -v p="$path" '{ print p ":" $0 }'
-    done < <(awk -F'\t' '!seen[$1]++ { print $1 }' "$tmp")
+            | prose_check_lines "$kind" | awk -v p="$path" '{ print p ":" $0 }' || { rc=1; break; }
+    done <<< "$paths"
 
     rm -f "$tmp" "$mask"
+    return "$rc"
 }
 
-# prose_scan_diff <base-commit> [repo-root]
+# prose_scan_diff <base-commit> [repo-root] [path]
 # Print `path:line:message` for every violation this branch ADDS to a tracked
 # file, comparing the base commit against the WORKING TREE.
 #
@@ -297,8 +300,9 @@ prose_filter_diff() {
 # caller must never read as "clean". Every knob the parse depends on is pinned
 # on the command line rather than inherited from the user's git config, for the
 # reasons em_dash_scan_diff records.
+# Filter after Git computes the diff so rename detection also sees other paths.
 prose_scan_diff() {
-    local base="$1" repo="${2:-.}" out rc
+    local base="$1" repo="${2:-.}" scope="${3:-}" out rc
     if out="$(git -C "$repo" -c core.quotePath=false diff --no-ext-diff --no-color \
         --src-prefix=a/ --dst-prefix=b/ -U0 "$base" --)"; then
         rc=0
@@ -314,13 +318,13 @@ prose_scan_diff() {
     # assignment after a FUNCTION call in its default mode but not in posix
     # mode, so the prefix form would work here and silently stop working there.
     PROSE_REPO_ROOT="$repo"
-    printf '%s\n' "$out" | prose_filter_diff
+    printf '%s\n' "$out" | prose_filter_diff "$scope"
     local filter_rc=$?
     unset PROSE_REPO_ROOT
     return "$filter_rc"
 }
 
-# prose_scan_untracked [repo-root]
+# prose_scan_untracked [repo-root] [path]
 # Print `path:line:message` for every violation in an untracked file. Untracked
 # files are absent from `git diff` entirely, yet every one of their lines is
 # new, so they are scanned whole.
@@ -329,7 +333,7 @@ prose_scan_diff() {
 # loop from a process substitution would discard `git ls-files`'s exit code, so
 # a failure would report a clean scan of files it never looked at.
 prose_scan_untracked() {
-    local repo="${1:-.}" f kind rc listing
+    local repo="${1:-.}" scope="${2:-}" f kind rc listing
     if listing="$(git -C "$repo" ls-files --others --exclude-standard)"; then
         rc=0
     else
@@ -341,11 +345,12 @@ prose_scan_untracked() {
     fi
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        [[ -z "$scope" || "$f" == "$scope" ]] || continue
         [ -f "$repo/$f" ] || continue
         kind="$(prose_kind "$f")"
         [ -n "$kind" ] || continue
         awk '{ printf "%d\t%s\n", FNR, $0 }' "$repo/$f" \
-            | prose_check_lines "$kind" | awk -v p="$f" '{ print p ":" $0 }'
+            | prose_check_lines "$kind" | awk -v p="$f" '{ print p ":" $0 }' || return 1
     done << EOF
 $listing
 EOF

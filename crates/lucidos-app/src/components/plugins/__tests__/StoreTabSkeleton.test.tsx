@@ -18,8 +18,6 @@ afterEach(() => {
 
 describe('StoreTabSkeleton: mirrors the loaded layout so the list does not jump', () => {
   it('reserves a full category-pills bar above the list skeleton', () => {
-    // Sized to a FULLY populated catalog: `All` plus ~9 categories, so the
-    // skeleton's bar fills the way the real bar's does, scrolling or wrapped.
     const pills = show().querySelectorAll('.app-store-filter-pills .pill-bar-btn');
     expect(pills.length).toBeGreaterThanOrEqual(10);
   });

@@ -24,7 +24,7 @@ pub(crate) fn is_concurrent_main_conflict(error: &str) -> bool {
 ///
 /// `or_unknown(false)`, and a start sha nobody could read is a "no" too. This
 /// answer authorizes a fast-forward of `main`, so only a positive may pass.
-pub(crate) async fn resolution_merged_main(
+pub async fn resolution_merged_main(
     repo_root: &Path,
     main_at_start: Option<&str>,
     branch_name: &str,
@@ -63,61 +63,6 @@ async fn catchup_with_main(
         }
         Err(e) => Err(e.into()),
     }
-}
-
-/// One merge to `main` at a time. Taken before [`WORKSPACE_REPO_MUTEX`].
-pub(crate) static MERGE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// The two locks a merge to `main` takes, in this order. Production passes
-/// [`MAIN_LOCKS`]. A test passes a pair of its own, so no other test queues on it.
-pub(crate) struct MainLocks {
-    pub(super) merge: &'static tokio::sync::Mutex<()>,
-    pub(super) repo: &'static tokio::sync::Mutex<()>,
-}
-
-pub(crate) static MAIN_LOCKS: MainLocks = MainLocks {
-    merge: &MERGE_MUTEX,
-    repo: &WORKSPACE_REPO_MUTEX,
-};
-
-impl MainLocks {
-    pub(crate) async fn lock_merge(&self) -> tokio::sync::MutexGuard<'static, ()> {
-        self.merge.lock().await
-    }
-
-    pub(crate) async fn lock_repo(&self) -> WorkspaceRepoLock {
-        WorkspaceRepoLock {
-            _guard: self.repo.lock().await,
-        }
-    }
-
-    /// Both locks, in order, for anything that moves `main` outside a merge:
-    /// a revert, or a commit on the repo root. A landing pass holds the merge
-    /// lock from reading `main` to moving it. So this keeps every other mover
-    /// out of that window (ADR 0463).
-    pub(crate) async fn lock_main(&self) -> MainMoveLock {
-        let merge = self.lock_merge().await;
-        MainMoveLock {
-            _repo: self.lock_repo().await,
-            _merge: merge,
-        }
-    }
-
-    /// A pair of locks nothing else queues on.
-    #[cfg(test)]
-    pub(crate) fn private_for_test() -> &'static MainLocks {
-        Box::leak(Box::new(MainLocks {
-            merge: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
-            repo: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
-        }))
-    }
-}
-
-/// Proof that the holder owns both locks of [`MainLocks::lock_main`]. The repo
-/// lock is declared first, so it is released first.
-pub(crate) struct MainMoveLock {
-    _repo: WorkspaceRepoLock,
-    _merge: tokio::sync::MutexGuard<'static, ()>,
 }
 
 /// Read `main` and the branch, then fast-forward `main` to the branch. The
@@ -205,7 +150,7 @@ pub(crate) async fn ff_main_to_locked(
             // because the Tier-3 fast path discards the Err.
             if let Some(err) = sync_err {
                 let short = &branch_sha[..branch_sha.floor_char_boundary(8)];
-                log!(
+                log_legacy!(
                     "[Changes] ERROR: checkout -f main after update-ref failed: {}. main advanced to {} but the repo-root working tree did not, so this merge is reported as failed rather than left to be silently reverted by the next auto-commit of data/.",
                     err,
                     short
@@ -230,7 +175,7 @@ pub(crate) async fn ff_main_to_locked(
 /// Catch up with main, then fast-forward main to the branch, all under one hold
 /// of the merge and repo locks. On success, deletes the branch.
 /// Returns (pre_merge_sha, post_merge_sha) on success for revert tracking.
-pub(crate) async fn catchup_and_ff_to_main(
+pub async fn catchup_and_ff_to_main(
     repo_root: &Path,
     worktree_path: &Path,
     branch_name: &str,
@@ -244,7 +189,7 @@ pub(crate) async fn catchup_and_ff_to_main_under(
     worktree_path: &Path,
     branch_name: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let _merge_guard = locks.merge.lock().await;
+    let _merge_guard = locks.lock_merge().await;
     let held = locks.lock_repo().await;
     catchup_with_main(worktree_path).await?;
     let shas = ff_main_to_branch(&held, repo_root, branch_name).await?;
@@ -266,21 +211,21 @@ pub(crate) async fn catchup_and_ff_to_main_under(
 /// worktree (ADR 0035), and dropping the change branch costs the thread its
 /// resumability the way `SessionEndAction::KeepEmptyBranch` describes. The
 /// Tier-2 fast path in `apply_change` keeps both for exactly that reason.
-pub(crate) async fn ff_merge_to_main(
+pub async fn ff_merge_to_main(
     repo_root: &Path,
     wt_path: &str,
     temp_branch: &str,
     feature_branch: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let merged = {
-        let _merge_guard = MAIN_LOCKS.merge.lock().await;
+        let _merge_guard = MAIN_LOCKS.lock_merge().await;
         let held = MAIN_LOCKS.lock_repo().await;
         catch_up_and_publish(&held, repo_root, wt_path, temp_branch, feature_branch).await
     };
     let err = match merged {
         Ok(shas) => {
             if temp_branch == feature_branch {
-                log!(
+                log_legacy!(
                     "[Changes] ff-merge applied {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
                     feature_branch
                 );
@@ -307,7 +252,7 @@ pub(crate) async fn ff_merge_to_main(
         let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
         let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
     } else {
-        log!(
+        log_legacy!(
             "[Changes] ff-merge failed for {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
             temp_branch
         );
@@ -357,12 +302,12 @@ async fn temp_branch_contains_change(
 /// Push `main` to `origin` in the background, for an Apply outside the landing
 /// lane. A repository without `origin` pushes nothing. A failed push emits
 /// `MainPushFailed`, so the user sees it (ADR 0589).
-pub(crate) fn push_main_in_background(repo_root: &Path, bus: &EventBus) {
+pub fn push_main_in_background(repo_root: &Path, bus: &EventBus) {
     let repo_root = repo_root.to_path_buf();
     let bus = bus.clone();
     tokio::spawn(async move {
         if let Some(reason) = push_main(&repo_root).await {
-            log!("[Changes] Push main to origin failed: {}", reason);
+            log_legacy!("[Changes] Push main to origin failed: {}", reason);
             bus.emit_or_log(
                 BusEvent::System(SystemEvent::MainPushFailed {
                     repo: repo_root.display().to_string(),
@@ -390,7 +335,7 @@ pub(super) async fn push_main(repo_root: &Path) -> Option<String> {
     };
     match push_to_origin_main(repo_root, &main).await {
         PushOutcome::Pushed => {
-            log!("[Changes] Pushed main to origin");
+            log_legacy!("[Changes] Pushed main to origin");
             None
         }
         PushOutcome::Rejected(e) => Some(format!(
@@ -509,7 +454,7 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
     let rebase_merge = repo_root.join(".git/rebase-merge");
     let rebase_apply = repo_root.join(".git/rebase-apply");
     if rebase_merge.exists() || rebase_apply.exists() {
-        log!("[Changes] Stale rebase state detected -- aborting");
+        log_legacy!("[Changes] Stale rebase state detected -- aborting");
         let abort = git_cmd(&["rebase", "--abort"], repo_root).await;
         let detail = match &abort {
             Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
@@ -518,18 +463,18 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         match classify_rebase_abort(&abort) {
             StaleRebase::Aborted => {}
             StaleRebase::Residue => {
-                log!("[Changes] git rebase --abort refused: {}", detail);
+                log_legacy!("[Changes] git rebase --abort refused: {}", detail);
                 for dir in [&rebase_merge, &rebase_apply] {
                     if dir.exists() {
                         if let Err(e) = std::fs::remove_dir_all(dir) {
-                            log!("[Changes] Failed to remove {}: {}", dir.display(), e);
+                            log_legacy!("[Changes] Failed to remove {}: {}", dir.display(), e);
                         }
                     }
                 }
-                log!("[Changes] Removed stale rebase directories directly");
+                log_legacy!("[Changes] Removed stale rebase directories directly");
             }
             StaleRebase::Unanswered => {
-                log!(
+                log_legacy!(
                     "[Changes] cannot run git rebase --abort: {}. Leaving the rebase state \
                      and HEAD untouched",
                     detail
@@ -549,17 +494,17 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         .await
         .or_unknown(true);
     if !head_ok {
-        log!("[Changes] HEAD is detached -- re-attaching to main");
+        log_legacy!("[Changes] HEAD is detached -- re-attaching to main");
         // Same lock contention as the sync in ff_main_to_locked: a detached HEAD that
         // stays detached because a concurrent artifact commit held a lock makes
         // every later `git status` report false dirty files.
         match git_cmd_await_lock_file(&["checkout", "-f", "main"], repo_root).await {
             Ok(o) if o.status.success() => {}
-            Ok(o) => log!(
+            Ok(o) => log_legacy!(
                 "[Changes] Failed to re-attach HEAD: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => log!("[Changes] Failed to re-attach HEAD: {}", e),
+            Err(e) => log_legacy!("[Changes] Failed to re-attach HEAD: {}", e),
         }
     }
 }
@@ -569,24 +514,24 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
 /// or `None` when there is no `origin` remote (so the worktree will branch from HEAD).
 pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<String> {
     if !origin_remote(repo_root).await.or_unknown(false) {
-        log!("[Changes] No 'origin' remote found -- will branch from HEAD");
+        log_legacy!("[Changes] No 'origin' remote found -- will branch from HEAD");
         return None;
     }
 
     // Fetch latest from origin so we branch from up-to-date default branch
     match git_cmd(&["fetch", "origin"], repo_root).await {
         Ok(o) if o.status.success() => {}
-        Ok(o) => log!(
+        Ok(o) => log_legacy!(
             "[Changes] git fetch origin warning: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!("[Changes] Failed to run git fetch: {}", e),
+        Err(e) => log_legacy!("[Changes] Failed to run git fetch: {}", e),
     }
 
     let remote_ref = match read_origin_head_ref(repo_root).await {
         Some(branch) => format!("origin/{}", branch),
         None => {
-            log!("[Changes] Could not detect default branch, falling back to origin/main");
+            log_legacy!("[Changes] Could not detect default branch, falling back to origin/main");
             "origin/main".to_string()
         }
     };
@@ -604,17 +549,17 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
         Some(b) if b == local_branch => {
             // We're on the default branch -- merge ff-only to update it in place
             match git_cmd(&["merge", "--ff-only", &remote_ref], repo_root).await {
-                Ok(o) if o.status.success() => log!(
+                Ok(o) if o.status.success() => log_legacy!(
                     "[Changes] Fast-forwarded local {} to {}",
                     local_branch,
                     remote_ref
                 ),
-                Ok(_) => log!(
+                Ok(_) => log_legacy!(
                     "[Changes] Could not fast-forward {} (diverged) -- worktree will branch from {}",
                     local_branch,
                     remote_ref
                 ),
-                Err(e) => log!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
+                Err(e) => log_legacy!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
             }
         }
         Some(_) => {
@@ -623,17 +568,17 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
             // also refuses a branch checked out in another worktree.
             let refspec = format!("refs/remotes/{remote_ref}:refs/heads/{local_branch}");
             match git_cmd(&["fetch", ".", &refspec], repo_root).await {
-                Ok(o) if o.status.success() => log!(
+                Ok(o) if o.status.success() => log_legacy!(
                     "[Changes] Updated local {} to match {}",
                     local_branch,
                     remote_ref
                 ),
-                Ok(_) => log!(
+                Ok(_) => log_legacy!(
                     "[Changes] Could not update local {} -- worktree will branch from {}",
                     local_branch,
                     remote_ref
                 ),
-                Err(e) => log!("[Changes] Failed to update local {}: {}", local_branch, e),
+                Err(e) => log_legacy!("[Changes] Failed to update local {}: {}", local_branch, e),
             }
         }
         None => {
@@ -641,7 +586,7 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
             // arm above is known to fit. Leave the local ref alone; worktrees
             // branch from a slightly older base, which both arms already treat
             // as an acceptable outcome.
-            log!(
+            log_legacy!(
                 "[Changes] Could not read the current branch; leaving local {} alone (worktree will branch from {})",
                 local_branch,
                 remote_ref
@@ -667,10 +612,7 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
 /// - **Lucidos-source repo**: the workspace's local default branch via
 ///   [`default_local_branch`] (`main` / `master` / …). Always `Some`, so a
 ///   Lucidos-source spawn can never silently fall back to `HEAD`.
-pub(crate) async fn resolve_worktree_base(
-    repo_root: &Path,
-    is_external_repo: bool,
-) -> Option<String> {
+pub async fn resolve_worktree_base(repo_root: &Path, is_external_repo: bool) -> Option<String> {
     if is_external_repo {
         detect_origin_default_branch(repo_root).await
     } else {
@@ -730,7 +672,7 @@ pub(crate) async fn find_branch_merge_in_main(
 /// Result is cached per `repo_root` for `DEFAULT_BRANCH_CACHE_TTL` (60s) to
 /// keep the cleanup worker from forking 2 git subprocesses per worktree per
 /// tick; default-branch changes are rare enough that a 60s lag is invisible.
-pub(crate) async fn default_local_branch(repo_root: &Path) -> String {
+pub async fn default_local_branch(repo_root: &Path) -> String {
     let key = tokio::fs::canonicalize(repo_root)
         .await
         .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -891,7 +833,7 @@ pub(crate) fn diff_base_from(facts: &RefFacts) -> DiffBase {
 /// through to its hardcoded `"main"` guess. We fall back to `origin/<default>`
 /// (the branch's true fork point) and ultimately to `HEAD`, never handing back a
 /// phantom branch name.
-pub(crate) async fn default_diff_base(repo_root: &Path) -> String {
+pub async fn default_diff_base(repo_root: &Path) -> String {
     match diff_base_from(&RefFacts::read(repo_root).await) {
         DiffBase::Settled(base) => base,
         DiffBase::LocalUnlessDiverged {
@@ -1107,13 +1049,13 @@ async fn remove_temp_merge_state(
     let _ = git_cmd(&["merge", "--abort"], std::path::Path::new(worktree)).await;
     let worktree_gone = match git_ran_ok(&["worktree", "remove", "--force", worktree], repo).await {
         Ok(()) => {
-            log!("{} Removed temp merge worktree {}", tag, worktree);
+            log_legacy!("{} Removed temp merge worktree {}", tag, worktree);
             true
         }
         // A stat, not a git probe: the directory is either there or it is not.
         Err(_) if !std::path::Path::new(worktree).exists() => true,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "{} Failed to remove temp merge worktree {}: {}",
                 tag,
                 worktree,
@@ -1124,7 +1066,7 @@ async fn remove_temp_merge_state(
     };
     let branch_gone = match git_ran_ok(&["branch", "-D", temp_branch], repo).await {
         Ok(()) => {
-            log!("{} Deleted temp merge branch {}", tag, temp_branch);
+            log_legacy!("{} Deleted temp merge branch {}", tag, temp_branch);
             true
         }
         Err(e) => {
@@ -1135,7 +1077,7 @@ async fn remove_temp_merge_state(
                 .await
                 .or_unknown(true);
             if still_there {
-                log!(
+                log_legacy!(
                     "{} Failed to delete temp merge branch {}: {}",
                     tag,
                     temp_branch,
@@ -1207,7 +1149,7 @@ async fn keep_temp_merge_work(
                     "Lucidos could not rename {temp_branch} to keep its work ({e}). Try Apply again."
                 )
             })?;
-        log!("{tag} Kept a temp merge pair's work on branch {kept_branch}");
+        log_legacy!("{tag} Kept a temp merge pair's work on branch {kept_branch}");
     }
     Ok(())
 }

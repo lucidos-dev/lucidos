@@ -1,10 +1,5 @@
 // @vitest-environment jsdom
-// The sanitizer and the click both need a real DOM.
 
-// Clicks real rendered agent markdown through the shared router. The reported
-// bug: a notification body rendered `[changelog](artifacts/…)` as an
-// `a.artifact-link`, but its own click handler only knew app and trigger
-// links, so the tap did nothing. Every surface now shares this router.
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
 import { readFileSync } from 'node:fs';
@@ -51,8 +46,6 @@ import type { App } from '../../store/types';
 
 const APPS: App[] = [{ id: 'pr-understanding', name: 'PR Understanding', description: '', reveal: 'on-load', kind: 'app', reusable: false }];
 
-/** Render markdown the way the notification detail does (no known artifact
- *  paths), click its first anchor, and report whether the default was stopped. */
 function clickFirstLink(markdown: string, source?: string): boolean {
   const host = document.createElement('div');
   host.innerHTML = linkifyPaths(renderMarkdown(markdown), [], APPS);
@@ -60,7 +53,6 @@ function clickFirstLink(markdown: string, source?: string): boolean {
   host.addEventListener('click', (e) => {
     handleMarkdownLinkClick(e, APPS, source);
     prevented = e.defaultPrevented;
-    // jsdom cannot navigate; stop a link the router left to the browser.
     e.preventDefault();
   });
   document.body.appendChild(host);
@@ -87,7 +79,6 @@ describe('handleMarkdownLinkClick', () => {
     });
   });
 
-  // A data link's `#L` used to be cut off at render and again at click.
   it.each([
     ['an href line', '[the notes](artifacts/notes.md#L10-L20)', 10, 20],
     ['a single href line', '[the notes](artifacts/notes.md#L7)', 7, undefined],
@@ -122,6 +113,14 @@ describe('handleMarkdownLinkClick', () => {
     expect(mocks.openAppById).toHaveBeenCalledWith('pr-understanding', 'a notification', 'pr-1645');
   });
 
+  it('opens a colon-anchored Settings row without a toast', () => {
+    expect(clickFirstLink('[Agent sandbox](settings:permissions#agent-sandbox:unsandboxed)')).toBe(true);
+    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith({
+      target: 'settings', settings_view: 'permissions', fragment: 'agent-sandbox:unsandboxed',
+    });
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
   it('opens a panel link', () => {
     clickFirstLink('[Triggers](triggers)');
     expect(mocks.handleNavigationRequest).toHaveBeenCalledWith({ target: 'triggers' });
@@ -137,9 +136,6 @@ describe('handleMarkdownLinkClick', () => {
     );
   });
 
-  // The reported bug: macOS got a `repo:` link and answered "unsupported
-  // scheme". The router claims it, with the repository named by id or name.
-  // The resolver gets the file, the ref and the cited lines.
   it.each([
     ['repo:lucidos:file:crates/lucidos-app/src/main.tsx', { locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'crates/lucidos-app/src/main.tsx' } }],
     ['repo:6f1c2a90-0000-5000-8000-000000000001:file:README.md', { locator: { repoId: '6f1c2a90-0000-5000-8000-000000000001', mode: 'file', ref: undefined, path: 'README.md' } }],
@@ -164,7 +160,6 @@ describe('handleMarkdownLinkClick', () => {
     );
   });
 
-  // The reported link: the agent named the lines in the label only.
   it.each([
     ['[Consumer.kt:184-204](repo:svc:file:src/Consumer.kt)', 184, 204],
     ['[Consumer.kt:184\u2013204](repo:svc:file:src/Consumer.kt)', 184, 204],

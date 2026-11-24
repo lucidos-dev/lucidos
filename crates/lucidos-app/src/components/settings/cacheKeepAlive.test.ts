@@ -1,5 +1,3 @@
-/** The cache cards are a sub-setting of the keep-alive: they draw only while
- *  the keep-alive is on, whatever their own switch says. */
 import { describe, it, expect, afterEach } from 'vitest';
 import { currentCacheCards, currentCacheKeepAliveOn } from '../../store/actions/preferences';
 import { preferences } from '../../store/store';

@@ -1,7 +1,7 @@
 //! Cascade archive API e2e tests.
 //!
 //! The pure-logic + DB-projection coverage of the cascade decision lives in
-//! `crates/lucidos-engine/src/api/threads.rs::cascade_tests`. The point of
+//! `crates/lucidos-engine/src/engine/archive_family.rs`. The point of
 //! these e2e tests is to validate the WIRING: real HTTP → real EventBus →
 //! real `thread_summaries` projection → real response shape, against a booted
 //! e2e workspace.

@@ -12,7 +12,6 @@ const { handleAppSoundMessage, watchShellSound } = await import('./app-sound-bri
 
 const message = (data: unknown, source: unknown) => ({ data, source }) as unknown as MessageEvent;
 
-/** jsdom plays nothing, so `paused` is set by hand and `pause` is a spy. */
 function shellAudio() {
   const el = document.createElement('audio');
   Object.defineProperty(el, 'paused', { configurable: true, value: false });

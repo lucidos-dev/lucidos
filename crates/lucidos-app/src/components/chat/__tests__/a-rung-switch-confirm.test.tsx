@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A pick on a started thread asks before it rebuilds the thread's cache. Keep
- * and a dismissal send nothing. "Switch anyway" is the only path that records
- * the pick on the engine, and the handoff starts a successor on the picked rung.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse, SwitchEstimate } from '../../../api/client';
@@ -94,7 +89,6 @@ function seedThread() {
   threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'claude_code', status: 'idle' } })]]);
 }
 
-/** Pick Opus 5.6 · high from the pill's list, then wait for what follows. */
 async function pickHigh(): Promise<void> {
   click('.rung-trigger');
   await settle();
@@ -168,7 +162,6 @@ describe('a rung pick on a started idle thread', () => {
 
   it('sends nothing when the dialog is dismissed', async () => {
     await startedPick(REBUILD);
-    // Escape and an outside click both settle the confirm as `false`.
     settleConfirm(false);
     await settle();
     expect(sendCodingAgentControl).not.toHaveBeenCalled();

@@ -16,7 +16,6 @@ import {
 } from '../modelSelection';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 
-/** The Lucidos Agent's vocabulary, as `store/models.ts` spells it. */
 const LUCIDOS: TierChoice[] = [
   { value: 'none', label: 'Off' },
   { value: 'low', label: 'Low' },
@@ -26,7 +25,6 @@ const LUCIDOS: TierChoice[] = [
   { value: 'max', label: 'Max' },
 ];
 
-/** A coding agent's vocabulary: different labels, no `none`, and descriptions. */
 const CODING_AGENT: TierChoice[] = [
   { value: 'low', label: 'Low', description: 'Minimal thinking' },
   { value: 'medium', label: 'Medium', description: 'Balanced' },
@@ -35,8 +33,6 @@ const CODING_AGENT: TierChoice[] = [
   { value: 'max', label: 'Max', description: 'Maximum' },
 ];
 
-/** The Codex model rows as the engine now serves them: the matrix transposed
- *  out of each effort's `supported_models`. */
 const CODEX_MODELS: ModelChoice[] = [
   { value: 'default', label: 'Default', reasoningEfforts: ['low', 'medium', 'high', 'xhigh'] },
   {
@@ -68,8 +64,6 @@ describe('clampToOffered', () => {
   });
 
   it('breaks a tie toward the higher tier', () => {
-    // `xhigh` sits one rung from both `high` and `max` on the Claude budget
-    // path, and reaching past `high` must not be answered with less.
     const budgetPath = tierOptions(['none', 'low', 'medium', 'high', 'max'], LUCIDOS);
     expect(clampToOffered('xhigh', budgetPath)).toBe('max');
   });
@@ -85,8 +79,6 @@ describe('clampToOffered', () => {
   });
 
   it('answers nothing when nothing is selected yet', () => {
-    // A coding-agent menu with no session and no pick. Answering would claim a
-    // tier the request will not carry.
     expect(clampToOffered(null, CODING_AGENT)).toBeNull();
   });
 
@@ -95,7 +87,6 @@ describe('clampToOffered', () => {
   });
 
   it('takes the top offered tier for a value off the ladder', () => {
-    // A display choice, not a billing one: the wire re-checks it.
     expect(clampToOffered('ultra', tierOptions(['low', 'medium'], LUCIDOS))).toBe('medium');
   });
 });
@@ -107,8 +98,6 @@ describe('tiersOf', () => {
   });
 
   it('offers nothing for a model with no row', () => {
-    // An effort a model rejects fails the whole turn, so a guess is worse than
-    // no control.
     expect(tiersOf(CODEX_MODELS, 'gpt-9')).toEqual([]);
     expect(tiersOf(CODEX_MODELS, null)).toEqual([]);
   });
@@ -125,8 +114,6 @@ describe('lucidosTiers', () => {
   });
 });
 
-/** The hook is a pure function of its input, so it is exercised directly
- *  rather than through a rendered component. */
 function selectionFor(models: ModelChoice[], vocabulary: TierChoice[], model: string | null, effort: string | null) {
   const patches: ModelSelectionPatch[] = [];
   const selection = useModelSelection({
@@ -147,7 +134,6 @@ describe('modelRows', () => {
   });
 
   it('offers no tier the model rejects', () => {
-    // `RoutingProvider` would clamp it behind the user's back.
     const rows = modelRows([CODEX_MODELS[2]], CODING_AGENT);
     expect(rows[0].tiers.some((t) => t.value === 'max')).toBe(false);
   });
@@ -188,8 +174,6 @@ describe('filterModelRows', () => {
   });
 
   it('never matches a tier, which is the NEXT step', () => {
-    // Every model offers much the same handful, so matching them here would
-    // return the whole list for any tier name.
     expect(filterModelRows(ROWS, 'max')).toEqual([]);
   });
 
@@ -232,7 +216,6 @@ describe('encodePair / decodePair', () => {
   });
 
   it('round-trips a model id that carries the separator', () => {
-    // Splitting on the FIRST separator would select a different model.
     const odd = 'weird|model';
     expect(decodePair(encodePair(odd, 'low'))).toEqual({ model: odd, effort: 'low' });
   });
@@ -242,15 +225,11 @@ describe('encodePair / decodePair', () => {
   });
 
   it('round-trips a TIERLESS id that carries the separator', () => {
-    // The registry is user-extensible, so no id shape can be promised. Without
-    // the trailing separator this read back as `weird` at tier `model`.
     expect(decodePair(encodePair('weird|model', null)))
       .toEqual({ model: 'weird|model', effort: null });
   });
 
   it('never encodes a tierless model onto a real pair', () => {
-    // `weird|model` with no tiers and `weird` at tier `model` are two different
-    // selections, and both can be rows in one list.
     expect(encodePair('weird|model', null)).not.toBe(encodePair('weird', 'model'));
   });
 
@@ -296,8 +275,6 @@ describe('useModelSelection', () => {
   });
 
   it('shows the clamp rather than the stored tier when the model dropped it', () => {
-    // A pick cannot leave a stale half behind any more, but a preference
-    // written before the pair became one thing still can.
     const { selection } = selectionFor(CODEX_MODELS, CODING_AGENT, 'gpt-5.5', 'max');
     expect(selection.effort).toBe('xhigh');
     expect(selection.value).toBe('gpt-5.5|xhigh');
@@ -309,8 +286,6 @@ describe('useModelSelection', () => {
     expect(selection.label).toBe('gpt-9');
   });
 
-  /** A model with no default effort runs at its provider's default. A surface
-   *  that opts in names that, rather than showing a bare model name. */
   it('names no tier in force with the surface label, only when tiers exist', () => {
     const select = (model: string) => useModelSelection({
       models: CODEX_MODELS,
@@ -325,8 +300,6 @@ describe('useModelSelection', () => {
     expect(selectionFor(CODEX_MODELS, CODING_AGENT, 'gpt-5.5', null).selection.label).toBe('GPT-5.5');
   });
 
-  /** The tier step opens on another model's own tier, and on the tier in force
-   *  for the model already selected. */
   it('opens each model on its own tier', () => {
     const selection = useModelSelection({
       models: CODEX_MODELS,
@@ -342,8 +315,6 @@ describe('useModelSelection', () => {
   });
 });
 
-/** A Claude row as the Lucidos Agent's adapter serves it: two backends. The
- *  OpenRouter one stops at `high`, since that server has no `xhigh`. */
 function dualRouted(configured: Record<string, boolean>, defaultProvider: string): ModelChoice {
   return {
     value: 'claude-opus-5-6',
@@ -391,7 +362,6 @@ describe('the provider step', () => {
       models: [model], vocabulary: LUCIDOS, model: model.value, effort: 'xhigh',
       providerFor: () => 'openrouter', onChange: (p) => patches.push(p),
     });
-    // The effort in force snaps onto what OpenRouter accepts.
     expect(selection.effort).toBe('high');
     expect(selection.label).toBe('Opus 5.6 · High · OpenRouter');
     selection.pick('claude-opus-5-6|low', 'vertex');
@@ -407,8 +377,6 @@ describe('the provider step', () => {
     });
     expect(selection.rows[0].providers).toEqual([]);
     expect(selection.label).toBe('Opus 5.6 · High · Vertex');
-    // Every row's muted note names where a pick of it would go, beside any
-    // description the model already carries.
     expect(selection.rows[0].description).toBe('Vertex');
     const described = modelRows([{ ...model, description: 'Fast' }], LUCIDOS);
     expect(described[0].description).toBe('Fast · Vertex');
@@ -418,8 +386,6 @@ describe('the provider step', () => {
     expect(formatPair('Opus 5.6', 'High', null)).toBe('Opus 5.6 · High');
   });
 
-  // Claude Code's picker is what Claude Code lists now, so a thread can stay
-  // pinned to a model the list has dropped. It keeps a name, not a bare id.
   it('names a selected model no row offers through labelFor', () => {
     const offered = { value: 'opus', label: 'Opus 5.6', description: '', reasoningEfforts: ['high'] };
     const named = useModelSelection({

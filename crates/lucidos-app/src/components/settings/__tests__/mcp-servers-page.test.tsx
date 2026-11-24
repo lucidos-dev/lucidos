@@ -25,16 +25,6 @@ import type {
 } from '../../../api/client';
 import type { Loadable } from '../../../store/types';
 
-/** Flatten a vnode tree to a string. Same shallow walk as the helper in
- *  `directory-picker-loadable.test.tsx`, with two differences the row needs.
- *
- *  A COMPONENT vnode keeps its tag and its scalar props. The row draws most of
- *  its text through `<SkText class=...>`. It also hands each switch its
- *  accessible name as a prop, so dropping either would hide what is asserted.
- *
- *  Only `children` is recursed into. A vnode merely PASSED as a prop, such as a
- *  `<LoadingFade>` skeleton, therefore does not count as rendered: it is
- *  constructed on every render and drawn on almost none. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -100,8 +90,6 @@ function totals(over: Partial<McpCostTotals> = {}): McpCostTotals {
   };
 }
 
-/** The engine's figures for a 200k window: 288k request chars, a quarter of
- *  it for MCP. */
 function budget(over: Partial<McpBudget> = {}): McpBudget {
   return {
     request_chars: 288000,
@@ -218,8 +206,6 @@ describe('header cost figures', () => {
       budget({ sent_tools: 23, sent_chars: 72000, sent_tokens: 28800 }),
     );
     expect(summary.live).toBe('Up to 23 tools, ~29k tokens per request, in a thread that enables every server');
-    // Chars over the request's char budget: a quarter of it is 25%, where
-    // tokens over the raw window would have said 14%.
     expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
   });
 
@@ -352,8 +338,6 @@ describe('the undispatchable row', () => {
     const text = vnodeToText(mcpServerRow({ server: backstage }));
     expect(text).toContain('Remove');
     expect(text).toContain('data-state="undispatchable"');
-    // Both switches are gone: with nothing callable, neither has anything to
-    // act on, and a Run toggle would invite a retry that can never work.
     expect(text).not.toContain('mcp-switch');
     expect(text).not.toContain('ariaLabel="Run Backstage"');
   });
@@ -379,8 +363,6 @@ describe('a row mid-verb and a row that failed', () => {
   });
 
   it('keeps the tool switches live while a server verb runs', () => {
-    // A switch is a pending intent laid over whatever list the verb reloads
-    // (ADR 0437), so nothing it does can bounce one back.
     const busy = vnodeToText(mcpServerRow({ server: server(), expanded: true, pending: 'start' }));
     expect(busy).not.toMatch(/disabled="true" ariaLabel="Offer /);
     expect(busy).toContain('ariaLabel="Offer mcp__slack__post_message to the agent"');
@@ -502,9 +484,6 @@ describe('every figure comes from the API', () => {
   );
 
   it('never turns chars into tokens in the frontend', () => {
-    // The Context Viewer once reported a measured 205k prompt as 361k, because
-    // a hand-copied chars-per-token ratio lived in TypeScript. `chars` is
-    // rendered nowhere and converted nowhere: the page formats `tokens`.
     for (const src of SOURCES) {
       expect(src).not.toMatch(/chars\s*[*/]/);
       expect(src).not.toMatch(/[*/]\s*2\.5/);
@@ -514,8 +493,6 @@ describe('every figure comes from the API', () => {
 });
 
 describe('the page keeps no write fences', () => {
-  // Pending switches end on the engine's acknowledgement (ADR 0437). The write
-  // queue and the counters that guessed at it are gone, and must stay gone.
   const here = dirname(fileURLToPath(import.meta.url));
   const src: string = readFileSync(resolve(here, '../McpServersPage.tsx'), 'utf8');
 

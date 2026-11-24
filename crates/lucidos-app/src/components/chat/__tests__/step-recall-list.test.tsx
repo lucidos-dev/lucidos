@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A recall step's detail lists the memories the model saw, each a link to its
- *  source, then the queries that found them. A tap closes the detail and
- *  navigates, so no row is a dead tap. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 

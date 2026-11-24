@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A context capture from a reloaded thread fetches its sections. Past the
- *  delay gate the step details draw the meta line and role headers as
- *  skeletons, never a line of "Loading sections…". */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

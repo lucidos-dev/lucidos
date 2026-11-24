@@ -12,6 +12,7 @@ import {
 
 const mockGetChangeById = vi.fn();
 const mockApplyAll = vi.fn();
+const mockApply = vi.fn();
 const mockArm = vi.fn();
 const mockDisarm = vi.fn();
 const mockFetchChanges = vi.fn();
@@ -21,6 +22,7 @@ vi.mock(import('../../api/client'), async (importOriginal) => {
   return {
     ...actual,
     getChangeById: (...args: Parameters<typeof actual.getChangeById>) => mockGetChangeById(...args),
+    applyChange: (...args: Parameters<typeof actual.applyChange>) => mockApply(...args),
     applyAllChanges: (...args: Parameters<typeof actual.applyAllChanges>) => mockApplyAll(...args),
     armStandingApply: (...args: Parameters<typeof actual.armStandingApply>) => mockArm(...args),
     disarmStandingApply: (...args: Parameters<typeof actual.disarmStandingApply>) => mockDisarm(...args),
@@ -29,6 +31,7 @@ vi.mock(import('../../api/client'), async (importOriginal) => {
 });
 
 const {
+  applySingleChange,
   ensureChangeLoaded,
   applyChangeSummarized,
   applyAllChanges,
@@ -39,7 +42,6 @@ const {
   refreshChangesState,
 } = await import('./chat-changes');
 
-/** A request the test lands or fails by hand, so it can look mid-flight. */
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -84,8 +86,6 @@ beforeEach(() => {
   toasts.value = [];
 });
 
-/** The flag changes face on the press, not a round trip and an SSE frame
- *  later. The engine's answer only decides whether it stays. */
 describe('the standing apply toggles on the press', () => {
   it('arms at once and keeps the flag once the engine agrees', async () => {
     const request = deferred<{ message: string }>();
@@ -123,8 +123,6 @@ describe('the standing apply toggles on the press', () => {
   });
 });
 
-/** The Not finished section's bulk control arms and disarms only the changes
- *  it lists, one bound arm each, never the workspace-wide sweep. */
 describe('a section of standing applies', () => {
   it('arms each listed change, bound to that change', async () => {
     mockArm.mockResolvedValue({ message: 'armed' });
@@ -149,8 +147,6 @@ describe('a section of standing applies', () => {
     expect([...standingApplyThreadIds.value]).toEqual(['elsewhere']);
   });
 
-  // A per-thread disarm drops a tap while that thread's arm is in flight. So
-  // the section's cancel waits for the section's arms, or it is lost.
   it('holds a cancel pressed mid-arm until the arms have landed', async () => {
     const slow = deferred<{ message: string }>();
     mockArm.mockResolvedValueOnce({ message: 'armed' }).mockReturnValueOnce(slow.promise);
@@ -171,8 +167,6 @@ describe('a section of standing applies', () => {
   });
 });
 
-/** A 404 says the engine holds no arm for the thread, which is what the owner
- *  asked for. A missed ending event is how the flag got there. */
 describe('disarmStandingApply', () => {
   it('reads a 404 as already disarmed: the flag clears and nothing toasts', async () => {
     standingApplyThreadIds.value = new Set(['t1', 't2']);
@@ -286,8 +280,6 @@ describe('ensureChangeLoaded', () => {
   });
 });
 
-// The panel refresh contract: a pull on Changes keeps both lists on screen while
-// it re-reads, and its promise waits for the new state.
 describe('refreshChangesState', () => {
   it('keeps the lists on screen and settles once the new state lands', async () => {
     const shown = makeChange('shown');
@@ -308,8 +300,6 @@ describe('refreshChangesState', () => {
   });
 });
 
-/** A summary lands on a change row fetched outside the two lists, but only
- *  while it describes that row's current commit list. */
 describe('a change summary reaches a lazily loaded row', () => {
   it('fills the summary of the commit list it describes', () => {
     lazyChanges.value = new Map([['c-1', { status: 'loaded', data: makeChange('c-1', { description: 'b\na' }) }]]);
@@ -324,4 +314,14 @@ describe('a change summary reaches a lazily loaded row', () => {
     const row = lazyChanges.value.get('c-1');
     expect(row?.status === 'loaded' && row.data.summary).toBeNull();
   });
+});
+
+
+it('an applied change says the version waits instead of claiming it is building or ready', async () => {
+  toasts.value = [];
+  changes.value = { status: 'loaded', data: [makeChange('held', { status: 'pending' })] };
+  mockApply.mockResolvedValue({ status: 'applied', version_build: 'deferred', deferred_coding_threads: 2 });
+  await applySingleChange('held');
+  expect(toasts.value[toasts.value.length - 1]?.message).toBe('Applied. New version waits for 2 coding threads.');
+  expect(changes.value).toEqual({ status: 'loaded', data: [] });
 });

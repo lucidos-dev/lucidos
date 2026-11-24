@@ -16,7 +16,6 @@ describe('threadOpenMarks', () => {
   it('returns the stamped open baseline, then undefined on a second take (fire-once)', () => {
     markThreadOpenStart('t1', base(1234.5));
     expect(takeThreadOpenStart('t1')).toEqual(base(1234.5));
-    // Deleted on take → a later re-render finds nothing and won't re-fire.
     expect(takeThreadOpenStart('t1')).toBeUndefined();
   });
 
@@ -47,11 +46,10 @@ describe('threadOpenMarks', () => {
   it('tracks re-render marks separately from open marks, carrying the cause', () => {
     markThreadOpenStart('t', base(1));
     markThreadRerenderStart('t', { start: 2, md: 0, link: 0, cause: 'send' });
-    // Re-render take doesn't disturb the open mark, and vice versa.
     const r = takeThreadRerenderStart('t');
     expect(r?.start).toBe(2);
     expect(r?.cause).toBe('send');
-    expect(takeThreadRerenderStart('t')).toBeUndefined(); // fire-once
+    expect(takeThreadRerenderStart('t')).toBeUndefined();
     expect(takeThreadOpenStart('t')?.start).toBe(1);
   });
 

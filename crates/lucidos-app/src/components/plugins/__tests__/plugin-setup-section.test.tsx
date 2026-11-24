@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A plugin's setup steps are instructions for the Lucidos Agent, which runs
- * them in a setup thread. Both panels must say so in the heading and keep the
- * steps folded, or they read as a to-do list for the user.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginInstallPanel, PluginInstallReceiptPanel } from '../PluginInstallPanel';

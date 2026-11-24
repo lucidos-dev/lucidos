@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The frame's wiring to its load probe (appFrameLoadProbe.ts): the probe is
- * told of the load and the ready signal, and it follows the element, so a
- * reload takes a fresh probe. The probe's own rules are in its unit test.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -43,6 +38,7 @@ afterEach(() => {
     render(null, host);
     host.remove();
   }
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -88,5 +84,29 @@ describe('AppFrame load probe', () => {
     expect(messages()).toEqual(['slow load']);
     expect(postClientLog.mock.calls[0][2]).toMatchObject({ app: 'waiting', sinceMountMs: SLOW_LOAD_MS });
     expect(frameIn(waiting)).toBe(fresh);
+  });
+
+  it('reads a reloaded frame the load its fresh element started, never the first one', () => {
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const loads: Record<string, number>[] = [];
+    const began = (startTime: number) => loads.push({
+      startTime, fetchStart: startTime, requestStart: startTime + 2, responseStart: startTime + 3, responseEnd: startTime + 4,
+    });
+    vi.spyOn(performance, 'getEntriesByName').mockImplementation(() => loads as unknown as PerformanceEntry[]);
+
+    const leaving = mount('leaving');
+    const waiting = mount('waiting', 'on-ready');
+    began(1010);
+    now = 4000;
+    unmount(leaving);
+    began(4050);
+    fireLoad(waiting);
+    act(() => { vi.advanceTimersByTime(SLOW_LOAD_MS); });
+
+    expect(postClientLog.mock.calls[0][2]).toMatchObject({
+      app: 'waiting',
+      frameDocument: { start: 50, fetchStart: 50, requestStart: 52, responseStart: 53, responseEnd: 54 },
+    });
   });
 });

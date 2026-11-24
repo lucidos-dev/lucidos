@@ -20,6 +20,9 @@ mod voice_ticket_test;
 #[path = "api_support/engine_build_log_test.rs"]
 mod engine_build_log_test;
 
+#[path = "api_support/diagnostic_log_test.rs"]
+mod diagnostic_log_test;
+
 #[path = "api_support/changelog_test.rs"]
 mod changelog_test;
 
@@ -49,6 +52,9 @@ mod served_document_sandbox_test;
 
 #[path = "api_support/workspace_label_test.rs"]
 mod workspace_label_test;
+
+#[path = "api_support/workspace_list_test.rs"]
+mod workspace_list_test;
 
 #[path = "api_support/chat_test.rs"]
 mod chat_test;
@@ -101,6 +107,9 @@ mod data_range_test;
 #[path = "api_support/data_mount_test.rs"]
 mod data_mount_test;
 
+#[path = "api_support/hooks_test.rs"]
+mod hooks_test;
+
 #[path = "api_support/event_wait_test.rs"]
 mod event_wait_test;
 
@@ -112,8 +121,8 @@ mod failed_turn_follow_up_test;
 mod read_decision_test;
 #[path = "api_support/read_request_test.rs"]
 mod read_request_test;
-#[path = "api_support/thread_people_test.rs"]
-mod thread_people_test;
+#[path = "api_support/thread_users_test.rs"]
+mod thread_users_test;
 #[path = "api_support/wake_decision_test.rs"]
 mod wake_decision_test;
 #[path = "api_support/wake_mode_test.rs"]
@@ -122,8 +131,8 @@ mod wake_mode_test;
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
 
-#[path = "api_support/owner_approval_test.rs"]
-mod owner_approval_test;
+#[path = "api_support/permission_request_test.rs"]
+mod permission_request_test;
 
 #[path = "api_support/prose_question_nudge_test.rs"]
 mod prose_question_nudge_test;
@@ -133,6 +142,9 @@ mod lucidos_cli_test;
 
 #[path = "api_support/permission_prompt_test.rs"]
 mod permission_prompt_test;
+
+#[path = "api_support/unattested_caller_test.rs"]
+mod unattested_caller_test;
 
 #[path = "api_support/ask_user_question_hook_test.rs"]
 mod ask_user_question_hook_test;
@@ -203,6 +215,9 @@ mod trigger_route_pins_test;
 #[path = "api_support/pinned_trigger_route_test.rs"]
 mod pinned_trigger_route_test;
 
+#[path = "api_support/announced_write_routes_test.rs"]
+mod announced_write_routes_test;
+
 #[path = "api_support/trigger_event_type_test.rs"]
 mod trigger_event_type_test;
 
@@ -246,6 +261,8 @@ mod oauth_connect_test;
 mod background_models_test;
 #[path = "api_support/model_prices_test.rs"]
 mod model_prices_test;
+#[path = "api_support/spend_cap_holds_test.rs"]
+mod spend_cap_holds_test;
 
 #[path = "api_support/models_test.rs"]
 mod models_test;
@@ -277,11 +294,23 @@ mod tailnet_status_test;
 #[path = "api_support/embedding_model_status_test.rs"]
 mod embedding_model_status_test;
 
+#[path = "api_support/bootstrap_test.rs"]
+mod bootstrap_test;
+
 #[path = "api_support/tree_backfill_test.rs"]
 mod tree_backfill_test;
 
 #[path = "api_support/follow_up_test.rs"]
 mod follow_up_test;
+
+#[path = "api_support/queued_message_remove_test.rs"]
+mod queued_message_remove_test;
+
+#[path = "api_support/create_draft_test.rs"]
+mod create_draft_test;
+
+#[path = "api_support/permissions_test.rs"]
+mod permissions_test;
 
 #[path = "api_support/chat_settings_test.rs"]
 mod chat_settings_test;

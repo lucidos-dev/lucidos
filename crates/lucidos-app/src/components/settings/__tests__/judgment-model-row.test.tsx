@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * One judgment site's model control, with the System One rows among the models.
- *
- * Four things the pure decision functions cannot show. The row waits for BOTH
- * reads before offering a System One row. The trigger reads the backend in force. A pick
- * writes the judgment key AND the model pair, in that order. And a pick of Jev
- * leaves the stored model alone.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -40,13 +32,11 @@ function registryRow(id: string, label: string, efforts: string[]): ModelInfo {
   };
 }
 
-/** The chat picker's list, which every background row offers. */
 const REGISTRY: ModelInfo[] = [
   registryRow('claude-haiku-4-5-20251001', 'Haiku 4.5', ['none', 'low']),
   registryRow('gemini-3.8-flash', 'Gemini 3.8 Flash', ['low', 'medium', 'high']),
 ];
 
-/** The engine's answer, before it lands. */
 const UNRESOLVED: BackgroundRows = { row: () => null, error: null, refresh: async () => {} };
 
 function resolvedTo(row: Partial<BackgroundModel>): BackgroundRows {
@@ -88,15 +78,9 @@ describe('JudgmentModelRow', () => {
   const trigger = () => host.querySelector<HTMLButtonElement>('.dropdown-trigger');
   const triggerLabel = () => host.querySelector('.model-selection-value')?.textContent ?? '';
   const detail = () => host.querySelector('.list-row-details')?.textContent ?? '';
-  /** The picker portals to `document.body`, so the options are not under the
-   *  host element. Rows are read by `data-value`, which is the model id on the
-   *  model step and the encoded pair on the tier step. A row's TEXT carries a
-   *  checkmark, a disclosure chevron and a description besides. */
   const options = () => [...document.body.querySelectorAll<HTMLElement>('.control-option')];
   const optionValues = () => options().map((o) => o.dataset.value ?? '');
 
-  /** Every interaction goes through `act`, so the panel the click opens is on
-   *  screen before the next line looks for it. */
   function open() {
     act(() => { trigger()!.click(); });
   }
@@ -140,15 +124,12 @@ describe('JudgmentModelRow', () => {
     chatModels.value = { status: 'not-loaded' };
   });
 
-  /** ADR 0220's no-change promise, at the surface the user sees. */
   it('offers only the chat models with no TypeSafe key', () => {
     mount();
     open();
     expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.8-flash']);
   });
 
-  /** Unloaded credentials read as no key. An ungated rule would drop the row
-   *  out of a workspace that HAS one, for as long as the load takes. */
   it('offers no Jev row while the credentials are still loading', () => {
     credentials.value = { status: 'loading' };
     mount();
@@ -179,8 +160,6 @@ describe('JudgmentModelRow', () => {
     expect(triggerLabel()).toBe('Haiku 4.5 · Low');
   });
 
-  /** One write, and the model key is not it: switching back has to restore the
-   *  model the user had. */
   it('writes only the judgment key when Jev is picked', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     mount();
@@ -190,8 +169,6 @@ describe('JudgmentModelRow', () => {
     expect(saveModelSelection).not.toHaveBeenCalled();
   });
 
-  /** Both writes, because the site was on Jev. The model alone would leave the
-   *  engine on Jev under a trigger reading a chat model. */
   it('moves the backend back to chat and writes the pair', async () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     preferences.value = { status: 'loaded', data: { judgment_command_guard: 'jev' } };
@@ -208,7 +185,6 @@ describe('JudgmentModelRow', () => {
     );
   });
 
-  /** A registry model opens its tiers, and the tier pick writes both keys. */
   it('commits a chat model with the tier picked for it', async () => {
     mount();
     open();
@@ -223,8 +199,6 @@ describe('JudgmentModelRow', () => {
     );
   });
 
-  /** `system_one_for` returns nothing while the master switch is off, so the
-   *  row must say the selection is not the one running. */
   it('says so while TypeSafe itself is switched off', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     preferences.value = {
@@ -236,8 +210,6 @@ describe('JudgmentModelRow', () => {
     expect(detail()).toContain('Settings → Providers');
   });
 
-  /** Still reachable, because the stored pick is Jev and there has to be a way
-   *  off it. */
   it('keeps the Jev row offered while TypeSafe is switched off', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     preferences.value = {
@@ -249,8 +221,6 @@ describe('JudgmentModelRow', () => {
     expect(optionValues()).toContain('typesafe-jev');
   });
 
-  /** A Workers AI token offers both Clef rows, and a pick writes the row id
-   *  the engine reads. */
   it('offers both Clef rows on a Cloudflare token, and writes the picked id', () => {
     credentials.value = {
       status: 'loaded',
@@ -273,23 +243,17 @@ describe('JudgmentModelRow', () => {
     expect(saveModelSelection).not.toHaveBeenCalled();
   });
 
-  /** No judge model resolves: the row says why, in the engine's words, since
-   *  a guarded turn then refuses to start. */
   it('shows why no judge model resolves', () => {
     const why = 'No configured provider serves a command judge model (gemini-3.1-flash-lite).';
     mount(resolvedTo({ source: 'chat-model', asks_no_model: true, unresolved: why }));
     expect(host.textContent).toContain(why);
   });
 
-  /** While unset, the trigger reads what the engine resolved, not a catalog
-   *  default no configured provider may serve. */
   it('reads the resolved model while unset', () => {
     mount(resolvedTo({ model: 'claude-haiku-4-5-20251001', effort: 'none' }));
     expect(triggerLabel()).toBe('Haiku 4.5 · Off');
   });
 
-  /** The recommended models head the list under their own heading, and the
-   *  System One rows get one too. */
   it('lists the recommended models first, each section under a heading', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     mount(resolvedTo({ recommended: [{ model: 'gemini-3.8-flash', effort: null }] }));
@@ -299,7 +263,6 @@ describe('JudgmentModelRow', () => {
     expect(headings).toEqual(['Recommended', 'Other models', 'System One']);
   });
 
-  /** A stored pick nobody serves is refused, never moved, so the row says so. */
   it('says when no configured provider serves the stored pick', () => {
     preferences.value = { status: 'loaded', data: { model_command_judge: 'gemini-3.8-flash' } };
     mount(resolvedTo({ source: 'preference', reachable: false }));

@@ -1,12 +1,4 @@
-/* Settings › System › Disk Usage. One quiet overview (a headline figure, the
-   bar and a key), one card for the recommended cleanup, then the worktree
-   list. Hairlines, not boxes, separate things. The overview and the card are
-   the shared look in settings-overview.css; this file adds what is Disk
-   Usage's own. */
 
-/* Every border here is a 0.5px hairline: one device pixel on a high-density
-   screen. A border width is snapped before layout, so it rounds up to a full
-   pixel on a 1x screen. */
 
 .disk-usage-figure {
     font-variant-numeric: tabular-nums;
@@ -49,11 +41,6 @@
     background: transparent;
 }
 
-/* A categorical chart palette with a legend, not a semantic scale: c2's only job
-   is to stay distinguishable from the other five slots. It keeps --accent-yellow
-   for that reason. The cool --accent-notable used for neutral markers elsewhere
-   would put three blues in a six-slot palette (c0, c4, and it). Don't
-   "consistency-fix" this one either. */
 .disk-usage-segment-c0 { background: var(--accent); }
 .disk-usage-segment-c1 { background: var(--accent-orange); }
 .disk-usage-segment-c2 { background: var(--accent-yellow); }
@@ -61,8 +48,6 @@
 .disk-usage-segment-c4 { background: var(--accent-light); }
 .disk-usage-segment-c5 { background: var(--accent-red); }
 
-/* The key's swatch for all worktrees at once: the first three palette slots,
-   since every worktree takes its own colour in the bar. */
 .disk-usage-segment-worktrees {
     background: linear-gradient(
         90deg,
@@ -76,7 +61,6 @@
     flex-shrink: 0;
 }
 
-/* The worktree list: rows on hairlines, titles at body size. */
 .disk-usage-rows > .disk-usage-row + .disk-usage-row {
     border-top: 0.5px solid var(--border-color);
 }
@@ -99,22 +83,15 @@
     }
 }
 
-/* A margin, not a space: a space inside the link would be underlined. */
 .disk-usage-row .list-row-name .settings-overview-swatch {
     margin-right: var(--space-sm);
     vertical-align: 0.0625rem;
 }
 
-/* A worktree row grows tall (a wrapping title over a line of fields) and
-   `.list-row` top-aligns its children, so pin the actions to the bottom edge,
-   the way `.trigger-row` (skills.css) and the Accounts rows
-   (settings/accounts.css) already do. */
 .disk-usage-row .list-row-actions {
     align-self: flex-end;
 }
 
-/* On mobile the row stacks (mobile.css). The two small buttons sit under the
-   fields, left-aligned with them, rather than floating at the far edge. */
 @media (--phone-layout) {
     .disk-usage-row .list-row-actions {
         align-self: flex-start;
@@ -122,7 +99,6 @@
     }
 }
 
-/* A running pass: the Backup page's running line and bar, across the card. */
 .disk-usage-reclaim-progress {
     flex: 1 0 100%;
 }

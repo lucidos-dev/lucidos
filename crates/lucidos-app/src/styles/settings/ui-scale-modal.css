@@ -1,17 +1,11 @@
-/* UI scale modal — uses fixed font-size so it doesn't shift with --user-ui-scale */
-/* Extends .modal-overlay — unique: fixed font-size for scale preview, no touch panning */
 .scale-modal-overlay {
     font-size: 16px;
     touch-action: none;
 }
 
-/* Use em (not rem) inside the modal so sizes are relative to the overlay's fixed 16px,
-   not the root font-size which changes during preview */
 .scale-modal {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    /* In em, like the rest of the modal. A rem token cannot scale with em, so
-       the corner keeps its size and squares only when the theme zeroes it. */
     border-radius: min(0.5em, var(--radius-surface) * 99);
     padding: 1.5em 2em;
     width: 18em;
@@ -29,8 +23,6 @@
     font-variant-numeric: tabular-nums;
 }
 
-/* The whole row is the hit target, and ScaleModal.tsx maps the pointer onto it
-   itself. So the thumb below is sized to be read, not to be caught. */
 .scale-modal-slider {
     position: relative;
     width: 100%;
@@ -39,8 +31,6 @@
     cursor: pointer;
     -webkit-user-select: none;
     user-select: none;
-    /* `none`, never `pan-x`: `pan-x` hands the horizontal gesture back to the
-       browser, which can claim a drag halfway through and fire pointercancel. */
     touch-action: none;
 }
 
@@ -55,8 +45,6 @@
     border-radius: min(0.125em, var(--radius-control) * 99);
 }
 
-/* Placed from the same inset span the pointer is read against
-   (`scaleSlider.ts`), so the thumb stays under the finger at both ends. */
 .scale-modal-thumb {
     --scale-slider-thumb: 1.25em;
     position: absolute;
@@ -72,9 +60,6 @@
     background: var(--accent);
 }
 
-/* The ring lands on the thumb, not on the row: the row is an invisible 2.75em
-   band, so a ring around it reads as a stray box. Same move as .toggle-switch,
-   which rings its visible pill rather than its hidden input. */
 .scale-modal-slider:focus-visible .scale-modal-thumb {
     box-shadow: var(--focus-ring);
 }
@@ -87,9 +72,6 @@
     color: var(--text-muted);
 }
 
-/* The row already carries a "This device" badge, so a raised neutral surface is
-   enough. A colored left border would be the banned left-accent stripe
-   (.claude/rules/frontend.md F18). */
 .device-current {
     background: var(--bg-tertiary);
 }
@@ -120,7 +102,6 @@
     }
 }
 
-/* Box and focus: global/text-input.css. */
 .device-name-input {
     font-family: var(--font-ui);
     font-size: var(--font-size-md);

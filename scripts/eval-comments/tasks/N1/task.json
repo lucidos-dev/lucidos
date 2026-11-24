@@ -1,0 +1,14 @@
+{
+  "id": "N1",
+  "fix": "0ce7e1ac3c6a13581b37662f148ab1d0c0dd92be",
+  "title": "fix: keep restore authority out of the agent role's reach",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/core/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/core/agent_role_tests.rs"
+  },
+  "needs_db": true,
+  "comment": "constraint",
+  "why": "READ_ONLY_TABLES's doc states the rule the fix extends: a table that grants or fences authority is readable but never writable for the agent role. Inside the changed restore replay, a block says rows must be carried by name and the rollback must carry that set. The fix had to keep both.",
+  "adaptation": "The fix's agent-role test, with two changes. A refusal is any error, not one whose text says 'permission denied', which pinned the fix's trigger message. The boundary row is seeded first and must survive, since deleting it is the harm. The restore half of the fix is in the bug report and the reference diff but not in the withheld test: its test needs the restore module's private helpers."
+}

@@ -1,7 +1,8 @@
-# 0544: The Lucidos Agent's rung locks while a turn runs; a pick between turns is a ChatSettingsChanged on the engine
+# 0544: The Lucidos Agent saves rung picks for the next turn and keeps the running rung visible
 
 - **Status**: Accepted
 - **Date**: 2026-10-21
+- **Amended**: 2026-11-15
 
 ## Context
 
@@ -19,65 +20,70 @@ it in full.
 
 ## Decision
 
-The Lucidos Agent's rung locks while a turn runs, on the engine and in the
-pill. A pick between turns is recorded on the engine at once, as a
-`ChatSettingsChanged` thread event, through `POST /api/v1/chat/settings`.
+A Lucidos Agent rung pick is saved immediately through
+`POST /api/v1/chat/settings`, including while a turn runs. It applies to the
+next turn. The running turn keeps its model, effort and provider.
 
-- **A turn runs** while the thread's turn-start gate is held, or its status is
-  `running`, `waiting_for_user_answer` or `paused`. These are ADR 0542's three
-  statuses.
-- **A locked pick is refused** with 409 and `reason: "turn-running"`, the slug
-  ADR 0542 uses, and nothing is recorded. A mid-turn send that carries its own
-  model, effort or provider gets the same 409, before anything is emitted. A
-  send whose turn starts just after that check queues behind the turn instead
-  of joining it, and runs next on its own pair.
-- **The event records the resolved pair** (`resolve_chat_pair`), so it holds
-  what the next turn runs on, never the raw request.
-- **The next turn reads it**, however it starts: `last_thread_chat_settings`
-  counts `ChatSettingsChanged` beside `MessageReceived` and `TriggerStarted`.
-- **A turn-start gate** per thread orders a pick against a turn starting. A turn
-  holds it from resolving its pair until its starter event is recorded. A pick
-  takes it before it reads the status.
-- **A message injected into a running turn** carries that turn's live pair. So
-  its `MessageReceived` never names a model that did not answer it.
-- **The browser holds no pending pick.** The pill reads the thread's events,
-  and a follow-up send carries a pair only from a compose override.
+This amends the original refusal policy: users should be able to pick during
+work without remembering to return when it finishes. ADR 0542's coding-agent
+policy stays unchanged.
+
+- **Picks are durable.** `ChatSettingsChanged` records the resolved pair. The
+  latest accepted pick replaces earlier picks and never changes account defaults.
+- **Applied settings are distinct.** At admission, the engine records a
+  `ChatTurnSettingsResolved` with `request_event_id` naming that turn's anchor.
+  `ChatSettingsChanged` remains exclusive to user picks, preserving subscriptions.
+  This also covers continuations whose starter carries no model.
+- **The gate orders starts and picks.** A turn holds its per-thread start gate
+  through resolution and the applied stamp. A pick waits for this short section,
+  then records next-turn settings. It never waits for the full running turn.
+- **Queued turns release the gate while waiting.** After admission they reacquire
+  it and resolve again. The latest pick therefore reaches the queued turn.
+  Explicit send overrides retain their precedence.
+- **Injection keeps the live pair.** An injected `MessageReceived` names the
+  running pair and carries the live request anchor. Settings queries and paged
+  pair snapshots exclude these messages, so they cannot erase a pending pick.
+- **Explicit overrides are never silently dropped.** An HTTP send that asks
+  for a different live pair is refused before recording. If a turn starts after
+  that check, process admission queues the message with its override intact.
+- **The pill stays truthful.** Both desktop and compact faces retain the
+  running rung and add `*` while a pick is pending. The popover explains it
+  with “Running” and “Next turn” pairs. When the turn ends, the saved pair
+  becomes the face. A later pick replaces the pending explanation.
+- **Reload and other devices agree.** Events and paged pair stamps carry both
+  the applied pair and the pending pick. The browser holds no authoritative
+  pending selection. Follow-up sends do not turn implicit settings into overrides.
 
 ## Rationale
 
-A pick that means "from the next turn" has to live where the next turn reads
-it. The engine starts turns the browser never sees, so only an engine record
-reaches all of them. Every device and a reload then see the same pair.
+The next turn must read the pick wherever that turn starts: a send, queued
+follow-up, continuation, child report or wake. Browser-only state cannot do that.
 
-Refusing a mid-turn pick keeps the pill honest. A pill that names a pair nothing
-runs is a lie the user acts on: they judge the answer by the wrong model.
+Saving a pick does not make it the running model. Distinguishing applied
+settings from picks preserves honest attribution while allowing useful mid-turn
+interaction. An asterisk keeps both collapsed faces compact; the popover gives
+the full explanation.
 
-Recording the resolved pair makes the event say what runs. A raw request with
-no effort would leave the effort to a later lookup, which may resolve
-differently once a preference changes.
-
-The gate closes the race between the check and the write. Without it, a pick
-can read the status as idle just before a turn resolves its pair. That turn then
-runs on the old pair while the event names the new one.
+The short start gate provides a definite ordering without blocking picks behind
+queued messages. Re-resolving after admission prevents a queued turn from
+retaining the settings it read before waiting.
 
 ## Consequences
 
-- One pill look for both agents: the shared lock plumbing is the same code.
-- A pick between turns costs one HTTP call and one event, where it cost
-  nothing before.
-- `TURN_RUNNING_REASON` is generated into the SDK constants. ADR 0542's branch
-  defines its own copy in `api/claude_code.rs`. Whichever lands second points
-  both at one constant.
-- Compose drafts are unchanged: their picks are per-draft overrides (ADR 0437),
-  bound at the first send.
+- Each admitted Lucidos Agent turn adds a `ChatTurnSettingsResolved` event. Existing
+  histories fall back to their non-injected starter stamps.
+- Pair snapshots retain the applied pair as well as the newest selection.
+- The shared rung component supports a pending marker. Coding-agent picks
+  retain their existing lock behavior.
+- Compose drafts keep their per-draft overrides (ADR 0437), bound at first send.
+- Coverage includes engine concurrency and override regressions, event replay,
+  paged snapshots, and desktop and phone browser layouts.
 
 ## Alternatives considered
 
-- **Keep the pending pick in the browser, and only lock the pill.** It fixes the
-  mid-turn lie but not the engine-started turn, and a reload still drops the
-  pick.
-- **Accept a mid-turn pick and apply it from the next turn.** The pill then has
-  to name two pairs at once, the running one and the queued one. ADR 0542
-  refused that shape for coding agents, and the two pills share one look.
-- **Write the pick to the account preference.** It would change every new
-  thread, which a per-thread control must never do.
+- **Refuse mid-turn picks.** This was the original policy. It lost the user's
+  intent and required another visit after the turn ended.
+- **Show the pending model as running.** It misattributes the current answer.
+- **Keep pending settings in the browser.** Reload, other devices and engine
+  re-entries would lose them.
+- **Write an account preference.** A per-thread pick must not change other threads.

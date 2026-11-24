@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A coding-agent thread can record a model with no effort, because it began
- * before the backend shipped a default effort. When the model offers tiers,
- * the pill still names an effort and never shows the model alone.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';

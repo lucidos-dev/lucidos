@@ -1,9 +1,3 @@
-// Guards the shape contract of the generated brand icons.
-//
-// macOS draws an app icon exactly as authored, so the macOS-facing assets carry
-// Apple's rounded rect and its transparent margin. Android and iOS mask their
-// own, so those stay full-bleed and opaque. Regenerate every asset with:
-//   node crates/lucidos-app/scripts/generate-brand-icons.mjs
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -17,14 +11,9 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const asset = (rel: string): Uint8Array => readFileSync(resolve(__dirname, rel));
 
-// Apple's template geometry. Mirrors MACOS_MARGIN and MACOS_CORNER in
-// scripts/generate-brand-icons.mjs, which is the source of truth. Deliberately
-// copied, not imported: a guard that reads the value it guards cannot fail.
 const MACOS_MARGIN = 100 / 1024;
 const MACOS_CORNER = 185.4 / 824;
 
-// The icns member types the generator writes, paired with their pixel size.
-// Two codes share a size: a retina variant and a larger @1x one.
 const ICNS_MEMBERS: [string, number][] = [
   ['ic11', 32],
   ['ic12', 64],
@@ -61,8 +50,6 @@ interface Png {
   alphaAt(x: number, y: number): number;
 }
 
-// Decode enough of a PNG to read its alpha channel: colour type 2 (opaque RGB)
-// or 6 (RGBA), 8-bit, non-interlaced, which is all the generator emits.
 function decodePng(buf: Uint8Array): Png {
   const width = u32(buf, 16);
   const height = u32(buf, 20);
@@ -79,9 +66,6 @@ function decodePng(buf: Uint8Array): Png {
   }
   const raw: Uint8Array = inflateSync(concat(idat));
 
-  // Undo the per-scanline filter. Filter bytes 0 to 4 are none, sub, up,
-  // average and Paeth. The generator writes 0, but decode all five so the guard
-  // survives an encoder that starts filtering.
   const stride = width * channels;
   const rows: Uint8Array[] = [];
   let prev = new Uint8Array(stride);
@@ -129,7 +113,6 @@ function icnsMembers(buf: Uint8Array): { type: string; png: Uint8Array }[] {
   return out;
 }
 
-// Apple's shape: a transparent margin all round, opaque art inside it.
 function expectMacosShaped(png: Png): void {
   const margin = Math.round(png.width * MACOS_MARGIN);
   const mid = png.width >> 1;
@@ -143,15 +126,11 @@ function expectMacosShaped(png: Png): void {
   expect(png.alphaAt(margin - 1, mid)).toBe(0);
   expect(png.alphaAt(margin, mid)).toBe(255);
   expect(png.alphaAt(mid, mid)).toBe(255);
-  // The corner is cut, not merely inset. Without this pair a plain inset
-  // square passes every assertion above. The art's own corner pixel sits
-  // outside the arc, and the arc's centre sits inside it.
   const radius = Math.round((png.width - 2 * margin) * MACOS_CORNER);
   expect(png.alphaAt(margin, margin)).toBe(0);
   expect(png.alphaAt(margin + radius, margin + radius)).toBe(255);
 }
 
-// No alpha channel at all, so no pixel can be transparent and no margin exists.
 function expectFullBleed(png: Png): void {
   expect(png.channels).toBe(3);
 }
@@ -180,15 +159,15 @@ describe('brand icons', () => {
 
   describe('full-bleed, because the platform masks these itself', () => {
     it.each([
-      'apple-touch-icon.png', // iOS masks the home-screen icon
-      'icon-192-maskable.png', // Android crops to its adaptive shape
+      'apple-touch-icon.png',
+      'icon-192-maskable.png',
       'icon-512-maskable.png',
     ])('public/icons/%s stays opaque corner to corner', (file) => {
       expectFullBleed(decodePng(asset(`../public/icons/${file}`)));
     });
 
     it.each([
-      'app-icon.png', // the Tauri source for the non-macOS native set
+      'app-icon.png',
       '256x256.png',
       '512x512.png',
     ])('icons/%s stays opaque corner to corner', (file) => {

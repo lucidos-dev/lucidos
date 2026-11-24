@@ -62,6 +62,24 @@ test_a_failure_that_does_not_add_up_is_never_rerun() {
     if [ -z "$(e2e_failed_engine_tests "$log")" ]; then pass "a run that ended with no summary"; else fail "listed: $(e2e_failed_engine_tests "$log")"; fi
 }
 
+test_failures_across_both_engine_libraries_are_collected() {
+    local log="$SANDBOX/both.log"
+    cat "$FIXTURE" > "$log"
+    cat >> "$log" <<'EOF'
+     Running unittests src/lib.rs (target/debug/deps/lucidos_agents_api-0a1b2c3d4e5f6789)
+failures:
+    api::tests::other
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+EOF
+    if [ "$(e2e_failed_engine_tests "$log")" = "$FAILED_TEST
+api::tests::other" ]; then
+        pass "both libraries' failures are named"
+    else
+        fail "names: $(e2e_failed_engine_tests "$log")"
+    fi
+}
+
 test_a_test_that_passes_its_rerun_is_flaky() {
     echo "test: a passing rerun succeeds and ends the log with the flaky block"
     local log runner
@@ -110,6 +128,7 @@ test_nothing_to_rerun_runs_nothing() {
 
 test_a_cargo_failure_names_the_test_to_rerun
 test_a_failure_that_does_not_add_up_is_never_rerun
+test_failures_across_both_engine_libraries_are_collected
 test_a_test_that_passes_its_rerun_is_flaky
 test_a_test_that_fails_its_rerun_stays_red
 test_a_rerun_that_ran_nothing_is_not_a_pass

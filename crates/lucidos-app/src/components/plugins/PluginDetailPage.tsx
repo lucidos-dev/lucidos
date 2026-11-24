@@ -27,17 +27,12 @@ interface PluginDetailPageProps {
   name: string;
 }
 
-/** The *plugin detail page*: every screenshot and video, the README and the
- *  media problems of one Plugins panel row. It shows media only. No plugin
- *  code runs here, so it mounts no frame (invariant I13). */
 export function PluginDetailPage({ marketplaceId, pluginId, name }: PluginDetailPageProps) {
   const catalog = marketplaceCatalog.value;
   const installed = installedPlugins.value;
   const settled = pluginRowsSettled(catalog, installed);
   const showLoading = useDelayedFlag(!settled);
 
-  // The same mount fetch as the list, so a page restored from nav history
-  // after a reload has rows to read.
   useEffect(() => {
     void refreshPluginCatalog();
     void loadInstalledPlugins();
@@ -84,8 +79,6 @@ function PluginDetailBody({ plugin, name }: { plugin?: MarketplacePlugin; name: 
   );
 }
 
-/** The header: icon, name, badges and source beside the buttons, then the
- *  full description and the chips at full width. Self-skeletonizing. */
 function PluginDetailHead({ plugin }: { plugin?: MarketplacePlugin }) {
   const sk = useSkeleton();
   const [busy, setBusy] = useState(false);
@@ -117,8 +110,6 @@ function PluginDetailHead({ plugin }: { plugin?: MarketplacePlugin }) {
   );
 }
 
-/** Every screenshot, then every video, in one strip that scrolls sideways. A
- *  screenshot opens full size, with the others a swipe away. */
 function MediaStrip({ plugin }: { plugin: MarketplacePlugin }) {
   const shots = plugin.media.screenshots.map(pluginMediaUrl);
   const videos = plugin.media.videos.map(pluginMediaUrl);
@@ -164,7 +155,6 @@ function Readme({ readme, showLoading }: { readme: Loadable<string>; showLoading
   );
 }
 
-/** What the engine left out, and why, so an author sees it in their own panel. */
 function MediaProblems({ problems }: { problems: MediaProblem[] }) {
   if (problems.length === 0) return null;
   const count = problems.length === 1 ? '1 media file was' : `${problems.length} media files were`;
@@ -180,8 +170,6 @@ function MediaProblems({ problems }: { problems: MediaProblem[] }) {
   );
 }
 
-/** The README at `url` as a `Loadable`, and a reload for the panel refresh
- *  that resolves once the re-read lands. No URL fetches nothing. */
 function useReadme(url: string | undefined) {
   const [epoch, setEpoch] = useState(0);
   const settles = useRef<Array<() => void>>([]);

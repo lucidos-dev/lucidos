@@ -1,16 +1,3 @@
-/**
- * Enter COMMITS an IME candidate, and must never also send or submit.
- *
- * A Japanese, Chinese or Korean user types a phrase and presses Enter to accept
- * what the IME is offering. The browser dispatches that keydown before
- * `compositionend`. An Enter branch with no composition guard fired on it: the
- * composer sent half-converted text, and a rename saved it as the title.
- * `preventDefault` also fought the IME's own commit.
- *
- * `isImeComposingKey` is the shared guard. The composer's own handler is a
- * closure over component state, so a test cannot reach it. The prompt dialog,
- * where a thread is renamed, decides through `promptEnterSubmits`.
- */
 import { describe, it, expect } from 'vitest';
 import { isImeComposingKey } from '../../../utils/ime';
 import { promptEnterSubmits } from '../../shared/PromptDialog';

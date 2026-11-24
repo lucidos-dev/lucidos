@@ -1,12 +1,3 @@
-/**
- * The `<Disclosure>` box (`components/shared/Disclosure.tsx`) measures its body
- * and rolls its own height to match. Two CSS properties keep that honest.
- *
- * - The body contains its children's margins. Otherwise a markdown body's
- *   margin collapses out of the measured height: the roll clips it, then jumps.
- * - The box never shrinks. The mid-roll clip drops a flex item's automatic
- *   minimum height, so a capped flex scroller squashed the box to nothing.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

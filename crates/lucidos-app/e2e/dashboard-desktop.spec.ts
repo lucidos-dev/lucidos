@@ -2,17 +2,11 @@ import { test, expect, Page, Locator } from './fixtures';
 import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, navigateToApp, rightClickInsideFrame, waitForDashboardReady } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
+import { stampPageRequests } from './harnessStamp';
 import { computeMinDashboardRailWidth } from '../src/store/paneMinimums';
 import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM } from '../src/utils/dashboardGeometry';
 
-/**
- * The desktop dashboard (ADRs 0432, 0496). Its widgets are tiles at their size
- * class, live, in a rail at the window's right edge, beside the header and the
- * panes. Each widget is a reusable folder written through the data API, added
- * to the dashboard over HTTP, so the spec needs no model.
- */
 
-/** Every data file a test wrote, so `afterEach` removes them all. */
 let written: string[] = [];
 let added: string[] = [];
 let seededThreads: string[] = [];
@@ -26,8 +20,6 @@ async function writeFile(page: Page, path: string, body: string): Promise<void> 
   expect(resp.ok(), `PUT ${path}`).toBeTruthy();
 }
 
-/** A widget that shows a random number per load, so a reload is visible, and
- *  echoes the word of each `E2EDashboardPinged` event. */
 function liveWidget(extraBody = ''): string {
   return '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head><body>'
     + '<p id="load"></p><p id="out">waiting</p>' + extraBody
@@ -49,7 +41,6 @@ async function addTile(page: Page, appId: string): Promise<void> {
   added.push(appId);
 }
 
-/** A reusable widget, as a tile on the desktop dashboard. */
 async function addToDashboard(page: Page, appId: string, manifest: Record<string, unknown>, html = liveWidget()): Promise<void> {
   await writeWidget(page, appId, manifest, html);
   await addTile(page, appId);
@@ -62,7 +53,6 @@ async function tileAppIds(page: Page, dashboard: 'phone' | 'desktop'): Promise<s
 }
 
 const rail = (page: Page): Locator => page.locator('.dashboard-rail');
-/** The live grid. While the loading fade runs, a skeleton copy of the grid sits beside it. */
 const grid = (page: Page): Locator => rail(page).locator('.dashboard-grid:not(.loading-fade-skeleton .dashboard-grid)');
 
 async function openDashboard(page: Page): Promise<void> {
@@ -82,13 +72,11 @@ async function box(locator: Locator) {
 
 const rootFontPx = (page: Page) => page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));
 
-/** The rail's floor as the page computes it, with the gutter it publishes. */
 async function railFloor(page: Page): Promise<number> {
   const gutter = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--scrollbar-gutter-width')) || 0);
   return computeMinDashboardRailWidth(await rootFontPx(page), gutter);
 }
 
-/** Drags the rail's divider until the rail is `width` wide. */
 async function dragRailTo(page: Page, width: number): Promise<void> {
   const handle = await box(page.locator('.dashboard-rail-divider'));
   const y = handle.y + 200;
@@ -108,7 +96,6 @@ test.describe('dashboard on desktop', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // An earlier spec in the shard may have truncated the Home row.
     ensureHomeThread();
     written = [];
     added = [];
@@ -149,8 +136,6 @@ test.describe('dashboard on desktop', () => {
     await expect(frame(page, ids.large).locator('html')).toHaveAttribute('data-widget-place', 'dashboard');
   });
 
-  /** ADR 0532. A widget tile keeps its old cell box. An app shortcut is a
-   *  quarter tile with no frame. A tap opens the app in the Canvas. */
   test('an app shortcut is a frameless quarter tile that opens its app, beside widgets at their old boxes', async ({ page }) => {
     const appId = `e2e-dash-app-${randomUUID().slice(0, 8)}`;
     await writeFile(page, `apps/${appId}/index.html`, '<!doctype html><html><body><p id="opened">opened</p></body></html>');
@@ -179,7 +164,6 @@ test.describe('dashboard on desktop', () => {
     await expect(rail(page)).toBeVisible();
   });
 
-  /** Invariant: a tile's size comes from its class, never its content. */
   test('a widget taller than its tile is clipped under a fade and never scrolls inside', async ({ page }) => {
     await addToDashboard(page, ids.small, { sizes: ['small'] });
     await addToDashboard(page, ids.medium, {}, liveWidget('<div style="height: 3000px"></div>'));
@@ -188,7 +172,6 @@ test.describe('dashboard on desktop', () => {
     const s = await box(tile(page, ids.small));
     const m = await box(tile(page, ids.medium));
     expect(Math.abs(m.height - s.height)).toBeLessThan(2);
-    // The fade marks the clip. Opening it full size is the tile menu's job.
     await expect(tile(page, ids.medium).locator('.widget-box-fade[data-edge="bottom"]')).toBeVisible();
     await expect(tile(page, ids.medium).locator('.widget-box-fade button')).toHaveCount(0);
     const html = frame(page, ids.medium).locator('html');
@@ -200,8 +183,6 @@ test.describe('dashboard on desktop', () => {
     expect(await html.evaluate((el) => el.ownerDocument.scrollingElement?.scrollTop ?? 0)).toBe(0);
   });
 
-  /** Invariants: a tile added over HTTP appears without a reload, and only on
-   *  the dashboard it was added to (ADR 0496). */
   test('a tile added to the desktop dashboard shows live, and the phone dashboard stays without it', async ({ page }) => {
     await writeWidget(page, ids.medium, {});
     await openDashboard(page);
@@ -225,8 +206,6 @@ test.describe('dashboard on desktop', () => {
     await expect(frame(page, ids.medium).locator('#out')).toHaveText(word);
   });
 
-  /** Invariants I1 and I8: a right-click inside a live tile's frame opens the
-   *  tile menu at the pointer, and leaves edit mode to that menu. */
   test('a right-click inside a tile opens the tile menu at the pointer, not edit mode', async ({ page }) => {
     await addToDashboard(page, ids.medium, {});
     await openDashboard(page);
@@ -239,7 +218,6 @@ test.describe('dashboard on desktop', () => {
     await page.locator('.dashboard-done').click();
   });
 
-  /** Invariant: the rail is outside the header and the panes. */
   test('the rail runs the full height at the right edge, and the header and panes end where it begins', async ({ page }) => {
     await openDashboard(page);
     const viewport = page.viewportSize()!;
@@ -253,7 +231,6 @@ test.describe('dashboard on desktop', () => {
     }
   });
 
-  /** Invariant: the menu drawer emerges from the split divider, whatever room the rail takes. */
   test('the menu drawer opens at the Canvas pane\'s leading edge while the rail shows', async ({ page }) => {
     await openDashboard(page);
     const row = page.locator('.app-header .content-header-elements');
@@ -263,7 +240,6 @@ test.describe('dashboard on desktop', () => {
     expect(Math.abs((await box(backdrop)).x - (await box(row)).x)).toBeLessThan(1);
   });
 
-  /** Invariant: an open overlay inerts the rail, as it does the rest of the shell. */
   test('an open overlay makes the rail inert like the rest of the shell', async ({ page }) => {
     await openDashboard(page);
     const head = rail(page).locator('.dashboard-head');
@@ -276,8 +252,6 @@ test.describe('dashboard on desktop', () => {
     await expect.poll(pe).not.toBe('none');
   });
 
-  /** Invariants: a drag only clamps, at two dashboard cells, and the width persists.
-   *  Resizing never moves a frame, so no tile reloads. */
   test('a drag on the rail stops at two dashboard cells, reloads no tile, and survives a reload', async ({ page }) => {
     await addToDashboard(page, ids.small, { sizes: ['small'] });
     await openDashboard(page);
@@ -291,7 +265,6 @@ test.describe('dashboard on desktop', () => {
     await page.mouse.up();
     await expect.poll(async () => Math.round((await box(rail(page))).width)).toBe(floor);
     await expect(grid(page)).toHaveCSS('--dashboard-columns', '2');
-    // The floor holds two whole cells, so they draw at their own edge.
     const cell = DASHBOARD_CELL_REM * await rootFontPx(page);
     expect(Math.abs((await box(tile(page, ids.small))).width - cell)).toBeLessThan(1);
     await expect(frame(page, ids.small).locator('#load')).toHaveText(loaded ?? '');
@@ -301,7 +274,6 @@ test.describe('dashboard on desktop', () => {
     expect(Math.round((await box(rail(page))).width)).toBe(floor);
   });
 
-  /** Invariant: the Home icon opens the chat and never the rail, even in Home. The rail toggle, in the window's corner in both states, shows and hides the rail. */
   test('the Home icon opens only the chat, and the rail toggle hides and shows the rail', async ({ page }) => {
     await addToDashboard(page, ids.small, { sizes: ['small'] });
     await openDashboard(page);
@@ -312,7 +284,6 @@ test.describe('dashboard on desktop', () => {
 
     const button = page.locator('.dashboard-rail-toggle');
     const bell = page.locator('.desktop-header .notifications-bell');
-    // Shown, it ends the rail's head, past Edit.
     const shown = await box(button);
     expect(shown.x).toBeGreaterThan((await box(rail(page))).x);
     const edit = await box(rail(page).locator('.dashboard-edit'));
@@ -321,20 +292,16 @@ test.describe('dashboard on desktop', () => {
     await button.click();
     await expect(rail(page)).toBeHidden();
     await expect(button).toHaveAttribute('aria-pressed', 'false');
-    // The shell's padding slides back, so the header reaches the edge once it lands.
     await expect.poll(async () => {
       const header = await box(page.locator('.app-header').first());
       return Math.abs(header.x + header.width - page.viewportSize()!.width);
     }).toBeLessThan(1);
-    // Hidden, it rests right of the bell, one gap past it.
     await expect.poll(async () => (await box(button)).x - ((await box(bell)).x + (await box(bell)).width)).toBeGreaterThan(0);
-    // Shown again soon, the tile is the one that was loaded (ADR 0422).
     await button.click();
     await expect(rail(page)).toBeVisible();
     await expect(frame(page, ids.small).locator('#load')).toHaveText(loaded ?? '');
     await button.click();
     await expect(rail(page)).toBeHidden();
-    // In Home already, the Home icon still leaves the rail to its toggle.
     await page.locator('.desktop-header .home-thread-btn').click();
     await expect(button).toHaveAttribute('aria-pressed', 'false');
     await expect(rail(page)).toBeHidden();
@@ -359,7 +326,6 @@ test.describe('dashboard on desktop', () => {
     await expect(frame(page, ids.medium).locator('#load')).toHaveText(loaded ?? '');
   });
 
-  /** Invariant: the rail alone sizes the dashboard, whatever the Conversation shows. */
   test('opening a long thread on the left leaves the dashboard width and columns alone', async ({ page }) => {
     await addToDashboard(page, ids.medium, {});
     const threadId = randomUUID();
@@ -384,8 +350,6 @@ test.describe('dashboard on desktop', () => {
     expect(await columns(page)).toBe(before.columns);
   });
 
-  /** Invariants: a tile keeps its size at every dashboard width, and the spare
-   *  width splits evenly, so the grid is centred. No tile reloads. */
   test('a tile keeps its size as the rail crosses a column boundary, centred in the dashboard', async ({ page }) => {
     await page.setViewportSize({ width: 1600, height: 900 });
     await addToDashboard(page, ids.medium, {});
@@ -400,7 +364,6 @@ test.describe('dashboard on desktop', () => {
     expect(await columns(page)).toBe('2');
     const two = await box(tile(page, ids.medium));
     const area = await box(grid(page));
-    // The medium tile spans both columns, so its insets are the grid's.
     const left = two.x - area.x;
     const right = area.x + area.width - (two.x + two.width);
     expect(Math.abs(left - right)).toBeLessThanOrEqual(1);
@@ -427,7 +390,6 @@ test.describe('dashboard on desktop', () => {
 
     const order = (page: Page, appId: string) => tile(page, appId).evaluate((el) => (el as HTMLElement).style.order);
 
-    /** Invariant: reordering never moves an iframe in the DOM. */
     test('a drag reorders without reloading a frame, survives a reload, and reaches a second browser', async ({ page, browser }) => {
       await addToDashboard(page, ids.small, { sizes: ['small'] });
       await addToDashboard(page, ids.medium, {});
@@ -450,6 +412,7 @@ test.describe('dashboard on desktop', () => {
       expect(await order(page, ids.small)).toBe(before[1]);
 
       const other = await browser.newContext();
+      await stampPageRequests(other);
       const second = await other.newPage();
       await navigateToApp(second);
       await expect(tile(second, ids.small)).toBeVisible({ timeout: 15_000 });
@@ -457,9 +420,6 @@ test.describe('dashboard on desktop', () => {
       await other.close();
     });
 
-    /** Invariant: `openDashboard` returns only once a press reaches the tiles.
-     *  Frames that load just after the skeleton shows settle the grid inside
-     *  the skeleton's minimum hold, and the held skeleton covers the grid. */
     test('a drag right after a slow dashboard opens reaches its tiles', async ({ page }) => {
       await addToDashboard(page, ids.small, { sizes: ['small'] });
       await addToDashboard(page, ids.large, { sizes: ['large'] });
@@ -479,8 +439,6 @@ test.describe('dashboard on desktop', () => {
       await expect.poll(() => order(page, ids.small)).toBe('1');
     });
 
-    /** Invariant: a widget that declares no sizes takes all three, and a size
-     *  change reloads no frame. */
     test('a widget that declares no sizes resizes through the pill without reloading', async ({ page }) => {
       await addToDashboard(page, ids.medium, {});
       await openDashboard(page);

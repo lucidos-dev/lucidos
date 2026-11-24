@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-30
+- **Amended by**: [0647](0647-only-a-signed-claim-proves-the-owner.md): only a signed identity is the owner
 
 ## Context
 

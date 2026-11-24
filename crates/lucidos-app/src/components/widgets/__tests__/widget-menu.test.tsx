@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A built-in widget is read-only (ADR 0415), so its menu offers no reuse
- * change. Every other item stays. Add to dashboard is offered in every thread
- * (ADR 0496). The retired pin items are gone from every thread (I8).
- */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -34,7 +29,6 @@ afterEach(() => {
   dashboards.value = new Map();
 });
 
-/** Both dashboards loaded, each holding these widgets, so no read starts. */
 function holding(apps: string[]): void {
   const tiles: DashboardTile[] = apps.map((app_id) => (
     { kind: 'widget', app_id, name: app_id, reusable: true, reveal: 'on-load', sizes: ['medium'], size: 'medium' }
@@ -92,8 +86,6 @@ describe('widgetMenuItems', () => {
     expect(host!.querySelector('.widget-menu-size')).toBeNull();
   });
 
-  /** Invariant: Add to dashboard targets the dashboard this layout shows, and
-   *  turns into Remove once that dashboard holds the instance. */
   it('offers Add to dashboard until the dashboard holds the instance', () => {
     holding([]);
     expect(labels({})).toContain('Add to dashboard');
@@ -113,7 +105,6 @@ describe('widgetMenuItems', () => {
     expect(api.added).toEqual([{ dashboard: currentDashboard(), tile: { appId: 'w', params: { clip: 'x.mp3' }, label: 'Clip' } }]);
   });
 
-  /** Invariant: the row never offers an action its unread dashboard may contradict. */
   it('keeps Add to dashboard inert, and says why, while its dashboard is unread', async () => {
     api.added = [];
     dashboards.value = new Map([[currentDashboard(), { status: 'failed', error: 'engine down' }]]);

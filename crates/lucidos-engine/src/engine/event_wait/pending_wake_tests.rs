@@ -12,6 +12,7 @@ use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
 
 fn live(watches: &[&str]) -> LiveWait {
     LiveWait {
+        background_timing: None,
         wait_id: Uuid::new_v4(),
         thread_id: Uuid::new_v4(),
         tool_use_id: "toolu_1".into(),

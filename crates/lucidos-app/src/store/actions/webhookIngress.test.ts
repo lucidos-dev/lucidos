@@ -1,9 +1,3 @@
-/**
- * What the two ingress surfaces are allowed to claim, pinned away from either.
- *
- * Both read one selector, so the rules live here: a failed refresh keeps the
- * outage it already had, and the age keeps counting while the outage stands.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../api/client', () => ({ fetchWebhookIngress: vi.fn() }));
@@ -59,7 +53,6 @@ describe('webhook ingress readings', () => {
     mockFetch.mockResolvedValueOnce({ degraded: outage() });
     await loadWebhookIngress();
 
-    // An engine that cannot answer is itself one way this path breaks.
     mockFetch.mockRejectedValueOnce(new Error('engine restarting'));
     await loadWebhookIngress();
 
@@ -78,7 +71,6 @@ describe('webhook ingress readings', () => {
     mockFetch.mockResolvedValueOnce({ degraded: outage({ down_secs: 120 }) });
     await loadWebhookIngress();
 
-    // The whole outage this feature exists to catch, read eight hours in.
     const eightHours = 8 * 60 * 60;
     const later = LANDED.getTime() + eightHours * 1000;
     expect(currentIngressOutage(later)?.down_secs).toBe(120 + eightHours);

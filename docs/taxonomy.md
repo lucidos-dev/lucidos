@@ -165,7 +165,7 @@ root. A file in a folder there is a reference its doc names by id (ADR 0413).
 - **The workspace root is a storage root** (mode 0700, ADR 0456). Another local user cannot traverse into it, so nothing under `data/` or `.lucidos/` is reachable to them whatever its own mode.
 - **`.lucidos/`** is ephemeral (runtime cache, temp files). Can be rebuilt. Not under `data/`. It holds nothing large but the catalog *plugin media* cache, which the next marketplace scan rebuilds. The embedding model is cached once per user (or per install), never per workspace. So a workspace directory carries no multi-hundred-MB copy of it (ADR 0061).
 - **Manifest vs knowhow:** `manifest.json` is for the user (UI display). Knowhow and intents are for the engine (LLM context). Don't put operational knowledge in manifests.
-- **Scripts belong with their consumer.** If only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`. A script shared across consumers (apps, triggers, intents) goes in the top-level `data/scripts/<name>/`, and so does one a proxy auth handshake invokes. See `system-knowhow/best-practices.md` § "scripts/: Shared Scripts". Don't duplicate it into each consumer.
+- **Scripts belong with their consumer.** If only one trigger uses a script, it goes in that trigger's `scripts/`. If only one app uses it, it goes in that app's `scripts/`. A script shared across consumers (apps, triggers, intents) goes in the top-level `data/scripts/<name>/`, and so does one a proxy auth handshake invokes. See `system-knowhow/best-practices/workspace-layout.md` § "scripts/: Shared Scripts". Don't duplicate it into each consumer.
 
 ## Apps
 
@@ -233,7 +233,7 @@ The trigger thread inherits the chat-thread knowhow surface: the system prompt a
 
 ### Order of Operations
 
-Knowhow file first, trigger second, as in the worked example above. That works for shared `data/knowhow/`, which is where a recipe belongs unless it is useless to anything else. Trigger-scoped knowhow inverts it: `<slug>` is only authoritative once the trigger exists, so write that file straight after creation. The chat system prompt's `CONTENT TAXONOMY` block states the same ordering. `system-knowhow/triggers.md` § "Write the knowhow file FIRST, then the intent" is what the LLM reads at trigger-creation time.
+Knowhow file first, trigger second, as in the worked example above. That works for shared `data/knowhow/`, which is where a recipe belongs unless it is useless to anything else. Trigger-scoped knowhow inverts it: `<slug>` is only authoritative once the trigger exists, so write that file straight after creation. The chat system prompt's `CONTENT TAXONOMY` block states the same ordering. `system-knowhow/triggers/when-a-trigger-is-the-right-answer.md` § "Write the knowhow file FIRST, then the intent" is what the LLM reads at trigger-creation time.
 
 ### Locations
 

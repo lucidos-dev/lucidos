@@ -1,9 +1,3 @@
-/** The transcript's skeleton answers to ONE clock, the shared delay gate.
- *
- *  A second clock lived here for a day, a hold that raised the skeleton ahead
- *  of the gate. ADR 0081 records why it is gone: it could only ever show the
- *  skeleton instantly and then block the paint, which is the bug it was
- *  reported as. */
 import { describe, it, expect } from 'vitest';
 import {
   wholeHistoryLoaded,
@@ -12,7 +6,6 @@ import {
   type ThreadLoadingState,
 } from '../threadSkeletonGate';
 
-/** Mid-open: nothing on screen, nothing terminal to say. */
 const LOADING: ThreadLoadingState = {
   hasExchanges: false,
   animating: false,
@@ -27,7 +20,6 @@ describe('wholeHistoryLoaded', () => {
   });
 
   it('needs nothing older left on the server', () => {
-    // A loaded page can draw nothing while older pages hold the messages.
     expect(wholeHistoryLoaded(true, true)).toBe(false);
   });
 
@@ -57,8 +49,6 @@ describe('threadIsLoadingNow', () => {
 
 describe('showThreadSkeletonNow', () => {
   it('shows nothing until the delay gate has elapsed', () => {
-    // The whole promise of the gate, and the one the hold used to break: a
-    // load that finishes inside 300ms never puts a skeleton on screen.
     expect(showThreadSkeletonNow(LOADING, false)).toBe(false);
   });
 

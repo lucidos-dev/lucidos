@@ -1,13 +1,8 @@
 // @vitest-environment jsdom
-// This file renders markdown, and the sanitizer runs on a real DOM.
-// The default `node` environment has none.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import type { Tap } from '@lucidos/sdk';
 
-// The row reads skeleton mode through useContext, which needs a real render.
-// These tests call the component as a plain function and inspect the VNode tree.
-// So pin the hook, and leave the rest of the module alone.
 vi.mock('../shared/Skeleton', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../shared/Skeleton')>()),
   useSkeleton: () => false,
@@ -78,9 +73,6 @@ describe('NotificationRow', () => {
     vi.clearAllMocks();
   });
 
-  // The row is one of four surfaces on one router. It reads the tap instead of
-  // hardcoding the detail. A jump from the bell therefore lands exactly where a
-  // jump from the toast or the push lands.
   it('dispatches the row deep link, carrying its tap and source event', () => {
     const n = notification({ thread_id: 't-1', event_id: 'e-1', tap: NAVIGATE_TAP });
     click(findByClass(NotificationRow({ n }), 'notification-item'));
@@ -103,15 +95,10 @@ describe('NotificationRow', () => {
     });
   });
 
-  // A jumping row leaves the notification's own text unseen, so it owes a way
-  // back to it. A modal row's body already opens the detail, so a chevron there
-  // would be a second button doing the same thing.
   it('gives a navigate row a chevron, on the shared row-icon tap target', () => {
     const tree = NotificationRow({ n: notification({ tap: NAVIGATE_TAP }) });
     const chevron = findByClass(tree, 'notification-row-detail-btn');
     expect(chevron).not.toBeNull();
-    // `row-icon` is where its 2.25rem tap target comes from. That is the size a
-    // row icon was grown to after one was reported unhittable on a phone.
     expect(classesOf(chevron)).toEqual(
       expect.arrayContaining(['icon-btn', 'row-icon']),
     );
@@ -132,8 +119,6 @@ describe('NotificationRow', () => {
     expect(dispatchDeepLink).not.toHaveBeenCalled();
   });
 
-  // A button cannot contain a button, and a nested one would fire both handlers
-  // on one tap: the chevron would open the detail AND jump away from it.
   it('keeps the chevron OUT of the row button', () => {
     const tree = NotificationRow({ n: notification({ tap: NAVIGATE_TAP }) });
     const item = findByClass(tree, 'notification-item');
@@ -141,9 +126,6 @@ describe('NotificationRow', () => {
     expect(findByClass(item!.props.children, 'notification-row-detail-btn')).toBeNull();
   });
 
-  // `clickVisibleElement` in the e2e helpers dispatches `el.click()` on whatever
-  // matches. A synthetic click bubbles up, never down, so a container row would
-  // swallow every e2e tap on the list.
   it('keeps .notification-item a real button, which the e2e click needs', () => {
     const tree = NotificationRow({ n: notification() });
     expect(findByClass(tree, 'notification-item')!.type).toBe('button');

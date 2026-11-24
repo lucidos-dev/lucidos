@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** Opening a dropdown must not take focus from the field being typed in.
- *
- *  On iOS the trigger's mousedown clears focus, so the keyboard slid away just
- *  as the menu opened. The shell grew under a menu placed for the shrunk
- *  viewport, and the menu jumped to its new place: the reported blink. */
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

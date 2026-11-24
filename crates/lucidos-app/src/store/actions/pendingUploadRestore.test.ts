@@ -102,7 +102,6 @@ beforeEach(() => {
   noteServerDraft(LIVE, '', []);
   queuedUploadSends.value = new Map();
   vi.mocked(ensureThreadByIdInMap).mockReset().mockImplementation(async (id) => threadMap.value.has(id));
-  // Held, so a resumed upload stays a chip for the test to see.
   vi.mocked(uploadThreadBlob).mockReset().mockImplementation(() => new Promise(() => {}));
 });
 
@@ -131,7 +130,6 @@ describe('restorePendingUploads', () => {
     expect(chip.file.name).toBe('photo.png');
     expect(new Uint8Array(await chip.file.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
     await vi.waitFor(() => expect(uploadThreadBlob).toHaveBeenCalledWith(LIVE, chip.file, expect.anything()));
-    // Now this page's record.
     expect((await readPendingUploadStore()).uploads[0].ownerId).not.toBe(EARLIER_PAGE);
     expect(warnings()).toEqual([]);
   });
@@ -235,9 +233,11 @@ describe('restorePendingUploads', () => {
     const prefix = PAGE_OWNER_LOCK_PREFIX;
     Object.defineProperty(globalThis.navigator, 'locks', {
       configurable: true,
-      value: { query: async () => ({ held: [{ name: prefix + 'other-tab' }] }), request: async () => {} },
+      value: {
+        query: async () => ({ held: [{ name: prefix + 'other-tab' }] }),
+        request: (...args: [string, () => Promise<never>]) => args[1](),
+      },
     });
-    // Their draft would read as gone here, so a wrong adopt would drop it.
     await seed(record('theirs', { ownerId: 'other-tab', threadId: 't-gone' }), record('orphan'));
     await restorePendingUploads(NOW);
     expect(await storedIds()).toEqual(['orphan', 'theirs']);
@@ -257,7 +257,6 @@ describe('a send queued at reload time', () => {
     await queuedOn(['u-1', 'u-2']);
     await restorePendingUploads(NOW);
     expect(queuedUploadSends.value.get(LIVE)).toEqual(intent);
-    // Still stored while it waits, so a second reload keeps it too.
     expect((await readPendingUploadStore()).queuedUploadSendRecords.map((q) => q.threadId)).toEqual([LIVE]);
   });
 
@@ -278,7 +277,6 @@ describe('a send queued at reload time', () => {
     await queuedOn(['u-1', 'u-old']);
     await restorePendingUploads(NOW);
     expect(queuedUploadSends.value.has(LIVE)).toBe(false);
-    // The image that did come back is still there for the user to send.
     expect(chipIds()).toEqual(['u-1']);
     expect(warnings()).toEqual([
       `An image attached before the reload was dropped: it waited more than 7 days. ${NOT_SENT}`,

@@ -1,8 +1,6 @@
+import '../../../utils/renderMarkdown';
 import { describe, it, expect, vi } from 'vitest';
 
-// Mock the actions BEFORE importing the component so module-load side effects
-// (if any survived the refactor) would land on these spies. The action paths
-// mirror SettingsView.tsx's imports.
 vi.mock('../../../store/actions/chat', async () => {
   const actual: object = await vi.importActual('../../../store/actions/chat');
   return { ...actual, loadRepositories: vi.fn() };
@@ -27,16 +25,10 @@ import { loadOAuthAccounts } from '../../../store/actions/oauth';
 
 describe('SettingsView render-body purity', () => {
   it('does not call load actions at module import time', async () => {
-    // Pre-fix: `repositoriesSection()` invoked `loadRepositories()` inside its
-    // render body — a setState-in-render gotcha that preact lint flags. With
-    // the fix moved into useEffect, merely importing the module must not
-    // dispatch any action; the effect runs at mount time only.
     await import('../SettingsView');
     expect(loadRepositories).not.toHaveBeenCalled();
     expect(loadDevices).not.toHaveBeenCalled();
     expect(loadCredentials).not.toHaveBeenCalled();
     expect(loadOAuthAccounts).not.toHaveBeenCalled();
-    // The cold import of the whole settings graph is the slow part, and on a
-    // loaded host it alone outlasts the 5 s default.
   }, 30_000);
 });

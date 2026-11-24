@@ -6,14 +6,17 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const FIX_INVOCATION_SQL: &str =
-    include_str!("../migrations/20260420195145_fix_trigger_invocation_event_only_backfill.sql");
+const FIX_INVOCATION_SQL: &str = include_str!(
+    "../../lucidos-core/migrations/20260420195145_fix_trigger_invocation_event_only_backfill.sql"
+);
 
-const RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL: &str =
-    include_str!("../migrations/20260429213500_rename_trigger_run_text_to_intent.sql");
+const RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL: &str = include_str!(
+    "../../lucidos-core/migrations/20260429213500_rename_trigger_run_text_to_intent.sql"
+);
 
-const MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL: &str =
-    include_str!("../migrations/20260516195912_migrate_trigger_on_to_subscription_list.sql");
+const MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL: &str = include_str!(
+    "../../lucidos-core/migrations/20260516195912_migrate_trigger_on_to_subscription_list.sql"
+);
 
 /// When the bad migration ran. Every row's `created` is relative to it, since
 /// a cloned template database carries the time the template was built.
@@ -828,7 +831,7 @@ async fn migrate_on_to_subscription_list_is_idempotent() {
 }
 
 const RENAME_USER_PROMPT_INJECTED_SQL: &str =
-    include_str!("../migrations/20261008112539_rename_user_prompt_injected_to_prompt_injected.sql");
+    include_str!("../../lucidos-core/migrations/20261008112539_rename_user_prompt_injected_to_prompt_injected.sql");
 
 async fn event_row(pool: &PgPool, event_id: Uuid) -> (String, Value) {
     sqlx::query_as::<_, (String, Value)>("SELECT event_type, payload FROM events WHERE id = $1")
@@ -1024,7 +1027,7 @@ async fn rename_user_prompt_injected_reaches_rows_and_every_subscription() {
 
 const RENAME_COMMAND_GUARD_CODING_AGENTS_SQL: &str = include_str!(
     // The file name carries the retired key.
-    "../migrations/20261110090530_rename_command_guard_coding_agents_to_coding_agent_auto_answer.sql"
+    "../../lucidos-core/migrations/20261110090530_rename_command_guard_coding_agents_to_coding_agent_auto_answer.sql"
 );
 
 /// Each workspace keeps what it ran: the guard on AND the old value, whose
@@ -1084,6 +1087,135 @@ async fn coding_agent_auto_answer_keeps_what_each_workspace_ran() {
             .unwrap();
         assert_eq!(left, 0, "{case}: no old row survives");
     }
+
+    teardown_test_db(&db_name).await;
+}
+
+const RENAME_OPERATOR_AND_PEOPLE_TO_USER_SQL: &str = include_str!(
+    "../../lucidos-core/migrations/20261111091917_rename_operator_and_people_to_user.sql"
+);
+
+/// Old rows take the user names (ADR 0655), no row is lost, and a rerun
+/// changes nothing. The old names are wire contracts, as stored.
+#[tokio::test]
+async fn rename_operator_and_people_to_user_rewrites_names_only() {
+    let (pool, db_name) = setup_test_db().await;
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let posted = insert_event_with_payload(
+        &pool,
+        "PeopleMessagePosted",
+        json!({ "text": "Kim, look?", "mentioned_operator_ids": ["op-2"] }),
+    )
+    .await;
+    let plain =
+        insert_event_with_payload(&pool, "PeopleMessagePosted", json!({ "text": "hi" })).await;
+    let watched =
+        insert_event_with_payload(&pool, "WorkItemWatched", json!({ "operator_id": "op-2" })).await;
+    let own_watch = insert_event_with_payload(&pool, "WorkItemWatched", json!({})).await;
+    let trigger = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({ "trigger_id": "t", "on": subscriptions_naming("PeopleMessagePosted") }),
+    )
+    .await;
+    let grouped = insert_event_with_payload(
+        &pool,
+        "NotificationCreated",
+        json!({ "title": "Kim", "push_group": { "kind": "people_messages", "thread_id": "t" } }),
+    )
+    .await;
+    let before = count().await;
+
+    for _ in 0..2 {
+        sqlx::raw_sql(RENAME_OPERATOR_AND_PEOPLE_TO_USER_SQL)
+            .execute(&pool)
+            .await
+            .expect("the migration runs");
+    }
+
+    assert_eq!(count().await, before, "no event row is lost");
+    assert_eq!(
+        event_row(&pool, posted).await,
+        (
+            "UserOnlyMessagePosted".to_string(),
+            json!({ "text": "Kim, look?", "mentioned_user_ids": ["op-2"] })
+        )
+    );
+    assert_eq!(
+        event_row(&pool, plain).await,
+        ("UserOnlyMessagePosted".to_string(), json!({ "text": "hi" }))
+    );
+    assert_eq!(
+        event_row(&pool, watched).await.1,
+        json!({ "user_id": "op-2" })
+    );
+    assert_eq!(event_row(&pool, own_watch).await.1, json!({}));
+    assert_eq!(
+        event_row(&pool, trigger).await.1["on"],
+        subscriptions_naming("UserOnlyMessagePosted")
+    );
+    assert_eq!(
+        event_row(&pool, grouped).await.1,
+        json!({ "title": "Kim", "push_group": { "kind": "user_only_messages", "thread_id": "t" } })
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The delivery tables a workspace created under their old names take the
+/// user names, keys included, and a stored notice keeps its flag's value.
+#[tokio::test]
+async fn rename_operator_and_people_to_user_renames_the_delivery_tables() {
+    let (pool, db_name) = setup_test_db().await;
+    sqlx::raw_sql(
+        "ALTER TABLE user_only_message_notices RENAME TO people_message_notices;
+         ALTER INDEX user_only_message_notices_pkey RENAME TO people_message_notices_pkey;
+         ALTER INDEX user_only_message_notices_pending RENAME TO people_message_notices_pending;
+         ALTER TABLE user_only_message_dispatches RENAME TO people_message_dispatches;
+         ALTER INDEX user_only_message_dispatches_pkey RENAME TO people_message_dispatches_pkey;
+         ALTER TABLE people_message_dispatches RENAME CONSTRAINT
+             user_only_message_dispatches_notification_id_fkey
+             TO people_message_dispatches_notification_id_fkey;
+         ALTER TABLE user_only_message_push_receipts RENAME TO people_message_push_receipts;",
+    )
+    .execute(&pool)
+    .await
+    .expect("the old names are restored");
+    let event_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO people_message_notices (event_id, notice) VALUES ($1, $2)")
+        .bind(event_id)
+        .bind(json!({ "text": "Kim, look?", "people_only": true }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        sqlx::raw_sql(RENAME_OPERATOR_AND_PEOPLE_TO_USER_SQL)
+            .execute(&pool)
+            .await
+            .expect("the migration runs");
+    }
+
+    let notice: Value =
+        sqlx::query_scalar("SELECT notice FROM user_only_message_notices WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notice, json!({ "text": "Kim, look?", "user_only": true }));
+    let old_names: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM pg_class WHERE relname LIKE 'people\\_message\\_%') \
+              + (SELECT COUNT(*) FROM pg_constraint WHERE conname LIKE 'people\\_message\\_%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(old_names, 0, "no table, index or key keeps the old name");
 
     teardown_test_db(&db_name).await;
 }

@@ -2,6 +2,7 @@
 
 - **Status** — Accepted
 - **Date** — 2026-07-29
+- **Amended by**: [0745: Loopback serves HTTPS from a per-user, name-constrained CA](0745-loopback-serves-tls-from-a-per-user-ca.md), which moves the window to `https://localhost:<port>` and closes the squatter residual
 
 ## Context
 
@@ -103,6 +104,10 @@ The residual is narrow and **accepted**. The origin is plain HTTP on loopback
 with no authentication, so a local process that bound the port first would
 receive this window's IPC. `desktop::launch` navigates only after the gateway
 answers, and the gateway holds the port for the life of the service.
+
+**Closed by ADR 0745.** The window now loads `https://localhost:<port>`, and
+WebKit trusts only a leaf signed by the user's loopback CA. A squatter on the
+port fails the handshake, so it never reaches the window's IPC.
 
 - **Drop `updater:default` from the gateway capability.** Rejected: it moves
   the update path off the window that shows it, so the toast could narrate an

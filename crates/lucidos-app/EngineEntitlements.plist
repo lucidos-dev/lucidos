@@ -12,7 +12,7 @@
   its own file, and this is it.
 
   Why a key at all. The engine embeds wasmtime and compiles a signer
-  module to native code on the proxy auth path (api/proxy_wasm_signer.rs).
+  module to native code on the proxy auth path (engine/proxy_wasm_signer.rs).
   The release path signs with the hardened runtime, which forbids
   executing a page no signature covers, so the kernel killed the process
   the instant it called compiled code: SIGKILL, CODESIGNING, Invalid Page.

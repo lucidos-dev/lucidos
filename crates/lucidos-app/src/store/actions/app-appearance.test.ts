@@ -55,7 +55,6 @@ describe('the appearance push to app frames', () => {
     }
   });
 
-  /** Invariant: a fit check's frame keeps the scale it measures at. */
   it('hands a frame on a fit check surface that surface\'s scale', async () => {
     installAppAppearanceSync();
     await Promise.resolve();

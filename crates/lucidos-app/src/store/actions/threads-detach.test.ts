@@ -1,6 +1,3 @@
-/** Moving a child thread to top level from the ⋯ menu (ADR 0278): the copy,
- *  who is offered the item, the confirm-then-call flow, and a list refresh
- *  that must not re-nest the moved row. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
@@ -34,7 +31,6 @@ function seedFamily(): void {
   ]);
 }
 
-/** Answer the dialog the handler opened, once it is up. */
 async function answerConfirm(ok: boolean): Promise<void> {
   await vi.waitFor(() => expect(confirmState.value.visible).toBe(true));
   confirmState.value.resolve?.(ok);

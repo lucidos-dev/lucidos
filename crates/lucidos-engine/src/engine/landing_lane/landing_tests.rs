@@ -72,6 +72,7 @@ async fn three_members_land_as_three_merges_in_first_parent_order() {
     let base = git(&repo, &["rev-parse", "main"]).await;
 
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -121,6 +122,7 @@ async fn a_conflicting_member_is_set_aside_and_the_rest_land() {
     let later = branch_writing(&repo, "b3", "c.txt", "c").await;
 
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -152,6 +154,7 @@ async fn a_batch_the_pass_opens_starts_on_main_as_the_pass_left_it() {
     git(&repo, &["commit", "-am", "main edits shared"]).await;
 
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -166,6 +169,7 @@ async fn a_batch_the_pass_opens_starts_on_main_as_the_pass_left_it() {
     assert_eq!(published.main_now(), main);
 
     let again = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -186,6 +190,7 @@ async fn a_member_already_on_main_lands_nothing() {
     let (_tmp, repo) = repo().await;
     let base = git(&repo, &["rev-parse", "main"]).await;
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -205,6 +210,7 @@ async fn an_unresolvable_snapshot_is_set_aside() {
     let base = git(&repo, &["rev-parse", "main"]).await;
     let missing = "0123456789012345678901234567890123456789";
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -232,6 +238,7 @@ async fn the_lane_lands_the_snapshot_and_keeps_a_later_commit_on_the_branch() {
     let later = git(&wt, &["rev-parse", "HEAD"]).await;
 
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -264,6 +271,7 @@ async fn recovery_finds_the_landing_merge_of_a_snapshot() {
     let a = branch_writing(&repo, "b1", "a.txt", "a").await;
     let b = branch_writing(&repo, "b2", "b.txt", "b").await;
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -308,6 +316,7 @@ async fn a_revert_waits_for_a_landing_pass_and_cannot_fail_it() {
     let locks = MainLocks::private_for_test();
     let first = branch_writing(&repo, "b1", "a.txt", "a").await;
     let published = publish_clean_pass(
+        &[],
         locks,
         &repo,
         &LandingOrder::OriginFirst,
@@ -365,6 +374,7 @@ async fn reverting_a_landing_merge_undoes_that_change_only() {
     let b = branch_writing(&repo, "b2", "b.txt", "b").await;
     let c = branch_writing(&repo, "b3", "c.txt", "c").await;
     let published = publish_clean_pass(
+        &[],
         MainLocks::private_for_test(),
         &repo,
         &LandingOrder::OriginFirst,
@@ -399,7 +409,7 @@ mod with_origin {
         order: &LandingOrder,
         inputs: &[LandingInput],
     ) -> CleanPass {
-        publish_clean_pass(MainLocks::private_for_test(), &f.repo, order, inputs)
+        publish_clean_pass(&[], MainLocks::private_for_test(), &f.repo, order, inputs)
             .await
             .unwrap()
     }

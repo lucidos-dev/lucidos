@@ -1,12 +1,3 @@
-/** A repositories read that fails TRANSIENTLY must not park the Loadable on
- *  `failed`. Nothing retries it: the compose destination picker's render-path
- *  kick-off only fires on `not-loaded`, and the SSE refresh only re-fires a list
- *  that is already `loaded` — so the packaged app painted a permanent red
- *  "Failed to load repositories / Fetch is aborted" row, and the user's only
- *  escape was mutating the repository list by hand (which refetches).
- *
- *  Two guarantees pinned here: one retry on a transient rejection, and a
- *  human-readable reason (not the raw WebKit string) when it genuinely fails. */
 
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import { repositories } from '../store';
@@ -18,6 +9,7 @@ vi.mock('../../api/client', async (importActual) => {
 
 import { json, ApiError } from '../../api/client';
 import { loadRepositories, refreshRepositories } from './repositoriesLoader';
+import { joinSliceLoadsDuring } from '../bootstrapSliceLoads';
 
 const read = json as unknown as Mock;
 
@@ -100,5 +92,26 @@ describe('refreshRepositories answers with a request sent after the call', () =>
     await refreshRepositories();
 
     expect(read).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('loadRepositories inside a bootstrap gap repair', () => {
+  beforeEach(() => {
+    (json as Mock).mockReset();
+    repositories.value = { status: 'not-loaded' };
+  });
+
+  it('joins the bootstrap without sharing that join with a later call', async () => {
+    let finishBootstrap = () => {};
+    const bootstrap = new Promise<void>((resolve) => { finishBootstrap = resolve; });
+    let joined: Promise<void> | undefined;
+    joinSliceLoadsDuring(bootstrap, () => { joined = loadRepositories(); });
+    expect(joined).toBe(bootstrap);
+    expect(json).not.toHaveBeenCalled();
+
+    (json as Mock).mockResolvedValueOnce([]);
+    await loadRepositories();
+    expect(repositories.value).toEqual({ status: 'loaded', data: [] });
+    finishBootstrap();
   });
 });

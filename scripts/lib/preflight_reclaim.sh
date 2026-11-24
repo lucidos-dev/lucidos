@@ -10,7 +10,7 @@
 #
 #   1. THE SIGNAL. The engine installs a SIGTERM ignorer on purpose, so that a
 #      stray `xargs kill` from a coding-agent test cannot stop it
-#      (crates/lucidos-engine/src/main.rs). A SIGTERM pass could never work.
+#      (crates/lucidos-engine-bin/src/main.rs). A SIGTERM pass could never work.
 #      Nothing here sends a raw signal at all.
 #   2. THE PATH. A non-dev workspace does not live under ~/workspaces. Every
 #      path is read out of the target engine's own environment, never built
@@ -102,7 +102,7 @@ _reclaim_seconds() {
 #
 # Quiet window: 2*2 + 5 + 2*15 = 39s of continuous absence. Deadline: 39 + 20,
 # the extra being twice the engine's own 10s graceful-shutdown budget
-# (crates/lucidos-engine/src/main.rs), since only the HTTP half of its shutdown
+# (crates/lucidos-engine-bin/src/main.rs), since only the HTTP half of its shutdown
 # is bounded by that constant.
 
 # Seconds of continuous absence that prove nothing is bringing this back.

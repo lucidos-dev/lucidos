@@ -67,13 +67,13 @@ const THREAD_VIEW_CLOSE: &str = "[END THREAD MEMORY VIEW]";
 /// `<thread id>/start+span` for a thread's. A bare `start+span` names the
 /// calling thread's tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NodeId {
-    pub(crate) scope: SummaryScope,
-    pub(crate) addr: NodeAddr,
+pub struct NodeId {
+    pub scope: SummaryScope,
+    pub addr: NodeAddr,
 }
 
 impl NodeId {
-    pub(crate) fn parse(text: &str, caller: Option<Uuid>) -> Result<Self, String> {
+    pub fn parse(text: &str, caller: Option<Uuid>) -> Result<Self, String> {
         let text = text.trim().trim_start_matches('[').trim_end_matches(']');
         let (scope, addr) = match text.rsplit_once('/') {
             Some(("w", addr)) => (SummaryScope::Workspace, addr),
@@ -136,12 +136,12 @@ fn indented_len(text: &str) -> usize {
 
 /// A framed view, cut into blocks of [`BLOCK_LINES`] lines.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ViewBlocks {
-    pub(crate) text: String,
+pub struct ViewBlocks {
+    pub text: String,
     /// Byte offsets into `text` where each whole block ends, ascending.
-    pub(crate) ends: Vec<usize>,
+    pub ends: Vec<usize>,
     /// The ends that take a cache mark, ascending: see [`cache_rungs`].
-    pub(crate) marks: Vec<usize>,
+    pub marks: Vec<usize>,
 }
 
 impl ViewBlocks {
@@ -189,7 +189,7 @@ impl ViewBlocks {
 
     /// One content block per piece: a marked piece is a memory view block,
     /// which every wire marks for its cache, and the rest plain text.
-    pub(crate) fn blocks(&self) -> impl Iterator<Item = ContentBlock> + '_ {
+    pub fn blocks(&self) -> impl Iterator<Item = ContentBlock> + '_ {
         self.pieces()
             .into_iter()
             .filter(|(text, _)| !text.is_empty())
@@ -227,11 +227,11 @@ pub(crate) fn trailing_cache_rungs(blocks: usize, count: usize) -> Vec<usize> {
 
 /// One turn's workspace view.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct WorkspaceView {
+pub struct WorkspaceView {
     /// The snapshot, framed. Shared byte for byte within its epoch.
-    pub(crate) snapshot: ViewBlocks,
+    pub snapshot: ViewBlocks,
     /// Leaves newer than the snapshot, framed, or empty.
-    pub(crate) recent: String,
+    pub recent: String,
 }
 
 struct Snapshot {
@@ -249,7 +249,7 @@ struct Snapshot {
 /// Held in memory as a cache: a restart folds afresh, which costs one cache
 /// miss and loses nothing a turn needs.
 #[derive(Default)]
-pub(crate) struct ViewSnapshots {
+pub struct ViewSnapshots {
     snapshots: tokio::sync::Mutex<HashMap<usize, Snapshot>>,
     epochs: AtomicU64,
 }
@@ -258,11 +258,7 @@ impl ViewSnapshots {
     /// The workspace view at `budget` bytes, snapshot and recent block
     /// together. Only built leaves show, in order, so a line the compactor has
     /// not written yet waits for the next turn rather than holding this one.
-    pub(crate) async fn workspace_view(
-        &self,
-        pool: &PgPool,
-        budget: usize,
-    ) -> StoreResult<WorkspaceView> {
+    pub async fn workspace_view(&self, pool: &PgPool, budget: usize) -> StoreResult<WorkspaceView> {
         if budget == 0 {
             return Ok(WorkspaceView::default());
         }
@@ -283,7 +279,7 @@ impl ViewSnapshots {
         }
 
         let snapshot = self.fold_snapshot(pool, budget - recent_cap).await?;
-        log!(
+        log_legacy!(
             "[SummaryTree] Workspace view snapshot epoch {} at {} leaves, {} bytes (budget {})",
             snapshot.epoch,
             snapshot.end,
@@ -361,7 +357,7 @@ async fn recent_lines(pool: &PgPool, from: u64) -> StoreResult<Vec<String>> {
 
 /// A coding agent's view section: the workspace view, then how to open it
 /// through the `lucidos` CLI. Empty when the view is.
-pub(crate) fn coding_agent_section(view: &WorkspaceView) -> String {
+pub fn coding_agent_section(view: &WorkspaceView) -> String {
     if view.snapshot.text.is_empty() && view.recent.is_empty() {
         return String::new();
     }
@@ -390,7 +386,7 @@ fn frame_recent(lines: &str) -> String {
 /// A Lucidos Agent thread's memory view at `budget` bytes, or empty for a
 /// thread with no past. `current_message` is the turn's own message, already
 /// in the log, which the view leaves to the request line.
-pub(crate) async fn thread_view(
+pub async fn thread_view(
     pool: &PgPool,
     thread_id: Uuid,
     budget: usize,

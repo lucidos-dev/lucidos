@@ -108,8 +108,6 @@ describe('handleGlobalEvent: standing apply', () => {
     expect(String(showToast.mock.calls[0][0])).toContain('parked on a question');
   });
 
-  // A fire ends the arm too. Missing this left the flag armed after the change
-  // applied, and its cancel answered 404.
   it('StandingApplyFired clears the thread and leaves the report to the apply', () => {
     standingApplyThreadIds.value = new Set(['t0', 't1']);
     handleGlobalEvent('StandingApplyFired', { thread_id: 't1', change_id: 'c1' });
@@ -124,8 +122,6 @@ describe('handleGlobalEvent: standing apply', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  // The workspace-scope off drops each arm on its own. So the panel and every
-  // armed thread's prompt row clear together, with no refetch and no toast.
   it('the workspace off clears every thread, one drop at a time', () => {
     standingApplyThreadIds.value = new Set(['t1', 't2', 't3']);
     for (const thread_id of ['t1', 't2', 't3']) {

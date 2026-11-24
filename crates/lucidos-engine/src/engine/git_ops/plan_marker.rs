@@ -6,15 +6,17 @@
 //! `Planned` via `lucidos planned approve`. A local fix is acknowledged
 //! directly as `AcknowledgedSimple` (no approval needed). An unattended run
 //! commits a scoped security fix as `BoundedSecurityFix`, which names the files
-//! it is bounded to. Those three satisfy every gate; `Proposed` and the ABSENCE
-//! of a row both block.
+//! it is bounded to. Those three permit source edits. `PlanOnly` permits landing
+//! plan files alone. `Proposed` and an absent row block both.
 //!
 //! Unlike hardening, the gate is binary satisfying/not, with no `Stale`
 //! re-check. Planning is a pre-condition *decision* about the branch's work
 //! that a follow-up commit does not invalidate, so the stored `head_sha` is
 //! diagnostic only.
 
-use super::plan_approval::{user_approved_plan, PlanApprovalError};
+use super::plan_approval::{
+    user_approved_plan, user_approved_plan_for, ApprovalTarget, PlanApprovalError,
+};
 use super::{canonical_repo_root, local_branch_exists};
 use std::path::Path;
 
@@ -26,17 +28,18 @@ use std::path::Path;
 pub(crate) const MAX_BOUNDED_SECURITY_FIX_FILES: usize = 10;
 
 /// The valid marker states. `Planned`, `AcknowledgedSimple` and
-/// `BoundedSecurityFix` satisfy the gate; `Proposed` is recorded but awaits
-/// human approval and does NOT satisfy it (see
+/// `BoundedSecurityFix` permit source edits. `Proposed` and `PlanOnly` do not (see
 /// [`PlanMarkerKind::satisfies_gate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlanMarkerKind {
+pub enum PlanMarkerKind {
     /// A `docs/plans/` file was written and recorded by the skill, but the
     /// human has not approved it yet. Does NOT satisfy the gate.
     Proposed,
     /// The human approved the proposed plan (the agent ran `planned approve`),
     /// or a legacy row recorded before the approval step existed. Satisfies.
     Planned,
+    /// Approved for later: permits landing plan files alone, never source edits.
+    PlanOnly,
     /// The agent declared this a local fix needing no plan. Satisfies.
     AcknowledgedSimple,
     /// An unattended run (the nightly security pass) is committing a security
@@ -55,10 +58,11 @@ pub(crate) enum PlanMarkerKind {
 impl PlanMarkerKind {
     /// Wire / DB string. Matches the `state` CHECK constraint in
     /// `planned_branches`.
-    pub(crate) fn as_db(&self) -> &'static str {
+    pub fn as_db(&self) -> &'static str {
         match self {
             PlanMarkerKind::Proposed => "proposed",
             PlanMarkerKind::Planned => "planned",
+            PlanMarkerKind::PlanOnly => "plan_only",
             PlanMarkerKind::AcknowledgedSimple => "acknowledged_simple",
             PlanMarkerKind::BoundedSecurityFix => "bounded_security_fix",
         }
@@ -82,41 +86,42 @@ impl PlanMarkerKind {
     /// live example. `CLAUDE.md` makes kebab-case the convention for public API
     /// values, so it is the spelling an agent reaches for. It would record a
     /// gate-satisfying marker with no bound to enforce.
-    pub(crate) fn parse_strict(raw: &str) -> Option<Self> {
+    pub fn parse_strict(raw: &str) -> Option<Self> {
         match raw.trim() {
             "proposed" => Some(PlanMarkerKind::Proposed),
             "planned" => Some(PlanMarkerKind::Planned),
+            "plan_only" => Some(PlanMarkerKind::PlanOnly),
             "acknowledged_simple" => Some(PlanMarkerKind::AcknowledgedSimple),
             "bounded_security_fix" => Some(PlanMarkerKind::BoundedSecurityFix),
             _ => None,
         }
     }
 
-    /// Whether this marker kind satisfies the cc-plan-gate hook and the Apply
-    /// floor. `Proposed` does not — implementation stays blocked until the human
-    /// approves and the marker flips to `Planned`.
-    pub(crate) fn satisfies_gate(&self) -> bool {
+    /// Whether source edits are approved. Plan-only approval never opens this gate.
+    pub fn satisfies_gate(&self) -> bool {
         match self {
             PlanMarkerKind::Planned
             | PlanMarkerKind::AcknowledgedSimple
             | PlanMarkerKind::BoundedSecurityFix => true,
-            PlanMarkerKind::Proposed => false,
+            PlanMarkerKind::Proposed | PlanMarkerKind::PlanOnly => false,
         }
     }
 
     /// Whether this kind carries a file bound the Apply floor must enforce.
-    pub(crate) fn is_file_bounded(&self) -> bool {
+    pub fn is_file_bounded(&self) -> bool {
         matches!(self, PlanMarkerKind::BoundedSecurityFix)
     }
 }
 
-/// `Present` carries which kind of marker exists; `Missing` means no row for
-/// this `(repo, branch)`. `change_ops::PlanFloor` decides what each one means
-/// for a change.
+/// The result of reading the marker and verifying its committed plan revision.
+/// `change_ops::PlanFloor` decides what each state means for a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlanMarkerState {
+pub enum PlanMarkerState {
     Present(PlanMarkerKind),
+    /// An approved plan differs from the version recorded on its marker.
+    Changed,
     Missing,
+    Unreadable,
 }
 
 pub(crate) async fn plan_marker_state(
@@ -124,8 +129,8 @@ pub(crate) async fn plan_marker_state(
     repo_root: &Path,
     branch_name: &str,
 ) -> PlanMarkerState {
-    let stored: Option<String> = match sqlx::query_scalar(
-        "SELECT state FROM planned_branches WHERE repo_root = $1 AND branch_name = $2",
+    let stored: Option<(String, Option<String>, Option<String>, bool)> = match sqlx::query_as(
+        "SELECT state, plan_path, plan_version, carried_without_plan FROM planned_branches WHERE repo_root = $1 AND branch_name = $2",
     )
     .bind(canonical_repo_root(repo_root))
     .bind(branch_name)
@@ -134,13 +139,36 @@ pub(crate) async fn plan_marker_state(
     {
         Ok(v) => v,
         Err(e) => {
-            log!("[Plan] Failed to read planned_branches: {}", e);
-            return PlanMarkerState::Missing;
+            log_legacy!("[Plan] Failed to read planned_branches: {}", e);
+            return PlanMarkerState::Unreadable;
         }
     };
     match stored {
-        Some(s) => PlanMarkerState::Present(PlanMarkerKind::parse(&s)),
+        Some((state, Some(path), Some(version), allow_absence)) => {
+            use super::super::plan_lifecycle::committed_plan_version;
+            let kind = PlanMarkerKind::parse(&state);
+            match committed_plan_version(repo_root, branch_name, &path).await {
+                Ok(Some(current)) if current == version => PlanMarkerState::Present(kind),
+                Ok(None) if allow_absence => PlanMarkerState::Present(kind),
+                Ok(_) => changed_plan_state(kind),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    changed_plan_state(kind)
+                }
+                Err(error) => {
+                    log_legacy!("[Plan] Failed to verify the committed plan: {}", error);
+                    PlanMarkerState::Unreadable
+                }
+            }
+        }
+        Some((state, _, _, _)) => PlanMarkerState::Present(PlanMarkerKind::parse(&state)),
         None => PlanMarkerState::Missing,
+    }
+}
+
+fn changed_plan_state(kind: PlanMarkerKind) -> PlanMarkerState {
+    match kind {
+        PlanMarkerKind::Planned | PlanMarkerKind::PlanOnly => PlanMarkerState::Changed,
+        _ => PlanMarkerState::Missing,
     }
 }
 
@@ -148,7 +176,7 @@ pub(crate) async fn plan_marker_state(
 /// Surfaced to the agent as the HTTP 400 body, so each variant's text is what
 /// the agent reads and acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PlanMarkerRejection {
+pub enum PlanMarkerRejection {
     /// A bounded security fix named no files, so there is no bound to enforce.
     BoundedFixNeedsFiles,
     /// A bounded security fix named more files than the lane allows.
@@ -191,7 +219,7 @@ impl std::error::Error for PlanMarkerRejection {}
 /// that tells the agent what to do instead. A raw constraint violation reads as
 /// an internal error and teaches nothing.
 /// Returns the CLEANED list to store, so no caller can record the raw one.
-pub(crate) fn validate_plan_files(
+pub fn validate_plan_files(
     kind: PlanMarkerKind,
     files: &[String],
 ) -> Result<Vec<String>, PlanMarkerRejection> {
@@ -227,7 +255,7 @@ pub(crate) fn validate_plan_files(
 /// `files` is the bound a `BoundedSecurityFix` is confined to and must be empty
 /// for every other kind; [`validate_plan_files`] is the arm that says so.
 #[allow(clippy::too_many_arguments)] // one arg per planned_branches column, plus the pool
-pub(crate) async fn record_planned(
+pub async fn record_planned(
     pool: &sqlx::PgPool,
     repo_root: &Path,
     branch_name: &str,
@@ -237,28 +265,110 @@ pub(crate) async fn record_planned(
     files: &[String],
     head_sha: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let files = validate_plan_files(kind, files)?;
-    // NULL rather than an empty array for the unbounded kinds, so the schema's
-    // pairing constraint can tell "no bound" from "an empty bound".
-    let files: Option<Vec<String>> = kind.is_file_bounded().then_some(files);
-    sqlx::query(
-        "INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, reason, files, head_sha, planned_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
-         ON CONFLICT (repo_root, branch_name) DO UPDATE SET \
-            state = EXCLUDED.state, plan_path = EXCLUDED.plan_path, \
-            reason = EXCLUDED.reason, files = EXCLUDED.files, \
-            head_sha = EXCLUDED.head_sha, planned_at = NOW()",
+    record_planned_with_kind(
+        pool,
+        repo_root,
+        branch_name,
+        kind,
+        plan_path,
+        reason,
+        files,
+        head_sha,
+        crate::engine::thread_events::PlanKind::Implementation,
     )
-    .bind(canonical_repo_root(repo_root))
-    .bind(branch_name)
-    .bind(kind.as_db())
-    .bind(plan_path)
-    .bind(reason)
-    .bind(files)
-    .bind(head_sha)
-    .execute(pool)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // one arg per marker column, plus the pool
+pub async fn record_planned_with_kind(
+    pool: &sqlx::PgPool,
+    repo_root: &Path,
+    branch_name: &str,
+    kind: PlanMarkerKind,
+    plan_path: Option<&str>,
+    reason: Option<&str>,
+    files: &[String],
+    head_sha: &str,
+    plan_kind: crate::engine::thread_events::PlanKind,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    PlanMarkerWrite::new(
+        repo_root,
+        branch_name,
+        kind,
+        plan_path,
+        reason,
+        files,
+        head_sha,
+        plan_kind,
+    )?
+    .write(pool)
     .await?;
     Ok(())
+}
+
+/// A validated marker write, usable in a thread event transaction.
+pub struct PlanMarkerWrite {
+    root: String,
+    branch: String,
+    kind: PlanMarkerKind,
+    path: Option<String>,
+    reason: Option<String>,
+    files: Option<Vec<String>>,
+    head: String,
+    plan_kind: crate::engine::thread_events::PlanKind,
+}
+
+impl PlanMarkerWrite {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        root: &Path,
+        branch: &str,
+        kind: PlanMarkerKind,
+        path: Option<&str>,
+        reason: Option<&str>,
+        files: &[String],
+        head: &str,
+        plan_kind: crate::engine::thread_events::PlanKind,
+    ) -> Result<Self, PlanMarkerRejection> {
+        let files = validate_plan_files(kind, files)?;
+        Ok(Self {
+            root: canonical_repo_root(root),
+            branch: branch.into(),
+            kind,
+            path: path.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+            files: kind.is_file_bounded().then_some(files),
+            head: head.into(),
+            plan_kind,
+        })
+    }
+
+    pub fn repo_root(&self) -> &str {
+        &self.root
+    }
+
+    pub async fn write<'e>(self, executor: impl sqlx::PgExecutor<'e>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+        "INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, reason, files, head_sha, kind, planned_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+         ON CONFLICT (repo_root, branch_name) DO UPDATE SET \
+            state = EXCLUDED.state, kind = EXCLUDED.kind, plan_path = EXCLUDED.plan_path, \
+            reason = EXCLUDED.reason, files = EXCLUDED.files, \
+            head_sha = EXCLUDED.head_sha, planned_at = NOW(), \
+            plan_version = NULL, carried_without_plan = FALSE",
+    )
+    .bind(self.root)
+    .bind(self.branch)
+    .bind(self.kind.as_db())
+    .bind(self.path)
+    .bind(self.reason)
+    .bind(self.files)
+    .bind(self.head)
+    .bind(self.plan_kind.as_str())
+    .execute(executor)
+    .await?;
+        Ok(())
+    }
 }
 
 /// The branch `caller_thread`'s Apply lands in `repo_root`, when that is not
@@ -269,7 +379,7 @@ pub(crate) async fn record_planned(
 /// cases read `None`: an external thread, which adopts a renamed branch at idle;
 /// a caller with no session; and a tracked branch absent from `repo_root`. The
 /// last covers a rename, which the next spawn takes over, and another repo.
-pub(crate) async fn tracked_branch_elsewhere(
+pub async fn tracked_branch_elsewhere(
     pool: &sqlx::PgPool,
     repo_root: &Path,
     caller_thread: &str,
@@ -319,44 +429,101 @@ async fn tracked_branch_named_otherwise(
 /// Copy `from_branch`'s marker onto `to_branch`, a legacy successor thread's fresh
 /// branch. The successor carries the same work, so the user's decision on it
 /// carries too. A branch that already holds a marker keeps its own.
-pub(crate) async fn carry_planned(
+pub async fn carry_planned(
     pool: &sqlx::PgPool,
     repo_root: &Path,
     from_branch: &str,
     to_branch: &str,
 ) -> Result<(), sqlx::Error> {
+    copy_plan_marker(pool, repo_root, from_branch, to_branch, None, false).await
+}
+
+async fn copy_plan_marker(
+    pool: &sqlx::PgPool,
+    repo_root: &Path,
+    from_branch: &str,
+    to_branch: &str,
+    checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    child_without_plan: bool,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, reason, files, head_sha, planned_at) \
-         SELECT repo_root, $3, state, plan_path, reason, files, head_sha, NOW() \
+        "INSERT INTO planned_branches (repo_root, branch_name, state, kind, plan_path, reason, files, head_sha, planned_at, plan_version, carried_without_plan) \
+         SELECT repo_root, $3, state, kind, plan_path, reason, files, head_sha, NOW(), plan_version, \
+                CASE WHEN $4::timestamptz IS NULL THEN carried_without_plan ELSE $5 END \
          FROM planned_branches WHERE repo_root = $1 AND branch_name = $2 \
+           AND ($4::timestamptz IS NULL OR planned_at = $4) \
          ON CONFLICT (repo_root, branch_name) DO NOTHING",
     )
     .bind(canonical_repo_root(repo_root))
     .bind(from_branch)
     .bind(to_branch)
+    .bind(checked_at)
+    .bind(child_without_plan)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Whether `path` (repo-relative) is a plan file: what the `implementation-plan`
-/// skill writes, and what the `cc-plan-gate` hook never blocks.
-pub(crate) fn is_plan_file(path: &str) -> bool {
-    path.starts_with("docs/plans/")
+/// Copy only a parent's version-bound implementation marker to a new child.
+pub async fn carry_child_planned(
+    pool: &sqlx::PgPool,
+    repo: &Path,
+    child: uuid::Uuid,
+    branch: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parent: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(child)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let Some((Some(folder), Some(parent_branch))) =
+        super::plan_approval::latest_plan_session(pool, parent).await?
+    else {
+        return Ok(());
+    };
+    let root = canonical_repo_root(repo);
+    if folder.is_empty() || canonical_repo_root(Path::new(&folder)) != root {
+        return Ok(());
+    }
+    let marker: Option<(String, String, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
+        "SELECT plan_path, plan_version, planned_at, carried_without_plan FROM planned_branches \
+         WHERE repo_root = $1 AND branch_name = $2 AND state = 'planned' \
+           AND kind = 'implementation' AND plan_path IS NOT NULL AND plan_version IS NOT NULL",
+    )
+    .bind(&root)
+    .bind(&parent_branch)
+    .fetch_optional(pool)
+    .await?;
+    let Some((path, version, marked_at, parent_without_plan)) = marker else {
+        return Ok(());
+    };
+    use super::super::plan_lifecycle::committed_plan_version;
+    let parent_version = committed_plan_version(repo, &parent_branch, &path).await?;
+    let child_version = committed_plan_version(repo, branch, &path).await?;
+    if (!parent_without_plan && parent_version.is_none())
+        || parent_version.as_ref().is_some_and(|v| v != &version)
+        || child_version.as_ref().is_some_and(|v| v != &version)
+    {
+        return Ok(());
+    }
+    copy_plan_marker(
+        pool,
+        repo,
+        &parent_branch,
+        branch,
+        Some(marked_at),
+        child_version.is_none(),
+    )
+    .await?;
+    Ok(())
 }
 
-/// Whether every file a branch would land is a plan file. An empty list is no
-/// evidence of a plan-only branch.
-pub(crate) fn lands_plan_files_only(landing: &[String]) -> bool {
-    !landing.is_empty() && landing.iter().all(|f| is_plan_file(f))
-}
-
-/// Whether Lucidos-source work must run `/harden` before it may become a
-/// change or merge. A plan has no tests, so hardening runs on the branch that
-/// implements it.
-pub(crate) fn needs_hardening(hardened: bool, landing: &[String]) -> bool {
-    !hardened && !lands_plan_files_only(landing)
-}
+pub(crate) use crate::core::git::needs_hardening;
+pub use crate::core::git::{is_plan_file, lands_plan_files_only};
 
 /// Which of `changed` fall outside the `bound` a `BoundedSecurityFix` named.
 /// An empty result means the branch kept its promise.
@@ -467,58 +634,77 @@ pub(crate) async fn plan_marker_files(
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        log!("[Plan] Failed to read planned_branches.files: {}", e);
+        log_legacy!("[Plan] Failed to read planned_branches.files: {}", e);
         format!("reading the recorded bound failed: {}", e)
     })?;
     Ok(stored.flatten().unwrap_or_default())
 }
 
-/// Approve a `Proposed` plan: flip its state to `Planned` so the gate passes.
-/// Targeted update — only a `proposed` row is flipped, so it never fabricates a
-/// marker on an unplanned branch and never clobbers an `acknowledged_simple`
-/// ack. `plan_path` and `reason` are preserved. `None` means no proposed row:
-/// missing, already planned, or simple. Called by the
-/// `/api/v1/internal/approve-plan` endpoint that `lucidos planned approve`
-/// POSTs to.
-///
-/// A proposed row flips only on the user's own approval, which
-/// [`user_approved_plan`] reads from the caller's thread or the branch's.
+/// Approve a proposed plan for its recorded kind. A design always stays plan-only.
+/// Requires the user's own approval on the owning thread. Missing or settled
+/// markers return `None`; only a proposed marker transitions.
 pub(crate) async fn approve_plan(
     pool: &sqlx::PgPool,
     repo_root: &Path,
     branch_name: &str,
     caller_thread: Option<&str>,
 ) -> Result<Option<ApprovedPlan>, PlanApprovalError> {
-    let proposed: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM planned_branches \
-         WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed')",
-    )
-    .bind(canonical_repo_root(repo_root))
-    .bind(branch_name)
-    .fetch_one(pool)
-    .await
-    .map_err(PlanApprovalError::Unreadable)?;
-    if !proposed {
+    approve_plan_for(pool, repo_root, branch_name, caller_thread, false).await
+}
+
+pub(crate) async fn approve_plan_for(
+    pool: &sqlx::PgPool,
+    repo_root: &Path,
+    branch_name: &str,
+    caller_thread: Option<&str>,
+    plan_only: bool,
+) -> Result<Option<ApprovedPlan>, PlanApprovalError> {
+    let kind: Option<String> = sqlx::query_scalar(
+        "SELECT kind FROM planned_branches WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed'",
+    ).bind(canonical_repo_root(repo_root)).bind(branch_name).fetch_optional(pool).await
+        .map_err(PlanApprovalError::Unreadable)?;
+    let Some(kind) = kind else {
         return Ok(None);
+    };
+    let target = match (kind.as_str(), plan_only) {
+        (_, true) => ApprovalTarget::PlanForLater,
+        ("design", false) => ApprovalTarget::Design,
+        (_, false) => ApprovalTarget::Implementation,
+    };
+    if target == ApprovalTarget::Implementation {
+        user_approved_plan(pool, repo_root, branch_name, caller_thread).await?;
+    } else {
+        user_approved_plan_for(pool, repo_root, branch_name, caller_thread, target).await?;
     }
-    user_approved_plan(pool, repo_root, branch_name, caller_thread).await?;
+    let plan_only = target != ApprovalTarget::Implementation;
+    let marker = if plan_only {
+        PlanMarkerKind::PlanOnly
+    } else {
+        PlanMarkerKind::Planned
+    };
     let row: Option<(Option<String>,)> = sqlx::query_as(
-        "UPDATE planned_branches SET state = 'planned', planned_at = NOW() \
-         WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed' \
+        "UPDATE planned_branches SET state = $3, planned_at = NOW() \
+         WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed' AND kind = $4 \
          RETURNING plan_path",
     )
     .bind(canonical_repo_root(repo_root))
     .bind(branch_name)
+    .bind(marker.as_db())
+    .bind(kind)
     .fetch_optional(pool)
     .await
     .map_err(PlanApprovalError::Unreadable)?;
-    Ok(row.map(|(plan_path,)| ApprovedPlan { plan_path }))
+    Ok(row.map(|(plan_path,)| ApprovedPlan {
+        plan_path,
+        plan_only,
+    }))
 }
 
-/// A plan [`approve_plan`] flipped, with the file the CLI marks approved.
+/// A plan the engine approved, with its landing and implementation scope.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ApprovedPlan {
+pub struct ApprovedPlan {
     pub plan_path: Option<String>,
+    pub plan_only: bool,
 }
 
 /// Delete the plan record once its change applied, alongside
@@ -536,7 +722,7 @@ pub(crate) async fn consume_plan_marker(pool: &sqlx::PgPool, repo_root: &Path, b
     .execute(pool)
     .await
     {
-        log!(
+        log_legacy!(
             "[Plan] Failed to delete planned_branches row for {}: {}",
             branch_name,
             e

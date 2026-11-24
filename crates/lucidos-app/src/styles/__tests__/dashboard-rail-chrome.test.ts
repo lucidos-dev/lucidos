@@ -1,10 +1,3 @@
-/**
- * The dashboard rail's chrome reads like the panes beside it. Its toggle is one
- * control that holds the window's corner in both rail states.
- *
- * Source scans, like `header-drawer-toggle-pinned.test.ts`: a fade, a second
- * position property or a hairline is a fact of the sheet.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -21,7 +14,6 @@ const styles = (rel: string): string => readFileSync(resolve(stylesDir, rel), 'u
 const railCss = styles('panels/dashboard.css');
 const shellCss = styles('panels/shell.css');
 
-/** The one rule with this exact selector. */
 function rule(css: string, selector: string): CssRule {
   const found = cssRules(css).filter(r => r.selector === selector);
   expect(found.length, `expected exactly one \`${selector}\` rule`).toBe(1);
@@ -33,7 +25,6 @@ describe('the rail reads like the panes', () => {
     const split = rule(shellCss, '.split-divider').props;
     const band = rule(railCss, '.dashboard-rail-divider').props;
     expect(band.get('width')).toBe(split.get('width'));
-    // One solid colour from the window's top edge down: no clear header stretch.
     expect(band.get('background')).toBe(split.get('background'));
     expect(band.get('top')).toBe('0');
     expect(band.get('bottom')).toBe('0');
@@ -44,7 +35,6 @@ describe('the rail reads like the panes', () => {
       r => r.selector.includes('.dashboard-rail-toggle-slot .icon-btn') && r.props.has('color'),
     );
     expect(colour?.props.get('color')).toBe('var(--header-fg-muted)');
-    // Shown, the toggle sits on the rail's own head, not the blue bar.
     expect(colour?.selector).toContain(':not([data-dashboard-rail])');
   });
 
@@ -59,8 +49,6 @@ describe('the rail reads like the panes', () => {
 });
 
 describe('a window-framed reader of the divider leaves the rail\'s room out', () => {
-  // In the header, `--divider-x`'s 100% is the header, which the rail already
-  // shrank. In a `position: fixed` box it is the whole window.
   it('takes the rail\'s share off --divider-x for the window frame', () => {
     const root = cssRules(shellCss).find(r => r.selector === ':root' && r.props.has('--divider-x'))!.props;
     expect(root.get('--divider-x-in-window')).toBe('calc(var(--divider-x) - var(--sr) * var(--dashboard-rail-room))');
@@ -104,7 +92,6 @@ describe('the rail toggle is one control in the window corner', () => {
       shellCss,
       ':root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) .app-header .content-header-elements',
     ).props;
-    // Padding, never a moved `right`, so the centred title holds still.
     expect(docked.has('right')).toBe(false);
     expect(docked.get('padding-right')).toBe('calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap))');
   });
@@ -136,10 +123,7 @@ describe('with the Canvas hidden, the toggle takes a slot in the Conversation ro
 
   it('keeps room at the row\'s trailing end, which the action collapse reads', () => {
     const row = rule(shellCss, `${DOCKED_IN_CHAT} .app-header .pane-header-brand`).props;
-    // Padding, as the Canvas row does: the centred brand holds still, and
-    // `useHeaderActionCollapse` folds the actions short of it.
     expect(row.has('right')).toBe(false);
-    // Both rows reach the edge and keep controls inset with padding.
     expect(rule(shellCss, '.app-header .content-header-elements').props.get('right')).toBe('0');
     expect(row.get('padding-right')).toBe('calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap))');
   });
@@ -161,7 +145,6 @@ describe('with the Canvas hidden, the toggle takes a slot in the Conversation ro
     const root = cssRules(shellCss).find(r => r.selector === ':root' && r.props.has('--brand-trail-end'))!.props;
     const docked = rule(shellCss, DOCKED_IN_CHAT).props;
     const { boxes, gaps } = terms(root.get('--brand-trail-end'))!;
-    // The row's padding is the header's own, as the slot's padding above says.
     expect(terms(docked.get('--brand-trail-end'))).toEqual({ pad: 'var(--header-padding-x)', boxes: boxes + 1, gaps: gaps + 1 });
   });
 });

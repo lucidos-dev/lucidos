@@ -22,35 +22,34 @@
 mod agent_surface;
 mod background_task;
 mod dispatcher;
-pub(crate) mod keep_alive;
+pub mod keep_alive;
 mod pending_wake;
 mod ping_plan;
 mod register;
 mod remembered_requests;
 mod wait_durations;
 
-pub(crate) use agent_surface::CancelEventWaitOutcome;
-pub(crate) use background_task::{OwnerTurn, StoppedTask};
+pub use agent_surface::CancelEventWaitOutcome;
 pub(crate) use keep_alive::KeepAliveBeats;
 /// Re-exported so the expected wake decision's tests can build a pending wake.
-#[cfg(test)]
-pub(crate) use keep_alive::WaitAgent;
-pub(crate) use pending_wake::PendingWake;
-#[cfg(test)]
-pub(crate) use pending_wake::{MissedEstimate, PendingChild, PendingWait};
+#[cfg(any(test, feature = "test-support"))]
+pub use keep_alive::WaitAgent;
+pub use pending_wake::PendingWake;
 pub(crate) use ping_plan::ReEstimates;
+pub(crate) use register::describe_subscriptions;
+pub use register::AwaitEventOutcome;
 /// Re-exported so the knowhow pins in `engine::value_pins_tests` can read it.
-#[cfg(test)]
-pub(crate) use register::MAX_LIVE_WAITS_PER_THREAD;
+#[cfg(any(test, feature = "test-support"))]
+pub use register::MAX_LIVE_WAITS_PER_THREAD;
 /// Re-exported so the `await_event` schema's `maximum` is the cap the refusal
 /// uses.
-pub(crate) use register::MAX_TIMEOUT_SECS;
-pub(crate) use register::{describe_subscriptions, AwaitEventOutcome};
-/// Re-exported so the `await_event` tool description interpolates the real cap.
-/// A restated number would silently drift from the refusal the model hits.
+pub use register::MAX_TIMEOUT_SECS;
 pub(crate) use register::{MAX_RECENT_SUBSCRIPTIONS, RECENT_SUBSCRIPTION_WINDOW_SECS};
 pub(crate) use remembered_requests::RememberedRequests;
 pub(crate) use wait_durations::WaitDurationsCache;
+pub use {background_task::OwnerTurn, background_task::StoppedTask};
+#[cfg(any(test, feature = "test-support"))]
+pub use {pending_wake::MissedEstimate, pending_wake::PendingChild, pending_wake::PendingWait};
 
 use crate::engine::thread_events::not_an_engine_turn_idle_sql;
 use std::collections::HashMap;
@@ -62,7 +61,7 @@ use uuid::Uuid;
 
 use crate::core::event_subscription::{is_subscribable, matchable_payload, EventSubscription};
 use crate::engine::thread_events::{
-    EngineReason, EventMeta, EventWaitOutcome, MessageOrigin, ThreadEvent,
+    BackgroundWaitTiming, EngineReason, EventMeta, EventWaitOutcome, MessageOrigin, ThreadEvent,
 };
 
 /// One live wait, as reconstructed from its `EventWaitStarted`.
@@ -82,6 +81,7 @@ pub struct LiveWait {
     /// answerable, and a derived one would drift the moment a deadline did.
     pub armed_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub background_timing: Option<BackgroundWaitTiming>,
     pub watermark: i64,
 }
 
@@ -115,7 +115,7 @@ impl LiveWait {
     /// the caller reads exactly what went. ADR 0059 records the rejected
     /// re-arm.
     pub fn watches(&self, event_type: &str) -> bool {
-        self.on.iter().any(|sub| sub.event_type == event_type)
+        self.on.iter().any(|sub| sub.matches_type(event_type))
     }
 }
 
@@ -136,6 +136,21 @@ impl LiveWaits {
 
     pub async fn insert(&self, wait: LiveWait) {
         self.inner.write().await.insert(wait.wait_id, wait);
+    }
+
+    /// Update timing only if the wait has not resolved.
+    pub(super) async fn update_timing(
+        &self,
+        wait_id: Uuid,
+        reason: String,
+        expires_at: DateTime<Utc>,
+        background_timing: BackgroundWaitTiming,
+    ) {
+        if let Some(wait) = self.inner.write().await.get_mut(&wait_id) {
+            wait.reason = reason;
+            wait.expires_at = expires_at;
+            wait.background_timing = Some(background_timing);
+        }
     }
 
     /// Remove and return a wait. **The one-shot gate.**
@@ -253,7 +268,13 @@ pub fn is_awaitable_event(event: &ThreadEvent) -> bool {
 macro_rules! unresolved_waits_sql {
     ($($bound:tt)+) => {
         concat!(
-            "SELECT e.aggregate_id::uuid, e.payload, e.sequence, e.created \
+            "SELECT e.aggregate_id::uuid, e.payload || COALESCE(( \
+                 SELECT u.payload FROM events u WHERE u.aggregate = 'thread' \
+                   AND u.aggregate_id = e.aggregate_id AND u.sequence > e.sequence \
+                   AND u.event_type = 'EventWaitTimingUpdated' \
+                   AND u.payload->>'wait_id' = e.payload->>'wait_id' \
+                 ORDER BY u.sequence DESC LIMIT 1 \
+             ), '{}'::jsonb), e.sequence, e.created \
              FROM events e \
              WHERE e.aggregate = 'thread' \
                AND e.event_type = 'EventWaitStarted' \
@@ -299,7 +320,7 @@ pub async fn rebuild_live_waits(
                 waits.insert(wait).await;
                 loaded += 1;
             }
-            None => crate::log!(
+            None => crate::log_legacy!(
                 "[EventWait] Skipped malformed EventWaitStarted payload on thread {} (seq {})",
                 thread_id,
                 sequence,
@@ -325,7 +346,7 @@ pub(crate) async fn settle_restored_waits(
         .await?;
     for (thread_id, payload, sequence, created) in rows {
         let Some(wait) = live_wait_from_payload(thread_id, &payload, sequence, created) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Skipped malformed archived EventWaitStarted on thread {} (seq {})",
                 thread_id,
                 sequence,
@@ -390,6 +411,10 @@ fn live_wait_from_payload(
         reason,
         armed_at,
         expires_at,
+        background_timing: payload
+            .get("background_timing")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
         watermark,
     })
 }
@@ -425,7 +450,11 @@ pub async fn catch_up_from_watermark(
     pool: &sqlx::PgPool,
     wait: &LiveWait,
 ) -> Result<Option<(Uuid, String, Value, usize)>, Box<dyn std::error::Error + Send + Sync>> {
-    let types: Vec<String> = wait.on.iter().map(|s| s.event_type.clone()).collect();
+    let types: Vec<_> = wait
+        .on
+        .iter()
+        .flat_map(EventSubscription::event_type_candidates)
+        .collect();
     if types.is_empty() {
         return Ok(None);
     }
@@ -531,7 +560,10 @@ pub async fn arming_lookback_matches(
     already_delivered: &std::collections::HashSet<Uuid>,
     limit: usize,
 ) -> Result<ArmingLookback, Box<dyn std::error::Error + Send + Sync>> {
-    let types: Vec<String> = on.iter().map(|s| s.event_type.clone()).collect();
+    let types: Vec<_> = on
+        .iter()
+        .flat_map(EventSubscription::event_type_candidates)
+        .collect();
     if types.is_empty() {
         return Ok(ArmingLookback::default());
     }
@@ -544,7 +576,7 @@ pub async fn arming_lookback_matches(
         if pages == ARMING_LOOKBACK_MAX_PAGES {
             // Not silent: a budget nobody can see reads as "the window was
             // empty", which is the wrong conclusion to hand a debugger.
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Arming lookback hit its {ARMING_LOOKBACK_MAX_PAGES}-page budget \
                  for {types:?}; reporting the {} match(es) found so far",
                 found.len(),
@@ -981,7 +1013,7 @@ pub async fn lost_wait_reentries(
             let thread_id = thread_str
                 .parse::<Uuid>()
                 .inspect_err(|_| {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventWait] Skipping lost re-entry on malformed thread id {:?}",
                         thread_str
                     )
@@ -1029,7 +1061,7 @@ pub async fn wait_delivery_names_any(
     {
         Ok(delivered) => delivered,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Delivery probe failed for thread {}: {}. Answering no, \
                  so the caller wakes the thread",
                 thread_id,

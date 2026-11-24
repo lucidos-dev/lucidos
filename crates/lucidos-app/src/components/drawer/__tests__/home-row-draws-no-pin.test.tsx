@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The filtered drawer views (In flight, Blocked, Drafts) still list the
- * home thread when it qualifies. Its row there draws a house and no pin: the
- * engine refuses a pin on Home (ADR 0362).
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { ThreadRow } from '../ThreadDrawer';

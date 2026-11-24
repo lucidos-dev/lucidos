@@ -1,10 +1,3 @@
-/**
- * Tests for CC model/effort per-thread behavior.
- *
- * Model and reasoning effort are per-thread — they come from backend events
- * (CodingAgentSettingsChanged) or the active session, never from cross-thread cache.
- * New threads start with null (no label shown = defaults).
- */
 import { describe, it, expect } from 'vitest';
 
 interface CodingAgentCommandsResponse {
@@ -16,9 +9,6 @@ interface CodingAgentCommandsResponse {
   has_active_session: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Mirror the loadCommands logic from CodingAgentControlMenu.tsx
-// ---------------------------------------------------------------------------
 
 interface State {
   pendingEffort: string | null;
@@ -28,10 +18,6 @@ interface State {
   hasActiveSession: boolean;
 }
 
-/** Simulate loadCommands() — always updates model/effort from backend response.
- *  Clears pending only when the live session has adopted that exact value, so
- *  a stale in-flight fetch can't wipe a pending pick set after the fetch went
- *  out. No cross-thread caching. */
 function handleLoadCommands(state: State, res: CodingAgentCommandsResponse): State {
   const next = { ...state };
   next.hasActiveSession = res.has_active_session;
@@ -48,18 +34,13 @@ function handleLoadCommands(state: State, res: CodingAgentCommandsResponse): Sta
   return next;
 }
 
-/** Mirror currentValueLabel() — pending overrides backend value. */
 function currentValueLabel(state: State, field: 'effort' | 'model'): string | null {
   if (field === 'effort') return state.pendingEffort ?? state.currentEffort;
   return state.pendingModel ?? state.currentModel;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe('CC model/effort: per-thread, no cross-thread cache', () => {
-  // Fresh thread — no prior state
   const freshState: State = {
     pendingEffort: null,
     pendingModel: null,
@@ -88,13 +69,11 @@ describe('CC model/effort: per-thread, no cross-thread cache', () => {
   });
 
   it('null response clears stale values (thread switch)', () => {
-    // Thread A had values
     const threadA: State = {
       ...freshState,
       currentModel: 'opus[1m]',
       currentEffort: 'max',
     };
-    // Switch to thread B — backend returns null (no Claude Code session, no events)
     const res: CodingAgentCommandsResponse = {
       control_commands: [],
       builtin_commands: [],
@@ -158,26 +137,6 @@ describe('CC pending preferences survive until session confirms', () => {
   });
 
   it('pending preserved when active-session response carries a different value (stale fetch race)', () => {
-    // Regression: cc-mid-session-settings.spec.ts on mobile-webkit. Reproduced
-    // in isolation against a fresh workspace.
-    // Sequence:
-    //   1. First CC turn ran with effort='high' (chat default), session
-    //      emitted CodingAgentSettingsChanged{high}; loadCommands fired and
-    //      cached current_reasoning_effort='high'.
-    //   2. The 1st-turn loadCommands fetch returned has_active_session=true
-    //      from when the session was still in the agent_sessions map (before
-    //      the idle-exit removed it). The response is in flight.
-    //   3. CC idled, session removed. The user clicks the CC menu, picks
-    //      Reasoning → Max, which sets pendingEffort='max'.
-    //   4. The stale in-flight fetch from step 2 lands. Old logic cleared
-    //      pendingEffort because has_active_session=true, even though the
-    //      response's current_reasoning_effort='high' didn't match.
-    //   5. sendMessage built the body with pendingEffort=null → fell back to
-    //      the default 'high' → backend spawned the follow-up with 'high'.
-    //   6. The test asserted current_reasoning_effort='max' → "Received: high".
-    // Fix: only clear pending when the response's value actually matches the
-    // pending pick, so a stale fetch can't wipe an intent set after it went
-    // out.
     let state: State = { ...freshState, pendingEffort: 'max', pendingModel: 'haiku' };
     const staleRes: CodingAgentCommandsResponse = {
       control_commands: [],
@@ -195,8 +154,6 @@ describe('CC pending preferences survive until session confirms', () => {
   });
 
   it('only the matching pending field clears when the response confirms one but not the other', () => {
-    // pendingEffort matches but pendingModel doesn't — half-adopted. Wiping
-    // both would lose the model pick the user still expects to take effect.
     let state: State = { ...freshState, pendingEffort: 'max', pendingModel: 'haiku' };
     const partialRes: CodingAgentCommandsResponse = {
       control_commands: [],
@@ -222,7 +179,6 @@ describe('CC model/effort from thread events (no active session)', () => {
   };
 
   it('existing thread with CodingAgentSettingsChanged events shows stored values', () => {
-    // Backend returns values from CodingAgentSettingsChanged events for this thread
     const res: CodingAgentCommandsResponse = {
       control_commands: [],
       builtin_commands: ['help'],
@@ -237,7 +193,6 @@ describe('CC model/effort from thread events (no active session)', () => {
   });
 
   it('values update when backend returns different thread settings', () => {
-    // First load — thread A settings
     let state = handleLoadCommands(freshState, {
       control_commands: [],
       builtin_commands: [],
@@ -246,7 +201,6 @@ describe('CC model/effort from thread events (no active session)', () => {
       current_reasoning_effort: 'high',
       has_active_session: false,
     });
-    // Switch to thread B — different settings from events
     state = handleLoadCommands(state, {
       control_commands: [],
       builtin_commands: [],

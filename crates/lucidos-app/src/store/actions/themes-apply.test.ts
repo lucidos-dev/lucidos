@@ -1,7 +1,3 @@
-/**
- * The shell's theme layer: which inline tokens land on <html>, and in what
- * order against the theme and the style overrides.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
 import {
@@ -251,7 +247,6 @@ describe('the active theme', () => {
       const swapping = () => attributes.has('data-theme-swap');
       applyThemeMode('light');
       expect(swapping()).toBe(true);
-      // The browser paints the swap after the first frame's callbacks.
       frames.shift()!(0);
       expect(swapping()).toBe(true);
       frames.shift()!(0);

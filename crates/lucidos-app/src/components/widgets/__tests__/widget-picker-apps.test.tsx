@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A dashboard's Add lists the installed apps under the reusable widgets, and a
- * pick adds an app shortcut. A dashboard leaves out an app it already shows.
- */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

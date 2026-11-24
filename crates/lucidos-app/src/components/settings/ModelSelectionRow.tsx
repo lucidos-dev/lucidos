@@ -4,11 +4,6 @@ import type { PickerLink } from '../shared/ModelSelectionPicker';
 import type { ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice, TierChoice } from '../../store/modelSelection';
 
-/** The Settings row for a *model selection*: one label, one field.
- *
- *  ONE control, because a model selection is one thing. Four background
- *  purposes are four rows here, where a Model row plus a Reasoning row made
- *  eight. */
 export function ModelSelectionRow({
   label,
   fieldLabel,
@@ -28,31 +23,19 @@ export function ModelSelectionRow({
   onChange,
 }: {
   label: string;
-  /** The picker's own name, when `label` heads more than the picker. */
   fieldLabel?: string;
-  /** `data-search-anchor` for the row. */
   anchor?: string;
-  /** The row sits under a parent control, so it indents. Layout only. */
   nested?: boolean;
-  /** An `<Explainer>` beside the label, for a row whose choices differ in
-   *  something the model names cannot say. */
   explainer?: ComponentChildren;
-  /** A sentence under the label, for something true of the CURRENT selection
-   *  rather than of the choices. An explainer is folded away behind a tap, so
-   *  it cannot carry a caveat the user has to see. */
   detail?: ComponentChildren;
   models: readonly ModelChoice[];
   vocabulary: readonly TierChoice[];
   model: string;
   effort: string | null;
-  /** The tier the picker opens on for another model. */
   effortFor?: (model: string) => string | null;
-  /** The tier's name when none is in force. */
   unsetEffortLabel?: string;
-  /** Names a Default row that drops the stored tier. */
   defaultEffortLabel?: (model: string) => string;
   disabled?: boolean;
-  /** A last row that navigates instead of picking. */
   link?: PickerLink;
   onChange: (patch: ModelSelectionPatch) => void;
 }) {

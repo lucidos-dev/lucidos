@@ -57,6 +57,116 @@ entry's removal condition should name them).
 
 ## 1. Temporary measures & workarounds
 
+### Manifest tools that run in-process
+
+- **Added:** 2026-11-20
+- **Lives in:** `LEGACY_IN_PROCESS` in
+  `crates/lucidos-agents-api/src/engine/tools/route_dispatch_tests.rs`, and
+  each listed domain's `LlmExecution::LegacyInProcess` in
+  `crates/lucidos-capabilities/src/lib.rs`, with its handler arm in
+  `engine/tools/mod.rs`.
+- **Impermanent because:** A manifest tool runs the route its CLI calls, so
+  a route's gate binds both (ADR 0751). These domains predate that rule and
+  keep hand-written handlers that can drift from their routes.
+- **Removal / resolution condition:** The list is empty. Move one domain at a
+  time. Mark it `Route` and move into a route anything its handler does that
+  the routes lack. Delete the handler, its `tn::` constants and its list
+  name. `only_the_listed_legacy_domains_run_in_process` checks each step.
+- **Status:** `active`. Fifteen domains listed; `models` moved first.
+- **Investigation:** n/a; `docs/plans/2026-11-20-one-gate-for-every-ladder-edit.md` owns it.
+
+### Bootstrap snapshot type is hand-written
+
+- **Added:** 2026-11-19
+- **Lives in:** `BootstrapSnapshot` in
+  `crates/lucidos-app/src/api/client/bootstrap.ts`.
+- **Impermanent because:** No Rust type exists to generate it from. The engine
+  route serializes its slice table and has no snapshot struct. The wire-types
+  crate that generates REST types has not landed (roadmap rank 8).
+- **Removal / resolution condition:** The wire-types crate is on `main` and
+  holds `BootstrapSnapshot`. Then replace the interface with the generated
+  type. Verify with `npm run typecheck` and `wire-types-have-one-spelling.test.ts`.
+- **Status:** `active`. Nothing calls the client module yet.
+- **Investigation:** n/a; `docs/plans/2026-11-19-bootstrap-snapshot.md` owns it.
+
+### Bootstrap 404 fallback
+
+- **Added:** 2026-11-19
+- **Lives in:** the `route-missing` answer of `fetchBootstrap`
+  (`crates/lucidos-app/src/api/client/bootstrap.ts`) and its branch in
+  `createBootstrapRequester` (`store/bootstrapRequester.ts`).
+- **Impermanent because:** A client can be newer than its engine: a remote
+  workspace on an older release, or a build waiting for its switch. Such an
+  engine answers 404, and the client then runs the slice loaders.
+- **Removal / resolution condition:** The oldest engine release a client may
+  reach serves `/api/v1/bootstrap`. Check it against the release counter, then
+  delete the answer and its branch in `pass`. Keep `loadNarrowly` and each
+  table row's `load` and `after`: they also read a slice the snapshot lacks.
+- **Status:** `active`. No released engine serves the route yet, so every
+  released engine is "older".
+- **Investigation:** n/a; `docs/plans/2026-11-19-bootstrap-snapshot.md` owns it.
+
+### Flat release notices for older desktop apps
+
+- **Added:** 2026-11-22.
+- **Lives in:** The release notice route and bootstrap slice. They serve
+  `notices`, `next_id` and the per-item action fields to older frontends.
+  The resolve route also accepts the older first-item answer.
+- **Impermanent because:** A desktop app can bring its own frontend to a newer engine.
+- **Removal condition:** The minimum supported desktop frontend includes the
+  grouped release notices. Remove the legacy fields and single-id answer together.
+- **Status:** active.
+
+### Legacy trigger category grants
+
+- **Added:** 2026-11-19.
+- **Lives in:** Trigger config replay, the command guard's category authorization
+  and migration path, and the conditional trigger program grants release notice.
+- **Impermanent because:** Older workspaces hold category grants. Each covered
+  invocation records a restricted program grant during the migration window.
+- **Removal condition:** Retire category authorization and automatic grant
+  recording on upgrade. Keep historical data for the one-time owner review.
+- **Status:** `removed` on 2026-11-19. The owner chose immediate retirement and explicit
+  approval of programs evidenced by past runs.
+
+### Legacy log lines during typed migration
+
+- **Added:** 2026-11-16
+- **Lives in:** The engine and gateway logging macros and call sites.
+  The shared diagnostic log renderer handles their untyped records (ADR 0717).
+- **Impermanent because:** Legacy sites lack compile-time value classification
+  while the typed `log!` migration proceeds. Maintainer bundles render them
+  as `<unstructured line>` so they cannot expose conversation text.
+- **Removal / resolution condition:** Migrate every engine and gateway site,
+  then delete `log_legacy!`. Verify no references remain with
+  `rg 'log_legacy!' crates/`, and run compile-fail and renderer marker tests.
+- **Status:** `open`; planned for migration, not yet installed.
+- **Investigation:** n/a; the diagnostic-bundle implementation tracks removal.
+
+### Diagnostic fault UI adoption
+
+- **Added:** 2026-11-16
+- **Lives in:** The `InternalFaultRecorded` and `DiagnosticBundleSent` rows in
+  `crates/lucidos-app/src/store/actions/sse-event-coverage.test.ts`.
+- **Impermanent because:** Phase 6 installs the persisted fault signal before
+  phase 10 installs the Debugging count and report UI. No current shell surface
+  holds either state.
+- **Removal / resolution condition:** In diagnostic-bundle phase 10, wire both
+  events to the Debugging view's refresh signal, including SSE gap recovery,
+  and remove both `NO_UI_STATE` rows. Verify the count changes on a fault and
+  resets only after a successful send, including reconnects.
+- **Status:** `active`.
+- **Investigation:** n/a; the approved diagnostic-bundle plan owns adoption.
+
+### Saved-draft approval availability
+
+- **Added:** 2026-11-11
+- **Lives in:** `api/thread_reach.rs::proposable` and `api/owner_approval.rs::checked_request`.
+- **Impermanent because:** The typed saved-draft service has no supported transport yet. An approval card would promise an unavailable action.
+- **Removal / resolution condition:** Wire the shared service to HTTP, tool and CLI surfaces under ADR 0651. Verify ordinary-send serialization and transport authorization before enabling approvals.
+- **Status:** `resolved` 2026-11-13. HTTP, the `threads` tool and the CLI now share `DraftSubmissionService::submit_as_agent`, and `submit-draft` cards are proposable.
+- **Investigation:** n/a
+
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 ### Undo key monitor for URL previews
@@ -82,7 +192,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   in `crates/lucidos-engine/src/engine/event_wait/keep_alive.rs`;
   `Remembered::PrefillPaused` in the adjacent `remembered_requests.rs`;
   `CacheKeepAliveNotKeptReason::PrefillPaused` in
-  `crates/lucidos-engine/src/engine/thread_events/keep_alive_status.rs`;
+  `crates/lucidos-core/src/engine/thread_events/keep_alive_status.rs`;
   and its text in `crates/lucidos-app/src/components/chat/CacheKeepAlive.tsx`.
 - **Impermanent because:** prefill beats missed caches that real requests read.
   A live probe proved the cause: the old cut sorted the request's JSON keys,
@@ -103,7 +213,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-10-26
 - **Lives in:** `crates/lucidos-engine/src/engine/event_wait/prefill_order_probe.rs`;
-  its route in `crates/lucidos-engine/src/api/claude_gateway.rs`;
+  its route in `crates/lucidos-agents-api/src/api/claude_gateway.rs`;
   `lucidos claude-gateway probe-prefill-order` in `crates/lucidos-cli/src/main.rs`
   and `claude_gateway.rs`; its section in `system-knowhow/lucidos-cli.md`.
   `ContextPurpose::PrefillProbe` stays after removal, so its rows still read.
@@ -294,6 +404,41 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** `active`.
 - **Investigation:** none.
 
+### Loopback TLS device cut
+
+- **Added:** 2026-11-19
+- **Lives in:** `cut_devices_once` in
+  `crates/lucidos-gateway/src/gateway_event_log.rs`, called at boot in
+  `server.rs`, and its tests in `gateway_event_log_tests.rs`.
+- **Impermanent because:** loopback moved to https with a hardened device
+  cookie (ADR 0745). Every device paired before that holds a credential the
+  new rules would not have minted, so the first boot revokes them all once.
+  A gateway that already ran the cut has its marker and skips it.
+- **Removal / resolution condition:** the oldest release a user can upgrade
+  from carries ADR 0745. Lucidos records no upgrade floor today. Remove once
+  one exists in the tree and sits at or above the release that ships this.
+  Delete the function, its boot call, its tests and `DEVICE_CUT_MARKER`.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### Respawn engines older than the https loopback
+
+- **Added:** 2026-11-20
+- **Lives in:** `LOOPBACK_TLS` in
+  `crates/lucidos-gateway-stamp/src/workspace_client.rs`, read by
+  `calls_gateway_over_tls` in `crates/lucidos-gateway/src/stack.rs`, and
+  `keyless_until_respawned` in `boot_all` in `server.rs`, with their tests.
+- **Impermanent because:** an engine built before ADR 0745 calls its gateway
+  over plain loopback http, and the new gateway answers with a 301. A gateway
+  reload hands every engine its key, so no idle re-key replaces the other
+  workspaces' engines. Dropping the key of an engine that lacks the capability
+  respawns it once idle.
+- **Removal / resolution condition:** the same upgrade floor as the loopback
+  TLS device cut above. Remove `keyless_until_respawned`, its boot call and
+  `calls_gateway_over_tls`. Keep the capability: it costs nothing.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ### Left-packed button rows awaiting the sweep
 
 - **Added:** 2026-10-03
@@ -377,6 +522,21 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** `removed` 2026-09-27. The `replace` is gone, and the pinning
   test now asserts a header's `>` survives with no handler after linkifying.
 
+### Client probe audit evidence
+
+The [client probe pass](investigations/2026-11-21-client-probe-pass.md)
+records the current evidence and runtime costs. For the client rows below,
+a recorded audit must name the build, device/browser, exercised scenarios,
+sample count, observations and verdict. Record sanitized findings, never raw
+user content. Cite the fix or upstream attribution and its verification.
+A quiet log, elapsed time, or absence of open readers alone proves nothing.
+
+For a usage-window condition, record the window and positive exercise of the
+affected interaction, including the expected diagnostic coverage. An unobserved
+interaction is not a passing sample. Close the named investigation explicitly.
+Before deleting shared helpers, search current callers and preserve consumers
+outside the retired probe.
+
 ### Focused-field reveal probe
 
 - **Added:** 2026-09-19
@@ -406,7 +566,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Lives in:** `crates/lucidos-app/src/utils/pageHealthLog.ts` (the
   counters), `pageHealthLog.report.ts` (the reporter), their test, and
   `pageHealthLog.install.ts`. `main.tsx` imports the install file second, and
-  `shellStartup.ts` calls `startPageHealthLog`.
+  `shellStartup.ts` calls `startPageHealthLog`. Resource/crash diagnostics also
+  live in `utils/crashMonitor.ts`, `pageResources.ts`, `crashBreadcrumbs.ts`, `crashStorage.ts`
+  and their tests. `liveness.ts` calls `recoveredStartup`.
 - **Impermanent because:** pure telemetry chasing a bug. On the iOS PWA, text
   editing degrades over a long session: the edit menu (Paste) mostly stops
   opening and caret moves lag, in the composer and in Search Everywhere alike. A
@@ -416,13 +578,43 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   main-thread lag, frame rate, animation-frame calls, DOM size, animations,
   live listeners, intervals and observers. The lines land in
   `~/.lucidos/gateway/gateway.log`; `docs/client-logs.md` covers reading them.
-- **Removal / resolution condition:** the trend across a degraded session
-  names the cause and that cause is fixed, or two months pass with no episode.
+  The resource diagnostics investigate crash-reloads as well: bounded local
+  samples survive a kill and attach to likely-crash startup reports.
+  The heartbeat records the last hide without moving its last visible time.
+  Records hold the document start, omit zero sample fields, and retain the
+  latest hide state (hidden, pagehide, or persisted pagehide), with reads in flight.
+  Worker marks record ping, pong, restart, controller change, update call,
+  update found, and unregister. They add no ping or timer.
+  Thread-open uses two-second sampling for twenty seconds.
+  Wake uses 500 ms sampling for fifteen seconds while visible, then the existing cadence.
+  Coalesced transcript/resource-mount samples cover early crash-reloads.
+
+  Build stamps distinguish the writer from the reporting bundle.
+  Immediate wake, stream, admission, iframe-load and transcript marks identify resume work.
+  Samples add request count, oldest age and collection cost, without request paths.
+  Widget SDK frames report bounded media and image counts on resource changes.
+  The host sums mounted frames as `frameVideoLoaded`, `frameVideoPixels` and `frameImagePixels`.
+  `uniqueImagePixels` deduplicates host images by URL; `imagePixels` counts every draw.
+  Reports contain no resource paths. Removed frames stop contributing.
+  This also lives in SDK `widgetResources.ts`, host `utils/frameResources.ts`
+  and `store/actions/widget-frame-bridge.ts`.
+  Samples are evicted before events within the existing byte caps.
+  The latest wake, stream, admission, hide and worker marks survive mount churn.
+  A shared capture guard preserves the prior document before either startup path writes.
+- **Removal / resolution condition:** remove the death diagnostics when each
+  death class has a cause or a fix, checked with phone logs.
+  Verify through a per-workspace diagnostic audit.
+
+  Resolve both the editing degradation and crash-reload investigations before removing their shared reporter. For editing,
+  the trend across a degraded session
+  names the cause and that cause is fixed in a recorded audit.
   Verify by confirming no open work reads the line. Then delete both modules,
   the test, the install file, its import in `main.tsx`, and the call in
-  `shellStartup.ts`.
+  `shellStartup.ts`. Remove the resource/crash utilities and tests, and
+  unwrap `recoveredStartup` in `liveness.ts`, retaining its startup fields.
+  Verify removal from the tree and a per-workspace diagnostic audit.
 - **Status:** active
-- **Investigation:** none.
+- **Investigation:** iOS PWA crash-reloads and editing degradation.
 
 ### App frame load probe
 
@@ -440,11 +632,16 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   then `slow load ended` or `slow load abandoned`. A fast frame writes nothing.
   `docs/client-logs.md` covers reading them.
 - **Removal / resolution condition:** a logged phone episode names the cause and
-  that cause is fixed, or two months pass with no `slow load` line from a
-  phone. Verify by confirming no open work reads the line. Then delete the
-  probe, the resume clock, the requests-in-flight tracker, the lanes snapshot,
-  their tests, and the wiring in `AppFrame.tsx`, `_core.ts`,
+  that cause is fixed, verified by a recorded phone resume/load audit. Then delete the
+  probe. Delete the resume clock, requests-in-flight tracker and lanes snapshot only
+  when caller searches prove they have no remaining consumers. Remove only
+  retired helpers’ tests and wiring in `AppFrame.tsx`, `_core.ts`,
   `app-bridge.ts` and `shellStartup.ts`.
+- **Evidence so far:** six desktop WebKit episodes and none from a phone. The
+  four with engine records reached their workspace through the gateway relay,
+  and the frame's requests queued behind the shell's reads. The stage that
+  admits one request at a time is not identified. Frame timing from an
+  older build is unreliable, and `docs/client-logs.md` says how to tell.
 - **Status:** active
 - **Investigation:** none.
 
@@ -465,8 +662,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   box moved, by how much, and what held focus.
 - **Removal / resolution condition:** a reported episode produces a
   `[Client/shell-scroll]` line that names the trigger, and that trigger is fixed
-  at its source. Or two months pass with no line in a tester's gateway log.
-  Verify by confirming no open work reads the line. Then delete the module, its
+  at its source, verified by a recorded packaged-macOS audit. Then delete the module, its
   test, the `reportShellSnapBack` call in `shellStartup.ts`, and the
   `shell-scroll` entry in `docs/client-logs.md`.
 - **Status:** active
@@ -487,9 +683,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   viewport units, to tell a wrong write from a wrong WebKit reading (ADR 0610).
 - **Removal / resolution condition:** the user confirms the always-on dynamic
   bars header on device (ADR 0553), and no iOS shell-height report is open
-  (ADR 0610). Or two months pass with no `[Client/safe-area]` line read by open
-  work.
-  Verify by confirming no open work reads the line. Then delete the module, its
+  (ADR 0610). Record the on-device header and shell-height audit with its verdict. Then delete the module, its
   test, both calls in `safeAreaFloor.ts`, and the `safe-area` entry in
   `docs/client-logs.md`.
 - **Status:** active
@@ -524,9 +718,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   landed while the finger was down. A lone neutral action is now a tap on the
   whole card (the *toast tap*), so the probe logs a card press as `toast body`.
 - **Removal / resolution condition:** a reported episode produces a
-  `[Client/toast-press]` line that names the cause, and that cause is fixed. Or
-  two months pass with no episode reported. Verify by confirming no open work
-  reads the line, then delete the module, its test and the install call.
+  `[Client/toast-press]` line that names the cause, and that cause is fixed.
+  A recorded iOS-PWA audit verifies the fix and closes the diagnosis. Then delete the module, its test and the install call.
 - **Status:** active
 
 ### Dead-press probe on the composer's action row
@@ -543,8 +736,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   All of `src/components/layout/keyboardCloseRelayout.ts` is part of it since
   ADR 0262, with `src/components/layout/__tests__/keyboard-close-relayout.test.ts`.
   So are its callers in `MobileSwipeContainer.tsx` and the viewport poll gated
-  there on **Perf instrumentation**. The relayout answered a stale-layout theory
-  that ADR retired.
+  there on the explicit device opt-in for **Perf instrumentation**. The relayout
+  answered a stale-layout theory that ADR retired.
 - **Impermanent because:** It chases one bug and produces no feature. On an iOS
   PWA the composer's buttons go dead now and then, wherever the finger presses,
   until the keyboard is dismissed. Six reports so far, each able to say only
@@ -684,16 +877,17 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `poll` is the reading worth hunting: it says the page was never told the keys
   went. Every other signal here arrives as an event, so nothing else can tell
   "the platform delivered nothing" from "nothing happened". The poll runs only
-  with **Perf instrumentation** on, so its absence on a default phone says
-  nothing either way.
+  with the explicit device opt-in. Automatic perf sampling on from-source
+  installs leaves the poll off unless that opt-in is set.
 
   **`fingers` and `fingersAtLift` count the contacts on the glass.** The first
   is the running maximum while the press was armed, and the second is what was
   still down at the lift. Anything but one and zero is a gesture WebKit owes no
   click to, and it writes `multi-touch` rather than `dead`.
-- **Removal / resolution condition:** Three weeks of normal phone use since
-  ADR 0262 named the cause, with no dead-Send report that autocorrect cannot
-  explain. With the Autocorrect switch off, every dead Send is such a report.
+- **Removal / resolution condition:** A recorded phone audit verifies the fixes for
+  autocorrect, cancelled taps and touch delivery across Send and Cancel,
+  with the keyboard both up and down. Record each outcome and close the diagnosis.
+  With Autocorrect off, any dead Send reopens it.
   With it on, a report counts when autocorrect had not just changed a word
   above Send.
   A report like that reopens the diagnosis instead. Then delete everything
@@ -1007,8 +1201,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   taps lost this way. That is a fix, not part of this probe, so the removal
   keeps it. The probe's cancel arm now rules a task later, so a served cancel
   logs `served` and raises no toast.
-- **Status:** `active` for the quiet period the removal condition names, now
-  that the cause is known.
+- **Status:** `active`; the recorded audit required above is not yet present.
 - **Neither relayout survives the removal.** They answered a stale-layout theory
   ADR 0262 retires, so the typing-driven relayout is deleted rather than moved.
   That is `liveCommitFace`, `commitFace`, `shouldNudgeUntouched`,
@@ -1047,7 +1240,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   line carries the verdict, the lengths involved, and the same viewport block a
   press line does, so the two read side by side.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
-  the fix that verdict points at ships, OR two months pass with no report. Then
+  the fix that verdict points at ships and passes a recorded on-device typing audit. Then
   delete the module, its install call, and the test. Verify with a tree-wide
   search for `deadKeystrokeProbe`, which must return nothing.
 - **Investigation:** none, same as the press probe. The plan behind it is
@@ -1099,7 +1292,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `packages/lucidos-sdk/src/textEntry.ts` and its cases in
   `textEntry.test.ts`. The host store and the SDK's app-frame stamp both read
   it. Also the `default` of the
-  `autocorrect` entry in `crates/lucidos-engine/src/core/preference_catalog.rs`,
+  `autocorrect` entry in `crates/lucidos-core/src/core/preference_catalog.rs`,
   with its row in `system-knowhow/preferences.md`.
 - **Scope note:** the switch itself is **permanent** and is NOT part of this
   measure: the `autocorrect` preference, its Debugging row, and the stamp's
@@ -1115,7 +1308,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   ten times, and every tap must send. Then delete `defaultAutocorrect` so an
   unset switch means on everywhere, and set the catalog default to `true`.
   Update the Debugging explainer and ADR 0262 to match. Update the knowhow too:
-  `system-knowhow/preferences.md`, and in `system-knowhow/js-sdk.md` § Text
+  `system-knowhow/preferences.md`, and in `system-knowhow/js-sdk/remote-workspace-client-contract.md` § Text
   fields and autocorrect and the `autocorrect` key row.
 - **Status:** `removed` 2026-09-23, the day it landed, by a product call rather
   than the upstream fix. A heavy iPhone user never hit the bug, and no other
@@ -1373,9 +1566,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-01
 - **Lives in:** `ArtifactManager::write_batch_and_commit`
-  (`crates/lucidos-engine/src/core/artifacts.rs`), registered as an
+  (`crates/lucidos-core/src/core/artifacts.rs`), registered as an
   `ExemptWriter` on the `core/artifacts.rs` entry in
-  `crates/lucidos-engine/src/core/announced_surfaces.rs`.
+  `crates/lucidos-core/src/core/announced_surfaces.rs`.
 - **Impermanent because:** Every other `data/` write takes a
   `WriteAnnouncement` and cannot skip its entity event. The batch writer is the
   one hole: it writes N files and announces nothing, relying on its single
@@ -1397,8 +1590,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-01
 - **Lives in:** `ArtifactManager::commit_data_path(s)`
-  (`crates/lucidos-engine/src/core/artifacts.rs`) and its callers in
-  `crates/lucidos-engine/src/engine/tools/files.rs`.
+  (`crates/lucidos-core/src/core/artifacts.rs`) and its callers in
+  `crates/lucidos-agents-api/src/engine/tools/files.rs`.
 - **Impermanent because:** These are commit-only helpers: the caller does its
   own `fs::write` and then asks the manager to stage and commit. The manager
   therefore cannot know whether the file pre-existed, so it cannot decide
@@ -1420,7 +1613,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the `DELETE /api/v1/data` calls, which commits any dirt under the fixture
   path with `git commit -- <pathspec>`.
 - **Impermanent because:** `ArtifactManager::commit_all_dirty`
-  (`crates/lucidos-engine/src/core/artifacts.rs`) stages `data/` on the HEAD it
+  (`crates/lucidos-core/src/core/artifacts.rs`) stages `data/` on the HEAD it
   read first, but `commit_index` takes the parent from HEAD at commit time. A
   single-path commit landing in between (a data-API delete, say) is silently
   reverted: the deleted file goes back into HEAD while it stays gone from disk,
@@ -1530,6 +1723,44 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** open
 - **Investigation:** `webkit-desktop-blank-thread`
 
+### The render probe's absent-target report
+
+- **Added:** 2026-11-15
+- **Lives in:** `reportAbsentThreadRender` in
+  `crates/lucidos-app/src/utils/threadRenderProbe.ts`, called by the settle
+  probe in `ThreadView.tsx` when the focused thread is not in the store.
+- **Impermanent because:** a cold notification open can sit on its skeleton
+  before its thread reaches the store, and the settle probe returned silently
+  then. One stuck open was attributed to restore admission's device storage
+  step and fixed. Another left no trace. This line names the admission phase
+  and the count and age of in-flight requests, so the next one says which owner
+  held it. It costs one line per such open on a WebKit client.
+- **Removal / resolution condition:** when `notification-cold-open-loading`
+  closes, delete `reportAbsentThreadRender` and its tests, and restore the
+  settle probe's silent return. Verify no open work reads a
+  `class=target-absent` line.
+- **Status:** open
+- **Investigation:** `notification-cold-open-loading`
+
+### Device storage release log
+
+- **Added:** 2026-11-15
+- **Lives in:** the `released_on_hide` log in `releaseDeviceDatabases`,
+  `crates/lucidos-app/src/store/deviceDatabase.ts`. The release itself is
+  permanent; only the log is temporary.
+- **Impermanent because:** the stall cause is not proven. On the iPhone the old
+  page often woke just before the notification's new page. A transaction it
+  left open would block the new page's device storage. Healthy taps show the
+  same wake, so it is a race. The line names what the hiding page still held,
+  so the next incident shows whether the old page was the holder.
+- **Removal / resolution condition:** the next iPhone stall incident has a
+  `[Client/device-database] released_on_hide` line from the old page, or shows
+  that none was written. Record the verdict under
+  `notification-cold-open-loading`, then delete the `postClientLog` call and
+  its test. Verify no open work reads the line.
+- **Status:** active
+- **Investigation:** `notification-cold-open-loading`
+
 ### Click-lag main-thread blocker probe
 
 - **Added:** 2026-06-24 (registered 2026-06-29 by the nightly harden sweep — the
@@ -1564,10 +1795,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### CC "No conversation found" error-string match (stale-resume detection)
 
 - **Added:** 2026-07-01
-- **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/engine/agent_session/lifecycle.rs`
   (`is_definitive_session_not_found` — substring match on `"No conversation found
   with session ID"`). Two consumers in
-  `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`: the run
+  `crates/lucidos-agents-api/src/engine/agent_session/run_session/run.rs`: the run
   loop's stale-resume branch, and `classify_startup_failure` for a refusal before
   the first prompt.
 - **Impermanent because:** matches Claude Code's **human-readable** error prose to
@@ -1781,16 +2012,21 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   sits under the keys. This is an upstream bug.
 
   The gateway log showed it once in 121 iPhone launches, after a notification
-  tap. That launch was the only one whose keyboard readings never shrank. So a
-  zero reading before the first real one marks the viewport blind, until it
-  next measures a keyboard. A later zero is a wake's transient one and is
-  ignored. While blind, a focused keyboard field shrinks the shell by the last
-  measured keyboard. That band is kept per orientation in the
-  `lucidos-keyboard-band` storage key.
+  tap. That launch was the only one whose keyboard readings never shrank. A
+  later launch read 874, then 812, then 0, and stayed blind with readings of
+  0, 874 and -33554432.
 
-  Who it misses: a blind launch with a hardware keyboard attached gets a
-  needless band on each focus until a relaunch. A blind state that starts with
-  no zero reading is not detected.
+  So a zero or negative reading marks the viewport blind, until it next
+  measures a keyboard. Once the page has measured a keyboard, a zero is a
+  wake's transient one and is ignored. While blind, a focused keyboard field
+  shrinks the shell by the last measured keyboard. That band is kept per
+  orientation in the `lucidos-keyboard-band` storage key.
+
+  Who it misses: a hardware keyboard never shrinks the viewport. The latch is
+  not gated on platform. So any mobile-layout client used with one gets a
+  needless band on each focus after a zero or negative reading, until a
+  reload. Only the installed iOS PWA has been seen to report such a reading.
+  A blind state that starts with no zero or negative reading is not detected.
 - **Removal / resolution condition:** when no iPhone launch logs a zero
   `visualViewport` in its `[Client/safe-area]` lines across a month of use on
   the oldest iOS we support. Then delete `viewportBlind`, the `blindBandPx`
@@ -1850,7 +2086,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-07
 - **Lives in:** `build_file_list_section`
-  (`crates/lucidos-engine/src/engine/chat/process/workspace_prompt_footprint.rs`), the
+  (`crates/lucidos-agents-api/src/engine/chat/process/workspace_prompt_footprint.rs`), the
   trailing advisory emitted whenever the workspace holds a vendored file. The
   block itself is never partial: it is an inventory or nothing (ADR 0086 as
   amended), and vendored paths are the one thing it names by count instead.
@@ -1920,12 +2156,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### Prompt-cache wire probe
 
 - **Added:** 2026-08-17
-- **Lives in:** `crates/lucidos-engine/src/llm/cache_probe.rs` plus
+- **Lives in:** `crates/lucidos-core/src/llm/cache_probe.rs` plus
   `cache_probe_tests.rs`, gated on `LUCIDOS_CACHE_PROBE`. Everything outside
   that module is thin, and all of it is in this list.
-  - `pub(crate) mod cache_probe;` in `crates/lucidos-engine/src/llm/mod.rs`.
+  - `pub(crate) mod cache_probe;` in `crates/lucidos-core/src/llm/mod.rs`.
   - `log_request` and `log_response` in
-    `crates/lucidos-engine/src/llm/anthropic_wire.rs`, at the end of
+    `crates/lucidos-core/src/llm/anthropic_wire.rs`, at the end of
     `build_claude_request` and `parse_claude_stream`.
   - the `url` field on both `WireTarget` variants in the same file, plus the
     `'a` lifetime it forced onto the enum. With it go the `request_url`
@@ -1937,7 +2173,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
     `anthropic_wire.rs`'s test module. Three other tests there construct a
     `WireTarget` and need the field dropped, not deleting.
   - the `scope` wrapper around `provider.chat` in
-    `crates/lucidos-engine/src/engine/agentic_loop/run.rs`.
+    `crates/lucidos-agents-api/src/engine/agentic_loop/run.rs`.
 
   Writes to engine.log only: no event, no DB row, no UI.
 - **Impermanent because:** Pure telemetry for the **first-of-turn prompt-cache
@@ -2099,11 +2335,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-09-20
 - **Lives in:** five doc passages.
-  - `system-knowhow/js-sdk.md` § Setup, the "Inline your own CSS and JS"
+  - `system-knowhow/js-sdk/remote-workspace-client-contract.md` § Setup, the "Inline your own CSS and JS"
     paragraph.
-  - `system-knowhow/js-sdk.md` § Setup, the second paragraph under the
+  - `system-knowhow/js-sdk/remote-workspace-client-contract.md` § Setup, the second paragraph under the
     `<a download>` note.
-  - `system-knowhow/js-sdk.md` § `url` and app-bundled assets, the note at the
+  - `system-knowhow/js-sdk/setup-2.md` § `url` and app-bundled assets, the note at the
     end.
   - `system-knowhow/building-an-app.md`, the "Inline `<script>` and `<style>`,
     at any size" bullet. It REPLACED two bullets of permanent advice, about
@@ -2149,7 +2385,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **What stays refused, and is not part of this:**
   `lucidos.data.url('system-knowhow/…')` routes through `/api/v1/data/…`. A
   frame capability deliberately reaches no `/api/v1` route, so that one call
-  still answers 401 behind a gateway. `system-knowhow/js-sdk.md` § `lucidos.data`
+  still answers 401 behind a gateway. `system-knowhow/js-sdk/setup-2.md` § `lucidos.data`
   says so.
 - **Status:** removed (2026-09-21)
 - **Investigation:** n/a. The cause was understood and the fix needed a design
@@ -2207,10 +2443,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `docs/plans/2026-09-23-coding-agent-notes-hidden-on-opus-5-5.md`.
 - **Lives in:** three sites.
   - The closing sentence of `REASONING_NOT_VISIBLE_RULE` in
-    `crates/lucidos-engine/src/engine/agent_session/prompts.rs`, pinned by
+    `crates/lucidos-agents-api/src/engine/agent_session/prompts.rs`, pinned by
     `coding_agent_prompts_tell_agent_its_reasoning_is_not_visible`.
   - `CODING_AGENT_CARD_REFUSAL` in
-    `crates/lucidos-engine/src/engine/question_card_gate.rs`, used by
+    `crates/lucidos-agents-api/src/engine/question_card_gate.rs`, used by
     `api/internal.rs`. Pinned by
     `the_coding_agent_refusal_explains_hidden_text_and_names_the_card_question`.
   - The "hidden reasoning" clause of "When the user asks back" in
@@ -2380,7 +2616,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### Gemini 3.8 Flash's introductory compactor price
 
 - **Added:** 2026-10-06
-- **Lives in:** `crates/lucidos-engine/src/llm/model_prices.rs`, the
+- **Lives in:** `crates/lucidos-core/src/llm/model_prices.rs`, the
   `GEMINI_3_8_FLASH` row's `input` and `output`.
 - **Impermanent because:** It records Google's introductory list price,
   $0.75 / $3.75 per million tokens. Google doubles it to $1.50 / $7.50 on
@@ -2451,7 +2687,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### Held-message delivery polls for the spawned session
 
 - **Added:** 2026-10-12
-- **Lives in:** `crates/lucidos-engine/src/engine/chat/held_messages.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/engine/chat/held_messages.rs`
   (`AGENT_START_GRACE`, `AGENT_POLL`): the loop at the end of
   `deliver_held_message`, and `wait_until_agent_takes_messages`.
 - **Impermanent because:** a session joins `agent_sessions` only once its
@@ -2500,8 +2736,87 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Postgres password file. Check by running `cat` on a key file from a chat
   `run_bash` with the rule disabled: the read must fail. Then decide whether the
   rule stays as an early, friendlier refusal, or goes along with its tests.
-- **Status:** active
+- **Status:** resolved 2026-11-11. Every agent-steered spawn runs in the OS
+  sandbox, which hides the private subtree and each older private entry
+  (ADR 0645). The rule stays, by decision 10: an early, clearer refusal, and
+  the only line when the owner opts out. `SECRET_PATHS` now names the subtree
+  plus the older names, from `lucidos_home::private`.
 - **Investigation:** n/a (see ADR 0516)
+
+### Live output timing log
+
+- **Added:** 2026-11-11
+- **Lives in:** `crates/lucidos-engine/src/voice/live_timing_log.rs`, and its
+  `timing` field and two call sites in `voice/live.rs` (`TurnState`,
+  `map_event`).
+- **Impermanent because:** it answers one question for the live voice call
+  review (`docs/plans/2026-11-11-live-voice-call-review.md`, F3). Do the
+  `gpt-live-1` worded output deltas carry `end_ms`? Do their arrival holes sit
+  over abutting timestamps? Does the talker's audio ever run dry?
+- **Removal / resolution condition:** one Live call on a build with this log
+  has its `[Voice] Timing:` lines read and recorded in the plan's F3 section.
+  Then F3 is built or dropped on that evidence, and the module, field and call
+  sites go.
+- **Status:** active
+- **Investigation:** none.
+
+### A sandboxed agent cannot list this machine's workspaces
+
+- **Added:** 2026-11-10
+- **Lives in:** the "Listing this machine's workspaces" section of
+  `system-knowhow/best-practices.md`, and `system-knowhow/scripts/list-workspaces.sh`.
+- **Impermanent because:** every listing route needs the machine-local token,
+  which the agent sandbox hides (ADR 0645). The helper and
+  `lucidos workspaces review` both fail there. The engine's
+  `GET /api/v1/workspaces` runs `scripts/status.sh`, which only a source
+  checkout has.
+- **Removal / resolution condition:** an engine route projects the gateway's
+  listing (names and health, nothing else) on every install shape, the way
+  `GET /api/v1/workspace-label` already reads it. Check from a sandboxed chat
+  `run_bash` on a packaged install: the documented call lists the workspaces.
+  Then point the knowhow at it and drop its sandbox note.
+- **Status:** resolved 2026-11-11. `GET /api/v1/workspaces` now projects the
+  gateway's listing over loopback, and `lucidos workspaces list` prints it.
+  The helper script is gone.
+- **Investigation:** n/a (see ADR 0645)
+
+### Local token proves nothing
+
+- **Added:** 2026-11-10
+- **Lives in:** `LOCAL_TOKEN_PROVES_OWNER` and `local_process_origin` in
+  `crates/lucidos-agents-api/src/api/local_auth.rs`. `api::actor` reads the token's
+  meaning only through `local_process_origin`.
+- **Impermanent because:** every subprocess Lucidos starts runs as the owner
+  with no OS sandbox, so any of them can read `~/.lucidos/local-token`. Until
+  that changes, the token lets a process reach the engine but proves no owner.
+  A caller holding only the token is an `UnattestedCaller`, and an owner-only
+  act it attempts is refused. Use the Lucidos app, or use a trigger so the job
+  runs as an agent.
+- **Removal / resolution condition:** subprocesses run in a sandbox, or as a
+  separate OS user, that cannot read `~/.lucidos/local-token`. The sandbox
+  design lives in its own thread, "OS sandbox for agent subprocesses". Check by
+  running `cat ~/.lucidos/local-token` from a chat `run_bash`: the read must
+  fail. Then set the const to `true` and invert
+  `the_local_token_does_not_prove_the_owner_today`. Drop the plain-terminal
+  residual from the unattested-callers ADR.
+- **Status:** active
+- **Investigation:** n/a (see `docs/plans/2026-11-10-unattested-callers-and-gateway-stamps.md`)
+
+### TODAY tests pin a late image pushing the line
+
+- **Added:** 2026-11-21
+- **Lives in:** the two tests titled `TODAY:` in
+  `crates/lucidos-app/src/components/chat/__tests__/late-image-above-an-unarmed-reader.test.ts`.
+- **Impermanent because:** they assert behaviour the product means to change.
+  Content that grows above an unarmed reader pushes their line down today. The
+  tests record that as a baseline, so the change shows up as a deliberate flip.
+- **Removal / resolution condition:** phase 4 of
+  `docs/plans/2026-11-21-transcript-position-one-owner.md` lands the standing
+  content hold. Each test then asserts the line stays put, and its title drops
+  `TODAY:`. Check with `grep -c "TODAY:"` on the file: it must print 0. If the
+  owner drops phase 4, delete both tests and close this row.
+- **Status:** active
+- **Investigation:** n/a (see the plan)
 
 ## 2. Model-tolerance measures
 
@@ -2590,12 +2905,12 @@ condition; fix the condition rather than acting on it.
 ### CC `API Error` prefix as the transient-vs-permanent failure signal (auto-resume)
 
 - **Added:** 2026-08-05
-- **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/engine/agent_session/lifecycle.rs`
   (`is_transient_api_failure`, read by `auto_resume_after_api_error` and by
   `transient_api_failure_error`), covered by
   `transient_api_failures_are_recognized_by_the_api_error_prefix` and
   `deterministic_failures_are_not_transient` in
-  `crates/lucidos-engine/src/engine/agent_session/lifecycle_tests/watchdog.rs`.
+  `crates/lucidos-agents-api/src/engine/agent_session/lifecycle_tests/watchdog.rs`.
   The prefix now also gates the parent-notification path. It decides the
   *auto-resume hold* that withholds a child's completion card. The error it
   carries becomes that card's summary if the resume never happens (ADR 0199).
@@ -2624,7 +2939,7 @@ condition; fix the condition rather than acting on it.
 ### CSS font-variable aliases (`--font-family`, `--font` → `--font-ui`)
 
 - **Added:** 2026-06-25
-- **Lives in:** `crates/lucidos-engine/src/api/sdk_iframe.css` (`:root` token block,
+- **Lives in:** `crates/lucidos-agents-api/src/api/sdk_iframe.css` (`:root` token block,
   served to every app iframe at `/api/v1/sdk-iframe.css`).
 - **Impermanent because (tolerates):** Coding agents building apps reach for
   `var(--font-family)` (it mirrors the CSS *property* name) or the `--font`
@@ -2649,7 +2964,7 @@ condition; fix the condition rather than acting on it.
   is an insufficient sample, **not** a pass — in particular a sweep that finds
   *zero* token-choosing apps is no evidence at all; leave the measure active and
   re-sweep later. On removal, also drop the "tolerated aliases" notes in
-  `system-knowhow/js-sdk.md` § Theme variables and
+  `system-knowhow/js-sdk/setup.md` § Theme variables and
   `system-knowhow/building-an-app.md`, and restore the stricter "don't invent
   `--font-family`" wording.
 - **Status:** active — last swept 2026-07-25 across two workspaces: of the apps
@@ -2660,7 +2975,7 @@ condition; fix the condition rather than acting on it.
 ### Gemini's plan narration is kept off the screen
 
 - **Added:** 2026-08-20
-- **Lives in:** `crates/lucidos-engine/src/llm/vertex/gemini.rs`
+- **Lives in:** `crates/lucidos-core/src/llm/vertex/gemini.rs`
   (`build_gemini_llm_response`, the `narration` branch).
 - **Impermanent because (tolerates):** Gemini writes its reasoning into
   ordinary, non-`thought` text parts beside a `functionCall`, even with
@@ -2687,13 +3002,13 @@ condition; fix the condition rather than acting on it.
 
 - **Added:** 2026-06-30 (registered by the temporary-measures survey — the guard
   predated this row)
-- **Lives in:** `crates/lucidos-engine/src/engine/tools/image.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/engine/tools/image.rs`
   (`looks_like_description_prompt` + the early-return block in
   `execute_generate_image`, plus the colocated tests
   `looks_like_description_prompt_blocks_describe_variants` and
   `generate_image_tool_description_warns_against_vision_misuse`), paired with the
   anti-misuse warning baked into the `generate_image` tool description
-  (`crates/lucidos-engine/src/llm/tools/images.rs`, `get_image_generation_tool`).
+  (`crates/lucidos-core/src/llm/tools/images.rs`, `get_image_generation_tool`).
 - **Impermanent because (tolerates):** The model sometimes calls `generate_image`
   with a description/analysis prompt ("describe this image in detail") expecting
   back text, mistaking the image-*synthesis* tool for a vision tool. The provider
@@ -2714,12 +3029,12 @@ condition; fix the condition rather than acting on it.
 ### "Did it again" anti-hallucination rule (repeat action without a fresh tool call)
 
 - **Added:** 2026-06-30
-- **Lives in:** `crates/lucidos-engine/src/engine/chat/process/system_prompt.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/engine/chat/process/system_prompt.rs`
   (`REPEATED_ACTION_RULE` const + the generalized CRITICAL RULE #1 it sits
   beside, spliced via the `__REPEATED_ACTION_RULE__` placeholder; the separate
   VERIFICATION line folded into that rule on 2026-08-07),
   with the colocated test `chat_prompt_forbids_faking_repeated_actions` in
-  `crates/lucidos-engine/src/engine/chat/process_tests.rs`.
+  `crates/lucidos-agents-api/src/engine/chat/process_tests.rs`.
 - **Impermanent because (tolerates):** On a repeat request — the user says
   "again" / "once more" / "send another" — the chat model pattern-matches on an
   identical earlier `ToolUse` (e.g. `send_notification`, `send_email`, `events
@@ -2746,7 +3061,7 @@ condition; fix the condition rather than acting on it.
 - **Lives in:** `crates/lucidos-engine/src/engine/event_wait/mod.rs` (the final
   sentence of the `WAIT_SPENT_NOTICE` const, "Narrating it does not do it: a turn
   that ends with no new call leaves nothing watching for this, whatever the
-  sentence said") and `crates/lucidos-engine/src/llm/tools/misc.rs` (the
+  sentence said") and `crates/lucidos-core/src/llm/tools/misc.rs` (the
   `await_event` description's "Saying you will re-subscribe is not
   re-subscribing", shortened from the fuller sentence by the 2026-08-07
   schema-budget trim; the wake notice still carries the long form).
@@ -2798,11 +3113,11 @@ condition; fix the condition rather than acting on it.
 - **Added:** 2026-07-02
 - **Narrowed:** 2026-07-29 — a confirmed attach now vetoes the whole heuristic
   (see below); what remains is the unconfirmed-attach fallback.
-- **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/engine/agent_session/lifecycle.rs`
   (`is_stale_resume_signal` / `StaleResumeInputs` — the output-shape fields
   `result_text_empty`, `buffered_text_empty`, `no_prior_results_this_turn`,
   `no_tool_calls_this_turn`) + its feeder `tool_calls_seen` counter in
-  `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`, with the
+  `crates/lucidos-agents-api/src/engine/agent_session/run_session/run.rs`, with the
   regression tests `empty_result_on_resume_but_made_tool_calls_is_not_stale_resume`
   and `unconfirmed_attach_still_falls_back_to_the_empty_echo_heuristic` in
   `agent_session/lifecycle_tests/classify.rs`.
@@ -2915,7 +3230,7 @@ condition; fix the condition rather than acting on it.
 
 - **Added:** 2026-06-30
 - **Lives in:** `crates/lucidos-engine/src/engine/inline_tool_call_repair.rs` +
-  its wiring in `crates/lucidos-engine/src/engine/agentic_loop/run.rs`
+  its wiring in `crates/lucidos-agents-api/src/engine/agentic_loop/run.rs`
   (mid-stream suppression in the token callback + the post-response
   `tool_call_repair` block).
 - **Impermanent because (tolerates):** The chat model sometimes emits a tool call
@@ -2951,7 +3266,7 @@ condition; fix the condition rather than acting on it.
   `docs/plans/2026-08-15-inline-question-leak-object-body-and-degenerate-tag.md`.
 - **Lives in:** `crates/lucidos-engine/src/engine/inline_question_repair.rs`,
   with its tests in the sibling `inline_question_repair_tests.rs`. Wired in
-  `crates/lucidos-engine/src/engine/agentic_loop/run.rs`: mid-stream
+  `crates/lucidos-agents-api/src/engine/agentic_loop/run.rs`: mid-stream
   suppression, the post-response `inline_repair` block, and the
   `QuestionReaskCause::LeakedAsText` arm of the re-ask guard.
 - **Impermanent because (tolerates):** The same leak class as the entry above, for
@@ -2995,8 +3310,11 @@ condition; fix the condition rather than acting on it.
   its link in the words or on the card. No plan: the incident is under
   "after a saved page" below. Narrowed later on 2026-10-07: text typed into
   a card counts as a message, so both typed-answer refusals are gone. See
-  "A typed answer is a message" below.
-- **Lives in:** `crates/lucidos-engine/src/engine/question_card_gate.rs`
+  "A typed answer is a message" below. Narrowed on 2026-11-22: a permission
+  request card always passes. `lucidos ask-permission` tells the agent to ask
+  at once, and the engine writes that card, so the gate refused an ask the CLI
+  had just ordered.
+- **Lives in:** `crates/lucidos-agents-api/src/engine/question_card_gate.rs`
   (rule, query, refusal text, tests in the sibling `_tests.rs`). The chat
   loop calls it in `agentic_loop/run.rs`. Coding agents reach it through
   `POST /api/v1/internal/ask-user-question`, which returns `refusal`. The CLI
@@ -3122,7 +3440,7 @@ condition; fix the condition rather than acting on it.
 - **Added:** 2026-08-09
 - **Lives in:** `crates/lucidos-engine/src/engine/tool_arg_entity_repair.rs`
   (+ its tests in the sibling `tool_arg_entity_repair_tests.rs`) and its wiring
-  in `crates/lucidos-engine/src/engine/agentic_loop/run.rs`, the third
+  in `crates/lucidos-agents-api/src/engine/agentic_loop/run.rs`, the third
   post-response repair block. The two guards that pin the bisection are
   `tool_argument_special_characters_survive_the_sse_accumulator`
   (`llm/anthropic_wire.rs`) and
@@ -3271,7 +3589,7 @@ event that retires it.
 
 - **Added:** 2026-10-04
 - **Lives in:**
-  - `crates/lucidos-engine/src/core/preference_catalog.rs`: the
+  - `crates/lucidos-core/src/core/preference_catalog.rs`: the
     `HOME_THREAD_ENABLED` handle and `PrefSideEffect::HomeThread`.
   - `engine/home_thread.rs`: the gate.
   - `core/store/threads/mod.rs`: `home_visible_sql`.
@@ -3294,7 +3612,7 @@ event that retires it.
 
 - **Added:** 2026-10-14
 - **Lives in:**
-  - `crates/lucidos-engine/src/core/preference_catalog.rs`: the
+  - `crates/lucidos-core/src/core/preference_catalog.rs`: the
     `CODING_AGENT_AUTO_COMPACT_TRIAL` handle.
   - `crates/lucidos-engine/src/engine/auto_compact_trial.rs`: the arm and
     the window.
@@ -3315,7 +3633,7 @@ event that retires it.
 ### `self_curated_context_mode` flag (ADR 0085)
 
 - **Added:** 2026-08-19
-- **Lives in:** `crates/lucidos-engine/src/core/preference_catalog.rs` (the
+- **Lives in:** `crates/lucidos-core/src/core/preference_catalog.rs` (the
   three handles), `core/preferences.rs` (`self_curated_context_schedule`), and
   `engine/chat/process/context_mode.rs`, which owns the whole mode. Also the `todo_write` gate in `llm/tools/misc.rs`.
 
@@ -3399,26 +3717,26 @@ event that retires it.
 - **Lives in:** five live sites, plus the tests that pin them. The row named only
   the first until the widening, so the rest were invisible to anyone executing the
   condition below.
-  - `crates/lucidos-engine/src/core/credentials.rs`
+  - `crates/lucidos-core/src/core/credentials.rs`
     (`CredentialStore::get_email_password`: the
     `service_name = $1 OR service_name = 'email:' || $1` disjunction and its
     `ORDER BY (service_name = $1) DESC` preference for the unprefixed row), pinned by
     `migration_strands_an_email_row_whose_bare_name_is_taken`.
   - `EmailStore::account_name_for_credential`
-    (`crates/lucidos-engine/src/core/email.rs`), the `strip_prefix("email:")` that
+    (`crates/lucidos-core/src/core/email.rs`), the `strip_prefix("email:")` that
     resolves a stranded row back to its `email_accounts` name.
-  - its production caller in `crates/lucidos-engine/src/api/settings.rs`,
+  - its production caller in `crates/lucidos-agents-api/src/api/settings.rs`,
     `update_credential`, which writes the mailbox's server settings to its
     `email_accounts` row.
   - `move_mailbox_passwords` in
-    `crates/lucidos-engine/src/core/secret_store/one_home.rs`, the boot step
+    `crates/lucidos-core/src/core/secret_store/one_home.rs`, the boot step
     that drops `email_accounts.password`. It files a password as
     `email:<account>` when another credential holds the bare name, and logs it.
   - `emailAccountName` in
     `crates/lucidos-app/src/components/credentials/CredentialModal.tsx`, the
     frontend mirror. Without it the edit form's settings fetch 404s on a stranded
     row.
-  - three `account_name_*` cases in `crates/lucidos-engine/src/core/email_tests.rs`,
+  - three `account_name_*` cases in `crates/lucidos-core/src/core/email_tests.rs`,
     of which `account_name_strips_a_prefix_the_migration_had_to_leave` is the one
     that asserts the strip.
 - **Impermanent because:** `20260805134838_drop_credential_name_prefixes_use_auth_type.sql`
@@ -3454,7 +3772,7 @@ event that retires it.
 ### `oauth:` prefix stripped from a caller-supplied credential name
 
 - **Added:** 2026-08-05
-- **Lives in:** `crates/lucidos-engine/src/core/oauth.rs`
+- **Lives in:** `crates/lucidos-core/src/core/oauth.rs`
   (`client_provider_name`, the `strip_prefix("oauth:")`), reached from two
   sites: the `request_credential` LLM tool
   (`engine/tools/credentials.rs::requested_service_name`) and
@@ -3492,7 +3810,7 @@ event that retires it.
 ### `script_handshake` workspace-root script fallback
 
 - **Added:** 2026-07-01
-- **Lives in:** `crates/lucidos-engine/src/api/proxy_script_runner.rs`
+- **Lives in:** `crates/lucidos-agents-api/src/api/proxy_script_runner.rs`
   (`run_handshake_script` — the `data_abs` → `root_abs` resolution: try
   `<workspace>/data/<script>` first, then fall back to `<workspace>/<script>`),
   pinned by `data_relative_script_is_found` + `data_relative_preferred_over_workspace_root`.
@@ -3694,7 +4012,7 @@ event that retires it.
 - **Added:** 2026-09-17 (registered by the project harden sweep; the lift itself
   predates this row)
 - **Lives in:** `lift_legacy_string` and the `Ok` arm of `to_outcome`, both in
-  `crates/lucidos-engine/src/engine/tools/mod.rs`. Six live call sites route
+  `crates/lucidos-agents-api/src/engine/tools/mod.rs`. Six live call sites route
   through it:
   - the four plugin-tool arms in `engine/tools/plugins/mod.rs`: install, check
     updates, update, uninstall.
@@ -3727,8 +4045,8 @@ event that retires it.
   second `setAttribute` in `ui.applyPreferences` (`ui.ts`). Tests: the
   "legacy data-theme attribute" cases in `boot/appearanceBoot.test.ts` and the
   `data-theme` asserts in `e2e/sdk-iframe-theme-all.spec.ts`, and the bundle asserts
-  and module doc in `crates/lucidos-engine/src/api/sdk_prefs.rs`. App-facing
-  sentence: `system-knowhow/js-sdk.md` § Theme variables.
+  and module doc in `crates/lucidos-agents-api/src/api/sdk_prefs.rs`. App-facing
+  sentence: `system-knowhow/js-sdk/setup.md` § Theme variables.
 - **What it is:** the light/dark attribute became `data-theme-mode` when
   *look* became *theme* (`docs/plans/2026-09-27-look-becomes-theme.md`). App
   styles written before that select on `[data-theme="light"]`. An app frame
@@ -3773,7 +4091,7 @@ event that retires it.
 - **Added:** 2026-09-28
 - **Lives in:** `current_data_path` in `engine/tools/plugins/registry.rs`,
   which reads `LEGACY_THEMES_DIR` from
-  `crates/lucidos-engine/src/core/themes/mod.rs`. The plugin refusal hint for a
+  `crates/lucidos-core/src/core/themes/mod.rs`. The plugin refusal hint for a
   `looks/` folder (`core/plugins.rs`, `UnexpectedTopLevelEntry`) reads the same
   constant and stays for good.
 - **What it is:** workspace themes lived in `data/looks/` before *look* became
@@ -3840,7 +4158,146 @@ event that retires it.
   rename, and the search found only this row. The alias and its sentence went,
   and `docs/generated/agent-surface.json` was regenerated without it.
 
+### Older homes keep their private entries in place
+
+- **Added:** 2026-11-10
+- **Lives in:** `lucidos_home::private::entry_in` and `legacy_entries`
+  (`crates/lucidos-home/src/private.rs`), `lucidos_private_entry_in` in
+  `scripts/lib/storage_root.sh`, and its byte-identical copy in
+  `scripts/lib/service.sh`.
+- **What it is:** a home an older release used keeps its secrets and control
+  files directly in `~/.lucidos`, and new binaries resolve each one there.
+  Only a fresh home uses `~/.lucidos/private` (ADR 0645). The agent sandbox
+  denies the old names one by one, from `legacy_entries`.
+- **Impermanent because:** a shipped binary opens the old paths and cannot be
+  patched. An engine re-adopted across an upgrade (ADR 0461), a CLI it
+  spawned, or a dev worktree built from an older branch all do. A move with
+  links broke them: the engine socket guard refuses a linked `run`, and the
+  `network.toml` writer renames a file over its link. So nothing moves until
+  no such binary can run.
+- **Removal / resolution condition:** two releases have shipped carrying
+  `entry_in`, so every binary a switch can re-adopt resolves both places. Then
+  add a move without links: each old entry renames into the subtree under its
+  lock, and `entry_in` finds it there by rule 2. Keep `legacy_entries` in the
+  sandbox's deny list until the move has run on the machine.
+- **Status:** active
+
+### Peer auth kept while adopted engines run
+
+- **Added:** 2026-11-10
+- **Lives in:** `SuperuserAuth::PeerForAdoptedEngines` and `pg_ident_conf` /
+  `os_user_name` in `crates/lucidos-gateway/src/postgres.rs`, chosen by
+  `GatewayState::superuser_auth` in `server.rs`.
+- **What it is:** the bundled cluster's superuser signs in by password
+  (ADR 0645). While another workspace runs an engine the gateway adopted, the
+  cluster keeps the previous release's peer rule for the superuser instead.
+- **Impermanent because:** an adopted engine got its database URL from an
+  older gateway image, which handed it no password. Dropping peer auth under
+  it would fail each new connection, and sqlx recycles its pool within about
+  30 minutes. The rule exists only for engines of a release before this one.
+- **Removal / resolution condition:** two releases have shipped carrying the
+  password. Then delete the variant, the ident helpers and
+  `superuser_auth`, and pass `Password` alone. An engine that outlived two
+  switches loses new connections once, until its next restart.
+- **Status:** removed (2026-11-16). ADR 0720 removes the peer variant, ident
+  helpers and adoption tracking because a later peer downgrade would expose the
+  superuser to already-running agents. Bundled authentication remains password-only;
+  older passwordless engines need the owner's Switch action for new connections.
+### Old relay user header
+
+- **Added:** 2026-11-11
+- **Lives in:** `LEGACY_HEADER_RELAY_OPERATOR`, its signature header and
+  `LEGACY_OPERATOR_BINDING` in `crates/lucidos-gateway/src/relay.rs`, read by
+  `signed_user` and sent by `signed_claim_headers`; the strip list
+  `RELAY_USER_HEADERS`.
+- **Impermanent because:** the user rename (ADR 0655) renamed the relay header
+  to `x-lucidos-relay-user`. A gateway older than that sends and reads only the
+  old pair, and two machines never update at once.
+- **Removal / resolution condition:** two releases have shipped since the
+  rename, so every supported gateway sends and reads the new pair. Then delete
+  the legacy constants, the second entry in `signed_user`, the legacy pair in
+  `signed_claim_headers`, and the tests
+  `an_older_a_with_the_operator_header_still_names_its_user` and
+  `a_new_a_also_signs_the_operator_header_for_an_older_b`.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### SDK threadPeople alias
+
+- **Added:** 2026-11-11
+- **Lives in:** `people` in `packages/lucidos-sdk/src/threadUsers.ts`, which also names
+  the caller `person`, and its entry in `packages/lucidos-sdk/src/threads.ts`.
+- **Impermanent because:** the user rename (ADR 0655) made
+  `lucidos.threads.users` the name. Apps users wrote call
+  `lucidos.threads.people`, and they are not ours to migrate.
+- **Removal / resolution condition:** two releases have shipped with the
+  deprecation in `system-knowhow/js-sdk.md`, and `rg -n 'threads\.people'`
+  over `system-knowhow/` and the shipped apps finds only the deprecation line. Then delete the
+  alias and its sentence in `system-knowhow/js-sdk.md`.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### User rename wire aliases
+
+- **Added:** 2026-11-11
+- **Lives in:** the legacy user HTTP routes in gateway `users_api.rs`,
+  engine `api/users.rs` and `api/gateway_signals.rs`.
+  The gateway signal constant `ENGINE_USERS_CHANGED_PATH` lives in `users_api.rs`.
+  Snapshot fallback lives in `gateway_users.rs`; gateway device and pairing
+  adapters live in `auth_api.rs`.
+  Browser adapters live in `api/client/control.ts`, `api/client/gatewayUsersCompat.ts` and `api/client/pairing.ts`.
+- **Impermanent because:** gateways, engines and remote workspace frontends
+  update independently. The rename must preserve identity and pairing choices
+  while either endpoint speaks the preceding wire contract (ADR 0655).
+- **Removal / resolution condition:** two releases have shipped after the
+  rename, and every supported gateway and engine uses the new contract.
+  Switch `ENGINE_USERS_CHANGED_PATH` to `/api/v1/users/changed` before removing engine aliases.
+  Remove the legacy HTTP routes, snapshot and browser fallbacks, old response
+  fields and query names together with their compatibility tests.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ---
+
+### `lucidos ask-owner-approval`, the retired spelling of `ask-permission`
+
+- **Added:** 2026-11-14
+- **Lives in:** the `alias` on `Command::AskPermission` in
+  `crates/lucidos-cli/src/main.rs` and its test
+  `the_retired_ask_spelling_still_parses_and_is_hidden`. Also the
+  `crates/lucidos-cli/src/main.rs` and `docs/generated/agent-surface.json`
+  rows of `docs/retired-term-exceptions.tsv`. Two sentences name the alias:
+  the end of § "`lucidos ask-permission`" in `system-knowhow/lucidos-cli.md`,
+  and the end of the retired term's entry in `docs/glossary.md`.
+- **What it is:** ADR 0688 renamed the command. A Claude Code or Codex session
+  resumed across the switch keeps the system prompt it started with, so it
+  still runs the old name. The hidden alias runs `ask-permission` for it.
+- **Impermanent because:** only a session started before the rename knows the
+  old name. No shipped prompt or help text teaches it. The two sentences above
+  only name it as retired.
+- **Removal condition:** the next tagged release after the one that ships ADR
+  0688. Then delete the alias, its test, both exceptions rows and the two
+  sentences. Run `./scripts/codegen.sh`, and confirm
+  `./scripts/check-retired-terms.sh` still passes.
+- **Status:** active.
+
+### The retired automation-pause aliases for Hold
+
+- **Added:** 2026-11-23
+- **Lives in:** the retired `/api/v1/threads/:thread_id/automation-pause` route in
+  `crates/lucidos-agents-api/src/api/threads/mod.rs` and its rows in
+  `app_reach_policy.rs` and `mutating_gate_tests.rs`, plus the
+  `pause-automation` alias on `lucidos threads hold` in
+  `crates/lucidos-cli/src/main.rs`.
+- **What it is:** Hold replaced the retired automation pause. The old route and CLI
+  name still reach Hold, so a session prompt or script written before the
+  rename keeps working.
+- **Impermanent because:** only callers written against the old names use
+  them. The engine's own prompts already say `lucidos threads hold`.
+- **Removal condition:** the first release after the one that shipped Hold.
+  Then a grep for the two retired names over `crates` and `system-knowhow`
+  should return only these alias sites. Delete them and flip this row.
+- **Status:** active.
 
 ## 4. Open investigations (parents)
 
@@ -3927,6 +4384,24 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Status:** open
 - **Measures referencing this investigation:** The render probe's WebKit
   surface (§1).
+
+### `notification-cold-open-loading`: a notification opens on a skeleton
+
+- **Opened:** 2026-11-15
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** an investigation closes once its question is
+  answered. An iOS PWA notification open can stay on the transcript skeleton
+  until the user reloads. One case was restore admission's device storage
+  step, fixed by retiring a stalled connection
+  (`docs/plans/2026-11-15-phone-notification-recovery-and-thread-cost.md`).
+  Another case left no admission or request trace.
+- **Removal / resolution condition:** every stuck open over a representative
+  iOS-PWA usage window is attributed by a `class=target-absent` line, and each
+  named owner is fixed. Record build, device, cold-notification opens, admission completion and
+  observed outcomes in an audit before closing; an empty log does not suffice.
+- **Status:** open
+- **Measures referencing this investigation:** The render probe's absent-target
+  report (§1); Device storage release log (§1).
 
 ### `cc-reasoning-dormant` — CC coding-agent "Thinking" step shows nothing
 
@@ -4188,9 +4663,9 @@ measure now eligible for removal** — search this file for the id to find them 
   or attributed to WebKit with evidence. The discriminator is the
   `[Client/follow] short` line's own numbers across a representative iOS-PWA
   window. A `short` that tracks a turn's growth points at the extent settling
-  late. A constant one points at a fixed band, which names a layout. No lines
-  at all over such a window closes it the other way: the two structural holes
-  ADR 0222 fixed were the whole of it. On close, flip every measure tagged
+  late. A constant one points at a fixed band, which names a layout. A recorded audit may instead verify ADR 0222 by exercising growing turns
+  and recording successful landings, build, device and sample count. Silence alone
+  does not close this investigation. On close, flip every measure tagged
   `Investigation: follow-ride-lands-short` to `removed` per its own removal
   steps.
 - **Status:** open

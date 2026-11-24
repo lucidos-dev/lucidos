@@ -18,9 +18,6 @@ test.describe('Mobile thread content visibility', () => {
     const responseText = await response.textContent();
     expect(responseText!.trim().length).toBeGreaterThan(0);
 
-    // .thread-content must have non-zero rendered height on mobile.
-    // iOS Safari collapses height: 100% inside flex items — the fix uses
-    // position: absolute; inset: 0 instead.
     const contentHeight = await page.evaluate(() => {
       const els = document.querySelectorAll('.thread-content');
       for (const el of els) {

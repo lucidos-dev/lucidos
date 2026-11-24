@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/** Settings → Memory: the backfill bar after an event gap.
- *
- *  The bar is fed by `TreeBackfill*` frames. A gap can swallow the one that
- *  ended the backfill, so the open page reads the snapshot again. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The TypeSafe (Jev) row on Settings → Providers.
- *
- * It wears the same frame as every other provider row, so the things worth
- * pinning are the ones its own state function decides: what the switch reads
- * with no key stored, what folds away behind it, and that off touches neither
- * the credential nor Remove.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -48,7 +40,6 @@ describe('TypeSafeJudgmentSettings', () => {
   const removeButton = () =>
     [...host.querySelectorAll('button')].find((b) => b.textContent === 'Remove') ?? null;
   const toggle = () => host.querySelector<HTMLInputElement>('.toggle-switch input');
-  /** Flip the switch and let Preact's queued rerender land. */
   const press = async (next: boolean): Promise<void> => {
     const input = toggle();
     if (!input) throw new Error('the enable switch is not rendered');
@@ -80,9 +71,6 @@ describe('TypeSafeJudgmentSettings', () => {
     credentials.value = { status: 'not-loaded' };
   });
 
-  /** The correction this row was rebuilt for. A stored credential stands in
-   *  for `/health`, so a workspace that saved nothing reads off, exactly as
-   *  xAI does. The preference defaulting to on must not light it up. */
   it('reads off and folded with no key stored', () => {
     render(<TypeSafeJudgmentSettings />, host);
     expect(header()).not.toBeNull();
@@ -99,8 +87,6 @@ describe('TypeSafeJudgmentSettings', () => {
     expect(header()?.textContent).toContain('configured');
   });
 
-  /** The only way to type a first key. A provider nobody configured has
-   *  nothing to switch, so the press reveals the fields and writes nothing. */
   it('reveals the secret field without writing, with no key stored', async () => {
     render(<TypeSafeJudgmentSettings />, host);
     await press(true);
@@ -124,10 +110,6 @@ describe('TypeSafeJudgmentSettings', () => {
     expect(secretInput()).toBeNull();
   });
 
-  /** An unloaded preference read is not "no site on". Saying so would claim
-   *  nothing is running on a workspace where both are. The fold is what
-   *  guarantees it now, since `open` needs both reads, so this pins the row
-   *  away rather than an empty string inside it. */
   it('asserts nothing about usage while the preferences load', () => {
     withKey();
     preferences.value = { status: 'loading' };
@@ -136,8 +118,6 @@ describe('TypeSafeJudgmentSettings', () => {
     expect(host.textContent).not.toContain('Nothing yet');
   });
 
-  /** Off parks the provider. Deleting the key is Remove's job, and the two
-   *  must stay separable or a user cannot put a key down and pick it up. */
   it('switches off without touching the stored key', async () => {
     withKey();
     render(<TypeSafeJudgmentSettings />, host);
@@ -147,7 +127,6 @@ describe('TypeSafeJudgmentSettings', () => {
 
     switchedOff();
     render(<TypeSafeJudgmentSettings />, host);
-    // The frame owns the preferences read, so its rerender lands on the flush.
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(header()?.textContent).toContain('switched off, key kept');
     expect(header()?.textContent).toContain('configured');
@@ -163,8 +142,6 @@ describe('TypeSafeJudgmentSettings', () => {
     expect(setSystemOneEnabled).toHaveBeenCalledWith('provider_enabled_typesafe', true);
   });
 
-  /** Remove sits on the header row beside the switch, like every other
-   *  provider's, so a parked key can be deleted without switching back on. */
   it('keeps Remove on the header row while switched off', () => {
     withKey();
     switchedOff();
@@ -179,9 +156,6 @@ describe('TypeSafeJudgmentSettings', () => {
     expect(removeButton()).toBeNull();
   });
 
-  /** A stored key IS the judge tool's whole condition, so it is on with no
-   *  preference set at all (ADR 0223). Neither classification is, which is what
-   *  keeps the promise that a key moves nothing on its own. */
   it('names the judge tool on a stored key, with no site switched over', () => {
     withKey();
     render(<TypeSafeJudgmentSettings />, host);
@@ -209,9 +183,6 @@ describe('TypeSafeJudgmentSettings', () => {
     expect(usage()).not.toContain('Query classification');
   });
 
-  /** The site preferences outlive the master switch, so a usage line left on
-   *  screen would name two classifications running on a provider that is off.
-   *  Folding it away with the rest is what keeps it honest. */
   it('claims no site is in use while the provider is switched off', () => {
     withKey();
     switchedOff({ judgment_command_guard: 'jev', judgment_query_classification: 'jev' });

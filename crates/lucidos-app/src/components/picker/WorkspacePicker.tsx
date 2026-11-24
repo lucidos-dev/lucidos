@@ -1,32 +1,12 @@
-/**
- * Workspace picker (ADR 0014) — the gateway's picker surface, served at `/`
- * (smart root) and `/~/` with `<base href="/~/">`.
- *
- * Rendered standalone (see main.tsx — when `IS_PICKER`, i.e. the stamped base
- * href is `/~/`) instead of the full app, so it never boots the app's SSE /
- * thread machinery. It lists every registered workspace with health, and is the
- * always-reachable recovery surface: Open / Create / Restore / Rename / Delete /
- * Retry. A right-click on a row opens that row's overflow menu, which also
- * offers the workspace in a new window or tab. A self-contained screen with
- * inline forms, no global store and no native dialogs.
- *
- * The footer (`PickerFooter.tsx`) keeps Create and Restore side by side in
- * every state. This is also the FIRST screen a new user meets, with nothing on
- * it yet.
- *
- * Visual language: the Lucidos app mark is the hero (animated), painted on the
- * brand-blue gradient the mark itself uses. Rows are flat (no card chrome): the
- * whole row opens the workspace, start/stop is a single play/pause control, and
- * the secondary actions (auto-start / rename / delete) stay out of the way until
- * the row is hovered (always tappable on touch). The name is always spelled
- * whole, wrapping onto as many lines as it needs, with the address under it: a
- * name is what tells two workspaces apart, so the row's height yields to it
- * rather than the other way round.
- */
 
 import type { ComponentChildren } from 'preact';
 import { useSignal } from '@preact/signals';
-import { CleanupManager } from './CleanupManager';
+import { TrashSection, useTrashInventory } from './TrashSection';
+import { deleteWorkspaces } from './workspaceDeletion';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { Disclosure } from '../shared/Disclosure';
+import { Toast } from '../shared/Toast';
+import { OverlayLayer } from '../layout/OverlayLayer';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
@@ -91,8 +71,6 @@ import {
   draftFromBind,
   type BindDraft,
 } from '../../utils/bindMode';
-// Shared with the in-app workspace switcher, so a dot means the same thing in
-// the menu as it does here.
 import { workspaceFaultNote, workspaceState, workspaceStateLabel, type WorkspaceState } from '../../utils/workspaceState';
 import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
 import {
@@ -130,65 +108,25 @@ import { keepUndrawnKeys, moveOrderKey, orderWorkspaces, stepOrderKey, type Orde
 import { makeOrderSaver } from './orderSave';
 import { singleFlight } from './singleFlight';
 
-/** Background ticks between two asks of the remote gateways. Each ask crosses
- *  a network and can wait seconds on a silent gateway. So it skips most of the
- *  2s ticks that keep the local list live. */
 const REMOTE_POLL_EVERY_TICKS = 8;
 
-/** Window-drag gate (Tauri desktop): the picker's whole background drags the
- *  window, except presses on its controls and inside an open popover.
- *
- *  The popover clause is not belt-and-braces. `<Overlay>` portals to `document.body`
- *  only when asked, and the picker's overlays (network access, the confirms, the
- *  row menu) all render in place, so their panels are DOM descendants of the
- *  region: without this, dragging to select the tailnet address out of the
- *  Network access popover would move the window instead.
- *
- *  Module-level so it is a stable reference for `useWindowDragRegion`'s effect
- *  deps, matching `AppHeader`. Both clauses are pinned by
- *  `hooks/__tests__/window-drag-roots-guard.test.ts`, on the source rather than
- *  on behavior: this suite has no jsdom, so `closest` has nothing to answer. */
 const pickerCanDragStart = (target: HTMLElement): boolean =>
   !isInteractiveTarget(target) && !target.closest('[data-overlay-panel]');
 
-/** How long the "Restored X" confirmation stays up before the picker clears the
- *  gateway's terminal status and the banner leaves. Long enough to read, short
- *  enough that it is gone by the time the user reaches for the new row. */
 const RESTORE_DONE_LINGER_MS = 6000;
 
-/** Quick-fill names offered in the create form while the name field is empty —
- *  the first-run "name your first workspace" nudge. Clicking one fills the
- *  (editable) field; the user still confirms with Create.
- *
- *  Offered on the FIRST run only. Someone who already has a workspace has
- *  likely used one of these names, so the chip fills the field with a duplicate
- *  Create then refuses. */
 const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
 
-/** A row's overflow trigger, so a right-click anywhere on the row can resolve
- *  it. A `data-role` rather than an `id`, which is banned on a dual-rendered
- *  component. Scoping the query to the row is what lets one selector serve
- *  every row. */
 const MORE_BUTTON = '[data-role="ws-row-more"]';
 
-/* ── Inline icons (kept local so the picker stays self-contained) ─────────── */
 
-// The Lucidos sparkle, centered on the origin so it can be placed at any tile.
 const SPARK_D =
   'M0 -19 C2.5 -6 5.5 -2.5 18.5 0 C5.5 2.5 2.5 6 0 19 C-2.5 6 -5.5 2.5 -18.5 0 C-5.5 -2.5 -2.5 -6 0 -19 Z';
 
-/** One tile's start offset, scaled by the animation-speed slider.
- *
- *  The keyframes in picker.css run on scaled durations. A raw delay would keep
- *  its 1x offset while they stretch, so a square would land before its own
- *  sparkle at any speed below 1x. */
 const revealDelay = (seconds: number) =>
   `animation-delay:calc(${seconds}s * var(--duration-scale))`;
 
 function LucidosMark() {
-  // The app icon (from public/favicon.svg) playing Logo Studio's "logo reveal":
-  // a sparkle flashes at each tile in turn (TL → BL → BR → TR), leaving a square
-  // behind it, and rests as the spark at the top-right — landing on the mark.
   return (
     <svg class="ws-picker-mark" viewBox="0 0 100 100" aria-hidden="true">
       <defs>
@@ -274,10 +212,6 @@ function MoreIcon() {
   );
 }
 
-// A box with an arrow leaving it: "this opens away from here". The same glyph
-// `PopOutIcon` draws in components/shared/icons, redrawn here because every icon
-// on this surface is local. Its neighbours in this menu are copies of the same
-// three shared glyphs.
 function PopOutIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -288,8 +222,6 @@ function PopOutIcon() {
   );
 }
 
-// The mirror: the arrow lands inside the box, "this loads here". Local for the
-// same reason its pop-out twin is.
 function PopInIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -310,12 +242,6 @@ function TrashIcon() {
   );
 }
 
-/** Loading placeholder for the workspace list — renders the real
- *  `ws-picker-row` / `ws-picker-open` markup inside a `SkeletonProvider`, so the
- *  shimmer cells (dot · name · action) mirror the loaded row by construction and
- *  use the shared `.sk-bar` vocabulary (no bespoke skel classes to drift). The
- *  skeleton→list handoff doesn't reflow; decorative → aria-hidden; crossfaded in
- *  via `<LoadingFade>`. */
 function PickerSkeleton({ rows = 3 }: { rows?: number }) {
   return (
     <SkeletonProvider>
@@ -327,10 +253,6 @@ function PickerSkeleton({ rows = 3 }: { rows?: number }) {
                 <SkBlock w="0.625rem" h="0.625rem" circle />
                 <div class="ws-picker-id">
                   <SkText class="ws-picker-name" w="9rem" />
-                  {/* The backup line, which every row draws whether or not it
-                      has a sentence for it. It is what makes the id cell the
-                      row's tallest, so a skeleton without it hands off one
-                      line short per row. */}
                   <SkText class="ws-picker-backup" w="6rem" />
                 </div>
                 <div class="ws-picker-actions">
@@ -348,97 +270,50 @@ function PickerSkeleton({ rows = 3 }: { rows?: number }) {
 type PickerEntry = OrderedWorkspace<WorkspaceStatus>;
 type RemotePickerEntry = Extract<PickerEntry, { kind: 'remote' }>;
 
-/** Remote rows join the list once the first ask of the remote gateways lands. */
 const NO_REMOTE_VIEWS: readonly RemoteGatewayView[] = [];
 
 export function WorkspacePicker() {
-  // The picker is its own render root (`main.tsx` renders EITHER <WorkspacePicker/>
-  // OR <App/>), so it must install the global tooltip system itself — App.tsx's
-  // call never runs here, and without it every `data-tooltip` below is inert.
   useTooltip();
 
   const workspaces = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
   const remoteWorkspaces = useSignal<Loadable<RemoteGatewayView[]>>({ status: 'not-loaded' });
-  // The workspace order as the gateway stores it, or as a drop just drew it.
   const order = useSignal<readonly string[]>([]);
   const error = useSignal<string | null>(null);
   const [orderSaver] = useState(() => makeOrderSaver({
     draw: (drawn) => { order.value = drawn; },
     save: setWorkspaceOrder,
-    // The picker's own error line: no toast host is mounted here.
     report: (message) => { error.value = message; },
   }));
-  // The rows as drawn: what a drop or a Move step reorders. A drag holds them
-  // still, so a poll landing mid-drag cannot change the row under the finger.
   const drawnEntries = useRef<PickerEntry[]>([]);
-  // One ask of the remote gateways at a time, and how many ticks since the last.
   const remoteAsk = useRef<((fresh?: boolean) => Promise<void>) | null>(null);
   const ticksSinceRemoteAsk = useRef(0);
   const busy = useSignal(false);
-  // Skeleton row count, captured once at mount (see where it's read below).
   const skeletonRowsRef = useRef<number | undefined>(undefined);
-  // Which footer form is open. ONE signal rather than a boolean per form: both
-  // entry points stay on screen whatever is open (they're how the user switches
-  // between them), so "both forms open at once" must not be representable.
   const footerMode = useSignal<FooterMode>('none');
   const remoteDraft = useSignal<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
   const pairedRemote = useSignal<string | null>(null);
+  const remoteAwaitingOwner = useSignal(false);
   const newName = useSignal('');
   const renamingId = useSignal<string | null>(null);
   const renameValue = useSignal('');
-  const deletingId = useSignal<string | null>(null);
-  const cleanupTick = useSignal(0);
-  // Restore-from-backup form + flow state. The three fields travel as one draft
-  // so the pure rules in `workspaceForms.ts` decide what the user is told.
+  const deleting = useSignal(false);
+  const trashRevision = useSignal(0);
   const restoreDraft = useSignal<RestoreDraft>(EMPTY_RESTORE_DRAFT);
   const restoreStatus = useSignal<GwRestoreStatus | null>(null);
-  // Gateway self-update: drives the header reload control + "new gateway
-  // available" badge. Null until the first poll lands (legacy non-gateway mode
-  // never resolves it, so the control stays hidden).
   const gatewayStatus = useSignal<GatewayStatus | null>(null);
   const reloading = useSignal(false);
-  // Confirm step before re-execing the gateway (the reload re-execs the running
-  // process). Anchored to the header reload icon.
   const reloadConfirmOpen = useSignal(false);
   const reloadAnchor = useSignal<HTMLElement | null>(null);
-  // Machine-global Network access control (writes ~/.lucidos/network.toml): the
-  // gateway bind + the "engines inherit gateway bind" toggle. Anchored to the
-  // header gear. Re-read from the gateway on every open.
-  //
-  // ONE signal holds both the saved config and the edit against it, so a draft
-  // cannot outlive the config it came from. Splitting them (a config signal
-  // plus three loose draft fields, none of them reset) is what made the popover
-  // reopen on the last CLICKED mode instead of the saved one: the config signal
-  // stayed truthy from the previous open, so the stale draft rendered as
-  // settled until the refetch corrected it.
   const networkOpen = useSignal(false);
   const networkAnchor = useSignal<HTMLElement | null>(null);
   const network = useSignal<Loadable<NetworkEditor>>({ status: 'not-loaded' });
   const networkSaving = useSignal(false);
-  // Identifies the newest load, so a slow response from a previous open cannot
-  // land on top of a newer one (the GET shells out to `tailscale ip -4`, so it
-  // is not always fast).
   const networkLoadToken = useRef(0);
-  // Per-row overflow menu (autostart / rename / delete). Only one open at a time;
-  // anchor is the ⋯ button that opened it.
   const menuOpenId = useSignal<string | null>(null);
   const menuAnchor = useSignal<HTMLElement | null>(null);
-  // Confirm step before stopping a running workspace (stopping it makes the
-  // workspace unreachable until restarted). Anchored to the row's stop button.
+  const selection = useSignal<ReadonlySet<string> | null>(null);
   const stopConfirmId = useSignal<string | null>(null);
   const stopAnchor = useSignal<HTMLElement | null>(null);
-  // Auto-open the last-active workspace whenever the picker loads — the smart
-  // root (`/`) AND the sigil (`/~/`), since the installed PWA launches at the
-  // picker manifest's `start_url` (`/~/`), not `/`. The ONLY escape is an
-  // explicit `?pick`: the in-app "Manage workspaces" link carries it so the list
-  // stays reachable for switching. Shows a brief "Opening…" splash while we
-  // confirm the remembered workspace still exists; if it's gone we forget it and
-  // fall through to the picker.
-  // The pairing screen is this same document (utils/pairingShell.ts), so every
-  // workspace it could open answers with the pairing screen again. The inline
-  // fast path stands down there first, and this is the slower route to the same
-  // navigation: `PairingGate` fails OPEN when its session probe fails, which
-  // renders the picker on a document that is still unpaired.
   const autoOpening = useSignal(
     typeof window !== 'undefined' &&
       !new URLSearchParams(window.location.search).has('pick') &&
@@ -446,32 +321,20 @@ export function WorkspacePicker() {
       !hasUnspentPairingLaunch() &&
       recallLastWorkspace() !== null,
   );
+  const trashInventory = useTrashInventory(trashRevision.value, !autoOpening.value);
 
   async function fetchWorkspaces(): Promise<void> {
     const read = orderSaver.readStarted();
     const { workspaces: list, order: stored } = await listWorkspacesWithOrder();
     workspaces.value = { status: 'loaded', data: list };
     orderSaver.stored(stored, read);
-    // Never clears `error`: the 2s poll runs this too, and would wipe a failed
-    // action's message before the user read it. `withBusy` clears it instead.
-    // Remember the count so a future load can size its skeleton to this list
-    // (no skeleton→list bounce on the next visit).
     rememberLastWorkspaceCount(list.length);
-    // Gateway-root PWA app-icon badge: the AGGREGATE unread total across running
-    // workspaces (a stopped one reports no count, so it contributes 0). Refreshed
-    // every poll while the picker is open. Not under Tauri — the desktop process
-    // drives a native dock badge from the same total (the WKWebView has no
-    // installable app icon of its own).
     if (!isTauri()) {
       const total = list.reduce((sum, w) => sum + (w.unread_count ?? 0), 0);
       applyAppBadge(total);
     }
   }
 
-  /** Ask every remote gateway for its workspaces. A gateway that does not
-   *  answer keeps its last rows, greyed (`mergeRemoteListings`). `true` asks
-   *  for an answer begun after the call, since an ask in flight may predate a
-   *  gateway just added. */
   remoteAsk.current ??= singleFlight(async () => {
     ticksSinceRemoteAsk.current = 0;
     const listings = await listRemoteWorkspaces();
@@ -499,12 +362,9 @@ export function WorkspacePicker() {
   async function fetchGatewayStatus(): Promise<void> {
     const status = await getGatewayStatus();
     gatewayStatus.value = status;
-    // After a reload, the running gateway IS the on-disk binary, so the update
-    // clears — that's our signal the new image is up; drop the "Reloading…" state.
     if (reloading.value && !status.update_available) reloading.value = false;
   }
 
-  // Initial load + user-initiated actions: a failure surfaces the error screen.
   async function refresh(): Promise<void> {
     try {
       await fetchWorkspaces();
@@ -513,37 +373,25 @@ export function WorkspacePicker() {
     }
   }
 
-  // Background poll (see useEffect). Best-effort, runs without user intent — a
-  // transient blip keeps the last-good list rather than flashing the error
-  // screen; the next tick recovers, and the initial load + user actions still
-  // surface failures via refresh(). Per frontend.md's best-effort carve-out this
-  // logs rather than toasts.
   async function pollRefresh(): Promise<void> {
-    cleanupTick.value++;
     try {
       await fetchWorkspaces();
     } catch (e) {
       console.warn('[picker] background refresh failed; keeping last-good list', e);
     }
-    // Best-effort, like the list above: a blip keeps the last-good rows, and
-    // each gateway's own silence already shows as a greyed row.
     if (++ticksSinceRemoteAsk.current >= REMOTE_POLL_EVERY_TICKS) {
+      trashRevision.value++;
       try {
         await fetchRemoteWorkspaces();
       } catch (e) {
         console.warn('[picker] remote workspace poll failed; keeping last-good rows', e);
       }
     }
-    // Best-effort restore-status poll (drives the restore banner / phase). A
-    // blip just keeps the last-good status; the next tick recovers.
     try {
       await fetchRestoreStatus();
     } catch (e) {
       console.warn('[picker] restore-status poll failed; keeping last-good', e);
     }
-    // Best-effort gateway self-update check (drives the reload control + badge).
-    // Absent in legacy non-gateway mode and during a reload re-exec window; a
-    // blip keeps the last-good status and the next tick recovers.
     try {
       await fetchGatewayStatus();
     } catch (e) {
@@ -556,20 +404,15 @@ export function WorkspacePicker() {
     void withBusy(async () => {
       reloading.value = true;
       await reloadGateway();
-      // The gateway re-execs (~300ms delay server-side) and briefly drops; the
-      // 2s poll reconnects and clears `reloading` once the new image answers.
     });
   }
 
-  // Re-read the machine-global config and seed a fresh draft from it. Called on
-  // every open (and by the failure row's Retry), so what the popover shows is
-  // always what is stored, never a leftover edit.
   function loadNetwork() {
     const token = ++networkLoadToken.current;
     network.value = { status: 'loading' };
     void getGatewayNetworkConfig()
       .then((cfg) => {
-        if (token !== networkLoadToken.current) return; // superseded by a newer open
+        if (token !== networkLoadToken.current) return;
         network.value = {
           status: 'loaded',
           data: { config: cfg, draft: draftFromBind(cfg.gateway_bind, cfg.inherit) },
@@ -577,8 +420,6 @@ export function WorkspacePicker() {
       })
       .catch((e) => {
         if (token !== networkLoadToken.current) return;
-        // Stated inside the popover (with a Retry) rather than on the picker's
-        // error screen: the failure belongs to the thing the user just opened.
         network.value = toFailed(e);
       });
   }
@@ -589,8 +430,6 @@ export function WorkspacePicker() {
     loadNetwork();
   }
 
-  /** Edit the draft. A no-op unless a config is loaded, because a draft only
-   *  exists as part of one. */
   function patchNetworkDraft(patch: Partial<BindDraft>) {
     const s = network.value;
     if (s.status !== 'loaded') return;
@@ -600,9 +439,6 @@ export function WorkspacePicker() {
     };
   }
 
-  // Click-to-fill the detected Tailscale address: drop it into the IP field and
-  // switch to the Tailnet / IP mode (idempotent, since that mode is the only one
-  // where the detected line shows, but set both so it is self-contained).
   function fillDetectedTailscaleIp() {
     const s = network.value;
     if (s.status !== 'loaded') return;
@@ -613,9 +449,6 @@ export function WorkspacePicker() {
 
   function onSaveNetwork() {
     const s = network.value;
-    // Both guards are also what disables the Save button, so neither is
-    // reachable by clicking; they keep the write honest if it is ever called
-    // from somewhere else.
     if (s.status !== 'loaded') return;
     const { draft } = s.data;
     if (!isValidBindSelection(draft.mode, draft.address)) return;
@@ -640,65 +473,34 @@ export function WorkspacePicker() {
       if (!autoOpening.value) return;
       const list = workspaces.value;
       const remembered = recallLastWorkspace();
-      // A remote workspace is not in the local list. Open it anyway: the relay
-      // sends a page load back here when its gateway is gone or unreachable.
       if (remembered && parseWorkspaceRoute(remembered)?.gateway) {
         openWorkspace(remembered);
         return;
       }
       if (list.status === 'loaded' && remembered) {
         const w = list.data.find((x) => x.id === remembered);
-        // Only auto-open a workspace that isn't already known-unhealthy — opening
-        // into an unhealthy engine is the dead-end we're fixing. 'stopped' /
-        // 'booting' still auto-open (a stopped workspace lazy-starts, intended).
         if (w && workspaceState(w) !== 'unhealthy') {
-          openWorkspace(remembered); // navigates away; splash holds until unload
+          openWorkspace(remembered);
           return;
         }
-        if (!w) forgetLastWorkspace(); // remembered workspace was deleted — stop retrying
-        // else: it exists but is unhealthy — keep it remembered (not gone), but
-        // fall through to the list so the user sees its state + Retry.
+        if (!w) forgetLastWorkspace();
       }
-      autoOpening.value = false; // nothing to open / unhealthy / load failed → show the picker
+      autoOpening.value = false;
     })();
     remoteWorkspaces.value = { status: 'loading' };
     void refreshRemoteWorkspaces();
-    // Seed the restore banner so a reload mid-restore re-attaches to the live
-    // phase (the gateway holds the authoritative single-slot status).
-    void fetchRestoreStatus().catch(() => { /* no banner until the poll lands */ });
-    // Seed the gateway self-update status so the reload control appears without
-    // waiting for the first 2s tick (absent in legacy non-gateway mode).
-    void fetchGatewayStatus().catch(() => { /* no control until the poll lands */ });
-    // Poll the full list so a workspace launched (or stopped) while the picker
-    // is open appears on its own — not only while something is already
-    // "Starting…" (that gate left a freshly-launched workspace invisible until a
-    // manual reload). The same tick refreshes the restore status.
+    void fetchRestoreStatus().catch(() => {  });
+    void fetchGatewayStatus().catch(() => {  });
     const timer = setInterval(() => {
       void pollRefresh();
     }, 2000);
     return () => clearInterval(timer);
   }, []);
 
-  // Drive the inline boot splash (index.html). While auto-opening, leave it up
-  // untouched — it keeps its baked "Opening your workspace…" status (do NOT
-  // re-set it here: the workspace document bakes the SAME text, so leaving it
-  // alone keeps the status byte-identical across the cross-document hop, with no
-  // wording swap at the seam). It stays on screen straight through the navigation
-  // (the workspace's own inline splash continues it), so there is no picker-grid
-  // "blink". When we instead show the list, fade it.
   useEffect(() => {
     if (!autoOpening.value) dismissBootSplash();
   }, [autoOpening.value]);
 
-  // First run: when the picker loads with zero workspaces, unfold the create
-  // form so the user names their first workspace right away, instead of an
-  // empty screen (and instead of a pre-made `default`). The unfolded form is
-  // what says "start here", so nothing narrates it in prose above.
-  // The field stays empty and editable; the suggestion chips ("personal" /
-  // "work") offer a one-click fill. Both entry points stay visible above it, so
-  // this never hides restore: the case ADR 0015 exists for (a user with a backup
-  // and no workspace) IS the first-run state. Runs once; a manual Cancel then
-  // stays cancelled.
   const firstRunPrompted = useSignal(false);
   useEffect(() => {
     if (firstRunPrompted.value) return;
@@ -708,18 +510,6 @@ export function WorkspacePicker() {
     }
   }, [workspaces.value]);
 
-  // A finished restore states itself once and then gets out of the way. The
-  // restored workspace is already a row in the list above, healthy and
-  // clickable, so the completed banner carries no buttons (see RestoreBanner);
-  // clearing the gateway's terminal status is what makes it leave, and the
-  // picker does that on a timer rather than asking the user to tidy up after a
-  // success. A FAILED restore is deliberately excluded: it keeps its Dismiss.
-  //
-  // Keyed on the restored workspace's id, NOT on the status object: the 2s poll
-  // hands back a fresh object every tick, and an object-keyed effect would
-  // cancel and re-arm the timer on every one of them, so it would never fire.
-  // `clearRetry` re-arms after a failed clear, which is the only other way the
-  // key can change.
   const clearRetry = useSignal(0);
   const completedRestoreId =
     restoreStatus.value?.status === 'completed' && !restoreNeedsReading(restoreStatus.value)
@@ -730,13 +520,11 @@ export function WorkspacePicker() {
     const timer = setTimeout(() => {
       void clearRestoreStatus()
         .then(() => {
-          // Drop the banner now rather than waiting up to a poll tick for the
-          // gateway to answer idle.
           if (restoreStatus.value?.status === 'completed') restoreStatus.value = { status: 'idle' };
         })
         .catch((e) => {
-          // Best-effort and self-recovering, per frontend.md's telemetry
-          // carve-out: nothing the user asked for failed (they pressed nothing),
+          // BEST-EFFORT: self-recovering, per frontend.md's telemetry
+          // carve-out. Nothing the user asked for failed (they pressed nothing),
           // and bumping the retry re-arms the timer for another attempt, so a
           // blip cannot strand a buttonless banner on screen.
           console.warn('[picker] clearing the finished restore failed; retrying', e);
@@ -746,8 +534,6 @@ export function WorkspacePicker() {
     return () => clearTimeout(timer);
   }, [completedRestoreId, clearRetry.value]);
 
-  // Ref to the create form's name input so a suggestion chip can fill it and
-  // hand focus back (select the filled text so the user can type over it).
   const nameInputRef = useRef<HTMLInputElement>(null);
   function pickSuggestion(name: string) {
     newName.value = name;
@@ -767,6 +553,20 @@ export function WorkspacePicker() {
       error.value = errorDetail(e);
     } finally {
       busy.value = false;
+    }
+  }
+
+  async function onDelete(ids: string[], bulk = false) {
+    if (deleting.value) return;
+    deleting.value = true;
+    try {
+      await deleteWorkspaces(ids, async () => {
+        if (bulk) selection.value = null;
+        trashRevision.value++;
+        await refresh();
+      });
+    } finally {
+      deleting.value = false;
     }
   }
 
@@ -792,8 +592,6 @@ export function WorkspacePicker() {
     });
   }
 
-  /** Apply a chosen or dropped file. An empty selection (cancelled dialog,
-   *  file-less drop) leaves the draft alone: see `applyRestoreFile`. */
   function pickRestoreFile(file: File | null | undefined) {
     restoreDraft.value = applyRestoreFile(restoreDraft.value, file);
   }
@@ -821,10 +619,16 @@ export function WorkspacePicker() {
   function onAddRemote() {
     if (remoteGatewayBlocker(remoteDraft.value) !== null) return;
     void withBusy(async () => {
-      const added = await submitRemoteGateway(remoteDraft.value);
-      remoteDraft.value = EMPTY_REMOTE_GATEWAY_DRAFT;
-      pairedRemote.value = added.name;
-      await refreshRemoteWorkspaces();
+      try {
+        const added = await submitRemoteGateway(remoteDraft.value, () => {
+          remoteAwaitingOwner.value = true;
+        });
+        remoteDraft.value = EMPTY_REMOTE_GATEWAY_DRAFT;
+        pairedRemote.value = added.name;
+        await refreshRemoteWorkspaces();
+      } finally {
+        remoteAwaitingOwner.value = false;
+      }
     });
   }
 
@@ -833,7 +637,6 @@ export function WorkspacePicker() {
     if (!file || !key.trim() || !name.trim()) return;
     void withBusy(async () => {
       const started = await restoreBackup(file, key.trim(), name.trim());
-      // Optimistically show the running banner; the poll keeps it current.
       restoreStatus.value = { status: 'running', id: started.id, name: started.name, phase: 'starting' };
       closeRestore();
     });
@@ -846,47 +649,18 @@ export function WorkspacePicker() {
     });
   }
 
-  // Tapping a row opens the workspace — EXCEPT an `unhealthy` one, where opening
-  // would drop the user into a dead app shell (the reported "navigated into a
-  // workspace I couldn't connect to" bug). For unhealthy, Retry (restart +
-  // refresh) instead — matching the row's play/Retry button — so the user opens
-  // it once it goes healthy. `healthy`/`booting`/`stopped` open normally; a
-  // stopped workspace lazy-starts behind the gateway's own auto-refreshing boot
-  // splash, which is the good path, not the dead-skeleton case. This mirrors the
-  // auto-open guard above, which already skips an unhealthy remembered workspace.
-  //
-  // `mode` is how the activation asked to open it: a plain one takes this
-  // client's default, and a cmd-click or middle-click asks for a tab. On the
-  // desktop client the default is a window, and the shell decides which. A
-  // `null` mode is a gesture that is not an activation, so the row does
-  // nothing: a macOS Ctrl-click, which the row menu already answers.
   function openOrRetry(w: WorkspaceStatus, state: WorkspaceState, mode: WorkspaceOpenMode | null) {
     if (mode === null || w.health === 'restoring') return;
     if (state === 'unhealthy') {
       void withBusy(() => restartWorkspace(w.id).then(refresh));
       return;
     }
-    // `withBusy` reports a rejection on the picker's own error line, which is
-    // the only surface it has: no toast host is mounted here.
     void withBusy(async () => {
       await openWorkspaceIn(mode, w.id);
     });
   }
 
-  /** Right-click a row: open that row's own overflow menu, where the ALTERNATE
-   *  open mode lives beside rename and delete.
-   *
-   *  The menu is anchored to the OVERFLOW BUTTON rather than to the row, for
-   *  two reasons. It is CSS-positioned under that button, so this is where it
-   *  appears whichever way it was opened. And the anchor is exempt from the
-   *  Overlay's outside-click dismiss: with the row as anchor, a left-click on
-   *  it would neither close the menu nor be swallowed, so a dismissing click
-   *  would open the workspace.
-   *
-   *  A row with no trigger (renaming, deleting) is not one of these rows at all,
-   *  and never carries this handler. */
   function openRowMenu(e: MouseEvent, id: string) {
-    // On touch a hold lifts the row to drag it, and the ⋯ button opens the menu.
     if (hasCoarsePointer()) return;
     const trigger = (e.currentTarget as HTMLElement).querySelector<HTMLElement>(MORE_BUTTON);
     if (!trigger) return;
@@ -895,8 +669,6 @@ export function WorkspacePicker() {
     menuOpenId.value = id;
   }
 
-  /** Draw `reordered`, the drawn keys in a new order, and store it. A stored
-   *  key with no row on screen keeps its place. */
   function reorder(reordered: readonly string[]) {
     void orderSaver.reorder(keepUndrawnKeys(order.value, reordered));
   }
@@ -913,8 +685,18 @@ export function WorkspacePicker() {
     drawnEntries.current = v.status === 'loaded' ? orderWorkspaces(v.data, remoteViews, order.value) : [];
   }
   const entries = drawnEntries.current;
+  const selected = selection.value;
+  const selectedIds = v.status === 'loaded' && selected
+    ? v.data.filter((workspace) => selected.has(workspace.id)).map((workspace) => workspace.id)
+    : [];
 
-  /** The row's ⋯ button and the menu it opens. `id` names the row's menu. */
+  function toggleSelected(id: string, checked: boolean) {
+    const next = new Set(selection.value);
+    if (checked) next.add(id);
+    else next.delete(id);
+    selection.value = next;
+  }
+
   function rowMenu(id: string, label: string, disabled: boolean, items: ComponentChildren) {
     return (
       <div class="ws-picker-menu-wrap">
@@ -953,7 +735,6 @@ export function WorkspacePicker() {
     );
   }
 
-  /** Move up and Move down: the keyboard's and screen reader's way to reorder. */
   function moveItems(key: string) {
     const at = drawnKeys().indexOf(key);
     const step = (direction: 'up' | 'down') => (e: MouseEvent) => {
@@ -980,14 +761,12 @@ export function WorkspacePicker() {
     );
   }
 
-  /** The list item every row sits in: its place in the drag, and its grip.
-   *  A row being renamed is not `draggable`. */
   function rowShell(entry: PickerEntry, index: number, draggable: boolean, body: ComponentChildren) {
+    const workspace = selected && entry.kind === 'local' ? entry.workspace : null;
+    draggable = draggable && !selected;
     const lift = drag?.from === index ? drag.dy : undefined;
     const dropAt = drag && drag.to === index && drag.to !== drag.from ? (drag.to > drag.from ? 'after' : 'before') : null;
     const unreachable = entry.kind === 'remote' && entry.view.unreachable !== null;
-    // The hold guard swallows the click a drag ends on, so it runs on the way
-    // down, before the row under it opens the workspace.
     const { onClick: dragClickGuard, ...holdProps } = rowProps;
     return (
       <li
@@ -997,6 +776,17 @@ export function WorkspacePicker() {
         style={lift !== undefined ? { '--ws-picker-drag-dy': `${lift}px` } : undefined}
         {...(draggable ? { ...holdProps, onClickCapture: dragClickGuard } : {})}
       >
+        {workspace && (
+          <label class="ws-picker-select-slot">
+            <input
+              type="checkbox"
+              aria-label={`Select ${workspace.name}`}
+              checked={selected?.has(workspace.id)}
+              disabled={deleting.value}
+              onChange={(event) => toggleSelected(workspace.id, event.currentTarget.checked)}
+            />
+          </label>
+        )}
         {draggable && (
           <span class="ws-picker-grip" aria-hidden="true" {...gripProps}>
             <GripIcon size="0.875rem" />
@@ -1045,81 +835,35 @@ export function WorkspacePicker() {
     ));
   }
 
-  // Gate the skeleton behind the standard SPINNER_DELAY_MS (300ms), like every
-  // other view — a fast local gateway resolves well inside that window, so the
-  // skeleton never appears and can't flash. There IS competing content behind it
-  // (the brand header + footer render immediately) and the inline boot splash
-  // fades over the picker for ~0.65s on every open, masking the brief empty→list
-  // transition on a fast load — so the earlier "show it immediately" approach
-  // (the picker as a no-competing-content exception) just produced a skeleton
-  // blink under the clearing splash. Only a genuinely slow load (>300ms) now
-  // shows the skeleton, which is exactly when it helps; <LoadingFade> still
-  // crossfades it out so a shown skeleton doesn't hard-snap to the list.
   const listLoading = v.status === 'loading' || v.status === 'not-loaded';
-  const showListSkeleton = useDelayedFlag(listLoading);
-  // Size the skeleton to the last-known workspace count so the skeleton→list
-  // handoff doesn't bounce (each skeleton row matches a real row's height).
-  // Captured once at mount so it stays stable while the skeleton fades out
-  // (LoadingFade) after the fresh count is recorded; first-ever visit → 3.
+  const trashStatus = trashInventory.state.status;
+  const trashLoading = !autoOpening.value && (trashStatus === 'loading' || trashStatus === 'not-loaded');
+  const showSkeletons = useDelayedFlag(listLoading || trashLoading);
   if (skeletonRowsRef.current === undefined) {
     skeletonRowsRef.current = recallLastWorkspaceCount() ?? 3;
   }
   const skeletonRows = skeletonRowsRef.current;
-  // What still stands between the draft and a submittable restore, stated to the
-  // user rather than expressed only as a dead button (a disabled Restore with no
-  // reason is what made a missing file read as "the app is broken"). Includes
-  // the address collision, which the gateway re-checks authoritatively.
   const known = v.status === 'loaded' ? v.data : [];
   const blocker = restoreBlocker(restoreDraft.value, known);
   const fileNote = restoreFileNote(restoreDraft.value.file);
   const createNote = buildCreateNote(newName.value, known);
-  // A rename may not take another workspace's name (renaming to its own current
-  // name is not a collision, hence the exclusion).
   const renameTaken = renamingId.value
     ? nameTakenBy(renameValue.value, known, renamingId.value)
     : null;
-  // One condition for Save and for the Enter key, so they cannot drift apart.
   const canRename = !busy.value && renameValue.value.trim() !== '' && renameTaken === null;
   const restore = restoreStatus.value;
   const restoreRunning = restore?.status === 'running';
 
-  // Packaged macOS: the picker is a render root of its own, so it inherits none
-  // of the app shell's window chrome. Without this the window cannot be moved at
-  // all while the picker is up: `titleBarStyle: "Overlay"` gives the webview the
-  // full window height, and the app's drag regions (`.titlebar-strip`, the
-  // header) live in `<App/>`, which the picker never mounts. The whole
-  // background is the region here, since a picker that is nothing but chrome has
-  // no title bar to aim at, and `isInteractiveTarget` keeps presses on the rows,
-  // buttons and name field out of it.
-  //
-  // A state-backed element rather than a `useRef`, because the root below is
-  // conditionally rendered: the auto-open branch returns null first and only
-  // reveals the picker if the remembered workspace turns out to be gone or
-  // unhealthy. `useWindowDragRegion`'s effect has stable deps, so a plain ref
-  // would leave it holding the null it read on that first render and the picker
-  // it eventually showed would be undraggable, which is this bug again in its
-  // rarest form.
   const [pickerEl, setPickerEl] = useState<HTMLElement | null>(null);
   const pickerRef = useMemo(() => ({ current: pickerEl }), [pickerEl]);
   useWindowDragRegion(pickerRef, { canStart: pickerCanDragStart });
 
-  // Packaged macOS: tell the shell where THIS surface's title-bar band ends, so
-  // it centres the traffic lights on a bar the picker actually has. Keyed on the
-  // picker element, since the band is mounted by the same render and there is
-  // nothing to observe before it. See `watchTitlebarBand`.
   useEffect(() => (pickerEl ? watchTitlebarBand() : undefined), [pickerEl]);
 
-  // Smart-root auto-open in progress: render nothing so the inline boot splash
-  // (index.html, kept up by the effect above) stays the only thing on screen —
-  // the picker grid never flashes before the redirect to the last-active
-  // workspace, and the splash carries straight through the navigation.
   if (autoOpening.value) return null;
 
   return (
     <div class="ws-picker" ref={setPickerEl}>
-      {/* The band the macOS traffic lights centre on. Invisible and untouchable:
-          the picker draws no bar, but the window still wears the OS buttons, and
-          they have to sit on something this surface states for itself. */}
       <div class="ws-picker-titlebar-band" data-titlebar-band aria-hidden="true" />
       <div class="ws-picker-shell">
         <header class="ws-picker-header">
@@ -1220,26 +964,40 @@ export function WorkspacePicker() {
           <div class="ws-picker-error">Failed to load workspaces: {v.error}</div>
         )}
 
-        <LoadingFade showSkeleton={showListSkeleton} skeleton={<PickerSkeleton rows={skeletonRows} />}>
-        {/* Nothing stands in for an empty list: the two footer entry points and
-            their fields say what they do, so a sentence restating them is noise
-            on the first screen a new user meets. */}
+        <LoadingFade showSkeleton={listLoading && showSkeletons} skeleton={<PickerSkeleton rows={skeletonRows} />}>
         {v.status === 'loaded' && (
+          <>
+          <Disclosure open={v.data.length > 0} bodyClass="ws-picker-select-bar">
+            <div class={selected ? 'ws-picker-select-actions is-selecting' : 'ws-picker-select-actions'}>
+              <button
+                type="button"
+                class="ws-picker-btn"
+                aria-pressed={selected !== null}
+                disabled={busy.value || deleting.value || Boolean(drag)}
+                onClick={() => {
+                  menuOpenId.value = null;
+                  renamingId.value = null;
+                  selection.value = selected ? null : new Set();
+                }}
+              >{selected ? 'Cancel selection' : 'Select'}</button>
+              {selected && (
+                <button
+                  type="button"
+                  class="ws-picker-btn ws-picker-btn-danger"
+                  disabled={busy.value || deleting.value || selectedIds.length === 0}
+                  onClick={() => void onDelete(selectedIds, true)}
+                >Delete {selectedIds.length} {selectedIds.length === 1 ? 'workspace' : 'workspaces'}</button>
+              )}
+            </div>
+          </Disclosure>
           <ul class="ws-picker-list" ref={listRef}>
             {entries.map((entry, index) => {
               if (entry.kind === 'remote') return remoteRow(entry, index);
               const w = entry.workspace;
               const state = workspaceState(w);
               const running = state === 'healthy' || state === 'booting';
-              // Non-null for the one state that is a fault, which is also the
-              // one the dot draws in red. See `workspaceFaultNote`.
               const fault = workspaceFaultNote(w);
-              // Null only when the gateway could not ask. See `backupNote`.
               const backup = backupNote(w);
-              // The row's whole accessible name. An `aria-label` REPLACES the
-              // element's content, so every sentence rendered inside has to be
-              // folded in here or it goes unread. Two can be: the fault note,
-              // and the backup line.
               const rowLabel = [
                 w.health === 'restoring' ? `Restoring ${w.name}` : fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`,
                 w.health === 'restoring' ? w.last_error : null,
@@ -1265,10 +1023,6 @@ export function WorkspacePicker() {
                         >Save</button>
                         <button class="ws-picker-btn" onClick={() => (renamingId.value = null)}>Cancel</button>
                       </div>
-                      {/* Renaming onto another workspace's name is how the picker
-                          ended up with two rows reading the same thing. Refused
-                          here and at the gateway; renaming to what this workspace
-                          is already called is not a collision with itself. */}
                       {renameTaken && (
                         <p class="ws-picker-note ws-picker-note-warn">{nameTakenMessage(renameTaken)}</p>
                       )}
@@ -1278,57 +1032,30 @@ export function WorkspacePicker() {
                       class="ws-picker-open"
                       role="button"
                       tabIndex={0}
-                      // The row's own label, and with it the ONLY thing a screen
-                      // reader hears here. See `rowLabel` above for what it
-                      // folds in and why it has to.
                       aria-label={rowLabel}
                       onClick={(e) => openOrRetry(w, state, openModeForClick(e))}
-                      // Only where a middle press would open something beside.
-                      // On an unhealthy row the primary action is a RESTART,
-                      // and a wheel press must never reboot an engine.
                       onAuxClick={middleClickActivates(state)
                         ? middleClickHandler((e) => openOrRetry(w, state, openModeForClick(e)))
                         : undefined}
                       onContextMenu={(e) => openRowMenu(e, w.id)}
                       onKeyDown={(e) => {
-                        // Only the row itself opens on Enter/Space — a keydown
-                        // bubbling up from a focused action button (rename, play,
-                        // …) must not also navigate to the workspace.
                         if (e.target !== e.currentTarget) return;
                         if (e.key === 'Enter' || e.key === ' ') {
                           e.preventDefault();
-                          // A keystroke carries no gesture, so it takes the
-                          // default mode. Its modifiers mean nothing here: they
-                          // are the browser's own on a link, not on a key press.
                           openOrRetry(w, state, defaultOpenMode());
                         }
                       }}
                     >
                       <div class="ws-picker-line">
-                        {/* The dot keeps its hover tooltip for every state, since
-                            that is where the label lives when the row says nothing.
-                            Its `aria-label` is the fallback for the same reason,
-                            and it steps aside for the fault note below: with the
-                            error rendered as text in this row, labelling the dot
-                            with it too has a screen reader read the same sentence
-                            twice. */}
                         <span
                           class={`ws-picker-dot ws-picker-dot-${state}`}
                           data-tooltip={workspaceStateLabel(w)}
                           aria-label={fault ? undefined : workspaceStateLabel(w)}
                           aria-hidden={fault ? 'true' : undefined}
                         />
-                        {/* Name over address, as one cell. Both name this
-                            workspace, so they stack instead of splitting the
-                            row's one horizontal budget between them. */}
                         <div class="ws-picker-id">
                           <span class="ws-picker-name">{w.name}</span>
                           {w.health === 'restoring' && <span class="ws-picker-address">{workspaceStateLabel(w)}</span>}
-                          {/* The address is normally invisible, and normally that's
-                              fine (it matches the name). It is shown exactly when it
-                              would otherwise surprise: a rename left the name off its
-                              address, or two rows share a name and this is the only
-                              thing telling them apart. See `showsAddress`. */}
                           {showsAddress(w, v.data) && (
                             <span
                               class="ws-picker-address"
@@ -1338,24 +1065,6 @@ export function WorkspacePicker() {
                               {workspaceAddress(w.id)}
                             </span>
                           )}
-                          {/* When this workspace last backed up, under the name
-                              it belongs to. In the stacked id cell rather than
-                              on the row's line, which holds three cells and
-                              stays that way: a fourth item there would push the
-                              play and ⋯ buttons off the row.
-
-                              The slot is ALWAYS drawn, and stays empty until
-                              the gateway has a fact for it. The fact lands on
-                              the 2s poll, and a workspace the gateway could not
-                              ask has none at all. A slot that came and went
-                              would grow the row under the pointer, and shove
-                              every row below it down. Empty, it still says
-                              nothing: the picker never calls an unreachable
-                              workspace un-backed-up.
-
-                              `aria-hidden` because the row's own label already
-                              carries this sentence (see `rowLabel`), and a
-                              screen reader would otherwise read it twice. */}
                           <span
                             class={`ws-picker-backup${backup ? ` ws-picker-backup-${backup.level}` : ''}`}
                             aria-hidden="true"
@@ -1372,10 +1081,6 @@ export function WorkspacePicker() {
                             {w.unread_count > 99 ? '99+' : w.unread_count}
                           </GlyphBadge>
                         )}
-                        {/* Both, because they are different events: a middle
-                            press dispatches `auxclick` and no `click` at all, so
-                            the click stopper alone let a middle-click on Stop or
-                            the ⋯ trigger fall through and open the workspace. */}
                         <div
                           class="ws-picker-actions"
                           onClick={(e) => e.stopPropagation()}
@@ -1448,19 +1153,6 @@ export function WorkspacePicker() {
                           )}
                           {rowMenu(w.id, `More actions for ${w.name}`, busy.value || w.health === 'restoring', (
                             <>
-                              {/* Leads the menu because it is the only item that
-                                  OPENS the workspace, which is what the row is
-                                  for; the three below it configure or destroy it.
-                                  It carries the ALTERNATE mode, so it is always
-                                  the thing a plain tap on the row does not do.
-                                  `alternateOpenMode` decides which rows get one,
-                                  and the in-app switcher asks the same function.
-
-                                  `WORKSPACE_ID` is null here, since the picker is
-                                  served at `/~/`, inside no workspace. That is
-                                  what withholds the desktop client's "switch this
-                                  window": the default already repoints THIS
-                                  window, so the item would say nothing new. */}
                               {alternateMode !== null && (
                                 <button
                                   class="ws-picker-menu-item"
@@ -1469,10 +1161,6 @@ export function WorkspacePicker() {
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     menuOpenId.value = null;
-                                    // `withBusy` reports a rejection on the
-                                    // picker's own error line, which is the only
-                                    // surface it has: no toast host is mounted
-                                    // here.
                                     void withBusy(async () => {
                                       await openWorkspaceIn(alternateMode, w.id);
                                     });
@@ -1493,12 +1181,6 @@ export function WorkspacePicker() {
                                 }}
                               >
                                 <ClockIcon />
-                                {/* States the CURRENT state, and states it in terms of
-                                    what the user gets. "Starts with gateway" named an
-                                    internal process the user never sees; what the
-                                    setting actually decides is whether this workspace
-                                    keeps working (triggers, scheduled tasks, coding
-                                    agents, notifications) while no window is open. */}
                                 <span>{w.autostart ? 'Runs in the background' : 'Only runs while open'}</span>
                               </button>
                               <button
@@ -1517,10 +1199,11 @@ export function WorkspacePicker() {
                               <button
                                 class="ws-picker-menu-item ws-picker-menu-item-danger"
                                 role="menuitem"
+                                disabled={deleting.value}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   menuOpenId.value = null;
-                                  deletingId.value = w.id;
+                                  void onDelete([w.id]);
                                 }}
                               >
                                 <TrashIcon />
@@ -1531,24 +1214,12 @@ export function WorkspacePicker() {
                           ))}
                         </div>
                       </div>
-                      {/* What the red dot means, in words, on the row it is
-                          about. The dot was the only surface carrying
-                          `last_error`, and it is a 0.625rem disc with a
-                          hover-only tooltip, so on a phone (and on any pointer
-                          that did not happen to land on it) a workspace could be
-                          broken and say nothing about it.
-
-                          OUTSIDE `.ws-picker-line`, and that is what keeps it
-                          off the three cells: the row is a column of two boxes,
-                          and the note is the second one. Move it back inside
-                          the line and it becomes a wrapping item, which is what
-                          pushes the actions off the row. Only a faulty row is
-                          taller, by exactly the line that explains it. */}
                       {fault && <p class="ws-picker-row-note">{fault}</p>}
                     </div>
                   ));
             })}
           </ul>
+          </>
         )}
         </LoadingFade>
 
@@ -1561,12 +1232,10 @@ export function WorkspacePicker() {
 
         {restoreBanner({ status: restore, busy: busy.value, onDismiss: onDismissRestore })}
 
-        <CleanupManager tick={cleanupTick.value} requestedWorkspace={deletingId.value} onRequestHandled={() => { deletingId.value = null; }} onChanged={refresh} />
+        <TrashSection inventory={trashInventory} showSkeleton={trashLoading && showSkeletons} onChanged={refresh} />
 
         {pickerFooter({
           mode: footerMode.value,
-          // Re-activating the open entry point closes its form; the draft is
-          // kept, so flipping between the two never costs the user their typing.
           onMode: (m) => (footerMode.value = footerMode.value === m ? 'none' : m),
           busy: busy.value,
           restoreRunning,
@@ -1585,15 +1254,19 @@ export function WorkspacePicker() {
           onCancelRestore: closeRestore,
           blocker,
           fileNote,
-          // Collisions use the same frozen, named cleanup flow as the row menu.
-          onDeleteColliding: (id) => { deletingId.value = id; },
+          onDeleteColliding: (id) => { void onDelete([id]); },
           remoteDraft: remoteDraft.value,
           onRemoteDraft: patchRemote,
           onAddRemote,
           onCancelRemote: closeRemote,
           pairedRemote: pairedRemote.value,
+          remoteAwaitingOwner: remoteAwaitingOwner.value,
         })}
       </div>
+      <OverlayLayer>
+        <Toast />
+        <ConfirmDialog />
+      </OverlayLayer>
     </div>
   );
 }

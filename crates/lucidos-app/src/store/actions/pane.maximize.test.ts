@@ -4,8 +4,6 @@ import { DEFAULT_SPLIT_RATIO } from '../../components/layout/splitHelpers';
 
 describe('computeDrawerShortcutAction (⌘⇧1 three-stage)', () => {
   it('hidden drawer → open + focus', () => {
-    // Hidden covers a closed drawer, a Conversation side that is collapsed, and
-    // a drawer the layout yielded: none of them is drawn.
     expect(computeDrawerShortcutAction(false, false)).toBe('open-focus');
     expect(computeDrawerShortcutAction(false, true)).toBe('open-focus');
   });

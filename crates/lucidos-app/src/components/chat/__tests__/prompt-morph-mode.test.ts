@@ -29,20 +29,13 @@ describe('computeMorphMode', () => {
     expect(computeMorphMode({ ...base, cancelTargetId: 't1', isCanceling: true })).toBe('canceling');
   });
 
-  // hasContent wins over cancelTargetId — once the user starts typing, the
-  // morph flips back to Send so the follow-up path stays accessible.
   it('send wins over cancel when user has typed text', () => {
     expect(computeMorphMode({ ...base, hasContent: true, cancelTargetId: 't1' })).toBe('send');
   });
 
-  // Documents the intended resolution sequence on Send. The actual ordering
-  // invariant (stamp before send) is enforced by dispatchSend's tests below.
   it('Send→Cancel resolves through send → cancel without hitting hidden', () => {
-    // 1. User taps Send: hasContent true, no cancel target yet
     expect(computeMorphMode({ ...base, hasContent: true })).toBe('send');
-    // 2. dispatchSend stamps cancelTargetId before invoking the send call
     expect(computeMorphMode({ ...base, hasContent: true, cancelTargetId: 't1' })).toBe('send');
-    // 3. sendCompose runs: hasContent flips false, section buttons appear
     expect(computeMorphMode({
       ...base,
       hasContent: false,
@@ -52,8 +45,6 @@ describe('computeMorphMode', () => {
   });
 });
 
-// Locks dispatchSend's stamp-before-send invariant — see the helper's
-// docstring in PromptInput.tsx for the why.
 describe('dispatchSend ordering', () => {
   beforeEach(() => {
     submittingThreadIds.value = new Set();

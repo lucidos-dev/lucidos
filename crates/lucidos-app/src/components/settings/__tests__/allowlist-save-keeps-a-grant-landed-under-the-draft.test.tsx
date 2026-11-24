@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A Save writes the user's edits onto the file as it is NOW, not onto the
- * file as it was when the editor loaded. A permission granted while the draft
- * was dirty must survive the Save, and a pattern the user deleted must stay
- * deleted.
- *
- * Regression: the re-read pauses while the draft is dirty, and Save wrote the
- * whole file from the loaded snapshot. An "Always allow" clicked meanwhile was
- * silently revoked by the next Save.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -23,7 +13,6 @@ vi.mock('../../../store/store', async (importOriginal) => ({
 const { permissionGrantsVersion } = await import('../../../store/store');
 const { AllowlistEditor } = await import('../AllowlistEditor');
 
-/** Lets pending promises land, then flushes Preact's renders and effects. */
 function settled(): Promise<void> {
   return act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -38,7 +27,6 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 
 describe('AllowlistEditor save over a file that moved', () => {
   let host: HTMLElement;
-  /** What the engine's allowlist file holds. The grant path writes here. */
   let onDisk: string;
   let saved: string[];
 
@@ -63,7 +51,6 @@ describe('AllowlistEditor save over a file that moved', () => {
     if (!el) throw new Error(`no delete button for "${pattern}"`);
     return el;
   }
-  /** The engine appends a grant and broadcasts PermissionGrantsChanged. */
   async function grantLands(pattern: string): Promise<void> {
     onDisk += `${pattern}\n`;
     permissionGrantsVersion.value++;
@@ -78,6 +65,7 @@ describe('AllowlistEditor save over a file that moved', () => {
         description="what it is for"
         placeholder="Bash(npm:*)"
         noun="tool permissions"
+        rememberButton="Always allow"
         load={load}
         save={save}
       />,
@@ -86,7 +74,6 @@ describe('AllowlistEditor save over a file that moved', () => {
     await settled();
   }
 
-  /** The user's dirty draft: add one pattern, delete another. */
   async function editDraft(): Promise<void> {
     buttonSaying('Add pattern').click();
     await settled();
@@ -113,7 +100,6 @@ describe('AllowlistEditor save over a file that moved', () => {
     await mount(async (contents) => { saved.push(contents); onDisk = contents; });
     await editDraft();
     await grantLands('Bash(git status)');
-    // Paused while dirty: the grant is not on screen yet.
     expect(rows()).toEqual(['Bash(git:*)', 'Bash(ls:*)']);
 
     buttonSaying('Save').click();
@@ -137,7 +123,6 @@ describe('AllowlistEditor save over a file that moved', () => {
 
     expect(saved).toEqual([]);
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('engine unreachable'), 'error');
-    // The draft is still the user's, so they can retry.
     expect(rows()).toEqual(['Bash(git:*)', 'Bash(ls:*)']);
     expect(buttonSaying('Save').disabled).toBe(false);
   });
@@ -150,7 +135,6 @@ describe('AllowlistEditor save over a file that moved', () => {
 
     buttonSaying('Save').click();
     await settled();
-    // Typed while the save is still on the wire.
     buttonSaying('Add pattern').click();
     await settled();
     type(inputs()[inputs().length - 1], 'Bash(pwd)');
@@ -159,7 +143,6 @@ describe('AllowlistEditor save over a file that moved', () => {
     await settled();
 
     expect(rows()).toEqual(['Bash(git:*)', 'Bash(ls:*)', 'Bash(pwd)', 'Bash(git status)']);
-    // A second Save must not read the grant's absence as a deletion.
     buttonSaying('Save').click();
     await settled();
     expect(saved[1]).toBe('# header\nBash(git:*)\nBash(ls:*)\nBash(pwd)\nBash(git status)\n');

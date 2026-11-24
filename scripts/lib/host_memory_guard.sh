@@ -178,6 +178,9 @@
 
 # shellcheck source=proc_tree.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_tree.sh"
+# For E2E_DEFAULT_WORKSPACE.
+# shellcheck source=e2e_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_root.sh"
 # For `engine_live_pid`: the e2e engine's pid counts only while it owns its lock.
 # shellcheck source=flock.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/flock.sh"
@@ -234,6 +237,100 @@ HOST_MEMORY_STOP_COMPRESSOR_GB=""
 # open. A guard that cannot measure must never stop the suite. Same posture as
 # the host-load guard and the reaper.
 
+_host_mem_os() { uname -s; }
+_host_mem_proc_root() { printf '/proc'; }
+
+# Discover the mounted cgroup v2 hierarchy instead of assuming a fixed mount.
+_host_mem_linux_cgroup() {
+    local proc="$1" member root mount relative
+    member="$(sed -n 's/^0:://p' "$proc/self/cgroup" 2>/dev/null || :)"
+    case "$member" in /*) ;; *) return 0 ;; esac
+    while read -r root mount; do
+        root="$(printf '%b' "${root//\\134/\\0134}")"
+        mount="$(printf '%b' "${mount//\\134/\\0134}")"
+        case "$member" in
+            "$root") relative="" ;;
+            "$root"/*) relative="${member#"$root"}" ;;
+            *) relative="$member" ;;
+        esac
+        case "$relative/" in */../*) continue ;; esac
+        mount="${mount%/}"
+        if [ -d "${mount}$relative" ]; then
+            printf '%s\n%s\n' "$mount" "${mount}$relative"
+        fi
+    done < <(awk '/ - cgroup2 / {print $4, $5}' "$proc/self/mountinfo" 2>/dev/null)
+}
+
+# A parent limit can bind even when the process's own ceiling is `max`.
+_host_mem_linux_cgroup_values() {
+    local mount dir limit current inactive_file
+    while IFS= read -r mount && IFS= read -r dir; do
+        dir="${dir%/}"
+        while :; do
+            if [ -r "$dir/memory.max" ] && read -r limit <"$dir/memory.max"; then
+                case "$limit" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        current=""
+                        if [ -r "$dir/memory.current" ]; then
+                            read -r current <"$dir/memory.current" || :
+                        fi
+                        inactive_file="$(awk '$1 == "inactive_file" && $2 ~ /^[0-9]+$/ {
+                            print $2; exit
+                        }' "$dir/memory.stat" 2>/dev/null || :)"
+                        printf '%s %s %s\n' "$limit" "${current:-unknown}" "${inactive_file:-0}"
+                        ;;
+                esac
+            fi
+            [ "$dir" != "$mount" ] && [ -n "$dir" ] || break
+            dir="${dir%/*}"
+        done
+    done < <(_host_mem_linux_cgroup "$1")
+}
+
+_host_mem_linux_gb() {
+    local field="$1" proc
+    proc="$(_host_mem_proc_root)"
+    {
+        awk -v key="$field:" '$1 == key && $2 ~ /^[0-9]+$/ && $3 == "kB" {
+            printf "host %.0f\n", $2 * 1024; exit
+        }' "$proc/meminfo" 2>/dev/null || :
+        _host_mem_linux_cgroup_values "$proc"
+    } | LC_ALL=C awk -v field="$field" '
+        $1 == "host" { value = $2; measured = 1; next }
+        field == "MemTotal" { bound = $1 }
+        field != "MemTotal" && $2 ~ /^[0-9]+$/ {
+            # Inactive file pages can be reclaimed under pressure.
+            used = ($2 > $3) ? $2 - $3 : 0
+            bound = ($1 > used) ? $1 - used : 0
+        }
+        field != "MemTotal" && $2 !~ /^[0-9]+$/ { next }
+        { if (!measured || bound < value) value = bound; measured = 1 }
+        END { if (measured) printf "%.2f", value / 1073741824 }
+    '
+}
+
+_host_mem_linux_pressure() {
+    local proc mount dir
+    proc="$(_host_mem_proc_root)"
+    # Partial stalls corroborate low headroom. Full stalls signal thrashing.
+    {
+        cat "$proc/pressure/memory" 2>/dev/null || :
+        while IFS= read -r mount && IFS= read -r dir; do
+            cat "$dir/memory.pressure" 2>/dev/null || :
+        done < <(_host_mem_linux_cgroup "$proc")
+    } | LC_ALL=C awk '
+        ($1 == "some" || $1 == "full") && $2 ~ /^avg10=[0-9]+([.][0-9]+)?$/ {
+            value = substr($2, 7) + 0
+            if (value > 100) next
+            measured = 1
+            if ($1 == "full" && value >= 5) critical = 1
+            if ($1 == "some" && value >= 15) warn = 1
+        }
+        END { if (measured) print critical ? 4 : (warn ? 2 : 1) }
+    '
+}
+
 # Compressor size in GB, from vm_stat. The page size comes from vm_stat's own
 # header rather than a constant, because it is 16 KB on Apple silicon and 4 KB
 # on Intel.
@@ -242,6 +339,7 @@ _host_mem_read_compressor_gb() {
         printf '%s' "$HOST_COMPRESSOR_GB_OVERRIDE"
         return 0
     fi
+    [ "$(_host_mem_os)" != Linux ] || return 0
     vm_stat 2>/dev/null | awk '
         /page size of/ { for (i = 1; i < NF; i++) if ($i == "of") page = $(i + 1) + 0 }
         /^Pages occupied by compressor:/ { pages = $NF + 0 }
@@ -259,6 +357,10 @@ _host_mem_read_compressor_gb() {
 _host_mem_read_available_gb() {
     if [ -n "${HOST_AVAIL_GB_OVERRIDE:-}" ]; then
         printf '%s' "$HOST_AVAIL_GB_OVERRIDE"
+        return 0
+    fi
+    if [ "$(_host_mem_os)" = Linux ]; then
+        _host_mem_linux_gb MemAvailable
         return 0
     fi
     vm_stat 2>/dev/null | awk '
@@ -282,6 +384,14 @@ _host_mem_read_available_gb() {
 _host_mem_read_swap_used_gb() {
     if [ -n "${HOST_SWAP_USED_GB_OVERRIDE:-}" ]; then
         printf '%s' "$HOST_SWAP_USED_GB_OVERRIDE"
+        return 0
+    fi
+    if [ "$(_host_mem_os)" = Linux ]; then
+        LC_ALL=C awk '
+            /^SwapTotal:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { total = $2 }
+            /^SwapFree:/ && $2 ~ /^[0-9]+$/ && $3 == "kB" { free = $2 }
+            END { if (total != "" && free != "" && total >= free) printf "%.2f", (total - free) / 1048576 }
+        ' "$(_host_mem_proc_root)/meminfo" 2>/dev/null || :
         return 0
     fi
     sysctl -n vm.swapusage 2>/dev/null | awk '
@@ -310,6 +420,10 @@ _host_mem_read_swap_used_gb() {
 _host_mem_read_pressure_level() {
     if [ -n "${HOST_PRESSURE_LEVEL_OVERRIDE:-}" ]; then
         printf '%s' "$HOST_PRESSURE_LEVEL_OVERRIDE"
+        return 0
+    fi
+    if [ "$(_host_mem_os)" = Linux ]; then
+        _host_mem_linux_pressure
         return 0
     fi
     local level
@@ -348,6 +462,10 @@ _host_mem_pressure_word() {
 _host_mem_read_physical_gb() {
     if [ -n "${HOST_PHYSMEM_GB_OVERRIDE:-}" ]; then
         printf '%s' "$HOST_PHYSMEM_GB_OVERRIDE"
+        return 0
+    fi
+    if [ "$(_host_mem_os)" = Linux ]; then
+        _host_mem_linux_gb MemTotal
         return 0
     fi
     local bytes
@@ -563,11 +681,11 @@ _host_mem_worse_of() {
 HOST_MEMORY_SAMPLER_PID="${HOST_MEMORY_SAMPLER_PID:-}"
 
 _host_mem_samples_file() {
-    printf '%s' "${HOST_MEMORY_SAMPLES_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-samples}"
+    printf '%s' "${HOST_MEMORY_SAMPLES_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-samples}"
 }
 
 _host_mem_sampler_pidfile() {
-    printf '%s' "${HOST_MEMORY_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-sampler.pid}"
+    printf '%s' "${HOST_MEMORY_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-sampler.pid}"
 }
 
 # One tick: append "<level> <compressor> <available> <swap>" and echo the
@@ -704,11 +822,11 @@ stop_host_memory_sampler() {
 # Plan: docs/plans/2026-09-24-host-memory-watch-and-in-chunk-stop.md.
 
 _host_mem_trip_file() {
-    printf '%s' "${HOST_MEMORY_TRIP_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-trip}"
+    printf '%s' "${HOST_MEMORY_TRIP_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-trip}"
 }
 
 _host_mem_runner_pidfile() {
-    printf '%s' "${HOST_MEMORY_RUNNER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-runner.pid}"
+    printf '%s' "${HOST_MEMORY_RUNNER_PIDFILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-runner.pid}"
 }
 
 # A positive integer, or the default. Zero would trip on the first sample.
@@ -973,7 +1091,7 @@ _host_mem_attr_report() {
     # The e2e engine is the primary suspect, keyed on the disposable workspace's
     # OWN engine so we never confuse it with the user's dev/personal engines.
     local ws engine_pid="" ws_real=""
-    ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+    ws="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
     engine_pid="$(engine_live_pid "$ws")"
     ws_real="$(cd "$ws" 2>/dev/null && pwd -P)" || ws_real=""
 
@@ -1480,6 +1598,11 @@ _host_mem_now() {
     date +%s
 }
 
+# Epoch second $1 as local time in format $2. BSD date takes -r, GNU date -d.
+_host_mem_clock() { # <epoch> <format>
+    date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2" 2>/dev/null
+}
+
 _host_mem_gate_wait() {
     sleep "$1"
 }
@@ -1513,10 +1636,16 @@ _host_mem_wait_cap() {
 # A host that cannot be read is GO, the posture of every reader in this file.
 host_memory_gate_verdict() {
     local line="$1" level avail swap gb collapse ceiling reasons="" corroboration=""
-    level="$(_host_mem_read_pressure_level)"
+    # Strict callers can supply a validated boundary reading. Confirmation
+    # still samples the live reader; existing callers retain their policy.
+    if [ "$#" -ge 2 ]; then level=$2; else level="$(_host_mem_read_pressure_level)"; fi
     avail="$(_host_mem_read_available_gb)"
     swap="$(_host_mem_read_swap_used_gb)"
     gb="$(_host_mem_read_compressor_gb)"
+    if [ "$avail" = "0.00" ] && [ "$(_host_mem_os)" = Linux ]; then
+        printf '%s\n' "available Linux memory is $avail GB"
+        return 1
+    fi
     if [ -z "$level$avail$swap$gb" ]; then
         return 0
     fi
@@ -1626,7 +1755,7 @@ host_memory_build_gate() {
 HOST_MEMORY_CEILING_PID=""
 
 _host_mem_ceiling_file() {
-    printf '%s' "${HOST_MEMORY_CEILING_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-ceiling}"
+    printf '%s' "${HOST_MEMORY_CEILING_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-ceiling}"
 }
 
 host_memory_chunk_ceiling_secs() {
@@ -1716,7 +1845,7 @@ _host_mem_epoch_of_local_time() {
     esac
     [ "$((10#$hh))" -le 23 ] || return 0
     now="$(_host_mem_now)"
-    midnight="$(date -r "$now" '+%H %M %S' 2>/dev/null | awk -v n="$now" '{ print n - ($1 * 3600 + $2 * 60 + $3) }')"
+    midnight="$(_host_mem_clock "$now" '+%H %M %S' | awk -v n="$now" '{ print n - ($1 * 3600 + $2 * 60 + $3) }')"
     [ -n "$midnight" ] || return 0
     printf '%s' "$((midnight + 10#$hh * 3600 + 10#$mm * 60))"
 }
@@ -1770,7 +1899,7 @@ host_memory_wait_for_recovery() {
     local deadline start now good=0 reasons
     start="$(_host_mem_now)"
     deadline="$(_host_mem_recovery_deadline)"
-    echo "[e2e-resume] waiting for the host to recover, until $(date -r "$deadline" '+%H:%M' 2>/dev/null || echo "$deadline"): $HOST_MEMORY_RECOVERY_POLLS clean readings in a row, ${HOST_MEMORY_RECOVERY_POLL_SECS}s apart."
+    echo "[e2e-resume] waiting for the host to recover, until $(_host_mem_clock "$deadline" '+%H:%M' || echo "$deadline"): $HOST_MEMORY_RECOVERY_POLLS clean readings in a row, ${HOST_MEMORY_RECOVERY_POLL_SECS}s apart."
     while :; do
         if reasons="$(_host_mem_recovery_reading)"; then
             good=$((good + 1))
@@ -1848,7 +1977,7 @@ _host_mem_workspace_counts() {
 _host_mem_left_behind_report() {
     local where="$1" tag="$HOST_MEMORY_ATTR_TAG" ws engine_pid counts apps files commits
     local agents_now="" pid started n=0 engine_part="e2e engine unmeasured"
-    ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+    ws="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
     engine_pid="$(engine_live_pid "$ws")"
 
     if [ -n "$HOST_MEMORY_ENGINE_MB_NOW" ]; then

@@ -1,17 +1,6 @@
-/**
- * `showToast` bounds the title and message it STORES, not what the renderer
- * draws.
- *
- * The clamp itself is unit-tested in `components/shared/toastMessage.test.ts`.
- * What is under test here is that `showToast` is the one gate, so no caller can
- * route around it. A keyed update writes through a second branch, which must
- * clamp too.
- */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { showToast, toasts } from '../store';
 
-/** The gateway's 503 boot splash, in the shape that reached the screen: a
- *  prefix from the caller, then a whole HTML page. */
 const HTML_ERROR = [
   'Compose sync failed: 503 <!doctype html><html><head>',
   '<meta http-equiv="refresh" content="2">',
@@ -28,7 +17,6 @@ describe('showToast bounds every message it stores', () => {
     const [toast] = toasts.value;
     expect(toast.message).not.toContain('\n');
     expect(toast.message.length).toBeLessThanOrEqual(200);
-    // Still names what failed: the clamp cuts the tail, never the lead.
     expect(toast.message.startsWith('Compose sync failed: 503')).toBe(true);
   });
 

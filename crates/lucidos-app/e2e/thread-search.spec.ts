@@ -5,7 +5,6 @@ import {
   clickVisibleElement,
 } from './helpers';
 
-/** Click the visible "Search threads" button (handles dual desktop/mobile layout) */
 async function clickSearchButton(page: import('@playwright/test').Page) {
   await clickVisibleElement(page, 'button[aria-label="Search threads"]');
 }
@@ -31,7 +30,6 @@ test.describe('Thread search', () => {
     await expect(searchInput).toBeVisible({ timeout: 5_000 });
     await searchInput.fill(marker);
 
-    // Wait for at least one result to appear
     await page.waitForFunction(() => {
       const rows = document.querySelectorAll('.thread-row');
       return Array.from(rows).filter(el => {
@@ -55,7 +53,6 @@ test.describe('Thread search', () => {
     await expect(searchInput).toBeVisible({ timeout: 5_000 });
     await searchInput.fill('zzzzz-nonexistent-query-99999');
 
-    // Wait for results to settle (debounce + render)
     await page.waitForFunction(() => {
       const rows = document.querySelectorAll('.thread-row');
       return Array.from(rows).filter(el => {
@@ -77,7 +74,6 @@ test.describe('Thread search', () => {
 
     await openThreadDrawer(page);
 
-    // Wait for threads to load
     await page.waitForFunction(() => {
       const rows = document.querySelectorAll('.thread-row');
       return Array.from(rows).some(el => {
@@ -101,17 +97,11 @@ test.describe('Thread search', () => {
       }).length === 0;
     }, undefined, { timeout: 10_000 });
 
-    // Close search (dual-layout: click the visible close button).
-    // Verify the button was actually clicked — if not, the search wasn't open.
     const closed = await clickVisibleElement(page, 'button[aria-label="Close search"]');
     expect(closed).toBe(true);
 
-    // Wait for header title to reappear (confirms search actually closed).
-    // Can't check search input dimensions — clip-path:inset(50%) hides visually
-    // but getBoundingClientRect() still returns non-zero dimensions.
     await expect(page.locator('.threads-header-title:visible, .mobile-header-title:visible').first()).toBeVisible({ timeout: 5_000 });
 
-    // Wait for thread list to be restored — at least 1 thread visible
     await page.waitForFunction(() => {
       const rows = document.querySelectorAll('.thread-row');
       return Array.from(rows).filter(el => {

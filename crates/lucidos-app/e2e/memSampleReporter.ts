@@ -1,10 +1,3 @@
-// Per-test macOS compressor sampling, to find the spec that leaks compressor
-// pages. One line per test end goes to $LUCIDOS_E2E_MEM_LOG and its mirror
-// $LUCIDOS_E2E_MEM_MIRROR. export_e2e_mem_sample_env in scripts/lib/e2e.sh sets
-// both, plus the WebKit path token, and prints the end-of-run table. See docs/e2e-test-decisions.md "Per-spec compressor sampling".
-//
-// It must never fail or slow a test. Every hook swallows its own errors, the
-// sampling is async on one queue, and each child process has a short timeout.
 import { execFile } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, relative } from 'node:path';
@@ -13,7 +6,6 @@ import type { FullConfig, Reporter, Suite, TestCase, TestResult } from '@playwri
 export interface MemSample {
   pages: number;
   limit: number;
-  /** Live Playwright WebKit GPU processes; null when `ps` failed or no token was set. */
   gpuCount: number | null;
   gpuRssKb: number | null;
 }
@@ -48,7 +40,6 @@ const LIMIT_SYSCTL = 'vm.compressor.pages_compressed_limit';
 const clean = (s: string) => s.replace(/[\t\r\n]+/g, ' ');
 const orUnknown = (n: number | null) => (n === null ? '?' : String(n));
 
-/** One tab-separated `key=value` line. scripts/lib/e2e.sh parses it by key. */
 export function formatMemLine(l: MemLine): string {
   return [
     l.time.toISOString(),
@@ -66,17 +57,11 @@ export function formatMemLine(l: MemLine): string {
   ].join('\t');
 }
 
-/** `sysctl -n <pages> <limit>` prints one value per line. */
 export function parseSysctl(stdout: string): { pages: number; limit: number } | null {
   const [pages, limit] = stdout.trim().split('\n').map((v) => Number(v.trim()));
   return Number.isFinite(pages) && Number.isFinite(limit) ? { pages, limit } : null;
 }
 
-/**
- * Count and sum the RSS of Playwright WebKit GPU processes in `ps -o rss=,comm=`
- * output. `comm` is the executable path with no arguments, so a process that
- * merely mentions the browsers cache on its command line can never match.
- */
 export function parseGpuProcesses(stdout: string, token: string): { count: number; rssKb: number } {
   let count = 0;
   let rssKb = 0;
@@ -101,10 +86,6 @@ function run(cmd: string, args: string[]): Promise<string> {
   });
 }
 
-/**
- * One `sysctl` and one `ps`, run side by side. The WebKit token is the reaper's
- * (`_reaper_match` in scripts/lib/webkit_reaper.sh); without it there is no `ps`.
- */
 export function systemReadSample(env: Env): ReadSample {
   const token = env.LUCIDOS_E2E_WEBKIT_PATH_TOKEN;
   return async () => {
@@ -119,7 +100,6 @@ export function systemReadSample(env: Env): ReadSample {
   };
 }
 
-/** Describe blocks and the test title, outermost first. */
 function testTitle(test: TestCase): string {
   const parts = [test.title];
   for (let s: Suite | undefined = test.parent; s && s.type === 'describe'; s = s.parent) {
@@ -161,8 +141,6 @@ export default class MemSampleReporter implements Reporter {
   onTestEnd(test: TestCase, result: TestResult): void {
     if (!this.enabled) return;
     try {
-      // The worker slot, not the worker: a worker replaced after a failure keeps
-      // its slot, so a retry is measured from the test before it.
       const worker = result.parallelIndex;
       const fields = {
         time: this.now(),
@@ -182,7 +160,6 @@ export default class MemSampleReporter implements Reporter {
         this.append(formatMemLine({ ...fields, sample, delta }));
       });
     } catch {
-      // Never let sampling reach a test.
     }
   }
 
@@ -200,7 +177,6 @@ export default class MemSampleReporter implements Reporter {
         mkdirSync(dirname(path), { recursive: true });
         appendFileSync(path, `${line}\n`);
       } catch {
-        // A missing copy is not worth a failed test.
       }
     }
   }

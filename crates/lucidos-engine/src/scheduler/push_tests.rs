@@ -378,7 +378,7 @@ fn payload_includes_navigate_tap_for_cta_app() {
 #[test]
 fn wake_payload_carries_wake_flag_plus_original_content() {
     // Layer 3 of the macOS-Chrome partial-wedge mitigation (see
-    // system-knowhow/notifications.md §4.5). The `wake: true` flag sits
+    // system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md §4.5). The `wake: true` flag sits
     // at TOP LEVEL (sibling to `web_push`/`notification`), NOT inside the
     // notification object — Safari ignores unknown top-level fields, and
     // wake pushes never reach Safari anyway (filtered by is_mac_chromium).
@@ -449,7 +449,7 @@ fn declarative_navigate_falls_back_to_scope_relative_query_when_scope_missing() 
     // never updates, and the page-side hash router finds nothing to route
     // ("tap nav to thread only focuses the app"). A query string changes the
     // document, forcing a real navigation iOS actually performs. See
-    // system-knowhow/notifications.md §4.5.
+    // system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md §4.5.
     //
     // Legacy subscriptions created before scope_url was recorded still fan out.
     // The next page load refreshes them with scope_url; until then keep the
@@ -695,7 +695,7 @@ fn declarative_notification_data_carries_hash_navigate_url_for_chrome_sw() {
     // change (no reload), while `notification.navigate` (iOS declarative) is an
     // absolute QUERY URL so iOS cold/hot launches do not depend on WebKit/APNs
     // accepting a query-only relative string. Same params, different carrier.
-    // See system-knowhow/notifications.md §4.5.
+    // See system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac.md §4.5.
     let nid = uuid::Uuid::new_v4();
     let tid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), None);
@@ -1327,11 +1327,9 @@ fn s4_5_body_fits_exactly_at_the_ceiling_is_not_truncated() {
 // iff no page reports that it already handled the notification in the app.
 // Multi-tab same-device pongs OR within the device.
 
-use crate::api::presence_pong::{
-    decide_push_allowed,
-    PresenceOutcome::{self, AutoRead, NotShown, Shown, Silenced},
-    PresencePong,
-};
+use crate::engine::presence_tracker::{decide_push_allowed, PresencePong};
+
+use crate::scheduler::PresenceOutcome::{self, AutoRead, NotShown, Shown, Silenced};
 
 fn pong(device_id: &str, outcome: PresenceOutcome) -> PresencePong {
     PresencePong {
@@ -1617,7 +1615,7 @@ async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
     //
     // `start_paused` + the auto-advancing tokio test clock lets us
     // assert the timing precisely without sleeping in wall time.
-    use crate::api::presence_pong::{PresencePongRequest, PresenceTracker};
+    use crate::engine::presence_tracker::{PresencePongRequest, PresenceTracker};
     use std::time::Duration;
 
     const SIMULATED_RTT_MS: u64 = 1500;
@@ -1650,7 +1648,6 @@ async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
 }
 
 /// A request the test transport hands back: settled at once, or never.
-#[cfg(not(feature = "e2e-test-hooks"))]
 type TestSend = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
 
 /// A socket that finished its handshake and then went quiet. Before
@@ -1659,7 +1656,6 @@ type TestSend = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), St
 /// trigger's Thread Queue slot. Two quiet devices must still cost one
 /// deadline, not one each. The outer timeout turns a hang into a failure on
 /// the paused clock, rather than a test that never ends.
-#[cfg(not(feature = "e2e-test-hooks"))]
 #[tokio::test(start_paused = true)]
 async fn quiet_sends_give_up_at_one_deadline_and_the_healthy_device_still_gets_its_push() {
     let quiet_phone = sub_with_device("quiet-phone");
@@ -1708,7 +1704,6 @@ async fn quiet_sends_give_up_at_one_deadline_and_the_healthy_device_still_gets_i
 
 /// Moving the send into `send_each` must keep the one answer that drops a
 /// subscription.
-#[cfg(not(feature = "e2e-test-hooks"))]
 #[tokio::test]
 async fn a_410_still_marks_the_subscription_stale() {
     let gone = sub_with_device("gone");
@@ -1774,14 +1769,14 @@ fn the_service_worker_knows_the_unwatch_action() {
     assert!(sw.contains(&needle), "sw.js must carry `{needle}`");
 }
 
-/// Every push about a people-only message in one thread carries that
+/// Every push about a user-only message in one thread carries that
 /// thread's tag and an Unwatch action, so a burst replaces one banner. The
 /// group survives the size fitting, and the wake push carries it too.
 #[test]
-fn a_people_message_push_groups_per_thread_with_an_unwatch_action() {
+fn a_user_only_message_push_groups_per_thread_with_an_unwatch_action() {
     use crate::scheduler::notifications::{Notification, PushGroup, UNWATCH_PUSH_ACTION};
     let thread = uuid::Uuid::new_v4();
-    let group = PushGroup::PeopleMessages {
+    let group = PushGroup::UserOnlyMessages {
         thread_id: thread,
         to_driver: false,
     };
@@ -1803,7 +1798,7 @@ fn a_people_message_push_groups_per_thread_with_an_unwatch_action() {
     let first = push(uuid::Uuid::new_v4(), "Kim, can you look?");
     let second = push(uuid::Uuid::new_v4(), &"long ".repeat(2000));
     assert_eq!(first["notification"]["tag"], second["notification"]["tag"]);
-    assert_eq!(first["notification"]["tag"], format!("people-{thread}"));
+    assert_eq!(first["notification"]["tag"], format!("user-{thread}"));
     assert!(second.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES);
     for payload in [&first, &second] {
         let notification = &payload["notification"];
@@ -1834,7 +1829,7 @@ fn a_people_message_push_groups_per_thread_with_an_unwatch_action() {
     assert!(ordinary["notification"].get("actions").is_none());
 
     // The driver cannot unwatch, so its copy shares the tag but offers none.
-    let to_driver = PushGroup::PeopleMessages {
+    let to_driver = PushGroup::UserOnlyMessages {
         thread_id: thread,
         to_driver: true,
     };
@@ -1894,5 +1889,210 @@ fn navigate_urls_preserve_push_generation() {
                 .contains(&format!("restore_generation={token}")));
         }
         assert!(payload.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES);
+    }
+}
+
+#[tokio::test]
+async fn recipient_gateway_totals_reach_normal_and_wake_payloads_without_cross_reader_fallback() {
+    use axum::{extract::Query, routing::get, Json, Router};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let app = Router::new().route("/~/api/v1/control/unread-total", get(move |Query(q): Query<HashMap<String, String>>| {
+        let seen = seen.clone();
+        async move {
+            let id = q.get("recipient-device-id").expect("every push count selects a recipient");
+            seen.lock().unwrap().push(id.clone());
+            if id == "slow" {
+                tokio::time::sleep(GATEWAY_TOTAL_TIMEOUT * 3).await;
+            }
+            Json(serde_json::json!({"total": match id.as_str() { "first" => Some(0), "second" => Some(9), _ => None::<i64> }}))
+        }
+    }));
+    let server = lucidos_local_token::test_support::serve_https(app);
+    let port = server.port().to_string();
+    let mut subs: Vec<_> = ["first", "second", "first", "unknown", "slow"]
+        .into_iter()
+        .map(|id| {
+            let mut sub = sub_with_device(id);
+            sub.scope_url = Some("http://gateway.test/dev/".into());
+            sub
+        })
+        .collect();
+    let mut missing = sub_without_device();
+    missing.scope_url = Some("http://gateway.test/dev/".into());
+    subs.push(missing);
+    let mut relayed = sub_with_device("relayed");
+    relayed.scope_url = Some("http://gateway.test/dev@remote/".into());
+    subs.push(relayed);
+    subs.push(sub_with_device("direct"));
+    let started = std::time::Instant::now();
+    let totals = gateway_unread_totals_at(&subs, Some(&port)).await;
+    assert!(started.elapsed() < GATEWAY_TOTAL_TIMEOUT * 2);
+    let mut seen = requests.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen, ["first", "second", "slow", "unknown"]);
+    assert_eq!(totals["first"], Some(0));
+    assert_eq!(totals["second"], Some(9));
+    assert_eq!(totals["unknown"], None);
+    assert_eq!(totals["slow"], None);
+    let own = [
+        ((Some("first".into()), BadgeScope::Gateway), Some(1)),
+        ((Some("second".into()), BadgeScope::Gateway), Some(2)),
+        ((Some("slow".into()), BadgeScope::Gateway), Some(4)),
+        ((Some("direct".into()), BadgeScope::Own), Some(5)),
+        ((None, BadgeScope::Own), Some(12)),
+    ]
+    .into_iter()
+    .collect();
+    let notification = crate::scheduler::notifications::Notification {
+        id: uuid::Uuid::new_v4(),
+        task_id: None,
+        app_id: None,
+        thread_id: None,
+        event_id: None,
+        title: "Hi".into(),
+        message: "Body".into(),
+        read: false,
+        created_at: chrono::Utc::now(),
+        tap: Tap::Modal,
+    };
+    for wake in [false, true] {
+        let deliveries = badge_deliveries(subs.clone(), &own, &totals, |sub, badge| {
+            if wake {
+                build_wake_payload(None, &notification, sub.scope_url.as_deref(), badge, None)
+            } else {
+                build_push_payload_fitted(
+                    None,
+                    "Hi",
+                    "Body",
+                    None,
+                    None,
+                    None,
+                    None,
+                    &Tap::Modal,
+                    sub.scope_url.as_deref(),
+                    badge,
+                    None,
+                )
+            }
+        });
+        let values: Vec<_> = deliveries
+            .iter()
+            .map(|(_, body)| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["app_badge"].clone()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                serde_json::json!(0),
+                serde_json::json!(9),
+                serde_json::json!(0),
+                serde_json::Value::Null,
+                serde_json::json!(4),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::json!(5)
+            ]
+        );
+    }
+    assert!(gateway_unread_totals_at(&subs, None).await.is_empty());
+    server.abort();
+}
+
+#[test]
+fn legacy_direct_single_reader_subscription_keeps_its_own_badge() {
+    let snapshot = crate::gateway_users::UserSnapshot::default();
+    assert!(matches!(
+        badge_reader(None, BadgeScope::Own, &snapshot),
+        Some(crate::gateway_users::Reader::Team)
+    ));
+    let own = [((None, BadgeScope::Own), Some(12))].into_iter().collect();
+    let deliveries = badge_deliveries(
+        vec![sub_without_device()],
+        &own,
+        &Default::default(),
+        |_, badge| serde_json::json!({"app_badge": badge}),
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&deliveries[0].1).unwrap()["app_badge"],
+        12
+    );
+}
+
+#[test]
+fn revoked_badge_recipient_cannot_fall_back_to_the_team_on_a_known_gateway() {
+    use crate::gateway_users::{User, UserSnapshot};
+    let snapshot = UserSnapshot {
+        users: vec![
+            User {
+                id: "user-one".into(),
+                name: "Sam".into(),
+                emails: vec![],
+                device_ids: vec!["first".into()],
+            },
+            User {
+                id: "user-two".into(),
+                name: "Alex".into(),
+                emails: vec![],
+                device_ids: vec!["second".into()],
+            },
+        ],
+        relayed: vec![],
+    };
+    assert!(badge_reader(Some("revoked"), BadgeScope::Gateway, &snapshot).is_none());
+    assert!(badge_reader(None, BadgeScope::Own, &snapshot).is_none());
+    assert!(
+        matches!(badge_reader(Some("first"), BadgeScope::Gateway, &snapshot), Some(crate::gateway_users::Reader::User { device_id, .. }) if device_id == "first")
+    );
+}
+
+#[test]
+fn single_reader_directory_keeps_direct_counts_separate_from_gateway_fallbacks() {
+    use crate::gateway_users::{User, UserSnapshot};
+    for snapshot in [
+        UserSnapshot::default(),
+        UserSnapshot {
+            users: vec![User {
+                id: "user-one".into(),
+                name: "Sam".into(),
+                emails: vec![],
+                device_ids: vec!["paired".into()],
+            }],
+            relayed: vec![],
+        },
+    ] {
+        for device in [None, Some("unpaired"), Some("")] {
+            assert!(matches!(
+                badge_reader(device, BadgeScope::Own, &snapshot),
+                Some(crate::gateway_users::Reader::Team)
+            ));
+            assert!(badge_reader(device, BadgeScope::Gateway, &snapshot).is_none());
+            assert!(badge_reader(device, BadgeScope::Relayed, &snapshot).is_none());
+            let mut direct = sub_without_device();
+            direct.device_id = device.map(str::to_string);
+            let mut gateway = direct.clone();
+            gateway.scope_url = Some("http://gateway.test/dev/".into());
+            let own = [((direct.device_id.clone(), BadgeScope::Own), Some(12))]
+                .into_iter()
+                .collect();
+            let deliveries = badge_deliveries(
+                vec![direct, gateway],
+                &own,
+                &Default::default(),
+                |_, badge| serde_json::json!({"app_badge": badge}),
+            );
+            let values: Vec<_> = deliveries
+                .iter()
+                .map(|(_, body)| {
+                    serde_json::from_str::<serde_json::Value>(body).unwrap()["app_badge"].clone()
+                })
+                .collect();
+            assert_eq!(values, vec![serde_json::json!(12), serde_json::Value::Null]);
+        }
     }
 }

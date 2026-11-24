@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A coding-agent rung control that remounts for a request key it has read
- * starts from that read and refreshes it in place. Otherwise every thread
- * switch and every row unfold would draw the pill again from nothing.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';

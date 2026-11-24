@@ -18,24 +18,14 @@ const baseCss: string = readFileSync(
 );
 const toastSource: string = readFileSync(resolve(here, '../Toast.tsx'), 'utf-8');
 
-/** A toast that waits to be answered, which is what `showToast` records. */
 function standing(type: ToastType): ToastItem {
   return { id: 1, message: 'x', type, persistent: true };
 }
 
-/** One on a timer: it is removed on its own schedule, seen or not. */
 function timed(type: ToastType): ToastItem {
   return { id: 2, message: 'x', type, persistent: false };
 }
 
-/**
- * The toast layer sat above every modal, which is right for a failure and
- * wrong for a standing offer.
- *
- * The report, the split between the two, and why lowering the whole layer is
- * the one thing that must not happen:
- * `docs/adr/0237-overlay-and-toast-paint-order.md`.
- */
 describe('toastStackUrgency', () => {
   it('calls a stack of waiting offers standing', () => {
     expect(toastStackUrgency([standing('info'), standing('success')])).toBe('standing');
@@ -53,31 +43,21 @@ describe('toastStackUrgency', () => {
     expect(toastStackUrgency([standing('warning')])).toBe('urgent');
   });
 
-  /** The trap the type alone walks into. A plain `success` auto-dismisses after
-   *  five seconds, so lowering it spends that timer under the scrim and the
-   *  reader never learns the backup finished. */
   it('turns urgent for a TIMED toast, whatever its type says', () => {
     expect(toastStackUrgency([timed('success')])).toBe('urgent');
     expect(toastStackUrgency([timed('info')])).toBe('urgent');
   });
 
-  /** The container is one stacking context, so the answer cannot be split. One
-   *  toast that must be seen keeps the whole stack up. */
   it('keeps the whole stack up for one toast that cannot wait', () => {
     expect(toastStackUrgency([standing('info'), timed('success')])).toBe('urgent');
   });
 
-  /** A toast stored before `persistent` existed carries none. Treating that as
-   *  "may be lowered" would hide it, so the absent case reads as urgent. */
   it('treats a toast with no recorded persistence as urgent', () => {
     expect(toastStackUrgency([{ id: 3, message: 'x', type: 'info' }])).toBe('urgent');
   });
 });
 
 describe('the CSS the urgency drives', () => {
-  /** The container is one stacking context, so a per-toast level cannot escape
-   *  it. The attribute has to be on the container, and the render has to set
-   *  it, or the rule below matches nothing. */
   it('is wired: the container carries the urgency the rule keys on', () => {
     expect(toastSource).toMatch(/data-toast-urgency=\{toastStackUrgency\(items\)\}/);
   });
@@ -92,9 +72,6 @@ describe('the CSS the urgency drives', () => {
     return z![1].trim();
   }
 
-  /** Below the FLOOR of the band, so one value clears every stacked modal at
-   *  once. A modal resolves to `--z-modal + depth` (overlayStack.ts), and the
-   *  tallest it reaches is the floor plus `MAX_MODAL_STACK_DEPTH`. */
   it('drops a standing stack below every modal the band can hold', () => {
     const floor = parseInt(baseCss.match(/--z-modal:\s*(\d+)\s*;/)![1], 10);
     const expr = standingRuleZ();
@@ -103,23 +80,16 @@ describe('the CSS the urgency drives', () => {
     const lowered = floor - parseInt(calc![1], 10);
     expect(lowered).toBeLessThan(floor);
     expect(lowered).toBeLessThan(floor + MAX_MODAL_STACK_DEPTH);
-    // Still above the header chrome, so it is not buried under the whole shell
-    // when the overlay that lowered it draws no scrim.
     const controlPanel = parseInt(baseCss.match(/--z-control-panel:\s*(\d+)\s*;/)![1], 10);
     expect(lowered).toBeGreaterThan(controlPanel);
   });
 
-  /** The blocker is not an `<Overlay>`, so it raises no `data-overlay-open` of
-   *  its own. A modal left open when a client refresh starts would otherwise
-   *  take the "Refreshing…" toast down with it. */
   it('stands down while the UI blocker is up, so the refresh toast survives', () => {
     expect(componentsCss).toMatch(
       /:root\[data-overlay-open\]:not\(\[data-ui-blocked\]\)\s*\.toast-container\[data-toast-urgency="standing"\]/,
     );
   });
 
-  /** The whole point of the split. An urgent stack is never lowered, so no
-   *  selector may match it. */
   it('never lowers an urgent stack', () => {
     expect(componentsCss).not.toMatch(/\.toast-container\[data-toast-urgency="urgent"\]/);
   });

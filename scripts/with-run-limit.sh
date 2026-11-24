@@ -21,6 +21,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/proc_tree.sh
 source "$SCRIPT_DIR/lib/proc_tree.sh"
+# shellcheck source=scripts/lib/ps_tools.sh
+source "$SCRIPT_DIR/lib/ps_tools.sh"
+ps_tools_env
 
 TIMEOUT_EXIT=124
 GRACE_SECS="${LUCIDOS_RUN_LIMIT_GRACE_SECS:-10}"

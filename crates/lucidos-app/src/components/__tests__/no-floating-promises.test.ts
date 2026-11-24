@@ -10,9 +10,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SRC_ROOT = resolve(__dirname, '..', '..');
 const COMPONENTS_ROOT = resolve(SRC_ROOT, 'components');
 
-/** Source roots that export the project's promise-returning surface. The test
- *  discovers async function names from these directories and flags bare calls
- *  to any of them inside `components/**`. */
 const ASYNC_SOURCE_ROOTS = [
   resolve(SRC_ROOT, 'api'),
   resolve(SRC_ROOT, 'store'),
@@ -20,9 +17,6 @@ const ASYNC_SOURCE_ROOTS = [
   resolve(SRC_ROOT, 'utils'),
 ];
 
-/** Component-tree files this lint deliberately skips today. Format:
- *  `['owning sweep / plan', 'components/<rel>.tsx']`. Empty when no debt is
- *  outstanding — that's the steady state. Anything not listed must pass. */
 const KNOWN_OFFENDERS_BY_OWNER: ReadonlyArray<readonly [string, string]> = [];
 const KNOWN_OFFENDER_PATHS = new Set(KNOWN_OFFENDERS_BY_OWNER.map(([, p]) => p));
 
@@ -46,66 +40,32 @@ function isTestFile(path: string): boolean {
     path.includes('/__tests__/');
 }
 
-/** Discover the set of identifier names that are exported as promise-returning
- *  functions from `ASYNC_SOURCE_ROOTS`. Catches:
- *    - `export async function X` (any params, any return)
- *    - `export function X(...): Promise<...>` (sync function declaring Promise return)
- *  For the second form we paren-match the parameter list so callback-typed
- *  params like `(cb: () => void): Promise<T>` are still discovered. */
 function discoverAsyncExports(): Set<string> {
   const names = new Set<string>();
   for (const root of ASYNC_SOURCE_ROOTS) {
     for (const file of walkTs(root)) {
       if (isTestFile(file)) continue;
-      const source = readFileSync(file, 'utf-8');
-      for (const m of source.matchAll(/^export async function (\w+)\b/gm)) {
-        names.add(m[1]);
-      }
-      for (const m of source.matchAll(/^export function (\w+)\s*(?:<[^>]*>)?\s*\(/gm)) {
-        const openIdx = source.indexOf('(', m.index! + m[0].length - 1);
-        const closeIdx = findMatchingParenInSource(source, openIdx);
-        if (closeIdx < 0) continue;
-        const tail = source.slice(closeIdx + 1, closeIdx + 200);
-        if (/^\s*:\s*Promise</.test(tail)) names.add(m[1]);
-      }
+      for (const name of asyncExportNames(readFileSync(file, 'utf-8'))) names.add(name);
     }
   }
   return names;
 }
 
-/** Like findMatchingParen but for a whole multi-line source — used to walk
- *  past a parameter list whose own parens nest (callback types, defaults). */
-function findMatchingParenInSource(s: string, openIdx: number): number {
-  let depth = 0;
-  let inStr: string | null = null;
-  for (let i = openIdx; i < s.length; i++) {
-    const ch = s[i];
-    if (inStr) {
-      if (ch === '\\') { i++; continue; }
-      if (ch === inStr) inStr = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      inStr = ch;
-      continue;
-    }
-    if (ch === '(') depth++;
-    else if (ch === ')') {
-      depth--;
-      if (depth === 0) return i;
-    }
+function asyncExportNames(source: string): string[] {
+  const names: string[] = [];
+  for (const m of source.matchAll(/^export async function (\w+)\b/gm)) {
+    names.push(m[1]);
   }
-  return -1;
+  for (const m of source.matchAll(/^export function (\w+)\s*(?:<[^>]*>)?\s*\(/gm)) {
+    const openIdx = source.indexOf('(', m.index! + m[0].length - 1);
+    const closeIdx = findMatchingParen(source, openIdx);
+    if (closeIdx < 0) continue;
+    const tail = source.slice(closeIdx + 1, closeIdx + 200);
+    if (/^\s*:\s*Promise</.test(tail)) names.push(m[1]);
+  }
+  return names;
 }
 
-/** Find locally-declared async function names in a component source. Bare
- *  calls to a local helper inside the same file are just as floating as bare
- *  calls to an imported one. Catches three forms:
- *    - `async function NAME(...) { ... }`
- *    - `const/let/var NAME = async (...) => ...`
- *    - `const/let/var NAME = useCallback(async (...) => ..., [...])`
- *  TSX components write helpers in all three shapes; the keyword-only regex
- *  missed the latter two. */
 function discoverLocalAsync(source: string): Set<string> {
   const names = new Set<string>();
   for (const m of source.matchAll(/\basync function (\w+)\b/g)) {
@@ -120,10 +80,6 @@ function discoverLocalAsync(source: string): Set<string> {
   return names;
 }
 
-/** Find the index of the `)` that closes the `(` at `openIdx`. Tracks string
- *  literals (single/double/backtick) so paren-looking chars inside strings
- *  don't throw off the depth counter. Returns -1 if the `(` doesn't close on
- *  the same line. */
 function findMatchingParen(s: string, openIdx: number): number {
   let depth = 0;
   let inStr: string | null = null;
@@ -132,6 +88,12 @@ function findMatchingParen(s: string, openIdx: number): number {
     if (inStr) {
       if (ch === '\\') { i++; continue; }
       if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '/' && (s[i + 1] === '/' || s[i + 1] === '*')) {
+      const end = s[i + 1] === '/' ? s.indexOf('\n', i) : s.indexOf('*/', i + 2);
+      if (end < 0) return -1;
+      i = s[i + 1] === '/' ? end : end + 1;
       continue;
     }
     if (ch === '"' || ch === "'" || ch === '`') {
@@ -147,33 +109,6 @@ function findMatchingParen(s: string, openIdx: number): number {
   return -1;
 }
 
-/** True if this line is an element of an argument list or array literal that
- *  opened on an earlier line.
- *
- *  The same-line rules below already exempt a call passed as an argument
- *  (`before` ending in `(` or `,`), because handing a promise to a receiver is
- *  the receiver's problem, not a float. They just cannot see across a line
- *  break, so the multi-line spelling of the same thing was flagged:
- *
- *      await Promise.allSettled([
- *        getA(),          <- reported as floating
- *        getB(),
- *      ]);
- *
- *  That is the idiomatic shape for `Promise.all` / `allSettled`, and
- *  `allSettled` in particular is the most thoroughly handled a promise can be.
- *
- *  Sound because no bare statement can FOLLOW a line ending in `(`, `[` or `,`:
- *  each of those leaves an expression open, so whatever comes next is part of
- *  it. A line ending in `)`, `]` or `;` closes the expression and the next call
- *  is flagged as before.
- *
- *  This SUBSUMES the former `isInsideAsyncConsumer` / `PROMISE_CONSUMING_RECEIVERS`
- *  pair, which exempted an arrow passed to a hook that consumes the promise
- *  (`useLoadableFetch<T>(\n  () => fetchIt(),\n  [deps])`). Every such call site
- *  ends its opening line with `(`, so the general rule already covers it, and
- *  the hand-maintained receiver allow-list was one more thing to keep in step
- *  with the codebase for no added coverage. */
 function isOpenArgListElement(lines: string[], i: number): boolean {
   for (let j = i - 1; j >= 0; j--) {
     const ln = lines[j].trimEnd();
@@ -183,9 +118,6 @@ function isOpenArgListElement(lines: string[], i: number): boolean {
   return false;
 }
 
-/** True if the closing paren of the call ends the current line and the next
- *  non-blank line begins with `.then(` / `.catch(` / `.finally(` — i.e. the
- *  promise is chained across lines, not floated. */
 function nextNonBlankLineStartsWithChain(lines: string[], i: number): boolean {
   for (let j = i + 1; j < lines.length; j++) {
     const ln = lines[j].trim();
@@ -195,11 +127,6 @@ function nextNonBlankLineStartsWithChain(lines: string[], i: number): boolean {
   return false;
 }
 
-/** Match a bare call `<name>(...)` that isn't awaited, voided, returned,
- *  thrown, assigned, passed as an argument, or chained with `.then/.catch/
- *  .finally`. Definition lines, import lines, and prop assignments are
- *  filtered out. Multi-line continuation lines that start with `?`/`:`/`,`
- *  are treated as part of the parent expression, not bare statements. */
 function findFloatingCalls(source: string, name: string): string[] {
   const lines = source.split('\n');
   const offenders: string[] = [];
@@ -207,14 +134,12 @@ function findFloatingCalls(source: string, name: string): string[] {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!pattern.test(line)) continue;
-    // Comment-only lines and JSDoc-style continuation lines never call code.
     if (/^\s*(\/\/|\*|\/\*)/.test(line)) continue;
     if (new RegExp(`\\b(function|async function)\\s+${name}\\b`).test(line)) continue;
     if (/^\s*import\b/.test(line)) continue;
     if (new RegExp(`\\b${name}\\s*:`).test(line)) continue;
     if (new RegExp(`(const|let|var)\\s+${name}\\b`).test(line)) continue;
     const trimmed = line.trimStart();
-    // Ternary / argument-list continuations are never bare statements.
     if (/^[?:,]/.test(trimmed)) continue;
     const callIdx = line.search(new RegExp(`(^|[^a-zA-Z_$.])${name}\\s*\\(`));
     const before = line.slice(0, callIdx + 1);
@@ -224,23 +149,16 @@ function findFloatingCalls(source: string, name: string): string[] {
     if (/\(\s*$/.test(before)) continue;
     if (/,\s*$/.test(before)) continue;
 
-    // What comes after the call's closing paren on the same line? If it's
-    // `.then(` / `.catch(` / `.finally(`, the promise is chained and fine.
     const openParenIdx = line.indexOf('(', callIdx);
     if (openParenIdx >= 0) {
       const closeParenIdx = findMatchingParen(line, openParenIdx);
       if (closeParenIdx >= 0) {
         const after = line.slice(closeParenIdx + 1).trimStart();
         if (/^\.\s*(then|catch|finally)\s*\(/.test(after)) continue;
-        // Closing paren ends the line — check next line for the chain.
         if (after === '' && nextNonBlankLineStartsWithChain(lines, i)) continue;
       }
     }
 
-    // An element of an argument list / array literal opened on an earlier line
-    // (`Promise.allSettled([\n  getA(),\n  getB(),\n])`, or an arrow handed to
-    // a promise-consuming hook) is the multi-line spelling of the same-line
-    // "passed as an argument" exemption above.
     if (isOpenArgListElement(lines, i)) continue;
 
     offenders.push(`${i + 1}: ${line.trim()}`);
@@ -252,20 +170,13 @@ const ASYNC_EXPORTS = discoverAsyncExports();
 const COMPONENT_FILES = walkTs(COMPONENTS_ROOT).filter(f => !isTestFile(f));
 
 describe('no floating promises in components/', () => {
-  // Sanity-check the discovery — if the source roots ever drift out from under
-  // us, the test loses its teeth silently. A bare assertion here makes that
-  // failure mode loud.
   it('discovers a plausible set of async export names', () => {
     expect(ASYNC_EXPORTS.size).toBeGreaterThan(50);
-    // Spot-check known async exports across action/api/v1/preferences surfaces.
     expect(ASYNC_EXPORTS.has('loadApps')).toBe(true);
     expect(ASYNC_EXPORTS.has('uploadFiles')).toBe(true);
     expect(ASYNC_EXPORTS.has('applySingleChange')).toBe(true);
     expect(ASYNC_EXPORTS.has('setThemeMode')).toBe(true);
     expect(ASYNC_EXPORTS.has('setUiScale')).toBe(true);
-    // `listen` in utils/tauri.ts has a callback-typed parameter
-    // (`handler: (e: { payload: T }) => void`) — verifies the paren-matching
-    // in `discoverAsyncExports` walks past the inner `)`.
     expect(ASYNC_EXPORTS.has('listen')).toBe(true);
   });
 
@@ -285,10 +196,24 @@ describe('no floating promises in components/', () => {
     });
   }
 
-  // The detector's own exemptions are what decide whether this lint has teeth,
-  // so the widest one is pinned from both sides: it must swallow the shape it
-  // was added for, and must NOT swallow a genuine float that merely sits near
-  // a multi-line call.
+  describe('the parameter-list walk', () => {
+    it('walks past a quote inside a comment', () => {
+      const source = [
+        'export function open(nav: {',
+        "  /** The reader's place (if any). */",
+        "  fragment?: string; // absent is not empty",
+        '}): Promise<unknown> | void {',
+        '}',
+      ].join('\n');
+      expect(asyncExportNames(source)).toEqual(['open']);
+    });
+
+    it('still reads a paren or a slash pair inside a string as text', () => {
+      const source = "export function open(sep = ')', url = 'a//b'): Promise<void> {\n}";
+      expect(asyncExportNames(source)).toEqual(['open']);
+    });
+  });
+
   describe('the multi-line argument-list exemption', () => {
     it('accepts an element of an argument list opened on an earlier line', () => {
       const source = [
@@ -304,9 +229,6 @@ describe('no floating promises in components/', () => {
     });
 
     it('still flags a float on the line after the list closes', () => {
-      // `]);` closes the expression, so the next call is a bare statement
-      // again. This is the assertion that keeps the exemption from turning
-      // "anywhere below a multi-line call" into a blanket amnesty.
       const source = [
         'async function go() {',
         '  await Promise.allSettled([',
@@ -320,9 +242,6 @@ describe('no floating promises in components/', () => {
     });
 
     it('covers the promise-consuming hook shape it replaced', () => {
-      // The case the deleted `isInsideAsyncConsumer` existed for. Its opening
-      // line ends with `(`, so the general rule catches it and the receiver
-      // allow-list is not needed.
       const source = [
         'function C() {',
         '  const { loadable } = useLoadableFetch<string>(',
@@ -335,17 +254,12 @@ describe('no floating promises in components/', () => {
     });
 
     it('still flags consecutive bare statements', () => {
-      // A line ending in `;` leaves nothing open, so the following call is not
-      // a continuation however it is indented.
       const source = ['function go() {', '  getThing();', '  getOther();', '}'].join('\n');
       expect(findFloatingCalls(source, 'getThing')).toHaveLength(1);
       expect(findFloatingCalls(source, 'getOther')).toHaveLength(1);
     });
   });
 
-  // The exclusion list is a debt marker, not a permanent skip. Each entry
-  // must still be a real file (typo guard) so a rename surfaces the entry
-  // for cleanup instead of letting it rot.
   it('every known-offender path still exists', () => {
     for (const [, p] of KNOWN_OFFENDERS_BY_OWNER) {
       const abs = resolve(SRC_ROOT, p);

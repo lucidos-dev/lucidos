@@ -1,14 +1,3 @@
-/**
- * An apply's progress is told in the Lucidos menu's activity group, never in a
- * toast (ADR 0306). Its row says what the apply is doing: merging, resolving a
- * merge conflict, or hardening. Its thread link lands on the event that
- * started the phase. The apply's one toast, keyed `applying-<thread>`, is its
- * result: Applied or Failed.
- *
- * A member of a running Apply All raises no result of its own: the batch
- * summary reports it. Only its failure still toasts, because a failure is
- * never silent.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Change } from '../../api/client';
 import { toasts, focusedThreadId, threadMap, changes, applyAllBatch, applyPhases } from '../store';
@@ -17,14 +6,11 @@ import { makeThreadAggregate } from '../actions/threads-test-helpers';
 import { focusThreadOrBootstrap } from '../actions/threads';
 import { liveActivityRows } from '../actions/activityRows';
 
-// The threads module pulls Preact-coupled modules, so a landing is checked against a
-// stub. Matches apply-change-toast.test.ts.
 vi.mock('../actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
   unfocusThread: vi.fn(),
 }));
 
-// handleThreadEvent batches signal updates on requestAnimationFrame.
 vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(cb, 0));
 vi.stubGlobal('cancelAnimationFrame', (id: number) => clearTimeout(id));
 
@@ -81,7 +67,6 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-/** The apply's row in the activity group, the one place its progress shows. */
 function row() {
   return liveActivityRows().find((r) => r.key === 'apply-thread-A');
 }
@@ -95,7 +80,6 @@ describe('a single-thread apply', () => {
     expect(row()?.label).toBe('Resolving merge conflict: Convert Filter Icon');
     expect(row()?.body).toMatchObject({
       kind: 'apply-thread',
-      // The menu measures the phase's elapsed time from the event's own time.
       thread: { reading: { phase: 'resolving-conflict', eventId: 'mcd-1', startedAt: EVENT_CREATED } },
     });
     expect(toasts.value).toEqual([]);

@@ -25,13 +25,20 @@ SCRATCH="$(mktemp -d)"
 SIGNALS="$SCRATCH/signals.log"
 : > "$SIGNALS"
 
-# Stands in for the child `cargo check` that `cargo clippy` runs: argv[0] is
-# `cargo` and `check` follows. `yes` is a signed system binary, and `exec -a`
-# sets its argv[0].
-( exec -a cargo yes check --locked --workspace --all-targets >/dev/null 2>&1 ) &
+# Stands in for the child `cargo check` that `cargo clippy` runs. The `pgrep`
+# shim below names this pid, so it only has to stay alive. `sleep` is a signed
+# system binary that accepts no flags, so no coreutils flavor rejects its
+# argument list, and `exec -a` sets its argv[0] to `cargo`.
+( exec -a cargo sleep 300 >/dev/null 2>&1 ) &
 FAKE_CARGO=$!
 trap 'builtin kill "$FAKE_CARGO" 2>/dev/null; wait 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 sleep 0.5
+# A fake that never ran would read as one the build killed.
+if ! builtin kill -0 "$FAKE_CARGO" 2>/dev/null; then
+    wait "$FAKE_CARGO"
+    echo "  FAIL: the fake cargo check exited before the build ran (status $?), so this proves nothing"
+    exit 1
+fi
 
 # PATH shims catch a kill that runs as a program, as `xargs kill` does.
 mkdir -p "$SCRATCH/bin"
@@ -84,7 +91,8 @@ echo "test: another build's cargo check is still running"
 if builtin kill -0 "$FAKE_CARGO" 2>/dev/null; then
     pass "the fake cargo check $FAKE_CARGO survived"
 else
-    fail "the fake cargo check $FAKE_CARGO is gone"
+    wait "$FAKE_CARGO"
+    fail "the fake cargo check $FAKE_CARGO is gone (status $?: 143 is TERM, 137 KILL): $(tail -5 "$SCRATCH/build.out")"
 fi
 
 echo "test: cargo's lock files are left in place"

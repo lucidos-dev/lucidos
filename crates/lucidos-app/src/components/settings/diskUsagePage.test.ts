@@ -1,10 +1,3 @@
-/**
- * Disk Usage recovers from a failed read.
- *
- * Its loadables are module-level signals, and the page used to read only from
- * `not-loaded`. One failed read then showed the error on every later visit,
- * with no Retry, until the whole app reloaded.
- */
 import { afterEach, describe, it, expect, vi } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -22,7 +15,6 @@ import {
   type WorktreeRow,
 } from './DiskUsagePage';
 
-/** Answer every cleanup POST with one status and a JSON body. */
 function answerCleanup(status: number, body: unknown) {
   vi.stubGlobal('fetch', async () => new Response(JSON.stringify(body), {
     status,
@@ -35,9 +27,6 @@ const LIVE_SESSION = { error: 'Thread has a live coding-agent session in this wo
 describe('a cleanup the engine refuses', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
-  // The engine answers 409 on EVERY tier while a coding-agent session is live.
-  // Read as "dirty", Clean reported "Nothing to clean", and a forced Remove
-  // ended in silence after the user had confirmed losing their edits.
   it('surfaces the reason on Clean (tier 1)', async () => {
     answerCleanup(409, LIVE_SESSION);
     await expect(runCleanup('t', 1)).rejects.toThrow(/live coding-agent session/);

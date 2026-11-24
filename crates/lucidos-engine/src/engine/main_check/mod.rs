@@ -1,9 +1,8 @@
 //! The *main check* (ADR 0464): after a landing moves `main`, the engine runs
 //! the engine suite and every e2e suite on GitHub against a stripped copy
 //! of `main`. It gates nothing. One check runs at a time, and the next covers
-//! everything that landed meanwhile. A red check opens one *fix thread*, and
-//! no check starts while it is open, until a fix lands or the maintainer
-//! closes it.
+//! everything that landed meanwhile, including while red. One repair owns the
+//! findings and waits for idle capacity before its first prompt.
 //!
 //! - `state`: the pure scheduler.
 //! - `runner`: the child that runs `scripts/main-check.sh`.
@@ -12,6 +11,7 @@
 //! - `snapshot`: the check as clients see it.
 //! - `driver`: the task that runs it all, one message at a time.
 
+mod admission;
 mod driver;
 mod fix_thread;
 mod recovery;
@@ -22,40 +22,35 @@ mod state;
 pub(crate) use driver::{settle_restored_checks, MainCheckMsg};
 pub(crate) use runner::RunnerSlot;
 pub(crate) use snapshot::MainCheckSnapshot;
-pub(crate) use state::CloseRefusal;
+pub use state::CloseRefusal;
 pub use state::FailedTest;
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope};
+use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope, SystemEvent};
 use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
 use crate::engine::LucidosEngine;
 use driver::{Driver, DriverHooks, DriverSetup};
 use runner::MainCheckCommand;
 
-/// Why a red main check closed, on `MainCheckRedClosed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RedCloseReason {
-    /// A change from its fix thread landed.
-    FixLanded,
-    /// The maintainer closed it.
-    Closed,
-}
+#[cfg(test)]
+use crate::engine::thread_events::main_check::SETTING_VALUES;
+pub use crate::engine::thread_events::main_check::{
+    MainCheckSetting, MainRepairStartedBy, RedCloseReason,
+};
 
 /// The check script, relative to the repository root.
 const MAIN_CHECK_SCRIPT: &str = "scripts/main-check.sh";
 
 /// The event types [`landing_of`] reads a landing from. The landing feed
 /// replays only these after a lag.
-const LANDING_EVENT_TYPES: [&str; 1] = ["ChangeApplied"];
+const LANDING_EVENT_TYPES: [&str; 3] = ["ChangeApplied", "MainFollowed", "RemoteChangesLanded"];
 
 /// What a bus event tells the main check: a `ChangeApplied` with a landing
-/// merge is a Lucidos-source change that moved `main`. Only the landing lane
-/// records one.
+/// merge is a Lucidos-source change that moved `main`, and only the landing
+/// lane records one. A `MainFollowed` is another gateway's landing.
 pub(crate) fn landing_of(event: &BusEvent) -> Option<MainCheckMsg> {
     match event {
         BusEvent::Thread {
@@ -68,8 +63,15 @@ pub(crate) fn landing_of(event: &BusEvent) -> Option<MainCheckMsg> {
                 },
             ..
         } => Some(MainCheckMsg::Landed {
-            thread_id: *thread_id,
+            thread_id: Some(*thread_id),
             pre_sha: pre_merge_sha.clone(),
+        }),
+        BusEvent::System(
+            SystemEvent::MainFollowed { from_sha, .. }
+            | SystemEvent::RemoteChangesLanded { from_sha, .. },
+        ) => Some(MainCheckMsg::Landed {
+            thread_id: None,
+            pre_sha: Some(from_sha.clone()),
         }),
         _ => None,
     }
@@ -97,12 +99,30 @@ impl LucidosEngine {
     /// rebuilds the check from events at the next start.
     pub(crate) fn notify_main_check(&self, msg: MainCheckMsg) {
         if self.main_check_tx.send(msg).is_err() {
-            log!("[MainCheck] driver gone, dropping a message");
+            log_legacy!("[MainCheck] driver gone, dropping a message");
+        }
+    }
+
+    /// Evaluate coverage before carrying a certificate into a landing.
+    pub(crate) async fn main_check_covers_landing(&self) -> bool {
+        match crate::core::prefs::MAIN_CHECK.try_read(self.pool()).await {
+            Ok(Some(setting)) if setting == "another-host" => true,
+            Ok(Some(setting)) if setting == "off" => false,
+            Ok(_) => {
+                let repo = self.repo_root();
+                driver::unavailable_reason(repo, &repo.join(MAIN_CHECK_SCRIPT))
+                    .await
+                    .is_none()
+            }
+            Err(error) => {
+                log_legacy!("[MainCheck] cannot verify landing coverage: {}", error);
+                false
+            }
         }
     }
 
     /// The main check as clients see it, as the driver last published it.
-    pub(crate) fn main_check_snapshot(&self) -> MainCheckSnapshot {
+    pub fn main_check_snapshot(&self) -> MainCheckSnapshot {
         match self.main_check_snapshot.read() {
             Ok(snapshot) => snapshot.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -111,7 +131,7 @@ impl LucidosEngine {
 
     /// Close the red check for the maintainer. `Err` when the driver stopped
     /// before it answered; the inner `Err` when no red is open.
-    pub(crate) async fn close_main_check_red(
+    pub async fn close_main_check_red(
         &self,
         actor: Option<MessageOrigin>,
     ) -> Result<Result<(), CloseRefusal>, String> {
@@ -122,12 +142,23 @@ impl LucidosEngine {
             .map_err(|_| "The main check stopped before it answered.".to_string())
     }
 
+    pub async fn fix_main_now(
+        &self,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Result<(), CloseRefusal>, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.notify_main_check(MainCheckMsg::FixNow { actor, reply });
+        answer
+            .await
+            .map_err(|_| "The main check stopped before it answered.".to_string())
+    }
+
     /// Start the main check's driver and the bus subscriber that feeds it
     /// landings. Spawned once at engine startup.
     pub fn start_main_check_driver(self: &Arc<Self>) {
         let rx = crate::engine::MAIN_CHECK_RX.with(|cell| cell.borrow_mut().take());
         let Some(mut rx) = rx else {
-            log!("[MainCheck] driver receiver missing, main check not started");
+            log_legacy!("[MainCheck] driver receiver missing, main check not started");
             return;
         };
         let repo_root = self.repo_root().to_path_buf();
@@ -147,13 +178,14 @@ impl LucidosEngine {
         let publisher = self.clone();
         let hooks = DriverHooks {
             open_fix_thread: Box::new(move |opening| {
-                opener.spawn_engine_coding_turn_as(
+                opener.agent_host().spawn_engine_coding_turn_as(
+                    &opener,
                     opening.thread_id,
                     opening.prompt,
                     Some(opening.title),
                     crate::engine::thread_events::MessageOrigin::engine(opening.reason),
                     opening.implementer,
-                    |_| {},
+                    Box::new(|_| {}),
                 );
             }),
             publish: Box::new(move |snapshot| {
@@ -167,12 +199,63 @@ impl LucidosEngine {
         };
         let mut driver = Driver::new(setup, hooks);
         tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                driver.deliver(msg).await;
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(msg) => driver.deliver(msg).await,
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(admission::SAMPLE_INTERVAL), if driver.repair_admits() => {
+                        driver.deliver(MainCheckMsg::SampleWork).await;
+                    }
+                }
             }
-            log!("[MainCheck] driver exiting, channel closed");
+            log_legacy!("[MainCheck] driver exiting, channel closed");
         });
         self.start_main_check_landing_feed();
+        let engine = self.clone();
+        let mut events = self.event_bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(frame) => {
+                        let sample = match &frame.typed {
+                            BusEvent::Thread { event, .. } => {
+                                crate::engine::thread_queue::moves_user_occupancy(event)
+                                    || matches!(
+                                        event.event_type(),
+                                        "ApplyNowStarted" | "ApplyNowEnded"
+                                    )
+                            }
+                            BusEvent::System(SystemEvent::PreferencesChanged { key, .. })
+                                if key == crate::core::prefs::MAIN_CHECK.key() =>
+                            {
+                                engine.notify_main_check(MainCheckMsg::SettingChanged);
+                                false
+                            }
+                            BusEvent::System(event) => matches!(
+                                event.event_type(),
+                                "ThreadQueued"
+                                    | "ThreadQueueAdmitted"
+                                    | "ThreadQueueDropped"
+                                    | "ThreadQueueCompleted"
+                                    | "BuildSlotReleased"
+                            ),
+                        };
+                        if sample {
+                            engine.notify_main_check(MainCheckMsg::SampleWork);
+                        }
+                    }
+                    // A dropped frame may have been a setting change, and a
+                    // re-read of an unchanged setting does nothing.
+                    Err(RecvError::Lagged(_)) => {
+                        engine.notify_main_check(MainCheckMsg::SettingChanged);
+                        engine.notify_main_check(MainCheckMsg::SampleWork);
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     /// Feed the driver every landing the bus announces. A lag replays the
@@ -208,3 +291,77 @@ impl LucidosEngine {
 #[cfg(test)]
 #[path = "integration_tests.rs"]
 mod integration_tests;
+
+/// Resumes, successors and child work inherit the durable repair's build class.
+pub async fn repair_build_class(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> Result<lucidos_build_slot::SlotClass, sqlx::Error> {
+    let automatic: bool = sqlx::query_scalar(
+        "WITH RECURSIVE lineage AS (
+            SELECT requested.thread_id, stored.parent_thread_id, stored.successor_of, 0 AS depth
+            FROM (VALUES ($1::uuid)) AS requested(thread_id)
+            LEFT JOIN thread_summaries stored USING (thread_id)
+            UNION ALL
+            SELECT t.thread_id, t.parent_thread_id, t.successor_of, l.depth + 1
+            FROM thread_summaries t JOIN lineage l
+            ON t.thread_id = l.parent_thread_id OR t.thread_id = l.successor_of
+            WHERE l.depth < 16
+        )
+        SELECT COALESCE((SELECT e.payload->'data'->>'started_by' = 'auto'
+            FROM events e JOIN lineage l
+            ON e.payload->'data'->>'fix_thread_id' = l.thread_id::text
+            WHERE e.event_type = 'MainCheckRepairStarted'
+            ORDER BY e.sequence DESC LIMIT 1), FALSE)",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(if automatic {
+        lucidos_build_slot::SlotClass::Background
+    } else {
+        lucidos_build_slot::SlotClass::Ordinary
+    })
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::*;
+
+    #[test]
+    fn the_catalog_values_are_the_settings_wire_names() {
+        let wire: Vec<String> = [
+            MainCheckSetting::Here,
+            MainCheckSetting::AnotherHost,
+            MainCheckSetting::Off,
+        ]
+        .iter()
+        .map(|setting| {
+            serde_json::to_value(setting)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+        assert_eq!(wire, SETTING_VALUES);
+        for value in SETTING_VALUES {
+            let setting = MainCheckSetting::resolve(Some(value), false);
+            assert_eq!(serde_json::to_value(setting).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn an_unset_or_unknown_value_defaults_by_availability() {
+        for stored in [None, Some("bogus")] {
+            assert_eq!(
+                MainCheckSetting::resolve(stored, true),
+                MainCheckSetting::Here
+            );
+            assert_eq!(
+                MainCheckSetting::resolve(stored, false),
+                MainCheckSetting::Off
+            );
+        }
+    }
+}

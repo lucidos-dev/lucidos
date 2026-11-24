@@ -2,12 +2,6 @@ import { describe, it, expect } from 'vitest';
 import { buildEventQueryString } from './events';
 import type { EventQuery } from './events';
 
-// The engine's `EventsQueryParams`
-// (`crates/lucidos-engine/src/api/history.rs`) is the wire contract. A param
-// the SDK declares but never puts on the querystring is dropped in silence:
-// the engine answers 200 with the unfiltered page, so a caller paging with
-// `before_event_id` gets the identical first page forever and looks correct
-// while doing it. These tests exist to make that failure loud.
 describe('buildEventQueryString', () => {
   it('emits nothing for an empty query', () => {
     expect(buildEventQueryString({})).toBe('');
@@ -30,9 +24,6 @@ describe('buildEventQueryString', () => {
     }
   });
 
-  // Asserted through URLSearchParams rather than against a literal string:
-  // param order is irrelevant to the engine, so pinning it would fail a pure
-  // reorder of the `set` calls for no behavioural reason.
   it('carries the paging cursor and omits the params left unset', () => {
     const got = new URLSearchParams(
       buildEventQueryString({

@@ -12,9 +12,6 @@ import {
 } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
-/** Only the user names the home thread (ADR 0362). Its Rename dialog offers
- *  no Suggest link, and a turn on it leaves its title alone. No suffix, so
- *  desktop Chromium, phone Chromium and iPhone WebKit all run it. */
 test.describe('Naming the home thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);

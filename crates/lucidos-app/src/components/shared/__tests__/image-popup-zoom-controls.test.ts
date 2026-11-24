@@ -10,7 +10,6 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ImagePopup.tsx'), 'utf-8');
 const css = readFileSync(resolve(here, '../../../styles/components.css'), 'utf-8');
 
-/** The first rule whose selector list names `selector`, alone or grouped. */
 function rule(selector: string): string {
   const name = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const block = css.match(new RegExp(`^(?:[^{}\\n]+,\\s*)*${name}\\s*(?:,\\s*[^{}\\n]+)*\\{[^}]*\\}`, 'm'));
@@ -30,8 +29,6 @@ describe('image popup: visible zoom controls', () => {
     expect(source, 'the readout must be the live percentage').toMatch(/\{level\.percent\}%/);
     expect(source, "a 'Fit' / '100%' label reports the destination, not the level")
       .not.toMatch(/'Fit' : '100%'/);
-    // The action is still named, in the tooltip and the accessible name, and
-    // named as a verb: "450%, actual size" would claim the level, not the act.
     expect(source).toMatch(/level\.atFit \? 'Zoom to actual size' : 'Fit to window'/);
     expect(source).toMatch(/level\.percent}%, \$\{level\.atFit \? 'zoom to actual size' : 'fit to window'/);
   });
@@ -41,9 +38,6 @@ describe('image popup: visible zoom controls', () => {
     expect(source).toMatch(/disabled=\{level\.atMax\}/);
   });
 
-  // An image fitting the screen it was captured on is already at 1:1, so the
-  // fit / actual-size toggle has one place to be. Left live it is a dead
-  // button, and its label still promises a zoom that cannot happen.
   it('greys the level control out where fit and actual size are one place', () => {
     expect(source).toMatch(/disabled=\{!level\.canPreset\}/);
     expect(source).toMatch(/canPreset: !atFit \|\| full <= 0 \|\| !sameScale\(full, fit\)/);
@@ -55,9 +49,6 @@ describe('image popup: visible zoom controls', () => {
     expect(source).toMatch(/percent: zoomPercent\(scale, full, fit\)/);
   });
 
-  // The reported bug: the popup counted CSS pixels, so a phone screenshot
-  // filling the phone it came from read 33%. Every pixel of it sat on a screen
-  // pixel, and the "actual size" offered from there was a threefold blow-up.
   it('counts physical screen pixels, so 100% is one image pixel per screen pixel', () => {
     expect(source).toMatch(/fullSizeScale\(layout\.imgW, img\.naturalWidth, screenPixelRatio\(\)\)/);
     expect(source).toMatch(/function screenPixelRatio\(\)/);
@@ -84,8 +75,6 @@ describe('image popup: visible zoom controls', () => {
 });
 
 describe('image popup: an image opens fitted to the window', () => {
-  // The bug: an image smaller than the window sat at its own size, and the
-  // control called that a fit while reading out 100%.
   it('rests at the scale that reaches the window edge, not at scale 1', () => {
     expect(source).toMatch(/function fitScale\(\)/);
     expect(source).toMatch(/fitToWindowScale\(layout\.containerW, layout\.containerH/);
@@ -112,11 +101,6 @@ describe('image popup: an image opens fitted to the window', () => {
       .not.toMatch(/zoomRef\.current\.scale > 1/);
   });
 
-  // Layout is recovered by dividing the live transform out of a measured rect,
-  // which holds only while the element and zoomRef agree. A slide still wearing
-  // the fit of a previous visit measures several times its own size. The fit
-  // computed from that reopens the image at nothing like a fit, and tracking
-  // only the ZOOMED image missed exactly the upscaled fitted one.
   it('remembers every image it transformed, so navigation can clear it', () => {
     expect(source).toMatch(/transformedImgRef\.current = img;/);
     expect(source, 'a fitted image carries a transform too, and is not "zoomed"')
@@ -135,8 +119,6 @@ describe('image popup: full size is always reachable', () => {
     expect(source).toMatch(/max: zoomCeiling\(MAX_ZOOM_PAST_FIT \* fit, full\)/);
   });
 
-  // A tall screenshot's 1:1 sits above the fit, a small image's below it, and a
-  // phone screenshot's on it. One fixed end always hides one of the three.
   it('has no fixed floor of 1, which hid 1:1 from a blown-up image', () => {
     expect(source, 'a fixed floor is what put actual size out of reach')
       .not.toMatch(/MIN_SCALE/);
@@ -148,9 +130,6 @@ describe('image popup: full size is always reachable', () => {
 });
 
 describe('image popup: the chrome is pinned to the viewport', () => {
-  // .image-popup-content clips its children, so pinch-zoom stays inside the
-  // box. Anything positioned against that box and sitting outside it is simply
-  // not drawn: the close button spent that way off the top of the screen.
   it('close, copy, counter and zoom cluster are all fixed', () => {
     for (const selector of ['.image-popup-close', '.image-popup-copy', '.image-popup-counter', '.image-popup-zoom']) {
       expect(rule(selector), `${selector} must not be positioned against the clipped box`)

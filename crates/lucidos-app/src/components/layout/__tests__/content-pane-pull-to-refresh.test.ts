@@ -6,9 +6,6 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-// Pull to refresh on the content pane. The gesture, the runner and the header
-// spinner each have tests of their own. This pins the wiring between them,
-// since the frontend test environment is deliberately non-jsdom.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const pane = readFileSync(resolve(here, '../ContentPane.tsx'), 'utf-8');
@@ -28,14 +25,10 @@ describe('content pane pull to refresh', () => {
   });
 
   it('draws the pull affordance outside the scrolling body', () => {
-    // Inside the body it would scroll away with the content it sits over.
-    const bodyClose = pane.lastIndexOf('</div>\n      {/* Outside `.content-pane-body`');
-    expect(bodyClose).toBeGreaterThan(-1);
-    expect(pane.indexOf('<PullRefreshAffordance />')).toBeGreaterThan(bodyClose);
+    expect(pane).toMatch(/<\/div>\s*(\{\/\*[^]*?\*\/\}\s*)?<NavigationCover viewKey=\{viewKey\} \/>\s*<PullRefreshAffordance \/>\s*<\/div>\s*\);/);
   });
 
   it('leads the desktop row with Refresh, after the hamburger', () => {
-    // Out of the trailing cluster, so it never folds into the ⋯ menu.
     expect(desktopHeader).toMatch(/<HamburgerButton \/>\s*<ContentRefreshButton \/>/);
     expect(contentActions).not.toMatch(/busy/);
   });
@@ -45,12 +38,10 @@ describe('content pane pull to refresh', () => {
     expect(shellCss).toMatch(new RegExp(`${spinning}\\s*\\{\\s*animation: spin`));
     expect(shellCss).toMatch(new RegExp(`:root\\[data-motion="reduce"\\] ${spinning}\\s*\\{\\s*animation: none;`));
     expect(shellCss).toMatch(/\.app-header \.content-refresh-btn\[data-state="done"\] \.refresh-check\s*\{[^}]*opacity: 1;/);
-    // The old in-place spin on the trailing action is gone with it.
     expect(hostCss).not.toMatch(/is-busy/);
   });
 
   it('makes desktop Refresh inert while it spins or checks, keeping its tooltip', () => {
-    // aria-disabled, not `disabled`: the real attribute takes the pointer, and the tooltip with it.
     expect(indicator).toMatch(/const busy = state !== 'idle';/);
     expect(indicator).toMatch(/onClick: busy \? undefined : \(\) => void runPanelRefresh\(\)/);
     expect(indicator).toMatch(/'aria-disabled': String\(busy\)/);
@@ -60,9 +51,7 @@ describe('content pane pull to refresh', () => {
   });
 
   it('spins a phone\'s running refresh in the leading slot, beside the hamburger', () => {
-    // The trailing slot is the ⋯ trigger's, and a spinner there folds away.
     expect(mobileHeader).toMatch(/<HamburgerButton \/>\s*<MobileRefreshIndicator \/>/);
-    // Spins only while shown, since a hidden spin still costs frames.
     const spinning = '\\.mobile-refresh-indicator:not\\(\\[data-state="idle"\\]\\) svg:not\\(\\.refresh-check\\)';
     expect(mobileCss).toMatch(new RegExp(`${spinning}\\s*\\{\\s*animation: spin`));
     expect(mobileCss).not.toMatch(/\.mobile-refresh-indicator svg\s*\{[^}]*animation/);
@@ -70,13 +59,11 @@ describe('content pane pull to refresh', () => {
   });
 
   it('crossfades the spinner into a check once the refresh lands', () => {
-    // Hidden outside `refreshing`, so it never fades back in over the leaving check.
     expect(mobileCss).toMatch(/\.mobile-refresh-indicator:not\(\[data-state="refreshing"\]\) svg:not\(\.refresh-check\)\s*\{\s*opacity: 0;/);
     expect(mobileCss).toMatch(/\.mobile-refresh-indicator\[data-state="done"\] \.refresh-check\s*\{\s*opacity: 1;/);
   });
 
   it('fades the check out at full size, on both rows', () => {
-    // The exit resets `scale` only once the check is invisible, so it fades rather than shrinks.
     const exit = 'transition: opacity var\\(--duration-slow\\) ease-in-out, scale 0s var\\(--duration-slow\\);';
     expect(mobileCss).toMatch(new RegExp(`\\.mobile-refresh-indicator \\.refresh-check\\s*\\{[^}]*${exit}`));
     expect(shellCss).toMatch(new RegExp(`\\.app-header \\.content-refresh-btn \\.refresh-check\\s*\\{[^}]*${exit}`));
@@ -106,7 +93,6 @@ describe('content pane pull to refresh', () => {
   });
 
   it('lets the affordance spring back on a scaled duration token', () => {
-    // A tokenized transition collapses with reduced motion by itself.
     expect(shellCss).toMatch(/\.pull-refresh-affordance \{[^}]*transition: transform var\(--duration-normal\)/);
   });
 });

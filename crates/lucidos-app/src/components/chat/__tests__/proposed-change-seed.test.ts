@@ -11,8 +11,6 @@ const proposed = (description: string, files: string[] = ['a.rs']) =>
 const summarized = (summary: string, description: string) =>
   ({ type: 'ChangeSummarized', change_id: 'c-1', summary, description });
 
-/** The lifecycle card resolves the change's LAST proposal, so that is the
- *  seed, and a summary counts only while it summarized that list. */
 describe('the change card seed', () => {
   it('takes the latest proposal and the summary of its commit list', () => {
     const seed = buildProposedChangeInfo([

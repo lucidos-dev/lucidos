@@ -1,11 +1,6 @@
-/** A leaf shared by HTTP and stream startup. Installed before client effects;
- * tests and isolated clients that do not start the shell have no gate. */
 import { signal } from '@preact/signals';
 import type { QueuedUploadSendRecord } from '../store/pendingUploadRecords';
 
-/** Exact queued intent, including its page owner. A thread id alone would
- * suppress every later send on that thread. Canonicalize context object keys
- * so storage cloning and object insertion order cannot change the identity. */
 export function queuedRestoreSourceId(record: QueuedUploadSendRecord): string {
   const canonical = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonical);
@@ -15,14 +10,24 @@ export function queuedRestoreSourceId(record: QueuedUploadSendRecord): string {
     }
     return value;
   };
-  // Origin metadata classifies startup admission; it is not send intent. Live
-  // queue captures and older retained records may omit it.
   return JSON.stringify(canonical({ threadId: record.threadId, ownerId: record.ownerId,
     text: record.text, localIds: record.localIds, intent: record.intent }));
 }
+export type RestoreAdmissionPhase =
+  | 'awaiting-hello'
+  | 'generation'
+  | 'local-records'
+  | 'historical-sources'
+  | 'journal'
+  | 'recoveries'
+  | 'draft-recovery'
+  | 'admitted';
+
 export interface RestoreAdmission {
   wait(): Promise<void>;
   ready(): boolean;
+  phase(): RestoreAdmissionPhase;
+  provisional?(): boolean;
 }
 
 let admission: RestoreAdmission | undefined;
@@ -53,11 +58,33 @@ export function restoreAdmissionReady(): boolean {
   return admission?.ready() ?? true;
 }
 
+export function restoreAdmissionPhase(): RestoreAdmissionPhase {
+  return admission?.phase() ?? 'admitted';
+}
+
+export function restoreAdmissionProvisional(): boolean {
+  return admission?.provisional?.() ?? false;
+}
+
 export async function waitForRestoreAdmission(): Promise<void> {
   await admission?.wait();
 }
 
-/** Bootstrapping identity and health cannot depend on stream admission. */
 export function isRestoreBootstrapRequest(url: string): boolean {
   return /\/(health|devices\/register|internal\/client-log)(\?|$)/.test(url);
+}
+
+const PROVISIONAL_READ = /\/api\/v1\/threads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\/events)?(\?|$)/i;
+let provisionalReadApplied = false;
+
+export function isProvisionalRead(url: string, method: string): boolean {
+  return method === 'GET' && PROVISIONAL_READ.test(url) && restoreAdmissionProvisional();
+}
+
+export function noteProvisionalRead(): void { provisionalReadApplied = true; }
+
+export function consumeProvisionalReads(): boolean {
+  const applied = provisionalReadApplied;
+  provisionalReadApplied = false;
+  return applied;
 }

@@ -6,24 +6,9 @@ import {
   shouldSeed,
   migrateUnprefixedKeys,
   installWorkspaceStorage,
+  rawStorageKey,
 } from './workspaceStorage';
 
-/**
- * In-memory Storage faithful to the native `Storage` contract — the previous mock
- * was a plain object literal, which let the buggy instance-assignment install
- * "work" in tests while silently no-opping in every real browser.
- *
- * Two faithful properties matter here:
- *   1. The methods live on a dedicated PROTOTYPE (like `Storage.prototype`), so a
- *      correct install must override them there. `Object.getPrototypeOf(storage)`
- *      returns that prototype.
- *   2. The instance models WebIDL `[LegacyOverrideBuiltIns]` + named-property
- *      setter: assigning OR `Object.defineProperty`-ing any property on the
- *      instance is swallowed as a stored item, NOT a real own property — so the
- *      old `storage.getItem = fn` technique fails here exactly as it does on a
- *      native `Storage`. This is the regression guard: reverting to instance
- *      assignment breaks the namespacing tests below.
- */
 function makeStorage(seed: Record<string, string> = {}): Storage {
   const store: Record<string, string> = { ...seed };
   const proto = {
@@ -36,10 +21,7 @@ function makeStorage(seed: Record<string, string> = {}): Storage {
   };
   const instance = Object.create(proto) as Storage;
   return new Proxy(instance, {
-    // Native named-property setter: plain assignment stores an item, it never
-    // creates an own property that shadows the prototype method.
     set(_target, prop, value) { store[String(prop)] = String(value); return true; },
-    // [[DefineOwnProperty]] routes through the named setter too.
     defineProperty(_target, prop, desc) {
       store[String(prop)] = String((desc as PropertyDescriptor).value);
       return true;
@@ -47,7 +29,6 @@ function makeStorage(seed: Record<string, string> = {}): Storage {
   });
 }
 
-/** Read a key bypassing any installed override (raw storage). */
 function rawKeys(storage: Storage): string[] {
   const out: string[] = [];
   for (let i = 0; i < storage.length; i++) {
@@ -67,13 +48,10 @@ describe('pure helpers', () => {
   it('isGlobalKey: only switcher keys and device pairing history stay raw', () => {
     expect(isGlobalKey('lucidos-last-workspace')).toBe(true);
     expect(isGlobalKey('lucidos-last-workspace-count')).toBe(true);
-    // Tapping a peer lands in ITS namespace, so a scoped key would forget the
-    // unfolded list on every switch.
     expect(isGlobalKey('lucidos-workspace-switcher-expanded')).toBe(true);
     expect(isGlobalKey('lucidos-remote-workspaces')).toBe(true);
     expect(isGlobalKey('lucidos.pairing.spentLaunchCodes')).toBe(true);
     expect(GLOBAL_KEYS.size).toBe(5);
-    // Everything else is now workspace-scoped — including device id + appearance.
     expect(isGlobalKey('lucidos-device-id')).toBe(false);
     expect(isGlobalKey('lucidos-theme')).toBe(false);
     expect(isGlobalKey('lucidos-font-family')).toBe(false);
@@ -85,20 +63,16 @@ describe('pure helpers', () => {
   });
 
   it('shouldSeed: only former-global appearance keys, never device id or per-workspace state', () => {
-    // Seeded once from the legacy raw value so the user's look carries over.
     expect(shouldSeed('lucidos-theme')).toBe(true);
     expect(shouldSeed('lucidos-font-family')).toBe(true);
     expect(shouldSeed('lucidos-ui-scale')).toBe(true);
     expect(shouldSeed('lucidos-animation-speed-slider')).toBe(true);
-    // Device id is NOT seeded — each workspace gets a fresh identity.
     expect(shouldSeed('lucidos-device-id')).toBe(false);
-    // Per-workspace state is NOT adopted (contamination fix) — starts clean.
     expect(shouldSeed('lucidos-focused-thread')).toBe(false);
     expect(shouldSeed('lucidos-nav-history')).toBe(false);
     expect(shouldSeed('pinned_apps')).toBe(false);
     expect(shouldSeed('file-preview-open')).toBe(false);
     expect(shouldSeed('lucidos-scroll-thread-abc')).toBe(false);
-    // Already-namespaced never re-seeds.
     expect(shouldSeed('ws:alpha:lucidos-theme')).toBe(false);
   });
 });
@@ -110,7 +84,6 @@ describe('installWorkspaceStorage — cross-workspace isolation', () => {
 
     storage.setItem('lucidos-focused-thread', 't1');
     expect(storage.getItem('lucidos-focused-thread')).toBe('t1');
-    // physically stored under the namespaced key
     expect(rawKeys(storage)).toContain('ws:alpha:lucidos-focused-thread');
   });
 
@@ -128,9 +101,6 @@ describe('installWorkspaceStorage — cross-workspace isolation', () => {
   });
 
   it('one origin, two namespaces never collide (shared storage)', () => {
-    // Models the gateway: one localStorage, two workspaces. We can't install two
-    // overrides on one object, so assert alpha's write lands only in alpha's
-    // namespaced slot — beta's slot (which a beta install would read) stays empty.
     const storage = makeStorage();
     installWorkspaceStorage(storage, 'alpha');
     storage.setItem('lucidos-nav-history', 'alpha-nav');
@@ -138,8 +108,6 @@ describe('installWorkspaceStorage — cross-workspace isolation', () => {
     expect(namespacedKey('lucidos-nav-history', 'alpha')).not.toBe(
       namespacedKey('lucidos-nav-history', 'beta'),
     );
-    // Inspect raw storage (the override would re-map a getItem call): alpha's
-    // slot holds the value, beta's slot was never written.
     const keys = rawKeys(storage);
     expect(keys).toContain('ws:alpha:lucidos-nav-history');
     expect(keys).not.toContain('ws:beta:lucidos-nav-history');
@@ -192,9 +160,6 @@ describe('installWorkspaceStorage — device id + appearance are now scoped', ()
   });
 
   it('is idempotent — an already-namespaced key is not double-prefixed', () => {
-    // Guards the SDK-in-parent-realm footgun: a key that already carries the
-    // `ws:<slug>:` prefix (e.g. handed in by the SDK's own _storage helper) must
-    // pass through untouched rather than becoming `ws:slug:ws:slug:key`.
     const storage = makeStorage();
     installWorkspaceStorage(storage, 'alpha');
     storage.setItem('ws:alpha:lucidos-theme', 'light');
@@ -219,7 +184,6 @@ describe('installWorkspaceStorage — null workspace passes through', () => {
     const storage = makeStorage({ 'lucidos-focused-thread': 't1' });
     installWorkspaceStorage(storage, null);
     storage.setItem('lucidos-nav-history', 'x');
-    // raw keys unchanged in shape — no ws: prefix, no migration marker
     expect(storage.getItem('lucidos-focused-thread')).toBe('t1');
     expect(rawKeys(storage)).toEqual(
       expect.arrayContaining(['lucidos-focused-thread', 'lucidos-nav-history']),
@@ -236,12 +200,10 @@ describe('one-time migration (seed appearance, never adopt, fresh device id)', (
     });
     installWorkspaceStorage(storage, 'alpha');
 
-    // appearance carried over into this workspace
     expect(storage.getItem('lucidos-theme')).toBe('light');
     expect(storage.getItem('lucidos-font-family')).toBe('fira-code');
     const keys = rawKeys(storage);
     expect(keys).toContain('ws:alpha:lucidos-theme');
-    // legacy raw left as a harmless orphan so a second workspace can seed too
     expect(keys).toContain('lucidos-theme');
   });
 
@@ -253,7 +215,6 @@ describe('one-time migration (seed appearance, never adopt, fresh device id)', (
     });
     installWorkspaceStorage(storage, 'alpha');
 
-    // none of the foreign per-workspace state bleeds in — clean slate
     expect(storage.getItem('lucidos-nav-history')).toBe(null);
     expect(storage.getItem('pinned_apps')).toBe(null);
     expect(storage.getItem('lucidos-focused-thread')).toBe(null);
@@ -263,7 +224,6 @@ describe('one-time migration (seed appearance, never adopt, fresh device id)', (
   it('does NOT seed device id — each workspace generates a fresh one', () => {
     const storage = makeStorage({ 'lucidos-device-id': 'legacy-shared-id' });
     installWorkspaceStorage(storage, 'alpha');
-    // the legacy shared id is not adopted into the workspace namespace
     expect(storage.getItem('lucidos-device-id')).toBe(null);
     expect(rawKeys(storage)).not.toContain('ws:alpha:lucidos-device-id');
   });
@@ -271,7 +231,6 @@ describe('one-time migration (seed appearance, never adopt, fresh device id)', (
   it('is idempotent — second run seeds nothing new', () => {
     const storage = makeStorage({ 'lucidos-theme': 'light' });
     migrateUnprefixedKeys(storage, 'alpha');
-    // user changes the namespaced theme; a re-run must not clobber it back to legacy
     storage.setItem('ws:alpha:lucidos-theme', 'dark');
     migrateUnprefixedKeys(storage, 'alpha');
     expect(storage.getItem('ws:alpha:lucidos-theme' as string)).toBe('dark');
@@ -290,5 +249,43 @@ describe('one-time migration (seed appearance, never adopt, fresh device id)', (
     const storage = makeStorage();
     migrateUnprefixedKeys(storage, 'alpha');
     expect(storage.getItem(namespacedKey('__migrated', 'alpha'))).toBe('1');
+  });
+});
+
+describe('installWorkspaceStorage with a peer-served client', () => {
+  it('scopes workspace and global keys under the peer, apart from the own client', () => {
+    const storage = makeStorage({ 'lucidos-theme': 'own-theme', 'ws:dev@cloud:lucidos-theme': 'own' });
+    installWorkspaceStorage(storage, 'dev@cloud', 'cloud');
+    const [global] = [...GLOBAL_KEYS];
+
+    storage.setItem('lucidos-focused-thread', 'peer');
+    storage.setItem(global, 'peer-global');
+    storage.setItem('ws:dev@cloud:lucidos-nav-history', 'peer-nav');
+
+    const keys = rawKeys(storage);
+    expect(keys).toContain('peer:cloud:ws:dev@cloud:lucidos-focused-thread');
+    expect(keys).toContain(`peer:cloud:${global}`);
+    expect(keys).toContain('peer:cloud:ws:dev@cloud:lucidos-nav-history');
+    expect(keys).not.toContain('ws:dev@cloud:lucidos-focused-thread');
+    expect(keys).not.toContain(global);
+    expect(storage.getItem('lucidos-theme')).toBeNull();
+  });
+
+  it('never double-scopes a key that already carries the peer prefix', () => {
+    const storage = makeStorage();
+    installWorkspaceStorage(storage, 'dev@cloud', 'cloud');
+    storage.setItem('peer:cloud:ws:dev@cloud:lucidos-theme', 'dark');
+    expect(rawKeys(storage)).toEqual(
+      expect.arrayContaining(['peer:cloud:ws:dev@cloud:lucidos-theme']),
+    );
+    expect(storage.getItem('lucidos-theme')).toBe('dark');
+  });
+
+  it('enumerates under the same raw prefix it writes to', () => {
+    const storage = makeStorage();
+    installWorkspaceStorage(storage, 'dev@cloud', 'cloud');
+    const prefix = rawStorageKey('lucidos-app:habit-tracker:', 'dev@cloud', 'cloud');
+    storage.setItem(`${prefix}streak`, '3');
+    expect(rawKeys(storage)).toContain(`${prefix}streak`);
   });
 });

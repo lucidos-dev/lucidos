@@ -9,11 +9,11 @@
 use serde::Deserialize;
 
 use crate::engine::types::ApiUsage;
-pub(crate) use crate::llm::cache_lifetime::CacheLifetime;
+pub use crate::llm::cache_lifetime::CacheLifetime;
 
 /// How long a prompt cache entry lives, and what says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheTtl {
+pub enum CacheTtl {
     /// The response split the write by lifetime.
     Reported(CacheLifetime),
     /// The response split nothing, and the request asked for this lifetime
@@ -96,7 +96,7 @@ impl CacheTtl {
     }
 
     /// The lifetime, when evidence gave one.
-    pub(crate) fn lifetime(self) -> Option<CacheLifetime> {
+    pub fn lifetime(self) -> Option<CacheLifetime> {
         match self {
             Self::Reported(lifetime) | Self::Requested(lifetime) => Some(lifetime),
             Self::Unknown => None,
@@ -131,7 +131,7 @@ SELECT e.payload->'usage' AS usage
 /// across a workspace, and a repo's project settings can change the TTL, so
 /// the repo is the closest evidence. Unknown when there is none, or it is
 /// unreadable.
-pub(crate) async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -> CacheTtl {
+pub async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -> CacheTtl {
     let row: Option<(sqlx::types::Json<WriteSplit>,)> = match sqlx::query_as(LATEST_REPO_WRITE_SQL)
         .bind(REPO_WRITE_LOOKBACK_DAYS)
         .bind(repo_id)
@@ -140,7 +140,7 @@ pub(crate) async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -
     {
         Ok(row) => row,
         Err(e) => {
-            crate::log!("[CacheTtl] Could not read the repo's latest cache write: {e}");
+            crate::log_legacy!("[CacheTtl] Could not read the repo's latest cache write: {e}");
             return CacheTtl::Unknown;
         }
     };

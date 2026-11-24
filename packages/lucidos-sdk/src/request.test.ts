@@ -1,10 +1,3 @@
-/**
- * The escape hatch sends what it checked, and refuses the rest.
- *
- * `_fetch` is mocked, so these cases are about the classification and the path
- * that reaches the transport. Whether the transport bridges or goes direct is
- * `_fetch`'s own decision, covered by its tests.
- */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SdkError } from './_fetch';
 
@@ -75,8 +68,6 @@ describe('lucidos.request', () => {
 
   it('throws on a suffix that is not a string', async () => {
     const { request } = await import('./request');
-    // Synchronous, like `preferences.set` and `data.edit`: a caller passing the
-    // wrong type has a bug, and the stack should point at their call.
     expect(() => (request as unknown as (s: unknown) => unknown)(7)).toThrow(TypeError);
   });
 });

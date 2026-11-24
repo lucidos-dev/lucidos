@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-// jsdom, since fragment resolution searches a real DOM tree for a heading id.
 
 import { describe, it, expect } from 'vitest';
 import { markdownLinkTooltip } from './markdownLinkTooltip';

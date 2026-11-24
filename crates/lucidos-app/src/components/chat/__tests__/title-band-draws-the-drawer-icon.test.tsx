@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The title band draws the same thread icon as the thread's drawer row, after
- * the status mark and before the title.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { ThreadTitleMenu } from '../ThreadTitle';

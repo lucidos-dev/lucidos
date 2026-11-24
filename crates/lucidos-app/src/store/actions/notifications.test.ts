@@ -19,9 +19,6 @@ import {
 } from '../store';
 import type { Notification, Loadable } from '../types';
 
-// Mock the API client to prevent real HTTP calls. The error classifiers and the
-// retry are the real ones, so the transport-blip paths are exercised, not
-// stubbed away.
 vi.mock('../../api/client', async () => {
   const core = await vi.importActual<typeof import('../../api/client/_core')>('../../api/client/_core');
   return {
@@ -34,16 +31,9 @@ vi.mock('../../api/client', async () => {
   };
 });
 
-// viewNotification reveals the content pane and pushes a nav-history entry as a
-// side effect; both reach for the DOM / localStorage, so they are stubbed. They
-// are also asserted on (the memory-first open must not shed either), so the
-// stubs are imported below rather than left write-only.
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 
-// The dock-badge nudge is a desktop-only side effect of handleNotificationSSE.
-// Override just isTauri (default off) + the nudge so we can assert the gate;
-// keep the rest of each module real (the store import chain uses them).
 vi.mock('../../utils/platform', async (importActual) => ({
   ...(await importActual<typeof import('../../utils/platform')>()),
   isTauri: vi.fn(() => false),
@@ -52,9 +42,6 @@ vi.mock('../../utils/tauri', async (importActual) => ({
   ...(await importActual<typeof import('../../utils/tauri')>()),
   nudgeDockBadge: vi.fn(),
 }));
-// The app-icon badge re-assert is a side effect of every path that
-// (re)establishes the unread truth. Spy on it here; app-badge.test.ts pins that
-// it writes `unreadCount` onto the Badging API.
 vi.mock('./app-badge', () => ({
   syncWorkspaceAppBadge: vi.fn(),
   applyAppBadge: vi.fn(),
@@ -73,6 +60,7 @@ const {
   viewNotification,
   resetViewDedup,
   _resetNotificationLoadsForTesting,
+  unreadNotificationsSlice,
 } = await import('./notifications');
 const { getNotifications, getNotification, markNotificationRead, markAllNotificationsRead } = await import('../../api/client');
 const { revealContentPane } = await import('./pane');
@@ -84,8 +72,6 @@ const { syncWorkspaceAppBadge } = await import('./app-badge');
 type Mock = ReturnType<typeof vi.fn>;
 type NotifResponse = { notifications: Notification[]; unread_count: number; has_more: boolean };
 
-/** A promise plus its resolver, so a test can hold a GET pending and resolve
- *  it out of order. */
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
   const promise = new Promise<T>((r) => { resolve = r; });
@@ -102,7 +88,6 @@ function makeNotification(id: string, read: boolean): Notification {
   };
 }
 
-/** N unread notifications, ids `u0`..`u{N-1}`. */
 function makeUnread(n: number): Notification[] {
   return Array.from({ length: n }, (_, i) => makeNotification(`u${i}`, false));
 }
@@ -112,14 +97,12 @@ function loadedRows(list: Loadable<Notification[]>): Notification[] {
   return list.data;
 }
 
-// Pending reads and loads in flight are module state, so each test starts with none.
 beforeEach(() => {
   _resetNotificationLoadsForTesting();
   pendingNotificationReads.value = new Map();
   servedNotificationEpochs.value = { browse: 0, unread: 0 };
 });
 
-/** Seed the unread set (the bell badge's single source of truth) directly. */
 function seedUnread(items: Notification[]): void {
   servedUnreadNotifications.value = { status: 'loaded', data: items };
 }
@@ -143,9 +126,6 @@ describe('handleNotificationSSE', () => {
   });
 
   it('ALWAYS reloads the unread set (bell + app-icon badge AND the Unread tab, one source)', () => {
-    // The unread set is the single source the badge and the Unread tab both
-    // project from — it must refresh on every notification event regardless of
-    // which tab is visible or whether a detail is open.
     handleNotificationSSE();
     expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
   });
@@ -153,21 +133,16 @@ describe('handleNotificationSSE', () => {
   it('reloads the "All" browse list when it is the visible tab with no detail open', () => {
     handleNotificationSSE();
 
-    // The paginated browse list is refetched with the 'all' filter...
     expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
-    // ...and existing data stays visible through the round-trip (no loading flash).
     expect(notifications.value.status).toBe('loaded');
   });
 
   it('does NOT reload the "All" browse list when a notification detail is open', () => {
-    // Detail open: the browse list must stay intact so prev/next navigation works.
     panelOverlay.value = { type: 'notification-detail', notification: makeNotification('a', true) };
 
     handleNotificationSSE();
 
-    // The unread set (badge) still refreshes...
     expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
-    // ...but the browse list is NOT reloaded.
     expect(getNotifications).not.toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
     expect(notifications.value.status).toBe('loaded');
     if (notifications.value.status === 'loaded') {
@@ -180,16 +155,12 @@ describe('handleNotificationSSE', () => {
 
     handleNotificationSSE();
 
-    // The badge's unread set still refreshes regardless of the active panel...
     expect(getNotifications).toHaveBeenCalledWith(expect.objectContaining({ filter: 'unread' }));
-    // ...but the browse list is not reloaded off-panel.
     expect(getNotifications).not.toHaveBeenCalledWith(expect.objectContaining({ filter: 'all' }));
     expect(notifications.value.status).toBe('loaded');
   });
 
   it('on the "Unread" tab refreshes ONLY the unread set — never the browse list', () => {
-    // The Unread tab renders `unreadNotifications`, so there is no separate browse
-    // fetch to keep in sync (and none that could drift from the badge).
     notificationsFilter.value = 'unread';
 
     handleNotificationSSE();
@@ -217,12 +188,6 @@ describe('handleNotificationSSE', () => {
   });
 });
 
-// The badge is a pure projection of the unread set — there is no separately
-// fetched count to drift from it. These pin that the count is ALWAYS the set's
-// length and that local mark-read shrinks the set immediately.
-// The detail-panel chevrons walk the inbox list, which is paginated. Stepping
-// "older" (next) must not stop at the first loaded page — it loads the next page
-// and continues, so navigation is bounded only by how many notifications exist.
 describe('navigateAdjacentNotification', () => {
   beforeEach(() => {
     panelOverlay.value = null;
@@ -237,9 +202,6 @@ describe('navigateAdjacentNotification', () => {
   });
 
   it('steps within the loaded page from memory — no page fetch AND no detail GET', async () => {
-    // The loaded row IS the full notification (the list query selects identical
-    // columns to the single-notification GET), so stepping must render straight
-    // from memory — a per-chevron getNotification round-trip was the iOS-PWA lag.
     servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true), makeNotification('c', true)],
@@ -248,10 +210,8 @@ describe('navigateAdjacentNotification', () => {
     const id = await navigateAdjacentNotification('a', 1);
 
     expect(id).toBe('b');
-    expect(getNotifications).not.toHaveBeenCalled(); // already loaded — no page fetch
-    expect(getNotification).not.toHaveBeenCalled();  // rendered from memory — no detail GET
-    // The overlay carries the full in-memory row (incl. its message body), not a
-    // re-fetched copy.
+    expect(getNotifications).not.toHaveBeenCalled();
+    expect(getNotification).not.toHaveBeenCalled();
     expect(panelOverlay.value).toMatchObject({
       type: 'notification-detail',
       notification: { id: 'b', message: 'Message b' },
@@ -267,9 +227,8 @@ describe('navigateAdjacentNotification', () => {
     const id = await navigateAdjacentNotification('a', 1);
 
     expect(id).toBe('b');
-    expect(getNotification).not.toHaveBeenCalled();         // never gated on a GET
-    expect(markNotificationRead).toHaveBeenCalledWith('b'); // fire-and-forget read flip
-    // The browse row flips read optimistically (display only).
+    expect(getNotification).not.toHaveBeenCalled();
+    expect(markNotificationRead).toHaveBeenCalledWith('b');
     if (notifications.value.status === 'loaded') {
       expect(notifications.value.data.find((n) => n.id === 'b')?.read).toBe(true);
     }
@@ -292,7 +251,6 @@ describe('navigateAdjacentNotification', () => {
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
     notificationsHasMore.value = true;
-    // loadMoreNotifications appends the next page (cursor-based).
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: [makeNotification('c', true), makeNotification('d', true)],
       unread_count: 0,
@@ -301,9 +259,9 @@ describe('navigateAdjacentNotification', () => {
 
     const id = await navigateAdjacentNotification('b', 1);
 
-    expect(getNotifications).toHaveBeenCalledTimes(1); // pulled the next page
-    expect(getNotification).not.toHaveBeenCalled();    // stepped into it from memory
-    expect(id).toBe('c'); // stepped into the freshly-loaded page
+    expect(getNotifications).toHaveBeenCalledTimes(1);
+    expect(getNotification).not.toHaveBeenCalled();
+    expect(id).toBe('c');
     if (notifications.value.status === 'loaded') {
       expect(notifications.value.data.map((n) => n.id)).toEqual(['a', 'b', 'c', 'd']);
     }
@@ -327,17 +285,15 @@ describe('navigateAdjacentNotification', () => {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
-    notificationsHasMore.value = true; // irrelevant to prev
+    notificationsHasMore.value = true;
 
     const id = await navigateAdjacentNotification('a', -1);
 
-    expect(id).toBeNull(); // 'a' is index 0 — nothing newer
+    expect(id).toBeNull();
     expect(getNotifications).not.toHaveBeenCalled();
   });
 });
 
-// ⌘↑/⌘↓ step turns in the thread pane. With the Canvas pane focused on a
-// notification, the same keys step the inbox instead.
 describe('stepViewedNotification', () => {
   beforeEach(() => {
     notificationsHasMore.value = false;
@@ -372,11 +328,6 @@ describe('stepViewedNotification', () => {
   });
 });
 
-// A push tap / deep link opens a notification detail via viewNotification
-// WITHOUT the user ever having opened the Notifications panel — so the inbox
-// browse list is unloaded and the detail's prev/next chevrons (which walk that
-// list) would sit permanently disabled. viewNotification must load the list so
-// the chevrons can step the inbox.
 describe('viewNotification loads the inbox list so detail chevrons work', () => {
   beforeEach(() => {
     resetViewDedup();
@@ -392,8 +343,6 @@ describe('viewNotification loads the inbox list so detail chevrons work', () => 
   it('loads the browse list on the deep-link path (list not yet loaded)', async () => {
     servedNotifications.value = { status: 'not-loaded' };
     (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
-    // The list load runs while the row is still unread server-side, so it comes
-    // back under either filter; here it returns the row plus an older sibling.
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: [makeNotification('x', false), makeNotification('y', false)],
       unread_count: 2,
@@ -402,24 +351,17 @@ describe('viewNotification loads the inbox list so detail chevrons work', () => 
 
     await viewNotification('x');
 
-    // The detail opened...
     expect(panelOverlay.value).toMatchObject({
       type: 'notification-detail',
       notification: { id: 'x' },
     });
-    // ...and the browse list got loaded and now holds the viewed row, so the
-    // chevrons have an inbox to walk (currentIndex !== -1).
     expect(getNotifications).toHaveBeenCalledTimes(1);
-    // Cast defeats TS flow-narrowing: the test body's last direct assignment was
-    // `{ status: 'not-loaded' }`, but viewNotification mutated it across the await.
     const list = notifications.value as Loadable<Notification[]>;
     if (list.status === 'loaded') {
       expect(list.data.some((n) => n.id === 'x')).toBe(true);
     } else {
       throw new Error('expected the browse list to be loaded');
     }
-    // The viewed row is marked read in place — it stays in the list (chevrons
-    // still resolve it), it isn't dropped.
     expect(markNotificationRead).toHaveBeenCalledWith('x');
   });
 
@@ -432,17 +374,10 @@ describe('viewNotification loads the inbox list so detail chevrons work', () => 
     await viewNotification('x');
 
     expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
-    // List already has the row — no redundant page fetch.
     expect(getNotifications).not.toHaveBeenCalled();
   });
 });
 
-// The reported bug: "lag opening a notification, with no user feedback". Every
-// pixel of the response sat behind a detail GET that the loaded row could
-// already answer, because the list query and the single-row query select an
-// identical column list and serialize the same Notification. On an iOS PWA that
-// is a 400-1800ms dead interval per tap. The open must be synchronous whenever
-// either list holds the row; only a genuine miss may reach the network.
 describe('viewNotification opens from memory, without a detail GET', () => {
   beforeEach(() => {
     resetViewDedup();
@@ -467,8 +402,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
       data: [makeNotification('x', false), makeNotification('y', false)],
     };
 
-    // Deliberately NOT awaited: the panel must be up on this very tick, which is
-    // the whole point. An await here would hide a regression back to fetch-first.
     void viewNotification('x');
 
     expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
@@ -476,9 +409,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('opens SYNCHRONOUSLY from the unread set (the "Unread" tab renders that list)', () => {
-    // Since the badge/list single-sourcing, the Unread tab renders
-    // `unreadNotifications` and nothing loads the browse list under that filter,
-    // so the unread set is the ONLY list holding the row the user tapped.
     notificationsFilter.value = 'unread';
     seedUnread([makeNotification('u0', false), makeNotification('u1', false)]);
 
@@ -489,8 +419,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('reveals the content pane and pushes a nav entry on the memory path too', () => {
-    // Skipping either is a silent no-op on mobile / a broken panel Back
-    // (.claude/rules/frontend.md), so the memory path must not shed them.
     servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
 
     void viewNotification('x');
@@ -508,8 +436,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('falls back to the detail GET when NEITHER list holds the row (cold push tap)', async () => {
-    // Cold start: the deep link dispatches before loadUnreadNotifications lands,
-    // so there is genuinely nothing in memory to open from.
     servedNotifications.value = { status: 'not-loaded' };
     servedUnreadNotifications.value = { status: 'not-loaded' };
     (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
@@ -532,9 +458,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('flags the pending fetch and reveals the pane on the miss path, then clears it', async () => {
-    // The one case left with a real wait. The pane is revealed on the tap and
-    // ContentPane fills it with the detail's own skeleton (delay-gated), rather
-    // than leaving the previous view up for the whole round-trip.
     servedNotifications.value = { status: 'not-loaded' };
     servedUnreadNotifications.value = { status: 'not-loaded' };
     const gate = deferred<Notification>();
@@ -543,8 +466,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
     const pending = viewNotification('x');
     expect(notificationDetailPending.value).toBe('x');
     expect(revealContentPane).toHaveBeenCalled();
-    // The overlay is NOT written speculatively: a phantom nav entry would be
-    // left behind if the fetch failed.
     expect(panelOverlay.value).toBeNull();
 
     gate.resolve(makeNotification('x', false));
@@ -576,9 +497,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('loads the browse list for the chevrons when only the unread set held the row', async () => {
-    // Unread tab: the row opened from `unreadNotifications`, but the detail's
-    // prev/next walk `notifications`, so that list still has to be fetched.
-    // It is fetched AFTER the panel is already up, never in front of it.
     notificationsFilter.value = 'unread';
     servedNotifications.value = { status: 'not-loaded' };
     seedUnread([makeNotification('u0', false)]);
@@ -589,7 +507,6 @@ describe('viewNotification opens from memory, without a detail GET', () => {
     });
 
     const pending = viewNotification('u0');
-    // Panel is up before the chevron-list fetch has settled.
     expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'u0' } });
     await pending;
 
@@ -627,12 +544,11 @@ describe('the bell badge is derived from the unread set', () => {
     if (unreadNotifications.value.status === 'loaded') {
       expect(unreadNotifications.value.data.map((n) => n.id)).toEqual(['y']);
     }
-    expect(getNotifications).not.toHaveBeenCalled(); // no fetch needed to drop the badge
+    expect(getNotifications).not.toHaveBeenCalled();
   });
 
   it('loadNotifications (inbox browse) never touches the badge', async () => {
-    seedUnread(makeUnread(2)); // badge = 2 from the unread set
-    // The browse fetch returns an all-read page (count is irrelevant to it now).
+    seedUnread(makeUnread(2));
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: [makeNotification('a', true), makeNotification('b', true)],
       unread_count: 999,
@@ -641,21 +557,12 @@ describe('the bell badge is derived from the unread set', () => {
 
     await loadNotifications();
 
-    // Badge stays tied to the unread set — the browse's unread_count is ignored,
-    // so an all-read inbox page can never strand a stale positive badge.
     expect(unreadCount.value).toBe(2);
     expect(notifications.value.status).toBe('loaded');
   });
 });
 
 describe('the app-icon badge is re-asserted, not diffed', () => {
-  // Regression: the PWA app-icon badge used to be written ONLY by the
-  // `unreadCount` effect, i.e. only when the count CHANGED. But the icon badge
-  // is written behind the page's back — iOS sets it from the push payload's
-  // `app_badge` in its parent process, the SW `push` handler sets it on
-  // Chrome/Android — so a count that never transitions (read on another device,
-  // or an already-dropped row) left the icon showing 1 next to a bell showing 0.
-  // Every path that (re)establishes the unread truth must re-assert the icon.
   beforeEach(() => {
     seedUnread([]);
     servedNotifications.value = { status: 'not-loaded' };
@@ -669,9 +576,6 @@ describe('the app-icon badge is re-asserted, not diffed', () => {
   });
 
   it('a reload landing the SAME count still re-asserts (the resume case)', async () => {
-    // The set was already loaded-empty and the server still says empty — the
-    // count doesn't move, so the effect can't fire. This is the exact shape of
-    // a resume-time reload after the notification was read on another device.
     await loadUnreadNotifications();
 
     expect(unreadCount.value).toBe(0);
@@ -679,9 +583,6 @@ describe('the app-icon badge is re-asserted, not diffed', () => {
   });
 
   it('marking read re-asserts even when the row was not in the unread set', () => {
-    // Cold/frozen page: the row never made it into this device's unread set, so
-    // the local drop is a no-op and the count stays 0 — but the icon may still
-    // carry the 1 the push wrote.
     markReadOptimistic('never-loaded-here');
 
     expect(unreadCount.value).toBe(0);
@@ -699,15 +600,13 @@ describe('the app-icon badge is re-asserted, not diffed', () => {
   });
 
   it('a superseded load never writes the badge', async () => {
-    // Same monotonic guard the unread set itself has: an out-of-order load must
-    // not paint the icon with a set it was not allowed to apply.
     const stale = deferred<NotifResponse>();
     (getNotifications as Mock)
       .mockReturnValueOnce(stale.promise)
       .mockResolvedValueOnce({ notifications: [], unread_count: 0, has_more: false });
 
-    const first = loadUnreadNotifications();   // older load
-    const second = loadUnreadNotifications();  // newer load: supersedes the first
+    const first = loadUnreadNotifications();
+    const second = loadUnreadNotifications();
     await second;
     (syncWorkspaceAppBadge as Mock).mockClear();
 
@@ -723,12 +622,7 @@ describe('loadUnreadNotifications failure handling', () => {
   beforeEach(async () => {
     toasts.value = [];
     seedUnread([]);
-    // The escalation only counts failures while the engine is REACHABLE (an
-    // outage is the connection dot's to report, once). The signal defaults to
-    // 'connecting', so every countable case has to say so explicitly.
     connectionStatus.value = 'connected';
-    // Reset the module-level failure counter — every test starts with a
-    // successful load so failures are independent across tests.
     (getNotifications as Mock).mockReset();
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: [], unread_count: 0, has_more: false,
@@ -761,20 +655,12 @@ describe('loadUnreadNotifications failure handling', () => {
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/unread count is stale/i);
 
-    // 4th, 5th failures don't re-toast — same outage, one notice.
     await loadUnreadNotifications();
     await loadUnreadNotifications();
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
   });
 
   it('does not count a browser-cancelled AbortError toward the threshold', async () => {
-    // No manual AbortController on this path — an AbortError is the browser
-    // cancelling the in-flight fetch on an iOS PWA freeze / radio handoff. It
-    // carries no reachability signal, so it must not push the counter toward the
-    // "Unread count is stale — couldn't reach the engine" escalation. Non-abort /
-    // non-transport rejections still count — the threshold test above proves that
-    // with a plain Error; a client-side TimeoutError is in that same countable
-    // bucket (isAbortError / isTransportError both reject it).
     (getNotifications as Mock).mockRejectedValue(new DOMException('aborted', 'AbortError'));
 
     await loadUnreadNotifications();
@@ -787,12 +673,6 @@ describe('loadUnreadNotifications failure handling', () => {
   });
 
   it('does not count a transport-layer TypeError ("Load failed") toward the threshold', async () => {
-    // The iOS-PWA-over-Tailscale case: on wake the stale HTTP/2 connection fails
-    // the fetch at the transport layer (Safari "Load failed"). It's the same
-    // page-lifecycle / reachability noise as an AbortError, not a definitive
-    // "engine is down" (the debounced connection dot owns that), so it must not
-    // trip the "Unread count is stale — couldn't reach the engine after 3 tries"
-    // escalation. This is the fix for the reported spurious iOS-PWA toast.
     (getNotifications as Mock).mockRejectedValue(new TypeError('Load failed'));
 
     await loadUnreadNotifications();
@@ -805,12 +685,6 @@ describe('loadUnreadNotifications failure handling', () => {
   });
 
   it('does not count ANY failure while the engine is unreachable', async () => {
-    // The reported symptom. Over a dropped tunnel the GET hangs rather than
-    // refusing, so it dies on the 10s client deadline as a TimeoutError, which
-    // the abort/transport suppressions above deliberately let through as the
-    // stronger "genuinely stuck" signal. But the connection dot is already
-    // reporting the outage, so counting it here tells the user the same thing
-    // twice. This is what made the card a constant companion on an iOS PWA.
     connectionStatus.value = 'disconnected';
     (getNotifications as Mock).mockRejectedValue(
       new DOMException('Request timed out after 10000ms', 'TimeoutError'),
@@ -822,8 +696,6 @@ describe('loadUnreadNotifications failure handling', () => {
   });
 
   it('still toasts when the engine is REACHABLE but this endpoint keeps failing', async () => {
-    // The other half of the gate: /health answering while /notifications does
-    // not is a real, actionable fault and must not be swallowed with the outage.
     connectionStatus.value = 'connected';
     (getNotifications as Mock).mockRejectedValue(
       new DOMException('Request timed out after 10000ms', 'TimeoutError'),
@@ -838,8 +710,6 @@ describe('loadUnreadNotifications failure handling', () => {
   });
 
   it('retracts the stale-count card once a load lands', async () => {
-    // The card asserts the count is stale. A landed set makes that false, so
-    // leaving it up parks a permanent lie above a live, correct badge.
     (getNotifications as Mock).mockRejectedValue(new Error('boom'));
     for (let i = 0; i < 3; i++) await loadUnreadNotifications();
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
@@ -861,21 +731,15 @@ describe('loadUnreadNotifications failure handling', () => {
 
     await loadUnreadNotifications();
     await loadUnreadNotifications();
-    await loadUnreadNotifications(); // success — counter resets
+    await loadUnreadNotifications();
     expect(unreadCount.value).toBe(7);
 
-    // Two more failures shouldn't trip the threshold yet (we're back to 0).
     await loadUnreadNotifications();
     await loadUnreadNotifications();
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
   });
 });
 
-// The unread set must stay in sync even when two loads are in flight at once.
-// The canonical case is an in-app auto-read (notifications.md §4 Row 1): the same
-// page sees NotificationCreated (the server now counts the row) and, a beat
-// later, NotificationRead (the server flipped it). Each fires a reload; if the
-// stale created-reload resolves LAST it must not strand the badge one too high.
 describe('unread set is resilient to out-of-order responses', () => {
   beforeEach(() => {
     seedUnread([]);
@@ -884,44 +748,35 @@ describe('unread set is resilient to out-of-order responses', () => {
   });
 
   it('discards a stale created-reload that resolves after the read-reload', async () => {
-    // #1 created-reload — held pending, will return the pre-read set (1 unread).
-    // #2 read-reload — resolves immediately to an empty set.
     const created = deferred<NotifResponse>();
     (getNotifications as Mock)
       .mockReturnValueOnce(created.promise)
       .mockResolvedValueOnce({ notifications: [], unread_count: 0, has_more: false });
 
-    const createdReload = loadUnreadNotifications(); // older load
-    const readReload = loadUnreadNotifications();     // newer load, the one that counts
+    const createdReload = loadUnreadNotifications();
+    const readReload = loadUnreadNotifications();
     await readReload;
     expect(unreadCount.value).toBe(0);
 
-    // The stale created-reload now lands with the old (non-empty) set.
     created.resolve({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false });
     await createdReload;
 
-    // It must NOT bounce the badge back to 1 — the read-reload was issued later.
     expect(unreadCount.value).toBe(0);
   });
 
   it('auto-read masks the row an in-flight created-reload brings back, so the badge never bumps (§2 Row 1)', async () => {
-    // Set is loaded + empty (badge 0). A NotificationCreated SSE has just kicked
-    // off a reload that WILL return the new unread row — but it is still in
-    // flight when the user (looking at the source event) auto-reads it.
     seedUnread([]);
     (markNotificationRead as Mock).mockResolvedValue({ success: true });
     const created = deferred<NotifResponse>();
     (getNotifications as Mock).mockReturnValueOnce(created.promise);
 
-    const createdReload = loadUnreadNotifications(); // in flight, will return [x]
-    markReadOptimistic('x'); // a pending read masks x in whatever lands
+    const createdReload = loadUnreadNotifications();
+    markReadOptimistic('x');
     expect(unreadCount.value).toBe(0);
 
-    // The created-reload lands AFTER the auto-read with the pre-read set.
     created.resolve({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false });
     await createdReload;
 
-    // It must NOT bump the badge to 1: the pending read masks the row.
     expect(unreadCount.value).toBe(0);
   });
 
@@ -932,20 +787,17 @@ describe('unread set is resilient to out-of-order responses', () => {
     (getNotifications as Mock).mockReturnValueOnce(stale.promise);
     (markAllNotificationsRead as Mock).mockResolvedValueOnce(undefined);
 
-    const staleReload = loadUnreadNotifications(); // held pending, would return 5
-    await markAllRead();                            // every cleared row is a pending read
+    const staleReload = loadUnreadNotifications();
+    await markAllRead();
     expect(unreadCount.value).toBe(0);
 
     stale.resolve({ notifications: makeUnread(5), unread_count: 5, has_more: false });
     await staleReload;
 
-    // The stale reload must not resurrect the pre-read set.
     expect(unreadCount.value).toBe(0);
   });
 
   it('mark-all-read clears the set on the tap, before the server answers', async () => {
-    // Reported: on a slow engine the tap changed nothing for the whole
-    // round-trip, so it read as dead until the error toasts arrived.
     seedUnread(makeUnread(2));
     servedNotifications.value = { status: 'loaded', data: makeUnread(2) };
     const post = deferred<void>();
@@ -980,7 +832,7 @@ describe('unread set is resilient to out-of-order responses', () => {
     (markNotificationRead as Mock).mockReturnValueOnce(new Promise(() => {}));
 
     const pending = markAllRead();
-    markReadOptimistic('u0'); // a newer read of a row the mark-all also cleared
+    markReadOptimistic('u0');
     reject(new Error('request timed out'));
     await pending;
 
@@ -988,10 +840,6 @@ describe('unread set is resilient to out-of-order responses', () => {
   });
 
   it('a cold-start load that lands after the read never shows the read row', async () => {
-    // The reported badge=1 / empty-Unread-list class. Cold start: the startup
-    // load is in flight and WOULD return the pre-read row when the push-tapped
-    // row is opened and marked read. That load still lands, and the read row
-    // stays masked while the genuinely unread one shows.
     servedUnreadNotifications.value = { status: 'not-loaded' };
     (markNotificationRead as Mock).mockReturnValueOnce(new Promise(() => {}));
     const startup = deferred<NotifResponse>();
@@ -1009,10 +857,6 @@ describe('unread set is resilient to out-of-order responses', () => {
   });
 });
 
-// A read is a pending intent until the server acknowledges it (ADR 0437). A
-// load answered before the read POST committed still lists the row as unread,
-// however late it lands. Only a load started after the acknowledgement may
-// show the row again.
 describe('a read holds until the server has acknowledged it', () => {
   const ids = (list: Loadable<Notification[]>) => loadedRows(list).map((n) => n.id);
 
@@ -1091,7 +935,7 @@ describe('a read holds until the server has acknowledged it', () => {
     (markNotificationRead as Mock).mockResolvedValueOnce({ success: true });
 
     markReadOptimistic('x');
-    const stale = loadUnreadNotifications(); // started before the acknowledgement
+    const stale = loadUnreadNotifications();
     await vi.waitFor(() => expect(markNotificationRead).toHaveBeenCalled());
     await Promise.resolve();
     (getNotifications as Mock).mockResolvedValueOnce({ notifications: [makeNotification('y', false)], unread_count: 1, has_more: false });
@@ -1100,6 +944,22 @@ describe('a read holds until the server has acknowledged it', () => {
     await stale;
 
     expect(ids(unreadNotifications.value)).toEqual(['y']);
+    expect(pendingNotificationReads.value.size).toBe(0);
+  });
+
+  it('a snapshot read that is abandoned stops owing an acknowledged read', async () => {
+    servedNotifications.value = { status: 'not-loaded' };
+    (markNotificationRead as Mock).mockResolvedValueOnce({ success: true });
+
+    markReadOptimistic('x');
+    const snapshotRead = unreadNotificationsSlice.begin();
+    await vi.waitFor(() => expect(markNotificationRead).toHaveBeenCalled());
+    await Promise.resolve();
+    (getNotifications as Mock).mockResolvedValueOnce({ notifications: [makeNotification('y', false)], unread_count: 1, has_more: false });
+    await loadUnreadNotifications();
+    expect(pendingNotificationReads.value.size).toBe(1);
+
+    unreadNotificationsSlice.abandon?.(snapshotRead);
     expect(pendingNotificationReads.value.size).toBe(0);
   });
 
@@ -1179,7 +1039,7 @@ describe('a read holds until the server has acknowledged it', () => {
     panelOverlay.value = null;
     const stale = deferred<NotifResponse>();
     (getNotifications as Mock).mockReturnValueOnce(stale.promise);
-    const browse = loadNotifications(); // started before the commit
+    const browse = loadNotifications();
     const post = deferred<void>();
     (markAllNotificationsRead as Mock).mockReturnValueOnce(post.promise);
 
@@ -1218,14 +1078,7 @@ describe('a read holds until the server has acknowledged it', () => {
   });
 });
 
-// Infinite scroll pages off the list's tail, and `handleNotificationSSE` can
-// reload page 1 while that request is out. Three answers are wrong. Writing the
-// pre-await snapshot back reverts the reload. Appending the page spans the
-// truncation, so the rows between become unreachable. Dropping it wedges the
-// sentinel, which re-arms only when `hasMore` changes. The fourth is to
-// re-cursor from the new tail and ask again.
 describe('loadMoreNotifications: a reload that lands mid-request', () => {
-  /** `n` rows, newest first, ids `p{start}`..., each a second older. */
   function page(start: number, n: number): Notification[] {
     return Array.from({ length: n }, (_, i) => ({
       ...makeNotification(`p${start + i}`, true),
@@ -1255,8 +1108,6 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
 
   it('re-cursors from the new tail instead of appending across a reload', async () => {
     servedNotifications.value = { status: 'loaded', data: page(0, 4) };
-    // First response answers the OLD cursor. While it is out, a reload
-    // truncates the list to its two newest rows.
     (getNotifications as Mock).mockImplementationOnce(async () => {
       servedNotifications.value = { status: 'loaded', data: page(0, 2) };
       return { notifications: page(4, 2), unread_count: 0, has_more: true };
@@ -1268,8 +1119,6 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
     await loadMoreNotifications();
 
     const ids = (notifications.value as Loadable<Notification[]> & { data: Notification[] }).data.map(n => n.id);
-    // p2 and p3 must NOT be skipped: appending the stale page would have gone
-    // straight from p1 to p4 and left them unreachable by scrolling.
     expect(ids).toEqual(['p0', 'p1', 'p2', 'p3']);
     expect(getNotifications).toHaveBeenCalledTimes(2);
     expect((getNotifications as Mock).mock.calls[1][0]).toMatchObject({
@@ -1291,7 +1140,6 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
 
   it('gives up after a bounded number of retries rather than spinning', async () => {
     servedNotifications.value = { status: 'loaded', data: page(0, 3) };
-    // Every response moves the list, so no attempt can ever settle.
     (getNotifications as Mock).mockImplementation(async () => {
       servedNotifications.value = { status: 'loaded', data: page(0, 3) };
       return { notifications: page(3, 1), unread_count: 0, has_more: true };
@@ -1304,8 +1152,6 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
   });
 });
 
-// The panel refresh contract: a pull on Notifications keeps the list on screen
-// while it re-reads, and its promise waits for the new rows.
 describe('refreshActiveNotificationsTab', () => {
   it('keeps the list on screen and settles once the new rows land', async () => {
     notificationsFilter.value = 'all';

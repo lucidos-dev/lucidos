@@ -109,9 +109,6 @@ describe('threadDisplayTitle', () => {
         expect(threadDisplayTitle(t)).toBe('Untitled Thread');
     });
 
-    // A call the talker answered alone writes no MessageReceived at all, so
-    // without this the whole thread read "Untitled Thread". The engine takes
-    // the same row into `first_message`, so both surfaces say one thing.
     it('falls back to the caller spoken words on a call nobody delegated from', () => {
         const t = makeThread({ state: 'active', title: '', spokenText: 'what happened overnight' });
         expect(threadDisplayTitle(t)).toBe('what happened overnight');

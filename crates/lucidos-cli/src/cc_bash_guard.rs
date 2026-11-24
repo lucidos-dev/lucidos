@@ -10,8 +10,8 @@
 //! the same argv. This hook refuses the obvious patterns at the source.
 //!
 //! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
-//! `cc_settings.rs`. Fails OPEN on parse / I/O errors so a hook bug can't
-//! brick every Bash call.
+//! `cc_settings.rs`. A managed session also reads the workspace’s current
+//! standing denies before the command runs.
 
 use std::io::Read;
 
@@ -391,22 +391,61 @@ fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+fn check_standing_deny(command: &str) -> Result<Option<String>, BoxError> {
+    let workspace = crate::workspace::resolve_from_env()?;
+    let url = format!(
+        "{}/api/v1/internal/command-deny-check",
+        workspace.base_url()
+    );
+    let client = crate::http::client_with_timeout(std::time::Duration::from_secs(5))?;
+    Ok(client
+        .post(url)
+        .json(&serde_json::json!({ "command": command }))
+        .send()?
+        .error_for_status()?
+        .json()?)
+}
+
 pub(crate) fn run() -> Result<u8, BoxError> {
+    run_hook(true)
+}
+
+pub(crate) fn run_command_deny() -> Result<u8, BoxError> {
+    run_hook(false)
+}
+
+fn run_hook(claude_code: bool) -> Result<u8, BoxError> {
+    let lucidos_session = !claude_code || std::env::var_os("LUCIDOS_THREAD_ID").is_some();
     let mut buf = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-        // Fail open but make the failure visible — silent breakage would mean
-        // the guard quietly stops working if the hook contract ever changes.
-        eprintln!("cc-bash-guard: stdin read failed, allowing: {}", e);
-        return Ok(0);
+        eprintln!("Could not read the command hook input: {e}");
+        return Ok(if lucidos_session { 2 } else { 0 });
     }
     let payload: HookPayload = match serde_json::from_str(&buf) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("cc-bash-guard: payload parse failed, allowing: {}", e);
-            return Ok(0);
+            eprintln!("Could not parse the command hook input: {e}");
+            return Ok(if lucidos_session { 2 } else { 0 });
         }
     };
 
+    if lucidos_session {
+        match check_standing_deny(&payload.tool_input.command) {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                eprintln!("{reason}");
+                return Ok(2);
+            }
+            Err(_) => {
+                eprintln!("Refused by the command guard: could not verify standing denies.");
+                return Ok(2);
+            }
+        }
+    }
+
+    if !claude_code {
+        return Ok(0);
+    }
     match decide(&payload.tool_input.command) {
         GuardDecision::Allow => Ok(0),
         GuardDecision::Block(reason) => {

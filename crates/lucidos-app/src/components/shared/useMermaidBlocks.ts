@@ -1,6 +1,5 @@
 import { useLayoutEffect } from 'preact/hooks';
 
-/** Load diagram machinery only for completed replies containing Mermaid. */
 export function useMermaidBlocks(host: HTMLElement | null, html: string, final: boolean): void {
   useLayoutEffect(() => {
     if (!host || !final || !host.querySelector('.code-block-lang') || !html.toLowerCase().includes('mermaid')) return;

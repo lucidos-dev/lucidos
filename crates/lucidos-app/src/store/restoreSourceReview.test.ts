@@ -1,4 +1,5 @@
 import { expect, it } from 'vitest';
+import { uploadFileIdentity, type StoredUploadSource } from './pendingUploadSource';
 import { restoreSourceReview } from './restoreSourceReview';
 import type { RestoreIntentRecord } from './restoreGenerationRecords';
 
@@ -64,15 +65,17 @@ it('marks retained queue revisions and unsent records as uncertain without dropp
 
 it('links exact attachment content across source kinds without merging contexts or independent files', () => {
   const record = capture('archive');
-  const upload = { localId: 'file', ownerId: 'owner', threadId: 'thread', name: 'image.png', mime: 'image/png',
-    size: 1, createdAt: 1, bytes: new Uint8Array([1]).buffer };
+  const metadata = { localId: 'file', ownerId: 'owner', threadId: 'thread', name: 'image.png', mime: 'image/png',
+    size: 1, createdAt: 1 };
+  const upload: StoredUploadSource = { ...metadata, byteKey: [uploadFileIdentity(metadata), 0] };
+  const independent = { ...metadata, localId: 'other' };
   const composer = record.intent.drafts[0];
   record.intent.drafts = [
     { ...composer, threadId: 'composer', uploads: [upload] },
     { ...composer, threadId: 'queue', uploads: [{ ...upload, ownerId: 'adopted', sourceGeneration: 'later' }],
       queuedUploadSend: { ownerId: 'owner', threadId: 'thread', localIds: ['file'], text: 'queued', intent: { useCodingAgent: false, context: null } } },
-    { ...composer, threadId: 'different-bytes', uploads: [{ ...upload, bytes: new Uint8Array([2]).buffer }] },
-    { ...composer, threadId: 'independent-file', uploads: [{ ...upload, localId: 'other' }] },
+    { ...composer, threadId: 'different-bytes', uploads: [{ ...upload, byteKey: [upload.byteKey[0], 1] }] },
+    { ...composer, threadId: 'independent-file', uploads: [{ ...independent, byteKey: [uploadFileIdentity(independent), 0] }] },
   ];
   const review = restoreSourceReview([record], null);
   expect(review).toHaveLength(4);
@@ -86,12 +89,12 @@ it('links exact attachment content across source kinds without merging contexts 
 it('does not read archived bytes just to decide recovery admission', () => {
   const record = capture('owner', 'original-owner');
   const upload = { localId: 'file', ownerId: 'owner', threadId: 'thread', name: 'image.png', mime: 'image/png',
-    size: 1, createdAt: 1, get bytes(): ArrayBuffer { throw new Error('bytes inspected'); } };
+    size: 1, createdAt: 1, byteKey: ['key', 0] as [string, number], get bytes(): ArrayBuffer { throw new Error('bytes inspected'); } };
   record.intent.drafts = [
     { ...record.intent.drafts[0], threadId: 'first', uploads: [upload] },
     { ...record.intent.drafts[0], threadId: 'second', uploads: [upload] },
   ];
   const review = restoreSourceReview([record], null);
   expect(review.every((entry) => entry.automatic)).toBe(true);
-  expect(() => review[0].related).toThrow('bytes inspected');
+  expect(review[0].related).toHaveLength(1);
 });

@@ -9,7 +9,8 @@
 //! Memory only. A successful install restarts the service and this state with
 //! it, so the requesting session settles on the running version instead.
 
-use crate::release_check::{version_is_newer, ReleaseCheck};
+use crate::release_check::ReleaseCheck;
+use lucidos_update_channel::is_upgrade;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -247,7 +248,7 @@ impl UpdateRelay {
             return Err(Refusal::InFlight);
         }
         let version = latest
-            .filter(|latest| version_is_newer(latest, &client.version))
+            .filter(|latest| is_upgrade(&client.version, latest))
             .ok_or(Refusal::NoNewerRelease)?
             .to_string();
         let n = self.next.fetch_add(1, Ordering::Relaxed);

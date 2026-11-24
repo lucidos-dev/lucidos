@@ -1,6 +1,3 @@
-// The macOS View menu's Show/Hide item per pane (view_menu.rs). The page owns
-// the state. It derives each item from the drawn layout, pushes it to the shell
-// on change, and answers the clicks the shell routes here.
 
 import { effect } from '@preact/signals';
 import { mobileView, type MobileView } from '../store';
@@ -29,7 +26,6 @@ const PANE_SHORTCUTS: Record<ViewMenuPane, ShortcutId | null> = {
   dashboard: null,
 };
 
-/** The phone pane each item swipes to, and the one hiding it swipes to. */
 const MOBILE_PANES: Record<Exclude<ViewMenuPane, 'dashboard'>, { pane: MobileView; hideTo: MobileView }> = {
   'thread-drawer': { pane: 'threads', hideTo: 'thread' },
   'thread-pane': { pane: 'thread', hideTo: 'content' },
@@ -41,8 +37,6 @@ interface PaneVisibility {
   enabled: boolean;
 }
 
-/** One pane at a time. The dashboard panel draws over the thread pane, so it
- *  counts as hidden off that pane. */
 function mobileVisibility(pane: ViewMenuPane): PaneVisibility {
   const view = mobileView.value;
   const shown = pane === 'dashboard'
@@ -51,9 +45,6 @@ function mobileVisibility(pane: ViewMenuPane): PaneVisibility {
   return { shown, enabled: true };
 }
 
-/** What the split layout draws. A hidden side pane the window has no room
- *  for is disabled, as its in-app toggle is. So is a hidden dashboard before
- *  Home exists, which is when its toggle appears. */
 function splitVisibility(pane: ViewMenuPane): PaneVisibility {
   switch (pane) {
     case 'thread-drawer': {
@@ -71,7 +62,6 @@ function splitVisibility(pane: ViewMenuPane): PaneVisibility {
   }
 }
 
-/** Every item as this window draws it, with each pane's current binding. */
 export function viewMenuItems(): ViewMenuItemState[] {
   const visibility = viewportIsMobile.value ? mobileVisibility : splitVisibility;
   return VIEW_MENU_PANES.map((pane) => {
@@ -95,7 +85,6 @@ function clickOnPhone(pane: ViewMenuPane): void {
   navigateToPane(shown ? hideTo : view);
 }
 
-/** Show a hidden pane or hide a shown one, with no focus stage. */
 export function handleViewMenuClick(pane: ViewMenuPane): void {
   if (viewportIsMobile.value) {
     clickOnPhone(pane);
@@ -109,8 +98,6 @@ export function handleViewMenuClick(pane: ViewMenuPane): void {
   }
 }
 
-/** Keep the shell's View menu in step with this window, and answer its
- *  clicks. Tauri only. Returns a stop that ends both. */
 export async function setupViewMenu(): Promise<() => void> {
   if (!isTauri()) return () => {};
   let pushed: string | null = null;
@@ -120,8 +107,8 @@ export async function setupViewMenu(): Promise<() => void> {
     if (key === pushed) return;
     pushed = key;
     setViewMenuState(items).catch((err: unknown) => {
-      // Telemetry carve-out (.claude/rules/frontend.md): no user intent rides
-      // on a push. The menu keeps its last state, and the next layout change
+      // BEST-EFFORT: telemetry carve-out (.claude/rules/frontend.md). No user
+      // intent rides on a push. The menu keeps its last state, and the next layout change
       // pushes again, since the failed state is no longer the one recorded.
       pushed = null;
       console.warn('[ViewMenu] Failed to push the View menu state:', err);
@@ -141,8 +128,6 @@ export async function setupViewMenu(): Promise<() => void> {
   }
 }
 
-/** {@link setupViewMenu} for `startShell`, whose installs return their stop at
- *  once. A stop that lands before the setup resolves ends it on arrival. */
 export function installViewMenu(): () => void {
   let stop: (() => void) | null = null;
   let stopped = false;
@@ -151,7 +136,7 @@ export function installViewMenu(): () => void {
       if (stopped) s();
       else stop = s;
     })
-    .catch(() => { /* best-effort: the in-app toggles and shortcuts still work */ });
+    .catch(() => {  });
   return () => {
     stopped = true;
     stop?.();

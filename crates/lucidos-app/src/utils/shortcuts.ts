@@ -1,14 +1,10 @@
-// Keyboard-shortcut registry + pure binding logic. No store/DOM dependency so
-// it stays unit-testable. The override-aware layer (reading the user's custom
-// bindings from preferences, saving them, override-aware tooltips) lives in
-// `store/actions/keybindings.ts`; the dispatcher that runs them lives in
-// `hooks/useKeyboardShortcuts.ts`.
 
 export type ShortcutId =
   | 'newThread'
   | 'closeThread'
   | 'searchEverywhere'
   | 'searchFiles'
+  | 'searchApps'
   | 'openSettings'
   | 'showShortcuts'
   | 'openNotifications'
@@ -54,10 +50,6 @@ export type ShortcutId =
 
 export type ShortcutCategory = 'Navigation' | 'Thread' | 'Panes' | 'View';
 
-/** A normalized key chord. `mod` means "the platform primary modifier" and
- *  matches either Cmd (meta) or Ctrl — the same lenient rule the handlers have
- *  always used, so `Cmd+K` and `Ctrl+K` both fire. `key` is normalized to a
- *  single lowercase token. */
 export interface Binding {
   mod: boolean;
   shift: boolean;
@@ -70,32 +62,17 @@ export interface ShortcutDef {
   label: string;
   category: ShortcutCategory;
   defaultBinding: Binding;
-  /** How to remember the DEFAULT chord: a letter's word, or the app it is
-   *  borrowed from. Platform-neutral, so it names no modifier glyph. */
   mnemonic?: string;
-  /** Runs only from a keydown on the host document. A chord forwarded from an
-   *  app frame or the HTML preview is refused, since that frame's own script
-   *  can forge one. Set on anything that acts beyond the screen: merging a
-   *  change, or opening the microphone. */
   hostOnly?: boolean;
 }
 
 const B = (mod: boolean, shift: boolean, alt: boolean, key: string): Binding => ({ mod, shift, alt, key });
 
-/** The full registry. Order is the cheat-sheet display order. All entries are
- *  rebindable; the single-key `c`/`t` shortcuts were intentionally dropped.
- *  A default copies the chord well-known apps use for the same action, where
- *  one exists (docs/plans/2026-09-29-familiar-keyboard-shortcuts.md).
- *  Labels render in Settings → Keyboard shortcuts (and in Search Everywhere via
- *  `searchIndex.ts`), so they use `system-knowhow/glossary.md`'s two layers: a
- *  shortcut acting on ONE pane names it mechanically — thread drawer, thread
- *  pane, content pane — while `maximizePaneGroup`, which acts on a whole side,
- *  names the sides (Conversation / Canvas). Never surface the dev-only "pane
- *  group" here; it is defined in `docs/glossary.md` only. */
 export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o'), mnemonic: 'ChatGPT\'s new chat chord' },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w'), mnemonic: 'W, as in close window' },
   { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, false, false, 'k'), mnemonic: 'The search chord in Slack, Linear and Notion' },
+  { id: 'searchApps', label: 'Search apps or plugins (current list)', category: 'Navigation', defaultBinding: B(true, false, true, 'Enter'), mnemonic: 'Alt for Apps, Enter to open search' },
   { id: 'searchFiles', label: 'Search files', category: 'Navigation', defaultBinding: B(true, false, false, 'p'), mnemonic: 'Quick open in VS Code and Zed' },
   { id: 'openSettings', label: 'Open settings', category: 'Navigation', defaultBinding: B(true, false, false, ','), mnemonic: 'Settings in every Mac app' },
   { id: 'showShortcuts', label: 'Show keyboard shortcuts', category: 'Navigation', defaultBinding: B(true, false, false, '/'), mnemonic: 'The shortcut list in ChatGPT and Slack' },
@@ -147,22 +124,15 @@ export function shortcutDef(id: ShortcutId): ShortcutDef {
   return def;
 }
 
-/** The `data-search-anchor` on a shortcut's Settings row, which its Search
- *  Everywhere result scrolls to. */
 export function shortcutSearchAnchor(id: ShortcutId): string {
   return `shortcut:${id}`;
 }
 
-/** Normalize a `KeyboardEvent.key` to the registry's canonical token: single
- *  characters lowercased, and `+` folded to `=` so zoom-in matches whether or
- *  not Shift produced the literal plus. */
 export function normalizeKey(key: string): string {
   if (key === '+') return '=';
   return key.length === 1 ? key.toLowerCase() : key;
 }
 
-/** Capture the chord a user just pressed. `mod` collapses Cmd/Ctrl into one
- *  primary modifier (matching the dispatcher's lenient rule). */
 export function eventToBinding(
   e: Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key'>,
 ): Binding {
@@ -174,8 +144,6 @@ export function eventToBinding(
   };
 }
 
-/** Does a keydown event match a binding? Cmd and Ctrl are interchangeable for
- *  the `mod` modifier (both fire), preserving the handlers' historical leniency. */
 export function matchesEvent(
   e: Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key'>,
   b: Binding,
@@ -192,25 +160,15 @@ export function bindingsEqual(a: Binding, b: Binding): boolean {
   return a.mod === b.mod && a.shift === b.shift && a.alt === b.alt && a.key === b.key;
 }
 
-/** A keypress is a valid shortcut only if it carries a non-Shift modifier (so a
- *  bare letter — which would collide with type-to-focus — can't be bound) or a
- *  named key (Escape, F-keys are excluded elsewhere). Used by the recorder to
- *  reject unusable chords. */
 export function isBindableChord(b: Binding): boolean {
   if (b.mod || b.alt) return true;
-  // No primary modifier: only allow it if the key isn't a lone printable char.
   return b.key.length > 1;
 }
 
-/** Enter, Shift+Enter and Cmd/Ctrl+Enter send or add a new line in the
- *  composer (`composerEnterSends`), whichever `composer_enter_key` mode is on.
- *  A shortcut on one would take that away, so the recorder refuses them. */
 export function isComposerEnterChord(b: Binding): boolean {
   return b.key === 'Enter' && !b.alt && !(b.mod && b.shift);
 }
 
-/** Canonical storage form, e.g. `mod+shift+o`, `mod+k`, `mod+=`. Stable across
- *  platforms; the display form is derived separately by `formatBinding`. */
 export function serializeBinding(b: Binding): string {
   const parts: string[] = [];
   if (b.mod) parts.push('mod');
@@ -222,8 +180,6 @@ export function serializeBinding(b: Binding): string {
 
 export function parseBinding(s: string): Binding | null {
   const parts = s.split('+');
-  // The key is the last segment; `+` itself can't be a segment because we fold
-  // it to `=` before serializing, so a trailing empty segment never happens.
   const key = parts.pop();
   if (!key) return null;
   const set = new Set(parts);
@@ -235,10 +191,6 @@ export function parseBinding(s: string): Binding | null {
   };
 }
 
-/** Free-text aliases a user might type to find this binding in search, e.g.
- *  `ctrl k ctrl+k cmd k cmd+k`. Covers both `mod` spellings (Ctrl/Cmd, since
- *  either fires) and both space- and plus-separated forms, so a query like
- *  "ctrl k" matches a `⌘K` binding. */
 export function bindingSearchText(b: Binding): string {
   const primaries = b.mod ? ['ctrl', 'cmd'] : [''];
   const mid: string[] = [];
@@ -253,8 +205,6 @@ export function bindingSearchText(b: Binding): string {
   return out.join(' ').toLowerCase();
 }
 
-/** Named keys whose display form is a glyph rather than the raw
- *  `KeyboardEvent.key` token. */
 const KEY_GLYPHS: Record<string, string> = {
   ArrowLeft: '←',
   ArrowRight: '→',
@@ -264,18 +214,10 @@ const KEY_GLYPHS: Record<string, string> = {
   Escape: 'Esc',
 };
 
-/** Whether a Mac draws `mod` as Control rather than Command (see `formatBinding`). */
 function macModIsCtrl(b: Binding): boolean {
   return b.mod && b.shift && /^[a-z0-9]$/.test(b.key);
 }
 
-/** Platform-correct display string, e.g. Mac `⌘K` / `⌃⇧O`, Win/Linux
- *  `Ctrl+K` / `Ctrl+Shift+O`. On Mac a `mod+Shift+<letter-or-digit>` chord
- *  renders with the Control glyph (⌃) rather than Command (⌘): the OS reserves
- *  Cmd+Shift+<letter> (and the Cmd+Shift+3/4/5 screenshot digits), so Ctrl is
- *  the modifier that actually fires — matching the long-standing display for
- *  the New-thread chord. The rule covers digits too so the three pane toggles
- *  read uniformly. Named keys display as glyphs (←→↑↓). */
 export function formatBinding(b: Binding, isMac: boolean): string {
   const keyDisplay = KEY_GLYPHS[b.key] ?? (b.key.length === 1 ? b.key.toUpperCase() : b.key);
   if (isMac) {
@@ -293,7 +235,6 @@ export function formatBinding(b: Binding, isMac: boolean): string {
   return parts.join('+');
 }
 
-/** Named keys the macOS menu can draw, spelled as its accelerator parser wants. */
 const MENU_NAMED_KEYS = new Set([
   'Enter', 'Tab', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'Escape',
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
@@ -307,9 +248,6 @@ function menuKey(key: string): string | null {
   return MENU_NAMED_KEYS.has(key) ? key : null;
 }
 
-/** The binding as a macOS menu accelerator, such as `Ctrl+Shift+1`, with the
- *  modifier `formatBinding` draws. Null for a key the menu cannot draw: the
- *  shell refuses an unparseable accelerator, so none may reach it. */
 export function formatMenuAccelerator(b: Binding): string | null {
   const key = menuKey(b.key);
   if (key === null) return null;

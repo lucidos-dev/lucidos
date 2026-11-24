@@ -14,11 +14,33 @@ license.workspace = true
 # four ways would drift the same way, and its failure mode is worse than a
 # missing feature: a stale copy is a caller that silently cannot authenticate.
 #
-# **Its one dependency is `lucidos-home`, which has none, and both must keep it
-# that way.** That is the whole reason every crate can take it.
+# It also holds the rest of what every loopback caller shares: the loopback
+# CA's public certificate path (`loopback_cert.rs`) and the one loopback client
+# setup (`client.rs`, behind the `client` and `blocking` features). Every client
+# caller already depends on this crate, and the CA crate itself stays with the
+# few that mint or trust (decision 14 of
+# `docs/plans/2026-11-19-desktop-window-https.md`).
+#
+# **Its default build depends only on `lucidos-home`, which has none, and both
+# must keep it that way.** That is the whole reason every crate can take it.
 
 [dependencies]
 lucidos-home = { path = "../lucidos-home" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# `test-support` only: a throwaway CA, and a stand-in listener serving its leaf.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"], optional = true }
+axum = { version = "0.7", default-features = false, optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+tokio = { version = "1", features = ["rt", "net"], optional = true }
+
+[features]
+client = ["dep:reqwest"]
+blocking = ["client", "reqwest/blocking"]
+# For tests in any crate: the loopback client trusts a throwaway CA instead of
+# the user's, and `test_support` serves that CA's leaf. A dev-dependency
+# feature, so no shipped build carries it.
+test-support = ["client", "dep:rcgen", "dep:rustls", "dep:axum", "dep:axum-server", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"

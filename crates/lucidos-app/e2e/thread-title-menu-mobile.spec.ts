@@ -2,15 +2,6 @@ import { test, expect } from './fixtures';
 import type { Page } from '@playwright/test';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, expectFocusedPinned } from './helpers';
 
-/** The phone's thread title is its own menu button.
- *
- * The title row draws no pin and no ⋯. A tap on the title toggles the thread
- * menu, and a hold opens it. The menu opens under the row, aligned to the
- * title's leading edge, away from the top-right corner.
- *
- * Driven through `page.mouse`, so the gesture goes through real hit-testing and
- * the browser pairs its own click with the lift. Playwright cannot hold a
- * touchscreen tap, and the hold reads no `pointerType`. */
 test.describe('Mobile thread title menu', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -22,7 +13,6 @@ test.describe('Mobile thread title menu', () => {
   const TITLE = '.mobile-thread-title-row .thread-title-menu:visible';
   const MENU = '.thread-overflow-menu';
 
-  /** The title's centre, checked to be what the browser hit-tests there. */
   const titlePoint = async (page: Page) => {
     const point = await page.evaluate(() => {
       for (const el of document.querySelectorAll('.mobile-thread-title-row .thread-title-menu')) {
@@ -76,7 +66,6 @@ test.describe('Mobile thread title menu', () => {
     const at = await titlePoint(page);
     await page.mouse.click(at.x, at.y);
     await expect(page.locator(MENU)).toHaveCount(1);
-    // Below the panel, over the transcript.
     const below = await page.evaluate((menu) => document.querySelector(menu)!.getBoundingClientRect().bottom + 24, MENU);
     await page.mouse.click(page.viewportSize()!.width / 2, below);
     await expect(page.locator(MENU)).toHaveCount(0);
@@ -88,7 +77,6 @@ test.describe('Mobile thread title menu', () => {
     await expect(page.locator(MENU)).toHaveCount(1);
     const pin = page.locator(MENU).getByRole('menuitem', { name: 'Pin thread', exact: true });
     await expect(pin).toBeVisible();
-    // A keyboard open focuses the first item. Rove until Pin thread has focus.
     for (let i = 0; i < 4; i++) {
       if (await pin.evaluate((el) => el === document.activeElement)) break;
       await page.keyboard.press('ArrowDown');

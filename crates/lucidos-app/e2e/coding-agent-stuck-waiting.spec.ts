@@ -8,11 +8,8 @@ import {
 import { randomUUID } from 'crypto';
 import type { Page } from './fixtures';
 
-/** Click Apply, wait for Archive (ChangeApplied keeps archive_state=inbox), click Archive, poll until archived. */
 async function applyAndDismiss(page: Page, threadId: string): Promise<void> {
   await clickChangeAction(page, 'Apply');
-  // Archive becomes the slot's face once the apply lands. Until then the Apply
-  // face still shows, and its menu holds no Archive.
   await waitForActionPanel(page, 'Archive', 15_000);
   await clickChangeAction(page, 'Archive');
 
@@ -22,19 +19,7 @@ async function applyAndDismiss(page: Page, threadId: string): Promise<void> {
   ).toBe('archived');
 }
 
-/**
- * Browser e2e tests for the CC stuck-in-waiting bug fix.
- *
- * Bug: After applying a CC change, CodingAgentIdled(has_changes=false) from
- * reset_worktree_and_idle set status back to 'waiting', leaving threads
- * permanently stuck in the Review section after engine restart.
- *
- * Fix: CodingAgentIdled now conditionally sets status — 'waiting' only if
- * has_changes=true, 'idle' otherwise. ThreadArchived clears all CC flags.
- * Startup query resets orphaned waiting threads with no changes.
- */
 
-/** Seed a CC thread stuck in waiting with NO changes (simulates the pre-fix bug). */
 function seedStuckThread(suffix: string): { threadId: string } {
   const threadId = randomUUID();
   const now = new Date().toISOString();
@@ -52,8 +37,6 @@ function seedStuckThread(suffix: string): { threadId: string } {
 test.describe('CC stuck-in-waiting regression', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // Clean up stale waiting CC threads from previous tests to avoid
-    // Done banners from old sessions interfering with these tests.
     psql("UPDATE thread_summaries SET status = 'idle', archive_state = 'archived' WHERE status = 'waiting' AND is_coding_agent = true");
   });
 
@@ -67,15 +50,6 @@ test.describe('CC stuck-in-waiting regression', () => {
       }, threadId);
       await navigateToApp(page);
 
-      // Verify the thread shows the review highlight before applying. The
-      // standalone "Review" section was merged into "Current" (commit
-      // f584c9ac0); a thread that needs review is now marked by the row-level
-      // .thread-row-review class (ThreadDrawer `needsReview`), not a separate
-      // section. Mirror the post-apply assertion below.
-      // The row carries both the .thread-row-review class and data-thread-nav on
-      // the SAME element (ThreadRowContent), so match them with one compound
-      // selector — a `has:` descendant filter never matches (an element is not
-      // its own descendant).
       await openThreadDrawer(page);
       const threadInReview = page.locator(`.thread-row-review[data-thread-nav="${threadId}"]`);
       await expect(threadInReview).toHaveCount(1, { timeout: 5_000 });
@@ -83,7 +57,6 @@ test.describe('CC stuck-in-waiting regression', () => {
       await ensureOnThreadPane(page);
       await applyAndDismiss(page, threadId);
 
-      // After apply + archive the same row no longer carries the review highlight.
       await openThreadDrawer(page);
       await expect(threadInReview).toHaveCount(0, { timeout: 5_000 });
 
@@ -106,15 +79,11 @@ test.describe('CC stuck-in-waiting regression', () => {
       const archiveBtn = page.locator('.thread-action-buttons:visible button.action-btn:has-text("Archive")').first();
       await expect(archiveBtn).toBeVisible({ timeout: 15_000 });
 
-      // Should NOT show Apply/Discard (no pending changes)
       await expect(page.locator('.thread-action-buttons:visible button:has-text("Apply")')).toHaveCount(0);
       await expect(page.locator('.thread-action-buttons:visible button:has-text("Discard")')).toHaveCount(0);
 
       await archiveBtn.click();
 
-      // Verify the seeded thread was dismissed — poll DB until status changes.
-      // Don't check banner visibility: handleArchiveThread may focus
-      // another review thread (from a previous test's idle CC session).
       await expect.poll(
         () => psql(`SELECT status FROM thread_summaries WHERE thread_id = '${threadId}'`),
         { intervals: [500], timeout: 10_000 },
@@ -136,8 +105,6 @@ test.describe('CC stuck-in-waiting regression', () => {
       await page.addInitScript((tid: string) => {
         localStorage.setItem('lucidos-focused-thread', tid);
       }, threadId);
-      // The drawer opens beside the thread below, and the rail would squeeze
-      // the pane until its actions fold into the overflow menu.
       await hideDashboardRail(page);
       await navigateToApp(page);
 
@@ -152,8 +119,6 @@ test.describe('CC stuck-in-waiting regression', () => {
       await expect(threadInReview).toHaveCount(0, { timeout: 5_000 });
 
       await ensureOnThreadPane(page);
-      // An archived thread draws no banner: no change action is left, and the
-      // composer keeps Send. The thread menu moves it back (ADR 0573).
       await expect(page.locator('.thread-action-buttons:visible')).toHaveCount(0, { timeout: 5_000 });
       await expect(page.locator('.prompt-actions-row:visible .send-cancel-morph')).toHaveCount(1);
 

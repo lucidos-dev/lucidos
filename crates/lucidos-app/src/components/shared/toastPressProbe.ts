@@ -13,13 +13,6 @@ import { postClientLog } from '../../utils/clientLog';
  *
  *  It logs the control's label and never the toast's message. */
 
-/** What a toast press ended as.
- *
- *  - `clicked`: the click arrived and nothing cancelled it.
- *  - `click-cancelled`: the click arrived and a listener cancelled it.
- *  - `no-click`: the finger lifted and no click followed.
- *  - `touch-cancelled`: the system took the gesture.
- *  - `no-lift`: the lift never arrived. */
 export type ToastPressVerdict =
   | 'clicked'
   | 'click-cancelled'
@@ -38,9 +31,7 @@ export function toastPressVerdict(f: {
   return f.lifted ? 'no-click' : 'no-lift';
 }
 
-/** Longer than WebKit's synthetic-click delay after a lift. */
 const CLICK_GRACE_MS = 600;
-/** Far beyond any tap, so only a lost lift reaches it. */
 const LIFT_DEADLINE_MS = 4000;
 
 const TOAST_CONTROL_SELECTOR = '.toast button, .toast[data-toast-tap]';
@@ -60,7 +51,6 @@ interface Press {
   touchCancelled: boolean;
   clicked: boolean;
   clickPrevented: boolean;
-  /** Page-wide DOM mutations since touchdown, and the count at the lift. */
   mutations: number;
   mutationsAtLift: number | null;
   observer: MutationObserver | null;
@@ -75,7 +65,6 @@ function toastControlOf(target: EventTarget | null): Element | null {
   return el?.closest?.(TOAST_CONTROL_SELECTOR) ?? null;
 }
 
-/** A button's label, never the body's text: the body IS the toast's message. */
 function labelOf(el: Element): string {
   if (el.tagName !== 'BUTTON') return 'toast body';
   return el.getAttribute('aria-label')?.trim() || el.textContent?.trim().slice(0, 40) || 'button';
@@ -131,8 +120,6 @@ function onTouchStart(e: TouchEvent): void {
     observer: null,
     timer: setTimeout(() => settle(p), LIFT_DEADLINE_MS),
   };
-  // Counts what changed on the page while the finger was down. WebKit drops a
-  // tap's click when content changes under it, so this names that case.
   if (typeof MutationObserver !== 'undefined') {
     p.observer = new MutationObserver((records) => { p.mutations += records.length; });
     p.observer.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
@@ -175,7 +162,6 @@ function onClick(e: MouseEvent): void {
   const p = press;
   if (!p || toastControlOf(e.target) !== p.control) return;
   p.clicked = true;
-  // Read after the whole dispatch, since a cancel can come from any listener.
   setTimeout(() => {
     p.clickPrevented = e.defaultPrevented;
     settle(p);

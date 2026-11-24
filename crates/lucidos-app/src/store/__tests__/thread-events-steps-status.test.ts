@@ -16,9 +16,9 @@ describe('PromptInjected in groupIntoExchanges', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].userEvent).toEqual({ type: 'MessageReceived', text: 'do X' });
-    expect(exchanges[0].steps).toHaveLength(2); // ToolCalled + ToolResult
+    expect(exchanges[0].steps).toHaveLength(2);
     expect(exchanges[1].userEvent).toEqual({ type: 'PromptInjected', text: 'actually do Y' });
-    expect(exchanges[1].steps).toHaveLength(2); // TextStreamed + ResponseGenerated
+    expect(exchanges[1].steps).toHaveLength(2);
   });
 
   it('multiple injections create multiple exchanges', () => {
@@ -80,21 +80,13 @@ describe('PromptInjected in groupIntoExchanges', () => {
     expect((exchanges[1].userEvent as { text: string }).text).toBe('orphan');
   });
 
-  // Real thread ab70366f: the chat agentic loop never re-anchors request_event_id,
-  // so a message the user types mid-flight (emitted optimistically as its own
-  // exchange) is only ingested via PromptInjected AFTER the agent asked — and
-  // the user answered — a question. The absorb must re-anchor that queued exchange
-  // to its ingestion point, otherwise its reply renders ABOVE the question card.
   it('queued mid-flight message ingested AFTER a question renders its reply below the question card', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'original', _eventId: 'req-orig' }],
       [2, { type: 'TextStreamed', text: 'working on original', request_event_id: 'req-orig' } as StoredEvent],
-      // user types a second message mid-flight (fast-path emits it immediately)
       [3, { type: 'MessageReceived', text: 'cancel button broke', _eventId: 'msg-cancel' }],
-      // agent (still on the original turn) asks a question before ingesting the queue
       [4, { type: 'UserQuestionAsked', question: 'pick one', tool_use_id: 'tuid-q', _eventId: 'uqa' } as StoredEvent],
       [5, { type: 'UserQuestionAnswered', tool_use_id: 'tuid-q' } as StoredEvent],
-      // loop ingests the queued message — PromptInjected carries the ORIGINAL turn's req id
       [6, { type: 'PromptInjected', text: 'cancel button broke', injected_message_id: 'msg-cancel', request_event_id: 'req-orig' } as StoredEvent],
       [7, { type: 'TextStreamed', text: 'analyzing the cancel bug', request_event_id: 'req-orig' } as StoredEvent],
       [8, { type: 'ResponseGenerated', text: 'done', request_event_id: 'req-orig' } as StoredEvent],
@@ -105,29 +97,22 @@ describe('PromptInjected in groupIntoExchanges', () => {
       e.userEvent.type === 'MessageReceived' &&
       (e.userEvent as { text?: string }).text === 'cancel button broke');
     expect(qIdx).toBeGreaterThanOrEqual(0);
-    // The reply (the absorbed exchange) must render BELOW the question card.
     expect(cancelIdx).toBeGreaterThan(qIdx);
     expect(exchanges[cancelIdx].steps.map(s => s.event.type)).toContain('TextStreamed');
   });
 });
 
-// ===========================================================================
-// Step spinner completion on finished exchanges
-// ===========================================================================
 describe('step completion — no eternal spinners', () => {
   it('parallel CC tool calls all resolve when results arrive', () => {
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';
     const map = new Map([['thread-1', thread]]);
 
-    // Simulate: user message, session start, then parallel tool calls with results
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'fix it' } as ThreadEvent, '2026-04-04T10:00:00Z');
     handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
     handleEvent(map, 'thread-1', 3, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: 'a.rs' } } as ThreadEvent, '2026-04-04T10:00:02Z');
     handleEvent(map, 'thread-1', 4, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: 'b.rs' } } as ThreadEvent, '2026-04-04T10:00:02Z');
-    // Only ONE result arrives (CC parallel — result for first call lost)
     handleEvent(map, 'thread-1', 5, { type: 'CodingAgentToolResult', name: '', result: 'ok' } as ThreadEvent, '2026-04-04T10:00:03Z');
-    // CC finishes
     handleEvent(map, 'thread-1', 6, { type: 'CodingAgentTextStreamed', text: 'Done!' } as ThreadEvent, '2026-04-04T10:00:04Z');
     handleEvent(map, 'thread-1', 7, { type: 'CodingAgentIdled' } as ThreadEvent, '2026-04-04T10:00:05Z');
 
@@ -137,9 +122,6 @@ describe('step completion — no eternal spinners', () => {
     const events = exchangeResponseEvents(exchanges[0]);
     const steps = events.filter(e => e.type === 'step');
 
-    // Both steps must be completed (no spinner): the exchange is done, and
-    // CodingAgentIdled is a CLEAN terminator, so the lost result resolves to a
-    // checkmark rather than "did not finish".
     for (const step of steps) {
       expect((step as { outcome: StepOutcome }).outcome).toBe('success');
     }
@@ -153,7 +135,6 @@ describe('step completion — no eternal spinners', () => {
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'fix it' } as ThreadEvent, '2026-04-04T10:00:00Z');
     handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
     handleEvent(map, 'thread-1', 3, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, '2026-04-04T10:00:02Z');
-    // NO ToolResult — session was killed
     handleEvent(map, 'thread-1', 4, { type: 'CodingAgentIdled' } as ThreadEvent, '2026-04-04T10:00:03Z');
 
     const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
@@ -161,7 +142,6 @@ describe('step completion — no eternal spinners', () => {
     const steps = events.filter(e => e.type === 'step');
 
     expect(steps).toHaveLength(1);
-    // Step must NOT show spinner on a completed exchange
     expect((steps[0] as { outcome: StepOutcome }).outcome).toBe('success');
   });
 
@@ -174,16 +154,13 @@ describe('step completion — no eternal spinners', () => {
     handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
     handleEvent(map, 'thread-1', 3, { type: 'CodingAgentToolCalled', name: 'Read', args: {} } as ThreadEvent, '2026-04-04T10:00:02Z');
     handleEvent(map, 'thread-1', 4, { type: 'CodingAgentToolResult', name: '', result: 'ok' } as ThreadEvent, '2026-04-04T10:00:03Z');
-    // CC idles then resumes with a new tool call (still in progress)
     handleEvent(map, 'thread-1', 5, { type: 'CodingAgentIdled' } as ThreadEvent, '2026-04-04T10:00:04Z');
     handleEvent(map, 'thread-1', 6, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, '2026-04-04T10:00:05Z');
-    // No result yet — tool is actively running
 
     const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     const events = exchangeResponseEvents(exchanges[0]);
     const steps = events.filter(e => e.type === 'step');
 
-    // The last step should still show spinner — CC is actively working
     const lastStep = steps[steps.length - 1] as { outcome: StepOutcome };
     expect(lastStep.outcome).toBe('pending');
   });
@@ -195,12 +172,10 @@ describe('step completion — no eternal spinners', () => {
 
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'fix it' } as ThreadEvent, '2026-04-04T10:00:00Z');
     handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
-    // Three parallel Agent launches
     handleEvent(map, 'thread-1', 3, { type: 'CodingAgentToolCalled', name: 'Agent', args: { prompt: 'task 1' } } as ThreadEvent, '2026-04-04T10:00:02Z');
     handleEvent(map, 'thread-1', 4, { type: 'CodingAgentToolCalled', name: 'Agent', args: { prompt: 'task 2' } } as ThreadEvent, '2026-04-04T10:00:02Z');
     handleEvent(map, 'thread-1', 5, { type: 'CodingAgentToolCalled', name: 'Agent', args: { prompt: 'task 3' } } as ThreadEvent, '2026-04-04T10:00:02Z');
 
-    // First result arrives — should resolve exactly one step
     handleEvent(map, 'thread-1', 6, { type: 'CodingAgentToolResult', name: '', result: 'done 1' } as ThreadEvent, '2026-04-04T10:00:05Z');
 
     let exchanges = groupIntoExchanges(map.get('thread-1')!.events);
@@ -211,7 +186,6 @@ describe('step completion — no eternal spinners', () => {
     expect(resolved).toBe(1);
     expect(pending).toBe(2);
 
-    // Second result
     handleEvent(map, 'thread-1', 7, { type: 'CodingAgentToolResult', name: '', result: 'done 2' } as ThreadEvent, '2026-04-04T10:00:06Z');
     exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     events = exchangeResponseEvents(exchanges[0]);
@@ -221,7 +195,6 @@ describe('step completion — no eternal spinners', () => {
     expect(resolved).toBe(2);
     expect(pending).toBe(1);
 
-    // Third result
     handleEvent(map, 'thread-1', 8, { type: 'CodingAgentToolResult', name: '', result: 'done 3' } as ThreadEvent, '2026-04-04T10:00:07Z');
     exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     events = exchangeResponseEvents(exchanges[0]);
@@ -246,10 +219,6 @@ describe('step completion — no eternal spinners', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(1);
 
-    // Three tool rows, each resolved by its own result, then the live row a
-    // coding-agent turn carries while the model holds control: nothing is
-    // running and no terminator has arrived, so the turn is still going. See
-    // `needsLiveThinkingRow` and `thread-events/coding-agent-live-row.test.ts`.
     const respEvents = exchangeResponseEvents(exchanges[0]);
     const respSteps = respEvents.filter(e => e.type === 'step');
     expect(respSteps).toHaveLength(4);
@@ -267,16 +236,11 @@ describe('step completion — no eternal spinners', () => {
   });
 
   it('parallel CC reads with same description: result pairs by tool_use_id, not visual order', () => {
-    // Two CC `Read SKILL.md` calls run in parallel — same row label, different
-    // paths, different tool_use_ids. The result for the first call arrives
-    // before the second; the row that gets resolved must be the one whose
-    // tool_use_id matches, not whichever pending row came last in the events.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'audit skills', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-04-04T10:00:01Z' } as ThreadEvent],
       [3, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: '/skills/grill-me/SKILL.md' }, tool_use_id: 'tu-A', created: '2026-04-04T10:00:02Z' } as ThreadEvent],
       [4, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: '/skills/superpowers/SKILL.md' }, tool_use_id: 'tu-B', created: '2026-04-04T10:00:02Z' } as ThreadEvent],
-      // Only the result for the FIRST call has arrived so far.
       [5, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok', tool_use_id: 'tu-A', created: '2026-04-04T10:00:03Z' } as ThreadEvent],
     ]);
 
@@ -287,8 +251,8 @@ describe('step completion — no eternal spinners', () => {
     expect(respSteps).toHaveLength(2);
     const stepA = respSteps.find(s => s.tool_use_id === 'tu-A');
     const stepB = respSteps.find(s => s.tool_use_id === 'tu-B');
-    expect(stepA?.outcome).toBe('success');  // Row that got its result is done
-    expect(stepB?.outcome).toBe('pending');  // Other row keeps spinning until its result arrives
+    expect(stepA?.outcome).toBe('success');
+    expect(stepB?.outcome).toBe('pending');
 
     const steps = exchangeSteps(exchanges[0]) as { tool_use_id?: string; outcome: StepOutcome }[];
     expect(steps).toHaveLength(2);
@@ -297,8 +261,6 @@ describe('step completion — no eternal spinners', () => {
   });
 
   it('legacy CC events without tool_use_id fall back to backward-walk resolution', () => {
-    // Stored events from before the tool_use_id field existed render with all
-    // pending steps eventually resolved by description-based fallback alone.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'fix it', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-04-04T10:00:01Z' } as ThreadEvent],
@@ -311,7 +273,6 @@ describe('step completion — no eternal spinners', () => {
 
     const exchanges = groupIntoExchanges(events);
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { description: string; outcome: StepOutcome }[];
-    // Both tool rows resolved, plus the still-running turn's live row.
     expect(respSteps).toHaveLength(3);
     for (const step of respSteps.slice(0, 2)) expect(step.outcome).toBe('success');
     expect(respSteps[2]).toMatchObject({ description: 'Thinking', outcome: 'pending' });
@@ -342,9 +303,6 @@ describe('step completion — no eternal spinners', () => {
     }
   });
 
-  // A parallel run answers in completion order (ADR 0246). Here the first call
-  // finishes first, so resolving the newest pending row would tick off the
-  // second call and leave the finished first one spinning.
   it('a parallel result resolves the row of the call it names, in any order', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'search', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
@@ -374,7 +332,6 @@ describe('step completion — no eternal spinners', () => {
     ]);
   });
 
-  // Old rows carry no call id, so they keep the positional walk.
   it('a legacy result with no call id still resolves the newest pending row', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'search', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
@@ -390,8 +347,6 @@ describe('step completion — no eternal spinners', () => {
     ]);
   });
 
-  // The engine stamps `success: false` on a failed call. A green Completed over
-  // it tells the reader the call worked. Rows that predate the flag stay green.
   it('a failed result settles its row to error in both projections', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'run it', created: '2026-04-04T10:00:00Z' } as ThreadEvent],
@@ -423,7 +378,6 @@ describe('step completion — no eternal spinners', () => {
 
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'fix it' } as ThreadEvent, '2026-04-04T10:00:00Z');
     handleEvent(map, 'thread-1', 2, { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, '2026-04-04T10:00:01Z');
-    // No ToolResult, but exchange completed
     handleEvent(map, 'thread-1', 3, { type: 'ResponseGenerated' } as ThreadEvent, '2026-04-04T10:00:02Z');
 
     const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
@@ -434,24 +388,7 @@ describe('step completion — no eternal spinners', () => {
   });
 });
 
-// ===========================================================================
-// A tool call that never returned: the turn died mid-execution
-// ===========================================================================
-// Real thread, 2026-08-03: a Bash tool call at 07:44:41, the Claude Code
-// process SIGKILLed at 07:44:43 before the tool produced anything, and the turn
-// terminated at 07:44:44 with a red "Event stream error" card. The step row sat
-// directly above that card with no check and no failure marker, reading as
-// though it were still executing.
-//
-// The turn's terminator decides the verdict, and the two branches must stay
-// split. A CLEAN end (ResponseGenerated / CodingAgentIdled) means the step did
-// finish and merely lacks a recorded result, so a ✓ is honest. An UNCLEAN end
-// (ResponseFailed / ResponseAborted / ResponseCanceled) means the step did NOT
-// finish, so a ✓ would be a worse lie than the spinner it replaces.
-// ===========================================================================
 
-/** The reproduction's event shape: one tool call that got its result, one that
- *  was still running when `terminal` landed. */
 function killedMidCall(terminal: Record<string, unknown>): Map<number, ThreadEvent> {
   return new Map<number, ThreadEvent>([
     [1, { type: 'MessageReceived', text: 'run the linter', created: '2026-08-03T07:44:30Z' } as ThreadEvent],
@@ -459,12 +396,10 @@ function killedMidCall(terminal: Record<string, unknown>): Map<number, ThreadEve
     [3, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: 'scripts/lib/webkit_shard.sh' }, tool_use_id: 'tu-done', created: '2026-08-03T07:44:35Z' } as ThreadEvent],
     [4, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok', tool_use_id: 'tu-done', created: '2026-08-03T07:44:36Z' } as ThreadEvent],
     [5, { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'shellcheck scripts/lib/webkit_shard.sh' }, tool_use_id: 'tu-killed', created: '2026-08-03T07:44:41Z' } as ThreadEvent],
-    // SIGKILL at 07:44:43: no CodingAgentToolResult for tu-killed, ever.
     [6, { ...terminal, created: '2026-08-03T07:44:44Z' } as unknown as ThreadEvent],
   ]);
 }
 
-/** Both projections of the first exchange, as `{ tool_use_id, outcome }` rows. */
 function stepOutcomes(events: Map<number, ThreadEvent>) {
   const exchanges = groupIntoExchanges(events);
   const inline = exchangeResponseEvents(exchanges[0])
@@ -487,11 +422,7 @@ describe('step outcome when a tool call never returned', () => {
       for (const steps of [inline, list]) {
         expect(steps).toHaveLength(2);
         const killed = steps.find(s => s.tool_use_id === 'tu-killed');
-        // The bug: 'pending' forever (an eternal spinner above a red error
-        // card). The wrong fix: 'success' (a green check on a killed call).
         expect(killed?.outcome).toBe('unfinished');
-        // The call that DID return keeps its checkmark, so the kill lands on
-        // exactly one row and the user can see which.
         expect(steps.find(s => s.tool_use_id === 'tu-done')?.outcome).toBe('success');
       }
     });
@@ -508,9 +439,6 @@ describe('step outcome when a tool call never returned', () => {
 
       for (const steps of [inline, list]) {
         expect(steps).toHaveLength(2);
-        // A clean terminator means the tool DID finish and only its result
-        // event is missing. Collapsing this branch into the unclean one would
-        // put "did not finish" rows all over successful turns.
         expect(steps.find(s => s.tool_use_id === 'tu-killed')?.outcome).toBe('success');
         expect(steps.find(s => s.tool_use_id === 'tu-done')?.outcome).toBe('success');
       }
@@ -518,9 +446,6 @@ describe('step outcome when a tool call never returned', () => {
   }
 
   it('a later same-request terminal wins: the recovered engine-restart turn keeps its checkmarks', () => {
-    // Engine restart mid-turn: recovery emits ResponseAborted, the rerun re-uses
-    // the original request_event_id and succeeds. `supersededAbortIndices`
-    // already deflates the panel verdict to the success; the steps must agree.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'run the linter', _eventId: 'req-1', created: '2026-08-03T07:44:30Z' } as ThreadEvent],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-08-03T07:44:31Z' } as ThreadEvent],
@@ -536,9 +461,6 @@ describe('step outcome when a tool call never returned', () => {
   });
 });
 
-// ===========================================================================
-// Tool description from event (DRY: backend provides, frontend falls back)
-// ===========================================================================
 describe('tool description from event', () => {
   it('exchangeSteps uses event description for ToolCalled when present', () => {
     const thread = makeThreadState();
@@ -567,11 +489,6 @@ describe('tool description from event', () => {
   });
 
   it('ContextTokensMeasured overwrites the previous Thinking step context_tokens in both projections', () => {
-    // chars/4 estimate is wildly wrong for image-heavy turns (counts base64
-    // bytes). The real input_tokens from the LLM provider arrives via a
-    // ContextTokensMeasured event right after the response — both projections
-    // (exchangeSteps for the secondary list, exchangeResponseEvents for the
-    // inline chip in the chat view) must overwrite the displayed token count.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'hi' } as ThreadEvent, '2026-04-09T10:00:00Z');
@@ -594,20 +511,13 @@ describe('tool description from event', () => {
   });
 
   it('Thinking stays pending while the chat-agent LLM call is still running', () => {
-    // Bug: ThoughtStreamed was hardcoded to success: true, so the latest
-    // "Thinking" step rendered with a ✓ checkmark while the agent was still
-    // working. ThoughtStreamed marks "about to invoke the LLM with this
-    // context size" — the Thinking step should stay as a spinner until the
-    // LLM produces output (TextStreamed / ToolCalled), the next ThoughtStreamed
-    // supersedes it, or the thread goes idle.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
     handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent, '2026-05-24T19:00:01Z');
-    // No terminator — LLM is still working
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    const steps = exchangeSteps(exchanges[0], /* isLast */ true);
+    const steps = exchangeSteps(exchanges[0],  true);
     expect(steps).toHaveLength(1);
     expect(steps[0].description).toBe('Thinking');
     expect(steps[0].outcome).toBe('pending');
@@ -619,10 +529,6 @@ describe('tool description from event', () => {
   });
 
   it('ToolCalled NAMES the Thinking row rather than opening a second one', () => {
-    // The fold: one LLM call is one row. The row is born as a shimmering
-    // "Thinking" marker and renames itself to the call it produced, staying
-    // pending because that call is now the thing running. Two rows for one
-    // action read as two actions.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
@@ -630,7 +536,7 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 3, { type: 'ToolCalled', name: 'run_bash', args: { command: 'ls' } } as ThreadEvent, '2026-05-24T19:00:02Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    const steps = exchangeSteps(exchanges[0], /* isLast */ true);
+    const steps = exchangeSteps(exchanges[0],  true);
     expect(steps).toHaveLength(1);
     expect(steps[0].description).toBe('Run ls');
     expect(steps[0].outcome).toBe('pending');
@@ -645,9 +551,6 @@ describe('tool description from event', () => {
   });
 
   it('only the FIRST of a pass\'s tool calls takes the row; parallel calls get their own', () => {
-    // A result pairs back by tool_use_id, so two calls sharing a row could not
-    // both be resolved. Naming the row stops it matching `isThinking`, which is
-    // what leaves the second call nothing to fold onto.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
@@ -656,18 +559,12 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 4, { type: 'ToolCalled', name: 'run_bash', args: { command: 'pwd' } } as ThreadEvent, '2026-05-24T19:00:03Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    const steps = exchangeSteps(exchanges[0], /* isLast */ true);
+    const steps = exchangeSteps(exchanges[0],  true);
     expect(steps.map(s => s.description)).toEqual(['Run ls', 'Run pwd']);
     expect(steps.every(s => s.outcome === 'pending')).toBe(true);
   });
 
   it('a blank text chunk before a coding-agent tool call does not cost the fold its row', () => {
-    // Real stream, read off a live Claude Code thread: EVERY CodingAgentToolCalled
-    // is preceded by a whitespace-only CodingAgentTextStreamed. That chunk used to
-    // resolve the pending Thinking row, so the tool call arrived to find nothing to
-    // rename and opened a second row. The blank text renders as nothing, so the two
-    // rows looked adjacent and the fold looked broken on exactly the threads that
-    // produce the most steps.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
       [2, { type: 'CodingAgentPromptSent', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
@@ -688,12 +585,6 @@ describe('tool description from event', () => {
   });
 
   it('prose before a tool call does not cost the pass its row, and the row lands below the prose', () => {
-    // The model narrating before it acts is the common shape, not the exception.
-    // Its text resolves the marker, so the arriving tool call finds nothing
-    // PENDING to name. If it opened a second row, every narrated pass would
-    // print "Thinking ✓" above the step it produced, which is the transcript the
-    // fold exists to prevent. The call claims the resolved marker instead, and
-    // the row moves below the prose that introduced it.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
       [2, { type: 'CodingAgentPromptSent', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
@@ -715,10 +606,6 @@ describe('tool description from event', () => {
   });
 
   it('a narrated chat pass keeps its context counter on the row the call took over', () => {
-    // The counter is the whole reason the marker is worth claiming rather than
-    // dropping: the snapshot binds to the `Thinking` row (`bindSnapshotToStep`),
-    // and the engine emits it before the tool call, so the row the tool renames
-    // is the one carrying "how full was the context for this call".
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
@@ -745,10 +632,6 @@ describe('tool description from event', () => {
   });
 
   it('an auxiliary capture leaves the turn its context chip', () => {
-    // A memory classification fires during turn setup and a title fires
-    // alongside it, both on this thread. Each is a ContextCaptured, and a
-    // capture binds to the step it follows. Unfiltered, the last one to land
-    // would overwrite the turn's chip with its own few hundred tokens.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
@@ -783,8 +666,6 @@ describe('tool description from event', () => {
   });
 
   it('a capture with no purpose is a turn, so legacy rows still bind', () => {
-    // Every row written before `purpose` existed omits it. Treating an absent
-    // value as auxiliary would strip the chip from the whole archive.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
@@ -804,9 +685,6 @@ describe('tool description from event', () => {
   });
 
   it('a second narrated pass opens its own row rather than reclaiming the first', () => {
-    // The claim is scoped to the pass that opened the marker: once a call has
-    // taken the row, it is no longer a `Thinking` row, so the next pass's call
-    // has nothing to reclaim and the transcript keeps one row per call.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
@@ -826,8 +704,6 @@ describe('tool description from event', () => {
   });
 
   it('a tool call does not reclaim a marker left unfinished by a dead turn', () => {
-    // `unfinished` says the turn died mid-pass. Whatever runs after that is not
-    // that pass continuing, so the marker keeps its own row and its own verdict.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
@@ -835,14 +711,11 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 3, { type: 'ResponseAborted', reason: 'engine restart' } as ThreadEvent, '2026-08-12T09:00:02Z');
 
     const aborted = groupIntoExchanges(map.get('t')!.events)[0];
-    const marker = exchangeSteps(aborted, /* isLast */ false)[0];
+    const marker = exchangeSteps(aborted,  false)[0];
     expect(marker).toMatchObject({ description: 'Thinking', outcome: 'unfinished' });
   });
 
   it('a pass that answers in text keeps its Thinking row, which is where its counter lives', () => {
-    // Nothing to fold into: the model called no tool. The row resolves in place
-    // rather than disappearing, because the context counter for that LLM call
-    // hangs off it.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
@@ -868,7 +741,7 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 3, { type: 'TextStreamed', text: 'hello' } as ThreadEvent, '2026-05-24T19:00:02Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    const steps = exchangeSteps(exchanges[0], /* isLast */ true);
+    const steps = exchangeSteps(exchanges[0],  true);
     expect(steps).toHaveLength(1);
     expect(steps[0].description).toBe('Thinking');
     expect(steps[0].outcome).toBe('success');
@@ -888,7 +761,7 @@ describe('tool description from event', () => {
     handleEvent(map, 't', 3, { type: 'ThoughtStreamed', text: 'Context: 200 tokens, 2 messages' } as ThreadEvent, '2026-05-24T19:00:02Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    const steps = exchangeSteps(exchanges[0], /* isLast */ true);
+    const steps = exchangeSteps(exchanges[0],  true);
     expect(steps).toHaveLength(2);
     expect(steps[0].outcome).toBe('success');
     expect(steps[1].outcome).toBe('pending');
@@ -917,9 +790,6 @@ describe('tool description from event', () => {
   });
 
   it('exchangeResponseEvents stamps full command on engine ToolCalled steps for hover tooltip', () => {
-    // The engine middle-truncates run_bash descriptions to ~60 chars, marking the
-    // cut with `…` and keeping the command's tail (`Running: cd /Users/…head -20...`).
-    // The full command is preserved on the step so the UI can show it on mouseover.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     const fullCmd = 'cd /Users/me/projects/lucidos && git log --oneline -50 | head -20';
@@ -933,7 +803,6 @@ describe('tool description from event', () => {
   });
 
   it('exchangeResponseEvents stamps event.created on step events for the detail modal', () => {
-    // Steps come from events; the modal needs the originating event's timestamp.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-04-30T10:00:00Z');
@@ -994,8 +863,6 @@ describe('tool description from event', () => {
   });
 
   it('fullCommandForCCTool formats Codex todo_list as a checkbox list (TodoWrite parity)', () => {
-    // Both Codex protocols normalize the plan tool to {items: [{text, completed}]}
-    // (exec emits it natively; app-server maps turn/plan/updated onto it).
     const items = [
       { text: 'Map the code', completed: true },
       { text: 'Fix the bug', completed: false },
@@ -1009,10 +876,6 @@ describe('tool description from event', () => {
   });
 
   it('fullCommandForCCTool gives a Codex step the un-elided value a Claude Code step gets', () => {
-    // Codex had no arm for any of its own item types, so no Codex step ever
-    // carried a `full` and the step detail had nothing to show under a
-    // truncated label. The shell wrapper is stripped here too, so the detail
-    // and the row agree about what ran.
     expect(fullCommandForCCTool('command_execution', { command: '/bin/zsh -lc "cd /tmp && ls -la | head"' }))
       .toBe('cd /tmp && ls -la | head');
     expect(fullCommandForCCTool('Bash', { command: 'cd /tmp && ls -la | head' }))
@@ -1025,9 +888,6 @@ describe('tool description from event', () => {
         { kind: { type: 'delete' }, path: '/w/e2e/probe.spec.ts' },
       ],
     })).toBe('Edit /w/src/lib.rs\nDelete /w/e2e/probe.spec.ts');
-    // One entry we cannot name discards the whole set, same rule the permission
-    // card applies: a complete-looking list whose unnamed half writes elsewhere
-    // is worse than no list.
     expect(fullCommandForCCTool('file_change', {
       changes: [{ kind: { type: 'update' }, path: '/w/a.ts' }, { kind: { type: 'add' } }],
     })).toBeUndefined();
@@ -1036,13 +896,6 @@ describe('tool description from event', () => {
     expect(fullCommandForCCTool('web_search', { query: 'rust async' })).toBe('rust async');
   });
 
-  // --- Codex and Claude Code step labels are one vocabulary ---
-  //
-  // Every expectation below is asserted verbatim in the Rust twin
-  // (`core::tests::describe_cc_tool_*` in `crates/lucidos-engine/src/core/mod_tests.rs`),
-  // so the two implementations can be diffed by eye. Rust produces the stored
-  // description; this fallback only runs for events stored before descriptions
-  // existed, and the two must not disagree.
 
   it('describeCCTool reads a Codex shell step like a Claude Code one', () => {
     const bare = describeCCTool('Bash', { command: 'git log --oneline -20' });
@@ -1058,8 +911,6 @@ describe('tool description from event', () => {
   });
 
   it('describeCCTool never unwraps a Claude Code Bash call', () => {
-    // When that model asks for a login shell it chose to, and the row must not
-    // rewrite the request.
     expect(describeCCTool('Bash', { command: 'bash -lc "make lint"' }))
       .toBe('Run bash -lc "make lint"');
   });
@@ -1067,12 +918,12 @@ describe('tool description from event', () => {
   it('shellScriptBody declines anything it cannot read', () => {
     for (const untouched of [
       'cargo test --locked',
-      'shellcheck -x scripts/e2e.sh',       // first word merely contains a shell name
+      'shellcheck -x scripts/e2e.sh',
       '/usr/local/bin/pushd -c \'x\'',
-      'zsh --version',                       // no script-carrying flag
+      'zsh --version',
       'bash -x script.sh',
-      'zsh -lc "a" && "b"',                  // two quoted words and a pipeline
-      'zsh -lc "git status',                 // unterminated
+      'zsh -lc "a" && "b"',
+      'zsh -lc "git status',
       'zsh -lc',
       'zsh',
       '',
@@ -1085,32 +936,21 @@ describe('tool description from event', () => {
     expect(shellScriptBody("/bin/zsh -lc 'echo '\\''hi'\\'' > out'")).toBe("echo 'hi' > out");
     expect(shellScriptBody('/bin/zsh -lc "rg -n \\"pat\\" src"')).toBe('rg -n "pat" src');
     expect(shellScriptBody('/bin/zsh -lc "printf \'%s\\\\n\' x"')).toBe("printf '%s\\n' x");
-    // A backslash before anything else inside double quotes is literal.
     expect(shellScriptBody('zsh -lc "grep \'\\d+\' f"')).toBe("grep '\\d+' f");
   });
 
   it('shellScriptBody keeps the wrapper on a multiword unquoted script', () => {
-    // POSIX `sh -c` reads ONE operand as the script and assigns the rest to $0,
-    // $1, ..., so `zsh -lc git status` runs `git` with $0=status. Labelling it
-    // "Run git status" would put a command in the row that never ran.
     expect(shellScriptBody('zsh -lc git status')).toBe('zsh -lc git status');
     expect(describeCCTool('command_execution', { command: 'zsh -lc git status' }))
       .toBe('Run zsh -lc git status');
-    // A single unquoted word IS the whole script.
     expect(shellScriptBody('zsh -lc ls')).toBe('ls');
-    // Trailing whitespace around the script is the wrapper's, not the command's.
     expect(shellScriptBody('zsh -lc "git status"  ')).toBe('git status');
   });
 
   it('shellScriptBody handles the two real Codex shapes, one by reading it and one by declining', () => {
-    // The double-quoted one is the common case: nested \" escapes resolve and
-    // the row finally shows the command.
     expect(shellScriptBody('/bin/zsh -lc "rg -n \\"detailsExpanded|stepsExpanded\\" src -g \'*.ts\' | head -40; git status --short"'))
       .toBe('rg -n "detailsExpanded|stepsExpanded" src -g \'*.ts\' | head -40; git status --short');
 
-    // The second uses shell quote CONCATENATION ('a'"b"'c' is one word), which
-    // this deliberately does not parse: a wrong guess would re-punctuate a
-    // command someone is reading to find out what ran.
     const concatenated = `/bin/zsh -lc 'if [ -e "$LOCK" ]; then sed -n '"'1,20p' \\""'$LOCK"; else echo MISSING; fi'`;
     expect(shellScriptBody(concatenated)).toBe(concatenated);
   });
@@ -1121,9 +961,7 @@ describe('tool description from event', () => {
     expect(label([{ kind: { type: 'add' }, path: '/w/src/new.ts' }])).toBe('Write new.ts');
     expect(label([{ kind: { type: 'update', move_path: null }, path: '/w/src/lib.rs' }])).toBe('Edit lib.rs');
     expect(label([{ kind: { type: 'delete' }, path: '/w/e2e/probe.spec.ts' }])).toBe('Delete probe.spec.ts');
-    // Older exec frames send the kind as a bare string.
     expect(label([{ kind: 'update', path: '/w/src/lib.rs' }])).toBe('Edit lib.rs');
-    // The Claude Code row for the same edit reads the same way.
     expect(describeCCTool('Edit', { file_path: '/w/src/lib.rs' })).toBe('Edit lib.rs');
   });
 
@@ -1139,11 +977,8 @@ describe('tool description from event', () => {
       { kind: { type: 'add' }, path: '/w/a.ts' },
       { kind: { type: 'delete' }, path: '/w/b.ts' },
     ])).toBe('Change 2 files');
-    // An unreadable kind claims nothing beyond "something changed"; a prototype
-    // key must not answer off Object.prototype either.
     expect(label([{ path: '/w/a.ts' }])).toBe('Change a.ts');
     expect(label([{ kind: 'constructor', path: '/w/a.ts' }])).toBe('Change a.ts');
-    // No path to name: state the verb and the count rather than inventing one.
     expect(label([{ kind: { type: 'add' } }])).toBe('Write 1 file');
     expect(label([])).toBe('Apply file changes');
     expect(describeCCTool('file_change', {})).toBe('Apply file changes');
@@ -1155,16 +990,12 @@ describe('tool description from event', () => {
     expect(describeCCTool('ExitPlanMode', {})).toBe('Present plan for approval');
     expect(describeCCTool('web_search', { query: 'rust lifetimes' })).toBe("Search 'rust lifetimes'");
     expect(describeCCTool('WebSearch', { query: 'rust lifetimes' })).toBe("Search 'rust lifetimes'");
-    // Both backends name an MCP tool `mcp__<server>__<tool>`; the server prefix
-    // is noise, and a malformed name keeps the whole identifier.
     expect(describeCCTool('mcp__example_server__create_issue', {})).toBe('MCP: create_issue');
     expect(describeCCTool('mcp__weird', {})).toBe('MCP: mcp__weird');
     expect(describeCCTool('CustomTool', {})).toBe('CustomTool');
   });
 
   it('exchangeResponseEvents stamps full path on CodingAgentToolCalled steps for hover tooltip', () => {
-    // Rust describe_cc_tool() shows only basename(file_path); the full path is
-    // preserved on the step so the UI can show it on mouseover.
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';
     const map = new Map([['t', thread]]);
@@ -1194,54 +1025,33 @@ describe('tool description from event', () => {
   });
 
   it('resolves pending steps in non-last exchange when user message splits ToolCalled from its result', () => {
-    // Bug: user cancels mid-tool-call → MessageReceived starts a new exchange,
-    // orphaning the ToolCalled in the previous exchange without a ToolResult or
-    // completion event. The spinner persists forever.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
 
-    // Exchange 1: user asks, engine calls a tool
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'find the file' } as ThreadEvent, '2026-04-13T19:30:00Z');
     handleEvent(map, 't', 2, { type: 'ThoughtStreamed' } as ThreadEvent, '2026-04-13T19:30:01Z');
     handleEvent(map, 't', 3, { type: 'ToolCalled', name: 'bash', args: { command: 'find . -name "Foo.tsx"' } } as ThreadEvent, '2026-04-13T19:30:02Z');
-    // User sends a new message BEFORE the tool result arrives — starts Exchange 2
     handleEvent(map, 't', 4, { type: 'MessageReceived', text: 'stop, I found it' } as ThreadEvent, '2026-04-13T19:30:10Z');
-    // The tool result and cancellation arrive AFTER the new message
     handleEvent(map, 't', 5, { type: 'ToolResult', name: 'bash', result: 'ok' } as ThreadEvent, '2026-04-13T19:30:15Z');
     handleEvent(map, 't', 6, { type: 'ResponseCanceled' } as ThreadEvent, '2026-04-13T19:30:15Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
-    // 1: original 'find the file' (with orphaned ToolCalled), 2: 'stop, I found it'
-    // (with the late ToolResult + ResponseCanceled step), 3: cancel boundary panel.
     expect(exchanges).toHaveLength(3);
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
 
-    // Verify the step IS pending when treated as the last exchange (the bug scenario)
     const stepsAsLast = exchangeSteps(exchanges[0], true);
     expect(stepsAsLast.filter(s => s.outcome === 'pending')).toHaveLength(1);
 
-    // Exchange 1's ToolResult ended up in exchange 2. Cancel took the thread
-    // idle, which is what resolves the orphaned spinner.
-    const ex1Steps = exchangeSteps(exchanges[0], /* isLast */ false, /* threadIdle */ true);
+    const ex1Steps = exchangeSteps(exchanges[0],  false,  true);
     expect(ex1Steps.filter(s => s.outcome === 'pending')).toHaveLength(0);
 
-    const ex1Events = exchangeResponseEvents(exchanges[0], /* isLast */ false, /* threadIdle */ true);
+    const ex1Events = exchangeResponseEvents(exchanges[0],  false,  true);
     const pendingEvents = ex1Events.filter(e => e.type === 'step' && (e as { outcome: StepOutcome }).outcome === 'pending');
     expect(pendingEvents).toHaveLength(0);
   });
 });
 
 
-// ===========================================================================
-// exchangeStatus — CC follow-up scenarios (integration tests)
-// ===========================================================================
-// These tests simulate the full SSE→events→exchanges→status pipeline for CC
-// follow-up messages. Each test builds events via handleEvent, groups them
-// into exchanges, and asserts the user-visible status for each exchange.
-//
-// The bug: follow-up messages intermittently show "Aborted" status when the
-// CC process exits during or after processing a follow-up.
-// ===========================================================================
 
 
 describe('exchangeStatus — CC follow-up happy path', () => {
@@ -1260,14 +1070,12 @@ describe('exchangeStatus — CC follow-up happy path', () => {
 
   it('CC follow-up: idle → follow-up message → CC resumes → idle = both done', () => {
     const { statuses, exchanges } = buildCCThread([
-      // Exchange 1: initial request
       { seq: 1, event: { type: 'MessageReceived', text: 'fix bug', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
       { seq: 3, event: { type: 'CodingAgentToolCalled', name: 'Read', args: {} } as ThreadEvent, created: '2026-04-12T10:00:02Z' },
       { seq: 4, event: { type: 'CodingAgentToolResult', name: 'Read', result: 'ok' } as ThreadEvent, created: '2026-04-12T10:00:03Z' },
       { seq: 5, event: { type: 'CodingAgentTextStreamed', text: 'Done with initial analysis' } as ThreadEvent, created: '2026-04-12T10:00:04Z' },
       { seq: 6, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:00:05Z' },
-      // Exchange 2: follow-up
       { seq: 7, event: { type: 'MessageReceived', text: 'now also fix the tests', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 8, event: { type: 'CodingAgentUserMessageSent', text: 'now also fix the tests' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 9, event: { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
@@ -1276,17 +1084,15 @@ describe('exchangeStatus — CC follow-up happy path', () => {
       { seq: 12, event: { type: 'CodingAgentIdled', has_changes: true } as ThreadEvent, created: '2026-04-12T10:01:04Z' },
     ]);
     expect(exchanges).toHaveLength(2);
-    expect(statuses[0]).toBe('done');      // Exchange 1: completed normally
-    expect(statuses[1]).toBe('done');      // Exchange 2: follow-up completed normally
+    expect(statuses[0]).toBe('done');
+    expect(statuses[1]).toBe('done');
   });
 
   it('CC follow-up without CodingAgentUserMessageSent (new data path) = both done', () => {
     const { statuses, exchanges } = buildCCThread([
-      // Exchange 1
       { seq: 1, event: { type: 'MessageReceived', text: 'fix bug', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
       { seq: 3, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:00:05Z' },
-      // Exchange 2: follow-up with only MessageReceived (no CodingAgentUserMessageSent)
       { seq: 4, event: { type: 'MessageReceived', text: 'also fix tests', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
       { seq: 6, event: { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok' } as ThreadEvent, created: '2026-04-12T10:01:02Z' },
@@ -1299,15 +1105,12 @@ describe('exchangeStatus — CC follow-up happy path', () => {
 
   it('multiple follow-ups all complete normally = all done', () => {
     const { statuses, exchanges } = buildCCThread([
-      // Exchange 1
       { seq: 1, event: { type: 'MessageReceived', text: 'first', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
       { seq: 3, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:00:02Z' },
-      // Exchange 2
       { seq: 4, event: { type: 'MessageReceived', text: 'second', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'CodingAgentUserMessageSent', text: 'second' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 6, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:01:02Z' },
-      // Exchange 3
       { seq: 7, event: { type: 'MessageReceived', text: 'third', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:02:00Z' },
       { seq: 8, event: { type: 'CodingAgentUserMessageSent', text: 'third' } as ThreadEvent, created: '2026-04-12T10:02:00Z' },
       { seq: 9, event: { type: 'CodingAgentTextStreamed', text: 'All done!' } as ThreadEvent, created: '2026-04-12T10:02:01Z' },
@@ -1323,23 +1126,18 @@ describe('exchangeStatus — CC follow-up happy path', () => {
 describe('exchangeStatus — CC follow-up abort scenarios', () => {
   it('CC process crash mid-follow-up: ResponseAborted = aborted (not done)', () => {
     const { statuses, exchanges } = buildCCThread([
-      // Exchange 1: completes normally
       { seq: 1, event: { type: 'MessageReceived', text: 'fix bug', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
       { seq: 3, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:00:02Z' },
-      // Exchange 2: follow-up — CC crashes mid-work
       { seq: 4, event: { type: 'MessageReceived', text: 'also fix tests', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'CodingAgentUserMessageSent', text: 'also fix tests' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 6, event: { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
-      // CC process dies — safety-net ResponseAborted, also opens its own abort exchange.
       { seq: 7, event: { type: 'ResponseAborted', text: '' } as ThreadEvent, created: '2026-04-12T10:01:02Z' },
     ]);
-    // ResponseAborted dual-purpose: terminates exchange 2 AND opens a new
-    // abort boundary exchange (the AbortPanel + Continue button surface).
     expect(exchanges).toHaveLength(3);
-    expect(statuses[0]).toBe('done');      // Exchange 1 was already done
-    expect(statuses[1]).toBe('aborted');   // Exchange 2 aborted by crash
-    expect(exchanges[2].userEvent.type).toBe('ResponseAborted'); // boundary
+    expect(statuses[0]).toBe('done');
+    expect(statuses[1]).toBe('aborted');
+    expect(exchanges[2].userEvent.type).toBe('ResponseAborted');
   });
 
   it('CC crash on follow-up: ResponseAborted opens its own boundary exchange', () => {
@@ -1350,7 +1148,6 @@ describe('exchangeStatus — CC follow-up abort scenarios', () => {
       { seq: 4, event: { type: 'MessageReceived', text: 'follow-up', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'ResponseAborted', text: '' } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
     ]);
-    // 1: idle, 2: aborted follow-up, 3: ResponseAborted boundary
     expect(exchanges).toHaveLength(3);
     expect(exchanges[2].userEvent.type).toBe('ResponseAborted');
   });
@@ -1369,14 +1166,10 @@ describe('exchangeStatus — CC follow-up abort scenarios', () => {
 
   it('lost follow-up during CC exit: ResponseAborted for drained messages = aborted', () => {
     const { statuses, exchanges } = buildCCThread([
-      // Exchange 1: normal
       { seq: 1, event: { type: 'MessageReceived', text: 'fix bug', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
       { seq: 3, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:00:02Z' },
-      // Exchange 2: follow-up sent, but CC was exiting — message lost
       { seq: 4, event: { type: 'MessageReceived', text: 'follow-up that got lost', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
-      // Backend drains lost follow-ups → single ResponseAborted (also opens
-      // its own abort boundary exchange).
       { seq: 5, event: { type: 'ResponseAborted', text: '1 follow-up message(s) lost during session exit' } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
     ]);
     expect(exchanges).toHaveLength(3);
@@ -1401,16 +1194,10 @@ describe('exchangeStatus — CC follow-up abort scenarios', () => {
   });
 
   it('follow-up with ResponseAborted + SessionEnded(completed) mid-work = aborted', () => {
-    // Engine flow when CC dies before producing a Result for a follow-up:
-    // the run_session safety net emits ResponseAborted, then the post-loop
-    // emits SessionEnded(completed). The exchange reads as aborted because
-    // ResponseAborted set isAborted=true; SessionEnded(completed) is just
-    // the normal lifecycle terminator that follows.
     const { statuses } = buildCCThread([
       { seq: 1, event: { type: 'MessageReceived', text: 'fix', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:00:00Z' },
       { seq: 2, event: { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, created: '2026-04-12T10:00:01Z' },
       { seq: 3, event: { type: 'CodingAgentIdled', has_changes: false } as ThreadEvent, created: '2026-04-12T10:00:02Z' },
-      // Follow-up — CC starts working, dies without Result, safety net fires
       { seq: 4, event: { type: 'MessageReceived', text: 'follow-up', channel: 'claude_code' } as ThreadEvent, created: '2026-04-12T10:01:00Z' },
       { seq: 5, event: { type: 'CodingAgentToolCalled', name: 'Edit', args: {} } as ThreadEvent, created: '2026-04-12T10:01:01Z' },
       { seq: 6, event: { type: 'ResponseAborted' } as ThreadEvent, created: '2026-04-12T10:01:02Z' },
@@ -1440,9 +1227,7 @@ describe('CodingAgentThoughtStreamed reasoning rendering', () => {
       | { thinkingText?: string; outcome: StepOutcome }
       | undefined;
     expect(thinking).toBeDefined();
-    // Both deltas coalesced onto the one Thinking step, in order.
     expect(thinking!.thinkingText).toBe('Let me check the tokens.');
-    // Visible text resolved the Thinking step (no dangling spinner).
     expect(thinking!.outcome).toBe('success');
   });
 
@@ -1451,8 +1236,6 @@ describe('CodingAgentThoughtStreamed reasoning rendering', () => {
     thread.meta.channel = 'claude_code';
     const map = new Map([['thread-1', thread]]);
 
-    // Resume-after-cancel: the follow-up is the resumed session's initial prompt,
-    // so NO CodingAgentPromptSent is emitted — reasoning is the first activity.
     handleEvent(map, 'thread-1', 1, { type: 'MessageReceived', text: 'redirect' } as ThreadEvent, '2026-04-04T10:00:00Z');
     handleEvent(map, 'thread-1', 2, { type: 'SessionStarted', session_id: 's1' } as ThreadEvent, '2026-04-04T10:00:01Z');
     handleEvent(map, 'thread-1', 3, { type: 'CodingAgentThoughtStreamed', text: 'Reasoning hard…' } as ThreadEvent, '2026-04-04T10:00:02Z');
@@ -1464,7 +1247,6 @@ describe('CodingAgentThoughtStreamed reasoning rendering', () => {
       | undefined;
     expect(thinking).toBeDefined();
     expect(thinking!.thinkingText).toBe('Reasoning hard…');
-    // Still streaming — the step is live (spinner), not resolved.
     expect(thinking!.outcome).toBe('pending');
   });
 });

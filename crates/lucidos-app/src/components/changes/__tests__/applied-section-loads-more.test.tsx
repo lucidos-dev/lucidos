@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Recently applied pages in older changes as its last row scrolls into view.
- * The sentinel that asks lives inside the collapsible section, so opening the
- * section must observe the sentinel it mounts.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

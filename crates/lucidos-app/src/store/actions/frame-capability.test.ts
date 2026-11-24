@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The host's half of keeping an app frame's URL pass alive (ADR 0238).
- *
- * jsdom, because a round walks the mounted `iframe[data-role="app-ui-frame"]`
- * elements and posts to each one's `contentWindow`. Neither is expressible
- * against the suite's default document stub.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   artifactPreviewCapability,
@@ -23,7 +16,6 @@ function mountAppFrame(src: string): HTMLIFrameElement {
   return frame;
 }
 
-/** What the engine answered, and what the frame was handed. */
 function capture(frame: HTMLIFrameElement): unknown[] {
   const seen: unknown[] = [];
   const target = frame.contentWindow as Window;
@@ -63,7 +55,6 @@ describe('renewEveryOpenFrame', () => {
 
     await renewEveryOpenFrame();
 
-    // The app id comes from the frame's own `src`, never from the app.
     expect(asked).toEqual([
       '/api/v1/app-frame-capability?app_id=site-publisher',
       '/api/v1/app-frame-capability?app_id=habit-tracker',
@@ -103,7 +94,6 @@ describe('renewEveryOpenFrame', () => {
 
     expect(seen).toEqual([]);
     expect(frame.isConnected).toBe(true);
-    // A minute, not the half-life. A lapsed pass is a visibly broken app.
     expect(nextDelayMs).toBe(60_000);
     expect(console.warn).toHaveBeenCalledOnce();
   });
@@ -116,12 +106,6 @@ describe('renewEveryOpenFrame', () => {
   });
 
   it('arms no timer of its own, so a stop cannot be undone by a round in flight', async () => {
-    // The loop owns the schedule; a round only says when to come back. Before
-    // this split, a round that resolved after `stop` re-armed the timer behind
-    // the teardown's back.
-    // `capture` stubs the frame's `postMessage`, which jsdom otherwise delivers
-    // on a `setTimeout(0)` of its own. That timer would be counted below and
-    // read as one this module armed.
     capture(mountAppFrame('/app/site-publisher/'));
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: true,
@@ -141,8 +125,6 @@ function mountPreviewFrame(): HTMLIFrameElement {
   return frame;
 }
 
-/** A pass the way the engine writes one: expiry in hex seconds, then subject
- *  and signature. */
 function passExpiringIn(secs: number, tag: string): string {
   return `${Math.floor(Date.now() / 1000 + secs).toString(16)}~artifact..preview~${tag}`;
 }
@@ -194,7 +176,6 @@ describe('the artifact preview pass', () => {
     expect(one).toEqual([pushed]);
     expect(two).toEqual([pushed]);
     expect(nextDelayMs).toBe(1_800_000);
-    // The round also refreshed the cache the next preview builds from.
     expect(await artifactPreviewCapability()).toBe(pass);
   });
 

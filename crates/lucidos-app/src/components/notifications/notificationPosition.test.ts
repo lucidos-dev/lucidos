@@ -26,8 +26,6 @@ describe('notificationPosition', () => {
     expect(pos.hasOlder).toBe(false);
   });
 
-  // Stepping older past the last loaded row pulls the next page first, so the
-  // button stays live.
   it('keeps older live at the last loaded row while more pages exist', () => {
     expect(notificationPosition(list('a', 'b'), 'b', true)).toEqual({
       hasNewer: true,

@@ -1,13 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
-// Held outside the factory so the assertions below can read them: the Backup
-// page's freshness rides on which of the two a PreferencesChanged moves.
 const backupStatusVersion = signal(0);
 const backupPreferencesVersion = signal(0);
 
-// Mirror the mock scaffold of the sibling thread-sync-*.test.ts files so we can
-// import handleGlobalEvent in isolation.
 vi.mock('../store', () => ({
   threadMap: signal(new Map()),
   focusedThreadId: signal<string | null>(null),
@@ -45,12 +41,14 @@ vi.mock('../thread-events', () => ({
 }));
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
 vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
-// loadPreferences is async — the PreferencesChanged arm chains a client-update
-// re-derive off it, so the mock must resolve a Promise.
-vi.mock('./preferences', () => ({ loadPreferences: vi.fn(() => Promise.resolve()) }));
+vi.mock('./preferences', () => ({
+  loadPreferences: vi.fn(() => Promise.resolve()),
+  refreshActiveTheme: vi.fn(() => Promise.resolve()),
+}));
+vi.mock('./engine-update', () => ({ handleEngineVersionStatusChanged: vi.fn() }));
 vi.mock('./client-update', () => ({ syncClientUpdateFromBuild: vi.fn() }));
 vi.mock('./releaseNotices', () => ({ loadReleaseNotices: vi.fn() }));
-vi.mock('./operators', () => ({ loadOperators: vi.fn() }));
+vi.mock('./gatewayUsers', () => ({ loadGatewayUsers: vi.fn() }));
 vi.mock('./reader-devices', () => ({ loadReaderDevices: vi.fn(), readIsMine: vi.fn(() => true) }));
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),
@@ -84,11 +82,12 @@ vi.mock('./thread-loading', () => ({
 }));
 
 const { handleGlobalEvent } = await import('./thread-sync');
+const { handleEngineVersionStatusChanged } = await import('./engine-update');
 const { loadPreferences } = await import('./preferences');
 const { syncClientUpdateFromBuild } = await import('./client-update');
 const { refreshLlmConfigured } = await import('./entityReferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
-const { loadOperators } = await import('./operators');
+const { loadGatewayUsers } = await import('./gatewayUsers');
 const { loadReaderDevices } = await import('./reader-devices');
 
 describe('handleGlobalEvent — preference events refresh the preferences cache', () => {
@@ -101,20 +100,18 @@ describe('handleGlobalEvent — preference events refresh the preferences cache'
   it('PreferencesChanged reloads preferences AND re-derives the client-update surface', async () => {
     handleGlobalEvent('PreferencesChanged', {});
     expect(loadPreferences).toHaveBeenCalledTimes(1);
-    // A peer may have dismissed the client-refresh toast globally; the re-derive
-    // hides it on this device too. Chained off loadPreferences → runs on a
-    // microtask, so wait for it.
     await vi.waitFor(() => expect(syncClientUpdateFromBuild).toHaveBeenCalledTimes(1));
   });
 
-  // set_language / set_timezone emit LanguageSet / TimezoneSet but NOT
-  // PreferencesChanged — without these arms the cached locale/timezone goes
-  // stale until reload.
+  it.each(['theme', 'chat_model', 'client_refresh_dismissed_build', 'engine_switch_dismissed_build'])('does not read engine status for %s', async (key) => {
+    handleGlobalEvent('PreferencesChanged', { key, value: 'example' });
+    await vi.waitFor(() => expect(syncClientUpdateFromBuild).toHaveBeenCalledTimes(1));
+    expect(handleEngineVersionStatusChanged).not.toHaveBeenCalled();
+  });
+
   it('LanguageSet reloads preferences (no client-update re-derive)', async () => {
     handleGlobalEvent('LanguageSet', { language: 'nb' });
     expect(loadPreferences).toHaveBeenCalledTimes(1);
-    // The client-update re-derive is PreferencesChanged-only — a locale change
-    // carries no dismissed-build change, so it must not fire a needless sw.js fetch.
     await Promise.resolve();
     expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
   });
@@ -127,30 +124,17 @@ describe('handleGlobalEvent — preference events refresh the preferences cache'
   });
 });
 
-/**
- * A release notice can be conditional on a preference: the Tree notice shows
- * only while `memory_module` is Classic. Picking Tree must drop it, and its
- * badge, without a reload.
- */
 describe('handleGlobalEvent: a preference change re-reads the release notices', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
   it.each(['memory_module', 'theme-mode'])('%s re-reads them', (key) => {
-    // Only the engine knows which keys a condition reads, so every key does.
     handleGlobalEvent('PreferencesChanged', { key, value: 'tree' });
     expect(loadReleaseNotices).toHaveBeenCalledTimes(1);
   });
 });
 
-/**
- * The Backup page reads its provider, schedule and retention from the backup
- * endpoints, NOT from the preferences cache the arm above reloads. So a
- * PreferencesChanged that reloads the cache still leaves that page showing the
- * old destination, which is what happened live on 2026-08-07 when the agent
- * wrote `backup_provider` and the dropdown did not move until a manual reload.
- */
 describe('handleGlobalEvent: a backup preference change bumps the Backup page', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -167,16 +151,11 @@ describe('handleGlobalEvent: a backup preference change bumps the Backup page', 
   );
 
   it('counts a deleted preference as a change', () => {
-    // `value: null` is the engine's reset-to-default. What the page shows has to
-    // move either way, so skipping it would leave the dropdown on a destination
-    // the preference no longer names.
     handleGlobalEvent('PreferencesChanged', { key: 'backup_provider', value: null });
     expect(backupPreferencesVersion.value).toBe(1);
   });
 
   it('leaves the Backup page alone for every other key', () => {
-    // The bump costs three HTTP reads, one of which resolves the provider's
-    // connected / ready verdict. A theme flip must not pay for them.
     for (const key of ['theme-mode', 'chat_model', 'language', '']) {
       handleGlobalEvent('PreferencesChanged', { key, value: 'x' });
     }
@@ -185,20 +164,11 @@ describe('handleGlobalEvent: a backup preference change bumps the Backup page', 
   });
 
   it('does not refetch backup STATUS for a preference change', () => {
-    // The two signals mean different things: backupStatusVersion is "a backup
-    // RUN reached a terminal state" and the health card hits /backup/status on
-    // it, which lists the remote folder. A retention edit must not.
     handleGlobalEvent('PreferencesChanged', { key: 'backup_retention', value: '10' });
     expect(backupStatusVersion.value).toBe(0);
   });
 });
 
-/**
- * A provider switch rebuilds the engine's active provider set in-process, the
- * same way a credential change does. So it owes the same `/health` re-probe:
- * `configuredProviders` is what filters the model picker, and without the probe
- * the picker keeps offering a provider the engine has already dropped.
- */
 describe('handleGlobalEvent: a provider preference re-probes /health', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -213,8 +183,6 @@ describe('handleGlobalEvent: a provider preference re-probes /health', () => {
   );
 
   it('leaves /health alone for every other key', () => {
-    // The probe is an HTTP round trip plus a delayed second one. A theme flip
-    // changes no provider, so it must not pay for them.
     for (const key of ['theme-mode', 'chat_model', '']) {
       handleGlobalEvent('PreferencesChanged', { key, value: 'x' });
     }
@@ -223,16 +191,14 @@ describe('handleGlobalEvent: a provider preference re-probes /health', () => {
   });
 });
 
-/** Every people list (Settings People, the device picker, pairing) reads the
- *  operators signal, so a change made on another device re-reads it. */
-describe('handleGlobalEvent: OperatorsChanged re-reads the people', () => {
+describe('handleGlobalEvent: UsersChanged re-reads the users', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('reloads the operators and this page\'s reader devices', () => {
-    handleGlobalEvent('OperatorsChanged', {});
-    expect(loadOperators).toHaveBeenCalledTimes(1);
+  it('reloads the users and this page\'s reader devices', () => {
+    handleGlobalEvent('UsersChanged', {});
+    expect(loadGatewayUsers).toHaveBeenCalledTimes(1);
     expect(loadReaderDevices).toHaveBeenCalledTimes(1);
   });
 });

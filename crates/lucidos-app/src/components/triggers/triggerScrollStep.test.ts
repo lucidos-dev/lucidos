@@ -28,9 +28,6 @@ describe('resolveTriggerScrollStep', () => {
   });
 
   it('expands a collapsed group instead of scrolling to a row that is not mounted', () => {
-    // The regression this prevents: a collapsed group renders none of its
-    // members, so the anchor does not exist. Scrolling would find nothing and
-    // the link would silently do nothing, which is the original bug.
     expect(resolveTriggerScrollStep('in-group', ROWS, new Set(['g1'])))
       .toEqual({ kind: 'expand', sectionId: 'g1' });
   });
@@ -38,13 +35,11 @@ describe('resolveTriggerScrollStep', () => {
   it('scrolls on the next pass, once the group has been expanded', () => {
     const first = resolveTriggerScrollStep('in-group', ROWS, new Set(['g1']));
     expect(first).toEqual({ kind: 'expand', sectionId: 'g1' });
-    // The target deliberately survives an expand, so the re-run lands it.
     expect(resolveTriggerScrollStep('in-group', ROWS, new Set()))
       .toEqual({ kind: 'scroll', triggerId: 'in-group' });
   });
 
   it('drops a target naming no row, rather than holding it', () => {
-    // Consume-once: a held stale id would mark an unrelated row later.
     expect(resolveTriggerScrollStep('gone', ROWS, new Set())).toEqual({ kind: 'drop' });
   });
 });

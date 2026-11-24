@@ -1,9 +1,3 @@
-/** Reopening the compose destination picker must retry a list whose load
- *  FAILED. Without it a single transient failure (browser-cancelled fetch, a
- *  deadline that fired while the engine was still booting) leaves the picker on
- *  a red "Failed to load repositories" row forever — the render-path kick-off
- *  only fires on `not-loaded`, and the SSE refresh only re-fires an already
- *  `loaded` list. */
 
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

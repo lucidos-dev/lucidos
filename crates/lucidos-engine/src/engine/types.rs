@@ -7,8 +7,150 @@ use uuid::Uuid;
 // `ConversationSnapshot` etc. directly without the `core::` path.
 pub use crate::core::{ConversationMessage, ConversationSnapshot, SessionMessage};
 
-pub use crate::api::AppContext;
 pub use crate::llm::api_usage::{ApiUsage, ModalityUsage};
+
+pub type SharedEngine = std::sync::Arc<super::LucidosEngine>;
+
+pub use super::thread_events::queue::{AppContext, UrlContext};
+pub use super::thread_events::{ContextProducer, ContextPurpose, ContextRole, ContextSection};
+
+/// An image as base64 bytes plus their mime type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImage {
+    pub base64: String,
+    /// Optional on the wire. `chat_submit` ignores a client's value and uses
+    /// the format the blob store sniffs.
+    #[serde(default)]
+    pub mime_type: String,
+}
+
+/// Maximum base64-encoded image size accepted by LLM APIs (Claude: 5 MB).
+/// We target 4.5 MB to leave margin for encoding overhead.
+pub const MAX_IMAGE_BASE64_BYTES: usize = 4_500_000;
+
+/// Maximum dimension (width or height) for images sent to LLMs.
+/// Larger images waste tokens without improving understanding.
+pub const MAX_IMAGE_DIMENSION: u32 = 2048;
+
+/// Longest image side Claude accepts. A longer side fails the whole request.
+const PROVIDER_MAX_IMAGE_SIDE: u32 = 8000;
+
+impl ChatImage {
+    /// Always compress images for LLM consumption: re-encode as JPEG (quality 85)
+    /// and cap dimensions at `MAX_IMAGE_DIMENSION`. This reduces token usage and
+    /// ensures images stay under the API's 5 MB limit.
+    pub fn compress(self) -> Self {
+        use base64::Engine as _;
+        use image::GenericImageView;
+
+        let raw = match base64::engine::general_purpose::STANDARD.decode(&self.base64) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::log_legacy!("[Image] base64 decode failed, skipping compression: {}", e);
+                return self;
+            }
+        };
+
+        let img = match image::load_from_memory(&raw) {
+            Ok(img) => img,
+            Err(e) => {
+                crate::log_legacy!("[Image] image decode failed, skipping compression: {}", e);
+                return self;
+            }
+        };
+
+        let img = crate::core::blobs::apply_exif_orientation(&raw, img);
+
+        let (orig_w, orig_h) = img.dimensions();
+        let orig_base64_len = self.base64.len();
+
+        // Scale down if either dimension exceeds the cap
+        let img = if orig_w > MAX_IMAGE_DIMENSION || orig_h > MAX_IMAGE_DIMENSION {
+            img.resize(
+                MAX_IMAGE_DIMENSION,
+                MAX_IMAGE_DIMENSION,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            img
+        };
+
+        let (new_w, new_h) = img.dimensions();
+
+        // Encode as JPEG — always, even if already JPEG (re-encoding normalizes quality)
+        let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+        if let Err(e) = img.write_to(&mut jpeg_buf, image::ImageFormat::Jpeg) {
+            crate::log_legacy!("[Image] JPEG encoding failed: {}", e);
+            return self;
+        }
+
+        let mut jpeg_bytes = jpeg_buf.into_inner();
+        let mut encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
+
+        // If still over the limit, progressively reduce dimensions
+        let mut scale: f64 = 0.8;
+        while encoded.len() > MAX_IMAGE_BASE64_BYTES && scale > 0.1 {
+            let sw = ((new_w as f64) * scale).max(1.0) as u32;
+            let sh = ((new_h as f64) * scale).max(1.0) as u32;
+            let resized = img.resize(sw, sh, image::imageops::FilterType::Lanczos3);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            if resized.write_to(&mut buf, image::ImageFormat::Jpeg).is_ok() {
+                jpeg_bytes = buf.into_inner();
+                encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes);
+            }
+            scale *= 0.7;
+        }
+
+        crate::log_legacy!(
+            "[Image] {}x{} ({} KB) → {}x{} ({} KB)",
+            orig_w,
+            orig_h,
+            orig_base64_len / 1024,
+            new_w,
+            new_h,
+            encoded.len() / 1024
+        );
+
+        ChatImage {
+            base64: encoded,
+            mime_type: "image/jpeg".to_string(),
+        }
+    }
+
+    /// Fit this image to what a model accepts. It runs [`compress`] when the
+    /// base64 payload is over `MAX_IMAGE_BASE64_BYTES` or either side is over
+    /// `PROVIDER_MAX_IMAGE_SIDE`. Otherwise it returns the image untouched, in
+    /// its original format, with no quality loss.
+    ///
+    /// This is the single decision point for "can this image go to a model".
+    /// Every LLM-bound image path routes through it: chat message blocks, the
+    /// image-description pass, `read_file` and `view_image`. A full-page
+    /// screenshot is often under the byte limit but over the side limit.
+    ///
+    /// [`compress`]: ChatImage::compress
+    pub fn fit_for_llm(self) -> Self {
+        if self.base64.len() > MAX_IMAGE_BASE64_BYTES || self.exceeds_provider_max_side() {
+            self.compress()
+        } else {
+            self
+        }
+    }
+
+    /// Reads only the image header. An image it cannot read counts as within
+    /// bounds, because [`ChatImage::compress`] could not decode it either.
+    fn exceeds_provider_max_side(&self) -> bool {
+        use base64::Engine as _;
+
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&self.base64) else {
+            return false;
+        };
+        image::ImageReader::new(std::io::Cursor::new(raw))
+            .with_guessed_format()
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+            .is_some_and(|(w, h)| w.max(h) > PROVIDER_MAX_IMAGE_SIDE)
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcessResult {
@@ -40,66 +182,6 @@ pub struct ProcessResult {
 /// thread appears active but nobody reads the injection channel.
 pub type OrphanedInjection = super::InjectedPrompt;
 
-/// `content` is `Option` so the modal can render section *shape* (name + the
-/// two sizes) without persisting the body when the `capture_context`
-/// preference is off. Old DB rows always have content and deserialize as
-/// `Some(_)`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextSection {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// Chars this section ADDS to the request, beyond what other sections
-    /// already count. Sum it over a capture and you get the budget the
-    /// request spent.
-    ///
-    /// On most sections nothing else counts their bytes, so the delta happens
-    /// to equal `content_chars`. `Conversation` is where the two part: every
-    /// other section is already concatenated into `messages[0]`, so its delta
-    /// is what the tool loop added on top.
-    ///
-    /// The alias is honest. The stored value always was the delta, and only
-    /// the name lied. Two read paths serve `sections` verbatim rather than
-    /// through serde, so they rename the stored key themselves: see
-    /// `api::threads::events_snapshot::rename_legacy_section_size`.
-    #[serde(alias = "char_count")]
-    pub budget_delta_chars: usize,
-    /// True `chars().count()` of this section's own content, whatever the
-    /// persisted `content` shows. A dropped body (`capture_context` off) and a
-    /// head-and-tail truncation both leave it untouched.
-    ///
-    /// `None` means the row predates this field, never a zero-size section.
-    #[serde(default)]
-    pub content_chars: Option<usize>,
-    /// API role this section is sent under. Defaults to "user" for backward
-    /// compat with persisted ContextCaptured events from before this change.
-    /// Every previous section was actually part of either the system prompt
-    /// (System Instructions) or the user message. The system row gets
-    /// migrated by name in the viewer fallback.
-    #[serde(default = "default_context_role")]
-    pub role: ContextRole,
-    /// Inner-group label used by the viewer to nest sections within the
-    /// user-message role. None for system-role sections, prior-message rows,
-    /// and legacy events.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
-}
-
-/// API role bucket a `ContextSection` belongs to. Mirrors the three buckets
-/// in the LLM API call: the system prompt, prior messages (verbatim resume
-/// tool blocks), and this turn's user message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextRole {
-    System,
-    PriorMessage,
-    User,
-}
-
-fn default_context_role() -> ContextRole {
-    ContextRole::User
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,72 +207,6 @@ mod tests {
             reply: Some("Done.".to_string()),
         });
         assert_eq!(QuietPick::terminal_text(pick, "partial", false), "partial");
-    }
-
-    /// Rows a retired purpose wrote still read, and still write back the same
-    /// purpose a cost filter matches on. The literals pin the stored wire form.
-    #[test]
-    fn a_retired_purpose_capture_still_round_trips() {
-        for (wire, retired) in [
-            ("intent_loop", ContextPurpose::IntentLoop),
-            ("prefill_probe", ContextPurpose::PrefillProbe),
-        ] {
-            let purpose: ContextPurpose = serde_json::from_value(serde_json::json!(wire))
-                .unwrap_or_else(|e| panic!("an old {wire} row reads: {e}"));
-            assert_eq!(purpose, retired);
-            assert_eq!(
-                serde_json::to_value(purpose).unwrap(),
-                serde_json::json!(wire)
-            );
-        }
-    }
-
-    #[test]
-    fn context_section_legacy_payload_deserializes_with_default_role_and_no_group() {
-        // Pre-change ContextCaptured events have no `role` or `group` fields.
-        // They must still deserialize cleanly: `role` defaults to `User`, and
-        // `group` stays `None`.
-        let json = r#"{"name":"X","char_count":42}"#;
-        let section: ContextSection =
-            serde_json::from_str(json).expect("legacy payload must deserialize");
-        assert_eq!(section.name, "X");
-        assert_eq!(section.budget_delta_chars, 42);
-        assert!(section.content.is_none());
-        assert_eq!(section.role, ContextRole::User);
-        assert!(section.group.is_none());
-    }
-
-    /// Months of stored rows spell the delta `char_count`. They must land in
-    /// the field that holds a delta, and they must not claim a content size
-    /// nobody measured.
-    #[test]
-    fn a_stored_char_count_is_the_budget_delta_and_leaves_the_content_size_unknown() {
-        let json = r#"{"name":"Conversation","char_count":418291}"#;
-        let section: ContextSection =
-            serde_json::from_str(json).expect("legacy payload must deserialize");
-        assert_eq!(section.budget_delta_chars, 418_291);
-        assert_eq!(
-            section.content_chars, None,
-            "absent means unmeasured, not zero"
-        );
-    }
-
-    /// The rename has no shim, so nothing writes the old key. A reader summing
-    /// `char_count` off a fresh row must find nothing there.
-    #[test]
-    fn a_written_section_spells_both_sizes_and_never_the_old_name() {
-        let section = ContextSection {
-            name: "System Instructions".to_string(),
-            content: None,
-            budget_delta_chars: 90,
-            content_chars: Some(90),
-            role: ContextRole::System,
-            group: None,
-        };
-        let json = serde_json::to_value(&section).expect("serializes");
-        assert_eq!(json["budget_delta_chars"], 90);
-        assert_eq!(json["content_chars"], 90);
-        assert!(json.get("char_count").is_none());
     }
 
     /// A session whose run loop still owns `msg_rx` is live.
@@ -245,206 +261,6 @@ mod tests {
     }
 }
 
-/// CC can't expose its system prompt body or tool schemas via the
-/// stream-json envelope, only their token cost. The frontend uses this
-/// discriminant to know whether to expect a section breakdown body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextProducer {
-    MainLlm,
-    ClaudeCode,
-    Codex,
-    /// An *auxiliary model call*: one the engine makes for itself rather than
-    /// as an agent's turn (a thread title, an image description, a memory
-    /// call, an image generation). It has its own producer so a cost
-    /// breakdown keyed on `producer` does not file background spend under the
-    /// agent that happened to be running. Like the coding-agent producers it
-    /// carries no section breakdown body, only the call's cost.
-    Auxiliary,
-}
-
-impl ContextProducer {
-    /// Producer for a `ContextCaptured` emitted from a coding-agent session.
-    pub fn from_coding_agent(agent: crate::runtime::CodingAgent) -> Self {
-        match agent {
-            crate::runtime::CodingAgent::ClaudeCode => Self::ClaudeCode,
-            crate::runtime::CodingAgent::Codex => Self::Codex,
-        }
-    }
-}
-
-/// Which model call a `ContextCaptured` records.
-///
-/// `Turn` is an agent's own round trip and is the only value the two agentic
-/// loops emit. Every other variant is an *auxiliary model call*, and always
-/// pairs with [`ContextProducer::Auxiliary`]: `AuxCapture` is the single
-/// constructor for both fields, so the pair cannot diverge.
-///
-/// Serialized only when it is not `Turn`, so a turn row keeps the wire shape
-/// it had before this field existed. A stored row without the key reads back
-/// as `Turn`, which is what the 600k rows written before it rely on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextPurpose {
-    #[default]
-    Turn,
-    Title,
-    ImageDescribe,
-    Memory,
-    /// History summarisation, which used to be stamped [`Self::Memory`] along
-    /// with fact extraction and query classification. One purpose over three
-    /// jobs left a 94,903-char summariser call and a 6,800-char extraction
-    /// indistinguishable on the wire. Diagnosing the summariser then meant
-    /// inferring it from payload size.
-    ///
-    /// Standing invariant: **one purpose per auxiliary model preference**. This
-    /// one owns `model_conversation_summary`, and `Memory` is fact extraction
-    /// alone now that [`Self::QueryClassification`] has its own key too.
-    ConversationSummary,
-    /// The three yes/no questions in front of memory retrieval.
-    ///
-    /// It owns `model_query_classification`, which follows no other key. Split
-    /// out for the reason the summariser was, plus one of its own. The user can point it at a different BACKEND
-    /// (`judgment_query_classification`, ADR 0220), and a backend is chosen in
-    /// the same control the model is.
-    QueryClassification,
-    ImageGen,
-    /// One reply from a voice session's rented *talker* (ADR 0149).
-    ///
-    /// It owns `model_voice_talker`, per the standing invariant above. Unlike
-    /// every sibling here it is not one HTTP call: the talker speaks over a
-    /// live socket, so a row is written per reply and the purpose's
-    /// `AuxBudget` is never asked for.
-    Voice,
-    /// The *command guard*'s judge over the ambiguous middle (ADR 0002).
-    ///
-    /// It owns `model_command_judge` and `reasoning_command_judge`, per the
-    /// standing invariant above. Both backends stamp this one purpose. The user
-    /// can point the judge at Jev with `judgment_command_guard`, and a switch of
-    /// backend must not read as a switch of job.
-    CommandJudge,
-    /// One call of the agent's own `judge` tool.
-    ///
-    /// It owns no model preference, because the tool is Jev or nothing. See
-    /// `aux_purpose`, which names that case rather than exempting it.
-    JudgeTool,
-    /// Retired: one round of the removed `execute_intent` sub-loop.
-    ///
-    /// Nothing produces it now. It stays so old `ContextCaptured` rows still
-    /// read, and so a cost filter on `purpose: "intent_loop"` still matches
-    /// them.
-    IntentLoop,
-    /// The verdict behind `correct_memory`, which asks which stored entries
-    /// carry the fact the user rejected. Runs the agent's own chat model.
-    MemoryCorrection,
-    /// The summary written for one file the `import_file` tool imported. Runs
-    /// the agent's own chat model, once per imported file.
-    ArtifactSummary,
-    /// One *side question*'s model call, on either agent: a Lucidos Agent round
-    /// on its own chat model, or a Claude Code session copy's summed usage.
-    /// It runs beside the thread and is never a turn.
-    SideQuestion,
-    /// The *change summary*: one line saying what a change of several commits
-    /// does. It owns `model_change_summary`, falling back to the title model.
-    ChangeSummary,
-    /// One *compactor* call: a *summary tree* node written from its source
-    /// lines (ADR 0362). It owns `model_summary_compaction`, whose unset
-    /// default is resolved against the configured providers.
-    SummaryCompaction,
-    /// One batch of the recall tool's `find`: a judgment provider judging
-    /// summary lines against a query (ADR 0362). It owns `model_memory_find`,
-    /// which follows no other key.
-    MemoryFind,
-    /// One `web_search` call, on whichever backend answered. Each backend
-    /// fixes its own search model, so it owns no preference.
-    WebSearch,
-    /// One model call an app or script made through the credentialed proxy.
-    /// The caller names the model in its own request, so it owns no
-    /// preference.
-    Proxy,
-    /// The turn-end gate's forced *read decision*, for a turn that ended
-    /// without one (ADR 0417). It owns `model_read_decision`, which follows
-    /// no other key.
-    ReadDecision,
-    /// The turn-end gate's forced *wake decision*, for a child turn that ended
-    /// without one. It owns `model_wake_decision`, which follows no other key.
-    /// The user can point it at a System One model with
-    /// `judgment_wake_decision`.
-    WakeDecision,
-    /// The turn-end *expected wake decision*, for a turn that left its thread
-    /// waiting and stated no expected wake (ADR 0603). It owns
-    /// `model_expected_wake_decision`, which follows no other key. The user can
-    /// point it at a System One model with `judgment_expected_wake_decision`.
-    ExpectedWakeDecision,
-    /// One *copy beat* of the cache keep-alive: a Claude Code session copy
-    /// asked for one word while its session is parked on a card. It runs the
-    /// session's own model. Its `duration_ms` dates the request that refreshed
-    /// the cache.
-    CacheKeepAlive,
-    /// Retired: one call of the removed prefill byte-order probe, a synthetic
-    /// turn or beat on the Claude gateway (ADR 0581).
-    ///
-    /// Nothing produces it now. It stays so old `ContextCaptured` rows still
-    /// read, and so a cost filter on `purpose: "prefill_probe"` still matches
-    /// them.
-    PrefillProbe,
-}
-
-/// SQL predicate over an `events` row: true for an *auxiliary capture*, a
-/// `ContextCaptured` whose payload names a purpose other than `turn`. A turn
-/// writes no key ([`ContextPurpose::is_turn`]). The store's page tests pin it
-/// against the serializer for every purpose. The transcript's twin is
-/// `isAuxiliaryCapture` in the app's `store/thread-events/exchange-grouping.ts`.
-pub(crate) const AUXILIARY_CAPTURE_SQL: &str = "(event_type = 'ContextCaptured' \
-     AND payload->>'purpose' IS NOT NULL AND payload->>'purpose' <> 'turn')";
-
-impl ContextPurpose {
-    /// Skip-serializing predicate: a turn capture writes no `purpose` key.
-    pub(crate) fn is_turn(&self) -> bool {
-        matches!(self, Self::Turn)
-    }
-
-    /// How the event payload spells `purpose`, for SQL to match on.
-    pub(crate) fn wire(self) -> String {
-        serde_json::to_value(self)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default()
-    }
-
-    /// Section name for the one body-less section an auxiliary capture
-    /// carries. Names the request so a reader of the raw payload can tell
-    /// which call the estimate belongs to.
-    pub(crate) fn section_name(&self) -> &'static str {
-        match self {
-            Self::Turn => "Request",
-            Self::Title => "Title Request",
-            Self::ImageDescribe => "Image Description Request",
-            Self::Memory => "Memory Request",
-            Self::ConversationSummary => "Conversation Summary Request",
-            Self::QueryClassification => "Query Classification Request",
-            Self::ImageGen => "Image Generation Request",
-            Self::Voice => "Voice Reply",
-            Self::CommandJudge => "Command Judge Request",
-            Self::JudgeTool => "Judge Tool Request",
-            Self::IntentLoop => "Intent Loop Request",
-            Self::MemoryCorrection => "Memory Correction Request",
-            Self::ArtifactSummary => "Artifact Summary Request",
-            Self::SideQuestion => "Side Question Request",
-            Self::ChangeSummary => "Change Summary Request",
-            Self::SummaryCompaction => "Summary Compaction Request",
-            Self::MemoryFind => "Memory Find Request",
-            Self::WebSearch => "Web Search Request",
-            Self::Proxy => "Proxied Request",
-            Self::ReadDecision => "Read Decision Request",
-            Self::WakeDecision => "Wake Decision Request",
-            Self::ExpectedWakeDecision => "Expected Wake Decision Request",
-            Self::CacheKeepAlive => "Cache Keep-Alive Request",
-            Self::PrefillProbe => "Prefill Probe Request",
-        }
-    }
-}
-
 /// Result of an App UI capture from the frontend
 pub struct CaptureResult {
     pub screenshot: String, // base64-encoded image (JPEG, or the requested save format; sniffed downstream)
@@ -457,7 +273,7 @@ pub struct CaptureResult {
 /// follow-ups without emitting a duplicate exchange boundary.
 pub struct AgentUserInput {
     pub text: String,
-    pub images: Option<Vec<crate::api::ChatImage>>,
+    pub images: Option<Vec<crate::engine::types::ChatImage>>,
     /// UUID of the exchange-starter event already emitted before routing
     /// (`MessageReceived` for user follow-ups; `ChildThreadCompleted` for
     /// engine re-entry follow-ups). `None` for auto-harden and other internally
@@ -485,11 +301,24 @@ pub enum InputAnswered {
 }
 
 impl AgentUserInput {
+    /// The Continue a live run reads as a follow-up, anchored to its
+    /// `ContinuationRequested`.
+    pub fn continuation(text: String, continuation_requested: uuid::Uuid) -> Self {
+        Self {
+            text,
+            images: None,
+            origin_event_id: Some(continuation_requested),
+            kind: AgentInputKind::Continuation,
+            completion: None,
+        }
+    }
+
     /// The event of the user message behind this input, if a user sent one.
     /// A child wake or an engine-made prompt (auto-harden, apply) has none.
     pub fn user_origin(&self) -> Option<uuid::Uuid> {
         match self.kind {
             AgentInputKind::User
+            | AgentInputKind::Continuation
             | AgentInputKind::Redelivered {
                 input: RedeliveredInput::Message { .. },
                 ..
@@ -509,6 +338,11 @@ impl AgentUserInput {
 pub enum AgentInputKind {
     /// User-typed follow-up. Emit `CodingAgentPromptSent` as the audit trail.
     User,
+    /// A Continue the spawn dispatcher routed into a live run (ADR 0272),
+    /// anchored to its `ContinuationRequested`. Forwards and renders like
+    /// `User`. If unread when the run exits, a drain preserves its instructions
+    /// and anchor as engine re-entry.
+    Continuation,
     /// Engine-synthesized re-entry: a completed child thread, a resolved *event
     /// wait*, a continuation rerun's note. Suppress `CodingAgentPromptSent` so
     /// the response groups under the event that already started the exchange
@@ -516,8 +350,8 @@ pub enum AgentInputKind {
     /// `PreEmittedOrigin::is_engine_reentry` origin lands here, which is why the
     /// name says engine rather than child.
     ReentryFromEngine,
-    /// The *ceiling re-entry* (ADR 0629): a `ReentryFromEngine` whose turn is
-    /// the engine's, so its end forces no read or wake decision.
+    /// The *ceiling re-entry* (ADR 0629). A read after Result opens an
+    /// engine turn; a mid-turn read preserves the user's read and wake decisions.
     CeilingReentry,
     /// An input a session dropped before its agent read it, sent again by the
     /// next session (`agent_session::stranded_follow_ups`). A message is like
@@ -537,6 +371,7 @@ impl AgentInputKind {
         matches!(
             self,
             Self::User
+                | Self::Continuation
                 | Self::Redelivered {
                     input: RedeliveredInput::Message { .. },
                     ..
@@ -717,6 +552,8 @@ impl QuietPick {
 /// follow-up with 409), and the session records its backend in
 /// [`AgentSession::coding_agent`].
 pub struct AgentSession {
+    /// Captured at spawn; preference changes cannot change an existing process.
+    pub execution_sandbox: Option<crate::runtime::agent_sandbox::Sandbox>,
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     /// The turn reached its boundary. Only the run loop writes it, because the
     /// loop keeps a local copy in step (`only_the_run_loop_writes_the_session_phase`).
@@ -865,11 +702,9 @@ pub struct AgentSession {
     /// See [`SessionPhase`].
     pub phase: SessionPhase,
     /// Withdraws for this session's run loop, which owns the input ledger.
-    pub withdraw_tx: tokio::sync::mpsc::UnboundedSender<
-        crate::engine::agent_session::withdraw::WithdrawInputRequest,
-    >,
+    pub withdraw_tx: tokio::sync::mpsc::UnboundedSender<WithdrawInputRequest>,
     /// Child-report takes for the run loop, and how many reports wait unread.
-    pub child_reports: crate::engine::agent_session::child_reports::ChildReportsHandle,
+    pub child_reports: crate::engine::child_report_channel::ChildReportsHandle,
     /// Follow-ups sent on `msg_tx` that the run loop has not forwarded yet,
     /// by origin event id. The chat fast path adds one before its send and the
     /// run loop removes it on receipt, both under the `agent_sessions` lock. A
@@ -909,8 +744,8 @@ pub struct AgentSession {
     /// takes it at the turn's `Result`: the turn ends on the pick's *quiet
     /// reply* when it has one, and an empty reply counts as finished.
     pub quiet_answer_pending: Option<QuietPick>,
-    /// The turn in flight is the *ceiling re-entry*. A follow-up never
-    /// interrupts it: input waits for the successor session.
+    /// The session owes or has received its *ceiling re-entry*. A follow-up
+    /// never interrupts it: input waits for the successor session.
     pub in_ceiling_reentry: bool,
     /// Paired ToolCalled / ToolResult counter, mirrored from the local
     /// counter inside `run_session`. Read by the external watchdog
@@ -923,15 +758,12 @@ pub struct AgentSession {
     pub tools_in_flight: std::sync::Arc<std::sync::atomic::AtomicI32>,
     /// The question tool uses the run loop has flushed, which a question
     /// card's gate waits on before its second look.
-    pub(crate) question_flushes: std::sync::Arc<crate::engine::question_card_gate::QuestionFlushes>,
-    /// Which coding-agent backend drives this session. Locked at session
-    /// creation. Read by the follow-up fast-path to decide how a mid-turn
-    /// follow-up is delivered: Claude Code steers the live turn via stdin, so
-    /// the message is forwarded as-is; Codex's app-server/exec protocols only
-    /// accept input at a turn boundary, so a mid-turn follow-up first
-    /// interrupts the running turn (see the Codex interrupt-and-redirect path
-    /// in `chat::process`).
+    pub question_flushes: std::sync::Arc<crate::engine::question_flushes::QuestionFlushes>,
+    /// Backend driving this session, fixed at creation. Follow-up routing also
+    /// uses the process capability negotiated at Init.
     pub coding_agent: crate::runtime::CodingAgent,
+    /// Negotiated with this process; false until its Init proves support.
+    pub can_steer: bool,
     /// Clone of `run_session`'s `agent_cancel` `CancellationToken` — the lever
     /// that tears the coding-agent subprocess down. `run_session` and its
     /// in-loop watchdog / stale-resume paths already hold the original and
@@ -1021,21 +853,22 @@ impl AgentSession {
 /// been dropped is a phantom (see [`AgentSession::is_live`]), so a builder that
 /// dropped it internally would silently hand every test a dead session. Bind it
 /// (`let (session, _rx) = …`) for the lifetime of the test.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AgentSession {
-    pub(crate) fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>) {
+    pub fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>) {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
         (Self::for_test_with_sender(msg_tx), msg_rx)
     }
 
     /// Same, for a test that already owns the channel pair (and therefore keeps
     /// the receiver alive itself).
-    pub(crate) fn for_test_with_sender(
+    pub fn for_test_with_sender(
         msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     ) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64};
         use std::sync::Arc;
         Self {
+            execution_sandbox: None,
             msg_tx,
             is_waiting: true,
             pending_stop: None,
@@ -1059,7 +892,7 @@ impl AgentSession {
                 control_tx: tokio::sync::mpsc::unbounded_channel().0,
             },
             withdraw_tx: tokio::sync::mpsc::unbounded_channel().0,
-            child_reports: crate::engine::agent_session::child_reports::child_reports_channel().0,
+            child_reports: crate::engine::child_report_channel::child_reports_channel().0,
             unforwarded_inputs: Default::default(),
             builtin_commands: vec![],
             skill_commands: vec![],
@@ -1073,6 +906,7 @@ impl AgentSession {
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             question_flushes: Default::default(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            can_steer: true,
             agent_cancel: tokio_util::sync::CancellationToken::new(),
             keep_alive: false,
         }
@@ -1080,13 +914,17 @@ impl AgentSession {
 }
 
 /// Outcome class of an apply attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyStatus {
     /// Branch merged into main (or external-repo handoff completed).
     Applied,
     /// Branch had nothing to merge — already applied, or no commits exist.
     /// Distinct from `Applied` so callers don't infer a fresh merge happened.
+    ///
+    /// The default, as the only safe "no-info" value. Defaulting to `Applied`
+    /// would let a forgotten field silently claim a successful merge.
+    #[default]
     Noop,
     /// Hardening recovery session was spawned. The change will auto-apply
     /// after hardening completes — `review_thread_id` points at it.
@@ -1099,15 +937,6 @@ pub enum ApplyStatus {
     Queued,
 }
 
-impl Default for ApplyStatus {
-    /// `Noop` is the only safe "no-info" default. Defaulting to `Applied`
-    /// would let a forgotten field silently claim a successful merge —
-    /// the very ambiguity this struct exists to prevent.
-    fn default() -> Self {
-        Self::Noop
-    }
-}
-
 /// Result of applying a pending change. Serialized directly as the HTTP
 /// response body — see `docs/apply-change-api.md`.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1116,6 +945,8 @@ pub struct ApplyResult {
     pub change_id: Uuid,
     pub thread_id: Option<Uuid>,
     pub restart_required: bool,
+    pub version_build: VersionBuild,
+    pub deferred_coding_threads: i64,
     pub message: String,
     /// Set on `Conflict` — frontend should focus this thread to resolve.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1132,6 +963,16 @@ pub struct ApplyResult {
     pub files_changed: usize,
 }
 
+/// Whether applying requested a new-version build.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionBuild {
+    #[default]
+    None,
+    Started,
+    Deferred,
+}
+
 fn applied_message(restart_required: bool) -> String {
     if restart_required {
         "Change applied. This change requires the engine to restart.".to_string()
@@ -1141,6 +982,25 @@ fn applied_message(restart_required: bool) -> String {
 }
 
 impl ApplyResult {
+    pub(crate) fn with_version_build(
+        mut self,
+        request: super::build_deferral::BuildRequest,
+    ) -> Self {
+        use super::build_deferral::BuildRequest;
+        match request {
+            BuildRequest::None => {}
+            BuildRequest::Started => self.version_build = VersionBuild::Started,
+            BuildRequest::Deferred(count) => {
+                self.version_build = VersionBuild::Deferred;
+                self.deferred_coding_threads = count;
+                let noun = if count == 1 { "thread" } else { "threads" };
+                self.message =
+                    format!("Applied. The new version waits for {count} coding {noun} to finish.");
+            }
+        }
+        self
+    }
+
     pub fn applied(change_id: Uuid, thread_id: Option<Uuid>, restart_required: bool) -> Self {
         Self {
             status: ApplyStatus::Applied,
@@ -1234,4 +1094,197 @@ impl ApplyResult {
             ..Self::default()
         }
     }
+}
+
+/// A withdraw on its way to a session's run loop.
+#[derive(Debug)]
+pub struct WithdrawInputRequest {
+    /// The event that carried the input: a follow-up's `MessageReceived`, or
+    /// a child report's `ChildThreadCompleted`.
+    pub input_event_id: Uuid,
+    /// Who asked, for the tombstone.
+    pub actor: Option<crate::engine::thread_events::MessageOrigin>,
+    pub purpose: WithdrawPurpose,
+    pub reply: tokio::sync::oneshot::Sender<crate::runtime::InputWithdrawal>,
+}
+
+/// Why the input is taken back, which decides what a success records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawPurpose {
+    /// The user removed a queued message: a `QueuedMessageRemoved` tombstone.
+    Remove,
+    /// The agent took a child report mid-turn: a `ChildReportTaken`.
+    TakeChildReport,
+}
+
+/// A turn's exchange-starter event that the CALLER already persisted, so
+/// `process_message_with_steps_internal` must not emit its own
+/// `MessageReceived`.
+///
+/// The variant identifies what to inject into a live turn. A user's message
+/// uses `UserText`, emits `PromptInjected` and can interrupt when required. An
+/// engine re-entry uses the silent `ReentryFromEngine` path.
+///
+/// An event ID alone cannot distinguish a user message from a re-entry. A
+/// caller can emit the user's queued message before injecting it. It still
+/// needs the usual visible acknowledgment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreEmittedOrigin {
+    /// Real input from a person or an agent, whose starter event the caller
+    /// persisted before dispatch: the chat API boundary's emit-before-ack, the
+    /// Thread Queue executor's eager child `MessageReceived`, or a call's
+    /// `WorkDelegated` (ADR 0201). Routes exactly like a message this function
+    /// emitted itself, which is the point: the words are the user's, so they
+    /// must not reach a live turn framed as engine text.
+    Message(Uuid),
+    /// An engine-internal re-entry on an existing thread, anchored to an event
+    /// the UI already renders: a child thread's completion re-opening its parent
+    /// (`notify_parent_of_child_completion`), a continuation rerun's note
+    /// (`chat::rerun`), or the re-processing of an orphaned injection. Not
+    /// something the person just typed, so it must not surface as one.
+    EngineReentry(Uuid),
+    /// An **event-wait re-entry** (`engine::event_wait`). Keep its own
+    /// injection variant so the log attributes the wake to the subscription
+    /// rather than a child.
+    ///
+    /// Anchored to the `PromptInjected` `emit_resolution` wrote beside the
+    /// resolution, which carries the payload as prose. One shape, always: a
+    /// subscription does not hold its thread's turn, so there is never a
+    /// dangling tool call for the delivery to land in instead.
+    WaitReentry(Uuid),
+    /// A *cache keep-alive* (`engine::event_wait::keep_alive`), anchored to its
+    /// own hidden `PromptInjected`. It only ever starts a fresh `--resume` turn:
+    /// it never enters a live session, waits on a hold, or supersedes a card.
+    KeepAlive(Uuid),
+}
+
+impl PreEmittedOrigin {
+    /// The `events.id` of the already-persisted event.
+    pub fn event_id(self) -> Uuid {
+        match self {
+            PreEmittedOrigin::Message(id)
+            | PreEmittedOrigin::EngineReentry(id)
+            | PreEmittedOrigin::WaitReentry(id)
+            | PreEmittedOrigin::KeepAlive(id) => id,
+        }
+    }
+
+    /// True for an engine-internal re-entry, false for a real message.
+    pub fn is_engine_reentry(self) -> bool {
+        matches!(
+            self,
+            PreEmittedOrigin::EngineReentry(_)
+                | PreEmittedOrigin::WaitReentry(_)
+                | PreEmittedOrigin::KeepAlive(_)
+        )
+    }
+
+    pub fn is_keep_alive(self) -> bool {
+        matches!(self, PreEmittedOrigin::KeepAlive(_))
+    }
+
+    /// How a LIVE thread injects this re-entry. `Message` is not an engine
+    /// re-entry at all, so it routes as ordinary user text.
+    pub fn inject_kind(self) -> crate::engine::InjectedPromptKind {
+        match self {
+            PreEmittedOrigin::Message(_) => crate::engine::InjectedPromptKind::UserText,
+            PreEmittedOrigin::EngineReentry(_) | PreEmittedOrigin::KeepAlive(_) => {
+                crate::engine::InjectedPromptKind::ReentryFromEngine
+            }
+            PreEmittedOrigin::WaitReentry(_) => crate::engine::InjectedPromptKind::ReentryFromWait,
+        }
+    }
+}
+
+/// Whether the caller is willing to end the child's current turn to be read now.
+///
+/// Use named states so callers can see whether the follow-up interrupts work.
+/// The default, `Normal`, queues behind current work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FollowUpUrgency {
+    /// Queue behind the child's current work. Claude Code and Lucidos Agent
+    /// deliver the message at the next internal boundary. A long tool call can
+    /// delay it until the call returns or times out.
+    #[default]
+    Normal,
+    /// Preempt the child's in-flight work, accepting that its current turn ends
+    /// as `ResponseCanceled { SupersededByFollowup }` and the follow-up runs as
+    /// the next turn. For the messages that cannot wait for a tool timeout: a
+    /// cancellation, a "stop, you are working from a wrong assumption".
+    ///
+    /// Codex app-servers with steer support preserve ordinary turns too.
+    /// Older app-servers and exec retain interrupt-and-redirect. See
+    /// `process_helpers::should_redirect_followup`.
+    Urgent,
+}
+
+impl FollowUpUrgency {
+    pub fn is_urgent(self) -> bool {
+        matches!(self, Self::Urgent)
+    }
+
+    /// Parse the HTTP spelling, where serde has already rejected anything that
+    /// is not a boolean. Absent means `Normal`, so every caller that predates
+    /// the flag keeps its behaviour.
+    pub fn from_flag(urgent: Option<bool>) -> Self {
+        if urgent.unwrap_or(false) {
+            Self::Urgent
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// Parse the LLM tool's raw argument, which has no schema enforcement
+    /// behind it: the model hands us whatever JSON it emitted.
+    ///
+    /// Absent or `null` urgency defaults to `Normal`. Reject any other
+    /// non-boolean input. Silently defaulting an invalid urgent request could
+    /// leave the child working when the caller expects it to stop. HTTP already
+    /// enforces this through serde.
+    pub fn from_tool_arg(urgent: Option<&serde_json::Value>) -> Result<Self, String> {
+        match urgent {
+            None | Some(serde_json::Value::Null) => Ok(Self::Normal),
+            Some(serde_json::Value::Bool(b)) => Ok(Self::from_flag(Some(*b))),
+            Some(other) => Err(format!(
+                "`urgent` must be a boolean (true or false), got {other}. It is not \
+                 defaulted, because reading a malformed urgent as 'not urgent' would \
+                 report the follow-up as sent while the child kept working."
+            )),
+        }
+    }
+}
+
+/// Parameters for spawning a new CC thread.
+///
+/// `caller_title`: Some(non-empty) becomes the thread's name and keeps the
+/// title model out. None leaves the naming to the model, and the parent's
+/// sub-thread row shows the prompt's opening words until it lands.
+pub struct SpawnAgentThreadParams {
+    pub prompt: String,
+    pub user_images: Option<Vec<crate::engine::types::ChatImage>>,
+    pub device_id: Option<String>,
+    pub parent_thread_id: Option<Uuid>,
+    pub spawning_event_id: Option<Uuid>,
+    /// The child's wake mode, beside its parent link. `None` for a top spawn.
+    pub wake_mode: Option<crate::engine::thread_events::WakeMode>,
+    pub repo_id: Option<String>,
+    pub caller_title: Option<String>,
+    /// When `Some`, spawn an **app coding-agent thread** instead of a
+    /// Lucidos / external-repo one: sparse-checkout worktree of the
+    /// workspace git narrowed to `data/apps/<id>/`. `repo_id` MUST be
+    /// `None` when this is set — apps are not in the repo registry.
+    pub app_id: Option<String>,
+    /// Backend to launch for this coding-agent thread.
+    pub coding_agent: crate::runtime::CodingAgent,
+    /// Model the session runs on, validated against `coding_agent`'s own picker
+    /// at the tool boundary. `None` inherits the backend default.
+    pub model: Option<String>,
+    /// Thinking budget for the session. `None` inherits the backend default.
+    pub reasoning_effort: Option<String>,
+    /// Who launched this thread, stamped on its first `MessageReceived` for the
+    /// message route popover. Independent of `parent_thread_id` above: a
+    /// `relation: "top"` spawn records its spawning thread here while carrying no
+    /// callback linkage. `None` falls back to the linkage-derived origin in
+    /// `synthesize_legacy_origin`.
+    pub origin: Option<crate::engine::thread_events::MessageOrigin>,
 }

@@ -34,23 +34,7 @@ import {
   sampleRestartDialog,
 } from './communicationSamples';
 
-/** Settings → System → Communication Surfaces: every way Lucidos speaks to the
- *  user, on one page, rendered against realistic content.
- *
- *  Three surfaces, split by the WEIGHT of the message rather than its origin.
- *  A toast is transient and ignorable. A banner is a condition that stays true
- *  until it ends. A dialog is irreversible or needs an answer now. The page
- *  exists because that split is only judgeable side by side.
- *
- *  Permanent, not scaffolding. These surfaces get iterated on, and this is
- *  where that happens.
- *
- *  NOTHING HERE PERFORMS AN OPERATION. Every button renders a surface and
- *  stops. See `communicationSamples.ts` and its inertness guard. */
 export function CommunicationSurfacesPage() {
-  // A fake progress run would otherwise outlive the page. It is an interval
-  // writing a store signal, and navigating away would leave a modal over the
-  // app with nothing left to stop it.
   useEffect(() => stopSampleProgressDialog, []);
 
   return (
@@ -80,11 +64,25 @@ export function CommunicationSurfacesPage() {
           A condition that stays true until something changes. Rendered inline here
           rather than fired, so none of them has to be provoked into existing.
         </p>
-        {/* The real bodies, not copies. Each is a hook-free pure function for
-            exactly this reason, so the gallery cannot drift from what the app
-            shows. */}
         <div class="surfaces-banner-preview">
-          {backupReminderBody({ layout: 'desktop', onSetUp: () => {}, onDismiss: () => {} })}
+          {backupReminderBody({
+            layout: 'desktop',
+            reminder: { state: 'setup', onSetUp: () => {} },
+            onDismiss: () => {},
+          })}
+        </div>
+        <div class="surfaces-banner-preview">
+          {backupReminderBody({
+            layout: 'desktop',
+            reminder: {
+              state: 'overdue',
+              lastBackupAt: new Date(Date.now() - 12 * 24 * 60 * 60 * 1000).toISOString(),
+              now: new Date(),
+              running: false,
+              onBackUp: () => {},
+            },
+            onDismiss: () => {},
+          })}
         </div>
         <div class="surfaces-banner-preview">
           {connectionBannerBody({ layout: 'desktop', status: 'disconnected', workspace: 'dev' })}
@@ -105,9 +103,6 @@ export function CommunicationSurfacesPage() {
             onDiscuss: () => {},
           })}
         </div>
-        {/* Both causes, because the pair is the point. The bar above reports a
-            path nobody can reach; these two report deliveries that arrived and
-            were thrown away, and they must not read alike. */}
         <div class="surfaces-banner-preview">
           {refusalBannerBody({
             layout: 'desktop',
@@ -134,8 +129,6 @@ export function CommunicationSurfacesPage() {
           Detail the user opened from a control, hung from that control. A popover
           never opens a second layer: more detail drills in, with a way back.
         </p>
-        {/* The real body again: the waiting panel drilled into a condition.
-            It is inert, and the back link goes nowhere. */}
         <div class="surfaces-popover-previews">
           <div class="surface surfaces-popover-preview">
             {waitingPanelBody({

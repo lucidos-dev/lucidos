@@ -78,7 +78,6 @@ describe('boot timing', () => {
     expect(recordPerfSample.mock.calls[0][1].connectedMs).toBe(100);
   });
 
-  // A plain launch, a refresh and a tap that opens a panel never land.
   it('sends without a landing once the grace runs out', () => {
     boot('https://host/myws/');
     markBoot('splashLifted');
@@ -89,8 +88,6 @@ describe('boot timing', () => {
     expect(recordPerfSample.mock.calls[0][1].landedMs).toBeUndefined();
   });
 
-  // The router consumes the deep link early, so only a document that booted
-  // with one may claim a landing. A later in-app jump is not the tap's.
   it('ignores a landing on a document that booted without a deep link', () => {
     boot('https://host/myws/');
     markBoot('splashLifted');

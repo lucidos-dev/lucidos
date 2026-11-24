@@ -15,7 +15,7 @@
 //! emit, because the write path was the obvious suspect:
 //!
 //! - **Nothing on the write path escapes.** The only entity-encoding sites in
-//!   the tree build standalone HTML pages (`core/oauth.rs`, `api/base_path.rs`,
+//!   the tree build standalone HTML pages (`core/oauth.rs`, `core/base_path.rs`,
 //!   the gateway proxy, the desktop shell); the frontend's escapes are all
 //!   render-time. `llm/anthropic_wire.rs` concatenates `partial_json` deltas
 //!   and hands the string to `serde_json::from_str` untouched, and the only
@@ -153,7 +153,7 @@ const PLAIN_TEXT_ARGS_BY_TOOL: &[(&str, &[&str])] = &[
 /// and keep its frequency observable for the registry's removal condition.
 ///
 /// A tool with no row in [`PLAIN_TEXT_ARGS_BY_TOOL`] is left completely alone.
-pub(crate) fn repair_tool_arg_entities(tool_name: &str, args: &mut serde_json::Value) -> bool {
+pub fn repair_tool_arg_entities(tool_name: &str, args: &mut serde_json::Value) -> bool {
     let Some((_, paths)) = PLAIN_TEXT_ARGS_BY_TOOL
         .iter()
         .find(|(tool, _)| *tool == tool_name)

@@ -32,8 +32,6 @@ beforeEach(() => {
   threadMap.value = new Map();
   selectedAppIds.value = new Set();
   filterFacets.value = { status: 'not-loaded' };
-  // These cases assert deleted-entry labelling, which is independent of the
-  // include-deleted toggle, so deleted rows are listed.
   includeDeletedFilterOptions.value = true;
 });
 

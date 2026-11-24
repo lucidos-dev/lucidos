@@ -39,6 +39,7 @@ async fn max_sequence(pool: &sqlx::PgPool) -> i64 {
 
 fn wait_with(thread_id: Uuid, on: Vec<EventSubscription>, watermark: i64) -> LiveWait {
     LiveWait {
+        background_timing: None,
         wait_id: Uuid::new_v4(),
         thread_id,
         tool_use_id: "toolu_park".into(),
@@ -152,6 +153,7 @@ fn the_firehose_never_reaches_the_wait_matcher() {
 #[test]
 fn the_event_wait_family_never_reaches_the_wait_matcher() {
     let started = ThreadEvent::EventWaitStarted {
+        background_timing: None,
         wait_id: Uuid::new_v4(),
         tool_use_id: "toolu".into(),
         on: vec![sub("ChangeProposed", None)],
@@ -656,6 +658,7 @@ fn an_idle() -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -673,6 +676,7 @@ async fn seed_coding_agent_idle(
         bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: format!("session-{}", thread_id.simple()),
             branch: format!("claude-code/{}", thread_id.simple()),
@@ -811,6 +815,7 @@ async fn emit_subscribe(bus: &EventBus, thread_id: Uuid, on: Vec<EventSubscripti
         bus,
         thread_id,
         ThreadEvent::EventWaitStarted {
+            background_timing: None,
             wait_id,
             tool_use_id: format!("toolu_{}", wait_id.simple()),
             on,
@@ -880,6 +885,7 @@ async fn rebuild_keeps_armed_at_and_falls_back_to_the_row_for_a_legacy_payload()
         &bus,
         recorded_thread,
         ThreadEvent::EventWaitStarted {
+            background_timing: None,
             wait_id: recorded_id,
             tool_use_id: "toolu_armed".into(),
             on: vec![sub("ChangeProposed", None)],
@@ -947,6 +953,7 @@ async fn rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down() {
         &bus,
         thread_id,
         ThreadEvent::EventWaitStarted {
+            background_timing: None,
             wait_id,
             tool_use_id: "toolu_stale".into(),
             on: vec![sub("ChangeProposed", None)],
@@ -967,6 +974,61 @@ async fn rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down() {
         "the sweep must see it as due, not miss it"
     );
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn rebuild_reads_the_latest_timing_without_rearming_the_wait() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let wait_id = Uuid::new_v4();
+    let armed_at = Utc::now();
+    let expires_at = armed_at + chrono::Duration::minutes(20);
+    seed_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::EventWaitStarted {
+            background_timing: Some(BackgroundWaitTiming::Queued),
+            wait_id,
+            tool_use_id: "engine:bg-task-wait:fixture".into(),
+            on: vec![sub("BackgroundBashCompleted", None)],
+            reason: "a build slot".into(),
+            armed_at,
+            expires_at: armed_at + chrono::Duration::hours(24),
+            watermark: 17,
+        },
+    )
+    .await;
+    seed_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::EventWaitTimingUpdated {
+            wait_id,
+            reason: "the build to finish".into(),
+            expires_at,
+            background_timing: BackgroundWaitTiming::Running {
+                deadline: expires_at,
+            },
+        },
+    )
+    .await;
+
+    let waits = LiveWaits::new();
+    assert_eq!(rebuild_live_waits(&pool, &waits).await.unwrap(), 1);
+    let wait = waits.take(wait_id).await.unwrap();
+    assert_eq!(wait.watermark, 17);
+    assert_eq!(
+        wait.expires_at.timestamp_millis(),
+        expires_at.timestamp_millis()
+    );
+    assert_eq!(wait.reason, "the build to finish");
+    assert!(matches!(
+        wait.background_timing,
+        Some(BackgroundWaitTiming::Running { .. })
+    ));
+    assert_eq!(wait.on.len(), 1);
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -2663,6 +2725,7 @@ async fn recent_subscriptions_resets_on_a_human_answer_only() {
     let answer = |tool_use_id: &str, actor: MessageOrigin| BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer: crate::engine::thread_events::AnswerKind::Canceled,

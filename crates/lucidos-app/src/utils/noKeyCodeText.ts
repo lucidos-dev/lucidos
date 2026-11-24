@@ -17,8 +17,6 @@ import { isKeyCodeTextInsertion } from '@lucidos/text-entry';
 
 let installed = false;
 
-/** Install the global key-code text guard. Idempotent. Capture phase, so the
- *  cancel lands before any field's own `beforeinput` handler. */
 export function installNoKeyCodeText(): void {
   if (installed) return;
   installed = true;

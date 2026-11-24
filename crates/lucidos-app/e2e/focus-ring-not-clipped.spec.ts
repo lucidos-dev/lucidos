@@ -1,8 +1,3 @@
-/**
- * No focus ring is cut by a box that scrolls or clips. Each page is walked
- * whole, so the header, drawer and composer beside it are checked too, and
- * each sample dialog is walked on its own. The walk lives in focusRingClip.ts.
- */
 import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
 import { assertHealthy, navigateToApp, openSettingsView, waitForEventStream } from './helpers';
@@ -10,8 +5,8 @@ import { formatClipped, walkFocusRings } from './focusRingClip';
 
 const SETTINGS_VIEWS = [
   'main', 'system', 'system-overview', 'providers', 'models', 'intelligence', 'appearance', 'memory', 'devices',
-  'accounts', 'backup', 'coding-agents', 'locale', 'marketplaces', 'permissions',
-  'mcp', 'keyboard-shortcuts', 'access', 'webhooks', 'environment-variables',
+  'users', 'accounts', 'backup', 'coding-agents', 'locale', 'marketplaces', 'permissions',
+  'mcp', 'keyboard-shortcuts', 'access', 'webhooks', 'event-hooks', 'environment-variables',
   'thread-queue', 'release-notices', 'debugging', 'communication-surfaces',
 ];
 

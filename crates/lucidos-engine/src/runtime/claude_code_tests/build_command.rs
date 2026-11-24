@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::agent_session::side_question::SIDE_QUESTION_MAX_TURNS;
+use crate::engine::side_question_policy::SIDE_QUESTION_MAX_TURNS;
 
 fn collect_envs(
     cmd: &tokio::process::Command,
@@ -11,41 +11,13 @@ fn collect_envs(
 }
 
 /// The command alone, for tests that only read its flags and env.
-fn session_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
+fn session_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> SandboxedCommand {
     build_command(args, cli_dir)
         .expect("the command builds")
         .cmd
 }
 
-fn test_spawn_args<'a>(
-    worktree: &'a Path,
-    workspace: &'a Path,
-    thread_id: uuid::Uuid,
-) -> SpawnArgs<'a> {
-    SpawnArgs {
-        worktree_path: worktree,
-        coding_agent_kind: Default::default(),
-        workspace_path: workspace,
-        allowed_tools: None,
-        system_prompt: None,
-        session_context: None,
-        resume_session_id: None,
-        model: None,
-        reasoning_effort: None,
-        thread_id,
-        spawning_event_id: None,
-        repo_name: None,
-        interactive: false,
-        user_env_vars: &[],
-        account_pin: None,
-        binary_override: None,
-        permission_mode: None,
-        additional_directories: &[],
-        auto_compact: None,
-        keep_alive: false,
-        agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
-    }
-}
+use super::build_command_test_support::test_spawn_args;
 
 fn test_spawn_args_with_event<'a>(
     worktree: &'a Path,
@@ -67,6 +39,7 @@ fn test_spawn_args_with_event<'a>(
         spawning_event_id,
         repo_name: None,
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &[],
         account_pin: None,
         binary_override: None,
@@ -75,6 +48,7 @@ fn test_spawn_args_with_event<'a>(
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     }
 }
 
@@ -98,6 +72,7 @@ fn test_spawn_args_with_repo<'a>(
         spawning_event_id: None,
         repo_name,
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &[],
         account_pin: None,
         binary_override: None,
@@ -106,6 +81,7 @@ fn test_spawn_args_with_repo<'a>(
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     }
 }
 
@@ -134,6 +110,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         spawning_event_id: None,
         repo_name: Some("engine-repo"),
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &user_env,
         account_pin: None,
         binary_override: None,
@@ -142,6 +119,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     };
     let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
@@ -395,17 +373,19 @@ fn build_command_sets_lucidos_session_kind_when_interactive() {
 }
 
 #[test]
-fn build_command_omits_lucidos_session_kind_when_not_interactive() {
-    // Conflict-resolution sessions are unattended — they would hang on a
-    // question redirect waiting for an answer that's not coming. The
-    // cc-stop-reminder hook treats absence of LUCIDOS_SESSION_KIND as
-    // "unattended, skip the question redirect".
-    let thread_id = uuid::Uuid::new_v4();
+fn build_command_removes_inherited_session_kind_when_owner_questions_are_disabled() {
+    // Both unattended sessions and integrated sub-threads set interactive=false.
     let p = std::path::Path::new("/tmp");
-    let args = test_spawn_args(p, p, thread_id); // interactive=false by default
+    let args = test_spawn_args(p, p, uuid::Uuid::new_v4());
     let cmd = session_command(&args, None);
-    let env = collect_envs(&cmd);
-    assert!(!env.contains_key(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND")),);
+    assert_eq!(
+        cmd.as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "LUCIDOS_SESSION_KIND")
+            .map(|(_, value)| value),
+        Some(None),
+        "the Stop hook must skip its redirect even if the engine inherited the marker",
+    );
 }
 
 #[test]
@@ -948,6 +928,7 @@ fn build_command_carries_the_agent_compile_env() {
 fn format_user_input_text_only() {
     let uuid = uuid::Uuid::new_v4();
     let input = AgentInput {
+        defer_on_steer_failure: false,
         text: "hello".into(),
         images: vec![],
         uuid,
@@ -965,8 +946,9 @@ fn format_user_input_text_only() {
 #[test]
 fn format_user_input_with_images_uses_blocks() {
     let input = AgentInput {
+        defer_on_steer_failure: false,
         text: "describe".into(),
-        images: vec![crate::api::ChatImage {
+        images: vec![crate::engine::types::ChatImage {
             base64: "deadbeef".into(),
             mime_type: "image/png".into(),
         }],
@@ -992,54 +974,6 @@ fn format_user_input_with_images_uses_blocks() {
 // own inactivity watchdog covers the same silence with a RECOVERABLE outcome,
 // so CC's deadline has to be the outer one.
 // See docs/investigations/2026-08-02-cc-stream-idle-timeout.md.
-
-#[test]
-fn build_command_raises_cc_byte_idle_deadline_past_the_engine_watchdog() {
-    // The ordering IS the fix: whichever deadline is shorter decides what a
-    // provider stall costs. Engine watchdog first => kill plus auto-resume via
-    // ContinuationRequested. CC watchdog first => dead thread. Asserted against
-    // the real constant so the two cannot drift into the wrong order.
-    let thread_id = uuid::Uuid::new_v4();
-    let p = std::path::Path::new("/tmp");
-    let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
-    let env = collect_envs(&cmd);
-    let raw = env
-        .get(std::ffi::OsStr::new("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"))
-        .expect(
-            "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS must be set, or CC kills a stalled turn at 300s",
-        );
-    let ms: i64 = raw
-        .to_string_lossy()
-        .parse()
-        .expect("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS must be a number of milliseconds");
-    // BOTH engine silence detectors, not just the in-loop one: the external
-    // watchdog is the out-of-loop backstop for a session the run loop lost
-    // track of, and its decision is `Resume` / `ResumeIfRunning`, equally
-    // non-destructive. CC's deadline has to be outside whichever of the two
-    // fires last, or the destructive handler wins again for that case.
-    for (name, engine_limit) in [
-        (
-            "in-loop inactivity watchdog",
-            crate::engine::agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS,
-        ),
-        (
-            "external watchdog",
-            crate::engine::agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS,
-        ),
-    ] {
-        assert!(
-            ms > engine_limit,
-            "CC's byte-idle deadline ({ms}ms) must exceed the engine's {name} \
-             ({engine_limit}ms) so a provider stall auto-resumes instead of failing the thread"
-        );
-    }
-    // CC clamps the value to [10_000, 1_800_000]; anything above the ceiling is
-    // silently reduced, so sending more would misrepresent the effective deadline.
-    assert!(
-        (10_000..=1_800_000).contains(&ms),
-        "CC clamps this env var to [10000, 1800000]ms; {ms}ms would not survive the clamp"
-    );
-}
 
 #[test]
 fn build_command_lets_a_workspace_env_var_override_the_byte_idle_deadline() {
@@ -1341,6 +1275,32 @@ fn a_session_gets_no_vertex_base_url_from_the_engine() {
     assert_eq!(vertex_base_url(&session_command(&args, None)), None);
 }
 
+/// Claude Code picks its own backend from its login and settings, per install.
+/// The engine never stamps a backend selector onto a fresh or resumed session.
+#[test]
+fn a_session_gets_no_backend_selector_from_the_engine() {
+    let p = std::path::Path::new("/tmp");
+    let fresh = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    let mut resumed = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    resumed.resume_session_id = Some("sess-1");
+    for args in [&fresh, &resumed] {
+        let envs = collect_envs(&session_command(args, None));
+        for selector in [
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            "CLOUD_ML_REGION",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "ANTHROPIC_BASE_URL",
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(selector)),
+                None,
+                "the engine set {selector} on a Claude Code session"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_workspace_vertex_url_reaches_the_session_untouched() {
     let p = std::path::Path::new("/tmp");
@@ -1606,13 +1566,113 @@ struct StartupWorkspace {
     env: Vec<(String, String)>,
 }
 
+/// Exercise the production spawn, including the configured wrapper and the
+/// pinned account on resume. A host-side auth probe cannot satisfy this stub.
+#[cfg(unix)]
+#[tokio::test]
+async fn billing_initialize_uses_the_session_wrapper_and_pinned_environment() {
+    // Spawn resolves the Lucidos CLI and may write CLI skills under HOME.
+    // Keep both independent of the developer's installed binaries/home.
+    const CHILD: &str = "LUCIDOS_TEST_BILLING_WRAPPER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let cli = home.path().join("lucidos");
+        crate::runtime::stub_executable::write_stub_executable(&cli, "#!/bin/sh\ntrue\n");
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::claude_code::build_command_tests::billing_initialize_uses_the_session_wrapper_and_pinned_environment", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .env("LUCIDOS_CLI_BIN", cli)
+                .kill_on_drop(true)
+                .output(),
+        ).await.unwrap().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut ws = StartupWorkspace::new();
+    let bin = ws.bin();
+    ws.env.push((
+        "BILLING_TEST_CWD".into(),
+        ws.worktree.path().to_string_lossy().into_owned(),
+    ));
+    ws.env.push((
+        "BILLING_TEST_PIN".into(),
+        ws.config.path().to_string_lossy().into_owned(),
+    ));
+    ws.env[0].1 = "/unused/user-config".into();
+    std::fs::write(&bin, r##"#!/bin/sh
+case "$*" in
+*--version*) echo '7.7.7 (Claude Code)' ;;
+*)
+[ "$(pwd -P)" = "$(cd "$BILLING_TEST_CWD" && pwd -P)" ] || exit 21
+[ "$CLAUDE_CONFIG_DIR" = "$BILLING_TEST_PIN" ] || exit 22
+IFS= read -r initialize
+case "$initialize" in
+  *'"subtype":"initialize"'*'"type":"control_request"'*|*'"type":"control_request"'*'"subtype":"initialize"'*) ;;
+  *) exit 23 ;;
+esac
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"lucidos-billing-initialize","response":{"account":{"apiProvider":"firstParty","apiKeySource":"none","tokenSource":"claude-login","email":"fixture@example.com","accessToken":"fixture-secret"}}}}'
+IFS= read -r status
+case "$status" in *'"subtype":"get_status"'*) ;; *) exit 24 ;; esac
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"lucidos-billing-status","response":{"sections":[{"title":"Session","rows":[{"label":"Version","value":"7.7.7"},{"label":"Session ID","value":"fixture-session"},{"label":"cwd","value":"/tmp/fixture"}]}]}}}'
+IFS= read -r prompt
+printf '%s\n' '{"type":"assistant","message":{"id":"fixture-call","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":2,"output_tokens":4}}}'
+;;
+esac
+"##).unwrap();
+    let pin = AccountPin::ExplicitConfigDir {
+        dir: ws.config.path().to_string_lossy().into_owned(),
+    };
+    let mut args = ws.args(&bin);
+    args.account_pin = Some(&pin);
+    args.resume_session_id = Some("fixture-session");
+    let cancel = CancellationToken::new();
+    let mut agent = ClaudeCodeRuntime.spawn(args, cancel.clone()).await.unwrap();
+    agent
+        .input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "ping".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut billing = None;
+        while let Some(event) = agent.events_rx.recv().await {
+            match event {
+                AgentEvent::BillingObserved { attribution } => billing = Some(attribution),
+                AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    assert_eq!((input_tokens, output_tokens), (2, 4));
+                    return billing.expect("same-process evidence precedes usage");
+                }
+                _ => {}
+            }
+        }
+        panic!("wrapper ended before usage");
+    })
+    .await;
+    cancel.cancel();
+    assert_eq!(result.unwrap().provider_id(), "anthropic-subscription");
+}
+
 #[cfg(unix)]
 const LUCIDOS_PROMPT: &str = "THE LUCIDOS PROMPT";
 
 #[cfg(unix)]
 impl StartupWorkspace {
     fn new() -> Self {
-        use std::os::unix::fs::PermissionsExt;
         let config = tempfile::tempdir().unwrap();
         let env = vec![(
             "CLAUDE_CONFIG_DIR".to_string(),
@@ -1627,8 +1687,10 @@ impl StartupWorkspace {
         };
         std::fs::write(this.worktree.path().join("CLAUDE.md"), "# Project rules\n").unwrap();
         let bin = this.claude.path().join("claude");
-        std::fs::write(&bin, "#!/bin/sh\necho '7.7.7 (Claude Code)'\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::runtime::stub_executable::write_stub_executable(
+            &bin,
+            "#!/bin/sh\necho '7.7.7 (Claude Code)'\n",
+        );
         let base =
             crate::engine::cc_settings::cc_settings_path_for_workspace(this.workspace.path());
         std::fs::create_dir_all(base.parent().unwrap()).unwrap();

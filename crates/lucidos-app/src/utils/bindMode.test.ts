@@ -108,8 +108,6 @@ describe('bindDraftMatchesSaved', () => {
   });
 
   it('ignores address text in the modes that do not use it', () => {
-    // Type an IP, then pick "all": the write would still be "all", so there is
-    // nothing to save and the button must stay disabled.
     expect(
       bindDraftMatchesSaved({ mode: 'all', address: '100.64.0.1', inherit: true }, 'all', true),
     ).toBe(true);

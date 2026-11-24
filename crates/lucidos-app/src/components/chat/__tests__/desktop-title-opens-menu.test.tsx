@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * On desktop the thread title is a menu button too. A left-click toggles the
- * thread menu and a right-click opens it, as on the mobile row. The pin stays
- * beside it, and the row draws no ⋯.
- */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -12,7 +7,6 @@ import { threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
 
-// The menu's rows are code-split. Warm them, so a click opens it at once.
 beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 vi.mock('../../../store/actions/threads', () => ({

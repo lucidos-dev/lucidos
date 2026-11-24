@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A diff navigation stages the diff view before it knows which repo the diff
- * belongs to. While it loads, the Files panel must stay in its repo view. The
- * workspace artifacts tree showing there is a middle screen the user sees
- * flash past on the way to the diff.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

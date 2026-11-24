@@ -15,16 +15,6 @@ interface AppRowProps {
   onDelete: () => void;
 }
 
-/** Self-skeletonizing row: rendered with no props inside a SkeletonProvider
- *  (`<AppRow />`) it draws itself as a loading placeholder via the Sk* leaves;
- *  with real props it renders normally. Props are optional only to support the
- *  skeleton call; real call sites pass them all.
- *
- *  The row's actions work as a thread drawer row's do. The pin toggle is always
- *  drawn and shows the pinned state. Edit and Delete sit in the row's menu.
- *  A desktop row opens it from its ⋯ or a right-click, and a phone row from a
- *  long press (`useRowActionsGesture`). Marketplace and update state live in
- *  the Plugins panel, so the row stays calm. */
 export function AppRow({ app, onOpen, onEdit, onDelete }: Partial<AppRowProps>) {
   const sk = useSkeleton();
   const gesture = useRowActionsGesture({ onTap: onOpen, enabled: !sk });
@@ -69,9 +59,6 @@ export function AppRow({ app, onOpen, onEdit, onDelete }: Partial<AppRowProps>) 
   );
 }
 
-/** Edit and Add to dashboard, then Delete on its own below a divider, as in
- *  the thread menu. The row's own pin toggle covers pinning, so the menu does
- *  not repeat it. */
 function appMenuItems(
   { run }: OverflowMenuContext,
   { app, onEdit, onDelete }: Pick<Partial<AppRowProps>, 'onEdit' | 'onDelete'> & { app: App },

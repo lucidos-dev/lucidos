@@ -1,7 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level.
-// vi.hoisted runs before any imports are resolved.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -12,7 +10,6 @@ vi.hoisted(() => {
     get length() { return storage.size; },
     key: (_i: number) => null,
   };
-  // scrollToBottom() needs document.querySelector and requestAnimationFrame
   if (typeof globalThis.document === 'undefined') {
     (globalThis as any).document = {};
   }
@@ -42,7 +39,6 @@ import { _resetRowIntentsForTesting, archiveRequestInFlight } from '../rowIntent
 import * as drawerOrder from '../../components/drawer/drawerOrder';
 import { provideDrawerOrder } from '../drawerOrderHandle';
 
-// Mock the API module
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
@@ -51,9 +47,6 @@ vi.mock('../../api/threads', () => ({
   archiveThread: vi.fn().mockResolvedValue({ archived: [] }),
 }));
 
-// Use the real isComposeFocusedHere — the compose-preservation tests below
-// plant a fake activeElement + querySelectorAll to drive its branches. Mocking
-// only the focus-side-effect helpers keeps the predicate honest if it grows.
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
@@ -70,34 +63,23 @@ vi.mock('../../api/client', async (importOriginal) => ({
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
 
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
 
-// The archive hand-off walks the drawer on screen, which `startShell` provides.
 provideDrawerOrder(drawerOrder);
 
 beforeEach(() => {
   threadMap.value = new Map();
   _resetComposeDraftsForTesting();
   focusedThreadId.value = null;
-  // Desktop viewport by default (mobileView is a mobile-only concept); the
-  // mobile-specific test below opts into 375. Reset here so a prior mobile test
-  // can't leak its viewport into the next.
   (globalThis as any).innerWidth = 1024;
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
   generatedTitleIds.clear();
   _resetRowIntentsForTesting();
-  // Reset the thread filter to its neutral "show everything" state so one
-  // test's narrowed filter can't leak into the next.
   threadChannelFilter.value = new Set(ALL_CHANNELS);
   selectedTriggerIds.value = new Set();
   selectedRepoIds.value = new Set();
   selectedAppIds.value = new Set();
-  // Reset the drawer view + search so the post-archive focus picker defaults to
-  // the full Current list unless a test opts into an alternate view.
   setDrawerGrouping('folders');
   setSelectedOngoingGroup('blocked');
   threadSearchQuery.value = '';
@@ -107,7 +89,6 @@ beforeEach(() => {
 
 describe('handleArchiveThread', () => {
   it('focuses the next review thread after dismissing', async () => {
-    // Set up: t1 (focused, waiting/inbox = review), t2 (also waiting/inbox = review)
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -120,15 +101,10 @@ describe('handleArchiveThread', () => {
 
     await handleArchiveThread('t1');
 
-    // Should focus t2 (next review thread), not unfocus
     expect(focusedThreadId.value).toBe('t2');
   });
 
   it('mobile: unfocuses but stays on the thread drawer when no more review threads remain', async () => {
-    // Archiving is not navigation: the user archived a row from the thread
-    // drawer (its own pane on mobile) and must stay there to keep triaging.
-    // unfocusThread({ revealPane: false }) leaves mobileView on 'threads'; the
-    // thread pane behind it falls back to the compose view.
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
@@ -145,9 +121,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('mobile: stays on the thread drawer when the focus hands off to the next thread', async () => {
-    // Same rule for the common case: archiving t1 from the thread drawer moves
-    // the focus to t2 (so the thread pane isn't left on an archived thread)
-    // without swiping the user off the list they're working through.
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
@@ -167,8 +140,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('mobile: a rejected archive re-focuses without leaving the thread drawer', async () => {
-    // The rollback re-focuses the thread the API refused. That is bookkeeping
-    // too, so it must not swipe the user off the thread drawer either.
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
@@ -189,9 +160,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('does not focus prompt when dismissing the last review thread', async () => {
-    // Bug: dismissing the last review thread called focusPromptNow(), which
-    // opened the keyboard on mobile. The compose view should appear with the
-    // prompt unfocused and the header visible.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -207,8 +175,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('focuses the next thread below, not the top one', async () => {
-    // 3 review threads sorted by updatedAt desc: t1 (newest), t2 (middle), t3 (oldest)
-    // Dismissing t2 should focus t3 (below), not t1 (top)
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -228,10 +194,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('skips threads hidden by the active channel filter when picking the next focus', async () => {
-    // Bug: archiving jumped to the next Current thread regardless of the active
-    // filter, landing the user on a thread that isn't even in their drawer view.
-    // With the channel filter narrowed to claude_code, archiving t1 must skip
-    // the chat thread t2 (filtered out) and land on the next claude_code thread.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'CC t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -248,20 +210,14 @@ describe('handleArchiveThread', () => {
 
     await handleArchiveThread('t1');
 
-    // t2 (chat) is hidden by the filter, so next focus is t3, not t2.
     expect(focusedThreadId.value).toBe('t3');
   });
 
   it('navigates to next review thread after apply+archive (regression: Apply used to skip Archive)', async () => {
-    // Simulates the fixed flow: after Apply, thread stays in review (section=inbox,
-    // nothing proposed), Archive button appears, clicking Archive navigates to next thread.
-    // Previously Apply moved the thread to ARCHIVE immediately, skipping Archive button.
     const map = new Map<string, ThreadState>();
-    // t1: just applied — still in review with Archive button (inbox, no changes, idle)
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Applied thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
-    // t2: another review thread waiting for attention
     map.set('t2', makeThreadState('t2', {
       meta: { id: 't2', title: 'Pending thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
@@ -270,15 +226,10 @@ describe('handleArchiveThread', () => {
 
     await handleArchiveThread('t1');
 
-    // After Done on t1, should navigate to t2 (next review thread)
     expect(focusedThreadId.value).toBe('t2');
   });
 
   it('keeps thread drawer open on desktop when all reviews are done (compose view)', async () => {
-    // Bug: dismissing the last review on desktop closed the thread drawer
-    // because handleArchiveThread called navigateToPane('thread'), which
-    // unconditionally cleared threadDrawerOpen. The drawer must remain open
-    // so the user can pick another thread from the compose view.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -294,7 +245,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('focuses the thread above when dismissing the last item', async () => {
-    // 2 review threads: t1 (top), t2 (bottom). Dismissing t2 should focus t1.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
       meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -311,12 +261,6 @@ describe('handleArchiveThread', () => {
   });
 
   it('skips cascaded descendants and lands on the next non-archived review thread', async () => {
-    // Archiving a parent cascades to its descendants. The frontend computes
-    // the cascade locally by walking parentThreadId so it can drop descendants
-    // out of review immediately, without waiting for the API response.
-    //
-    // Review order (tier 1 — all hold a proposal, sorted by
-    // recency desc): parent, child, sibling.
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
       meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -332,23 +276,10 @@ describe('handleArchiveThread', () => {
 
     await handleArchiveThread('parent');
 
-    // Must land on the unrelated sibling — not on the cascade-archived child.
     expect(focusedThreadId.value).toBe('sibling');
   });
 
   it('lands on the next family parent, not a sub-thread that sorts high by its own review tier', async () => {
-    // Bug: the post-archive focus picker ordered candidates with a per-thread
-    // review order instead of the drawer's family-aware order. A sub-thread with
-    // a high per-thread tier (e.g. a proposed change) could sort adjacent to the
-    // archived parent and steal focus — landing the user inside an unrelated
-    // family's child instead of on the next family's parent row.
-    //
-    // Family A: pA (focused/archived) — proposed (tier 1), newest.
-    // Family B: pB (parent — running, no CTA = tier 2, oldest) with sub-thread
-    //           cB (proposed = tier 1, middle). Family routing pulls the whole
-    //           family into Current; the drawer renders pB above its nested cB.
-    // Per-thread review order would be [pA(t1), cB(t1), pB(t2)] → archiving pA
-    // jumps to cB. The drawer's family order is [pA, pB, cB] → next row is pB.
     const map = new Map<string, ThreadState>();
     map.set('pA', makeThreadState('pA', {
       meta: { id: 'pA', title: 'Family A parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
@@ -364,7 +295,6 @@ describe('handleArchiveThread', () => {
 
     await handleArchiveThread('pA');
 
-    // Next visible row after family A is family B's PARENT, not its sub-thread.
     expect(focusedThreadId.value).toBe('pB');
   });
 
@@ -445,23 +375,9 @@ describe('handleArchiveThread', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread — walks the list on screen
-// ---------------------------------------------------------------------------
-// The post-archive focus walks the list the user is *currently looking at*,
-// not always the Current section. Under Ongoing it walks the selected group: from
-// Blocked the next blocked row, from Review the next review row.
-// From search it takes the next result. A thread in Current but NOT in the
-// selected group must be skipped.
-// ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — the list on screen', () => {
   it('lands on the next Blocked thread, skipping a Current-only thread', async () => {
-    // a1 (focused) and a3 both need attention (waiting_for_user_answer). c2 is a
-    // plain Current thread (idle, no CTA) that is NOT in the attention view but
-    // sorts between them in the Current list — so the OLD Current-only picker
-    // would land on c2. In the attention view, archiving a1 must skip c2 and
-    // land on a3.
     const map = new Map<string, ThreadState>();
     map.set('a1', makeThreadState('a1', {
       meta: { id: 'a1', title: 'Attention 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
@@ -483,9 +399,6 @@ describe('handleArchiveThread — the list on screen', () => {
   });
 
   it('lands on the next Review thread when the review view is active', async () => {
-    // r1 (focused) and r3 are review threads (a proposal, idle). a2 needs
-    // attention but is NOT in review. In the review view, archiving r1 must skip
-    // a2 and land on r3.
     const map = new Map<string, ThreadState>();
     map.set('r1', makeThreadState('r1', {
       meta: { id: 'r1', title: 'Review 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
@@ -507,9 +420,6 @@ describe('handleArchiveThread — the list on screen', () => {
   });
 
   it('lands on a Review thread when the archived thread already left the review view', async () => {
-    // r1 was applied, so it has no change left and is no longer a review row.
-    // The user archives it from the thread pane while the review view is open.
-    // The next focus must still come from the review view, not the compose view.
     const map = new Map<string, ThreadState>();
     map.set('r1', makeThreadState('r1', {
       meta: { id: 'r1', title: 'Applied', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, messageCount: 1, section: 'inbox' },
@@ -531,9 +441,6 @@ describe('handleArchiveThread — the list on screen', () => {
   });
 
   it('walks the In flight view in its nested order, sub-threads under their parent', async () => {
-    // Rendered: p1, then its sub-thread c, then x. Recency alone would put c
-    // first (c, p1, x). Archiving x, the last row, must land on the row drawn
-    // above it, c, which only the nested order gives.
     const map = new Map<string, ThreadState>();
     map.set('p1', makeThreadState('p1', {
       meta: { id: 'p1', title: 'Parent', channel: 'claude_code', updatedAt: '2026-01-01T00:00:04Z', status: 'idle', activeChildrenCount: 1, messageCount: 1, section: 'inbox' },
@@ -555,8 +462,6 @@ describe('handleArchiveThread — the list on screen', () => {
   });
 
   it('falls back to the thread above within the attention view', async () => {
-    // a1 (top), a2 (bottom/focused) both need attention. Archiving the last one
-    // falls back to the one above — within the view.
     const map = new Map<string, ThreadState>();
     map.set('a1', makeThreadState('a1', {
       meta: { id: 'a1', title: 'Attention 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
@@ -575,9 +480,6 @@ describe('handleArchiveThread — the list on screen', () => {
   });
 
   it('lands on the row below when the archived thread was stopped out of the attention view first', async () => {
-    // A thread waiting on a question offers Archive only once it is stopped,
-    // and stopping it idles it out of Blocked. Its place in the list
-    // when it was opened still decides where the focus goes.
     const waiting = (id: string, at: string) => makeThreadState(id, {
       meta: { id, title: id, channel: 'claude_code', updatedAt: at, status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     });
@@ -627,8 +529,6 @@ describe('handleArchiveThread — the list on screen', () => {
       meta: { id: 's2', title: 'Search 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    // A search query overrides the grouping (mirrors ThreadDrawer's
-    // activeView): the next focus follows the result order, not Current.
     setDrawerGrouping('folders');
     threadSearchQuery.value = 'foo';
     threadSearchResults.value = {
@@ -646,18 +546,8 @@ describe('handleArchiveThread — the list on screen', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread — optimistic UI
-// ---------------------------------------------------------------------------
-// The row + every descendant must drop out of review synchronously, before
-// the archive API resolves. The user-perceived latency was the await on the
-// per-thread cascade emit loop; the SSE round-trip lands later and just
-// confirms what we already did.
-// ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — optimistic UI', () => {
-  /** Does the drawer still route this row into Current? Asked through the same
-   *  function the drawer and the family graph ask, so the two cannot drift. */
   function currentSection(id: string): boolean {
     const thread = threadMap.value.get(id);
     return !!thread && getThreadDisplaySection(thread) === 'current';
@@ -679,7 +569,6 @@ describe('handleArchiveThread — optimistic UI', () => {
     threadMap.value = map;
     focusThread('parent');
 
-    // Don't await — verify mid-flight (API has not resolved).
     const pending = handleArchiveThread('parent');
 
     expect(currentSection('parent')).toBe(false);
@@ -710,7 +599,6 @@ describe('handleArchiveThread — optimistic UI', () => {
 
     const pending = handleArchiveThread('parent');
 
-    // The whole family must vanish from Current before the API resolves.
     for (const id of ['parent', 'child', 'grandchild']) {
       expect(currentSection(id), id).toBe(false);
     }
@@ -720,10 +608,6 @@ describe('handleArchiveThread — optimistic UI', () => {
   });
 
   it('leaves the user where they navigated to if archive rejects mid-flight', async () => {
-    // Bug guard: if the user navigates away from `nextId` (e.g. picks a
-    // different thread from the drawer) while the archive API is still
-    // in flight, the rollback must NOT yank them back to the rejected
-    // thread — they made an active choice and we should respect it.
     let rejectApi: (e: Error) => void = () => {};
     (archiveThread as ReturnType<typeof vi.fn>).mockImplementationOnce(
       () => new Promise<{ archived: string[] }>((_resolve, reject) => { rejectApi = reject; }),
@@ -743,16 +627,14 @@ describe('handleArchiveThread — optimistic UI', () => {
     focusThread('parent');
 
     const pending = handleArchiveThread('parent');
-    expect(focusedThreadId.value).toBe('sibling'); // optimistic focus moved
+    expect(focusedThreadId.value).toBe('sibling');
 
-    // User navigates somewhere else BEFORE the API resolves.
     focusThread('elsewhere');
     expect(focusedThreadId.value).toBe('elsewhere');
 
     rejectApi(new Error('boom'));
     await pending;
 
-    // Rollback must respect user's choice — stay on 'elsewhere'.
     expect(focusedThreadId.value).toBe('elsewhere');
   });
 
@@ -781,8 +663,6 @@ describe('handleArchiveThread — optimistic UI', () => {
   });
 });
 
-// A pinned thread is never archived (ADR 0312). Archive is offered on a pinned,
-// settled thread, and choosing it unpins as it archives.
 describe('handleArchiveThread: a pinned thread', () => {
   function seedPinned(): void {
     threadMap.value = new Map([
@@ -867,17 +747,6 @@ describe('handleArchiveThread: a pinned thread', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread — stale loadAllThreads response after optimistic flip
-// ---------------------------------------------------------------------------
-// Bug: on iOS Safari PWA resume the SSE reconnect fires resyncLoadedThreads,
-// which kicks off a GET /api/v1/threads. If the user clicks Archive while that
-// GET is in flight, the GET's pre-archive snapshot lands AFTER the optimistic
-// flip and upsertThread silently overwrites meta.section back to 'inbox' —
-// the row flickers back into Review until the SSE ThreadArchived event
-// finally confirms the move. The archive is a row intent held until the row
-// reaches the version the POST returned (ADR 0437).
-// ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — stale loadAllThreads response', () => {
   it('keeps section archived when a GET issued before the flip lands after with the pre-archive snapshot', async () => {
@@ -896,14 +765,11 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
     threadMap.value = map;
     focusThread('parent');
 
-    // The stale GET went out BEFORE the user clicked Archive.
 
-    // User clicks Archive — optimistic flip to 'archived'.
     const pending = handleArchiveThread('parent');
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
     expect(threadMap.value.get('parent')?.meta.codingAgentChangeState.kind).toBe('none');
 
-    // The stale GET response lands now, carrying the pre-archive snapshot.
     upsertThread(threadMap.value, {
       thread_id: 'parent',
       title: 'Parent',
@@ -911,12 +777,11 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       last_activity: '2026-01-01T00:00:01Z',
       created_at: '',
       message_count: 1,
-      section: 'inbox',              // stale
+      section: 'inbox',
       status: 'waiting',
-      coding_agent_change_state: { kind: 'proposed', requires_restart: false },   // stale
+      coding_agent_change_state: { kind: 'proposed', requires_restart: false },
     } as any, false);
 
-    // Optimistic flip must survive — no flicker back to Review.
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
     expect(threadMap.value.get('parent')?.meta.codingAgentChangeState.kind).toBe('none');
 
@@ -944,7 +809,6 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
 
     const pending = handleArchiveThread('parent');
 
-    // Stale GET response lands carrying the descendant's pre-archive snapshot.
     upsertThread(threadMap.value, {
       thread_id: 'child',
       title: 'Child',
@@ -966,9 +830,6 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
   });
 
   it('does not block a fresh GET issued after the flip from updating section', async () => {
-    // The guard must only suppress STALE responses — a refresh started after
-    // the archive (e.g. user navigates back to the list later) must still
-    // be allowed to update the row's section if the backend disagrees.
     let resolveApi: (v: { archived: string[] }) => void = () => {};
     (archiveThread as ReturnType<typeof vi.fn>).mockImplementationOnce(
       () => new Promise<{ archived: string[] }>(r => { resolveApi = r; }),
@@ -984,8 +845,6 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
     const pending = handleArchiveThread('parent');
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
 
-    // Now a FRESH GET (started after the flip) lands. In the real world this
-    // would carry section='archived' once the server has processed the POST.
     await new Promise(r => setTimeout(r, 5));
 
     upsertThread(threadMap.value, {
@@ -1007,18 +866,6 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread — stale SSE aggregate after optimistic flip
-// ---------------------------------------------------------------------------
-// Bug: every persisted SSE event carries an `aggregate` (backend projection
-// snapshot at emit time). The backend cascade runs `stop_agent` -> emits
-// CodingAgentIdled -> then ThreadArchived. CodingAgentIdled's aggregate is
-// the PRE-archive snapshot (section='inbox'); ThreadArchived's aggregate is
-// the POST-archive snapshot (section='archived'). applyAggregateToMeta
-// overwrites meta.section unconditionally, so the optimistic flip is reverted
-// by the first SSE and restored by the second — bouncing the row between
-// Review and Archive. Neighbours visibly reorder twice during the bounce.
-// ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — stale SSE aggregate', () => {
   it('keeps section archived when an SSE event arrives with a pre-archive aggregate', async () => {
@@ -1034,15 +881,9 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     threadMap.value = map;
     focusThread('t');
 
-    // User clicks Archive — optimistic flip to 'archived'.
     const pending = handleArchiveThread('t');
     expect(threadMap.value.get('t')?.meta.section).toBe('archived');
 
-    // Backend's stop_agent emits CodingAgentIdled BEFORE the ThreadArchived
-    // emit. Its aggregate is the PRE-archive snapshot (section='inbox',
-    // nothing proposed). Without the SSE archive-race guard,
-    // applyAggregateToMeta would overwrite section back to 'inbox' and the
-    // row would briefly fly back to Review.
     handleThreadEvent({
       thread_id: 't',
       seq: 101,
@@ -1099,8 +940,6 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
     expect(threadMap.value.get('child')?.meta.section).toBe('archived');
 
-    // SSE for the child's cascade carries the descendant's pre-archive
-    // aggregate. The guard must keep its optimistic flip intact too.
     handleThreadEvent({
       thread_id: 'child',
       seq: 201,
@@ -1138,9 +977,6 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
   });
 
   it('lets a post-flip aggregate through once the archive is acknowledged', async () => {
-    // The guard must only suppress aggregates that arrived during the
-    // in-flight archive. Once the API resolves, an engine that sends no
-    // version ends the hold, so later SSE events apply their aggregate.
     (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ archived: ['t'] });
 
     const map = new Map<string, ThreadState>();
@@ -1153,8 +989,6 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     await handleArchiveThread('t');
     expect(archiveRequestInFlight('t')).toBe(false);
 
-    // After archive completes, an unrelated late SSE arrives with the real
-    // backend aggregate. Section should follow the aggregate.
     handleThreadEvent({
       thread_id: 't',
       seq: 102,
@@ -1190,15 +1024,6 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
 });
 
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread — error toast for structured 409 rejections
-// ---------------------------------------------------------------------------
-// Backend's `POST /api/v1/threads/archive` returns 409 with a structured
-// `{reason, parent_status?, blocking?}` body. Without the formatter the toast
-// would show the bare `httpCode + reason` from `ApiError.message` — which for
-// the archive endpoint is `"409 descendants_blocking"` at best and `"409 "`
-// (with empty `statusText` and no `body.error`) at worst. Neither tells the
-// user what they need to do.
 
 describe('handleArchiveThread — 409 error toasts', () => {
   beforeEach(() => {
@@ -1221,7 +1046,6 @@ describe('handleArchiveThread — 409 error toasts', () => {
   }
 
   it("words a sub-thread blocker in the menu's words, and offers to show it", async () => {
-    // ADR 0378: the refusal names its blocker, so the toast says what the menu says.
     const { ApiError } = await import('../../api/client');
     seedReviewThread();
     const message = await archiveAndGetToast(new ApiError(409, 'descendants_blocking', {
@@ -1249,15 +1073,6 @@ describe('handleArchiveThread — 409 error toasts', () => {
   });
 
   it('archiving an already-archived thread is idempotent success, not a 409 toast', async () => {
-    // Archive is idempotent: the backend now treats an already-archived target
-    // as a no-op success (200 `{archived: []}`) rather than 409
-    // parent_not_archivable (see classify_archive_decision in
-    // crates/lucidos-engine/src/api/threads/archive.rs). This is what un-sticks
-    // the Archive button when the client's `meta.section` has desynced to
-    // 'inbox' while the backend is already 'archived' (a missed ThreadArchived
-    // SSE / failed archive HTTP on a flaky PWA): the optimistic flip to
-    // 'archived' stands instead of rolling back, the button disappears, and no
-    // error toast fires.
     (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ archived: [] });
     seedReviewThread();
     await handleArchiveThread('parent');
@@ -1332,9 +1147,6 @@ describe('handleArchiveThread — 409 error toasts', () => {
   });
 
   it('formats parent_has_pending_changes with the Apply/Discard hint', async () => {
-    // In-workspace CC thread with a pending change is no longer archivable —
-    // the user must Apply or Discard first. Toast must say so explicitly,
-    // otherwise the Archive click looks like it silently failed.
     const { ApiError } = await import('../../api/client');
     seedReviewThread();
     const message = await archiveAndGetToast(new ApiError(409, 'parent_has_pending_changes', {
@@ -1358,14 +1170,6 @@ describe('handleArchiveThread — 409 error toasts', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread — unsent draft confirm
-// ---------------------------------------------------------------------------
-// Archiving a thread that carries an unsent reply draft asks whether to discard
-// the draft too. "Keep draft" (OK) archives and leaves the draft; "Discard
-// draft" (extraAction) archives and clears it once the API succeeds;
-// Cancel/Escape aborts the archive. A thread with no draft skips the confirm.
-// ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — unsent draft confirm', () => {
   beforeEach(() => {
@@ -1383,7 +1187,6 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     focusThread('t');
   }
 
-  /** Mimic ConfirmDialog's extraAction button: run onClick, then resolve(false). */
   function clickDiscard(): void {
     confirmState.value.extraAction?.onClick();
     confirmState.value.resolve?.(false);
@@ -1414,7 +1217,7 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     expect(confirmState.value.okLabel).toBe('Keep draft');
     expect(confirmState.value.extraAction?.label).toBe('Discard draft');
 
-    confirmState.value.resolve?.(false); // Cancel — tidy the pending promise
+    confirmState.value.resolve?.(false);
     await pending;
     expect(archiveThread).not.toHaveBeenCalled();
   });
@@ -1425,13 +1228,13 @@ describe('handleArchiveThread — unsent draft confirm', () => {
 
     const pending = handleArchiveThread('t');
     expect(confirmState.value.visible).toBe(true);
-    confirmState.value.resolve?.(true); // OK = "Keep draft"
+    confirmState.value.resolve?.(true);
     await pending;
 
     expect(archiveThread).toHaveBeenCalledWith('t');
     expect(getDraft('t').text).toBe('half-written reply');
     expect(draftPresentThreadIds.value.has('t')).toBe(true);
-    expect(putComposeOnThread).not.toHaveBeenCalled(); // draft left untouched
+    expect(putComposeOnThread).not.toHaveBeenCalled();
   });
 
   it('discards the draft and archives when the user picks "Discard draft"', async () => {
@@ -1446,7 +1249,7 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     expect(archiveThread).toHaveBeenCalledWith('t');
     expect(getDraft('t').text).toBe('');
     expect(draftPresentThreadIds.value.has('t')).toBe(false);
-    expect(putComposeOnThread).toHaveBeenCalledWith('t', '', [], null, undefined, undefined); // server row cleared
+    expect(putComposeOnThread).toHaveBeenCalledWith('t', '', [], null, undefined, undefined);
   });
 
   it('aborts the archive entirely on Cancel, leaving the draft intact', async () => {
@@ -1455,7 +1258,7 @@ describe('handleArchiveThread — unsent draft confirm', () => {
 
     const pending = handleArchiveThread('t');
     expect(confirmState.value.visible).toBe(true);
-    confirmState.value.resolve?.(false); // Cancel / Escape — no extraAction click
+    confirmState.value.resolve?.(false);
     await pending;
 
     expect(archiveThread).not.toHaveBeenCalled();
@@ -1500,7 +1303,6 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     clickDiscard();
     await pending;
 
-    // Archive rejected → rollback; the draft survives (cleared only on success).
     expect(threadMap.value.get('t')?.meta.section).toBe('inbox');
     expect(getDraft('t').text).toBe('half-written reply');
     expect(draftPresentThreadIds.value.has('t')).toBe(true);
@@ -1515,12 +1317,9 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     const pending = handleArchiveThread('t');
     clickDiscard();
     await pending;
-    // Let the fire-and-forget PUT rejection settle so the rollback runs.
     await Promise.resolve();
     await Promise.resolve();
 
-    // Archive succeeded but the server clear failed → local draft is restored
-    // so it can't silently diverge from the server, and the user is told.
     expect(archiveThread).toHaveBeenCalledWith('t');
     expect(getDraft('t').text).toBe('half-written reply');
     expect(draftPresentThreadIds.value.has('t')).toBe(true);
@@ -1528,15 +1327,6 @@ describe('handleArchiveThread — unsent draft confirm', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// handleArchiveThread: the live thread-subscription confirm
-// ---------------------------------------------------------------------------
-// Archiving cancels every live *thread subscription* in the cascade, which is
-// correct and stays. It used to happen in silence: an ordinary unsaved thread
-// with no draft and three live subscriptions archived on the first tap and the
-// dispatcher cancelled all three, with nothing on screen. Now it asks, and it
-// names what each one is watching rather than printing a count.
-// ---------------------------------------------------------------------------
 
 describe('handleArchiveThread: live subscription confirm', () => {
   beforeEach(() => {
@@ -1551,7 +1341,6 @@ describe('handleArchiveThread: live subscription confirm', () => {
     expires_at: new Date(Date.now() + 3_600_000).toISOString(),
   });
 
-  /** Every detail line the dialog would render, headers included. */
   function detailLines(): string[] {
     const d = confirmState.value.details;
     if (!d) return [];
@@ -1594,15 +1383,13 @@ describe('handleArchiveThread: live subscription confirm', () => {
     expect(confirmState.value.message).toBe('Archiving stops waiting for 2 events. They will not fire.');
     expect(confirmState.value.okLabel).toBe('Archive');
     expect(confirmState.value.cancelLabel).toBe('Cancel');
-    // The agent's own reason plus the event, the same pair the subscription
-    // indicator renders.
     expect(detailLines()).toEqual([
       'This thread',
       'waiting for the release build (change proposed)',
       'waiting for the nightly import (oura sleep imported)',
     ]);
 
-    confirmState.value.resolve?.(false); // tidy the pending promise
+    confirmState.value.resolve?.(false);
     await pending;
   });
 
@@ -1627,7 +1414,6 @@ describe('handleArchiveThread: live subscription confirm', () => {
     await pending;
 
     expect(archiveThread).not.toHaveBeenCalled();
-    // No optimistic flip either: the thread is still in Current.
     expect(threadMap.value.get('t')!.meta.section).toBe('inbox');
   });
 
@@ -1652,8 +1438,6 @@ describe('handleArchiveThread: live subscription confirm', () => {
   });
 
   it('walks the whole cascade, so a sub-thread parked on a long watch is counted', async () => {
-    // The parent holds none. Without the cascade walk this archives silently
-    // and takes the grandchild's subscription with it.
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
       meta: { id: 'parent', title: 'Parent', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox' },
@@ -1675,7 +1459,6 @@ describe('handleArchiveThread: live subscription confirm', () => {
 
     const pending = handleArchiveThread('parent');
     expect(confirmState.value.visible).toBe(true);
-    // Attributed to the descendant by title, not merged into "this thread".
     expect(detailLines()).toEqual([
       'Grandchild',
       'waiting for the deploy to land (release published)',
@@ -1686,9 +1469,6 @@ describe('handleArchiveThread: live subscription confirm', () => {
   });
 
   it('counts what it cannot name, for a sub-thread whose events were never loaded', async () => {
-    // `meta.liveEventWaits` is folded from a thread's LOADED events, so an
-    // unopened row has the projected count and an empty list. Naming nothing
-    // there is honest; omitting it would under-report what the archive stops.
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
       meta: {
@@ -1721,8 +1501,6 @@ describe('handleArchiveThread: live subscription confirm', () => {
   });
 
   it('asks about the draft first, then about the subscriptions', async () => {
-    // Two confirms, in the order the user meets them. Cancelling the draft one
-    // aborts before the subscription question is ever asked.
     const map = new Map<string, ThreadState>();
     map.set('t', makeThreadState('t', {
       meta: {
@@ -1738,22 +1516,19 @@ describe('handleArchiveThread: live subscription confirm', () => {
 
     const pending = handleArchiveThread('t');
     expect(confirmState.value.message).toBe('This thread has an unsent draft. Discard it too?');
-    confirmState.value.resolve?.(true); // "Keep draft"
+    confirmState.value.resolve?.(true);
     await Promise.resolve();
     await Promise.resolve();
     expect(confirmState.value.message).toBe(
       'Archiving stops what this thread is waiting for. It will not fire.',
     );
-    confirmState.value.resolve?.(true); // Archive
+    confirmState.value.resolve?.(true);
     await pending;
 
     expect(archiveThread).toHaveBeenCalledWith('t');
   });
 });
 
-// ---------------------------------------------------------------------------
-// subscriptionsStoppedByArchive: the count when a thread is partly loaded
-// ---------------------------------------------------------------------------
 
 describe('subscriptionsStoppedByArchive', () => {
   const wait2 = (id: string, reason: string, eventType: string) => ({
@@ -1763,10 +1538,6 @@ describe('subscriptionsStoppedByArchive', () => {
     expires_at: new Date(Date.now() + 3_600_000).toISOString(),
   });
 
-  /** A thread's events load in a window, so one holding two subscriptions can
-   *  have the newer `EventWaitStarted` inside it and the older one outside.
-   *  Counting only the all-or-nothing case named one and dropped the other,
-   *  under-reporting the total in the one dialog whose job is not to. */
   it('counts the shortfall even when the thread named SOME of its subscriptions', () => {
     const map = new Map<string, ThreadState>();
     map.set('t', makeThreadState('t', {
@@ -1796,8 +1567,6 @@ describe('subscriptionsStoppedByArchive', () => {
     expect(subscriptionsStoppedByArchive(new Set(['t']), 't')).toBeNull();
   });
 
-  /** A cascade id whose thread left the map between the walk and here counts
-   *  nothing, rather than throwing inside a confirm the user is waiting on. */
   it('skips a cascade member that is no longer in the map', () => {
     threadMap.value = new Map();
     expect(subscriptionsStoppedByArchive(new Set(['gone']), 'gone')).toBeNull();

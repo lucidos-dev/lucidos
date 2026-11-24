@@ -3,9 +3,6 @@ import type { VNode } from 'preact';
 import { ListRowAddCard } from '../ListRowAddCard';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 
-/** The rendered root, typed for the props this suite asserts on. There is no
- *  jsdom in the test infra, so the assertions are on the vnode rather than a
- *  mounted element. */
 function root(node: unknown) {
   return node as VNode<{ type?: string; class?: string; onClick?: () => void }>;
 }
@@ -14,7 +11,6 @@ describe('ListRowAddCard', () => {
   it('renders a real button, so the card takes a tab stop and answers Enter and Space', () => {
     const card = root(ListRowAddCard({ label: 'Add Repository', onClick: () => {} }));
     expect(card.type).toBe('button');
-    // Without an explicit type a button inside a form submits it.
     expect(card.props.type).toBe('button');
   });
 

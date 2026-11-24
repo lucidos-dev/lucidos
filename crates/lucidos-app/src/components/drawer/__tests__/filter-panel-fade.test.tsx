@@ -1,17 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The thread filter panel's swap with the thread list (`ThreadFilterCover`).
- *
- * The cover and the panel inside it stay mounted, so opening costs no render.
- * The open SIGNAL drives everything at once: the overlay stack, the pressed
- * Filter button, and the cover's `data-open` and `inert`. Each swap mounts a
- * fresh navigation cover playing the `dip`: it rises over the leaving view and
- * clears off the arriving one, while the CSS swaps the views at its midpoint.
- *
- * jsdom runs no animations, so these tests pin the DOM states the CSS keys on.
- * The frames themselves are covered by
- * `e2e/threads-header-filter-transitions-all.spec.ts`.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { signal } from '@preact/signals';
@@ -68,7 +55,6 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
     expect(onStack()).toBe(false);
     expect(pressed()).toBe(false);
     expect(cover().hasAttribute('data-open')).toBe(false);
-    // A leaving cover takes no pointer and no focus.
     expect(cover().hasAttribute('inert')).toBe(true);
     expect(panel()).toBe(open);
   });
@@ -86,7 +72,6 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
   it('leaves the Escape stack in the commit that hides the drawer, before any passive effect', () => {
     act(() => { openThreadFilterPanel(); });
     expect(onStack()).toBe(true);
-    // No `act`: it would flush passive effects, which is what this must not need.
     render(<ThreadFilterCover paneVisible={false} leaving={leaving} />, host);
     expect(cover().hasAttribute('inert')).toBe(true);
     expect(onStack()).toBe(false);
@@ -102,12 +87,10 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
     act(() => { openThreadFilterPanel(); });
     const opening = navCover();
     expect(opening).not.toBeNull();
-    // After the filter cover, so it paints over it at any equal z-index too.
     expect(cover().nextElementSibling).toBe(opening);
     expect(opening!.getAttribute('aria-hidden')).toBe('true');
     expect(opening!.classList.contains('nav-cover-dip')).toBe(true);
     act(() => { closeThreadFilterPanel(); });
-    // A new element, so its animation restarts.
     expect(navCover()).not.toBeNull();
     expect(navCover()).not.toBe(opening);
   });

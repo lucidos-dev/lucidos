@@ -4,15 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { test, expect, type Locator, type Page } from './fixtures';
 import { apiRequest, gotoWithRetry, setDevicePreference, waitForVisibleInput } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-// The drawn caret (ADR 0317): a block-caret theme draws its caret in WebKit,
-// which has no caret-shape, and Chromium keeps the native one with no overlay.
-// The fixture theme is a test theme from e2e/themes/, never a shipped one.
-//
-// The expected caret position is measured independently of the overlay: a
-// canvas measures the text before the caret in the composer's own font.
 
 const THEME = 'e2e-caret-phosphor';
 const here = dirname(fileURLToPath(import.meta.url));
@@ -36,12 +29,10 @@ interface CaretFacts {
   covered: string | null;
   background: string | null;
   animation: string | null;
-  /** How far the drawn caret sits from where the text says it should, in px. */
   dx: number | null;
   dy: number | null;
 }
 
-/** Where the drawn caret is, and where the composer's text says it belongs. */
 function caretFacts(composer: Locator): Promise<CaretFacts> {
   return composer.evaluate((el: HTMLTextAreaElement): CaretFacts => {
     const overlay = el.nextElementSibling as HTMLElement | null;
@@ -118,8 +109,6 @@ test.describe('the drawn caret', () => {
     expect(Math.abs(facts.dx!), 'x on the second line').toBeLessThan(1.5);
     expect(Math.abs(facts.dy!), 'y on the second line').toBeLessThan(2);
 
-    // Enough lines to scroll the capped composer. A scripted fill does not
-    // scroll to the caret; the next keystroke does, as it does for a user.
     await composer.fill(Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n'));
     await composer.pressSequentially('!');
     await expect.poll(() => composer.evaluate(el => el.scrollTop)).toBeGreaterThan(0);

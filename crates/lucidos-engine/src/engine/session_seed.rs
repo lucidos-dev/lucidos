@@ -57,12 +57,7 @@ use uuid::Uuid;
 /// git errors to an empty list, so a transient git failure writes no work; the
 /// next commit hook or restart sweep reconciles once git is healthy. DB
 /// failures log at `[SessionSeed]`.
-pub(crate) async fn seed_branch_work(
-    pool: &PgPool,
-    thread_id: Uuid,
-    repo_root: &Path,
-    branch_name: &str,
-) {
+pub async fn seed_branch_work(pool: &PgPool, thread_id: Uuid, repo_root: &Path, branch_name: &str) {
     let has_diff = crate::engine::git_ops::proposal_files_for_branch(repo_root, branch_name)
         .await
         .is_some();
@@ -76,7 +71,7 @@ pub(crate) async fn seed_branch_work(
     .execute(pool)
     .await
     {
-        log!(
+        log_legacy!(
             "[SessionSeed] Failed to seed the branch work for thread {} branch {}: {}",
             thread_id,
             branch_name,

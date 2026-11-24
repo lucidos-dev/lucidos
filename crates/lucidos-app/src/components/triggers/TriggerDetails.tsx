@@ -1,7 +1,10 @@
+import { AllowlistRow } from '../shared/AllowlistRow';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { activeInlineForm, triggers, triggerGroups, showToast, chatModels } from '../../store/store';
 import {
   closeTriggerForm,
+  revokeTriggerDeny,
+  revokeTriggerGrant,
   submitTrigger,
 } from '../../store/actions/triggers';
 import {
@@ -14,13 +17,13 @@ import { ModelSelectionField } from '../shared/ModelSelectionField';
 import { REASONING_LEVELS } from '../../store/models';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { deriveTriggerType, toFailed } from '../../store/types';
-import type { EventSubscription, SideEffectCategory, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
+import type { EventSubscription, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
 import { describeCron, validateCron } from '../../utils/describeCron';
 import { Dropdown } from '../shared/Dropdown';
 import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize, useWidthRemeasure } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { useServerBackedField, sameJson, sameSet } from '../../hooks/useServerBackedField';
+import { useServerBackedField, sameJson } from '../../hooks/useServerBackedField';
 import { LoadableError } from '../shared/LoadableError';
 import { FormSkeleton } from '../shared/FormSkeleton';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -32,32 +35,9 @@ const NEW_GROUP_SENTINEL = '__new_group__';
 type TriggerFormType = 'schedule' | 'event' | 'both';
 type RunType = 'intent' | 'script';
 
-/** The grantable irreversible side-effect categories, with their user-facing
- *  labels (ADR 0002, Phase 5). Kept in sync with the Rust `SideEffectCategory`
- *  enum's `label()` and the `SideEffectCategory` wire type. */
-const SIDE_EFFECT_CATEGORIES: { value: SideEffectCategory; label: string }[] = [
-  { value: 'email', label: 'Send email or messages' },
-  { value: 'external_api', label: 'Call external APIs (mutating HTTP)' },
-  { value: 'cloud_cli', label: 'Cloud CLI mutations (gh / aws / gcloud)' },
-  { value: 'out_of_workspace_destruction', label: 'Destroy files outside the workspace' },
-  { value: 'other', label: 'Other irreversible side-effects' },
-];
-
-// Module-level cache: shared across all TriggerFormInner mounts (open/reopen
-// the form without refetching). Loadable so consumers see all 4 states.
-//
-// A failure is not sticky. `loadEventTypes` runs unless the cache is `loaded`.
-// So the next mount retries, the error row's Retry button re-drives it, and
-// opening the picker retries it too. A loaded list is never refreshed for the
-// life of the page. An event type first emitted after that load is missing
-// until Retry, or a reload.
 let cachedEventTypes: Loadable<string[]> = { status: 'not-loaded' };
 let inflightFetch: Promise<string[]> | null = null;
 
-/** Fill the module cache, deduping concurrent callers onto one request.
- *
- *  `apply` publishes each state to the calling component. Every retry path
- *  comes through here, so there is one load path. */
 function loadEventTypes(apply: (l: Loadable<string[]>) => void): void {
   cachedEventTypes = { status: 'loading' };
   apply(cachedEventTypes);
@@ -76,27 +56,15 @@ function loadEventTypes(apply: (l: Loadable<string[]>) => void): void {
     .finally(() => { inflightFetch = null; });
 }
 
-/** Retry a failed list from the user's own gesture of opening the picker, the
- *  same bargain `retryFailedDestinationLists` strikes for the compose
- *  destination lists. The error row's Retry button is the visible affordance;
- *  this catches the user who opens the picker without reading the row. Only a
- *  failed cache refetches, and `loadEventTypes` single-flights, so an open
- *  costs at most one request. */
 function retryFailedEventTypes(apply: (l: Loadable<string[]>) => void): void {
   if (cachedEventTypes.status === 'failed') loadEventTypes(apply);
 }
 
-/** The event-subscription editor's value. The parsed condition lives on
- *  `subs[i].condition` so submit can forward it directly. The raw JSON the
- *  user is typing lives in `drafts[i]`. Parsing it back on every keystroke
- *  would lose the in-flight cursor and every invalid intermediate state. Both
- *  are keyed by row index, so they travel as one value. */
 interface SubscriptionDraft {
   subs: EventSubscription[];
   drafts: Record<number, string>;
 }
 
-/** The subscription editor as the stored trigger describes it. */
 function servedSubscriptions(on: EventSubscription[] | undefined): SubscriptionDraft {
   const subs = (on ?? []).map(s => ({ ...s }));
   const drafts: Record<number, string> = {};
@@ -106,8 +74,6 @@ function servedSubscriptions(on: EventSubscription[] | undefined): SubscriptionD
   return { subs, drafts };
 }
 
-/** Rekey an index-keyed map after row `index` was removed, so trailing entries
- *  shift down with the array they annotate. */
 function reindexAfterRemoval<T>(map: Record<number, T>, index: number): Record<number, T> {
   return Object.fromEntries(
     Object.entries(map)
@@ -117,12 +83,10 @@ function reindexAfterRemoval<T>(map: Record<number, T>, index: number): Record<n
   );
 }
 
-/** The edit form's leading fields, which every trigger has. */
 const TRIGGER_FORM_FIELDS = [{ label: 'Trigger Name' }, { label: 'Trigger Type' }, { label: 'Run' }, { label: 'Intent', tall: true }];
 
 export function TriggerDetails() {
   const form = activeInlineForm.value;
-  // Delay the spinner (300ms) so a fast load never flashes it.
   const showLoading = useDelayedLoading(triggers.value);
   if (form?.type !== 'trigger') return null;
 
@@ -139,11 +103,6 @@ export function TriggerDetails() {
     const list = triggers.value.status === 'loaded' ? triggers.value.data : null;
     const trigger = list?.find((t) => t.id === editingId);
     if (list && !trigger) {
-      // key={editingId} forces a remount when activeInlineForm flips from
-      // missing-A to missing-B in successive renders: without it, Preact reuses
-      // the instance and the empty-deps useEffect never re-fires for B, leaving
-      // the form open on a trigger that no longer exists. Same guard as
-      // AppUiEditModal's MissingAppCloser.
       return <MissingTriggerCloser key={editingId} />;
     }
     return (
@@ -156,9 +115,6 @@ export function TriggerDetails() {
   return <TriggerFormInner key="new" existingTrigger={null} />;
 }
 
-/** Closes the trigger form when the target trigger no longer exists. Lives in
- *  a child component so the signal write happens in useEffect (post-commit),
- *  not inside the parent's render body — which preact lint flags. */
 function MissingTriggerCloser() {
   useEffect(() => { closeTriggerForm(); }, []);
   return null;
@@ -166,9 +122,6 @@ function MissingTriggerCloser() {
 
 function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; existingTrigger: TriggerInfo | null }) {
 
-  // Every field below is a *server-backed field*: untouched it renders the
-  // trigger the store holds, so a `TriggerUpdated` frame repaints the open
-  // page; touched it holds the user's draft. See ADR 0118.
   const derived = existingTrigger ? deriveTriggerType(existingTrigger) : null;
   const servedFormType: TriggerFormType = derived === 'hybrid' ? 'both' : derived === 'event' ? 'event' : 'schedule';
 
@@ -192,8 +145,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   const [cronInput, setCronInput] = useState('');
   const [cronError, setCronError] = useState<string | null>(null);
 
-  // One field, not two: the rows and their drafts are index-parallel, and
-  // `removeSubscription` reindexes both. Touching one alone would desync them.
   const [subscriptions, setSubscriptions] = useServerBackedField(
     servedSubscriptions(existingTrigger?.on), sameJson,
   );
@@ -214,57 +165,31 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     if (eventTypesLoadable.status === 'loading' && showEventTypesLoading) {
       return [{ value: '', label: 'Loading event types...' }];
     }
-    // A failed load offers nothing. An empty-valued placeholder would clear
-    // the field, and `freeText` keeps hand-entry working with no options.
     return [];
   })();
 
   const [goToReview, setGoToReview] = useServerBackedField(existingTrigger?.go_to_review ?? false);
-  const [sideEffectGrant, setSideEffectGrant] = useServerBackedField<SideEffectCategory[]>(
-    existingTrigger?.side_effect_grant ?? [], sameSet,
-  );
   const [codingAgentGrant, setCodingAgentGrant] = useServerBackedField(
     existingTrigger?.coding_agent_grant ?? false,
   );
-  const toggleSideEffect = (cat: SideEffectCategory, on: boolean) => {
-    setSideEffectGrant(
-      on ? [...sideEffectGrant.filter(c => c !== cat), cat] : sideEffectGrant.filter(c => c !== cat)
-    );
-  };
-  // '' is the Default option: the trigger inherits the account trigger model
-  // and its effort, which is what a trigger without a pin does. Kept as ''
-  // rather than null so the <Dropdown> value round-trips as a plain string.
   const [model, setModel] = useServerBackedField(existingTrigger?.model ?? '');
   const [triggerEffort, setTriggerEffort] = useServerBackedField(existingTrigger?.reasoning_effort ?? '');
   const [triggerProvider, setTriggerProvider] = useServerBackedField(existingTrigger?.provider ?? '');
-  // The picker reads the DB-backed registry; kick a load if nothing has yet
-  // (loadChatModels single-flights via setLoadingIfFresh). Until it lands,
-  // chatModelOptions() falls back to the static list, so the field is never
-  // empty. Same guard as the in-thread Lucidos control menu.
   useEffect(() => {
     if (chatModels.value.status === 'not-loaded') void loadChatModels();
   }, []);
 
   const [groupId, setGroupId] = useServerBackedField(existingTrigger?.group_id ?? '');
-  // null = inline-create field hidden; string = visible with current draft.
   const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
-  // Set once the draft is submitted or cancelled. Hiding the field fires a
-  // trailing blur into commitNewGroupDraft, which would POST again (409) or
-  // create the group Escape cancelled. Reset when the field reopens.
   const groupDraftSettledRef = useRef(false);
 
-  // A create is not idempotent: every POST mints a new trigger. The ref guards
-  // a second submit in the same render window; the state twin disables Save.
   const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
 
   const intentRef = useRef<HTMLTextAreaElement>(null);
   const resizeIntent = () => { if (intentRef.current) resizeTextarea(intentRef.current); };
-  // runType included in deps because the textarea is unmounted/remounted when switching to script.
   useEffect(resizeIntent, [intentText, runType]);
   useFontMetricsResize(resizeIntent);
-  // The content pane resizes under this field exactly as the thread pane does
-  // under the composer, so the Intent box owes the same width re-measure.
   useWidthRemeasure(intentRef);
 
   const showCron = formType === 'schedule' || formType === 'both';
@@ -318,7 +243,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     const run = buildRun();
     if (!run) return;
 
-    // If there's text in the input, try to add it first
     let finalCrons = showCron ? cronExpressions : [];
     if (showCron && cronInput.trim()) {
       const error = validateCron(cronInput.trim());
@@ -359,10 +283,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on = built;
     }
 
-    // go_to_review / side_effect_grant / model / reasoning_effort / provider
-    // apply only to the intent path. `submitTrigger` gates them all on
-    // `run.type`, so a script trigger can't persist state left over from an
-    // intent → script switch.
     savingRef.current = true;
     setSaving(true);
     try {
@@ -370,9 +290,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
         name, run, cronExpressions: finalCrons, triggerId: editingId,
         on, showEvent, goToReview,
         groupId: groupId || null,
-        sideEffectGrant,
         codingAgentGrant,
-        // '' is the Default option; null is how it reaches the engine.
         model: model || null,
         reasoningEffort: triggerEffort || null,
         provider: triggerProvider || null,
@@ -435,23 +353,12 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     setNewGroupDraft(null);
   }
 
-  // The trigger form uses the shared dropdown shell inside its own
-  // `.form-group`, because the field explainer lives here.
-  //
-  // Its extra row is Default, which inherits the whole pair. It carries no
-  // tiers of its own, so picking it clears both halves. Its label names the
-  // pair the run will actually use: the account's trigger model, not the chat
-  // model. For a legacy trigger that pinned an effort and no model, that is
-  // the pinned tier.
   const tierLabel = (value: string | null) => (value === null
     ? PROVIDER_DEFAULT_EFFORT_LABEL
     : REASONING_LEVELS.find(l => l.value === value)?.label ?? value);
   const accountModel = currentTriggerModel();
   const accountLabel =
     chatModelOptions().find(o => o.value === accountModel)?.label ?? accountModel;
-  // The account's tier for its model, except on a legacy trigger that pinned an
-  // effort and no model. Once a model IS pinned the tier belongs to that pick,
-  // and naming it here would claim Default runs on it.
   const inheritedTier = tierLabel(
     model === '' && triggerEffort ? triggerEffort : accountChatEffort(accountModel),
   );
@@ -512,8 +419,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                 {...PROSE_TEXT_ATTRS}
                 onInput={e => setNewGroupDraft((e.target as HTMLInputElement).value)}
                 onBlur={commitNewGroupDraft}
-                // Escape cancels. The central Escape policy would blur the
-                // field first, and the blur commits, so the field handles it.
                 data-escape-self
                 onKeyDown={e => {
                   if (e.key === 'Enter') { e.preventDefault(); void commitNewGroupDraft(); }
@@ -712,10 +617,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
             </div>
           ) : (
             <div class="form-group">
-              {/* Script triggers are threadless (there is no run thread to
-                  open), so point at how to observe them instead. Only when
-                  editing an existing trigger: a brand-new one has no runs yet,
-                  and a falsy child leaves FieldLabel a plain label. */}
               <FieldLabel title="Watching this trigger's runs" label="Script Path">
                 {editingId && (
                   <>
@@ -741,10 +642,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
             </div>
           )}
 
-          {/* Both controls are consumed only on the intent (LLM) trigger path;
-              the script path never reads go_to_review or side_effect_grant.
-              Hide them in script mode so they can't imply behavior that never
-              runs. */}
           {runType === 'intent' && (
             <>
               <div class="form-group">
@@ -766,16 +663,12 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   onChange={(patch) => {
                     setModel(patch.model);
                     setTriggerEffort(patch.reasoningEffort ?? '');
-                    // A trigger pins its own backend. It does not touch the
-                    // model's remembered one, which is the chat picker's.
                     setTriggerProvider(patch.provider ?? '');
                   }}
                 />
               </div>
 
               <div class="form-group">
-                {/* The toggle reads the stored `go_to_review` inverted: on means
-                    false, the default, so a run goes straight to Archive. */}
                 <label class="form-checkbox-row">
                   <input
                     type="checkbox"
@@ -797,38 +690,72 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
               </div>
 
               <div class="form-group">
-                <FieldLabel title="Allowed side-effects">
-                    <p>Only used when command safety is on (Settings → Permissions).</p>
-                    <p>
-                      This trigger runs unattended, so it can't be asked to approve a
-                      risky command. Grant only the irreversible side-effects its intent
-                      genuinely needs: anything else is blocked and the run fails.
-                    </p>
-                    <p>
-                      Leave all off if it only reads, computes, or writes inside the
-                      workspace.
-                    </p>
-                </FieldLabel>
-                <div class="form-checkbox-list">
-                  {SIDE_EFFECT_CATEGORIES.map((cat) => (
-                    <label class="form-checkbox-row" key={cat.value}>
-                      <input
-                        type="checkbox"
-                        checked={sideEffectGrant.includes(cat.value)}
-                        onChange={(e) =>
-                          toggleSideEffect(cat.value, (e.target as HTMLInputElement).checked)
-                        }
+                <FieldLabel title="Program grants" />
+                <div class="allowlist-rows">
+                  {existingTrigger?.program_grants?.length
+                    ? existingTrigger.program_grants.map((grant, index) => (
+                      <AllowlistRow
+                        key={`${grant.pattern}-${index}`}
+                        pattern={grant.pattern}
+                        detail={grant.migrated_invocation ? 'Migrated invocation' : undefined}
+                        onDelete={editingId
+                          ? () => void revokeTriggerGrant(editingId, { program: grant.pattern })
+                          : undefined}
                       />
-                      <span>{cat.label}</span>
-                    </label>
-                  ))}
+                    ))
+                    : <div class="allowlist-empty">No program grants.</div>}
                 </div>
               </div>
             </>
           )}
 
-          {/* Shown for both run types: a script can start a thread through
-              the CLI as well. */}
+          <div class="form-group">
+            <FieldLabel title="Folder grants" />
+            <div class="allowlist-rows" data-role="folder-grants">
+              {existingTrigger?.folder_grants?.length
+                ? existingTrigger.folder_grants.map((grant) => (
+                  <AllowlistRow
+                    key={grant.folder}
+                    pattern={grant.folder}
+                    onDelete={editingId
+                      ? () => void revokeTriggerGrant(editingId, { folder: grant.folder })
+                      : undefined}
+                  />
+                ))
+                : <div class="allowlist-empty">No folder grants.</div>}
+            </div>
+          </div>
+
+          <div class="form-group">
+            <FieldLabel title="Denied" />
+            <div class="allowlist-rows" data-role="trigger-denies">
+              {existingTrigger?.program_denies?.length || existingTrigger?.folder_denies?.length
+                ? [
+                  ...(existingTrigger.program_denies ?? []).map((program) => (
+                    <AllowlistRow
+                      key={`program-${program}`}
+                      pattern={program}
+                      detail="Program"
+                      onDelete={editingId
+                        ? () => void revokeTriggerDeny(editingId, { program })
+                        : undefined}
+                    />
+                  )),
+                  ...(existingTrigger.folder_denies ?? []).map((folder) => (
+                    <AllowlistRow
+                      key={`folder-${folder}`}
+                      pattern={folder}
+                      detail="Folder"
+                      onDelete={editingId
+                        ? () => void revokeTriggerDeny(editingId, { folder })
+                        : undefined}
+                    />
+                  )),
+                ]
+                : <div class="allowlist-empty">Nothing denied.</div>}
+            </div>
+          </div>
+
           <div class="form-group">
             <label class="form-checkbox-row">
               <input

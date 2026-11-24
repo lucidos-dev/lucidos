@@ -1,18 +1,3 @@
-/**
- * Regression: the connection dot (`connectionStatus`) must NOT flash red on a
- * single transient `/health` failure while idle. The engine is local and almost
- * never down — a lone failed health GET is far more likely a transient blip (iOS
- * radio nap, Tailscale latency spike, HTTP/2 coalescing hiccup after the PWA
- * backgrounds) than a real outage. The dot is driven SOLELY by the 5s `/health`
- * poll (it does not reflect SSE liveness), so without debouncing, every blip
- * paints the dot red even though events are still flowing.
- *
- * Before the fix the failure debounce was gated behind `isProcessing`, so the
- * idle case (PWA sitting in a pocket — exactly when the radio naps) had ZERO
- * tolerance and a single failure flipped the dot to disconnected. These tests
- * pin the symmetric debounce: N consecutive failures to go red, mirroring the
- * MIN_RECONNECT_SUCCESSES hysteresis on the way back to green.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { connectionStatus, engineStartedAt } from '../store';
 
@@ -22,7 +7,7 @@ vi.mock('../../api/client', () => ({
   API_BASE: 'http://localhost:3000',
   API: 'http://localhost:3000/api/v1',
 }));
-vi.mock('./thread-sync', () => ({
+vi.mock('./thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),
@@ -47,7 +32,7 @@ const postClientLog = vi.fn();
 vi.mock('../../utils/clientLog', () => ({ postClientLog: (...a: unknown[]) => postClientLog(...a) }));
 
 const { checkConnection, noteWorkspaceStartAccepted, START_SETTLE_MS, START_BOOT_MS } = await import('./connection');
-const { connectThreadEvents } = await import('./thread-sync');
+const { connectThreadEvents } = await import('./thread-stream');
 
 const STARTED_AT = '2026-06-09T06:00:00Z';
 const loaded = {
@@ -56,9 +41,6 @@ const loaded = {
 };
 const unreachable = { status: 'failed' as const, error: 'Load failed' };
 
-/** One success resets the module-level failure/success counters and sets
- *  hasEverConnected, giving each test a clean 'connected' baseline regardless of
- *  the singleton state a prior test left behind. */
 async function settleConnected(): Promise<void> {
   mockCheckHealth.mockResolvedValueOnce(loaded);
   await checkConnection();
@@ -87,7 +69,6 @@ describe('connection dot debounces transient health failures', () => {
 
     await failOnce();
 
-    // The whole point of the fix: one blip while idle must stay green.
     expect(connectionStatus.value).toBe('connected');
   });
 
@@ -116,15 +97,12 @@ describe('connection dot debounces transient health failures', () => {
   it('a success in the middle of a blip resets the failure counter', async () => {
     await settleConnected();
 
-    // Three failures, then a success — counter must reset to zero.
     await failOnce();
     await failOnce();
     await failOnce();
     await succeedOnce();
     expect(connectionStatus.value).toBe('connected');
 
-    // Another three failures must again be tolerated. If the counter had NOT
-    // reset, the first of these would be the 4th cumulative failure and flip red.
     await failOnce();
     await failOnce();
     await failOnce();
@@ -134,29 +112,20 @@ describe('connection dot debounces transient health failures', () => {
   it('recovery from a real disconnect requires consecutive successes (symmetric hysteresis)', async () => {
     await settleConnected();
 
-    // Drive a genuine disconnect.
     await failOnce();
     await failOnce();
     await failOnce();
     await failOnce();
     expect(connectionStatus.value).toBe('disconnected');
 
-    // First success alone must not flip back — prevents red→green flicker when
-    // the engine flaps during a restart.
     await succeedOnce();
     expect(connectionStatus.value).toBe('disconnected');
 
-    // Second consecutive success reconnects.
     await succeedOnce();
     expect(connectionStatus.value).toBe('connected');
   });
 });
 
-/**
- * A gateway re-exec can briefly answer "stopped" while the new image adopts its
- * workspaces. So a `stopped` probe goes through the same tolerance as a failed
- * one. Only a sustained answer paints the bar and its Start button.
- */
 describe('a stopped workspace obeys the same debounce as a failed probe', () => {
   const stopped = { status: 'stopped' as const };
 
@@ -187,11 +156,6 @@ describe('a stopped workspace obeys the same debounce as a failed probe', () => 
 
 });
 
-/**
- * Regression: after Start, the booting engine fails every probe until it
- * answers. Those failures read as `disconnected`, so the window said it could
- * not reach the workspace the user had just started.
- */
 describe('an accepted Start reads as starting until the engine answers', () => {
   const stopped = { status: 'stopped' as const };
   const BOOTED_AT = '2026-06-09T07:00:00Z';
@@ -256,11 +220,6 @@ describe('an accepted Start reads as starting until the engine answers', () => {
   });
 });
 
-/**
- * iOS cuts a backgrounded PWA's network and freezes its timers, while the 5s
- * poll keeps probing. So the phone went red behind the user's back. It then
- * stayed red for a hysteresis window after they came back, on a link that was fine.
- */
 describe('a probe the page was away for proves nothing', () => {
   function setVisibility(state: DocumentVisibilityState) {
     Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
@@ -299,7 +258,6 @@ describe('a probe the page was away for proves nothing', () => {
   });
 
   it('does not reopen the event stream on a failed probe the dot is hiding', async () => {
-    // A hidden desktop tab can outlast an outage, so this would run every tick.
     await settleConnected();
     vi.mocked(connectThreadEvents).mockClear();
     setVisibility('hidden');
@@ -320,15 +278,6 @@ describe('a probe the page was away for proves nothing', () => {
   });
 });
 
-/**
- * Every case above drives probes sequentially, which is the poll's own rhythm.
- * These cover the overlap, which on iOS is the normal case rather than the edge:
- * a wake fires `visibilitychange`, `focus` AND `pageshow` at the same moment the
- * frozen 5s timer unfreezes, so `handleResume`'s probe lands on top of the
- * poll's. The counters are module state with a tolerance of four bad ticks;
- * un-coalesced, two overlapping runs both read `wasConnected` before either
- * writes and both increment, charging one bad moment twice.
- */
 describe('overlapping checkConnection calls share one probe', () => {
   it('issues one request and hands both callers the same verdict', async () => {
     await settleConnected();
@@ -346,14 +295,11 @@ describe('overlapping checkConnection calls share one probe', () => {
     await settleConnected();
     mockCheckHealth.mockResolvedValue(unreachable);
 
-    // Four overlapping pairs. Un-coalesced this is eight failures, so the dot
-    // would have gone red on the second pair.
     for (let i = 0; i < 3; i++) {
       await Promise.all([checkConnection(), checkConnection()]);
       expect(connectionStatus.value).toBe('connected');
     }
 
-    // The fourth distinct bad tick is what earns the red dot.
     await Promise.all([checkConnection(), checkConnection()]);
     expect(connectionStatus.value).toBe('disconnected');
     mockCheckHealth.mockReset();
@@ -367,25 +313,15 @@ describe('overlapping checkConnection calls share one probe', () => {
     await checkConnection();
     await checkConnection();
 
-    // The guard covers overlap only: the poll's next tick must still probe.
     expect(mockCheckHealth).toHaveBeenCalledTimes(2);
   });
 });
 
-/**
- * The dot is the one user-visible signal in the product with no record on either
- * side: `/api/v1/health` is excluded from the engine's request log (the gateway
- * probes every workspace every 2s for the picker badge and would bury it), and
- * the client logged nothing. So a report of "a lot of red blinking" on a phone
- * could be read from the source but not measured. These pin that the breadcrumb
- * marks transitions only, which is what keeps its rate far below the probe's.
- */
 describe('connection transitions leave a breadcrumb, steady state does not', () => {
   it('logs once going red and once coming back, and nothing in between', async () => {
     await settleConnected();
     postClientLog.mockClear();
 
-    // Three suppressed failures: the dot has not moved, so nothing is logged.
     await failOnce();
     await failOnce();
     await failOnce();
@@ -395,11 +331,9 @@ describe('connection transitions leave a breadcrumb, steady state does not', () 
     expect(connectionStatus.value).toBe('disconnected');
     expect(postClientLog).toHaveBeenCalledTimes(1);
 
-    // A further failure while already red changes nothing on screen.
     await failOnce();
     expect(postClientLog).toHaveBeenCalledTimes(1);
 
-    // The first success is still throttled by MIN_RECONNECT_SUCCESSES.
     await succeedOnce();
     expect(postClientLog).toHaveBeenCalledTimes(1);
 
@@ -429,13 +363,7 @@ describe('connection transitions leave a breadcrumb, steady state does not', () 
     const [category, message, data] = postClientLog.mock.calls[0];
     expect(category).toBe('connection');
     expect(message).toBe('state_changed');
-    // `probe_ok` is the raw health result: together with `to` it says whether
-    // the dot moved because the engine answered differently or because a
-    // counter crossed its threshold.
     expect(data).toMatchObject({ from: 'connected', to: 'disconnected', probe_ok: false });
-    // Never the two counters: both are reset before the breadcrumb runs and both
-    // sit at their threshold by definition when the dot flips, so they could only
-    // ever log a constant dressed up as a measurement.
     expect(data).not.toHaveProperty('consecutive_failures');
     expect(data).not.toHaveProperty('consecutive_successes');
   });
@@ -452,13 +380,8 @@ describe('connection transitions leave a breadcrumb, steady state does not', () 
     await succeedOnce();
 
     const [red, green] = postClientLog.mock.calls.map((c) => c[2]);
-    // How long red lasted is the actual question behind "a lot of red
-    // blinking", so the green transition must carry a real duration.
     expect(typeof green.held_ms).toBe('number');
     expect(green.held_ms).toBeGreaterThanOrEqual(0);
-    // The very first transition of the session measures from nothing: the
-    // client cannot know how long the engine was in that state before it
-    // started watching, so it reports null rather than time-since-page-load.
     expect(red.held_ms === null || typeof red.held_ms === 'number').toBe(true);
   });
 });

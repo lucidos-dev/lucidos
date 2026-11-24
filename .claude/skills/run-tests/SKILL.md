@@ -14,7 +14,7 @@ comment out a failing test.
 Run both phases. If either fails, the whole skill FAILED.
 
 1. **Rust engine.** Three steps:
-   1. **Build:** `cargo build -p lucidos-engine --release` — verifies the engine
+   1. **Build:** `cargo build -p lucidos-engine-bin --release` — verifies the engine
       compiles in the profile it ships in (a separate compilation from the test
       build below, which is debug + `cfg(test)`).
    2. **Eval crate:** `cargo test --locked -p lucidos-eval`, run before the
@@ -27,7 +27,7 @@ Run both phases. If either fails, the whole skill FAILED.
       unable to reach anything that spends money or boots a workspace
       (ADR 0087).
    3. **Test:** `./scripts/test-engine.sh --full`.
-      Runs the whole crate: lib + integration + doctests.
+      Runs both engine libraries and the executable package, including integration tests and doctests.
       **Do NOT run bare `cargo test -p lucidos-engine`.** The engine's
       integration tests (`setup_test_db` in `src/test_support.rs`) need a real
       Postgres: each `CREATE`s a throwaway `lucidos_test_*` database, migrates,
@@ -181,7 +181,7 @@ satisfies clause (a).
 
 **One doctest.** The doc run reports `1 passed; 0 failed; 0 ignored`.
 It is a ```` ```compile_fail ```` example on `Pref` in
-`crates/lucidos-engine/src/core/preference_catalog.rs`. It proves that a
+`crates/lucidos-core/src/core/preference_catalog.rs`. It proves that a
 flag handle on a text spec does not compile, so it is a real type-level
 guard, not a skip. If the doctest count changes, update this line.
 

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-pub(crate) const AGENT_RUN_ENV: &str = "LUCIDOS_AGENT_RUN";
+pub(crate) use crate::core::environment_variables::AGENT_RUN_ENV;
 
 /// sccache sets this in the environment of the daemon it forks. The agents'
 /// daemon is shared by every session, so it is never reaped, even when the
@@ -59,7 +59,7 @@ impl AgentRunMarker {
 /// agent's end leaves its marked processes running for the session that
 /// resumes it. The engine owns one, and every thread's [`AgentRun`] shares it.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TeardownHandover(Arc<AtomicBool>);
+pub struct TeardownHandover(Arc<AtomicBool>);
 
 impl TeardownHandover {
     pub(crate) fn hand_over(&self) {
@@ -74,7 +74,7 @@ impl TeardownHandover {
 /// One agent spawn's marker, and what the spawn's end does with the processes
 /// carrying it.
 #[derive(Clone, Debug)]
-pub(crate) struct AgentRun {
+pub struct AgentRun {
     marker: AgentRunMarker,
     handover: TeardownHandover,
     thread_id: Option<Uuid>,
@@ -83,7 +83,7 @@ pub(crate) struct AgentRun {
 impl AgentRun {
     /// A spawn no later session continues, such as a side question. It mints
     /// a fresh marker, records nothing, and always reaps.
-    pub(crate) fn unrecorded() -> Self {
+    pub fn unrecorded() -> Self {
         Self {
             marker: AgentRunMarker::mint(),
             handover: TeardownHandover::default(),
@@ -101,18 +101,14 @@ impl AgentRun {
     /// So a session adopts only once its own record replaced the old one. A
     /// failed write leaves the old record in place for the next session too.
     /// The session then mints a fresh marker and loses only the handover.
-    pub(crate) fn for_thread(
-        workspace: &Path,
-        thread_id: Uuid,
-        handover: TeardownHandover,
-    ) -> Self {
+    pub fn for_thread(workspace: &Path, thread_id: Uuid, handover: TeardownHandover) -> Self {
         let path = record_path(workspace, thread_id);
         let mut marker = std::fs::read_to_string(&path)
             .ok()
             .and_then(|record| marker_from_another_engine(&record))
             .unwrap_or_else(AgentRunMarker::mint);
         if let Err(e) = write_record(&path, &marker) {
-            crate::log!(
+            crate::log_legacy!(
                 "[AgentRunMarker] could not record the marker of thread {thread_id}, so a restart cannot hand its processes on: {e}"
             );
             marker = AgentRunMarker::mint();
@@ -137,7 +133,7 @@ impl AgentRun {
         if self.handover.is_handed_over() {
             let groups = scan_groups(&self.marker).await;
             if !groups.is_empty() {
-                crate::log!(
+                crate::log_legacy!(
                     "[AgentRunMarker] leaving process groups {groups:?} of {whose} ({}) to the session that resumes it",
                     self.marker.value()
                 );
@@ -191,7 +187,7 @@ async fn reap_marked_groups(marker: AgentRunMarker, whose: &str, grace: Duration
     if groups.is_empty() {
         return;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[AgentRunMarker] process groups {groups:?} outlived the agent of {whose} ({}), sending SIGTERM",
         marker.value()
     );
@@ -199,7 +195,7 @@ async fn reap_marked_groups(marker: AgentRunMarker, whose: &str, grace: Duration
     tokio::time::sleep(grace).await;
     let left = scan_groups(&marker).await;
     if !left.is_empty() {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentRunMarker] process groups {left:?} of {whose} ignored SIGTERM ({}), sending SIGKILL",
             marker.value()
         );
@@ -231,7 +227,7 @@ async fn scan_groups(marker: &AgentRunMarker) -> BTreeSet<i32> {
     {
         Ok(found) => found,
         Err(e) => {
-            crate::log!("[AgentRunMarker] process scan failed, reaping nothing: {e}");
+            crate::log_legacy!("[AgentRunMarker] process scan failed, reaping nothing: {e}");
             Vec::new()
         }
     };
@@ -310,7 +306,7 @@ mod platform {
         // SAFETY: a null buffer asks only for the current count.
         let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         let Ok(count) = usize::try_from(count) else {
-            crate::log!("[AgentRunMarker] could not list processes, reaping nothing");
+            crate::log_legacy!("[AgentRunMarker] could not list processes, reaping nothing");
             return Vec::new();
         };
         // Room for processes started between the two calls.
@@ -373,7 +369,7 @@ mod platform {
     pub(super) fn marked_processes(marker_entry: &[u8]) -> Vec<(i32, i32)> {
         let own = std::process::id() as i32;
         let Ok(dir) = std::fs::read_dir("/proc") else {
-            crate::log!("[AgentRunMarker] could not list /proc, reaping nothing");
+            crate::log_legacy!("[AgentRunMarker] could not list /proc, reaping nothing");
             return Vec::new();
         };
         dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())

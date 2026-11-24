@@ -1,9 +1,3 @@
-/**
- * The file-preview header's own action list, extracted so the header toolbar
- * and the preview's right-click context menu can share one source. Pinning
- * its order and its conditions here is what keeps the two from drifting
- * apart (see `docs/plans/2026-10-04-file-preview-context-menu.md`).
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const platform = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false, clipboardCopy: true }));
@@ -22,7 +16,6 @@ const keysOf = (path: string, mobile = false) => filePreviewContentActions(path,
 
 describe('filePreviewContentActions', () => {
   beforeEach(() => {
-    // `lucidos.data.url` (behind the popout action) reads the page path.
     (globalThis as unknown as { window: { location: unknown } }).window.location =
       { pathname: '/dev/', search: '', href: 'https://localhost:5251/dev/' };
     platform.isTauri = false;
@@ -43,7 +36,7 @@ describe('filePreviewContentActions', () => {
   it('offers popout, copy-path, find, the source toggle, wrap and edit, in that order', () => {
     const path = 'artifacts/notes.md';
     panelOverlay.value = { type: 'file-preview', path };
-    filePreviewSource.value = true; // a renderable file in source view is also the wrap-eligible body
+    filePreviewSource.value = true;
 
     expect(keysOf(path)).toEqual(['open-in-tab', 'copy-path', 'find', 'source-toggle', 'wrap-toggle', 'edit']);
   });
@@ -67,8 +60,6 @@ describe('filePreviewContentActions', () => {
   });
 
   it('offers neither the source toggle nor edit for a non-renderable, non-editable file', () => {
-    // .png has no rendered/source pair and nothing to edit; only the
-    // platform-gated popout/copy-path can appear.
     expect(keysOf('artifacts/photo.png')).toEqual(['open-in-tab', 'copy-path']);
   });
 
@@ -79,7 +70,6 @@ describe('filePreviewContentActions', () => {
 
     const mobileKeys = keysOf(path, true);
     expect(mobileKeys[0]).toBe('refresh');
-    // A repo file is read at a git ref, so it is never inline-editable.
     expect(mobileKeys).not.toContain('edit');
   });
 

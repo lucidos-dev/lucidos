@@ -8,16 +8,6 @@ import { describe, expect, it } from 'vitest';
 import { gapClearedProgress, gapRefreshedVersion, repairGapState } from '../eventGap';
 import { backupProgress, backupStatusVersion } from '../store';
 
-/**
- * A *gap* is a span in which SSE frames may have been lost: the stream
- * dropped and reopened, or the engine reported `Lagged`. Transient frames are
- * never replayed, so a signal fed only by them stays wrong until something
- * repairs it. A manual backup that finished while an iPhone PWA slept left
- * the Backup page on its old "Last cloud backup" line for exactly this reason.
- *
- * Two halves. The first proves the repair itself. The second makes forgetting
- * a signal fail the build, so the repair cannot rot.
- */
 
 describe('repairing the state a gap leaves behind', () => {
   it('bumps every registered version counter exactly once', () => {
@@ -35,8 +25,6 @@ describe('repairing the state a gap leaves behind', () => {
   });
 
   it('moves the Backup health card off a backup that finished in the gap', () => {
-    // The reported bug: BackupCompleted fired while the stream was down, so
-    // the page never re-read /backup/status.
     backupProgress.value = { phase: 'upload', progress: 1, total: 2 };
     const before = backupStatusVersion.value;
     repairGapState();
@@ -55,13 +43,8 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-/** `export const fooVersion = signal(` and `export const fooProgress = gapCleared…(`:
- *  the name, then the callee that builds it. */
 const DECLARATION = /export const (\w+(?:Version|Progress)) = (\w+)\b/g;
 
-/** A signal named `*Version` or `*Progress` that SSE frames do not feed, and
- *  why. Each row is a decision. Adding one is the way to pass without
- *  registering, so it should be harder to justify than the factory call. */
 const NOT_GAP_STATE: Record<string, string> = {
   engineVersion: 'a version string read from the engine, not a counter',
   latestEngineVersion: 'a version string read from the engine, not a counter',

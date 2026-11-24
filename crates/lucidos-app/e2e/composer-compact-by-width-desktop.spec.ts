@@ -3,13 +3,9 @@ import {
   assertHealthy, navigateToApp, ensureOnThreadPane, newThread, waitForVisibleInput, hideDashboardRail,
 } from './helpers';
 
-// A composer row narrower than 36rem draws the compact faces: the badge alone
-// and a round action button. That holds on a desktop viewport too (ADR 0576).
-// Desktop-only (`-desktop.spec.ts`): the phone layout is always compact.
 
 const ROW = '.prompt-actions-row:visible';
 
-/** Cap the composer row at `rem` of content, its own padding added. */
 async function capRow(page: Page, rem: number): Promise<void> {
   await page.evaluate((contentRem) => {
     const row = Array.from(document.querySelectorAll<HTMLElement>('.prompt-actions-row'))
@@ -52,7 +48,6 @@ test.describe('The composer row picks its faces by its own width', () => {
     await expect(row.locator('.rung-step').first()).toBeHidden();
     await expect.poll(async () => (await send.boundingBox())!.width).toBeLessThan(wide.send);
     await expect.poll(async () => (await pill.boundingBox())!.width).toBeLessThan(wide.pill);
-    // Faces move and sizing stays: the row keeps its desktop height.
     expect((await pill.boundingBox())!.height).toBeCloseTo(28, 0);
 
     await uncapRow(page);

@@ -7,7 +7,6 @@ const DELAY = 450;
 function pointerDown(over: Partial<{ button: number; clientX: number; clientY: number; pointerId: number; pointerType: string }> = {}, target: object = document.createElement('div')): PointerEvent {
   return { button: 0, clientX: 0, clientY: 0, pointerId: 1, timeStamp: 0, currentTarget: target, ...over } as unknown as PointerEvent;
 }
-/** A document-level event, as the browser dispatches a lift to the document. */
 function docEvent(type: string, fields: object): Event {
   return Object.assign(new Event(type), fields);
 }
@@ -63,8 +62,6 @@ describe('makeLongPressHandlers', () => {
   });
 
   it("a touch press turns off the target's native long-press at once, until the next press", () => {
-    // iOS shows its own selection or link menu while the finger rests,
-    // and a selection also cancels the gesture.
     const target = document.createElement('div');
     target.style.setProperty('user-select', 'text');
     h.onPointerDown(pointerDown({}, target));
@@ -114,7 +111,6 @@ describe('makeLongPressHandlers', () => {
   });
 
   it('a tap whose button is swapped out mid-press still ends the hold', () => {
-    // A button swapped out by its own tap never sees its pointerup.
     h.onPointerDown(pointerDown({ pointerId: 7 }));
     vi.advanceTimersByTime(100);
     lift(7);
@@ -123,7 +119,6 @@ describe('makeLongPressHandlers', () => {
   });
 
   it.each(['touchend', 'touchcancel'])('a %s that leaves no finger on the glass ends the hold', (type) => {
-    // A tap's touchend can disable its button, and WebKit then never dispatches the pointerup.
     h.onPointerDown(pointerDown({ pointerId: 7 }));
     document.dispatchEvent(docEvent(type, { touches: [] }));
     vi.advanceTimersByTime(DELAY);
@@ -177,7 +172,6 @@ describe('makeLongPressHandlers', () => {
     h.onPointerUp({} as PointerEvent);
     const click = clickEvent();
     h.onClick(click);
-    // The click the browser pairs with the hold is swallowed — step nav must not run.
     expect(onClick).not.toHaveBeenCalled();
     expect(click.preventDefault).toHaveBeenCalled();
     expect(click.stopPropagation).toHaveBeenCalled();
@@ -215,11 +209,11 @@ describe('makeLongPressHandlers', () => {
 
   it('the click suppressor auto-disarms after the fuse so a later tap still navigates', () => {
     h.onPointerDown(pointerDown());
-    vi.advanceTimersByTime(DELAY);     // long-press fires, arm set
-    h.onPointerUp({} as PointerEvent); // arms the disarm fuse
-    vi.advanceTimersByTime(1000);      // fuse elapses
+    vi.advanceTimersByTime(DELAY);
+    h.onPointerUp({} as PointerEvent);
+    vi.advanceTimersByTime(1000);
 
-    h.onClick(clickEvent());           // unrelated later click is NOT swallowed
+    h.onClick(clickEvent());
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
@@ -230,15 +224,12 @@ describe('makeLongPressHandlers', () => {
     expect(onLongPress).not.toHaveBeenCalled();
   });
 
-  /** Capture would retarget the paired click to this element, so a press
-   *  dragged off the control and released would fire its action. */
   it('never captures the pointer', () => {
     const setPointerCapture = vi.fn();
     h.onPointerDown(pointerDown({ pointerId: 7 }, Object.assign(document.createElement('div'), { setPointerCapture })));
     expect(setPointerCapture).not.toHaveBeenCalled();
   });
 
-  /** Leaving the element cancels the hold, which capture would suppress. */
   it('a pointer that leaves the element cancels the hold', () => {
     h.onPointerDown(pointerDown());
     h.onPointerLeave({} as PointerEvent);
@@ -247,8 +238,7 @@ describe('makeLongPressHandlers', () => {
   });
 
   it('a fresh press clears a stranded arm from a right-click that had no paired click', () => {
-    h.onContextMenu(contextMenuEvent()); // arms (touch may pair a click; mouse won't)
-    // New unrelated gesture before the fuse elapses:
+    h.onContextMenu(contextMenuEvent());
     h.onPointerDown(pointerDown());
     vi.advanceTimersByTime(100);
     h.onPointerUp({} as PointerEvent);

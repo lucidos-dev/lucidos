@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A Store row shows the name, the description and one button. The version
- * and the Modified chip live on the plugin detail page.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginStoreRow } from '../StoreTab';

@@ -1,12 +1,3 @@
-/**
- * An app page never scrolls sideways (ADR 0530).
- *
- * The served `/api/v1/sdk-iframe.css` clips `<html>` and `<body>` on the x
- * axis. The fixture carries the culprits that made real apps scroll: a
- * `flex: none` nowrap pill holding long text, a `100vw` block with a margin,
- * a negative margin and a wide image. A chip row is the one deliberate
- * sideways scroller, and it must still scroll inside itself.
- */
 import type { Frame } from '@playwright/test';
 import { test, expect, type Page } from './fixtures';
 import { appPath, createIframeAppFixture } from './db-helpers';
@@ -56,9 +47,7 @@ test.describe('An app page never scrolls sideways', () => {
     fixture.cleanup();
   });
 
-  /** What the page reports after a sideways scroll attempt by code. */
   async function measure(target: Page | Frame) {
-    // The served stylesheet loads after `#ready` parses on a slow first load.
     await target.waitForFunction(() => getComputedStyle(document.documentElement).overflowX === 'clip');
     return target.evaluate(() => {
       const page = document.scrollingElement!;
@@ -69,9 +58,6 @@ test.describe('An app page never scrolls sideways', () => {
         scrollWidth: page.scrollWidth,
         clientWidth: page.clientWidth,
         scrollX: window.scrollX,
-        // Emulated mobile WebKit draws the page's classic scrollbar inside the
-        // layout viewport, so code can pan by its width. An iPhone's scrollbar
-        // is an overlay and takes no width.
         scrollbarWidth: window.innerWidth - window.visualViewport!.width,
         chipsScrollWidth: chips.scrollWidth,
         chipsClientWidth: chips.clientWidth,

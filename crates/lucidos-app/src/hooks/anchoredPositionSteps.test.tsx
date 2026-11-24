@@ -1,26 +1,17 @@
 // @vitest-environment jsdom
-/**
- * `useAnchoredPosition` against a panel whose content changes while open: the
- * position lands before the next frame, and a step change glides.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
 import { useAnchoredPosition, type AnchorBox, type AnchorPosition } from './useAnchoredPopover';
 
-/** An anchor near the viewport's bottom, so the panel opens upward and its
- *  `top` depends on its height. */
 const anchor: AnchorBox = {
   getBoundingClientRect: () => ({
     left: 50, right: 80, top: 700, bottom: 720, width: 30, height: 20, x: 50, y: 700, toJSON: () => ({}),
   }),
 };
 
-/** The box a running morph draws, which jsdom cannot animate. */
 let animatedBox: { top: number; height: number } | null = null;
 
-/** jsdom lays nothing out, so a panel's height is its `data-h`, and its top is
- *  the `top` the hook wrote. */
 function layOut(panel: HTMLElement): void {
   Object.defineProperty(panel, 'offsetHeight', { configurable: true, get: () => Number(panel.dataset.h) });
   Object.defineProperty(panel, 'offsetWidth', { configurable: true, get: () => 200 });
@@ -50,7 +41,6 @@ function Host({ step, height }: { step: string; height: number }) {
       data-h={height}
       style={pos ? { top: `${pos.top}px` } : undefined}
     >
-      {/* The content is what changes, and the height follows it. */}
       <div data-surface-step={step}>{`${step} ${height}`}</div>
     </div>
   );
@@ -64,7 +54,6 @@ async function settle(): Promise<void> {
 
 let root: HTMLElement;
 
-/** Records every animation the panel and its children start. */
 function recordAnimations(): { el: Element; frames: Keyframe[]; animation: { onfinish: (() => void) | null } }[] {
   const calls: { el: Element; frames: Keyframe[]; animation: { onfinish: (() => void) | null } }[] = [];
   HTMLElement.prototype.animate = function (this: Element, kf: Keyframe[]) {
@@ -102,7 +91,6 @@ describe('useAnchoredPosition when the content changes', () => {
 
     render(<Host step="list" height={200} />, root);
     await settle();
-    // No frame has run, so only the mutation callback can have re-measured.
     expect(lastTop()).toBe(700 - 4 - 200);
   });
 
@@ -160,7 +148,6 @@ describe('useAnchoredPosition when the content changes', () => {
     runFrames();
     const boxes = calls.filter((c) => c.el === root.firstElementChild);
     expect(boxes).toHaveLength(2);
-    // The new step rests at top 576, so the glide starts 30px above it.
     expect(boxes[1].frames[0]).toEqual({ width: '200px', height: '150px', translate: '0px -30px' });
   });
 

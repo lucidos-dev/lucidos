@@ -6,10 +6,6 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-/** A change's `description` is its commit subjects, newest first. Printed raw,
- *  a toast or a Changes row names the change by its latest fix, or by every
- *  commit it holds. Every surface naming a change goes through
- *  `changeHeadline` (store/changeHeadline.ts) instead. */
 const SRC: string = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 function sources(dir: string): [string, string][] {

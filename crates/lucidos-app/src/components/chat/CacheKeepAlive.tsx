@@ -15,9 +15,6 @@ import { eventNameChip, eventRowBody } from './EventRow';
 
 type Status<S extends CacheKeepAliveStatus['state']> = Extract<CacheKeepAliveStatus, { state: S }>;
 
-/** The thread's *cache keep-alive status* while it waits, or null. A running
- *  thread reads its cache anyway, so a status left over from its wait is not
- *  shown, and an `ended` one is closed. */
 export function shownKeepAliveStatus(thread: ThreadState | undefined): CacheKeepAliveStatus | null {
   const status = thread?.meta.cacheKeepAliveStatus;
   if (!status || status.state === 'ended' || isMidTurn(effectiveThreadStatus(thread))) return null;
@@ -28,7 +25,6 @@ function usd(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
-/** An amount that may be negative, with a true minus sign: `−$0.72`. */
 function signedUsd(cost: number): string {
   const cents = Math.round(cost * 100) / 100;
   return cents < 0 ? `\u2212${usd(-cents)}` : usd(cents);
@@ -42,13 +38,10 @@ function clock(iso: string): string {
   return formatShortTime(new Date(iso));
 }
 
-/** The context a wake-up would reread, as a phrase after "reread". */
 function rereadWhat(contextTokens: number): string {
   return contextTokens > 0 ? `${formatTokens(contextTokens)} tokens` : 'the whole conversation';
 }
 
-/** Each reason ends on a full stop. `pings_paused` names its end in
- *  `notKeptReason`. */
 const NOT_KEPT_REASON: Record<CacheKeepAliveNotKeptReason, string> = {
   codex: 'Codex sessions get no keep-alive: their cache cannot be kept warm this way.',
   off: 'The cache keep-alive is off.',
@@ -56,7 +49,6 @@ const NOT_KEPT_REASON: Record<CacheKeepAliveNotKeptReason, string> = {
   children_awaiting_user: 'The sub-threads are waiting on you. Pings start again if your answer comes while the cache is still warm.',
   uncacheable_provider: 'Lucidos cannot safely prefill this prompt cache.',
   provider_paused: 'Pings on this provider are paused after a failed ping.',
-  // Historical: the engine no longer emits it, but stored events still carry it.
   prefill_paused: 'Prefill pings are temporarily paused.',
   pings_paused: "Pings to this model's provider kept missing the cache, so they pause for a while.",
   cache_expired: 'The cache went cold before a ping reached it, so a ping would pay to rewrite it.',
@@ -71,8 +63,6 @@ const NOT_KEPT_REASON: Record<CacheKeepAliveNotKeptReason, string> = {
   beat_missed: 'A ping missed the cache, so this wait is not kept warm.',
 };
 
-/** Why nothing keeps the cache warm, with the time paused pings resume and
- *  the plan behind a give-up. */
 function notKeptReason(status: Status<'not_kept'>): string {
   if (status.reason === 'pings_paused' && status.until !== undefined) {
     return `Pings to this model's provider kept missing the cache, so they pause until ${clock(status.until)}.`;
@@ -80,7 +70,6 @@ function notKeptReason(status: Status<'not_kept'>): string {
   return `${NOT_KEPT_REASON[status.reason]}${planSentence(status.cap_source)}`;
 }
 
-/** What set a run's give-up time, as a phrase after "its plan:". */
 function capSourcePhrase(source: CapSource): string {
   switch (source.kind) {
     case 'half_reread':
@@ -98,9 +87,6 @@ function capSourcePhrase(source: CapSource): string {
   }
 }
 
-/** A learned cap's hours on the clock every other time here reads:
- *  `20:00 to 01:00`. The engine counts them in the `timezone` preference's
- *  zone, `utc_offset_mins` from UTC at the ask. */
 function hourWindow(source: Extract<CapSource, { kind: 'learned' }>): string {
   const today = new Date();
   const at = (hour: number) =>
@@ -110,32 +96,24 @@ function hourWindow(source: Extract<CapSource, { kind: 'learned' }>): string {
   return `${at(source.from_hour)} to ${at(source.to_hour)}`;
 }
 
-/** `n` past waits, as a phrase: `41 waits like this`. */
 function waitsLikeThis(n: number): string {
   return n === 1 ? '1 wait like this' : `${n.toLocaleString('en-US')} waits like this`;
 }
 
-/** The sentence naming a run's plan, after the sentence before it. Empty on a
- *  status stored before cap sources. */
 function planSentence(source: CapSource | undefined): string {
   return source ? ` Its plan: ${capSourcePhrase(source)}.` : '';
 }
 
-/** "Warm until" or "Stopped at" a time, then what set it. */
 function capEnd(lead: string, iso: string, source: CapSource | undefined): string {
   return source ? `${lead} ${clock(iso)}, the end of its plan: ${capSourcePhrase(source)}.` : `${lead} ${clock(iso)}.`;
 }
 
-/** Who expects the wake a run plans from, and when. Empty with none: the
- *  run then pings until the reread cap. */
 function expectedWakeSentence(wake: PlannedWake | undefined): string {
   if (!wake) return '';
   const who = wake.source === 'agent' ? 'The agent expects' : 'Lucidos estimates';
   return ` ${who} a wake about ${clock(wake.at)}.`;
 }
 
-/** The sentences of a run, on the card and in the panel. A run that is not
- *  open drops the budget. `null` for a status that names no run. */
 export function keepAliveSentence(status: CacheKeepAliveStatus, open = true): string | null {
   switch (status.state) {
     case 'warming': {
@@ -162,14 +140,11 @@ export function keepAliveSentence(status: CacheKeepAliveStatus, open = true): st
   }
 }
 
-/** The explainer's sentence of a run: a warming one counts against its budget. */
 function explainerSentence(status: RunStatus): string {
   if (status.state !== 'warming') return keepAliveSentence(status)!;
   return `${status.beats} of ${pings(status.budget_beats)} sent, ${usd(status.cost_usd)} so far. ${capEnd('Warm until', status.give_up_at, status.cap_source)}${expectedWakeSentence(status.expected_wake)}`;
 }
 
-/** One row of the keep-alive math: when the reply comes, how likely that is,
- *  and what each choice costs then. */
 interface MathRow {
   when: string;
   chance: number;
@@ -179,14 +154,11 @@ interface MathRow {
 
 type RunStatus = Status<'warming' | 'stopped' | 'ended' | 'turned_off'>;
 
-/** What a closed run actually cost against what no keep-alive would have cost. */
 interface KeepAliveScore {
   keepWarm: number;
   noKeepAlive: number;
 }
 
-/** The expected cost of a run against no keep-alive, slot by slot. A closed
- *  run adds its final `score` and the row it `landed` in. */
 export interface KeepAliveMath {
   rows: MathRow[];
   keepWarm: number;
@@ -197,45 +169,29 @@ export interface KeepAliveMath {
   rereadUsd: number;
   score: KeepAliveScore | null;
   landed: number | null;
-  /** The local hours a learned cap counted, `null` for any other cap. */
   hours: string | null;
 }
 
-/** Minutes as the math labels them: `4.5`, `9`. */
 function minutes(secs: number): string {
   return String(Number((secs / 60).toFixed(1)));
 }
 
-/** Whether an ended run's reply read a warm cache: the engine claims a saving,
- *  or the run never pinged and the cache was warm with or without it. */
 function readWarmCache(status: RunStatus): status is Status<'ended'> {
   return status.state === 'ended' && (status.saved_usd !== undefined || status.beats === 0);
 }
 
-/** The final score of a closed run, `null` while it is open. A reply that read
- *  a warm cache paid the pings and saved the reread. Any other reply pays the
- *  reread whatever the pings did: a stopped or turned-off run, or an ended one
- *  on a cold cache. */
 function keepAliveScore(status: RunStatus, rereadUsd: number): KeepAliveScore | null {
   if (status.state === 'warming') return null;
   if (readWarmCache(status)) return { keepWarm: status.cost_usd, noKeepAlive: status.saved_usd ?? 0 };
   return { keepWarm: status.cost_usd + rereadUsd, noKeepAlive: rereadUsd };
 }
 
-/** The table row a closed run landed in: the slot of its pings when its reply
- *  read a warm cache, and the last row for a run that stopped. `null` where no
- *  row fits, such as a run the user turned off. */
 function landedRow(status: RunStatus, score: KeepAliveScore | null, cap: number): number | null {
   if (!score) return null;
   if (status.state === 'stopped') return cap + 1;
   return readWarmCache(status) && status.beats <= cap ? status.beats : null;
 }
 
-/** The keep-alive math of a run, from the cap odds the engine counted when it
- *  chose the cap. Slot `k` ended after `k` pings with the cache warm. Without
- *  a keep-alive any reply after the first slot pays the reread. A reply after
- *  the cap pays every ping and the reread. `null` without odds, an interval
- *  or prices. */
 export function keepAliveMath(status: CacheKeepAliveStatus): KeepAliveMath | null {
   if (status.state === 'not_kept') return null;
   const { odds, ping_usd: pingUsd, reread_usd: rereadUsd, beat_every_secs: interval } = status;
@@ -273,36 +229,29 @@ export function keepAliveMath(status: CacheKeepAliveStatus): KeepAliveMath | nul
   };
 }
 
-/** The card's word on the math: what keeping the cache warm should save, and
- *  the waits that says so. */
 function expectedSaving(math: KeepAliveMath): string {
   const saving = math.noKeepAlive - math.keepWarm;
   const verdict = saving >= 0 ? `Expected to save ${usd(saving)}` : `Expected to cost ${usd(-saving)} more`;
   return `${verdict}, from ${oddsSource(math)}.`;
 }
 
-/** The past waits the chances count: for a learned cap, those asked in its
- *  hours. */
 function oddsSource(math: KeepAliveMath): string {
   const last = `your last ${math.samples === 1 ? 'wait like this' : waitsLikeThis(math.samples)}`;
   return math.hours ? `${last} asked ${math.hours}` : last;
 }
 
-/** The explainer's one-sentence summary of the math. */
 function expectedSummary(math: KeepAliveMath): string {
   const saving = math.noKeepAlive - math.keepWarm;
   const verdict = saving >= 0 ? `saves about ${usd(saving)}` : `costs about ${usd(-saving)} more`;
   return `Expected cost: keep warm ${usd(math.keepWarm)}, no keep-alive ${usd(math.noKeepAlive)}, so keeping it warm ${verdict}.`;
 }
 
-/** The explainer's summary of a closed run: what it cost against none. */
 function scoreSummary({ keepWarm, noKeepAlive }: KeepAliveScore): string {
   const net = Math.round((noKeepAlive - keepWarm) * 100) / 100;
   const verdict = net > 0 ? `saved ${usd(net)}` : net < 0 ? `cost ${usd(-net)} more` : 'made no difference';
   return `Final cost: keep warm ${usd(keepWarm)}, no keep-alive ${usd(noKeepAlive)}, so keeping it warm ${verdict}.`;
 }
 
-/** Where the chances and the prices come from. */
 function mathFootnote(math: KeepAliveMath): string {
   const tokens = formatTokens(math.contextTokens);
   const perMillion = (price: number) => `$${((price / math.contextTokens) * 1e6).toFixed(2)}/M`;
@@ -313,14 +262,11 @@ function mathFootnote(math: KeepAliveMath): string {
   );
 }
 
-/** A chance as a whole percent. A share that rounds to none but is not
- *  none reads `<1%`, so a slot past waits did end in never reads empty. */
 function percent(share: number): string {
   const whole = Math.round(share * 100);
   return whole === 0 && share > 0 ? '<1%' : `${whole}%`;
 }
 
-/** The math behind the expected cost, folded away until asked for. */
 function KeepAliveMathFold({ math }: { math: KeepAliveMath }) {
   const [open, setOpen] = useState(false);
   return (
@@ -370,8 +316,6 @@ function KeepAliveMathFold({ math }: { math: KeepAliveMath }) {
   );
 }
 
-/** What a reply after the cache goes cold pays, where the status knows. An
- *  ended run that saved the reread already says what it saved. */
 function rereadSentence(status: RunStatus): string | null {
   if (status.state === 'ended' && status.saved_usd !== undefined) return null;
   const tokens = status.context_tokens ?? 0;
@@ -379,17 +323,12 @@ function rereadSentence(status: RunStatus): string | null {
   return `Rereading ${rereadWhat(tokens)} costs ${usd(status.reread_usd)}.`;
 }
 
-/** The pings an open run needs to keep the cache warm up to its expected wake:
- *  one per interval since the run began. `null` without a wake or interval. */
 function pingsBeforeWake(status: Status<'warming'>): number | null {
   if (!status.expected_wake || status.beat_every_secs === undefined) return null;
   const secs = (Date.parse(status.expected_wake.at) - Date.parse(status.since)) / 1000;
   return Math.max(0, Math.floor(secs / status.beat_every_secs));
 }
 
-/** What an open run with no odds should cost against rereading, scored like
- *  the math's rows: a wake before the first ping reads a warm cache anyway,
- *  and a wake past the budget pays every ping and the reread. */
 function warmingComparison(status: Status<'warming'>, pingUsd: number, rereadUsd: number): string {
   const wakePings = pingsBeforeWake(status);
   const budget = status.budget_beats;
@@ -406,8 +345,6 @@ function warmingComparison(status: Status<'warming'>, pingUsd: number, rereadUsd
   return `Keeping it warm to the expected wake takes ${pings(wakePings)}, about ${usd(keepWarm)}, against ${usd(rereadUsd)} to reread. That ${verdict}.`;
 }
 
-/** The explainer's prices for a run with no odds to build the math from: what
- *  one ping costs, then the reread, compared where the run is open. */
 function priceSentences(status: RunStatus): string[] {
   const reread = rereadSentence(status);
   const tokens = status.context_tokens ?? 0;
@@ -419,11 +356,6 @@ function priceSentences(status: RunStatus): string[] {
   return reread ? [ping, reread] : [ping];
 }
 
-/** Whether `status` is a run the thread still keeps warm, so its card may carry
- *  the meter and the switch. A card of a closed run, or one read while the
- *  thread runs, is not open. A parked thread is not running: its beats run
- *  beside the turn. `since` names the wait a run keeps warm, and `at` the
- *  moment the user turned it off. */
 function isOpenRun(status: CacheKeepAliveStatus, thread: ThreadState | undefined): boolean {
   const live = thread?.meta.cacheKeepAliveStatus;
   if (!thread || !live || effectiveThreadStatus(thread) === 'running') return false;
@@ -432,8 +364,6 @@ function isOpenRun(status: CacheKeepAliveStatus, thread: ThreadState | undefined
   return false;
 }
 
-/** Turn the keep-alive off for one thread, or back on. The status follows on
- *  the event, so only a refusal needs saying. */
 function switchKeepAlive(threadId: string, state: 'off' | 'on'): void {
   switchCacheKeepAlive(threadId, state).catch((e: unknown) => {
     const verb = state === 'off' ? 'turn the cache keep-alive off' : 'turn the cache keep-alive back on';
@@ -441,9 +371,6 @@ function switchKeepAlive(threadId: string, state: 'off' | 'on'): void {
   });
 }
 
-/** The per-thread switch (ADR 0554), one button for the card and the panel:
- *  off while pings run, back on once the user turned it off. Nothing for the
- *  other states. */
 function KeepAliveSwitch({ threadId, status }: { threadId: string; status: CacheKeepAliveStatus }) {
   const state = status.state === 'warming' ? 'off' : status.state === 'turned_off' ? 'on' : null;
   if (state === null) return null;
@@ -456,7 +383,6 @@ function KeepAliveSwitch({ threadId, status }: { threadId: string; status: Cache
   );
 }
 
-/** The thin meter of pings spent against the reread cap. */
 function KeepAliveMeter({ status }: { status: Status<'warming'> }) {
   return (
     <div class="keep-alive-meter" aria-hidden="true">
@@ -465,28 +391,20 @@ function KeepAliveMeter({ status }: { status: Status<'warming'> }) {
   );
 }
 
-/** Whether the run's pings kept the cache warm: only a warming or ended run
- *  says so. */
 function keptWarm(status: CacheKeepAliveStatus): boolean {
   return status.state === 'warming' || status.state === 'ended';
 }
 
-/** The title of a card's chip and its explainer, and of a warming panel
- *  headline. */
 function cacheTitle(status: CacheKeepAliveStatus): string {
   return keptWarm(status) ? 'Cache kept warm' : 'Cache keep-alive';
 }
 
-/** The panel section's headline for one status: the card's sentence. Only
- *  pings that run claim warmth here: any other state leaves that to the
- *  engine's warmth read. */
 function sectionHeadline(status: CacheKeepAliveStatus): string {
   return keepAliveSentence(status) ?? 'Not kept';
 }
 
 const TURNS_BACK_ON = 'It turns back on when the thread runs again.';
 
-/** The panel section's detail, where the headline does not say it all. */
 function sectionDetail(status: CacheKeepAliveStatus): string | null {
   switch (status.state) {
     case 'warming':
@@ -501,11 +419,6 @@ function sectionDetail(status: CacheKeepAliveStatus): string | null {
   }
 }
 
-/** When the cache of a thread no ping keeps warm goes cold, read from the
- *  engine: a time, `null` once cold, `'unknown'` when no evidence gives its
- *  lifetime, `undefined` until read. A warming run reads nothing, since its
- *  pings keep the cache warm. Every status change reads afresh: an earlier
- *  answer may describe another state. */
 function useColdAt(threadId: string, status: CacheKeepAliveStatus): ColdAt | undefined {
   const { loadable } = useLoadableFetch(
     async (): Promise<ColdAt | undefined> => {
@@ -513,8 +426,6 @@ function useColdAt(threadId: string, status: CacheKeepAliveStatus): ColdAt | und
       try {
         return coldAtOf(await fetchCacheWarmth(threadId));
       } catch (e) {
-        // Best-effort hint, as on the cache-warm line: the headline only drops
-        // its warmth words, and the next status change reads again.
         console.warn(`[KeepAliveSection] cache-warmth read failed for thread "${threadId}"`, e);
         throw e;
       }
@@ -524,8 +435,6 @@ function useColdAt(threadId: string, status: CacheKeepAliveStatus): ColdAt | und
   return loadable.status === 'loaded' ? loadable.data : undefined;
 }
 
-/** When a cache goes cold, with the lifetime that says so. `null` once it is
- *  cold, or `'unknown'`. */
 type ColdAt = WarmUntil | null | 'unknown';
 
 interface WarmUntil {
@@ -546,7 +455,6 @@ function coldAtOf(warmth: CacheWarmth): ColdAt {
 
 const LIFETIME_WORDS: Record<WarmthTtl['lifetime'], string> = { '5m': '5-minute', '30m': '30-minute', '1h': '1-hour', '12h': '12-hour' };
 
-/** "Warm until" a time, and the lifetime evidence it counts from (ADR 0575). */
 function warmUntil({ at, ttl }: WarmUntil): string {
   const time = `Warm until ${formatShortTime(new Date(at))}`;
   if (!ttl) return time;
@@ -554,16 +462,12 @@ function warmUntil({ at, ttl }: WarmUntil): string {
   return `${time}, on the ${LIFETIME_WORDS[ttl.lifetime]} lifetime ${says}`;
 }
 
-/** The headline's warmth sentence: until when the cache stays warm, that it
- *  is cold, or that its lifetime is unknown. Empty until read. */
 function warmthSentence(coldAt: ColdAt | undefined, now: number): string {
   if (coldAt === undefined) return '';
   if (coldAt === 'unknown') return ' Its lifetime is unknown.';
   return coldAt !== null && now < coldAt.at ? ` ${warmUntil(coldAt)}.` : ' The cache is cold.';
 }
 
-/** The waiting panel's "Prompt cache" section. It is always labelled, since it
- *  says something different in kind from the lists above it. */
 export function KeepAliveSection({ threadId, status }: { threadId: string; status: CacheKeepAliveStatus }) {
   const coldAt = useColdAt(threadId, status);
   const now = useNow(typeof coldAt === 'object' && coldAt !== null ? coldAt.at : 0);
@@ -583,9 +487,6 @@ export function KeepAliveSection({ threadId, status }: { threadId: string; statu
   );
 }
 
-/** The transcript card of one *keep-alive run*: the pings the engine sent to
- *  keep a waiting thread's cache warm. The card stays after the run ends. It
- *  reads the thread itself, for its switch and meter belong to an open run. */
 export function KeepAliveRow({ threadId, status }: { threadId: string; status: CacheKeepAliveStatus }) {
   if (status.state === 'not_kept') return null;
   const open = isOpenRun(status, threadMap.value.get(threadId));
@@ -613,11 +514,8 @@ export function KeepAliveRow({ threadId, status }: { threadId: string; status: C
   });
 }
 
-/** How often a countdown re-renders. Under a minute the text counts seconds. */
 const COUNTDOWN_TICK_MS = 1000;
 
-/** A local clock that re-renders once a second, for a countdown. With `until`
- *  it stops ticking once that time has passed. */
 function useNow(until = Infinity): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -631,31 +529,15 @@ function useNow(until = Infinity): number {
   return now;
 }
 
-/** Whether the cache-warm line may read the engine: the thread is idle or
- *  parked on a question with no answer or follow-up in flight. The read says
- *  whether a keep-alive card already speaks for the cache. */
 export function cacheWarmLineEligible(thread: ThreadState): boolean {
   return isRenderedThreadIdle(thread);
 }
 
-/** One read of the cache-warm line: when the cache goes cold, or that no
- *  evidence gives its lifetime. */
 interface WarmRead {
   coldAt: WarmUntil | 'unknown';
   keepAlive: CacheKeepAliveStatus;
 }
 
-/** The card that closes the feed of a thread waiting on the user while its
- *  prompt cache is warm and nothing pings it: an idle thread, or one parked on
- *  a question. The engine says how long is left. Any other status already has
- *  a keep-alive card, so the line draws nothing beside it. A cold cache draws
- *  nothing, and so does a failed read: the next status or event change reads
- *  again. A beat is a `ContextCaptured` on the thread, so it reads again too.
- *
- *  It takes values derived from the thread, never the thread itself. The SSE
- *  path mutates a thread in place, and `@preact/signals` skips a render whose
- *  props are all identical. Handed the thread, the line kept counting down
- *  through a running turn. */
 export function CacheWarmLine({ threadId, eligible, eventCount }: { threadId: string; eligible: boolean; eventCount: number }) {
   const { loadable } = useLoadableFetch(
     async (): Promise<WarmRead | null> => {
@@ -666,16 +548,11 @@ export function CacheWarmLine({ threadId, eligible, eventCount }: { threadId: st
         if (warmth.keep_alive === null || coldAt === null) return null;
         return { coldAt, keepAlive: warmth.keep_alive };
       } catch (e) {
-        // Best-effort hint the user never asked for: a toast on every failed
-        // read would be noise. The line is absent, and the next status or
-        // event change reads again.
         console.warn(`[CacheWarmLine] cache-warmth read failed for thread "${threadId}"`, e);
         return null;
       }
     },
     [threadId, eligible, eventCount],
-    // An event while idle re-reads the same thing. Leaving idle clears the
-    // figure, since the ineligible pass loads null.
     { keepLoadedWhileRefetching: true },
   );
   if (!eligible || loadable.status !== 'loaded' || loadable.data === null || loadable.data.keepAlive.state !== 'not_kept') return null;
@@ -706,10 +583,6 @@ function WarmLineCard({ read }: { read: WarmRead }) {
   );
 }
 
-/** The card's, the cache-warm card's and the panel's one ⓘ. It opens the shared
- *  explainer, which says what the cache is, the run's facts and the setting
- *  behind it. The switch stays on the surface that opened it. Its title repeats
- *  that surface's words. */
 function KeepAliveExplainerButton({ status, title }: { status: CacheKeepAliveStatus; title: string }) {
   return (
     <Explainer title={title} wide={keepAliveMath(status) !== null}>
@@ -724,8 +597,6 @@ function KeepAliveExplainerButton({ status, title }: { status: CacheKeepAliveSta
   );
 }
 
-/** What the cache is, and what keeping it warm saves. Only a status with a run
- *  says Lucidos pings it. */
 function cacheIntro(status: CacheKeepAliveStatus): string {
   const keeps =
     status.state === 'not_kept'
@@ -734,8 +605,6 @@ function cacheIntro(status: CacheKeepAliveStatus): string {
   return `The model holds this thread's context in its prompt cache for a while. ${keeps} instead of paying to reread it.`;
 }
 
-/** The run's sentence and the meter, then the math or the prices. Or the
- *  reason nothing keeps the cache warm. */
 function KeepAliveRunFacts({ status }: { status: CacheKeepAliveStatus }) {
   if (status.state === 'not_kept') return <p>{`Nothing keeps it warm while you are away. ${notKeptReason(status)}`}</p>;
   const math = keepAliveMath(status);
@@ -767,10 +636,6 @@ function SettingLink({ label, close, open }: { label: string; close: () => void;
 
 const KEEP_ALIVE_SETTING = 'Settings → Models → Cache keep-alive';
 
-/** The paragraph linking the setting behind the status, ending on its link
- *  with no full stop to wrap. The keep-alive is on or off, so an off status
- *  links the switch. Any other status links the cache cards switch, which
- *  shows only while the keep-alive is on. */
 function KeepAliveSettingLinks({ status, close }: { status: CacheKeepAliveStatus; close: () => void }) {
   if (status.state === 'not_kept' && status.reason === 'off') {
     return (

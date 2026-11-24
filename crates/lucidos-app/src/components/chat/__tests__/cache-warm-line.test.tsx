@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The *cache-warm line*: a card that closes the feed of a waiting thread while
- * its prompt cache is warm and no keep-alive card speaks for it. The engine
- * answers how long is left. The card goes at the cold time and re-reads when
- * the thread's status or events change.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -36,7 +30,6 @@ vi.mock('../../../api/client', () => ({
 
 const NOW = Date.parse('2026-10-19T10:00:00Z');
 
-/** An idle thread with no card parked on it: nothing keeps its cache warm. */
 const NOTHING_PENDING: CacheKeepAliveStatus = { state: 'not_kept', reason: 'nothing_pending' };
 
 const warm = (remaining_secs: number, keep_alive: CacheKeepAliveStatus = NOTHING_PENDING, ttl: WarmthTtl | null = null): CacheWarmth => ({
@@ -63,7 +56,6 @@ const stopped: CacheKeepAliveStatus = {
 const turnedOff: CacheKeepAliveStatus = {
   state: 'turned_off', at: '2026-10-19T09:59:00Z', beats: 3, cost_usd: 0.07, context_tokens: 118_000,
 };
-/** The card's detail for a cache that goes cold `secs` after the read. */
 const warmUntil = (secs: number) => `Warm until ${formatShortTime(new Date(NOW + secs * 1000))}`;
 const detailOf = (host: HTMLElement) => host.querySelector('.event-row-detail')?.textContent;
 
@@ -76,7 +68,6 @@ function threadWith(
 
 const root = () => document.querySelector('[data-role="cache-warm"]');
 
-/** Render the line as `ThreadView` does, then let the engine's answer land. */
 async function show(thread: ThreadState, host: HTMLElement): Promise<void> {
   await act(async () => {
     render(
@@ -106,8 +97,6 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  // Unmount first: an open popover left on the overlay stack would swallow the
-  // next test's click.
   await act(async () => {
     for (const host of Array.from(document.body.children)) render(null, host);
   });
@@ -239,8 +228,6 @@ describe('the cache-warm card', () => {
   });
 
   it('draws once beside a warming card on a thread parked on a question', async () => {
-    // Mid-turn the shown status is null while the warming card stays open, so
-    // only the engine's read can tell that the card already speaks.
     fetchCacheWarmth.mockResolvedValue(warm(240, kept));
     await mount(threadWith('waiting_for_user_answer', kept));
     expect(root()).toBeNull();
@@ -300,7 +287,6 @@ describe('the cache-warm card', () => {
     const thread = threadWith('idle');
     const host = await mount(thread);
     expect(detailOf(host)).toBe(warmUntil(240));
-    // The SSE path mutates the thread rather than replacing it.
     applySummaryVersion(thread.meta, thread.meta.summaryVersion + 1, 'running');
     await show(thread, host);
     expect(root()).toBeNull();

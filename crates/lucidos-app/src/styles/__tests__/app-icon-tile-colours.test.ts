@@ -1,8 +1,3 @@
-/**
- * The app icon tile paints only theme variables, so every theme recolours it
- * (ADR 0414, invariant I4). `AppIcon` picks the monogram hue from
- * `MONOGRAM_HUES`, which its own test holds to theme variables.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

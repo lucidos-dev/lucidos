@@ -119,7 +119,7 @@ async fn land_one(repo_root: &Path, tip: &str, input: &LandingInput) -> LandingS
             })
         }
         Ok(o) => {
-            log!(
+            log_legacy!(
                 "[LandingLane] commit-tree for {} failed: {}",
                 input.change_id,
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -127,7 +127,7 @@ async fn land_one(repo_root: &Path, tip: &str, input: &LandingInput) -> LandingS
             LandingStep::SetAside
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[LandingLane] commit-tree for {} failed: {}",
                 input.change_id,
                 e
@@ -143,7 +143,7 @@ async fn earlier_landing(repo_root: &Path, input: &LandingInput) -> Option<Landi
     find_landing_merge(repo_root, &input.snapshot_sha)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[LandingLane] could not look up the landing merge of {}: {}",
                 input.change_id,
                 e
@@ -220,6 +220,7 @@ pub(super) const MAX_PUSH_ATTEMPTS: usize = 3;
 /// it first (`MainLocks::lock_main`).
 /// `Err` only when `main` could not be read, and then nothing happened.
 pub(crate) async fn publish_clean_pass(
+    remote: &[&super::LaneMember],
     locks: &MainLocks,
     repo_root: &Path,
     order: &LandingOrder,
@@ -228,13 +229,33 @@ pub(crate) async fn publish_clean_pass(
     let _merge = locks.lock_merge().await;
     let mut rejected = String::new();
     for _ in 0..MAX_PUSH_ATTEMPTS {
+        let order = if remote.is_empty() {
+            order
+        } else {
+            &LandingOrder::OriginFirst
+        };
         let base = match landing_base(repo_root, order).await {
             Ok(base) => base,
             Err(BaseRefusal::MainUnreadable(e)) => return Err(e),
             Err(BaseRefusal::Origin(why)) => return Ok(CleanPass::WaitingForOrigin(why)),
         };
         let chain = build_landing_chain(repo_root, &base.base, inputs).await;
-        if base.origin.needs_push(&chain.tip) {
+        let landed: Vec<_> = remote
+            .iter()
+            .copied()
+            .filter(|member| {
+                chain.steps.iter().any(|(id, step)| {
+                    *id == member.change_id
+                        && matches!(step, LandingStep::Landed(_) | LandingStep::AlreadyOnMain(_))
+                })
+            })
+            .collect();
+        if !landed.is_empty() {
+            if let Err(error) = super::remote::land(repo_root, &chain.tip, &landed).await {
+                rejected = error;
+                continue;
+            }
+        } else if base.origin.needs_push(&chain.tip) {
             match push_to_origin_main(repo_root, &chain.tip).await {
                 PushOutcome::Pushed => {}
                 PushOutcome::Rejected(e) => {
@@ -279,13 +300,13 @@ pub(super) async fn move_local_main(
         // The ref moved but the repo-root tree did not follow. The landing
         // happened, so it is reported as one, and the error is logged.
         Err(e) if branch_head_sha(repo_root, "main").await.as_deref() == Some(tip) => {
-            log!("[LandingLane] main moved to {} but: {}", tip, e);
+            log_legacy!("[LandingLane] main moved to {} but: {}", tip, e);
             None
         }
         // `origin` holds the landing, so it happened. Local `main` follows
         // on the next pass.
         Err(e) if base.origin.origin_first() => {
-            log!(
+            log_legacy!(
                 "[LandingLane] origin/main is at {} but local main is not: {}",
                 tip,
                 e

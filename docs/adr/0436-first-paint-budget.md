@@ -5,6 +5,9 @@
 
 ## Context
 
+ADR [0739](0739-consolidate-small-lazy-chunks.md) supersedes the first-paint limit
+with 1950 kB for the approved small-chunk consolidation.
+
 ADR 0288 split `crates/lucidos-app` into an entry chunk and a shell chunk. The
 entry holds the data layer, the shell holds the UI, and the entry got a 600 kB
 budget. ADR 0353 added a 90 % soft line and taught the dev build-watch to report

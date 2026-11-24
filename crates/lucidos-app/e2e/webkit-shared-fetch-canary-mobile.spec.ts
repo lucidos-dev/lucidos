@@ -18,10 +18,7 @@ import { test, expect, type Page } from '@playwright/test';
 // take longer than any fixed delay to start the fetch, and a frame removed
 // before its siblings join strands nobody.
 
-/** After both siblings reach their subresource tags, the time they get to ask
- *  for them. A sibling asks in the same parser pass, so this is slack. */
 const JOIN_MS = 200;
-/** Between the removal and the answer, so the removal fails the fetch first. */
 const RELEASE_AFTER_MS = 300;
 const REPORT_TIMEOUT_MS = 6000;
 
@@ -29,9 +26,7 @@ type FrameReport = { id: string; js: boolean; css: string };
 
 let server: http.Server;
 let origin: string;
-/** Subresource requests the server has seen since the page loaded. */
 let requested: string[] = [];
-/** Subresource answers held until the page asks for them. */
 let held: (() => void)[] = [];
 let released = false;
 
@@ -72,7 +67,6 @@ test.beforeAll(async () => {
       res.end();
       return;
     }
-    // Only the page resets the state, never a stray request such as a favicon.
     if (url.pathname !== '/') {
       res.writeHead(404);
       res.end();

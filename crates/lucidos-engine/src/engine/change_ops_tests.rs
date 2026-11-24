@@ -5,7 +5,7 @@
 // for a SIGABRT under parallel `cargo test -p lucidos-engine --lib`.
 // They were wrong. Bisection in a fourth session pinned the actual
 // cause: the **wasmtime-`Engine`-creating tests** in
-// `api::proxy_wasm_*`, `api::proxy_pipeline_builder`, and
+// `engine::proxy_wasm_*`, `api::proxy_pipeline_builder`, and
 // `api::proxy::tests::reload_*`.
 //
 // The error on stderr was:
@@ -44,7 +44,7 @@
 //     the primary fix)
 //
 // The fix that actually worked: move the 13+2 Engine-creating cases
-// to `crates/lucidos-engine/tests/proxy_wasm_engine.rs`. Each
+// to `crates/lucidos-agents-api/tests/proxy_wasm_engine.rs`. Each
 // `[[test]]` binary runs in its OWN process, so it gets its own
 // per-process Mach IPC budget and can't blow past the threshold.
 // `cargo test -p lucidos-engine` runs both the lib's parallel test
@@ -887,10 +887,10 @@ fn a_live_session_harden_re_enters_the_apply() {
         "the live-session harden must hand its receiver to the follow-up apply. Arm was:\n{arm}"
     );
 
-    let spawn = include_str!("claude_code/spawn.rs");
+    let spawn = include_str!("../../../lucidos-agents-api/src/engine/claude_code/spawn.rs");
     let production = &spawn[..spawn.find("\n#[cfg(test)]").unwrap()];
     let follow_up = &production[production
-        .find("pub(crate) fn spawn_apply_after_session_harden(")
+        .find("fn spawn_apply_after_session_harden(")
         .unwrap()..];
     let follow_up = &follow_up[..follow_up.find("\n    }\n").unwrap()];
     let turn = follow_up.find("wait_for_prompt_turn(").unwrap();
@@ -905,9 +905,7 @@ fn a_live_session_harden_re_enters_the_apply() {
         "a turn that never settles must not apply: its proposal may still write the branch"
     );
 
-    let after = &production[production
-        .find("pub(crate) async fn apply_after_hardening(")
-        .unwrap()..];
+    let after = &production[production.find("async fn apply_after_hardening(").unwrap()..];
     let after = &after[..after.find("\n    }\n").unwrap()];
     assert!(
         !after.contains("ThreadEvent::ChangeApplyFailed"),
@@ -934,10 +932,22 @@ fn a_live_session_harden_re_enters_the_apply() {
 fn api_handlers_never_drive_a_coding_agent_session_directly() {
     // Every `api/*.rs` that could plausibly reach a session.
     for (name, source) in [
-        ("api/chat.rs", include_str!("../api/chat.rs")),
-        ("api/claude_code.rs", include_str!("../api/claude_code.rs")),
-        ("api/changes.rs", include_str!("../api/changes.rs")),
-        ("api/history.rs", include_str!("../api/history.rs")),
+        (
+            "api/chat.rs",
+            include_str!("../../../lucidos-agents-api/src/api/chat.rs"),
+        ),
+        (
+            "api/claude_code.rs",
+            include_str!("../../../lucidos-agents-api/src/api/claude_code.rs"),
+        ),
+        (
+            "api/changes.rs",
+            include_str!("../../../lucidos-agents-api/src/api/changes.rs"),
+        ),
+        (
+            "api/history.rs",
+            include_str!("../../../lucidos-agents-api/src/api/history.rs"),
+        ),
     ] {
         assert!(
             !source.contains("run_direct_agent("),
@@ -949,61 +959,6 @@ fn api_handlers_never_drive_a_coding_agent_session_directly() {
 }
 
 // ── One failed apply, one card ──
-
-/// A caller of `apply_change` must not emit its own `ChangeApplyFailed`.
-///
-/// The apply path announces every failure it decides, then returns the same
-/// text as `Err`. A caller that emits on that `Err` therefore writes the event
-/// a second time, and the thread draws two identical "Change failed" cards.
-/// Four callers did: both no-live-session paths in `apply_now`, and both
-/// auto-apply paths in `claude_code/spawn.rs`.
-///
-/// Whole-tree rather than a hand-kept file list. The callers are spread over
-/// six modules, and a new one must inherit the rule without being enrolled.
-/// Test sources are skipped: this file names the banned tokens to assert on
-/// them, and would otherwise match itself.
-#[test]
-fn apply_change_callers_do_not_re_announce_the_failure() {
-    for (path, source) in engine_sources() {
-        for block in apply_change_result_blocks(&source) {
-            for banned in ["emit_apply_failed(", "ThreadEvent::ChangeApplyFailed"] {
-                assert!(
-                    !block.contains(banned),
-                    "{path} handles an apply_change result with `{banned}`. The apply path \
-                     already emitted that failure, so this draws the same card twice. Log it \
-                     and let the event stand, as apply_all_driver.rs does. Block was:\n{block}"
-                );
-            }
-        }
-    }
-}
-
-/// Every non-test `.rs` under this crate's `src/`, as (display path, contents).
-fn engine_sources() -> Vec<(String, String)> {
-    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
-        let entries = std::fs::read_dir(dir).expect("engine src must be readable");
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, root, out);
-                continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if !name.ends_with(".rs") || name.contains("_test") {
-                continue;
-            }
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            out.push((
-                rel.to_string_lossy().into_owned(),
-                std::fs::read_to_string(&path).expect("source must be readable"),
-            ));
-        }
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut out = Vec::new();
-    walk(&root, &root, &mut out);
-    out
-}
 
 /// Byte offset of every live `.apply_change(` call in `source`. A
 /// commented-out call is skipped, so naming the method in prose costs nothing.
@@ -1059,33 +1014,6 @@ const APPLY_CHANGE_CALLERS: &[(&str, &str)] = &[
         "requesting: the `changes` LLM tool, via change_action_refusal",
     ),
 ];
-
-/// A new `apply_change` caller cannot land unclassified.
-///
-/// The `changes` LLM tool was exactly this gap. It merged a branch whose
-/// coding agent was mid-turn, because it was a requesting surface that nobody
-/// had enrolled. Whole-tree, so the next one inherits the question.
-#[test]
-fn every_apply_change_caller_is_classified() {
-    let mut found: Vec<String> = engine_sources()
-        .into_iter()
-        .filter(|(_, source)| !apply_change_call_offsets(source).is_empty())
-        .map(|(path, _)| path)
-        .collect();
-    found.sort();
-    let mut enrolled: Vec<String> = APPLY_CHANGE_CALLERS
-        .iter()
-        .map(|(path, _)| (*path).to_string())
-        .collect();
-    enrolled.sort();
-    assert_eq!(
-        found, enrolled,
-        "the set of apply_change callers moved. Add the file to APPLY_CHANGE_CALLERS with its \
-         reason. A surface a person or an agent drives must call \
-         api::changes::change_action_refusal first, or it will merge a branch whose coding agent \
-         is still writing to it. An engine-internal path must not."
-    );
-}
 
 /// The block that handles each `apply_change` result in `source`.
 ///
@@ -1288,5 +1216,114 @@ mod unknown_worktree_lookup_is_not_a_no {
             "git clean -fd must not run in the primary checkout"
         );
         assert_eq!(rev_parse(&repo, UNHELD).await, before);
+    }
+}
+
+mod guard_tests {
+    #[test]
+    fn every_merging_apply_result_keeps_the_requested_build_outcome() {
+        for source in [
+            include_str!("change_ops/apply.rs"),
+            include_str!("landing_lane/driver.rs"),
+        ] {
+            for block in source.split("ApplyResult::applied_with_merge(").skip(1) {
+                let end = block.find(".with_version_build(build_request)");
+                assert!(
+                    end.is_some_and(|end| end < 500),
+                    "Apply dropped its build outcome"
+                );
+            }
+        }
+        let api = include_str!("../../../lucidos-agents-api/src/api/history.rs");
+        assert!(api.contains("join_or_start_background_rebuild"));
+        assert!(api.contains("restart_background_rebuild"));
+    }
+
+    use super::*;
+    use crate::test_support::source_scan::production_sources;
+
+    /// A caller of `apply_change` must not emit its own `ChangeApplyFailed`.
+    ///
+    /// The apply path announces every failure it decides, then returns the same
+    /// text as `Err`. A caller that emits on that `Err` therefore writes the event
+    /// a second time, and the thread draws two identical "Change failed" cards.
+    /// Four callers did: both no-live-session paths in `apply_now`, and both
+    /// auto-apply paths in `claude_code/spawn.rs`.
+    ///
+    /// Whole-tree rather than a hand-kept file list. The callers are spread over
+    /// six modules, and a new one must inherit the rule without being enrolled.
+    /// Test sources are skipped: this file names the banned tokens to assert on
+    /// them, and would otherwise match itself.
+    #[test]
+    fn apply_change_callers_do_not_re_announce_the_failure() {
+        for (path, source) in production_sources() {
+            for block in apply_change_result_blocks(&source) {
+                for banned in ["emit_apply_failed(", "ThreadEvent::ChangeApplyFailed"] {
+                    assert!(
+                        !block.contains(banned),
+                        "{path} handles an apply_change result with `{banned}`. The apply path \
+                     already emitted that failure, so this draws the same card twice. Log it \
+                     and let the event stand, as apply_all_driver.rs does. Block was:\n{block}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A new `apply_change` caller cannot land unclassified.
+    ///
+    /// The `changes` LLM tool was exactly this gap. It merged a branch whose
+    /// coding agent was mid-turn, because it was a requesting surface that nobody
+    /// had enrolled. Whole-tree, so the next one inherits the question.
+    #[test]
+    fn every_apply_change_caller_is_classified() {
+        let mut found: Vec<String> = production_sources()
+            .into_iter()
+            .filter(|(_, source)| !apply_change_call_offsets(source).is_empty())
+            .map(|(path, _)| path)
+            .collect();
+        found.sort();
+        let mut enrolled: Vec<String> = APPLY_CHANGE_CALLERS
+            .iter()
+            .map(|(path, _)| (*path).to_string())
+            .collect();
+        enrolled.sort();
+        assert_eq!(
+            found, enrolled,
+            "the set of apply_change callers moved. Add the file to APPLY_CHANGE_CALLERS with its \
+         reason. A surface a person or an agent drives must call \
+         api::changes::change_action_refusal first, or it will merge a branch whose coding agent \
+         is still writing to it. An engine-internal path must not."
+        );
+    }
+}
+
+#[test]
+fn apply_result_wire_explains_the_same_deferred_request() {
+    let result = ApplyResult::applied(Uuid::new_v4(), None, true)
+        .with_version_build(crate::engine::build_deferral::BuildRequest::Deferred(2));
+    let wire = serde_json::to_value(result).unwrap();
+    assert_eq!(wire["status"], "applied");
+    assert_eq!(wire["version_build"], "deferred");
+    assert_eq!(wire["deferred_coding_threads"], 2);
+    assert_eq!(
+        wire["message"],
+        "Applied. The new version waits for 2 coding threads to finish."
+    );
+}
+
+#[test]
+fn apply_result_wire_distinguishes_started_and_no_build() {
+    for (request, expected) in [
+        (
+            crate::engine::build_deferral::BuildRequest::Started,
+            "started",
+        ),
+        (crate::engine::build_deferral::BuildRequest::None, "none"),
+    ] {
+        let result = ApplyResult::applied(Uuid::new_v4(), None, true).with_version_build(request);
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["version_build"], expected);
+        assert_eq!(wire["deferred_coding_threads"], 0);
     }
 }

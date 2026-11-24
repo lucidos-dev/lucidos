@@ -1,10 +1,3 @@
-/**
- * Text on an accent fill takes the theme's `--text-on-accent`, never a literal.
- *
- * The reported bug: a theme with a bright green accent set `--text-on-accent`
- * to black, but the needs-attention count stayed white on green and could not
- * be read. `.badge` and the drawer's attention pill both wrote `color: white`.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -32,9 +25,6 @@ describe('ink on the accent fill', () => {
   });
 
   it('a badge never inks with a literal, even where its fill comes from .badge', () => {
-    // A badge that sets no background of its own takes its fill from `.badge`,
-    // so the scan above cannot see it. Only the header bar's badges repaint
-    // the fill.
     const allowed = ['var(--text-on-accent)', 'var(--header-badge-fg)'];
     const inked = sheets.flatMap(([file, css]) => rulesTargeting(css, 'badge')
       .filter(r => r.props.has('color'))

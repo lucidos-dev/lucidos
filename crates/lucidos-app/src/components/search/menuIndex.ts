@@ -2,30 +2,12 @@ import { MENU_ITEMS, MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
 import type { SearchResultItem } from '../../api/client';
 import { rankByTitle } from './titleMatch';
 
-/**
- * The menu items themselves, as Search Everywhere results.
- *
- * Sibling of `searchIndex.ts` (the Settings index) and resolved the same way:
- * entirely in the frontend, so the engine never sees the `menu` category.
- *
- * The two differ in one respect. A settings entry carries visibility flags,
- * because the row it lands on may not render. Every menu item always opens a
- * real content-pane view through `switchMenuItem`, so no result here can land
- * on nothing and none of them is gated.
- *
- * Names come from `MENU_ITEM_LABELS`, which the drawer and the header read too.
- * So a page cannot be called one thing in search and another where you land.
- */
 interface MenuSearchEntry {
-  /** The menu item to switch to, and the result id (also the recents key). */
   id: MenuItem;
-  /** What the page holds, shown as the result subtitle. */
   subtitle: string;
-  /** Extra free-text matched alongside the label. Not shown in the UI. */
   keywords: string;
 }
 
-/** Keyed by `MenuItem`, so a new page cannot ship unfindable. */
 const MENU_SEARCH_DETAIL: Record<MenuItem, Omit<MenuSearchEntry, 'id'>> = {
   files: { subtitle: 'Your workspace files', keywords: 'files artifacts documents folder browse workspace' },
   apps: { subtitle: 'Your apps', keywords: 'apps app ui pinned open' },
@@ -36,7 +18,6 @@ const MENU_SEARCH_DETAIL: Record<MenuItem, Omit<MenuSearchEntry, 'id'>> = {
   notifications: { subtitle: 'Your notifications', keywords: 'notifications alerts unread bell push' },
 };
 
-/** In the order `MENU_ITEMS` declares, which is the order the Menu tab lists. */
 const MENU_SEARCH_INDEX: MenuSearchEntry[] =
   MENU_ITEMS.map(id => ({ id, ...MENU_SEARCH_DETAIL[id] }));
 
@@ -50,10 +31,6 @@ function toResult(entry: MenuSearchEntry): SearchResultItem {
   };
 }
 
-/** Filter the index by query (case-insensitive substring over label plus
- *  keywords), rank by label best first, and return as SearchResultItems. An
- *  empty query lists every menu item in menu order, which is what the Menu tab
- *  opens on. */
 export function getMenuSearchResults(query: string, limit: number): SearchResultItem[] {
   const q = query.trim().toLowerCase();
   const matches = q

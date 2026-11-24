@@ -1,14 +1,3 @@
-/**
- * The compose actor toggle (Lucidos Agent / coding agent) MUST remember the
- * last pick across page reloads. Without persistence, picking the coding agent
- * → reloading → sending lands the message on the Lucidos Agent despite the
- * prior pick (and the toggle displays Lucidos again, silently overriding the
- * user's choice).
- *
- * Restoration: `store.ts` reads 'lucidos-input-mode' from localStorage on init.
- * Persistence: `effects.ts` writes it back on every change.
- * In-session: `compose.ts` no longer resets inputMode on send/discard.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 describe('inputMode persistence (compose toggle remembers last choice)', () => {
@@ -73,11 +62,8 @@ describe('inputMode persistence (compose toggle remembers last choice)', () => {
 
   it('changing inputMode persists to localStorage so the next page load picks it up', async () => {
     const { inputMode } = await import('./store');
-    // effects.ts registers the persist effect; load it explicitly.
     await import('./effects');
     inputMode.value = { type: 'coding_agent' };
-    // Preact signal effects fire synchronously, but yield a microtask in case
-    // a future refactor batches the persist.
     await Promise.resolve();
     expect(localStorage.getItem('lucidos-input-mode')).toBe(JSON.stringify({ type: 'coding_agent' }));
   });

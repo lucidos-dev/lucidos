@@ -42,14 +42,12 @@ vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
 
 type Mock = ReturnType<typeof vi.fn>;
 
-/** A promise plus its resolver, so a test can hold a POST pending. */
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
   const promise = new Promise<T>((r) => { resolve = r; });
   return { promise, resolve };
 }
 
-/** One idle chat thread in Current, at summary version 3. */
 function seed(overrides: Partial<ThreadState['meta']> = {}): void {
   const map = new Map<string, ThreadState>();
   map.set('t', makeThreadState('t', {
@@ -65,7 +63,6 @@ function seed(overrides: Partial<ThreadState['meta']> = {}): void {
 
 const meta = () => threadMap.value.get('t')!.meta;
 
-/** An SSE frame for `t` whose aggregate says the row is at `version`. */
 function frame(version: number, fields: Partial<ThreadAggregate>): void {
   handleThreadEvent({
     thread_id: 't',
@@ -84,7 +81,6 @@ function frame(version: number, fields: Partial<ThreadAggregate>): void {
   });
 }
 
-/** A list GET's summary for `t` at `version`. */
 function listed(version: number, fields: { section: string; saved?: boolean }): void {
   upsertThread(threadMap.value, {
     thread_id: 't', title: 'Thread', channel: 'chat', last_activity: '2026-01-01T00:00:01Z',
@@ -101,9 +97,6 @@ beforeEach(() => {
   (unsaveThread as Mock).mockReset();
 });
 
-// An optimistic row change is a pending intent until the row reaches the
-// version the write returned (ADR 0437). A frame or a GET below that version
-// was produced before the write, however late it arrives.
 describe('an archive holds until the row reaches the version the server returned', () => {
   it('a pre-archive frame landing after the POST returned keeps the row archived', async () => {
     seed();
@@ -131,7 +124,6 @@ describe('an archive holds until the row reaches the version the server returned
 
     await handleArchiveThread('t');
     frame(5, { section: 'archived' });
-    // Another device moved it back to Current.
     frame(6, { section: 'inbox' });
 
     expect(meta().section).toBe('inbox');
@@ -157,7 +149,6 @@ describe('an archive holds until the row reaches the version the server returned
     (archiveThread as Mock).mockReturnValueOnce(post.promise);
 
     const archiving = handleArchiveThread('t');
-    // While the POST is out, the server moves the row on to running.
     frame(4, { section: 'inbox', status: 'running' });
     expect(meta().section).toBe('archived');
     post.resolve({ archived: [], skipped: [{ thread_id: 't', reason: 'not_archivable', message: 'left open' }] });
@@ -190,8 +181,6 @@ describe('a pin or unpin holds until the row reaches the version the server retu
     expect(meta().saved).toBe(false);
   });
 
-  // Two writes on one row both in flight can commit in either order, so the
-  // second waits until the first has answered.
   it('an unpin sends nothing while the pin it would undo is still in flight', async () => {
     seed();
     const pin = deferred<{ summary_version: number }>();
@@ -229,8 +218,6 @@ describe('a pin or unpin holds until the row reaches the version the server retu
     await pinning;
   });
 
-  // An older engine acknowledges with no version. The client then waits for
-  // any row newer than the one it held as it sent.
   it('an unversioned pin ends when its frame beat the response', async () => {
     seed();
     const pin = deferred<Record<string, never>>();

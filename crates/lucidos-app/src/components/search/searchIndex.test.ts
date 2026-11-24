@@ -1,9 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { enginePackaged, preferences } from '../../store/store';
-import { getSettingsSearchResults, findSettingsEntry, settingsLinkAnchor } from './searchIndex';
+import { getSettingsSearchResults, findSettingsEntry, settingsLinkAnchor, settingsSearchEntryIds } from './searchIndex';
 
-// Only `isIOS` is steered. Everything else stays real, so jsdom answers as the
-// desktop browser it is.
 const platformMocks = vi.hoisted(() => ({ isIOS: false }));
 vi.mock('../../utils/platform', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/platform')>()),
@@ -17,9 +15,7 @@ function setViewportWidth(px: number): void {
 }
 
 beforeEach(() => {
-  // Default bindings (no overrides): searchEverywhere = mod+K.
   preferences.value = { status: 'not-loaded' };
-  // Default to a dev install; the packaged-only cases opt in explicitly.
   enginePackaged.value = false;
 });
 
@@ -82,7 +78,6 @@ describe('settings search — keyboard shortcuts', () => {
   it('reflects a custom binding in search (rebound search to ctrl+shift+p)', () => {
     preferences.value = { status: 'loaded', data: { keybindings: JSON.stringify({ searchEverywhere: 'mod+shift+p' }) } };
     expect(getSettingsSearchResults('ctrl shift p', 20).some((r) => r.id === 'shortcut:searchEverywhere')).toBe(true);
-    // The default combo no longer matches it.
     expect(getSettingsSearchResults('ctrl k', 20).some((r) => r.id === 'shortcut:searchEverywhere')).toBe(false);
   });
 });
@@ -91,8 +86,6 @@ describe('settings search — Permissions section', () => {
   it('finds the Command safety rows by name', () => {
     const guard = getSettingsSearchResults('command guard', 20);
     expect(guard.some((r) => r.id === 'command-safety:guard')).toBe(true);
-    // The judge model lives under Models: the guard and coding-agent
-    // auto-answer both run on it.
     const judge = getSettingsSearchResults('judge model', 20);
     expect(judge.some((r) => r.id === 'models:command-judge')).toBe(true);
   });
@@ -122,7 +115,6 @@ describe('settings search — mobile-only rows', () => {
     setViewportWidth(1280);
     const results = getSettingsSearchResults('dynamic bars', 20);
     expect(results.some((r) => r.id === 'appearance:mobile-dynamic-bars')).toBe(false);
-    // The "Mobile" section row is mobile-only too.
     expect(getSettingsSearchResults('mobile', 20).some((r) => r.id === 'appearance:mobile')).toBe(false);
   });
 
@@ -130,7 +122,6 @@ describe('settings search — mobile-only rows', () => {
     setViewportWidth(375);
     const results = getSettingsSearchResults('dynamic bars', 20);
     expect(results.some((r) => r.id === 'appearance:mobile-dynamic-bars')).toBe(true);
-    // Someone who remembers the old "Keep header visible" row still finds it.
     const byOldName = getSettingsSearchResults('keep header visible', 20);
     expect(byOldName.some((r) => r.id === 'appearance:mobile-dynamic-bars')).toBe(true);
   });
@@ -154,16 +145,12 @@ describe('settings search — System section', () => {
   });
 
   it('resolves maintenance to Overview, the page that renders it', () => {
-    // The three Overview rows moved with their page when `system` became the
-    // submenu. Landing them on the submenu would scroll to nothing.
     const entry = findSettingsEntry('system:maintenance');
     expect(entry?.subview).toBe('system-overview');
     expect(entry?.anchor).toBe('system:maintenance');
   });
 
   it('never puts the System submenu above the sub-page the user named', () => {
-    // Enter on the top hit must open the page, not a list of ten rows. Ranking
-    // by label keeps a keyword-only hit on `system` below the page's own.
     for (const [query, id] of [
       ['backup', 'backup'],
       ['memory', 'memory'],
@@ -171,7 +158,6 @@ describe('settings search — System section', () => {
       ['environment variables', 'environment-variables'],
       ['debugging', 'debugging'],
       ['release notices', 'release-notices'],
-      // Overview's own vocabulary leads with Overview, the page that holds it.
       ['uptime', 'system-overview'],
     ] as const) {
       expect(getSettingsSearchResults(query, 5)[0]?.id, `"${query}" must lead with ${id}`).toBe(id);
@@ -181,8 +167,6 @@ describe('settings search — System section', () => {
 
 describe('settings search: packaged-only rows', () => {
   it('hides the Debugging "Restart engine" row from search on a dev install', () => {
-    // Dev keeps its restart in System > Overview as "Rebuild & Restart", so the
-    // Debugging row does not render there and must not be offered as a result.
     enginePackaged.value = false;
     expect(getSettingsSearchResults('restart engine', 20).some((r) => r.id === 'debugging:restart-engine')).toBe(false);
   });
@@ -202,11 +186,6 @@ describe('settings search: packaged-only rows', () => {
 
 describe('settings search: the Access Other addresses row', () => {
   it('is offered in a plain browser, where the section now renders', () => {
-    // It carried `tauriOnly` + `packagedOnly` from when the address list existed
-    // only inside the packaged desktop app. The section renders everywhere now,
-    // deriving its tailnet rows from two plain-HTTP reads. Gating the search
-    // entry hid the address a browser user came looking for, behind the very
-    // section showing it.
     enginePackaged.value = false;
     const hits = getSettingsSearchResults('connect url', 20);
     expect(hits.some((r) => r.id === 'access:addresses')).toBe(true);
@@ -227,17 +206,12 @@ describe('settings search: the Access Other addresses row', () => {
 
 describe('settings search: the Paired devices row', () => {
   it('resolves to the Devices subview and its anchor', () => {
-    // Pairing and push are one row now, so Revoke is found where the device
-    // is, not under Access. Two lists under one word were the confusion.
     const entry = findSettingsEntry('devices:paired');
     expect(entry?.subview).toBe('devices');
     expect(entry?.anchor).toBe('devices:list');
   });
 
   it('is findable by the word the user is actually after', async () => {
-    // Gated on the gateway having served the page, which is what `<base href>`
-    // says. The suite's DOM stub stamps none, so the entry is hidden by
-    // default and this reloads the module with one.
     const stub = document.querySelector;
     (document as unknown as { querySelector: (s: string) => unknown }).querySelector = (s) =>
       s === 'base' ? { getAttribute: () => '/dev/' } : null;
@@ -253,8 +227,6 @@ describe('settings search: the Paired devices row', () => {
   });
 
   it('is withheld where no row can carry a Revoke button', () => {
-    // No gateway served this page, so no device is paired and nothing on the
-    // list revokes. A hit landing on nothing is worse than no hit at all.
     expect(getSettingsSearchResults('revoke', 20).some((r) => r.id === 'devices:paired'))
       .toBe(false);
   });
@@ -292,8 +264,6 @@ describe('settings search: the Voice section', () => {
     },
   );
 
-  // The rows under the switch render only while voice is on. Landing on one
-  // while it is off would scroll to nothing.
   it.each(['models:voice-talker', 'models:voice-transcriber', 'models:voice-talker-voice', 'models:voice-resident-sections'])(
     'lands %s on the switch row, which always renders',
     (id) => {
@@ -322,7 +292,6 @@ describe('settings search: rows gated on state', () => {
 
 describe('settings search: ranked before the cut', () => {
   it('puts a label hit first, even one the index lists last', () => {
-    // The shortcut entries are appended after the whole static index.
     expect(getSettingsSearchResults('settings', 5)[0]?.id).toBe('shortcut:openSettings');
   });
 
@@ -334,12 +303,33 @@ describe('settings search: ranked before the cut', () => {
 });
 
 describe('settingsLinkAnchor', () => {
+  it('lands every full indexed anchor without adding a view prefix', () => {
+    for (const id of settingsSearchEntryIds()) {
+      const entry = findSettingsEntry(id)!;
+      if (!entry.anchor) continue;
+      expect(settingsLinkAnchor(entry.subview, entry.anchor), id).toBe(entry.anchor);
+    }
+  });
+
+  it('resolves a full row id inside a fold to its ancestor', () => {
+    expect(settingsLinkAnchor('providers', 'providers:vertex-region')).toBe('providers:vertex');
+  });
+
   it('resolves a fragment on a page whose anchors carry another prefix', () => {
     expect(settingsLinkAnchor('permissions', 'guard')).toBe('command-safety:guard');
   });
 
   it('lands a row inside a fold on the ancestor its entry names', () => {
     expect(settingsLinkAnchor('providers', 'vertex-region')).toBe('providers:vertex');
+  });
+
+  it('resolves retired full anchors before finding their landing row', () => {
+    expect(settingsLinkAnchor('providers', 'models:vertex-ai')).toBe('providers:vertex');
+    expect(settingsLinkAnchor('providers', 'models:region')).toBe('providers:vertex');
+  });
+
+  it('preserves unknown full anchors without adding a prefix', () => {
+    expect(settingsLinkAnchor('providers', 'old:no-such-row')).toBe('old:no-such-row');
   });
 
   it('keeps <view>:<fragment> for a fragment the index lacks', () => {

@@ -1,16 +1,3 @@
-/**
- * The build-watch's pure helpers: when a build outcome is worth announcing,
- * what to say about a failure, and what goes in the status file.
- *
- * These exist because a wedged frontend build used to be invisible. The atomic
- * publish keeps the previous `dist/`, which is correct and is also why nobody
- * notices. An Apply landed a package the checkout had not installed. Every
- * build then failed for over half an hour, and the only record was a log file.
- * See `docs/plans/2026-08-21-a-wedged-frontend-build-heals-itself-and-shouts.md`.
- *
- * Importing the watcher is safe: it starts a build only when it IS the entry
- * module, which is exactly what makes these testable.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: dev tooling, JS with no type declarations
 import * as watcher from '../../dev-build-watch.mjs';
@@ -49,23 +36,17 @@ describe('when a build outcome is announced', () => {
   });
 
   it('stays quiet while nothing changed', () => {
-    // A build fires on every keystroke-sized change. Announcing each failure
-    // would be a notification storm, so only the edges speak.
     expect(alertTransition(false, false)).toBeNull();
     expect(alertTransition(true, true)).toBeNull();
   });
 
   it('announces a first build only when it failed', () => {
-    // `null` is the state before this process has built anything. A first build
-    // that fails is news. One that succeeds recovered nothing.
     expect(alertTransition(null, false)).toBe('broken');
     expect(alertTransition(null, true)).toBeNull();
   });
 });
 
 describe('a failure that heals within the grace period', () => {
-  // An Apply's merge can catch a build half-written. The next build is green a
-  // second later, and a "failing" then "green again" pair is pure noise.
   function harness() {
     const raised: { title: string; message: string }[] = [];
     const delays: number[] = [];
@@ -118,7 +99,6 @@ describe('a failure that heals within the grace period', () => {
   });
 
   it('waits out a build still running when the grace period ends', () => {
-    // A rebuild that runs `npm ci` can outlast the grace period and still heal.
     const { raised, alerts, elapse, delays, build } = harness();
     alerts.record(false, 'broken');
     build.running = true;
@@ -150,22 +130,17 @@ describe('what a failure says', () => {
   });
 
   it('survives a chunk boundary mid-line', () => {
-    // The tail is a byte window over piped output, so its first line is
-    // routinely half of one. The marker search must still find the real error.
     const truncated = 'ing for production...\ntransforming...\nerror during build:\nthe real error\n';
     expect(firstErrorLine(truncated)).toBe('the real error');
   });
 
   it('never answers with nothing', () => {
-    // An empty message in a notification tells the reader the build broke and
-    // nothing else, which is the failure this whole path exists to end.
     expect(firstErrorLine('')).toBeTruthy();
     expect(firstErrorLine('\n\n  \n')).toBeTruthy();
     expect(firstErrorLine('some unrecognised tail')).toBe('some unrecognised tail');
   });
 });
 
-/** A measurement as `budgetFromLine` reads it off the plugin's own line. */
 function measured(budget: typeof ENTRY_BUDGET, subject: string, bytes: number) {
   return budgetFromLine(budgetLine(budget, { subject, bytes }));
 }
@@ -179,8 +154,6 @@ describe('the status record', () => {
   const at = '2026-08-21T12:00:00.000Z';
 
   it('carries the error only when the build failed', () => {
-    // A success that kept a stale error would make the engine report a failure
-    // that is over.
     expect(buildStatusRecord({ ok: true, at, error: 'stale', skippedInstall: null })).toEqual({
       ok: true,
       at,
@@ -191,8 +164,6 @@ describe('the status record', () => {
   });
 
   it('keeps a served build green while recording each budget overrun', () => {
-    // The overrun is reported, never a failure: `ok: false` would tell the
-    // engine nothing new is being served, which is the opposite of true.
     const chunkBudgets = { entry: overEntry, 'first-paint': overFirstPaint };
     const record = buildStatusRecord({ ok: true, at, chunkBudgets });
     expect(record.ok).toBe(true);
@@ -200,8 +171,6 @@ describe('the status record', () => {
   });
 
   it('records a refused install alongside the outcome', () => {
-    // A build that failed because its dependencies could not be installed has
-    // two facts, and the second is the actionable one.
     const record = buildStatusRecord({
       ok: false,
       at,
@@ -214,7 +183,6 @@ describe('the status record', () => {
   });
 
   it('normalises a missing error to null rather than undefined', () => {
-    // It is serialised to JSON, and `undefined` would drop the key entirely.
     const record = buildStatusRecord({ ok: false, at });
     expect(record.error).toBeNull();
     expect(JSON.parse(JSON.stringify(record))).toHaveProperty('error');
@@ -227,8 +195,6 @@ describe('the vite build child', () => {
     expect(env[WATCHER_ENV]).toBe('4242');
     expect(env.LUCIDOS_ATOMIC_DIST).toBe('1');
     expect(env.PATH).toBe('/usr/bin');
-    // The child Vite is spawned directly, so its parent IS the watcher, and the
-    // budget plugin accepts the signal only in exactly that case.
     expect(underDevBuildWatch(env, 4242)).toBe(true);
   });
 
@@ -289,7 +255,6 @@ describe('announcing a budget edge', () => {
   });
 
   it('keeps the last state of a budget a build did not measure', () => {
-    // A build that failed early prints no measurement. That is not a recovery.
     const over = budgetAlerts({}, { entry: overEntry });
     const silent = budgetAlerts(over.within, {});
     expect(silent.alerts).toEqual([]);
@@ -298,9 +263,6 @@ describe('announcing a budget edge', () => {
 });
 
 describe('a watch whose file-system events stopped', () => {
-  // The incident: `fs.watch` went quiet while the process stayed alive. Two
-  // landings never built. The committed inputs are the second trigger, and it
-  // needs no events at all.
   const base = { built: 'tree-a', current: 'tree-b', eventSinceBuild: false };
 
   it('re-arms and builds when the committed inputs moved and no event said so', () => {

@@ -1,43 +1,23 @@
-/**
- * The mobile nav chevrons take a tap that lands NEAR them, not only on their
- * 1.75rem button. The button box is what the edge reserve places, so it cannot
- * grow. A transparent `::before` reaches into the empty space around it instead
- * (styles/header-mark.css, `.header-nav-cluster > .nav-chevron::before`).
- * Without it, a tap a few px off the glyph lands on the bare row, and the header
- * does nothing with it on mobile.
- *
- * Three things are pinned at a 393px phone, at 100% and 112.5% ui-scale:
- * - each chevron's real hit box, found by walking `elementFromPoint` outward,
- *   is at least the 2.75rem target on both axes;
- * - taps just off each side of the drawn glyph reach the chevron;
- * - the chevrons did not move, and the mark between them keeps its own taps.
- * A 320px phone at 200% pins the other side: no neighbour loses a tap.
- */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, navigateToApp, ensureMobileView } from './helpers';
+import { assertHealthy, navigateToApp, ensureMobileView, watchPreferenceReads } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
 test.use({ viewport: { width: 393, height: 852 } });
 
-const SIMULATED_SAFE_AREA_TOP_PX = 59; // iPhone dynamic-island inset
+const SIMULATED_SAFE_AREA_TOP_PX = 59;
 
 interface Box { left: number; right: number; top: number; bottom: number }
 
 interface ChevronProbe {
-  /** The chevron's button box and its drawn glyph, in viewport px. */
   box: Box;
   glyph: Box;
-  /** The span around the button centre where a tap still reaches it. */
   hit: Box;
-  /** Near-miss taps off the glyph, keyed `side+px`, and what each reached. */
   nearMiss: Record<string, string>;
-  /** The row edge on the chevron's own side, and what the reserve resolves to. */
   rowEdge: number;
   reserve: number;
   iconBox: number;
 }
 
-/** Probe one chevron. `outer` is the side facing the row edge. */
 async function probeChevron(
   page: Page, headerSel: string, chevronSel: string, outer: 'left' | 'right',
 ): Promise<ChevronProbe | null> {
@@ -59,7 +39,6 @@ async function probeChevron(
     const reaches = (x: number, y: number) =>
       document.elementFromPoint(x, y)?.closest('button') === btn;
 
-    // Walk out from the centre in half-px steps until a tap stops reaching it.
     const walk = (dx: number, dy: number): number => {
       let d = 0;
       while (d < 80 && reaches(cx + dx * (d + 0.5), cy + dy * (d + 0.5))) d += 0.5;
@@ -81,7 +60,6 @@ async function probeChevron(
     };
     const root = parseFloat(getComputedStyle(document.documentElement).fontSize);
     const nearMiss: Record<string, string> = {};
-    // 4px and 7px at the 16px root, scaled with it, off each side of the glyph.
     for (const base of [4, 7]) {
       const d = (base * root) / 16;
       nearMiss[`left+${base}`] = describe(glyph.left - d, cy);
@@ -110,7 +88,6 @@ async function probeChevron(
   }, { headerSel, chevronSel, outer });
 }
 
-/** Resolve the hit target token to px through a probe, at the current root. */
 async function hitTargetPx(page: Page): Promise<number> {
   return page.evaluate(() => {
     const probe = document.createElement('div');
@@ -123,18 +100,10 @@ async function hitTargetPx(page: Page): Promise<number> {
   });
 }
 
-/** Open the app and put it in a state where the scale and the taps mean
- *  what they would on a phone. */
 async function prepare(page: Page): Promise<void> {
+  const preferencesSettled = watchPreferenceReads(page);
   await navigateToApp(page);
-  // The app's own preference load writes the ui-scale. Wait for it, so the
-  // scale a test sets is the last write rather than one that gets undone.
-  await page.waitForFunction(
-    () => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 },
-  );
-  // The emulator zeroes the safe-area insets, which puts the row at the top
-  // edge, where a tap above a chevron is off screen. A phone has the status
-  // bar there, so stamp its inset on the floor the layout reads.
+  await preferencesSettled();
   await page.evaluate((px) => {
     document.documentElement.style.setProperty('--safe-area-floor-top', `${px}px`);
   }, SIMULATED_SAFE_AREA_TOP_PX);
@@ -142,10 +111,7 @@ async function prepare(page: Page): Promise<void> {
 
 interface Neighbour {
   sel: string;
-  /** Probe this child's box instead of the element's own, e.g. a drawn glyph. */
   glyph?: string;
-  /** Not rendered in every state, like a content title with no view open, or
-   *  one squeezed to its padding with no room left for text. */
   optional?: boolean;
 }
 
@@ -154,8 +120,6 @@ const MARK: Neighbour = { sel: '.mobile-thread-header .brand-mark', glyph: '.bra
 type Landed = 'self' | 'chevron' | 'other';
 const ALL_SELF: Landed[] = ['self', 'self', 'self', 'self', 'self'];
 
-/** Tap the centre and 1px inside each edge of an element (or its glyph), and
- *  report where each tap lands. Null if the element is not rendered. */
 async function tapsOn(page: Page, n: Neighbour): Promise<Landed[] | null> {
   return page.evaluate(({ sel, glyph, optional }) => {
     const el = document.querySelector(sel) as HTMLElement | null;
@@ -224,14 +188,8 @@ test.describe('The mobile nav chevrons take a near miss', () => {
             + `hit ${(p.hit.right - p.hit.left).toFixed(1)}x${(p.hit.bottom - p.hit.top).toFixed(1)} `
             + `[${p.hit.left.toFixed(1)}..${p.hit.right.toFixed(1)}], near misses ${JSON.stringify(p.nearMiss)}`);
 
-          // The row sits below the simulated status bar. At the top edge the
-          // walk would stop at the viewport, and the hit box would read short.
           expect(p.box.top, `${where}: the row is under the status bar`).toBeGreaterThanOrEqual(SIMULATED_SAFE_AREA_TOP_PX);
 
-          // The chevron did not move: its button is still one icon box, set
-          // the reserve in from its row edge, with the glyph centred in it.
-          // Whole-px precision (under 0.5px), as the alignment spec uses:
-          // WebKit snaps layout to its 3x device pixels, a 0.08px drift.
           expect(p.box.right - p.box.left, `${where}: the button box grew`).toBeCloseTo(p.iconBox, 0);
           expect(p.box.bottom - p.box.top, `${where}: the button box grew`).toBeCloseTo(p.iconBox, 0);
           const offset = outer === 'left' ? p.box.left - p.rowEdge : p.rowEdge - p.box.right;
@@ -239,14 +197,9 @@ test.describe('The mobile nav chevrons take a near miss', () => {
           expect((p.glyph.left + p.glyph.right) / 2, `${where}: the glyph moved off the button centre`)
             .toBeCloseTo((p.box.left + p.box.right) / 2, 0);
 
-          // The hit box is the full target on both axes. The half-px walk
-          // loses up to a step at each end.
           expect(p.hit.bottom - p.hit.top, `${where}: hit height`).toBeGreaterThanOrEqual(target - 1);
           expect(p.hit.right - p.hit.left, `${where}: hit width`).toBeGreaterThanOrEqual(target - 1);
 
-          // A tap just off the drawn glyph reaches the chevron. One exception:
-          // the content row's trailing actions sit flush beside its forward
-          // chevron. That outer side may reach them, but never the bare row.
           for (const [key, reached] of Object.entries(p.nearMiss)) {
             const outerSide = key.startsWith(outer);
             if (pane.view === 'content' && name === 'forward' && outerSide && reached !== 'chevron') {
@@ -265,20 +218,11 @@ test.describe('The mobile nav chevrons take a near miss', () => {
   });
 });
 
-/** The reach overlaps its neighbours only where the row runs out of room: a
- *  narrow phone at a large ui-scale. There no tap on a neighbour may land on a
- *  chevron, whether or not the chevron is disabled. A disabled chevron is a
- *  stacking context of its own, so it cannot rely on a z-index to lose.
- *
- *  The content title may still lose its trailing edge to the row's actions,
- *  which are raised over the whole cluster. Only the chevrons are the subject. */
 test.describe('The chevron reach never takes a neighbour\'s tap', () => {
   test.use({ viewport: { width: 320, height: 640 } });
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    // Home is one of the neighbours, and a spec before this one may have
-    // truncated the threads, home included.
     ensureHomeThread();
   });
 

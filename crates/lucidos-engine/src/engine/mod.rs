@@ -1,175 +1,202 @@
-pub(crate) mod agent_context;
+pub use lucidos_core::engine::*;
+
+pub(crate) mod accepted_messages;
+pub mod agent_context;
+pub mod agent_drafts;
+pub mod agent_host;
 pub mod agent_pause;
-pub(crate) mod agent_question;
-pub mod agent_recovery;
-pub(crate) mod agent_session;
-mod agentic_loop;
+pub mod agent_question;
+mod api_router;
 mod apply_all_batches;
-pub(crate) mod apply_all_driver;
+pub mod apply_all_driver;
 pub(crate) mod apply_estimate;
-mod archive_request;
+pub mod approved_plan;
+pub mod archive_family;
+pub mod archive_family_rules;
+pub mod archive_policy;
 pub mod auto_compact_trial;
-pub(crate) mod aux_purpose;
+pub mod aux_purpose;
 mod background_build;
-pub(crate) mod cache_ttl;
+pub mod bash_background;
+pub mod bash_background_recovery;
+pub mod branch_recovery_queries;
+pub(crate) mod build_deferral;
+pub mod model_swap;
+pub mod thread_hold;
+pub use build_deferral::BuildRequest;
+pub mod cache_ttl;
 pub mod cc_permission;
 pub mod cc_question_wait;
-pub(crate) mod cc_settings;
-mod change_ops;
+pub mod cc_settings;
+pub mod change_ops;
+pub use change_ops::{apply_claim::ApplyClaim, LiveSessionInfo};
+pub use pending_handoff::Implementer;
+pub mod card_hold;
+pub mod card_queue;
+pub mod card_retirement;
 pub mod change_summary_consumer;
 pub mod changelog;
-pub(in crate::engine) mod chat;
 pub mod chatgpt_plan_sign_in;
+pub mod child_limits;
+pub mod child_report_channel;
+pub mod coding_command_grants;
+pub mod coding_task;
+pub mod coding_turn_end;
+pub mod continuation_queries;
+pub mod replay_inputs;
+pub mod resume_anchor;
+pub mod sse_connections;
+pub mod thread_stop;
+pub mod turn_start_gate;
 // Scheduler boot recovery shares the turn boundary list with chat sweeps.
-pub(crate) use chat::recovery::turn_terminal_events;
-pub(crate) mod claude_code;
-pub(crate) mod claude_gateway_sign_in;
-pub(crate) mod command_guard;
+pub(crate) use restore_boot::turn_terminal_events;
+pub mod claude_gateway_sign_in;
+pub mod command_guard;
+pub use command_guard::SideEffectCategory;
+#[doc(hidden)]
+pub mod command_guard_corpus;
 pub(crate) mod command_judge;
 pub use command_judge::{classify_for_eval as classify_command_for_eval, EvalVerdict};
 pub(crate) mod command_judge_questions;
 pub mod command_permission;
 pub mod config_change;
-/// `pub(crate)` for the cost helpers: `tool_definitions_chars`,
-/// `estimate_tokens_from_chars` and `agent_context_char_budget` are what the
-/// MCP surface is capped and reported by, and it lives outside `engine`. The
-/// cap, the report and the request packer must share one definition of cost.
-pub(crate) mod context;
+/// The MCP surface and the request packer share one definition of context cost.
+pub mod context;
 pub mod context_ceiling;
+pub mod context_guidance;
 pub mod db_health;
 pub mod engine_version;
 /// The eval-only full-capture gate (ADR 0110). Inert without
 /// `LUCIDOS_EVAL_FULL_CAPTURE`, which only the eval harness sets.
-pub(crate) mod eval_capture;
-pub mod event_bus;
+pub mod eval_capture;
 pub mod event_wait;
-pub(crate) mod expected_wake;
-mod follow_main;
-pub mod form_requests;
+pub mod expected_wake;
+pub mod failure_terminator;
+pub mod file_text;
+pub mod find_cache;
+pub mod follow_main;
 pub mod frontend_preview;
-mod frontend_refresh;
+pub(crate) mod frontend_refresh;
+pub mod frontend_snapshot;
 pub use frontend_refresh::register_as_build_watch_consumer;
 pub mod dashboard;
-pub(crate) mod git_ops;
+pub mod gateway_control;
+pub mod git_ops;
 pub mod handoff_estimate;
 pub(crate) mod handoff_history;
+pub mod handoff_state;
+pub mod held_deliveries;
 pub mod home_thread;
-pub mod http;
 pub(crate) mod image_size_hint;
-pub(crate) mod inline_question_repair;
-pub(crate) mod inline_tool_call_repair;
-pub(crate) mod integrated;
-mod landing_lane;
+pub mod in_place_merge;
+pub mod inline_question_repair;
+pub mod inline_tool_call_repair;
+pub mod integrated;
+pub mod landing_lane;
 pub mod loaded_knowhow;
-mod main_check;
+pub mod main_check;
 pub mod mcp_permission;
-/// `pub(crate)` for `relevance_score` / `age_in_days`: the `/memory/search`
-/// endpoint ranks with the SAME formula as the pre-turn injection, so a
-/// follow-up search cannot come back in a different order from the facts
-/// already in context. Two orderings for one corpus is a thing the agent would
-/// have to reconcile, and nothing would tell it which to trust.
-pub(crate) mod memory;
+/// The memory search endpoint and pre-turn injection share the same ranking.
+pub mod memory;
 pub mod memory_consumer;
+pub mod merge_prompts;
+pub mod message_events;
 pub mod model_call;
-pub(crate) mod pending_answers;
+pub mod open_question;
+pub mod pending_answers;
 mod pending_apply_actors;
 pub mod pending_change_watch;
+pub mod pending_plugins;
+pub mod permission;
+pub mod plan_lifecycle;
 pub(crate) mod preferences;
-pub(crate) mod prompt_footprint;
-pub(crate) mod question_card_gate;
-pub(crate) mod read_request;
+pub mod presence_tracker;
+pub mod prompt_footprint;
+pub(crate) mod proxy_wasm_host;
+pub mod proxy_wasm_signer;
+pub mod question_flushes;
+pub mod read_request;
 pub mod release_notices;
-pub(crate) mod repo_directory_grants;
-pub(crate) mod session_scope;
-mod session_seed;
+pub mod repo_directory_grants;
+pub(crate) mod session_capture_sql;
+pub mod session_claim;
+pub mod session_claim_refusal;
+pub mod session_copy;
+pub(crate) mod session_entry_guard;
+pub mod session_follow_ups;
+pub mod session_queries;
+pub mod session_seed;
+pub mod side_question_policy;
 pub mod standing_apply;
-pub mod successor;
+pub mod start_failure;
 pub mod summary_tree;
 pub mod supervisor_respawn_sidecar;
 pub mod switch_estimate;
-pub(crate) mod text_search;
-pub mod thread_events;
-pub(crate) mod thread_family;
-pub mod thread_lifecycle;
+pub mod text_search;
+pub mod thread_agent;
+pub mod thread_liveness;
 pub mod thread_queue;
-pub(crate) mod thread_search;
-pub mod thread_state;
-pub(crate) mod thread_triage;
-pub(crate) mod title_match;
+pub mod thread_search;
+pub mod thread_users;
+pub mod title_match;
 pub mod todo_consumer;
-pub(crate) mod tool_arg_entity_repair;
-pub(crate) mod tools;
-pub(crate) mod trigger_group_writes;
-pub(crate) mod trigger_writes;
+pub mod todo_state;
+pub mod tool_arg_entity_repair;
+pub mod tool_arguments;
+pub mod triage_facts;
+pub mod triage_policy;
+pub mod trigger_group_writes;
+pub mod trigger_writes;
 pub(crate) mod trusted_repo_scripts;
-pub(crate) mod turn_end;
-pub use turn_end::{
-    decide_read_for_eval, decide_wake_for_eval, read_decision_chat_judge, wake_decision_chat_judge,
-    AnsweredQuestion, EvalReadDecision, EvalWakeDecision, InFlight, OpeningSource, ParentView,
-    PushedNotification, TurnRead,
-};
-pub mod thread_people;
+pub mod turn_requirements;
 pub mod types;
+pub mod undelivered_input;
 pub(crate) mod until_restored;
-pub(crate) mod user_profile;
-pub mod widget_embed;
-pub(crate) mod widget_fit;
+pub mod user_only_message_delivery;
+pub mod user_profile;
+pub mod widget_fit;
+pub mod widget_fit_sessions;
 pub mod widget_guidance;
 pub mod widgets;
+pub mod workspace_classification;
+mod workspace_deletion;
+pub mod workspace_directory;
+pub mod worktree_artifacts;
 pub mod worktree_cleanup;
+pub mod worktree_provision;
 
-pub(crate) use agentic_loop::{
-    coalesced_images_for_reprocess, coalesced_user_text_for_reprocess, emit_prompt_injected_event,
-    filter_removed_queued_prompts, strip_app_capture_marker,
-};
-#[cfg(test)]
-pub(crate) use change_ops::bind_in_place_conflict_resolution;
+#[cfg(any(test, feature = "test-support"))]
+pub use change_ops::bind_in_place_conflict_resolution;
 pub(crate) use change_ops::now_epoch_millis;
-pub(crate) use model_call::AuxCapture;
+pub use model_call::AuxCapture;
 // Re-exported for `api::claude_code`, which classifies an `apply_now` refusal
 // into an HTTP status by identity against this const (a 404 there means "no
 // live session" to the frontend, so misclassifying it runs the wrong fallback).
-pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
-pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
-pub(crate) use landing_lane::LaneRemoval;
-pub(crate) use main_check::{
-    CloseRefusal as MainCheckCloseRefusal, FailedTest, MainCheckSnapshot, RedCloseReason,
-};
-// The child-follow-up vocabulary, re-exported for the HTTP route in
-// `api::threads::follow_up`, which is outside `engine`. Only the ack and the
-// refusal taxonomy: the delivery half stays reachable solely as
-// `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
-// second delivery path out of its parts.
-pub(crate) use chat::accepted_messages::chat_event_id_is_recorded;
-pub(crate) use chat::agent_archive::{AgentArchiveAck, AgentArchiveError};
-pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
-pub(crate) use chat::child_follow_up::{
-    ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach, FollowUpUrgency,
-};
-pub(crate) use chat::input_order::{
-    overtaken_message, InputAdmission, InputOrder, InputPosition, InputTurn, OVERTAKEN_REASON,
-};
-pub use chat::rung::ChatSettingsOutcome;
-pub(crate) use chat::rung::{TURN_RUNNING_MESSAGE, TURN_RUNNING_REASON};
-pub(crate) use chat::PreEmittedOrigin;
-pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
+pub use accepted_messages::chat_event_id_is_recorded;
+pub use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
+pub use change_ops::SET_ASIDE_APPLY_REFUSAL;
 #[cfg(test)]
 pub(crate) use context::format_history_steps;
+pub use engine_impl::release_change_claim;
+pub use landing_lane::LaneRemoval;
+pub use main_check::CloseRefusal as MainCheckCloseRefusal;
+pub(crate) use main_check::MainCheckSnapshot;
+pub use message_events::emit_routing_failure;
+pub use thread_agent::thread_agent;
+pub use thread_agent::ThreadAgent;
+pub use thread_events::input_order::InputTurn;
+pub use thread_events::input_order::{
+    overtaken_message, InputAdmission, InputOrder, InputPosition, OVERTAKEN_REASON,
+};
+pub use types::{FollowUpUrgency, PreEmittedOrigin};
 // `core` resolves the schedule's two numbers, and `chat` is not reachable from
 // there. One type crossing beats two bare `usize` a caller can transpose in
 // silence.
-pub(crate) use chat::process::context_mode::SweepSchedule;
+pub use context_guidance::SweepSchedule;
 // Public because the eval's `guidance_hash` has to cover the text a model
 // actually saw, and two arms swept at different values must hash differently.
-pub use chat::process::context_mode::rendered_context_mode_prompt;
+pub use context_guidance::rendered_context_mode_prompt;
 pub use types::*;
-
-/// Public re-export so binaries (notably `main.rs`) can start the CC spawn
-/// dispatcher at engine startup. The rest of `agent_session` stays
-/// crate-private — only this background task entry point is public.
-pub mod spawn_dispatcher {
-    pub use super::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
-}
 
 use crate::core::{AppManager, ArtifactManager, EventStore};
 use crate::llm::LlmProvider;
@@ -208,7 +235,7 @@ pub struct InjectedPrompt {
     /// Event in the parent thread that triggered this injection (mode != Human).
     pub spawning_event_id: Option<Uuid>,
     /// Optional images attached to the injected message.
-    pub images: Option<Vec<crate::api::ChatImage>>,
+    pub images: Option<Vec<crate::engine::types::ChatImage>>,
     /// Structured origin describing the actor (e.g. ThreadLink::Child for a
     /// child→parent callback). Stamped onto the persisted PromptInjected
     /// event so the chip can render the right initiator label.
@@ -256,28 +283,51 @@ pub enum InjectedPromptKind {
     /// **It never wakes an idle thread.** With no live handle there is nothing
     /// to inject into, and history carries the turn to the next round anyway.
     SpokenAside,
+    /// The rest of a spoken sentence this turn was started on (ADR 0198).
+    ///
+    /// The caller's own words, already recorded as their own row. So it
+    /// emits no `PromptInjected`, exactly as a spoken aside does.
+    ///
+    /// It never wakes an idle thread either: the row carries the words to the
+    /// next round. [`inject_the_rest_of_a_sentence`] says which live turn
+    /// gets one.
+    SpokenContinuation,
 }
 
 impl InjectedPromptKind {
     /// True for every kind that must NOT emit its own exchange-starter.
     ///
-    /// The two re-entries already put one on the wire. A spoken aside belongs
-    /// to somebody else's, which comes to the same rule from the other side.
-    pub(crate) fn is_engine_reentry(&self) -> bool {
+    /// The two re-entries already put one on the wire. The two spoken kinds
+    /// already have their own rows, which comes to the same rule.
+    pub fn is_engine_reentry(&self) -> bool {
         matches!(
             self,
-            Self::ReentryFromEngine | Self::ReentryFromWait | Self::SpokenAside
+            Self::ReentryFromEngine
+                | Self::ReentryFromWait
+                | Self::SpokenAside
+                | Self::SpokenContinuation
         )
     }
 
     /// Whether a prompt of this kind can be the REASON a turn runs.
     ///
-    /// A spoken aside cannot, and is the only kind that cannot. It reports
-    /// what the talker said out loud, so it starts nothing (ADR 0149) and only
-    /// rides a round that was running anyway. Two paths ask this: one decides
-    /// whether a finished answer reopens, the other whether an orphan is
-    /// re-submitted.
-    pub(crate) fn can_carry_a_turn(&self) -> bool {
+    /// The two spoken kinds cannot. They start nothing (ADR 0149) and only
+    /// ride a round that was running anyway. `drain_turn_orphans` asks this
+    /// before it re-submits an orphan.
+    pub fn can_carry_a_turn(&self) -> bool {
+        !matches!(self, Self::SpokenAside | Self::SpokenContinuation)
+    }
+
+    /// Whether a prompt of this kind is worth reopening a finished answer for.
+    ///
+    /// Every kind that can carry a turn is. So is the rest of a spoken
+    /// sentence: it reaches only a turn whose history may lack it, and that
+    /// turn's answer would otherwise answer half a question. Reopening costs a
+    /// round but never a second answer, since the talker speaks only the
+    /// turn's last one.
+    ///
+    /// A spoken aside alone is not worth a round: it asks nothing.
+    pub fn reopens_a_finished_answer(&self) -> bool {
         !matches!(self, Self::SpokenAside)
     }
 }
@@ -321,16 +371,14 @@ pub struct ThreadHandle {
     /// once via `take_cancel_actor` to avoid reusing a stale device across
     /// requests. The `CancellationToken` itself remains signal-only.
     pub cancel_actor: Arc<std::sync::Mutex<Option<thread_events::MessageOrigin>>>,
-    /// Set by `cancel_thread_for_followup` when an urgent child follow-up
-    /// preempts this turn, so the cancel arm classifies it as
-    /// `CancelCause::SupersededByFollowup` (rendered neutrally, and excluded
-    /// from the parent-callback terminal set) instead of `UserStop` ("Canceled
-    /// x"). A real Stop click leaves it false.
+    /// The cause the cancel arm stamps instead of `UserStop`. An urgent child
+    /// follow-up sets `SupersededByFollowup`, and a Hold sets `Hold`. A real
+    /// Stop click leaves it empty.
     ///
-    /// The Lucidos Agent analog of `AgentSession::redirect_followup`, and
-    /// drained on read for the same reason `cancel_actor` is: a stale flag
-    /// must not relabel the next turn on the same thread.
-    pub redirect_followup: Arc<std::sync::atomic::AtomicBool>,
+    /// The Lucidos Agent analog of `AgentSession::redirect_cause`, and drained
+    /// on read for the same reason `cancel_actor` is: a stale cause must not
+    /// relabel the next turn on the same thread.
+    pub cancel_cause: Arc<std::sync::Mutex<Option<thread_events::CancelCause>>>,
     /// The `EventMeta::request_event_id` this turn stamps on every event it
     /// emits, including its own terminator. Recorded by
     /// [`LucidosEngine::set_thread_request_event_id`] as soon as the turn's
@@ -354,6 +402,17 @@ pub struct ThreadHandle {
     /// Never needs clearing: the handle IS the turn, and `ThreadGuard::drop`
     /// removes it, so the value cannot outlive what it describes.
     pub request_event_id: Arc<std::sync::Mutex<Option<Uuid>>>,
+    /// The event ids of the prompts coalesced into this turn, besides its
+    /// anchor. Recorded by [`Self::inject`] and read by [`Self::took`].
+    coalesced_event_ids: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// The rest of a spoken sentence that arrived before its ask was coalesced
+    /// into this turn, keyed by the prompt carrying the ask. [`Self::inject`]
+    /// sends it right behind that prompt. Dropped with the handle when the
+    /// prompt goes elsewhere.
+    held_continuations: std::sync::Mutex<HashMap<Uuid, Vec<InjectedPrompt>>>,
+    /// Set by [`record_history_read_begun`] just before the turn reads its
+    /// history. A row committed before then is in that history.
+    history_read_begun: std::sync::atomic::AtomicBool,
 }
 
 impl ThreadHandle {
@@ -369,9 +428,19 @@ impl ThreadHandle {
             pending_injections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation,
             cancel_actor: Arc::new(std::sync::Mutex::new(None)),
-            redirect_followup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_cause: Arc::new(std::sync::Mutex::new(None)),
             request_event_id: Arc::new(std::sync::Mutex::new(None)),
+            coalesced_event_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
+            held_continuations: std::sync::Mutex::new(HashMap::new()),
+            history_read_begun: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether this turn was given the prompt `event_id`, as its anchor or
+    /// coalesced into it.
+    pub fn took(&self, event_id: Uuid) -> bool {
+        *self.request_event_id.lock().unwrap() == Some(event_id)
+            || self.coalesced_event_ids.lock().unwrap().contains(&event_id)
     }
 
     /// Deliver a prompt to the running agentic loop and wake anything
@@ -379,9 +448,42 @@ impl ThreadHandle {
     /// (the turn ended between the caller's lookup and this send) — the
     /// caller then falls back to starting a fresh turn.
     ///
+    /// A prompt that can carry a turn is recorded as taken. The rest of its
+    /// sentence, held because it arrived first, then goes right behind it.
+    ///
+    /// Callers hold the `active_threads` lock, which keeps this atomic with
+    /// [`inject_the_rest_of_a_sentence`]'s check and hold.
+    pub fn inject(&self, prompt: InjectedPrompt) -> bool {
+        let coalesced = prompt.event_id.filter(|_| prompt.kind.can_carry_a_turn());
+        if !self.send(prompt) {
+            return false;
+        }
+        if let Some(event_id) = coalesced {
+            self.coalesced_event_ids.lock().unwrap().insert(event_id);
+            let held = self.held_continuations.lock().unwrap().remove(&event_id);
+            for rest in held.into_iter().flatten() {
+                self.send(rest);
+            }
+        }
+        true
+    }
+
+    /// Hold the rest of a spoken sentence until `asked_turn`, the prompt
+    /// carrying its ask, is coalesced into this turn.
+    fn hold_until_taken(&self, asked_turn: Uuid, rest: InjectedPrompt) {
+        self.held_continuations
+            .lock()
+            .unwrap()
+            .entry(asked_turn)
+            .or_default()
+            .push(rest);
+    }
+
+    /// Put one prompt on the channel. False when the receiver is gone.
+    ///
     /// Count BEFORE sending, and wake after. Both orderings are load-bearing:
     ///
-    /// - **Count before send.** `send` publishes the prompt to the loop at
+    /// - **Count before send.** The channel send publishes the prompt to the loop at
     ///   once, so a drain can report it consumed before a post-send increment
     ///   lands. The saturating decrement would then no-op against a zero
     ///   count and the late `+1` would strand a phantom unread forever —
@@ -390,7 +492,7 @@ impl ThreadHandle {
     /// - **Wake after count.** A blocking tool registers its waiter and then
     ///   reads the counter, so it must never see "no notification AND no
     ///   pending work".
-    pub fn inject(&self, prompt: InjectedPrompt) -> bool {
+    fn send(&self, prompt: InjectedPrompt) -> bool {
         self.pending_injections
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         if self.injection_tx.send(prompt).is_ok() {
@@ -425,11 +527,12 @@ impl ThreadHandle {
 static THREAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct LucidosEngine {
-    artifact_manager: ArtifactManager,
-    event_store: EventStore,
-    python_runtime: PythonRuntime,
-    browser_runtime: BrowserRuntime,
-    app_manager: Arc<AppManager>,
+    agent_host: Arc<dyn agent_host::AgentHost>,
+    pub artifact_manager: ArtifactManager,
+    pub event_store: EventStore,
+    pub python_runtime: PythonRuntime,
+    pub browser_runtime: BrowserRuntime,
+    pub app_manager: Arc<AppManager>,
     /// Active LLM provider behind a swappable handle. The config subscriber
     /// (`spawn_provider_config_subscriber`) hot-swaps it when a provider is
     /// configured or removed, with no engine restart. All reads go
@@ -451,21 +554,21 @@ pub struct LucidosEngine {
     /// (`spawn_embedder_load`) installs the model without a restart once it
     /// lands. Until then memory features degrade descriptively. See
     /// `memory::EmbedderSlot`.
-    embedder: Arc<EmbedderSlot>,
-    memory_index: Option<PgVectorIndex>,
+    pub embedder: Arc<EmbedderSlot>,
+    pub memory_index: Option<PgVectorIndex>,
     /// Vertex project ID — used to build image providers on demand.
-    vertex_project_id: String,
+    pub vertex_project_id: String,
     /// Shared region handle, updated in place when `vertex_region` changes.
-    vertex_location: crate::llm::vertex::LocationHandle,
-    vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
+    pub vertex_location: crate::llm::vertex::LocationHandle,
+    pub vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
     /// Shared with chat and proxy callers, including rotating-token refreshes.
-    pub(crate) claude_gateway_access: crate::llm::claude_gateway::GatewayAccessFactory,
+    pub claude_gateway_access: crate::llm::claude_gateway::GatewayAccessFactory,
     /// Shared model routing map (provider + declared context window), reloaded
     /// in place by `spawn_models_registry_subscriber` on any `Model*` event.
     /// The engine holds it — not just `RoutingProvider` — because the context
     /// trimmer needs the declared context window to size its budget.
-    model_registry: crate::llm::model_registry::ModelRegistry,
-    openai_api_key: Option<String>,
+    pub model_registry: crate::llm::model_registry::ModelRegistry,
+    pub openai_api_key: Option<String>,
     /// Threads with a *conversation summary* refresh in flight, claimed by
     /// `SummaryInFlight`.
     ///
@@ -475,7 +578,7 @@ pub struct LucidosEngine {
     ///
     /// Ephemeral by design. Losing it on restart permits a duplicate call and
     /// nothing worse: the cache is the `ConversationSummarized` event.
-    summarizing_threads: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    pub summarizing_threads: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     rebuilding_memory: AtomicBool,
     cancel_rebuild: AtomicBool,
     /// Set once the engine has begun graceful shutdown or a restart (`main.rs`
@@ -494,7 +597,7 @@ pub struct LucidosEngine {
     /// archive request is refused; the scheduled backup skips its tick.
     pub archive_job_slot: crate::core::snapshot::ArchiveJobSlot,
     /// Is the workspace database answering, and if not, why? Only the background
-    /// probe (`db_health::spawn_db_health_probe`) writes it. `GET /api/v1/health`
+    /// probe in `lucidos-engine-boot` writes it. `GET /api/v1/health`
     /// reads it per request, so an outage adds no latency to the endpoint the
     /// gateway health-checks. See `engine::db_health` and ADR 0037.
     database_health: db_health::DatabaseHealthCell,
@@ -507,13 +610,13 @@ pub struct LucidosEngine {
     /// engine stays pinned to its own (the e2e engine). Fixed at construction.
     version_tracking: engine_version::VersionTracking,
     /// Memoized "is a newer engine binary on disk?" verdict, keyed by the running
-    /// binary's last-seen mtime, so a polling client doesn't fork
+    /// binary's last-seen mtime, so a status reader does not fork
     /// `current_exe --build-id` every tick (mirrors the gateway's `UpdateCheck`).
     update_check: std::sync::Mutex<engine_version::UpdateCheck>,
     /// Throttled cache of "is the engine SOURCE behind HEAD with a
     /// restart-requiring change pending?" (the `engine_source_matches_head` git
-    /// check). Read by `GET /api/v1/engine/version-status` (polled every ~4s per
-    /// client) and the self-heal driver, so the underlying `git diff` runs at most
+    /// check). Status readers, the connected-page watcher and self-heal share it.
+    /// The underlying `git diff` runs at most
     /// once per TTL regardless of client count. Dev-only; always false packaged.
     /// See `engine_version::source_behind_head`.
     source_behind_cache: std::sync::Mutex<engine_version::SourceBehindCache>,
@@ -521,13 +624,13 @@ pub struct LucidosEngine {
     /// engine's?" verdict, keyed by the on-disk build id. Answers the direction
     /// question `update_available` needs — a DIFFERENT binary is only an update
     /// when it isn't an older one — without forking `git merge-base` on every
-    /// ~4s version-status poll. Dev-only. See
+    /// version-status read. Dev-only. See
     /// `engine_version::disk_binary_is_upgrade`.
     disk_direction_cache: std::sync::Mutex<engine_version::DiskDirectionCache>,
     /// Throttled cache of the commits a switch would bring (see
     /// `engine_version::PendingCommits`), which the status toast lists while a
     /// rebuild runs. Same reason as
-    /// `source_behind_cache`: version-status is polled every ~4s per client and
+    /// `source_behind_cache`: version-status readers share the cached result because
     /// this forks `git log`. Only read when a build is in flight or the source is
     /// behind HEAD, so an idle workspace never populates it. Dev-only. See
     /// `engine_version::pending_commits`.
@@ -556,6 +659,9 @@ pub struct LucidosEngine {
     /// `LUCIDOS_STATIC_DIR`). Set once by `api::create_router` via
     /// `init_served_frontend`. See `engine::frontend_refresh`.
     served_frontend: std::sync::OnceLock<Arc<std::sync::RwLock<PathBuf>>>,
+    /// The built `/api/v1` router, with every layer a live request passes.
+    /// See `engine::api_router`.
+    api_router: std::sync::OnceLock<axum::Router>,
     /// The source dir (`LUCIDOS_STATIC_DIR` = live `dist/`) that served-frontend
     /// snapshots are taken from. Set alongside `served_frontend`.
     served_frontend_source: std::sync::OnceLock<PathBuf>,
@@ -621,7 +727,7 @@ pub struct LucidosEngine {
     /// re-entered by an event 1.5s into a *Switch to new version* therefore settled
     /// `failed` with a manual Continue while its two siblings settled `paused`
     /// and auto-resumed, because the device actor is half the switch fingerprint
-    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`).
+    /// (`crate::engine::switch_recovery_sql::SWITCH_TEARDOWN_ABORT_SQL`).
     ///
     /// `None` means either "no teardown yet" or "a teardown nobody requested".
     /// Neither needs distinguishing: both stamp `MessageOrigin::system()`, and
@@ -630,7 +736,7 @@ pub struct LucidosEngine {
     /// Set by `begin_teardown` when the teardown promises an auto-resume. Every
     /// thread's agent run reads it at its end, to leave its processes running
     /// for the session that resumes it (ADR 0478).
-    teardown_handover: crate::runtime::agent_run_marker::TeardownHandover,
+    pub teardown_handover: crate::runtime::agent_run_marker::TeardownHandover,
     /// Thread ids `recover_orphaned_worktrees` decided to auto-resume after a
     /// user-initiated *Switch to new version* (in-flight coding-agent threads with
     /// a device-attributed teardown boundary). Drained by `main.rs` after the
@@ -642,12 +748,12 @@ pub struct LucidosEngine {
     /// Per-thread handles (cancellation token + injection channel). Key = thread_id.
     /// Uses std::sync::Mutex since operations are trivial (insert/remove),
     /// and this allows the ThreadGuard to clean up synchronously in Drop (even on panic).
-    active_threads: Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    pub active_threads: Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
     /// Per-thread completion notifiers for queuing follow-up requests.
     /// When a thread finishes (guard drops), it notifies waiters so queued
     /// requests can proceed instead of cancelling in-progress work.
-    thread_completion: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
-    workspace_path: PathBuf,
+    pub thread_completion: Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    pub workspace_path: PathBuf,
     /// Lucidos source repo root (resolved at startup via `git_ops::main_worktree`).
     /// Stored so the API surface can fall back to a known path when the
     /// `repositories` row is missing (e.g. e2e tests truncate the table).
@@ -662,23 +768,23 @@ pub struct LucidosEngine {
     /// User profile - always included in context for broad queries.
     /// Kept coherent with `artifacts/user_profile.md` by every write route that
     /// can touch the file: see [`user_profile::UserProfileCache`].
-    user_profile: user_profile::UserProfileCache,
+    pub user_profile: user_profile::UserProfileCache,
     /// User's timezone (IANA format, e.g., "America/New_York")
-    user_timezone: tokio::sync::RwLock<String>,
+    pub user_timezone: tokio::sync::RwLock<String>,
     /// User's preferred language (e.g., "English", "Spanish")
-    user_language: tokio::sync::RwLock<String>,
+    pub user_language: tokio::sync::RwLock<String>,
     /// Database pool for credentials and preferences
-    pool: sqlx::PgPool,
+    pub pool: sqlx::PgPool,
     /// In-memory cache of `script_handshake` proxy auth headers, shared
     /// across both the HTTP proxy and the `proxy_request` LLM tool so the
     /// handshake script runs once per expiry window regardless of caller.
-    proxy_token_cache: Arc<crate::api::proxy_token_cache::ProxyTokenCache>,
+    proxy_token_cache: Arc<proxy_token_cache::ProxyTokenCache>,
     /// Compiled WASM signer modules (`data/auth-modules/<name>.wasm`)
     /// loaded at startup. Keyed by file basename (without `.wasm`). Wrapped
     /// in `RwLock` so the Phase-9 reload endpoint can swap the map atomically.
     proxy_modules: Arc<
         tokio::sync::RwLock<
-            std::collections::HashMap<String, Arc<crate::api::proxy_wasm_signer::CompiledModule>>,
+            std::collections::HashMap<String, Arc<proxy_wasm_signer::CompiledModule>>,
         >,
     >,
     /// Shared wasmtime engine. Module compilation + per-request
@@ -688,19 +794,20 @@ pub struct LucidosEngine {
     wasm_engine: Arc<wasmtime::Engine>,
     /// App UI captures waiting for an answer. `capture_app` / `refresh_app`
     /// insert one; `POST /api/v1/app-capture` resolves it.
-    pub(crate) pending_captures: Arc<tools::app_capture::PendingCaptures>,
+    pub pending_captures: Arc<pending_answers::PendingCaptures>,
     /// Widget fit checks waiting for a page's answer. The fit check inserts
     /// one; `POST /api/v1/widgets/fit-report` resolves it.
-    pub(crate) pending_widget_fits: Arc<widget_fit::PendingWidgetFits>,
+    pub pending_widget_fits: Arc<widget_fit::PendingWidgetFits>,
+    pub widget_fit_sessions: Arc<widget_fit_sessions::FitSessions>,
     /// The Claude gateway sign-in in progress, if any. Allowed-ephemeral: a
     /// restart mid-sign-in only means starting again.
-    pub(crate) claude_gateway_sign_in: Arc<claude_gateway_sign_in::ClaudeGatewaySignIn>,
+    pub claude_gateway_sign_in: Arc<claude_gateway_sign_in::ClaudeGatewaySignIn>,
     /// The Sign in with ChatGPT attempt in progress, if any. Allowed-ephemeral
     /// like the gateway slot above.
-    pub(crate) chatgpt_plan_sign_in: Arc<chatgpt_plan_sign_in::ChatGptPlanSignIn>,
+    pub chatgpt_plan_sign_in: Arc<chatgpt_plan_sign_in::ChatGptPlanSignIn>,
     /// The ChatGPT plan access every provider build shares, held here so the
     /// status route reads the same limit pause the provider observes.
-    pub(crate) chatgpt_plan_access: crate::llm::chatgpt_plan::ChatGptPlanAccess,
+    pub chatgpt_plan_access: crate::llm::chatgpt_plan::ChatGptPlanAccess,
     /// Plugin installs awaiting user confirmation in the install panel.
     /// Key: install_id (UUID). Value: staged plugin tree + manifest. Inserted
     /// when `install_plugin` returns the `[PLUGIN_INSTALL_REQUEST]` sentinel;
@@ -708,61 +815,55 @@ pub struct LucidosEngine {
     /// the engine restarts — the staged temp dir is dropped on shutdown).
     /// Allowed-ephemeral per CLAUDE.md (same justification as
     /// `pending_captures`).
-    pub pending_installs: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, crate::engine::tools::plugins::PendingInstall>,
-        >,
-    >,
+    pub pending_installs:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, pending_plugins::PendingInstall>>>,
     /// Pending plugin uninstalls awaiting confirm/cancel from the uninstall
     /// panel. Mirrors `pending_installs` exactly — entry registered when
     /// `uninstall_plugin` returns the `[PLUGIN_UNINSTALL_REQUEST]` sentinel,
     /// removed on Confirm/Cancel (or engine restart). Allowed-ephemeral.
-    pub pending_uninstalls: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, crate::engine::tools::plugins::PendingUninstall>,
-        >,
-    >,
+    pub pending_uninstalls:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, pending_plugins::PendingUninstall>>>,
     /// Frontend origin URL (e.g., "https://lucidos.example.com"), set from first request's Origin header
     pub frontend_origin: std::sync::Mutex<Option<String>>,
     /// Active coding-agent sessions keyed by thread_id.
-    pub(crate) agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    pub agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
     /// The device and preferences block each coding-agent conversation last
     /// read. A cache: an empty map only costs one repeated block.
-    pub(crate) sent_device_contexts: Arc<agent_context::SentDeviceContexts>,
+    pub sent_device_contexts: Arc<agent_context::SentDeviceContexts>,
     /// The changes an apply holds right now. See `change_ops::apply_claim`.
     pub(crate) apply_claims: Arc<change_ops::apply_claim::ApplyClaims>,
     /// The live workspace *view snapshots* of the Tree memory module, one per
     /// view budget. A cache: a restart folds them afresh.
-    pub(crate) view_snapshots: crate::engine::summary_tree::view::ViewSnapshots,
+    pub view_snapshots: crate::engine::summary_tree::view::ViewSnapshots,
     /// Cached verdicts of the recall tool's `find`, by query and line.
-    pub(crate) find_cache: crate::engine::tools::recall::FindCache,
+    pub find_cache: find_cache::FindCache,
     /// Registered coding-agent backends (Claude Code, Codex, …).
     /// Engine code spawns agents via this registry instead of naming a concrete runtime.
-    pub(crate) agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
+    pub agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
     /// The system prompt each thread's latest Claude Code spawn appended. A
     /// side question's session copy appends the same one, so its prompt prefix
     /// matches and the transcript reads from the prompt cache. Memory only: a
     /// thread missing from it, after a restart or an eviction, answers every
     /// side question uncached and without that prompt until its next spawn.
-    pub(crate) cc_system_prompts: std::sync::Mutex<HashMap<Uuid, String>>,
+    pub cc_system_prompts: std::sync::Mutex<HashMap<Uuid, String>>,
     /// Pre-spawn map of `cc_thread_id` → `app_id` for app coding-agent
     /// threads. `spawn_agent_thread` stashes the app id here before
     /// `process_message_with_steps` runs; `run_direct_agent` pops it in to
     /// dispatch sparse-checkout worktree creation. Cleared when the first
     /// `SessionStarted` event lands (the value is then persisted on the
     /// event payload and in `thread_summaries.coding_agent_kind`).
-    pub(crate) pending_app_spawn: std::sync::Mutex<HashMap<Uuid, String>>,
+    pub pending_app_spawn: std::sync::Mutex<HashMap<Uuid, String>>,
     /// Keeps a thread's admitted inputs in the order admission gave them.
     /// See `chat::input_order`.
-    pub(crate) input_order: InputOrder,
+    pub input_order: InputOrder,
     /// Client event ids `POST /chat/stream` already accepted, so a re-post
-    /// starts nothing. See `chat::accepted_messages`.
-    pub(crate) accepted_messages: chat::accepted_messages::AcceptedMessages,
+    /// starts nothing. See `accepted_messages`.
+    pub accepted_messages: accepted_messages::AcceptedMessages,
     /// Orders a Lucidos Agent turn's start with a rung pick. See `chat::rung`.
-    pub(crate) turn_start_gate: chat::rung::TurnStartGate,
+    pub turn_start_gate: turn_start_gate::TurnStartGate,
     /// Limits concurrent CC process startups to prevent CPU contention.
     /// Acquired before spawn_or_resume(), released after Init event.
-    cc_startup_semaphore: Arc<tokio::sync::Semaphore>,
+    pub cc_startup_semaphore: Arc<tokio::sync::Semaphore>,
     /// MCP server manager — handles lifecycle, tool discovery, and tool calls
     pub mcp_manager: crate::mcp::McpManager,
     /// Pending CC permission prompts, deduped by `(thread, tool, input)` so
@@ -788,7 +889,7 @@ pub struct LucidosEngine {
     /// resolution). The cleanup in `agent_session::run_session` takes the
     /// actor back out so `ChangeApplied` / `ChangeApplyFailed` carry the
     /// device that clicked Apply instead of collapsing to "Lucidos Engine".
-    pub(crate) pending_apply_actors: pending_apply_actors::PendingApplyActors,
+    pub pending_apply_actors: pending_apply_actors::PendingApplyActors,
     /// In-flight Apply All batches (see `apply_all_batches`). Each entry is
     /// the live state of one batch — what's been applied, what's failed,
     /// what's still pending. The driver advances the batch from inside
@@ -796,10 +897,10 @@ pub struct LucidosEngine {
     /// suspension+resume happens organically: the recovery CC's eventual
     /// `ChangeApplied` for the conflict member triggers the next apply
     /// via the same hook the happy path uses.
-    pub(crate) apply_all_batches: Arc<tokio::sync::Mutex<apply_all_batches::ApplyAllRegistry>>,
+    pub apply_all_batches: Arc<tokio::sync::Mutex<apply_all_batches::ApplyAllRegistry>>,
     /// How long hardening and conflict resolution usually take, served to the
     /// Changes panel and its apply toasts. A cache over the events table.
-    pub(crate) apply_estimates: Arc<apply_estimate::ApplyEstimateCache>,
+    pub apply_estimates: Arc<apply_estimate::ApplyEstimateCache>,
     /// Sender for the apply-all driver task. `emit_change_applied` /
     /// `emit_apply_failed` push `Applied` / `Failed` messages here; the
     /// driver task (spawned at engine startup via `start_apply_all_driver`)
@@ -814,6 +915,7 @@ pub struct LucidosEngine {
     pub(crate) landing_lane_tx: tokio::sync::mpsc::UnboundedSender<landing_lane::LaneMsg>,
     /// The lane as clients see it. Only the lane's driver writes it, after
     /// each message it handles.
+    pub(crate) landing_setting_gate: tokio::sync::Mutex<()>,
     pub(crate) landing_lane_snapshot: std::sync::RwLock<landing_lane::LaneSnapshot>,
     /// Wakes the follow task before its interval runs out. A paired gateway
     /// that just landed sends it (ADR 0589).
@@ -838,16 +940,16 @@ pub struct LucidosEngine {
     /// In-memory pong inbox for the PresenceCheck protocol — owned here so
     /// both the API handler (`POST /api/v1/presence-pong`) and the fan-out
     /// code (`send_push_to_all_with_app`) share the same tracker.
-    /// See `system-knowhow/notifications.md` §3. Transient by design;
+    /// See `system-knowhow/notifications/3-the-presencecheck-protocol.md` §3. Transient by design;
     /// cleared on engine restart (no recovery is meaningful — in-flight
     /// pongs from a previous process are stale).
-    pub presence_tracker: crate::api::presence_pong::PresenceTracker,
+    pub presence_tracker: presence_tracker::PresenceTracker,
     /// Live count of open SSE connections (`GET /api/v1/events`). The push
     /// fan-out gates the PresenceCheck on this — a connected page can pong
     /// even when its `device_presence` heartbeat has gone stale (iOS suspends
     /// the 30s timer while the PWA is foregrounded). See
-    /// `system-knowhow/notifications.md` §3. Transient — reset on restart.
-    pub sse_connections: crate::api::sse_connections::SseConnectionCounter,
+    /// `system-knowhow/notifications/3-the-presencecheck-protocol.md` §3. Transient — reset on restart.
+    pub sse_connections: sse_connections::SseConnectionCounter,
     /// Which threads have a live *voice session*. One per thread, so a second
     /// upgrade is refused and every start stays paired with one end. Transient:
     /// a call cannot outlive the process holding its socket, and the boot sweep
@@ -865,18 +967,16 @@ pub struct LucidosEngine {
     pub(crate) threads_being_named: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     /// CC commands cache keyed by repo root — each repo has different tools.
     /// Populated from CC Init events, persisted to `.lucidos/cc-commands.json`.
-    pub(crate) cc_commands_cache: tokio::sync::RwLock<HashMap<String, CcCommandsInfo>>,
+    pub cc_commands_cache: tokio::sync::RwLock<HashMap<String, CcCommandsInfo>>,
     /// Shared in-memory trigger configs — same Arc as SchedulerManager's.
     /// Allows engine tools to read trigger state without going through the scheduler.
-    pub(crate) trigger_configs:
-        Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
+    pub trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
     /// Shared in-memory trigger groups — user-visible folders shown in the
     /// triggers panel. Same Arc-sharing pattern as `trigger_configs`. Groups
     /// don't schedule anything; the SchedulerManager just owns the loader for
     /// startup-replay symmetry with triggers, while HTTP / LLM tool callers
     /// read this registry directly.
-    pub(crate) trigger_groups:
-        Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerGroup>>>,
+    pub trigger_groups: Arc<std::sync::RwLock<crate::triggers::TriggerGroupProjection>>,
     /// Serializes invariant-bearing writes (create, rename) on
     /// `trigger_groups`. The std `RwLock` on the registry above can't be held
     /// across `.await`, which leaves a TOCTOU window between the read-time
@@ -885,9 +985,8 @@ pub struct LucidosEngine {
     /// async mutex closes the window: helpers in `trigger_group_writes`
     /// acquire it for the full read-dedup + emit + apply span, so the
     /// unique-name invariant holds even under concurrent requests. Reads,
-    /// delete, and reorder don't acquire it (they can't violate the
-    /// invariant; delete-then-create false-positive 409 is a separate,
-    /// known-quirk).
+    /// delete, and reorder don't acquire it. The projection merges their
+    /// sequence-versioned updates independently.
     pub(crate) trigger_group_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes emit + registry-apply on `trigger_configs`, so the order the
     /// registry is written in is the order the event log records. Same shape as
@@ -908,8 +1007,8 @@ pub struct LucidosEngine {
     /// completion instant still gets the final tail. Every finish is persisted
     /// to the events stream as `BackgroundBashCompleted`, which is what serves
     /// a drain after the retention window closes. See
-    /// `tools/bash_background.rs`.
-    pub(crate) bash_background: tools::bash_background::BackgroundBashRegistry,
+    /// `bash_background.rs`.
+    pub bash_background: bash_background::BackgroundBashRegistry,
     /// The *Thread Queue* — system-wide admission control for background
     /// spawns (event-trigger fires, cron fires, agent-driven sub-thread /
     /// coding-agent spawns). User-initiated chat never routes through it.
@@ -926,7 +1025,7 @@ pub struct LucidosEngine {
     /// persisted `EventWaitStarted` **is** the wait (ADR 0047), and
     /// `rebuild_event_waits` reconstructs this whole map from the event store
     /// at boot. There is no `thread_event_waits` table and must not be one.
-    pub(crate) live_waits: Arc<event_wait::LiveWaits>,
+    pub live_waits: Arc<event_wait::LiveWaits>,
     /// Sender for the event-wait re-entry task. A resolved wait pushes a
     /// [`event_wait::WaitReentryRequest`] here and the consumer (started at boot
     /// via `start_wait_reentry_consumer`) runs the actual turn.
@@ -944,7 +1043,7 @@ pub struct LucidosEngine {
     pub(crate) keep_alive_re_estimates: event_wait::ReEstimates,
     /// Each Lucidos Agent thread's last request, for its prefill beats. A
     /// cache: a restart loses it, and the thread pays one rewrite.
-    pub(crate) remembered_requests: Arc<event_wait::RememberedRequests>,
+    pub remembered_requests: Arc<event_wait::RememberedRequests>,
     /// Held by a keep-alive tick and by the per-thread switch. A tick that read
     /// a thread before the switch never writes its stale status after it.
     pub(crate) keep_alive_status_writes: tokio::sync::Mutex<()>,
@@ -1081,7 +1180,7 @@ async fn follow_vertex_region(
                     None => return true,
                 },
                 Err(e) => {
-                    log!("[Preferences] vertex_region re-read failed: {}", e);
+                    log_legacy!("[Preferences] vertex_region re-read failed: {}", e);
                     return true;
                 }
             }
@@ -1091,14 +1190,14 @@ async fn follow_vertex_region(
         Ok(mut guard) => {
             let old = std::mem::replace(&mut *guard, region.clone());
             if old != region {
-                log!(
+                log_legacy!(
                     "[Preferences] vertex_region updated live: {} → {}",
                     old,
                     region
                 );
             }
         }
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Preferences] vertex_region update skipped (lock poisoned): {}",
             e
         ),
@@ -1117,7 +1216,7 @@ fn lag_or_stop<T>(
     use tokio::sync::broadcast::error::RecvError;
     match e {
         RecvError::Lagged(n) => {
-            log!(
+            log_legacy!(
                 "{} subscriber lagged by {} events, re-reading its state",
                 subscriber,
                 n
@@ -1312,14 +1411,14 @@ pub(crate) async fn swap_in_rebuilt_providers(
             match llm_handle.write() {
                 Ok(mut guard) => {
                     *guard = llm;
-                    log!(
+                    log_legacy!(
                         "[Providers] active LLM provider swapped to {:?} after {} changed, no restart",
                         selection,
                         trigger
                     );
                 }
                 Err(e) => {
-                    log!("[Providers] provider swap skipped (lock poisoned): {}", e)
+                    log_legacy!("[Providers] provider swap skipped (lock poisoned): {}", e)
                 }
             }
             // Swapped in the same pass as the LLM provider: adding an
@@ -1329,7 +1428,7 @@ pub(crate) async fn swap_in_rebuilt_providers(
                 Ok(mut guard) => {
                     let ids = web_search.backend_ids();
                     *guard = web_search;
-                    log!(
+                    log_legacy!(
                         "[Providers] web search backends now: {}",
                         if ids.is_empty() {
                             "none configured".to_string()
@@ -1339,12 +1438,12 @@ pub(crate) async fn swap_in_rebuilt_providers(
                     );
                 }
                 Err(e) => {
-                    log!("[Providers] web search swap skipped (lock poisoned): {}", e)
+                    log_legacy!("[Providers] web search swap skipped (lock poisoned): {}", e)
                 }
             }
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Providers] provider rebuild after {} changed failed: {}. Keeping current provider",
                 trigger,
                 e
@@ -1367,7 +1466,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
         return;
     }
     if new_dir.exists() {
-        log!(
+        log_legacy!(
             "[Startup] both legacy {} and new {} auth-modules dirs exist; \
              leaving both alone (engine reads new path only)",
             legacy.display(),
@@ -1377,7 +1476,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
     }
     if let Some(parent) = new_dir.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            log!(
+            log_legacy!(
                 "[Startup] could not create parent {} for auth-modules migration: {}",
                 parent.display(),
                 e
@@ -1386,12 +1485,12 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
         }
     }
     match std::fs::rename(&legacy, &new_dir) {
-        Ok(()) => log!(
+        Ok(()) => log_legacy!(
             "[Startup] migrated auth-modules dir: {} -> {}",
             legacy.display(),
             new_dir.display()
         ),
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Startup] auth-modules migration failed ({} -> {}): {}",
             legacy.display(),
             new_dir.display(),
@@ -1400,9 +1499,9 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
     }
 }
 
-mod engine_impl;
-pub(crate) mod restore_boot;
-pub(crate) use engine_impl::mask_stored_events;
+pub mod engine_impl;
+pub mod restore_boot;
+pub use engine_impl::mask_stored_events;
 
 /// `processing_thread_ids - all_cc_thread_ids`. Idle coding-agent sessions stay in
 /// `active_threads` between turns, so the exclusion set must cover them or
@@ -1428,7 +1527,7 @@ pub(crate) type ThreadRegistration = (
 
 /// Build the handle and its guard, and put the handle in the map.
 ///
-/// The shared body of the two admission functions below. Never call it
+/// The shared body of the admission functions. Never call it
 /// directly: on its own it is the unconditional insert they exist to prevent.
 fn install_thread_handle(
     threads: &mut HashMap<Uuid, ThreadHandle>,
@@ -1457,7 +1556,7 @@ fn install_thread_handle(
 }
 
 /// The answer to one admission attempt.
-pub(crate) enum Admission {
+pub enum Admission {
     /// The caller owns the turn.
     Admitted(ThreadRegistration),
     /// A turn already owns the thread, at this registration generation.
@@ -1482,10 +1581,9 @@ impl Admission {
 
 /// Admit one run on `thread_id`, or refuse because a turn already owns it.
 ///
-/// **This is the single-flight point for the whole engine.** The question "is a
-/// turn already live here?" and the insert that answers it for the next caller
-/// happen under ONE lock acquisition, through a vacant entry. Nothing else may
-/// put a handle in `active_threads`.
+/// Admission keeps the engine single-flight: the check and insert happen
+/// under one lock. [`hand_over_or_admit`] shares that lock and installer.
+/// Only admission functions may put a handle in `active_threads`.
 ///
 /// The predecessor asked and inserted separately, and inserted unconditionally.
 /// Two wakes for one logical event both read "free", both inserted, and the
@@ -1497,7 +1595,7 @@ impl Admission {
 /// A refusal is not an error. The caller coalesces into the live turn by
 /// injecting (`chat::process`), or waits for it to release the thread
 /// ([`admit_with_stuck_turn_eviction`]).
-pub(crate) fn try_register_thread(
+pub fn try_register_thread(
     active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
     completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
     thread_id: Uuid,
@@ -1613,7 +1711,7 @@ where
             };
 
         if tokio::time::Instant::now() >= deadline {
-            log!(
+            log_legacy!(
                 "[Chat] Thread {} stuck for {}s, force-cancelling and evicting",
                 thread_id,
                 stuck_turn_timeout.as_secs()
@@ -1624,14 +1722,14 @@ where
             {
                 return registration;
             }
-            log!(
+            log_legacy!(
                 "[Chat] Thread {} was handed to another waiter first, queuing behind its turn",
                 thread_id
             );
             continue;
         }
 
-        log!(
+        log_legacy!(
             "[Chat] Thread {} is busy, queuing follow-up request",
             thread_id
         );
@@ -1670,6 +1768,156 @@ pub(crate) fn record_request_event_id(
     }
 }
 
+/// Record that `thread_id`'s turn is about to read its history, unless the
+/// registration has moved on. `generation` guards it as in
+/// [`record_request_event_id`].
+///
+/// Call it BEFORE the read. Marked late, a row committed in between would be
+/// in neither the history nor an injection.
+pub(crate) fn record_history_read_begun(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    generation: u64,
+) {
+    if let Some(handle) = active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .filter(|h| h.generation == generation)
+    {
+        handle
+            .history_read_begun
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// What became of the rest of a spoken sentence offered to a live turn.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestOfSentence {
+    /// The turn that took the ask has it now.
+    Injected,
+    /// The live turn has not taken the ask yet. It gets the words right behind
+    /// the ask if the ask is coalesced into it.
+    Held,
+    /// Whatever turn takes the ask reads the row from its history.
+    LeftToHistory,
+}
+
+/// Offer the rest of a spoken sentence to the live turn on `thread_id`
+/// (ADR 0198).
+///
+/// `asked_turn` is the prompt the turn that took the ask was given: the ask
+/// itself, or the anchor of the turn it went into. The words are on the
+/// thread as their own row already. So only a live turn that took
+/// `asked_turn`, and has started reading its history, gets them:
+///
+/// - A turn still to read its history reads the row there, and an offer
+///   would make it read them twice.
+/// - A turn that has not taken `asked_turn` may still have it coalesced into
+///   it, so it holds the words for that. Any other turn never hears of them.
+pub(crate) fn inject_the_rest_of_a_sentence(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    asked_turn: Uuid,
+    prompt: InjectedPrompt,
+) -> RestOfSentence {
+    let threads = active_threads.lock().unwrap();
+    let Some(handle) = threads.get(&thread_id).filter(|h| {
+        h.history_read_begun
+            .load(std::sync::atomic::Ordering::Acquire)
+    }) else {
+        return RestOfSentence::LeftToHistory;
+    };
+    if !handle.took(asked_turn) {
+        handle.hold_until_taken(asked_turn, prompt);
+        return RestOfSentence::Held;
+    }
+    if handle.inject(prompt) {
+        RestOfSentence::Injected
+    } else {
+        RestOfSentence::LeftToHistory
+    }
+}
+
+/// The result of offering an orphan batch under the admission lock.
+pub enum OrphanAdmission {
+    HandedOver,
+    Closing(Vec<InjectedPrompt>),
+    Admitted(ThreadRegistration, Vec<InjectedPrompt>),
+}
+
+/// Hand over a batch or install its re-run under the same lock.
+pub(crate) fn hand_over_or_admit(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+    prompts: Vec<InjectedPrompt>,
+) -> OrphanAdmission {
+    let mut threads = active_threads.lock().unwrap();
+    let Some(handle) = threads.get(&thread_id) else {
+        let registration =
+            install_thread_handle(&mut threads, active_threads, completion_notify, thread_id);
+        return OrphanAdmission::Admitted(registration, prompts);
+    };
+    let mut prompts = prompts.into_iter();
+    while let Some(prompt) = prompts.next() {
+        if !handle.inject(prompt.clone()) {
+            return OrphanAdmission::Closing(std::iter::once(prompt).chain(prompts).collect());
+        }
+    }
+    OrphanAdmission::HandedOver
+}
+
+/// Own a registration during setup, recovering injections on an early return.
+pub struct PreAdmission {
+    registration: Option<ThreadRegistration>,
+    recover: Box<dyn FnOnce(Vec<InjectedPrompt>) + Send + Sync>,
+}
+
+impl PreAdmission {
+    pub fn new(
+        registration: ThreadRegistration,
+        recover: impl FnOnce(Vec<InjectedPrompt>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            registration: Some(registration),
+            recover: Box::new(recover),
+        }
+    }
+
+    pub fn take(mut self) -> ThreadRegistration {
+        self.registration
+            .take()
+            .expect("pre-admission owns its registration")
+    }
+}
+
+/// Setup checks for a predecessor, excluding the registration it already owns.
+pub fn has_other_live_turn(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    admission: Option<&PreAdmission>,
+) -> bool {
+    let own_generation = admission
+        .and_then(|pending| pending.registration.as_ref())
+        .map(|(_, _, guard)| guard.generation());
+    active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .is_some_and(|handle| Some(handle.generation) != own_generation)
+}
+
+impl Drop for PreAdmission {
+    fn drop(&mut self) {
+        if let Some((_, mut rx, guard)) = self.registration.take() {
+            let prompts = LucidosEngine::finalize_turn_and_drain_injections(guard, &mut rx);
+            let recover = std::mem::replace(&mut self.recover, Box::new(|_| {}));
+            recover(prompts);
+        }
+    }
+}
+
 /// The `request_event_id` an abort emitted from OUTSIDE the agentic loop must
 /// carry, so it terminates the turn that is actually in flight.
 ///
@@ -1686,7 +1934,7 @@ pub(crate) fn record_request_event_id(
 /// docs for how it goes wrong), but a guessed anchor still beats none: a
 /// `NULL` `request_event_id` breaks `chat/rerun.rs`'s Continue window and the
 /// frontend's exchange grouping alike.
-pub(crate) async fn in_flight_request_event_id(
+pub async fn in_flight_request_event_id(
     active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -1700,7 +1948,7 @@ pub(crate) async fn in_flight_request_event_id(
     match recorded {
         Some(id) => Some(id),
         None => {
-            crate::engine::agent_session::latest_originating_event_id(
+            crate::engine::session_queries::latest_originating_event_id(
                 pool,
                 thread_id,
                 fallback_event_types,
@@ -1723,7 +1971,7 @@ pub(crate) async fn in_flight_request_event_id(
 /// frontend's `Aborted`-before-`Canceled` check in `exchangeStatus` only ever
 /// deflated the duplicate when both landed on the SAME exchange; with a
 /// mis-anchored abort they landed on two, and both rendered.
-pub(crate) async fn emit_stuck_thread_eviction_abort(
+pub async fn emit_stuck_thread_eviction_abort(
     bus: &event_bus::EventBus,
     pool: &sqlx::PgPool,
     agent_sessions: &tokio::sync::Mutex<HashMap<Uuid, types::AgentSession>>,
@@ -1753,9 +2001,9 @@ pub(crate) async fn emit_stuck_thread_eviction_abort(
     // same list minus CCUMS. The shared constants live in
     // `agent_session::resume`.
     let originating_types: &[&str] = if channel == Some(EventChannel::ClaudeCode) {
-        crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES
+        crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES
     } else {
-        crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES
+        crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES
     };
     let request_event_id =
         in_flight_request_event_id(active_threads, pool, thread_id, originating_types).await;
@@ -1808,4 +2056,37 @@ mod injection_tests;
 mod restart_anchor_tests;
 
 #[cfg(test)]
-mod value_pins_tests;
+#[path = "mod_tests/rest_of_sentence.rs"]
+mod rest_of_sentence_tests;
+
+#[cfg(test)]
+mod event_bus_engine_tests;
+
+#[cfg(test)]
+mod restore_boot_engine_tests;
+
+#[cfg(test)]
+mod changes_reader_tests;
+
+#[cfg(test)]
+mod shell_label_tests;
+
+#[cfg(test)]
+mod plugin_release_tests;
+
+#[cfg(test)]
+mod taken_back_message_tests;
+
+#[cfg(test)]
+mod session_scope_integration_tests;
+
+#[cfg(test)]
+mod auto_compact_family_tests;
+
+#[cfg(test)]
+mod resume_history_tests;
+
+#[cfg(test)]
+mod announced_surfaces_tests;
+#[cfg(test)]
+mod retired_question_tests;

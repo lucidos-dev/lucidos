@@ -1,23 +1,3 @@
-/**
- * Every frame the engine can broadcast is either answered by the frontend or
- * written down as answering nothing. This is the receiving mirror of
- * `core/announced_surfaces.rs`, which holds the emitting half (ADR 0032), and
- * the enforcement behind ADR 0118.
- *
- * The reported bug was a trigger detail page that ignored a `TriggerUpdated`
- * frame its own store had already applied. The event WAS handled, so this
- * guard would not have caught that one. It catches the other half of the same
- * class: the event nobody wired at all, which is how MCP servers, webhooks and
- * the permission allowlists went a whole session stale.
- *
- * `RESERVED_TYPE_NAMES` is read out of the Rust source rather than restated
- * here, and `reserved_type_names_match_event_type` guards that const against
- * the enum. So a new `SystemEvent` variant reaches this test with no step in
- * between.
- *
- * The reverse direction holds too: every arm names a frame the engine sends.
- * An arm for a renamed or invented name never fires, and nothing else says so.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -30,24 +10,32 @@ import ts from 'typescript';
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(here, '../../../../..');
 
-const SYSTEM_EVENT_RS = 'crates/lucidos-engine/src/engine/event_bus_system_event.rs';
-/** The SSE route. It writes a few transport frames itself, such as `Lagged`. */
-const SSE_ROUTE_RS = 'crates/lucidos-engine/src/api/history.rs';
+const SYSTEM_EVENT_RS = 'crates/lucidos-core/src/engine/event_bus_system_event.rs';
+const SSE_ROUTE_RS = 'crates/lucidos-core/src/core/event_subscription/frames.rs';
 
-/** The two SSE dispatchers: the function that switches on a frame's `type`.
- *  Every `case '…':` of that switch is a handled frame. Other switches in the
- *  same file dispatch on something else, such as a `ThreadEvent` variant. */
 const DISPATCHERS = [
   { file: 'thread-sync.ts', fn: 'handleGlobalEvent' },
   { file: 'entityReferences.ts', fn: 'processSSEForReferences' },
 ];
 const DISPATCHER_FILES = DISPATCHERS.map((d) => d.file).join(' or ');
 
-/** A frame that drives no UI state, and why. Each entry is a decision, so the
- *  next reader re-decides rather than re-discovers. Adding a row is the way to
- *  make this test pass WITHOUT an arm, and it should be harder to justify than
- *  writing the arm. */
 const NO_UI_STATE: Record<string, string> = {
+  HardenCertificateCarried:
+    'The lander updates the lane certificate for a disjoint catch-up. The UI reads the lane snapshot in ChangesUpdated.',
+  LaneArrivalsHeld:
+    'the lane snapshot names the hold, and rides the ChangesUpdated the lane sends beside it',
+  LaneArrivalsReleased:
+    'the lane snapshot drops the hold, and rides the ChangesUpdated the lane sends beside it',
+  LaneBatchFailureRequested:
+    'The lane waits for origin to accept failure results before closing the batch.',
+  RemoteChangesLanded:
+    'The lander records the main move for the main check. The lane snapshot arrives in ChangesUpdated.',
+  MainFollowed:
+    'the main check reads it as a landing, and its next snapshot rides ChangesUpdated; '
+    + 'the shell holds no follow state',
+  MemoryExtractionFailed:
+    'an exhausted extraction record for event queries and workspace learning; '
+    + 'the shell holds no extraction failure count or status',
   WorkspaceRestored:
     'a restricted-boot audit record emitted before serving SSE; StreamHello owns generation '
     + 'admission and cache reconstruction, and NotificationCreated populates the inbox',
@@ -103,6 +91,13 @@ const NO_UI_STATE: Record<string, string> = {
     + 'shows the injects column either, and the Files panel banner moves on '
     + '`HandshakeScriptApproved`',
   EmailSent: 'an audit record of a send. No surface lists sent mail',
+  // Temporary measure: docs/temporary-measures.md, Diagnostic fault UI adoption.
+  InternalFaultRecorded:
+    'the engine persists the fault count for diagnostic snapshots; the shell has no fault-count state yet',
+  DiagnosticBundleReceived:
+    'the private diagnostic inbox is queried through the CLI; no client inbox state exists',
+  DiagnosticBundleSent:
+    'the engine resets the persisted fault count; the shell has no diagnostic-report state yet',
   EngineSupervisorRespawned:
     'emitted at boot, for the timeline. Every client reconnecting after that '
     + 'boot re-reads its state anyway',
@@ -117,7 +112,6 @@ function read(path: string): string {
   return readFileSync(resolve(REPO_ROOT, path), 'utf8');
 }
 
-/** The wire names the engine reserves, straight out of the Rust const. */
 function reservedTypeNames(): string[] {
   const src = read(SYSTEM_EVENT_RS);
   const block = /pub const RESERVED_TYPE_NAMES: &'static \[&'static str\] = &\[([\s\S]*?)\n {4}\];/
@@ -126,15 +120,12 @@ function reservedTypeNames(): string[] {
   return [...block[1].matchAll(/"([A-Za-z0-9_]+)"/g)].map((m) => m[1]);
 }
 
-/** The frame types the SSE route writes itself: its `*_FRAME` consts. */
 function sseRouteFrameNames(): string[] {
   return [...read(SSE_ROUTE_RS).matchAll(/const [A-Z_]+_FRAME: &str = "([A-Za-z0-9_]+)"/g)].map(
     (m) => m[1],
   );
 }
 
-/** The case labels of the switch on `type` at the top of a dispatcher. A
- *  nested switch has its own clauses, so its labels are not collected. */
 function dispatchCaseLabels(file: string, fn: string): string[] {
   const path = resolve(here, file);
   const ast = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -156,7 +147,6 @@ function dispatchCaseLabels(file: string, fn: string): string[] {
     });
 }
 
-/** Every case label of the two dispatch switches. */
 function handledTypeNames(): Set<string> {
   return new Set(DISPATCHERS.flatMap(({ file, fn }) => dispatchCaseLabels(file, fn)));
 }
@@ -167,8 +157,6 @@ describe('every SystemEvent is answered or written down', () => {
   const handled = handledTypeNames();
 
   it('reads a plausible list of wire names out of the Rust source', () => {
-    // A regex that silently matched nothing would make every assertion below
-    // pass while checking nothing at all.
     expect(reserved.length).toBeGreaterThan(50);
     expect(reserved).toContain('TriggerUpdated');
     expect(routeFrames).toContain('Lagged');
@@ -217,6 +205,7 @@ describe('every SystemEvent is answered or written down', () => {
       'McpServerRegistered', 'McpServerUpdated', 'McpServerRemoved',
       'McpServerStopped', 'McpServerDisabledToolsChanged', 'McpLaunchApproved',
       'WebhookCreated', 'WebhookUpdated', 'WebhookDeleted',
+      'EventHookArmed', 'EventHookDisarmed', 'EventHookRemoved',
       'PermissionGrantsChanged',
       'PluginInstallCanceled', 'PluginUninstallCanceled',
     ]) {
@@ -226,12 +215,9 @@ describe('every SystemEvent is answered or written down', () => {
 });
 
 describe('no surface answers a frame by polling instead', () => {
-  // The one path. A timer or a focus listener makes the symptom go away and
-  // leaves the rule unenforced, so the next surface repeats the bug.
-  // `device-presence.ts` legitimately owns the visibility listeners: it
-  // REPORTS this device's presence rather than reading state.
   const BANNED = [/setInterval\s*\(/, /'visibilitychange'/, /'focus'\s*,/];
   const SUBSCRIBERS = [
+    'engine-update.ts',
     'entityReferences.ts',
     '../../hooks/useVersionedRefresh.ts',
     '../../hooks/useServerBackedField.ts',

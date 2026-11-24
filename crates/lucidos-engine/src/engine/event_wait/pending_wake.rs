@@ -13,9 +13,9 @@ use super::keep_alive::{
     unattended_trigger_sql, CacheKeepAliveMode, KeepWarmKinds, WaitAgent, WaitType,
 };
 use super::{describe_subscriptions, LiveWait};
+use crate::engine::bash_background::TaskProgress;
 use crate::engine::thread_events::{WakeMode, WakeSource};
 use crate::engine::thread_lifecycle::ThreadStatus;
-use crate::engine::tools::bash_background::TaskProgress;
 use crate::runtime::CodingAgent;
 
 /// The most earlier estimates a decision reads.
@@ -23,7 +23,7 @@ const MISSES_SHOWN: i64 = 5;
 
 /// Everything the thread waits on, with what each has done so far.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingWake {
+pub struct PendingWake {
     pub agent: WaitAgent,
     pub waits: Vec<PendingWait>,
     pub children: Vec<PendingChild>,
@@ -37,7 +37,7 @@ pub(crate) struct PendingWake {
 
 /// One live event wait the keep-alive keeps warm.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingWait {
+pub struct PendingWait {
     pub reason: String,
     pub watches: String,
     pub armed_at: DateTime<Utc>,
@@ -47,7 +47,7 @@ pub(crate) struct PendingWait {
 
 /// One child thread that will report to the thread.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingChild {
+pub struct PendingChild {
     pub title: String,
     /// The message the child was started with.
     pub task: String,
@@ -58,7 +58,7 @@ pub(crate) struct PendingChild {
 
 /// An earlier expected wake whose time passed while the thread still waited.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-pub(crate) struct MissedEstimate {
+pub struct MissedEstimate {
     pub stated_at: DateTime<Utc>,
     pub expected_at: DateTime<Utc>,
     pub source: sqlx::types::Json<WakeSource>,
@@ -214,7 +214,7 @@ impl crate::engine::LucidosEngine {
     /// wake is owed: the keep-alive is off, the thread is Codex or an
     /// unattended trigger, or nothing keep-warm is pending. An unreadable row
     /// reads as `None`, and the log records it.
-    pub(crate) async fn pending_wake(&self, thread_id: Uuid) -> Option<PendingWake> {
+    pub async fn pending_wake(&self, thread_id: Uuid) -> Option<PendingWake> {
         if self.keep_alive_mode().await != CacheKeepAliveMode::On {
             return None;
         }
@@ -222,7 +222,7 @@ impl crate::engine::LucidosEngine {
         let mut pending = read_pending_wake(&self.pool, thread_id, keep_warm_waits(live.clone()))
             .await
             .unwrap_or_else(|e| {
-                crate::log!("[ExpectedWake] Pending work of {thread_id} unreadable: {e}");
+                crate::log_legacy!("[ExpectedWake] Pending work of {thread_id} unreadable: {e}");
                 None
             })?;
         let durations = self.keep_alive_durations.current();

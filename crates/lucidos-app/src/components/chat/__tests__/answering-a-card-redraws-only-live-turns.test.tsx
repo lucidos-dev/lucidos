@@ -1,8 +1,3 @@
-/** Answering a card flips thread-level flags (`threadIdle` at the tap,
- *  `threadAwaitingAnswer` at the confirmation). A turn those flags cannot change
- *  must keep its memo, or a long thread redraws every row before the pick's
- *  spinner paints. See
- *  `docs/plans/2026-10-24-answering-a-card-redraws-only-live-turns.md`. */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { VNode } from 'preact';
 import { chatExchangePropsEqual } from '../ChatExchange';

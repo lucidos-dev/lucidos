@@ -11,7 +11,6 @@ export function ConfirmDialog() {
   const dialogRef = useRef<HTMLDivElement>(null);
   const okBtnRef = useRef<HTMLButtonElement>(null);
 
-  // The native panel webview paints over the dialog; hold it hidden while open.
   useHidePanelWebviewWhile(state.visible);
 
   useEffect(() => {
@@ -21,12 +20,8 @@ export function ConfirmDialog() {
 
     function handleKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null;
-      // A keystroke aimed at another open overlay is not ours to answer: a
-      // prompt can sit on top of this confirm, and this listener would
-      // otherwise resolve `true` on the Enter that submits it. See dialogOwnsKey.
       if (!dialogOwnsKey(target, dialogRef.current)) return;
       if (e.key === 'Enter') {
-        // Buttons handle Enter natively (triggers click); textareas need newlines.
         if (target?.tagName === 'BUTTON' || target?.tagName === 'TEXTAREA') return;
         e.preventDefault();
         settleConfirm(true);
@@ -36,10 +31,6 @@ export function ConfirmDialog() {
     return () => {
       document.removeEventListener('keydown', handleKey);
     };
-    // Key on `resolve` (a fresh closure per showConfirm call), not `visible`.
-    // A second confirm REPLACES a visible one, keeping visible true→true, so a
-    // `[state.visible]` dep would skip the focus. The caret would stay on the
-    // previous dialog's button. Same reason as `PromptDialog`.
   }, [state.resolve]);
 
   if (!state.visible) return null;
@@ -61,11 +52,6 @@ export function ConfirmDialog() {
       <div class="surface-body dialog-body" tabIndex={-1}>
         <DialogMessage message={state.message} />
         {state.details && (
-          // `tabIndex={-1}`, so Chrome leaves the list out of the Tab order. A
-          // long one overflows, and Chrome promotes an overflowing scroller
-          // with no focusable child to a Tab stop. The overlay Tab rule cycles
-          // the two buttons and never names it, so the promotion only ever painted
-          // the browser's ring around the list. See `.confirm-details:focus`.
           <div class="confirm-details" tabIndex={-1}>
             {state.details.intro && <p class="confirm-details-intro">{state.details.intro}</p>}
             {state.details.groups.map((g, gi) => (
@@ -101,10 +87,6 @@ export function ConfirmDialog() {
         )}
       </div>
       <div class="surface-foot">
-        {/* An acknowledgement has no Cancel: there is nothing to decline, and
-            a second button meaning the same as the first reads as a choice
-            the user does not have. Escape and an outside click still work,
-            and `settleConfirm(true)` below is why they mean "read it". */}
         {!state.acknowledge && state.extraAction && (
           <button
             class="action-btn action-btn-secondary confirm-extra"

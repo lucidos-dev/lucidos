@@ -28,9 +28,6 @@ describe('loadInstalledPlugins', () => {
     installedPlugins.value = { status: 'not-loaded' };
   });
 
-  // Startup, the nav switch and the panel mount can each start a load. The
-  // newest request describes the newest state, so an older response landing
-  // last must not overwrite it.
   it('keeps the newest request when an older response lands last', async () => {
     const older = deferred<{ plugins: InstalledPlugin[] }>();
     const newer = deferred<{ plugins: InstalledPlugin[] }>();
@@ -62,8 +59,6 @@ describe('loadInstalledPlugins', () => {
 });
 
 describe('openPluginDetail', () => {
-  // A navigation that lands content reveals the content pane and takes a nav
-  // history row (`.claude/rules/frontend.md`).
   it('lands the plugin detail page, reveals the pane and records history', () => {
     openPluginDetail({ marketplace_id: 'mkt', id: 'habit-tracker', name: 'Habit Tracker' } as never);
     expect(panelOverlay.value).toEqual({

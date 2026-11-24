@@ -45,8 +45,6 @@ describe('loadMoreChanges against a list that moves under it', () => {
       .mockResolvedValueOnce(page([applied('a0', '2025-12-31T00:00:00Z')], false));
 
     const loading = loadMoreChanges();
-    // A change lands while the page is in flight. The frame replaces the list
-    // with the newest window, which now leads with `a3`.
     handleGlobalEvent('ChangesUpdated', {
       pending: [],
       applied: [

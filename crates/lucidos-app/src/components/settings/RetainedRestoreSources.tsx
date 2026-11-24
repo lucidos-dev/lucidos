@@ -1,6 +1,3 @@
-/** Device-local journal review, separate from automatic reconstruction. These
- * originals are not server projections: header refresh re-reads owner evidence
- * and durable content, and admission changes revoke actions immediately. */
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { readRetainedRestoreSources, copyRetainedRestoreSource } from '../../store/restoreRuntime';
 import type { RestoreSourceReview } from '../../store/restoreSourceReview';

@@ -361,22 +361,16 @@ jobs:
           port="${API_PORT:-${VITE_PORT:?ports file has no API_PORT/VITE_PORT}}"
           echo "User-facing engine port: $port"
 
-          # health_get PORT  → echoes the /health body on the right scheme, or empty.
-          # Mirrors scripts/status.sh:_engine_health_json — try https first (PROTO
-          # may be TLS and isn't always written to the ports file), then http.
-          health_get() {
-            local p="$1" out
-            out="$(curl -sk --connect-timeout 2 --max-time 5 "https://localhost:$p/api/v1/health" 2>/dev/null)" && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
-            out="$(curl -s  --connect-timeout 2 --max-time 5 "http://localhost:$p/api/v1/health"  2>/dev/null)" && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
-            return 1
-          }
+          # API_PORT is the workspace engine's direct HTTP listener. Gateway
+          # probes in the packaged jobs use the separate HTTPS listener.
+          engine_base="http://localhost:$port"
 
           # --- rung 2: engine /health == ok (allow the long first-run build) ---
           echo "Polling /api/v1/health on port $port (timeout ${HEALTH_TIMEOUT_SECS}s)…"
           deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECS ))
           body=""
           until [ "$(date +%s)" -ge "$deadline" ]; do
-            body="$(health_get "$port" || true)"
+            body="$(curl -fsS --connect-timeout 2 --max-time 5 "$engine_base/api/v1/health" 2>/dev/null || true)"
             if echo "$body" | grep -q '"status":"ok"'; then echo "Engine healthy."; break; fi
             if ! kill -0 "${INSTALL_PID:-0}" 2>/dev/null; then
               echo "::error::installer process died during build/launch"
@@ -410,14 +404,12 @@ jobs:
           # a cheap flake to live with, because a re-run costs 15 minutes of
           # release wall clock.
           #
-          # Determine scheme from whichever one /health answered on.
-          scheme="http"; curl -sk --max-time 5 "https://localhost:$port/api/v1/health" >/dev/null 2>&1 && scheme="https"
-          fe_url="$scheme://localhost:$port/"
+          fe_url="$engine_base/"
           echo "Polling $fe_url for the built frontend (timeout ${FRONTEND_TIMEOUT_SECS}s)…"
           deadline=$(( $(date +%s) + FRONTEND_TIMEOUT_SECS ))
           code=000
           until [ "$(date +%s)" -ge "$deadline" ]; do
-            code="$(curl -k -s -o /dev/null -w '%{http_code}' "$fe_url" || echo 000)"
+            code="$(curl -s -o /dev/null -w '%{http_code}' "$fe_url" || echo 000)"
             [ "$code" = "200" ] && break
             if ! kill -0 "${INSTALL_PID:-0}" 2>/dev/null; then
               echo "::error::the installer exited while the frontend was still not served (last HTTP $code)"
@@ -584,10 +576,12 @@ jobs:
     # for a NON-draft rc: accept both `prereleased` and `released` (rc creation
     # can surface either action) and guard on prerelease==true so the real GA
     # publish never triggers it.
+    # Rolling Beta carries only updater assets and has already passed this gate.
     if: >-
       github.repository == 'lucidos-dev/lucidos'
       && ((github.event_name == 'release'
-           && github.event.release.prerelease == true)
+           && github.event.release.prerelease == true
+           && startsWith(github.event.release.tag_name, 'rc-'))
           || (github.event_name == 'workflow_dispatch' && inputs.dmg_tag != ''))
     # `contents: write` is what makes a DRAFT release readable, and it is the only
     # reason this job needs write at all: it downloads and verifies, it never
@@ -777,11 +771,6 @@ jobs:
       #     resolution are `<app-data>/config/engine-port` and then
       #     DEFAULT_ENGINE_PORT, and on a clean runner both land on the same 5252.
       #
-      # Plain http on loopback with no https fallback, unlike the `smoke` job's
-      # `health_get`: a packaged window is pointed at `gateway_url`, which builds
-      # `http://localhost:<port>` unconditionally, and a packaged gateway binds
-      # loopback-only with no TLS opt-in.
-      #
       # `scripts/e2e-packaged.sh` runs a longer version of this same ladder
       # locally, and the two are NOT redundant, so do not delete either for the
       # other. That script runs the bundle's headless `--service` role directly
@@ -793,7 +782,9 @@ jobs:
       - name: App launches and the gateway becomes READY
         run: |
           set -uo pipefail
-          base="http://127.0.0.1:$LUCIDOS_ENGINE_PORT"
+          base="https://127.0.0.1:$LUCIDOS_ENGINE_PORT"
+          # This job runs without a checkout and may wait for the CA to appear.
+          loopback_curl() { curl --noproxy '*' --cacert "$HOME/.lucidos/loopback-ca.pem" "$@"; }
           app_data="$HOME/Library/Application Support/com.lucidos.app"
 
           # Everything the runner can still say about a start that did not
@@ -830,7 +821,7 @@ jobs:
           deadline=$(( $(date +%s) + DMG_READY_TIMEOUT_SECS ))
           body=""
           until [ "$(date +%s)" -ge "$deadline" ]; do
-            body="$(curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
+            body="$(loopback_curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
             if echo "$body" | grep -q '"status":"ok"'; then echo "Gateway healthy."; break; fi
             sleep 2
           done
@@ -863,13 +854,13 @@ jobs:
           # bytes came from and is exactly the field to compare against the tag.
           # The gateway tells only a credentialed caller its `release`, so this
           # read sends the local token the gateway wrote at startup.
-          token_file="$HOME/.lucidos/local-token"
+          token_file="$HOME/.lucidos/private/local-token"
           [ -r "$token_file" ] || {
             echo "::error::local token missing at $token_file: the gateway writes it at startup"
             diagnostics
             exit 1
           }
-          body="$(curl -fsS --max-time 5 -H "x-lucidos-local-token: $(cat "$token_file")" "$base/~/api/v1/health" 2>/dev/null || true)"
+          body="$(loopback_curl -fsS --max-time 5 -H "x-lucidos-local-token: $(cat "$token_file")" "$base/~/api/v1/health" 2>/dev/null || true)"
           echo "$body" | grep -q "\"release\":\"$EXPECTED_VERSION\"" || {
             echo "::error::the DMG on this tag reports a release other than $EXPECTED_VERSION, so the wrong build is attached to it: $body"
             diagnostics
@@ -882,7 +873,7 @@ jobs:
           # runner: the smart root redirects into the sole workspace only when
           # there is exactly one, and a first run registers none, so `/` serves
           # the picker itself out of the bundle's Resources/frontend.
-          code="$(curl -s -o /dev/null -w '%{http_code}' "$base/" || echo 000)"
+          code="$(loopback_curl -s -o /dev/null -w '%{http_code}' "$base/" || echo 000)"
           [ "$code" = "200" ] || {
             echo "::error::gateway root $base/ returned HTTP $code, so the packaged frontend is not being served"
             diagnostics
@@ -1114,8 +1105,11 @@ jobs:
 
       - name: Build the prebuilt headless tarball (the download artifact)
         shell: bash
+        env:
+          LUCIDOS_E2E_FREE_FLOOR_MIN_GB: "1"
         run: |
           set -euo pipefail
+          echo "Memory gate: disposable CI runner uses a 1 GB floor; critical pressure and compressor checks remain active."
           version="$(tr -d ' \t\r\n' < RELEASE)"
           ./scripts/build-headless.sh --triple "$TRIPLE" --version "$version" --out-dir dist/headless
           echo "--- artifacts:"; ls -la dist/headless
@@ -1174,7 +1168,8 @@ jobs:
           set -uo pipefail
           unit="lucidos-gateway-${SLUG}.service"   # == service_systemd_unit_name "$SLUG"
           repo_version="$(tr -d ' \t\r\n' < RELEASE)"
-          base="http://localhost:$GW_PORT"
+          source scripts/lib/loopback_curl.sh
+          base="$(loopback_origin "$GW_PORT")"
 
           # ── rung 1: the always-on user service is registered + running ───────────
           if ! systemctl --user is-active --quiet "$unit"; then
@@ -1190,7 +1185,7 @@ jobs:
           # Assert status:ok, role:gateway, and release == RELEASE. ─────────────────
           gw=""
           for _ in $(seq 1 60); do
-            gw="$(curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
+            gw="$(loopback_curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
             echo "$gw" | grep -q '"status":"ok"' && break
             sleep 1
           done
@@ -1198,12 +1193,12 @@ jobs:
           echo "$gw" | grep -q '"role":"gateway"' || { echo "::error::gateway health missing role=gateway: $gw"; exit 1; }
           # The gateway tells only a credentialed caller its `release`, so the
           # release read goes through gateway_curl with the local token.
-          token_file="$HOME/.lucidos/local-token"
+          token_file="$HOME/.lucidos/private/local-token"
           [ -r "$token_file" ] || {
             echo "::error::local token missing at $token_file: the gateway writes it at startup, so the service did not come up as expected"
             exit 1
           }
-          gateway_curl() { curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"; }
+          gateway_curl() { loopback_curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"; }
           gw="$(gateway_curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
           echo "$gw" | grep -q "\"release\":\"$repo_version\"" \
             || { echo "::error::gateway release != RELEASE ($repo_version), a stale or wrong build: $gw"; exit 1; }
@@ -1273,9 +1268,13 @@ jobs:
           unit_path="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/lucidos-gateway-${SLUG}.service"
           grep -q "LUCIDOS_TLS_CERT=$certs/cert.pem" "$unit_path" \
             || { echo "::error::the re-run dropped LUCIDOS_TLS_CERT from $unit_path"; exit 1; }
+          # Even with an operator certificate configured, loopback serves
+          # the loopback CA's leaf. The unit assertion above checks retention.
+          source scripts/lib/loopback_curl.sh
+          base="$(loopback_origin "$GW_PORT")"
           gw=""
           for _ in $(seq 1 60); do
-            gw="$(curl -fsSk --max-time 5 "https://localhost:$GW_PORT/~/api/v1/health" 2>/dev/null || true)"
+            gw="$(loopback_curl -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
             echo "$gw" | grep -q '"status":"ok"' && break
             sleep 1
           done
@@ -2385,14 +2384,27 @@ jobs:
           # upward, so read what it chose instead of assuming.
           echo "Polling the gateway (timeout ${GW_HEALTH_TIMEOUT_SECS}s)…"
           deadline=$(( $(date +%s) + GW_HEALTH_TIMEOUT_SECS ))
-          port="$GW_DEFAULT_PORT"
+          ca="$HOME/.lucidos/loopback-ca.pem"
+          base="https://localhost:$GW_DEFAULT_PORT"
+          probe_options=(--noproxy '*' --cacert "$ca")
           body=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
             assert_no_html_payload
             assert_no_download_failure
-            banner_port="$(sed -n 's|.*http://localhost:\([0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
-            [ -n "$banner_port" ] && port="$banner_port"
-            body="$(curl -fsS --max-time 5 "http://localhost:$port/~/api/v1/health" 2>/dev/null || true)"
+            banner_origin="$(sed -n 's|.*\(https\{0,1\}://localhost:[0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
+            if [ -n "$banner_origin" ]; then
+              base="$banner_origin"
+              # Older published installers advertise a plaintext gateway.
+              # Once a loopback CA exists, always verify HTTPS.
+              if [ -r "$ca" ]; then
+                base="https://localhost:${banner_origin##*:}"
+              fi
+              case "$base" in
+                https:*) probe_options=(--noproxy '*' --cacert "$ca") ;;
+                *) probe_options=(--noproxy '*') ;;
+              esac
+            fi
+            body="$(curl "${probe_options[@]}" -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
             echo "$body" | grep -q '"status":"ok"' && break
             # Unquoted-default deliberately absent: `kill -0 0` targets the whole
             # process group and ALWAYS succeeds, so a `${INSTALL_PID:-0}` fallback
@@ -2413,13 +2425,13 @@ jobs:
             || { echo "::error::the gateway never reported healthy within ${GW_HEALTH_TIMEOUT_SECS}s"; dump; exit 1; }
           echo "$body" | grep -q '"role":"gateway"' \
             || { echo "::error::/~/api/v1/health did not answer as the gateway: $body"; dump; exit 1; }
-          echo "rung 2 + 3 OK — installed cleanly, gateway healthy on port $port: $body"
+          echo "rung 2 + 3 OK — installed cleanly, gateway healthy at $base: $body"
 
           # ── rung 4: the frontend is served ────────────────────────────────────
-          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://localhost:$port/" || echo 000)"
+          code="$(curl "${probe_options[@]}" -s -o /dev/null -w '%{http_code}' --max-time 15 "$base/" || echo 000)"
           [ "$code" = "200" ] \
-            || { echo "::error::frontend http://localhost:$port/ returned HTTP $code"; dump; exit 1; }
-          echo "rung 4 OK — frontend serves 200 at http://localhost:$port/"
+            || { echo "::error::frontend $base/ returned HTTP $code"; dump; exit 1; }
+          echo "rung 4 OK — frontend serves 200 at $base/"
 
           echo "OK — 'curl -fsSL $FRONT_DOOR/install.sh | sh' works on a fresh ubuntu:22.04 box."
 
@@ -3629,14 +3641,27 @@ jobs:
           # runs start timing out at the 30-minute job limit.
           echo "Polling the gateway (timeout ${GW_HEALTH_TIMEOUT_SECS}s)…"
           deadline=$(( $(date +%s) + GW_HEALTH_TIMEOUT_SECS ))
-          port="$GW_DEFAULT_PORT"
+          ca="$HOME/.lucidos/loopback-ca.pem"
+          base="https://localhost:$GW_DEFAULT_PORT"
+          probe_options=(--noproxy '*' --cacert "$ca")
           body=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
             assert_no_html_payload
             assert_no_download_failure
-            banner_port="$(sed -n 's|.*http://localhost:\([0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
-            [ -n "$banner_port" ] && port="$banner_port"
-            body="$(curl -fsS --max-time 5 "http://localhost:$port/~/api/v1/health" 2>/dev/null || true)"
+            banner_origin="$(sed -n 's|.*\(https\{0,1\}://localhost:[0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
+            if [ -n "$banner_origin" ]; then
+              base="$banner_origin"
+              # Older published installers advertise a plaintext gateway.
+              # Once a loopback CA exists, always verify HTTPS.
+              if [ -r "$ca" ]; then
+                base="https://localhost:${banner_origin##*:}"
+              fi
+              case "$base" in
+                https:*) probe_options=(--noproxy '*' --cacert "$ca") ;;
+                *) probe_options=(--noproxy '*') ;;
+              esac
+            fi
+            body="$(curl "${probe_options[@]}" -fsS --max-time 5 "$base/~/api/v1/health" 2>/dev/null || true)"
             echo "$body" | grep -q '"status":"ok"' && break
             sleep 5
           done
@@ -3646,7 +3671,7 @@ jobs:
             || { echo "::error::the gateway never reported healthy within ${GW_HEALTH_TIMEOUT_SECS}s ($(installer_state))"; dump; exit 1; }
           echo "$body" | grep -q '"role":"gateway"' \
             || { echo "::error::/~/api/v1/health did not answer as the gateway: $body"; dump; exit 1; }
-          echo "rung 2 + 3 OK — installed cleanly, gateway healthy on port $port ($(installer_state)): $body"
+          echo "rung 2 + 3 OK — installed cleanly, gateway healthy at $base ($(installer_state)): $body"
 
           # Healthy — but did the advertised command itself SUCCEED? An exited
           # installer is legal here (the launchd shape exits 0); a NON-ZERO exit
@@ -3672,10 +3697,10 @@ jobs:
           fi
 
           # ── rung 4: the frontend is served ────────────────────────────────────
-          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://localhost:$port/" || echo 000)"
+          code="$(curl "${probe_options[@]}" -s -o /dev/null -w '%{http_code}' --max-time 15 "$base/" || echo 000)"
           [ "$code" = "200" ] \
-            || { echo "::error::frontend http://localhost:$port/ returned HTTP $code"; dump; exit 1; }
-          echo "rung 4 OK — frontend serves 200 at http://localhost:$port/"
+            || { echo "::error::frontend $base/ returned HTTP $code"; dump; exit 1; }
+          echo "rung 4 OK — frontend serves 200 at $base/"
 
           echo "OK — 'curl -fsSL $FRONT_DOOR/install.sh | sh' works on a fresh ${{ matrix.runner }} ($TRIPLE)."
 

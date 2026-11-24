@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The drawn caret (ADR 0317): when it runs, and what it shows.
- *
- * jsdom lays nothing out, so position is the browser e2e's job
- * (`e2e/theme-caret-fallback-all.spec.ts`). These tests pin the decision and the
- * controller's reaction to focus, selection, composition and theme switches.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { attachDrawnCaret, drawnCaretShape } from './drawnCaret';
 
@@ -114,7 +107,6 @@ describe('attachDrawnCaret', () => {
     await frame();
     expect(cursor()!.textContent).toBe('👍🏽');
 
-    // A caret set inside the cluster never repeats text before it.
     textarea.setSelectionRange(3, 3);
     document.dispatchEvent(new Event('selectionchange'));
     await frame();

@@ -14,6 +14,7 @@
 # A pass holds for 60 s in the process tree. A caller that just passed exports
 # LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT, so a nested build skips the readings.
 #
+# Linux reads MemAvailable, memory pressure and the cgroup v2 memory ceiling.
 # Exit status: 0 GO, 72 refused. A host it cannot read is GO.
 
 set -uo pipefail

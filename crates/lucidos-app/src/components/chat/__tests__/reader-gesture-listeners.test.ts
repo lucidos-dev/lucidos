@@ -18,32 +18,9 @@ import {
   TOUCH_COAST_IDLE_MS,
   TOUCH_COAST_MAX_MS,
 } from '../scrollState';
+import { READER_SCROLL_EVENT_WAIT_MS } from '../readerInput';
 
-/**
- * **What the listeners themselves make of each input.**
- *
- * The suite next door (`scroll-follow-the-live-edge.test.ts`) drives the
- * DECISION through `readerGestureForTest`, which states the fact the listeners
- * record without going near them. That is the right shape for asking what the
- * follow does with a gesture, and it leaves the other half unasked: whether a
- * given input produces one. The distinction is not academic. Every bug this
- * mechanism has had so far lived on this side of the line, in which event
- * counts as the reader:
- *
- *   - arming on `pointerdown` put a window over every press inside the
- *     transcript, and a press is how the reader answers a question or grants a
- *     permission (both of which must KEEP the follow);
- *   - reading `offsetX` off a bubbled press measured the wrong box, so an
- *     ordinary tap low in a tall turn read as a press in the scrollbar gutter;
- *   - `Cmd+ArrowDown` is turn stepping, not a scroll key, and stamping it
- *     defeated the one case `stepThreadTurn` keeps the ride for.
- *
- * So this file drives real events at the real listeners, through a container
- * double that records what was registered on it.
- */
 describe('what the reader-gesture listeners count as a scroll', () => {
-  /** A container that records its listeners, plus `window`'s, so a test can
-   *  fire either and the teardown can be checked for both. */
   function makeContainer() {
     const own: Record<string, Function[]> = {};
     const el: any = {
@@ -64,8 +41,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       removeEventListener(type: string, fn: Function) {
         own[type] = (own[type] ?? []).filter(f => f !== fn);
       },
-      /** Fire an event at the container's own listeners. `target` defaults to
-       *  the container, which is what a press on its scrollbar reports. */
       fire(type: string, event: Record<string, unknown> = {}) {
         for (const fn of own[type] ?? []) fn({ target: el, button: 0, ...event });
       },
@@ -86,8 +61,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       },
     };
     stopFollowingBottom();
-    // A live thread, where a reader's scroll turns the follow off. A waiting
-    // thread parks it instead (`scroll-follow-the-live-edge.test.ts`).
     setTranscriptLive(true);
     setActiveScrollElement(null);
     readerGestureForTest(null, false);
@@ -102,7 +75,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     readerGestureForTest(null, false);
   });
 
-  /** An armed reader, with the listeners really attached. */
   function riding() {
     const el = makeContainer();
     const observers = makeScrollObservers(el);
@@ -113,24 +85,19 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     return { el, ...observers };
   }
 
-  /** Move the container the way the platform does: no input event at all. */
   function platformScrollsTo(el: any, top: number, onScroll: () => void) {
     el.scrollTop = top;
     onScroll();
   }
 
-  /** A press in the scrollbar gutter, past the client box. */
   function gutterPress(el: any) {
     el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
   }
 
-  /** Fire an event at `window`'s listeners, where the releases live. */
   function fireWindow(type: string, event: Record<string, unknown> = {}) {
     for (const fn of windowListeners[type] ?? []) fn(event);
   }
 
-  /** `riding()`, plus the glide's own trailing scroll event, so the cases that
-   *  ask what the transcript then DOES start from a settled ride. */
   function ridingAndAnchored() {
     const r = riding();
     r.onScroll();
@@ -142,10 +109,8 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     const { detachGestures } = makeScrollObservers(el);
 
     expect(Object.keys(el.listeners).sort()).toEqual(
-      ['focusin', 'keydown', 'pointerdown', 'pointermove', 'scroll', 'touchmove', 'wheel'],
+      ['focusin', 'keydown', 'pointerdown', 'pointermove', 'scroll', 'touchmove', 'touchstart', 'wheel'],
     );
-    // The release goes on `window`: a drag that ends with the pointer outside
-    // the transcript would otherwise leave the press recorded forever.
     expect(Object.keys(windowListeners).sort()).toEqual(
       ['blur', 'pointercancel', 'pointerup', 'touchcancel', 'touchend'],
     );
@@ -160,6 +125,27 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     el.fire('wheel');
     platformScrollsTo(el, 900, onScroll);
     expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('never writes the edge between a wheel notch and its scroll event', () => {
+    const { el, onScroll, onResize } = riding();
+    const before = el.scrollTop;
+    el.fire('wheel');
+    el.scrollHeight += 60;
+    onResize();
+    expect(el.scrollTop).toBe(before);
+    platformScrollsTo(el, before - 200, onScroll);
+    expect(followingLiveEdge.value).toBe(false);
+  });
+
+  it('keeps the edge once a wheel notch that moved nothing has waited', () => {
+    const { el, onResize } = riding();
+    el.fire('wheel');
+    el.scrollHeight += 60;
+    onResize();
+    vi.advanceTimersByTime(READER_SCROLL_EVENT_WAIT_MS + 1);
+    expect(el.scrollTop).toBe(el.scrollHeight - el.clientHeight);
+    expect(followingLiveEdge.value).toBe(true);
   });
 
   it('counts a finger travelling', () => {
@@ -177,9 +163,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('does NOT count a chord, which is a shortcut rather than a scroll key', () => {
-    // Cmd+Arrow is turn stepping. Stamping it would retire the ride from
-    // `onScroll` mid-glide, defeating the one case `stepThreadTurn` keeps it
-    // for: a step onto the last turn, which lands at the live edge anyway.
     const { el, onScroll } = riding();
     el.fire('keydown', { key: 'ArrowDown', metaKey: true });
     platformScrollsTo(el, 900, onScroll);
@@ -194,12 +177,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('reads a scroll key on a control INSIDE the transcript as a placement, not the platform', () => {
-    // A scroll key the focused control does not consume still scrolls the
-    // transcript, because the browser scrolls the nearest scrollable ancestor.
-    // The choice-card seeding parks focus on a button INSIDE the transcript. A
-    // reader answering a question and then paging back is in exactly this state. The correction must stand down or keyboard scrolling
-    // is undone the instant it happens. The reader moved themselves off the
-    // edge, so the ride ends with it.
     const { el, onScroll } = ridingAndAnchored();
 
     el.fire('keydown', { key: 'PageUp', target: { nodeName: 'BUTTON' } });
@@ -210,8 +187,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('and answers the platform again once that keypress is four frames old', () => {
-    // A window, like every other answer to "was that scroll ours". A PageUp four
-    // frames ago says nothing about the keyboard adjusting the offset now.
     const { el, onScroll } = ridingAndAnchored();
 
     el.fire('keydown', { key: 'PageUp', target: { nodeName: 'BUTTON' } });
@@ -223,12 +198,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('keeps the reader where FOCUS landing inside it took them, and ends the ride', () => {
-    // The other way the container scrolls with nobody writing `scrollTop`: the
-    // browser reveals a focused control that is off screen, for Tab, Shift+Tab,
-    // a screen reader moving the cursor, or any `focus()` without
-    // `preventScroll`. It is a PLACEMENT, so the correction must not write them
-    // back. Otherwise Tab appears to do nothing, with its control off screen.
-    // The reader is off the edge, so the toggle goes off.
     const { el, onScroll, onResize } = ridingAndAnchored();
     const buttonInAnOlderTurn = { nodeName: 'BUTTON' };
 
@@ -238,30 +207,23 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     expect(el.scrollTop).toBe(400);
     expect(followingLiveEdge.value).toBe(false);
 
-    el.scrollHeight = 3100;   // and the next growth moves them nowhere
+    el.scrollHeight = 3100;
     onResize();
     expect(el.scrollTop).toBe(400);
   });
 
   it('and answers the platform again once the focus reveal is four frames old', () => {
-    // The stamp is a WINDOW, like every other answer to "was that scroll ours":
-    // a focus move four frames ago says nothing about a scroll now, and if it
-    // did, one Tab would exempt the rest of the thread from the correction.
     const { el, onScroll } = ridingAndAnchored();
 
     el.fire('focusin', { target: { nodeName: 'BUTTON' } });
     vi.advanceTimersByTime(200);
     platformScrollsTo(el, 400, onScroll);
 
-    expect(el.scrollTop).toBe(2500);   // carried back to the live edge
+    expect(el.scrollTop).toBe(2500);
     expect(followingLiveEdge.value).toBe(true);
   });
 
   it('does NOT read focus on a control already in full view as a placement', () => {
-    // A tap focuses the option it lands on, and the browser reveals nothing.
-    // Stamped anyway, the next platform clamp read as the reader placing
-    // themselves. On a phone the composer shrinks right after an answer, so
-    // that clamp cancelled the answer's landing. Reported.
     const { el, onScroll } = ridingAndAnchored();
     const tappedOption = {
       nodeName: 'BUTTON',
@@ -271,12 +233,11 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     el.fire('focusin', { target: tappedOption });
     platformScrollsTo(el, 400, onScroll);
 
-    expect(el.scrollTop).toBe(2500);   // the platform, so carried back
+    expect(el.scrollTop).toBe(2500);
     expect(followingLiveEdge.value).toBe(true);
   });
 
   it('does NOT read focus on the transcript itself as a placement', () => {
-    // A tap on plain text focuses the container, which scrolls nothing.
     const { el, onScroll } = ridingAndAnchored();
 
     el.fire('focusin', { target: el });
@@ -287,8 +248,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('counts a scrollbar DRAG for as long as the thumb is held', () => {
-    // The press stamps once; a slow haul down the bar can outlast the window,
-    // so the moves under it keep the signal fresh.
     const { el, onScroll } = riding();
     gutterPress(el);
     vi.advanceTimersByTime(1000);
@@ -300,8 +259,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('does NOT count a pointer merely crossing the transcript', () => {
-    // On a desktop this fires constantly. Without the press gate the signal
-    // would be permanently in flight and every platform scroll would retire.
     const { el, onScroll } = riding();
     el.fire('pointermove', { buttons: 0 });
     platformScrollsTo(el, 900, onScroll);
@@ -309,24 +266,18 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('does NOT count the jitter every real click on a control carries', () => {
-    // A press on content never arms the drag path at all, so the sub-pixel
-    // movement between pressing a question card's button and releasing it
-    // cannot stamp. Recording content presses is what made that reachable.
     const { el, onScroll } = riding();
     const answerButton = { nodeName: 'BUTTON' };
 
     el.fire('pointerdown', { target: answerButton, offsetX: 40, offsetY: 12 });
-    el.fire('pointermove', { buttons: 1 }); // the finger settling on the button
     el.fire('pointermove', { buttons: 1 });
-    platformScrollsTo(el, 900, onScroll);   // and the card's reflow
+    el.fire('pointermove', { buttons: 1 });
+    platformScrollsTo(el, 900, onScroll);
 
     expect(followingLiveEdge.value).toBe(true);
   });
 
   it('counts a press in the scrollbar GUTTER, which scrolls with no movement', () => {
-    // Clicking the track pages the transcript in one jump, so there is no move
-    // to wait for. The gutter is outside the client box, which is what makes
-    // this the one press that cannot be a content control.
     const { el, onScroll } = riding();
     gutterPress(el);
     platformScrollsTo(el, 900, onScroll);
@@ -334,11 +285,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('does NOT count an ordinary press, wherever in the transcript it lands', () => {
-    // Answering a question, granting a permission, expanding a turn. The
-    // `offsetY` case is the one that shipped broken: `offsetX`/`offsetY` are
-    // measured from the TARGET's box and `pointerdown` bubbles, so a tap low in
-    // a turn taller than the viewport reported an offset past the container's
-    // client box and read as the gutter.
     const { el, onScroll } = riding();
     const tallTurn = { nodeName: 'DIV' };
 
@@ -349,16 +295,12 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   it('forgets a scrollbar press released where it could not see it', () => {
-    // A release over a nested iframe, or one that happens while the PWA is
-    // backgrounded, never reaches the window listener. The next move with no
-    // button held is what clears it, so the press cannot stick and turn an
-    // ordinary hover into a drag.
     const { el, onScroll } = riding();
 
     gutterPress(el);
-    el.fire('pointermove', { buttons: 0 }); // the release we never saw
-    vi.advanceTimersByTime(2000);           // and the press's own stamp lapses
-    el.fire('pointermove', { buttons: 0 }); // now just a hover
+    el.fire('pointermove', { buttons: 0 });
+    vi.advanceTimersByTime(2000);
+    el.fire('pointermove', { buttons: 0 });
     platformScrollsTo(el, 900, onScroll);
 
     expect(followingLiveEdge.value).toBe(true);
@@ -369,17 +311,14 @@ describe('what the reader-gesture listeners count as a scroll', () => {
 
     gutterPress(el);
     fireWindow('pointerup');
-    vi.advanceTimersByTime(2000);           // the press's own stamp lapses
-    el.fire('pointermove', { buttons: 1 }); // a drag that belongs to something else
+    vi.advanceTimersByTime(2000);
+    el.fire('pointermove', { buttons: 1 });
     platformScrollsTo(el, 900, onScroll);
 
     expect(followingLiveEdge.value).toBe(true);
   });
 
   describe('a held scrollbar, which the window waits out (ADR 0258)', () => {
-    // While the thumb is held, Chromium puts its own drag position back and
-    // undoes an anchor write. So ThreadView grows the window, and lets history
-    // land above the reader, on the RELEASE, which these exports report.
     let released: unknown[];
     let unsubscribe: () => void;
     let realDocument: any;
@@ -413,10 +352,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     });
 
     it('leaves the reader where an overlay thumb drag put them', () => {
-      // macOS draws overlay scrollbars, so the press lands inside the client
-      // box. Writing the reader back to the live edge here fought Chromium,
-      // which puts its own drag position back every frame: the content shook
-      // and the thumb would not leave the bottom.
       const { el, onScroll } = ridingAndAnchored();
       el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
       platformScrollsTo(el, 400, onScroll);
@@ -425,8 +360,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     });
 
     it('retires the ride on an overlay thumb drag, however slow', () => {
-      // Chromium may send no pointer moves while it drives its own thumb, so
-      // the hold itself says the reader is scrolling, not a fresh stamp.
       const { el, onScroll } = ridingAndAnchored();
       el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
       vi.advanceTimersByTime(3000);
@@ -547,10 +480,6 @@ describe('what the reader-gesture listeners count as a scroll', () => {
   });
 
   describe('a touch scroll, held until its momentum stops', () => {
-    // iOS kills a fling on any scrollTop write, and a grow's anchor write is
-    // built from a reading the fling has already left. Both read as the
-    // transcript flickering and landing somewhere else. So the touch holds the
-    // window exactly as a held scrollbar does, until the coast is over.
     let released: unknown[];
     let unsubscribe: () => void;
     beforeEach(() => {

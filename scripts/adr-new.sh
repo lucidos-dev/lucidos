@@ -26,6 +26,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/adr_scan.sh
 source "$SCRIPT_DIR/lib/adr_scan.sh"
+# shellcheck source=scripts/lib/flock.sh
+source "$SCRIPT_DIR/lib/flock.sh"
 
 usage() {
     awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
@@ -81,43 +83,37 @@ fi
 # two sessions that both finish scanning before either writes its file would
 # receive the SAME number and create it in their separate working trees: the
 # silent collision this script exists to prevent, reintroduced at the last
-# step. `mkdir` is atomic on every filesystem git runs on, and the common git
-# dir is shared by every worktree of the repository, so one lock covers them
-# all. It is held across the scan, the file creation, AND the index append.
+# step. The common git dir is shared by every worktree of the repository, so
+# one lock there covers them all. It is held across the scan, the file
+# creation, AND the index append.
+#
+# It is a kernel flock, which the OS releases when its holder dies, so no
+# waiter ever has to judge a lock stale. Every staleness guess raced: an old
+# mtime lies after a clock step, and a pid check reads one holder but breaks
+# whichever lock exists by then. Never delete the lock file: a new opener
+# would lock a new inode while the holder still locks the old one.
 GIT_COMMON="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2> /dev/null)"
 case "$GIT_COMMON" in
     /*) ;;
     *) GIT_COMMON="$REPO_ROOT/$GIT_COMMON" ;;
 esac
-LOCK="$GIT_COMMON/lucidos-adr-alloc.lock"
+LOCK="$GIT_COMMON/lucidos-adr-alloc.flock"
 WAITED=0
-until mkdir "$LOCK" 2> /dev/null; do
-    # A killed session leaves the directory behind. Nothing in here takes
-    # anywhere near a minute, so a lock older than that is dead, not slow, and
-    # breaking it is safer than making every later allocation hang forever.
-    #
-    # Break it by RENAMING, never by deleting in place. Two waiters can both
-    # see the same stale lock and both decide to clear it; with `rm -rf "$LOCK"`
-    # the slower one would delete the directory the faster one had just
-    # legitimately re-created, and both would then hold the lock and allocate
-    # the same number. `mv` to a per-process name is the atomic claim: the
-    # source is already gone for the loser, so exactly one waiter removes
-    # exactly the instance it inspected.
-    if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1 2> /dev/null)" ]; then
-        if mv "$LOCK" "$LOCK.stale.$$" 2> /dev/null; then
-            rm -rf "$LOCK.stale.$$"
-        fi
-        continue
+while true; do
+    LOCK_RC=0
+    flock_try 9 "$LOCK" ex || LOCK_RC=$?
+    [ "$LOCK_RC" -eq 0 ] && break
+    if [ "$LOCK_RC" -ne 1 ]; then
+        echo "ERROR: could not take the allocation lock $LOCK." >&2
+        exit 1
     fi
     if [ "$WAITED" -ge 30 ]; then
         echo "ERROR: another ADR allocation has held $LOCK for 30s." >&2
-        echo "       If no other session is creating an ADR, remove it." >&2
         exit 1
     fi
     sleep 1
     WAITED=$((WAITED + 1))
 done
-trap 'rm -rf "$LOCK"' EXIT
 
 NUMBER="$(adr_next_number "$REPO_ROOT")" || exit 1
 

@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * I8 of the one-render plan: the thread ⋯ menu offers no Add widget. A
- * thread holds no pins, so a widget reaches it only through a reply's embed.
- */
 import { beforeAll, describe, it, expect, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

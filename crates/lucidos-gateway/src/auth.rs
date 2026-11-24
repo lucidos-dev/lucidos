@@ -117,6 +117,18 @@ pub enum Authorization {
 #[derive(Debug, Clone, Copy)]
 pub struct AuthenticatedLocalProcess;
 
+/// The thread-bound credential an engine mints for each agent it spawns. Only
+/// that engine's MAC key can verify it, so the gateway forwards it unread.
+pub const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
+
+/// Stamped by [`crate::auth_api::enforce`] onto an agent's snapshot restore
+/// call from this machine that carries no local token.
+///
+/// It proves only the loopback peer. A sandboxed agent cannot read the local
+/// token, so the source engine's verdict on the origin token is the proof.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentRestoreCaller;
+
 /// The device [`crate::auth_api::enforce`] resolved, stamped onto the request
 /// for the proxy to forward.
 ///
@@ -133,16 +145,34 @@ pub struct AuthenticatedDevice {
 }
 
 impl AuthenticatedDevice {
-    /// The headers that tell the engine who this is. The label is
+    /// The headers that tell the engine who this is, and the gateway stamp that
+    /// proves it to the engine holding `stamp_key`. The label is
     /// percent-encoded, because it is user text and a header value is bytes.
-    pub fn forwarded_headers(&self) -> [(&'static str, String); 2] {
-        [
+    ///
+    /// With no key (an engine adopted keyless) the stamp is left off, and the
+    /// engine reads the device as an unattested caller.
+    pub fn forwarded_headers(
+        &self,
+        workspace_id: &str,
+        stamp_key: Option<&lucidos_gateway_stamp::StampKey>,
+    ) -> Vec<(&'static str, String)> {
+        let mut headers = vec![
             (crate::stack::HEADER_DEVICE_ID, self.id.clone()),
             (
                 crate::stack::HEADER_DEVICE_LABEL,
                 urlencoding::encode(&self.label).into_owned(),
             ),
-        ]
+        ];
+        if let Some(key) = stamp_key {
+            headers.push((
+                lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+                key.sign_now(lucidos_gateway_stamp::Claim::Device {
+                    workspace_id,
+                    device_id: &self.id,
+                }),
+            ));
+        }
+        headers
     }
 }
 
@@ -258,20 +288,20 @@ impl PairedDevices {
 /// loaded it once, then rewrote it whole from private memory, so every write
 /// deleted the other's devices. A device now pairs to a gateway.
 pub fn paired_devices_path(app_data: &Path) -> PathBuf {
-    app_data.join("paired-devices.json")
+    app_data.join(lucidos_home::private::PAIRED_DEVICES)
 }
 
-/// The pre-isolation store at `~/.lucidos/paired-devices.json`, now a seed.
+/// The pre-isolation store, now a seed in the private subtree.
 ///
 /// Moving the path alone would refuse every device paired before the upgrade.
 /// That is the failure `docs/plans/2026-08-19-nobody-is-stranded-by-the-pairing-update.md`
 /// exists to prevent. [`crate::gateway_event_log::open`] reads it and never
-/// writes it. The other gateway needs it too, and none can tell whether the
-/// others have already read it.
+/// writes it. [`crate::gateway_event_log::cut_devices_once`] deletes it, since
+/// every credential it holds predates loopback https.
 ///
 /// `None` only when `HOME` is unset.
 pub fn legacy_paired_devices_path() -> Option<PathBuf> {
-    Some(lucidos_home::path()?.join("paired-devices.json"))
+    lucidos_home::private_entry(lucidos_home::private::PAIRED_DEVICES)
 }
 
 /// Lowercase-hex SHA-256 of `value`.
@@ -351,58 +381,111 @@ impl LogThrottle {
 
 /// A fresh device credential: 32 bytes of entropy, lowercase hex.
 pub fn mint_credential() -> std::io::Result<String> {
-    local_token::mint_hex(32)
+    local_token::mint_hex(32).map(crate::diagnostic_log::secret)
 }
 
-/// Render the `Set-Cookie` value that hands a device its credential.
+/// The prefix that binds the hardened cookie to a secure origin, its own host
+/// and `Path=/` (RFC 6265bis `__Host-`).
+const HARDENED_PREFIX: &str = "__Host-";
+
+/// Which form of the device cookie a request reads and is handed.
 ///
-/// `name` is this gateway's own ([`device_cookie_name`]), never the legacy one:
+/// One form per request, never both: a request on an https origin ignores a
+/// plain cookie, which any `http://localhost` page could have planted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CookieForm {
+    /// TLS terminated by us or by a proxy in front of us. `__Host-`, `Secure`
+    /// and `Partitioned`: keyed by the schemeful top-level site, so no
+    /// `http://localhost` page is ever sent it (ADR 0745).
+    Hardened,
+    /// A plain listener beyond loopback: the LAN, or a tailnet without
+    /// certificates. `Secure` there would make the browser drop the cookie.
+    Plain,
+}
+
+impl CookieForm {
+    /// The form for a request on `connection` carrying `headers`.
+    ///
+    /// The forwarded header covers a proxy that terminated TLS and forwarded
+    /// to us, which is what `tailscale serve` does. It decides only the form,
+    /// never whether to authorize, so a spoofed one buys a caller nothing.
+    pub fn of(headers: &HeaderMap, connection: &lucidos_gateway_tls::Connection) -> CookieForm {
+        let forwarded_https = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').next().is_some_and(|p| p.trim() == "https"));
+        if connection.is_tls() || forwarded_https {
+            CookieForm::Hardened
+        } else {
+            CookieForm::Plain
+        }
+    }
+
+    /// [`CookieForm::of`] for a request whose acceptor tagged its connection.
+    pub fn of_request<B>(req: &axum::http::Request<B>) -> CookieForm {
+        CookieForm::of(
+            req.headers(),
+            &lucidos_gateway_tls::Connection::of(req.extensions()),
+        )
+    }
+
+    /// The cookie name this form gives the base name `base`.
+    pub fn name(self, base: &str) -> String {
+        match self {
+            CookieForm::Hardened => format!("{HARDENED_PREFIX}{base}"),
+            CookieForm::Plain => base.to_string(),
+        }
+    }
+
+    /// The base name inside `name`, when `name` has this form.
+    fn base_of(self, name: &str) -> Option<&str> {
+        match self {
+            CookieForm::Hardened => name.strip_prefix(HARDENED_PREFIX),
+            CookieForm::Plain => Some(name),
+        }
+    }
+
+    fn attributes(self) -> &'static str {
+        match self {
+            CookieForm::Hardened => "; Secure; Partitioned",
+            CookieForm::Plain => "",
+        }
+    }
+}
+
+/// Render the `Set-Cookie` value that hands a device its credential. The one
+/// place a device cookie is formatted.
+///
+/// `base` is this gateway's own ([`device_cookie_name`]), never the legacy one:
 /// writing that would put the two gateways back in one slot. `HttpOnly` always,
 /// for the app-iframe reason there. `SameSite=Lax` blocks the cross-site POST
-/// shape of CSRF while keeping a normal top-level navigation working. `Secure`
-/// is conditional, because setting it on a plain-http origin makes the browser
-/// drop the cookie and pairing would fail with nothing to see.
-pub fn credential_cookie(name: &str, credential: &str, secure: bool) -> String {
-    let mut cookie =
-        format!("{name}={credential}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000");
-    if secure {
-        cookie.push_str("; Secure");
-    }
-    cookie
+/// shape of CSRF while keeping a normal top-level navigation working.
+pub fn credential_cookie(base: &str, credential: &str, form: CookieForm) -> String {
+    format!(
+        "{}={credential}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{}",
+        form.name(base),
+        form.attributes()
+    )
 }
 
-/// The `Set-Cookie` value that clears a device's credential.
+/// The `Set-Cookie` value that clears a device's credential. A partitioned
+/// cookie is cleared only by a `Set-Cookie` that is partitioned too.
 ///
 /// This gateway's name only. Clearing the legacy one would sign the browser out
 /// of every OTHER gateway on the host, which is the eviction the split removed.
 /// Leaving it costs nothing: the revoked credential resolves to no device here.
-pub fn cleared_credential_cookie(name: &str) -> String {
-    format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
-}
-
-/// Did this request reach us over TLS?
-///
-/// `connection_is_tls` is whether our own socket terminated TLS for THIS
-/// connection: one gateway serves loopback plain and its tailnet address over
-/// TLS, so no gateway-wide flag can answer. The forwarded header covers
-/// the shipped case where something else terminated TLS and proxied to us,
-/// which is what `tailscale serve` does. This decides only whether to mark a
-/// cookie `Secure`, never whether to authorize, so a spoofed header buys a
-/// caller nothing.
-pub fn request_is_secure(headers: &HeaderMap, connection_is_tls: bool) -> bool {
-    if connection_is_tls {
-        return true;
-    }
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').next().is_some_and(|p| p.trim() == "https"))
+pub fn cleared_credential_cookie(base: &str, form: CookieForm) -> String {
+    format!(
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        form.name(base),
+        form.attributes()
+    )
 }
 
 /// Read the local token, minting it on first use. A gateway-less engine mints
 /// too, and `lucidos_local_token::ensure` settles which value lands.
 pub fn ensure_local_token() -> std::io::Result<String> {
-    local_token::ensure()
+    local_token::ensure().map(crate::diagnostic_log::secret)
 }
 
 /// Read the hook socket token, minting it on first use.
@@ -413,6 +496,7 @@ pub fn ensure_local_token() -> std::io::Result<String> {
 /// workspace restart.
 pub fn ensure_hook_socket_token() -> std::io::Result<String> {
     local_token::ensure_named(local_token::HOOK_SOCKET_TOKEN_FILE)
+        .map(crate::diagnostic_log::secret)
 }
 
 /// A fresh device id. Not a secret: it names a row in the paired-device store
@@ -437,11 +521,12 @@ pub fn authorize_with_match<'a>(
     local_token: &str,
     paired: &PairedDevices,
     cookie_name: &str,
+    form: CookieForm,
 ) -> (Authorization, Option<PresentedCredential<'a>>) {
     if presented_local_token(headers).is_some_and(|t| ct_eq(t, local_token)) {
         return (Authorization::LocalProcess, None);
     }
-    for presented in presented_credentials(headers, cookie_name) {
+    for presented in presented_credentials(headers, cookie_name, form) {
         if let Some(device) = paired.match_credential(presented.value()) {
             return (
                 Authorization::Device {
@@ -478,13 +563,14 @@ fn presented_local_token(headers: &HeaderMap) -> Option<&str> {
 pub fn presented_credentials<'a>(
     headers: &'a HeaderMap,
     cookie_name: &str,
+    form: CookieForm,
 ) -> Vec<PresentedCredential<'a>> {
     let mut found = Vec::new();
     for (name, value) in cookie_pairs(headers) {
-        if !is_device_cookie_name(name) {
+        let Some(base) = form.base_of(name).filter(|b| is_device_cookie_name(b)) else {
             continue;
-        }
-        let own_name = name == cookie_name;
+        };
+        let own_name = base == cookie_name;
         let presented = PresentedCredential { value, own_name };
         // A `Cookie` header may legally repeat a name, so this can front-insert
         // more than once. Ours still all precede the rest, which is the order
@@ -519,18 +605,22 @@ pub struct CookieAudit {
 ///
 /// Counted off the header rather than through [`presented_credentials`], so a
 /// refused request allocates nothing. Every unpaired asset request lands here.
-pub fn presented_credential_summary(headers: &HeaderMap, cookie_name: &str) -> CookieAudit {
+pub fn presented_credential_summary(
+    headers: &HeaderMap,
+    cookie_name: &str,
+    form: CookieForm,
+) -> CookieAudit {
     let mut audit = CookieAudit {
         fields: headers.get_all(axum::http::header::COOKIE).iter().count(),
         ..CookieAudit::default()
     };
     for (name, _) in cookie_pairs(headers) {
         audit.cookies += 1;
-        if !is_device_cookie_name(name) {
+        let Some(base) = form.base_of(name).filter(|b| is_device_cookie_name(b)) else {
             continue;
-        }
+        };
         audit.credentials += 1;
-        audit.own_name |= name == cookie_name;
+        audit.own_name |= base == cookie_name;
     }
     audit
 }
@@ -569,7 +659,7 @@ fn is_device_cookie_name(name: &str) -> bool {
 /// [`presented_credential_summary`] said zero and `log_device_refusal` stayed
 /// silent. Reproduced against a running gateway: the same two cookies read as 2
 /// over HTTP/1.1 and 1 over HTTP/2.
-fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
+pub(crate) fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
     headers
         .get_all(axum::http::header::COOKIE)
         .into_iter()
@@ -622,7 +712,7 @@ mod tests {
         paired: &PairedDevices,
         cookie_name: &str,
     ) -> Authorization {
-        authorize_with_match(headers, local_token, paired, cookie_name).0
+        authorize_with_match(headers, local_token, paired, cookie_name, CookieForm::Plain).0
     }
 
     fn paired_with(credential: &str) -> PairedDevices {
@@ -760,7 +850,7 @@ mod tests {
             "cookie",
             &format!("lucidos_device=legacy-value; {own}=own-value"),
         )]);
-        let candidates = presented_credentials(&h, &own);
+        let candidates = presented_credentials(&h, &own, CookieForm::Plain);
         assert_eq!(candidates[0].value(), "own-value");
         assert!(!candidates[0].is_renamed());
         assert_eq!(candidates.len(), 2);
@@ -772,7 +862,7 @@ mod tests {
         // under the gateway's own name once it sees this.
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
         let h = headers(&[("cookie", "lucidos_device=legacy-value")]);
-        let candidates = presented_credentials(&h, &own);
+        let candidates = presented_credentials(&h, &own, CookieForm::Plain);
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].is_renamed());
         assert_eq!(candidates[0].value(), "legacy-value");
@@ -789,7 +879,8 @@ mod tests {
             "cookie",
             &format!("{own}=long-dead; lucidos_device=cred-abc"),
         )]);
-        let (decision, matched) = authorize_with_match(&h, "secret", &paired, &own);
+        let (decision, matched) =
+            authorize_with_match(&h, "secret", &paired, &own, CookieForm::Plain);
         assert!(matches!(decision, Authorization::Device { .. }));
         let matched = matched.expect("the match is handed back for the re-issue");
         assert_eq!(matched.value(), "cred-abc");
@@ -805,7 +896,8 @@ mod tests {
         let after = device_cookie_name(Path::new("/tmp/gw-new"));
         let paired = paired_with("cred-abc");
         let h = headers(&[("cookie", &format!("{before}=cred-abc"))]);
-        let (decision, matched) = authorize_with_match(&h, "secret", &paired, &after);
+        let (decision, matched) =
+            authorize_with_match(&h, "secret", &paired, &after, CookieForm::Plain);
         assert!(matches!(decision, Authorization::Device { .. }));
         assert!(matched.expect("matched").is_renamed());
     }
@@ -835,7 +927,8 @@ mod tests {
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
         let paired = paired_with("cred-abc");
         let h = cookie_fields(&["theme=dark", &format!("{own}=cred-abc")]);
-        let (decision, matched) = authorize_with_match(&h, "secret", &paired, &own);
+        let (decision, matched) =
+            authorize_with_match(&h, "secret", &paired, &own, CookieForm::Plain);
         assert!(
             matches!(decision, Authorization::Device { .. }),
             "a credential past the first field is still one the client sent"
@@ -852,7 +945,7 @@ mod tests {
         // arrives in the LAST field here and must still be the first candidate.
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
         let h = cookie_fields(&["lucidos_device=legacy-value", &format!("{own}=own-value")]);
-        let candidates = presented_credentials(&h, &own);
+        let candidates = presented_credentials(&h, &own, CookieForm::Plain);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].value(), "own-value");
         assert!(!candidates[0].is_renamed());
@@ -867,7 +960,7 @@ mod tests {
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
         let h = cookie_fields(&["theme=dark", &format!("{own}=cred-abc")]);
         assert_eq!(
-            presented_credential_summary(&h, &own),
+            presented_credential_summary(&h, &own, CookieForm::Plain),
             CookieAudit {
                 fields: 2,
                 cookies: 2,
@@ -883,13 +976,17 @@ mod tests {
         // without the one cookie that lets it in. The old reader counted
         // credentials alone, so that read as a first run and said nothing.
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
-        let known = presented_credential_summary(&headers(&[("cookie", "theme=dark")]), &own);
+        let known = presented_credential_summary(
+            &headers(&[("cookie", "theme=dark")]),
+            &own,
+            CookieForm::Plain,
+        );
         assert_eq!(known.cookies, 1);
         assert_eq!(known.credentials, 0);
         assert!(refusal_is_worth_logging(known));
 
         // A browser carrying nothing at all stays silent, which is a first run.
-        let fresh = presented_credential_summary(&headers(&[]), &own);
+        let fresh = presented_credential_summary(&headers(&[]), &own, CookieForm::Plain);
         assert_eq!(fresh, CookieAudit::default());
         assert!(!refusal_is_worth_logging(fresh));
     }
@@ -924,13 +1021,13 @@ mod tests {
             "cookie",
             &format!("theme=dark; {own}=v1; {other}=v2; lucidos_device=v3"),
         )]);
-        let audit = presented_credential_summary(&h, &own);
+        let audit = presented_credential_summary(&h, &own, CookieForm::Plain);
         assert_eq!(audit.credentials, 3);
         assert_eq!(audit.cookies, 4);
         assert!(audit.own_name);
 
         let h = headers(&[("cookie", "theme=dark")]);
-        let audit = presented_credential_summary(&h, &own);
+        let audit = presented_credential_summary(&h, &own, CookieForm::Plain);
         assert_eq!(audit.credentials, 0);
         assert!(!audit.own_name);
     }
@@ -979,33 +1076,126 @@ mod tests {
     // constant-time compare) is tested in `lucidos-local-token`, which owns it.
 
     #[test]
-    fn the_credential_cookie_is_always_httponly_and_lax() {
+    fn the_plain_cookie_is_httponly_and_lax_and_never_secure() {
         // An app iframe is same-origin, so a readable credential is one an app
-        // can exfiltrate. This attribute is the whole defence.
-        let cookie = credential_cookie(OWN_COOKIE, "abc", false);
-        // Written under this gateway's name, never the shared legacy one.
-        assert!(
-            cookie.starts_with(&format!("{OWN_COOKIE}=abc;")),
-            "{cookie}"
+        // can exfiltrate. `HttpOnly` is the whole defence.
+        let cookie = credential_cookie(OWN_COOKIE, "abc", CookieForm::Plain);
+        assert_eq!(
+            cookie,
+            format!("{OWN_COOKIE}=abc; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000")
         );
-        assert!(cookie.contains("HttpOnly"), "{cookie}");
-        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
-        assert!(cookie.contains("Path=/"), "{cookie}");
-        assert!(!cookie.contains("Secure"), "plain http must not set Secure");
-        assert!(credential_cookie(OWN_COOKIE, "abc", true).contains("; Secure"));
     }
 
     #[test]
-    fn secure_follows_our_own_tls_or_a_forwarding_terminator() {
-        assert!(request_is_secure(&headers(&[]), true));
-        assert!(!request_is_secure(&headers(&[]), false));
+    fn the_hardened_cookie_is_host_bound_secure_and_partitioned() {
+        let expected = format!(
+            "__Host-{OWN_COOKIE}=abc; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000; \
+             Secure; Partitioned"
+        );
+        assert_eq!(
+            credential_cookie(OWN_COOKIE, "abc", CookieForm::Hardened),
+            expected
+        );
+        // The clearing one must be partitioned too, or it misses the cookie.
+        assert_eq!(
+            cleared_credential_cookie(OWN_COOKIE, CookieForm::Hardened),
+            format!("__Host-{OWN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure; Partitioned")
+        );
+        assert_eq!(
+            cleared_credential_cookie(OWN_COOKIE, CookieForm::Plain),
+            format!("{OWN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+        );
+    }
+
+    #[test]
+    fn the_form_follows_our_own_tls_or_a_forwarding_terminator() {
+        use lucidos_gateway_tls::Connection;
+        let tls = Connection::Tls;
+        let plain = Connection::Plain;
+        assert_eq!(CookieForm::of(&headers(&[]), &tls), CookieForm::Hardened);
+        assert_eq!(CookieForm::of(&headers(&[]), &plain), CookieForm::Plain);
         let fwd = headers(&[("x-forwarded-proto", "https")]);
-        assert!(request_is_secure(&fwd, false));
+        assert_eq!(CookieForm::of(&fwd, &plain), CookieForm::Hardened);
         // A proxy chain appends, so only the first hop is ours to read.
         let chain = headers(&[("x-forwarded-proto", "https, http")]);
-        assert!(request_is_secure(&chain, false));
-        let plain = headers(&[("x-forwarded-proto", "http")]);
-        assert!(!request_is_secure(&plain, false));
+        assert_eq!(CookieForm::of(&chain, &plain), CookieForm::Hardened);
+        let http = headers(&[("x-forwarded-proto", "http")]);
+        assert_eq!(CookieForm::of(&http, &plain), CookieForm::Plain);
+        let redirecting = Connection::PlainWithHttps {
+            authority: "node.example.ts.net:5252".into(),
+        };
+        assert_eq!(
+            CookieForm::of(&headers(&[]), &redirecting),
+            CookieForm::Plain
+        );
+    }
+
+    #[test]
+    fn each_form_reads_only_its_own_cookie() {
+        // An https origin ignores a plain cookie, which any `http://localhost`
+        // page could have planted. A plain listener never sees `__Host-`.
+        let paired = paired_with("cred-abc");
+        let plain = headers(&[("cookie", &format!("{OWN_COOKIE}=cred-abc"))]);
+        let hardened = headers(&[("cookie", &format!("__Host-{OWN_COOKIE}=cred-abc"))]);
+        let decide =
+            |h: &HeaderMap, form| authorize_with_match(h, "secret", &paired, OWN_COOKIE, form).0;
+        assert!(matches!(
+            decide(&hardened, CookieForm::Hardened),
+            Authorization::Device { .. }
+        ));
+        assert!(matches!(
+            decide(&plain, CookieForm::Plain),
+            Authorization::Device { .. }
+        ));
+        assert_eq!(
+            decide(&plain, CookieForm::Hardened),
+            Authorization::Unauthorized
+        );
+        assert_eq!(
+            decide(&hardened, CookieForm::Plain),
+            Authorization::Unauthorized
+        );
+    }
+
+    #[test]
+    fn the_hardened_reader_takes_our_own_name_as_ours() {
+        let h = headers(&[("cookie", &format!("__Host-{OWN_COOKIE}=v"))]);
+        let found = presented_credentials(&h, OWN_COOKIE, CookieForm::Hardened);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].is_renamed());
+        let audit = presented_credential_summary(&h, OWN_COOKIE, CookieForm::Hardened);
+        assert!(audit.own_name);
+    }
+
+    /// One formatter, so no site can hand out a weaker cookie. Every
+    /// `Set-Cookie` attribute list in the crate lives in this file.
+    #[test]
+    fn no_other_file_formats_a_device_cookie() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name == "auth.rs" || name.ends_with("_tests.rs") || !name.ends_with(".rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let shipped = text.split("#[cfg(test)]").next().unwrap_or_default();
+                if shipped.contains("HttpOnly") {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a second cookie formatter: {offenders:?}"
+        );
     }
 
     #[test]

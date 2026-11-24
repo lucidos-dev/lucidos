@@ -2,6 +2,14 @@
 //! them directly, the app through the generated `gateway-constants.ts`
 //! (ADR 0368).
 
+/// The `chrono` format that starts every engine and gateway log line: RFC 3339
+/// with the local UTC offset, such as `2026-11-11T21:25:19+01:00`. A line in
+/// the host log then names its day and zone on any install.
+pub const LOG_STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%:z";
+
+/// A device session must never impersonate a device paired with the gateway.
+pub const DEVICE_SESSION_OWNER_DEVICE: &str = "device_session_owner_device";
+
 /// Digits in a pairing code. Short enough to type on a phone. Its safety comes
 /// from the TTL, single use and a local-only channel, not from the digits.
 pub const PAIRING_CODE_DIGITS: u32 = 8;
@@ -78,6 +86,38 @@ pub fn is_valid_workspace_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
         && !id.starts_with('-')
         && !id.ends_with('-')
+}
+
+/// Do two display names name the same workspace? Trimmed and case-insensitive:
+/// "Work" and "work" are no more tellable apart in a list than two equal ones.
+pub fn display_names_match(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// Derive a stable, filesystem- and URL-safe slug from a display name:
+/// lowercase, non-alphanumerics collapsed to single `-`, leading/trailing `-`
+/// trimmed. Empty input (or all-punctuation) falls back to `workspace`. The
+/// output is always `[a-z0-9-]`, so it can never start with the gateway sigil.
+pub fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "workspace".to_string()
+    } else {
+        out
+    }
 }
 
 /// The database authority shared by gateway provisioning and offline restore.

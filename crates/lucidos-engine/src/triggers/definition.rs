@@ -24,7 +24,7 @@ use crate::triggers::config::{TriggerConfig, TriggerRun};
 use crate::triggers::EventSubscription;
 
 /// The zone a trigger runs in while neither it nor the workspace names one.
-pub(crate) fn default_timezone() -> String {
+pub fn default_timezone() -> String {
     chrono_tz::UTC.name().to_string()
 }
 
@@ -184,7 +184,7 @@ pub fn write_trigger_definition(workspace_path: &Path, config: &TriggerConfig) {
     let toml = match def.to_toml() {
         Ok(t) => t,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[TriggerDefn] serialize trigger.toml for '{}' failed: {}",
                 config.slug,
                 e
@@ -195,12 +195,12 @@ pub fn write_trigger_definition(workspace_path: &Path, config: &TriggerConfig) {
     let path = trigger_toml_abspath(workspace_path, &config.slug);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            crate::log!("[TriggerDefn] mkdir {:?} failed: {}", parent, e);
+            crate::log_legacy!("[TriggerDefn] mkdir {:?} failed: {}", parent, e);
             return;
         }
     }
     if let Err(e) = std::fs::write(&path, toml) {
-        crate::log!("[TriggerDefn] write {:?} failed: {}", path, e);
+        crate::log_legacy!("[TriggerDefn] write {:?} failed: {}", path, e);
     }
 }
 
@@ -215,7 +215,7 @@ pub fn remove_trigger_definition(workspace_path: &Path, slug: &str) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            crate::log!("[TriggerDefn] remove {:?} failed: {}", path, e);
+            crate::log_legacy!("[TriggerDefn] remove {:?} failed: {}", path, e);
             return;
         }
     }
@@ -281,7 +281,7 @@ pub fn ensure_trigger_toml_gitignored(workspace_path: &Path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[TriggerDefn] read {:?} failed, leaving it untouched: {}",
                 exclude,
                 e
@@ -306,7 +306,7 @@ pub fn ensure_trigger_toml_gitignored(workspace_path: &Path) {
     next.push_str(TRIGGER_TOML_EXCLUDE);
     next.push('\n');
     if let Err(e) = std::fs::write(&exclude, next) {
-        crate::log!("[TriggerDefn] write {:?} failed: {}", exclude, e);
+        crate::log_legacy!("[TriggerDefn] write {:?} failed: {}", exclude, e);
     }
 }
 

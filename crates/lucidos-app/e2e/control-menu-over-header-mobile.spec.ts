@@ -5,18 +5,7 @@ import {
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
-/** The composer's command menu lays over the header when the viewport is short.
- *
- *  With the iOS keyboard up, the space above the composer is shorter than the
- *  menu. Its head, the filter box and first rows, must paint above the header
- *  rather than under it. A short viewport stands in for the keyboard.
- *
- *  The check is a hit test at a point inside both the panel's head and the
- *  header. An open overlay makes the header click-through, and a hit test
- *  skips click-through elements, so the probe lifts that for its one read.
- *  Otherwise it would see through the header and measure nothing. */
 
-/** Short enough that the menu's head reaches up into the header. */
 const KEYBOARD_UP_HEIGHT = 380;
 
 test.describe('the composer command menu on a short phone viewport', () => {
@@ -37,10 +26,6 @@ test.describe('the composer command menu on a short phone viewport', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    // The destination pick reloads the commands, and the control can read ready
-    // on the old list and then drop it. A tap then opens nothing, so tap until
-    // the menu is up rather than trusting one ready check. The control may sit
-    // behind the row's ⋯.
     const panel = page.locator('.control-dropdown:visible');
     await expect(async () => {
       if (await panel.count() === 0) {
@@ -49,7 +34,6 @@ test.describe('the composer command menu on a short phone viewport', () => {
       await expect(panel).toHaveCount(1, { timeout: 2_000 });
     }).toPass({ timeout: 20_000 });
 
-    // Placement lands a frame after mount, so poll until the head reads clear.
     await expect.poll(() => panel.evaluate((el) => {
       const rect = el.getBoundingClientRect();
       if (rect.top < 0) return 'head above the viewport';
@@ -64,7 +48,6 @@ test.describe('the composer command menu on a short phone viewport', () => {
       return hit && el.contains(hit) ? 'clear' : `covered by ${hit?.className ?? 'nothing'}`;
     })).toBe('clear');
 
-    // The filter box is the panel's first row, the one the header hid.
     await expect(page.locator('.control-dropdown .control-filter')).toBeInViewport();
 
     await page.keyboard.press('Escape');

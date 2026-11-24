@@ -3,11 +3,6 @@ import { assertHealthy } from './helpers';
 import { clearAllThreads } from './db-helpers';
 import { seedCurrent, sweepList, openSeededList, type SeededCurrent } from './drawer-row-window-probe';
 
-/**
- * The row window specs sweep the list inside one `page.evaluate`. A page that
- * stops painting used to hold that call until the 120 s test timeout, with no
- * word on why. The sweep now fails fast and names the page's state.
- */
 
 let seeded: SeededCurrent;
 

@@ -11,7 +11,6 @@ import { useServerBackedField } from '../../hooks/useServerBackedField';
 
 export function AppUiEditModal() {
   const form = activeInlineForm.value;
-  // Delay the spinner (300ms) so a fast load never flashes it.
   const showLoading = useDelayedLoading(appsList.value);
   if (form?.type !== 'app-edit') return null;
 
@@ -26,9 +25,6 @@ export function AppUiEditModal() {
   }
   const apps = appsList.value.status === 'loaded' ? appsList.value.data : null;
   const app = apps?.find((s) => s.id === appId);
-  // key={appId} remounts the closer when the form flips from missing-A to
-  // missing-B. Without it, Preact reuses the instance, and the empty-deps
-  // useEffect never re-fires for B.
   if (apps && !app) return <MissingAppCloser key={appId} />;
 
   return (
@@ -40,17 +36,12 @@ export function AppUiEditModal() {
 
 const APP_EDIT_FORM_FIELDS = [{ label: 'Name' }, { label: 'Description' }];
 
-/** Closes the app-edit form when the target app no longer exists. Lives in a
- *  child component so the signal write happens in useEffect (post-commit),
- *  not inside the parent's render body. */
 function MissingAppCloser() {
   useEffect(() => { closeAppForm(); }, []);
   return null;
 }
 
 function AppUiEditModalInner({ app }: { app: App }) {
-  // Server-backed: an `AppUpdated` frame repaints an untouched field, and a
-  // touched one keeps the user's draft (ADR 0118).
   const [name, setName] = useServerBackedField(app.name);
   const [description, setDescription] = useServerBackedField(app.description);
 

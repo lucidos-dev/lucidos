@@ -18,10 +18,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(crate) const ENGINE_BUILD_LOG_PATH: &str = ".lucidos/engine-build.log";
+pub const ENGINE_BUILD_LOG_PATH: &str = ".lucidos/engine-build.log";
 
 /// How long a `source_behind_head` verdict is reused before the underlying
-/// `git diff` is re-run. version-status is polled ~4s per client; a shared TTL
+/// `git diff` is re-run. Events can prompt several clients to read; a shared TTL
 /// bounds the git fork to at most one per interval regardless of client count.
 /// Short enough that a freshly-merged engine change surfaces within a few seconds.
 const SOURCE_BEHIND_TTL: Duration = Duration::from_secs(3);
@@ -63,7 +63,12 @@ pub enum BuildState {
     ///
     /// Carries the HEAD whose delivery was proved, rather than assuming that
     /// a successful script built everything present when it finished.
-    Ready { built_head: Option<String> },
+    Ready {
+        built_head: Option<String>,
+        deferred: Option<DeferredRequest>,
+    },
+    /// An automatic build waiting for coding threads.
+    Deferred(DeferredRequest),
     /// The rebuild failed. The old engine keeps running.
     ///
     /// Carries WHY, for the same reason `Building` carries its instant. The
@@ -71,6 +76,13 @@ pub enum BuildState {
     /// nobody knows why" is not representable: a failure no recognizer names
     /// still reports its exit status and last output line.
     Failed { reason: BuildFailure },
+}
+
+/// Ephemeral waiting request. Ready may retain one without hiding Switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredRequest {
+    pub since: Instant,
+    pub retrying: Option<BuildFailure>,
 }
 
 /// Why a background build failed, reduced to what a toast can carry.
@@ -123,7 +135,7 @@ impl DeliveryRetry {
 
 /// Linux retains the unlinked inode as `/proc/self/exe` after atomic publish.
 /// Probe the published pathname, rather than the old inode's deleted spelling.
-pub(crate) fn published_engine_exe() -> Option<std::path::PathBuf> {
+pub fn published_engine_exe() -> Option<std::path::PathBuf> {
     Some(published_engine_path(
         std::env::current_exe().ok()?,
         cfg!(target_os = "linux"),
@@ -138,14 +150,17 @@ fn published_engine_path(exe: std::path::PathBuf, linux: bool) -> std::path::Pat
 }
 
 /// A source build and a standalone Switch must target the same published layout.
-pub(crate) fn published_launch_dir(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+pub fn published_launch_dir(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = exe.parent()?;
     (dir.parent()?.parent()?.file_name()? == std::ffi::OsStr::new(".launch"))
         .then(|| dir.to_path_buf())
 }
 
 async fn uncached_engine_disk_build_id() -> Option<String> {
-    let exe = published_engine_exe()?;
+    disk_build_id_at(&published_engine_exe()?).await
+}
+
+async fn disk_build_id_at(exe: &std::path::Path) -> Option<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(exe)
@@ -331,6 +346,7 @@ impl BuildState {
     pub fn as_wire(&self) -> &'static str {
         match self {
             BuildState::Idle => "idle",
+            BuildState::Deferred(_) => "deferred",
             BuildState::Building { .. } => "building",
             BuildState::Verifying => "verifying",
             BuildState::Ready { .. } => "ready",
@@ -342,7 +358,36 @@ impl BuildState {
     pub fn failure(&self) -> Option<&BuildFailure> {
         match self {
             BuildState::Failed { reason } => Some(reason),
+            BuildState::Deferred(deferred) => deferred.retrying.as_ref(),
             _ => None,
+        }
+    }
+
+    pub fn deferred(&self) -> Option<&DeferredRequest> {
+        match self {
+            Self::Deferred(deferred)
+            | Self::Ready {
+                deferred: Some(deferred),
+                ..
+            } => Some(deferred),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn with_deferral(self) -> Self {
+        if self.deferred().is_some() {
+            return self;
+        }
+        let deferred = DeferredRequest {
+            since: Instant::now(),
+            retrying: self.failure().cloned(),
+        };
+        match self {
+            Self::Ready { built_head, .. } => Self::Ready {
+                built_head,
+                deferred: Some(deferred),
+            },
+            _ => Self::Deferred(deferred),
         }
     }
 
@@ -365,7 +410,10 @@ impl BuildState {
     /// A finished build stamped with the HEAD it was started from. The one
     /// constructor for `Ready`, so a completion site cannot forget the stamp.
     pub fn ready_from(built_head: Option<String>) -> Self {
-        BuildState::Ready { built_head }
+        BuildState::Ready {
+            built_head,
+            deferred: None,
+        }
     }
 
     /// A failed build carrying why. The one constructor for `Failed`, matching
@@ -384,10 +432,18 @@ pub struct UpdateCheck {
     disk_build_id: Option<String>,
 }
 
+/// May an observation that began at `started` replace the cached one, stamped
+/// `stored`? Only when no later observation already wrote. A slow probe that
+/// began before HEAD moved would otherwise overwrite the watcher's newer
+/// verdict, and the watcher would never announce the change again.
+fn observation_is_newest(stored: Option<Instant>, started: Instant) -> bool {
+    stored.is_none_or(|at| at <= started)
+}
+
 /// Throttled cache of the `source_behind_head` verdict (see
 /// [`LucidosEngine::source_behind_head`]). `checked_at == None` means "never
 /// computed". TTL-gated by `SOURCE_BEHIND_TTL`, so the git probe runs at most
-/// once per interval across all polling clients.
+/// once per interval across all status readers.
 #[derive(Default)]
 pub struct SourceBehindCache {
     checked_at: Option<Instant>,
@@ -438,7 +494,7 @@ impl CommitGroupKind {
     ///
     /// An exhaustive `match` rather than a lookup in the order array: adding a
     /// variant then has to answer this, at compile time, instead of panicking
-    /// on a `position(...).unwrap()` inside a version-status poll.
+    /// on a `position(...).unwrap()` inside a version-status read.
     fn slot(self) -> usize {
         match self {
             CommitGroupKind::New => 0,
@@ -506,11 +562,25 @@ impl PendingCommits {
 /// Throttled cache of [`LucidosEngine::pending_commits`], mirroring
 /// [`SourceBehindCache`]. `checked_at == None` means "never computed", and
 /// `commits == None` is a cached UNKNOWN, cached so a wedged git is not
-/// re-forked per poll.
+/// re-forked per poll. `checked_at` is the latest claim and gates the TTL;
+/// `observed_at` is when the read behind `commits` began.
 #[derive(Default)]
 pub struct PendingCommitsCache {
     checked_at: Option<Instant>,
+    observed_at: Option<Instant>,
     commits: Option<PendingCommits>,
+}
+
+impl PendingCommitsCache {
+    /// Store a finished read unless a later-started read already stored its
+    /// answer. A claim still reading does not block it: the watcher announces
+    /// what it read, so the cache must serve that until something newer lands.
+    fn record(&mut self, started: Instant, commits: Option<PendingCommits>) {
+        if observation_is_newest(self.observed_at, started) {
+            self.observed_at = Some(started);
+            self.commits = commits;
+        }
+    }
 }
 
 /// Memoized ancestry verdict for the on-disk binary (see
@@ -578,6 +648,30 @@ pub struct SelfHealState {
     attempts: u32,
 }
 
+impl SelfHealState {
+    fn request(
+        &mut self,
+        head: Option<String>,
+        state: &BuildState,
+        deferral: &super::build_deferral::BuildDeferral,
+    ) -> bool {
+        if self.head != head {
+            self.head = head;
+            self.attempts = 0;
+        }
+        if self.attempts >= SELF_HEAL_MAX_ATTEMPTS_PER_HEAD
+            || (self.attempts > 0 && state.failure().is_some())
+            || matches!(state, BuildState::Building { .. } | BuildState::Verifying)
+        {
+            return false;
+        }
+        if matches!(deferral, super::build_deferral::BuildDeferral::Admit) {
+            self.attempts += 1;
+        }
+        true
+    }
+}
+
 /// Wire shape of `GET /api/v1/engine/version-status`.
 #[derive(Serialize)]
 pub struct VersionStatus {
@@ -595,7 +689,7 @@ pub struct VersionStatus {
     /// True under the packaged desktop/service runtime. The frontend uses it to
     /// route to the release updater instead of the dev build/switch flow.
     pub packaged: bool,
-    /// Dev background-rebuild state: `idle` | `building` | `ready` | `failed`.
+    /// Dev background-rebuild state, including `deferred` and `verifying`.
     pub build_state: &'static str,
     /// True (dev only) when the engine SOURCE is behind HEAD by a
     /// restart-requiring change, so a NEW engine version exists in source even
@@ -646,6 +740,8 @@ pub struct VersionStatus {
     /// always absent for a co-located peer's build. See [`queued_behind`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_queued: Option<QueuedBuild>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_deferred: Option<DeferredBuild>,
     /// The commits the switch would bring, or absent when git could not say
     /// (see [`PendingCommits`]). Read only when a surface
     /// will show it, so an idle workspace forks no git: see
@@ -661,6 +757,109 @@ pub struct VersionStatus {
     /// Always absent packaged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontend_refresh_elapsed_ms: Option<u64>,
+}
+
+/// One observation per engine, independent of the number of connected clients.
+const VERSION_STATUS_WATCH_INTERVAL: Duration = Duration::from_secs(4);
+
+fn version_status_watch_enabled(packaged: bool) -> bool {
+    !packaged
+}
+
+impl VersionStatus {
+    fn fingerprint(mut self) -> serde_json::Value {
+        self.build_elapsed_ms = None;
+        self.frontend_refresh_elapsed_ms = None;
+        if let Some(deferred) = &mut self.build_deferred {
+            deferred.deferred_ms = 0;
+        }
+        serde_json::to_value(self).expect("VersionStatus is JSON serializable")
+    }
+}
+
+#[derive(Default)]
+struct VersionStatusWatch {
+    previous: Option<serde_json::Value>,
+}
+
+impl VersionStatusWatch {
+    async fn observe(
+        &mut self,
+        connected: bool,
+        read: impl std::future::Future<Output = VersionStatus>,
+    ) -> bool {
+        if !connected {
+            self.previous = None;
+            return false;
+        }
+        let next = read.await.fingerprint();
+        let changed = self.previous.as_ref() != Some(&next);
+        self.previous = Some(next);
+        changed
+    }
+}
+
+impl LucidosEngine {
+    /// Watch external build inputs only while a page can consume the result.
+    pub fn spawn_version_status_watch(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            if !version_status_watch_enabled(crate::runtime::is_packaged()) {
+                return;
+            }
+            run_version_status_watch(
+                &engine.sse_connections,
+                || engine.version_status(),
+                |event| async {
+                    engine
+                        .event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::System(event),
+                            "[Version] EngineVersionStatusChanged",
+                        )
+                        .await;
+                },
+            )
+            .await;
+        })
+    }
+}
+
+async fn run_version_status_watch<R, F, E, G>(
+    connections: &super::sse_connections::SseConnectionCounter,
+    read: R,
+    emit: E,
+) where
+    R: Fn() -> F,
+    F: std::future::Future<Output = VersionStatus>,
+    E: Fn(crate::engine::event_bus::SystemEvent) -> G,
+    G: std::future::Future<Output = ()>,
+{
+    let mut watch = VersionStatusWatch::default();
+    let mut ticker = tokio::time::interval(VERSION_STATUS_WATCH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if watch
+            .observe(connections.count() > 0, async { read().await })
+            .await
+        {
+            emit(
+                crate::engine::event_bus::SystemEvent::EngineVersionStatusChanged {
+                    sent_at_ms: crate::engine::now_epoch_millis(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Waiting on workspace coding activity, independently of the build slots.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeferredBuild {
+    pub coding_threads: i64,
+    pub threads: Vec<super::build_deferral::ActiveThread>,
+    pub deferred_ms: u64,
 }
 
 /// A rebuild that is waiting for a *build slot*, as the version-status wire
@@ -805,7 +1004,7 @@ impl LucidosEngine {
     /// teardown, not of when a thread became in-flight.**
     ///
     /// A device actor is half the switch fingerprint
-    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`). A thread that reaches a
+    /// (`crate::engine::switch_recovery_sql::SWITCH_TEARDOWN_ABORT_SQL`). A thread that reaches a
     /// later emit with a system actor therefore loses the `paused` verdict, the
     /// withheld Continue button, and the auto-resume. See
     /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
@@ -829,14 +1028,14 @@ impl LucidosEngine {
     /// runs after the boundary pre-emit. `None` outside a teardown, and `None`
     /// for one nobody requested (bare `stop.sh`, an external SIGUSR1, ctrl-c).
     /// Callers fall back to `MessageOrigin::system()` for both.
-    pub(crate) fn teardown_actor(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
+    pub fn teardown_actor(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
         self.teardown_actor.lock().unwrap().clone()
     }
 
     /// Enqueue a thread for auto-resume after a user-initiated switch (recovery).
     /// Idempotent: two recovery sources can name one thread, and a second
     /// request would double-spawn it.
-    pub(crate) fn enqueue_switch_resume(&self, thread_id: uuid::Uuid) {
+    pub fn enqueue_switch_resume(&self, thread_id: uuid::Uuid) {
         let mut queue = self.pending_switch_resumes.lock().unwrap();
         if !queue.contains(&thread_id) {
             queue.push(thread_id);
@@ -876,13 +1075,13 @@ impl LucidosEngine {
             // request. Emitting a second one here would put two request event
             // ids on one thread, past the per-EVENT idempotency guard, and
             // double-spawn.
-            if crate::engine::agent_session::spawn_dispatcher::thread_has_unactuated_continuation(
+            if crate::engine::continuation_queries::thread_has_unactuated_continuation(
                 self.pool(),
                 thread_id,
             )
             .await
             {
-                log!(
+                log_legacy!(
                     "[Recovery] thread {} already has an unactuated ContinuationRequested: \
                      the dispatcher's startup orphan re-dispatch owns the resume; skipping duplicate emit",
                     thread_id
@@ -898,7 +1097,7 @@ impl LucidosEngine {
             let requested = crate::engine::thread_events::emit_continuation_requested_or_log(
                 &self.event_bus,
                 thread_id,
-                crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON,
+                crate::engine::continuation_reason::AUTO_RESUME_AFTER_SWITCH_REASON,
                 None,
                 "[Recovery] ContinuationRequested (auto-resume after switch)",
             )
@@ -988,12 +1187,12 @@ impl LucidosEngine {
         let Some(disk) = disk else {
             return false; // packaged or unreadable: nothing to switch onto
         };
-        if disk == crate::ENGINE_BUILD_ID {
+        if disk == crate::build_identity().id {
             return false; // identical build, no git needed
         }
         disk_upgrade_verdict(
             Some(disk),
-            crate::ENGINE_BUILD_ID,
+            crate::build_identity().id,
             self.disk_is_older(disk).await,
         )
     }
@@ -1011,7 +1210,7 @@ impl LucidosEngine {
         }
         let verdict = match (
             build_id_commit(disk_id),
-            build_id_commit(crate::ENGINE_BUILD_ID),
+            build_id_commit(crate::build_identity().id),
         ) {
             (Some(disk_commit), Some(running_commit)) if disk_commit != running_commit => {
                 match crate::paths::repo_root() {
@@ -1026,12 +1225,12 @@ impl LucidosEngine {
             _ => None,
         };
         if verdict == Some(true) {
-            crate::log!(
+            crate::log_legacy!(
                 "[Rebuild] on-disk engine binary ({}) is OLDER than the running engine ({}): \
                  not offering a downgrade as a new version. Something rebuilt an earlier checkout \
                  state over target/debug; `web-dev.sh -w <ws> -b` rebuilds it forward.",
                 disk_id,
-                crate::ENGINE_BUILD_ID
+                crate::build_identity().id
             );
         }
         let mut cache = self.disk_direction_cache.lock().unwrap();
@@ -1073,11 +1272,14 @@ impl LucidosEngine {
         // `Some(false)` means a restart-requiring change is pending between the
         // running engine's commit and HEAD. `Some(true)` (frontend-only) and
         // `None` (git unavailable) both read as not behind.
+        let started = Instant::now();
         let behind = self.engine_source_matches_head().await == Some(false)
             && !self.running_is_ahead_of_head().await;
         let mut cache = self.source_behind_cache.lock().unwrap();
-        cache.checked_at = Some(Instant::now());
-        cache.behind = behind;
+        if observation_is_newest(cache.checked_at, started) {
+            cache.checked_at = Some(started);
+            cache.behind = behind;
+        }
         behind
     }
 
@@ -1086,7 +1288,7 @@ impl LucidosEngine {
     ///
     /// The version-status response and self-heal driver's per-HEAD budget
     /// share this cache. Uncached, that is a
-    /// `git rev-parse` per caller per ~4s poll per connected client, on a
+    /// `git rev-parse` per caller per version-status read, on a
     /// question whose answer only changes when someone commits. Dev-only: no
     /// caller reaches it packaged.
     pub(crate) async fn head_sha(&self) -> Option<String> {
@@ -1099,10 +1301,13 @@ impl LucidosEngine {
                 return cache.sha.clone();
             }
         }
+        let started = Instant::now();
         let sha = current_head_sha().await;
         let mut cache = self.head_sha_cache.lock().unwrap();
-        cache.checked_at = Some(Instant::now());
-        cache.sha.clone_from(&sha);
+        if observation_is_newest(cache.checked_at, started) {
+            cache.checked_at = Some(started);
+            cache.sha.clone_from(&sha);
+        }
         sha
     }
 
@@ -1111,7 +1316,7 @@ impl LucidosEngine {
     /// guard for [`Self::source_behind_head`]. `false` whenever git cannot tell,
     /// so an indeterminate answer changes nothing.
     async fn running_is_ahead_of_head(&self) -> bool {
-        let Some(running_commit) = build_id_commit(crate::ENGINE_BUILD_ID) else {
+        let Some(running_commit) = build_id_commit(crate::build_identity().id) else {
             return false; // `src-…` or unstamped id: no commit to compare
         };
         let Ok(root) = crate::paths::repo_root() else {
@@ -1154,8 +1359,24 @@ impl LucidosEngine {
         } else {
             None
         };
+        let build_deferred = if let Some(deferred) = build_state.deferred() {
+            match super::build_deferral::active_coding_threads(self.pool()).await {
+                Ok(active) => Some(DeferredBuild {
+                    coding_threads: active.count,
+                    threads: active.threads,
+                    deferred_ms: u64::try_from(deferred.since.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                }),
+                Err(error) => {
+                    super::build_deferral::log_unreadable_once(&error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         VersionStatus {
-            build_id: crate::ENGINE_BUILD_ID.to_string(),
+            build_id: crate::build_identity().id.to_string(),
             update_available,
             disk_build_id,
             packaged: crate::runtime::is_packaged(),
@@ -1168,6 +1389,7 @@ impl LucidosEngine {
                 .elapsed()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             build_queued: self.build_queued(),
+            build_deferred,
             pending_commits,
             frontend_refresh_elapsed_ms: self
                 .frontend_refresh_elapsed()
@@ -1203,8 +1425,9 @@ impl LucidosEngine {
     /// The [`PendingCommits`] a switch would bring, or `None` when git could
     /// not answer. TTL-cached
     /// ([`PENDING_COMMITS_TTL`]) so the `git log` runs at most once per interval
-    /// across every polling client.
+    /// across all status readers.
     async fn pending_commits(&self) -> Option<PendingCommits> {
+        let claimed = Instant::now();
         {
             let mut cache = self.pending_commits_cache.lock().unwrap();
             if cache
@@ -1219,14 +1442,13 @@ impl LucidosEngine {
             // the TTL bounding nothing under concurrency: every client arriving
             // mid-read sees the same expired timestamp and forks its own. The
             // cost is one stale generation for the length of a single `git log`.
-            cache.checked_at = Some(Instant::now());
+            cache.checked_at = Some(claimed);
         }
         let commits = self.read_pending_commits().await;
         self.pending_commits_cache
             .lock()
             .unwrap()
-            .commits
-            .clone_from(&commits);
+            .record(claimed, commits.clone());
         commits
     }
 
@@ -1238,7 +1460,7 @@ impl LucidosEngine {
         if crate::runtime::is_packaged() {
             return None;
         }
-        let running = build_id_commit(crate::ENGINE_BUILD_ID)?;
+        let running = build_id_commit(crate::build_identity().id)?;
         let root = crate::paths::repo_root().ok()?;
         let served = self.served_frontend_source_commit();
         pending_commits_since(running, served.as_deref(), &root).await
@@ -1261,10 +1483,10 @@ impl LucidosEngine {
     ///   `main` cannot spin builds forever. The count resets when HEAD moves.
     /// - Stops after a named failure for this HEAD; explicit Retry stays available.
     ///
-    /// No-op packaged or when git is unavailable. Driven by the dev periodic
+    /// No-op packaged, in manual build mode, or when git is unavailable. Driven by the dev periodic
     /// loop (`frontend_refresh::spawn_served_frontend_sync`).
     pub(crate) async fn self_heal_engine_version_if_needed(self: &Arc<Self>) {
-        if crate::runtime::is_packaged() {
+        if crate::runtime::is_packaged() || !self.automatic_source_builds_enabled().await {
             return;
         }
         if !self.source_behind_head().await {
@@ -1275,7 +1497,7 @@ impl LucidosEngine {
         // two in-flight builds are never equal to each other.
         if matches!(
             self.build_state(),
-            BuildState::Building { .. } | BuildState::Verifying
+            BuildState::Building { .. } | BuildState::Verifying | BuildState::Deferred(_)
         ) {
             return;
         }
@@ -1285,37 +1507,32 @@ impl LucidosEngine {
         if self.disk_binary_is_upgrade().await {
             return;
         }
+        // Share one admission result with the request: a hold spends no attempt.
+        let deferral = super::build_deferral::automatic_build_deferral(self.pool()).await;
         let head = self.head_sha().await;
         // Read the build state at DECISION time, not before the awaits above. A
         // rebuild can start or finish during them, and judging "did my rebuild
         // succeed?" from a stale value gives up on a live build.
         let build_state = self.build_state();
         {
-            let mut sh = self.self_heal_state.lock().unwrap();
-            if sh.head != head {
-                sh.head = head;
-                sh.attempts = 0;
-            }
-            // Budget spent for this HEAD: wait for a new commit or explicit retry.
-            if sh.attempts >= SELF_HEAL_MAX_ATTEMPTS_PER_HEAD {
-                return;
-            }
-            // A named failure ends automatic attempts for this HEAD. The user
-            // can always retry explicitly; a new HEAD resets this budget.
-            if sh.attempts > 0 && matches!(build_state, BuildState::Failed { .. }) {
-                return;
-            }
             // Racy probe; the in-build lock in `run_engine_build` is the real
             // guard. Synchronous, so no await is held across the state lock.
             if engine_build_in_progress_elsewhere() {
                 return;
             }
-            sh.attempts += 1;
+            if !self
+                .self_heal_state
+                .lock()
+                .unwrap()
+                .request(head, &build_state, &deferral)
+            {
+                return;
+            }
         }
-        crate::log!(
+        crate::log_legacy!(
             "[Rebuild] self-heal: engine source is behind HEAD with a stale binary, triggering a background rebuild"
         );
-        self.join_or_start_background_rebuild();
+        super::background_build::automatic_with_deferral(self, deferral).await;
     }
 
     /// Kick off a background engine rebuild (dev only), the non-disruptive half
@@ -1323,7 +1540,7 @@ impl LucidosEngine {
     /// When the rebuild finishes, the on-disk build id differs from the running
     /// `ENGINE_BUILD_ID` and `version_status` surfaces the switch.
     ///
-    /// For an Apply and self-heal. A build in flight is **joined**, never
+    /// For an explicit Build now request. A build in flight is **joined**, never
     /// aborted: it builds once more if HEAD moved past it (ADR 0412). No-op
     /// packaged.
     pub fn join_or_start_background_rebuild(self: &Arc<Self>) {
@@ -1331,6 +1548,19 @@ impl LucidosEngine {
             return;
         }
         crate::engine::background_build::join_or_start(self);
+    }
+
+    pub(crate) async fn automatic_background_rebuild(
+        self: &Arc<Self>,
+    ) -> super::build_deferral::BuildDeferral {
+        if crate::runtime::is_packaged() {
+            return super::build_deferral::BuildDeferral::Admit;
+        }
+        super::background_build::automatic(self).await
+    }
+
+    pub(crate) async fn start_deferred_build_if_admitted(self: &Arc<Self>) {
+        super::background_build::start_deferred_build_if_admitted(self).await;
     }
 
     /// The explicit Rebuild (`POST /api/v1/engine/rebuild`): abort the build in
@@ -1345,8 +1575,7 @@ impl LucidosEngine {
 
     /// Emit the transient `EngineBuildStateChanged` UI poke. A connected client
     /// then learns of a background-rebuild transition over the live SSE stream.
-    /// The throttled version-status poll cannot carry it, because iOS suspends
-    /// that timer on a backgrounded PWA. The frontend handler re-runs the
+    /// The frontend handler re-runs the
     /// authoritative `checkEngineVersion` GET, so this is a pure nudge and
     /// `state` is informational.
     async fn emit_build_state_changed(&self, state: &BuildState) {
@@ -1371,6 +1600,10 @@ trait DeliveryHost: BuildHost {
     async fn head(&self) -> Option<String>;
     async fn build(&self, previous_failure: Option<&str>, fresh: bool) -> EngineBuildOutcome;
     async fn delivered(&self, head: Option<&str>) -> Result<bool, BuildFailure>;
+    /// Whether the build published a binary of `start` or a later snapshot.
+    /// Looser than [`DeliveryHost::delivered`], so it only picks between a
+    /// follow-up build and the fresh retry, and never makes a build `Ready`.
+    async fn published_since(&self, start: Option<&str>) -> Result<bool, BuildFailure>;
 }
 
 fn delivery_probe_failure(cause: &str) -> BuildFailure {
@@ -1435,7 +1668,7 @@ async fn build_and_verify(
                     }
                 };
                 let earlier_delivered = if !delivered && head_moved && build_head.is_some() {
-                    match host.delivered(build_head.as_deref()).await {
+                    match host.published_since(build_head.as_deref()).await {
                         Ok(delivered) => delivered,
                         Err(reason) => {
                             return FinishedBuild {
@@ -1463,21 +1696,6 @@ async fn build_and_verify(
                             "The build did not publish a new executable covering HEAD after a fresh retry.",
                         ))
                 }
-            }
-            EngineBuildOutcome::HeadMoved => {
-                let head = host.head().await;
-                if head.is_some() && head != built_head {
-                    fresh = false;
-                    continue;
-                }
-                if retry.can_fresh(head.as_deref()) {
-                    fresh = true;
-                    continue;
-                }
-                BuildState::failed_with(BuildFailure::delivery(
-                    BuildFailureKind::NotDelivered,
-                    "The published executable is still stale after a fresh retry.",
-                ))
             }
             EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
             EngineBuildOutcome::SkippedLocked => BuildState::Idle,
@@ -1508,28 +1726,81 @@ impl DeliveryHost for LucidosEngine {
     }
     async fn delivered(&self, head: Option<&str>) -> Result<bool, BuildFailure> {
         let head = head.ok_or_else(|| delivery_probe_failure("cannot read checkout HEAD"))?;
-        let disk = uncached_engine_disk_build_id()
-            .await
-            .ok_or_else(|| delivery_probe_failure("published executable build-ID probe failed"))?;
-        if disk == crate::ENGINE_BUILD_ID {
-            return Ok(false);
-        }
-        let Some(commit) = build_id_commit(&disk) else {
+        let Some(commit) = newly_published_commit().await? else {
             return Ok(false);
         };
-        let root = crate::paths::repo_root()
-            .map_err(|_| delivery_probe_failure("cannot resolve source checkout"))?;
-        if head.starts_with(commit) {
-            return Ok(true);
-        }
-        no_restart_between(commit, head, &root)
+        let root = source_checkout()?;
+        build_covers_commit(&commit, head, &root)
+            .await
+            .ok_or_else(|| delivery_probe_failure("source coverage probe failed"))
+    }
+    async fn published_since(&self, start: Option<&str>) -> Result<bool, BuildFailure> {
+        let start = start.ok_or_else(|| delivery_probe_failure("cannot read checkout HEAD"))?;
+        let Some(commit) = newly_published_commit().await? else {
+            return Ok(false);
+        };
+        let root = source_checkout()?;
+        snapshot_since(&commit, start, &root)
             .await
             .ok_or_else(|| delivery_probe_failure("source coverage probe failed"))
     }
 }
 
+/// The commit the published binary was built from, or `None` when the build
+/// published nothing new: the running binary's id, or an unstamped one.
+async fn newly_published_commit() -> Result<Option<String>, BuildFailure> {
+    let disk = uncached_engine_disk_build_id()
+        .await
+        .ok_or_else(|| delivery_probe_failure("published executable build-ID probe failed"))?;
+    if disk == crate::build_identity().id {
+        return Ok(None);
+    }
+    Ok(build_id_commit(&disk).map(str::to_string))
+}
+
+fn source_checkout() -> Result<std::path::PathBuf, BuildFailure> {
+    crate::paths::repo_root().map_err(|_| delivery_probe_failure("cannot resolve source checkout"))
+}
+
+/// Whether a binary built from `commit` serves `head`: the same commit, or no
+/// restart-requiring file between them. `None` when git could not answer.
+async fn build_covers_commit(commit: &str, head: &str, root: &std::path::Path) -> Option<bool> {
+    if head.starts_with(commit) {
+        return Some(true);
+    }
+    no_restart_between(commit, head, root).await
+}
+
+/// Whether a binary built from `commit` is the snapshot of `start` or a later
+/// one. The script snapshots the checkout as cargo starts, so a queued build
+/// can publish a descendant of the HEAD the engine read (ADR 0668).
+async fn snapshot_since(commit: &str, start: &str, root: &std::path::Path) -> Option<bool> {
+    if commit_is_strict_ancestor(root, start, commit).await == Some(true) {
+        return Some(true);
+    }
+    build_covers_commit(commit, start, root).await
+}
+
 #[async_trait::async_trait]
 impl BuildHost for LucidosEngine {
+    async fn deferred_build_needed(&self) -> bool {
+        if !self.source_behind_head().await {
+            return false;
+        }
+        let (Some(built), Some(head), Ok(root)) = (
+            uncached_engine_disk_build_id()
+                .await
+                .as_deref()
+                .and_then(build_id_commit)
+                .map(str::to_string),
+            current_head_sha().await,
+            crate::paths::repo_root(),
+        ) else {
+            return true;
+        };
+        !build_covers_head(&built, &head, &root).await
+    }
+
     fn background_build(&self) -> &BackgroundBuild {
         &self.background_build
     }
@@ -1546,6 +1817,10 @@ impl BuildHost for LucidosEngine {
         LucidosEngine::emit_build_state_changed(self, state).await;
     }
 
+    async fn automatic_deferral(&self) -> super::build_deferral::BuildDeferral {
+        super::build_deferral::automatic_build_deferral(self.pool()).await
+    }
+
     async fn run_build(&self, previous_failure: Option<&str>, generation: u64) -> FinishedBuild {
         let finished = build_and_verify(self, previous_failure, generation).await;
         if matches!(finished.state, BuildState::Failed { .. }) {
@@ -1559,7 +1834,7 @@ impl BuildHost for LucidosEngine {
     }
 
     /// A success is judged by the binary it published, which the build
-    /// script's own rebuild once may have moved past `built_head`.
+    /// script's late snapshot may have moved past `built_head`.
     async fn covers_head(&self, finished: &FinishedBuild) -> bool {
         let built = match &finished.state {
             // A peer holds the build lock and builds for us. Self-heal follows
@@ -1585,7 +1860,7 @@ impl BuildHost for LucidosEngine {
 /// or no restart-requiring file between them. An unknown answer reads as
 /// "not covered", since one more build costs less than a binary behind HEAD.
 async fn build_covers_head(built: &str, head: &str, root: &std::path::Path) -> bool {
-    head.starts_with(built) || no_restart_between(built, head, root).await == Some(true)
+    build_covers_commit(built, head, root).await == Some(true)
 }
 
 /// Outcome of a background engine build. `SkippedLocked` is distinct from
@@ -1594,7 +1869,6 @@ async fn build_covers_head(built: &str, head: &str, root: &std::path::Path) -> b
 /// surface the "build failed" toast.
 enum EngineBuildOutcome {
     Succeeded,
-    HeadMoved,
     /// Carries why, so the toast can say it.
     Failed(BuildFailure),
     SkippedLocked,
@@ -1909,16 +2183,16 @@ pub(crate) async fn no_restart_between(
 /// `files_require_restart` flags differs between its build commit and HEAD.
 /// `None` for an unstamped id, no checkout, or a git probe that could not run.
 pub(crate) async fn own_source_matches_head() -> Option<bool> {
-    let commit = build_id_commit(crate::ENGINE_BUILD_ID)?;
+    let commit = build_id_commit(crate::build_identity().id)?;
     let root = crate::paths::repo_root().ok()?;
     no_restart_between(commit, "HEAD", &root).await
 }
 
 /// What `lucidos-engine --build-id --source-state` prints.
 ///
-/// The dev build script reads it to decide whether HEAD moving during a build
-/// needs a second build (`published_build_state`, `scripts/lib/workspace.sh`).
-/// It treats every answer but `current` as a mismatch.
+/// The dev build script reads it after a publish to note when HEAD moved past
+/// the snapshot by engine source (`note_head_moved_past`,
+/// `scripts/lib/workspace.sh`). It never rebuilds on the answer.
 pub async fn own_source_state() -> &'static str {
     source_state_word(own_source_matches_head().await)
 }
@@ -2129,7 +2403,7 @@ async fn run_engine_build(
         Some(path) => match acquire_engine_build_lock_waiting(&path, BUILD_LOCK_WAIT).await {
             Some(guard) => Some(guard),
             None => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Rebuild] the checkout-shared engine build lock stayed held for {}s, \
                      skipping this build (a co-located workspace is building; its build \
                      advances the shared binary for us too)",
@@ -2143,7 +2417,7 @@ async fn run_engine_build(
     let script = match crate::paths::script("web-dev.sh") {
         Ok(s) => s,
         Err(e) => {
-            crate::log!("[Rebuild] cannot locate web-dev.sh: {e}");
+            crate::log_legacy!("[Rebuild] cannot locate web-dev.sh: {e}");
             return EngineBuildOutcome::Failed(BuildFailure::plain(format!(
                 "cannot locate web-dev.sh: {e}"
             )));
@@ -2160,18 +2434,17 @@ async fn run_engine_build(
     let log_path = workspace.join(ENGINE_BUILD_LOG_PATH);
     match run_capturing_output(cmd, &log_path, BUILD_OUTPUT_DRAIN_GRACE, published_group).await {
         Ok((status, _)) if status.success() => EngineBuildOutcome::Succeeded,
-        Ok((status, _)) if status.code() == Some(75) => EngineBuildOutcome::HeadMoved,
         Ok((status, output)) => {
-            crate::log!("[Rebuild] engine build exited {status}");
+            crate::log_legacy!("[Rebuild] engine build exited {status}");
             let reason = classify_build_failure(&output.head_text(), previous_failure)
                 .unwrap_or_else(|| {
                     unrecognized_build_failure(&status.to_string(), output.last_line().as_deref())
                 });
-            crate::log!("[Rebuild] cause: {}", reason.summary);
+            crate::log_legacy!("[Rebuild] cause: {}", reason.summary);
             EngineBuildOutcome::Failed(reason)
         }
         Err(e) => {
-            crate::log!("[Rebuild] {e}");
+            crate::log_legacy!("[Rebuild] {e}");
             EngineBuildOutcome::Failed(BuildFailure::plain(e))
         }
     }
@@ -2193,7 +2466,7 @@ fn engine_build_command(
         .arg("--engine-build")
         .arg("--publish-to")
         .arg(publish_to)
-        .env(lucidos_build_slot::ENV_PRIORITY, "1")
+        .env(lucidos_build_slot::ENV_CLASS, "priority")
         .kill_on_drop(true);
     if fresh {
         cmd.arg("--fresh");
@@ -2250,7 +2523,7 @@ async fn run_capturing_output(
             read = receiver.read(&mut buf), if open => match read {
                 Ok(0) => open = false,
                 Err(e) => {
-                    crate::log!("[Rebuild] stopped reading the build output: {e}");
+                    crate::log_legacy!("[Rebuild] stopped reading the build output: {e}");
                     open = false;
                 }
                 Ok(n) => output.push(&buf[..n]),
@@ -2268,7 +2541,7 @@ async fn run_capturing_output(
         })
         .await;
         if drained.is_err() {
-            crate::log!(
+            crate::log_legacy!(
                 "[Rebuild] a process the build started still holds its output open; \
                  its output keeps going to the log in the background"
             );
@@ -2280,7 +2553,7 @@ async fn run_capturing_output(
                 let mut buf = vec![0u8; 8192];
                 while let Ok(n @ 1..) = receiver.read(&mut buf).await {
                     if let Some(Err(e)) = log.as_mut().map(|f| f.write_all(&buf[..n])) {
-                        crate::log!("[Rebuild] stopped copying late build output: {e}");
+                        crate::log_legacy!("[Rebuild] stopped copying late build output: {e}");
                         log = None;
                     }
                 }
@@ -2317,7 +2590,7 @@ impl BuildOutput {
             .append(true)
             .open(log_path)
             .inspect_err(|e| {
-                crate::log!(
+                crate::log_legacy!(
                     "[Rebuild] cannot open {} to copy the build output: {e}",
                     log_path.display()
                 );
@@ -2335,7 +2608,7 @@ impl BuildOutput {
         use std::io::Write;
         if let Some(log) = &mut self.log {
             if let Err(e) = log.write_all(chunk) {
-                crate::log!(
+                crate::log_legacy!(
                     "[Rebuild] stopped copying the build output to {}: {e}",
                     self.log_path.display()
                 );
@@ -2370,17 +2643,291 @@ impl BuildOutput {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_status_watch_is_dev_only() {
+        assert!(!super::version_status_watch_enabled(true));
+        assert!(super::version_status_watch_enabled(false));
+    }
+
+    #[test]
+    fn an_older_observation_never_replaces_a_newer_one() {
+        let older = std::time::Instant::now();
+        let newer = older + std::time::Duration::from_millis(5);
+        assert!(super::observation_is_newest(None, older));
+        assert!(super::observation_is_newest(Some(older), newer));
+        assert!(!super::observation_is_newest(Some(newer), older));
+    }
+
+    /// A read that finishes while a later claim is still reading must still
+    /// replace an older answer: the watcher announces what it read, and a
+    /// client refreshing on that announcement must be served it.
+    #[test]
+    fn pending_commits_serve_the_newest_finished_read() {
+        let first = std::time::Instant::now();
+        let second = first + std::time::Duration::from_millis(5);
+        let third = second + std::time::Duration::from_millis(5);
+        let mut cache = super::PendingCommitsCache::default();
+        cache.record(first, None);
+        cache.checked_at = Some(third);
+        cache.record(second, Some(super::PendingCommits::from_groups(Vec::new())));
+        assert!(cache.commits.is_some());
+        cache.record(first, None);
+        assert!(cache.commits.is_some());
+        assert_eq!(cache.checked_at, Some(third));
+    }
+
+    fn watched_status() -> super::VersionStatus {
+        super::VersionStatus {
+            build_id: "running".into(),
+            update_available: false,
+            disk_build_id: Some("disk-a".into()),
+            packaged: false,
+            build_state: "idle",
+            source_behind_head: false,
+            shared_build_in_progress: false,
+            head_commit: None,
+            build_failure: None,
+            build_elapsed_ms: None,
+            build_queued: None,
+            build_deferred: Some(super::DeferredBuild {
+                coding_threads: 1,
+                threads: vec![],
+                deferred_ms: 0,
+            }),
+            pending_commits: None,
+            frontend_refresh_elapsed_ms: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watcher_ticks_read_replaced_binary_and_emit_once() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("engine");
+        let publish = |id: &str| {
+            let staged = dir.path().join("staged");
+            std::fs::write(&staged, format!("#!/bin/sh\nprintf '%s\\n' '{id}'\n")).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(staged, &binary).unwrap();
+        };
+        publish("disk-a");
+        let connections = super::super::sse_connections::SseConnectionCounter::new();
+        let counter = connections.clone();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (samples, mut sampled) = tokio::sync::mpsc::unbounded_channel();
+        let executable = binary.clone();
+        let watcher = tokio::spawn(async move {
+            super::run_version_status_watch(
+                &counter,
+                || async {
+                    let mut status = watched_status();
+                    status.disk_build_id = super::disk_build_id_at(&executable).await;
+                    samples.send(status.disk_build_id.clone()).unwrap();
+                    status
+                },
+                |event| {
+                    events.send(event).unwrap();
+                    std::future::ready(())
+                },
+            )
+            .await;
+        });
+        // Dropping a JoinHandle detaches its task; abort even on assertion failure.
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _watcher = AbortOnDrop(watcher);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            sampled.try_recv().is_err(),
+            "idle tick must not read the executable"
+        );
+        let _page = connections.connect();
+        for id in ["disk-a", "disk-b"] {
+            if id == "disk-b" {
+                publish(id);
+            }
+            let sample = tokio::time::timeout(Duration::from_secs(15), sampled.recv())
+                .await
+                .unwrap();
+            assert_eq!(sample, Some(Some(id.into())));
+            let event = tokio::time::timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap();
+            assert!(matches!(
+                event,
+                Some(crate::engine::event_bus::SystemEvent::EngineVersionStatusChanged { .. })
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(15), sampled.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err(), "unchanged tick must not emit");
+    }
+
+    #[tokio::test]
+    async fn watcher_notices_outside_binary_once() {
+        let mut watch = super::VersionStatusWatch::default();
+        assert!(watch.observe(true, async { watched_status() }).await);
+        let changed = || {
+            let mut s = watched_status();
+            s.disk_build_id = Some("disk-b".into());
+            s
+        };
+        assert!(watch.observe(true, async { changed() }).await);
+        assert!(!watch.observe(true, async { changed() }).await);
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_elapsed_but_keeps_deferred_details() {
+        let mut watch = super::VersionStatusWatch::default();
+        assert!(watch.observe(true, async { watched_status() }).await);
+        assert!(
+            !watch
+                .observe(true, async {
+                    let mut s = watched_status();
+                    s.build_elapsed_ms = Some(4000);
+                    s.frontend_refresh_elapsed_ms = Some(4000);
+                    s.build_deferred.as_mut().unwrap().deferred_ms = 4000;
+                    s
+                })
+                .await
+        );
+        assert!(
+            watch
+                .observe(true, async {
+                    let mut s = watched_status();
+                    s.build_deferred.as_mut().unwrap().coding_threads = 2;
+                    s
+                })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_notices_each_outside_input_independently() {
+        for field in ["head", "queued", "shared"] {
+            let mut watch = super::VersionStatusWatch::default();
+            assert!(watch.observe(true, async { watched_status() }).await);
+            let changed = || {
+                let mut s = watched_status();
+                match field {
+                    "head" => s.head_commit = Some("next-head".into()),
+                    "queued" => {
+                        s.build_queued = Some(super::QueuedBuild {
+                            holders: vec!["another build".into()],
+                        })
+                    }
+                    "shared" => s.shared_build_in_progress = true,
+                    _ => unreachable!(),
+                }
+                s
+            };
+            assert!(watch.observe(true, async { changed() }).await, "{field}");
+            assert!(!watch.observe(true, async { changed() }).await, "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_repairs_first_connection_and_reconnection() {
+        let mut watch = super::VersionStatusWatch::default();
+        assert!(watch.observe(true, async { watched_status() }).await);
+        assert!(!watch.observe(true, async { watched_status() }).await);
+        assert!(
+            !watch
+                .observe(false, async { panic!("idle watcher read") })
+                .await
+        );
+        assert!(watch.observe(true, async { watched_status() }).await);
+        assert!(!watch.observe(true, async { watched_status() }).await);
+    }
+
+    #[tokio::test]
+    async fn watcher_does_not_read_without_a_page() {
+        let mut watch = super::VersionStatusWatch::default();
+        assert!(
+            !watch
+                .observe(false, async { panic!("idle watcher read status") })
+                .await
+        );
+        assert!(watch.previous.is_none());
+    }
+
+    #[test]
+    fn version_status_wire_keeps_deferred_details_beside_ready() {
+        use super::*;
+        let deferred = DeferredBuild {
+            coding_threads: 2,
+            threads: Vec::new(),
+            deferred_ms: 840_000,
+        };
+        for state in ["deferred", "ready"] {
+            let status = VersionStatus {
+                build_id: "test".into(),
+                update_available: state == "ready",
+                disk_build_id: None,
+                packaged: false,
+                build_state: state,
+                source_behind_head: true,
+                shared_build_in_progress: false,
+                head_commit: None,
+                build_failure: None,
+                build_elapsed_ms: None,
+                build_queued: None,
+                build_deferred: Some(deferred.clone()),
+                pending_commits: None,
+                frontend_refresh_elapsed_ms: None,
+            };
+            let wire = serde_json::to_value(&status).unwrap();
+            assert_eq!(wire["build_state"], state);
+            assert_eq!(wire["build_deferred"]["coding_threads"], 2);
+            assert_eq!(wire["build_deferred"]["deferred_ms"], 840_000);
+            assert_eq!(wire["build_deferred"]["threads"], serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn self_heal_holds_spend_no_attempts_and_cannot_bypass_exhaustion() {
+        use super::{BuildState, SelfHealState, SELF_HEAL_MAX_ATTEMPTS_PER_HEAD};
+        use crate::engine::build_deferral::{ActiveThreads, BuildDeferral};
+        let deferral = BuildDeferral::Defer(ActiveThreads {
+            count: 1,
+            threads: vec![],
+        });
+        let mut budget = SelfHealState::default();
+        let head = Some("head-a".to_string());
+        for _ in 0..100 {
+            assert!(budget.request(head.clone(), &BuildState::Idle, &deferral));
+        }
+        assert_eq!(budget.attempts, 0);
+        for _ in 0..SELF_HEAL_MAX_ATTEMPTS_PER_HEAD {
+            assert!(budget.request(head.clone(), &BuildState::Idle, &BuildDeferral::Admit));
+        }
+        assert!(!budget.request(head.clone(), &BuildState::Idle, &deferral));
+        assert!(!budget.request(head, &BuildState::Idle, &BuildDeferral::Admit));
+        assert!(budget.request(Some("head-b".into()), &BuildState::Idle, &deferral));
+        assert_eq!(budget.attempts, 0);
+    }
+
     use super::{
-        acquire_engine_build_lock_waiting, build_id_commit, classify_build_failure,
-        classify_commit_subject, classify_pending_commits, commit_is_strict_ancestor,
-        compatible_served_commit, disk_upgrade_verdict, engine_build_command,
-        engine_build_lock_path, group_commit_subjects, lock_held_at, newer_version_visible,
-        no_restart_between, open_teardown, pending_commits_since, queued_behind,
-        run_capturing_output, source_state_word, stash_first_restart_actor, try_lock_file,
-        unrecognized_build_failure, wants_pending_commits, BuildFailure, BuildOutput,
-        BuildProcessGroupGuard, BuildState, CommitGroupKind, QueuedBuild, VersionTracking,
-        BUILD_FAILURE_SUMMARY_CAP, BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP,
-        COMMIT_GROUP_ORDER, PENDING_COMMIT_DESCRIPTION_CAP, UNLABELLED_HOLDER,
+        acquire_engine_build_lock_waiting, build_covers_commit, build_id_commit,
+        classify_build_failure, classify_commit_subject, classify_pending_commits,
+        commit_is_strict_ancestor, compatible_served_commit, disk_upgrade_verdict,
+        engine_build_command, engine_build_lock_path, group_commit_subjects, lock_held_at,
+        newer_version_visible, no_restart_between, open_teardown, pending_commits_since,
+        queued_behind, run_capturing_output, snapshot_since, source_state_word,
+        stash_first_restart_actor, try_lock_file, unrecognized_build_failure,
+        wants_pending_commits, BuildFailure, BuildOutput, BuildProcessGroupGuard, BuildState,
+        CommitGroupKind, QueuedBuild, VersionTracking, BUILD_FAILURE_SUMMARY_CAP,
+        BUILD_OUTPUT_HEAD_CAP, BUILD_OUTPUT_TAIL_CAP, COMMIT_GROUP_ORDER,
+        PENDING_COMMIT_DESCRIPTION_CAP, UNLABELLED_HOLDER,
     };
     use crate::engine::thread_events::MessageOrigin;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3017,11 +3564,15 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         delivered: bool,
         probe_failure: bool,
         delivered_head: Option<String>,
+        published_since: Option<String>,
         heads: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
     }
 
     #[async_trait::async_trait]
     impl super::BuildHost for DeliveryStub {
+        async fn deferred_build_needed(&self) -> bool {
+            true
+        }
         fn background_build(&self) -> &super::BackgroundBuild {
             &self.background
         }
@@ -3037,6 +3588,9 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             self.states.lock().unwrap().push(state);
         }
         async fn emit_build_state_changed(&self, _: &BuildState) {}
+        async fn automatic_deferral(&self) -> crate::engine::build_deferral::BuildDeferral {
+            crate::engine::build_deferral::BuildDeferral::Admit
+        }
         async fn run_build(&self, previous: Option<&str>, generation: u64) -> super::FinishedBuild {
             super::build_and_verify(self, previous, generation).await
         }
@@ -3084,6 +3638,9 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
                     .delivered_head
                     .as_deref()
                     .is_some_and(|covered| head == Some(covered)))
+        }
+        async fn published_since(&self, start: Option<&str>) -> Result<bool, super::BuildFailure> {
+            Ok(self.published_since.is_some() && self.published_since.as_deref() == start)
         }
     }
 
@@ -3140,7 +3697,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     #[tokio::test]
     async fn head_moving_after_script_success_rebuilds_incrementally_before_cleaning() {
         let host = DeliveryStub {
-            delivered_head: Some("old".into()),
+            published_since: Some("old".into()),
             ..Default::default()
         };
         *host.heads.lock().unwrap() = ["old", "head1", "head1", "head1"]
@@ -3153,6 +3710,39 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             Some(super::BuildFailureKind::NotDelivered)
         );
         assert_eq!(*host.fresh.lock().unwrap(), [false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn late_snapshot_covering_head_is_ready_without_another_compile() {
+        let host = DeliveryStub {
+            delivered_head: Some("snapshot".into()),
+            ..Default::default()
+        };
+        *host.heads.lock().unwrap() = ["start", "snapshot"]
+            .into_iter()
+            .map(|head| Some(head.to_owned()))
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert!(matches!(finished.state, BuildState::Ready { .. }));
+        assert_eq!(finished.built_head.as_deref(), Some("snapshot"));
+        assert_eq!(*host.fresh.lock().unwrap(), [false]);
+    }
+
+    #[tokio::test]
+    async fn late_snapshot_behind_head_gets_one_incremental_follow_up_then_ready() {
+        let host = DeliveryStub {
+            published_since: Some("start".into()),
+            delivered_head: Some("latest".into()),
+            ..Default::default()
+        };
+        *host.heads.lock().unwrap() = ["start", "past-snapshot", "latest", "latest"]
+            .into_iter()
+            .map(|head| Some(head.to_owned()))
+            .collect();
+        let finished = super::build_and_verify(&host, None, 0).await;
+        assert!(matches!(finished.state, BuildState::Ready { .. }));
+        assert_eq!(finished.built_head.as_deref(), Some("latest"));
+        assert_eq!(*host.fresh.lock().unwrap(), [false, false]);
     }
 
     #[tokio::test]
@@ -3283,9 +3873,9 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         let priority = cmd
             .as_std()
             .get_envs()
-            .find(|(k, _)| *k == lucidos_build_slot::ENV_PRIORITY)
+            .find(|(k, _)| *k == lucidos_build_slot::ENV_CLASS)
             .and_then(|(_, v)| v);
-        assert_eq!(priority, Some(std::ffi::OsStr::new("1")));
+        assert_eq!(priority, Some(std::ffi::OsStr::new("priority")));
         let args: Vec<_> = cmd.as_std().get_args().collect();
         assert_eq!(
             args,
@@ -3423,39 +4013,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         );
     }
 
-    /// The lock must not live under `target/`. `flock` binds to an inode, so a
-    /// `cargo clean` deleting the file mid-build releases nothing: the next
-    /// builder creates a fresh inode and takes an uncontended lock, and two
-    /// cargo builds then run against the shared `target/` at once. That is the
-    /// collision the lock exists to prevent, and a clean build is exactly when
-    /// it would happen.
-    #[test]
-    fn build_lock_lives_outside_cargos_target_dir() {
-        let Some(path) = engine_build_lock_path() else {
-            // No repo root (packaged runtime): there is no checkout to
-            // coordinate on, which `run_engine_build` handles separately.
-            return;
-        };
-        // Checked RELATIVE to the checkout. A repo living under an unrelated
-        // directory named `target` is not a cargo target dir, and an
-        // absolute-path scan would fail the test for it.
-        let root = crate::paths::repo_root().expect("lock path implies a repo root");
-        let rel = path
-            .strip_prefix(&root)
-            .expect("the lock lives inside the checkout");
-        assert!(
-            !rel.components().any(|c| c.as_os_str() == "target"),
-            "build lock must not sit under target/, cargo clean would orphan its inode: {}",
-            rel.display()
-        );
-        assert_eq!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some(".lucidos-engine-build.lock"),
-            "lock filename changed: {}",
-            path.display()
-        );
-    }
-
     /// Take the lock, tolerating a transient hold by a concurrently-forked
     /// child that hasn't reached `exec` yet. See [`eventually`].
     fn eventually_acquire(path: &std::path::Path) -> std::fs::File {
@@ -3554,6 +4111,43 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         commit_file("crates/lucidos-engine/src/lib.rs");
         assert_eq!(no_restart_between(&built, "HEAD", &dir).await, Some(false));
         assert_eq!(no_restart_between("0123456789ab", "HEAD", &dir).await, None);
+    }
+
+    /// A late snapshot past the start HEAD, even by engine source, counts as
+    /// published since that start. An older binary does not, so it keeps the
+    /// fresh retry, and `build_covers_commit` stays strict for `Ready`.
+    #[tokio::test]
+    async fn a_later_snapshot_is_published_since_its_start_but_does_not_cover_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        let commit_file = |path: &str| {
+            let full = dir.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, uuid::Uuid::new_v4().to_string()).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", path]);
+            git(&["rev-parse", "--short", "HEAD"])
+        };
+        let older = commit_file("crates/lucidos-engine/src/a.rs");
+        let start = commit_file("crates/lucidos-engine/src/b.rs");
+        let later = commit_file("crates/lucidos-engine/src/c.rs");
+        assert_eq!(snapshot_since(&start, &start, &dir).await, Some(true));
+        assert_eq!(snapshot_since(&later, &start, &dir).await, Some(true));
+        assert_eq!(snapshot_since(&older, &start, &dir).await, Some(false));
+        assert_eq!(build_covers_commit(&later, &start, &dir).await, Some(false));
+        assert_eq!(snapshot_since("0123456789ab", &start, &dir).await, None);
     }
 
     #[test]
@@ -4006,11 +4600,11 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         let snapshot = dir.join("snapshot");
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(
-            snapshot.join(crate::api::frontend_snapshot::SOURCE_COMMIT_FILE),
+            snapshot.join(crate::engine::frontend_refresh::SOURCE_COMMIT_FILE),
             format!("{served}\n"),
         )
         .unwrap();
-        let stamped = crate::api::frontend_snapshot::read_source_commit(&snapshot);
+        let stamped = crate::engine::frontend_snapshot::read_source_commit(&snapshot);
         assert_eq!(stamped.as_deref(), Some(served.as_str()));
         let commits = pending_commits_since(&running, stamped.as_deref(), &dir)
             .await
@@ -4084,5 +4678,42 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             None,
             "a range git cannot resolve says nothing about what is pending"
         );
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The lock must not live under `target/`. `flock` binds to an inode, so a
+        /// `cargo clean` deleting the file mid-build releases nothing: the next
+        /// builder creates a fresh inode and takes an uncontended lock, and two
+        /// cargo builds then run against the shared `target/` at once. That is the
+        /// collision the lock exists to prevent, and a clean build is exactly when
+        /// it would happen.
+        #[test]
+        fn build_lock_lives_outside_cargos_target_dir() {
+            let Some(path) = engine_build_lock_path() else {
+                // No repo root (packaged runtime): there is no checkout to
+                // coordinate on, which `run_engine_build` handles separately.
+                return;
+            };
+            // Checked RELATIVE to the checkout. A repo living under an unrelated
+            // directory named `target` is not a cargo target dir, and an
+            // absolute-path scan would fail the test for it.
+            let root = crate::paths::repo_root().expect("lock path implies a repo root");
+            let rel = path
+                .strip_prefix(&root)
+                .expect("the lock lives inside the checkout");
+            assert!(
+                !rel.components().any(|c| c.as_os_str() == "target"),
+                "build lock must not sit under target/, cargo clean would orphan its inode: {}",
+                rel.display()
+            );
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(".lucidos-engine-build.lock"),
+                "lock filename changed: {}",
+                path.display()
+            );
+        }
     }
 }

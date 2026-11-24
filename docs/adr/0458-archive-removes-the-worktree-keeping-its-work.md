@@ -39,8 +39,9 @@ lost on the way. Plan: `docs/plans/2026-10-12-archive-removes-thread-worktrees.m
    first. Remaining dirt is committed on the thread's own branch as
    `Coding agent changes (snapshot before worktree removal)`, the *snapshot
    commit*. The thread's own branch is its latest `SessionStarted.branch`.
-3. **The branch stays unless it has no commits ahead** (`BranchDisposal::
-   WhenMerged`). Patch-equivalence and squash detection decide nothing.
+3. **The branch stays**, including after its commits have been merged.
+   [ADR 0740](0740-reclamation-preserves-thread-branches.md) supersedes the
+   original `WhenMerged` policy.
 4. **Removal moves the tree aside first.** `remove_worktree_and_optionally_delete_branch`
    renames the tree to a `reclaiming-` sibling, prunes git's registration,
    settles the branch, then deletes the directory. The worker deletes any

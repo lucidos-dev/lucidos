@@ -59,7 +59,7 @@ fn an_upgrade_lists_every_enabled_model_in_shipped_order() {
     let enabled: Vec<String> = [
         "claude-haiku-5-5",
         "claude-sonnet-5-5[1m]",
-        "gpt-5.6-luna",
+        "gpt-6-sol",
         "my-model",
     ]
     .map(str::to_string)
@@ -68,7 +68,7 @@ fn an_upgrade_lists_every_enabled_model_in_shipped_order() {
         pair("claude-haiku-5-5", "low"),
         pair("claude-opus-5-5", "medium"),
         pair("claude-sonnet-5-5", "medium"),
-        pair("gpt-5.6-luna", "high"),
+        pair("gpt-6-sol", "max"),
         pair("my-model", "high"),
     ];
     let pairs = upgraded_chat_ladder(&EveryPair(joining), &enabled).expect("an override");
@@ -82,7 +82,7 @@ fn an_upgrade_lists_every_enabled_model_in_shipped_order() {
         .map(|p| pair(&p.model, &p.effort))
         .collect();
     let mut expected = shipped;
-    expected.push(pair("gpt-5.6-luna", "high"));
+    expected.push(pair("gpt-6-sol", "max"));
     assert_eq!(pairs, expected);
     assert!(pairs.iter().all(|p| p.model != "claude-opus-5-5"));
 }
@@ -104,12 +104,12 @@ fn an_upgrade_leaves_a_model_without_an_estimate_off() {
 /// estimate: only the joining rung stays off.
 #[test]
 fn an_upgrade_keeps_the_shipped_rungs_of_a_model_whose_joining_rung_is_unestimated() {
-    let enabled: Vec<String> = ["claude-haiku-5-5", "gpt-5.6-luna"]
+    let enabled: Vec<String> = ["claude-haiku-5-5", "gpt-6-sol"]
         .map(str::to_string)
         .to_vec();
     let joining = vec![
         pair("claude-haiku-5-5", "no-such-effort"),
-        pair("gpt-5.6-luna", "high"),
+        pair("gpt-6-sol", "max"),
     ];
     let pairs = upgraded_chat_ladder(&EveryPair(joining), &enabled).expect("an override");
     assert!(pairs.iter().any(|p| p.model == "claude-haiku-5-5"));
@@ -131,6 +131,7 @@ async fn routes_of(pool: &PgPool) -> ModelRoutes {
     ModelRoutes {
         registry,
         configured: ProviderKind::ALL.to_vec(),
+        provider: None,
     }
 }
 
@@ -141,8 +142,9 @@ async fn snapshot(pool: &PgPool) -> Vec<String> {
         .unwrap()
 }
 
-const MIGRATION: &str =
-    include_str!("../../migrations/20261019131405_chat_ladder_replaces_enabled.sql");
+const MIGRATION: &str = include_str!(
+    "../../../lucidos-core/migrations/20261019131405_chat_ladder_replaces_enabled.sql"
+);
 
 /// The migration seeded with a custom enabled set: every model that was on
 /// lists on the chat ladder after, and the upgrade runs once.
@@ -196,9 +198,14 @@ async fn upgrading_a_custom_enabled_set_hides_nothing_and_runs_once() {
             "{id} has no estimate and stays off"
         );
     }
-    for id in ["claude-opus-5-5", "gpt-6.1-sol"] {
-        assert!(!ladder.lists_model(id), "{id} was off and must stay off");
-    }
+    assert!(
+        ladder.lists_model("claude-opus-5-5"),
+        "the default stays on"
+    );
+    assert!(
+        !ladder.lists_model("gpt-6.1-sol"),
+        "the non-default model stays off"
+    );
     assert_eq!(snapshot(&pool).await, Vec::<String>::new());
 
     PreferenceStore::delete(&pool, &bus, prefs::INTELLIGENCE_LADDER_CHAT.key(), None)
@@ -271,6 +278,10 @@ async fn a_model_turns_on_and_off_the_chat_ladder() {
         "the shipped rungs stay on"
     );
 
+    PreferenceStore::set(&pool, &bus, prefs::CHAT_MODEL.key(), "grok-4.20", None)
+        .await
+        .unwrap();
+
     match set("gpt-6-luna", false).await {
         Ok(ChatLadderChange::TurnedOff(off)) => {
             assert!(off.len() > 1 && off.iter().all(|p| p.model == "gpt-6-luna"));
@@ -299,8 +310,32 @@ async fn the_last_model_cannot_leave_the_chat_ladder() {
     )
     .await
     .unwrap();
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::CHAT_MODEL.key(),
+        "claude-haiku-5-5",
+        None,
+    )
+    .await
+    .unwrap();
     let routes = routes_of(&pool).await;
     let err = set_model_on_chat_ladder(&pool, &bus, &routes, "claude-haiku-5-5", false, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Pick another default"), "{err}");
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::CHAT_MODEL.key(),
+        "claude-opus-5-5",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut unconfigured = routes;
+    unconfigured.configured.clear();
+    let err = set_model_on_chat_ladder(&pool, &bus, &unconfigured, "claude-haiku-5-5", false, None)
         .await
         .unwrap_err();
     assert!(err.contains("only model"), "{err}");
@@ -308,8 +343,7 @@ async fn the_last_model_cannot_leave_the_chat_ladder() {
     teardown_test_db(&db_name).await;
 }
 
-/// Deleting a user model takes it off the chat ladder, and refuses when it is
-/// the last model there, deleting nothing.
+/// Deleting a user model takes it off the chat ladder, but refuses to delete the default.
 #[tokio::test]
 async fn deleting_a_user_model_takes_it_off_the_chat_ladder() {
     let (pool, db_name) = setup_test_db().await;
@@ -334,22 +368,107 @@ async fn deleting_a_user_model_takes_it_off_the_chat_ladder() {
     .await
     .unwrap();
 
+    PreferenceStore::set(&pool, &bus, prefs::CHAT_MODEL.key(), "local/my-model", None)
+        .await
+        .unwrap();
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        &override_value(&[ladder::chat_joining_intelligence_rung(
+            &routes.registry,
+            "local/my-model",
+        )
+        .unwrap()]),
+        None,
+    )
+    .await
+    .unwrap();
     let err = delete_user_model(&pool, &bus, &routes, "local/my-model", None)
         .await
         .unwrap_err();
-    assert!(err.contains("only model"), "{err}");
+    assert!(err.contains("Pick another default"), "{err}");
     let kept = crate::core::ModelStore::get(&pool, "local/my-model").await;
     assert!(kept.unwrap().is_some(), "a refusal deletes nothing");
 
     set_model_on_chat_ladder(&pool, &bus, &routes, "claude-haiku-5-5", true, None)
         .await
         .unwrap();
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::CHAT_MODEL.key(),
+        "claude-haiku-5-5",
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         delete_user_model(&pool, &bus, &routes, "local/my-model", None).await,
         Ok(true)
     );
     let stored = prefs::INTELLIGENCE_LADDER_CHAT.read(&pool).await.unwrap();
     assert!(!stored.contains("my-model"), "{stored}");
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The default stays undeletable while it is off the ladder. The override
+/// leaves it out, and its unavailable provider keeps the default rung off.
+#[tokio::test]
+async fn the_default_model_off_the_ladder_cannot_be_deleted() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    sqlx::query(
+        "INSERT INTO models (id, label, routes, sort_order, source) VALUES \
+         ('local/my-model', 'My Model', '[{\"provider\": \"local\"}]', 1000, 'user')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let routes = routes_of(&pool).await;
+    let mine =
+        ladder::chat_joining_intelligence_rung(&routes.registry, "local/my-model").expect("a row");
+    let haiku = ladder::chat_joining_intelligence_rung(&routes.registry, "claude-haiku-5-5")
+        .expect("a row");
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::INTELLIGENCE_LADDER_CHAT.key(),
+        &override_value(&[haiku]),
+        None,
+    )
+    .await
+    .unwrap();
+    PreferenceStore::set(&pool, &bus, prefs::CHAT_MODEL.key(), "local/my-model", None)
+        .await
+        .unwrap();
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        &override_value(&[mine]),
+        None,
+    )
+    .await
+    .unwrap();
+    let mut unconfigured = routes;
+    unconfigured
+        .configured
+        .retain(|provider| *provider != ProviderKind::Local);
+    assert!(
+        !ladder::load(&pool, &unconfigured, LadderSurface::Chat)
+            .await
+            .lists_model("local/my-model"),
+        "an unavailable provider takes the model off the ladder"
+    );
+
+    let err = delete_user_model(&pool, &bus, &unconfigured, "local/my-model", None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Pick another default"), "{err}");
+    let kept = crate::core::ModelStore::get(&pool, "local/my-model").await;
+    assert!(kept.unwrap().is_some(), "a refusal deletes nothing");
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -420,6 +539,16 @@ async fn copy_from_chat_writes_the_coding_override_and_leaves_chat_alone() {
         async move { copy_chat_ladder_to(&pool, &bus, &routes, target, None).await }
     };
 
+    PreferenceStore::set(
+        &pool,
+        &bus,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        "claude-opus-5-5=max",
+        None,
+    )
+    .await
+    .unwrap();
+
     let copied = copy(LadderSurface::ClaudeCode).await.expect("a copy");
     let expected = vec![
         pair("claude-haiku-5-5", "high"),
@@ -444,6 +573,9 @@ async fn copy_from_chat_writes_the_coding_override_and_leaves_chat_alone() {
     assert!(prefs::INTELLIGENCE_LADDER_CODEX.read(&pool).await.is_none());
     assert!(copy(LadderSurface::Chat).await.is_err());
 
+    PreferenceStore::delete(&pool, &bus, prefs::CHAT_REASONING_EFFORTS.key(), None)
+        .await
+        .unwrap();
     let shipped_cc = ladder::shipped_on(LadderSurface::ClaudeCode, |m, e| {
         ladder::is_offered(crate::runtime::CodingAgent::ClaudeCode, m, e)
     });
@@ -492,7 +624,7 @@ async fn sort_ladder_writes_the_sorted_override_and_clears_one_equal_to_shipped(
         }
     };
 
-    set("claude-sonnet-5-5=low, claude-haiku-5-5=high".into()).await;
+    set("claude-sonnet-5-5=high, claude-haiku-5-5=low".into()).await;
     assert!(!ladder::load(&pool, &routes, target).await.climbs);
     let sorted = sort_ladder(&pool, &bus, &routes, target, None)
         .await
@@ -500,8 +632,9 @@ async fn sort_ladder_writes_the_sorted_override_and_clears_one_equal_to_shipped(
     assert_eq!(
         sorted,
         vec![
-            pair("claude-haiku-5-5", "high"),
-            pair("claude-sonnet-5-5", "low")
+            pair("claude-haiku-5-5", "low"),
+            pair("claude-sonnet-5-5", "high"),
+            pair("claude-opus-5-5", "medium")
         ]
     );
     assert_eq!(
@@ -509,7 +642,7 @@ async fn sort_ladder_writes_the_sorted_override_and_clears_one_equal_to_shipped(
             .read(&pool)
             .await
             .as_deref(),
-        Some("claude-haiku-5-5=high, claude-sonnet-5-5=low")
+        Some("claude-haiku-5-5=low, claude-sonnet-5-5=high, claude-opus-5-5=medium")
     );
     let served = ladder::load(&pool, &routes, target).await;
     assert!(served.climbs && served.customised);
@@ -531,27 +664,35 @@ async fn sort_ladder_writes_the_sorted_override_and_clears_one_equal_to_shipped(
     teardown_test_db(&db_name).await;
 }
 
-/// The chat ladder is the only switch for what the picker lists, so no code
-/// reads the `models.enabled` column it replaced. The column itself stays
-/// until a later migration drops it.
-#[test]
-fn nothing_reads_the_enabled_column_of_models() {
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let statement = regex::Regex::new(r"\b(?:FROM|UPDATE|INTO|JOIN)\s+models\b").unwrap();
-    let enabled = regex::Regex::new(r"\benabled\b").unwrap();
-    let mut offenders = Vec::new();
-    let mut dirs = vec![crates];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            if path.is_dir() {
-                if name != "target" && name != "node_modules" {
-                    dirs.push(path);
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") || name == "chat_ladder_tests.rs" {
+mod guard_tests {
+    /// The chat ladder is the only switch for what the picker lists, so no code
+    /// reads the `models.enabled` column it replaced. The column itself stays
+    /// until a later migration drops it.
+    #[test]
+    fn nothing_reads_the_enabled_column_of_models() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let statement = regex::Regex::new(r"\b(?:FROM|UPDATE|INTO|JOIN)\s+models\b").unwrap();
+        let enabled = regex::Regex::new(r"\benabled\b").unwrap();
+        let mut offenders = Vec::new();
+        // Browser runs create and remove nested worktrees under test-results.
+        // The index names the source population without traversing that runtime data.
+        let sources = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", "*.rs"])
+            .current_dir(&crates)
+            .output()
+            .expect("list tracked Rust sources");
+        assert!(
+            sources.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sources.stderr)
+        );
+        let paths = std::str::from_utf8(&sources.stdout).unwrap();
+        for relative in paths.split('\0').filter(|path| !path.is_empty()) {
+            let path = crates.join(relative);
+            if path
+                .file_name()
+                .is_some_and(|name| name == "chat_ladder_tests.rs")
+            {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
@@ -565,6 +706,88 @@ fn nothing_reads_the_enabled_column_of_models() {
                 }
             }
         }
+        assert!(offenders.is_empty(), "{offenders:#?}");
     }
-    assert!(offenders.is_empty(), "{offenders:#?}");
+}
+
+#[tokio::test]
+async fn setting_the_default_persists_the_pair_on_each_surface() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let routes = routes_of(&pool).await;
+    let actor = MessageOrigin::Device {
+        device_id: "test-device".into(),
+    };
+    let effort_key = prefs::CHAT_REASONING_EFFORTS.key();
+    PreferenceStore::set(&pool, &bus, effort_key, "claude-opus-5-5=high", None)
+        .await
+        .unwrap();
+
+    for (surface, pick) in [
+        (LadderSurface::Chat, pair("claude-sonnet-5-5", "low")),
+        (LadderSurface::ClaudeCode, pair("claude-sonnet-5-5", "low")),
+        (LadderSurface::Codex, pair("gpt-6.2-sol", "high")),
+    ] {
+        let key = surface.override_pref();
+        let original_default = ladder::load(&pool, &routes, surface)
+            .await
+            .default_intelligence_rung
+            .unwrap();
+        assert!(key.read(&pool).await.is_none());
+        set_default_intelligence_rung(&pool, &bus, &routes, surface, &pick, actor.clone())
+            .await
+            .unwrap();
+        assert!(
+            key.read(&pool).await.is_none(),
+            "an unset override stays unset"
+        );
+        let current = ladder::load(&pool, &routes, surface).await;
+        assert_eq!(current.default_intelligence_rung.as_ref(), Some(&pick));
+        assert_eq!(current.check_pick(&pick), Ok(()));
+
+        let original = format!("{original_default}, unavailable-model=low");
+        PreferenceStore::set(&pool, &bus, key.key(), &original, None)
+            .await
+            .unwrap();
+        set_default_intelligence_rung(
+            &pool,
+            &bus,
+            &routes,
+            surface,
+            &original_default,
+            actor.clone(),
+        )
+        .await
+        .unwrap();
+        let customised = ladder::load(&pool, &routes, surface).await;
+        assert!(customised.check_pick(&pick).is_err());
+        let expected = customised.on_with(&pick).unwrap();
+        set_default_intelligence_rung(&pool, &bus, &routes, surface, &pick, actor.clone())
+            .await
+            .unwrap();
+        set_default_intelligence_rung(
+            &pool,
+            &bus,
+            &routes,
+            surface,
+            &original_default,
+            actor.clone(),
+        )
+        .await
+        .unwrap();
+
+        let current = ladder::load(&pool, &routes, surface).await;
+        assert_eq!(current.pairs(), expected);
+        let stored = key.read(&pool).await.unwrap();
+        assert!(stored.contains("unavailable-model=low"), "{stored}");
+        assert!(stored.contains(&pick.to_string()), "{stored}");
+    }
+    assert_eq!(
+        PreferenceStore::user_chat_effort(&pool, "claude-opus-5-5")
+            .await
+            .as_deref(),
+        Some("high"),
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }

@@ -23,6 +23,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/test_skip.sh
+source "$SCRIPT_DIR/test_skip.sh"
+test_skip_unless_present "$SCRIPT_DIR/../.." scripts/release.sh scripts/release-to-lucidos.sh scripts/lib/release_tree.sh
 # shellcheck source=scripts/lib/private_data_patterns.sh
 source "$SCRIPT_DIR/private_data_patterns.sh"
 

@@ -17,9 +17,6 @@ import type { App } from '../../store/types';
 import { reusableWidgets } from '../../store/widgets';
 import type { Dashboard } from '../../generated/thread-event-wire';
 
-/** Add a reusable widget to `dashboard`. One that needs params goes to Home
- *  as a drafted prompt, so the agent asks for them: a dashboard has no chat
- *  of its own. */
 function addWidget(widget: App, dashboard: Dashboard): void {
   const required = Object.entries(widget.params ?? {}).filter(([, p]) => p.required).map(([n]) => n);
   if (required.length === 0) {
@@ -37,10 +34,6 @@ function addWidget(widget: App, dashboard: Dashboard): void {
   focusPromptNow();
 }
 
-/** The installed reusable widgets, as menu rows that add one to `dashboard`,
- *  and the installed apps below them, each an app shortcut.
- *  A plugin in a catalog has nothing on disk, so it is never listed and runs
- *  no code before install. The caller loads the list as its menu opens. */
 export function WidgetPickerItems({ run, dashboard }: { run: OverflowMenuContext['run']; dashboard: Dashboard }) {
   const listRef = useRef<HTMLDivElement>(null);
   const filter = useListFilter({ enabled: true });

@@ -1,9 +1,3 @@
-/**
- * `lucidos.storage`, the public face of app storage.
- *
- * Two shapes. An isolated frame reads from the primed mirror. A standalone app
- * tab writes browser storage itself, under the keys the host writes for a frame.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as bridge from './_bridge';
 import { _resetBridgedStorageForTesting, wsLocalGet } from './_storage';
@@ -105,7 +99,7 @@ describe('in an isolated frame', () => {
     expect(() => storage.local.setItem('big', 'x'.repeat(APP_STORAGE_VALUE_MAX + 1)))
       .toThrow(expect.objectContaining({ name: 'QuotaExceededError' }));
     expect(storage.local.getItem('big')).toBeNull();
-    expect(call).toHaveBeenCalledTimes(1); // the prime only
+    expect(call).toHaveBeenCalledTimes(1);
   });
 
   it('throws QuotaExceededError past the per-app quota', async () => {
@@ -116,9 +110,7 @@ describe('in an isolated frame', () => {
     storage.local.setItem('b', chunk);
     expect(2 * chunk.length + 2).toBeLessThanOrEqual(APP_STORAGE_QUOTA);
     expect(() => storage.local.setItem('c', chunk)).toThrow(expect.objectContaining({ name: 'QuotaExceededError' }));
-    // Replacing a key counts it once, at its new size.
     expect(() => storage.local.setItem('a', chunk)).not.toThrow();
-    // The session area has its own quota.
     expect(() => storage.session.setItem('c', chunk)).not.toThrow();
   });
 
@@ -166,8 +158,6 @@ describe('in a standalone app tab', () => {
   });
 
   it('writes the same key the host writes for a frame', () => {
-    // The literals here pin the stored key layout, shared with the host.
-    // Changing it orphans every value already saved.
     storage.local.setItem('room', 'kitchen');
     expect(local.getItem('ws:myws:appbridge:habit-tracker:app:room')).toBe('kitchen');
     expect(storage.local.getItem('room')).toBe('kitchen');

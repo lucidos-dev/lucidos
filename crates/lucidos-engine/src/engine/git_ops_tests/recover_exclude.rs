@@ -517,7 +517,7 @@ async fn add_paths_to_worktree_exclude_makes_git_status_honor_paths_in_worktree(
 /// itself to keep the constant and the matching semantics in lockstep.
 #[tokio::test]
 async fn worktree_exclude_paths_hide_deep_app_lucidos_cli_skill_from_git_status() {
-    use super::super::claude_code::WORKTREE_EXCLUDE_PATHS;
+    use crate::engine::worktree_artifacts::WORKTREE_EXCLUDE_PATHS;
 
     let (_tmp, repo) = make_test_repo().await;
 
@@ -1208,7 +1208,7 @@ async fn skip_worktree_tag(wt: &std::path::Path) -> String {
 /// would be overwritten" behind a clean `git status`.
 #[tokio::test]
 async fn lucidos_source_spawn_never_blocks_merging_main() {
-    use crate::engine::agent_session::CodingAgentKind;
+    use crate::engine::thread_events::CodingAgentKind;
     use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
 
     let (_tmp, repo) = make_test_repo().await;
@@ -1235,7 +1235,7 @@ async fn lucidos_source_spawn_never_blocks_merging_main() {
 /// respawn: the engine's embedded copy never overwrites the tracked one.
 #[tokio::test]
 async fn lucidos_source_spawn_keeps_the_branch_copy() {
-    use crate::engine::agent_session::CodingAgentKind;
+    use crate::engine::thread_events::CodingAgentKind;
     use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
 
     let (_tmp, repo) = make_test_repo().await;
@@ -1259,7 +1259,7 @@ async fn lucidos_source_spawn_keeps_the_branch_copy() {
 /// written over a tracked stale one, and the divergence is hidden.
 #[tokio::test]
 async fn external_spawn_installs_and_hides_the_engine_copy() {
-    use crate::engine::agent_session::CodingAgentKind;
+    use crate::engine::thread_events::CodingAgentKind;
     use crate::runtime::lucidos_cli::place_lucidos_cli_skill;
 
     let (_tmp, repo) = make_test_repo().await;

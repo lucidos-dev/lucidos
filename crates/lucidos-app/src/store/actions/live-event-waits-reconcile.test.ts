@@ -1,26 +1,5 @@
-/**
- * Regression: the subscription panel kept rendering an *event wait* the engine
- * had already resolved, reason text and live countdown and all.
- *
- * Root cause: `meta.liveEventWaits` was built ONLY by folding a thread's own
- * `EventWait*` events. `makeThreadState` seeded it to `[]` and `upsertThread`
- * never touched it again, and no API returned it on a summary, so no snapshot
- * could correct it. One missed `EventWaitDelivered` stranded the wait forever.
- * `handleEvent`'s seq-dedup guard returns before the fold, so a re-delivery of
- * the same sequence could not repair it either. The diagnostic signature was
- * the count reading 0 while the panel still drew the wait.
- *
- * Fix: `thread_summaries.live_event_waits`, written in the same statement as
- * `live_event_wait_count`, carried on both `ThreadSummary` and
- * `ThreadAggregate`, and overwritten by both snapshot paths.
- *
- * The load-bearing test is the first one: the client is deliberately never
- * handed the delivery. A test that fed it the resolution would prove only that
- * the fold works, which was never in doubt.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage before store.ts is imported at module level.
 vi.hoisted(() => {
   const storage = new Map<string, string>();
   (globalThis as any).localStorage = {
@@ -50,7 +29,6 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-/** When the wait was armed, and when the engine resolved it. */
 const ARMED_AT = '2026-08-14T10:00:00.000Z';
 const RESOLVED_AT = '2026-08-14T10:07:00.000Z';
 
@@ -89,7 +67,6 @@ function summary(overrides: Partial<ThreadSummary>): ThreadSummary {
   };
 }
 
-/** A thread whose client folded in the arm and is still drawing the panel. */
 function watchingThread(): Map<string, ThreadState> {
   const map = new Map<string, ThreadState>();
   map.set('t1', makeThreadState('t1', {
@@ -104,8 +81,6 @@ beforeEach(() => {
 });
 
 describe('upsertThread reconciles the live event-wait list against the server', () => {
-  /** THE regression. The client never sees the `EventWaitDelivered`, exactly as
-   *  in the report, so only the snapshot can save it. */
   it('drops a wait the client never saw resolved, on the next summary snapshot', () => {
     const map = watchingThread();
 
@@ -132,8 +107,6 @@ describe('upsertThread reconciles the live event-wait list against the server', 
     expect(map.get('t1')!.meta.liveEventWaits).toEqual([WAIT]);
   });
 
-  /** A GET issued before the arm, landing after live SSE already applied it.
-   *  Without the version guard this blanks a wait that is genuinely live. */
   it('does not blank a freshly armed wait when the GET snapshot is older', () => {
     const map = new Map<string, ThreadState>();
     const thread = makeThreadState('t1', {
@@ -147,8 +120,6 @@ describe('upsertThread reconciles the live event-wait list against the server', 
     expect(map.get('t1')!.meta.liveEventWaits).toEqual([WAIT]);
   });
 
-  /** The mirror image: a GET issued before the delivery must not put a dead
-   *  wait back on screen, counting down to a deadline nobody is waiting for. */
   it('does not resurrect a resolved wait when the GET snapshot is older', () => {
     const map = new Map<string, ThreadState>();
     const thread = makeThreadState('t1', { meta: { id: 't1', updatedAt: RESOLVED_AT } });
@@ -160,9 +131,6 @@ describe('upsertThread reconciles the live event-wait list against the server', 
     expect(map.get('t1')!.meta.liveEventWaits).toEqual([]);
   });
 
-  /** Absence is not emptiness. A partial fixture must leave a populated list
-   *  alone, rather than silently clearing it and hiding a regression behind a
-   *  passing test. */
   it('leaves the list alone when the snapshot omits the field', () => {
     const map = watchingThread();
     const partial = summary({ last_activity: RESOLVED_AT });
@@ -174,10 +142,6 @@ describe('upsertThread reconciles the live event-wait list against the server', 
   });
 });
 
-/** The per-event aggregate is the second reconciliation path, and the stronger
- *  one: `handleEvent` applies it BEFORE the `thread.events.has(seq)` dedup
- *  guard. So even a re-delivered sequence repairs a stranded list, which is the
- *  one path that could not repair it before. */
 describe('handleEvent repairs the list from the per-event aggregate', () => {
   const aggregate = (waits: EventWaitSummary[]): ThreadAggregate => ({
     liveEventWaitCount: waits.length,
@@ -207,9 +171,6 @@ describe('handleEvent repairs the list from the per-event aggregate', () => {
     expect(map.get('t1')!.meta.liveEventWaits).toEqual([]);
   });
 
-  /** The aggregate lands first and the fold runs second, so the two must
-   *  converge rather than double-count. `eventWaitProjection` is idempotent by
-   *  `wait_id`, which is what makes that true. */
   it('does not duplicate a wait the aggregate already carries', () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { id: 't1', updatedAt: ARMED_AT } }));

@@ -3,11 +3,8 @@ import { randomUUID } from 'crypto';
 import { assertHealthy, navigateToApp, openThreadDrawer } from './helpers';
 import { clearAllThreads, psql } from './db-helpers';
 
-/** Enough turns that the transcript scrolls well past one screen. */
 const EXCHANGES = 30;
 
-/** A thread parked on a question, its last turn. Returns the question's event
- *  id, which the question card's turn wears as `data-event-id`. */
 function seedQuestionThread(threadId: string, title: string, lastAction: string): string {
   const questionId = randomUUID();
   const base = Date.parse(lastAction) - EXCHANGES * 3000;
@@ -41,7 +38,6 @@ function visibleScroller(page: Page) {
   });
 }
 
-/** Is the question card's turn top inside the transcript's viewport? */
 function questionInView(page: Page, eventId: string) {
   return page.evaluate((eid) => {
     const scroller = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
@@ -59,15 +55,12 @@ async function scrollTranscriptToTop(page: Page) {
   const box = await page.locator('.thread-content:visible').first().boundingBox();
   if (!box) throw new Error('no visible transcript');
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  // The landing draws from the question's turn (ADR 0631). Each wheel at the
-  // top grows older turns above the reader, so wheel until the first is drawn.
   await expect.poll(async () => {
     await page.mouse.wheel(0, -100_000);
     const top = (await visibleScroller(page))?.top;
     const firstDrawn = await page.locator('.chat-exchange:visible', { hasText: 'Message 1:' }).count();
     return top === 0 && firstDrawn > 0;
   }, { timeout: 15_000 }).toBe(true);
-  // Past the scroll memory's save debounce.
   await page.waitForTimeout(800);
 }
 
@@ -133,8 +126,6 @@ test.describe('Opening a thread from Blocked lands on its question', () => {
     await row(page, ids[2]).click();
     await expectLandsOnQuestion(page, questions[2]);
     await scrollTranscriptToTop(page);
-    // A thread waiting on a question offers no Archive, so the middle row is a
-    // failed thread instead.
     psql([
       `DELETE FROM events WHERE aggregate_id = '${ids[1]}'`,
       `UPDATE thread_summaries SET status = 'failed' WHERE thread_id = '${ids[1]}'`,

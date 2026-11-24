@@ -1,10 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { nextMenuIndex } from '../OverflowMenu';
 
-// The ⋯ menu's roving-focus math: ↑/↓ wrap at both ends; Home/End jump to the
-// edges; a no-focus start (-1) steps to the natural end for the direction.
 describe('nextMenuIndex', () => {
-  const N = 4; // e.g. Pin / Archive / Copy ref / Download
+  const N = 4;
 
   it('ArrowDown advances and wraps past the last item', () => {
     expect(nextMenuIndex(0, N, 'ArrowDown')).toBe(1);

@@ -1,12 +1,4 @@
 #!/usr/bin/env node
-// Replays the same scripted turns against the real Claude Code and the fake,
-// then diffs what the engine would parse from each. Run by the workspace
-// trigger claude-code-fake-drift when the installed version changes.
-//
-//   node drift-check.mjs --real <path to claude>
-//
-// Exit 0: in step. 1: drift. 2: could not run, which is unknown, not a pass.
-// The real side spends two short Haiku turns.
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
@@ -21,29 +13,20 @@ export const EXIT_UNKNOWN = 2;
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), 'claude.mjs');
 const TURN_TIMEOUT_MS = 120_000;
 
-// The engine's session spawn flags (build_command_with_settings in
-// runtime/claude_code.rs), split three ways. fake-claude-code.test.ts pins the
-// union to that function, so a new engine flag fails until it is placed here.
-// Flags that shape the stream, passed on every spawn:
 export const SESSION_FLAGS = [
   '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
   '--replay-user-messages', '--include-partial-messages',
 ];
-// Flags each scenario sets itself:
 export const SCENARIO_FLAGS = ['--print', '--resume', '--model'];
-// Flags left out, because none changes a line the check diffs:
 export const UNREPLAYED_FLAGS = [
   '--permission-mode', '--permission-prompt-tool', '--mcp-config', '--settings', '--add-dir', '--append-system-prompt-file',
 ];
 
-// Lines the engine reads, and the fields it reads from each
-// (runtime/claude_code_parse.rs, cc_model_discovery.rs).
 const PARSED_MODEL_FIELDS = ['value', 'resolvedModel', 'displayName', 'description', 'supportsEffort', 'supportedEffortLevels'];
 
-// Lines the engine skips today. A real-only line outside this list and the
-// parsed set is reported as a notice: Claude Code grew something new.
 const KNOWN_IGNORED = new Set([
   'system/hook_started', 'system/hook_progress', 'system/hook_response', 'system/status',
+  'system/informational', 'system/commands_changed',
   'system/thinking_tokens', 'command_lifecycle', 'rate_limit_event', 'assistant',
   'stream_event/content_block_start', 'stream_event/content_block_delta',
   'stream_event/content_block_stop', 'stream_event/message_stop',
@@ -51,18 +34,14 @@ const KNOWN_IGNORED = new Set([
 
 const keysOf = (obj, wanted) => wanted.filter((k) => obj != null && obj[k] !== undefined).join(',');
 
-/** The engine's view of one line, or null when the engine skips it. */
 export function signature(line) {
   const kind = line.subtype ? `${line.type}/${line.subtype}` : line.type;
   switch (line.type) {
     case 'control_response': {
       const r = line.response ?? {};
-      // Which models a machine lists depends on its settings, so only the
-      // distinct field shapes count. diffShapes lets the fake carry extra ones.
       const models = r.response?.models;
       const shapes = Array.isArray(models) ? [...new Set(models.map((m) => keysOf(m, PARSED_MODEL_FIELDS)))].sort() : null;
       const modelFields = shapes ? `models[${shapes.join('|')}]` : '';
-      // The engine reads success or error off `subtype`, so its value counts.
       return `control_response/${r.subtype}{${keysOf(r, ['request_id'])}}${modelFields}`;
     }
     case 'system':
@@ -72,8 +51,6 @@ export function signature(line) {
     case 'user':
       return line.isReplay === true ? `user/replay{${keysOf(line.message, ['content'])}}` : 'user/tool_result';
     case 'assistant': {
-      // Thinking frames are model behaviour, and the engine renders them only
-      // for relayed models, so only text and tool_use blocks count.
       const blocks = (line.message?.content ?? []).map((b) => b.type).filter((t) => t === 'text' || t === 'tool_use');
       if (blocks.length === 0) return null;
       return `assistant{${keysOf(line.message, ['id', 'model', 'usage'])}}[${blocks.join(',')}]`;
@@ -91,12 +68,10 @@ export function signature(line) {
   }
 }
 
-/** The ordered signatures of a stream. The engine parses every frame, so repeats count. */
 export function shapeOf(lines) {
   return lines.map(signature).filter((sig) => sig !== null);
 }
 
-/** Line kinds only the real side sent that the engine has never seen. */
 export function unknownKinds(lines) {
   const kinds = new Set();
   for (const line of lines) {
@@ -110,12 +85,6 @@ export function unknownKinds(lines) {
 
 const MODELS_SUFFIX = /^(.*)models\[(.*)\]$/;
 
-/**
- * The model row shapes the real side sends that the fake lacks, or null when
- * either signature carries no model list or the rest of the line differs.
- * Which row shapes a machine lists depends on its gateway, so the fake may
- * send more shapes than the real CLI does, never fewer.
- */
 function missingModelShapes(real, fake) {
   const r = MODELS_SUFFIX.exec(real ?? '');
   const f = MODELS_SUFFIX.exec(fake ?? '');
@@ -124,7 +93,6 @@ function missingModelShapes(real, fake) {
   return r[2].split('|').filter((shape) => !fakeShapes.has(shape));
 }
 
-/** Every difference between two shapes, as readable lines. Empty when in step. */
 export function diffShapes(real, fake) {
   const diffs = [];
   const length = Math.max(real.length, fake.length);
@@ -138,7 +106,6 @@ export function diffShapes(real, fake) {
   return diffs;
 }
 
-/** Run one scenario: write `inputs` in turn, each after the reply to the last. */
 function runScenario(binary, args, cwd, inputs) {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -167,7 +134,11 @@ function runScenario(binary, args, cwd, inputs) {
         if (inputs[next - 1]?.doneWhen(line)) send();
       }
     });
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    const fail = (e) => { clearTimeout(timer); reject(e); };
+    child.on('error', fail);
+    child.stdin.on('error', (e) => {
+      if (e.code !== 'EPIPE') fail(e);
+    });
     child.on('close', () => { clearTimeout(timer); resolve(lines); });
     send();
   });
@@ -185,22 +156,50 @@ const controlTurn = (subtype, extra = {}) => {
   };
 };
 
-/** Every scenario against one CLI, `command` plus its leading `prefix` args. */
+const initialize = controlTurn('initialize');
+const findInit = (lines) => lines.find((l) => l.type === 'system' && l.subtype === 'init');
+
+export function incompleteScenario(runs) {
+  if (!runs.probe.some(initialize.doneWhen)) {
+    return { scenario: 'probe', reason: 'missing control_response for initialize' };
+  }
+  for (const scenario of ['first', 'resumed']) {
+    const lines = runs[scenario];
+    const init = findInit(lines);
+    const result = lines.find((l) => l.type === 'result');
+    if (result && (result.subtype !== 'success' || result.is_error === true)) {
+      const errorFlag = result.subtype === 'success' ? ' with is_error=true' : '';
+      const timing = !init || lines.indexOf(result) < lines.indexOf(init) ? ' before system/init' : '';
+      return { scenario, reason: `result/${result.subtype ?? '(missing subtype)'}${errorFlag}${timing}` };
+    }
+    if (!init) return { scenario, reason: 'missing system/init' };
+    if (!result) return { scenario, reason: 'missing result/success' };
+    if (scenario === 'first' && !init.session_id) {
+      return { scenario, reason: 'system/init reported no session id' };
+    }
+  }
+  return null;
+}
+
 async function runAll([command, ...prefix], cwd) {
-  const run = (args, inputs) => runScenario(command, [...prefix, ...SESSION_FLAGS, ...args], cwd, inputs);
-  const probe = await run(['--no-session-persistence'], [controlTurn('initialize')]);
-  const first = await run(['--model', 'haiku'], [userTurn('Say exactly: "drift-one" and nothing else. Do not create any files.')]);
-  const sessionId = first.find((l) => l.type === 'system' && l.subtype === 'init')?.session_id;
-  if (!sessionId) throw new Error('the first turn reported no session id');
-  const resumed = await run(['--model', 'haiku', '--print', '--resume', sessionId], [
+  const run = async (scenario, args, inputs) => {
+    try {
+      return await runScenario(command, [...prefix, ...SESSION_FLAGS, ...args], cwd, inputs);
+    } catch (e) {
+      throw new Error(`${scenario}: ${e.message}`, { cause: e });
+    }
+  };
+  const probe = await run('probe', ['--no-session-persistence'], [initialize]);
+  const first = await run('first', ['--model', 'haiku'], [userTurn('Say exactly: "drift-one" and nothing else. Do not create any files.')]);
+  const sessionId = findInit(first)?.session_id;
+  if (!sessionId) return { probe, first, resumed: [], resumeKeptId: false };
+  const resumed = await run('resumed', ['--model', 'haiku', '--print', '--resume', sessionId], [
     userTurn('Say exactly: "drift-two" and nothing else. Do not create any files.'),
-    // The engine sends neither of the next two: the rung locks for a turn
-    // (ADR 0542). They stay as canaries: the day the CLI changes, shapes differ.
     controlTurn('set_reasoning_effort', { effort: 'low' }),
     controlTurn('set_model', { model: 'haiku' }),
     controlTurn('interrupt'),
   ]);
-  const resumedId = resumed.find((l) => l.type === 'system' && l.subtype === 'init')?.session_id;
+  const resumedId = findInit(resumed)?.session_id;
   return { probe, first, resumed, resumeKeptId: resumedId === sessionId };
 }
 
@@ -228,14 +227,18 @@ async function main(argv) {
     try {
       realRuns = await runAll([real], work);
     } catch (e) {
-      console.log(`UNKNOWN: the real claude did not complete the script: ${e.message}`);
+      console.log(`UNKNOWN: the real claude did not complete ${e.message}`);
+      return EXIT_UNKNOWN;
+    }
+    const incomplete = incompleteScenario(realRuns);
+    if (incomplete) {
+      console.log(`UNKNOWN: the real claude did not complete ${incomplete.scenario}: ${incomplete.reason}`);
       return EXIT_UNKNOWN;
     }
     let fakeRuns;
     try {
       fakeRuns = await runAll([process.execPath, FAKE], work);
     } catch (e) {
-      // The real CLI completed the script and the fake did not: the fake is what broke.
       console.log(`DRIFT fake: the fake did not complete the script: ${e.message}`);
       return EXIT_DRIFT;
     }
@@ -257,7 +260,6 @@ async function main(argv) {
     return drift ? EXIT_DRIFT : EXIT_IN_STEP;
   } finally {
     rmSync(work, { recursive: true, force: true });
-    // Only the session files this run created: new entries naming its temp dir.
     const tag = work.split('/').pop();
     for (const entry of listDir(projectsDir())) {
       if (!projectsBefore.has(entry) && entry.includes(tag)) rmSync(join(projectsDir(), entry), { recursive: true, force: true });
@@ -266,7 +268,6 @@ async function main(argv) {
 }
 
 const invokedAs = process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href;
-// An escaped error would exit 1, which reads as drift. It is unknown instead.
 if (import.meta.url === invokedAs) {
   main(process.argv.slice(2)).then(
     (code) => process.exit(code),

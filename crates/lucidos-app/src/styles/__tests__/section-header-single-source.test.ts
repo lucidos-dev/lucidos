@@ -1,11 +1,3 @@
-/**
- * Every list panel draws its sections with one header and its rows with one
- * hairline: the thread drawer, Triggers, Changes and Thread queue
- * (docs/plans/2026-09-30-list-panel-section-headers.md).
- *
- * A source scan. The rendered look is measured by
- * e2e/list-panel-sections.spec.ts.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -26,7 +18,6 @@ const PANELS = {
   threadQueue: 'components/thread-queue/ThreadQueueView.tsx',
 };
 
-/** Classes each panel used to style its own header with. */
 const RETIRED = [
   'trigger-group-chevron',
   'trigger-group-count',
@@ -47,8 +38,6 @@ describe('the list panels share one section header', () => {
   });
 
   it('gives every collapsible header the chevron, from the shared content', () => {
-    // The two components that mark a header collapsible. Each passes
-    // `collapsible`, which is what draws the chevron.
     for (const path of ['components/shared/SectionHeader.tsx', 'components/drawer/ThreadDrawer.tsx']) {
       const src = read(path);
       expect(src, path).toContain('list-section-title-collapsible');
@@ -66,7 +55,6 @@ describe('the list panels share one section header', () => {
       'components/layout/ThreadFilterPanel.tsx',
     ].map(read);
     const sheets = styleSheetPaths(resolve(SRC, 'styles')).map((p: string) => readFileSync(p, 'utf-8'));
-    // The whole class name, so a spec file named after one does not count.
     const found = RETIRED.filter(cls => {
       const named = new RegExp(`(?<![\\w-])${cls}(?![\\w-])`);
       return [...sources, ...sheets].some(src => named.test(src));
@@ -75,7 +63,6 @@ describe('the list panels share one section header', () => {
   });
 
   it('keeps the Triggers heading class a hook, with no look of its own', () => {
-    // It stays for the hover reveal of rename and delete, and for e2e.
     const skills = cssRules(read('styles/skills.css'));
     const styled = skills.filter(r => selectorList(r.selector).some(s => /\.trigger-group-header\s*$/.test(s)));
     expect(styled.map(r => r.selector)).toEqual([]);

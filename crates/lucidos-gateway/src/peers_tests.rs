@@ -4,10 +4,8 @@
 //! reads the machine it runs on. The developer running these has a real bundle
 //! and a real dev gateway, and either would otherwise answer for a fixture.
 //!
-//! The load-bearing pair is `a_peer_serving_http_reports_http` and
-//! `a_peer_serving_https_reports_https`. Two shipped gateways disagree on the
-//! scheme, so a probe that assumed one composes a dead URL for half the machines
-//! this feature exists for.
+//! The probe trusts only a leaf the loopback CA issued, so the foreign-cert
+//! case is the load-bearing one: a squatter on the port is not a gateway.
 
 use super::*;
 use crate::registry::Workspace;
@@ -72,7 +70,7 @@ impl Fixture {
 
     /// The dev source checkout, its data dir registered with `entries`.
     fn source_checkout(&self, entries: &[Entry]) -> PathBuf {
-        let data = self.home.join(".lucidos/gateway");
+        let data = self.home.join(".lucidos/private/gateway");
         self.register(&data, entries);
         data
     }
@@ -309,7 +307,8 @@ fn stand_in_router(body: Value) -> Router {
     )
 }
 
-/// Serve `body` over plain http on a free loopback port.
+/// Serve `body` over plain http on a free loopback port, the way a gateway
+/// from before loopback TLS did.
 async fn http_stand_in(body: Value) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -319,11 +318,9 @@ async fn http_stand_in(body: Value) -> u16 {
     port
 }
 
-/// Serve `body` over https on a free loopback port, behind a cert minted here.
-/// A checked-in cert would expire and fail a test years from now.
-async fn https_stand_in(body: Value) -> u16 {
-    // Installing twice in one test binary is an error, and every https case
-    // asks. The first caller wins and the rest read the same provider.
+/// Serve `body` over https behind a self-signed cert the loopback CA never
+/// issued: a squatter on a gateway's port.
+async fn foreign_https_stand_in(body: Value) -> u16 {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let config = axum_server::tls_rustls::RustlsConfig::from_pem(
@@ -344,38 +341,42 @@ async fn https_stand_in(body: Value) -> u16 {
 }
 
 #[tokio::test]
-async fn a_peer_serving_http_reports_http() {
+async fn a_peer_serving_the_loopback_ca_leaf_answers_as_gateway() {
+    let peer = lucidos_local_token::test_support::serve_https(stand_in_router(gateway_body()));
+    assert!(answers_as_gateway(&probe_client(), peer.port()).await);
+}
+
+/// Loopback is https on every gateway now, so plain http is not one of ours.
+#[tokio::test]
+async fn a_plaintext_peer_does_not_answer_as_gateway() {
     let port = http_stand_in(gateway_body()).await;
-    assert_eq!(
-        probe_scheme(&probe_client(), port).await,
-        Some(SCHEME_HTTP),
-        "https is tried first, so http here proves the answer is measured"
-    );
+    assert!(!answers_as_gateway(&probe_client(), port).await);
+}
+
+/// A squatter can claim the role in its body, but not present a leaf the
+/// loopback CA issued.
+#[tokio::test]
+async fn a_peer_with_a_foreign_cert_does_not_answer_as_gateway() {
+    let port = foreign_https_stand_in(gateway_body()).await;
+    assert!(!answers_as_gateway(&probe_client(), port).await);
 }
 
 #[tokio::test]
-async fn a_peer_serving_https_reports_https() {
-    let port = https_stand_in(gateway_body()).await;
-    assert_eq!(
-        probe_scheme(&probe_client(), port).await,
-        Some(SCHEME_HTTPS)
-    );
-}
-
-#[tokio::test]
-async fn nothing_listening_reports_no_scheme() {
+async fn nothing_listening_does_not_answer_as_gateway() {
     // Bind and drop, so the port is free and almost certainly still unclaimed.
     let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = free.local_addr().unwrap().port();
     drop(free);
 
-    assert_eq!(probe_scheme(&probe_client(), port).await, None);
+    assert!(!answers_as_gateway(&probe_client(), port).await);
 }
 
 /// The port is a well-known number and anything may hold it, so the answer has
 /// to say it came from a gateway.
 #[tokio::test]
-async fn something_else_on_the_port_reports_no_scheme() {
-    let port = http_stand_in(json!({"status": "ok", "role": "engine"})).await;
-    assert_eq!(probe_scheme(&probe_client(), port).await, None);
+async fn something_else_on_the_port_does_not_answer_as_gateway() {
+    let other = lucidos_local_token::test_support::serve_https(stand_in_router(
+        json!({"status": "ok", "role": "engine"}),
+    ));
+    assert!(!answers_as_gateway(&probe_client(), other.port()).await);
 }

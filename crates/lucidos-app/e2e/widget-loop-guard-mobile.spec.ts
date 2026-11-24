@@ -3,22 +3,6 @@ import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, gotoWithRetry, hideDashboardRail, navigateToApp } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
 
-/**
- * A widget cannot lock a phone out of the app
- * (`docs/plans/2026-10-18-widget-loop-and-restore-guard.md`). WebKit runs the
- * app frame in the page's process, so a widget that loops hangs the whole
- * page there. The `mobile-webkit` project is the one that proves these.
- *
- * - A widget whose `<html>` observer writes back to `<html>` still sizes its
- *   frame, because the SDK writes only when the host's value changes.
- * - A widget whose content grows with its frame stops growing, because the
- *   widget height guard locks the frame.
- *
- * Both draw the widget in a question option: the one place whose frame follows
- * its content, and so the one the height guard covers (ADR 0621).
- * - A launch that finds the restore guard's marker starts on Home and offers
- *   the thread back.
- */
 
 const OPTION_WIDGET_HEIGHT_PX = 48;
 const MESSAGE_TEXT = 'compare the fares';
@@ -45,8 +29,6 @@ async function writeWidget(page: Page, appId: string, threadId: string, html: st
   }));
 }
 
-/** A thread with one human message, asking a question whose first option draws
- *  `appId` when given. */
 function seedThread(threadId: string, appId?: string): void {
   seededThreads.push(threadId);
   const now = new Date().toISOString();
@@ -77,8 +59,6 @@ function widgetHtml(head: string, body: string): string {
   return `<!doctype html><html><head><script src="/api/v1/sdk.js"></script>${head}</head><body>${body}</body></html>`;
 }
 
-/** The thread-cost widget's preview pin: it re-adds a present class, which
- *  still queues a mutation record, on every write to `<html>`. */
 const SELF_PINNING_WIDGET = widgetHtml(
   `<script>
     function pin() {
@@ -92,8 +72,6 @@ const SELF_PINNING_WIDGET = widgetHtml(
   '<div style="height: 400px">Cost</div>',
 );
 
-/** Content as tall as the frame plus the body margin, so each report grows
- *  the frame by 16 px. */
 const VIEWPORT_TALL_WIDGET = widgetHtml('<style>body { height: 100vh; }</style>', '<p>Cost</p>');
 
 const optionFrame = (page: Page) => page.locator('.widget-frame-option:visible').first();
@@ -130,8 +108,6 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     await openThread(page, threadId);
 
     await expect(optionFrame(page)).toBeVisible({ timeout: 15_000 });
-    // A loop starves the frame's animation frames, so it never reports and
-    // keeps the default height.
     await expect.poll(() => frameHeight(page), { timeout: 15_000 }).not.toBe(OPTION_WIDGET_HEIGHT_PX);
     const height = await frameHeight(page);
     expect(height).toBeGreaterThan(400);
@@ -142,15 +118,12 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     const threadId = randomUUID();
     await writeWidget(page, appId, threadId, VIEWPORT_TALL_WIDGET);
     seedThread(threadId, appId);
-    // A locked runaway returns to its start height. Only the log line tells
-    // that lock from a frame that never reported.
     const locked = page.waitForRequest((req) => req.url().includes('/internal/client-log')
       && req.postDataJSON()?.message === 'height guard locked a frame'
       && req.postDataJSON()?.data?.reason === 'runaway-growth', { timeout: 15_000 });
     await openThread(page, threadId);
     await locked;
 
-    // A locked frame stops moving: two samples apart must agree.
     await expect.poll(async () => {
       const before = await frameHeight(page);
       await page.waitForTimeout(1_500);
@@ -163,8 +136,6 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     const home = ensureHomeThread();
     const threadId = randomUUID();
     seedThread(threadId);
-    // The marker naming the stored focus is what a session that died there
-    // leaves behind. The init script runs on every load, so never reload.
     await page.addInitScript((tid: string) => {
       localStorage.setItem('lucidos-focused-thread', tid);
       localStorage.setItem('lucidos-restore-guard', tid);
@@ -176,12 +147,9 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     const toast = page.locator('.toast', { hasText: 'Started on Home' });
     await expect(toast).toBeVisible();
 
-    // Nothing in the text says a tap opens the thread, so the card keeps a
-    // real button and a tap on the card does nothing.
     await expect(toast).not.toHaveAttribute('data-toast-tap');
     await toast.getByRole('button', { name: 'Open thread' }).click();
     await expect(page.locator('.chat-exchange:visible', { hasText: MESSAGE_TEXT }).first()).toBeVisible();
-    // The marker names the thread, then the window that armed it (ADR 0585).
     await expect.poll(() => page.evaluate(() => localStorage.getItem('lucidos-restore-guard')?.split(' ')[0]))
       .toBe(threadId);
   });

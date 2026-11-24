@@ -1,9 +1,3 @@
-/**
- * The slowness bar, component side: which instance renders and the bar's
- * markup. The dismissal and per-workspace rules are tested in
- * `store/actions/slowness.test.ts` and the wording in
- * `utils/slownessNotice.test.ts`.
- */
 import { describe, expect, it, vi } from 'vitest';
 import type { SlownessEpisode } from '../../../store/actions/slowness';
 import { slownessBannerBody, shouldRenderSlownessBanner } from '../SlownessBanner';

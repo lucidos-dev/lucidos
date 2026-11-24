@@ -1,5 +1,3 @@
-/** Production runtime, real IndexedDB/Web Locks and actual page reloads.
- * The routed origin is disposable; no engine or user workspace is contacted. */
 import { test, expect } from '@playwright/test';
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +17,8 @@ declare const restore: typeof import('../src/store/restoreRuntime')
   & Pick<typeof import('../src/store/actions/unsentMessageRestore'), 'restoreUnsentMessages'>
   & { sdkRequest: typeof import('../../../packages/lucidos-sdk/src/_fetch').request;
       sdkSse: typeof import('../../../packages/lucidos-sdk/src/sse').sse }
-  & Pick<typeof import('../src/store/store'), 'backupProgress'>;
+  & Pick<typeof import('../src/store/store'), 'backupProgress'>
+  & Pick<typeof import('../src/utils/idlePrefetch'), 'startIdlePrefetch'>;
 const origin = 'http://localhost:43119';
 let bundle: string;
 test.beforeAll(async () => {
@@ -31,6 +30,7 @@ test.beforeAll(async () => {
       export * from './src/api/client/_core';
       export { connectThreadEvents, disconnectThreadEvents } from './src/store/actions/thread-sync';
       export { backupProgress } from './src/store/store';
+      export { startIdlePrefetch } from './src/utils/idlePrefetch';
       export * from './src/components/chat/prompt-input-helpers';
       export * from './src/store/pendingUploads';
       export * from './src/store/actions/app-bridge';
@@ -43,7 +43,6 @@ test.beforeAll(async () => {
       resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'ts' },
     bundle: true, write: false, format: 'iife', globalName: 'restore',
     define: { 'import.meta.env.DEV': 'false' },
-    // Match Vite's SDK source alias; the package main is an iframe IIFE.
     alias: { '@lucidos/sdk': fileURLToPath(new URL('../../../packages/lucidos-sdk/src/index.ts', import.meta.url)) },
     plugins: [{ name: 'build-identity', setup(b) {
       b.onResolve({ filter: /^virtual:build-id$/ }, () => ({ path: 'build-id', namespace: 'fixture' }));
@@ -64,8 +63,6 @@ test.beforeEach(async ({ page }) => {
   await page.addScriptTag({ content: bundle });
 });
 
-// Only the browser's socket is controlled. The production transport opener,
-// connectThreadEvents serialization, restore runtime and IndexedDB stay real.
 test('lower-sequence hello journals before subsequent production stream frames', async ({ page }) => {
   const generation = '10000000-0000-4000-8000-000000000001';
   await page.evaluate(() => {
@@ -81,6 +78,7 @@ test('lower-sequence hello journals before subsequent production stream frames',
     Object.defineProperty(window, 'EventSource', { value: Socket, configurable: true });
     restore.installRestoreRuntime();
     restore.connectThreadEvents();
+    restore.startIdlePrefetch();
   });
   await page.evaluate(() => {
     const socket = (window as unknown as { socket: EventSource }).socket;
@@ -104,13 +102,10 @@ test('lower-sequence hello journals before subsequent production stream frames',
   await page.evaluate(generation => {
     const socket = (window as unknown as { socket: EventSource }).socket;
     socket.onopen!(new Event('open'));
-    // A restored log can restart below the old stream's sequence. Queue a
-    // data frame immediately behind its hello while IDB work is outstanding.
     for (const frame of [
       { type: 'StreamHello', seq: 1, data: { restore_generation: generation } },
       { type: 'BackupProgress', seq: 2, data: { phase: 'must not dispatch', progress: 1, total: 2 } },
     ]) socket.onmessage!(new MessageEvent('message', { data: JSON.stringify(frame) }));
-    // Let the new document inspect the old document's state at navigation.
     window.addEventListener('pagehide', () => sessionStorage.setItem('stream-result', JSON.stringify({
       progress: restore.backupProgress.peek(), ready: restore.restoreAdmissionReady(),
     })));
@@ -191,8 +186,6 @@ test('production upload queue is retained through reload without dispatch', asyn
     let dispatched = 0;
     restore.settleQueuedUploadSends(() => { dispatched++; });
     if (dispatched !== 0) throw new Error('Queue ignored in-flight upload');
-    // begin closes admission synchronously; the queued intent and its bytes
-    // must survive capture without dispatch, including after the real reload.
     const connection = restore.beginRestoreConnection();
     window.addEventListener('pagehide', () => sessionStorage.setItem('queue-dispatched', String(dispatched)));
     void restore.acceptRestoreHello(connection, 'restored-generation');
@@ -203,11 +196,12 @@ test('production upload queue is retained through reload without dispatch', asyn
   expect(await page.evaluate(() => sessionStorage.getItem('queue-dispatched'))).toBe('0');
   await page.addScriptTag({ content: bundle });
   expect(await page.evaluate(async () => {
-    const records = await restore.createRestoreGenerationStore(null, 'inspector').readRecoveries();
+    const store = restore.createRestoreGenerationStore(null, 'inspector');
+    const records = await store.readRecoveries();
+    const drafts = await Promise.all(records.flatMap(r => r.intent.drafts).map(d => store.materializeDraft(d)));
     return {
       queue: records.flatMap(r => r.intent.queuedUploadSends ?? []).map(q => ({ text: q.text, intent: q.intent })),
-      bytes: records.flatMap(r => r.intent.drafts.flatMap(d => d.uploads ?? []))
-        .map(u => new TextDecoder().decode(u.bytes)),
+      bytes: drafts.flatMap(d => d.uploads ?? []).map(u => new TextDecoder().decode(u.bytes)),
     };
   })).toEqual({ queue: [{ text: 'review this queued send', intent: { useCodingAgent: false, context: { note: 'retained context' } } }],
     bytes: ['retained upload bytes'] });
@@ -250,9 +244,6 @@ test('real iframe bridge does not release queued calls into a restored generatio
   let reloads = 0;
   page.on('framenavigated', frame => { if (frame === page.mainFrame()) reloads++; });
   await page.evaluate(() => {
-    // These original-generation calls were admitted by the real postMessage
-    // sender check. Closing runtime admission must fence their late replies
-    // and the fourth invocation waiting in the production fetch lane.
     const connection = restore.beginRestoreConnection();
     void restore.acceptRestoreHello(connection, 'restored-generation');
   });
@@ -283,15 +274,12 @@ for (const initial of [null, '10000000-0000-4000-8000-000000000001']) {
     })).toBe('accepted');
     expect(requests).toEqual([initial ?? 'none', initial ?? 'none']);
 
-    // Close the real runtime gate before creating the invocation. No HTTP
-    // dispatch is allowed until a same-generation hello admits this page.
     await page.evaluate(() => {
       const connection = restore.beginRestoreConnection();
       const probe = restore.mutatingFetchIdempotent('/api/v1/retry-probe', { method: 'PATCH', body: 'waiting intent' })
         .then(response => response.text());
       Object.assign(window, { admissionProbe: { connection, probe } });
     });
-    // A browser task boundary lets the request reach its admission wait.
     expect(await page.evaluate(() => restore.restoreAdmissionReady())).toBe(false);
     expect(requests).toHaveLength(2);
     expect(await page.evaluate(async initial => {
@@ -357,8 +345,6 @@ test('startup retains historical upload and unsent bytes without requeue or disp
   expect(await page.evaluate(async () => {
     restore.installRestoreRuntime();
     const admitted = await restore.acceptRestoreHello(restore.beginRestoreConnection(), 'restored-generation');
-    // Invoke the actual startup passes after runtime admission, exactly where
-    // old source records would otherwise be adopted, uploaded or requeued.
     const uploads = await restore.restorePendingUploads();
     const sends = await restore.restoreUnsentMessages();
     let dispatched = 0;

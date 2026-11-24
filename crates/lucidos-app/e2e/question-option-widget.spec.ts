@@ -3,10 +3,9 @@ import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, api
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-/** Half a second of silence as a 16-bit mono WAV: a clip every engine plays. */
 function silentWav(): Buffer {
   const rate = 8_000;
-  const data = rate; // 0.5s of 2-byte samples
+  const data = rate;
   const wav = Buffer.alloc(44 + data);
   wav.write('RIFF', 0);
   wav.writeUInt32LE(36 + data, 4);
@@ -23,11 +22,6 @@ function silentWav(): Buffer {
   return wav;
 }
 
-/**
- * ADR 0415: a question option draws its widget in one box with its button.
- * The built-in sound player plays its clip through the `/data` mount, and a
- * press on the player never answers the card: only the button picks.
- */
 test.describe('a question option with a widget', () => {
   test('draws the sound player beside the option, and playing it answers nothing', async ({ page }) => {
     await assertHealthy(page);
@@ -84,8 +78,6 @@ test.describe('a question option with a widget', () => {
       const player = box.frameLocator('iframe');
       await expect(player.locator('#audio')).toHaveAttribute('src', new RegExp(`/data/${clip.replace(/\./g, '\\.')}`));
 
-      // The frame holds its iframe, so the player never spills over the next
-      // option: an iframe's intrinsic 150px must not outgrow a smaller frame.
       const spill = await box.evaluate((el) => {
         const frame = el.querySelector('.widget-frame')!.getBoundingClientRect();
         const iframe = el.querySelector('iframe')!.getBoundingClientRect();
@@ -102,7 +94,6 @@ test.describe('a question option with a widget', () => {
       expect(ashHit, 'the next option takes its own tap').toBe(true);
       await player.locator('#play').click();
 
-      // A press inside the player never reaches the answer route.
       await page.waitForTimeout(1_000);
       expect(psql(
         `SELECT COUNT(*) FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered'`,

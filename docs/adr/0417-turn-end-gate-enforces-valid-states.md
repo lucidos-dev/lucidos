@@ -80,6 +80,14 @@ silently.
 - The chat loop's question re-ask and wake check stay in the loop, outside
   the gate. They depend on loop state mid-turn.
 
+### Amendment: the approved-plan re-entry
+
+A turn that approved the plan's full scope and changed no source file gets
+one more session re-entry: the *approved-plan re-entry*. It sends once per
+session, after the ceiling and before the proposal hold. An automation pause
+asks the owner with the `build-approved-plan` step. Evidence and invariants:
+`docs/plans/2026-11-16-codex-early-turn-ends.md`.
+
 ## Alternatives considered
 
 - **A stronger prompt only.** Rejected: the prompt and the tool description

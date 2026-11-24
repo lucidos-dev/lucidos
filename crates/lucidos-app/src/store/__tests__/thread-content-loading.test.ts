@@ -1,4 +1,3 @@
-/** Tests for thread content loading resilience (iOS Safari PWA resume). */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { threadMap, focusedThreadId, threadsLoaded } from '../store';
 import { handleEvent, groupIntoExchanges, type ThreadState, type ThreadMeta, type ThreadEvent } from '../thread-events';
@@ -40,9 +39,6 @@ function makeThread(id: string, overrides: Partial<Omit<ThreadState, 'meta'>> & 
   };
 }
 
-/** Replicate ThreadView's content-display decision (hasContent gate).
- *  The render tree NEVER produces null — it always shows spinner, error, empty, or content.
- *  Even when thread is undefined (not in map yet), ThreadView shows a spinner, never blank. */
 function shouldShowExchanges(thread: ThreadState | undefined, animating: boolean): 'content' | 'empty-message' | 'error' | 'spinner' {
   if (!thread) return 'spinner';
   const hasPending = thread.pendingUserMessages.length > 0;
@@ -52,7 +48,7 @@ function shouldShowExchanges(thread: ThreadState | undefined, animating: boolean
   if (exchanges.length === 0 && !hasPending) {
     if (thread.eventsLoadFailed && !hasContent) return 'error';
     if (hasContent && !animating) return 'empty-message';
-    return 'spinner';  // Always spinner — never null/blank
+    return 'spinner';
   }
   return 'content';
 }
@@ -101,12 +97,6 @@ describe('ThreadView content display decision', () => {
   });
 
   it('eventsLoaded=false, SSE events present → show content (THE FIX)', () => {
-    // This is the iOS Safari PWA scenario:
-    // 1. SSE connected and delivered events
-    // 2. loadThreadEvents failed (iOS resume network issue)
-    // 3. eventsLoaded stays false
-    // 4. But thread.events has data from SSE
-    // 5. ThreadView should show these events, not blank
     const thread = makeThread('t1', { eventsLoaded: false });
     const map = new Map([['t1', thread]]);
     insertEvents(map, 't1', [
@@ -116,7 +106,6 @@ describe('ThreadView content display decision', () => {
 
     expect(thread.events.size).toBe(2);
     expect(thread.eventsLoaded).toBe(false);
-    // With the fix, this should show content (not nothing)
     expect(shouldShowExchanges(thread, false)).toBe('content');
   });
 
@@ -206,7 +195,6 @@ describe('CC thread content loading — full integration', () => {
       { type: 'CodingAgentTextStreamed', text: 'Analyzing...', created: '2026-04-01T10:00:05Z' } as any,
     ]);
 
-    // Content should be renderable despite eventsLoaded=false
     expect(shouldShowExchanges(thread, false)).toBe('content');
   });
 });
@@ -238,8 +226,6 @@ describe('pending messages show on a thread whose events have not loaded', () =>
   });
 
   it('pending messages make hasContent=true even with eventsLoaded=false', () => {
-    // A send's optimistic row can sit on a thread whose events are still
-    // loading. It must show while they load.
     const thread = makeThread('cc-spawn-1', {
       eventsLoaded: false,
       meta: { channel: 'claude_code' } as any,
@@ -278,7 +264,6 @@ describe('No-content bug regression — render tree never produces null', () => 
     insertEvents(map, 't-blank-2', [
       { type: 'MessageReceived', text: 'hi', channel: 'chat', created: '2026-04-01T10:00:00Z' } as any,
     ]);
-    // Even with content, animating gates it — but shows spinner, not blank
     expect(shouldShowExchanges(thread, true)).toBe('spinner');
   });
 
@@ -293,8 +278,6 @@ describe('No-content bug regression — render tree never produces null', () => 
   });
 
   it('every state — including undefined thread — produces visible output', () => {
-    // Exhaustive check: no combination of thread/eventsLoaded/eventsLoadFailed/animating/hasEvents
-    // ever produces blank/null output. This is the core "no content" bug guarantee.
     const states = [
       { eventsLoaded: false, eventsLoadFailed: false, hasEvents: false, animating: false },
       { eventsLoaded: false, eventsLoadFailed: false, hasEvents: false, animating: true },
@@ -325,7 +308,6 @@ describe('No-content bug regression — render tree never produces null', () => 
       );
     }
 
-    // The critical case: undefined thread (not in map yet) — must show spinner
     const undefinedResult = shouldShowExchanges(undefined, false);
     expect(undefinedResult, 'undefined thread must show spinner, never blank').toBe('spinner');
   });
@@ -340,43 +322,32 @@ describe('Empty focused thread recovery', () => {
   });
 
   it('focused thread with eventsLoaded=true but 0 events should be refreshable', () => {
-    // Scenario: loadThreadEvents succeeded but API returned 0 rows (events not
-    // yet committed). The thread shows "No messages" permanently. A subsequent
-    // refreshThreadEvents call should be able to fetch the now-committed events
-    // and the UI should recover to show content.
     const thread = makeThread('t-empty-focus', { eventsLoaded: true });
     const map = new Map([['t-empty-focus', thread]]);
     threadMap.value = map;
     focusedThreadId.value = 't-empty-focus';
 
-    // Before refresh: empty
     expect(shouldShowExchanges(thread, false)).toBe('empty-message');
     expect(thread.events.size).toBe(0);
 
-    // Simulate events arriving via refreshThreadEvents
     insertEvents(map, 't-empty-focus', [
       { type: 'MessageReceived', text: 'hello', channel: 'chat', created: '2026-04-06T10:00:00Z' } as any,
       { type: 'ResponseGenerated', text: 'hi', created: '2026-04-06T10:00:05Z' } as any,
     ]);
 
-    // After refresh: content should be visible
     expect(thread.events.size).toBe(2);
     expect(shouldShowExchanges(thread, false)).toBe('content');
   });
 
   it('shouldRefreshFocusedThread detects empty focused thread needing refresh', () => {
-    // Health-poll recovery: if the focused thread is loaded but empty,
-    // the health poll should trigger a refresh. Verify the detection logic.
     const thread = makeThread('t-detect', { eventsLoaded: true });
     threadMap.value = new Map([['t-detect', thread]]);
     focusedThreadId.value = 't-detect';
 
-    // Loaded + 0 events + focused → needs refresh
     expect(thread.eventsLoaded).toBe(true);
     expect(thread.events.size).toBe(0);
     expect(focusedThreadId.value).toBe('t-detect');
 
-    // After events arrive, no longer needs refresh
     insertEvents(threadMap.value, 't-detect', [
       { type: 'MessageReceived', text: 'hi', channel: 'chat', created: '2026-04-06T10:00:00Z' } as any,
     ]);
@@ -384,15 +355,12 @@ describe('Empty focused thread recovery', () => {
   });
 
   it('non-focused empty thread does NOT trigger refresh', () => {
-    // Only the focused thread should be auto-refreshed. Non-focused
-    // threads can stay empty until the user focuses them.
     const thread = makeThread('t-nonfocus', { eventsLoaded: true });
     threadMap.value = new Map([['t-nonfocus', thread]]);
     focusedThreadId.value = 'other-thread';
 
     expect(thread.eventsLoaded).toBe(true);
     expect(thread.events.size).toBe(0);
-    // Not focused → no refresh needed
   });
 });
 
@@ -426,59 +394,39 @@ describe('loadThreadEvents failure handling', () => {
   });
 
   it('failure sets eventsLoadFailed — UI shows error, not spinner or "no messages"', () => {
-    // When loadThreadEvents fails after retries, it sets eventsLoadFailed=true
-    // (NOT eventsLoaded=true — that would be a lie). This means:
-    // - eventsLoaded stays false (events were NOT loaded)
-    // - eventsLoadFailed=true → UI shows error state
-    // - No infinite spinner, no misleading "No messages"
-    // - On next resume, runResumeSync retries failed threads via loadThreadEvents
     const thread = makeThread('t1', { eventsLoaded: false });
     const map = new Map([['t1', thread]]);
     threadMap.value = map;
 
-    // Simulate what loadThreadEvents does on failure
     thread.eventsLoadFailed = true;
     threadMap.value = new Map(threadMap.value);
 
-    // eventsLoaded must stay false — events were NOT loaded
     expect(thread.eventsLoaded).toBe(false);
     expect(thread.eventsLoadFailed).toBe(true);
 
-    // UI should show error state, not loading spinner or "no messages"
     expect(shouldShowExchanges(thread, false)).toBe('error');
   });
 
   it('SSE events arriving clear eventsLoadFailed — content recovers', () => {
-    // After API fails 3 times, eventsLoadFailed=true. If SSE subsequently
-    // delivers events, the thread should recover and show content.
     const thread = makeThread('t-sse-recover', { eventsLoaded: false, eventsLoadFailed: true });
     const map = new Map([['t-sse-recover', thread]]);
     threadMap.value = map;
 
-    // Before SSE events: shows error
     expect(shouldShowExchanges(thread, false)).toBe('error');
 
-    // SSE events arrive → eventsLoadFailed should be cleared
-    thread.eventsLoadFailed = false; // This is what the SSE handler fix does
+    thread.eventsLoadFailed = false;
     insertEvents(map, 't-sse-recover', [
       { type: 'MessageReceived', text: 'hello', channel: 'chat', created: '2026-04-01T10:00:00Z' } as any,
     ]);
 
-    // After SSE events: shows content
     expect(shouldShowExchanges(thread, false)).toBe('content');
   });
 
   it('failed thread can recover via loadThreadEvents retry on resume', () => {
-    // After loadThreadEvents fails:
-    // 1. eventsLoaded=false, eventsLoadFailed=true
-    // 2. On resume, runResumeSync calls loadThreadEvents for failed threads
-    // 3. loadThreadEvents resets eventsLoadFailed=false, retries the fetch
-    // 4. On success: eventsLoaded=true, events populated, content renders
     const thread = makeThread('t1', { eventsLoaded: false, eventsLoadFailed: true });
     const map = new Map([['t1', thread]]);
     threadMap.value = map;
 
-    // Simulate successful retry: loadThreadEvents resets flag and loads events
     thread.eventsLoadFailed = false;
     thread.eventsLoaded = true;
     insertEvents(map, 't1', [

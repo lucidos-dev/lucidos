@@ -6,20 +6,9 @@ import {
   enableMobileDynamicBars, disableMobileDynamicBars,
 } from './helpers';
 
-/** Answering a question card rests the reader on the live edge until the agent
- *  starts, follow armed or not (ADR 0080). What they wait to see is the agent's
- *  line under the card and the first thing the agent writes there. Reported
- *  from a phone with the follow off and dynamic bars on, where the reply landed
- *  under the composer. Every project runs it. */
 
 const transcript = (page: Page) => page.locator('.thread-content.visible:visible').first();
 
-/** How the answered card's turn sits against what covers the transcript, as
- *  the px hidden below the clear area. The clear area ends at the transcript's
- *  bottom, or at the composer's top where the composer overlays it. Two things
- *  are measured: the whole agent line (`.response-header`), and the FIRST line
- *  of the agent's reply. The reply streams on below the fold by design, so only
- *  its start is owed. -1 means the element is not there yet. */
 function hiddenBelow(page: Page) {
   return transcript(page).evaluate((el) => {
     const answered = Array.from(el.querySelectorAll<HTMLElement>('.question-body-answered')).pop();
@@ -41,7 +30,6 @@ function hiddenBelow(page: Page) {
   });
 }
 
-/** Two finished turns, so the transcript overflows. */
 async function tallThread(page: Page) {
   await navigateToApp(page);
   await ensureOnThreadPane(page);
@@ -63,8 +51,6 @@ async function askQuestion(page: Page) {
   await expect(page.locator('.question-body:not(.question-body-answered):visible')).toHaveCount(1, { timeout: 15_000 });
 }
 
-/** The reader scrolls down to the options, the way they reach a tall card. A
- *  phone dispatches the swipe's `touchmove`, a desktop turns the wheel. */
 async function readerScrollsToBottom(page: Page) {
   if (isMobileViewport(page)) {
     await transcript(page).evaluate((el) => {
@@ -82,7 +68,6 @@ async function readerScrollsToBottom(page: Page) {
 
 async function expectAgentShown(page: Page) {
   await expect.poll(() => hiddenBelow(page), { timeout: 10_000 }).toEqual({ line: 0, reply: 0 });
-  // And it stays: nothing after the landing takes it away again.
   await page.waitForTimeout(1500);
   expect(await hiddenBelow(page)).toEqual({ line: 0, reply: 0 });
 }

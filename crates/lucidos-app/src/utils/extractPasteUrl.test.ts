@@ -59,8 +59,6 @@ describe('extractPasteUrl', () => {
     expect(extractPasteUrl('[bad](javascript:alert(1))')).toBeNull();
   });
 
-  // A crafted clipboard payload must not be able to break out of the
-  // [title](url) substitution by closing the link early and opening another.
   it('returns null for plain URL containing markdown delimiters', () => {
     expect(extractPasteUrl('https://evil.com/)[innocent](https://real.com')).toBeNull();
     expect(extractPasteUrl('https://x.com)hi')).toBeNull();

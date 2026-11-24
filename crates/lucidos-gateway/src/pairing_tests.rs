@@ -99,11 +99,11 @@ fn a_long_secret_redeems_once_on_any_channel() {
         let mut pending = device();
         let minted = pending.mint(PairingIntent::labelled("My iPhone")).unwrap();
         assert_eq!(
-            pending.redeem(&minted.secret, channel),
+            pending.redeem(&minted.secret, channel, OwnerGate::NoDevicePaired),
             Redemption::Redeemed(PairingIntent::labelled("My iPhone"))
         );
         assert_eq!(
-            pending.redeem(&minted.secret, channel),
+            pending.redeem(&minted.secret, channel, OwnerGate::NoDevicePaired),
             Redemption::Rejected
         );
     }
@@ -114,11 +114,11 @@ fn redeeming_either_half_spends_the_whole_pairing() {
     let mut pending = device();
     let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(
-        pending.redeem(short(&minted), lan(2)),
+        pending.redeem(short(&minted), lan(2), OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default())
     );
     assert_eq!(
-        pending.redeem(&minted.secret, lan(2)),
+        pending.redeem(&minted.secret, lan(2), OwnerGate::NoDevicePaired),
         Redemption::Rejected,
         "the secret died with its short code"
     );
@@ -129,11 +129,19 @@ fn a_short_code_from_a_public_channel_is_refused_before_any_compare() {
     let mut pending = device();
     let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(
-        pending.redeem(short(&minted), PairingChannel::Public),
+        pending.redeem(
+            short(&minted),
+            PairingChannel::Public,
+            OwnerGate::NoDevicePaired
+        ),
         Redemption::LocalOnly
     );
     assert_eq!(
-        pending.redeem(&minted.secret, PairingChannel::Public),
+        pending.redeem(
+            &minted.secret,
+            PairingChannel::Public,
+            OwnerGate::NoDevicePaired
+        ),
         Redemption::Redeemed(PairingIntent::default()),
         "the refusal spent nothing"
     );
@@ -145,9 +153,16 @@ fn a_gateway_pairing_has_no_short_code_on_any_channel() {
     let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(minted.code, None);
     assert!(minted.secret.starts_with("lgp_"));
-    assert_eq!(pending.redeem("01234567", lan(2)), Redemption::Rejected);
     assert_eq!(
-        pending.redeem(&minted.secret, PairingChannel::Public),
+        pending.redeem("01234567", lan(2), OwnerGate::NoDevicePaired),
+        Redemption::Rejected
+    );
+    assert_eq!(
+        pending.redeem(
+            &minted.secret,
+            PairingChannel::Public,
+            OwnerGate::NoDevicePaired
+        ),
         Redemption::Redeemed(PairingIntent::default())
     );
 }
@@ -158,7 +173,12 @@ fn a_pairing_expires() {
     let minted = pending.mint(PairingIntent::default()).unwrap();
     let later = Instant::now() + PAIRING_TTL;
     assert_eq!(
-        pending.redeem_at(&minted.secret, PairingChannel::Public, later),
+        pending.redeem_at(
+            &minted.secret,
+            PairingChannel::Public,
+            OwnerGate::NoDevicePaired,
+            later
+        ),
         Redemption::Rejected
     );
 }
@@ -189,14 +209,14 @@ fn a_distributed_flood_never_stops_a_correct_long_secret() {
                 continue;
             }
             assert_ne!(
-                pending.redeem(&guess, channel),
+                pending.redeem(&guess, channel, OwnerGate::NoDevicePaired),
                 Redemption::Redeemed(PairingIntent::default()),
                 "a wrong guess paired"
             );
         }
         for (minted, channel) in [(over_public, PairingChannel::Public), (over_lan, source(2))] {
             assert_eq!(
-                pending.redeem(&minted.secret, channel),
+                pending.redeem(&minted.secret, channel, OwnerGate::NoDevicePaired),
                 Redemption::Redeemed(PairingIntent::default()),
                 "{kind:?}: the flood refused the correct secret on {channel:?}"
             );
@@ -209,11 +229,14 @@ fn a_distributed_flood_never_stops_a_correct_long_secret() {
 fn a_flood_with_nothing_pending_costs_the_next_pairing_nothing() {
     let mut pending = device();
     for _ in 0..1_000 {
-        assert_eq!(pending.redeem("00000000", lan(9)), Redemption::Rejected);
+        assert_eq!(
+            pending.redeem("00000000", lan(9), OwnerGate::NoDevicePaired),
+            Redemption::Rejected
+        );
     }
     let minted = pending.mint(PairingIntent::default()).unwrap();
     assert_eq!(
-        pending.redeem(short(&minted), lan(9)),
+        pending.redeem(short(&minted), lan(9), OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default())
     );
 }
@@ -229,18 +252,24 @@ fn one_local_source_spends_only_its_own_budget() {
         "00000000"
     };
     for _ in 0..SHORT_CODE_FAILURES_PER_SOURCE {
-        assert_eq!(pending.redeem(wrong, lan(66)), Redemption::Rejected);
+        assert_eq!(
+            pending.redeem(wrong, lan(66), OwnerGate::NoDevicePaired),
+            Redemption::Rejected
+        );
     }
     for _ in 0..1_000 {
-        assert_eq!(pending.redeem(wrong, lan(66)), Redemption::Throttled);
+        assert_eq!(
+            pending.redeem(wrong, lan(66), OwnerGate::NoDevicePaired),
+            Redemption::Throttled
+        );
     }
     assert_eq!(
-        pending.redeem(short(&minted), lan(66)),
+        pending.redeem(short(&minted), lan(66), OwnerGate::NoDevicePaired),
         Redemption::Throttled,
         "a spent source is not even compared"
     );
     assert_eq!(
-        pending.redeem(short(&minted), lan(7)),
+        pending.redeem(short(&minted), lan(7), OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default())
     );
 }
@@ -261,10 +290,13 @@ fn an_ipv6_host_cannot_rotate_its_way_to_a_fresh_budget() {
         )
     };
     for n in 0..SHORT_CODE_FAILURES_PER_SOURCE as u16 {
-        assert_eq!(pending.redeem(wrong, in_one_64(n)), Redemption::Rejected);
+        assert_eq!(
+            pending.redeem(wrong, in_one_64(n), OwnerGate::NoDevicePaired),
+            Redemption::Rejected
+        );
     }
     assert_eq!(
-        pending.redeem(short(&minted), in_one_64(999)),
+        pending.redeem(short(&minted), in_one_64(999), OwnerGate::NoDevicePaired),
         Redemption::Throttled
     );
 }
@@ -289,14 +321,17 @@ fn one_tailnet_device_cannot_spend_another_ones_budget() {
         )
     };
     for _ in 0..SHORT_CODE_FAILURES_PER_SOURCE {
-        assert_eq!(pending.redeem(wrong, node(2)), Redemption::Rejected);
+        assert_eq!(
+            pending.redeem(wrong, node(2), OwnerGate::NoDevicePaired),
+            Redemption::Rejected
+        );
     }
     assert_eq!(
-        pending.redeem(short(&minted), node(2)),
+        pending.redeem(short(&minted), node(2), OwnerGate::NoDevicePaired),
         Redemption::Throttled
     );
     assert_eq!(
-        pending.redeem(short(&minted), node(3)),
+        pending.redeem(short(&minted), node(3), OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default())
     );
 }
@@ -313,15 +348,18 @@ fn the_backstop_caps_many_local_sources_and_never_a_long_secret() {
     let sources = SHORT_CODE_FAILURES_GLOBAL / SHORT_CODE_FAILURES_PER_SOURCE;
     for n in 0..sources {
         for _ in 0..SHORT_CODE_FAILURES_PER_SOURCE {
-            assert_eq!(pending.redeem(wrong, source(n)), Redemption::Rejected);
+            assert_eq!(
+                pending.redeem(wrong, source(n), OwnerGate::NoDevicePaired),
+                Redemption::Rejected
+            );
         }
     }
     assert_eq!(
-        pending.redeem(short(&minted), source(500)),
+        pending.redeem(short(&minted), source(500), OwnerGate::NoDevicePaired),
         Redemption::Throttled
     );
     assert_eq!(
-        pending.redeem(&minted.secret, source(500)),
+        pending.redeem(&minted.secret, source(500), OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default()),
         "the long secret is never throttled"
     );
@@ -339,20 +377,221 @@ fn a_correct_short_code_clears_its_source_and_the_window_refills() {
         }
     };
     for _ in 0..SHORT_CODE_FAILURES_PER_SOURCE - 1 {
-        assert_eq!(pending.redeem(wrong(&first), lan(3)), Redemption::Rejected);
+        assert_eq!(
+            pending.redeem(wrong(&first), lan(3), OwnerGate::NoDevicePaired),
+            Redemption::Rejected
+        );
     }
     assert_eq!(
-        pending.redeem(short(&first), lan(3)),
+        pending.redeem(short(&first), lan(3), OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default())
     );
     let second = pending.mint(PairingIntent::default()).unwrap();
     for _ in 0..SHORT_CODE_FAILURES_PER_SOURCE {
-        assert_eq!(pending.redeem(wrong(&second), lan(3)), Redemption::Rejected);
+        assert_eq!(
+            pending.redeem(wrong(&second), lan(3), OwnerGate::NoDevicePaired),
+            Redemption::Rejected
+        );
     }
     let later = Instant::now() + FAILURE_WINDOW;
     assert_eq!(
-        pending.redeem_at(short(&second), lan(3), later),
+        pending.redeem_at(short(&second), lan(3), OwnerGate::NoDevicePaired, later),
         Redemption::Redeemed(PairingIntent::default())
+    );
+}
+
+// ── The owner's answer ──────────────────────────────────────────────────────
+
+fn minted_by(minter: Minter) -> PairingIntent {
+    PairingIntent {
+        minter,
+        ..PairingIntent::default()
+    }
+}
+
+const OWNER: OwnerGate<'static> = OwnerGate::DevicePaired {
+    asking_as: "My iPhone",
+};
+
+/// The one request waiting, answered by id the way a paired device would.
+fn only_request(pending: &mut PendingPairings) -> PairingRequest {
+    let requests = pending.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    requests.into_iter().next().unwrap()
+}
+
+#[test]
+fn a_pairing_counts_as_a_local_process_s_unless_a_device_minted_it() {
+    assert_eq!(PairingIntent::default().minter, Minter::LocalProcess);
+}
+
+/// Invariant 9: with no device paired, a local process's code redeems at once.
+#[test]
+fn a_local_process_s_code_redeems_at_once_with_no_device_paired() {
+    for kind in [PairingKind::Device, PairingKind::Gateway] {
+        let mut pending = PendingPairings::new(kind);
+        let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+        assert_eq!(
+            pending.redeem(
+                &minted.secret,
+                PairingChannel::Public,
+                OwnerGate::NoDevicePaired
+            ),
+            Redemption::Redeemed(minted_by(Minter::LocalProcess))
+        );
+    }
+}
+
+/// Invariant 9: a paired device's own code never waits.
+#[test]
+fn a_paired_device_s_code_redeems_at_once() {
+    for kind in [PairingKind::Device, PairingKind::Gateway] {
+        let mut pending = PendingPairings::new(kind);
+        let minted = pending.mint(minted_by(Minter::PairedDevice)).unwrap();
+        assert_eq!(
+            pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+            Redemption::Redeemed(minted_by(Minter::PairedDevice))
+        );
+        assert!(pending.requests().is_empty());
+    }
+}
+
+/// Invariant 9: with a device paired, a local process's code waits for Allow.
+#[test]
+fn a_local_process_s_code_waits_for_allow_then_redeems() {
+    for kind in [PairingKind::Device, PairingKind::Gateway] {
+        let mut pending = PendingPairings::new(kind);
+        let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+        // Only the first redeem starts the wait, so the owner hears it once.
+        for started in [true, false, false] {
+            assert_eq!(
+                pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+                Redemption::AwaitingOwner { started },
+                "{kind:?}: asking again never pairs"
+            );
+        }
+        let request = only_request(&mut pending);
+        assert_eq!(request.label, "My iPhone");
+        assert!(pending.answer(&request.id, PairingAnswer::Allow));
+        assert_eq!(
+            pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+            Redemption::Redeemed(minted_by(Minter::LocalProcess))
+        );
+        assert_eq!(
+            pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+            Redemption::Rejected,
+            "an allowed pairing still redeems once"
+        );
+    }
+}
+
+#[test]
+fn don_t_allow_is_heard_once_and_then_the_pairing_is_gone() {
+    let mut pending = device();
+    let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+    assert_eq!(
+        pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+        Redemption::AwaitingOwner { started: true }
+    );
+    let request = only_request(&mut pending);
+    assert!(pending.answer(&request.id, PairingAnswer::Decline));
+    assert!(
+        pending.requests().is_empty(),
+        "a declined request is no longer asked"
+    );
+    assert_eq!(
+        pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+        Redemption::Declined
+    );
+    assert_eq!(
+        pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+        Redemption::Rejected
+    );
+}
+
+#[test]
+fn a_short_code_waits_the_same_way() {
+    let mut pending = device();
+    let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+    assert_eq!(
+        pending.redeem(short(&minted), lan(4), OWNER),
+        Redemption::AwaitingOwner { started: true }
+    );
+    let request = only_request(&mut pending);
+    assert!(pending.answer(&request.id, PairingAnswer::Allow));
+    assert_eq!(
+        pending.redeem(short(&minted), lan(4), OWNER),
+        Redemption::Redeemed(minted_by(Minter::LocalProcess))
+    );
+}
+
+#[test]
+fn nothing_is_asked_until_someone_redeems() {
+    let mut pending = device();
+    pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+    assert!(pending.requests().is_empty());
+}
+
+#[test]
+fn the_window_restarts_when_the_redeem_starts_waiting() {
+    let mut pending = device();
+    let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+    let claimed = Instant::now() + PAIRING_TTL - Duration::from_secs(1);
+    assert_eq!(
+        pending.redeem_at(&minted.secret, PairingChannel::Public, OWNER, claimed),
+        Redemption::AwaitingOwner { started: true }
+    );
+    let request = pending.requests_at(claimed).into_iter().next().unwrap();
+    assert_eq!(request.expires_in_secs, PAIRING_TTL.as_secs());
+    assert!(pending.answer(&request.id, PairingAnswer::Allow));
+    let still_open = claimed + PAIRING_TTL - Duration::from_secs(1);
+    assert_eq!(
+        pending.redeem_at(&minted.secret, PairingChannel::Public, OWNER, still_open),
+        Redemption::Redeemed(minted_by(Minter::LocalProcess))
+    );
+}
+
+#[test]
+fn a_waiting_request_expires_with_its_window() {
+    let mut pending = device();
+    let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+    assert_eq!(
+        pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+        Redemption::AwaitingOwner { started: true }
+    );
+    let later = Instant::now() + PAIRING_TTL;
+    assert!(pending.requests_at(later).is_empty());
+    let id = only_request(&mut pending).id;
+    pending.drop_expired(later);
+    assert!(
+        !pending.answer(&id, PairingAnswer::Allow),
+        "nothing left to allow"
+    );
+}
+
+#[test]
+fn an_unknown_request_id_answers_nothing() {
+    let mut pending = device();
+    assert!(!pending.answer("no-such-request", PairingAnswer::Allow));
+}
+
+/// Revoking every device reopens the free pass, as the owner settled
+/// (plan § Phase 6 Design). A request already waiting then redeems.
+#[test]
+fn a_waiting_code_redeems_once_no_device_is_paired() {
+    let mut pending = device();
+    let minted = pending.mint(minted_by(Minter::LocalProcess)).unwrap();
+    assert_eq!(
+        pending.redeem(&minted.secret, PairingChannel::Public, OWNER),
+        Redemption::AwaitingOwner { started: true }
+    );
+    assert_eq!(
+        pending.redeem(
+            &minted.secret,
+            PairingChannel::Public,
+            OwnerGate::NoDevicePaired
+        ),
+        Redemption::Redeemed(minted_by(Minter::LocalProcess))
     );
 }
 
@@ -466,11 +705,14 @@ fn a_spoofed_forwarding_header_neither_spends_nor_earns_a_budget() {
     for n in 0..1_000 {
         let spoof = format!("10.9.{}.{}", n / 256, n % 256);
         let ch = channel(lan_peer, &[("x-forwarded-for", &spoof)]);
-        assert_eq!(pending.redeem("00000000", ch), Redemption::LocalOnly);
+        assert_eq!(
+            pending.redeem("00000000", ch, OwnerGate::NoDevicePaired),
+            Redemption::LocalOnly
+        );
     }
     let direct = channel(lan_peer, &[]);
     assert_eq!(
-        pending.redeem(short(&minted), direct),
+        pending.redeem(short(&minted), direct, OwnerGate::NoDevicePaired),
         Redemption::Redeemed(PairingIntent::default())
     );
 }

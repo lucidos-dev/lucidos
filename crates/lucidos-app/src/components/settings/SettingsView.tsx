@@ -1,9 +1,10 @@
+import { PREF_EXTERNAL_LINK_TARGET, PREF_IMAGE_MODEL } from '@lucidos/preference-catalog';
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
+import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill, agentSandboxUnavailable, agentSandboxTruncationUnguarded, agentSandboxMetadataUnguarded } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { currentAgentBrandColours, setAgentBrandColours, setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentAgentsUnsandboxed, setAgentsUnsandboxed, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -13,7 +14,6 @@ import {
   grantOAuthScope,
 } from '../../store/actions/oauth';
 import {
-  connectScopes,
   missingScopes,
   prefillLabel,
   providerToSend,
@@ -51,22 +51,29 @@ import { Explainer } from '../shared/Explainer';
 import { MobileDynamicBarsRow } from './MobileDynamicBarsRow';
 import { ThemePicker } from './ThemePicker';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
+import { PrivatePathsSection } from './PrivatePathsSection';
 import { AllowlistEditor } from './AllowlistEditor';
+import { StandingDeniesSection } from './StandingDeniesSection';
 import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { MarketplacesSection } from './MarketplacesSection';
 import { McpServersPage } from './McpServersPage';
 import { WebhooksPage } from './WebhooksPage';
+import { EventHooksPage } from './EventHooksPage';
 import { MobileAccessPage } from './MobileAccessPage';
 import { usePairedDevices, revokePaired } from './pairedDevices';
 import { pairedRows, pairingIsKnown } from '../../store/actions/pairedDevices';
 import { SectionHeader } from '../shared/SectionHeader';
-import { DevicePersonPicker, PeopleSection } from './PeopleSection';
+import { DeviceUserPicker, UsersPage } from './UsersSection';
+import { RemoteGatewayDevicesSection, useRemoteGatewayLists } from './remoteGatewaySections';
+import { REMOTE_GATEWAY } from '../../utils/basePath';
 import { buildDeviceRows, isUnusedDevice, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
 import { CodingAgentContextCeilingSection } from './CodingAgentContextCeilingSection';
+import { LandingSettingSection } from './LandingSettingSection';
+import { MainCheckSettingSection } from './MainCheckSettingSection';
 import { CacheKeepAlivePointer, CacheKeepAliveSection } from './CacheKeepAliveSection';
 import { IntelligenceLinkRow, IntelligencePage } from './IntelligencePage';
 import { SystemPage } from './SystemPage';
@@ -95,14 +102,11 @@ import { themeEffectsPreference } from '../../utils/themeEffects';
 import { LADDER_LINK_ROW } from '../chat/rungRows';
 import type { PickerLink } from '../shared/ModelSelectionPicker';
 
-/** The chat ladder decides which models Chat model and Trigger model list,
- *  so both end on a link to it. */
 const CHAT_LADDER_LINK: PickerLink = {
   option: LADDER_LINK_ROW,
   onChoose: () => openIntelligenceLadder('chat'),
 };
 
-/** Turn scope URLs into short human-readable labels. */
 function formatScopes(scopes: string): string {
   const map: Record<string, string> = {
     'calendar': 'Calendar',
@@ -119,15 +123,13 @@ function formatScopes(scopes: string): string {
     .filter(Boolean)
     .filter((s) => !hidden.has(s))
     .map((s) => {
-      // Extract the last path segment from URLs like https://www.googleapis.com/auth/drive.file
       const key = s.includes('/') ? s.split('/').pop()! : s;
-      // Match against known prefixes
       for (const [prefix, label] of Object.entries(map)) {
         if (key.toLowerCase().includes(prefix)) return label;
       }
       return key;
     })
-    .filter((v, i, a) => a.indexOf(v) === i) // dedupe
+    .filter((v, i, a) => a.indexOf(v) === i)
     .join(', ');
 }
 
@@ -137,7 +139,6 @@ const THEME_MODE_LABELS: Record<ThemeMode, string> = {
   system: 'System',
 };
 
-/** The default first, as in the Motion row. */
 const THEME_MODE_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
   DEFAULT_THEME_MODE,
   ...THEME_MODES.filter((mode) => mode !== DEFAULT_THEME_MODE),
@@ -161,15 +162,11 @@ const EXTERNAL_LINK_TARGET_LABELS: Record<ExternalLinkTarget, string> = {
   'in-app': 'In-app view',
 };
 
-const EXTERNAL_LINK_TARGET_OPTIONS = PREFERENCE_CATALOG.external_link_target.values
+const EXTERNAL_LINK_TARGET_OPTIONS = PREF_EXTERNAL_LINK_TARGET.values
   .map((target) => ({ value: target, label: EXTERNAL_LINK_TARGET_LABELS[target] }));
 
-// Presets for the per-turn tool-call cap. The dropdown is `freeText`, so these
-// are a starting point rather than the allowed set: any whole number between
-// `MAX_TOOL_CALLS_MIN` and `MAX_TOOL_CALLS_MAX` can be typed.
 const MAX_TOOL_CALLS_PRESETS = [50, 100, 250, 1000, 2000, 5000];
 
-/** The presets and the default, in order, with the default marked. */
 const MAX_TOOL_CALLS_OPTIONS = [...new Set([...MAX_TOOL_CALLS_PRESETS, MAX_TOOL_CALLS_DEFAULT])]
   .sort((a, b) => a - b)
   .map((cap) => ({
@@ -185,20 +182,12 @@ const IMAGE_MODEL_LABELS: Record<ImageModel, string> = {
   'gpt-image-2': 'GPT Image 2',
 };
 
-/** Image generation has no reasoning tiers at all, so its picker renders the
- *  model alone. The empty list is what decides that, not a prop. */
-const IMAGE_MODEL_CHOICES: ModelChoice[] = PREFERENCE_CATALOG.image_model.values.map((model) => ({
+const IMAGE_MODEL_CHOICES: ModelChoice[] = PREF_IMAGE_MODEL.values.map((model) => ({
   value: model,
   label: IMAGE_MODEL_LABELS[model],
   reasoningEfforts: [],
 }));
 
-/** Self-skeletonizing device row: rendered with no props inside a
- *  SkeletonProvider (`<DeviceRow />`) it draws itself as a loading placeholder
- *  via the Sk* leaves; with real props it renders normally. The `editing` state
- *  lives in the parent (`editingId`/`setEditingId`) so the skeleton call passes
- *  nothing. Props are optional only to support that call; real call sites pass
- *  them all. */
 function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: {
   row?: DeviceRowModel;
   editingId?: string | null;
@@ -215,15 +204,11 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
   const inputRef = useCallback((el: HTMLInputElement | null) => {
     if (el) { el.focus(); el.select(); }
   }, []);
-  // Closing the field unmounts it, and that fires a trailing blur into
-  // `saveEdit`. Latched so Enter saves once and Escape saves nothing.
   const closedRef = useRef(false);
 
   function startEditing() {
     if (!device) return;
     closedRef.current = false;
-    // `displayName` already IS the stored name when there is one. So it is the
-    // single source for the prefill and for `saveEdit`'s unchanged check.
     setEditValue(displayName);
     setEditingId?.(device.id);
   }
@@ -243,14 +228,6 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
     setEditingId?.(null);
   }
 
-  // Web push can only be enabled from the target device itself — a browser can
-  // only create its own `pushManager.subscribe()`, never another device's. So
-  // enabling push for a non-current device is impossible; the toggle is disabled
-  // in that state (see below) rather than firing an error on click. Disabling
-  // push remotely (and Remove) stays allowed.
-  //
-  // A row with no engine row is blocked too, whether or not it is current:
-  // push hangs off that row, so there is nothing here to switch on.
   const enableBlocked = !sk && (!device || (!isCurrent && !device.push_enabled));
 
   return (
@@ -270,14 +247,10 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
                 if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
               }}
               onBlur={saveEdit}
-              // The blur saves, so the central Escape policy must not blur it.
               data-escape-self
               ref={inputRef}
             />
           ) : (
-            // Renaming writes the ENGINE row, so a device that only paired
-            // has nothing to rename. Render it as plain text rather than a
-            // control that silently does nothing.
             device ? (
               <span class="device-name" onClick={startEditing}>{displayName}</span>
             ) : (
@@ -286,9 +259,6 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
           )}
           {isCurrent && <span class="device-badge">This device</span>}
         </div>
-        {/* FIELDS, separated by `.list-row-details`' own 0.75rem flex gap.
-            No manual middle-dot glue: it would be its own anonymous flex item
-            and pick the gap up on both sides (see the oauth row's note below). */}
         <SkText class="list-row-details" as="div" w="14rem">
           {(row
             ? deviceRowSummary(row, describeDeviceUserAgent, gatewayAnswered === true, Date.now())
@@ -302,11 +272,7 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
         </SkText>
       </div>
       <div class="list-row-actions">
-        {!sk && row?.paired && <DevicePersonPicker deviceId={row.paired.id} />}
-        {/* Push is per WORKSPACE, so it hangs off the engine row. A device that
-            only paired has none yet, and the toggle STILL renders, off and
-            disabled: leaving it out asks the reader why this one row has no
-            push, and the answer is not that push is unavailable to it. */}
+        {!sk && row?.paired && <DeviceUserPicker deviceId={row.paired.id} />}
         {!sk && (
           <span class={`device-push-label${device?.push_enabled ? '' : ' push-disabled'}`}>Push</span>
         )}
@@ -326,10 +292,6 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
             <span class="toggle-slider" />
           </label>
         </SkBlock>
-        {/* Revoke is MACHINE-GLOBAL and Remove is per workspace, so they are
-            two buttons rather than one. Revoking cuts this device off every
-            workspace at once; removing forgets its push and preferences here
-            and leaves it paired. */}
         {!sk && row?.paired && onRevoke && (
           <button
             class="action-btn action-btn-danger"
@@ -337,11 +299,6 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
             onClick={() => onRevoke(row)}
           >Revoke</button>
         )}
-        {/* Rendered only when there is something to remove. An invisible
-            placeholder used to hold this slot open so the buttons lined up in a
-            column, but it also sat to the RIGHT of Revoke on every row without
-            a Remove, holding that button a button's width off the edge. The
-            actions are flush right instead, which is where the eye looks. */}
         {(sk || (device && !isCurrent)) && (
           <SkBlock w="4.5rem" h="2rem" round>
             <button
@@ -444,16 +401,8 @@ function AddRepositoryForm() {
   );
 }
 
-/** Hand the connection to the agent, which reads the same *OAuth provider
- *  registry* and can walk the user through the provider's app console: the one
- *  step this page cannot do for them, since the Client ID only exists once an
- *  app is registered there.
- *
- *  Routed through `handleNavigationRequest` rather than poking compose directly,
- *  so it clears the settings overlay, allocates a fresh draft and focuses the
- *  prompt exactly like every other new-chat entry point. */
 function askLucidosToConnectAccount(): void {
-  handleNavigationRequest({
+  void handleNavigationRequest({
     target: 'new-chat',
     prompt:
       'Help me connect an account: register the app with the provider, '
@@ -461,12 +410,8 @@ function askLucidosToConnectAccount(): void {
   });
 }
 
-/** How long a landing waits for its row. Some rows render only once their
- *  page's data loads, or its delay gate passes. */
 export const SETTINGS_ANCHOR_WAIT_MS = 5000;
 
-/** Land on `anchor` once it renders, or report the miss after
- *  `SETTINGS_ANCHOR_WAIT_MS`. Returns the cancel. */
 function landWhenRendered(anchor: string, land: (el: HTMLElement) => void, missed: () => void): () => void {
   const find = () => document.querySelector<HTMLElement>(`[data-search-anchor="${anchor}"]`);
   const present = find();
@@ -495,27 +440,19 @@ function landWhenRendered(anchor: string, land: (el: HTMLElement) => void, misse
 export function SettingsView() {
   const loadable = devices.value;
   const showLoading = useDelayedLoading(loadable);
-  // The pairing half of the device list. Fetched unconditionally: a hook
-  // cannot be called from inside the Devices branch alone. It costs one local
-  // request, which resolves to "no gateway" everywhere else.
   const paired = usePairedDevices();
+  useRemoteGatewayLists(settingsSubview.value === 'devices' || settingsSubview.value === 'users');
   const background = useBackgroundModels();
   usePanelRefresh('background models', background.refresh);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [changingAgentSandbox, setChangingAgentSandbox] = useState(false);
   const [unusedDevicesOpen, setUnusedDevicesOpen] = useState(false);
   const [oauthProvider, setOauthProvider] = useState('');
   const [oauthConnecting, setOauthConnecting] = useState(false);
-  /** The scopes a deep link said this connection is for, or null for a bare
-   *  sign-in. Cleared once used, or when the user picks a different provider:
-   *  Backup's upload scopes mean nothing for the provider they typed instead. */
   const [oauthPurpose, setOauthPurpose] = useState<string | null>(null);
-  // A failed or absent registry is not an error state on this page: it means no
-  // quick buttons and no autofill, and the typed-name path still connects. So
-  // it degrades to an empty list rather than a `LoadableError`.
   const registryLoadable = knownOAuthProviders.value;
   const registryProviders =
     registryLoadable.status === 'loaded' ? registryLoadable.data.providers : [];
-  // Access preferences.value to subscribe to signal updates, then use typed accessors
   preferences.value;
   const uiScale = currentUiScale();
   const styleOverrideCount = Object.keys(currentStyleOverrides()).length;
@@ -524,20 +461,15 @@ export function SettingsView() {
   useEffect(warmSettingsReads, []);
   usePanelRefresh(`${settingsSubview.value} settings`, SETTINGS_SECTION_REFRESH[settingsSubview.value] ?? null);
 
-  // Beyond the warm-up above, this re-reads when the list drops back to
-  // not-loaded while a subview is open.
   useEffect(() => {
     if (repositories.value.status === 'not-loaded') {
       void loadRepositories();
     }
   }, [repositories.value.status]);
 
-  // A landing outlives the effect run that clears its signals, so it is
-  // cancelled here, when the page changes or the view unmounts.
   const anchorWatch = useRef<(() => void) | null>(null);
   useEffect(() => () => anchorWatch.current?.(), [settingsSubview.value]);
 
-  // Subscribe to every signal so this fires after the requested subview has rendered.
   useEffect(() => {
     const view = settingsSubview.value;
     const fragment = settingsLinkedFragment.value;
@@ -548,40 +480,20 @@ export function SettingsView() {
     anchorWatch.current?.();
     anchorWatch.current = landWhenRendered(aliasRetiredSettingsAnchor(target), (el) => {
       el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
-      // The anchor can sit on a settings row, a row LABEL span, or a section
-      // title. Land the focus marker on the enclosing .settings-row when there is
-      // one so the sticky highlight washes the whole row (its CSS gives it a uniform
-      // gap on all four sides — a bare label span can't take the marker's vertical
-      // margin trick); a section-title anchor (no enclosing row) keeps the marker
-      // on itself, where it's already padded uniformly.
       const markEl = (el.closest('.settings-row') as HTMLElement | null) ?? el;
-      // Shared navigation focus marker: a sticky background highlight that dissolves
-      // on the user's next action, never before its hold has elapsed
-      // (components/shared/focusMarker.ts). Same look as chat + plugins.
       applyNavFocus(markEl);
-      // Land keyboard focus on the targeted row's control (e.g. the Language
-      // dropdown) so a Search Everywhere jump lands focus on the setting itself,
-      // not the panel's first control. No-op for a section-title anchor with no
-      // focusable child; desktop-only (see focusFirstFocusableWithin).
       focusFirstFocusableWithin(markEl);
     }, () => {
       if (fragment) showToast(`No "${fragment}" on ${settingsSubviewLabel(view) ?? view} settings`, 'error');
     });
   }, [settingsScrollTarget.value, settingsLinkedFragment.value, settingsSubview.value]);
 
-  // The *OAuth provider registry* backs both the quick buttons and the Connect
-  // form's autofill, so it is fetched once when Accounts is first shown rather
-  // than per press.
   useEffect(() => {
     if (settingsSubview.value !== 'accounts') return;
     if (knownOAuthProviders.value.status !== 'not-loaded') return;
     void loadKnownOAuthProviders();
   }, [settingsSubview.value, knownOAuthProviders.value.status]);
 
-  // Arriving from a deep link (Backup's Connect button) with the provider and
-  // what the connection is for. Consumed once and cleared, like
-  // `settingsScrollTarget`. Waits for the registry so a known provider's field
-  // shows its label rather than its bare id.
   useEffect(() => {
     const prefill = oauthConnectPrefill.value;
     if (!prefill || settingsSubview.value !== 'accounts') return;
@@ -601,11 +513,6 @@ export function SettingsView() {
     }
     return (
       <div class="list-rows">
-        {/* Keyed by `id`, never `service_name`: a name stopped identifying a row
-            when `auth_type` became the discriminator, so an `oauth_client` app
-            registration and an API key for the same provider share a name and
-            would collide into one key. */}
-        {/* The service account lives in the 1Password section below. */}
         {credLoadable.data
           .filter((cred) => cred.auth_type !== 'onepassword_service_account')
           .map((cred) => (
@@ -618,17 +525,11 @@ export function SettingsView() {
 
   async function handleConnectProvider() {
     if (!oauthProvider.trim()) return;
-    // The id, not the text in the field: a quick button puts "Dropbox" there and
-    // the credential's service name is `dropbox`, so sending the label would
-    // open a second connection under a name differing only in case.
     const provider = providerToSend(registryProviders, oauthProvider);
     if (!provider) return;
     setOauthConnecting(true);
     try {
-      // `oauthPurpose` is what a deep link said this connection is FOR. Requesting
-      // it here is what makes one consent screen enough when the user arrived
-      // from Backup.
-      await grantOAuthScope(provider, connectScopes(oauthPurpose));
+      await grantOAuthScope(provider, oauthPurpose?.trim() ?? '', true);
       setOauthProvider('');
       setOauthPurpose(null);
     } finally {
@@ -647,23 +548,8 @@ export function SettingsView() {
     return (
       <div class="list-rows">
         {oauthLoadable.data.map(account => {
-          // formatScopes drops the always-present openid/email/profile scopes,
-          // so an account connected with only those (what the Connect button
-          // requests) formats to "". Gate on the LABEL, not on account.scopes —
-          // an empty span is still a flex item, and .list-row-details' 0.75rem
-          // gap would render it as a trailing hole after the email.
           const scopeLabel = account.scopes ? formatScopes(account.scopes) : '';
-          // Asked for but not granted: a provider refusing part of a request is
-          // a real state, and before the account recorded what it asked for
-          // there was nothing to compare, so it looked exactly like an account
-          // nobody had asked. Reconnect is the fix, and it is the button beside
-          // this line.
           const shortfall = missingScopes(account);
-          // Where to go and what to enable there, from the same registry row the
-          // Connect form renders. Reconnect on its own grants the same narrow
-          // set again whenever the provider's console is the thing that refused
-          // it, so naming the shortfall without naming the console leaves the
-          // user pressing a button that cannot work.
           const consoleRow = reauthorizationHint(
             registryProviders,
             account.provider,
@@ -673,10 +559,6 @@ export function SettingsView() {
           <div class="list-row oauth-account-row" key={account.id}>
             <div class="list-row-info">
               <div class="title list-row-name">{account.provider}</div>
-              {/* .list-row-details is a flex row whose 0.75rem gap IS the
-                  separator — same as the credential row's url/type pair and the
-                  app row's description. Each field is its own element; manual
-                  "·" glue would be double-spaced by that gap. */}
               <div class="list-row-details">
                 <span>{account.email || 'No email'}</span>
                 {scopeLabel && <span>{scopeLabel}</span>}
@@ -697,11 +579,6 @@ export function SettingsView() {
               </div>
             </div>
             <div class="list-row-actions">
-              {/* The DESIRED set, not the granted one. Re-requesting what the
-                  account already holds made the engine's merge compute
-                  `granted UNION granted`, so this button could never recover a
-                  scope a provider had refused, which is the one thing the
-                  engine's own permission errors send the user here to do. */}
               <button
                 class="action-btn"
                 onClick={() => void grantOAuthScope(account.provider, reconnectScopes(account))}
@@ -715,10 +592,6 @@ export function SettingsView() {
           );
         })}
         <div class="list-row oauth-connect-row">
-          {/* One button per known provider, straight from the registry. This was
-              a hardcoded `['Google', 'Microsoft', 'GitHub']` array, which is why
-              Dropbox had no button despite the engine knowing its endpoints all
-              along. Adding a provider to the JSON now adds its button. */}
           <div class="oauth-quick-providers">
             {registryProviders.map(p => (
               <button
@@ -726,8 +599,6 @@ export function SettingsView() {
                 class={`oauth-quick-btn${oauthProvider.toLowerCase() === p.label.toLowerCase() ? ' active' : ''}`}
                 disabled={oauthConnecting}
                 onClick={() => {
-                  // Switching provider drops any purpose a deep link supplied:
-                  // Backup's upload scopes mean nothing for a different service.
                   setOauthPurpose(null);
                   setOauthProvider(prev =>
                     prev.toLowerCase() === p.label.toLowerCase() ? '' : p.label);
@@ -751,10 +622,6 @@ export function SettingsView() {
               onClick={handleConnectProvider}
             >{oauthConnecting ? 'Connecting...' : 'Connect'}</button>
           </div>
-          {/* Connecting a provider needs a Client ID out of that provider's own
-              app console, with the redirect URI registered byte for byte. The
-              form says which console and shows the URI, but the agent can walk
-              someone through the console itself, which no static form can. */}
           <p class="form-hint oauth-connect-hint">
             Connecting needs an app registration with the provider.{' '}
             <button class="accent-link" onClick={askLucidosToConnectAccount}>
@@ -767,17 +634,9 @@ export function SettingsView() {
     );
   }
 
-  // `accounts-section` full-bleeds the list rows out of .settings-panel's
-  // gutter so they sit flush like the Apps and Triggers panels — see
-  // styles/settings/accounts.css.
   function accountsSection() {
     return (
       <>
-        {/* Both sections carry a one-line explainer. They used to be bare
-            "Credentials" and "OAuth" headings, which left a user with no way to
-            tell what the difference was, or why connecting Dropbox had produced
-            an entry in each (2026-08-05). Credentials is the secret store;
-            Connected accounts is the sign-in list. */}
         <div class="settings-section accounts-section">
           <div class="settings-section-title" data-search-anchor="accounts:connected">
             Connected accounts
@@ -794,12 +653,6 @@ export function SettingsView() {
         <div class="settings-section accounts-section">
           <div class="settings-section-title" data-search-anchor="accounts:credentials">
             Credentials
-            {/* Deliberately does NOT spell out the `oauth:<provider>` service
-                name. That name is the storage key, and the row title drops the
-                prefix on purpose (see `credentialRowLabel`), so naming it here
-                sent the user looking for a string that appears nowhere on the
-                screen. The row explains itself instead: provider title, type
-                badge, and a note saying which account it belongs to. */}
             <Explainer title="Credentials">
               <p>
                 Secrets Lucidos stores for you: API keys, tokens and passwords, and the
@@ -814,14 +667,6 @@ export function SettingsView() {
     );
   }
 
-  /** Devices: the one list of every device, and the two things you can do to
-   *  one. Pairing decides whether it reaches the machine at all, on every
-   *  workspace; the engine row decides where push goes and which preferences
-   *  apply, here. Both used to be their own list under their own word, which is
-   *  how the same phone read as two different devices.
-   *
-   *  `buildDeviceRows` joins them, outer on both sides, because neither half
-   *  missing is an error. See `deviceList.ts`. */
   function devicesSection() {
     if (loadable.status === 'failed') {
       return (
@@ -841,53 +686,60 @@ export function SettingsView() {
       });
     }
     return (
+      <div class="list-rows" data-search-anchor="devices:list">
+        {paired.paired.status === 'failed' && (
+          <LoadableError noun="paired devices" error={paired.paired.error} />
+        )}
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
+          {loadable.status === 'loaded'
+            ? (() => {
+                const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
+                if (rows.length === 0) {
+                  return <div class="empty-state">No devices registered</div>;
+                }
+                const unused = rows.filter(isUnusedDevice);
+                const drawRow = (row: DeviceRowModel) => (
+                  <DeviceRow
+                    key={row.id}
+                    row={row}
+                    editingId={editingId}
+                    setEditingId={setEditingId}
+                    onRevoke={revoke}
+                    gatewayAnswered={pairingIsKnown(paired.paired)}
+                  />
+                );
+                return (
+                  <>
+                    {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
+                    {unused.length > 0 && (
+                      <>
+                        <SectionHeader
+                          title="Unused devices"
+                          count={unused.length}
+                          collapsed={!unusedDevicesOpen}
+                          onToggle={() => setUnusedDevicesOpen((open) => !open)}
+                        />
+                        <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
+                      </>
+                    )}
+                  </>
+                );
+              })()
+            : null}
+        </LoadingFade>
+      </div>
+    );
+  }
+
+  function devicesPage() {
+    if (REMOTE_GATEWAY === null) return devicesSection();
+    return (
       <>
-        <div class="list-rows" data-search-anchor="devices:list">
-          {/* A gateway that broke is not a deployment that never had one, so it
-              says so instead of silently dropping the pairing column. The engine
-              half below still renders: push and preferences are unaffected. */}
-          {paired.paired.status === 'failed' && (
-            <LoadableError noun="paired devices" error={paired.paired.error} />
-          )}
-          <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
-            {loadable.status === 'loaded'
-              ? (() => {
-                  const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
-                  if (rows.length === 0) {
-                    return <div class="empty-state">No devices registered</div>;
-                  }
-                  const unused = rows.filter(isUnusedDevice);
-                  const drawRow = (row: DeviceRowModel) => (
-                    <DeviceRow
-                      key={row.id}
-                      row={row}
-                      editingId={editingId}
-                      setEditingId={setEditingId}
-                      onRevoke={revoke}
-                      gatewayAnswered={pairingIsKnown(paired.paired)}
-                    />
-                  );
-                  return (
-                    <>
-                      {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
-                      {unused.length > 0 && (
-                        <>
-                          <SectionHeader
-                            title="Unused devices"
-                            count={unused.length}
-                            collapsed={!unusedDevicesOpen}
-                            onToggle={() => setUnusedDevicesOpen((open) => !open)}
-                          />
-                          <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
-                        </>
-                      )}
-                    </>
-                  );
-                })()
-              : null}
-          </LoadingFade>
+        <RemoteGatewayDevicesSection gateway={REMOTE_GATEWAY} />
+        <div class="settings-section">
+          <div class="settings-section-title">In this workspace</div>
+          {devicesSection()}
         </div>
-        <PeopleSection />
       </>
     );
   }
@@ -895,14 +747,6 @@ export function SettingsView() {
   function repositoriesSection() {
     const repoLoadable = repositories.value;
 
-    // The section header renders in EVERY state, because it carries
-    // `data-search-anchor="coding-agents:repositories"` and that anchor is a
-    // navigation target (Search Everywhere, and the compose picker's "Register
-    // a repository" row). `SettingsView`'s scroll effect above does one
-    // `querySelector` on the commit where the subview mounts and then clears
-    // the target whether or not it matched, so an anchor that waits for a fetch
-    // is missed on a cold open and the jump silently lands at the top of the
-    // page. Only the LIST is Loadable-gated.
     const rows =
       repoLoadable.status === 'failed'
         ? <LoadableError noun="repositories" error={repoLoadable.error} />
@@ -948,17 +792,14 @@ export function SettingsView() {
     );
   }
 
-  /** Coding Agents: which `claude` / `codex` binary a coding-agent thread runs,
-   *  a link to the ladders on Intelligence, and which repositories it may run
-   *  in. Two halves of the same setup that
-   *  used to sit in different places (the binaries under System → Overview, the
-   *  repositories as their own top-level category). */
   function codingAgentsSection() {
     return (
       <>
         <CodingAgentBinariesSection />
         <CodingAgentPermissionSection />
         <CodingAgentContextCeilingSection />
+        <LandingSettingSection />
+        <MainCheckSettingSection />
         <CacheKeepAlivePointer />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="coding-agents:intelligence">Intelligence ladders</div>
@@ -969,40 +810,16 @@ export function SettingsView() {
     );
   }
 
-  /** Access: how you reach this engine from somewhere else. `MobileAccessPage`
-   *  renders the whole page, the engine's Network access section included, so
-   *  its own "Local network is off" row scrolls there rather than deep-linking.
-   *
-   *  The guide and the Network access section each fetch
-   *  `GET /api/v1/network-config` on mount, so opening this page costs two
-   *  requests for one payload. Left as two independent `Loadable`s
-   *  deliberately, because they read DISJOINT fields (the guide uses
-   *  `gateway_bind` / `detected_tailscale_ip`, the bind editor uses
-   *  `engine_bind` / `inherit`) and the call is a cheap local one. That
-   *  disjointness is the invariant: give both a field in common and one side
-   *  goes stale after the other's Save, at which point the fetch has to be
-   *  hoisted into a single owner rather than duplicated. */
   function accessSection() {
     return <MobileAccessPage />;
   }
 
   function commandSafetySection() {
-    // Parent master (`command_guard`) gates the whole feature. The LLM judge
-    // switch takes effect, and is enabled, only while the master is on. The
-    // judge model lives under Models, linked from here.
-    // `command_guard` / `command_guard_judge` default to a definite value while
-    // `preferences` is still loading; gate the toggles on the loaded status so
-    // they mount in their persisted position rather than animating across on
-    // reload (see `LoadableToggle`).
     const loaded = preferences.value.status === 'loaded';
     const guardOn = currentCommandGuard();
     const judgeOn = currentCommandGuardJudge();
     return (
       <div class="settings-section">
-        {/* On the section title, not on the Command guard row: the copy is
-            about what the whole section reaches, and the LLM judge below now
-            reaches one thing the guard's own tools do not. Matches the two
-            allowlist sections under it, which also explain from their title. */}
         <div class="settings-section-title" data-search-anchor="command-safety">
           Command safety
           <Explainer title="Command safety">
@@ -1054,9 +871,6 @@ export function SettingsView() {
     );
   }
 
-  /** A link to the judge model's row under Models. The guard and coding-agent
-   *  auto-answer both run on it, so neither section owns the picker. Search
-   *  finds the picker itself, so the link carries no anchor. */
   function commandJudgeLinkRow() {
     return (
       <div class="settings-row settings-row-child">
@@ -1068,8 +882,6 @@ export function SettingsView() {
     );
   }
 
-  /** The *coding-agent auto-answer* switch. Independent of the command guard,
-   *  so it sits with the coding-agent list it answers beyond. */
   function codingAgentAutoAnswerRow() {
     return (
       <div class="settings-row" data-search-anchor="permissions:coding-agent-auto-answer">
@@ -1113,16 +925,95 @@ export function SettingsView() {
     );
   }
 
-  /** Permissions subview: the command safety guard plus the two per-agent
-   *  command/tool allowlists, each an editable + deletable list. */
+  async function changeAgentsUnsandboxed(on: boolean) {
+    if (on) {
+      const ok = await showConfirm(
+        'Agents will run without the sandbox. Any command, script or coding agent can then read Lucidos\'s own secrets on this machine. These include its sign-in tokens and database password.\n\nTurn Sandbox agents off only where the sandbox cannot run and you accept that.',
+        'Run unsandboxed',
+        { variant: 'default' },
+      );
+      if (!ok) return;
+    }
+    await setAgentsUnsandboxed(on);
+  }
+
+  function agentSandboxSection() {
+    const loaded = preferences.value.status === 'loaded';
+    const unavailable = agentSandboxUnavailable.value;
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="agent-sandbox">
+          Agent sandbox
+          <Explainer title="Agent sandbox">
+            <p>
+              With Sandbox agents on, an OS sandbox protects every process an agent runs.
+              This covers the Lucidos Agent's commands and scripts, triggers, coding
+              agents, background tasks and MCP servers. The sandbox hides Lucidos's own secrets, such as its sign-in tokens
+              and database password, and keeps each workspace's permission lists read-only.
+              The rest of your files stay as reachable as before.
+            </p>
+            <p>
+              Where this machine cannot apply the sandbox, those processes do not start.
+              Turn Sandbox agents off to let them start without that protection.
+            </p>
+          </Explainer>
+        </div>
+        {unavailable !== null && (
+          <div class="settings-row">
+            <span class="settings-row-label">
+              This machine cannot sandbox agents: {unavailable}
+            </span>
+          </div>
+        )}
+        {agentSandboxTruncationUnguarded.value && (
+          <div class="settings-row">
+            <span class="settings-row-label">
+              On this system the sandbox cannot stop an agent from emptying a protected
+              file. It still stops reading, changing and replacing one. Linux 6.2 or later
+              closes this gap.
+            </span>
+          </div>
+        )}
+        {agentSandboxMetadataUnguarded.value && (
+          <div class="settings-row">
+            <span class="settings-row-label">
+              On this system the sandbox cannot stop a trigger from changing the permissions,
+              owner or timestamps of a file outside its folders. It still stops changing the
+              file's contents. Allowing unprivileged user namespaces closes this gap.
+            </span>
+          </div>
+        )}
+        <div class="settings-row" data-search-anchor="agent-sandbox:unsandboxed">
+          <span class="settings-row-label">Sandbox agents</span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={!currentAgentsUnsandboxed()}
+            ariaLabel="Sandbox agents"
+            disabled={changingAgentSandbox}
+            onChange={(c) => {
+              setChangingAgentSandbox(true);
+              changeAgentsUnsandboxed(!c).catch((e: unknown) => {
+                showToast(`Could not change the agent sandbox: ${e instanceof Error ? e.message : String(e)}`, 'error');
+              }).finally(() => setChangingAgentSandbox(false));
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
   function permissionsSection() {
     return (
       <>
+        {agentSandboxSection()}
+        <PrivatePathsSection />
         {commandSafetySection()}
+        <StandingDeniesSection />
         <AllowlistEditor
           title="Lucidos Agent permissions"
           anchor="permissions:lucidos"
           noun="command permissions"
+          rememberButton="Always allow"
           placeholder="Bash(git:*)"
           load={getAgentAllowedCommands}
           save={putAgentAllowedCommands}
@@ -1138,6 +1029,7 @@ export function SettingsView() {
           title="Coding agent permissions"
           anchor="permissions:coding-agent"
           noun="tool permissions"
+          rememberButton="Always allow"
           placeholder="Bash(npm:*)"
           load={getCcAllowedTools}
           save={putCcAllowedTools}
@@ -1187,13 +1079,6 @@ export function SettingsView() {
     const maxToolCalls = currentMaxToolCalls();
     const triggerModel = currentTriggerModel();
 
-    /** The dropdown is `freeText`, so this takes whatever the user typed. Only
-     *  a whole number is a cap; anything else is rejected with a toast rather
-     *  than silently coerced, because a silent coercion of "1oo" to 1 would set
-     *  a cap far tighter than the user meant. Integers only, matching the
-     *  engine's `parse::<usize>()` (a bare `parseInt` would read "12.5" as 12).
-     *  Below the floor is a typo more often than an intent, but the floor is
-     *  what the engine would apply anyway, so it saves rather than rejects. */
     function handleMaxToolCallsChange(raw: string) {
       const trimmed = raw.trim();
       if (!/^\d+$/.test(trimmed)) {
@@ -1201,7 +1086,6 @@ export function SettingsView() {
         return;
       }
       const parsed = Number(trimmed);
-      // The engine refuses a cap above its bound, so say so before the write.
       if (parsed > MAX_TOOL_CALLS_MAX) {
         showToast(
           `${trimmed} is above the limit of ${MAX_TOOL_CALLS_MAX.toLocaleString()} tool calls`,
@@ -1290,10 +1174,6 @@ export function SettingsView() {
               onChange={handleMaxToolCallsChange}
             />
           </div>
-          {/* Stays at rest while the rest of the note moved behind the
-              explainer: it is COMPUTED from the value in the field above, and a
-              dialog cannot show a figure the user is reading off the control it
-              describes. */}
           <div class="settings-row-note">
             {maxToolCalls.toLocaleString()} allows up to about{' '}
             {estimateTurnDuration(maxToolCalls)} of work.
@@ -1302,8 +1182,6 @@ export function SettingsView() {
         <ResponseStylesSection />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:image-generation">Image generation</div>
-          {/* One row per model, no tier beside it: an image model has no tiers,
-              and the empty tier set is what decides that. */}
           <ModelSelectionRow
             label="Model"
             models={IMAGE_MODEL_CHOICES}
@@ -1323,8 +1201,6 @@ export function SettingsView() {
             background={background}
           />
           <TitleStyleRow />
-          {/* Under the title model, because it inherits it while unset: both
-              write one line naming a piece of work. */}
           <BackgroundModelRow
             label="Change summary"
             anchor="models:change-summary"
@@ -1347,9 +1223,6 @@ export function SettingsView() {
             reasoningKey="reasoning_memory"
             background={background}
           />
-          {/* Under the memory model, because this is the call deciding whether
-              memory is retrieved at all. The System One rows are among its
-              models. */}
           <JudgmentModelRow
             site="query-classification"
             label="Query classification"
@@ -1364,11 +1237,6 @@ export function SettingsView() {
             reasoningKey="reasoning_conversation_summary"
             background={background}
           />
-          {/* The System One rows are among its models, as for query
-              classification. */}
-          {/* Every System One row is in this picker, not a switch beside it:
-              a backend is picked where the model is. Never disabled by the
-              guard's switches, since coding-agent auto-answer runs on it too. */}
           <JudgmentModelRow
             site="command-guard"
             label="Command judge"
@@ -1381,8 +1249,6 @@ export function SettingsView() {
             anchor="models:read-decision"
             background={background}
           />
-          {/* Under the read decision, its sibling at a child's turn end. The
-              System One rows are among its models. */}
           <JudgmentModelRow
             site="wake-decision"
             label="Wake decision"
@@ -1390,8 +1256,6 @@ export function SettingsView() {
             nested
             background={background}
           />
-          {/* Also at the turn end: when a waiting thread wakes, for the cache
-              keep-alive. The System One rows are among its models. */}
           <JudgmentModelRow
             site="expected-wake-decision"
             label="Expected wake"
@@ -1399,7 +1263,12 @@ export function SettingsView() {
             nested
             background={background}
           />
-          {/* The compactor runs only under Tree, so the row shows only then. */}
+          <JudgmentModelRow
+            site="permission-answer"
+            label="Permission answer"
+            anchor="models:permission-answer"
+            background={background}
+          />
           <Disclosure open={currentMemoryModule() === 'tree'}>
             <BackgroundModelRow
               label="Summary compaction"
@@ -1417,11 +1286,6 @@ export function SettingsView() {
     );
   }
 
-  /** Appearance & Behavior: how the client looks and behaves on this device.
-   *  The label gained "& Behavior" when link routing moved in, since where a
-   *  link opens is behaviour rather than display. The key stays `appearance`,
-   *  the standard name for this category and the head noun of the label, the
-   *  same way "Chat & triggers" is anchored `models:chat`. */
   function appearanceSection() {
     const mode = currentThemeMode();
     const motion = motionPreference.value;
@@ -1462,6 +1326,21 @@ export function SettingsView() {
             </div>
           </div>
           <ThemePicker />
+          <div class="settings-row" data-search-anchor="appearance:agent-brand-colours">
+            <span class="settings-row-label">Agent brand colours</span>
+            <div class="segmented-control" role="group" aria-label="Agent brand colours">
+              {[true, false].map(enabled => (
+                <button
+                  type="button"
+                  aria-pressed={currentAgentBrandColours() === enabled}
+                  class={`segmented-btn ${currentAgentBrandColours() === enabled ? 'active' : ''}`}
+                  onClick={() => void setAgentBrandColours(enabled)}
+                >
+                  {enabled ? 'On' : 'Off'}
+                </button>
+              ))}
+            </div>
+          </div>
           <div class="settings-row" data-search-anchor="appearance:theme-effects">
             <span class="settings-row-label">
               Effects
@@ -1532,7 +1411,6 @@ export function SettingsView() {
             <Dropdown
               options={workspaceFontList.value.status === 'loaded'
                 ? fontOptions(workspaceFontList.value.data.fonts, font)
-                // Unknown until the list loads, so no row claims "not installed".
                 : fontOptions([])}
               value={font}
               onChange={(v) => void setFontFamily(v as FontPreference)}
@@ -1546,14 +1424,6 @@ export function SettingsView() {
             </button>
           </div>
         </div>
-        {/* The live style remote's undo. A custom property override is applied
-            to <html> the moment it is written, so a bad value (a background
-            that matches the text, a zero font size) is one slider away, and the
-            way out must not depend on the tuned UI being legible. Two routes,
-            deliberately: this row, and the `?style-reset` URL parameter, which
-            clears the map before first paint and so works even when this row
-            cannot be read. The row renders only while overrides exist, so it
-            costs nothing to a user who has never opened the remote. */}
         {styleOverrideCount > 0 && (
           <div class="settings-section">
             <div class="settings-section-title" data-search-anchor="appearance:style-overrides">Style overrides</div>
@@ -1570,12 +1440,6 @@ export function SettingsView() {
             </div>
           </div>
         )}
-        {/* The mobile header (and its hide-on-scroll behavior) only exists at the
-            phone layout, so this toggle does nothing observable on desktop.
-            Gate the whole section on the reactive viewport signal: it appears /
-            disappears live as the viewport crosses the breakpoint. The preference
-            is global, so it's set from a mobile-width viewport where its effect is
-            visible. */}
         {viewportIsMobile.value && (
           <div class="settings-section">
             <div class="settings-section-title" data-search-anchor="appearance:mobile">Mobile</div>
@@ -1588,24 +1452,11 @@ export function SettingsView() {
     );
   }
 
-  /** Notifications: the push switch for THIS device, the same one the device's
-   *  own row in Settings → Devices carries. Duplicated here on purpose. Push is
-   *  per device, and the switch someone reaches for is the one governing the
-   *  device in their hand, which is behaviour of this client rather than a fact
-   *  about the fleet; Devices stays the place to see and manage the others.
-   *  Both rows call `setDevicePushEnabled`, so they cannot disagree.
-   *
-   *  In-app toasts is one workspace-wide preference. It sits OUTSIDE the
-   *  device-list branch. A failed device list says nothing about it, and
-   *  hiding the row there would take the switch away. */
   function notificationsSection() {
     const currentId = getDeviceId();
     const current = loadable.status === 'loaded'
       ? loadable.data.find((d) => d.id === currentId)
       : undefined;
-    // Loaded, but this device is not in the list: registration failed earlier
-    // this page load (`registerCurrentDevice` swallows its own errors as
-    // telemetry). Say so, rather than leaving a toggle that can never settle.
     const unregistered = loadable.status === 'loaded' && current === undefined;
     return (
       <div class="settings-section">
@@ -1619,9 +1470,6 @@ export function SettingsView() {
             <div class="settings-row" data-search-anchor="appearance:push-notifications">
               <span class="settings-row-label">
                 Push notifications
-                {/* The Devices link is why this takes the function form: it
-                    navigates, and the dialog has to go with it or it is left
-                    floating over the page it just opened. */}
                 <Explainer title="Push notifications">
                   {(close) => (
                     <>
@@ -1687,27 +1535,10 @@ export function SettingsView() {
     );
   }
 
-  /** Links: where a link opens when you tap it. ONE section for one user
-   *  question, with a platform-conditional ROW for each answer:
-   *
-   *   - the external-link target, on an installed iOS PWA (the only client
-   *     where the choice has any effect: see `externalLinkTargetConfigurable`);
-   *   - the in-app browser, under Tauri (the webview it opens is desktop-only).
-   *
-   *  Those two used to be separate top-level categories, `Links` and
-   *  `Experimental`, each gated so it vanished off its platform. That is how the
-   *  external-link setting shipped unreachable on the one platform it applies
-   *  to: it sat inside `Experimental`, whose nav entry was `isTauri()`-only. The
-   *  gating now lives HERE, on the rows, and the category above it
-   *  (Appearance & Behavior) renders Theme + Typography unconditionally, so no
-   *  page can come up empty.
-   *  Pinned by `__tests__/settings-nav-structure.test.ts`. */
   function linksSection() {
     const showExternalTarget = externalLinkTargetConfigurable();
     const showInAppBrowser = isTauri();
     if (!showExternalTarget && !showInAppBrowser) return null;
-    // Gate the toggle on the loaded status so it mounts in its persisted
-    // position rather than animating across on reload (see `LoadableToggle`).
     const loaded = preferences.value.status === 'loaded';
     return (
       <div class="settings-section">
@@ -1727,10 +1558,6 @@ export function SettingsView() {
                   directly, so "Ask" is the option that lets iOS itself offer every
                   browser you have installed.
                 </p>
-                {/* The per-link override is iOS's OWN long-press menu, not something
-                    we render: suppressing it to draw our own would cost Copy Link,
-                    Share and Add to Reading List alongside Open in Safari. Naming it
-                    here is the documented way to make it discoverable. */}
                 <p>
                   For a one-off, long-press any link instead: iOS offers Open in
                   Safari, Copy and Share without changing this setting.
@@ -1782,7 +1609,8 @@ export function SettingsView() {
       case 'intelligence': return <IntelligencePage />;
       case 'appearance': return appearanceSection();
       case 'memory': return <SystemPage panel="memory" />;
-      case 'devices': return devicesSection();
+      case 'devices': return devicesPage();
+      case 'users': return <UsersPage />;
       case 'accounts': return accountsSection();
       case 'backup': return <SystemPage panel="backup" />;
       case 'coding-agents': return codingAgentsSection();
@@ -1792,6 +1620,7 @@ export function SettingsView() {
       case 'permissions': return permissionsSection();
       case 'mcp': return <McpServersPage />;
       case 'webhooks': return <WebhooksPage />;
+      case 'event-hooks': return <EventHooksPage />;
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'prompt-footprint': return <SystemPage panel="prompt-footprint" />;

@@ -11,40 +11,20 @@ import {
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-/**
- * A follow-up send on a phone moves as one piece.
- *
- * Reported as janky from an iOS PWA. A frame trace of one send showed three
- * things out of step:
- *
- * - The box snapped from its draft's height to one line in a single frame.
- * - The Stop it morphed into dimmed to 40% a beat later. It brightened again
- *   1.2 s on: the post-send settle guard was wearing the disabled style.
- * - As the keyboard closed, the thread's title bar popped to the top of the
- *   screen in one frame. The header only then glided in above it.
- *
- * Each check below reads a state, not a frame count, so a slow host that drops
- * frames cannot fail it.
- */
 
-/** What an open keyboard leaves of an iPhone 15 Pro's visual viewport. */
 const KEYBOARD_APP_HEIGHT_PX = 490;
 const FULL_APP_HEIGHT_PX = 852;
 
 const PANE = '.mobile-swipe-pane';
 
-/** One drawn frame of the header and the thread's title bar, in px. */
 interface ChromeFrame {
   headerTop: number;
   headerBottom: number;
   titleTop: number;
 }
 
-/** Open the seeded thread with the keyboard up and a four-line draft in the
- *  box. The shell is shrunk to what the keyboard leaves. */
 async function openThreadWithDraft(page: Page, title: string): Promise<void> {
   await navigateToApp(page);
   await openThreadDrawer(page);
@@ -91,9 +71,6 @@ test.describe('A mobile follow-up send moves as one piece', () => {
   test('the box eases shut, and Stop arrives at full strength', async ({ page }) => {
     await openThreadWithDraft(page, title);
 
-    // Read in the same task as the press, before any frame can run. A snap
-    // has already written the short height by then. An ease parks the box at
-    // the height it came from and only starts moving on a later frame.
     const atPress = await page.evaluate((pane) => {
       const box = document.querySelector<HTMLTextAreaElement>(`${pane} [data-role="prompt-input"]`)!;
       const before = box.getBoundingClientRect().height;
@@ -105,8 +82,6 @@ test.describe('A mobile follow-up send moves as one piece', () => {
 
     const stop = page.locator(`${PANE} .send-cancel-morph[aria-label="Cancel"]`);
     await expect(stop, 'the send never turned the button into Stop').toBeVisible();
-    // The settle guard holds Stop disabled right after the send. It must not
-    // look disabled while it does.
     await expect(stop).toBeDisabled();
     await expect(stop).toHaveCSS('opacity', '1');
 
@@ -118,15 +93,11 @@ test.describe('A mobile follow-up send moves as one piece', () => {
 
   test('the title bar comes back under the header, never ahead of it', async ({ page }) => {
     await openThreadWithDraft(page, title);
-    // The focus sends the header away on a glide. A send before it has gone
-    // brings it straight back, so there is no glide in for this test to read.
     await expect.poll(
       () => page.locator('.app-header').evaluate((el) => el.getBoundingClientRect().bottom),
       { message: 'the keyboard never sent the header away' },
     ).toBeLessThanOrEqual(0.5);
 
-    // Sample every frame of the keyboard close. Frames a slow host drops
-    // cannot fail this: every frame it does draw must hold the rule.
     await page.evaluate(({ pane, fullHeight }) => {
       const w = window as unknown as { __chromeFrames: ChromeFrame[] };
       w.__chromeFrames = [];
@@ -157,9 +128,6 @@ test.describe('A mobile follow-up send moves as one piece', () => {
     const frames = await page.evaluate(
       () => (window as unknown as { __chromeFrames: ChromeFrame[] }).__chromeFrames,
     );
-    // The pop glued the title bar to the header's bottom edge for the whole
-    // glide. So it reached the screen first. Starting fully hidden, it rides
-    // UNDER the header until both rest.
     const midGlide = frames.filter((f) => f.headerTop < -10 && f.headerBottom > 0);
     expect(midGlide.length, 'no frame caught the header mid-glide').toBeGreaterThan(0);
     const ahead = midGlide.filter((f) => f.titleTop >= f.headerBottom - 1);

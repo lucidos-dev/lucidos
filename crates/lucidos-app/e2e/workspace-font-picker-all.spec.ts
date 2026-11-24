@@ -1,11 +1,3 @@
-/**
- * The install form's file picker: a themed button at the row's right edge,
- * the pick in muted text to its left, and the real input hidden but reachable.
- *
- * Runs at desktop and phone width, since the failure modes differ. On
- * desktop, the right edge can miss the column. On a phone, a long file name
- * can push the button out of the pane.
- */
 import { test, expect, type Locator, type Page } from './fixtures';
 import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 
@@ -45,26 +37,19 @@ test.describe('the font file picker', () => {
     await expect(input).toHaveAttribute('multiple', '');
     await expect(page.getByLabel('Choose font files')).toHaveCount(1);
 
-    // The status sits left of the button.
     const statusBox = (await status.boundingBox())!;
     const buttonBox = (await button.boundingBox())!;
     expect(statusBox.x + statusBox.width).toBeLessThanOrEqual(buttonBox.x);
 
-    // One right edge with the Group select and the UI scale readout.
     const groupTrigger = form.locator('.settings-row', { hasText: 'Group' }).locator('.dropdown-trigger');
     const scaleButton = page.locator('.settings-row', { hasText: 'UI scale' }).locator('.settings-option');
     const edge = await right(button);
     expect(Math.abs(edge - (await right(groupTrigger)))).toBeLessThan(0.5);
     expect(Math.abs(edge - (await right(scaleButton)))).toBeLessThan(0.5);
 
-    // The same box as the Install button beside it.
     const installBox = (await form.getByRole('button', { name: 'Install', exact: true }).boundingBox())!;
     expect(Math.abs(buttonBox.height - installBox.height)).toBeLessThan(0.5);
 
-    // Shift+Tab from the Name field lands on the input: the button shows the
-    // ring, and Enter opens the picker. Before any pick, so no per-file row
-    // sits between the two in tab order. WebKit tabs past every button and
-    // file input unless an OS setting says otherwise, so it focuses directly.
     if (browserName === 'webkit') {
       await input.focus();
     } else {
@@ -77,7 +62,6 @@ test.describe('the font file picker', () => {
     await page.keyboard.press('Enter');
     expect((await chooser).isMultiple()).toBe(true);
 
-    // A long name truncates; the button keeps its place inside the pane.
     await input.setInputFiles({ name: LONG_NAME, mimeType: 'font/woff2', buffer: Buffer.from('x') });
     await expect(status).toHaveText(LONG_NAME);
     const truncated = await status.evaluate(el => ({
@@ -89,7 +73,6 @@ test.describe('the font file picker', () => {
     const pane = page.locator('.content-pane-body').first();
     expect(await pane.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
 
-    // Several files read as a count.
     await input.setInputFiles([
       { name: 'Brand-Regular.woff2', mimeType: 'font/woff2', buffer: Buffer.from('x') },
       { name: 'Brand-Bold.woff2', mimeType: 'font/woff2', buffer: Buffer.from('x') },

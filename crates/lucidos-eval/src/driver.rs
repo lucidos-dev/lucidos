@@ -623,14 +623,8 @@ pub struct ArmEndpoint {
 impl ArmEndpoint {
     /// Build a client that speaks for a registered device.
     pub async fn connect(base_url: &str, pool: PgPool) -> Fallible<ArmEndpoint> {
-        // `no_proxy()` + `danger_accept_invalid_certs(true)` is the loopback
-        // pair `.claude/rules/rust.md` prescribes: an arm's engine is on
-        // 127.0.0.1 with a self-signed cert, so an `HTTPS_PROXY` in the
-        // environment must never be consulted.
-        let bootstrap = reqwest::Client::builder()
-            .no_proxy()
-            .danger_accept_invalid_certs(true)
-            .build()?;
+        // An arm's engine is a loopback listener.
+        let bootstrap = lucidos_local_token::client::client_builder().build()?;
         bootstrap
             .post(format!("{base_url}/api/v1/devices/register"))
             .json(&serde_json::json!({
@@ -647,9 +641,7 @@ impl ArmEndpoint {
         );
         Ok(ArmEndpoint {
             base_url: base_url.to_string(),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .danger_accept_invalid_certs(true)
+            client: lucidos_local_token::client::client_builder()
                 .default_headers(headers)
                 .build()?,
             pool,
@@ -1700,7 +1692,7 @@ mod tests {
     /// either one there fails here, rather than turning re-posts off silently.
     #[test]
     fn the_refusal_prefix_is_the_text_the_engine_writes() {
-        let run = include_str!("../../lucidos-engine/src/engine/agentic_loop/run.rs");
+        let run = include_str!("../../lucidos-agents-api/src/engine/agentic_loop/run.rs");
         let failure = r#""Model returned no response ({}).""#;
         let diagnostic = r#""stop_reason: {}, output_tokens: {}"#;
         for fragment in [failure, diagnostic] {

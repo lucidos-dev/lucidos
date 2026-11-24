@@ -58,14 +58,18 @@ def declarations(ref, tracked):
         targets = targets.split()
         for target in targets:
             pattern(target)
-            if target not in tracked:
+            # A glob target names the parts of a doc split over the size cap.
+            if not any(matches(p, [target]) for p in tracked):
                 raise ValueError(f'{registry}:{number}: missing tracked documentation: {target}')
             if matches(target, sources):
                 raise ValueError(f'{registry}:{number}: documentation and sources overlap: {target}')
         rules[name] = (sources, targets, guidance)
     if not rules:
         raise ValueError(f'{registry}: empty registry')
-    sections = sorted(p for p in tracked if p.startswith('system-knowhow/workspace-audit/') and p.endswith('.md'))
+    # A section is a file directly under workspace-audit/. Its folder holds its
+    # parts when it is split over the size cap, and they share its declaration.
+    sections = sorted(p for p in tracked if p.startswith('system-knowhow/workspace-audit/')
+                      and p.endswith('.md') and p.count('/') == 2)
     if not sections:
         raise ValueError('missing workspace-audit sections')
     for section in sections:
@@ -80,11 +84,12 @@ def declarations(ref, tracked):
         if (not isinstance(sources, list) or not sources
                 or any(not isinstance(p, str) for p in sources) or len(set(sources)) != len(sources)):
             raise ValueError(f'{section}: sources must be a nonempty JSON array of unique repository globs')
+        # Unique: one folder level, and a registry name never holds a slash.
         name = f'audit/{pathlib.PurePosixPath(section).stem}'
-        if name in rules:
-            raise ValueError(f'{section}: duplicate audit surface: {name}')
-        rules[name] = ([pattern(p) for p in sources], [section], f'Review {section} against its declared sources.')
-        if matches(section, sources):
+        parts = f'{section[:-len(".md")]}/*.md'
+        rules[name] = ([pattern(p) for p in sources], [section, parts],
+                       f'Review {section} and its parts against its declared sources.')
+        if matches(section, sources) or any(matches(p, sources) for p in tracked if matches(p, [parts])):
             raise ValueError(f'{section}: cannot declare itself as a source')
     for name, (sources, _, _) in rules.items():
         for glob in sources:
@@ -135,7 +140,7 @@ def main():
     for rules in versions:
         for name, (sources, targets, guidance) in rules.items():
             touched = {p for p in diff if matches(p, sources)}
-            if not touched or diff.intersection(targets):
+            if not touched or any(matches(p, targets) for p in diff):
                 continue
             for path in touched:
                 related = [exempt for changes, exempt in commits if path in changes]

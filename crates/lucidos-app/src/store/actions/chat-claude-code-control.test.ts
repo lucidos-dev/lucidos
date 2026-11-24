@@ -1,7 +1,3 @@
-/**
- * `sendCodingAgentControl` reports whether the engine recorded a pick. A
- * refusal, such as a pick made while a turn runs, toasts the engine's reason.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 import type { sendControlRequest as SendControlRequest } from '../../api/client';
@@ -29,6 +25,8 @@ vi.mock('../../api/client', () => ({
 }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./send-probe', () => ({ probeStreamAfterSend: vi.fn() }));
+
+vi.mock('../composeSync', () => ({ knownComposeEpoch: vi.fn(), parseComposeReport: vi.fn(), acceptComposeReport: vi.fn() }));
 
 const { sendCodingAgentControl } = await import('./chat-claude-code');
 

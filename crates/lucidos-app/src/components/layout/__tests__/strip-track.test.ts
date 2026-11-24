@@ -5,7 +5,6 @@ import { mobileView, PANE_INDEX } from '../../../store/store';
 
 const WIDTH = 300;
 
-/** A container and a track, with the width jsdom does not lay out. */
 function strip(transform: string) {
   const container = document.createElement('div');
   Object.defineProperty(container, 'offsetWidth', { value: WIDTH });
@@ -23,7 +22,6 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// Defect 9: a drag that locked mid-slide jumped the strip to the slide's end.
 describe('stripTrack', () => {
   it('catches a drag where the strip is on screen, mid-slide included', () => {
     const { track, t } = strip('matrix(1, 0, 0, 1, -150, 0)');

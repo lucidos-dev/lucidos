@@ -3,19 +3,11 @@ import { sectionTokenScale } from '../sectionTokens';
 import { groupSections } from '../contextGrouping';
 import type { ContextCapture, ContextSection } from '../../../store/types';
 
-/** The LLM Context Viewer rendered its section rows through a hand-copied
- *  `chars × 2/3` (the engine's *trim-budget* ratio of 1.5 chars/token), while
- *  the header rendered the provider's measured `usage.input_tokens`. On the
- *  capture that surfaced this the tree summed to 361k under a header reading
- *  205k. These pin the property that replaced it: the rows are shares of the
- *  headline, so the tree sums to the header by construction. */
 
 function section(name: string, chars: number, role: ContextSection['role'] = 'user'): ContextSection {
   return { name, budget_delta_chars: chars, content_chars: chars, role };
 }
 
-/** The reported capture, to scale: 540.1K chars of sections against a real
- *  205k-token prompt. Section sizes are the three role totals from it. */
 function capture(over: Partial<ContextCapture> = {}): ContextCapture {
   return {
     producer: 'main_llm',
@@ -27,15 +19,12 @@ function capture(over: Partial<ContextCapture> = {}): ContextCapture {
       section('Conversation', 374_900, 'user'),
     ],
     tools: [],
-    estimated_total_tokens: 360_066, // 540,100 × 2/3, what the engine stored
+    estimated_total_tokens: 360_066,
     trimmed: false,
     ...over,
   };
 }
 
-/** Sum of what the tree actually renders: every role header, which is what a
- *  reader adds up. Mirrors `ContextCapturePanel`'s grouping so a change to the
- *  role buckets cannot quietly break the sum. */
 function renderedRoleTotals(snap: ContextCapture): number {
   const tokens = sectionTokenScale(snap);
   return groupSections(snap.sections)
@@ -48,7 +37,6 @@ describe('sectionTokenScale', () => {
     const snap = capture({
       usage: { input_tokens: 205_000, output_tokens: 196, cache_read_tokens: 203_000, cache_creation_tokens: 2_000 },
     });
-    // Rounding can move each of the three rows by at most half a token.
     expect(renderedRoleTotals(snap)).toBeCloseTo(205_000, -1);
   });
 
@@ -64,20 +52,15 @@ describe('sectionTokenScale', () => {
         usage: { input_tokens: 205_000, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
       }),
     )(147_800);
-    // 205k/360k of the estimate: the correction the whole change exists for.
     expect(measured).toBeLessThan(estimated);
     expect(measured / estimated).toBeCloseTo(205_000 / 360_066, 3);
   });
 
   it('splits proportionally, so a section twice the size reads twice the tokens', () => {
     const tokens = sectionTokenScale(capture());
-    // Within a token: each row is rounded independently, so doubling the chars
-    // can land half a token either side of doubling the rounded result.
     expect(tokens(2_000)).toBeCloseTo(tokens(1_000) * 2, -0.5);
   });
 
-  // INV-6: three degenerate shapes that all occur in the wild. None may render
-  // `NaN tokens` or throw.
   it('returns zero for a capture with no sections (the Claude Code producer)', () => {
     const tokens = sectionTokenScale(
       capture({
@@ -91,8 +74,6 @@ describe('sectionTokenScale', () => {
   });
 
   it('returns zero for a legacy synthesis with no headline total', () => {
-    // `synthesizeContextCapture` falls back to 0 when the legacy row carried
-    // neither a measured token count nor a char total.
     const tokens = sectionTokenScale(capture({ estimated_total_tokens: 0, legacy: true }));
     expect(tokens(147_800)).toBe(0);
   });
@@ -104,15 +85,11 @@ describe('sectionTokenScale', () => {
     expect(tokens(147_800)).toBe(0);
   });
 
-  /** The Conversation row is the one section whose two sizes disagree. Its
-   *  content_chars counts the bundle a second time, so a tree that divided by
-   *  it would not sum to the header. */
   it('divides by the budget delta, so a delta section does not break the sum', () => {
     const snap = capture({
       sections: [
         section('System Instructions', 147_800, 'system'),
         section('Prior turn', 17_400, 'prior_message'),
-        // 374,900 added on top of a 165,200-char bundle already in message 0.
         { name: 'Conversation', budget_delta_chars: 374_900, content_chars: 540_100, role: 'user' },
       ],
       usage: { input_tokens: 205_000, output_tokens: 196, cache_read_tokens: 203_000, cache_creation_tokens: 2_000 },
@@ -120,8 +97,6 @@ describe('sectionTokenScale', () => {
     expect(renderedRoleTotals(snap)).toBeCloseTo(205_000, -1);
   });
 
-  /** A row written before the split carries no content_chars at all. Nothing
-   *  the viewer reads may go undefined on it. */
   it('renders a pre-split row, which measured no region', () => {
     const snap = capture({
       sections: [{ name: 'Conversation', budget_delta_chars: 500, role: 'user' }],

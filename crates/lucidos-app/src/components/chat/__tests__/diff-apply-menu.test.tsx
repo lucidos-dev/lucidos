@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Diff and the standing apply, merged into one box on a row too narrow for
- * both. The menu's rows are the members' own rows, so each action stays
- * reachable and the armed state stays visible.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

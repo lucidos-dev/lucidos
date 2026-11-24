@@ -1,9 +1,3 @@
-/**
- * A *form request* renders in the turn that asked for it, so the user can
- * reopen a form they closed or never saw. Its resolution usually lands turns
- * later: the user answers after the agent went quiet, or types a new message
- * instead. The row still has to show how it ended.
- */
 import { describe, it, expect } from 'vitest';
 import {
   exchangeResponseEvents,

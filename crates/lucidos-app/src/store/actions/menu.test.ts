@@ -12,33 +12,19 @@ import {
 import type { App } from '../types';
 import { ladderAnchor } from '../../components/settings/intelligenceLadder';
 
-// Mock navigation to spy on pushNavState
 const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 
-// Mock pane helper — single rule across the codebase: any user-intent navigation
-// that lands content into the right pane must call revealContentPane(), so the
-// mobile user gets swiped to it AND the desktop user's collapsed split expands.
-// We mock here to verify each helper in this file calls it (or, for the pure
-// plumbing helper setActiveMenu, that it does NOT).
 const revealContentPane = vi.fn();
 const navigateToPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane, navigateToPane }));
 
-// Force isMobile() to return true so the setActiveMenu pure-plumbing pin would
-// have ALSO failed under the pre-refactor conditional (`item !== prev &&
-// isMobile() && mobileView === 'thread'`). jsdom's default viewport is desktop;
-// without this mock the conditional would skip on isMobile() alone and the
-// pin would pass for the wrong reason — green even before the refactor.
 vi.mock('../../utils/viewport', () => ({ isMobile: () => true }));
 
-// Mock credentials loader (called by openSettingsSubview('accounts'))
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn().mockResolvedValue(undefined) }));
 
-// Mock env var loader (called by openSettingsSubview('environment-variables'))
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn().mockResolvedValue(undefined) }));
 
-// Mock API calls triggered by switchMenuItem's data loaders
 vi.mock('../../api/client', () => ({
   getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
   listTriggers: vi.fn().mockResolvedValue({ triggers: [] }),
@@ -79,18 +65,12 @@ describe('switchMenuItem', () => {
   });
 
   it('clears app UI overlay when re-selecting the SAME menu item (pinned app bug)', () => {
-    // BUG SCENARIO:
-    // 1. activeMenuItem is 'notifications' (saved from previous visit)
-    // 2. User opened pinned app UI (doesn't change activeMenuItem)
-    // 3. User clicks notification bell → switchMenuItem('notifications')
-    // 4. item === prev, so clearing was skipped → app UI stayed visible
     activeMenuItem.value = 'notifications';
     panelOverlay.value = { type: 'app-ui', app: fakeApp };
 
     switchMenuItem('notifications');
 
     expect(activeMenuItem.value).toBe('notifications');
-    // These must be cleared even though item === prev
     expect(currentApp.value).toBeNull();
   });
 
@@ -126,29 +106,17 @@ describe('switchMenuItem', () => {
   });
 
   it('reveals the content pane on every menu switch (mobile swipe, desktop expand)', () => {
-    // The user-intent rule: any helper that puts something into the right-hand
-    // content pane must call revealContentPane(). switchMenuItem is the
-    // user-intent layer for drawer clicks, NotificationsBell, nav-link clicks,
-    // and SDK navigate_ui → handleNavigationRequest panel branches.
     switchMenuItem('notifications');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
   it('navigates to the Plugins panel and reveals the content pane', () => {
-    // Mirror entry for the new top-level Plugins panel (frontend.md: new
-    // navigation entry points get pinned here). switchMenuItem('plugins') is
-    // the user-intent layer for the drawer's Plugins item + the `app-store`
-    // navigate target.
     switchMenuItem('plugins');
     expect(activeMenuItem.value).toBe('plugins');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
   it('reveals the content pane even when re-selecting the SAME menu item', () => {
-    // Regression for the old setActiveMenu gate that skipped pane navigation
-    // when `item === prev`. Re-tapping a link to a panel the user previously
-    // visited (e.g. activeMenuItem stuck at 'notifications' from prior visit)
-    // while looking at a thread must STILL swipe to content.
     activeMenuItem.value = 'notifications';
     switchMenuItem('notifications');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
@@ -191,12 +159,6 @@ describe('openSettingsSubview', () => {
   });
 
   it('lands the Settings menu item itself, in a SINGLE nav push', () => {
-    // The reported bug: a deep link from outside Settings (the Backup failure
-    // notification's "Open settings", a Search Everywhere hit, the Marketplaces
-    // jump) had to pair this with switchMenuItem('settings') because it set only
-    // the subview. Both push, so one tap left two history entries and Back
-    // walked onto a Settings home the user never visited. This helper is now a
-    // complete destination, so the pairing is gone from every caller.
     activeMenuItem.value = 'notifications';
 
     openSettingsSubview('backup');
@@ -207,9 +169,6 @@ describe('openSettingsSubview', () => {
   });
 
   it('clears an open overlay so a deep link is not covered by it', () => {
-    // setActiveMenu's clearing, inherited now that this helper routes through
-    // it: arriving from a notification-detail panel (which IS an overlay) must
-    // show the settings page, not the panel that was open behind the tap.
     activeMenuItem.value = 'notifications';
     panelOverlay.value = { type: 'app-ui', app: fakeApp };
 
@@ -220,10 +179,6 @@ describe('openSettingsSubview', () => {
   });
 
   it('reveals the content pane (mobile swipe, desktop expand)', () => {
-    // Settings sub-sections live inside the content pane. Opening one from
-    // any source (deep link, search result, in-panel nav) must swipe to it
-    // on mobile — without this, tapping a settings deep-link from a chat on
-    // mobile silently left the user on the thread pane.
     openSettingsSubview('devices');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
@@ -235,17 +190,12 @@ describe('openSettingsSubview', () => {
   });
 
   it('opens the thread-queue subview (Thread Queue lives under Settings → System)', () => {
-    // Mirror entry for the Thread Queue navigation point (frontend.md: new
-    // navigation entry points get pinned here). The Thread Queue is now a System
-    // subpanel reached via openSettingsSubview, not a top-level menu item.
     openSettingsSubview('thread-queue');
     expect(settingsSubview.value).toBe('thread-queue');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
   it('opens the models subview (the triggering deep-link case)', () => {
-    // The agent could not deep-link Settings → Models before settings_view was
-    // widened; pin that it now lands (frontend.md: pin new navigation points).
     openSettingsSubview('models');
     expect(settingsSubview.value).toBe('models');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
@@ -265,24 +215,10 @@ describe('setActiveMenu (pure plumbing)', () => {
     pushNavState.mockClear();
     revealContentPane.mockClear();
     navigateToPane.mockClear();
-    // Force the conditions under which the OLD setActiveMenu's
-    // `if (item !== prev && isMobile() && mobileView === 'thread')` block
-    // WOULD have fired (item changes from 'files' to 'notifications', isMobile
-    // is forced true, mobileView is the default 'thread'). This makes the
-    // pin a real regression guard — if someone re-introduces the conditional,
-    // the test breaks; the test cannot pass for the wrong reason because the
-    // pre-refactor branch would have called navigateToPane here.
     mobileView.value = 'thread';
   });
 
   it('does NOT touch pane navigation — that is the user-intent layer job', () => {
-    // Pin: setActiveMenu is internal plumbing used by multiple flows
-    // (switchMenuItem, landOnAccountsWithOverlay, thread-sync new-app /
-    // new-trigger branches). Each user-intent caller is responsible for
-    // calling revealContentPane() itself. Putting pane logic inside
-    // setActiveMenu — gated on `item !== prev && mobileView === 'thread'` —
-    // was the original bug: silent no-swipe when the user re-tapped the same
-    // item, or was already on the threads pane.
     setActiveMenu('notifications');
     expect(revealContentPane).not.toHaveBeenCalled();
     expect(navigateToPane).not.toHaveBeenCalled();
@@ -318,10 +254,6 @@ describe('openBackupSettings', () => {
   });
 
   it('lands on Settings > Backup and reveals the content pane', () => {
-    // The app-shell backup reminder's "Set up backup" button. Without the
-    // reveal the tap is a silent no-op for a mobile user (who is looking at the
-    // thread pane) and leaves a desktop user's collapsed split unchanged, which
-    // reads as a dead button on both.
     openBackupSettings();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('backup');
@@ -341,9 +273,6 @@ describe('openWebhookSettings', () => {
   });
 
   it('lands on Settings > Webhooks and reveals the content pane', () => {
-    // The "Open Webhooks" button both webhook bars carry. Without the reveal
-    // the tap does nothing visible for a mobile user on the thread pane, and
-    // leaves a desktop user's collapsed split shut.
     openWebhookSettings();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('webhooks');
@@ -363,8 +292,6 @@ describe('Debugging row deep links', () => {
   });
 
   it('lands on the Capture context row in Settings > Debugging', () => {
-    // The context viewer's link on a section with no body. The scroll target
-    // is what puts the user on the switch rather than at the top of the page.
     openCaptureContextSetting();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('debugging');
@@ -374,8 +301,6 @@ describe('Debugging row deep links', () => {
   });
 
   it('lands on the Cache cards row under Settings > Models > Cache keep-alive', () => {
-    // Every cache explainer's link. Without the scroll target the
-    // page opens at its top and the row the link names is not marked.
     openCacheCardsSetting();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('models');
@@ -396,8 +321,6 @@ describe('Coding Agents row deep links', () => {
   });
 
   it('lands on the Cache keep-alive section in Settings > Models', () => {
-    // The cache-warm line's explainer link. The scroll target marks the
-    // section the explainer names.
     openCacheKeepAliveSetting();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('models');

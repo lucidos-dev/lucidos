@@ -3,13 +3,8 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { overlayStack, pushOverlay, _resetOverlayStackForTesting } from '../../../store/overlayStack';
 import { handleOverlayTab, overlayTabAction, shouldRestoreFocus } from '../overlayFocus';
 
-// The shell behind an overlay is inert only to the pointer, so Tab walked
-// straight into it: open a step's detail modal from the keyboard and Tab went on
-// through the transcript underneath.
 describe('overlayTabAction', () => {
   it('a popover closes when Tab starts outside it, such as on its combobox input', () => {
-    // A free-text dropdown opens on focus. Tabbing past it left the menu open,
-    // and a Settings page collected a stack of them.
     expect(overlayTabAction({ modal: false, activeInPanel: false, count: 3, target: 0 })).toEqual({ kind: 'dismiss' });
   });
 
@@ -37,7 +32,6 @@ describe('handleOverlayTab', () => {
 
   function mount(html: string): void {
     document.body.innerHTML = html;
-    // jsdom lays nothing out; give every control a box.
     for (const el of document.querySelectorAll<HTMLElement>('*')) {
       el.getClientRects = () => [{}] as unknown as DOMRectList;
     }
@@ -73,7 +67,6 @@ describe('handleOverlayTab', () => {
   });
 
   it('after closing a popover, the dialog under it still contains the Tab', () => {
-    // A dropdown inside a dialog: its input sits in the dialog, outside the menu.
     mount(`
       <div class="modal-overlay"><div data-overlay-panel="d" data-overlay-modal>
         <input data-id="combo"><button data-id="ok">OK</button>
@@ -91,8 +84,6 @@ describe('handleOverlayTab', () => {
   });
 
   it('keeps Tab inside a dialog whose body the reader clicked', () => {
-    // A click on dialog prose focuses its tabindex=-1 body. Native Tab from
-    // there walked out into the shell behind.
     mount(`
       <div class="modal-overlay"><div data-overlay-panel="d" data-overlay-modal>
         <button data-id="close">Close</button><div tabindex="-1" data-id="body">Text</div>
@@ -127,7 +118,6 @@ describe('shouldRestoreFocus', () => {
   });
 
   it('respects an action that sent the reader to another pane', () => {
-    // A menu item that opened a file moved the marker to the content pane.
     expect(shouldRestoreFocus({ ...base, markerPane: 'content' })).toBe(false);
   });
 

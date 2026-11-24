@@ -9,31 +9,24 @@ import { LEGACY_RESOLUTION_NOTES, PLAIN_RESOLUTION_NOTES } from '../PermissionCa
 import { TOOL_CALL_CAP_OPENING } from '../ChatExchange';
 import { LEGACY_REENTRY_OPENINGS } from '../../../store/thread-events';
 
-/**
- * Three UI tables match on words the engine writes for the agent: permission
- * resolution reasons, the old re-entry openings, and the tool-call cap message.
- * If the engine rewords one, the card silently falls back to raw engine text.
- * This reads the engine source, so the rewording fails here instead.
- */
 
 const here = dirname(fileURLToPath(import.meta.url));
-const ENGINE = resolve(here, '../../../../../lucidos-engine/src');
+const CRATES = resolve(here, '../../../../..');
 
 const engineText = [
-  'engine/cc_permission.rs',
-  'engine/command_permission.rs',
-  'engine/mcp_permission.rs',
-  'engine/agent_recovery/has_diff.rs',
-  'engine/event_wait/mod.rs',
-  'engine/agentic_loop/helpers.rs',
-].map((path) => readFileSync(resolve(ENGINE, path), 'utf8')).join('\n');
+  'lucidos-engine/src/engine/cc_permission.rs',
+  'lucidos-engine/src/engine/command_permission.rs',
+  'lucidos-engine/src/engine/mcp_permission.rs',
+  'lucidos-agents-api/src/engine/agent_recovery/has_diff.rs',
+  'lucidos-engine/src/engine/event_wait/mod.rs',
+  'lucidos-agents-api/src/engine/agentic_loop/helpers.rs',
+].map((path) => readFileSync(resolve(CRATES, path), 'utf8')).join('\n');
 
 describe('the engine still writes the words the UI matches on', () => {
   it.each(PLAIN_RESOLUTION_NOTES.map(([opening]) => opening))('a permission reason opening "%s"', (opening) => {
     expect(engineText).toContain(opening);
   });
 
-  // A retired row the engine still wrote would belong in the current table.
   it.each(LEGACY_RESOLUTION_NOTES.map(([opening]) => opening))('no longer a reason opening "%s"', (opening) => {
     expect(engineText).not.toContain(opening);
   });

@@ -79,6 +79,9 @@
 # needs is held (E2E_LOCK_BUSY_EXIT).
 # shellcheck source=host_busy_exits.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_busy_exits.sh"
+# For E2E_DEFAULT_WORKSPACE.
+# shellcheck source=e2e_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_root.sh"
 E2E_LOCK_HELD_MESSAGE="another e2e run is in progress on the e2e-test workspace."
 
 E2E_LOCK_OWNED=""
@@ -123,7 +126,7 @@ source "$_E2E_LOCK_LIB_DIR/flock.sh"
 # run with it, or the umbrella, takes every slot, so WebKit never runs beside
 # another run (the 2026-04-19 crash above). Fixed at source time, so a run
 # that moved $E2E_WORKSPACE to its slot still names both.
-E2E_BASE_WORKSPACE="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+E2E_BASE_WORKSPACE="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
 
 # The checkout these scripts run from. A run records it, because two runs from
 # one checkout would share its dist/ and test-results/.
@@ -137,10 +140,10 @@ e2e_slot_workspaces() {
 }
 
 # e2e_lock_kind <projects>: `exclusive` when the comma-separated projects
-# include mobile-webkit, else `shared`.
+# include a WebKit project, else `shared`.
 e2e_lock_kind() {
     case ",$1," in
-        *,mobile-webkit,*) echo exclusive ;;
+        *-webkit,*) echo exclusive ;;
         *) echo shared ;;
     esac
 }
@@ -148,7 +151,7 @@ e2e_lock_kind() {
 # Resolve the lock file path of $E2E_WORKSPACE. $E2E_LOCK_DIR_OVERRIDE is for
 # tests, and a slot other than the base gets a subdirectory of it.
 _e2e_lock_path() {
-    local ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}" dir
+    local ws="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}" dir
     while [ "${ws%/}" != "$ws" ]; do ws="${ws%/}"; done
     dir="$ws/.lucidos"
     if [ -n "${E2E_LOCK_DIR_OVERRIDE:-}" ]; then
@@ -161,7 +164,7 @@ _e2e_lock_path() {
 
 # The e2e-test workspace directory ($E2E_WORKSPACE for tests; default otherwise).
 _e2e_workspace_dir() {
-    printf '%s' "${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+    printf '%s' "${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
 }
 
 # ── orphan detection + sweep (the test seam) ────────────────────────────

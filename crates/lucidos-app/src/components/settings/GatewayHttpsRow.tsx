@@ -5,10 +5,6 @@ import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkText, SkeletonProvider } from '../shared/Skeleton';
 
-/** Pure: the row's title and sentence, from the gateway's TLS state.
- *
- *  Every state says something true. With no HTTPS it always says why, since
- *  plain HTTP with no stated reason is the failure this row exists to stop. */
 export function gatewayHttpsSummary(tls: GatewayTls): { title: string; detail: string } {
   if (tls.source === 'operator') {
     const tailnet =
@@ -39,9 +35,6 @@ export function gatewayHttpsSummary(tls: GatewayTls): { title: string; detail: s
   };
 }
 
-/** The HTTPS row under "The machine running Lucidos". The certificate is the
- *  gateway's, so this reads its control plane, and the caller renders it only
- *  behind the gateway. */
 export function GatewayHttpsRow({ tls }: { tls: Loadable<GatewayTls> }) {
   const showLoading = useDelayedLoading(tls);
   if (tls.status === 'failed') return <LoadableError noun="HTTPS state" error={tls.error} />;
@@ -55,7 +48,6 @@ export function GatewayHttpsRow({ tls }: { tls: Loadable<GatewayTls> }) {
   );
 }
 
-/** With no `summary`, inside a `SkeletonProvider`, it is the placeholder. */
 function HttpsRow({ summary }: { summary?: { title: string; detail: string } }) {
   return (
     <div class="list-rows">

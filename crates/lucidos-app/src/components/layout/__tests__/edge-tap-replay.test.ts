@@ -11,10 +11,6 @@ import MOBILE_SWIPE_CONTAINER from '../MobileSwipeContainer.tsx?raw';
 import { TAP_MOVE_THRESHOLD_PX } from '@lucidos/tap-press';
 import { LONG_PRESS_DELAY_MS } from '../../../hooks/useLongPress';
 
-// An edge tap lands on a transparent strip over the row, and the strip's gate
-// cancels its touchstart, which kills the synthetic click. replayEdgeTap gives
-// the click back to the row, for a tap only. The decisions run on plain
-// objects, so this needs no DOM.
 
 const el = (tagName: string, ...classes: string[]): ReplayCandidate => ({
   tagName,
@@ -53,7 +49,6 @@ const touch = (identifier: number, x: number, y = 100): FakeTouch => ({
   identifier, screenX: x, screenY: y, clientX: x, clientY: y,
 });
 
-/** A document that records its listeners and what the replay clicks. */
 function fakeHost(stack: ReplayCandidate[]) {
   const listeners = new Map<string, Array<(e: never) => void>>();
   const clicks: Array<{ target: ReplayCandidate; x: number; y: number }> = [];
@@ -152,7 +147,6 @@ describe('replayEdgeTap', () => {
 
   it('measures travel in screen space, not client space', () => {
     const t = begin();
-    // The visual viewport shifted under a still finger: client moved, screen did not.
     const lift = { ...touch(1, 8), clientX: 8 + 3 * TAP_MOVE_THRESHOLD_PX };
     t.fire('touchend', { changedTouches: [lift], touches: [] });
     expect(t.clicks).toHaveLength(1);

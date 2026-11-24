@@ -4,9 +4,6 @@ import { backupHealthCard, backupHealthCardSkeleton, shouldPollBackupStatus, sho
 import type { BackupProviderInfo, BackupStatus } from '../../../api/client';
 import type { Loadable } from '../../../store/types';
 
-/** Flatten a vnode tree into a string with the class + data-state attributes
- *  preserved so we can assert on per-state CSS classes. Mirrors the helper in
- *  directory-picker-loadable.test.tsx. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -19,9 +16,6 @@ function vnodeToText(node: ComponentChildren): string {
   return tag ? `<${tag}${cls}${state}>${inner}</${tag}>` : inner;
 }
 
-/** Every `class` in the tree, component vnodes included. `vnodeToText` above
- *  only names host tags, so it cannot see the `Sk*` placeholder leaves (and
- *  invoking them here would throw: they read a hook). */
 function collectClasses(node: ComponentChildren, out: string[] = []): string[] {
   if (node === null || node === undefined || typeof node !== 'object') return out;
   if (Array.isArray(node)) {
@@ -114,16 +108,11 @@ describe('backupHealthCard', () => {
     });
     const text = vnodeToText(backupHealthCard({ status, liveProgress: null, providerName: 'Google Drive' }));
     expect(text).toContain('failed');
-    // The error text must render in the red error span, not primary color.
     expect(text).toMatch(/backup-health-error">[^<]*pg_dump failed/);
-    // A failed last run escalates the whole card to the error (red) hue.
     expect(text).toMatch(/data-state="error"/);
   });
 
   it('a failed last run wins over staleness — the card is error, not stale', () => {
-    // The user-visible scenario: the last attempt failed AND there's no recent
-    // good backup. The card must read as an error (red), never sit inside the
-    // soft-yellow stale box.
     const status = loaded({
       ...BASE,
       last_run: { status: 'failure', at: new Date().toISOString(), started_at: null, filename: null, size_bytes: null, error: 'Drive is full' },
@@ -171,9 +160,6 @@ describe('backupHealthCardSkeleton', () => {
   const UNLOADED: Loadable<BackupStatus> = { status: 'not-loaded' };
 
   it('draws the card box, with a placeholder for each line the real card shows', () => {
-    // The point of the skeleton: the card reserves its space instead of arriving
-    // late and pushing the rest of the page down. Same box AND same line class
-    // as the real card, so both take their metrics from one rule.
     const classes = collectClasses(backupHealthCardSkeleton());
     expect(classes).toContain('backup-health-card');
     expect(classes.filter((c) => c === 'backup-health-line')).toHaveLength(2);
@@ -188,11 +174,6 @@ describe('backupHealthCardSkeleton', () => {
   });
 
   it('leaves the running card to draw itself while a refetch is in flight', () => {
-    // The section gates its skeleton on the card having nothing to draw, because
-    // both would land in the same grid cell. `loadStatus` blanks the status to
-    // `loading` on every 4s poll of a running backup, and the card keeps
-    // rendering live SSE progress through it: a shimmer stacked over that would
-    // smear a placeholder across live information.
     const card = backupHealthCard({
       status: { status: 'loading' },
       liveProgress: { phase: 'uploading', progress: 30, total: 100 },
@@ -205,8 +186,6 @@ describe('backupHealthCardSkeleton', () => {
 
 describe('shouldPollBackupStatus', () => {
   it('polls when the engine reports running but no live progress is flowing', () => {
-    // The post-backup pruning window: backup_in_progress is still set after the
-    // terminal SSE fired, so we must keep polling until it clears.
     expect(shouldPollBackupStatus(loaded({ ...BASE, running: true }), null)).toBe(true);
   });
 
@@ -247,8 +226,6 @@ describe('showBackupSetupOffer', () => {
   });
 
   it('shows the offer when no destination is ready, without waiting on status', () => {
-    // Not connected, or connected but short of the upload scope. Status is never
-    // fetched in that state, so it stays at not-loaded forever.
     expect(showBackupSetupOffer(PROVIDERS, false, { status: 'not-loaded' })).toBe(true);
   });
 
@@ -277,9 +254,6 @@ describe('showBackupSetupOffer', () => {
   });
 
   it('stays hidden across a refetch of a working page (no flash on mount or poll)', () => {
-    // loadStatus blanks the status to `loading` before every refetch, so reading
-    // an unloaded status as "not working" would pop the offer in and shove the
-    // health card down on every open and every 4s poll.
     expect(showBackupSetupOffer(PROVIDERS, true, { status: 'not-loaded' })).toBe(false);
     expect(showBackupSetupOffer(PROVIDERS, true, { status: 'loading' })).toBe(false);
     expect(showBackupSetupOffer(PROVIDERS, true, { status: 'failed', error: 'boom' })).toBe(false);
@@ -292,8 +266,6 @@ describe('showBackupSetupOffer', () => {
   });
 
   it('stays hidden when the destination could not be listed', () => {
-    // A transient cloud outage must not read as "your backups were never set
-    // up"; the card says what actually happened in its own muted line.
     const status = loaded({
       ...BASE,
       latest_backup: recentBackup(3600),

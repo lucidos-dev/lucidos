@@ -3,7 +3,6 @@ import { showPrompt, promptState } from '../store';
 
 describe('showPrompt', () => {
   beforeEach(() => {
-    // Reset any leftover dialog from a prior test.
     promptState.value = { visible: false, message: '' };
   });
 
@@ -33,7 +32,6 @@ describe('showPrompt', () => {
   it('a second prompt resolves the prior one as null and replaces it (never queues)', async () => {
     const first = showPrompt('First?');
     const second = showPrompt('Second?');
-    // The prior prompt is auto-resolved null by the replace.
     await expect(first).resolves.toBeNull();
     expect(promptState.value.message).toBe('Second?');
     promptState.value.resolve?.('done');

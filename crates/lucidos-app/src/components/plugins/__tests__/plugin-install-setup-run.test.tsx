@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The confirm panel says whether an update runs setup again. The line sits
- * under the Agent setup steps heading, so it reads while the section is folded.
- */
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { PluginInstallPanel } from '../PluginInstallPanel';

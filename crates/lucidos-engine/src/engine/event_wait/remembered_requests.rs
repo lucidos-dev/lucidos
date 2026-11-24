@@ -64,7 +64,7 @@ pub(crate) const MISSES_TO_PAUSE: u32 = 3;
 pub(crate) const PAUSE_AFTER_MISSES: chrono::Duration = chrono::Duration::hours(1);
 
 #[derive(Default)]
-pub(crate) struct RememberedRequests {
+pub struct RememberedRequests {
     by_thread: Mutex<HashMap<Uuid, Entry>>,
     providers: Mutex<HashMap<ProviderKind, ProviderRecord>>,
     in_flight: AtomicUsize,
@@ -158,7 +158,7 @@ impl Memory {
 impl RememberedRequests {
     /// Remember the request a thread just made, replacing the one before.
     /// `None` means its provider could not prefill it.
-    pub(crate) fn remember(&self, thread_id: Uuid, pair: Option<PrefillPair>, now: Instant) {
+    pub fn remember(&self, thread_id: Uuid, pair: Option<PrefillPair>, now: Instant) {
         let memory = match pair.filter(|pair| pair.stable.provider.is_some()) {
             Some(pair) => Memory::Pair(Arc::new(pair)),
             None => Memory::Uncacheable,
@@ -333,17 +333,7 @@ mod tests {
     use std::time::Duration;
 
     fn pair(provider: Option<ProviderKind>) -> PrefillPair {
-        let body = crate::llm::prefill::PrefillBody {
-            provider,
-            model: "m".into(),
-            reasoning_effort: None,
-            stable_prefix_fingerprint: None,
-            output_cap: Some(0),
-            reply: crate::llm::prefill::ReplyShape::Json,
-            wire_model: "m".into(),
-            betas: Vec::new(),
-            body: bytes::Bytes::from_static(b"{}"),
-        };
+        let body = crate::llm::prefill::PrefillBody::for_test(provider, "m");
         PrefillPair {
             stable: body.clone(),
             whole: body,

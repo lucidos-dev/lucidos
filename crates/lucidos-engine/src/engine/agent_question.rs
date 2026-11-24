@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::engine::agent_recovery::ANSWERED_AFTER_IDLE_REASON;
-use crate::engine::chat::rerun::ChatResumeAnchor;
+use crate::engine::continuation_reason::ANSWERED_AFTER_IDLE_REASON;
 use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::question_park_sql::{engine_raised_card_sql, CARD_EVENT_TYPES_SQL};
+use crate::engine::resume_anchor::ChatResumeAnchor;
 use crate::engine::thread_events::{
     AnswerKind, EventChannel, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
 };
@@ -48,7 +49,15 @@ pub async fn resolve_pending_question_as_canceled(
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
 ) -> bool {
-    resolve_pending_question_as(engine, thread_id, AnswerKind::Canceled, actor, "canceled").await
+    resolve_pending_question_as(
+        engine,
+        thread_id,
+        &PENDING_QUESTION_SQL,
+        AnswerKind::Canceled,
+        actor,
+        "canceled",
+    )
+    .await
 }
 
 /// Resolve any pending `UserQuestionAsked` for `thread_id` as `Superseded`,
@@ -67,6 +76,9 @@ pub async fn resolve_pending_question_as_canceled(
 /// the agent already overtook parks the same call the same way. That is the
 /// parallel-tool-call race, and the narrow "active" lookup walks straight past
 /// it. See `docs/adr/0082-a-followup-supersedes-the-open-question.md`.
+///
+/// An engine-raised permission request stays open. No agent call is parked
+/// on it.
 pub async fn resolve_pending_question_as_superseded(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
@@ -75,6 +87,7 @@ pub async fn resolve_pending_question_as_superseded(
     resolve_pending_question_as(
         engine,
         thread_id,
+        &SUPERSEDABLE_QUESTION_SQL,
         AnswerKind::Superseded,
         actor,
         "superseded",
@@ -88,35 +101,87 @@ pub async fn resolve_pending_question_as_superseded(
 async fn resolve_pending_question_as(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
+    lookup_sql: &str,
     kind: AnswerKind,
     actor: Option<MessageOrigin>,
     label: &str,
 ) -> bool {
-    let Some(tool_use_id) = lookup_pending_question_tool_use_id(engine.pool(), thread_id).await
-    else {
-        return false;
-    };
-    match answer_pending_question(engine, thread_id, tool_use_id, kind, actor).await {
+    // Retire the queued agent cards first, so the open card's close cannot
+    // let the card queue post one.
+    let mut resolved = false;
+    for tool_use_id in waiting_queued_agent_cards(engine.pool(), thread_id).await {
+        resolved |= resolve_card_as(engine, thread_id, tool_use_id, &kind, &actor, label).await;
+    }
+    let result = sqlx::query_as::<_, (String,)>(lookup_sql)
+        .bind(thread_id)
+        .fetch_optional(engine.pool())
+        .await;
+    if let Some(tool_use_id) = unwrap_tool_use_id_row(result, thread_id) {
+        resolved |= resolve_card_as(engine, thread_id, tool_use_id, &kind, &actor, label).await;
+    }
+    resolved
+}
+
+async fn resolve_card_as(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    kind: &AnswerKind,
+    actor: &Option<MessageOrigin>,
+    label: &str,
+) -> bool {
+    match answer_pending_question(engine, thread_id, tool_use_id, kind.clone(), actor.clone()).await
+    {
         AnswerResult::Resumed => true,
         AnswerResult::Conflict(msg) => {
-            log!(
-                "[CCQuestion] resolve_pending_question_as_{}({}): {}",
-                label,
-                thread_id,
-                msg
-            );
+            log_legacy!("[CCQuestion] resolve_pending_question_as_{label}({thread_id}): {msg}");
             false
         }
     }
 }
 
-const PENDING_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
-     FROM events q \
-     LEFT JOIN events a ON a.thread_id = q.thread_id \
-          AND a.event_type = 'UserQuestionAnswered' \
-          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
-     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
-     ORDER BY q.sequence DESC LIMIT 1";
+/// Every *queued card* on `thread_id` that parks an agent call and was never
+/// posted. A queued engine card is left alone: it waits for the owner.
+async fn waiting_queued_agent_cards(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "SELECT q.payload->>'tool_use_id' FROM events q \
+             WHERE q.aggregate_id = $1 AND {queued} AND NOT {engine_raised} \
+             ORDER BY q.sequence",
+            queued = crate::engine::question_park_sql::waiting_queued_card_sql("q"),
+            engine_raised = engine_raised_card_sql("q"),
+        )
+    });
+    sqlx::query_scalar::<_, String>(&SQL)
+        .bind(thread_id.to_string())
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            log_legacy!("[CCQuestion] Queued cards on {thread_id} unreadable: {e}");
+            Vec::new()
+        })
+}
+
+/// The newest unanswered card on `$1`, narrowed by `filter`.
+fn pending_question_sql(filter: &str) -> String {
+    format!(
+        "SELECT q.payload->>'tool_use_id' \
+         FROM events q \
+         LEFT JOIN events a ON a.thread_id = q.thread_id \
+              AND a.event_type = 'UserQuestionAnswered' \
+              AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+         WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+         {filter} ORDER BY q.sequence DESC LIMIT 1"
+    )
+}
+
+static PENDING_QUESTION_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| pending_question_sql(""));
+
+/// A permission request the engine raised itself stays open past a follow-up.
+static SUPERSEDABLE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    pending_question_sql(&format!("AND NOT {}", engine_raised_card_sql("q")))
+});
 
 static ACTIVE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
@@ -126,6 +191,7 @@ static ACTIVE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
               AND a.event_type = 'UserQuestionAnswered' \
               AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
          WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+           AND NOT {engine_raised} \
            AND NOT EXISTS ( \
              SELECT 1 FROM events t \
              WHERE t.thread_id = q.thread_id \
@@ -133,6 +199,7 @@ static ACTIVE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                AND (t.event_type = ANY($2::text[]) OR {own_result}) \
            ) \
          ORDER BY q.sequence DESC LIMIT 1",
+        engine_raised = engine_raised_card_sql("q"),
         own_result = ThreadEvent::question_own_result_sql("q", "t"),
     )
 });
@@ -147,7 +214,7 @@ fn unwrap_tool_use_id_row(
             // Don't silently treat a DB outage as "no pending question" —
             // that would let the user's free-form text spawn a brand-new CC
             // turn over the unanswered one.
-            log!(
+            log_legacy!(
                 "[CCQuestion] DB lookup failed for pending question on {}: {}",
                 thread_id,
                 e
@@ -172,7 +239,7 @@ pub async fn lookup_pending_question_tool_use_id(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Option<String> {
-    let result = sqlx::query_as::<_, (String,)>(PENDING_QUESTION_SQL)
+    let result = sqlx::query_as::<_, (String,)>(&PENDING_QUESTION_SQL)
         .bind(thread_id)
         .fetch_optional(pool)
         .await;
@@ -185,7 +252,7 @@ pub(crate) async fn try_lookup_pending_question_tool_use_id(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (String,)>(PENDING_QUESTION_SQL)
+    let row = sqlx::query_as::<_, (String,)>(&PENDING_QUESTION_SQL)
         .bind(thread_id)
         .fetch_optional(pool)
         .await?;
@@ -225,16 +292,17 @@ pub async fn lookup_active_question_tool_use_id(
     unwrap_tool_use_id_row(result, thread_id)
 }
 
-/// Look up whether `(thread_id, tool_use_id)` has a `UserQuestionAsked` and
-/// (if so) whether it's already been answered. Single round-trip.
+/// Look up whether `(thread_id, tool_use_id)` has a card, posted or queued,
+/// and (if so) whether it's already been answered. Single round-trip.
 /// Returns `None` when no question exists, `Some(true)` when answered,
-/// `Some(false)` when pending.
+/// `Some(false)` when pending. The EventBus refuses an owner's reply to a
+/// queued card, so only the engine can retire one through here.
 async fn find_pending_question(
     engine: &LucidosEngine,
     thread_id: Uuid,
     tool_use_id: &str,
 ) -> Result<Option<bool>, sqlx::Error> {
-    let row: Option<(bool,)> = sqlx::query_as(
+    let row: Option<(bool,)> = sqlx::query_as(&format!(
         "SELECT EXISTS(\
              SELECT 1 FROM events a \
              WHERE a.thread_id = q.thread_id \
@@ -242,10 +310,10 @@ async fn find_pending_question(
                AND a.payload->>'tool_use_id' = $2 \
          ) \
          FROM events q \
-         WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' \
+         WHERE q.thread_id = $1 AND q.event_type IN ({CARD_EVENT_TYPES_SQL}) \
            AND q.payload->>'tool_use_id' = $2 \
          ORDER BY q.sequence DESC LIMIT 1",
-    )
+    ))
     .bind(thread_id)
     .bind(tool_use_id)
     .fetch_optional(engine.pool())
@@ -258,7 +326,7 @@ async fn find_pending_question(
 /// the same order as the input questions. Callers feed it to
 /// `build_hook_answers` to produce the joined `{question_text: label}` map.
 #[derive(Debug)]
-pub(crate) struct QuestionWalkOutcome {
+pub struct QuestionWalkOutcome {
     pub answer_kinds: Vec<serde_json::Value>,
     /// Every question was answered with *quiet options*, so the caller ends
     /// the turn instead of handing the answers back to the agent.
@@ -278,7 +346,7 @@ pub(crate) type QuestionWalkError = Box<dyn std::error::Error + Send + Sync>;
 /// The chat card's `message`, or `None` when it is absent or blank. Prose
 /// before a tool call may reach the user only as a summary. A tool input
 /// never does, so an answer the card follows belongs here.
-pub(crate) fn card_message(tool_args: &serde_json::Value) -> Option<&str> {
+pub fn card_message(tool_args: &serde_json::Value) -> Option<&str> {
     tool_args
         .get("message")
         .and_then(|m| m.as_str())
@@ -286,9 +354,9 @@ pub(crate) fn card_message(tool_args: &serde_json::Value) -> Option<&str> {
 }
 
 /// A card's message, with the turn's meta so it renders in the asking turn.
-pub(crate) struct CardMessage<'a> {
-    pub(crate) text: &'a str,
-    pub(crate) meta: &'a EventMeta,
+pub struct CardMessage<'a> {
+    pub text: &'a str,
+    pub meta: &'a EventMeta,
 }
 
 /// Shows a card's message as the agent's text. Emit it just before the card:
@@ -310,12 +378,12 @@ pub(crate) async fn emit_card_message(
 }
 
 /// Who asks a question batch, and on what terms.
-pub(crate) struct QuestionAsker {
+pub struct QuestionAsker {
     /// The Claude Code session to resume. Empty for chat and Codex.
-    pub(crate) cc_session_id: String,
-    pub(crate) channel: crate::engine::thread_events::EventChannel,
-    /// Set only when the batch is an *owner approval card* (ADR 0387).
-    pub(crate) owner_approval: Option<crate::engine::thread_events::OwnerApproval>,
+    pub cc_session_id: String,
+    pub channel: crate::engine::thread_events::EventChannel,
+    /// Set only when the batch is a permission request the agent prepared.
+    pub permission_request: Option<crate::engine::permission::PermissionRequest>,
 }
 
 /// Refuse a batch whose option carries a widget that cannot draw: a
@@ -323,7 +391,7 @@ pub(crate) struct QuestionAsker {
 /// widget that is not reusable, or params its manifest does not take.
 pub(crate) fn check_option_widgets(
     app_manager: &crate::core::AppManager,
-    parsed: &[crate::engine::agent_session::ParsedQuestion],
+    parsed: &[crate::engine::question_parsing::ParsedQuestion],
     thread_id: Uuid,
 ) -> Result<(), QuestionWalkError> {
     use crate::engine::widgets::{check_widget_embed, WidgetCheckFailed};
@@ -337,7 +405,7 @@ pub(crate) fn check_option_widgets(
                 )
                 .into()
             };
-            if let Some(problem) = crate::engine::agent_session::option_embed_problem(option) {
+            if let Some(problem) = crate::engine::question_parsing::option_embed_problem(option) {
                 return Err(refuse(problem));
             }
             let Some(widget) = &option.widget else {
@@ -365,7 +433,7 @@ pub(crate) fn check_option_widgets(
 /// list above the card makes them match samples to buttons by name.
 pub(crate) fn check_message_embeds(
     message: Option<&str>,
-    parsed: &[crate::engine::agent_session::ParsedQuestion],
+    parsed: &[crate::engine::question_parsing::ParsedQuestion],
 ) -> Result<(), QuestionWalkError> {
     let Some(message) = message else {
         return Ok(());
@@ -395,7 +463,7 @@ pub(crate) fn check_message_embeds(
 /// option is quiet: each pick would end the turn, so an option that promises
 /// work ("Save progress and stop") would never run it.
 pub(crate) fn check_quiet_options(
-    parsed: &[crate::engine::agent_session::ParsedQuestion],
+    parsed: &[crate::engine::question_parsing::ParsedQuestion],
 ) -> Result<(), QuestionWalkError> {
     for (idx, q) in parsed.iter().enumerate() {
         if let Some(option) = q
@@ -443,7 +511,7 @@ impl LucidosEngine {
     /// tool result.
     ///
     /// The walk shows `message` once, just before it first asks the first card.
-    pub(crate) async fn walk_question_batch(
+    pub async fn walk_question_batch(
         &self,
         thread_id: Uuid,
         outer_tool_use_id: &str,
@@ -454,11 +522,11 @@ impl LucidosEngine {
         let QuestionAsker {
             cc_session_id,
             channel,
-            owner_approval,
+            permission_request,
         } = asker;
         let parser_input = serde_json::json!({ "questions": questions });
         let mut parsed =
-            crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+            crate::engine::question_parsing::parse_ask_user_question_inputs(&parser_input);
         let total = parsed.len();
         // A quiet pick ends the turn, which only one question can mean: a later
         // card still needs the agent. So a batch carries no quiet option.
@@ -544,26 +612,31 @@ impl LucidosEngine {
                 Ok(None) => {}
                 Err(e) => {
                     self.question_wait_registry.forget(&sub_id).await;
-                    log!("[QuestionWalk] prior-answer lookup failed {thread_id}/{sub_id}: {e}");
+                    log_legacy!(
+                        "[QuestionWalk] prior-answer lookup failed {thread_id}/{sub_id}: {e}"
+                    );
                     return Err(format!("DB lookup for question state failed: {e}").into());
                 }
             }
 
-            let already_asked = match user_question_already_asked(self.pool(), thread_id, &sub_id)
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    self.question_wait_registry.forget(&sub_id).await;
-                    log!("[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}");
-                    return Err(format!("DB lookup for question state failed: {e}").into());
-                }
-            };
+            let already_asked =
+                match user_question_already_asked(self.pool(), thread_id, &sub_id).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.question_wait_registry.forget(&sub_id).await;
+                        log_legacy!(
+                            "[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}"
+                        );
+                        return Err(format!("DB lookup for question state failed: {e}").into());
+                    }
+                };
             if !already_asked {
                 if let Some(message) = message.as_ref().filter(|_| i == 0) {
                     if let Err(e) = emit_card_message(&self.event_bus, thread_id, message).await {
                         self.question_wait_registry.forget(&sub_id).await;
-                        log!("[QuestionWalk] emit card message failed {thread_id}/{sub_id}: {e}");
+                        log_legacy!(
+                            "[QuestionWalk] emit card message failed {thread_id}/{sub_id}: {e}"
+                        );
                         return Err(format!("Failed to persist the card's message: {e}").into());
                     }
                 }
@@ -582,7 +655,8 @@ impl LucidosEngine {
                                 .collect(),
                             worktree_path: None,
                             multi_select: q.multi_select,
-                            owner_approval: owner_approval.clone(),
+                            owner_approval: None,
+                            permission_request: permission_request.clone(),
                         },
                         meta: EventMeta {
                             channel: Some(channel),
@@ -592,7 +666,9 @@ impl LucidosEngine {
                     .await
                 {
                     self.question_wait_registry.forget(&sub_id).await;
-                    log!("[QuestionWalk] emit UserQuestionAsked failed {thread_id}/{sub_id}: {e}");
+                    log_legacy!(
+                        "[QuestionWalk] emit UserQuestionAsked failed {thread_id}/{sub_id}: {e}"
+                    );
                     return Err(format!("Failed to persist UserQuestionAsked: {e}").into());
                 }
             }
@@ -639,6 +715,7 @@ impl LucidosEngine {
                         BusEvent::Thread {
                             thread_id,
                             event: ThreadEvent::UserQuestionAnswered {
+                                compose: None,
                                 tool_use_id: remaining_sub,
                                 answer: ending_kind.clone(),
                                 quiet: false,
@@ -662,26 +739,26 @@ impl LucidosEngine {
     }
 }
 
-/// Is this card an *owner approval card* (ADR 0387)? `Err` when the read
-/// failed, so a caller deciding who may answer it can fail closed.
-pub(crate) async fn is_owner_approval_card(
+/// Did the engine word this card, as a *permission request*? `Err` when the
+/// read failed, so a caller deciding who may answer it can fail closed.
+pub async fn is_engine_card(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     tool_use_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM events \
-           WHERE aggregate_id = $1 AND event_type = 'UserQuestionAsked' \
-             AND payload->>'tool_use_id' = $2 \
-             AND payload ? 'owner_approval')",
-    )
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM events q \
+           WHERE q.aggregate_id = $1 AND q.event_type = 'UserQuestionAsked' \
+             AND q.payload->>'tool_use_id' = $2 AND {})",
+        crate::engine::permission::engine_card_sql("q"),
+    ))
     .bind(thread_id.to_string())
     .bind(tool_use_id)
     .fetch_one(pool)
     .await
 }
 
-/// Read the `channel` field from the most recent `UserQuestionAsked` for
+/// Read the `channel` field from the most recent card, posted or queued, for
 /// `(thread_id, tool_use_id)`. `Ok(None)` covers no matching row, NULL
 /// channel, and unparseable channel string (legacy rows or a hand-edited
 /// payload); callers must default such rows to today's CC behaviour for
@@ -692,13 +769,13 @@ pub(crate) async fn lookup_question_channel(
     thread_id: Uuid,
     tool_use_id: &str,
 ) -> Result<Option<crate::engine::thread_events::EventChannel>, sqlx::Error> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
+    let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
         "SELECT payload->>'channel' \
          FROM events \
-         WHERE thread_id = $1 AND event_type = 'UserQuestionAsked' \
+         WHERE thread_id = $1 AND event_type IN ({CARD_EVENT_TYPES_SQL}) \
            AND payload->>'tool_use_id' = $2 \
          ORDER BY sequence DESC LIMIT 1",
-    )
+    ))
     .bind(thread_id)
     .bind(tool_use_id)
     .fetch_optional(pool)
@@ -711,7 +788,7 @@ pub(crate) async fn lookup_question_channel(
     ) {
         Ok(channel) => Ok(Some(channel)),
         Err(_) => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] UserQuestionAsked payload->>'channel' = {:?} did not parse as EventChannel for {}/{}; defaulting to CC resume behaviour",
                 channel_str,
                 thread_id,
@@ -900,7 +977,7 @@ fn lookup_option_label(
                 .and_then(|opts| opts.get(idx))
                 .and_then(|opt| opt.get("label"))
                 .and_then(|v| v.as_str())
-                .map(|s| crate::engine::agent_session::strip_quiet_label_prefix(s).label)
+                .map(|s| crate::engine::question_parsing::strip_quiet_label_prefix(s).label)
         })
         .unwrap_or_else(|| opt_id.to_string())
 }
@@ -926,7 +1003,7 @@ pub(crate) const TYPED_REPLY_NOTE: &str = "The user typed this instead of pickin
 
 /// How an answer's images are written into the text its agent reads.
 #[derive(Clone, Copy)]
-pub(crate) enum AnswerImages<'a> {
+pub enum AnswerImages<'a> {
     /// A coding agent opens each image itself, from its blob path under this
     /// workspace. Its sessions are granted `data/`, so no permission card.
     BlobPaths(&'a std::path::Path),
@@ -1142,7 +1219,7 @@ fn answer_kind_note(answer_kind: &serde_json::Value) -> &'static str {
 /// Read back out of the `events` table rather than carried in memory, so an
 /// engine restart between the answer and the respawn changes nothing
 /// (`CLAUDE.md` § Engine Statelessness).
-pub(crate) async fn answered_question_recap(
+pub async fn answered_question_recap(
     pool: &sqlx::PgPool,
     workspace: &std::path::Path,
     thread_id: Uuid,
@@ -1158,7 +1235,7 @@ pub(crate) async fn answered_question_recap(
     .unwrap_or_else(|e| {
         // A DB error is not "this thread has no answer": say so, and fall
         // through to the bare continue message rather than inventing silence.
-        log!("[CCQuestion] newest-answer lookup failed for {thread_id}: {e}");
+        log_legacy!("[CCQuestion] newest-answer lookup failed for {thread_id}: {e}");
         None
     })
     .flatten()
@@ -1179,7 +1256,7 @@ pub(crate) async fn answered_question_recap(
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[CCQuestion] answered-batch lookup failed for {thread_id}: {e}");
+            log_legacy!("[CCQuestion] answered-batch lookup failed for {thread_id}: {e}");
             Vec::new()
         });
     if rows.is_empty() {
@@ -1215,7 +1292,7 @@ pub(crate) async fn answered_question_recap(
 /// re-invokes the tool. Duplicate question texts disambiguate with a
 /// `" (#i)"` suffix — without it, a naive `Map::insert` would silently
 /// overwrite the first answer.
-pub(crate) fn build_hook_answers(
+pub fn build_hook_answers(
     answer_kinds: &[serde_json::Value],
     cc_questions: &serde_json::Value,
     images: AnswerImages<'_>,
@@ -1238,7 +1315,7 @@ pub(crate) fn build_hook_answers(
             .unwrap_or("(unknown question)")
             .to_string();
         let key = if map.contains_key(&raw_text) {
-            crate::log!(
+            crate::log_legacy!(
                 "[AskUserQuestion] duplicate question text in tool input — disambiguating with suffix: {raw_text:?}"
             );
             format!("{raw_text} (#{})", i + 1)
@@ -1321,7 +1398,7 @@ const ANSWER_IMAGES_PREFIX: &str = "[ANSWER_IMAGES:";
 
 /// Prefix `result` with the images of every answer in the batch, or return it
 /// unchanged when none has any.
-pub(crate) fn with_answer_images(result: String, answer_kinds: &[serde_json::Value]) -> String {
+pub fn with_answer_images(result: String, answer_kinds: &[serde_json::Value]) -> String {
     let hashes: Vec<String> = answer_kinds
         .iter()
         .filter_map(|answer| answer.get("image_hashes")?.as_array().cloned())
@@ -1335,28 +1412,28 @@ pub(crate) fn with_answer_images(result: String, answer_kinds: &[serde_json::Val
 }
 
 /// Split a [`with_answer_images`] result into its blob hashes and the result.
-pub(crate) fn parse_answer_images(result: &str) -> Option<(Vec<String>, &str)> {
+pub fn parse_answer_images(result: &str) -> Option<(Vec<String>, &str)> {
     let rest = result.strip_prefix(ANSWER_IMAGES_PREFIX)?;
     let (list, text) = rest.split_once("]\n")?;
     Some((list.split(',').map(str::to_string).collect(), text))
 }
 
-/// Look up `(options, multi_select)` for the most recent `UserQuestionAsked`
-/// matching `tool_use_id` on `thread_id`. Returns the parsed pair so the
-/// validator can run against the canonical persisted shape.
+/// Look up `(options, multi_select)` for the most recent card, posted or
+/// queued, matching `tool_use_id` on `thread_id`. Returns the parsed pair so
+/// the validator can run against the canonical persisted shape.
 async fn lookup_question_options(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     tool_use_id: &str,
 ) -> Result<Option<(Vec<QuestionOption>, bool)>, sqlx::Error> {
-    let row: Option<(serde_json::Value, Option<bool>)> = sqlx::query_as(
+    let row: Option<(serde_json::Value, Option<bool>)> = sqlx::query_as(&format!(
         "SELECT COALESCE(payload->'options', '[]'::jsonb), \
                 (payload->>'multi_select')::bool \
          FROM events \
-         WHERE thread_id = $1 AND event_type = 'UserQuestionAsked' \
+         WHERE thread_id = $1 AND event_type IN ({CARD_EVENT_TYPES_SQL}) \
            AND payload->>'tool_use_id' = $2 \
          ORDER BY sequence DESC LIMIT 1",
-    )
+    ))
     .bind(thread_id)
     .bind(tool_use_id)
     .fetch_optional(pool)
@@ -1398,6 +1475,58 @@ pub async fn answer_pending_question_with_event_id(
     actor: Option<MessageOrigin>,
     event_id: Option<Uuid>,
 ) -> AnswerResult {
+    answer_pending_question_placed(
+        engine,
+        thread_id,
+        tool_use_id,
+        answer,
+        actor,
+        event_id,
+        None,
+        crate::engine::permission::PickedBy::Tap,
+    )
+    .await
+}
+
+/// [`answer_pending_question_with_event_id`], saying how the owner picked the
+/// option. Only a permission request reads `picked_by`, for its grant receipt.
+pub(crate) async fn answer_pending_question_picked_by(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    answer: AnswerKind,
+    actor: Option<MessageOrigin>,
+    event_id: Option<Uuid>,
+    picked_by: crate::engine::permission::PickedBy,
+) -> AnswerResult {
+    answer_pending_question_placed(
+        engine,
+        thread_id,
+        tool_use_id,
+        answer,
+        actor,
+        event_id,
+        None,
+        picked_by,
+    )
+    .await
+}
+
+pub use crate::engine::thread_events::composer_submission;
+
+/// HTTP card answers use one atomic urgent append for placement and compose.
+/// `picked_by` says how the owner picked, for a permission request's receipt.
+#[allow(clippy::too_many_arguments)]
+pub async fn answer_pending_question_placed(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    answer: AnswerKind,
+    actor: Option<MessageOrigin>,
+    event_id: Option<Uuid>,
+    placement: Option<(Option<crate::engine::InputPosition>, Option<i64>)>,
+    picked_by: crate::engine::permission::PickedBy,
+) -> AnswerResult {
     match find_pending_question(engine, thread_id, &tool_use_id).await {
         Ok(Some(false)) => {}
         Ok(Some(true)) => {
@@ -1413,7 +1542,7 @@ pub async fn answer_pending_question_with_event_id(
             ));
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] DB lookup failed for {}/{}: {}",
                 thread_id,
                 tool_use_id,
@@ -1423,9 +1552,125 @@ pub async fn answer_pending_question_with_event_id(
         }
     }
 
-    // Validate the answer shape against the persisted question. The pending
-    // lookup above guarantees the question exists, so a `None` here is a
-    // race we treat as a conflict for symmetry with the answered-already arm.
+    // Read the originating question's channel so we can propagate it onto
+    // the answer (so the persisted pair shares a wire-channel) and decide
+    // whether to fire the CC-specific resume side-effects below. Legacy
+    // rows without a channel field default to today's CC behaviour, both
+    // here and in `should_emit_cc_resume_side_effects`.
+    let original_channel =
+        match lookup_question_channel(engine.pool(), thread_id, &tool_use_id).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                log_legacy!(
+                    "[CCQuestion] DB lookup for question channel failed {}/{}: {}",
+                    thread_id,
+                    tool_use_id,
+                    e
+                );
+                return AnswerResult::Conflict("Database lookup failed".into());
+            }
+        };
+    let answer_channel = original_channel.unwrap_or(EventChannel::ClaudeCode);
+    // An engine-raised permission request has no agent waiting on it.
+    let pool = engine.pool();
+    let permission_request =
+        match crate::engine::permission::card_request(pool, thread_id, &tool_use_id).await {
+            Ok(request) => request,
+            Err(e) => {
+                log_legacy!(
+                    "[CCQuestion] Card lookup failed {}/{}: {}",
+                    thread_id,
+                    tool_use_id,
+                    e
+                );
+                return AnswerResult::Conflict("Database lookup failed".into());
+            }
+        };
+    if answer.is_a_reply()
+        && permission_request
+            .as_ref()
+            .is_some_and(|r| r.lines.is_some())
+    {
+        return AnswerResult::Conflict(
+            "This grant review has been retired. Manage grants in Settings → Permissions.".into(),
+        );
+    }
+    let engine_card = permission_request
+        .as_ref()
+        .is_some_and(|request| request.prepared.is_none());
+    let trigger_grant = permission_request
+        .as_ref()
+        .filter(|request| request.action.is_trigger_grant());
+    // A start card's answer starts or ends a thread, so only a tap picks it.
+    let start_card = permission_request
+        .as_ref()
+        .filter(|request| request.action == crate::engine::permission::Action::StartRemoteThread);
+    // Stop closes it with `Canceled`. A typed reply or an agent's supersede
+    // would end the start with no pick, so it leaves the card open.
+    if start_card.is_some() {
+        match answer {
+            AnswerKind::Selected { .. }
+                if !matches!(actor, Some(MessageOrigin::Device { .. }))
+                    || picked_by != crate::engine::permission::PickedBy::Tap =>
+            {
+                return AnswerResult::Conflict(
+                    "Only the owner's device can answer this card".into(),
+                );
+            }
+            AnswerKind::Selected { .. } | AnswerKind::Canceled => {}
+            _ => {
+                return AnswerResult::Conflict(
+                    "Tap an option on the remote start card to answer it.".into(),
+                );
+            }
+        }
+    }
+    const STALE_TRIGGER_GRANT: &str =
+        "The trigger or folder changed. Dismiss this card and ask again to review current grants.";
+    let mut trigger_proposal = None;
+    if trigger_grant.is_some()
+        && answer.is_a_reply()
+        && (!matches!(actor, Some(MessageOrigin::Device { .. }))
+            || picked_by != crate::engine::permission::PickedBy::Tap
+            || !matches!(answer, AnswerKind::Selected { .. }))
+    {
+        return AnswerResult::Conflict(
+            "Tap an option on the owner's device to answer this card".into(),
+        );
+    }
+    if let (Some(request), AnswerKind::Selected { option_id }) = (trigger_grant, &answer) {
+        use crate::engine::permission::PermissionChoice;
+        let choice = request.choices.get(option_id);
+        // A card asked before Allow once left it still offers it. Saving the
+        // grant would make it lasting, so the pick is refused instead.
+        if choice.is_some_and(PermissionChoice::is_once) {
+            return AnswerResult::Conflict(
+                "Allow once cannot apply to a trigger grant: no run is waiting. \
+                 Pick Always allow, Always deny or Cancel."
+                    .into(),
+            );
+        }
+        let decision = match choice {
+            Some(PermissionChoice::Grant { .. }) => {
+                Some(crate::engine::trigger_writes::TriggerGrantDecision::Allow)
+            }
+            Some(PermissionChoice::RefuseStanding) => {
+                Some(crate::engine::trigger_writes::TriggerGrantDecision::Deny)
+            }
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            let proposal = request
+                .breadth
+                .as_deref()
+                .and_then(|breadth| serde_json::from_str(breadth).ok());
+            let Some(proposal) = proposal else {
+                return AnswerResult::Conflict("The trigger grant proposal is unreadable".into());
+            };
+            trigger_proposal = Some((proposal, decision));
+        }
+    }
+    // A question that disappeared after the pending lookup is a conflict.
     let (quiet, quiet_reply) =
         match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
             Ok(Some((options, multi_select))) => {
@@ -1446,7 +1691,7 @@ pub async fn answer_pending_question_with_event_id(
                 ));
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[CCQuestion] DB lookup for question options failed {}/{}: {}",
                     thread_id,
                     tool_use_id,
@@ -1456,48 +1701,90 @@ pub async fn answer_pending_question_with_event_id(
             }
         };
 
-    // Read the originating question's channel so we can propagate it onto
-    // the answer (so the persisted pair shares a wire-channel) and decide
-    // whether to fire the CC-specific resume side-effects below. Legacy
-    // rows without a channel field default to today's CC behaviour, both
-    // here and in `should_emit_cc_resume_side_effects`.
-    let original_channel =
-        match lookup_question_channel(engine.pool(), thread_id, &tool_use_id).await {
-            Ok(ch) => ch,
-            Err(e) => {
-                log!(
-                    "[CCQuestion] DB lookup for question channel failed {}/{}: {}",
-                    thread_id,
-                    tool_use_id,
-                    e
-                );
-                return AnswerResult::Conflict("Database lookup failed".into());
-            }
-        };
-    let answer_channel = original_channel.unwrap_or(EventChannel::ClaudeCode);
     // A delivery held behind a chat card needs the agent, so the pick wakes it.
-    let quiet = quiet
-        && (should_emit_cc_resume_side_effects(original_channel)
-            || !has_held_deliveries(engine, thread_id, &tool_use_id).await);
+    let quiet = engine_card
+        || (quiet
+            && (should_emit_cc_resume_side_effects(original_channel)
+                || !has_held_deliveries(engine, thread_id, &tool_use_id).await));
 
-    if let Err(e) = engine
-        .event_bus
-        .emit(BusEvent::Thread {
-            thread_id,
-            event: ThreadEvent::UserQuestionAnswered {
-                tool_use_id: tool_use_id.clone(),
-                answer: answer.clone(),
-                quiet,
-            },
-            meta: EventMeta {
-                event_id,
-                channel: Some(answer_channel),
-                actor: actor.clone(),
-                ..EventMeta::NONE
-            },
-        })
-        .await
+    // Saved first: a pick whose setting did not save must not end the start.
+    let start_choice = start_card.and_then(|request| match &answer {
+        AnswerKind::Selected { option_id } => request.choices.get(option_id).cloned(),
+        _ => None,
+    });
+    let _start_answer_guard = match start_card {
+        Some(_) => Some(
+            crate::engine::permission::remote_start::ANSWER_LOCK
+                .lock()
+                .await,
+        ),
+        None => None,
+    };
+    if start_card.is_some()
+        && !matches!(
+            find_pending_question(engine, thread_id, &tool_use_id).await,
+            Ok(Some(false))
+        )
     {
+        return AnswerResult::Conflict(format!(
+            "Question {tool_use_id} on thread {thread_id} has already been answered"
+        ));
+    }
+    if let Some(setting) = start_choice
+        .as_ref()
+        .and_then(crate::engine::permission::remote_start::remembered_setting)
+    {
+        if let Err(e) =
+            crate::engine::permission::remote_start::remember(engine.pool(), thread_id, setting)
+                .await
+        {
+            log_legacy!("[PermissionRequest] Could not save the remote start setting: {e}");
+            return AnswerResult::Conflict(format!(
+                "Lucidos could not save this choice on the gateway ({e}), so the card is still \
+                 open. Pick it again, or pick an option that remembers nothing."
+            ));
+        }
+    }
+
+    let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
+        tool_use_id: tool_use_id.clone(),
+        answer: answer.clone(),
+        quiet,
+    };
+    let meta = EventMeta {
+        event_id,
+        channel: Some(answer_channel),
+        actor: actor.clone(),
+        ..EventMeta::NONE
+    };
+    let granting_trigger = trigger_proposal.is_some();
+    let recorded = if let Some((proposal, decision)) = trigger_proposal {
+        engine
+            .trigger_registry_writer()
+            .record_grant_answer(proposal, decision, thread_id, (event, meta), placement)
+            .await
+    } else if let Some((position, epoch)) = placement {
+        engine
+            .event_bus
+            .emit_question_answer(thread_id, event, meta, position, epoch)
+            .await
+            .map(|result| result.is_some())
+    } else {
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            })
+            .await
+            .map(|result| result.is_some())
+    };
+    if matches!(recorded, Ok(false)) && granting_trigger {
+        return AnswerResult::Conflict(STALE_TRIGGER_GRANT.into());
+    }
+    if let Err(e) = recorded {
         if crate::engine::event_bus::violates_unique_index(
             &*e,
             "events_user_question_answered_unique",
@@ -1507,7 +1794,7 @@ pub async fn answer_pending_question_with_event_id(
                 tool_use_id, thread_id
             ));
         }
-        log!(
+        log_legacy!(
             "[CCQuestion] Failed to emit UserQuestionAnswered for {}/{}: {}",
             thread_id,
             tool_use_id,
@@ -1515,11 +1802,54 @@ pub async fn answer_pending_question_with_event_id(
         );
         return AnswerResult::Conflict(format!("Failed to persist answer: {}", e));
     }
+    if start_card.is_some() {
+        // The start card grants nothing lasting here: its answer runs or ends
+        // the parked start. A Remember pick saved its setting above.
+        engine.agent_host().spawn_remote_start_answer(
+            engine,
+            thread_id,
+            start_choice,
+            actor.clone(),
+        );
+    } else if let Some(request) = permission_request.filter(|r| !r.action.is_trigger_grant()) {
+        // The answer stands either way, so a failed grant only logs.
+        match crate::engine::permission::resolve_answer(
+            &engine.event_bus,
+            thread_id,
+            &tool_use_id,
+            &request,
+            &answer,
+            actor.as_ref(),
+            picked_by,
+        )
+        .await
+        {
+            Ok(resolution) => {
+                // A confirmed batch answers other cards, so it runs after this
+                // answer returns rather than inside it.
+                if request.batch.is_some() {
+                    tokio::spawn(crate::engine::permission::batch::run_batch(
+                        engine.clone(),
+                        thread_id,
+                        request,
+                        resolution,
+                        actor.clone(),
+                    ));
+                }
+            }
+            Err(e) => log_legacy!(
+                "[CCQuestion] Permission request {tool_use_id} on {thread_id} did not resolve: {e}"
+            ),
+        }
+    }
+    if engine_card {
+        return AnswerResult::Resumed;
+    }
 
     // The answer stands either way, so a failed driver take only logs.
     if let (Some(answerer), true) = (actor.as_ref(), answer.is_a_reply()) {
-        use crate::engine::thread_people::{notify, take_on_answer, PeopleNotice};
-        let snapshot = crate::gateway_operators::current();
+        use crate::engine::thread_users::{notify, take_on_answer, UserNotice};
+        let snapshot = crate::gateway_users::current();
         let taken = match take_on_answer(
             engine.pool(),
             &engine.event_bus,
@@ -1531,7 +1861,7 @@ pub async fn answer_pending_question_with_event_id(
         {
             Ok(taken) => taken,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[CCQuestion] Could not make the answerer of {}/{} the driver: {}",
                     thread_id,
                     tool_use_id,
@@ -1544,18 +1874,12 @@ pub async fn answer_pending_question_with_event_id(
             let notified =
                 match crate::engine::thread_family::family_root(engine.pool(), thread_id).await {
                     Ok(root) => {
-                        notify(
-                            engine,
-                            root,
-                            PeopleNotice::GateAnswered(takeover),
-                            &snapshot,
-                        )
-                        .await
+                        notify(engine, root, UserNotice::GateAnswered(takeover), &snapshot).await
                     }
                     Err(e) => Err(e.into()),
                 };
             if let Err(e) = notified {
-                log!(
+                log_legacy!(
                     "[CCQuestion] Could not tell the driver of {} about the answer: {}",
                     thread_id,
                     e
@@ -1659,8 +1983,10 @@ pub async fn answer_pending_question_with_event_id(
 
     // The human replied, so agent messages held behind the question go now.
     // A Cancel keeps them held (ADR 0256).
-    if crate::engine::chat::answer_releases_held_messages(&answer) {
-        engine.spawn_held_message_release(thread_id);
+    if answer_releases_held_messages(&answer) {
+        engine
+            .agent_host()
+            .spawn_held_message_release(engine, thread_id);
     }
 
     AnswerResult::Resumed
@@ -1737,7 +2063,7 @@ pub(crate) async fn lookup_interrupted_ask(
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!("[CCQuestion] ask_user_question call lookup failed for {thread_id}: {e}");
+        log_legacy!("[CCQuestion] ask_user_question call lookup failed for {thread_id}: {e}");
         None
     })
 }
@@ -1760,7 +2086,7 @@ pub(crate) fn resume_anchor_for_ask(
     match ask.and_then(|a| a.request_event_id) {
         Some(request_event_id) => ChatResumeAnchor::ExistingTurn(request_event_id),
         None => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] no interrupted turn to continue for thread {} — resuming with a Continue boundary",
                 thread_id
             );
@@ -1770,6 +2096,12 @@ pub(crate) fn resume_anchor_for_ask(
             }
         }
     }
+}
+
+/// Whether resolving a question with `answer` releases the held messages.
+/// Cancel means stop, so it keeps them held until a human writes again.
+pub fn answer_releases_held_messages(answer: &AnswerKind) -> bool {
+    !matches!(answer, AnswerKind::Canceled)
 }
 
 /// Re-enter a chat thread's agentic loop after its `ask_user_question` was
@@ -1791,7 +2123,7 @@ pub(crate) fn resume_anchor_for_ask(
 /// ([`ChatResumeAnchor::ExistingTurn`], read off the originating
 /// `ToolCalled{ask_user_question}`), so it emits **no** `ContinuationStarted` /
 /// `PromptInjected` boundary: this thread was never aborted (the restart
-/// preserve guard, `agent_recovery::thread_has_unanswered_question`, is what
+/// preserve guard, `question_park_sql::thread_has_unanswered_question`, is what
 /// kept the card live) and the user already did the one thing that was needed —
 /// they answered. Opening the manual-Continue boundary here mislabelled the
 /// resume as "Continued the response" and surfaced a stale "Reminded the model
@@ -1822,7 +2154,7 @@ async fn resume_chat_after_answer(
 
     // Read before the ToolResult, which would mark every held delivery as
     // read (ADR 0321).
-    let held = crate::engine::chat::held_deliveries::held_deliveries(
+    let held = crate::engine::held_deliveries::held_deliveries(
         engine.pool(),
         thread_id,
         &synth_question_id(outer_question_id(sub_tool_use_id), 0),
@@ -1833,13 +2165,13 @@ async fn resume_chat_after_answer(
 
     // `spawn_chat_resume` returns a boxed `dyn Future`, the boundary that breaks
     // the async recursion cycle (see its doc). So a plain `.await` is Send-safe.
-    let note =
-        crate::engine::chat::held_deliveries::resume_note_with_held_deliveries(RESUME_NOTE, &held);
+    let note = crate::engine::held_deliveries::resume_note_with_held_deliveries(RESUME_NOTE, &held);
     if let Err(e) = engine
-        .spawn_chat_resume(thread_id, note, channel, actor, anchor)
+        .agent_host()
+        .spawn_chat_resume(engine, thread_id, note, channel, actor, anchor)
         .await
     {
-        log!(
+        log_legacy!(
             "[CCQuestion] chat resume-after-answer failed for thread {}: {}",
             thread_id,
             e
@@ -1852,8 +2184,7 @@ async fn resume_chat_after_answer(
 async fn has_held_deliveries(engine: &LucidosEngine, thread_id: Uuid, tool_use_id: &str) -> bool {
     let first = synth_question_id(outer_question_id(tool_use_id), 0);
     let held =
-        crate::engine::chat::held_deliveries::held_deliveries(engine.pool(), thread_id, &first)
-            .await;
+        crate::engine::held_deliveries::held_deliveries(engine.pool(), thread_id, &first).await;
     !held.wait_texts.is_empty() || held.child_reports > 0
 }
 
@@ -1945,7 +2276,7 @@ async fn emit_restart_orphaned_ask_result(
                 // Nothing above can retry (this path returns `()`), so stop and say
                 // so loudly rather than mislabel the answers silently.
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Question] Sub-answer lookup failed for {} at index {}: {}. \
                          Resuming with the {} answer(s) found so far; any later \
                          question will read as (canceled) to the model",
@@ -2150,12 +2481,10 @@ async fn arm_question_resume_if_live(
     }
 }
 
-// `pub(crate)`: the CC seeding helpers (`seed_cc_thread`, `emit_user_question`)
-// are shared with `engine_impl/shutdown_tests.rs` — the teardown-preserve tests
-// park a thread on the same question shape this suite uses.
-#[cfg(test)]
+// Shared fixtures for tests that park a thread on a coding-agent question.
+#[cfg(any(test, feature = "test-support"))]
 #[path = "agent_question_tests/common.rs"]
-pub(crate) mod aq_test_helpers;
+pub mod aq_test_helpers;
 
 #[cfg(test)]
 #[path = "agent_question_tests/tests.rs"]

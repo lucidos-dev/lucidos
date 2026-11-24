@@ -5,7 +5,6 @@ vi.mock('../store', () => ({ showToast }));
 
 const { panelPullTravel, panelRefreshAvailable, panelRefreshing, panelRefreshSucceeded, registerPanelRefresh, runPanelRefresh, showPullTravel } = await import('../panelRefresh');
 
-/** A promise the test settles by hand, to hold a refresh open. */
 function deferred() {
   let resolve!: () => void;
   let reject!: (e: unknown) => void;

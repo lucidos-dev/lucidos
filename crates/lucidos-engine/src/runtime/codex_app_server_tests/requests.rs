@@ -12,6 +12,8 @@ fn test_config() -> CodexConfig {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: vec![
             (
@@ -31,6 +33,30 @@ fn test_config() -> CodexConfig {
 }
 
 #[test]
+fn standing_deny_hook_is_configured_and_verified_with_agent_sandbox_off() {
+    let config = test_config();
+    let (_, params) = build_thread_request(&config, None);
+    assert_eq!(params["sandbox"], "workspace-write");
+    let hook = &params["config"]["hooks"]["PreToolUse"][0];
+    assert_eq!(hook["matcher"], "Bash");
+    assert_eq!(
+        hook["hooks"][0]["command"],
+        super::super::codex::COMMAND_DENY_HOOK
+    );
+
+    let key = super::super::codex_side_question::GUARD_KEY;
+    let mut result = serde_json::json!({"data": [{"errors": [], "hooks": [{
+        "key": key, "eventName": "preToolUse", "handlerType": "command",
+        "command": super::super::codex::COMMAND_DENY_HOOK, "matcher": "Bash",
+        "async": false, "enabled": true, "trustStatus": "trusted"
+    }]}]});
+    assert!(command_deny_hook_is_active(&result));
+    result["data"][0]["hooks"][0]["trustStatus"] = "untrusted".into();
+    assert!(!command_deny_hook_is_active(&result));
+    assert!(!command_deny_hook_is_active(&serde_json::json!({})));
+}
+
+#[test]
 fn fresh_thread_request_shape() {
     let (method, params) = build_thread_request(&test_config(), None);
     assert_eq!(method, "thread/start");
@@ -38,7 +64,7 @@ fn fresh_thread_request_shape() {
     assert_eq!(params["sandbox"], "workspace-write");
     assert_eq!(
         params["approvalPolicy"], "on-request",
-        "on-request is the point of this driver — sandbox escalations raise a card"
+        "with Codex's own sandbox on, its escalations raise a card"
     );
     assert_eq!(params["developerInstructions"], "SYSPROMPT");
     assert_eq!(
@@ -80,6 +106,35 @@ fn fresh_thread_request_shape() {
         params["config"]["project_doc_max_bytes"], 65536,
         "codex's 32KiB default would truncate Lucidos' ~29KiB CLAUDE.md soon"
     );
+}
+
+/// Inside the Lucidos sandbox Codex's own is off, so every command and file
+/// change must ask, as a Claude Code `Bash` call does (ADR 0645).
+#[test]
+fn inside_the_lucidos_sandbox_codex_asks_for_every_command() {
+    let mut config = test_config();
+    config.sandbox = crate::runtime::agent_sandbox::Sandbox::inherited();
+    for resume in [None, Some("sid-9")] {
+        let (_, params) = build_thread_request(&config, resume);
+        assert_eq!(params["sandbox"], "danger-full-access");
+        assert_eq!(params["approvalPolicy"], "untrusted", "resume: {resume:?}");
+    }
+}
+
+/// A login shell's `path_helper` would put `/bin/ps` ahead of the shim.
+#[test]
+fn with_the_ps_shim_codex_runs_no_login_shell() {
+    let (_, params) = build_thread_request(&test_config(), None);
+    assert!(params["config"].get("allow_login_shell").is_none());
+    let mut config = test_config();
+    config.login_shell = false;
+    for resume in [None, Some("sid-9")] {
+        let (_, params) = build_thread_request(&config, resume);
+        assert_eq!(
+            params["config"]["allow_login_shell"], false,
+            "resume: {resume:?}"
+        );
+    }
 }
 
 #[test]

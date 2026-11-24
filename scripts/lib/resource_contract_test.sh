@@ -132,6 +132,13 @@ echo "test: an unreadable packaged launcher is refused, never waved through"
 out="$(resource_contract_check /no/such/desktop.rs 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "not found"; then pass "a missing desktop.rs is a refusal"; else fail "expected a missing-source refusal (rc=$rc): $out"; fi
 
+echo "test: the persistent launcher must delegate to the scanned shared path"
+ROOT="$(scratch_tree)"
+perl -0pi -e 's/spawn_gateway_in_scope\(resources, app_data, port, None\)/unscanned_launcher(resources, app_data, port)/' "$ROOT/crates/lucidos-app/src/desktop.rs"
+out="$(scratch_check "$ROOT")"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q 'does not delegate'; then pass "disconnected launcher refused"; else fail "expected delegation refusal: $out"; fi
+rm -rf "$ROOT"
+
 # ── build-headless.sh --check can actually fail ──────────────────────────────
 
 echo ""

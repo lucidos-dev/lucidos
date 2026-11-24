@@ -6,7 +6,6 @@ import { toFailed } from '../store/types';
 import { composeHandlers } from '../components/chat/composeHandlers';
 import { moveHighlight, selectHighlighted } from '../components/drawer/ThreadDrawer';
 
-/** Shared thread search state and handlers for desktop and mobile headers. */
 export function useThreadSearch() {
   const searchOpen = threadSearchOpen.value;
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -27,8 +26,6 @@ export function useThreadSearch() {
       return;
     }
 
-    // A close aborts from an effect, a frame after the fact. So the timer and
-    // the response also check the session, and a closed search stays empty.
     const session = threadSearchSession();
     const stillWanted = (controller?: AbortController) =>
       session === threadSearchSession() && !controller?.signal.aborted;
@@ -50,8 +47,6 @@ export function useThreadSearch() {
     }, 300);
   }, [cancelPending]);
 
-  // The other header copy or a shortcut can close search too. So this copy
-  // drops its in-flight search when the shared state closes.
   useEffect(() => {
     if (!searchOpen) cancelPending();
   }, [searchOpen, cancelPending]);
@@ -71,22 +66,10 @@ export function useThreadSearch() {
     else if (e.key === 'Enter') { e.preventDefault(); selectHighlighted(); }
   }, []);
 
-  /**
-   * Handlers for the search button. Uses composeHandlers to focus the input
-   * synchronously within the user gesture so iOS Safari opens the keyboard.
-   * The input is always in the DOM (hidden via CSS when closed), so the ref
-   * is populated.
-   */
   const openSearchHandlers = useMemo(
     () => composeHandlers(
       openThreadSearch,
       () => {
-        // Expand the search bar BEFORE focusing so iOS calculates the caret
-        // from the correct container dimensions. focus() must be synchronous
-        // within the gesture (for iOS keyboard), but Preact's state-driven
-        // class toggle happens after — by then iOS has locked in the caret
-        // size from the 1px hidden container. Adding the class to the DOM
-        // first ensures the layout is correct at focus() time.
         const header = searchInputRef.current?.closest('.mobile-threads-header, .threads-header');
         if (header) header.classList.add('search-active');
         searchInputRef.current?.focus();

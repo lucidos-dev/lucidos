@@ -22,8 +22,6 @@ import {
 } from '../store';
 import type { EmbeddingModelLoadState } from '../../api/types';
 
-// Hoisted by vitest, so the module under test sees the stub even though this
-// sits below the imports.
 const mockGetStatus = vi.fn();
 vi.mock('../../api/client', () => ({
   getEmbeddingModelStatus: () => mockGetStatus(),
@@ -62,7 +60,6 @@ function reset(): void {
 describe('the embedding-model download', () => {
   beforeEach(reset);
 
-  /** Progress lives in the Lucidos menu. A download starting raises no toast. */
   it('raises no toast while it runs', () => {
     setModel(downloadFrame(100));
     syncEmbeddingModelOutcome();
@@ -93,7 +90,6 @@ describe('the embedding-model download', () => {
     expect(modelOutcomeToast()?.type).toBe('error');
   });
 
-  /** A retry that downloads again and then lands is a new result. */
   it('reports again after a stalled download retries and lands', () => {
     setModel(downloadFrame(100));
     syncEmbeddingModelOutcome();
@@ -108,8 +104,6 @@ describe('the embedding-model download', () => {
     expect(modelOutcomeToast()?.type).toBe('success');
   });
 
-  /** An existing workspace loads from a warm cache and never downloads. Its
-   *  `ready` is not news, so it stays completely silent. */
   it('says nothing about a warm-cache boot', () => {
     setModel({ kind: 'loading' });
     syncEmbeddingModelOutcome();
@@ -118,8 +112,6 @@ describe('the embedding-model download', () => {
     expect(toasts.value).toEqual([]);
   });
 
-  /** `showToast` drops everything while the workspace is unavailable. An
-   *  outcome it swallowed is still owed, so the next frame reports it. */
   it('is not spent on a report the unavailable workspace swallowed', () => {
     setModel(downloadFrame(100));
     syncEmbeddingModelOutcome();
@@ -147,11 +139,6 @@ describe('snapshot vs live-frame freshness', () => {
     mockGetStatus.mockReset();
   });
 
-  /** The regression this counter exists for. The snapshot read and the SSE
-   *  stream race, and the loader emits its terminal `ready` frame and then
-   *  RETURNS, so there is no later frame to undo a stale write: a `downloading`
-   *  body resolving after `ready` would spin the badge for the rest of the
-   *  session. */
   it('discards a snapshot that a live frame overtook', async () => {
     let resolveRead: (v: unknown) => void = () => {};
     mockGetStatus.mockImplementation(
@@ -160,13 +147,11 @@ describe('snapshot vs live-frame freshness', () => {
 
     const inFlight = loadEmbeddingModelStatus();
 
-    // The download finishes over SSE while the HTTP read is still open.
     applyEmbeddingModelStatus({
       model_id: 'multilingual-e5-small',
       load_state: { kind: 'ready' },
     });
 
-    // ...and only THEN does the stale body land.
     resolveRead({
       model_id: 'multilingual-e5-small',
       load_state: { kind: 'downloading', downloaded_bytes: 400, total_bytes: 1000 },
@@ -176,8 +161,6 @@ describe('snapshot vs live-frame freshness', () => {
     expect(embeddingModelStatus.value?.load_state).toEqual({ kind: 'ready' });
   });
 
-  /** A client that connected mid-download reads the snapshot, which is what
-   *  lets it report the download's result later. */
   it('applies a snapshot that nothing overtook, and watches the download it names', async () => {
     mockGetStatus.mockResolvedValue({
       model_id: 'multilingual-e5-small',
@@ -195,8 +178,6 @@ describe('snapshot vs live-frame freshness', () => {
     expect(modelOutcomeToast()?.type).toBe('success');
   });
 
-  /** A failed read must not disturb the state a live frame already established:
-   *  it is an unsolicited probe, and SSE remains the newer truth. */
   it('leaves the live state alone when the read fails', async () => {
     applyEmbeddingModelStatus({
       model_id: 'multilingual-e5-small',
@@ -215,8 +196,6 @@ describe('the Expose run keeps its toast', () => {
 
   beforeEach(reset);
 
-  /** A button the user just pressed, so it narrates every time. Pressing Expose
-   *  twice in a session must not go silent the second time. */
   it('opens its toast on every run', () => {
     beginTailscaleServeRun();
     expect(serveToast()?.message).toContain('Setting up Tailscale access');
@@ -233,20 +212,16 @@ describe('the Expose run keeps its toast', () => {
     applyTailscaleServeProgress({ phase: 'configuring' });
     expect(serveToast()?.message).toContain('Configuring tailscale serve');
 
-    // A step with a note shows its label as the title, over the note.
     applyTailscaleServeProgress({ phase: 'waiting-for-https' });
     expect(serveToast()?.title).toContain('Waiting for HTTPS');
     expect(serveToast()?.message).toContain('first certificate');
 
     expect(toasts.value.filter((t) => t.key === SERVE_RUN_TOAST_KEY)).toHaveLength(1);
     expect(serveToast()?.id).toBe(firstId);
-    // Indeterminate throughout: a spinner, never a fabricated bar.
     expect(serveToast()?.spinning).toBe(true);
     expect(serveToast()?.progress ?? null).toBeNull();
   });
 
-  /** The step that blocks on the user: the link the CLI printed, offered as a
-   *  button, with a way out of the wait. */
   it('turns the tailnet-approval step into a real button', () => {
     beginTailscaleServeRun();
     applyTailscaleServeProgress({ phase: 'awaiting-tailnet-approval', url: APPROVAL_URL });
@@ -255,8 +230,6 @@ describe('the Expose run keeps its toast', () => {
     expect(serveToast()?.message).toContain('Open the link, approve it');
   });
 
-  /** The run is the only background work that narrates in a toast. A download
-   *  running beside it stays in the menu. */
   it('narrates only itself', () => {
     setModel(downloadFrame(100));
     syncEmbeddingModelOutcome();
@@ -274,8 +247,6 @@ describe('the Expose run keeps its toast', () => {
     expect(serveToast()).toBeUndefined();
   });
 
-  /** A failure reaches the user even if they had closed the narration, because
-   *  it is the outcome of something they pressed. */
   it('reports a failure even after the narration was closed', () => {
     beginTailscaleServeRun();
     dismissToast(SERVE_RUN_TOAST_KEY);
@@ -294,9 +265,6 @@ describe('the Expose run keeps its toast', () => {
     expect(tailscaleServeRun.value).toBeNull();
   });
 
-  /** `showToast` with a key creates a missing toast, so a closed narration must
-   *  not come back on the next frame. The run's menu row is how the user sees
-   *  it again. */
   it('stays dismissed for mid-run frames after the user closes it', () => {
     beginTailscaleServeRun();
     dismissToast(SERVE_RUN_TOAST_KEY);
@@ -307,8 +275,6 @@ describe('the Expose run keeps its toast', () => {
     expect(tailscaleServeRun.value?.phase).toBe('awaiting-tailnet-approval');
   });
 
-  /** For what Rust could not report at all: a rejected invoke, an ACL denial, a
-   *  dead bridge. The page shows the error; this only has to stop the badge. */
   it('clears the run without narrating when no frame ever arrived', () => {
     beginTailscaleServeRun();
     clearTailscaleServeRun();

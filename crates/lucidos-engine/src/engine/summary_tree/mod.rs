@@ -27,25 +27,26 @@ mod compactor;
 pub(crate) mod compactor_models;
 mod consumer;
 pub(crate) mod estimate;
-pub(crate) mod fold;
+pub mod fold;
 mod limit;
 pub(crate) mod log;
-pub(crate) mod module;
+pub mod module;
 mod prompt;
-pub(crate) mod recall;
+pub mod recall;
 mod shape;
-pub(crate) mod spend;
-pub(crate) mod store;
-pub(crate) mod view;
+pub mod spend;
+pub mod store;
+pub mod view;
 pub(crate) mod workspace_log;
 
 pub use compactor_models::CompactorSelection;
-pub(crate) use compactor_models::{compactor_selection, default_effort_for, COMPACTOR_DEFAULTS};
+pub use compactor_models::COMPACTOR_DEFAULTS;
 pub use consumer::spawn;
 pub use estimate::{Bounds, EffortCost, ModelCost, TreeBackfillEstimate};
 pub use module::{tree_ready, BackfillProgress, TreeBackfill};
 pub use spend::StartEstimate;
 pub use store::caught_up;
+pub(crate) use {compactor_models::compactor_selection, compactor_models::default_effort_for};
 
 /// Target size of one summary line, in UTF-8 bytes.
 pub(crate) const NODE_BYTES: usize = 512;
@@ -83,7 +84,7 @@ const HORIZON_SECS: i64 = 2;
 
 /// Which log a tree summarizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum SummaryScope {
+pub enum SummaryScope {
     Workspace,
     Thread(uuid::Uuid),
 }
@@ -103,13 +104,13 @@ impl SummaryScope {
 /// A node's address: the entries `[start, start + span)`, `span` a power of 2
 /// and `start` a multiple of it. Rendered `start+span`, as OptChat names lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct NodeAddr {
-    pub(crate) start: u64,
-    pub(crate) span: u64,
+pub struct NodeAddr {
+    pub start: u64,
+    pub span: u64,
 }
 
 impl NodeAddr {
-    pub(crate) fn leaf(index: u64) -> Self {
+    pub fn leaf(index: u64) -> Self {
         Self {
             start: index,
             span: 1,
@@ -120,12 +121,12 @@ impl NodeAddr {
         self.start + self.span
     }
 
-    pub(crate) fn is_leaf(&self) -> bool {
+    pub fn is_leaf(&self) -> bool {
         self.span == 1
     }
 
     /// The two halves a merge is built from. `None` for a leaf.
-    pub(crate) fn children(&self) -> Option<(NodeAddr, NodeAddr)> {
+    pub fn children(&self) -> Option<(NodeAddr, NodeAddr)> {
         if self.is_leaf() {
             return None;
         }
@@ -151,7 +152,7 @@ impl std::fmt::Display for NodeAddr {
 
 /// The engine's Tree backfill state, as `GET /api/v1/memory/tree-backfill`
 /// serves it.
-pub(crate) async fn tree_backfill(
+pub async fn tree_backfill(
     engine: &crate::engine::LucidosEngine,
 ) -> Result<TreeBackfill, Box<dyn std::error::Error + Send + Sync>> {
     module::tree_backfill(engine.pool(), engine.summary_tree()).await
@@ -159,7 +160,7 @@ pub(crate) async fn tree_backfill(
 
 /// What a Tree backfill of this workspace would cost, as
 /// `GET /api/v1/memory/tree-backfill/estimate` serves it.
-pub(crate) async fn tree_backfill_estimate(
+pub async fn tree_backfill_estimate(
     engine: &crate::engine::LucidosEngine,
 ) -> Result<TreeBackfillEstimate, sqlx::Error> {
     let pool = engine.pool();
@@ -179,19 +180,21 @@ pub(crate) async fn tree_backfill_estimate(
 /// The engine's handle on its one compactor, set the first time the workspace
 /// goes on Tree. Routes read the backfill count through it.
 #[derive(Default)]
-pub(crate) struct Runtime {
+pub struct Runtime {
     compactor: std::sync::OnceLock<std::sync::Arc<compactor::Compactor>>,
 }
 
 impl Runtime {
     fn set(&self, compactor: std::sync::Arc<compactor::Compactor>) {
         if self.compactor.set(compactor).is_err() {
-            log!("[SummaryTree] A second compactor started; the first stays the one routes read");
+            log_legacy!(
+                "[SummaryTree] A second compactor started; the first stays the one routes read"
+            );
         }
     }
 
     /// The running backfill's count, or `None` when no backfill runs.
-    pub(crate) fn backfill_progress(&self) -> Option<BackfillProgress> {
+    pub fn backfill_progress(&self) -> Option<BackfillProgress> {
         self.compactor.get()?.backfill_progress()
     }
 }

@@ -1,9 +1,5 @@
 // @vitest-environment jsdom
-/**
- * The markdown facade before and after the markdown engine lands. The test
- * setup provides the engine to every file, so each test here takes a fresh
- * facade that has none.
- */
+import './renderMarkdown';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { vi } from 'vitest';
 
@@ -45,7 +41,9 @@ describe('the markdown facade before the engine lands', () => {
 
   it('formats once the engine is provided, never answering from the plain text', async () => {
     expect(facade.renderMarkdown('**bold**')).not.toContain('<strong>');
-    facade.provideMarkdownEngine(await import('./markdownEngine'));
+    const engine = await import('./markdownEngine');
+    await engine.loadMarkdownLibraries();
+    facade.provideMarkdownEngine(engine);
     expect(facade.renderMarkdown('**bold**')).toContain('<strong>bold</strong>');
     expect(facade.renderMarkdownInline('*a*')).toContain('<em>a</em>');
   });
@@ -61,7 +59,9 @@ describe('a memoised markdown surface', () => {
     expect(host.querySelector('strong')).toBeNull();
     expect(host.textContent).toContain('**bold**');
 
-    facade.provideMarkdownEngine(await import('./markdownEngine'));
+    const engine = await import('./markdownEngine');
+    await engine.loadMarkdownLibraries();
+    facade.provideMarkdownEngine(engine);
     await vi.waitFor(() => expect(host.querySelector('strong')?.textContent).toBe('bold'));
     expect(host.querySelector('h1')?.textContent).toBe('Title');
     render(null, host);

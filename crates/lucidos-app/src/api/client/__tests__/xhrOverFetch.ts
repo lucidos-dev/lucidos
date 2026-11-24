@@ -1,6 +1,3 @@
-/** A test `XMLHttpRequest` that routes through `globalThis.fetch`. Suites that
- *  stub `fetch` to drive the whole client keep working for the one call that
- *  uses XHR, the image upload (`postWithUploadProgress`). Not a test file. */
 
 type Handler = ((e: unknown) => void) | null;
 

@@ -7,9 +7,6 @@ import {
   workspaceRouteUrlSegment,
 } from './basePath';
 
-// `normalizeBasePath` turns the server-stamped `<base href>` into a path prefix
-// (no trailing slash, '' at root). It is slug-agnostic — any workspace name
-// works, and `/~/` marks the picker context (ADR 0014).
 
 describe('normalizeBasePath', () => {
   it('returns the /<slug> prefix for a workspace base href', () => {
@@ -36,9 +33,6 @@ describe('normalizeBasePath', () => {
   });
 });
 
-// `baseContextValidFor` is the defensive guard `main.tsx` uses to bounce a
-// malformed workspace base-path context to the picker instead of rendering a
-// broken app (the "string did not match the expected pattern" dead-end).
 describe('baseContextValidFor', () => {
   it('treats the picker and legacy-root contexts (null slug) as valid', () => {
     expect(baseContextValidFor(null)).toBe(true);
@@ -86,10 +80,6 @@ describe('parseWorkspaceRoute', () => {
   });
 });
 
-// `computeGatewayPickerHref` builds the "Manage workspaces" link target. The bug
-// it fixes: on a page served on the engine's OWN port the gateway picker lives at
-// a *different* origin (its own port), so the origin-relative `/~/?pick` dead-ends
-// (ADR 0014).
 describe('computeGatewayPickerHref', () => {
   it('uses the relative picker route behind the gateway (same origin)', () => {
     expect(
@@ -100,7 +90,6 @@ describe('computeGatewayPickerHref', () => {
         hostname: 'localhost',
       }),
     ).toBe('/~/?pick');
-    // Relative even when no port is stamped — same origin is the gateway.
     expect(
       computeGatewayPickerHref({
         behindGateway: true,

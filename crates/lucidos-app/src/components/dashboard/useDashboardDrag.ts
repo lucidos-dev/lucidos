@@ -3,13 +3,11 @@ import { EASING_DISCLOSURE, DISCLOSURE_MIN_MS } from '../../utils/disclosureMoti
 import { scaledDurationMs } from '../../utils/motion';
 import { moveTile } from './dashboardArrangement';
 
-/** Pointer travel before a press on a tile's shield becomes a drag. */
 export const TILE_DRAG_THRESHOLD_PX = 6;
 
 interface Drag {
   key: string;
   pointerId: number;
-  /** Where the pointer holds the tile, from its top left corner. */
   grabX: number;
   grabY: number;
   startX: number;
@@ -17,13 +15,9 @@ interface Drag {
   x: number;
   y: number;
   moved: boolean;
-  /** The tile the last swap moved past. The pointer must leave it before it
-   *  can swap again, or a slide still under the pointer swaps straight back.
-   *  After a reflow it is the tile now under the pointer. */
   passed: string | null;
 }
 
-/** Slide each element from where it was to where it is now. */
 function slideFrom(el: HTMLElement, from: DOMRect, to: DOMRect): void {
   const dx = from.left - to.left;
   const dy = from.top - to.top;
@@ -35,7 +29,6 @@ function slideFrom(el: HTMLElement, from: DOMRect, to: DOMRect): void {
   );
 }
 
-/** The tile under a point, other than the one being dragged. */
 function tileUnder(x: number, y: number, dragged: string, known: Map<string, HTMLElement>): string | null {
   if (typeof document.elementsFromPoint !== 'function') return null;
   for (const el of document.elementsFromPoint(x, y)) {
@@ -45,13 +38,6 @@ function tileUnder(x: number, y: number, dragged: string, known: Map<string, HTM
   return null;
 }
 
-/** Drag to reorder a dashboard's tiles in edit mode (ADR 0432).
- *
- *  The dragged tile follows the pointer on a transform, and the others reflow
- *  live through CSS `order`, sliding to their new places. No element ever
- *  moves in the DOM, so no frame reloads. Only a drop commits: `onDrop` runs
- *  once per drag, never per pointer move. `moveBy` is the keyboard's Alt plus
- *  an arrow, one place per press. */
 export function useDashboardDrag({ order, enabled, onDrop }: {
   order: readonly string[];
   enabled: boolean;
@@ -74,7 +60,6 @@ export function useDashboardDrag({ order, enabled, onDrop }: {
     before.current = new Map([...elements.current].map(([k, el]) => [k, el.getBoundingClientRect()]));
   };
 
-  /** Keep the dragged tile under the pointer from wherever its slot now is. */
   const follow = () => {
     const d = drag.current;
     const el = d?.moved ? elements.current.get(d.key) : undefined;
@@ -87,7 +72,6 @@ export function useDashboardDrag({ order, enabled, onDrop }: {
   useLayoutEffect(() => {
     const previous = before.current;
     before.current = null;
-    // Hit-test before the slides start: their first frame draws each tile at its old place.
     const d = drag.current;
     if (d?.moved) d.passed = tileUnder(d.x, d.y, d.key, elements.current) ?? d.passed;
     if (previous) {
@@ -165,7 +149,6 @@ export function useDashboardDrag({ order, enabled, onDrop }: {
     onLostPointerCapture: (e: PointerEvent) => finish(e.pointerId, false),
   });
 
-  // Leaving edit mode mid-drag drops the drag, uncommitted.
   useEffect(() => {
     if (!enabled && drag.current) finish(drag.current.pointerId, false);
   }, [enabled]);

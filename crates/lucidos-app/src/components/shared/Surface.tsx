@@ -2,23 +2,17 @@ import type { ComponentChildren } from 'preact';
 import type { ToastType } from '../../store/types';
 import { BackIcon, CloseIcon, ToneIcon } from './icons';
 
-/** The drill-in's way back to the view it came from, named after that view. */
 export interface SurfaceBack {
   label: string;
   onClick: () => void;
 }
 
-/** A surface's tone, as the only coloured mark on it (ADR 0290). */
 export function SurfaceToneIcon({ tone }: { tone: ToastType }) {
   return (
     <span class={`surface-icon surface-icon-${tone}`} aria-hidden="true"><ToneIcon tone={tone} /></span>
   );
 }
 
-/** The head row every surface shares (styles/global/surface.css): an optional
- *  back link, a glyph, the title, a meta readout, actions, and the close X.
- *  The X is the ONE close affordance a surface has, so a surface never grows a
- *  text Close button at its foot. */
 export function SurfaceHead({
   title,
   icon,
@@ -29,10 +23,8 @@ export function SurfaceHead({
   closeLabel = 'Close',
 }: {
   title?: ComponentChildren;
-  /** A leading glyph: a `SurfaceToneIcon`, or the spinner of work in flight. */
   icon?: ComponentChildren;
   meta?: ComponentChildren;
-  /** Controls that act on what the surface shows, before the X. */
   actions?: ComponentChildren;
   back?: SurfaceBack;
   onClose?: () => void;

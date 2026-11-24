@@ -5,9 +5,6 @@ import {
   ACTIVE_STATUSES,
 } from './exchange-status';
 
-// ===========================================================================
-// isActive
-// ===========================================================================
 describe('isActive', () => {
   it('pending is active', () => expect(isActive('pending')).toBe(true));
   it('streaming is active', () => expect(isActive('streaming')).toBe(true));
@@ -27,9 +24,6 @@ describe('ACTIVE_STATUSES', () => {
   });
 });
 
-// ===========================================================================
-// statusLabel
-// ===========================================================================
 describe('statusLabel', () => {
   it('pending without steps → Requesting', () => {
     const result = statusLabel('pending', false);

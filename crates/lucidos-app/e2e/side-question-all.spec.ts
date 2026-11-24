@@ -9,14 +9,8 @@ import {
 } from './helpers';
 import { psql, createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
-// A controlled page sends fetches through the service worker in WebKit, where
-// `page.route` cannot see them. `sw.js` handles GETs only, so blocking it
-// changes nothing for this POST (see `answer-over-a-stale-connection-all.spec.ts`).
 test.use({ serviceWorkers: 'block' });
 
-/** A Claude Code thread parked on a question card, single-select unless
- *  `multiSelect`, seeded straight into the database. The caller cleans it up
- *  with `cleanupCCThread`. */
 function seedWaitingCard(name: string, multiSelect = false) {
   const suffix = randomUUID().slice(0, 8);
   const toolUseId = `tu-side-${suffix}`;
@@ -39,17 +33,13 @@ function seedWaitingCard(name: string, multiSelect = false) {
   return { threadId, changeId, branch, file, toolUseId, title: `${name} ${suffix}` };
 }
 
-/** Press the composer row's side-question toggle, wherever the fold put it. */
 async function pressSideQuestionToggle(page: Page): Promise<void> {
   await (await composerControl(page, '[data-role="side-question-toggle"]')).click();
 }
 
-/** The round button that asks the box while side-question mode is on. */
 const roundAsk = (page: Page): Locator =>
   page.locator('button.send-cancel-morph[aria-label="Ask side question"]:visible').first();
 
-/** Ask `question` as a side question: type it, press the toggle to turn on the
- *  mode, then press the round Ask. */
 async function askByToggle(page: Page, question: string): Promise<void> {
   const input = await waitForVisibleInput(page, 15_000);
   await input.fill(question);
@@ -58,19 +48,12 @@ async function askByToggle(page: Page, question: string): Promise<void> {
   await roundAsk(page).click();
 }
 
-/** A side question in a Claude Code thread (ADR 0320). The question goes to the
- *  side-question endpoint, the answer lands on a card that survives a reload,
- *  and no turn of the thread shows it. Runs on desktop and on the mobile
- *  projects, since the card must work on the iOS PWA too.
- *
- *  It runs against the real Claude Code: a copy of the session that persists
- *  nothing (ADR 0324). */
 test.describe('side questions in a Claude Code thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  test('a side question answers on a card and never enters the thread', { tag: '@real-claude-code' }, async ({ page }) => {
+  test('a side question answers on a card and never enters the thread', async ({ page }) => {
     const chatPosts: string[] = [];
     page.on('request', (req) => {
       if (req.method() === 'POST' && /\/api\/v1\/chat\b/.test(req.url())) chatPosts.push(req.url());
@@ -85,26 +68,24 @@ test.describe('side questions in a Claude Code thread', () => {
     const exchangesBefore = await countExchanges(page);
     const postsBefore = chatPosts.length;
 
-    await askByToggle(page, 'What codeword did you just say? Reply with the codeword only.');
+    const sideToken = uniqueMessage('side-answer');
+    const question = `Say exactly: "${sideToken}" and nothing else.`;
+    await askByToggle(page, question);
 
     const card = page.locator('[data-role="side-question-card"]:visible').first();
     await expect(card).toBeVisible();
     await expect(card.locator('.side-question-question')).toHaveText(
-      'What codeword did you just say? Reply with the codeword only.',
+      question,
     );
     await expect(card).toHaveAttribute('data-status', 'answered', { timeout: 150_000 });
-    await expect(card.locator('.side-question-body > .markdown-content')).toContainText(token);
+    await expect(card.locator('.side-question-body > .markdown-content')).toContainText(sideToken);
     await expect(card).toContainText('Not added to the conversation');
 
-    // The side Q&A is not a turn: no new exchange, no user message, no chat POST.
     expect(await countExchanges(page)).toBe(exchangesBefore);
     expect(chatPosts.length).toBe(postsBefore);
 
-    // The whole head is the toggle. Folding rolls the body away and leaves
-    // the card in place as one line.
     const head = card.locator('button.side-question-head');
     await expect(head).toHaveAttribute('aria-expanded', 'true');
-    // The head is shorter than a finger, so its hit area reaches past its box.
     const box = (await head.boundingBox())!;
     const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
     for (const dy of [-21, 21]) {
@@ -117,22 +98,17 @@ test.describe('side questions in a Claude Code thread', () => {
     expect((await dismissed).ok()).toBe(true);
     await expect(card).toHaveAttribute('data-collapsed', '');
     await expect(head).toHaveAttribute('aria-expanded', 'false');
-    await expect(card.locator('.side-question-summary')).toContainText('What codeword did you just say?');
+    await expect(card.locator('.side-question-summary')).toContainText(question);
     await expect(card.locator('.side-question-question')).toHaveCount(0);
 
-    // Recorded as events, so the card is still folded after a reload, and a
-    // tap on its head opens the answer again.
     await page.reload();
     const folded = page.locator('[data-role="side-question-card"][data-collapsed]:visible').first();
     await expect(folded).toBeVisible({ timeout: 30_000 });
     await folded.locator('button.side-question-head').click();
-    await expect(page.locator('[data-role="side-question-card"]:visible .side-question-body > .markdown-content')).toContainText(token);
+    await expect(page.locator('[data-role="side-question-card"]:visible .side-question-body > .markdown-content')).toContainText(sideToken);
     expect(await countExchanges(page)).toBe(exchangesBefore);
   });
 
-  // While a question card waits, a typed draft turns the row's end button into
-  // Submit. The toggle turns on side-question mode with the draft kept, and the
-  // round Ask then asks it aside, never as an answer to the card.
   test('the toggle turns on the mode and the round Ask leaves the card waiting', async ({ page }) => {
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Submit');
 
@@ -167,10 +143,8 @@ test.describe('side questions in a Claude Code thread', () => {
 
       await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
       await expect(input).toHaveValue('what does option two mean?');
-      // One Ask button in every state: the round one, never a square "Ask".
       await expect(roundAsk(page)).toBeVisible();
       await expect(page.locator('button[aria-label="Submit answer"]:visible')).toHaveCount(0);
-      // Turning the mode on answered nothing.
       expect(answerPosts).toEqual([]);
 
       await roundAsk(page).click();
@@ -183,9 +157,6 @@ test.describe('side questions in a Claude Code thread', () => {
     }
   });
 
-  // An empty box on a waiting card shows a lone Cancel. The toggle turns on
-  // side-question mode and cancels nothing. The mode then wins over the card:
-  // a typed box shows the round Ask, and asking leaves the card waiting.
   test('the toggle on a waiting card starts a side question', async ({ page }) => {
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Cancel');
     const sideQuestionBodies: string[] = [];
@@ -208,7 +179,6 @@ test.describe('side questions in a Claude Code thread', () => {
       await openThreadDrawer(page);
       await page.locator(`.thread-row:has-text("${title}")`).first().click();
       await ensureOnThreadPane(page);
-      // The row click slides the pane in, and what follows reads geometry.
       await waitForPaneAtRest(page);
       const card = page.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first();
       await expect(card).toBeVisible({ timeout: 15_000 });
@@ -234,8 +204,6 @@ test.describe('side questions in a Claude Code thread', () => {
     }
   });
 
-  // Before any pick, a multi-select card shows a lone Cancel and no Submit. The
-  // toggle still turns on the mode and answers nothing.
   test('the toggle turns on the mode on a multi-select card, even before a pick', async ({ page }) => {
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Multi Hold', true);
     const answerPosts: string[] = [];
@@ -264,8 +232,6 @@ test.describe('side questions in a Claude Code thread', () => {
     }
   });
 
-  // A multi-select card had no way in. The shortcut now turns on the mode
-  // there too. Typing in the mode then shows the round Ask, not Submit.
   test('the Side question shortcut works on a multi-select card', async ({ page }) => {
     test.skip(isMobileViewport(page), 'Keyboard shortcuts are desktop only');
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Multi', true);
@@ -311,9 +277,6 @@ test.describe('side questions in a Claude Code thread', () => {
   });
 });
 
-/** A Lucidos Agent thread answers from its own model (the mock, in e2e). The
- *  toggle turns on side-question mode, with any draft kept in the box. No
- *  composer button has a hold. */
 test.describe('side questions in a Lucidos Agent thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -338,7 +301,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
 
     await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
     await expect(input).toHaveValue('what did you just say?');
-    // The toggle sent nothing.
     expect(chatPosts.length).toBe(postsBefore);
     await roundAsk(page).click();
 
@@ -351,8 +313,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(chatPosts.length).toBe(postsBefore);
   });
 
-  // The toggle puts focus in the composer, so the user types on and Enter asks
-  // the whole draft rather than sending it.
   test('typing on after the toggle, then Enter, asks the whole draft', async ({ page }) => {
     test.skip(isMobileViewport(page), 'Enter sends only on desktop; on a phone it is a newline');
     const chatPosts: string[] = [];
@@ -385,8 +345,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(chatPosts.length).toBe(postsBefore);
   });
 
-  // An idle thread with an empty box had no way in. The shortcut now turns
-  // the mode on there, and a second press turns it off with the text kept.
   test('the Side question shortcut toggles the mode, even over an idle empty box', async ({ page }) => {
     test.skip(isMobileViewport(page), 'Keyboard shortcuts are desktop only');
     const sideQuestionPosts: string[] = [];
@@ -415,9 +373,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(sideQuestionPosts).toEqual([]);
   });
 
-  // Stop shows only over an empty box, and the toggle turns on side-question
-  // mode without stopping the turn. The mode survives a reload, and its × leaves
-  // it with the text kept.
   test('the toggle turns on side-question mode and leaves the turn running', async ({ page }) => {
     const cancelPosts: string[] = [];
     page.on('request', (req) => {
@@ -429,7 +384,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     await sendMessage(page, `Write an extremely long and detailed essay about the history of bridges. Be as verbose as possible. Include: ${uniqueMessage('stop-hold')}`);
     await waitForStreamingToStart(page, 5, 60_000);
 
-    // Past the settle window, which holds a fresh Stop disabled.
     const stop = page.locator('button.send-cancel-morph[aria-label="Cancel"]:not(:disabled):visible').first();
     await expect(stop).toBeVisible({ timeout: 30_000 });
     await pressSideQuestionToggle(page);
@@ -440,10 +394,8 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     await expect(input).toHaveValue('');
     await expect(input).toHaveAttribute('placeholder', 'Ask a side question…');
     await expect(input).toBeFocused();
-    // Stop stays until the box holds text, so the turn can still be stopped.
     await expect(stop).toBeVisible();
 
-    // The PUT that carries the typing carries the mode too.
     const saved = page.waitForResponse((res) => res.url().includes('/compose')
       && res.request().method() === 'PUT' && (res.request().postData() ?? '').includes('"sideQuestionMode":true'));
     await page.keyboard.type('what');
@@ -455,7 +407,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     await expect(pill).toBeVisible();
     await expect(reloaded).toHaveValue('what');
 
-    // Off is stored too, so a reload does not bring the pill back.
     const cleared = page.waitForResponse((res) => res.url().includes('/compose')
       && res.request().method() === 'PUT' && (res.request().postData() ?? '').includes('"sideQuestionMode":false'));
     await pill.getByRole('button', { name: 'Back to a normal message' }).click();
@@ -468,9 +419,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(cancelPosts).toEqual([]);
   });
 
-  // Over an empty box the shortcut turns on side-question mode too, so the box
-  // takes typing at once and Enter asks. Escape leaves the mode before it
-  // would stop the turn.
   test('the Side question shortcut over an empty box lets the user type and ask', async ({ page }) => {
     test.skip(isMobileViewport(page), 'Keyboard shortcuts are desktop only');
     const chatPosts: string[] = [];
@@ -492,7 +440,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     await expect(pill).toBeVisible();
     await expect(input).toBeFocused();
 
-    // Escape leaves the mode and keeps the text. The turn keeps running.
     await page.keyboard.type('draft');
     await page.keyboard.press('Escape');
     await expect(pill).toHaveCount(0);
@@ -512,8 +459,6 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(chatPosts.length).toBe(postsBefore);
   });
 
-  // A long press on Send is a slow tap. A lost iOS lift once read as a hold on
-  // it and turned on the mode, so no composer button has a hold now.
   test('a long press on Send sends the message and never turns on the mode', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);

@@ -15,6 +15,19 @@ Project-scoped grill skill for the Lucidos repo. Interview relentlessly via `Ask
 >
 > If a question can be answered by exploring the codebase, explore the codebase instead.
 
+## Door test: ask only about one-way doors
+
+Before each question, ask yourself one thing: **can this decision change cheaply later?**
+
+| Door | Examples | What you do |
+|---|---|---|
+| **Two-way** | A report layout, a schedule, a name inside one file | No card. Decide it yourself, and record it under *Decided without asking*. |
+| **One-way** | What gets recorded, a default that reaches users, a schema, a security boundary | Ask it on a card. |
+
+A one-way door loses data or work if the answer is wrong. When unsure, ask: a wrong guess there costs more than one card.
+
+*Decided without asking* lists every two-way decision with its one-line reason, so the user can strike any of them. Put it in the design plan, or in the grill's closing message when it writes no plan. A struck item becomes a question.
+
 ## Question format
 
 Ask each question via the `AskUserQuestion` tool, not as plain text.
@@ -31,6 +44,32 @@ The user can always type a free-text answer in the prompt instead of picking, so
 **When the user asks back.** A typed reply that asks something is not an answer. Answer it in a visible message before the next question.
 
 **Plain-text fallback:** if a question is genuinely open-ended and no 2+ plausible options exist (e.g. "paste the error message", "what's the API key"), ask in plain text. Use this fallback sparingly — most design questions have natural option sets.
+
+## Progress bar
+
+Open every grill question with a progress line, as the first line of the question text:
+
+```
+`██████░░░░░░░` 6 of 13 decided
+```
+
+- **One cell per one-way door.** `█` for each decided one, `░` for each one still open. Above 20, draw 20 cells and fill them in proportion. Two-way doors never appear in the bar.
+- **Wrap the cells in a code span.** The card renders markdown, and a code span keeps the cells one width.
+- **The line describes itself.** Never write "the bar above" or point at earlier prose: the card must make sense alone, and the question hook refuses a card pointing "above".
+- **A decided question advances it.** That is a picked option, or a typed answer that settles the question.
+- **A re-ask does not.** When the user typed a question back, answer it, then ask again with the same count.
+- **Glossary cards do not count.** They still open with the bar, at the current count.
+
+### Keep the total honest
+
+The total is an estimate of the open decision tree, not a promise. Re-count it before every question:
+
+- An answer that opens a branch adds its questions.
+- A question that turns out not to be a decision, that the codebase answered, or that turns out to be a two-way door drops out.
+
+When the total moves, say so on the same card, on the line after the bar, with the reason: *"Total 13 → 15: the sync answer opened conflict handling."* Never move the total silently, and never lowball it to make the end feel closer.
+
+When the grill ends on a design-approval card, that card shows the bar full and carries *Decided without asking*.
 
 ## Use and sharpen the project glossary
 
@@ -72,6 +111,29 @@ This practice is not grill-specific. It applies to brainstorming (`superpowers:b
 ### The point
 
 Every grill session either reinforces the canonical vocabulary or improves it. Drift never accumulates. The next grill, by you, by another agent session, or by the user reading back through `docs/glossary.md`, starts from sharper ground. That's the multiplier.
+
+## Record a settled design
+
+When the dialogue is producing a design plan, run `lucidos planned start --kind design`
+before writing it. This records Designing without opening the source edit gate.
+Write the settled decisions to `docs/plans/YYYY-MM-DD-<slug>-design.md`; a design
+plan has no implementation phases and includes `- **Status**: Proposed`. Commit the file, then run
+`lucidos planned mark --plan <path> --kind design`.
+
+Ask with your question tool (`AskUserQuestion` on Claude Code,
+`ask_user_question` on the Lucidos MCP server on Codex). Put the design summary
+and any changed decisions on the card itself. Offer `Approve design` first,
+then a real design fork if one exists; otherwise offer `Approve design and plan here`.
+Typed questions and suggestions mean revise the design, commit it, mark it again,
+and ask again. A fork approves that variant after its file is revised and committed.
+
+After approval, run `lucidos planned approve`. Design approval always records
+plan-only scope: it permits landing design plan files alone and never source edits.
+For `Approve design`, end the turn with the committed design alone so Lucidos can
+propose it. For `Approve design and plan here`, keep the design on the branch and
+run the `implementation-plan` skill here. That skill starts implementation
+planning, records a new proposed marker, and asks for its own approval before any
+source edit. Design approval does not approve implementation.
 
 ## See also
 

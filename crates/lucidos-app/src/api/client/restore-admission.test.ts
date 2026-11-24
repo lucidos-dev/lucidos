@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { json, mutatingFetch, mutatingFetchIdempotent, retryTransient, text } from './_core';
-import { installRestoreAdmission } from '../../utils/restoreAdmission';
+import { consumeProvisionalReads, installRestoreAdmission } from '../../utils/restoreAdmission';
 
 import { trackDeviceRegistration } from '../../utils/deviceRegistration';
 import { observeSourceGeneration } from '../../utils/restoreSourceGeneration';
@@ -9,16 +9,111 @@ const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
   observeSourceGeneration(null);
-  installRestoreAdmission({ ready: () => true, wait: async () => {} });
+  installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
 });
 
-function closedGate() {
+function closedGate(provisional = false) {
   let ready = false;
   let release!: () => void;
   const wait = new Promise<void>((resolve) => { release = resolve; });
-  installRestoreAdmission({ ready: () => ready, wait: () => wait });
+  installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'generation', wait: () => wait,
+    provisional: () => provisional });
   return () => { ready = true; release(); };
 }
+
+const target = '00000000-0000-4000-8000-0000000000aa';
+
+it('answers a never-admitted page\'s thread and event reads while every other request waits', async () => {
+  const open = closedGate(true);
+  const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response('{}'));
+  globalThis.fetch = fetch;
+  const held = [
+    json('/api/v1/threads'),
+    json('/api/v1/threads?focused=x'),
+    json('/api/v1/threads/archived-count'),
+    json(`/api/v1/threads/${target}/children`),
+    json(`/api/v1/threads/${target}`, { method: 'POST' }),
+    mutatingFetch(`/api/v1/threads/${target}`, { method: 'PUT' }),
+    mutatingFetch(`/api/v1/threads/${target}/compose`, { method: 'PUT' }),
+    mutatingFetch(`/api/v1/threads/${target}`, { method: 'DELETE' }),
+  ];
+  await expect(json(`/dev/api/v1/threads/${target}`)).resolves.toEqual({});
+  await expect(json(`/api/v1/threads/${target}/events?limit=50`)).resolves.toEqual({});
+  expect(fetch.mock.calls.map((c) => c[0])).toEqual([`/dev/api/v1/threads/${target}`, `/api/v1/threads/${target}/events?limit=50`]);
+  expect(consumeProvisionalReads()).toBe(true);
+  expect(consumeProvisionalReads()).toBe(false);
+  open();
+  await Promise.all(held);
+  expect(fetch).toHaveBeenCalledTimes(10);
+});
+
+it('starts a mutation\'s deadline after admission, so a send held by a storage stall still goes out', async () => {
+  vi.useFakeTimers();
+  try {
+    const open = closedGate();
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response('{}'));
+    globalThis.fetch = fetch;
+    const sends = [
+      mutatingFetch('/api/v1/chat/stream', { method: 'POST', timeoutMs: 1_000 }),
+      mutatingFetchIdempotent('/api/v1/threads', { method: 'POST', timeoutMs: 1_000 }),
+    ];
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).not.toHaveBeenCalled();
+    open();
+    await Promise.all(sends);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetch.mock.calls) {
+      expect(init?.signal?.aborted).toBe(false);
+      expect(init).not.toHaveProperty('timeoutMs');
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('re-stamps a mutation\'s fired deadline as a timeout, as WebKit reports it as a cancel', async () => {
+  globalThis.fetch = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('Fetch is aborted', 'AbortError')));
+  }));
+  await expect(mutatingFetch('/api/v1/chat/stream', { method: 'POST', timeoutMs: 5 }))
+    .rejects.toMatchObject({ name: 'TimeoutError' });
+});
+
+it('holds the same thread read on a page that was admitted before', async () => {
+  const open = closedGate(false);
+  const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response('{}'));
+  globalThis.fetch = fetch;
+  const read = json(`/api/v1/threads/${target}`);
+  await Promise.resolve(); await Promise.resolve();
+  expect(fetch).not.toHaveBeenCalled();
+  open();
+  await read;
+  expect(consumeProvisionalReads()).toBe(false);
+});
+
+it('does not refuse a provisional read whose admission landed on a generation it could not prove', async () => {
+  const open = closedGate(true);
+  let answer!: (response: Response) => void;
+  globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { answer = resolve; }));
+  const read = json(`/api/v1/threads/${target}`);
+  await vi.waitFor(() => expect(answer).toBeTypeOf('function'));
+  observeSourceGeneration(restored, false);
+  open();
+  answer(new Response('{"thread_id":"t"}'));
+  await expect(read).resolves.toEqual({ thread_id: 't' });
+});
+
+it('does not refuse the same read wrapped in a transient retry', async () => {
+  const open = closedGate(true);
+  let answer!: (response: Response) => void;
+  globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { answer = resolve; }));
+  const read = retryTransient(() => json(`/api/v1/threads/${target}/events`));
+  await vi.waitFor(() => expect(answer).toBeTypeOf('function'));
+  observeSourceGeneration(restored, false);
+  open();
+  answer(new Response('{"events":[]}'));
+  await expect(read).resolves.toEqual({ events: [] });
+});
 
 it('holds startup reads and compose mutations, while allowing the health probe', async () => {
   const open = closedGate();
@@ -37,7 +132,6 @@ it('holds an in-flight read when admission closes before its response arrives', 
   let answer!: (response: Response) => void;
   globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { answer = resolve; }));
   const read = json('/api/v1/threads');
-  // fetchWithDefaults awaits the engine-ready check before issuing the read.
   await vi.waitFor(() => expect(answer).toBeTypeOf('function'));
   const open = closedGate();
   let applied = false;
@@ -112,8 +206,6 @@ it('rejects mutation intent crossing restore while device registration is pendin
   expect(fetch).not.toHaveBeenCalled();
 });
 
-// The explicit original-generation sentinel distinguishes pre-restore pages
-// from clients that did not implement the protocol.
 it.each([null, restored])('stamps the invocation generation %s on reads and mutations', async (generation) => {
   observeSourceGeneration(generation);
   const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response('{}'));
@@ -140,9 +232,6 @@ it('preserves the generation header over a same-generation idempotent retry', as
   }
 });
 
-// A page loading after a restore issues its startup reads before the first
-// hello. That admission only succeeds when the generation matches the page's
-// durable baseline (a change reloads instead), so those reads belong to it.
 it('admits startup reads issued before the first hello at the admitted generation', async () => {
   vi.resetModules();
   const core = await import('./_core');
@@ -151,7 +240,7 @@ it('admits startup reads issued before the first hello at the admitted generatio
   let ready = false;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
-  admission.installRestoreAdmission({ ready: () => ready, wait: () => gate });
+  admission.installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => gate });
   const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response('{}'));
   globalThis.fetch = fetch;
   const read = core.json('/api/v1/threads');

@@ -9,10 +9,6 @@ import { dialogOwnsKey } from './dialogKeyScope';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 import { isImeComposingKey } from '../../utils/ime';
 
-/** Whether this keydown submits the prompt. Buttons answer Enter themselves,
- *  and a multiline textarea keeps Enter for newlines. An Enter that commits an
- *  IME candidate belongs to the IME, so it never submits half-converted text.
- *  Pure, and exported for testing. */
 export function promptEnterSubmits(
   e: Pick<KeyboardEvent, 'key' | 'isComposing' | 'keyCode'>,
   targetTag: string | undefined,
@@ -32,11 +28,8 @@ export function PromptDialog() {
   const dialogRef = useRef<HTMLDivElement>(null);
   const [suggesting, setSuggesting] = useState(false);
 
-  // The native panel webview paints over the dialog; hold it hidden while open.
   useHidePanelWebviewWhile(state.visible);
 
-  // A layout effect seeds the field before it paints. A passive one runs after,
-  // and overwrites whatever the user typed into the drawn field meanwhile.
   useLayoutEffect(() => {
     setSuggesting(false);
     if (!state.visible) return;
@@ -50,15 +43,11 @@ export function PromptDialog() {
 
     function handleKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null;
-      // A keystroke aimed at another open overlay is not ours to submit: a
-      // confirm can sit on top of this prompt, and this listener would
-      // otherwise close it with the input's text. See dialogOwnsKey.
       if (!dialogOwnsKey(target, dialogRef.current)) return;
       if (e.key === 'Enter') {
         if (!promptEnterSubmits(e, target?.tagName, state.multiline)) return;
         e.preventDefault();
         const el = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
-        // A suggestion in flight locks the field, and Enter waits with it.
         if (el?.readOnly) return;
         close(el?.value ?? '');
       }
@@ -67,11 +56,6 @@ export function PromptDialog() {
     return () => {
       document.removeEventListener('keydown', handleKey);
     };
-    // Key on `resolve` (a fresh closure per showPrompt call), not `visible`: a
-    // second prompt that REPLACES a visible one keeps visible true→true, so a
-    // `[state.visible]` dep would skip re-seeding the uncontrolled input — the
-    // new prompt would show the prior one's typed text and not refocus. It
-    // also drops a replaced prompt's suggestion lock.
   }, [state.resolve]);
 
   if (!state.visible) return null;
@@ -85,8 +69,6 @@ export function PromptDialog() {
     close(el?.value ?? '');
   }
 
-  /** Locks the field while the suggestion loads, then fills it. A result for
-   *  a prompt that has since closed or been replaced is dropped. */
   async function suggest(run: () => Promise<string | null>) {
     const resolve = state.resolve;
     const isCurrent = () => promptState.peek().resolve === resolve;
@@ -128,8 +110,6 @@ export function PromptDialog() {
         ) : (
           <DialogMessage message={state.message} />
         )}
-        {/* The answer is free-form natural language (the dialog is driven by the
-            LLM's ask-the-user payload), so both branches are prose fields. */}
         {state.multiline ? (
           <textarea class="prompt-input prompt-textarea" placeholder={state.placeholder} rows={4} readOnly={suggesting} aria-busy={suggesting} {...PROSE_TEXT_ATTRS} />
         ) : (
@@ -148,8 +128,6 @@ export function PromptDialog() {
   );
 }
 
-/** The prompt's Suggest link. It spins while the suggestion loads, and stays
- *  in the focus order meanwhile, so `aria-disabled` rather than `disabled`. */
 function SuggestLink({ suggesting, onClick }: { suggesting: boolean; onClick: () => void }) {
   return (
     <button type="button" class="accent-link prompt-suggest" data-role="prompt-suggest"

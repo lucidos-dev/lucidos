@@ -34,8 +34,6 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
     const thread = makeThreadState();
     thread.meta.section = 'inbox';
     const map = new Map([['thread-1', thread]]);
-    // ResponseCanceled would normally set section='inbox' via the lookup —
-    // aggregate says 'archived' so aggregate wins.
     handleEvent(
       map,
       'thread-1',
@@ -52,8 +50,6 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
     const thread = makeThreadState();
     applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'running');
     const map = new Map([['thread-1', thread]]);
-    // ResponseGenerated with no CC changes would normally drive status='idle' —
-    // aggregate says 'waiting' (e.g. a change was proposed in the same exchange).
     handleEvent(
       map,
       'thread-1',
@@ -68,9 +64,6 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
 
 });
 
-// ===========================================================================
-// groupIntoExchanges
-// ===========================================================================
 describe('groupIntoExchanges', () => {
   it('groups by MessageReceived boundaries', () => {
     const events = new Map<number, ThreadEvent>([
@@ -108,9 +101,6 @@ describe('groupIntoExchanges', () => {
     expect(turn.steps.map((s) => s.seq)).toEqual([3, 6]);
   });
 
-  /** A summary is written after the turn that proposed the change, often
-   *  once the change card has opened. It joins the proposal, never the card:
-   *  a stray step on the card would read as a turn in flight. */
   it('files a late change summary under the turn that proposed the change', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'build it' }],
@@ -175,10 +165,6 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[0].steps).toHaveLength(0);
   });
 
-  // Change lifecycle events are system-initiated mutations on the project
-  // (apply / discard / revert / fail). They render as their own initiator
-  // panels so the actor is visible at the top-level timeline, not buried
-  // inside the previous CC response.
   it.each([
     'ChangeApplied',
     'ChangeDiscarded',
@@ -197,35 +183,22 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[1].steps).toHaveLength(0);
   });
 
-  // Regression (real thread 276f5580): a background WorktreeCleaned event is
-  // pure bookkeeping (EventClass::Metadata in Rust, no render case). It must
-  // NOT be folded as a step into whatever exchange happens to be `current` —
-  // here the trailing ChildThreadCompleted card. The leak flipped the card's
-  // status to a phantom 'coding-agent-working' that survived reloads.
   it('does not fold WorktreeCleaned into any exchange, leaving the child card "done"', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'spawn a child' }],
       [2, { type: 'CodingAgentTextStreamed', text: 'Spawned successfully' } as ThreadEvent],
       [3, { type: 'CodingAgentIdled', has_changes: false }],
-      // Child finishes → completion card opens a new exchange on the parent.
       [4, { type: 'ChildThreadCompleted', child_thread_id: 'c1', status: 'success', summary: 'done' } as ThreadEvent],
-      // An hour later the cleanup worker emits this onto the same thread.
-      // WorktreeCleaned is now a first-class ThreadEvent variant (the
-      // union-coverage contract test keeps it in sync with the generated
-      // EVENT_CLASSIFICATION), so it constructs without a cast.
       [5, { type: 'WorktreeCleaned', tier: 0, freed_bytes: 15853 }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // The WorktreeCleaned event belongs to no exchange.
     const allSteps = exchanges.flatMap(e => e.steps.map(s => s.event.type));
     expect(allSteps).not.toContain('WorktreeCleaned');
-    // The child-completion card is the last exchange and has no steps…
     const card = exchanges[exchanges.length - 1];
     expect(card.userEvent.type).toBe('ChildThreadCompleted');
     expect(card.steps).toHaveLength(0);
-    // …so it reads as terminal on an idle CC thread, not a phantom spinner.
     expect(
-      exchangeStatus(card, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ true, /* threadIdle */ true),
+      exchangeStatus(card, '',  true,  false,  true,  true),
     ).toBe('done');
   });
 
@@ -237,10 +210,8 @@ describe('groupIntoExchanges', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
-    // Prior exchange keeps the abort as its terminating step (drives 'aborted' status)
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
     expect(exchanges[0].steps.map(s => s.event.type)).toEqual(['TextStreamed', 'ResponseAborted']);
-    // New boundary exchange wraps the AbortPanel
     expect(exchanges[1].userEvent.type).toBe('ResponseAborted');
     expect(exchanges[1].steps).toHaveLength(0);
   });
@@ -250,8 +221,6 @@ describe('groupIntoExchanges', () => {
       [1, { type: 'MessageReceived', text: 'fix the bug' }],
       [2, { type: 'ResponseAborted', text: '' }],
       [3, { type: 'ContinuationStarted' }],
-      // Engine-mode PromptInjected (the engine note) — must absorb into the
-      // ContinuationStarted exchange as a step, not start a new exchange.
       [4, { type: 'PromptInjected', text: '[Engine note]', mode: 'engine' }],
       [5, { type: 'TextStreamed', text: 'On it.' }],
       [6, { type: 'ResponseGenerated' }],
@@ -259,7 +228,7 @@ describe('groupIntoExchanges', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(3);
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
-    expect(exchanges[1].userEvent.type).toBe('ResponseAborted'); // boundary
+    expect(exchanges[1].userEvent.type).toBe('ResponseAborted');
     expect(exchanges[2].userEvent.type).toBe('ContinuationStarted');
     expect(exchanges[2].steps.map(s => s.event.type)).toEqual([
       'PromptInjected', 'TextStreamed', 'ResponseGenerated',
@@ -272,16 +241,11 @@ describe('groupIntoExchanges', () => {
       [2, { type: 'PromptInjected', text: 'human correction', mode: 'human' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // Two exchanges: ContinuationStarted, then PromptInjected as its own boundary.
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].userEvent.type).toBe('ContinuationStarted');
     expect(exchanges[1].userEvent.type).toBe('PromptInjected');
   });
 
-  // Engine-restart-then-recovered: abort + later same-id terminal must stay
-  // in the originating exchange so the rerun's TextStreamed/ResponseGenerated
-  // render in the response panel (otherwise they land on a ResponseAborted
-  // boundary exchange whose response panel is suppressed).
   it('legacy supersede: ResponseAborted with later same-id terminal stays in originating exchange', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'try this' }],
@@ -301,7 +265,6 @@ describe('groupIntoExchanges', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'try this' }],
       [2, { type: 'ResponseAborted', text: 'restart', request_event_id: 'req-1' }],
-      // Later terminal with DIFFERENT request_event_id — does not supersede.
       [3, { type: 'MessageReceived', text: 'next' }],
       [4, { type: 'ResponseGenerated', request_event_id: 'req-2' }],
     ]);
@@ -312,18 +275,12 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[2].userEvent.type).toBe('MessageReceived');
   });
 
-  // Mid-flight misattribution: chat agentic loop's request_event_id never
-  // re-anchors, so A's late events land after B's MessageReceived in the DB
-  // but must still route to A by request_event_id, not chronological position.
   it('routes pre-injection events to A and post-injection events to B (PromptInjected is the split)', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
       [2, { type: 'ToolCalled', name: 'web_search', args: {}, request_event_id: 'A' } as StoredEvent],
       [3, { type: 'MessageReceived', text: 'B', _eventId: 'B' }],
       [4, { type: 'ToolResult', name: 'web_search', result: 'ok', request_event_id: 'A' } as StoredEvent],
-      // PromptInjected is the moment the loop ingested the queued prompt — every event
-      // after this is part of B's answer even though the loop keeps stamping
-      // them with A's req_id.
       [5, { type: 'PromptInjected', text: 'B', injected_message_id: 'B', request_event_id: 'A' } as StoredEvent],
       [6, { type: 'TextStreamed', text: 'final answer', request_event_id: 'A' } as StoredEvent],
       [7, { type: 'ResponseGenerated', text: 'final answer', request_event_id: 'A' }],
@@ -344,28 +301,14 @@ describe('groupIntoExchanges', () => {
     ]);
   });
 
-  // Regression for the off-by-one rendering observed in real thread
-  // 9b5a05aa: when the orphan-injection re-process loop stamped A's req_id
-  // onto a turn whose response actually belonged to B, the events the chat
-  // loop emits BEFORE its first injection check (the memory recall + the
-  // per-call ContextCaptured) used to bypass request-id routing and leak into
-  // B's exchange. The leaked step flipped the status heuristic to 'aborted'
-  // (the "stale exchange" branch needs hasSteps=true). Route every chat-loop
-  // event that carries request_event_id back to its anchor — none should
-  // fall through to `current`. `ContextCaptured` and `MemoryRecalled` are the
-  // live events; `ContextAssembled`/`ContextTokensMeasured`/`MemorySearched`
-  // are their retired predecessors, still routed for legacy DB rows.
   it('routes ContextCaptured/MemoryRecalled (+ legacy predecessors) by request_event_id, not current pointer', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
       [2, { type: 'TextStreamed', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
       [3, { type: 'ResponseGenerated', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
-      // B opens a new exchange in the timeline. Every late event for A's loop
-      // (including the chat-loop preludes) lands AFTER B's MR in the seq stream.
       [4, { type: 'MessageReceived', text: 'B', _eventId: 'B' }],
       [5, { type: 'MemoryRecalled', queries: [], results: 0, request_event_id: 'A' } as unknown as StoredEvent],
       [6, { type: 'ContextCaptured', producer: 'chat', model: 'm', context_window: 0, sections: [], tools: [], estimated_total_tokens: 0, request_event_id: 'A' } as unknown as StoredEvent],
-      // Retired predecessors — still routed so legacy threads behave.
       [7, { type: 'ContextAssembled', sections: [], tools: [], model: 'm', total_chars: 0, request_event_id: 'A' } as unknown as StoredEvent],
       [8, { type: 'ContextTokensMeasured', tokens: 100, message_count: 1, request_event_id: 'A' } as unknown as StoredEvent],
       [9, { type: 'MemorySearched', queries: [], results: 0, request_event_id: 'A' } as unknown as StoredEvent],
@@ -376,8 +319,6 @@ describe('groupIntoExchanges', () => {
     expect(exchanges).toHaveLength(2);
 
     expect((exchanges[0].userEvent as { text: string }).text).toBe('A');
-    // Every late event with req=A routes back to A, including the
-    // chat-loop preludes that previously fell through to `current`.
     expect(exchanges[0].steps.map(s => s.event.type)).toEqual([
       'TextStreamed',
       'ResponseGenerated',
@@ -391,27 +332,15 @@ describe('groupIntoExchanges', () => {
     ]);
 
     expect((exchanges[1].userEvent as { text: string }).text).toBe('B');
-    // B has no events of its own — none stamped with req=B in this scenario.
     expect(exchanges[1].steps).toHaveLength(0);
   });
 
-  // End-to-end regression for real thread ad178d6a: the user sent a follow-up
-  // ("hmm?") while A's response was mid-stream, then A's `ContextCaptured`
-  // (carrying A's req_id) arrived AFTER B's MR. Before the fix it fell through
-  // to `current` (= B's empty exchange), giving B a lone step; in the brief
-  // idle window before B's own response started, exchangeStatus read
-  // "isLast + hasSteps + !isComplete + threadIdle" as a stale crash and
-  // flashed 'aborted' — which then flipped to 'streaming'/'Working' once B's
-  // events landed. The user saw "Aborted → Working" on the follow-up. With
-  // ContextCaptured routed by req_id, B stays empty and reads 'done' at idle.
   it('does not flash "aborted" on a follow-up when the prior response\'s ContextCaptured arrives late', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'Min side > Innboks > Kontakt oss?', _eventId: 'A' }],
       [2, { type: 'MemorySearched', queries: [], results: [], request_event_id: 'A' } as unknown as StoredEvent],
       [3, { type: 'ThoughtStreamed', text: '', request_event_id: 'A' } as unknown as StoredEvent],
-      // User fires the follow-up while A is still streaming.
       [4, { type: 'MessageReceived', text: 'hmm?', _eventId: 'B' }],
-      // A's per-call ContextCaptured lands AFTER B's MR — the leaker.
       [5, { type: 'ContextCaptured', producer: 'chat', model: 'm', context_window: 0, sections: [], tools: [], estimated_total_tokens: 0, request_event_id: 'A' } as unknown as StoredEvent],
       [6, { type: 'TextStreamed', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
       [7, { type: 'ResponseGenerated', text: 'a-reply', request_event_id: 'A' } as StoredEvent],
@@ -419,19 +348,15 @@ describe('groupIntoExchanges', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
 
-    // ContextCaptured routes back to A, not the follow-up.
     expect((exchanges[0].userEvent as { text: string }).text).toBe('Min side > Innboks > Kontakt oss?');
     expect(exchanges[0].steps.map(s => s.event.type)).toContain('ContextCaptured');
 
-    // The follow-up exchange is empty — no leaked step.
     const followUp = exchanges[1];
     expect((followUp.userEvent as { text: string }).text).toBe('hmm?');
     expect(followUp.steps).toHaveLength(0);
 
-    // In the idle window before B's own response starts, the follow-up reads
-    // 'done' (empty-idle), never 'aborted'.
     expect(
-      exchangeStatus(followUp, '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true),
+      exchangeStatus(followUp, '',  true,  false,  false,  true),
     ).toBe('done');
   });
 
@@ -472,13 +397,6 @@ describe('groupIntoExchanges', () => {
     ]);
   });
 
-  // Claude Code sessions reuse one `request_event_id` across mid-flight follow-ups (the
-  // session's meta is stamped once at start and never re-anchored). When the
-  // user injects a new MessageReceived B mid-flight and then cancels, the
-  // resulting ResponseCanceled carries A's req_id but semantically terminates
-  // whatever is currently running — which is exchange B. Routing it back to A
-  // by req_id leaves B with no terminal, so it shows "Working" forever (or
-  // "Done" once a recovery CodingAgentIdled lands).
   it('CC: ResponseCanceled with old session req_id routes to the latest CC exchange (mid-flight cancel)', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', channel: 'claude_code', _eventId: 'A' }],
@@ -490,17 +408,11 @@ describe('groupIntoExchanges', () => {
       [7, { type: 'ResponseCanceled', channel: 'claude_code', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // 1: A's CC reply, 2: B follow-up (with ResponseCanceled step), 3: cancel boundary panel
     expect(exchanges).toHaveLength(3);
     expect(exchanges[1].steps.map(s => s.event.type)).toContain('ResponseCanceled');
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 
-  // Codex mid-turn follow-up redirect: the interrupted turn emits
-  // ResponseCanceled(superseded_by_followup). Unlike a real Stop cancel, this
-  // must NOT open a standalone "Response canceled" boundary exchange — the turn
-  // renders neutrally (like the chat/CC follow-up). The cancel stays a step on
-  // the originating turn so step resolution still sees a terminator.
   it('Codex: superseded_by_followup ResponseCanceled does NOT open a cancel boundary exchange', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', channel: 'claude_code', _eventId: 'A' }],
@@ -512,15 +424,11 @@ describe('groupIntoExchanges', () => {
       [7, { type: 'ResponseGenerated', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // 1: A's interrupted turn (carries the cancel + idle as steps), 2: B follow-up.
-    // No third "Response canceled" boundary panel.
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].steps.map(s => s.event.type)).toContain('ResponseCanceled');
     expect(exchanges.some(e => e.userEvent.type === 'ResponseCanceled')).toBe(false);
   });
 
-  // Chat threads still need request_event_id routing (each chat exchange has
-  // its own req_id; late events from A must route back to A).
   it('chat: ResponseCanceled with old req_id still routes to the originating exchange', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', channel: 'chat', _eventId: 'A' }],
@@ -529,20 +437,12 @@ describe('groupIntoExchanges', () => {
       [4, { type: 'ResponseCanceled', channel: 'chat', request_event_id: 'A' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // 1: A's chat exchange (with ResponseCanceled step), 2: B's exchange,
-    // 3: cancel boundary panel
     expect(exchanges).toHaveLength(3);
     expect(exchanges[0].steps.map(s => s.event.type)).toContain('ResponseCanceled');
     expect(exchanges[1].steps.map(s => s.event.type)).not.toContain('ResponseCanceled');
     expect(exchanges[2].userEvent.type).toBe('ResponseCanceled');
   });
 
-  // Legacy engine-spawned CC threads (merge-conflict, hardening) created before
-  // MergeConflictDetected/MissingHardeningDetected boundary events existed
-  // emit a bare CodingAgentPromptSent as the first content event. Without a
-  // boundary the exchange builder dropped every following step and returned
-  // zero exchanges, surfacing as the "Messages could not be displayed" empty
-  // state. Promote the orphaned prompt to its own boundary so the panel renders.
   it('promotes a leading CodingAgentPromptSent to an exchange-start when no boundary precedes it', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'CodingAgentPromptSent', text: 'Resolve the merge conflict in foo.rs.' }],
@@ -567,9 +467,6 @@ describe('groupIntoExchanges', () => {
     ]);
   });
 
-  // Modern engine-spawned threads emit MergeConflictDetected first; the
-  // following CodingAgentPromptSent must stay as a step under that boundary,
-  // not split into a second exchange.
   it('does NOT split when CodingAgentPromptSent follows a MergeConflictDetected boundary', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MergeConflictDetected', change_id: 'c1', files: ['foo.rs'] }],
@@ -597,7 +494,6 @@ describe('continuableAbortIndex', () => {
       [4, { type: 'ResponseAborted' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // 4 exchanges: msg, abort, msg, abort
     expect(continuableAbortIndex(exchanges)).toBe(3);
   });
 
@@ -621,9 +517,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
-  // Stale-settle aborts are engine cleanup of stuck threads — clicking
-  // Continue would re-run work the user just stopped. Treat them like
-  // ContinuationStarted so the AbortPanel renders without a Continue button.
   it('returns null when the latest abort is stale-settle', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -634,8 +527,6 @@ describe('continuableAbortIndex', () => {
   });
 
   it('returns null when a stale-settle abort sits above an older real abort', () => {
-    // The older real abort is irrelevant once the user has triggered
-    // stale-settle on the thread — the thread is settled, no Continue.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
       [2, { type: 'ResponseAborted', cause: 'engine_shutdown' }],
@@ -646,10 +537,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
-  // The switch fingerprint, mirroring the backend's SWITCH_TEARDOWN_ABORT_SQL:
-  // engine_shutdown AND a device actor. The engine auto-resumes that turn, so
-  // offering Continue races its own recovery (the 2026-08-05 report: the button
-  // sat there through the whole restart and the user's click landed first).
   it('returns null on a switch-teardown abort: the engine is auto-resuming it', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -663,9 +550,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
-  // Both halves of the fingerprint are load-bearing on the backend, so both are
-  // here. A bare engine_shutdown (stop.sh / an external SIGUSR1) is NOT a switch:
-  // nothing auto-resumes it, so it keeps the manual Continue.
   it('offers Continue on an engine_shutdown abort with no device actor', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -675,13 +559,7 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBe(1);
   });
 
-  // The other half: a device actor on a NON-shutdown cause is not a switch
-  // either. `stale_settle` deliberately carries the actor of the button that
-  // exposed the stuck row, which is why an actor-only check would be wrong.
   it('offers Continue on the boot floor abort that withdraws a resume promise', () => {
-    // The engine declined to resume this switch-interrupted thread, so the boot
-    // floor emitted a fresh recovery_after_restart abort on top. That newer
-    // abort is not a switch abort, so the button comes back.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
       [2, {
@@ -695,12 +573,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBe(2);
   });
 
-  // An abort boundary can ACQUIRE a turn. An event-wait delivery anchors on an
-  // event that is not an exchange-start type, so its whole turn folds into
-  // whatever boundary is current, and if that boundary is an abort the turn
-  // renders under it. Continue there re-runs completed work: on 2026-08-06 the
-  // button sat above a turn that had applied a change and spawned a sub-thread
-  // two minutes earlier (real thread ebc787a4).
   it('returns null when the latest abort has since produced a terminal', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -712,9 +584,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
-  // A resolved boundary does not STOP the scan: an older unresolved abort above
-  // it is still legitimately continuable, so the walk keeps going rather than
-  // returning null the way ContinuationStarted does.
   it('skips a resolved abort and offers the older unresolved one', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -724,12 +593,9 @@ describe('continuableAbortIndex', () => {
       [5, { type: 'ResponseGenerated' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // 0: msg, 1: abort (unresolved), 2: msg, 3: abort (resolved by [5]).
     expect(continuableAbortIndex(exchanges)).toBe(1);
   });
 
-  // The ordinary shape stays untouched: a bare boundary with no work under it
-  // is exactly what Continue exists for.
   it('still offers Continue on an abort with steps but no terminal', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -740,15 +606,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBe(1);
   });
 
-  // Crash recovery emits the boundary and its OWN marker together: a
-  // `recovery_after_restart` abort immediately followed by the synthetic
-  // `CodingAgentIdled { reason: engine_restart_interrupt }` whose entire purpose
-  // is to say "this was interrupted, offer Continue"
-  // (`agent_recovery/recovery.rs`). `CodingAgentIdled` is not an exchange-start
-  // type, so it folds into the abort as a step, and the resolved-boundary check
-  // read the engine's own offer as a turn that had run and finished. Every
-  // coding-agent thread a restart touched came back unresumable (reported
-  // 2026-08-07, across a whole workspace at once).
   it('offers Continue on the recovery pair, whose idle IS the interruption marker', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -759,9 +616,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBe(1);
   });
 
-  // The other direction, and the reason the carve-out is keyed on the reason
-  // rather than on the event type: a coding-agent turn that genuinely ran under
-  // the boundary and finished still resolves it.
   it('returns null when a real coding-agent turn under the abort went idle', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -773,9 +627,6 @@ describe('continuableAbortIndex', () => {
     expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
-  // A coding-agent session stamps one request_event_id on every turn's
-  // terminal. So an earlier turn's ResponseGenerated shares its id with a
-  // follow-up's crash abort, and that match is no rerun-in-place.
   it('offers Continue on a crash-aborted coding-agent follow-up', () => {
     const cc = { channel: 'claude_code', request_event_id: 'req-1' };
     const events = new Map<number, ThreadEvent>([
@@ -810,16 +661,10 @@ describe('abortPromisesAutoResume', () => {
     expect(abortPromisesAutoResume(
       { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: device },
     )).toBe(false);
-    // Legacy rows carry neither field.
     expect(abortPromisesAutoResume({ type: 'ResponseAborted' })).toBe(false);
     expect(abortPromisesAutoResume({ type: 'ResponseGenerated' })).toBe(false);
   });
 
-  /** The Continue button and the transcript label read the same fingerprint, so
-   *  a turn can never say "Paused by restart" while offering the button that
-   *  means nothing is resuming it (or the reverse). Both route through
-   *  `isSwitchTeardownAbort`; this pins that they still agree, in both
-   *  directions, across the shapes that differ in only one half of the pair. */
   it('agrees with the transcript label on every shape', () => {
     const cases: { actor?: MessageOrigin; cause?: AbortCause }[] = [
       { cause: 'engine_shutdown', actor: device },
@@ -840,31 +685,16 @@ describe('abortPromisesAutoResume', () => {
     }
   });
 
-  /** `stale_settle` carries the actor of whichever button exposed the stuck row
-   *  (Stop / Apply / Discard / Archive), so a device actor there must NOT read as
-   *  a switch. It gets its own label, and the engine settles it to idle rather
-   *  than to any verdict. */
   it('never reads a device-attributed stale_settle as a switch', () => {
     expect(isSwitchTeardownAbort(device, 'stale_settle')).toBe(false);
     expect(responseAbortedSummary(device, 'stale_settle')).toBe('Stuck reply cleared');
   });
 
-  /** The two predicates answer different questions and differ by exactly the
-   *  actor: `abortTookEngineDown` asks whether the engine is gone (so nothing
-   *  can be running), `abortPromisesAutoResume` asks whether it promised to
-   *  bring the turn back (so the button and the wording change).
-   *
-   *  The row that matters is the unattributed shutdown, which is every terminal
-   *  `stop.sh`, external SIGUSR1 and ctrl-c: engine down, nothing promised. It
-   *  read as neither before 2026-08-13, so the boundary kept a shimmering
-   *  "Working" over a dead subprocess (real thread b146c294). */
   it('separates "the engine is gone" from "the engine promised to resume"', () => {
     const cases: { cause?: AbortCause; actor?: MessageOrigin; down: boolean; promised: boolean }[] = [
       { cause: 'engine_shutdown', actor: device, down: true, promised: true },
       { cause: 'engine_shutdown', actor: { kind: 'system' }, down: true, promised: false },
       { cause: 'engine_shutdown', down: true, promised: false },
-      // The engine is alive for every other cause, so its boundary can still
-      // acquire a live turn (real thread ebc787a4, the `safety_net` case).
       { cause: 'safety_net', down: false, promised: false },
       { cause: 'recovery_after_restart', actor: device, down: false, promised: false },
       { cause: 'stale_settle', actor: device, down: false, promised: false },
@@ -876,7 +706,6 @@ describe('abortPromisesAutoResume', () => {
       expect(abortTookEngineDown(ev), `down for ${cause} / ${actor?.kind}`).toBe(down);
       expect(abortPromisesAutoResume(ev), `promised for ${cause} / ${actor?.kind}`).toBe(promised);
     }
-    // Only an abort qualifies: no other terminator takes the engine with it.
     expect(abortTookEngineDown({ type: 'ResponseGenerated' })).toBe(false);
     expect(abortTookEngineDown({ type: 'ResponseCanceled', cause: 'user_stop' })).toBe(false);
   });
@@ -905,7 +734,6 @@ describe('resumeEngineNote', () => {
   it('returns null when the ContinuationStarted has no engine PromptInjected step', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'ContinuationStarted' }],
-      // CC resume path emits ContinuationStarted alone (no engine note).
       [2, { type: 'CodingAgentTextStreamed', text: 'Continuing.' }],
     ]);
     const exchanges = groupIntoExchanges(events);
@@ -913,9 +741,6 @@ describe('resumeEngineNote', () => {
   });
 });
 
-// ===========================================================================
-// handleEvent
-// ===========================================================================
 describe('handleEvent', () => {
   it('inserts persisted events', () => {
     const thread = makeThreadState();
@@ -938,14 +763,12 @@ describe('handleEvent', () => {
     const result = handleEvent(threadMap, 'thread-1', 1, event2, TS);
 
     expect(result.applied).toBe(false);
-    expect(thread.events.get(1)).toEqual(expect.objectContaining(event1)); // original kept
+    expect(thread.events.get(1)).toEqual(expect.objectContaining(event1));
   });
 
   it('takes the latest cumulative transient text into the streaming buffer', () => {
     const thread = makeThreadState();
     const threadMap = new Map([['thread-1', thread]]);
-    // Each `CumulativeTextUpdated` carries the whole accumulated turn text, not
-    // a delta, so the later frame replaces the earlier one.
     const transient: TransientEvent = { type: 'CumulativeTextUpdated', text: 'hel' };
 
     handleEvent(threadMap, 'thread-1', null, transient);
@@ -1035,7 +858,7 @@ describe('handleEvent', () => {
 
     const t2 = '2026-03-30T18:00:00Z';
     handleEvent(threadMap, 'thread-1', 2, { type: 'CodingAgentPromptSent', text: 'Run /harden now.' }, t2);
-    expect(thread.meta.updatedAt).toBe(t1); // Should NOT update — backend doesn't update last_activity
+    expect(thread.meta.updatedAt).toBe(t1);
   });
 
   it('does NOT update updatedAt on SessionEnded (lifecycle, not activity)', () => {
@@ -1049,7 +872,7 @@ describe('handleEvent', () => {
 
     const t2 = '2026-03-15T12:01:43Z';
     handleEvent(threadMap, 'thread-1', 2, { type: 'SessionEnded' }, t2);
-    expect(thread.meta.updatedAt).toBe(t1); // SessionEnded should NOT update
+    expect(thread.meta.updatedAt).toBe(t1);
   });
 
   it('does NOT update updatedAt on ChangeProposed (status-only, not activity)', () => {
@@ -1062,7 +885,7 @@ describe('handleEvent', () => {
 
     const t2 = '2026-03-15T12:01:00Z';
     handleEvent(threadMap, 'thread-1', 2, { type: 'ChangeProposed', change_id: 'c1' }, t2);
-    expect(thread.meta.updatedAt).toBe(t1); // ChangeProposed should NOT update
+    expect(thread.meta.updatedAt).toBe(t1);
   });
 
   it('does NOT update updatedAt on ResponseCanceled (status-only)', () => {
@@ -1074,7 +897,7 @@ describe('handleEvent', () => {
 
     const t2 = '2026-03-15T12:01:00Z';
     handleEvent(threadMap, 'thread-1', 2, { type: 'ResponseCanceled' }, t2);
-    expect(thread.meta.updatedAt).toBe(t1); // ResponseCanceled should NOT update
+    expect(thread.meta.updatedAt).toBe(t1);
   });
 
   it('does NOT update updatedAt on metadata events (ThreadTitleGenerated)', () => {
@@ -1086,7 +909,7 @@ describe('handleEvent', () => {
 
     const t2 = '2026-03-15T12:10:00Z';
     handleEvent(threadMap, 'thread-1', 2, { type: 'ThreadTitleGenerated', title: 'Test' }, t2);
-    expect(thread.meta.updatedAt).toBe(t1); // Should NOT update to t2
+    expect(thread.meta.updatedAt).toBe(t1);
   });
 
   it('clears matching pendingUserMessage on MessageReceived with matching event_id', () => {
@@ -1114,14 +937,11 @@ describe('handleEvent', () => {
     thread.pendingUserMessages = [{ text: 'my question', eventId: 'msg-1', created: '2026-01-01T00:00:00Z' }];
     const threadMap = new Map([['thread-1', thread]]);
 
-    // A ToolCalled event arrives — should NOT clear pending messages
     const result = handleEvent(threadMap, 'thread-1', 100, { type: 'ToolCalled', name: 'search', args: {} }, TS);
 
-    // pendingUserMessages should still be there
     expect(thread.pendingUserMessages).toHaveLength(1);
     expect(result.clearedPendingUserMessage).toBe(false);
 
-    // Only the ToolCalled event — no synthetic MessageReceived
     expect(thread.events.size).toBe(1);
     expect(thread.events.get(100)!.type).toBe('ToolCalled');
   });
@@ -1215,12 +1035,6 @@ describe('handleEvent', () => {
     expect(result.clearedPendingUserMessage).toBe(true);
   });
 
-  // Free-form CC question answers route through process.rs's
-  // answer_pending_question path, which emits UserQuestionAnswered (FreeText)
-  // but never a MessageReceived. Without explicit cleanup, the optimistic
-  // pendingUserMessage from sendMessage() lives until the 30s safety timer,
-  // and computeExchanges synthesizes it as a duplicate "You" exchange below
-  // the question card's "YOUR ANSWER" panel.
   it('clears matching pendingUserMessage on UserQuestionAnswered with FreeText answer', () => {
     const thread = makeThreadState();
     thread.pendingUserMessages = [
@@ -1238,9 +1052,6 @@ describe('handleEvent', () => {
     expect(result.clearedPendingUserMessage).toBe(true);
   });
 
-  // Selected answers come from the option-button POST path which never adds
-  // a pendingUserMessage in the first place — so any pending message in the
-  // queue belongs to an unrelated typed-input flow and must NOT be cleared.
   it('does not clear pendingUserMessages on UserQuestionAnswered with Selected answer', () => {
     const thread = makeThreadState();
     thread.pendingUserMessages = [
@@ -1257,8 +1068,6 @@ describe('handleEvent', () => {
     expect(thread.pendingUserMessages).toHaveLength(1);
   });
 
-  // Full integration: typed answer to a CC AskUserQuestion must render only
-  // inside the question's divider, not as a separate "You" exchange below.
   it('does not duplicate user answer as a separate exchange after UserQuestionAnswered (FreeText)', () => {
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';
@@ -1274,14 +1083,12 @@ describe('handleEvent', () => {
       options: [],
     } as ThreadEvent, '2026-05-04T07:45:00Z');
 
-    // sendMessage's optimistic update for the user-typed answer
     thread.pendingUserMessages.push({
       text: 'Y',
       eventId: 'msg-optimistic',
       created: '2026-05-04T07:45:01Z',
     });
 
-    // Backend routes the typed text to answer_pending_question
     handleEvent(map, 'thread-1', 4, {
       type: 'UserQuestionAnswered',
       tool_use_id: 'tu-1',
@@ -1296,37 +1103,20 @@ describe('handleEvent', () => {
   });
 });
 
-// ===========================================================================
-// PromptInjected — groupIntoExchanges
-// ===========================================================================
 
-// ===========================================================================
-// exchangeKey — stable render identity across the optimistic→persisted swap
-// ===========================================================================
 describe('exchangeKey', () => {
   it('keeps the same key when an optimistic pending message becomes a persisted MessageReceived', () => {
-    // Reproduces the "follow-up disappears, then shows up after a while" bug.
-    // The optimistic synthetic exchange sorts at a MAX_SAFE_INTEGER seq; the
-    // persisted MessageReceived carries its real (much smaller) DB seq. Keying
-    // the rendered <ChatExchange> by `userSeq` therefore changes the key on the
-    // swap, remounting the DOM node — which churns the auto-scroll observers and
-    // leaves the message off-screen until a later event re-snaps to the bottom.
-    // The client `event_id` round-trips as the events-table PK, so `_eventId` is
-    // identical across the swap and is the stable identity to key on.
     const thread = makeThreadState();
     const EVENT_ID = 'client-uuid-1';
     thread.pendingUserMessages.push({ text: 'logo must match height', eventId: EVENT_ID, created: TS });
     const map = new Map([['thread-1', thread]]);
 
-    // Optimistic phase.
     const optimistic = computeExchanges(thread);
     expect(optimistic).toHaveLength(1);
     const optimisticEx = optimistic[0];
     expect(optimisticEx.userEvent.type).toBe('MessageReceived');
     const optimisticKey = exchangeKey(optimisticEx);
 
-    // Server confirmation: real MessageReceived arrives via SSE with the SAME
-    // client event_id but a real DB seq. handleEvent clears the optimistic row.
     handleEvent(map, 'thread-1', 42, { type: 'MessageReceived', text: 'logo must match height' } as ThreadEvent, TS, EVENT_ID);
     expect(thread.pendingUserMessages).toHaveLength(0);
 
@@ -1334,9 +1124,7 @@ describe('exchangeKey', () => {
     expect(persisted).toHaveLength(1);
     const persistedEx = persisted[0];
 
-    // The seq genuinely changes — the old `'ex-' + userSeq` key would remount.
     expect(persistedEx.userSeq).not.toBe(optimisticEx.userSeq);
-    // …but the stable key does not, so Preact reconciles the node in place.
     expect(exchangeKey(persistedEx)).toBe(optimisticKey);
   });
 
@@ -1347,7 +1135,6 @@ describe('exchangeKey', () => {
   });
 
   it('never collides an _eventId key with a seq fallback key', () => {
-    // A seq fallback could otherwise stringify to the same value as an _eventId.
     const withId: Exchange = { userEvent: { type: 'MessageReceived', text: 'x', _eventId: '5' } as StoredEvent, userSeq: 99, steps: [] };
     const withoutId: Exchange = { userEvent: { type: 'MessageReceived', text: 'y' } as StoredEvent, userSeq: 5, steps: [] };
     expect(exchangeKey(withId)).not.toBe(exchangeKey(withoutId));

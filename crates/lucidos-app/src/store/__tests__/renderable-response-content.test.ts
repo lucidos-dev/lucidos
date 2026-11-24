@@ -1,21 +1,3 @@
-/**
- * `hasRenderableResponseContent` must agree with what `responseBody`
- * (ChatExchange.tsx) will actually draw.
- *
- * The two answer different questions and the difference is load-bearing: an
- * abort boundary picks up the DRAIN of whatever the teardown killed, a
- * coding-agent subprocess signs off with a bare `"\n\n"`, and
- * `exchangeResponseEvents` turns that into a `text` event. Counting events said
- * "there is content here"; the renderer, which needs `evt.md?.trim()`, drew
- * nothing. So the switch-teardown boundary got a response panel with an empty
- * body whose only visible content was a status badge reading "Working" over a
- * stopped engine (reported 2026-08-06).
- *
- * A `text` event is therefore the ONE non-drawing shape. Every other kind draws
- * (steps behind the Show-steps toggle, which is a user affordance, not absence),
- * so the predicate must not start filtering by kind.
- * See docs/plans/2026-08-06-no-working-label-while-nothing-is-running.md
- */
 import { describe, it, expect } from 'vitest';
 import { hasRenderableResponseContent } from '../thread-events';
 import type { ResponseEvent } from '../types';

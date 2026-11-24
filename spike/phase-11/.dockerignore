@@ -1,0 +1,12 @@
+*
+!Dockerfile
+!guest.py
+!workloads.py
+!run.py
+!service.py
+!phase11-init.sh
+!.cache/
+.cache/*
+!.cache/vmlinuz-virt
+!.cache/modloop-virt
+!.cache/lucidos

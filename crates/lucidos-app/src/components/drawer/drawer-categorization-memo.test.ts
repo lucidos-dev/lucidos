@@ -1,14 +1,3 @@
-/**
- * Equivalence guard for `computeDrawerCategorization` — the memoized drawer
- * categorization pass extracted from `ThreadList` (dev-ws input-lag fix,
- * 2026-06-24). The component now calls this one function inside a `useMemo`
- * keyed on its real inputs instead of inlining the seven-step pipeline on every
- * render. This test pins the load-bearing invariant: the composite MUST produce
- * a result deep-equal to the from-scratch sequence it replaced, for every input
- * — same section buckets, same family routing, same decorations, same status
- * map. (The individual steps' own behavior is covered by categorize-threads /
- * filter-by-top-thread / lifted-family / sort-drawer-sections / nest-by-parent.)
- */
 
 import { describe, it, expect } from 'vitest';
 import {
@@ -78,8 +67,6 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
     };
 }
 
-/** The seven-step pipeline exactly as `ThreadList` inlined it before the
- *  extraction — the oracle the composite must match. */
 function fromScratch(
     threads: ThreadState[],
     channelFilter: ReadonlySet<ThreadChannel>,
@@ -102,7 +89,6 @@ function fromScratch(
     return { categorized, familyGraph, decorations };
 }
 
-/** Order-sensitive, reference-free snapshot for deep comparison. */
 function snapshot(r: DrawerCategorization) {
     return {
         current: r.categorized.current.map(t => t.meta.id),
@@ -119,11 +105,6 @@ function snapshot(r: DrawerCategorization) {
 }
 
 describe('computeDrawerCategorization equals the inlined from-scratch pipeline', () => {
-    // A representative set exercising every routing path: a family whose archived
-    // root lifts to Current via a running coding-agent child (lifted root); a
-    // saved family; a trigger thread; an archived coding-agent thread carrying a
-    // repoId (for the sub-selection any-member path); and an excluded composing
-    // draft.
     const threads: ThreadState[] = [
         makeThread('root1', { channel: 'chat', section: 'archived', createdAt: '2026-04-10T00:00:00Z' }),
         makeThread('child1a', { parentId: 'root1', channel: CODING_AGENT_CHANNEL, status: 'running', section: 'inbox' }),

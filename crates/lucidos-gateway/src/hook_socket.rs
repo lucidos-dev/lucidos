@@ -154,7 +154,7 @@ async fn deliver(
     };
 
     let Ok(path) = engine_delivery_path(&hook_id) else {
-        crate::log!("[Hook] '{slug}' delivery could not construct the engine URL");
+        crate::log_legacy!("[Hook] '{slug}' delivery could not construct the engine URL");
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let mut request = axum::http::Request::post(path);
@@ -167,7 +167,7 @@ async fn deliver(
         request = request.header(name.as_str(), value);
     }
     let Ok(request) = request.body(Body::from(body)) else {
-        crate::log!("[Hook] '{slug}' delivery could not build the engine request");
+        crate::log_legacy!("[Hook] '{slug}' delivery could not build the engine request");
         return StatusCode::BAD_GATEWAY.into_response();
     };
 
@@ -176,7 +176,7 @@ async fn deliver(
     // or upgrade itself to the full-authority token beside it.
     //
     // It reaches exactly the delivery route on an engine that requires a
-    // credential (`lucidos_engine::api::local_auth`). That is what stops a
+    // credential (`lucidos_agents_api::api::local_auth`). That is what stops a
     // funnel-exposed hook from becoming a workspace restart.
     let credential = Credential::HookSocket(state.hook_socket_token());
     match engine_hop::send(&engine, request, credential).await {
@@ -188,7 +188,7 @@ async fn deliver(
             (status, Body::from(bytes)).into_response()
         }
         Err(e) => {
-            crate::log!("[Hook] '{slug}' delivery could not reach the engine: {e}");
+            crate::log_legacy!("[Hook] '{slug}' delivery could not reach the engine: {e}");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }

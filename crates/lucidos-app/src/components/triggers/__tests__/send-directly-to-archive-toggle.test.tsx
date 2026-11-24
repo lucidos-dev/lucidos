@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The trigger form's "Send directly to Archive" toggle is `go_to_review`
- * inverted (ADR 0349). The stored field keeps its meaning, so an existing
- * trigger keeps its behaviour: on means `go_to_review` is false.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 

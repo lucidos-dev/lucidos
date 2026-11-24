@@ -8,7 +8,6 @@ import {
   type StoredEvent,
 } from '../thread-events';
 
-/** Build an events map from a [seq, event] list. */
 function eventsMap(entries: [number, StoredEvent][]): Map<number, StoredEvent> {
   return new Map(entries);
 }
@@ -38,7 +37,6 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
   });
 
   it('prefers ResponseGenerated model over CodingAgentSettingsChanged', () => {
-    // Edge case: both present (e.g. chat in a CC thread)
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'test', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'CodingAgentSettingsChanged', model: 'claude-haiku-4-5-20251001', created: '2026-01-01T00:00:02Z' }],
@@ -61,8 +59,6 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
   });
 
   it('returns model from ResponseGenerated in a CC exchange (default model)', () => {
-    // When user doesn't select a model, the engine puts the full model ID
-    // on ResponseGenerated (normalized from CC's alias).
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'fix the bug', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-01-01T00:00:02Z' }],
@@ -88,8 +84,6 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
   });
 
   it('returns undefined for idle CC exchange without CodingAgentSettingsChanged (default model, no Init emit)', () => {
-    // Bug scenario: user didn't select a model, CC resolved it via Init, but
-    // CodingAgentSettingsChanged was never emitted. Idle exchange has no model source.
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'fix the bug', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-01-01T00:00:02Z' }],
@@ -99,13 +93,10 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(1);
-    // Without CodingAgentSettingsChanged or ResponseGenerated, no model is available
     expect(exchangeResponseModel(exchanges[0])).toBeUndefined();
   });
 
   it('returns model for idle CC exchange when CodingAgentSettingsChanged is emitted after Init', () => {
-    // Fixed scenario: Init resolves default model and emits CodingAgentSettingsChanged.
-    // Even without ResponseGenerated, idle exchange shows the model.
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'fix the bug', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-01-01T00:00:02Z' }],
@@ -120,15 +111,12 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
   });
 
   it('returns model for CC follow-up exchange (CodingAgentSettingsChanged re-emitted)', () => {
-    // Follow-up exchanges get their own CodingAgentSettingsChanged from run_direct_claude_code.
     const events = eventsMap([
-      // First exchange
       [1, { type: 'MessageReceived', text: 'fix the bug', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'SessionStarted', session_id: 's1', created: '2026-01-01T00:00:02Z' }],
       [3, { type: 'CodingAgentSettingsChanged', model: 'claude-opus-4-6', created: '2026-01-01T00:00:03Z' }],
       [4, { type: 'ResponseGenerated', text: 'done', model: 'claude-opus-4-6', created: '2026-01-01T00:00:04Z' }],
       [5, { type: 'CodingAgentIdled', has_changes: false, created: '2026-01-01T00:00:05Z' }],
-      // Follow-up exchange
       [6, { type: 'MessageReceived', text: 'now add tests', channel: 'claude_code', created: '2026-01-01T00:00:06Z' }],
       [7, { type: 'SessionStarted', session_id: 's2', created: '2026-01-01T00:00:07Z' }],
       [8, { type: 'CodingAgentSettingsChanged', model: 'claude-opus-4-6', created: '2026-01-01T00:00:08Z' }],
@@ -136,16 +124,11 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
-    // First exchange: model from ResponseGenerated
     expect(exchangeResponseModel(exchanges[0])).toBe('claude-opus-4-6');
-    // Follow-up exchange: model from CodingAgentSettingsChanged (no ResponseGenerated yet)
     expect(exchangeResponseModel(exchanges[1])).toBe('claude-opus-4-6');
   });
 
   it('returns model from MessageReceived for in-progress chat exchange (no ResponseGenerated yet)', () => {
-    // Bug: while a chat response is "Working", model/effort were missing from the
-    // route tooltip because they only appear on terminal events. The chat path
-    // now stamps them on MessageReceived so they're visible immediately.
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'hi', model: 'claude-opus-4-6', reasoning_effort: 'high', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'TextStreamed', text: 'hel', created: '2026-01-01T00:00:02Z' }],
@@ -166,8 +149,6 @@ describe('exchangeResponseModel for Claude Code sessions', () => {
   });
 
   it('skips terminal events without model and falls through to CodingAgentSettingsChanged', () => {
-    // CC follow-up where ResponseAborted has no model (recovery/shutdown path)
-    // but CodingAgentSettingsChanged in the same exchange has it.
     const events = eventsMap([
       [1, { type: 'MessageReceived', text: 'fix it', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
       [2, { type: 'CodingAgentSettingsChanged', model: 'claude-opus-4-7', created: '2026-01-01T00:00:02Z' }],
@@ -204,10 +185,6 @@ describe('displayModelName', () => {
   });
 
   it('maps CC short aliases (and their 1M variants) to their picker labels', () => {
-    // `opus` and `sonnet` are CC's own always-latest aliases, so their labels
-    // stay version-free and mirror the picker rows: a stored alias does not
-    // record which generation ran. `sonnet[1m]` is retired from the picker
-    // but keeps the label older threads were pinned under.
     expect(displayModelName('opus')).toBe('Opus (latest)');
     expect(displayModelName('opus[1m]')).toBe('Opus (latest, 1M)');
     expect(displayModelName('sonnet')).toBe('Sonnet (latest)');
@@ -256,8 +233,6 @@ describe('exchangeReasoningEffort', () => {
     expect(exchangeReasoningEffort(exchanges[0])).toBeUndefined();
   });
 
-  /** The user picked xhigh mid-turn, and every call after it still ran at
-   *  medium. The row names what ran, never the pick. */
   describe('names the effort in force, not a pick', () => {
     const pick = { kind: 'device', device_id: 'test-device' };
     const capture = (effort: string, extra: Record<string, unknown> = {}) => ({
@@ -300,9 +275,6 @@ describe('exchangeReasoningEffort', () => {
   });
 });
 
-/** A rung pick between turns is a `CodingAgentSettingsChanged` with an actor,
- *  grouped into the exchange before it. The next turn's starter carries the
- *  pair it runs on (ADR 0542). */
 describe('a rung pick between coding-agent turns', () => {
   const pick = { kind: 'device', device_id: 'test-device' };
   const events = eventsMap([
@@ -334,11 +306,6 @@ describe('a rung pick between coding-agent turns', () => {
   });
 });
 
-/** A trigger fire is a chat turn whose starter event is `TriggerStarted` rather
- *  than `MessageReceived`: the fire resolves a model and an effort exactly like
- *  a typed message does, and the engine stamps both on that event. Reading only
- *  `MessageReceived` left the Executor popover with no Model and no Effort row
- *  for the whole run, which is what the user reported. */
 describe('starter-event fallback on a trigger exchange', () => {
   const FIRING: [number, StoredEvent][] = [
     [1, {

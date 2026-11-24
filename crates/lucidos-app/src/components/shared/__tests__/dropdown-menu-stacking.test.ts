@@ -9,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf-8');
 
-// Root tokens live in the base partial; menus use host/iframe shared styles.
 const baseCss: string = read('../../../styles/global/base.css');
 const menuCss: string = read('../../../styles/global/shared-components.css');
 const dropdownSource: string = read('../Dropdown.tsx');
@@ -19,9 +18,6 @@ for (const m of baseCss.matchAll(/--(z-[\w-]+):\s*(\d+)\s*;/g)) {
   TOKENS[m[1]] = parseInt(m[2], 10);
 }
 
-/** Resolve a z-index value string: a plain number, var(--token), or
- *  calc(var(--token) ± N). Throws on anything else so an unexpected form fails
- *  loudly instead of silently passing the comparison. */
 function resolveZ(expr: string): number {
   const trimmed = expr.trim();
   if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
@@ -36,7 +32,6 @@ function resolveZ(expr: string): number {
   throw new Error(`Unrecognized z-index expression: "${expr}"`);
 }
 
-/** Pull the resolved z-index out of a single-selector rule block. */
 function blockZ(css: string, selector: string): number {
   const re = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`);
   const block = css.match(re);
@@ -46,18 +41,6 @@ function blockZ(css: string, selector: string): number {
   return resolveZ(z![1]);
 }
 
-/**
- * Regression: an open dropdown menu rendered UNDER the floating header chrome.
- * The composer's destination picker opens upward and, once its option list
- * outgrows the space above the trigger, clamps to the top margin and reaches
- * into the header band, where the header's icons painted straight through it.
- *
- * Two halves, and only both together fix it: the menu must out-rank the header
- * chrome, AND it must be portaled to <body> so that number is reachable. Inside
- * a pane it is not: `.mobile-swipe-pane` is `isolation: isolate` +
- * `translateZ(0)`, a stacking context that caps everything inside it below the
- * header however high the menu asks to be.
- */
 describe('dropdown menu stacking (regression: header icons painted over the menu)', () => {
   const menuZ = blockZ(menuCss, '.dropdown-menu');
 
@@ -70,16 +53,10 @@ describe('dropdown menu stacking (regression: header icons painted over the menu
   });
 
   it('is portaled to <body>, without which the z-index is capped by the pane', () => {
-    // A source scan rather than a render assertion: the portal is a prop on the
-    // shared <Overlay>, and dropping it would silently reinstate the bug on
-    // mobile (where the pane is a stacking context) while desktop kept working.
     expect(dropdownSource).toMatch(/\n\s*portal\n/);
   });
 
   it('leaves the header popout token restore unnecessary by construction', () => {
-    // The menu is no longer in the `.app-header` subtree, so it inherits the
-    // document's dark-on-light defaults. A reintroduced `.app-header
-    // .dropdown-menu` rule would mean a menu had stopped portaling.
     const shellCss: string = read('../../../styles/panels/shell.css');
     expect(shellCss).not.toMatch(/\.app-header\s+\.dropdown-menu\s*[,{]/);
   });

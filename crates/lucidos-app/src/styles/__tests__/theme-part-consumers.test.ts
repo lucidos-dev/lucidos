@@ -1,21 +1,3 @@
-/**
- * Every theme part paints through one shipped rule, under the selector the
- * catalog names (ADR 0307).
- *
- * A theme sets part tokens only. This suite pins the other half, the rules that
- * read them:
- *
- *   - each (part, property) has exactly one declaration, under the catalog's
- *     selector, whose fallback is the catalog's default;
- *   - no stylesheet reads a part token the catalog does not list;
- *   - shell parts paint in the shell only, frame parts in app frames only;
- *   - no part selector names a protected surface or a container of one;
- *   - no shadow or filter part sits in a transition, which would repaint it on
- *     every frame on iOS.
- *
- * The `@property` rules and the three resets are generated from the catalog
- * (`styles/generated/theme-parts.css`), and a Rust test keeps them current.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -37,13 +19,10 @@ interface Catalog {
   properties: Record<string, { effect?: boolean }>;
   parts: Part[];
 }
-const catalog: Catalog = JSON.parse(read(resolve(repo, 'crates/lucidos-engine/src/core/themes/theme-parts.json')));
+const catalog: Catalog = JSON.parse(read(resolve(repo, 'crates/lucidos-core/src/core/themes/theme-parts.json')));
 
 interface Sheet { file: string; rules: CssRule[] }
 
-/** Sheets only the shell loads. The shared layer and the generated resets are
- *  left out: the first is also served to app frames, the second sets tokens
- *  rather than reading them. */
 const shellSheets: Sheet[] = styleSheetPaths(styles)
   .filter(path => !/shared-components\.css$|\/generated\//.test(path))
   .map(path => ({ file: relative(styles, path), rules: cssRules(read(path)) }));
@@ -51,22 +30,17 @@ const sharedSheet: Sheet = {
   file: 'global/shared-components.css',
   rules: cssRules(read(resolve(styles, 'global/shared-components.css'))),
 };
-/** The two engine files carrying frame-part CONSUMER rules. The control one
- *  is its own file, concatenated last in the served stylesheet, because a
- *  `.dropdown-trigger` / `.text-input` border shorthand would otherwise undo
- *  it (`crates/lucidos-engine/src/api/sdk.rs`). */
 const frameSheet: Sheet = {
   file: 'sdk_iframe.css',
   rules: [
-    ...cssRules(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk_iframe.css'))),
-    ...cssRules(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css'))),
+    ...cssRules(read(resolve(repo, 'crates/lucidos-agents-api/src/api/sdk_iframe.css'))),
+    ...cssRules(read(resolve(repo, 'crates/lucidos-agents-api/src/api/sdk_iframe_control_theme_parts.css'))),
   ],
 };
 
 const PART_REF = /var\(\s*(--part-[a-z0-9-]+)/g;
 const tokens = new Map(catalog.parts.flatMap(part => part.properties.map(p => [p.token, part] as const)));
 
-/** Every declaration in `sheets` reading a part token. */
 function readers(sheets: Sheet[]): { file: string; rule: CssRule; prop: string; value: string; token: string }[] {
   return sheets.flatMap(({ file, rules }) => rules.flatMap(rule => [...rule.props].flatMap(([prop, value]) =>
     [...value.matchAll(PART_REF)].map(m => ({ file, rule, prop, value, token: m[1] })),
@@ -97,7 +71,6 @@ describe('theme part consumers', () => {
       const part = tokens.get(r.token);
       expect(part, `${r.file} reads ${r.token}, which is not a part token`).toBeDefined();
       if (!part) continue;
-      // A child part's rule falls back to its parent's token.
       if (catalog.parts.some(child => child.parent === part.id && sameList(r.rule.selector, child.selector))) continue;
       const scopes = selectorList(part.selector);
       const grouped = `:is(${scopes.join(', ')}) `;
@@ -125,8 +98,6 @@ describe('theme part consumers', () => {
       /modal/, /thread-content/, /thread-feed/, /chat-exchange/, /initiator-body/,
       /split-button/, /action-btn/,
     ];
-    // A floating surface may be a part only with protected dialogs excluded,
-    // at no added specificity (ADR 0313).
     const EXCLUDED_SURFACE = /^\.surface(-box)?:where\(:not\(\.protected-surface\)\)$/;
     for (const part of catalog.parts) {
       for (const selector of selectorList(part.selector)) {
@@ -136,8 +107,6 @@ describe('theme part consumers', () => {
     }
   });
 
-  // The screen fills hold every protected surface. So their rule adds no box,
-  // no position and nothing that takes a pointer.
   it('paints the scanlines as a background image and nothing else (ADR 0313)', () => {
     const screen = catalog.parts.find(p => p.id === 'screen');
     expect(screen).toBeDefined();
@@ -182,7 +151,7 @@ describe('theme part consumers', () => {
 
   it('loads the generated @property rules and resets in the shell and in app frames', () => {
     expect(read(resolve(styles, 'global.css'))).toContain("@import './generated/theme-parts.css';");
-    expect(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk.rs')))
+    expect(read(resolve(repo, 'crates/lucidos-agents-api/src/api/sdk.rs')))
       .toContain('parts::codegen::frame_css()');
   });
 });

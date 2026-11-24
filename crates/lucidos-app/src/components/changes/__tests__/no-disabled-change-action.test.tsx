@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-/**
- * **Invariant: no change action renders disabled, on either surface.**
- *
- * ADR 0168. `.action-btn:disabled` and `.icon-btn:disabled` both set
- * `pointer-events: none`, so the tooltip explaining the block can never be
- * read. A control that cannot act is replaced by the one that can, which is
- * the standing apply.
- *
- * Rendered rather than asserted through the pure selectors. What is banned is a
- * `disabled` attribute in the markup, and a selector can be right while the JSX
- * beside it still draws one.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, type ComponentChild } from 'preact';
 
@@ -23,8 +11,6 @@ vi.mock('../../../store/actions/repositories', () => ({
   viewThreadCcDiff: vi.fn(),
 }));
 
-// Only the section's bulk arm and disarm are replaced, so every other action
-// keeps its real identity and the module's own constants still resolve.
 const { armSection, disarmSection } = vi.hoisted(() => ({ armSection: vi.fn(), disarmSection: vi.fn() }));
 vi.mock('../../../store/actions/chat-changes', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -49,7 +35,6 @@ import {
 import type { Change } from '../../../api/client';
 import type { ThreadState } from '../../../store/thread-events';
 
-/** The standing apply as the prompt row draws it, or null when it has none. */
 function standingApply(): ComponentChild | null {
   const member = getStandaloneActions().find((m) => m.key === 'standing-apply');
   return member?.render ? member.render({}) : null;
@@ -176,8 +161,6 @@ describe('the Changes panel row', () => {
     expect(disabledActionButtons()).toEqual([]);
   });
 
-  // The reason has to be readable somewhere. With no control left to hang a
-  // tooltip on, the row says it in text.
   it('names the unsettled thread in the row details, not in a tooltip', () => {
     changes.value = {
       status: 'loaded',
@@ -188,8 +171,6 @@ describe('the Changes panel row', () => {
     expect(host.textContent).toContain('The thread has not finished');
   });
 
-  // The served flag alone carries it, so a reload shows the apply in flight
-  // with the live `MergeConflictDetected` bookkeeping empty.
   it('shows an apply resolving merge conflicts as in flight, with no standing apply', () => {
     changes.value = {
       status: 'loaded',
@@ -209,17 +190,12 @@ describe('the Changes panel row', () => {
     };
     render(<ChangesView />, host);
     expect(disabledActionButtons()).toEqual([]);
-    // Discard IS how an emptied change is resolved, so it stays; Apply goes.
     expect(actionLabels()).toContain('Discard');
     expect(actionLabels()).not.toContain('Apply');
   });
 });
 
-/** The Not finished section's bulk control is a toggle, wearing the shape the
- *  row and the prompt-row icon already wear. It reaches only the changes it
- *  lists. */
 describe('the Not finished bulk control', () => {
-  // The toggle is the one control here carrying a pressed state.
   function bulkButton(): HTMLButtonElement {
     const btn = host.querySelector<HTMLButtonElement>('.changes-bulk-actions button[aria-pressed]');
     if (!btn) throw new Error('the bulk row draws no standing-apply toggle');
@@ -259,7 +235,6 @@ describe('the Not finished bulk control', () => {
     expect(disabledActionButtons()).not.toContain('✓ Applying all on settle');
   });
 
-  // A parked thread cannot be armed, so the control has nothing to offer.
   it('draws no toggle when nothing in the section can be armed', () => {
     changes.value = {
       status: 'loaded',
@@ -270,12 +245,6 @@ describe('the Not finished bulk control', () => {
   });
 });
 
-/** The prompt row's control is an ICON, so it is not an `.action-btn` at all
- *  and the two helpers above cannot see it. The invariant is the same one:
- *  `.icon-btn:disabled` sets `pointer-events: none` just as its pill sibling
- *  does, so a disabled control here would take the same tooltip out of reach.
- *  What the icon itself draws is
- *  `components/chat/__tests__/standing-apply-is-an-icon.test.tsx`. */
 describe("the thread's own prompt row", () => {
   function promptRowControl(): HTMLButtonElement {
     const btn = host.querySelector<HTMLButtonElement>('button[data-role="standing-apply"]');

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The sentence under the External address field. A save's probe verdict
- * reaches the user only here. So does the news that an empty field means
- * Tailscale.
- */
 import { describe, it, expect } from 'vitest';
 import { h, render } from 'preact';
 import { ExternalAddressSection, externalAddressNote, publicListenerNote } from './ExternalAddressSection';

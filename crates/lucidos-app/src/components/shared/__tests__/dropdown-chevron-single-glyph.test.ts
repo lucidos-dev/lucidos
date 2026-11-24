@@ -1,6 +1,3 @@
-/** No component draws an up-pointing chevron. A trigger that swaps `▾` for `▴`
- *  resizes as its menu opens, because the two glyphs can differ in width. Every
- *  trigger renders `DropdownChevron`, which turns one glyph over instead. */
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 // @ts-expect-error: same

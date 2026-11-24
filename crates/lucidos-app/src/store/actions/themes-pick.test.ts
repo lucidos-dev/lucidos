@@ -1,7 +1,3 @@
-/**
- * Picking a theme from the picker: a single-mode theme picked from its other
- * mode asks before it switches the theme to the theme's mode.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { confirmState, preferences } from '../store';
 import { applyThemeMode, paintedThemeMode, _resetPendingPreferenceWritesForTesting } from './preferences';
@@ -30,7 +26,6 @@ function saved(): Record<string, string> {
   return Object.fromEntries(setPreference.mock.calls.map(([key, value]) => [key, value]));
 }
 
-/** Answer the confirm `pickTheme` raised, then let the pick finish. */
 async function answer(pick: Promise<void>, ok: boolean): Promise<void> {
   await vi.waitFor(() => expect(confirmState.value.visible).toBe(true));
   confirmState.value.resolve?.(ok);
@@ -88,7 +83,6 @@ describe('pickTheme', () => {
     paper.resolved.light = { '--accent': '#abcdef' };
     await answer(pickTheme(paper), true);
 
-    // The boot cache holds what was painted.
     expect(JSON.parse(localStorage.getItem('lucidos-theme-resolved')!).light['--accent']).toBe('#abcdef');
   });
 

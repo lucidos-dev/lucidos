@@ -1,20 +1,3 @@
-/**
- * The bars over an app hold still under the finger (ADR 0482, and the plan
- * docs/plans/2026-10-14-v0-49-0-release-blockers.md, Part 3).
- *
- * A host `requestAnimationFrame` sampler records the header, the app panel,
- * the frame and a finger, frame by frame, while a driver scrolls. Two drivers:
- *
- * - `screen`: the scroll moves at a constant speed, as a finger tracked in
- *   screen space does. It measures how far the content drifts off the finger.
- * - `finger`: iOS tracks a drag in the scroll view's coordinates. So the
- *   scroll follows the finger minus the frame's own motion, and a frame that
- *   moves up reads as a scroll up.
- *
- * The same drag runs on a thread, whose scroller never moves, for comparison.
- * The page mirrors an iPhone with a notch at 112.5%: a 47px top inset and an
- * 18px rem, so the header is about 97px tall.
- */
 import { writeFileSync } from 'node:fs';
 import { test, expect, type Page, type Frame } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
@@ -23,16 +6,13 @@ import {
   ensureMobileView, gotoWithRetry, navigateToApp, sendMessage, uniqueMessage, waitForResponse,
 } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
 const APP_ID = 'e2e-dynamic-bars-motion';
 const PANEL = '.mobile-swipe-pane [data-role="app-ui-panel"]';
 const FRAME = `${PANEL} iframe[data-role="app-ui-frame"]`;
 const THREAD = '.mobile-swipe-pane .thread-content.visible';
-/** A slow reading drag, in px per frame. The frame's glide outruns it. */
 const SLOW = 1.5;
-/** A brisk drag, in px per frame. */
 const BRISK = 4;
 
 type Driver = 'screen' | 'finger';
@@ -49,23 +29,14 @@ interface Sample {
 }
 
 interface Metrics {
-  /** Times the header's target turned back within one drag and its lift. */
   headerFlips: number;
-  /** Times the header's target changed over the whole down-and-up cycle. */
   headerMoves: number;
-  /** Times the header's target changed while the finger was down. */
   headerMovesWhileTouching: number;
-  /** Frames the scroller moved on screen while the finger was down. */
   scrollerMovesWhileTouching: number;
-  /** The furthest the content under the finger drifted off it, in px. */
   rowDriftPx: number;
-  /** Times the scroller changed height over the cycle. */
   scrollerResizes: number;
-  /** Frames over 25ms within 400ms of a header move. */
   longFramesInGlide: number;
-  /** Header moves after the last lift settled. */
   movesAfterLift: number;
-  /** Ms from the first lift to the header's away target, or -1 for never. */
   awayAfterLiftMs: number;
 }
 
@@ -75,9 +46,6 @@ const APP_HTML = `<!DOCTYPE html>
 <style>body { margin: 0; } .row { height: 50px; border-bottom: 1px solid #ccc; }</style>
 </head><body><script src="script.js"></script></body></html>`;
 
-/** Rows, plus the driver's two hands inside the frame: a scroll and a touch.
- *  The touch is a plain event with a \`touches\` list, which every engine can
- *  dispatch. */
 const APP_JS = `for (let i = 0; i < 200; i++) {
   const div = document.createElement('div');
   div.className = 'row';
@@ -100,12 +68,8 @@ addEventListener('message', (e) => {
 
 let fixture: { cleanup: () => void };
 
-// `sw.js` answers every API GET, and `page.route` cannot see a request the
-// worker makes. Blocking it lets the spec hide the backup reminder below.
 test.use({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
 
-/** Mirror the iPhone the bug was reported on: a notch inset and 112.5%. The
- *  backup reminder would sit in the header and double its height. */
 async function mirrorNotchedPhone(page: Page) {
   await page.route('**/api/v1/preferences**', async (route) => {
     if (route.request().method() !== 'GET') return route.fallback();
@@ -121,10 +85,6 @@ async function mirrorNotchedPhone(page: Page) {
   });
 }
 
-/**
- * Run one down drag, a lift, one up drag and a lift, and sample every frame.
- * Runs in the page. `target` names the scroller: the app frame or the thread.
- */
 async function trace(
   page: Page,
   opts: { target: 'app' | 'thread'; driver: Driver; speed: number; startTop: number },
@@ -206,7 +166,6 @@ function metrics(samples: Sample[]): Metrics {
     const prev = samples[i - 1];
     const s = samples[i];
     const start = segmentStart(s.segment);
-    // Each drag and its lift is one gesture, so the direction starts afresh.
     if (s.segment === 2 && prev.segment === 1) lastDir = 0;
     if (s.headerTarget !== prev.headerTarget) {
       headerMoves++;
@@ -217,10 +176,7 @@ function metrics(samples: Sample[]): Metrics {
       lastDir = dir;
       if (!s.touching && s.t - start.t > 400) movesAfterLift++;
     }
-    // A whole pixel: the transcript's box jitters by one with no scroll at all.
     if (s.touching && Math.abs(s.scrollerTop - prev.scrollerTop) > 1) scrollerMovesWhileTouching++;
-    // The content scrolls with the finger, so the row under it drifts off by
-    // exactly how far the scroller itself moved on screen.
     if (s.touching) rowDriftPx = Math.max(rowDriftPx, Math.abs(s.scrollerTop - start.scrollerTop));
     if (Math.abs(s.scrollerHeight - prev.scrollerHeight) > 0.5) scrollerResizes++;
     if (s.t - prev.t > 25 && moveTimes.some((m) => s.t >= m && s.t - m <= 400)) longFramesInGlide++;
@@ -234,12 +190,10 @@ function metrics(samples: Sample[]): Metrics {
   };
 }
 
-/** Report one leg on stdout, where the plan's numbers are copied from. */
 function report(leg: string, m: Metrics) {
   console.log(`TRACE ${leg} ${JSON.stringify(m)}`);
 }
 
-/** The app's frame, once its rows have rendered, parked mid-page. */
 async function appAtRest(page: Page): Promise<Frame> {
   await expect(page.locator(FRAME)).toBeVisible({ timeout: 15_000 });
   const frame = (await (await page.locator(FRAME).elementHandle())!.contentFrame())!;
@@ -249,13 +203,11 @@ async function appAtRest(page: Page): Promise<Frame> {
   return frame;
 }
 
-/** Start the next run with the bars shown, whatever the last one left. */
 async function revealBars(page: Page) {
   await page.evaluate(() => document.dispatchEvent(new CustomEvent('reveal-mobile-bars')));
   await settle(page);
 }
 
-/** Wait until the header and the panel stop moving. */
 async function settle(page: Page) {
   let last = '';
   await expect.poll(async () => {
@@ -287,8 +239,6 @@ test.describe('dynamic bars over an app: motion trace', () => {
   });
 
   test.afterEach(async ({ page }) => {
-    // A preferences fetch still in flight when the test ends would reject
-    // inside the handler and fail whichever test the worker runs next.
     await page.unrouteAll({ behavior: 'ignoreErrors' });
     await disableMobileDynamicBars(page);
   });
@@ -319,14 +269,11 @@ test.describe('dynamic bars over an app: motion trace', () => {
       report(`app screen ${speed}`, s);
       writeFileSync(info.outputPath(`app-trace-${speed}.json`), JSON.stringify({ finger, screen }));
 
-      // The bars never turn back during a one-way drag.
       expect(f.headerFlips).toBe(0);
-      // Nothing moves the header or the scroller while the finger is on it.
       expect(f.headerMovesWhileTouching).toBe(0);
       expect(f.scrollerMovesWhileTouching).toBe(0);
       expect(s.scrollerMovesWhileTouching).toBe(0);
       expect(s.rowDriftPx).toBeLessThanOrEqual(1);
-      // After the lift the bars glide away once, and back once after the up drag.
       expect(f.headerMoves).toBe(2);
       expect(f.awayAfterLiftMs).toBeGreaterThanOrEqual(0);
       expect(f.movesAfterLift).toBe(0);

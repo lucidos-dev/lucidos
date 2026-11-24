@@ -10,12 +10,6 @@ import {
   waitForVisibleInput,
 } from './helpers';
 
-/** A send that got no answer, or that a reload cut off, comes back after the
- *  reload as a Not sent card with Retry. Exercises the real IndexedDB store,
- *  which Vitest cannot reach.
- *  Plan: `docs/plans/2026-10-03-unsent-messages-survive-a-reload.md`.
- *
- *  Service workers are blocked so `page.route` sees the chat POST in WebKit. */
 
 test.use({ serviceWorkers: 'block' });
 
@@ -24,7 +18,6 @@ const CHAT_ROUTE = '**/api/v1/chat/stream';
 const notSentCard = (page: Page) => page.locator('.exchange-error:visible', { hasText: 'Not sent' });
 const userBubble = (page: Page, text: string) => page.locator(`${USER_MSG_SELECTOR}:visible`, { hasText: text });
 
-/** How many sends the unsent-message database holds. */
 function storedCount(page: Page): Promise<number> {
   return page.evaluate(async () => {
     let count = 0;
@@ -45,7 +38,6 @@ function storedCount(page: Page): Promise<number> {
   });
 }
 
-/** Type a draft and wait for the engine to store it, as a real first send has. */
 async function typeStoredDraft(page: Page, message: string): Promise<void> {
   const stored = page.waitForResponse((r) =>
     r.url().endsWith('/compose') && r.request().method() === 'PUT' && r.ok());
@@ -58,7 +50,6 @@ async function pressSend(page: Page): Promise<void> {
   await page.locator('button[aria-label="Send message"]:visible').first().click();
 }
 
-/** Hold every chat POST until the page goes away. */
 async function holdChatPosts(page: Page): Promise<void> {
   await page.route(CHAT_ROUTE, () => new Promise<void>(() => {}));
 }
@@ -81,7 +72,6 @@ test.describe('An unsent message survives a page reload', () => {
     await page.reload();
     await expect(notSentCard(page)).toHaveCount(1, { timeout: 15_000 });
     await expect(userBubble(page, message)).toHaveCount(1);
-    // The draft it was written from is not back in the composer beside it.
     await expect(await waitForVisibleInput(page)).toHaveValue('');
 
     await notSentCard(page).getByRole('button', { name: 'Retry' }).click();
@@ -102,13 +92,8 @@ test.describe('An unsent message survives a page reload', () => {
     await sendMessage(page, followUp);
     await expect.poll(() => storedCount(page)).toBe(1);
 
-    // The hold stays through the reload, which is what cuts the POST off.
-    // Unrouting first would release the held POST to the engine, which then
-    // takes the message, so no Not sent card would be owed.
     await page.reload();
     await expect(notSentCard(page)).toHaveCount(1, { timeout: 15_000 });
-    // Unloading may reject the held POST first, and the page then records "no
-    // answer" before it goes. Either way the message must come back.
     await expect(notSentCard(page)).toContainText(/reloaded before Lucidos answered|did not answer/);
     await expect(userBubble(page, followUp)).toHaveCount(1);
 

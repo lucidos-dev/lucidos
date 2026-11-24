@@ -1,9 +1,3 @@
-/**
- * A content-pane column keeps one width whether or not it overflows. With
- * classic scrollbars, a view growing past one screen otherwise gains a
- * scrollbar and slides sideways. A browser with overlay scrollbars cannot show
- * the slide, so the source pins it too.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

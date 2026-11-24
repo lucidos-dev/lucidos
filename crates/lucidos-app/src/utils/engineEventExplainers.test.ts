@@ -17,13 +17,6 @@ import {
   type CancelCause,
 } from '../store/thread-events';
 
-/** Every `AbortCause` / `CancelCause` variant, kept honest by tsc rather than
- *  by hand. The `satisfies Record<Union, true>` trick is the same drift guard
- *  `THREAD_EVENT_TYPE_FLAGS` uses for the `ThreadEvent` union
- *  (`.claude/rules/testing.md`): adding a variant without listing it here is a
- *  type error, so the "every variant" tests below cannot silently cover a
- *  subset. They had both drifted, missing `session_dropped` and
- *  `superseded_by_followup` respectively. */
 const ABORT_CAUSE_FLAGS = {
   safety_net: true,
   engine_shutdown: true,
@@ -41,6 +34,8 @@ const CANCEL_CAUSE_FLAGS = {
   user_action: true,
   superseded_by_followup: true,
   effort_restart: true,
+  refused: true,
+  hold: true,
   unknown: true,
 } satisfies Record<CancelCause, true>;
 const CANCEL_CAUSES = Object.keys(CANCEL_CAUSE_FLAGS) as CancelCause[];
@@ -64,7 +59,7 @@ describe('describeEngineReason', () => {
   });
   it('returns explainer for archived_branch_work', () => {
     expect(describeEngineReason({ kind: 'archived_branch_work' }))
-      .toMatch(/set it aside/i);
+      .toMatch(/kept it on the thread’s branch.*unarchive/i);
   });
   it('returns explainer for merge_conflict', () => {
     expect(describeEngineReason({ kind: 'merge_conflict' }))
@@ -107,8 +102,6 @@ describe('describeEngineReason', () => {
     })).toMatch(/action by sam@example\.com/);
   });
 
-  // The reported card: an expired wait read "Prompt to the agent" with no
-  // story. The explainer says who asked, for what, why, and what happened.
   it('tells a timed-out wait as a story', () => {
     const text = describeEngineReason({
       kind: 'event_wait',
@@ -134,7 +127,6 @@ describe('describeEngineReason', () => {
     expect(text).toMatch(/It happened, so Lucidos told the agent/);
   });
 
-  // An older row infers only the outcome. No blank clause may print.
   it('drops the clauses an older re-entry did not record', () => {
     const text = describeEngineReason({ kind: 'event_wait', outcome: 'expired', watched: [], wait_reason: '' });
     expect(text).toBe(
@@ -144,7 +136,6 @@ describe('describeEngineReason', () => {
   });
 });
 
-/** Words a reader cannot act on. None may reach an explainer (plan invariant 9). */
 const ENGINE_INTERNALS = /marker|orphan|safety net|event loop|Thread Queue|driver task|ContinuationRequested|`|session/i;
 
 describe('every explainer is plain', () => {
@@ -154,7 +145,7 @@ describe('every explainer is plain', () => {
       ...CANCEL_CAUSES.map(describeCancelCause),
       ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
         'stale_session', 'archived_branch_work', 'unmerged_integrated_work', 'successor_residue', 'merge_conflict', 'main_check_red', 'main_check_flaky',
-        'missing_hardening', 'missing_plan', 'context_ceiling'] as const)
+        'missing_hardening', 'missing_plan', 'approved_plan_unstarted', 'model_substituted', 'context_ceiling'] as const)
         .map(kind => describeEngineReason({ kind })),
     ];
     for (const text of texts) expect(text).not.toMatch(ENGINE_INTERNALS);
@@ -167,8 +158,6 @@ describe('every explainer is plain', () => {
 });
 
 describe('describeAbortCause', () => {
-  // The two remaining safety nets: the agent's turn ended without a reply, or
-  // another job waited on the thread for a minute.
   it('explains safety_net by its two cases, in plain words', () => {
     const text = describeAbortCause('safety_net');
     expect(text).toMatch(/stopped without finishing/i);
@@ -178,12 +167,6 @@ describe('describeAbortCause', () => {
     expect(describeAbortCause('engine_shutdown')).toMatch(/shut down|restarted/i);
   });
   it('explains recovery_after_restart as a deliberate hold, not an impossibility', () => {
-    // The turn CAN be resumed, and Continue is armed for it. The engine
-    // declines to do it on its own rather than re-run work that may be what
-    // brought it down. Saying it "could not be resumed" blames the engine for
-    // a caution it chose. The text must also stay true of BOTH emit sites (the
-    // boot orphan sweep's unknown cause and the boot floor's withdrawn switch
-    // promise), so it must not claim the cause is always unknown.
     const text = describeAbortCause('recovery_after_restart');
     expect(text).toMatch(/restart/i);
     expect(text).toMatch(/Continue/);
@@ -213,9 +196,6 @@ describe('describeContinuationReason', () => {
       .toMatch(/chose Switch on the new version/);
   });
 
-  // The honesty rule `continuationStartedSummary` enforces for the turn header
-  // has to hold in the popover too: a hang recovery is a LOCAL interruption, so
-  // the explainer must not claim anything restarted.
   it('does not claim an engine restart for auto_recovery_after_hang', () => {
     const text = describeContinuationReason(CONTINUATION_AUTO_RECOVERY_REASON);
     expect(text).toMatch(/stopped responding|stray signal/i);
@@ -226,10 +206,6 @@ describe('describeContinuationReason', () => {
     expect(describeContinuationReason(CONTINUATION_USER_CLICKED_REASON)).toMatch(/^You pressed Continue/);
   });
 
-  // An upstream drop is a LOCAL interruption too: the engine resumed one
-  // session, it did not restart. The explainer also has to say the retrying is
-  // bounded, or a user watching it resume twice has no way to know it will ever
-  // stop.
   it('explains an api-error auto-resume without claiming a restart', () => {
     const text = describeContinuationReason(CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON);
     expect(text).not.toBeNull();
@@ -238,13 +214,6 @@ describe('describeContinuationReason', () => {
     expect(text).toMatch(/few times|at most/i);
   });
 
-  // The turn header keys off the same reason and must agree with the popover.
-  // It also has to SAY which interruption: both auto-resume reasons shared one
-  // "Resumed after an interruption" label, so a thread that dropped its
-  // connection and was then killed by the hang watchdog showed two identical
-  // rows with no way to tell them apart or to know they had different causes
-  // (reported 2026-08-07). Neither may claim a restart, which is what the
-  // shared label was protecting and what these keep.
   it('names which interruption the api-error resume recovered from', () => {
     const label = continuationStartedSummary(CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON, undefined);
     expect(label).toMatch(/connection/i);
@@ -262,8 +231,6 @@ describe('describeContinuationReason', () => {
       .not.toBe(continuationStartedSummary(CONTINUATION_AUTO_RECOVERY_REASON, undefined));
   });
 
-  // The engine resumes an effort restart with no actor, so without its own
-  // branch the header would fall through to "Resumed after engine restart".
   it('says an effort restart came from the effort pick, not an engine restart', () => {
     expect(describeContinuationReason(CONTINUATION_EFFORT_RESTART_REASON)).toMatch(/^You picked a new reasoning effort/);
     expect(continuationStartedSummary(CONTINUATION_EFFORT_RESTART_REASON, undefined))
@@ -284,7 +251,6 @@ describe('describeCancelCause', () => {
   it('mentions apply/discard/archive for user_action', () => {
     expect(describeCancelCause('user_action')).toMatch(/appl|discard|archiv/i);
   });
-  // The turn an effort pick interrupted must not claim a follow-up nobody sent.
   it('names the effort pick for effort_restart', () => {
     const text = describeCancelCause('effort_restart');
     expect(text).toMatch(/reasoning effort/);
@@ -294,9 +260,13 @@ describe('describeCancelCause', () => {
     expect(describeCancelCause('unknown')).toMatch(/did not record how/i);
     expect(describeCancelCause(undefined)).toMatch(/did not record how/i);
   });
-  it('attributes every cause to the user ("You")', () => {
-    for (const cause of CANCEL_CAUSES) {
+  it('attributes every cause but a hold to the user ("You")', () => {
+    for (const cause of CANCEL_CAUSES.filter((c) => c !== 'hold')) {
       expect(describeCancelCause(cause)).toMatch(/^You\b/);
     }
+  });
+
+  it('names no actor for a hold, which an agent may have placed', () => {
+    expect(describeCancelCause('hold')).toMatch(/^This thread was put on hold/);
   });
 });

@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Models draws model rows while the registry loads, past the delay
- *  gate. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

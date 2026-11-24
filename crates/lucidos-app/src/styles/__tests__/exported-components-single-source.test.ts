@@ -1,18 +1,3 @@
-/**
- * The host components apps get are the host's own, from one stylesheet.
- *
- * The switch, the spinner, the label tones and the pill bar each live in
- * `styles/global/shared-components.css`. The host imports that file and the
- * engine appends it to the served `/api/v1/sdk-iframe.css`, so an app draws
- * exactly what the host draws.
- *
- * Two things break that silently. A second base rule anywhere else reaches the
- * host alone, and the two copies drift. A token only `base.css` defines paints
- * nothing in an app frame, which never loads it.
- *
- * A host rule that restyles one in context (`.thread-status .mini-spinner`) is
- * fine: it is not a second definition, and no app matches it.
- */
 import { describe, it, expect } from 'vitest';
 import postcss, { type Root } from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -29,7 +14,7 @@ const REPO_ROOT: string = resolve(here, '../../../../..');
 const STYLES_DIR: string = resolve(here, '..');
 const SHARED_CSS: string = resolve(STYLES_DIR, 'global/shared-components.css');
 const HOST_TOKENS_CSS: string = resolve(STYLES_DIR, 'global/base.css');
-const IFRAME_CSS: string = resolve(REPO_ROOT, 'crates/lucidos-engine/src/api/sdk_iframe.css');
+const IFRAME_CSS: string = resolve(REPO_ROOT, 'crates/lucidos-agents-api/src/api/sdk_iframe.css');
 
 const EXPORTED: string[] = [
   'toggle-switch',
@@ -50,12 +35,6 @@ const EXPORTED: string[] = [
 const read = (path: string): string => readFileSync(path, 'utf-8');
 const parse = (path: string): Root => postcss.parse(read(path), { from: path });
 
-/** Rules that define the class itself: `.x` alone in a selector-list member,
- *  at the TOP LEVEL. A media-nested one is a refinement, gated by a
- *  condition. mobile.css bumps `.dropdown-chevron`'s size under
- *  `pointer: coarse`. That is the same "restyles in context" shape a
- *  descendant selector already gets a pass for above, not a rival
- *  definition. */
 function baseRules(css: string, className: string): string[] {
   return cssRules(css)
     .filter(rule => rule.atRules === ''

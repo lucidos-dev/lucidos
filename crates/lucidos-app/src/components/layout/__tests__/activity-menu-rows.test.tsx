@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The activity group in the Lucidos menu: one row per job in flight, each
- * unfolding its detail in place. A pending row stands for unbuilt code, and
- * an idle workspace draws nothing at all.
- */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -15,6 +10,7 @@ import {
   applyAllCanceling,
   applyAllInProgress,
   engineBuilding,
+  engineBuildDeferred,
   engineVersionPending,
   IDLE_MAIN_CHECK,
   mainCheck,
@@ -133,6 +129,23 @@ describe('activityMenuGroup', () => {
     if (host) { render(null, host); host.remove(); host = null; }
   });
 
+  it('names blocking threads and keeps an explicit override beside a ready version', () => {
+    const onBuildNow = vi.fn();
+    const onOpenFixThread = vi.fn();
+    const el = draw(props({ deferred: { coding_threads: 2, deferred_ms: 840000,
+      threads: [{ id: 'blocked-thread', title: 'Fix the guard', state: 'waiting_for_user_answer' }] },
+      versionReady: true, onBuildNow, onOpenFixThread }));
+    expect(el.textContent).toContain('Newer version waits');
+    expect(el.textContent).toContain('2 coding threads active');
+    expect(el.textContent).toContain('14');
+    expect(el.textContent).toContain('Fix the guard (waits for your answer)');
+    expect(el.textContent).toContain('It builds by itself when they finish.');
+    el.querySelector<HTMLButtonElement>('[data-role="deferred-thread"]')!.click();
+    expect(onOpenFixThread).toHaveBeenCalledWith('blocked-thread');
+    el.querySelector<HTMLButtonElement>('[data-role="build-now"]')!.click();
+    expect(onBuildNow).toHaveBeenCalledOnce();
+  });
+
   it('renders nothing, separator included, when nothing runs', () => {
     expect(activityMenuGroup(props({}))).toBeNull();
   });
@@ -160,7 +173,6 @@ describe('activityMenuGroup', () => {
       .toBe('14 commits come with the new version');
     const titles = [...changes.querySelectorAll('.brand-menu-activity-group-title')].map((n) => n.textContent);
     expect(titles).toEqual(['New', 'Fixed']);
-    // Fixed shows one of its three, and says so rather than under-reporting.
     expect(changes.textContent).toContain('and 2 more');
     expect(changes.querySelector('.brand-menu-activity-housekeeping')?.textContent)
       .toBe('10 housekeeping commits (docs, tests, chores)');
@@ -200,7 +212,6 @@ describe('activityMenuGroup', () => {
     const el = draw(props({ rows: [applyAllRow], open: new Set(['apply-all']), onOpenThread, onCancelApplyAll }));
     const body = el.querySelector('[data-role="activity-body"]')!;
     expect(body.textContent).toContain('1 of 5 done · about 28 min until all are applied');
-    // The finished member fills, and the member in flight owns its own span.
     expect(body.querySelector<HTMLElement>('.progress-bar-fill')?.style.width).toBe('20%');
     const working = body.querySelector<HTMLElement>('.brand-menu-activity-working');
     expect([working?.style.left, working?.style.width]).toEqual(['20%', '20%']);
@@ -267,7 +278,6 @@ describe('activityMenuGroup', () => {
     expect(onOpenLaneThread).toHaveBeenCalledWith('lane-t');
     links[1].click();
     expect(onOpenLaneEntry).toHaveBeenCalledWith({ changeId: 'c-1', threadId: 't-1', title: 'Card gate fix' });
-    // Only a waiting change gets Remove: a batch member leaves with its batch.
     const removes = [...body.querySelectorAll('button')].filter((b) => b.textContent === 'Remove');
     expect(removes).toHaveLength(1);
     expect(removes[0].closest('[data-role="lane-waiting"]')?.textContent).toContain('Fix the parser');
@@ -318,7 +328,16 @@ describe('activityMenuGroup', () => {
     expect(line?.textContent).toBe(`${LANE_WAITING_FOR_ORIGIN_LABEL}: could not fetch from origin: timed out`);
   });
 
-  /** A lane row whose body carries `mainCheck`, unfolded. */
+  it('shows how to designate a single lander when the lane observes another one', () => {
+    const el = draw(props({
+      rows: [laneRow],
+      lane: { ...EMPTY_LANE, multipleLanders: true },
+      open: new Set(['landing-lane']),
+    }));
+    const body = el.querySelector('[data-role="activity-body"]');
+    expect(body?.textContent).toContain('Set one workspace to Here and the others to Another host');
+  });
+
   function drawMainCheck(mainCheck: MainCheckLine, extra: Partial<ActivityGroupProps> = {}): HTMLDivElement {
     return draw(props({ rows: [laneRow], lane: { ...LANE, mainCheck }, open: new Set(['landing-lane']), ...extra }));
   }
@@ -401,11 +420,24 @@ describe('ActivityMenuGroup', () => {
     if (host) { render(null, host); host.remove(); host = null; }
     engineVersionPending.value = false;
     engineBuilding.value = false;
+    engineBuildDeferred.value = null;
     applyAllInProgress.value = false;
     applyAllCanceling.value = false;
     mainCheck.value = IDLE_MAIN_CHECK;
     toasts.value = [];
     vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('advances a deferred build age without another status read', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    engineBuildDeferred.value = { coding_threads: 1, threads: [], deferred_ms: 5_000, anchoredAt: Date.now() };
+    let el!: HTMLDivElement;
+    await act(async () => { el = mount().host; });
+    expect(el.textContent).toContain('active · 5s');
+    await act(async () => { vi.advanceTimersByTime(2_000); });
+    expect(el.textContent).toContain('active · 7s');
   });
 
   it('unfolds a row in place and leaves the menu open', async () => {
@@ -448,7 +480,7 @@ describe('ActivityMenuGroup', () => {
     const pendingRow = [...el.querySelectorAll('button')].find((b) => b.textContent?.includes('New code pending'));
     pendingRow?.click();
     expect(onClose).toHaveBeenCalledOnce();
-    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Rebuild');
+    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Build new version');
   });
 
   it('opens a fix thread the page never loaded, such as an archived one', async () => {

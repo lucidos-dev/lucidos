@@ -4,11 +4,11 @@ Decisions and tradeoffs made while building the end-to-end test suite.
 
 ## Architecture: Layers
 
-1. **Browser E2E tests** (Playwright, `crates/lucidos-app/e2e/`) — drive a real browser against the running Lucidos UI. Three projects run by default: `chromium` (desktop), `mobile` (mobile Chromium), and `mobile-webkit` (iOS Safari emulation via WebKit).
+1. **Browser E2E tests** (Playwright, `crates/lucidos-app/e2e/`) — drive a real browser against the running Lucidos UI. Four projects run by default: `chromium` (desktop), `mobile` (mobile Chromium), `desktop-webkit` (the macOS app's engine) and `mobile-webkit` (iOS Safari emulation via WebKit).
 2. **HTTP API tests** (Rust, `crates/lucidos-e2e/tests/api_support/`, workspace member crate `lucidos-e2e`) — hit the API directly without a browser
 3. **Packaged build smoke test** (`scripts/e2e-packaged.sh`) — boots the macOS `.app` itself (service role + embedded Postgres) and asserts the packaged boot chain over HTTP + on disk. macOS-only, opt-in, does **not** drive the WKWebView (see below).
 
-The browser + API layers require a running dev workspace (`~/workspaces/e2e-test` by default). The packaged smoke test boots the bundle's own isolated stack instead.
+The browser + API layers require a running dev workspace (`~/.lucidos/e2e-root/workspaces/e2e-test` by default, in the e2e root). The packaged smoke test boots the bundle's own isolated stack instead.
 
 ## Key Decisions
 
@@ -53,9 +53,11 @@ A spec's file suffix picks its Playwright projects (`e2e/projectRules.ts`, ADR 0
 | `-mobile` | mobile Chromium, mobile WebKit |
 | `-all` | all three |
 
+Desktop WebKit is a fourth project, `desktop-webkit`, and no suffix selects it. It runs the specs `e2e/desktop-webkit-specs.txt` names: the transcript position specs that mean something without touch. It is the engine of the macOS app's WKWebView, which no other project covers. `--webkit` runs it with `mobile-webkit`, and `--no-webkit` drops both. Add a spec to the list when it asserts a transcript position.
+
 Name a new spec `-all` when it asserts a phone path or a WebKit behaviour as well as the desktop one. Name it `-mobile` when only the phone matters.
 
-`scripts/lib/e2e_projects.sh` `project_runs_spec` restates the rules for the shell: targeted runs, the WebKit chunking, the GitHub shard plan and `/harden`'s WebKit specs. `e2e/project-rules.test.ts` fails when the two disagree, or when a spec runs on no project. It also fails when a desktop-only spec branches on `isMobile`, `browserName`, `project.name`, `hasTouch`, `tap()` or `touchscreen`.
+`scripts/lib/e2e_projects.sh` `project_runs_spec` restates the rules for the shell: targeted runs, the WebKit chunking, the GitHub shard plan and `/harden`'s WebKit specs. The shell reads the same list file. `e2e/project-rules.test.ts` fails when the two disagree, when a spec runs on no project, or when the list names a missing or phone-only spec. It also fails when a desktop-only spec branches on `isMobile`, `browserName`, `project.name`, `hasTouch`, `tap()` or `touchscreen`.
 
 **Rejected:** unsuffixed specs on all three projects with a `-chromium` opt-out. Every new spec would pay for three projects unless its author thought to opt out.
 
@@ -75,7 +77,7 @@ This tests the important thing (data persistence) without depending on the auto-
 Lucidos uses HTTPS even in dev (Vite TLS). Both Playwright (`ignoreHTTPSErrors: true`) and Rust tests (`danger_accept_invalid_certs`) accept self-signed certificates.
 
 ### Port discovery
-Both test layers read the workspace ports from `<workspace>/.lucidos/ports`. The workspace path is configurable via the `E2E_WORKSPACE` environment variable, defaulting to `~/workspaces/e2e-test`.
+Both test layers read the workspace ports from `<workspace>/.lucidos/ports`. The workspace path is configurable via the `E2E_WORKSPACE` environment variable, defaulting to `workspaces/e2e-test` under the e2e root (`scripts/lib/e2e_root.sh`).
 
 **The name is gated.** `scripts/lib/e2e.sh` asserts at source time that the basename starts with `e2e-`, and aborts otherwise. The suite drops that workspace's database and force-removes its worktrees and `lucidos-*` branches. Nothing else checked what the variable pointed at, so `E2E_WORKSPACE=$HOME/workspaces/dev` was a working way to destroy a live workspace. It is asserted at source time rather than inside the destructive functions because `setup_e2e_session` installs its teardown trap first: a refusal raised later aborts under `set -e` and the trap then runs against the workspace just refused. A new sandbox in a lib test must be named to match.
 
@@ -109,7 +111,7 @@ Call it **instead of** `ensure_workspace_running`, never before it: booting firs
 This also **replaced** `purge_orphan_migrations`, which dropped the public schema when `_sqlx_migrations` referenced a migration file that no longer existed (abandoned CC branches left orphan rows and sqlx then refused to start with `VersionMissing`). Every resetting run now starts from an empty database, so that case can't arise. It survives only on the paths that deliberately *don't* reset — `--no-reset` and `e2e-ios.sh`, which both attach to whatever database is already there. On those, the developer has explicitly asked to keep it and silently wiping their schema was the wrong answer anyway; the engine's `VersionMissing` names the problem, and running once without `--no-reset` fixes it.
 
 ### Single-writer lock on the e2e workspace
-Every e2e entry point (`e2e.sh`, `e2e-browser.sh`, `e2e-api.sh`) acquires `~/workspaces/e2e-test/.lucidos/e2e.lock` (PID + `$LUCIDOS_THREAD_ID` + worktree path + start time) before starting the workspace or any browser. A second invocation while the lock is held (owner PID alive) exits 1 with a message naming the holder. The lock exists because two CC sessions running Playwright concurrently against the shared workspace race on browser processes — on 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac.
+Every e2e entry point (`e2e.sh`, `e2e-browser.sh`, `e2e-api.sh`) acquires `<e2e workspace>/.lucidos/e2e.lock` (PID + `$LUCIDOS_THREAD_ID` + worktree path + start time) before starting the workspace or any browser. A second invocation while the lock is held (owner PID alive) exits 1 with a message naming the holder. The lock exists because two CC sessions running Playwright against the shared workspace race on browser processes. On 2026-04-19 a WebKit GPU child leaked to 28 GB and OOM-rebooted a 32 GB Mac.
 
 **Reclaiming a stale lock is orphan-safe, not blind.** A "stale" lock is one whose owner PID is dead. But an *interrupted* run, killed before its EXIT trap could tear down, leaves orphaned e2e processes alive. They are Playwright/WebKit browser children and the e2e-test workspace engine, still holding RSS.
 
@@ -244,8 +246,8 @@ and lossless.
 
 **Safety nets for variant 2 (kept — recovery, not prevention):**
 
-- The mobile-webkit `context` fixture (`e2e/fixtures.ts`) now preflights every
-  fresh browser context with a cheap same-origin `/api/v1/health` navigation
+- The `context` fixture (`e2e/fixtures.ts`) preflights every fresh browser
+  context of a WebKit project with a cheap same-origin `/api/v1/health` navigation
   before the test's `page` fixture is created. If that first navigation cannot
   commit promptly, the fixture discards the cold context and creates a clean
   one. This makes "context can reach localhost" a setup invariant instead of

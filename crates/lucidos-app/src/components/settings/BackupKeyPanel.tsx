@@ -18,8 +18,6 @@ import {
   type BackupKeys,
 } from '../../api/client';
 
-/** Where the user is in a key flow. Each step holds only what it shows, so a
- *  backup key minted for one setup cannot leak into another step. */
 export type KeyStep =
   | { kind: 'idle' }
   | { kind: 'legacy'; legacyKey: string }
@@ -30,17 +28,12 @@ export type KeyStep =
 
 const PENDING_LINE = 'A new backup key is waiting for you to paste it back.';
 
-/** Why a paste into the own-key step cannot be sent, or `null` to let the
- *  engine judge it. A backup key never leaves the browser from this step,
- *  even inside a pasted key file, whose comment lines come first. */
 export function publicKeyPasteProblem(pasted: string): string | null {
   return pasted.toUpperCase().includes('AGE-SECRET-KEY-')
     ? 'That is your secret backup key. Paste its public key instead, which starts with age1.'
     : null;
 }
 
-/** What seals backups now, in one line. A pending switch away from a legacy key
- *  or from no key names only the switch, since that is the next step. */
 export function backupKeyStatusLine(keys: BackupKeys): string {
   if (keys.recipient) {
     const checked = keys.secs_since_verified == null
@@ -56,12 +49,10 @@ export function backupKeyStatusLine(keys: BackupKeys): string {
   return 'Backups are not set up. Create a backup key first. Only you hold it, so nobody else can open your backups.';
 }
 
-/** Whether anything can seal a backup right now. */
 export function backupsCanSeal(keys: BackupKeys): boolean {
   return keys.recipient !== null || keys.legacy_key;
 }
 
-/** The panel's label, with what age is behind the icon. */
 function backupKeyTitle(): VNode {
   return (
     <span class="settings-row-label">
@@ -90,7 +81,6 @@ function backupKeyTitle(): VNode {
   );
 }
 
-/** The key block as shimmer: its label, status line and one row of buttons. */
 export function backupKeyPanelSkeleton(): VNode {
   return (
     <SkeletonProvider>
@@ -106,13 +96,6 @@ export function backupKeyPanelSkeleton(): VNode {
   );
 }
 
-/**
- * The backup key: setup with the paste-back gate, verify, rotate, the user's
- * own age public key, and the switch from a legacy key.
- *
- * The engine never stores a backup key. It shows a minted one once, and
- * backups keep their current key until the user pastes the new one back.
- */
 export function BackupKeyPanel({
   keys,
   onKeysChanged,
@@ -140,9 +123,6 @@ export function BackupKeyPanel({
     }
   }
 
-  /** A setup and a verify write state the engine does not announce
-   *  (`announced_surfaces.rs`), so the panel re-reads it after either one.
-   *  Its failure has its own toast, so it never hides the write's success. */
   async function rereadKeys() {
     try {
       onKeysChanged(await getBackupKeys());
@@ -364,7 +344,6 @@ export function BackupKeyPanel({
   return (
     <div class="backup-key" data-search-anchor="backup:key">
       {backupKeyTitle()}
-      {/* A step says what is happening itself, so the status line steps aside. */}
       <Disclosure open={step.kind === 'idle'} bodyClass="backup-key-step">
         <div class="backup-key-status" data-state={backupsCanSeal(keys) && !keys.legacy_key ? 'ok' : 'warn'}>
           {backupKeyStatusLine(keys)}

@@ -19,8 +19,6 @@ test.describe('Archiving in Blocked', () => {
             const stamp = Date.now();
             const ids = [randomUUID(), randomUUID(), randomUUID()];
             const base = Date.now();
-            // The list sorts on last_user_action, which the seed leaves at one
-            // shared now(). Pin it so the rows run ids[0], ids[1], ids[2].
             psql([
                 ...ids.map((id, i) => seedThreadRow({
                     id, title: `attention-${i}-${stamp}`, now: new Date(base - i * 60_000).toISOString(),

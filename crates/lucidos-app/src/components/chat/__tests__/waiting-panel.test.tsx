@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
-  unfinishedSubThreads,
+  awaitedSubThreads,
   SubThreadRow,
   subscriptionLine,
   waitingIndicatorBody,
@@ -18,15 +18,11 @@ vi.mock('../../../store/actions/threads', () => ({
 }));
 import type { EventWaitSummary, ThreadMeta, ThreadState, ThreadStatus } from '../../../store/thread-events';
 
-/** Flatten a vnode tree into HTML-ish text preserving class / data-* / aria-*
- *  attributes. Same helper as `todo-list-panel.test.tsx` beside it. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
   if (Array.isArray(node)) return node.map(vnodeToText).join('');
   const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
-  // The head is a pure component, so the walker expands it in place and its
-  // markup reads as rendered. Rows keep hooks, so they stay unexpanded.
   if (v.type === SurfaceHead) {
     return vnodeToText(SurfaceHead(v.props as Parameters<typeof SurfaceHead>[0]));
   }
@@ -93,52 +89,50 @@ function map(...threads: ThreadState[]): Map<string, ThreadState> {
   return new Map(threads.map((t) => [t.meta.id, t]));
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Which children count, and who decides how many there are.
-// ──────────────────────────────────────────────────────────────────────────
 
-describe('unfinishedSubThreads', () => {
-  it('names nothing while the server counts no unfinished child', () => {
-    const children = map(thread('c', { parentThreadId: 'p', status: 'running' }));
-    expect(unfinishedSubThreads('p', children, 0)).toEqual({ threads: [], unresolved: 0 });
+describe('awaitedSubThreads', () => {
+  it('names nothing while the server counts no awaited child', () => {
+    const children = map(
+      thread('c', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
+      thread('no-wake', { parentThreadId: 'p', status: 'running' }),
+    );
+    expect(awaitedSubThreads('p', children, 0)).toEqual({ threads: [], unresolved: 0 });
   });
 
-  it('takes the running, question and waiting children, and no others', () => {
+  it('takes the children the engine flags as awaited, and no others', () => {
     const children = map(
-      thread('running', { parentThreadId: 'p', status: 'running' }),
-      thread('asking', { parentThreadId: 'p', status: 'waiting_for_user_answer' }),
-      // Idle while holding its own subscription: it has not finished
-      // (ADR 0254), and the engine counts it in `waiting_children_count`.
-      thread('subscribed', { parentThreadId: 'p', status: 'idle', liveEventWaitCount: 1 }),
-      // Idle with a proposed change: it reported, and waits only for the user.
-      thread('proposed', { parentThreadId: 'p', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }}),
+      thread('running', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
+      thread('awaiting', { parentThreadId: 'p', status: 'idle', awaitedByParent: true }),
+      thread('no-wake', { parentThreadId: 'p', status: 'running' }),
       thread('finished', { parentThreadId: 'p', status: 'idle' }),
-      thread('elsewhere', { parentThreadId: 'other', status: 'running' }),
+      thread('elsewhere', { parentThreadId: 'other', status: 'running', awaitedByParent: true }),
     );
-    const found = unfinishedSubThreads('p', children, 3);
-    expect(found.threads.map((t) => t.meta.id).sort()).toEqual(['asking', 'running', 'subscribed']);
+    const found = awaitedSubThreads('p', children, 2);
+    expect(found.threads.map((t) => t.meta.id).sort()).toEqual(['awaiting', 'running']);
     expect(found.unresolved).toBe(0);
   });
 
+  it('lists an awaited idle child when the count is 1', () => {
+    const children = map(thread('c1', { parentThreadId: 'p', status: 'idle', awaitedByParent: true }));
+    expect(awaitedSubThreads('p', children, 1)).toEqual({ threads: [children.get('c1')], unresolved: 0 });
+  });
+
   it('reports the children the server counts and the map cannot name', () => {
-    const children = map(thread('c1', { parentThreadId: 'p', status: 'running' }));
-    const found = unfinishedSubThreads('p', children, 3);
+    const children = map(thread('c1', { parentThreadId: 'p', status: 'running', awaitedByParent: true }));
+    const found = awaitedSubThreads('p', children, 3);
     expect(found.threads.map((t) => t.meta.id)).toEqual(['c1']);
     expect(found.unresolved).toBe(2);
   });
 
   it('never reports a negative shortfall when the map is ahead of the count', () => {
     const children = map(
-      thread('c1', { parentThreadId: 'p', status: 'running' }),
-      thread('c2', { parentThreadId: 'p', status: 'running' }),
+      thread('c1', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
+      thread('c2', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
     );
-    expect(unfinishedSubThreads('p', children, 1).unresolved).toBe(0);
+    expect(awaitedSubThreads('p', children, 1).unresolved).toBe(0);
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// The button: it exists exactly while the thread is parked on something.
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('waitingIndicatorBody', () => {
   it('renders nothing when the thread waits on nothing', () => {
@@ -189,12 +183,6 @@ describe('waitingIndicatorBody', () => {
     expect(text).toContain('data-tooltip="3 sub-threads"');
   });
 
-  /** The tooltip says the model's words as written, and carries no verb of its
-   *  own. The aria-label does carry one, so it takes the subject instead: every
-   *  reason for this concept contains a waiting word, and "Waiting for waiting
-   *  for X" is the doubled label
-   *  `docs/plans/2026-08-14-a-wait-label-does-not-say-waiting-twice.md` exists
-   *  to prevent. */
   it('speaks the reason once, however the model phrased it', () => {
     const text = vnodeToText(
       waitingIndicatorBody({
@@ -215,19 +203,11 @@ describe('waitingIndicatorBody', () => {
         onClick: NOOP,
       }),
     );
-    // The lone-reason shortcut is off here: two reasons do not fit a tooltip.
     expect(text).toContain('data-tooltip="1 event, 1 sub-thread"');
     expect(text).toContain('aria-label="Waiting for 1 event, 1 sub-thread. Click to expand."');
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// Panel: the close button lives in the shell's header strip, never floating
-// over the rows. It was absolutely positioned in the panel's top-right corner,
-// where it sat on top of the description as soon as that description wrapped.
-// Being absolute inside the scrolling box, it also scrolled away with a long
-// list. The structure is what fixes that, so the structure is what this pins.
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('waitingPanelBody', () => {
   const body = (over: Partial<Parameters<typeof waitingPanelBody>[0]> = {}) =>
@@ -260,8 +240,6 @@ describe('waitingPanelBody', () => {
 
   it('renders one header strip however many waits are live', () => {
     const text = body({ waits: [wait({ wait_id: 'a' }), wait({ wait_id: 'b' })] });
-    // Rows are their own component, so they render as an empty vnode here;
-    // the list container plus the head is what this body owns.
     expect(text).toContain('event-wait-list');
     expect((text.match(/class="surface-head"/g) ?? []).length).toBe(1);
   });
@@ -281,17 +259,12 @@ describe('waitingPanelBody', () => {
     expect(text).toContain('>Sub-threads<');
   });
 
-  /** A label tells two lists apart, so a lone list needs none. With one it
-   *  restated the panel's own "Waiting for" title one step in, and stacked two
-   *  uppercase labels above a single row. */
   it('leaves a lone section unlabelled', () => {
     expect(body()).not.toContain('waiting-panel-section-label');
     const childrenOnly = body({ waits: [], subThreads: { threads: [thread('c1')], unresolved: 0 } });
     expect(childrenOnly).not.toContain('waiting-panel-section-label');
   });
 
-  /** A popover never opens a second layer, so a condition replaces the list in
-   *  place, under a head that leads back to it. */
   it('drills into a condition in place, with a way back to the list', () => {
     const text = body({ condition: { eventType: 'CodingAgentIdled', conditions: [{ thread_id: 't1' }] } });
     expect(text).toContain('data-role="surface-back"');
@@ -299,9 +272,7 @@ describe('waitingPanelBody', () => {
     expect(text).toContain('>Condition<');
     expect(text).toContain('data-role="waiting-condition"');
     expect(text).toContain('data-role="event-condition-json"');
-    // The list is gone, not hidden under the condition.
     expect(text).not.toContain('event-wait-list');
-    // The X still closes the whole panel.
     expect(text).toContain('aria-label="Close what this thread is waiting for"');
   });
 
@@ -327,13 +298,6 @@ describe('waitingPanelBody', () => {
   });
 });
 
-/** **The panel says "(with a condition)" too, so it owes the same answer as the
- *  transcript.** Both go through `eventConditionDoor`, which is what keeps one
- *  affordance from acquiring two behaviours.
- *
- *  The joined LOOK survives: still one muted line reading `watching for A or B`.
- *  Only a filtered entry becomes a button, and it drills the popover into the
- *  condition rather than stacking a second popover over it. */
 describe('the panel subscription line', () => {
   afterEach(() => {
     eventConditionPopover.value = null;
@@ -359,20 +323,15 @@ describe('the panel subscription line', () => {
     ]);
     const button = line[1] as VNode<{ 'aria-label': string; onClick: () => void }>;
     expect(button.type).toBe('button');
-    // The same accessible name the transcript chip carries, because both come
-    // from the one door.
     expect(button.props['aria-label']).toBe('github workflow run state changed · show the condition');
     button.props.onClick();
     expect(waitingPanelCondition.value).toEqual({
       eventType: 'GithubWorkflowRunStateChanged',
       conditions: [CONDITION],
     });
-    // No second layer: the transcript's popover stays shut.
     expect(eventConditionPopover.value).toBeNull();
   });
 
-  /** An entry with no condition promises nothing, so it must offer no door. Its
-   *  tooltip says what the event means, as the transcript chip's does. */
   it('leaves an unfiltered entry as plain text', () => {
     const line = subscriptionLine([{ event_type: 'ChangeProposed' }]);
     expect((line[1] as VNode).type).toBe('span');
@@ -383,8 +342,6 @@ describe('the panel subscription line', () => {
 });
 
 describe('a sub-thread row', () => {
-  /** The click handler off the row's button, which the vnode walkers above
-   *  deliberately drop (they render attributes, not behaviour). */
   function clickRow(onOpen: () => void): void {
     const li = SubThreadRow({ child: thread('c1'), onOpen }) as VNode<{
       children?: ComponentChildren;
@@ -399,8 +356,6 @@ describe('a sub-thread row', () => {
     expect(focusThreadOrBootstrap).toHaveBeenCalledWith('c1');
   });
 
-  /** The panel describes the thread it was opened from, so it must not survive
-   *  a jump to another one: left open it would re-read against the child. */
   it('closes the panel on the way out', () => {
     const onOpen = vi.fn();
     clickRow(onOpen);

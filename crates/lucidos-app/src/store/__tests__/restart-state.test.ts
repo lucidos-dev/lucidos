@@ -18,13 +18,6 @@ beforeEach(() => {
   localStorage.removeItem(LEGACY_REASONS_LS_KEY);
 });
 
-// The pre-switch "New version available." engine toast was RETIRED (single-surface
-// decision, docs/plans/2026-07-01-version-toast-single-surface-and-client-ordering.md):
-// the engine "New version available → Switch to new version" surface is owned solely
-// by the poll-driven engine-new-version toast (engine-update.ts), which fires only
-// once the background rebuild is `ready`. syncRestartState / addRestartGroup do
-// bookkeeping only (restartRequired + restartGroups + RESTART_LS_KEY) so the
-// brand badge and the restart confirm dialog survive a reload, with no toast.
 describe('restart-required state (no pre-switch toast)', () => {
   it('does NOT show a toast when restartRequired is true', () => {
     restartRequired.value = true;
@@ -72,9 +65,6 @@ describe('restart-required state (no pre-switch toast)', () => {
   });
 
   it('leaves the progress dialog alone while a restart is in flight', () => {
-    // Restart in progress: engineRestarting is true and so is restartRequired,
-    // which only clears on reconnect. A re-sync (SSE reconnect / new applied
-    // change) must not close the dialog by clearing the flag it rides.
     engineRestarting.value = true;
     restartRequired.value = true;
     engineRestartNewVersion.value = true;
@@ -132,8 +122,6 @@ describe('restart groups tracking (thread title + commits)', () => {
   });
 
   it('restoreRestartState restores groups from localStorage for the confirm dialog', () => {
-    // The groups are needed by the Lucidos menu / SystemPage restart confirm
-    // dialog, so they must rehydrate on reload even though no toast is shown.
     const groups = [
       { threadId: 't1', threadTitle: 'Fix auth', commits: ['feat: OAuth'] },
       { threadId: 't2', threadTitle: 'Update API', commits: ['refactor: handler'] },

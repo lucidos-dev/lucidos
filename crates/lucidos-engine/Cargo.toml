@@ -4,22 +4,27 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# Exposes engine fixtures to the agent crate dev-dependency.
+test-support = ["lucidos-core/test-support", "lucidos-local-token/test-support"]
+
 # Tests that exercise properties of the real fastembed model
 # (MultilingualE5Small). These tests require ~465 MB of model + tokenizer
 # files from huggingface.co on first run, so they're excluded from default
 # `cargo test` to keep the suite offline-safe. Run with:
 #     cargo test -p lucidos-engine --features real-embedder-tests
-real-embedder-tests = []
+real-embedder-tests = ["lucidos-core/real-embedder-tests"]
 
 # Compiles in test-only HTTP endpoints (e.g. `GET /api/_test/push-log`) and
 # swaps the real web-push transport for an in-process logger that appends to
 # the `push_log` table. The e2e workspace builds with this feature enabled;
 # production binaries never include the test endpoints or the stub
-# transport. See `system-knowhow/notifications.md` §5.4 for the e2e harness
+# transport. See `system-knowhow/notifications/4-5-service-worker-wedge-mitigation-stac-3.md` §5 for the e2e harness
 # this feature backs.
-e2e-test-hooks = []
+e2e-test-hooks = ["lucidos-core/e2e-test-hooks"]
 
 [dependencies]
+lucidos-core = { path = "../lucidos-core" }
+lucidos-diagnostic-log = { path = "../lucidos-diagnostic-log" }
 lucidos-secret-store = { path = "../lucidos-secret-store" }
 async-trait = "0.1"
 bytes = "1"
@@ -37,13 +42,16 @@ lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-build-slot = { path = "../lucidos-build-slot" }
 lucidos-home = { path = "../lucidos-home" }
 lucidos-installs = { path = "../lucidos-installs" }
-lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-update-channel = { path = "../lucidos-update-channel" }
+lucidos-local-token = { path = "../lucidos-local-token", features = ["client"] }
 lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 # The engine socket the gateway reaches this engine on (ADR 0445).
 lucidos-engine-socket = { path = "../lucidos-engine-socket" }
 lucidos-frame-capability = { path = "../lucidos-frame-capability" }
+lucidos-gateway-stamp = { path = "../lucidos-gateway-stamp" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
 lucidos-pg-url = { path = "../lucidos-pg-url" }
+lucidos-agent-sandbox = { path = "../lucidos-agent-sandbox" }
 lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 lucidos-capabilities = { path = "../lucidos-capabilities" }
 lucidos-claude-code-managed = { path = "../lucidos-claude-code-managed" }
@@ -129,19 +137,14 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 toml = "0.8"
 semver = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "async", "cache"] }
 unicode-normalization = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false }
-# Rust parser. Reads the ThreadEvent enum and its payload types out of the
-# source, so the frontend's wire types can be generated from them
-# (`engine/thread_events/ts_codegen.rs`). Only the `lucidos-codegen` bin reaches
-# it, so the linker leaves it out of the engine binary. No production type
-# carries a codegen derive.
-syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
-proc-macro2 = "1"
 
 [dev-dependencies]
+lucidos-core = { path = "../lucidos-core", features = ["test-support"] }
+lucidos-local-token = { path = "../lucidos-local-token", features = ["test-support"] }
 # Enables `#[tokio::test(start_paused = true)]` for time-mocked tests.
 tokio = { version = "1", features = ["test-util"] }
 # WAT (WebAssembly text format) compiler — used by proxy_wasm_signer tests

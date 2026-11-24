@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A theme recolours the three actor icons through the "Brand marks" tokens.
- *
- * `theme-token-catalog.test.ts` already pins each default to `base.css`. This
- * pins the other half. Every mark reads its token, and each var() fallback is
- * the catalog default. So a mark painted before the stylesheet loads looks the
- * same as one painted after.
- */
 import { describe, it, expect } from 'vitest';
 import { render } from 'preact';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -32,7 +24,7 @@ interface CatalogToken {
   derive?: unknown;
 }
 const catalog: { tokens: CatalogToken[] } = JSON.parse(
-  readFileSync(resolve(repo, 'crates/lucidos-engine/src/core/themes/theme-tokens.json'), 'utf-8'),
+  readFileSync(resolve(repo, 'crates/lucidos-core/src/core/themes/theme-tokens.json'), 'utf-8'),
 );
 const defaultOf = (name: string): string => {
   const token = catalog.tokens.find(t => t.name === name);
@@ -98,8 +90,6 @@ describe('the Lucidos mark', () => {
 
 describe('the Codex mark', () => {
   it('fills --codex-mark through a presentation attribute', () => {
-    // `.thread-row-agent .codex-icon` repaints it with an author rule, which
-    // an inline style would beat.
     const host = document.createElement('div');
     render(<CodexIcon />, host);
     const svg = host.querySelector('svg')!;
@@ -127,5 +117,53 @@ describe('the Claude mark', () => {
       .filter(({ css }) => css.includes('var(--initiator-coding-agent)'))
       .map(({ file }) => file);
     expect(readers).toEqual(['global/base.css']);
+  });
+});
+
+
+describe('optional agent colours', () => {
+  it('preserves the existing appearance outside the drawer when colours are off', () => {
+    const css = readFileSync(resolve(styles, 'global/base.css'), 'utf-8');
+    expect(cssRules(css).filter(r => r.selector.includes('data-agent-brand-colours'))).toEqual([]);
+  });
+
+  it('uses the original flat drawer marks unless brand colours are enabled', () => {
+    const rules = cssRules(readFileSync(resolve(styles, 'drawer.css'), 'utf-8'));
+    const props = (selector: string) => rules.find(r => r.selector === selector)!.props;
+    const enabled = ':root:not([data-agent-brand-colours="off"]) ';
+    expect(props('.thread-row-agent').get('color')).toBe('var(--text-muted)');
+    expect(props('.thread-row-agent .codex-icon').get('fill')).toBe('currentColor');
+    expect(props('.thread-row-agent[data-glyph="lucidos"] .lucidos-mark').get('display')).toBe('none');
+    expect(props(enabled + '.thread-row-agent .claude-icon').get('color')).toBe('var(--claude-mark)');
+    expect(props(enabled + '.thread-row-agent .codex-icon').get('fill')).toBe('var(--codex-mark)');
+    expect(props(enabled + '.thread-row-agent .lucidos-mark-icon').get('display')).toBe('none');
+    expect(props(enabled + '.thread-row-agent[data-glyph="lucidos"] .lucidos-mark').get('display')).toBe('block');
+  });
+});
+
+
+describe('default agent mark contrast', () => {
+  const colour = (name: string, mode: 'light' | 'dark'): string => {
+    const value = catalog.tokens.find(t => t.name === name)!.default[mode];
+    const reference = /^var\((--[a-z-]+)\)$/.exec(value);
+    return reference ? colour(reference[1], mode) : value;
+  };
+  const luminance = (hex: string): number => {
+    const digits = hex.slice(1);
+    const full = digits.length === 3 ? [...digits].map(c => c + c).join('') : digits;
+    const channels = full.match(/../g)!.map(c => {
+      const value = parseInt(c, 16) / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  };
+  it.each(['light', 'dark'] as const)('keeps coloured and muted glyphs readable in %s mode', mode => {
+    for (const mark of ['--claude-mark', '--codex-mark', '--text-secondary']) {
+      for (const surface of ['--bg-primary', '--bg-secondary', '--bg-selected', '--bg-tertiary']) {
+        const a = luminance(colour(mark, mode));
+        const b = luminance(colour(surface, mode));
+        expect((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), `${mark} on ${surface}`).toBeGreaterThanOrEqual(3);
+      }
+    }
   });
 });

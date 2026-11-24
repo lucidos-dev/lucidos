@@ -11,6 +11,7 @@ fn input(command: &str, out_of_workspace: bool) -> JudgeInput {
         command: command.to_string(),
         out_of_workspace,
         fast_path_refused: false,
+        script_sources: vec![],
     }
 }
 
@@ -196,34 +197,41 @@ fn a_confident_answer_takes_its_own_lane() {
     );
 }
 
-/// ADR 0002's first tie-break, now in code. A command the model leans toward
-/// safe, but not confidently, still asks.
 #[test]
-fn an_unsure_safe_answer_asks() {
-    assert_eq!(
-        read_lane_of(lanes(SAFE_MIN_PROBABILITY - 0.1, 0.2, 0.2)),
-        RiskLane::IrreversibleDanger,
-        "leading is not enough, the bar is the threshold"
-    );
-    assert_eq!(
-        read_lane_of(lanes(SAFE_MIN_PROBABILITY, 0.2, 0.1)),
-        RiskLane::Safe,
-        "at it"
-    );
+fn the_combined_threshold_decides_whether_to_ask() {
+    let threshold = SAFE_MIN_PROBABILITY;
+    for (safe, reversible, expected) in [
+        (threshold - 0.2, 0.1, RiskLane::IrreversibleDanger),
+        (0.0, threshold, RiskLane::ReversibleDanger),
+        (threshold - 0.25, 0.25, RiskLane::ReversibleDanger),
+        (threshold - 0.25, 0.3, RiskLane::ReversibleDanger),
+        (threshold, 0.0, RiskLane::Safe),
+        (threshold + 0.1, 0.0, RiskLane::Safe),
+    ] {
+        assert_eq!(read_lane_of(lanes(safe, reversible, 0.0)), expected);
+    }
 }
 
-/// ADR 0002's second tie-break. Split between the two danger lanes means ask,
-/// never snapshot-and-run.
 #[test]
-fn an_unsure_danger_answer_is_irreversible() {
-    assert_eq!(
-        read_lane_of(lanes(0.1, 0.5, 0.4)),
-        RiskLane::IrreversibleDanger
-    );
-    assert_eq!(
-        read_lane_of(lanes(0.1, 0.7, 0.2)),
-        RiskLane::ReversibleDanger
-    );
+fn empty_and_malformed_lane_distributions_ask() {
+    for probabilities in [
+        HashMap::new(),
+        HashMap::from([(SAFE.to_string(), f64::NAN)]),
+        HashMap::from([(SAFE.to_string(), f64::INFINITY)]),
+        HashMap::from([(SAFE.to_string(), -1.0)]),
+        HashMap::from([(SAFE.to_string(), 2.0)]),
+        HashMap::from([(SAFE.to_string(), 0.9), (REVERSIBLE.to_string(), 0.9)]),
+        HashMap::from([(SAFE.to_string(), 1.0), ("unknown".to_string(), 0.0)]),
+    ] {
+        assert_eq!(
+            read_lane(&ChoiceAnswer {
+                choice: SAFE.to_string(),
+                probabilities,
+                confidence: 1.0,
+            }),
+            RiskLane::IrreversibleDanger
+        );
+    }
 }
 
 /// A distribution naming options nobody asked for reads as all-zero, so it

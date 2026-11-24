@@ -100,7 +100,6 @@ function create(options: ModelPickerOptions): ModelPickerInstance {
           onKeyDown={event => {
             if (event.key === 'Tab') {
               opened.value = false;
-              // Restore DOM order before the browser performs native traversal.
               trigger.current?.focus();
             }
           }}
@@ -137,8 +136,6 @@ function create(options: ModelPickerOptions): ModelPickerInstance {
     }
   }
   const ready = refresh();
-  // `ready` remains rejectable to callers while an optional onError-only user
-  // does not create an unhandled rejection during initial loading.
   void ready.catch(() => {});
   return {
     element, ready, refresh,

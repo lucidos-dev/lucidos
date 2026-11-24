@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Widget embeds in a reply (ADR 0415). The renderer writes a nonce-marked slot
- * per embed. The reply mounts a frame in it only once its text is final. It
- * keeps that frame across re-renders with the same HTML.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
 import { render } from 'preact';
@@ -100,10 +95,6 @@ describe('ReplyHtml', () => {
     expect(frames()[0]).toBe(first);
   });
 
-  // A reply cannot be refused, so the frontend applies the rules the engine
-  // applies to an option: params the manifest takes, and the owner rule.
-  // The reason is the one the engine gives for an option, so whoever wrote the
-  // embed can fix it.
   const reasons = () => Array.from(host.querySelectorAll('.inline-widget-gone-reason'), (el) => el.textContent);
 
   it('reads "not available", and why, for unknown params, a missing one, or another thread\'s widget', () => {

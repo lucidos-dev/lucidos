@@ -1,9 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
-// Real ApiError shape (httpCode + parsed body) so `instanceof` + `.body`
-// resolve exactly as the production class does — confirmDeleteApp keys its
-// redirect on both.
 class ApiError extends Error {
   constructor(
     public readonly httpCode: number,
@@ -70,7 +67,6 @@ describe('confirmDeleteApp — plugin ownership', () => {
   });
 
   it('redirects to the plugin uninstall panel on a 409 (plugin-owned app)', async () => {
-    // Engine refuses the raw delete with the owning plugin id/name.
     deleteAppApi.mockRejectedValue(
       new ApiError(409, 'owned by plugin', {
         plugin_id: 'no-role-playing',
@@ -83,10 +79,8 @@ describe('confirmDeleteApp — plugin ownership', () => {
     const { confirmDeleteApp } = await import('./apps');
     await confirmDeleteApp('anti-sycophancy-critique', 'No role playing');
 
-    // Stages the uninstall for the OWNING PLUGIN, not the app id.
     expect(stagePluginUninstall).toHaveBeenCalledWith('no-role-playing');
     expect(openPluginUninstallRequest).toHaveBeenCalledWith(staged);
-    // No dead-end error toast — the user was routed, not failed.
     expect(showToast).not.toHaveBeenCalled();
   });
 

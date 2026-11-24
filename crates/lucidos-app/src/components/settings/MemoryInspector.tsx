@@ -72,8 +72,6 @@ function ImportanceBar({ distribution, selected, onToggle }: {
   );
 }
 
-/** The stats strip. Its labels are known up front; with no `stats`, inside a
- *  `SkeletonProvider`, its figures and importance bar shimmer. */
 function MemoryStatsBar({ stats, importanceFilter = new Set(), onToggle = () => {} }: {
   stats?: MemoryStatsResponse;
   importanceFilter?: Set<ImportanceLevel>;
@@ -108,11 +106,8 @@ function MemoryStatsBar({ stats, importanceFilter = new Set(), onToggle = () => 
   );
 }
 
-/** Line widths a source block shimmers with while it loads. */
 const SOURCE_SKELETON_LINES = ['70%', '88%', '55%', '80%'];
 
-/** A memory's source text. Under a `SkeletonProvider` it draws its own box
- *  with shimmer lines. */
 function SourceBlock({ text }: { text?: string }) {
   if (useSkeleton()) {
     return (
@@ -131,12 +126,6 @@ function importanceDotClass(importance: number): string {
   return 'low';
 }
 
-/** Self-skeletonizing memory row: rendered with no entry inside a
- *  SkeletonProvider (`<MemoryEntryRow />`) it draws itself as a collapsed loading
- *  placeholder via the Sk* leaves; with a real `entry` it renders normally. The
- *  prop is optional only to support the skeleton call; the real call site passes
- *  it. The expand state stays collapsed in skeleton mode (initial state + the
- *  click handler is gated on `!sk`), so the detail section never shows. */
 function MemoryEntryRow({ entry }: { entry?: MemoryEntryInfo }) {
   const sk = useSkeleton();
   const [expanded, setExpanded] = useState(false);
@@ -239,8 +228,6 @@ function MemoryEntryRow({ entry }: { entry?: MemoryEntryInfo }) {
               {sourceData.status === 'failed' && (
                 <div class="memory-source-error">Failed to load source: {sourceData.error}</div>
               )}
-              {/* Rolls open with the skeleton once the read is slow, or with the
-                  source itself on a fast one. */}
               <Disclosure open={sourceVisible && (sourceData.status === 'loaded' || showSourceLoading)}>
                 <LoadingFade
                   showSkeleton={showSourceLoading}
@@ -281,19 +268,13 @@ export function MemoryInspector() {
   const rebuild = memoryRebuildProgress.value;
   const statsPending = stats.status === 'not-loaded' || stats.status === 'loading';
   const entriesPending = entries.status === 'not-loaded' || entries.status === 'loading';
-  // One gate for both reads, so their skeletons arrive in one wave. Each still
-  // clears on its own read.
   const gate = useDelayedFlag(statsPending || entriesPending);
   const showStatsLoading = gate && statsPending;
   const showEntriesLoading = gate && entriesPending;
 
   const importanceParam = [...importanceFilter].join(',');
 
-  // Numbers each read of the entries. A filter or page change can start a read
-  // before the last one answers, and only the newest may land.
   const entriesRequest = useRef(0);
-  // A re-read of the page on show keeps it visible. A new filter or page is
-  // different entries, so it blanks rather than show the old ones as its own.
   const loadEntries = useCallback(async (newOffset: number, { reread = false }: { reread?: boolean } = {}) => {
     const request = ++entriesRequest.current;
     if (reread) setLoadingIfFresh(entriesLoadable);
@@ -327,7 +308,6 @@ export function MemoryInspector() {
     }
   }, []);
 
-  // Reload stats and entries when rebuild completes
   useEffect(() => {
     const isRebuilding = rebuild !== null;
     if (prevRebuilding.current && !isRebuilding) {
@@ -403,7 +383,6 @@ export function MemoryInspector() {
   async function handleRebuild() {
     try {
       await rebuildMemory(forceRebuild);
-      // Show immediate feedback before first SSE progress event arrives
       memoryRebuildProgress.value = { processed: 0, total: 0, percent: 0 };
     } catch (e) {
       showToast(`Failed to start rebuild: ${errorDetail(e)}`, 'error');

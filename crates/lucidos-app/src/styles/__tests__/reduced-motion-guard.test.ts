@@ -1,18 +1,3 @@
-/**
- * Reduced motion has ONE source of truth, and every animation answers to it.
- *
- * The client resolves the device's Motion setting and the OS switch into one
- * value (`utils/motion.ts`) and publishes it as `data-motion` on `<html>`. The
- * boot script does the same before first paint. So:
- *
- *   1. Nothing reads the media query itself. A stylesheet that does ignores a
- *      user who picked Reduce or Full in the app.
- *   2. Every animation that the duration scale cannot reach has a rule on
- *      `:root[data-motion="reduce"]` for its own selector. The scale collapses
- *      a scaled one-shot; an indefinite or literal-duration one needs a rule.
- *   3. The boot splash resolves before it paints, so it never moves for a
- *      device that asked for calm.
- */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -31,14 +16,12 @@ const srcRoot = resolve(here, '../..');
 const appRoot = resolve(srcRoot, '..');
 const indexHtml = readFileSync(resolve(appRoot, 'index.html'), 'utf8');
 
-/** The boot splash's inline stylesheet, which ships in index.html. */
 function splashCss(): string {
   const start = indexHtml.indexOf('/* lucidos-boot-splash-css-start */');
   const end = indexHtml.indexOf('/* lucidos-boot-splash-css-end */');
   return indexHtml.slice(start, end);
 }
 
-/** Every stylesheet the client ships, as [label, css]. */
 function clientStyleSheets(): Array<[string, string]> {
   const sheets: Array<[string, string]> = styleSheetPaths(srcRoot).map(
     (path: string) => [relative(srcRoot, path), readFileSync(path, 'utf8')] as [string, string],
@@ -47,14 +30,10 @@ function clientStyleSheets(): Array<[string, string]> {
   return sheets;
 }
 
-/** One entry of an `animation` shorthand needs its own reduced-motion rule
- *  unless the duration scale reaches it. An indefinite one never scales, by
- *  convention (`.claude/rules/frontend-css.md`), and a literal one never can. */
 function needsOwnRule(entry: string): boolean {
   return /\binfinite\b/.test(entry) || !/var\(--duration/.test(entry);
 }
 
-/** The animated selectors in `css` that no reduced-motion rule stops. */
 function uncoveredAnimations(css: string): string[] {
   const rules = cssRules(css).filter((r) => !r.atRules.includes('@keyframes'));
   const stopped = new Set<string>();

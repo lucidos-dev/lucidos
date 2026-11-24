@@ -267,12 +267,14 @@ Workspace crates:
 | `lucidos-engine` | The engine: everything in the table above |
 | `lucidos-e2e` | API end-to-end suite |
 | `lucidos-gateway` | Multi-workspace gateway and routing |
+| `lucidos-gateway-tls` | What each gateway connection is served over, and its certificates |
 | `lucidos-app` | Tauri desktop shell, plus the frontend under `src/` |
 | `lucidos-eval` | Evaluation harness |
 | `lucidos-cli` | The `lucidos` command-line tool |
 | `lucidos-installs` | Install discovery and update checks |
 | `lucidos-build-slot` | Build-slot arbitration between concurrent builds |
-| `lucidos-local-token` | Local auth token issue and verify |
+| `lucidos-local-token` | Local auth token issue and verify, and the loopback client |
+| `lucidos-loopback-ca` | Per-user CA that signs the loopback HTTPS leaves, and its trust |
 | `lucidos-tailscale` | Tailscale integration |
 | `lucidos-file-backup-exclusion` | Marks paths excluded from OS backup |
 | `signers/binance-hmac` | Request-signing plugin, outside `crates/` and the workspace |

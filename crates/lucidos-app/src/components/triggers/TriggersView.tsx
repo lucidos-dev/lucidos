@@ -29,8 +29,6 @@ import { scrollBehavior } from '../../utils/motion';
 const NO_COLLAPSED_SECTIONS: ReadonlySet<string> = new Set();
 
 function sortByCompletion(a: TriggerInfo, b: TriggerInfo): number {
-  // Stopped triggers sink to the bottom within their section, preserving the
-  // panel's pre-grouping behavior.
   const aNoMore = hasNoMoreRuns(a);
   const bNoMore = hasNoMoreRuns(b);
   if (aNoMore !== bNoMore) return aNoMore ? 1 : -1;
@@ -49,13 +47,8 @@ export function TriggersView() {
   const triggersLoadable = triggers.value;
   const groupsLoadable = triggerGroups.value;
   const showTriggersLoading = useDelayedLoading(triggersLoadable);
-  // Scopes the deep-link row lookup to this panel's own list, which is what
-  // keeps it off a chat link wearing the same attribute. See the effect below.
   const listRef = useRef<HTMLDivElement>(null);
   const [newGroupName, setNewGroupName] = useState<string | null>(null);
-  // Set once the draft is submitted or cancelled. Closing the field fires a
-  // trailing blur into commitNewGroup, which would POST again (a sticky 409
-  // toast) or create the group Escape cancelled. Reset when the field reopens.
   const groupDraftSettledRef = useRef(false);
 
   async function commitNewGroup() {
@@ -116,17 +109,9 @@ function TriggersLoaded({
   groupDraftSettledRef: { current: boolean };
   listRef: { current: HTMLDivElement | null };
 }) {
-  // Group registry is small; if it failed, fall back to a flat panel under
-  // "Ungrouped" so the user still sees their triggers. The failure surfaces
-  // separately wherever the registry is needed (e.g. the picker in the trigger
-  // form). Same idea as triggers' empty-as-failed guard.
   const groups = loadedOr(groupsLoadable, []);
   const knownGroupIds = new Set(groups.map(g => g.id));
 
-  // Bucket triggers by section: their group id, or Ungrouped. A trigger whose
-  // group_id doesn't resolve to a known group (e.g. concurrent delete landed
-  // between the trigger's group_id update and the panel refetch) falls back to
-  // the Ungrouped section so the row can never go invisible.
   const sectionOf = (t: TriggerInfo) =>
     t.group_id && knownGroupIds.has(t.group_id) ? t.group_id : UNGROUPED_TRIGGER_SECTION_ID;
   const sectionRows = triggersData.map(t => ({ id: t.id, section: sectionOf(t) }));
@@ -139,16 +124,10 @@ function TriggersLoaded({
   }
   for (const bucket of bySection.values()) bucket.sort(sortByCompletion);
 
-  // With no groups there are no headings, so nothing can be collapsed or
-  // reopened. A saved Ungrouped collapse must not hide the whole panel.
   const collapsed = groups.length > 0 ? collapsedTriggerSectionIds.value : NO_COLLAPSED_SECTIONS;
   const ungroupedTriggers = bySection.get(UNGROUPED_TRIGGER_SECTION_ID) ?? [];
   const ungroupedCollapsed = collapsed.has(UNGROUPED_TRIGGER_SECTION_ID);
 
-  // Trigger deep link: once the rows have rendered, scroll the targeted one
-  // into view and mark it. `resolveTriggerScrollStep` owns the decision and is
-  // unit-tested without a DOM; this effect only carries it out. Mirrors
-  // StoreTab's `pluginScrollTarget` effect.
   useEffect(() => {
     const step = resolveTriggerScrollStep(triggerScrollTarget.value, sectionRows, collapsed);
     if (step.kind === 'idle') return;
@@ -158,15 +137,8 @@ function TriggersLoaded({
     }
     if (step.kind === 'expand') {
       expandTriggerSection(step.sectionId);
-      return; // The anchor mounts on the next render; the target survives.
+      return;
     }
-    // Scoped to THIS panel's list, never `document`. A trigger link in a chat
-    // message carries the same `data-trigger-id`, and the transcript sits
-    // earlier in the DOM. Mobile mounts every pane at once, so a document-wide
-    // query returned the link the user had just tapped. It marked that link,
-    // scrolled the transcript, and spent the target before reaching the row.
-    // A link never sits inside the Triggers list, so the scope settles this by
-    // construction rather than by a tie-break.
     const el = listRef.current?.querySelector<HTMLElement>(
       `[data-trigger-id="${CSS.escape(step.triggerId)}"]`,
     );
@@ -174,16 +146,10 @@ function TriggersLoaded({
     el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
     applyNavFocus(el);
     triggerScrollTarget.value = null;
-    // `sectionRows` is rebuilt every render; the two loadables it derives from
-    // are the stable deps.
   }, [triggerScrollTarget.value, triggersData, groupsLoadable, collapsed, listRef]);
 
   const creatingGroup = newGroupName !== null;
   const createInputRef = useRef<HTMLInputElement>(null);
-  // Closing the field leaves it focused (Escape and a committed Enter both do),
-  // and it stays mounted now, so the mobile keyboard would hang over a panel
-  // with nothing to type into. onBlur is only wired while open, so this cannot
-  // re-submit the name.
   useEffect(() => {
     if (!creatingGroup) createInputRef.current?.blur();
   }, [creatingGroup]);
@@ -224,13 +190,6 @@ function TriggersLoaded({
           </Disclosure>
         </div>
       )}
-      {/* Mounted whether or not the field is open, clipped to nothing until it
-          is, for the same reason as the group header's rename field: iOS raises
-          the keyboard only for a focus() made inside the user's own gesture, so
-          the field the New Group card focuses has to already exist when the card
-          is tapped. The row collapses rather than unmounting, and the input
-          inside keeps its own box, so the element iOS scrolls into view is a
-          real one. */}
       <div class={`trigger-group-create-row${creatingGroup ? '' : ' trigger-group-create-idle'}`}>
         <input
           ref={createInputRef}
@@ -240,16 +199,9 @@ function TriggersLoaded({
           placeholder="Group name"
           {...PROSE_TEXT_ATTRS}
           tabIndex={creatingGroup ? 0 : -1}
-          // Clipped is not hidden: without this a screen reader would find a
-          // "Group name" field sitting in the panel at all times, doing
-          // nothing. Flips with the open state, and the New Group button
-          // unhides it in the same tap that focuses it.
           aria-hidden={!creatingGroup}
           onInput={e => setNewGroupName((e.target as HTMLInputElement).value)}
           onBlur={creatingGroup ? commitNewGroup : undefined}
-          // Escape cancels. The central Escape policy would blur the field
-          // first, and the blur commits, so the field handles it. The latch
-          // turns the blur below into a plain defocus.
           data-escape-self
           onKeyDown={e => {
             if (e.key === 'Enter') void commitNewGroup();
@@ -268,7 +220,6 @@ function TriggersLoaded({
           label="New Group"
           onClick={() => {
             groupDraftSettledRef.current = false;
-            // Synchronous, and before the state flip: see the note above.
             createInputRef.current?.focus();
             setNewGroupName('');
           }}

@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-19
+- **Amended by**: [0677: Tool grants live in the permissions store](0677-tool-grants-live-in-the-permission-store.md) (the engine imports and deletes the legacy workspace files)
 
 ## Context
 

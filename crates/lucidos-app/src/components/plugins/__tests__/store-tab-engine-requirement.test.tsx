@@ -39,7 +39,6 @@ function show(plugin: MarketplacePlugin): HTMLDivElement {
   return host;
 }
 
-/** The detail page's chips, where the no-requirement note lives. */
 function showMeta(plugin: MarketplacePlugin): HTMLDivElement {
   host = document.createElement('div');
   render(<PluginMeta plugin={plugin} />, host);

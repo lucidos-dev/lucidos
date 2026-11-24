@@ -59,7 +59,9 @@ service** (a launchd LaunchAgent on macOS, a systemd `--user` unit on Linux) so 
 survives terminal-close + reboot and restarts on failure. The gateway provisions
 the embedded Postgres and supervises the engine, the same model as the macOS
 `.app`. No Docker, no Rust/Node, no clone, no compile. First run is seconds, not
-minutes. It opens at <http://localhost:5252>. Pass `--no-service` to run it in the
+minutes. It opens at <https://localhost:5252>, once you trust its *local
+certificate*: the installer does that in a desktop session, and
+`lucidos tls trust` does it any time. Pass `--no-service` to run it in the
 foreground instead (Ctrl-C to stop).
 
 One more way to get the headless runtime:
@@ -116,16 +118,18 @@ relative search paths. Linux builds require `patchelf`, `binutils`, and the
 runtime library packages listed in `.github/workflows/release-tarballs.yml`.
 
 **Remote access & push notifications.** The gateway listens on **localhost
-only** by default (the secure posture) and serves plain HTTP. Browsers grant
-service workers (and with them **push notifications + PWA install**) only on
-a *secure origin* (https or localhost), so to use Lucidos from other devices:
+only** by default (the secure posture), over HTTPS with the local certificate.
+Only its own machine trusts that certificate, so an SSH tunnel to `localhost`
+does not work. Browsers grant service workers (and with them **push
+notifications + PWA install**) only on a *secure origin*, so to use Lucidos
+from other devices:
 
-- `ssh -L 5252:localhost:5252 <host>`, then open <http://localhost:5252>: the
-  full app including push, zero config (localhost is a secure context).
 - `tailscale serve --bg 5252`: trusted HTTPS on your tailnet.
+- From a second computer with Lucidos: pair this gateway in Settings → Access →
+  Remote gateways.
 - Or expose it directly:
   `./install.sh --bind all --tls-cert <cert.pem> --tls-key <key.pem>`.
-  `--bind` writes the machine-global `~/.lucidos/network.toml` (the same knob
+  `--bind` writes the machine-global `network.toml` in the private subtree (the same knob
   as the picker's Settings → Network access); the TLS pair makes the gateway
   serve https (push needs a certificate your browsers trust). A bare
   `--bind all` without TLS serves the app over `http://<host>`, usable, but
@@ -140,7 +144,7 @@ a *secure origin* (https or localhost), so to use Lucidos from other devices:
   Settings → Access → **Pair a gateway** (or `lucidos pair --gateway`) mints a
   code. On the opening machine, **Add a remote gateway** takes the `https`
   address and the code. Its workspaces then list as `<slug>@<name>`, for every
-  device paired with it. See `system-knowhow/remote-access.md` § Pair a gateway.
+  device paired with it. See `system-knowhow/remote-access/settings-access-2.md` § Pair a gateway.
 
 **Always-on service & multiple gateways.** The default install registers a
 **user-level service** named after the instance. On macOS a launchd LaunchAgent
@@ -248,11 +252,19 @@ for the architecture.
 - **Rust** (stable toolchain)
 - **Docker** (for PostgreSQL + pgvector)
 - **Node.js** (for Vite frontend dev server)
+- **ShellCheck 0.11.0 or later** for shell lint
+- **Python 3 with venv and ensurepip** for Python runtime tests
+- **Playwright Chromium headless shell** and its shared libraries on Linux
+  for browser tests in the frontend suite
 - **An LLM provider** (Anthropic, OpenAI, OpenRouter, xAI, Vertex AI, or a local
   OpenAI-compatible endpoint such as Ollama / LM Studio / vLLM). Configure it in
   **Settings → Providers**, or via the environment variables below.
   The same screen also offers **OpenCode Free**, a keyless tier that needs no
   account and no key. It is off by default, and the toggle explains the terms.
+
+Run `./scripts/dev-prerequisites.sh --all` to provision the pinned ShellCheck
+and Chromium headless shell when needed. It prints install commands for
+missing system packages.
 
 ## Dev Setup
 
@@ -276,7 +288,7 @@ This starts one shared PostgreSQL Docker container, builds/runs the Rust engine 
 
 ### Ports
 
-The first workspace lands on `5173` for direct engine access: plain `http://`, loopback only, so it answers only on this machine (ADR 0096). Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway serves workspaces at `http(s)://localhost:5251/<slug>/`, and `LUCIDOS_DEV_GATEWAY_PORT` overrides the port. Dev uses `5251` rather than the packaged app's `5252`, so a dev gateway and an installed `Lucidos.app` coexist. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
+The first workspace lands on `5173` for direct engine access: plain `http://`, loopback only, so it answers only on this machine (ADR 0096). Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway serves workspaces at `https://localhost:5251/<slug>/`, and `LUCIDOS_DEV_GATEWAY_PORT` overrides the port. Dev uses `5251` rather than the packaged app's `5252`, so a dev gateway and an installed `Lucidos.app` coexist. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
 
 If the target port is already taken by something else (e.g. another Vite app on `5173`), Lucidos walks forward to the next free offset and persists the new assignment. It does **not** kill the squatter. To pin a specific port:
 
@@ -309,7 +321,9 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 
 ## HTTPS for Local Development
 
-Lucidos uses [mkcert](https://github.com/FiloSottile/mkcert) to generate locally-trusted TLS certificates. When certs are present in `.certs/`, the dev gateway serves HTTPS at `https://localhost:5251/<slug>/`, and so does a manual `vite serve`. The engine behind the gateway stays plain HTTP on loopback, because the gateway terminates TLS.
+The dev gateway always serves `https://localhost:5251/<slug>/` with the *local certificate*, signed by your per-user loopback CA. Trust it once with `lucidos tls trust` (the desktop app's Trust screen does the same). The engine behind the gateway stays plain HTTP on loopback, because the gateway terminates TLS.
+
+[mkcert](https://github.com/FiloSottile/mkcert) is only for the other names: your LAN IP and tailnet hostname, from other devices. When certs are present in `.certs/`, the dev gateway serves them beyond loopback, and a manual `vite serve` uses them too.
 
 ### Install mkcert and generate certs
 
@@ -422,7 +436,7 @@ Two independent version axes:
   [GitHub Releases](https://github.com/lucidos-dev/lucidos/releases)). Think
   Ubuntu 24.04: one number per shipped release, regardless of how the
   individual components inside have moved. Exposed at runtime as
-  `lucidos_engine::LUCIDOS_RELEASE`, in the `release` field of `/api/health`,
+  `lucidos_engine::build_identity().release`, in the `release` field of `/api/health`,
   in the engine's `--version` output, and in the desktop app's control panel.
 - **Per-crate `Cargo.toml` versions**: semver per component (lucidos-engine,
   lucidos-app, etc.), bumped on their own cadence by `build.rs`. Visible as

@@ -25,15 +25,6 @@ function ccExchange(steps: Exchange['steps']): Exchange {
 let seq = 1;
 const ev = (event: Record<string, unknown>) => ({ seq: ++seq, event: { created: TS, ...event } as any });
 
-/** Mirror of the ChatExchange render decision for the in-thread status label
- *  and the inline step shimmer.
- *
- *  Takes the exchange, the steps-expanded toggle, and whether the response panel
- *  is collapsed (which hides the steps body). Then `rowInBand`, which stands for
- *  the whole DOM half of the component's answer: a row was marked, it handed up
- *  its element, and `useOnScreenInTranscript` says that element is in the band.
- *  It is where scroll position enters. A rendered row far below the fold is
- *  drawn and NOT seen, and the label owes the reader the shimmer there. */
 function shimmerState(
   exchange: Exchange,
   showSteps: boolean,
@@ -51,9 +42,6 @@ function shimmerState(
     status,
     statusClass: className,
     labelShimmers: className === 'working' && !liveStepOnScreen,
-    // A step shimmer is on screen iff steps are expanded, the panel isn't
-    // collapsed (collapse hides the steps body), a pending step renders, AND
-    // that row is inside the transcript's visible band.
     stepShimmers: showSteps && !collapsed && rowInBand
       && events.some(e => e.type === 'step' && e.outcome === 'pending'),
   };
@@ -96,18 +84,6 @@ describe('exactly-one-shimmer invariant while working', () => {
     }
   }
 
-  // A collapsed response panel hides the steps body, so a pending step's shimmer
-  // is NOT on screen — the "Working" header must carry the shimmer instead, even
-  // with steps globally expanded and a pending step in the data. (Regression:
-  // the live-step check ignored the collapse and suppressed the label shimmer,
-  // leaving the working turn with no shimmer at all.)
-  // The gap a coding-agent turn used to have: between a `CodingAgentToolResult`
-  // and the next `CodingAgentToolCalled` nothing was pending, so the transcript
-  // showed a column of finished checks and the ONLY thing saying work was
-  // happening was the header label (reported 2026-08-11: "the running state in
-  // between reflects in Working label above which is not good"). The derived
-  // live row (`needsLiveThinkingRow`) puts it back in the transcript, and the
-  // invariant then resolves the same way as for the native arm.
   const ccGap = ccExchange([
     ev({ type: 'SessionStarted', session_id: 's1' }),
     ev({ type: 'CodingAgentPromptSent', text: 'fix the projection' }),
@@ -116,35 +92,26 @@ describe('exactly-one-shimmer invariant while working', () => {
   ]);
 
   it('coding-agent gap between tool calls shimmers the step row, not the label', () => {
-    const s = shimmerState(ccGap, /*showSteps*/ true);
+    const s = shimmerState(ccGap,  true);
     expect(s.statusClass).toBe('working');
     expect(s.stepShimmers).toBe(true);
     expect(s.labelShimmers).toBe(false);
   });
 
-  // Drawn is not seen. A coding-agent turn always carries a live row. So a turn
-  // taller than the pane hid its only shimmer below the fold, leaving "Working"
-  // plain over a column of finished checks. That is the same complaint the
-  // derived row answered for the data gap, arriving the other way round.
   it('coding-agent gap with its live row below the fold shimmers the label', () => {
-    const s = shimmerState(ccGap, /*showSteps*/ true, /*collapsed*/ false, '', /*rowInBand*/ false);
+    const s = shimmerState(ccGap,  true,  false, '',  false);
     expect(s.statusClass).toBe('working');
     expect(s.stepShimmers).toBe(false);
     expect(s.labelShimmers).toBe(true);
   });
 
   it('coding-agent gap with steps hidden shimmers the label alone', () => {
-    const s = shimmerState(ccGap, /*showSteps*/ false);
+    const s = shimmerState(ccGap,  false);
     expect(s.statusClass).toBe('working');
     expect(s.stepShimmers).toBe(false);
     expect(s.labelShimmers).toBe(true);
   });
 
-  // The other direction, and the one this invariant must not be read as
-  // requiring. A turn held on a permission card is NOT working, so zero
-  // shimmers is right there. A `blocked` row must not be counted as the live
-  // one. The whole-transcript version is in
-  // `store/__tests__/gated-tool-step.test.ts`, which drives the real fold.
   it('a held call is not a live step, so it cannot satisfy the invariant', () => {
     const held = ccExchange([
       ev({ type: 'SessionStarted', session_id: 's1' }),
@@ -154,8 +121,6 @@ describe('exactly-one-shimmer invariant while working', () => {
     const events = exchangeResponseEvents(held, true, false);
     expect(events.filter(e => e.type === 'step' && e.outcome === 'blocked')).toHaveLength(1);
     expect(liveStepInBody(responseBody(events, { showSteps: true, showDetails: true, rowsHidden: 0 }))).toBe(-1);
-    // And no derived Thinking row was added beside it: the held row IS the
-    // turn's current row (`needsLiveThinkingRow`'s `anyLive`).
     expect(events.filter(e => e.type === 'step' && e.description === 'Thinking')).toHaveLength(0);
   });
 
@@ -164,9 +129,9 @@ describe('exactly-one-shimmer invariant while working', () => {
       ev({ type: 'ThoughtStreamed' }),
       ev({ type: 'ToolCalled', name: 'read_file', args: { path: 'list.md' } }),
     ]);
-    const s = shimmerState(working, /*showSteps*/ true, /*collapsed*/ true);
+    const s = shimmerState(working,  true,  true);
     expect(s.statusClass).toBe('working');
-    expect(s.stepShimmers).toBe(false); // body hidden by collapse
-    expect(s.labelShimmers).toBe(true); // label carries the sole shimmer
+    expect(s.stepShimmers).toBe(false);
+    expect(s.labelShimmers).toBe(true);
   });
 });

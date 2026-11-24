@@ -70,6 +70,18 @@ class References(unittest.TestCase):
         self.check('lucidos sample ' + chr(92) + '\n --missing', 1)
         self.check('`lucidos sample -- <command> --missing`', 0)
 
+    def test_a_bare_flags_value_is_not_a_subcommand(self):
+        surface = json.loads((self.root / self.manifest).read_text())
+        surface['cli']['commands'][0]['commands'] = [
+            {'name': 'sub', 'hidden': False, 'aliases': [], 'flags': [], 'commands': []}]
+        self.put(self.manifest, json.dumps(surface))
+        self.put('system-knowhow/lucidos-cli.md',
+                 '### `lucidos sample`\nSample.\n### `lucidos sample sub`\nSub.\n')
+        self.check('`lucidos sample --current value`', 0)
+        self.check('`lucidos sample --current sub`', 0)
+        self.check('`lucidos sample --current=value missing`', 1)
+        self.check('`lucidos sample --current value missing`', 1)
+
     def test_reverse_event_coverage_requires_a_table_row(self):
         self.check('# Reference', 0)
         for body in ('# Events\n', '`MessageReceived` is mentioned.\n',
@@ -212,6 +224,35 @@ class References(unittest.TestCase):
         self.check('```md\n![example](artifacts/sample.png)\n```', 0)
         self.check('[web](https://example.com) [anchor](#section)', 0)
 
+    def test_section_references_name_the_file_that_holds_the_section(self):
+        self.put('system-knowhow/split.md', '# Split\n## Parts\n')
+        self.put('system-knowhow/split/part-a.md',
+                 '## Alpha: the first\n### `lucidos sample run <x>`\n**Lead-in.** Text.\n'
+                 '## \u00a73: Numbered\n## Beta (continued)\n')
+        self.put('system-knowhow/split/part-b.md', '## Beta\n## 5. Plain number\n')
+        part_a, part_b = 'system-knowhow/split/part-a.md', 'system-knowhow/split/part-b.md'
+        self.check(f'See `{part_a}` \u00a7 Alpha: the first.', 0)
+        self.check(f'See `{part_a}` \u00a7 `lucidos sample run`.', 0)
+        self.check(f'See `{part_a}` \u00a7 Lead-in.', 0)
+        self.check(f'See `{part_a}` \u00a73 and `{part_b}` \u00a7 Beta.', 0)
+        self.check(f'See `{part_b}` \u00a7 5.', 0)
+        self.check(f'See `{part_a}` \u00a7 Beta.', 1)
+        self.check('See `system-knowhow/split.md` \u00a7 Alpha.', 1)
+        self.check(f'See `{part_a}` \u00a7 Gamma.', 1)
+        self.check(f'See `{part_a}` \u00a77.', 1)
+        self.check('See `system-knowhow/gone.md` \u00a7 Alpha.', 1)
+        self.put('docs/plans/note.md', 'See `system-knowhow/split.md` \u00a7 Alpha.')
+        self.check(f'See `{part_a}` \u00a7 Alpha.', 0)
+        self.put('system-knowhow/split/part-c.md', '## \u00a73.5: Sub\n')
+        self.check(f'See `{part_a}` \u00a73.5.', 1)
+        self.check(f'See `{part_a}` \u00a73.4.', 0)
+        self.check(f'See `{part_a}` \u00a7 Alpha, \u00a7 Gamma.', 1)
+        self.check(f'See `{part_a}` \u00a7 Alpha, \u00a7 Lead-in.', 0)
+        self.check(f'See `{part_a}` \u00a7\u00a73, 7.', 1)
+        self.check(f'See `{part_a}` \u00a7 Alpha for the permission request on this machine, and \u00a7 Gamma below.', 0)
+        self.put('docs/caf\u00e9.md', f'See `{part_a}` \u00a7 Gamma.')
+        self.check(f'See `{part_a}` \u00a7 Alpha.', 1)
+
     def test_missing_or_empty_inputs(self):
         for name in (self.manifest, self.settings, 'crates/demo/src/lib.rs'):
             path = self.root / name
@@ -240,11 +281,14 @@ class References(unittest.TestCase):
             (self.root / script).chmod(0o755)
         self.put('scripts/harden-gates.sh', source)
         (self.root / 'scripts/harden-gates.sh').chmod(0o755)
-        self.put('bin/make', '#!/bin/bash\nset -e\n[ "$1" = lint-knowhow ]\ntouch lint-ran\n')
-        (self.root / 'bin/make').chmod(0o755)
+        for checker in ('check-knowhow-refs', 'check-retired-terms', 'check-audit-scans'):
+            self.put(f'scripts/{checker}.sh', f'#!/bin/bash\ntouch {checker}-ran\n')
+        self.put('bin/node', '#!/bin/bash\ntrue\n')
+        (self.root / 'bin/node').chmod(0o755)
         subprocess.run(['git', 'add', '-A'], cwd=self.root, check=True)
         subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
                         'commit', '-qm', 'fixture'], cwd=self.root, check=True)
+        subprocess.run(['git', 'branch', '-M', 'main'], cwd=self.root, check=True)
         self.put('system-knowhow/doc-0.md', '# Changed knowhow')
         changed = subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], cwd=self.root, text=True)
         self.assertEqual(changed.strip(), 'system-knowhow/doc-0.md')
@@ -252,8 +296,9 @@ class References(unittest.TestCase):
         result = subprocess.run(['bash', 'scripts/harden-gates.sh'], cwd=self.root,
                                 env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue((self.root / 'lint-ran').is_file())
-        self.put('bin/make', '#!/bin/bash\nfalse\n')
+        for checker in ('check-knowhow-refs', 'check-retired-terms', 'check-audit-scans'):
+            self.assertTrue((self.root / f'{checker}-ran').is_file())
+        self.put('scripts/check-knowhow-refs.sh', '#!/bin/bash\nfalse\n')
         result = subprocess.run(['bash', 'scripts/harden-gates.sh'], cwd=self.root,
                                 env=env, text=True, capture_output=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

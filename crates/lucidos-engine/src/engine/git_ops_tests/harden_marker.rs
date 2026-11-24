@@ -41,8 +41,9 @@ fn a_full_marker_covers_a_fast_need_and_never_the_reverse() {
 /// tier the reader does not know.
 #[test]
 fn the_tier_check_lists_the_rust_tiers() {
-    const MIGRATION: &str =
-        include_str!("../../../migrations/20261013034934_add_tier_to_hardened_branches.sql");
+    const MIGRATION: &str = include_str!(
+        "../../../../lucidos-core/migrations/20261013034934_add_tier_to_hardened_branches.sql"
+    );
     let tiers: Vec<String> = HardenTier::ALL
         .iter()
         .map(|t| format!("'{}'", t.as_str()))

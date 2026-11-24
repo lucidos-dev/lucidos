@@ -6,24 +6,11 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error — same
 import { dirname, resolve } from 'node:path';
 
-/**
- * Folder-tree indentation must come from exactly ONE place: the per-level
- * `margin-left` on `.folder-contents`. A folder's children render INSIDE the
- * parent's `.folder-contents`, so the DOM nesting already accumulates the
- * offset — a second, per-row offset stacks on top of it and every level then
- * indents by the running total (0, 1, 3, 6, 10 … rem) instead of one unit each.
- * That triangular compounding is the bug this pins.
- *
- * The test infra has no jsdom, so this is a source scan rather than a render
- * test (precedent: `shared/__tests__/skeleton-guard.test.ts`).
- */
 
 const here = dirname(fileURLToPath(import.meta.url));
 const TREE_TSX = readFileSync(resolve(here, '../FolderTree.tsx'), 'utf8');
 const COMPONENTS_CSS = readFileSync(resolve(here, '../../../styles/components.css'), 'utf8');
 
-/** Body of the single-class rule `selector` — a bare `.foo { … }` at column 0,
- *  so a `.foo:hover` or nested/indented variant is never picked up instead. */
 function ruleBody(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const match = new RegExp(`(?:^|\\n)${escaped}\\s*\\{([^}]*)\\}`).exec(COMPONENTS_CSS);
@@ -59,8 +46,6 @@ describe('folder tree indentation', () => {
     expect(treeFileOffset, '.tree-file-item must carry the tree file-row offset').not.toBeNull();
     expect(treeFileOffset!).toBeGreaterThan(0);
 
-    // `.file-item` is shared with the flat changed-files list, which has no
-    // disclosure arrow to clear — the tree's extra offset must not land there.
     expect(
       ruleBody('.file-item'),
       'keep the tree file-row offset on .tree-file-item, not on the shared .file-item',

@@ -100,7 +100,7 @@ impl LucidosEngine {
                     &self.active_threads,
                     &self.pool,
                     *tid,
-                    crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+                    crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
                 )
             }))
             .await;
@@ -177,7 +177,7 @@ impl LucidosEngine {
                         &self.active_threads,
                         &self.pool,
                         *thread_id,
-                        crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
+                        crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES,
                     )
                     .await;
                     emit_teardown_abort_unless_question_parked(
@@ -251,16 +251,18 @@ impl LucidosEngine {
             // already skips + evicts these on the user-switch path; this covers a
             // thread that reached `processing_thread_ids()` after that pre-emit.
             // Same shared predicate as every other restart-abort path.
-            if crate::engine::agent_recovery::thread_has_unanswered_question(&self.pool, thread_id)
-                .await
+            if crate::engine::question_park_sql::thread_has_unanswered_question(
+                &self.pool, thread_id,
+            )
+            .await
             {
-                log!(
+                log_legacy!(
                     "[Shutdown] Preserving thread {} — parked on an unanswered question",
                     thread_id
                 );
                 continue;
             }
-            log!(
+            log_legacy!(
                 "[Shutdown] Emitting ResponseAborted for active thread {}",
                 thread_id
             );
@@ -268,7 +270,7 @@ impl LucidosEngine {
                 &self.active_threads,
                 &self.pool,
                 thread_id,
-                crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+                crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
             )
             .await;
             // Direct .emit (not emit_response_aborted): wants the Err for the per-thread log below.
@@ -291,7 +293,7 @@ impl LucidosEngine {
                 })
                 .await
             {
-                log!(
+                log_legacy!(
                     "[Shutdown] Failed to emit ResponseAborted for thread {}: {}",
                     thread_id,
                     e
@@ -303,7 +305,7 @@ impl LucidosEngine {
 
     pub async fn shutdown_browser(&self) {
         if let Err(e) = self.browser_runtime.close_all().await {
-            log!("[Engine] Error closing browsers on shutdown: {}", e);
+            log_legacy!("[Engine] Error closing browsers on shutdown: {}", e);
         }
     }
 
@@ -351,7 +353,7 @@ impl LucidosEngine {
             return;
         }
 
-        log!(
+        log_legacy!(
             "[Shutdown] Gracefully stopping {} Claude Code session(s)...",
             sessions.len()
         );
@@ -384,7 +386,7 @@ impl LucidosEngine {
         // awaits here would hold every session's Esc behind N round-trips on a
         // busy restart.
         let parked: Vec<bool> = futures::future::join_all(sessions.iter().map(|(tid, _, _, _)| {
-            crate::engine::agent_recovery::preserve_question_park_at_shutdown(
+            crate::engine::question_park_sql::preserve_question_park_at_shutdown(
                 &self.pool,
                 "session sweep",
                 *tid,
@@ -397,7 +399,7 @@ impl LucidosEngine {
                 stop.notify_one();
                 continue;
             }
-            log!("[Shutdown] Interrupting Claude Code session {}", tid);
+            log_legacy!("[Shutdown] Interrupting Claude Code session {}", tid);
             match startup_cancel {
                 Some(startup_cancel) => startup_cancel.cancel(),
                 None => interrupt.notify_one(),
@@ -412,7 +414,7 @@ impl LucidosEngine {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                log!(
+                log_legacy!(
                     "[Shutdown] {} session(s) still active after timeout — force-stopping",
                     remaining
                 );
@@ -431,7 +433,7 @@ impl LucidosEngine {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        log!("[Shutdown] Coding-agent sessions stopped.");
+        log_legacy!("[Shutdown] Coding-agent sessions stopped.");
     }
 }
 
@@ -463,7 +465,7 @@ impl LucidosEngine {
 /// Result classify and the stop arm produce `Aborted(EngineShutdown)`), and
 /// only that flag keeps those in-loop paths from landing the abort this skip
 /// just avoided.
-pub(crate) async fn emit_teardown_abort_unless_question_parked(
+pub async fn emit_teardown_abort_unless_question_parked(
     pool: &sqlx::PgPool,
     event_bus: &crate::engine::event_bus::EventBus,
     thread_id: uuid::Uuid,
@@ -474,8 +476,8 @@ pub(crate) async fn emit_teardown_abort_unless_question_parked(
 ) -> bool {
     use crate::engine::thread_events::{self, EventMeta};
 
-    if crate::engine::agent_recovery::thread_has_unanswered_question(pool, thread_id).await {
-        log!(
+    if crate::engine::question_park_sql::thread_has_unanswered_question(pool, thread_id).await {
+        log_legacy!(
             "[Restart] Preserving thread {} — parked on an unanswered question, no boundary abort",
             thread_id
         );
@@ -500,7 +502,3 @@ pub(crate) async fn emit_teardown_abort_unless_question_parked(
     .await;
     true
 }
-
-#[cfg(test)]
-#[path = "shutdown_tests.rs"]
-mod shutdown_tests;

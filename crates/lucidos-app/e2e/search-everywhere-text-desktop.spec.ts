@@ -1,13 +1,3 @@
-/**
- * Text search in Search Everywhere, against the real engine (ADR 0383). A
- * phrase typed in any case finds its line inside a workspace file. The Text
- * section comes after the name sections, and picking a line opens the file
- * scrolled to it, with the line marked. Find in file opens on the phrase, with
- * the match on that line current and the caret in the field.
- *
- * The unit tests mock the engine and the navigation router. This covers the
- * route, the router and the preview's line landing together.
- */
 import { test, expect } from './fixtures';
 import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
@@ -18,7 +8,6 @@ const DIR = 'artifacts/e2e-text-search';
 const NOTES = `${DIR}/notes.md`;
 const LOG = `${DIR}/log.txt`;
 const PHRASE = 'quokka-zebra-phrase';
-/** Far enough down that landing on it means the preview scrolled. */
 const LINE = 90;
 
 function write(rel: string, text: string) {
@@ -67,14 +56,10 @@ test.describe('Search Everywhere → Text', () => {
     const findInput = page.locator('.file-preview-frame [data-role="find-input"]');
     const status = page.locator('.file-preview-frame [data-role="find-status"]');
 
-    // Another file shows first, with its own find open, so the find must move
-    // to the picked file rather than stay on this one.
     await input.fill(PHRASE);
     await page.locator('.search-everywhere-result', { hasText: `${NOTES}:${LINE}` }).click();
     await expect(status).toHaveText('1 of 1', { timeout: 10_000 });
 
-    // The pick closed Search Everywhere, and its fading drawing keeps the
-    // input's class until the fade ends.
     await waitForModalExitFade(page);
     await page.keyboard.press('ControlOrMeta+k');
     await input.fill(PHRASE);
@@ -91,7 +76,6 @@ test.describe('Search Everywhere → Text', () => {
     }));
     expect(painted).toEqual({ all: 3, current: ['3'] });
 
-    // The field holds the caret, so Enter steps without a click first.
     await expect(findInput).toBeFocused();
     await page.keyboard.press('Enter');
     await expect(status).toHaveText('3 of 3');

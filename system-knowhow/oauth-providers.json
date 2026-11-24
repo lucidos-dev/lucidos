@@ -50,6 +50,7 @@
       "userinfo_method": "POST",
       "authorize_params": "token_access_type=offline",
       "client_type": "public",
+      "sign_in_scopes": "account_info.read",
       "console_label": "Dropbox App Console",
       "console_url": "https://www.dropbox.com/developers/apps",
       "setup_hint": "Create an app, add the redirect URI below under OAuth 2, and copy its App key as the Client ID. Leave the client secret blank to connect as a public client.",

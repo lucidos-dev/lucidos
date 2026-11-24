@@ -1,3 +1,4 @@
+import { EventWaitClockIcon } from './icons';
 import { describe, it, expect } from 'vitest';
 import { statusTooltip, ThreadStatusIcon } from './ThreadStatusIcon';
 import { resolveVisualStatus, visualStatusFor, type VisualStatus } from './threadVisualStatus';
@@ -6,36 +7,30 @@ import type { ThreadMeta } from '../../store/thread-events';
 describe('visualStatusFor', () => {
   const idle = {
     activeChildrenCount: 0,
-    waitingChildrenCount: 0,
+    awaitedChildrenCount: 0,
     codingAgentChangeState: { kind: 'none' },
     liveEventWaitCount: 0,
   } as ThreadMeta;
 
-  // The reported shape: every child idle on its own event wait. Each is
-  // unfinished (ADR 0254), so the parent must not read as finished.
-  it('reads a parent whose child waits as waiting', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 3 })).toBe('waiting');
+  it('reads a parent with an awaited child as waiting, with no child running', () => {
+    expect(visualStatusFor('idle', { ...idle, awaitedChildrenCount: 1 })).toBe('waiting');
   });
 
-  it('reads a waiting child exactly as a running one', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1 }))
-      .toBe(visualStatusFor('idle', { ...idle, activeChildrenCount: 1 }));
+  it('reads a running child the parent does not await as idle', () => {
+    const runningNoWakeChild: ThreadMeta = { ...idle, activeChildrenCount: 1 };
+    expect(visualStatusFor('idle', runningNoWakeChild)).toBe('idle');
   });
 
-  // The child writes its own worktree, so the parent's change stays
-  // applicable (ADR 0249), exactly as with a running child.
-  it('lets the parent\'s own change outrank a waiting child', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1, codingAgentChangeState: { kind: 'proposed', requires_restart: false }}))
+  it('lets the parent\'s own change outrank an awaited child', () => {
+    expect(visualStatusFor('idle', { ...idle, awaitedChildrenCount: 1, codingAgentChangeState: { kind: 'proposed', requires_restart: false }}))
       .toBe('changes');
   });
 
-  // Work a turn end withheld is not a proposal, so no changes dot, and the
-  // thread reads by its turn alone (ADR 0400).
   it('draws no changes dot for unproposed work', () => {
     const withheld = { kind: 'unproposed', reason: 'turn_incomplete' } as const;
     expect(visualStatusFor('idle', { ...idle, codingAgentChangeState: withheld }))
       .toBe('idle');
-    expect(visualStatusFor('idle', { ...idle, activeChildrenCount: 1, codingAgentChangeState: withheld }))
+    expect(visualStatusFor('idle', { ...idle, awaitedChildrenCount: 1, codingAgentChangeState: withheld }))
       .toBe('waiting');
   });
 
@@ -64,17 +59,11 @@ describe('statusTooltip', () => {
     expect(statusTooltip('changes').text).toMatch(/coding agent proposed changes/);
   });
 
-  // One dot now carries both ways a thread can be finished-but-not-done, so its
-  // explanation has to name both. Naming only children was true until an event
-  // wait could land here, and it would have read as a lie on a thread that has
-  // no children at all.
   it('explains BOTH causes of the waiting dot, children and event waits', () => {
     const { title, text } = statusTooltip('waiting');
     expect(title).toBe('Waiting');
     expect(text).toMatch(/child thread/);
     expect(text).toMatch(/subscribed/);
-    // An event wait outranks `changes`, so a parked thread with a real change
-    // wears this dot. The copy has to account for the change it is covering.
     expect(text).toMatch(/proposed change/);
   });
 
@@ -92,19 +81,11 @@ describe('statusTooltip', () => {
   });
 });
 
-// An engine restart interrupted the turn. Nothing failed, and after a *Switch to
-// new version* the engine resumes it by itself, so painting the red error dot
-// (which also claimed a Blocked slot) was wrong on both counts.
 describe('paused', () => {
   it('resolves to its own visual status, never failed', () => {
     expect(resolveVisualStatus('paused', false, false, false)).toBe('paused');
   });
 
-  // Outranks `changes` for the same reason `failed` does, and this is the ONLY
-  // place that precedence lives. The backend used to resolve it first, writing
-  // `waiting` instead of the verdict for an interrupted thread with a change.
-  // That lost the verdict to the dying turn's drain, so the pair reaches here
-  // now and this case is live rather than theoretical.
   it('outranks a proposed change and active children', () => {
     expect(resolveVisualStatus('paused', true, true, true)).toBe('paused');
     expect(resolveVisualStatus('paused', false, true, false)).toBe('paused');
@@ -124,9 +105,6 @@ describe('paused', () => {
   });
 });
 
-// A thread holding a live *event wait* is asleep on purpose. Its backend
-// status is plain `idle` (ADR 0049), so before this it fell through to the
-// no-dot `idle` branch and rendered exactly like a thread that had finished.
 describe('live event waits', () => {
   it('resolves to waiting on their own, with no children and no proposal', () => {
     expect(resolveVisualStatus('idle', false, false, true)).toBe('waiting');
@@ -136,16 +114,10 @@ describe('live event waits', () => {
     expect(resolveVisualStatus('idle', false, false, false)).toBe('idle');
   });
 
-  // The turn wins while it is running: the thread is not merely watching, it
-  // is working, and the waiting indicator says what it is watching for.
   it('does not mask a running turn', () => {
     expect(resolveVisualStatus('running', false, false, true)).toBe('running');
   });
 
-  // A parked thread's change is not final: it wakes on its delivery and may
-  // commit again on the same branch. Reading it as "Changes to review" invited
-  // an Apply that merges a live branch. The gate in `availableThreadActions`
-  // withholds the button on the same fact.
   it('outranks a proposed change', () => {
     expect(resolveVisualStatus('idle', false, true, true)).toBe('waiting');
   });
@@ -155,12 +127,7 @@ describe('live event waits', () => {
       .toBe(resolveVisualStatus('idle', false, false, true));
   });
 
-  // Every combination of the two waiting causes against a proposed change,
-  // pinned so the precedence cannot be flipped back by accident. The two
-  // causes differ against `changes` because the Apply gate differs: a running
-  // child does not withhold its parent's Apply (ADR 0249).
   it('resolves every cause combination the way the Apply gate does', () => {
-    // [children, proposed, waits] → dot
     const cases: [boolean, boolean, boolean, VisualStatus][] = [
       [false, false, false, 'idle'],
       [false, true, false, 'changes'],
@@ -176,14 +143,10 @@ describe('live event waits', () => {
     }
   });
 
-  // A delegating parent: idle apart from a running child, with a change of its
-  // own. The dot must offer what the panel offers, which is Apply.
   it('paints changes, not waiting, on a parent with a change and a running child', () => {
     expect(resolveVisualStatus('idle', true, true, false)).toBe('changes');
   });
 
-  // The verdict statuses stay ahead of both: they describe what happened to the
-  // turn, which outranks what the thread is watching for.
   it('never masks failed, running, question or paused', () => {
     expect(resolveVisualStatus('failed', true, true, true)).toBe('failed');
     expect(resolveVisualStatus('running', true, true, true)).toBe('running');
@@ -192,8 +155,6 @@ describe('live event waits', () => {
   });
 });
 
-// A read request (ADR 0409) takes the filled dot, which reads as "unread", and
-// a ready change names itself with the diff glyph instead.
 describe('read request and change marks', () => {
   function classesOf(status: 'read-request' | 'changes'): string[] {
     const vnode = ThreadStatusIcon({ status }) as unknown as { props: { children: unknown[] } };
@@ -206,7 +167,6 @@ describe('read request and change marks', () => {
     expect(resolveVisualStatus('idle', false, false, false, true)).toBe('read-request');
     expect(resolveVisualStatus('idle', false, true, false, true)).toBe('changes');
     expect(resolveVisualStatus('idle', true, false, false, true)).toBe('read-request');
-    // A read request has no Apply for a live wait to guard (ADR 0424).
     expect(resolveVisualStatus('idle', false, false, true, true)).toBe('read-request');
     expect(resolveVisualStatus('idle', false, true, true, false)).toBe('waiting');
     expect(resolveVisualStatus('running', false, false, false, true)).toBe('running');
@@ -215,5 +175,22 @@ describe('read request and change marks', () => {
   it('draws the filled dot for a read request and the diff glyph for a change', () => {
     expect(classesOf('read-request').join(' ')).toContain('progress-dot-read-request');
     expect(classesOf('changes')).toEqual(['thread-status-changes-icon']);
+  });
+});
+
+
+describe('waiting clock', () => {
+  it('uses the shared static clock for either waiting cause', () => {
+    for (const [children, events] of [[true, false], [false, true]]) {
+      const status = resolveVisualStatus('idle', children, false, events);
+      const vnode = ThreadStatusIcon({ status }) as unknown as {
+        props: { children: ({ props?: { class?: string; children?: { type: unknown } } } | false)[] };
+      };
+      const marks = vnode.props.children.filter(c => !!c && c.props?.class);
+      expect(marks).toHaveLength(1);
+      const mark = marks[0] as { props: { class: string; children: { type: unknown } } };
+      expect(mark.props.class).toBe('thread-status-waiting-icon');
+      expect(mark.props.children.type).toBe(EventWaitClockIcon);
+    }
   });
 });

@@ -40,6 +40,26 @@ describe('redeemPairingCode', () => {
     );
     await expect(redeemPairingCode('00000000')).rejects.toThrow(/not valid or has expired/);
   });
+
+  it('waits for a paired device\'s Allow, presenting the code again', async () => {
+    vi.useFakeTimers();
+    try {
+      const waiting = () => new Response(JSON.stringify({ awaiting_owner: true }), { status: 202 });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(waiting())
+        .mockResolvedValueOnce(new Response(JSON.stringify({ paired: true }), { status: 200 }));
+      vi.stubGlobal('fetch', fetchMock);
+      const onWaiting = vi.fn();
+      const paired = redeemPairingCode('12345678', 'My iPhone', onWaiting);
+      await vi.runAllTimersAsync();
+      await paired;
+      expect(onWaiting).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).code).toBe('12345678');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('pairDesktopWindow', () => {
@@ -53,8 +73,6 @@ describe('pairDesktopWindow', () => {
   });
 
   it('mints through the Rust side and redeems in the page', async () => {
-    // The split is the point. Redeeming in Rust would put the credential in an
-    // HTTP client that authorizes nothing the user can see.
     mockIsTauri.mockReturnValue(true);
     mockInvoke.mockResolvedValue({ code: '12345678', expires_in_secs: 300 });
     const fetchMock = okFetch();
@@ -89,8 +107,6 @@ describe('pairDesktopWindow', () => {
   });
 
   it('surfaces a refused mint rather than falling silent', async () => {
-    // The caller shows the typed form on a rejection, so swallowing it here
-    // would leave the window with no pairing surface at all.
     mockIsTauri.mockReturnValue(true);
     mockInvoke.mockRejectedValue(new Error('the gateway on port 5252 did not mint a pairing code'));
     vi.stubGlobal('fetch', okFetch());

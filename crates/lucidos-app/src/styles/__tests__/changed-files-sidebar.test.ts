@@ -1,14 +1,3 @@
-/**
- * The changed-files list beside a diff: its rows and the sidebar that holds it.
- *
- * A long path wraps the row onto several lines. The icon, diffstat and badge
- * then hold the top and share a line with the path's first line. The sidebar
- * wears the pane's own background, the surface the list has when it stands
- * alone.
- *
- * A source scan, like the sibling geometry guards: what regresses is which
- * declaration is written.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

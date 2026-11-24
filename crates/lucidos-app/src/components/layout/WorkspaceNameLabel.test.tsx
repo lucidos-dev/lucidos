@@ -17,8 +17,6 @@ it('identifies the remote gateway in the header inside dev@cloud, without a redu
   expect(container.textContent).toBe('dev@cloud');
 });
 
-/** Renders the label inside the brand box with stubbed geometry: the mark is
- *  30px, the name 100px, the `@cloud` suffix 60px (margin included). */
 function renderInBox(boxWidth: number): HTMLElement {
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   const brand = document.createElement('span');

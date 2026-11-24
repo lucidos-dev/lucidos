@@ -1,10 +1,3 @@
-/**
- * The "…" cut marker on a step line is muted text in every theme.
- *
- * A cut point is not a state. With a status token such as `--accent-notable`,
- * it turned amber in the green theme, so every step line read as a warning.
- * The scan covers every stylesheet, so a theme cannot repaint the marker either.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

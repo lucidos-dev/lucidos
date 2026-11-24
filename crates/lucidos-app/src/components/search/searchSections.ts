@@ -2,16 +2,10 @@ import type { SearchResultItem, TextSearchHit } from '../../api/client';
 import type { Loadable } from '../../store/types';
 import { bestFirst, NO_TITLE_MATCH, titleRank, type TitleRank } from './titleMatch';
 
-/** Hits per section in the All tab, and so hits asked of each category. */
 export const ALL_TAB_LIMIT = 5;
 
-/** The All tab's order among sections whose best hits rank the same. `menu`
- *  last, because a search is nearly always for a thing rather than for the page
- *  it lives on. */
 export const SECTION_ORDER = ['apps', 'files', 'settings', 'threads', 'triggers', 'changes', 'menu'];
 
-/** A Text search line in the results list. Its `id` is `<path>:<line>`, so
- *  `category:id` keys it like every other row. */
 export interface TextHitItem {
   category: 'text';
   id: string;
@@ -31,7 +25,6 @@ export function textHitItem(hit: TextSearchHit): TextHitItem {
 export interface Section {
   section: string;
   items: PaletteItem[];
-  /** Index of the first item in the flattened list. */
   offset: number;
 }
 
@@ -41,11 +34,6 @@ function bestRank(items: SearchResultItem[], query: string): TitleRank {
     .sort(bestFirst)[0] ?? NO_TITLE_MATCH;
 }
 
-/** The All tab's sections, each capped, ordered by the title rank of its best
- *  hit. So "settings" lists the Settings page above files that only mention
- *  it. Sections in `drawn`, already on screen for this query, keep that order
- *  above every later one: a late answer never pushes down a row being read.
- *  Text lines come after every name section, whatever their rank (ADR 0383). */
 export function rankedSections(
   results: Record<string, SearchResultItem[]>,
   query: string,
@@ -62,9 +50,7 @@ export function rankedSections(
       const items = results[section].slice(0, ALL_TAB_LIMIT);
       return { section, items, rank: bestRank(items, query) };
     })
-    // Stable, so SECTION_ORDER breaks every tie.
     .sort((a, b) => drawnAt(a.section) - drawnAt(b.section) || bestFirst(a.rank, b.rank));
-  // The engine's preview already holds the Text section's share of the tab.
   if (textHits.length) ranked.push({ section: 'text', items: textHits });
   let offset = 0;
   return ranked.map(({ section, items }) => {
@@ -74,8 +60,6 @@ export function rankedSections(
   });
 }
 
-/** What a category tab says about its hits. `unknown` while the category is
- *  still out or failed, so neither reads as "no hits". */
 export type TabHits = 'unknown' | 'none' | 'some';
 
 export function tabHits(state: Loadable<unknown[]>): TabHits {
@@ -83,7 +67,6 @@ export function tabHits(state: Loadable<unknown[]>): TabHits {
   return state.data.length === 0 ? 'none' : 'some';
 }
 
-/** The dimming is visual, so a screen reader hears it here. */
 export function tabAccessibleName(label: string, hits: TabHits): string | undefined {
   return hits === 'none' ? `${label}, no hits` : undefined;
 }

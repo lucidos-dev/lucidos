@@ -1,22 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
-// The per-thread half of the side-effect we're verifying.
 const refreshThreadEvents = vi.fn(async (_id: string) => {});
 const markLoadedThreadsStale = vi.fn();
 vi.mock('./thread-loading', () => ({ refreshThreadEvents, markLoadedThreadsStale }));
 
-// The metadata read goes through the shared wrapper, which is what owns the one
-// keyed card this shares with the resume sync (see thread-list-refresh.test.ts
-// for the reporting rules themselves). Mocked here so this suite stays about
-// resync ORDERING; asserting on it also pins that the site still routes through
-// the wrapper rather than calling `loadAllThreads` directly and growing its own
-// catch block, which is the divergence the shared module exists to prevent.
 const refreshThreadList = vi.fn(async () => {});
 vi.mock('./thread-list-refresh', () => ({ refreshThreadList }));
 
-// Stub the threadMap + focusedThreadId signals so the test can set fixture state
-// without pulling in the full store graph (which depends on browser-only modules).
 const threadMap = signal(new Map<string, { meta: { id: string }; eventsLoaded: boolean }>());
 const focusedThreadId = signal<string | null>(null);
 vi.mock('../store', () => ({
@@ -41,7 +32,6 @@ vi.mock('../store', () => ({
   repoSource: signal(null),
 }));
 
-// Side-effect imports thread-sync.ts pulls in — kept as no-ops.
 vi.mock('../../api/client', () => ({ API_BASE: '', API: '/api/v1', postMcpConsent: vi.fn() }));
 vi.mock('../thread-events', () => ({
   handleEvent: vi.fn(),
@@ -99,20 +89,12 @@ describe('resyncLoadedThreads', () => {
 
     await resyncLoadedThreads();
 
-    // The metadata read is what repairs the drawer after an SSE gap (the stuck
-    // "Thinking" spinner this function exists for reads `meta.status`), and it
-    // covers every thread in one request. Only the transcript on screen needs
-    // its events now; the rest are marked and catch up on focus.
     expect(refreshThreadList).toHaveBeenCalledTimes(1);
     expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
     expect(refreshThreadEvents.mock.calls.map((c) => c[0])).toEqual(['thread-c']);
   });
 
   it('marks without refreshing anything when no thread is focused', async () => {
-    // An SSE drop reconnects every 3s and each reopen ran this. On a workspace
-    // this size, unbounded, it put every request on one connection and one radio
-    // wake, racing the same 10s client deadline down a link that had only just
-    // come back; bounded, it queued the same burst. Now there is no burst.
     threadMap.value = new Map(
       Array.from({ length: 20 }, (_, i) => [`t${i}`, { meta: { id: `t${i}` }, eventsLoaded: true }] as const),
     );
@@ -125,8 +107,6 @@ describe('resyncLoadedThreads', () => {
   });
 
   it('does not refresh a focused thread whose events never loaded', async () => {
-    // `refreshThreadEvents` would decline it (there is no `lastDbSeq` to fetch
-    // after); the full load is `focusThread`'s / the retry's business.
     threadMap.value = new Map([
       ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: false }],
     ]);
@@ -138,9 +118,6 @@ describe('resyncLoadedThreads', () => {
   });
 
   it('reruns once for a gap that opened while a resync ran', async () => {
-    // The running resync's metadata read may have been answered before the
-    // second gap's events existed, so folding into it would keep a drawer
-    // status stale. Only a read that starts after the call can repair it.
     threadMap.value = new Map([
       ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: true }],
     ]);
@@ -170,8 +147,6 @@ describe('resyncLoadedThreads', () => {
     ]);
     focusedThreadId.value = 'thread-a';
 
-    // A burst of Lagged frames or back-to-back reconnects costs at most two
-    // round trips: the running one and a single rerun.
     await Promise.all([
       resyncLoadedThreads(),
       resyncLoadedThreads(),

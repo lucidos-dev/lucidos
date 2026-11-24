@@ -8,17 +8,41 @@
 //! tests can construct just those without spinning up the full engine. The
 //! [`LucidosEngine`] methods are thin sugar over them.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::LucidosEngine;
-use crate::triggers::{find_group_by_name_ci, TriggerGroup};
+use crate::triggers::{find_group_by_name_ci, TriggerGroupEventRow, TriggerGroupProjection};
 use uuid::Uuid;
 
+/// Persist before applying, using the receipt's sequence for causal ordering.
+pub async fn emit_and_apply_group_event(
+    groups: &Arc<std::sync::RwLock<TriggerGroupProjection>>,
+    bus: &EventBus,
+    event: SystemEvent,
+) -> Result<(), String> {
+    if event.aggregate() != "trigger_group" {
+        return Err("expected a trigger-group lifecycle event".into());
+    }
+    let event_type = event.event_type().to_owned();
+    let payload = event.to_payload();
+    let receipt = bus
+        .emit(BusEvent::System(event))
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("trigger-group event was not persisted")?;
+    groups.write().unwrap().apply(&TriggerGroupEventRow {
+        seq: receipt.seq,
+        event_type,
+        payload,
+        created: chrono::Utc::now(),
+    });
+    Ok(())
+}
+
 /// Successful outcome of [`create_trigger_group_locked`].
-pub(crate) struct CreatedTriggerGroup {
+pub struct CreatedTriggerGroup {
     pub group_id: String,
     pub name: String,
     pub order: i32,
@@ -28,7 +52,7 @@ pub(crate) struct CreatedTriggerGroup {
 /// Failure modes for create. Callers translate these to their own response
 /// shape (HTTP status code + JSON, or LLM-tool error string).
 #[derive(Debug)]
-pub(crate) enum CreateTriggerGroupError {
+pub enum CreateTriggerGroupError {
     /// Trimmed name was empty.
     EmptyName,
     /// A group whose name matches case-insensitively already exists. Carries
@@ -41,7 +65,7 @@ pub(crate) enum CreateTriggerGroupError {
 
 /// Failure modes for rename.
 #[derive(Debug)]
-pub(crate) enum RenameTriggerGroupError {
+pub enum RenameTriggerGroupError {
     EmptyName,
     NotFound,
     DuplicateName { existing_name: String },
@@ -52,7 +76,7 @@ pub(crate) enum RenameTriggerGroupError {
 /// the event emission, and the synchronous projection apply — so two
 /// concurrent callers with the same name can't both observe an empty slot.
 pub(crate) async fn create_trigger_group_locked(
-    trigger_groups: &Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
+    trigger_groups: &Arc<std::sync::RwLock<TriggerGroupProjection>>,
     event_bus: &EventBus,
     write_lock: &tokio::sync::Mutex<()>,
     raw_name: &str,
@@ -87,21 +111,17 @@ pub(crate) async fn create_trigger_group_locked(
         "order": order,
     });
 
-    event_bus
-        .emit(BusEvent::System(SystemEvent::TriggerGroupCreated {
-            group_id: group_id.clone(),
-            payload: payload.clone(),
-            actor,
-        }))
-        .await
-        .map_err(|e| CreateTriggerGroupError::EmitFailed(e.to_string()))?;
-
-    crate::scheduler::handle_trigger_group_event(
-        "TriggerGroupCreated",
-        &group_id,
-        &payload,
+    emit_and_apply_group_event(
         trigger_groups,
-    );
+        event_bus,
+        SystemEvent::TriggerGroupCreated {
+            group_id: group_id.clone(),
+            payload,
+            actor,
+        },
+    )
+    .await
+    .map_err(CreateTriggerGroupError::EmitFailed)?;
 
     Ok(CreatedTriggerGroup {
         group_id,
@@ -115,7 +135,7 @@ pub(crate) async fn create_trigger_group_locked(
 /// create-vs-rename and rename-vs-rename races where two writers could
 /// converge on the same name.
 pub(crate) async fn rename_trigger_group_locked(
-    trigger_groups: &Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
+    trigger_groups: &Arc<std::sync::RwLock<TriggerGroupProjection>>,
     event_bus: &EventBus,
     write_lock: &tokio::sync::Mutex<()>,
     group_id: &str,
@@ -158,21 +178,17 @@ pub(crate) async fn rename_trigger_group_locked(
     }
 
     let payload = serde_json::json!({ "group_id": group_id, "name": new_name });
-    event_bus
-        .emit(BusEvent::System(SystemEvent::TriggerGroupRenamed {
-            group_id: group_id.to_string(),
-            payload: payload.clone(),
-            actor,
-        }))
-        .await
-        .map_err(|e| RenameTriggerGroupError::EmitFailed(e.to_string()))?;
-
-    crate::scheduler::handle_trigger_group_event(
-        "TriggerGroupRenamed",
-        group_id,
-        &payload,
+    emit_and_apply_group_event(
         trigger_groups,
-    );
+        event_bus,
+        SystemEvent::TriggerGroupRenamed {
+            group_id: group_id.to_string(),
+            payload,
+            actor,
+        },
+    )
+    .await
+    .map_err(RenameTriggerGroupError::EmitFailed)?;
 
     Ok(())
 }
@@ -180,7 +196,7 @@ pub(crate) async fn rename_trigger_group_locked(
 impl LucidosEngine {
     /// Sugar over [`create_trigger_group_locked`] that wires up the engine's
     /// own registry, bus, and write lock.
-    pub(crate) async fn create_trigger_group_serialized(
+    pub async fn create_trigger_group_serialized(
         &self,
         raw_name: &str,
         explicit_order: Option<i32>,
@@ -198,7 +214,7 @@ impl LucidosEngine {
     }
 
     /// Sugar over [`rename_trigger_group_locked`].
-    pub(crate) async fn rename_trigger_group_serialized(
+    pub async fn rename_trigger_group_serialized(
         &self,
         group_id: &str,
         raw_new_name: &str,
@@ -224,12 +240,48 @@ mod tests {
     use super::*;
     use crate::test_support::setup_test_db;
 
-    fn registry() -> Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>> {
-        Arc::new(std::sync::RwLock::new(HashMap::new()))
+    fn registry() -> Arc<std::sync::RwLock<TriggerGroupProjection>> {
+        Arc::default()
     }
 
     fn lock() -> tokio::sync::Mutex<()> {
         tokio::sync::Mutex::new(())
+    }
+
+    #[tokio::test]
+    async fn delayed_create_cannot_undo_inline_rename() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool);
+        let mut rx = bus.subscribe();
+        let groups = registry();
+        let write_lock = lock();
+        let created =
+            create_trigger_group_locked(&groups, &bus, &write_lock, "Original", Some(100), None)
+                .await
+                .unwrap();
+        let frame = rx.recv().await.unwrap();
+        rename_trigger_group_locked(
+            &groups,
+            &bus,
+            &write_lock,
+            &created.group_id,
+            "Renamed",
+            None,
+        )
+        .await
+        .unwrap();
+
+        groups.write().unwrap().apply(&TriggerGroupEventRow {
+            seq: frame.seq.unwrap(),
+            event_type: "TriggerGroupCreated".into(),
+            payload: match frame.typed {
+                BusEvent::System(event) => event.to_payload(),
+                _ => panic!("expected system event"),
+            },
+            created: frame.created,
+        });
+        assert_eq!(groups.read().unwrap()[&created.group_id].name, "Renamed");
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     #[tokio::test]

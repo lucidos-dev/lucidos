@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-// A `repo:` link can name an image that is not in the repository at that ref.
-// The preview must say so, rather than draw a broken image.
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

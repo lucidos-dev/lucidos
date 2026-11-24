@@ -17,10 +17,6 @@ describe('fileRows', () => {
   });
 });
 
-/** Each wide-line mode has its own class, and one mode's CSS must never reach a
- *  `<pre>` another owns. `pan` lays the rows out in two columns, which a
- *  side-by-side diff column must not get: its tints cover the number in each
- *  row. Keeping that off a diff column is exactly what `caller` is for. */
 describe('codeBlockClass', () => {
   const MODE_CLASSES = ['line-numbered-wrap', 'line-numbered-pan'];
   const modesIn = (cls: string) => cls.split(' ').filter(c => MODE_CLASSES.includes(c));
@@ -39,15 +35,11 @@ describe('codeBlockClass', () => {
     expect(modesIn(codeBlockClass(true, 'pan'))).toEqual(['line-numbered-pan']);
   });
 
-  // A diff column owns its own overflow and its own row tints. So it opts out
-  // of both treatments rather than picking the less wrong one.
   it('gives a caller-owned block neither treatment', () => {
     expect(modesIn(codeBlockClass(false, 'caller'))).toEqual([]);
     expect(codeBlockClass(false, 'caller')).toBe('file-preview-code line-numbered line-numbered-static');
   });
 
-  // The selection mode is orthogonal: a diff column is static AND caller-owned,
-  // and a file preview is selectable in either of its two modes.
   it('carries the static marker independently of the wide-line mode', () => {
     expect(codeBlockClass(true, 'wrap')).toBe('file-preview-code line-numbered line-numbered-wrap');
     expect(codeBlockClass(true, 'pan')).toBe('file-preview-code line-numbered line-numbered-pan');
@@ -78,9 +70,6 @@ describe('renderRows: the file view', () => {
   });
 });
 
-/** A side-by-side diff column numbers the OLD file on the left and the NEW file on the
- *  right, so one file-level selection cannot mean both. All three behaviours are
- *  off there: the click, the highlight, and (below) the scroll-target consume. */
 describe('renderRows: a non-participating column', () => {
   const rows = fileRows(['one', 'two', 'three']);
 
@@ -88,18 +77,12 @@ describe('renderRows: a non-participating column', () => {
     expect(renderRows(rows, null, false).map(r => r.selectLine)).toEqual([null, null, null]);
   });
 
-  // The caller passes `sel: null` for a column precisely so it never subscribes
-  // to `selectedLines`; this pins that even a selection handed in by mistake
-  // paints nothing, so the two gates cannot half-fail.
   it('paints no highlight even for a matching selection', () => {
     const rendered = renderRows(rows, { start: 1, end: 3 }, false);
     expect(rendered.every(r => !r.cls.includes('line-selected'))).toBe(true);
   });
 });
 
-/** A filler row exists only to keep the two columns of a side-by-side diff lined up
- *  where one side has no line. It is not a line, so it shows no number, is not
- *  a scroll target, and is never selectable. */
 describe('renderRows: a filler row', () => {
   it('shows no number, exposes no data-line, and cannot be clicked', () => {
     const [filler] = renderRows([{ html: '', num: null }], { start: 1, end: 99 }, true);
@@ -119,10 +102,6 @@ describe('renderRows: a filler row', () => {
   });
 });
 
-/** The third gate lives in a signal `effect` and is DOM-bound, so it cannot be
- *  driven from here. It matters as much as the other two: a column that consumed
- *  a pending `lineScrollTarget` would swallow a navigate meant for a file view
- *  and, finding no such row, null the selection out from under it. */
 describe('the scroll target is consumed only by a participating view', () => {
   const source = readFileSync(new URL('./LineNumberedCode.tsx', import.meta.url), 'utf8');
 

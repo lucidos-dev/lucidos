@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import type { Exchange } from '../../store/thread-events';
 import { lastResponseText } from './copyLastResponse';
 
-/** An exchange carrying only the streamed text the picker reads. */
 function turn(...texts: string[]): Exchange {
   return { steps: texts.map((text) => ({ event: { type: 'TextStreamed', text } })) } as unknown as Exchange;
 }

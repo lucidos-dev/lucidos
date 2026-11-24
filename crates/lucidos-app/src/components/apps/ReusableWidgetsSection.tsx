@@ -8,9 +8,6 @@ import { Disclosure } from '../shared/Disclosure';
 import { LoadableError } from '../shared/LoadableError';
 import { AppIcon } from '../shared/AppIcon';
 
-/** The apps panel's "Widgets" group: the reusable widgets, which any thread
- *  may show (ADR 0402). A built-in one has no Stop reusing (ADR 0415). A tap opens one in Canvas. The group appears once
- *  there is one, below the apps list, which draws its own skeleton. */
 export function ReusableWidgetsSection() {
   const [collapsed, setCollapsed] = useState(false);
   useEffect(() => { void loadReusableWidgets(); }, []);

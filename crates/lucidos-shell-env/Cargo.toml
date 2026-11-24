@@ -1,0 +1,16 @@
+[package]
+name = "lucidos-shell-env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Hydrates a service launch from the user's login-shell environment (ADR 0326).
+# The gateway calls it once in `boot()`. It lives in its own crate to keep the
+# gateway binary under its size ceiling. Keep it std plus libc: no tokio, no
+# Lucidos crates. The caller passes the logger in.
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

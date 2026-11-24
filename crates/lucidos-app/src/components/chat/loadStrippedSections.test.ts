@@ -42,7 +42,6 @@ describe('mergeContextCaptureSections', () => {
     expect(merged.sections).toEqual(sections);
     expect(merged.tools).toEqual(['edit', 'search']);
     expect(merged.sections_stripped).toBe(false);
-    // Inline-chip fields preserved verbatim.
     expect(merged.producer).toBe('main_llm');
     expect(merged.model).toBe('claude-opus-4-7');
     expect(merged.context_window).toBe(200_000);

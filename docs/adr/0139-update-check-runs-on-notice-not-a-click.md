@@ -8,6 +8,12 @@ Amended by
 point: the Settings row now says what is sent behind its explainer, not at rest
 on the page.
 
+## Diagnostic reporting amendment
+
+[ADR 0716](0716-diagnostic-bundles.md) adds owner-approved diagnostic bundles.
+Lucidos sends diagnostics only when the owner taps Send, to the chosen recipient.
+The update check remains the only automatic request to a server we run.
+
 ## Context
 
 ADR 0108 put the update check in the gateway and gave it three gates. The

@@ -2,15 +2,10 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { activeInlineForm, activeMenuItem, panelOverlay, settingsSubview } from '../store';
 import type { EmailConfirmRequest } from '../types';
 
-// Spy on the nav-stack writes: a send mutates the panel in place, so it must
-// REPLACE the entry it already owns, never push a second one.
 const pushNavState = vi.fn();
 const replaceNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState, replaceNavState }));
 
-// Every user-intent navigation that lands content in the right pane must call
-// revealContentPane() — this one fires from an engine SSE event, so without it
-// a mobile user never sees the panel that just appeared.
 const revealContentPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane }));
 
@@ -49,9 +44,6 @@ describe('openEmailConfirmRequest', () => {
       type: 'form',
       form: { type: 'email-confirm', request: draft },
     });
-    // The regression this pins: the handler used to call
-    // landOnAccountsWithOverlay, which teleported the user to Settings →
-    // Accounts to confirm a send and stranded them there once the panel closed.
     expect(activeMenuItem.value).toBe('files');
     expect(settingsSubview.value).toBe('main');
   });
@@ -73,9 +65,6 @@ describe('markEmailSent', () => {
     const sent = activeInlineForm.value;
     expect(sent?.type).toBe('email-confirm');
     if (sent?.type !== 'email-confirm') return;
-    // The user can edit subject/body in the form; the receipt (and the history
-    // entry behind it) must show what went out, not the engine's draft — a
-    // remount re-seeds the panel from the form alone.
     expect(sent.request.subject).toBe('Q3 numbers');
     expect(sent.request.body).toBe('Edited body.');
     expect(sent.request.to).toEqual(draft.to);
@@ -104,8 +93,6 @@ describe('markEmailSent', () => {
 
   it('no-ops when a different email-confirm panel took over mid-send', () => {
     const form = openDraft();
-    // A second staged email is also an `email-confirm` form — a type check would
-    // let this one's receipt overwrite it, so the guard compares identity.
     const other = openDraft();
     replaceNavState.mockClear();
 

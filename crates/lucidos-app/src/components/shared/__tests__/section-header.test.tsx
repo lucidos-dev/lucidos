@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-// The list panels' collapsible section header: one toggle, actions beside it,
-// and a collapse the panel remembers per device.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { SectionHeader, SectionHeaderContent } from '../SectionHeader';
@@ -26,10 +24,10 @@ describe('SectionHeader', () => {
 
   it('toggles from one button that says whether the section is open', () => {
     let toggled = 0;
-    render(<SectionHeader title="Set aside" count={2} collapsed={false} onToggle={() => { toggled++; }} />, host);
+    render(<SectionHeader title="On hold" count={2} collapsed={false} onToggle={() => { toggled++; }} />, host);
     const toggle = host.querySelector<HTMLButtonElement>('.list-section-toggle')!;
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(toggle.querySelector('.section-label')?.textContent).toBe('Set aside');
+    expect(toggle.querySelector('.section-label')?.textContent).toBe('On hold');
     expect(toggle.querySelector('.section-count-open')?.textContent).toBe('2');
     toggle.click();
     expect(toggled).toBe(1);

@@ -61,8 +61,7 @@ impl ArgType {
 }
 
 /// Where an argument rides on the HTTP request the surface ultimately calls.
-/// Only the CLI/SDK generators care (they build the request); the LLM handler
-/// runs in-process and reads the args object directly.
+/// The CLI generator and the route-backed tool build the request from it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgIn {
     /// `?name=value` query parameter.
@@ -71,6 +70,9 @@ pub enum ArgIn {
     Body,
     /// `:name` path segment substitution.
     Path,
+    /// A JSON body field every call sends with this literal value. No caller
+    /// supplies it: it is never a CLI flag and never in the LLM schema.
+    FixedBody(&'static str),
 }
 
 /// One argument of one operation.
@@ -85,6 +87,13 @@ pub struct Arg {
     /// Where it rides on the underlying HTTP request.
     pub loc: ArgIn,
     pub description: &'static str,
+}
+
+impl Arg {
+    /// Whether a caller supplies this arg, as a CLI flag or an LLM property.
+    pub fn from_caller(&self) -> bool {
+        !matches!(self.loc, ArgIn::FixedBody(_))
+    }
 }
 
 /// HTTP method the operation maps to (the substrate route).
@@ -170,6 +179,10 @@ pub struct Operation {
 }
 
 impl Operation {
+    /// The args a caller supplies, in declaration order.
+    pub fn caller_args(&self) -> impl Iterator<Item = &Arg> {
+        self.args.iter().filter(|a| a.from_caller())
+    }
     /// Whether this operation is exposed on the LLM grouped tool.
     pub fn on_llm(&self, domain: &Domain) -> bool {
         self.llm.unwrap_or(domain.llm)
@@ -205,6 +218,23 @@ pub struct Domain {
     /// Whether a workspace's chat turns are offered the grouped tool. A gated
     /// domain still has its routes and CLI commands in every workspace.
     pub llm_gate: Gate,
+    /// How the grouped LLM tool runs an action (ADR 0751).
+    pub llm_execution: LlmExecution,
+}
+
+/// How a domain's grouped LLM tool runs an action.
+///
+/// A manifest tool runs the same route its CLI calls, so a route's gate binds
+/// the tool and the CLI alike. No default: a new domain states its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmExecution {
+    /// A *route-backed tool*: the action becomes the request the generated CLI
+    /// sends, carrying the calling thread's origin token. The domain has no
+    /// hand-written handler. A domain with no LLM tool states this too.
+    Route,
+    /// A hand-written in-process handler. Only the legacy domains the engine's
+    /// shrink-only list names may say this (`docs/temporary-measures.md`).
+    LegacyInProcess,
 }
 
 impl Domain {
@@ -401,6 +431,22 @@ const PREFERENCES_OPS: &[Operation] = &[
         cli: None,
         sdk: None,
     },
+    Operation {
+        action: "reset",
+        summary: "Put one global preference back to its default by deleting its stored value.",
+        method: Method::Delete,
+        path: "/preferences",
+        args: &[PREF_KEY_ARG],
+        cli_name: "reset",
+        sdk_name: "reset",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        // The CLI alone: the in-process tool and the SDK set a value instead.
+        llm: Some(false),
+        cli: None,
+        sdk: Some(false),
+    },
 ];
 
 const PREFERENCES_DOMAIN: Domain = Domain {
@@ -413,6 +459,7 @@ const PREFERENCES_DOMAIN: Domain = Domain {
     operations: PREFERENCES_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -520,8 +567,39 @@ const TRIGGER_SIDE_EFFECT_GRANT_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description:
-        "Irreversible side-effect categories this trigger may perform unattended, e.g. [\"email\"].",
+    description: "Send [] to revoke the trigger's legacy category grants.",
+};
+const TRIGGER_PROGRAM_GRANTS_ARG: Arg = Arg {
+    name: "program_grants",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Program names to request on a permission card in this thread.",
+};
+const TRIGGER_FOLDER_GRANTS_ARG: Arg = Arg {
+    name: "folder_grants",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Absolute folder paths to request on a permission card in this thread.",
+};
+const TRIGGER_REVOKE_PROGRAM_GRANTS_ARG: Arg = Arg {
+    name: "revoke_program_grants",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Program grant scopes to revoke, as listed on this trigger.",
+};
+const TRIGGER_REVOKE_FOLDER_GRANTS_ARG: Arg = Arg {
+    name: "revoke_folder_grants",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Folder grants to revoke, as listed on this trigger. Only the owner may.",
 };
 const TRIGGER_CODING_AGENT_GRANT_ARG: Arg = Arg {
     name: "coding_agent_grant",
@@ -604,6 +682,8 @@ pub const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name; notifications deep-link there. Null for standalone."},
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
   "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
+  "program_grants": {"type":"array","items":{"type":"string"},"description":"Programs to ask the owner for, on one card."},
+  "folder_grants": {"type":"array","items":{"type":"string"},"description":"Absolute folders to ask the owner for, on one card."},
   "mcp_servers": {"anyOf":[{"type":"null"},{"type":"array","items":{"type":"string"}}],"description":"MCP server ids its fires call; any other is refused."},
   "continue_key": {"anyOf":[{"type":"null"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}}],"description":"Intent triggers: payload paths naming one thread; a part may list alternatives. A fire with the same values continues its open thread. Null clears."},
   "actor": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Intent triggers: payload path of the email of the person behind a fire. The thread credits that operator. Null clears."},
@@ -635,9 +715,10 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_APP_ID_ARG,
             TRIGGER_GO_TO_REVIEW_ARG,
             TRIGGER_GROUP_ID_ARG,
-            TRIGGER_SIDE_EFFECT_GRANT_ARG,
             TRIGGER_CODING_AGENT_GRANT_ARG,
             TRIGGER_MCP_SERVERS_ARG,
+            TRIGGER_PROGRAM_GRANTS_ARG,
+            TRIGGER_FOLDER_GRANTS_ARG,
             TRIGGER_CONTINUE_KEY_ARG,
             TRIGGER_ACTOR_ARG,
             TRIGGER_SLUG_ARG,
@@ -685,8 +766,12 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GO_TO_REVIEW_ARG,
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
+            TRIGGER_REVOKE_PROGRAM_GRANTS_ARG,
+            TRIGGER_REVOKE_FOLDER_GRANTS_ARG,
             TRIGGER_CODING_AGENT_GRANT_ARG,
             TRIGGER_MCP_SERVERS_ARG,
+            TRIGGER_PROGRAM_GRANTS_ARG,
+            TRIGGER_FOLDER_GRANTS_ARG,
             TRIGGER_CONTINUE_KEY_ARG,
             TRIGGER_ACTOR_ARG,
             TRIGGER_SLUG_ARG,
@@ -781,6 +866,7 @@ const TRIGGERS_DOMAIN: Domain = Domain {
     operations: TRIGGERS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -929,6 +1015,7 @@ const TRIGGER_GROUPS_DOMAIN: Domain = Domain {
     operations: TRIGGER_GROUPS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1133,7 @@ const APPS_DOMAIN: Domain = Domain {
     operations: APPS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
 };
 
 // ---------------------------------------------------------------------------
@@ -1064,11 +1152,11 @@ const EVENTS_EMIT_LLM_SCHEMA: &str = r#"{
 const EVENTS_QUERY_LLM_SCHEMA: &str = r#"{
   "event_id": {"type":"string","description":"One event by id: the 'evt-<32 hex>' a tool result ends with, or a bare uuid. A tool call's address returns the pair, call then result. Errors if nothing matches."},
   "event_type": {"type":"string","description":"Omitting it queries all, worth avoiding on a busy workspace."},
-  "thread_id": {"type":"string","description":"One thread: 'current' is this one. Read it back with event_type 'MessageReceived'."},
+  "thread_id": {"type":"string","description":"One thread: 'current' is this one. Read it back with event_type 'MessageReceived'. Leads with its liveness."},
   "since": {"type":"string","description":"After this RFC 3339 timestamp."},
   "until": {"type":"string","description":"Before this RFC 3339 timestamp."},
   "limit": {"type":"integer","description":"1-200, default 50. Raise only to fully enumerate a small type."},
-  "byte_limit": {"type":"integer","description":"Response byte budget (1024-524288, default 131072). On truncation follow the hint and narrow the query before raising it."}
+  "byte_limit": {"type":"integer","description":"Response byte budget (1024-524288, default 131072). On truncation, narrow the query first."}
 }"#;
 const EVENTS_COUNT_LLM_SCHEMA: &str = r#"{
   "event_type": {"type":"string","description":"Omit for a per-type breakdown across all types."},
@@ -1152,6 +1240,7 @@ const EVENTS_DOMAIN: Domain = Domain {
     operations: EVENTS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -1281,21 +1370,21 @@ const CHANGES_DOMAIN: Domain = Domain {
     operations: CHANGES_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
 // models — chat-model registry (Settings → Models). The grouped
 // `manage_models` LLM tool keeps its name, and its schema is built from the
 // manifest. The domain also generates a `lucidos models` CLI over the /models
-// CRUD. execute_tool routes manage_models to execute_manage_models, which reads
-// `action` itself, so there is no grouped-alias delegation.
+// CRUD. The tool is route-backed: each action runs the CLI's route.
 //
 // LLM actions (list/add/enable/disable/update/remove) and CLI ops
-// (list/add/update/delete) diverge: enable/disable are LLM-only PUT
-// conveniences. `id` is a Body arg for `add` and a Query arg for update/delete
-// (two Args, same name/type). `routes` is a Json arg, which the LLM tool never
-// derives, so `add` and `update` carry a raw `llm_schema`. See
-// engine/tools/models.rs + api/settings.rs.
+// (list/add/update/delete) diverge: enable/disable are LLM-only PUTs with a
+// fixed `on_chat_ladder`. `id` is a Body arg for `add` and a Query arg for
+// update/delete (two Args, same name/type). `routes` is a Json arg, which the
+// LLM tool never derives, so `add` and `update` carry a raw `llm_schema`. See
+// api/settings.rs.
 // ---------------------------------------------------------------------------
 
 /// Every provider name, in `ProviderKind::ALL` order. A test holds the two in
@@ -1377,6 +1466,28 @@ const MODEL_ON_CHAT_LADDER_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "On or off the ladder.",
 };
+const MODEL_ONTO_CHAT_LADDER_ARG: Arg = Arg {
+    loc: ArgIn::FixedBody("true"),
+    ..MODEL_ON_CHAT_LADDER_ARG
+};
+const MODEL_OFF_CHAT_LADDER_ARG: Arg = Arg {
+    loc: ArgIn::FixedBody("false"),
+    ..MODEL_ON_CHAT_LADDER_ARG
+};
+/// Why an agent edits the Lucidos Agent's ladder. The owner's card quotes it.
+const MODEL_LADDER_REASON: &str = "Why you change the ladder. The owner reads it on the card.";
+const MODEL_REASON_BODY_ARG: Arg = Arg {
+    name: "reason",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: MODEL_LADDER_REASON,
+};
+const MODEL_REASON_QUERY_ARG: Arg = Arg {
+    loc: ArgIn::Query,
+    ..MODEL_REASON_BODY_ARG
+};
 const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     name: "context_window",
     ty: ArgType::Int,
@@ -1397,7 +1508,8 @@ const MODEL_VISION_ARG: Arg = Arg {
 // `routes` is a Json arg, so the LLM shape of `add` is spelled out here. `id`
 // keeps the structure `args` would derive, since enable / disable / remove still
 // derive it and the union must agree. Only the top-level `provider` spells the
-// enum: the handler refuses an unknown name in a route with the list.
+// enum: the route's `validate_routes` refuses an unknown name in a route with
+// the list.
 pub const MODELS_ADD_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"Model id, the API string unless a route overrides it. All but list need it."},
   "label": {"type":"string","description":"Display name; defaults to the id."},
@@ -1457,14 +1569,18 @@ const MODELS_OPS: &[Operation] = &[
         summary: "Put it on the ladder.",
         method: Method::Put,
         path: "/models",
-        args: &[MODEL_ID_QUERY_ARG],
+        args: &[
+            MODEL_ID_QUERY_ARG,
+            MODEL_ONTO_CHAT_LADDER_ARG,
+            MODEL_REASON_BODY_ARG,
+        ],
         cli_name: "enable",
         sdk_name: "enable",
         mutating: true,
         llm_alias: None,
         llm_schema: None,
-        // LLM-only convenience (the in-process handler turns its chat ladder
-        // rungs on); the CLI uses `update --on-chat-ladder true|false` instead.
+        // An LLM-only shorthand for `update` with `on_chat_ladder` set, which
+        // is what the CLI runs instead.
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -1474,7 +1590,11 @@ const MODELS_OPS: &[Operation] = &[
         summary: "Take it off the ladder.",
         method: Method::Put,
         path: "/models",
-        args: &[MODEL_ID_QUERY_ARG],
+        args: &[
+            MODEL_ID_QUERY_ARG,
+            MODEL_OFF_CHAT_LADDER_ARG,
+            MODEL_REASON_BODY_ARG,
+        ],
         cli_name: "disable",
         sdk_name: "disable",
         mutating: true,
@@ -1499,6 +1619,7 @@ const MODELS_OPS: &[Operation] = &[
             MODEL_ROUTES_ARG,
             MODEL_PREFERRED_PROVIDER_ARG,
             MODEL_VISION_ARG,
+            MODEL_REASON_BODY_ARG,
         ],
         cli_name: "update",
         sdk_name: "update",
@@ -1514,7 +1635,7 @@ const MODELS_OPS: &[Operation] = &[
         summary: "Delete a user-added model.",
         method: Method::Delete,
         path: "/models",
-        args: &[MODEL_ID_QUERY_ARG],
+        args: &[MODEL_ID_QUERY_ARG, MODEL_REASON_QUERY_ARG],
         cli_name: "delete",
         sdk_name: "remove",
         mutating: true,
@@ -1538,6 +1659,7 @@ const MODELS_DOMAIN: Domain = Domain {
     operations: MODELS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
 };
 
 // ---------------------------------------------------------------------------
@@ -1647,6 +1769,7 @@ const REPOSITORIES_DOMAIN: Domain = Domain {
     operations: REPOSITORIES_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -1747,6 +1870,7 @@ const ENV_VARS_DOMAIN: Domain = Domain {
     operations: ENV_VARS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -1963,6 +2087,7 @@ const WIDGETS_DOMAIN: Domain = Domain {
     operations: WIDGETS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -1980,7 +2105,7 @@ const WIDGETS_DOMAIN: Domain = Domain {
 // `ThreadStatus::ALL` by `threads_status_enum_matches_the_thread_status_enum`.
 pub const THREADS_LIST_LLM_SCHEMA: &str = r#"{
   "active": {"type":"boolean","description":"UNION of running and waiting_for_user_answer; false inverts. For 'is the workspace busy?' use status ['running']: a thread awaiting an answer is blocked on the human, not working."},
-  "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Exactly these, the values each row's status carries. Precise form of active; passing both errors."},
+  "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Turn status. Idle means no open turn; waiting is legacy. Conflicts with active."},
   "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' accepted). Omit for all."},
   "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children, not grandchildren; resolved from the calling thread, so no id. How you recover a child's thread_id."},
   "has_draft": {"type":"boolean","description":"Holds an unsent draft; false inverts."},
@@ -1989,7 +2114,7 @@ pub const THREADS_LIST_LLM_SCHEMA: &str = r#"{
 }"#;
 pub const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
   "active": {"type":"boolean","description":"UNION of running and waiting_for_user_answer; false inverts. Omit for the total. Nonzero does NOT mean work is in flight: for 'is anything still running?' use status ['running']."},
-  "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Count exactly these; passing both errors."},
+  "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Turn status, as in list."},
   "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent'. Omit for all."},
   "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children; resolved from the calling thread, so no id."}
 }"#;
@@ -2018,7 +2143,7 @@ const THREADS_SEARCH_LLM_SCHEMA: &str = r#"{
 const THREADS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Thread summaries newest-first: thread_id, title, channel, status, section, parent_thread_id, has_draft, draft_preview, link.",
+        summary: "Thread summaries newest-first, with liveness, turn status and draft previews.",
         method: Method::Get,
         path: "/threads/list",
         args: &[],
@@ -2065,6 +2190,29 @@ const THREADS_OPS: &[Operation] = &[
         sdk: Some(false),
     },
     Operation {
+        action: "submit_draft",
+        summary: "Send a saved draft exactly as saved, only on the owner's say-so. Read it \
+                  with 'drafts' first. (requires: thread_id, expected_revision, expected_epoch)",
+        method: Method::Post,
+        path: "/threads/:thread_id/submit-draft",
+        args: &[],
+        cli_name: "submit-draft",
+        sdk_name: "submitDraft",
+        mutating: true,
+        llm_alias: Some("submit_saved_draft"),
+        // `thread_id` is already in the union, from `detach_child`.
+        llm_schema: Some(
+            r#"{
+              "expected_revision": {"type":"integer","description":"submit_draft: snapshot.draft_revision from 'drafts'."},
+              "expected_epoch": {"type":"integer","description":"submit_draft: snapshot.compose_epoch from 'drafts'."},
+              "retry_key": {"type":"string","description":"submit_draft: a uuid naming this send. Reuse it to retry."}
+            }"#,
+        ),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
+    Operation {
         action: "held_messages",
         summary: "Agent messages held until the user answers a question, with link.",
         method: Method::Get,
@@ -2081,9 +2229,8 @@ const THREADS_OPS: &[Operation] = &[
     },
     Operation {
         action: "search",
-        summary: "Find past threads by what was SAID in them (text plus semantic), which \
-                  'list' cannot: it filters by status and channel, never by topic. Read one \
-                  via `events` 'query' with its thread_id. (requires: q)",
+        summary: "Find threads by topic (text plus semantic), with liveness and change state. \
+                  Read one via `events` 'query' with its thread_id. (requires: q)",
         method: Method::Get,
         path: "/threads/search",
         args: &[THREADS_SEARCH_Q_ARG, THREADS_SEARCH_LIMIT_ARG],
@@ -2107,9 +2254,7 @@ const THREADS_OPS: &[Operation] = &[
         sdk_name: "detachChild",
         mutating: true,
         llm_alias: Some("detach_child_thread"),
-        llm_schema: Some(
-            r#"{"thread_id":{"type":"string","description":"The child's uuid."}}"#,
-        ),
+        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"The child's uuid."}}"#),
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -2143,9 +2288,7 @@ const THREADS_OPS: &[Operation] = &[
         sdk_name: "cacheKeepAlive",
         mutating: true,
         llm_alias: Some("switch_cache_keep_alive"),
-        llm_schema: Some(
-            r#"{"state":{"type":"string","enum":["off","on"]}}"#,
-        ),
+        llm_schema: Some(r#"{"state":{"type":"string","enum":["off","on"]}}"#),
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -2186,7 +2329,8 @@ const THREADS_OPS: &[Operation] = &[
     },
     Operation {
         action: "apply_triage",
-        summary: "Apply what the user approved from this thread's newest triage. (requires: entries)",
+        summary:
+            "Apply what the user approved from this thread's newest triage. (requires: entries)",
         method: Method::Post,
         path: "/threads/triage/apply",
         args: &[],
@@ -2206,7 +2350,7 @@ const THREADS_OPS: &[Operation] = &[
 const THREADS_DOMAIN: Domain = Domain {
     name: "threads",
     tool_name: "threads",
-    tool_summary: "Read threads, cheaper than querying events for what exists, its status and its unsent draft; each row has a link to paste. Stop awaiting a child, archive one, or triage the inbox. 'list' and 'count' share filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
+    tool_summary: "Read threads and unsent drafts; each row has a link. Read what a thread is doing from liveness.state. A waiting thread wakes itself on the waits liveness names. Detach a child, archive one, or triage. Start via run_thread or run_coding_agent, redirect via follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.
@@ -2215,13 +2359,15 @@ const THREADS_DOMAIN: Domain = Domain {
     operations: THREADS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
 // memory: long-term memory. Mixed surfaces (declared parity per op). The LLM
-// gets CORRECTION: correct and correct_by_id run in-process, so they have no
-// HTTP route and are cli/sdk = false. It also gets two READS, `search` and
-// `source`. The CLI gets every read.
+// gets CORRECTION, run in-process. `correct` needs a model to judge matches,
+// so it has no HTTP route and is cli/sdk = false. `correct_by_id` also has a
+// route, for the CLI. The LLM gets two READS too, `search` and `source`. The
+// CLI gets every read.
 //
 // Memory is injected into context, and injection is the primary path. It cannot
 // recover from a bad guess, so the two LLM reads are the backstop for the misses
@@ -2332,6 +2478,23 @@ const MEM_COMMIT_ARG: Arg = Arg {
     description: "Artifact commit SHA (required when source_type is 'artifact').",
 };
 
+const MEM_CORRECT_ID_ARG: Arg = Arg {
+    name: "id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "The memory entry's UUID, as `entries` and `search` print it.",
+};
+const MEM_CORRECTION_ARG: Arg = Arg {
+    name: "correction",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "A corrected fact to store after the delete. Omit to only delete.",
+};
+
 const MEMORY_OPS: &[Operation] = &[
     Operation {
         action: "correct",
@@ -2359,8 +2522,8 @@ const MEMORY_OPS: &[Operation] = &[
         action: "correct_by_id",
         summary: "Delete (and optionally replace) ONE memory by its id, the precise path when the [id: <uuid>] is visible. (requires: id)",
         method: Method::Post,
-        path: "/memory/correct",
-        args: &[],
+        path: "/memory/correct-by-id",
+        args: &[MEM_CORRECT_ID_ARG, MEM_CORRECTION_ARG],
         cli_name: "correct-by-id",
         sdk_name: "correctById",
         mutating: true,
@@ -2372,7 +2535,7 @@ const MEMORY_OPS: &[Operation] = &[
             }"#,
         ),
         llm: None,
-        cli: Some(false),
+        cli: None,
         sdk: Some(false),
     },
     Operation {
@@ -2464,6 +2627,7 @@ const MEMORY_DOMAIN: Domain = Domain {
     // A Tree turn reads the summary trees and never this memory, so the tool
     // goes and `recall` takes its slot. The CLI stays, for Classic's own data.
     llm_gate: Gate::MemoryClassic,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -2621,6 +2785,7 @@ const RECALL_DOMAIN: Domain = Domain {
     operations: RECALL_OPS,
     llm_aliases: &[],
     llm_gate: Gate::MemoryTree,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -2741,6 +2906,7 @@ const THREAD_QUEUE_DOMAIN: Domain = Domain {
     operations: THREAD_QUEUE_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -2912,6 +3078,7 @@ const MCP_DOMAIN: Domain = Domain {
     operations: MCP_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -3017,6 +3184,7 @@ const PLUGINS_DOMAIN: Domain = Domain {
     operations: PLUGINS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::LegacyInProcess,
 };
 
 // ---------------------------------------------------------------------------
@@ -3213,6 +3381,7 @@ const WEBHOOKS_DOMAIN: Domain = Domain {
     operations: WEBHOOKS_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
 };
 
 // ---------------------------------------------------------------------------
@@ -3249,6 +3418,331 @@ const WORKSPACE_PROMPT_FOOTPRINT_DOMAIN: Domain = Domain {
     operations: WORKSPACE_PROMPT_FOOTPRINT_OPS,
     llm_aliases: &[],
     llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
+};
+
+// ---------------------------------------------------------------------------
+// permissions: list and revoke what owners' answers granted, and raise a batch
+// for the owner to confirm (ADR 0664). No LLM
+// tool, since its schema would bill every chat turn; the Lucidos Agent reaches
+// the CLI through its shell tool. No app needs it, so no SDK either.
+// ---------------------------------------------------------------------------
+
+const PERMISSIONS_ALL_ARG: Arg = Arg {
+    name: "all",
+    ty: ArgType::Bool,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Include ended permissions: spent, revoked, or ended when their plan landed.",
+};
+const PERMISSION_ID_ARG: Arg = Arg {
+    name: "permission_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Path,
+    description: "The permission to revoke, from `list`.",
+};
+const BATCH_ITEMS_ARG: Arg = Arg {
+    name: "items",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "JSON array of items. A pick on an open card in your sub-threads: { \"kind\": \"card_answer\", \"thread_id\": \"…\", \"option\": \"<label>\" }, adding \"tool_use_id\" when the thread has more than one open card. A trigger's grants: { \"kind\": \"trigger_grant\", \"trigger\": \"<id or slug>\", \"coding_agents\": true }. Workspaces' origin, for workspaces not yet classified: { \"kind\": \"workspace_classification\", \"workspaces\": [\"<slug>\"], \"origin\": \"agent|demo|eval|e2e|user\", \"evidence\": \"…\" }. Move machine-made workspaces to Trash after the owner confirms: { \"kind\": \"workspace_deletion\", \"workspaces\": [\"<slug>\"] }.",
+};
+
+const PERMISSIONS_OPS: &[Operation] = &[
+    Operation {
+        action: "list",
+        summary: "Live permissions, newest first: action, breadth, lifetime, holder, and the thread that granted it.",
+        method: Method::Get,
+        path: "/permissions",
+        args: &[PERMISSIONS_ALL_ARG],
+        cli_name: "list",
+        sdk_name: "list",
+        mutating: false,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "revoke",
+        summary: "Revoke one permission, ending it now. Revoking only takes power away.",
+        method: Method::Delete,
+        path: "/permissions/:permission_id",
+        args: &[PERMISSION_ID_ARG],
+        cli_name: "revoke",
+        sdk_name: "revoke",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "batch",
+        summary: "Raise a batch on your own thread: one card that runs exact picks on your sub-threads' open cards once the owner confirms it. Each pick is checked again as it runs.",
+        method: Method::Post,
+        path: "/permissions/batches",
+        args: &[BATCH_ITEMS_ARG],
+        cli_name: "batch",
+        sdk_name: "batch",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+];
+
+const PERMISSIONS_DOMAIN: Domain = Domain {
+    name: "permissions",
+    tool_name: "permissions",
+    tool_summary: "Permissions: what the owner's answers to permission requests granted, and batches for the owner to confirm.",
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: PERMISSIONS_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
+};
+
+// ---------------------------------------------------------------------------
+// hooks: the workspace's *event hooks* (ADR 0746), on the CLI alone. Only the
+// owner arms, disarms or removes one: an agent gets `permission_required`.
+// ---------------------------------------------------------------------------
+
+/// The hook's folder name under data/hooks/, as a path segment.
+const HOOK_SLUG_ARG: Arg = Arg {
+    name: "slug",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Path,
+    description: "The hook's folder name under data/hooks/, as `list` shows it.",
+};
+
+/// Why an agent asks. The owner reads it on the permission card.
+const HOOK_REASON_ARG: Arg = Arg {
+    name: "reason",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Why you ask. An agent must give one: the owner reads it on the card.",
+};
+
+const HOOKS_OPS: &[Operation] = &[
+    Operation {
+        action: "list",
+        summary: "Every hook under data/hooks/, valid or not, with its arming: disarmed, armed, or changed since it was armed. A row also says why it cannot be armed now.",
+        method: Method::Get,
+        path: "/hooks",
+        args: &[],
+        cli_name: "list",
+        sdk_name: "list",
+        mutating: false,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "arm",
+        summary: "Arm a valid hook at its current content, so Lucidos asks it before it records its event. Owner only: an agent needs the owner's Allow once, and an edit asks again.",
+        method: Method::Post,
+        path: "/hooks/:slug/arm",
+        args: &[HOOK_SLUG_ARG, HOOK_REASON_ARG],
+        cli_name: "arm",
+        sdk_name: "arm",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "disarm",
+        summary: "Disarm an armed hook. Its folder stays. Owner only: an agent needs the owner's Allow once.",
+        method: Method::Post,
+        path: "/hooks/:slug/disarm",
+        args: &[HOOK_SLUG_ARG, HOOK_REASON_ARG],
+        cli_name: "disarm",
+        sdk_name: "disarm",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "remove",
+        summary: "Delete a hook's folder from data/hooks/, commit that, and end any arming of it. Owner only: an agent needs the owner's Allow once.",
+        method: Method::Delete,
+        path: "/hooks/:slug",
+        args: &[HOOK_SLUG_ARG, HOOK_REASON_ARG],
+        cli_name: "remove",
+        sdk_name: "remove",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+];
+
+const HOOKS_DOMAIN: Domain = Domain {
+    name: "hooks",
+    tool_name: "hooks",
+    tool_summary:
+        "Event hooks: the scripts a workspace defines to stop progress until its own rule holds.",
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: HOOKS_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
+};
+
+// ---------------------------------------------------------------------------
+// pinned_apps and browser: the CLI routes for two tables an agent once wrote
+// by SQL. Each runs the engine's own mutator, so a pin announces itself.
+// ---------------------------------------------------------------------------
+
+const PIN_DEVICE_QUERY_ARG: Arg = Arg {
+    name: "device_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Query,
+    description: "The device whose pins to list, as `lucidos devices list` shows it.",
+};
+const PIN_DEVICE_ARG: Arg = Arg {
+    name: "device_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "The device to pin or unpin for, as `lucidos devices list` shows it.",
+};
+const PIN_APP_ARG: Arg = Arg {
+    name: "app_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "The app's id, as `lucidos apps list` shows it.",
+};
+
+const PINNED_APPS_OPS: &[Operation] = &[
+    Operation {
+        action: "list",
+        summary: "The apps one device has pinned, in pin order.",
+        method: Method::Get,
+        path: "/pinned-apps",
+        args: &[PIN_DEVICE_QUERY_ARG],
+        cli_name: "list",
+        sdk_name: "list",
+        mutating: false,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "pin",
+        summary: "Pin an app for one device. Pinning a pinned app changes nothing.",
+        method: Method::Post,
+        path: "/pinned-apps",
+        args: &[PIN_APP_ARG, PIN_DEVICE_ARG],
+        cli_name: "pin",
+        sdk_name: "pin",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "unpin",
+        summary: "Unpin an app for one device. Unpinning an unpinned app changes nothing.",
+        method: Method::Delete,
+        path: "/pinned-apps",
+        args: &[PIN_APP_ARG, PIN_DEVICE_ARG],
+        cli_name: "unpin",
+        sdk_name: "unpin",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+];
+
+const PINNED_APPS_DOMAIN: Domain = Domain {
+    name: "pinned_apps",
+    tool_name: "pinned_apps",
+    tool_summary: "The apps each device has pinned.",
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: PINNED_APPS_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
+};
+
+const BROWSER_DOMAIN_ARG: Arg = Arg {
+    name: "domain",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "The site's domain, such as example.com.",
+};
+
+const BROWSER_OPS: &[Operation] = &[Operation {
+    action: "forget_login",
+    summary: "Forget that the built-in browser is signed in to one domain. The chat tool browser_forget_login does the same.",
+    method: Method::Post,
+    path: "/browser/forget-login",
+    args: &[BROWSER_DOMAIN_ARG],
+    cli_name: "forget-login",
+    sdk_name: "forgetLogin",
+    mutating: true,
+    llm_alias: None,
+    llm_schema: None,
+    llm: None,
+    cli: None,
+    sdk: None,
+}];
+
+const BROWSER_DOMAIN: Domain = Domain {
+    name: "browser",
+    tool_name: "browser",
+    tool_summary: "The built-in browser's record of signed-in domains.",
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: BROWSER_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+    llm_execution: LlmExecution::Route,
 };
 
 const DOMAINS: &[Domain] = &[
@@ -3263,6 +3757,7 @@ const DOMAINS: &[Domain] = &[
         operations: NOTIFICATIONS_OPS,
         llm_aliases: &[],
         llm_gate: Gate::Ungated,
+        llm_execution: LlmExecution::LegacyInProcess,
     },
     PREFERENCES_DOMAIN,
     TRIGGERS_DOMAIN,
@@ -3282,6 +3777,10 @@ const DOMAINS: &[Domain] = &[
     WEBHOOKS_DOMAIN,
     WIDGETS_DOMAIN,
     WORKSPACE_PROMPT_FOOTPRINT_DOMAIN,
+    PERMISSIONS_DOMAIN,
+    HOOKS_DOMAIN,
+    PINNED_APPS_DOMAIN,
+    BROWSER_DOMAIN,
 ];
 
 /// The full manifest.

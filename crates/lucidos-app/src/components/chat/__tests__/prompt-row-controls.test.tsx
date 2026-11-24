@@ -1,11 +1,3 @@
-/** The composer row's order and its fold order.
- *
- *  The fold takes a prefix of the fold order. That follows the row left to
- *  right, except that todo and waiting fold first: the toggles keep their slots.
- *  The user asked for the Claude menu and attach image to fold before the model
- *  picker. The WIP preview toggle keeps its place in the order.
- *
- *  Plan: `docs/plans/2026-10-21-coding-agent-menu-folds-before-the-model-picker.md`. */
 import { describe, expect, it, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { SideQuestionIcon } from '../../shared/icons';
@@ -22,7 +14,6 @@ interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: un
 
 const spec = (key: string): HeaderActionSpec => ({ key, label: key, icon: () => null });
 
-/** Every member present, as on a busy coding-agent thread. */
 const members = (codingAgent: boolean, hasText = true) => composerRowMembers({
   codingAgentMenu: codingAgent ? codingAgentMenuAction('claude-code') : null,
   attachImage: spec('attach-image'),
@@ -34,13 +25,11 @@ const members = (codingAgent: boolean, hasText = true) => composerRowMembers({
   rung: spec(RUNG_FOLD_KEY),
 });
 
-/** Left to right, as the row draws them. */
 const order = (codingAgent: boolean) => {
   const { row, cluster } = members(codingAgent);
   return [...row, ...cluster].map((a) => a.key);
 };
 
-/** The order the fold takes them in. */
 const foldOrder = (codingAgent: boolean) => members(codingAgent).foldOrder.map((a) => a.key);
 
 describe('the composer row order', () => {
@@ -71,16 +60,12 @@ describe('the composer row order', () => {
     }
   });
 
-  /** The picker holds its spot: what comes and goes stands left of it, so it
-   *  folds first and never pushes the picker. */
   it('folds Diff and the standing apply before the model picker', () => {
     const keys = foldOrder(true);
     expect(keys.indexOf('thread-diff')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
     expect(keys.indexOf('standing-apply')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
   });
 
-  /** It reads no thread state, so this holds in compose context and in a
-   *  started thread alike. */
   it('folds the Claude menu and attach image before the model picker', () => {
     const keys = foldOrder(true);
     expect(keys.indexOf(CODING_AGENT_MENU_FOLD_KEY)).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
@@ -106,23 +91,16 @@ describe('the composer row order', () => {
     expect(order(true).slice(0, 2)).toEqual(order(false).slice(0, 2));
   });
 
-  /** A Lucidos Agent thread has no slash commands, and its model pick is the
-   *  rung control's. */
   it('offers the coding-agent menu to a coding-agent thread alone', () => {
     expect(order(false)[0]).toBe('call-toggle');
     expect(order(false)).not.toContain(CODING_AGENT_MENU_FOLD_KEY);
   });
 
-  /** Codex has no slash commands, so its menu could never open. The row drew
-   *  it anyway, dimmed for good. */
   it('offers no coding-agent menu to Codex', () => {
     expect(codingAgentMenuAction('codex')).toBeNull();
   });
 });
 
-/** Diff and the standing apply merge into one box before the row's first
- *  member after the readouts folds. That member is the leading toggle where
- *  one stands, else the coding-agent menu or attach image. */
 describe('the Diff and apply merge point', () => {
   it('is the leading toggle while one stands', () => {
     expect(members(true).mergeAt).toBe('call-toggle');
@@ -147,8 +125,6 @@ describe('the Diff and apply merge point', () => {
 describe('the row toggles', () => {
   const sideQuestion = sideQuestionToggleAction(false, () => {});
 
-  /** The follow toggle floats over the composer instead
-   *  (`follow-toggle-always-shown.test.ts`). */
   it('hold the side-question toggle alone with no call', () => {
     expect(promptRowToggles(null, undefined, sideQuestion).map((a) => a.key)).toEqual([sideQuestion.key]);
   });
@@ -157,9 +133,6 @@ describe('the row toggles', () => {
     expect(promptRowToggles(null, undefined, null)).toEqual([]);
   });
 
-  /** A call reaches the Lucidos Agent and nothing else (ADR 0165). Voice ships
-   *  off, so the member is absent either way here. What this pins is that the
-   *  factory is asked, rather than the composer deciding for itself. */
   it('offer no call member on a coding-agent thread', () => {
     expect(promptRowToggles('claude-code', undefined, null).map((a) => a.key))
       .not.toContain('call-toggle');
@@ -192,8 +165,6 @@ describe('the side-question toggle', () => {
 describe('the call toggle is offered on the home thread alone', () => {
   const thread = (home: boolean) => ({ meta: home ? { home: true } : {} }) as unknown as ThreadState;
 
-  /** Voice sessions live in the home thread (ADR 0362). Any other thread, and
-   *  the compose view with no thread at all, offer no call. */
   it('offers a call on the home thread with the Lucidos Agent', () => {
     expect(callIsOffered(thread(true), null)).toBe(true);
   });

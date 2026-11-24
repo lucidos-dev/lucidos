@@ -31,12 +31,10 @@ describe('Header double-click: thread drawer state preservation', () => {
   it('drawer stays open through full collapse/expand cycle', () => {
     threadDrawerOpen.value = true;
 
-    // Collapse
     resolveHeaderDblClick({ region: 'content', ratio: DEFAULT_SPLIT_RATIO });
     expect(splitRatio.value).toBe(0);
     expect(threadDrawerOpen.value).toBe(true);
 
-    // Expand: the drawer must reappear
     resolveHeaderDblClick({ region: 'content', ratio: 0 });
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
     expect(threadDrawerOpen.value).toBe(true);
@@ -45,12 +43,10 @@ describe('Header double-click: thread drawer state preservation', () => {
   it('drawer stays closed through full collapse/expand cycle', () => {
     threadDrawerOpen.value = false;
 
-    // Collapse
     resolveHeaderDblClick({ region: 'content', ratio: DEFAULT_SPLIT_RATIO });
     expect(splitRatio.value).toBe(0);
     expect(threadDrawerOpen.value).toBe(false);
 
-    // Expand: the drawer must stay closed
     resolveHeaderDblClick({ region: 'content', ratio: 0 });
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
     expect(threadDrawerOpen.value).toBe(false);
@@ -96,11 +92,6 @@ describe('the thread drawer\'s own header segment answers no double-click', () =
 });
 
 describe('headerDblClickRegion attributes a point to a pane segment', () => {
-  // A 1280px bar at the default 0.4 ratio, with a 300px drawer open behind a
-  // 6px divider: the drawer is [0, 300), the Conversation pane runs to the
-  // split divider at 300 + 6 + 0.4 * 974 = 695.6, and the Canvas pane has the
-  // rest. `headerLeft` is non-zero on purpose, so an implementation that forgot
-  // to subtract it cannot pass.
   const bar = {
     headerLeft: 40,
     headerWidth: 1280,
@@ -111,18 +102,18 @@ describe('headerDblClickRegion attributes a point to a pane segment', () => {
   const at = (x: number) => headerDblClickRegion({ ...bar, x });
 
   it('names the drawer for anything over the drawer', () => {
-    expect(at(40)).toBe('drawer');       // the bar's own leading edge
+    expect(at(40)).toBe('drawer');
     expect(at(200)).toBe('drawer');
-    expect(at(339)).toBe('drawer');      // one px inside the drawer's trailing edge
+    expect(at(339)).toBe('drawer');
   });
 
   it('names the Conversation pane from the drawer divider to the split', () => {
-    expect(at(340)).toBe('thread');      // the drawer divider seam, which is not the drawer
+    expect(at(340)).toBe('thread');
     expect(at(700)).toBe('thread');
   });
 
   it('names the Canvas pane past the split divider', () => {
-    expect(at(760)).toBe('content');     // 40 + 695.6, rounded clear
+    expect(at(760)).toBe('content');
     expect(at(1300)).toBe('content');
   });
 
@@ -132,10 +123,6 @@ describe('headerDblClickRegion attributes a point to a pane segment', () => {
   });
 
   it('attributes by x, so the sliver of bar above and below the control row counts', () => {
-    // The reason this is geometry and not a `closest('.threads-header')` fence:
-    // that row is 2.25rem inside a 3rem bar, so a press a few px from the bar's
-    // edge lands on the bar itself. y never enters the arithmetic, which is
-    // exactly what makes the whole segment inert rather than just the row.
     expect(at(200)).toBe('drawer');
   });
 });

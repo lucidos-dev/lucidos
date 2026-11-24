@@ -1,6 +1,3 @@
-/** Every icon-only retry control draws the one shared `RetryIcon`, and that
- *  glyph's arc runs into its arrowhead. A retry button once wore a play icon,
- *  and the glyph's head once floated off its arc. */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
@@ -19,7 +16,6 @@ function tsxFiles(dir: string): string[] {
   });
 }
 
-/** A control whose accessible name or tooltip says Retry. */
 const RETRY_LABEL = /(?:aria-label|data-tooltip)=\{?[^>\n]*Retry/;
 
 describe('one retry glyph', () => {

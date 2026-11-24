@@ -11,8 +11,6 @@ vi.mock('../actions/apps', () => ({
   openAppById: vi.fn(),
   refreshAppUI: vi.fn(),
   captureAppUI: vi.fn(),
-  // A `thread` navigate leaves fullscreen before it focuses, so the app the
-  // reader is inside cannot hide the conversation the tap lands in.
   exitAppFullscreen: vi.fn(() => false),
 }));
 const markReadOptimistic = vi.fn();
@@ -44,18 +42,13 @@ import { appPseudoFullscreen, databaseReachable } from '../store';
 import { focusThreadOrBootstrap } from '../actions/threads';
 import { viewNotification, handleNotificationSSE } from '../actions/notifications';
 
-// The store reaches scrollState through the handle, which the shell fills.
 provideScrollState(scrollState);
 
-/** The pongs this page sent, as `[notification_id, answer]` pairs. */
 const submitPong = vi.fn();
 setEventStream({ submitPong, close: () => {}, ownsReconnect: false, revalidate: () => 'live', restart: () => {} });
 
 const DEADLINE_MS = 2000;
 
-/** Fire a PresenceCheck the way the SSE channel would. It carries the toast,
- *  and the page acts on it before it answers (see notifications.md §3-§4).
- *  Returns the outcome the page reported. */
 function emitToast(overrides: Partial<{
   notification_id: string; title: string; body: string;
   thread_id: string; event_id: string; app_id: string; tap: Tap;
@@ -97,10 +90,6 @@ describe('PresenceCheck (active page) → in-app toast', () => {
   });
 
   it('opens a modal (pure) notification on a tap anywhere on the card, with no button', () => {
-    // Plain notification (no app/thread, no tap): resolveDeepLink returns
-    // view-notification. The card tap opens the detail and marks read. There is
-    // no button and no [OK]: deferring is the X (dismiss, keep unread), and
-    // merely showing the toast never marks it read.
     emitToast({ notification_id: 'notif-plain' });
 
     const t = toasts.value[0];
@@ -108,7 +97,6 @@ describe('PresenceCheck (active page) → in-app toast', () => {
     expect(t.onClick).toBeTypeOf('function');
     expect(t.action).toBeUndefined();
     expect(t.secondaryAction).toBeUndefined();
-    // The X stays available so the user can defer.
     expect(t.dismissable).not.toBe(false);
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
@@ -118,16 +106,11 @@ describe('PresenceCheck (active page) → in-app toast', () => {
     const t = toasts.value[0];
     t.onClick!();
     expect(viewNotification).toHaveBeenCalledWith('notif-open');
-    // The read is guaranteed by the handler (after viewNotification settles),
-    // not left to viewNotification's fetch-contingent internal mark.
     await Promise.resolve();
     expect(markReadOptimistic).toHaveBeenCalledWith('notif-open');
   });
 
   it('a tap on a modal notification still marks it read when the detail fetch fails', async () => {
-    // viewNotification swallows a failed fetch and does NOT mark read. The toast
-    // is already dismissed, so the tap must mark read itself, or the row
-    // silently stays unread.
     vi.mocked(viewNotification).mockReturnValueOnce(Promise.reject(new Error('fetch failed')));
     emitToast({ notification_id: 'notif-openfail' });
     const t = toasts.value[0];
@@ -188,10 +171,7 @@ describe('PresenceCheck (active page) → in-app toast', () => {
     expect(t.secondaryAction).toBeUndefined();
   });
 
-  it('a tap on a navigate (thread + event) notification deep-links to the source event', () => {
-    // The tap must route through the SAME navigate dispatch the inbox detail
-    // and push taps use: focusThreadOrBootstrap(threadId, { targetEventId }).
-    // The scroll-and-pulse itself is covered by e2e/notifications-all.spec.ts.
+  it('a tap on a navigate (thread + event) notification deep-links to the source event', async () => {
     emitToast({
       notification_id: 'notif-q',
       title: 'Claude is asking',
@@ -203,14 +183,11 @@ describe('PresenceCheck (active page) → in-app toast', () => {
 
     toasts.value[0].onClick!();
 
-    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' });
+    await vi.waitFor(() => expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' }));
     expect(markReadOptimistic).toHaveBeenCalledWith('notif-q', undefined);
   });
 
   it('defers a navigate notification via the X (dismissable, keeps it unread), with no OK button', () => {
-    // The only "clear without opening" path is the toast's built-in X, which
-    // dismisses WITHOUT marking read. An [OK] that marks read without opening
-    // would bury an unanswered question.
     emitToast({
       notification_id: 'notif-defer',
       thread_id: 't-9',
@@ -228,9 +205,6 @@ describe('PresenceCheck (active page) → in-app toast', () => {
   });
 
   it('coerces a historical tap=none into a modal toast the card tap opens (not passive/auto-read)', () => {
-    // tap=none is retired (docs/plans/2026-07-02-remove-notification-tap-none.md).
-    // A historical/coerced none behaves like modal: a toast that persists and
-    // is NOT auto-marked-read on show. Every notification is openable.
     emitToast({ notification_id: 'notif-legacy-none', tap: { kind: 'none' } as unknown as Tap });
 
     const t = toasts.value[0];
@@ -243,10 +217,6 @@ describe('PresenceCheck (active page) → in-app toast', () => {
 });
 
 describe('PresenceCheck → freshness gate', () => {
-  // Past its deadline the engine has decided, and with no pong it pushed. An
-  // iOS PWA flushing its SSE queue after a push tap delivers exactly that. A
-  // toast now would sit on top of the push, so the page does nothing and
-  // answers nothing. The bell badge (NotificationCreated) still reflects it.
   beforeEach(() => {
     toasts.value = [];
     focusedThreadId.value = null;
@@ -342,7 +312,6 @@ describe('PresenceCheck → §4 row classification (suppression when user has se
   });
 
   it('does NOT render a toast under an app filling the screen, and leaves the push to the OS', () => {
-    // One predicate for the answer and the render: the shell must be in front.
     appPseudoFullscreen.value = true;
     try {
       const outcome = emitToast({ notification_id: 'notif-fullscreen' });
@@ -398,11 +367,6 @@ describe('SSE wiring: handleGlobalEvent routes PresenceCheck → toast, then pon
 });
 
 describe('NotificationCreated SSE no longer fires toasts (architecture invariant)', () => {
-  // The iOS PWA queueing fix: NotificationCreated SSE is bell-badge-only.
-  // The toast is driven by PresenceCheck, whose freshness gate drops a check
-  // past its deadline. Without this
-  // invariant, an iOS-queued NotificationCreated would flush after the user
-  // taps the OS push and leak a duplicate in-app toast.
   beforeEach(() => {
     toasts.value = [];
     focusedThreadId.value = null;
@@ -438,13 +402,10 @@ describe('PresenceCheck → overflow at 5+ individual toasts', () => {
 
   it('keeps the first 4 individual toasts and rolls the 5th into "+1 more"', () => {
     const outcomes = [1, 2, 3, 4, 5].map((i) => emitToast({ notification_id: `n-${i}` }));
-    // A notification folded into the overflow toast is on screen too.
     expect(outcomes).toEqual(['shown', 'shown', 'shown', 'shown', 'shown']);
 
     const individuals = toasts.value.filter(t => t.key?.startsWith('notification-'));
     expect(individuals).toHaveLength(4);
-    // New toasts prepend (newest at the top of the column-stacked container), so
-    // the kept four are the first four created, listed newest-first.
     expect(individuals.map(t => t.key)).toEqual([
       'notification-n-4', 'notification-n-3', 'notification-n-2', 'notification-n-1',
     ]);
@@ -452,7 +413,6 @@ describe('PresenceCheck → overflow at 5+ individual toasts', () => {
     const overflow = toasts.value.find(t => t.key === 'notifications-overflow');
     expect(overflow).toBeTruthy();
     expect(overflow!.message).toBe('+1 more notification');
-    // Single-action toast: click the text to view, no separate button.
     expect(overflow!.action).toBeUndefined();
     expect(overflow!.onClick).toBeTypeOf('function');
   });
@@ -464,7 +424,6 @@ describe('PresenceCheck → overflow at 5+ individual toasts', () => {
     expect(overflow).toBeTruthy();
     expect(overflow!.message).toBe('+3 more notifications');
 
-    // Individual slots stay pinned to the original 4
     expect(toasts.value.filter(t => t.key?.startsWith('notification-'))).toHaveLength(4);
   });
 
@@ -519,8 +478,6 @@ describe('notification toasts persist (no auto-dismiss)', () => {
   });
 
   it('leaves an actioned (tap.kind=navigate) toast sticky', () => {
-    // Guards against a future "auto-dismiss every keyed toast" overcorrection
-    // so the card tap (and the X) stay reachable for the user to act.
     emitToast({
       notification_id: 'cta-stick',
       app_id: 'habit-tracker',
@@ -540,10 +497,6 @@ describe('notification toasts persist (no auto-dismiss)', () => {
 });
 
 describe('notification_toasts = false silences the pop-up', () => {
-  // The workspace-wide switch behind Settings → Notifications → In-app toasts.
-  // Off, the notification waits on the bell badge and in the panel instead of
-  // interrupting. Every other block in this file leaves the preference unloaded,
-  // which is the default-on path, so those cover the unchanged half.
   function setToastsPreference(value: string): void {
     preferences.value = { status: 'loaded', data: { notification_toasts: value } };
   }
@@ -569,10 +522,8 @@ describe('notification_toasts = false silences the pop-up', () => {
 
     const outcome = emitToast({ notification_id: 'notif-quiet', thread_id: 'thread-A', event_id: 'evt-1' });
 
-    // Still suppresses the push: the switch is about interruption, not presence.
     expect(outcome).toBe('silenced');
     expect(toasts.value).toHaveLength(0);
-    // Deferred, not dismissed: the row has to stay unread for the panel.
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
 
@@ -584,8 +535,6 @@ describe('notification_toasts = false silences the pop-up', () => {
   });
 
   it('still bumps the bell badge, which is a different SSE handler', () => {
-    // The gate lives in presentInAppNotification, below the badge's own path.
-    // Silencing the toast must not silence the count the panel is found by.
     setToastsPreference('false');
     handleGlobalEvent('NotificationCreated', {
       id: 'notif-badge',
@@ -600,7 +549,6 @@ describe('notification_toasts = false silences the pop-up', () => {
   });
 
   it('still auto-marks read when the user is looking at the source event (Row 1)', () => {
-    // Row 1 is about attention, not about the toast, so the switch leaves it be.
     setToastsPreference('false');
     focusedThreadId.value = 'thread-A';
     isEventInViewport.mockReturnValue(true);
@@ -621,9 +569,6 @@ describe('notification_toasts = false silences the pop-up', () => {
   });
 
   it('holds while preferences are still loading, from the device-local mirror', () => {
-    // The SSE stream connects before the preferences GET returns, and on an
-    // iOS PWA that gap is a whole round trip. Answering "on" there pops the
-    // exact toast the user turned off, so the last known value answers instead.
     localStorage.setItem('lucidos-notification-toasts', 'false');
     preferences.value = { status: 'loading' };
     focusedThreadId.value = 'thread-B';
@@ -663,9 +608,6 @@ describe('notification_toasts = false silences the pop-up', () => {
   });
 });
 
-// A read is the other end of the toast's lifetime. The unread-set watch owns
-// the reads this page can see, in `actions/notification-toast-lifetime.test.ts`.
-// These two SSE arms own the reads it cannot, and are a round trip slower.
 describe('NotificationRead / NotificationsAllRead → the toast goes', () => {
   beforeEach(() => {
     toasts.value = [];
@@ -684,7 +626,6 @@ describe('NotificationRead / NotificationsAllRead → the toast goes', () => {
     handleGlobalEvent('NotificationRead', { id: 'n-read', actor: null });
 
     expect(toasts.value.map(t => t.key)).toEqual(['notification-n-keep']);
-    // The badge still refreshes: the drop is additional, not a replacement.
     expect(handleNotificationSSE).toHaveBeenCalled();
   });
 

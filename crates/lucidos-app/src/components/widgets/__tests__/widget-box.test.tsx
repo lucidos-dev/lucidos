@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A size change never shows the widget's old layout in the new box (plan
- * 2026-11-09-frameless-centred-inline-widgets, invariants 5 and 6). The box
- * covers itself at once, and only a report naming the new size, or the fuse,
- * clears the cover.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -101,9 +95,6 @@ describe('WidgetBox resize cover', () => {
   });
 });
 
-/** Invariant: the right-edge fade shows exactly when the content is wider than
- *  the canvas it draws on, and never on a transparent box (plan
- *  2026-11-10-widget-fit-check). */
 describe('WidgetBox right-edge fade', () => {
   const rightFade = () => host.querySelector('.widget-box-fade[data-edge="right"]');
   const canvasWidth = (px: number) => {

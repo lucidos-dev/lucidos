@@ -1,7 +1,3 @@
-/** A card that reads "Needs your answer" draws last, above only the queued
- *  group, while `exchangeStatus` still reads it at its fold index. See
- *  ADR 0284 and `docs/plans/2026-09-25-pending-card-pins-to-the-bottom.md`.
- */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { renderExchanges } from '../CreateThreadView';
@@ -120,7 +116,6 @@ describe('a card awaiting the user draws last', () => {
     const nodes = renderExchanges([ASKING_TURN, question(), CALLBACK], 't1', '');
     expect(seqs(nodes)).toEqual([1, 4, 3]);
 
-    // No status moves with the card: the callback keeps its held label.
     const [, callback, card] = collectExchangeNodes(nodes);
     expect(statusOf(callback)).toBe('held');
     expect(statusOf(card)).toBe('awaiting-answer');
@@ -140,7 +135,6 @@ describe('a card awaiting the user draws last', () => {
     threadMap.value = new Map([['t1', makeThread('waiting_for_user_answer')]]);
     const nodes = renderExchanges([ASKING_TURN, question(), CALLBACK, QUEUED], 't1', '');
     const behind = collectExchangeNodes(nodes).map(n => n.props.behindOpenQuestion);
-    // Drawn order: the asking turn, the callback, the pinned card, the queued group.
     expect(behind).toEqual([false, true, false, false]);
   });
 

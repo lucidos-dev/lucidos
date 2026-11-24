@@ -2,8 +2,6 @@ import { describe, it, expect } from 'vitest';
 import { exchangeResponseEvents, exchangeSteps } from './exchange-render';
 import type { Exchange } from './exchange';
 
-/** A coding agent compacting its own context is visible, never hidden: the
- *  context counter drops, and the transcript says why at that step. */
 
 const TS = '2026-10-14T09:00:00Z';
 

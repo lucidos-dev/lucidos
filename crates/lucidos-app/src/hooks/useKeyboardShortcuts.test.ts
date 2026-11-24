@@ -1,14 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// isTextInput / isThreadTranscript use `instanceof HTMLElement`, which isn't
-// available in the node test env. Mock just those predicates; keep the rest real.
 vi.mock('../utils/dom', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/dom')>();
   return { ...actual, isTextInput: vi.fn(() => false), isThreadTranscript: vi.fn(() => false), isInteractiveTarget: vi.fn(() => false) };
 });
 
-// The new shortcuts' own actions are tested beside their buttons. Here only
-// the wiring, and who may run it, is under test.
 vi.mock('../components/chat/WaitingBanner', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/chat/WaitingBanner')>();
   return { ...actual, applyFocusedThreadChange: vi.fn(), showFocusedThreadDiff: vi.fn() };
@@ -43,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt, isMacTextEditingKey } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript, isInteractiveTarget } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
-import { focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
+import { activeMenuItem, appSearchOpen, focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
 import { makeThreadState } from '../store/__tests__/thread-events-helpers';
 import { findSurface } from '../store/actions/find-bar';
 import { openHighlightedThreadActions } from '../components/drawer/ThreadDrawer';
@@ -67,7 +63,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
   it('dismisses the top overlay first, before any blur', () => {
     const dismiss = vi.fn();
     pushOverlay({ id: 'm', dismiss, hasPanel: true });
-    // Even with a focused text input, an open overlay wins.
     vi.mocked(isTextInput).mockReturnValue(true);
     expect(dispatchEscape({ blur: vi.fn() } as unknown as Element)).toBe('dismissed');
     expect(dismiss).toHaveBeenCalledTimes(1);
@@ -81,10 +76,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
   });
 
   it('leaves a self-managing text input untouched so its own Escape handler can cancel', () => {
-    // A rename field such as the trigger group's marks its input
-    // data-escape-self because a blur there commits the rename. The universal
-    // blur-on-Escape would SAVE instead of cancel, so dispatchEscape must NOT
-    // blur it.
     vi.mocked(isTextInput).mockReturnValue(true);
     const blur = vi.fn();
     const active = { blur, hasAttribute: (n: string) => n === 'data-escape-self' };
@@ -96,11 +87,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
     expect(dispatchEscape(null)).toBe('noop');
   });
 
-  // A pseudo-fullscreen app registers on the same stack (ContentHeaderActions
-  // pushes it while active), and a modal an app raises over it is pushed after.
-  // LIFO is what keeps one Escape to one effect: the modal closes and the app
-  // stays fullscreen. Reversing the pop order would drop the reader out of
-  // fullscreen on the keystroke they aimed at the modal.
   it('pops only the modal when an app is pseudo-fullscreen behind it', () => {
     const exitFullscreen = vi.fn();
     const closeModal = vi.fn();
@@ -112,13 +98,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
     expect(exitFullscreen).not.toHaveBeenCalled();
   });
 
-  // Native fullscreen is the browser's: it takes Escape to exit, and nothing in
-  // a keydown handler can stop it (Escape grants no user activation to
-  // re-request with, and the only way to consume the close request first is the
-  // top layer, which the overlay layer deliberately does not use). Acting anyway
-  // would make one Escape close the overlay AND drop fullscreen. Standing down
-  // leaves it doing one thing; the overlay is then visible in the normal layout
-  // and the next Escape closes it.
   it('stands down while an element is natively fullscreen', () => {
     const dismiss = vi.fn();
     pushOverlay({ id: 'm', dismiss, hasPanel: true });
@@ -126,13 +105,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
     expect(dismiss).not.toHaveBeenCalled();
   });
 
-  // The stand-down is NOT 'noop'. <Overlay> installs its own bubble-phase
-  // Escape listener (useDismissOnOutside), which dismisses unconditionally and
-  // is normally shadowed by the stopPropagation the 'dismissed' branch does.
-  // A silent fall-through let that listener close the overlay anyway, so one
-  // Escape did both things after all. The distinct value is what tells the
-  // capture-phase dispatcher to stop the event (without preventDefault, which
-  // would be the UA's fullscreen exit).
   it('is distinguishable from a no-op, so the caller can stop the event', () => {
     expect(dispatchEscape(null, true)).not.toBe(dispatchEscape(null, false));
   });
@@ -144,8 +116,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
     expect(dismiss).toHaveBeenCalledTimes(1);
   });
 
-  // The stand-down must not swallow the blur either: whatever the browser is
-  // about to do with this Escape, the host does nothing.
   it('does not blur a focused text input while natively fullscreen', () => {
     vi.mocked(isTextInput).mockReturnValue(true);
     const blur = vi.fn();
@@ -153,9 +123,6 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
     expect(blur).not.toHaveBeenCalled();
   });
 
-  // The capture-phase dispatcher must stop the event on the stand-down (or the
-  // overlay's own Escape closes it anyway) and must NOT preventDefault (or it
-  // would try to suppress the one thing that should happen).
   it('is stopped but not defaulted by the capture dispatcher', () => {
     const src = readFileSync(resolve(here, './useKeyboardShortcuts.ts'), 'utf-8');
     const branch = src.match(/} else if \(result === 'fullscreen'\) \{[\s\S]*?\n {6}\}/)?.[0] ?? '';
@@ -174,8 +141,6 @@ describe('shouldTypeToFocusPrompt (bare-typing → prompt textarea)', () => {
   });
 
   it('does NOT steal the keystroke while an overlay is open — typing must search the dropdown', () => {
-    // The reported bug: opening a dropdown and typing wrote into the prompt
-    // textarea behind it instead of filtering the dropdown.
     expect(shouldTypeToFocusPrompt(ev(), { mobile: false, overlayOpen: true })).toBe(false);
   });
 
@@ -231,7 +196,6 @@ describe('classifyChord (host keydowns, app-frame forwards, the PDF preview)', (
   });
 
   it('maps default pane chords to their shortcut id', () => {
-    // Defaults from utils/shortcuts.ts (no overrides loaded in the test env).
     expect(classifyChord(chord({ metaKey: true, shiftKey: true, key: '3' }))).toBe('toggleContentPane');
     expect(classifyChord(chord({ metaKey: true, shiftKey: true, key: '2' }))).toBe('toggleThreadPane');
     expect(classifyChord(chord({ metaKey: true, shiftKey: true, key: '1' }))).toBe('toggleThreadDrawer');
@@ -317,7 +281,6 @@ describe('classifyChord (host keydowns, app-frame forwards, the PDF preview)', (
   });
 
   it('gives Shift+Escape to the Escape policy while an app is natively fullscreen', () => {
-    // The node test env has no document; stub the one field the check reads.
     const g = globalThis as { document?: unknown };
     const saved = g.document;
     g.document = { fullscreenElement: {} };
@@ -339,26 +302,20 @@ describe('dispatchForwardedChord (forwarded chord ⇒ content pane is focused)',
   });
 
   beforeEach(() => {
-    (globalThis as { innerWidth: number }).innerWidth = 1024; // desktop
-    // Stale focus: the user is working inside the app iframe, but the host never
-    // saw the pointerdown (it can't cross the iframe boundary), so focusedPane
-    // still points at the thread pane it was on before opening the app.
+    (globalThis as { innerWidth: number }).innerWidth = 1024;
     focusedPane.value = 'thread';
-    splitRatio.value = 0.5; // content pane visible
+    splitRatio.value = 0.5;
   });
 
   it('⌘⇧3 CLOSES the content pane the app lives in (regression: was a no-op)', () => {
-    // Without reconciling focusedPane, toggleContentPane reads 'thread', takes
-    // the "focus content" branch, and leaves splitRatio at 0.5 — the pane never
-    // closes. Reconciling to 'content' first makes the first press collapse it.
     dispatchForwardedChord(chord({ metaKey: true, shiftKey: true, key: '3' }));
-    expect(splitRatio.value).toBe(1); // collapsed = closed
+    expect(splitRatio.value).toBe(1);
   });
 
   it('⌘⇧2 focuses the thread pane (focus leaves the app)', () => {
     dispatchForwardedChord(chord({ metaKey: true, shiftKey: true, key: '2' }));
     expect(focusedPane.value).toBe('thread');
-    expect(splitRatio.value).toBe(0.5); // thread pane was unfocused → just focus, no collapse
+    expect(splitRatio.value).toBe(0.5);
   });
 
   it('a non-shortcut chord neither dispatches nor touches focus/layout', () => {
@@ -450,8 +407,6 @@ describe('the Search everywhere shortcut', () => {
 });
 
 describe('dispatchPreviewIframeShortcut (keydown INSIDE a content-pane preview iframe)', () => {
-  // KeyboardEvent isn't a global in the node test env, so fake the chord shape
-  // the dispatcher reads, with a preventDefault that records defaultPrevented.
   const key = (over: Partial<{ metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; key: string }>) => {
     const e = { metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, key: '', defaultPrevented: false, ...over } as unknown as KeyboardEvent & { defaultPrevented: boolean };
     (e as { preventDefault: () => void }).preventDefault = () => { (e as { defaultPrevented: boolean }).defaultPrevented = true; };
@@ -459,32 +414,28 @@ describe('dispatchPreviewIframeShortcut (keydown INSIDE a content-pane preview i
   };
 
   beforeEach(() => {
-    (globalThis as { innerWidth: number }).innerWidth = 1024; // desktop
-    // Focus is inside the preview iframe, but the host never saw a pointerdown
-    // cross the iframe boundary, so focusedPane is stale on the thread pane.
+    (globalThis as { innerWidth: number }).innerWidth = 1024;
     focusedPane.value = 'thread';
-    splitRatio.value = 0.5; // content pane visible, not maximized
+    splitRatio.value = 0.5;
   });
 
   it('⌘⇧↵ maximizes the content pane (the reported bug) and suppresses the browser default', () => {
-    // Without the bridge this keydown never reaches the host: no maximize, and
-    // Chrome runs its own default for ⌘⇧↵ (the page context menu).
     const e = key({ key: 'Enter', metaKey: true, shiftKey: true });
     expect(dispatchPreviewIframeShortcut(e)).toBe(true);
-    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(true); // browser default suppressed
-    expect(focusedPane.value).toBe('content');       // reconciled before dispatch
-    expect(splitRatio.value).toBe(0);                // content pane group maximized
+    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(true);
+    expect(focusedPane.value).toBe('content');
+    expect(splitRatio.value).toBe(0);
   });
 
   it('⌘⇧3 CLOSES the content pane the preview lives in (reconciles stale focus)', () => {
     expect(dispatchPreviewIframeShortcut(key({ key: '3', metaKey: true, shiftKey: true }))).toBe(true);
-    expect(splitRatio.value).toBe(1); // collapsed = closed
+    expect(splitRatio.value).toBe(1);
   });
 
   it('leaves a non-shortcut key (plain Enter on a link, normal typing) untouched', () => {
     const e = key({ key: 'Enter' });
     expect(dispatchPreviewIframeShortcut(e)).toBe(false);
-    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(false); // preview keeps its own behavior
+    expect((e as { defaultPrevented: boolean }).defaultPrevented).toBe(false);
     expect(splitRatio.value).toBe(0.5);
     expect(focusedPane.value).toBe('thread');
   });
@@ -564,8 +515,6 @@ describe('the host-only shortcuts', () => {
   });
 
   it('applies from a keydown the host itself received', () => {
-    // The same-origin PDF preview hands the host a real keydown, as the
-    // document listener does.
     expect(dispatchPreviewIframeShortcut(hostKeydown())).toBe(true);
     expect(applyFocusedThreadChange).toHaveBeenCalledTimes(1);
   });
@@ -584,5 +533,25 @@ describe('the host-only shortcuts', () => {
     pushOverlay({ id: 'confirm', dismiss: vi.fn(), hasPanel: true });
     dispatchPreviewIframeShortcut(hostKeydown());
     expect(applyFocusedThreadChange).not.toHaveBeenCalled();
+  });
+});
+
+describe('app-list search shortcut scope', () => {
+  const chord = { key: 'Enter', metaKey: true, ctrlKey: false, altKey: true, shiftKey: false };
+  it('claims only Apps and Plugins lists and yields under overlays', () => {
+    panelOverlay.value = null;
+    for (const menu of ['apps', 'plugins'] as const) {
+      activeMenuItem.value = menu;
+      expect(classifyChord(chord)).toBe('searchApps');
+    }
+    activeMenuItem.value = 'settings';
+    expect(classifyChord(chord)).toBeNull();
+    activeMenuItem.value = 'apps';
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/example.md' };
+    expect(classifyChord(chord)).toBeNull();
+    panelOverlay.value = null;
+    pushOverlay({ id: 'dialog', dismiss: () => {}, hasPanel: true });
+    expect(classifyChord(chord)).toBeNull();
+    appSearchOpen.value = false;
   });
 });

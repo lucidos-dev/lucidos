@@ -1,16 +1,3 @@
-/**
- * Three reports about the same wait, all of them geometry.
- *
- * The panel drew a filled row inside its own filled box, a card in a card. The
- * event type under the reason sat centred, because the UA centres a button's
- * text and a filtered entry is a button. And the folded ⋯ row carries the
- * model's own sentence, which made a `max-content` menu wider than the phone:
- * `computeAnchorPosition` can only clamp a panel that fits, so it pinned to the
- * left margin and ran off the right edge.
- *
- * Scanned rather than measured. Each failure is a property of the rule, and
- * reproducing one needs a live wait, a long event type and a narrow viewport.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -26,8 +13,6 @@ const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf-8');
 const waitingCss = read('../chat/waiting-indicator.css');
 const hostCss = read('../global/host-components.css');
 
-/** Every pseudo-class that means a pointer or a finger is on the row. A tint
- *  under one of those is feedback; the same fill at rest is a card. */
 const INTERACTING = /:hover|:active|:focus/;
 
 function restingFills(css: string, className: string): string[] {
@@ -42,8 +27,6 @@ describe('the waiting panel draws no card inside its own card', () => {
     expect(restingFills(waitingCss, 'event-wait-item')).toEqual([]);
   });
 
-  /** A pointer's hover lights the row. A finger gets no fill, as nowhere else
-   *  does (touch-paints-no-press.test.ts). */
   it('leaves a sub-thread row unfilled until a pointer is on it', () => {
     expect(restingFills(waitingCss, 'waiting-panel-child-link')).toEqual([]);
     const lit = rulesTargeting(waitingCss, 'waiting-panel-child-link')
@@ -82,15 +65,11 @@ describe('a folded action row stays inside the menu', () => {
     expect(nowrap.map((r) => `${r.selector} { ${r.body} }`)).toEqual([]);
   });
 
-  /** Two lines, then an ellipsis. Wrapping alone let one status readout fill
-   *  five lines of a three-row menu. */
   it('stops the label after two lines', () => {
     const label = rulesTargeting(hostCss, 'thread-overflow-label')[0];
     expect(label, 'no rule clamps a folded action label').toBeDefined();
     expect(label.props.get('-webkit-line-clamp')).toBe('2');
     expect(label.props.get('overflow')).toBe('hidden');
-    // Without it the box takes its longest word as a floor, and the row pushes
-    // the menu wider than the cap instead of clamping.
     expect(label.props.get('min-width')).toBe('0');
   });
 });

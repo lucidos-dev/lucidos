@@ -12,20 +12,16 @@ import { originPopoverHasContent, resolveOrigin } from './messageOrigin';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { appsList, contextViewer, repositories } from '../../store/store';
 import { devices } from '../../store/actions/devices';
-import { operators } from '../../store/actions/operators';
+import { gatewayUsers } from '../../store/actions/gatewayUsers';
 import { pairedDevices } from '../../store/actions/pairedDevices';
 import type { EngineReason, Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
+import { originMode } from '../../store/thread-events';
 
-/** Wrap a single StoredEvent as an Exchange so each test can keep declaring
- *  the userEvent inline — `resolveOrigin` takes the full exchange (it walks
- *  steps for divider-starter ActionRequired events, see the divider cases
- *  below). */
 function exch(userEvent: StoredEvent, steps: Exchange['steps'] = []): Exchange {
   return { userEvent, userSeq: 1, steps };
 }
 
 
-/** Seed the devices list a device origin's name is read from. */
 function seedDevice(id: string, name: string): void {
   pairedDevices.value = { status: 'loaded', data: [] };
   devices.value = {
@@ -122,11 +118,6 @@ describe('resolveOrigin', () => {
     });
   });
 
-  // Regression: an auto-resume records neither `origin` nor `actor` (the device
-  // that pressed Switch is on the teardown ResponseAborted, not here), so the
-  // popover rendered a bare "Unknown" over a chip that already read "Lucidos
-  // Engine". Only the engine can raise a ContinuationStarted nobody clicked, so
-  // the missing field is a legacy gap, not an unknown actor.
   it('defaults ContinuationStarted with no origin and no actor to the engine (auto-resume / legacy DB row)', () => {
     const ev: StoredEvent = { type: 'ContinuationStarted', branch: 'x' };
     expect(resolveOrigin(exch(ev))).toEqual({
@@ -146,8 +137,6 @@ describe('resolveOrigin', () => {
     });
   });
 
-  // The intrinsic default must not shadow a real actor: a user-clicked Continue
-  // still has to read "You" on its device, not "Lucidos Engine".
   it('prefers a persisted origin over the intrinsic engine default', () => {
     const ev: StoredEvent = {
       type: 'MergeConflictDetected',
@@ -156,18 +145,10 @@ describe('resolveOrigin', () => {
     expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1' });
   });
 
-  // ResponseAborted is deliberately NOT in the intrinsic map: its own branch in
-  // renderOriginSection keys on `origin === undefined` to render the System
-  // attribution plus the typed AbortCause.
   it('leaves ResponseAborted unattributed so its System branch still fires', () => {
     expect(resolveOrigin(exch({ type: 'ResponseAborted', cause: 'engine_shutdown' }))).toBeUndefined();
   });
 
-  // Regression: when the user clicks Continue on an interrupted CC thread the
-  // backend stamps the device on `EventMeta.actor` (renders the chip as "You")
-  // but until this fix forgot to mirror it onto the variant's `origin` field —
-  // the popover then read `event.origin`, found nothing, and rendered
-  // "Unknown" alongside the "You" chip.
   it('falls back to the actor on ContinuationStarted when origin is missing (user-clicked Continue)', () => {
     const ev: StoredEvent = {
       type: 'ContinuationStarted',
@@ -204,9 +185,6 @@ describe('resolveOrigin', () => {
     expect(resolveOrigin(exch(ev))).toEqual({ kind: 'api', user_agent: 'curl/8' });
   });
 
-  // Divider-starter ActionRequired events: the Origin is the device that
-  // *answered* the question / *resolved* the permission — read from the
-  // matching resolution step's actor.
 
   it('reads the answering device from UserQuestionAnswered.actor on a divider exchange', () => {
     const userEvent: StoredEvent = {
@@ -216,8 +194,6 @@ describe('resolveOrigin', () => {
       question: 'Pick one',
       options: [{ id: 'a', label: 'A' }],
     };
-    // Cast through unknown because UserQuestionAnswered's TS type doesn't yet
-    // declare `actor` — Task 11 will land the Rust stamp + the regen.
     const answered = {
       type: 'UserQuestionAnswered',
       tool_use_id: 'tu1',
@@ -283,11 +259,6 @@ describe('resolveThreadLinkTitle', () => {
     id === parentId ? title : undefined;
 
   it("uses the parent thread's live title when no other title is available", () => {
-    // Reproduces the bug: child spawned via run_thread/start_claude_code → MessageReceived
-    // emitted with origin: None → frontend synthesizes parent_thread origin with title:
-    // undefined. Cached parentThreadTitle is undefined because the thread entered
-    // threadMap via the SSE handler (CodingAgentThreadSpawned), which doesn't carry
-    // parent metadata. Without this fallback, the popover shows the UUID.
     const result = resolveThreadLinkTitle(
       { kind: 'thread_link', thread_id: parentId, mode: 'agent' },
       undefined,
@@ -323,7 +294,6 @@ describe('resolveThreadLinkTitle', () => {
     expect(result).toBe('Cached title from API');
   });
 
-  // A uuid is not a name. The id itself is in Technical details.
   it('falls back to "Untitled thread", never the id, when no source has a title', () => {
     const result = resolveThreadLinkTitle(
       { kind: 'thread_link', thread_id: parentId, mode: 'agent' },
@@ -344,8 +314,6 @@ describe('resolveThreadLinkTitle', () => {
 });
 
 describe('executorExtras', () => {
-  /** `at(N)` builds an ISO timestamp N seconds into the test window —
-   *  keeps timestamps readable while letting the chronological sort do real work. */
   const at = (seconds: number): string =>
     new Date(Date.UTC(2026, 3, 22, 12, 0, seconds)).toISOString();
   const stamp = <T extends Omit<StoredEvent, 'created'>>(seconds: number, body: T): StoredEvent =>
@@ -362,8 +330,6 @@ describe('executorExtras', () => {
   });
 
   it('falls back to earlier SessionStarted for follow-up exchanges in the same Claude Code session', () => {
-    // Turn 1: MessageReceived + SessionStarted (branch A)
-    // Turn 2: MessageReceived only — no fresh SessionStarted because CC reused the session
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: 's1', branch: 'claude-code/turn-1' });
     const t2User = stamp(300, { type: 'MessageReceived', text: 'follow up' });
@@ -377,8 +343,6 @@ describe('executorExtras', () => {
   });
 
   it('uses the most recent SessionStarted when a thread has multiple sessions over time', () => {
-    // Two Claude Code sessions back-to-back: branch A then branch B. Follow-up exchange after B
-    // must report branch B, not branch A.
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessA = stamp(1, { type: 'SessionStarted', session_id: 's1', branch: 'branch-A' });
     const t2User = stamp(3600, { type: 'MessageReceived', text: 'second' });
@@ -393,8 +357,6 @@ describe('executorExtras', () => {
   });
 
   it('does not leak a future session into an earlier exchange', () => {
-    // The first exchange ran on branch A; later the user started a new Claude Code session on
-    // branch B. Looking at the first exchange's panel must still show branch A.
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessA = stamp(1, { type: 'SessionStarted', session_id: 's1', branch: 'branch-A' });
     const t2User = stamp(3600, { type: 'MessageReceived', text: 'second' });
@@ -408,9 +370,6 @@ describe('executorExtras', () => {
   });
 
   it('reads session id from CodingAgentSettingsChanged when SessionStarted carries an empty id (real Claude Code/Codex path)', () => {
-    // The engine emits SessionStarted with session_id: "" at spawn; the real id
-    // arrives from the agent's Init event on CodingAgentSettingsChanged — same
-    // shape for both backends.
     const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
     const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/turn-1' });
     const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid', coding_agent: 'codex' });
@@ -426,8 +385,6 @@ describe('executorExtras', () => {
   });
 
   it('carries the Init session id into a follow-up exchange in the same session', () => {
-    // Turn 1: SessionStarted (empty id) + CodingAgentSettingsChanged (Init id).
-    // Turn 2: no fresh Init — the panel must still report the session id.
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/turn-1' });
     const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid' });
@@ -457,7 +414,6 @@ describe('executorExtras', () => {
     const userEvent = stamp(0, { type: 'MessageReceived', text: 'go' });
     const sessionStarted = stamp(1, { type: 'SessionStarted', session_id: '', branch: 'claude-code/x' });
     const init = stamp(2, { type: 'CodingAgentSettingsChanged', cc_session_id: 'real-sid' });
-    // User switches model mid-session. This settings event carries no id.
     const modelChange = stamp(3, { type: 'CodingAgentSettingsChanged', model: 'opus' });
     const exchange: Exchange = {
       userEvent,
@@ -479,7 +435,6 @@ describe('executorExtras', () => {
   });
 
   it('returns no branch when the thread has no SessionStarted/Recovered events', () => {
-    // Pure chat thread (Lucidos, no CC) — no executor branch to show.
     const userEvent = stamp(0, { type: 'MessageReceived', text: 'hi' });
     const exchange: Exchange = { userEvent, userSeq: 1, steps: [] };
     const events = new Map<number, StoredEvent>([[1, userEvent]]);
@@ -512,7 +467,6 @@ describe('executorExtras', () => {
   });
 
   it('uses the most recent SessionStarted.repo_id for follow-up exchanges (multi-session thread)', () => {
-    // Turn 1: workspace repo (no repo_id). Turn 2: switched to external repo. Turn 3 follows up.
     const t1User = stamp(0, { type: 'MessageReceived', text: 'first' });
     const sessA = stamp(1, { type: 'SessionStarted', session_id: 's1', branch: 'wsp-branch' });
     const t2User = stamp(3600, { type: 'MessageReceived', text: 'second' });
@@ -537,7 +491,6 @@ describe('executorExtras', () => {
     const extras = executorExtras(exchange, events);
     expect(extras.contextTokens).toBe(12345);
     expect(extras.contextTrimmed).toBe(true);
-    // A legacy row has no snapshot behind it, so there is nothing to open.
     expect(extras.contextCapture).toBeUndefined();
   });
 
@@ -565,34 +518,42 @@ describe('executorExtras', () => {
 });
 
 describe('renderChannelSection', () => {
+  it('distinguishes saved owner content from the thread that submitted it', () => {
+    const origin = {
+      kind: 'saved_draft' as const,
+      submission_event_id: 'acceptance',
+      submitted_by_thread_id: 'sender',
+    };
+    const rendered = JSON.stringify(renderChannelSection(origin, undefined, () => 'Submitting thread'));
+    expect(originMode(origin)).toBe('human');
+    expect(rendered).toContain('Your saved draft');
+    expect(rendered).toContain('Submitted by');
+    expect(rendered).toContain('Submitting thread');
+    expect(rendered).not.toContain('Device');
+  });
   it('device origin renders the name the devices list holds for its id', () => {
     seedDevice('d1', 'Chrome on Mac');
     const node = renderChannelSection({ kind: 'device', device_id: 'd1' });
     expect(JSON.stringify(node)).toContain('Chrome on Mac');
   });
-  it('device origin names the person on a team gateway, and not on a personal one', () => {
+  it('device origin names the user on a team gateway, and not on a personal one', () => {
     seedDevice('d1', 'Chrome on Mac');
     const holder = (id: string, name: string, device_ids: string[]) => ({ id, name, emails: [], device_ids });
-    operators.value = {
+    gatewayUsers.value = {
       status: 'loaded',
-      data: { operators: [holder('o1', 'Owner', ['mine']), holder('o2', 'Sam', ['d1'])], relayed: [] },
+      data: { users: [holder('o1', 'Owner', ['mine']), holder('o2', 'Sam', ['d1'])], relayed: [] },
     };
     expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).toContain('Sam');
-    operators.value = { status: 'loaded', data: { operators: [holder('o2', 'Sam', ['d1'])], relayed: [] } };
-    expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).not.toContain('Person');
-    operators.value = { status: 'not-loaded' };
+    gatewayUsers.value = { status: 'loaded', data: { users: [holder('o2', 'Sam', ['d1'])], relayed: [] } };
+    expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).not.toContain('"User"');
+    gatewayUsers.value = { status: 'not-loaded' };
   });
-  // The raw user-agent is machine words: it lives in Technical details.
   it('api origin names an outside app in words, not by its user-agent', () => {
     const s = JSON.stringify(renderChannelSection({ kind: 'api', user_agent: 'MyApp/1.0', mode: 'agent' }));
     expect(s).toContain('An app or script outside Lucidos');
     expect(s).not.toContain('MyApp/1.0');
   });
   it('api origin with source_thread_id renders deep-link to spawning thread', () => {
-    // The subprocess-origin path: `source_thread_id` set after the engine
-    // recognised the request as coming from a Lucidos subprocess. The
-    // popover must surface that link so a user can answer "which agent
-    // did this".
     const node = renderChannelSection(
       { kind: 'api', user_agent: 'curl/8.7.1', mode: 'agent', source_thread_id: 'src-thread' },
       undefined,
@@ -603,7 +564,6 @@ describe('renderChannelSection', () => {
     expect(s).toContain('Spawning thread title');
   });
   it('api origin with source_thread_id falls back to "Untitled thread" when no title resolves', () => {
-    // The link is never blank, and never an id.
     const node = renderChannelSection({
       kind: 'api',
       user_agent: 'curl/8.7.1',
@@ -621,9 +581,6 @@ describe('renderChannelSection', () => {
     expect(JSON.stringify(node)).toContain('myws');
   });
   it('workspace origin with thread_id renders a thread link ("Untitled thread" when title unresolved)', () => {
-    // No getLiveTitle and an empty current-workspace name (the test default):
-    // treated as local with no resolvable title, so the link reads
-    // "Untitled thread" rather than a blank or an id.
     const node = renderChannelSection({
       kind: 'workspace',
       workspace: 'myws',
@@ -636,8 +593,6 @@ describe('renderChannelSection', () => {
     expect(s).not.toContain('12345678');
   });
   it('workspace origin renders the live thread name when the source thread is local', () => {
-    // workspaceName defaults to '' in tests → the origin is treated as local →
-    // the live `getLiveTitle` lookup wins over the short-id fallback.
     const node = renderChannelSection(
       { kind: 'workspace', workspace: 'dev', thread_id: 'tid', mode: 'agent' },
       undefined,
@@ -659,8 +614,6 @@ describe('renderChannelSection', () => {
   });
 });
 
-/** The section with its Technical details fold cut out, so a test can say a
- *  raw id appears there and nowhere else. */
 function withoutTechnical(node: ComponentChildren): { body: string; technical: string } {
   let technical = '';
   const strip = (n: ComponentChildren): ComponentChildren => {
@@ -675,6 +628,38 @@ function withoutTechnical(node: ComponentChildren): { body: string; technical: s
   };
   return { body: JSON.stringify(strip(node)), technical };
 }
+
+describe('executor rows', () => {
+  it.each([
+    ['only a branch', 'agent/turn-1', ''],
+    ['only a session id', '', 'sid-1'],
+    ['both', 'agent/turn-1', 'sid-1'],
+    ['neither', '', ''],
+  ])('shows plain rows without a fold with %s', (_name, branch, sessionId) => {
+    const session: StoredEvent = { type: 'SessionStarted', session_id: '', branch };
+    const settings: StoredEvent = { type: 'CodingAgentSettingsChanged', cc_session_id: sessionId };
+    const exchange = exch({ type: 'MessageReceived', text: 'go' }, [
+      { seq: 2, event: session }, { seq: 3, event: settings },
+    ]);
+    const events = new Map<number, StoredEvent>([
+      [1, exchange.userEvent], [2, session], [3, settings],
+    ]);
+    const node = renderExecutorSection(exchange, events, {} as ThreadMeta);
+    const body = JSON.stringify(node);
+    expect(body).not.toContain('Technical details');
+    expect(body).not.toContain('route-technical');
+    if (branch) {
+      expect(JSON.stringify(routeRowCells(node, 'Branch'))).toContain(branch);
+    } else {
+      expect(routeRowCells(node, 'Branch')).toBeNull();
+    }
+    if (sessionId) {
+      expect(JSON.stringify(routeRowCells(node, 'Session id'))).toContain(sessionId);
+    } else {
+      expect(routeRowCells(node, 'Session id')).toBeNull();
+    }
+  });
+});
 
 describe('Technical details', () => {
   const section = (userEvent: StoredEvent) =>
@@ -715,8 +700,6 @@ describe('renderEngineExplainerSection', () => {
     const node = renderEngineExplainerSection({ kind: 'session_recovered' });
     expect(JSON.stringify(node)).toMatch(/picked it back up/i);
   });
-  // A scheduled message used to show no reason at all, and its turn read
-  // "Forwarded message". The trigger's name is the reason.
   it('scheduler names its trigger', () => {
     const node = renderEngineExplainerSection({ kind: 'scheduler', trigger_id: 't', trigger_name: 'Nightly' });
     expect(JSON.stringify(node)).toContain('“Nightly” ran on its schedule');
@@ -727,11 +710,6 @@ describe('renderOriginSection', () => {
   const origin = (userEvent: StoredEvent): string =>
     JSON.stringify(renderOriginSection(exch(userEvent), undefined, () => undefined));
 
-  // Regression: the auto-resume after a *Switch to new version* records the
-  // pressing device on the teardown ResponseAborted, so the resume boundary
-  // itself has no actor and no origin. The popover rendered a bare "Unknown"
-  // under a chip that read "Lucidos Engine", even though the event carries a
-  // typed `reason` that fully explains it.
   it('names the engine and the switch for an auto-resumed ContinuationStarted', () => {
     const s = origin({ type: 'ContinuationStarted', branch: '', reason: 'auto_resume_after_switch' });
     expect(s).toContain('Issued by');
@@ -741,8 +719,6 @@ describe('renderOriginSection', () => {
     expect(s).not.toContain('Unknown');
   });
 
-  // The header of a read message shows the read time, so the sent time lives
-  // here or nowhere.
   it('lists when a read message was sent and when it was read', () => {
     const message: StoredEvent = {
       type: 'MessageReceived', text: 'hi', mode: 'human',
@@ -763,17 +739,11 @@ describe('renderOriginSection', () => {
   it('keeps the engine attribution when a legacy resume recorded no reason', () => {
     const s = origin({ type: 'ContinuationStarted', branch: '' });
     expect(s).toContain('Lucidos Engine');
-    // No event-level reason to be precise about, so it falls through to the
-    // generic engine explanation rather than inventing a specific cause.
     expect(s).not.toContain('Why this resumed');
     expect(s).toContain('Why Lucidos acted');
     expect(s).not.toContain('Unknown');
   });
 
-  // Regression: the reason-keyed explainer must LAYER OVER the engine one, not
-  // replace it. A row that persisted `origin: engine{continuation_started}` but
-  // no event-level reason used to render the engine explanation and has to keep
-  // rendering it.
   it('falls back to the persisted engine reason when the event recorded no reason', () => {
     const s = origin({
       type: 'ContinuationStarted',
@@ -784,14 +754,10 @@ describe('renderOriginSection', () => {
     expect(s).toMatch(/picked it back up/i);
   });
 
-  // The generic fallback is reached by chat and trigger resumes too, so it must
-  // not name a coding agent.
   it('does not claim a Claude Code session in the generic resume explanation', () => {
     expect(origin({ type: 'ContinuationStarted', branch: '' })).not.toMatch(/Claude Code/);
   });
 
-  // The device that clicked Continue still owns the turn: it must read as its
-  // own device, never as the engine.
   it('attributes a user-clicked Continue to the clicking device, not the engine', () => {
     seedDevice('d1', 'iOS Safari PWA');
     const s = origin({
@@ -812,7 +778,6 @@ describe('renderOriginSection', () => {
     expect(s).not.toContain('Unknown');
   });
 
-  // The System branch must survive the intrinsic-engine default above it.
   it('still renders the System attribution for an actor-less ResponseAborted', () => {
     const s = origin({ type: 'ResponseAborted', cause: 'engine_shutdown' });
     expect(s).toContain('System');
@@ -820,8 +785,6 @@ describe('renderOriginSection', () => {
     expect(s).not.toContain('Unknown');
   });
 
-  // The second reported card: a bare "Unknown". Nothing was recorded, so the
-  // panel says that in words and claims no cause it cannot prove.
   it('says "Not recorded", never a bare Unknown, for a genuinely unattributed event', () => {
     const s = origin({ type: 'MessageReceived', text: 'hi', mode: 'human' });
     expect(s).toContain('Not recorded');
@@ -829,8 +792,6 @@ describe('renderOriginSection', () => {
     expect(s).not.toContain('Unknown');
   });
 
-  // An abort a person caused (a restart, a button that cleared a stuck reply)
-  // still says why it stopped. It used to show only the device.
   it('explains why a device-attributed abort stopped', () => {
     seedDevice('d1', 'My MacBook');
     const s = origin({ type: 'ResponseAborted', cause: 'stale_settle', actor: { kind: 'device', device_id: 'd1' } });
@@ -870,8 +831,6 @@ describe('an event wait re-entry says where its words came from', () => {
     expect(s).not.toContain('Unknown');
   });
 
-  // Rows from before the engine stamped an origin: every delivery and expiry
-  // in a real workspace read "Unknown" here.
   it.each([
     { type: 'PromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' },
     { type: 'PromptInjected', text: 'An event you subscribed to has arrived (you were waiting because: x).', mode: 'agent', delivered_event_id: 'e1' },
@@ -884,8 +843,6 @@ describe('an event wait re-entry says where its words came from', () => {
   });
 });
 
-/** One fixture per `EngineReason` kind. A new kind is a `tsc` error until it
- *  gets a row here, so the "never Unknown" sweep below cannot skip it. */
 const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, { kind: K }> } = {
   continuation_started: { kind: 'continuation_started' },
   session_recovered: { kind: 'session_recovered' },
@@ -904,6 +861,8 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   main_check_flaky: { kind: 'main_check_flaky' },
   missing_hardening: { kind: 'missing_hardening' },
   missing_plan: { kind: 'missing_plan' },
+  approved_plan_unstarted: { kind: 'approved_plan_unstarted' },
+  model_substituted: { kind: 'model_substituted' },
   context_ceiling: { kind: 'context_ceiling' },
   plugin_auto_update: {
     kind: 'plugin_auto_update', plugin_id: 'habit-tracker', marketplace_id: 'm1', marketplace_name: 'Example Market',
@@ -922,7 +881,6 @@ describe('the popover never reads Unknown for engine-authored work', () => {
   const origin = (userEvent: StoredEvent): string =>
     JSON.stringify(renderOriginSection(exch(userEvent), undefined, () => undefined));
 
-  // Engine-seeded first messages, such as the plugin setup seed.
   it.each(Object.values(EVERY_ENGINE_REASON))('an engine-seeded message with reason $kind', (reason) => {
     const s = origin({ type: 'MessageReceived', text: 'seed', mode: 'engine', origin: { kind: 'engine', reason } });
     expect(s).toContain('Lucidos Engine');
@@ -942,10 +900,6 @@ describe('the popover never reads Unknown for engine-authored work', () => {
     expect(origin(userEvent)).not.toContain('Unknown');
   });
 
-  // Rows written before the engine stamped an origin: an old plugin setup seed
-  // is agent-mode with no origin, no parent and no device. The chip already
-  // says "Lucidos Engine", so the panel says so too, and admits the reason
-  // was not recorded rather than inventing one.
   it.each(['agent', 'engine'] as const)('a legacy %s-mode message with nothing recorded', (mode) => {
     const s = origin({ type: 'MessageReceived', text: 'Set up X again.', mode });
     expect(s).toContain('Issued by');
@@ -983,7 +937,6 @@ describe('plugin seeds name what the engine acted on', () => {
     expect(s).toContain('⏰ Habit Tracker 0.1.4');
     expect(s).not.toContain('→');
     expect(s).toMatch(/You updated ⏰ Habit Tracker to 0\.1\.4/);
-    // No device recorded: no row claims one.
     expect(s).not.toContain('Confirmed on');
   });
 
@@ -1020,9 +973,6 @@ describe('plugin seeds name what the engine acted on', () => {
   });
 });
 
-// The chip on a question or permission card already names the agent that
-// asked, so the popover must never only repeat it. It opens once someone
-// answered, and says when and where.
 describe('a question or permission card popover', () => {
   const question: StoredEvent = { type: 'UserQuestionAsked', tool_use_id: 'tu-1', cc_session_id: '', question: 'q', options: [] };
   const answer = (kind: 'Selected' | 'Canceled', actor = true): StoredEvent => ({
@@ -1083,15 +1033,12 @@ describe('a question or permission card popover', () => {
   });
 });
 
-/** Drop the nodes preact renders as nothing, and flatten arrays, so what's left
- *  is exactly the elements the browser lays out. */
 function renderedChildren(node: ComponentChildren): ComponentChildren[] {
   if (node === null || node === undefined || node === '' || typeof node === 'boolean') return [];
   if (Array.isArray(node)) return node.flatMap(renderedChildren);
   return [node];
 }
 
-/** Child count of every `.route-row` in the tree, in document order. */
 function routeRowChildCounts(node: ComponentChildren, out: number[] = []): number[] {
   for (const child of renderedChildren(node)) {
     if (typeof child !== 'object') continue;
@@ -1103,17 +1050,7 @@ function routeRowChildCounts(node: ComponentChildren, out: number[] = []): numbe
   return out;
 }
 
-/** A `.route-row` is `display: contents` (styles/panels/previews.css), so its
- *  children ARE the label and value cells of the section's shared two-column
- *  grid. That grid is what keeps every value starting at the same x, and it
- *  only holds while each row contributes exactly two items: a row that renders
- *  a third pushes every row below it one cell along and the panel goes ragged
- *  again. A multi-part value (app icon + name, user-agent + spawning-thread
- *  link) therefore has to bring its own `.route-value-group` box. */
 describe('route rows contribute exactly two grid cells', () => {
-  // The executor case seeds the repo + app registries so the render path reads
-  // them instead of firing a fetch. Put them back, or a later test in this file
-  // inherits a loaded registry it never asked for.
   afterEach(() => {
     repositories.value = { status: 'not-loaded' };
     appsList.value = { status: 'not-loaded' };
@@ -1132,9 +1069,6 @@ describe('route rows contribute exactly two grid cells', () => {
       type: 'MessageReceived', text: 'hi', mode: 'human',
       origin: { kind: 'device', device_id: 'd1' },
     }), 1);
-    // The row that broke the grid before it was wrapped: an API origin from a
-    // Lucidos subprocess renders a user-agent AND a deep-link to the spawning
-    // thread, which used to be two siblings of the label.
     expectTwoCellRows(section({
       type: 'MessageReceived', text: 'hi', mode: 'human',
       origin: { kind: 'api', user_agent: 'curl/8.7.1', source_thread_id: 'src-thread' },
@@ -1176,8 +1110,6 @@ describe('route rows contribute exactly two grid cells', () => {
       () => undefined,
     );
     expectTwoCellRows(node, 2);
-    // A wrapper element would take the whole grid row and leave the label and
-    // value stacked inside it, so assert the rows really are section-level.
     expect(routeRowChildCounts(
       renderedChildren((node as VNode<{ children?: ComponentChildren }>).props?.children),
     )).toHaveLength(2);
@@ -1220,12 +1152,21 @@ describe('route rows contribute exactly two grid cells', () => {
       codingAgentFolder: 'data/apps/habit-tracker',
     } as unknown as ThreadMeta;
 
-    // Model, Effort, Context, Repository, App, Branch. The session id is in
-    // Technical details, whose fold body brings its own grid.
-    expectTwoCellRows(
-      renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh'),
-      6,
+    const node = renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh');
+    expectTwoCellRows(node, 7);
+    const body = JSON.stringify(node);
+    expect(body).not.toContain('Technical details');
+    const rows = renderedChildren(node.props.children).filter(
+      (child): child is VNode<{ class?: string; children?: ComponentChildren }> =>
+        typeof child === 'object' && (child as VNode<{ class?: string }>).props?.class === 'route-row',
     );
+    expect(rows.map(row => {
+      const label = renderedChildren(row.props.children)[0] as VNode<{ children: string }>;
+      return label.props.children;
+    })).toEqual(['Model', 'Effort', 'Context', 'Repository', 'App', 'Branch', 'Session id']);
+    for (const value of ['Repository', 'Lucidos', 'App', 'Habit Tracker', '\u{1F9ED}']) {
+      expect(body).toContain(value);
+    }
   });
 });
 
@@ -1267,7 +1208,6 @@ describe('the Context row opens what the turn\u2019s last call was sent', () => 
   });
 });
 
-/** The two cells of the `.route-row` whose label reads `label`. */
 function routeRowCells(node: ComponentChildren, label: string): ComponentChildren[] | null {
   for (const child of renderedChildren(node)) {
     if (typeof child !== 'object') continue;
@@ -1283,7 +1223,6 @@ function routeRowCells(node: ComponentChildren, label: string): ComponentChildre
   return null;
 }
 
-/** The App row's name span, the second child of its `.route-value-group`. */
 function appNameSpan(node: ComponentChildren): VNode<{ class?: string }> {
   const cells = routeRowCells(node, 'App');
   expect(cells, 'no App row rendered').not.toBeNull();
@@ -1291,10 +1230,6 @@ function appNameSpan(node: ComponentChildren): VNode<{ class?: string }> {
   return renderedChildren(group.props?.children)[1] as VNode<{ class?: string }>;
 }
 
-/** The App row is a value like any other. Its name takes the panel's secondary
- *  text by inheritance rather than a class of its own. It used to carry
- *  `--text-primary` at weight 500, which read as the one emphasized value in a
- *  panel of plain ones. A class here is how that comes back. */
 describe('the App row names its app in ordinary value text', () => {
   const meta = {
     codingAgentKind: 'app',

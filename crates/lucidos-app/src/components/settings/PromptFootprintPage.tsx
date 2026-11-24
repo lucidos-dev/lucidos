@@ -29,7 +29,6 @@ import {
 
 const report = signal<Loadable<WorkspacePromptFootprint>>({ status: 'not-loaded' });
 
-/** Keeps a loaded report on screen while it re-reads. */
 async function loadReport(): Promise<void> {
   setLoadingIfFresh(report);
   try {
@@ -41,8 +40,6 @@ async function loadReport(): Promise<void> {
 
 const chars = (n: number) => n.toLocaleString();
 
-/** Where the item is edited: the app, the widget, or the knowhow file. An item
- *  with nowhere to go is plain text. */
 function ItemName({ item }: { item: FootprintItem }) {
   let open: (() => void) | null = null;
   if (item.kind === 'app' || item.kind === 'app-knowhow') open = () => void openAppById(item.id, 'Prompt Footprint');
@@ -104,9 +101,6 @@ const LIMITS = [
   { pref: PREF_WORKSPACE_PROMPT_FOOTPRINT_UNUSED_DAYS, label: 'Unused after (days)', read: (d: WorkspacePromptFootprint) => d.unused_days },
 ] as const;
 
-/** A limit saves on blur or Enter, inside the catalog's range. The report
- *  re-reads on the `PreferencesChanged` that write announces. The row is keyed
- *  on the value in force, so a new value arrives as a fresh field. */
 function LimitRow({ limit, value }: { limit: (typeof LIMITS)[number]; value: number }) {
   const [draft, setDraft] = useServerBackedField(String(value));
   function commit() {
@@ -134,8 +128,6 @@ function LimitRow({ limit, value }: { limit: (typeof LIMITS)[number]; value: num
   );
 }
 
-/** The headline, the bar and its key. With no `data`, inside a
- *  `SkeletonProvider`, it draws itself as the loading placeholder. */
 function Overview({ data }: { data?: WorkspacePromptFootprint }) {
   const total = data ? chars(data.total_chars) : '';
   const system = data ? chars(data.system_prompt_chars) : '';
@@ -171,7 +163,6 @@ function Overview({ data }: { data?: WorkspacePromptFootprint }) {
   );
 }
 
-/** One section against its ceiling. With no `section` it is a placeholder. */
 function SectionRow({ section, ceiling = 0 }: { section?: FootprintSection; ceiling?: number }) {
   const over = section?.over_ceiling ? ' over' : '';
   return (
@@ -220,9 +211,6 @@ function Report({ data }: { data: WorkspacePromptFootprint }) {
   );
 }
 
-/** Settings → System → Workspace Prompt Footprint (ADR 0413): the report the
- *  audit reads, the three preferences it is judged against, and a way into
- *  the audit. Fixes go through the audit only, never a button here. */
 export function PromptFootprintPage() {
   const loadable = report.value;
   const skeleton = useDelayedLoading(loadable);

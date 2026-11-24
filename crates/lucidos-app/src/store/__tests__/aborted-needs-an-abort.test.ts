@@ -1,15 +1,3 @@
-/** "Aborted" is a claim that something aborted the turn, so an abort event must
- *  back it. The engine records every real abort as one: a crash, a kill, a
- *  shutdown, a stale settle, a recovery after restart.
- *
- *  The client's copy of the thread status lags the events and can be clobbered
- *  by a snapshot read. So "the thread reads idle and this exchange has no
- *  terminator" is not evidence of an abort: the turn may be about to read
- *  "Working".
- *
- *  So the tests sweep every status combination over turns with no abort in
- *  them, and assert that none reads "Aborted".
- */
 import { describe, it, expect } from 'vitest';
 import { ev } from './call-fixtures';
 import type { Recorded } from './call-fixtures';
@@ -29,8 +17,6 @@ function log(...events: Recorded[]): Map<number, StoredEvent> {
   return new Map(events.map((e, i) => ev(i + 1, e)));
 }
 
-/** Turns that no abort touched, each cut off at the point a lagging status
- *  can catch it: steps landed, no terminator yet. */
 const NO_ABORT_SHAPES: Record<string, Map<number, StoredEvent>> = {
   'a chat turn mid-flight': log(
     { type: 'MessageReceived', text: 'do the thing', mode: 'human', _eventId: MSG },
@@ -105,8 +91,6 @@ describe('"Aborted" needs an abort event', () => {
     });
   }
 
-  // The stale detector's real job survives: nothing runs on an idle thread,
-  // so a turn with no terminator must not spin "Working" either.
   it('settles an unterminated turn on an idle thread as done', () => {
     for (const events of [NO_ABORT_SHAPES['a chat turn mid-flight'], NO_ABORT_SHAPES['a coding-agent turn mid-flight']]) {
       const exchanges = groupIntoExchanges(events);
@@ -133,7 +117,6 @@ describe('"Aborted" needs an abort event', () => {
   });
 });
 
-/** Turns an abort did end, one per kind of evidence. */
 const ABORT_SHAPES: Record<string, Map<number, StoredEvent>> = {
   'a message the crash dropped before its first token': log(
     { type: 'MessageReceived', text: 'do the thing', mode: 'human', _eventId: MSG },
@@ -165,7 +148,6 @@ const ABORT_SHAPES: Record<string, Map<number, StoredEvent>> = {
   ),
 };
 
-/** Every event an exchange holds, its boundary included. */
 function eventsOf(exchange: Exchange): StoredEvent[] {
   return [exchange.userEvent, ...exchange.steps.map(s => s.event)];
 }

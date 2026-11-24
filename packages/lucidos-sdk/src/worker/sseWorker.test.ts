@@ -1,10 +1,3 @@
-/**
- * The shared worker's upstream watchdog and its late-join restart.
- *
- * `sseWorker.ts` installs an `onconnect` handler at import and keeps its state
- * at module level. Each test imports a fresh copy against a fake `self` and a
- * fake `EventSource`, and drives it through fake ports.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LATE_JOIN_STALL_AFTER_MS, STREAM_STALL_AFTER_MS } from '../eventStream';
 import { SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL_MS } from '../generated/engine-constants';
@@ -38,7 +31,6 @@ interface FakePort {
   send(msg: unknown): void;
 }
 
-/** A port the worker can attach, recording what the worker posts to it. */
 function fakePort(): FakePort & MessagePort {
   const port = {
     received: [] as Array<Record<string, unknown>>,
@@ -62,9 +54,6 @@ const HELLO = {
   pongUrl: 'http://test/api/v1/presence-pong',
 };
 
-/** Load a fresh worker and return what the browser calls for each port, before
- *  the page has said anything. A relaunched worker gets exactly this for every
- *  port its previous instance held. */
 async function loadWorker() {
   const scope: { onconnect?: (e: { ports: MessagePort[] }) => void } = {};
   vi.stubGlobal('self', scope);
@@ -83,7 +72,6 @@ async function startWorker() {
 
 const INTRODUCE = { t: 'introduce' };
 
-/** What the worker told a port after its greeting. */
 const types = (port: FakePort) => port.received.slice(1).map((m) => m.t);
 const lastReceived = (port: FakePort) => port.received[port.received.length - 1];
 
@@ -176,8 +164,6 @@ describe('shared worker upstream watchdog', () => {
     first.send({ t: 'restart' });
     const current = FakeEventSource.live[0];
     current.onopen!();
-    // Already queued callbacks from the closed EventSource cannot reinstall
-    // its generation, mark the replacement down, or broadcast stale frames.
     const before = first.received.length;
     old.onmessage!({ data: oldHello } as MessageEvent);
     old.onopen!();
@@ -332,9 +318,6 @@ describe('shared worker upstream watchdog', () => {
   });
 
   it('opens no stream for a check from a port that never said hello, says it is down, and asks again', async () => {
-    // A relaunched worker inherits its predecessor's ports with none of their
-    // hellos. A check from one used to open `new EventSource('')`, which
-    // fetched the worker's own script and failed with nobody told.
     const connect = await loadWorker();
     const orphan = fakePort();
     connect(orphan);

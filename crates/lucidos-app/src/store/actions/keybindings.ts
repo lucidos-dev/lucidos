@@ -1,8 +1,3 @@
-// Override-aware keybinding layer: merges the user's custom bindings (persisted
-// as the workspace `keybindings` preference — a JSON map of shortcutId →
-// serialized binding) over the registry defaults. The pure registry + binding
-// math live in `utils/shortcuts.ts`; this module adds the stateful read/write
-// and the override-aware tooltip helper.
 
 import { preferences } from '../store';
 import { savePreference } from './preferences';
@@ -23,17 +18,8 @@ import {
   type ShortcutId,
 } from '../../utils/shortcuts';
 
-/** Workspace preference key holding the JSON override map. Synced across
- *  devices via PreferencesChanged like any other preference. */
 export const KEYBINDINGS_PREF_KEY = 'keybindings';
 
-/** Shortcut ids that were renamed after users may have persisted overrides under
- *  the old key. `overrides()` falls back to the legacy key so a rename never
- *  silently drops a user's custom binding; the next `setBinding` rewrites the map
- *  with the current id (legacy keys aren't re-emitted), so the old key fades out
- *  naturally. `previousThread`/`nextThread` became `historyBack`/`historyForward`
- *  when the shortcut went from thread-only to focused-pane-aware.
- *  `prevThreadTurn`/`nextThreadTurn` gained the notification detail the same way. */
 const LEGACY_SHORTCUT_IDS: Partial<Record<ShortcutId, string>> = {
   historyBack: 'previousThread',
   historyForward: 'nextThread',
@@ -43,9 +29,6 @@ const LEGACY_SHORTCUT_IDS: Partial<Record<ShortcutId, string>> = {
 
 type EventLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'key'>;
 
-/** Parse the persisted override map from the preferences signal. Tolerant of a
- *  missing/corrupt value or unknown ids — bad data falls back to defaults
- *  rather than throwing. */
 function overrides(): Partial<Record<ShortcutId, Binding>> {
   if (preferences.value.status !== 'loaded') return {};
   const raw = preferences.value.data[KEYBINDINGS_PREF_KEY];
@@ -61,8 +44,6 @@ function overrides(): Partial<Record<ShortcutId, Binding>> {
   const out: Partial<Record<ShortcutId, Binding>> = {};
   for (const def of SHORTCUT_DEFS) {
     const legacyKey = LEGACY_SHORTCUT_IDS[def.id];
-    // Prefer the current id; fall back to the pre-rename key so a renamed
-    // shortcut keeps the user's custom binding.
     const v = typeof map[def.id] === 'string'
       ? map[def.id]
       : (legacyKey ? map[legacyKey] : undefined);
@@ -74,10 +55,6 @@ function overrides(): Partial<Record<ShortcutId, Binding>> {
   return out;
 }
 
-/** The current binding of every shortcut a frame may forward, in registry
- *  order: all but the `hostOnly` ones, and any the frame leaves to the
- *  browser (`omit`). Parses the override map once, where calling `bindingFor`
- *  per shortcut would parse it each time. */
 export function forwardableBindings(omit: readonly ShortcutId[] = []): Binding[] {
   const o = overrides();
   return SHORTCUT_DEFS
@@ -85,26 +62,16 @@ export function forwardableBindings(omit: readonly ShortcutId[] = []): Binding[]
     .map((def) => o[def.id] ?? def.defaultBinding);
 }
 
-/** The current (override-or-default) binding for a shortcut. */
 export function bindingFor(id: ShortcutId): Binding {
   return overrides()[id] ?? shortcutDef(id).defaultBinding;
 }
 
-/** True when the user has rebound this shortcut away from its default. */
 export function isCustomized(id: ShortcutId): boolean {
   const o = overrides()[id];
   return !!o && !bindingsEqual(o, shortcutDef(id).defaultBinding);
 }
 
-/** The shortcut whose current binding matches this keydown, or null. `exclude`
- *  skips one id — used by the recorder to detect a conflict with a DIFFERENT
- *  shortcut while ignoring the one being rebound.
- *
- *  A chord the user bound beats another shortcut's default. A release that
- *  gives a new default a chord they already use must not take it from them. */
 export function matchShortcut(e: EventLike, exclude?: ShortcutId): ShortcutId | null {
-  // Parse the override map once per event, not once per def — this runs on
-  // EVERY keydown (including plain typing), and the registry is small.
   const o = overrides();
   for (const def of SHORTCUT_DEFS) {
     const own = o[def.id];
@@ -116,8 +83,6 @@ export function matchShortcut(e: EventLike, exclude?: ShortcutId): ShortcutId | 
   return null;
 }
 
-/** Persist a new binding for `id`. Bindings equal to their default are omitted
- *  from the stored map (so a reset shrinks the preference back toward `{}`). */
 export async function setBinding(id: ShortcutId, binding: Binding): Promise<void> {
   const current = overrides();
   const next: Record<string, string> = {};
@@ -130,25 +95,18 @@ export async function setBinding(id: ShortcutId, binding: Binding): Promise<void
   await savePreference(KEYBINDINGS_PREF_KEY, JSON.stringify(next));
 }
 
-/** Reset a shortcut to its default binding (drops it from the override map). */
 export async function resetBinding(id: ShortcutId): Promise<void> {
   await setBinding(id, shortcutDef(id).defaultBinding);
 }
 
-/** Platform-correct display string for the shortcut's current binding. */
 export function displayBinding(id: ShortcutId): string {
   return formatBinding(bindingFor(id), isMac);
 }
 
-/** A `data-tooltip` value whose CURRENT (possibly customized) binding draws
- *  as a key chip under the text. */
 export function tooltipWithShortcut(text: string, id: ShortcutId): string {
   return `${text}${TOOLTIP_SHORTCUT_SEPARATOR}${displayBinding(id)}`;
 }
 
-/** Outcome of a keydown captured while recording a new binding for `id`. The
- *  recorder UI keeps listening on `modifier` (a bare Ctrl/Cmd/Shift/Alt), and
- *  acts on the rest. Pure decision logic — exported for unit testing. */
 export type RecordOutcome =
   | { kind: 'modifier' }
   | { kind: 'cancel' }

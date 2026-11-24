@@ -17,6 +17,19 @@ per-trigger caps. It queues only when the pool is full, so a person sees
 background can reclaim ahead of user work, so priority can't starve triggers or
 cron.
 
+Ordinary HTTP sends persist acceptance before acknowledging the request.
+They retain their original wire intent and resolved execution settings for replay and recovery.
+Recovered ordinary inputs use the same user-priority gate, after earlier accepted inputs record.
+User-only messages record before agent-capacity admission; only messages routed to the agent take a slot.
+
+Provider spend-cap holds gate model sends, separately from Thread Queue admission.
+A refused turn still ends with `ResponseFailed` and releases its running occupancy.
+Optional spend-cap details on that event do not keep a queue slot occupied.
+
+Main repairs use the same thread-status drain hints to sample chosen work.
+Their separate idle gate also checks Apply, queued rows and machine build slots.
+It changes neither this queue's capacity nor its priority policy (ADR 0682).
+
 ## What shares the pool
 
 | Path | Kind | How it's gated |
@@ -28,6 +41,12 @@ cron.
 | Agent/Engine-mode `POST /api/v1/chat/stream` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_coding_agent`; `coding_agent` preserves Claude Code vs Codex for coding-agent rows | background, via `submit` |
 | User-initiated chat / user-typed coding-agent threads (a person typing, any workspace; follow-ups on existing threads; child→parent callbacks) | `user-chat` | user, via `acquire_user_slot` |
 | Waking a thread parked on an *event wait* (a matching event arrived, or the wait timed out) | none | not gated; a user thread counts while it runs |
+
+Queued chat requests retain the submitting turn's app, resolved file or repository-file, URL and conflict-change context. Admission waits and restart recovery pass that context to the same executor as direct submission. Older queue rows without these fields carry no such context. Saved drafts carry only their saved snapshot; submission cannot add per-turn context.
+
+Queued chat dispatch errors release membership only when the exact input and its anchored terminal outcome are durable. Unrecorded or unsettled failures retain membership for recovery. A coding-agent start that the spawn gate parks on the owner's Allow once card completes its entry and sends no recovery notice: the card holds the turn, and Allow resumes the thread outside the queue. For requests with a message identity, startup hands off to thread recovery only after recording that exact input. An existing thread does not prove its follow-up ran. Legacy chat requests without an identity keep the thread-existence fallback.
+
+An agent's message to a thread with any open card waits in the executor until the card closes, including the agent's own question (ADR 0803). Only the owner's typed message supersedes that question. A permission card still holds the owner's typed message. The queue reads that card as open by the card slot's own rule, and admits the message when the card closes.
 
 Not gated at all: engine recovery resumes, and mid-flight injections into an
 already-running thread (they feed an existing response, not a new one).
@@ -69,9 +88,18 @@ cap: the fire was admitted when it started. A woken user-initiated thread is
   resumes, is continued, or auto-resumes after a restart counts again. A
   follow-up to a thread that is already `running` never waits for its own slot.
 
+  A trigger run that pauses on the owner's permission request completes its
+  queue entry, so it holds no slot while it waits. The owner's Allow resumes
+  it in place, outside the queue.
+
   One bus subscriber drains the queue when a user thread starts or stops, so a
   freed slot is taken at once. It is a hint only: if it falls behind, it drains
-  anyway, and admission never depends on it.
+  anyway, and admission never depends on it. Releasing an input with a waiting
+  successor also wakes the queue once that input is recorded and routed. The
+  successor still passes the input-order and capacity checks; it need not wait
+  for the preceding turn to finish or for the 60-second safety-net drain.
+  A lone input's own recording barrier sends no wake, including after startup
+  restores the accepted inputs. It still preserves order.
 
 ## Capacity policy
 
@@ -160,10 +188,19 @@ other: they coalesce to one entry per trigger (see *Cron coalescing* above).
 
 ## Persistence & restart
 
+Queued chat and coding-agent messages keep their image hashes. Before execution,
+the engine reads every attachment and verifies its content address and image type.
+If any attachment is missing, unreadable or corrupted, the turn fails explicitly;
+it does not send the remaining text or images. Continuation recovery also refuses
+missing or invalid attachments instead of resuming with only the text.
+
 After snapshot restore, archived entries cannot authorize another run.
 Recovery checks the first `ThreadQueued` event against the restore boundary.
 Missing provenance also refuses recovery. Later requeue events cannot renew archived authority.
 Cancellation persists through `ThreadQueueDropped`; fresh entries remain eligible on subsequent boots.
+
+Queue orchestration lives in `crates/lucidos-engine/src/engine/thread_queue/`.
+The persisted lane and admission types live with core thread events.
 
 **Background** entries live in the `thread_queue` projection (event-sourced from
 `ThreadQueued` / `ThreadQueueAdmitted` / `ThreadQueueDropped` /
@@ -177,10 +214,12 @@ Cancellation persists through `ThreadQueueDropped`; fresh entries remain eligibl
   reason for an engine-seeded thread such as a plugin *setup thread*. It is
   separate from `parent_thread_id` because a *top-thread* has an origin and no
   callback linkage. Entries queued before the field existed carry none.
-- **Retry context (`retry_of`)** on trigger requests: the interrupted thread and
-  the retry's admission deadline. Reload preserves both. The deadline is the
+- **Retry context (`retry_of`)** on trigger requests: the original thread and
+  the retry's admission deadline. Reload preserves both. For boot retries, the deadline is the
   earlier of 24 hours after fire start or the next cron slot. Admission at or
   after it drops the entry and notifies the user. **Run now** also checks it.
+  A program grant card queues a retry of the original request with a deadline
+  24 hours after approval. Event-trigger retries keep the original event and depth.
 - **The event-trigger chain depth**, for every spawn kind. A fire's spawned work
   runs at the fire's depth, whether admitted at once, drained after a wait, or
   re-fired after a restart. Rows written before the field carry 0, which is what
@@ -236,6 +275,8 @@ no task-local reaches. It is a cache, not state:
   ever clear one, and the resume is gated on cause, so a crashed loop cannot
   restart itself into a fresh budget.
 
+A script fire uses its admitting queue entry to retry after a folder grant.
+
 A spawn a script trigger fire asks for (`lucidos spawn-thread` from the
 script) records that trigger as `spawning_trigger_id` on its queued request.
 Cost attribution reads it from the `ThreadQueued` payload. It is no trigger
@@ -253,7 +294,7 @@ the capacity policy editor. Each **background** queued entry has **Run now**
 (force-admit, ignoring every cap) and **Drop** (discard without running).
 Running entries can't be dropped: cancel the thread itself. User-initiated
 entries (`kind: "user-chat"`) have no Run now or Drop, since they are already
-prioritized. Cancel those from the chat.
+prioritized. Cancel those from the chat. A device Stop takes back unconsumed human inputs and restores their text and images to durable compose before canceling live work. A lost response does not undo that restoration. Automation cancellation leaves those inputs alone.
 
 ## Notifications
 
@@ -278,6 +319,9 @@ Every other Thread Queue notification taps through to the **Thread Queue** panel
 
 ## HTTP API
 
+The HTTP handlers live in `lucidos-agents-api`. They read and update the queue
+owned by the engine.
+
 - `GET /api/v1/thread-queue` → `{ entries, policy }`. `entries` are background
   rows (FIFO) plus the user-initiated occupants (`kind: "user-chat"`): running
   user threads, gate reservations and waiters;
@@ -293,3 +337,10 @@ Every other Thread Queue notification taps through to the **Thread Queue** panel
 
 Mutations are actor-stamped: the panel actions carry the acting device on the
 emitted events; engine drain decisions carry no actor.
+
+## Diagnostic evidence
+
+Queue diagnostic lines remain private in maintainer bundles.
+Use the queue state to establish admission and capacity; a missing diagnostic line proves neither.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

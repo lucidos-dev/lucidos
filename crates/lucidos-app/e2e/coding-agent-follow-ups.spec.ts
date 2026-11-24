@@ -19,14 +19,11 @@ test.describe('Claude Code follow-ups during and after working', () => {
     const msg1 = uniqueMessage('coding-agent-working-1');
     await sendMessage(page, `Say exactly: "response ${msg1}" and nothing else. Do not create any files.`);
 
-    // Wait for CC to start responding (not just optimistic exchange render)
     await waitForCCToStart(page, 60_000);
 
-    // Send follow-up (CC may be working or just finished — both are valid)
     const msg2 = uniqueMessage('coding-agent-working-2');
     await sendFollowUp(page, `Say exactly: "follow-up ${msg2}" and nothing else. Do not create any files.`);
 
-    // Wait for both exchanges and CC to finish
     await waitForExchangeCount(page, 2, 120_000);
     await waitForCCToFinish(page, 120_000);
 
@@ -41,10 +38,8 @@ test.describe('Claude Code follow-ups during and after working', () => {
     const msg1 = uniqueMessage('cc-multi-1');
     await sendMessage(page, `Say exactly: "response ${msg1}" and nothing else. Do not create any files.`);
 
-    // Wait for CC to start responding (not just optimistic exchange render)
     await waitForCCToStart(page, 60_000);
 
-    // Send two follow-ups (wait between them to avoid debounce)
     const msg2 = uniqueMessage('cc-multi-2');
     await sendFollowUp(page, `Say exactly: "second ${msg2}". Do not create any files.`);
 
@@ -56,9 +51,6 @@ test.describe('Claude Code follow-ups during and after working', () => {
     await waitForExchangeCount(page, 3, 180_000);
     await waitForCCToFinish(page, 180_000);
 
-    // Both follow-ups usually land while the session is still starting. The
-    // engine must record and deliver them in sent order, and the agent may
-    // answer both in one turn.
     await assertUserMessagesInOrder(page, [msg1, msg2, msg3]);
   });
 
@@ -71,7 +63,6 @@ test.describe('Claude Code follow-ups during and after working', () => {
     await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
     await waitForActionPanel(page, 'Archive', 120_000);
 
-    // CC is now idle — send follow-up
     const msg2 = uniqueMessage('cc-after-idle-2');
     await sendFollowUp(page, `Say exactly: "second ${msg2}" and nothing else. Do not create any files.`);
 
@@ -94,7 +85,6 @@ test.describe('Claude Code follow-ups during and after working', () => {
 
     const msg2 = uniqueMessage('cc-seq-2');
     await sendFollowUp(page, `Say exactly: "two ${msg2}". Do not create any files.`);
-    // Wait for 2nd exchange to confirm msg2 was processed
     await waitForExchangeCount(page, 2, 120_000);
     await waitForCCToFinish(page, 120_000);
 

@@ -1,8 +1,3 @@
-/**
- * Every workspace has a home thread (ADR 0362, ADR 0411). The thread list
- * never draws it: the Home entries in the thread header and the Lucidos menu
- * open it instead.
- */
 
 import { describe, it, expect } from 'vitest';
 import { categorizeThreads } from './ThreadDrawer';

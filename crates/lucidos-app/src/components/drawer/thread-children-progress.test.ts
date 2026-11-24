@@ -1,13 +1,3 @@
-/**
- * Tests for the sub-thread toggle on family parent rows: a "Show / Hide N
- * sub-threads" link under the date. Both states name the count.
- *
- * The control only renders in the nested ThreadList (collapsible context);
- * search / drafts render flat lists, so they show no toggle.
- *
- * The waiting status icon (pulsing dot) must show on the parent row when
- * activeChildrenCount > 0.
- */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { threadMap, threadsLoaded } from '../../store/store';
@@ -52,9 +42,6 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
   };
 }
 
-/** ThreadRowContentImpl renders the toggle when `collapsible &&
- *  totalChildrenCount > 0`. Also surfaces the visual-status resolution still
- *  performed on every parent row (ThreadRow / SearchResultRow). */
 function familyRenderState(
   meta: ThreadMeta,
   status: ThreadStatus,
@@ -76,14 +63,9 @@ beforeEach(() => {
 describe('family disclosure visibility', () => {
   it('shows the toggle when a collapsible thread has children (any section)', () => {
     const sections: Array<{ section: ArchiveState; status: ThreadStatus; saved: boolean; activeChildren: number }> = [
-      // Waiting: idle + active children
       { section: 'archived', status: 'idle', saved: false, activeChildren: 2 },
-      // Review: inbox + no active children (all done)
       { section: 'inbox', status: 'idle', saved: false, activeChildren: 0 },
-      // Pinned: inbox + pinned + no active children (a pinned thread is never
-      // archived, ADR 0312)
       { section: 'inbox', status: 'idle', saved: true, activeChildren: 0 },
-      // Archive: default + not saved + no active children
       { section: 'archived', status: 'idle', saved: false, activeChildren: 0 },
     ];
 
@@ -96,7 +78,7 @@ describe('family disclosure visibility', () => {
         activeChildrenCount: activeChildren,
       });
 
-      const display = displaySection(section, status, saved, activeChildren > 0, false, false);
+      const display = displaySection(section, status, saved, activeChildren > 0, false, false, false);
       expect(familyRenderState(thread.meta, status).hasDisclosure).toBe(true);
       expect(['current', 'saved', 'archive']).toContain(display);
     }
@@ -129,9 +111,6 @@ describe('family disclosure visibility', () => {
 });
 
 describe('visual status resolution', () => {
-  // Rule: a thread that is ONLY waiting for other threads renders 'waiting'.
-  // Otherwise it renders its own status (failed / running / question / changes)
-  // — children's waiting state never overrides the parent's own meaningful state.
 
   it('idle + active children → waiting (only own state is idle)', () => {
     expect(resolveVisualStatus('idle', true, false, false)).toBe('waiting');
@@ -150,8 +129,6 @@ describe('visual status resolution', () => {
   });
 
   it('no active children + waiting without a proposal → idle (no dot)', () => {
-    // Defensive: backend shouldn't park threads in 'waiting' without changes,
-    // but historical chat threads (pre-fix ResponseAborted/Failed) might.
     expect(resolveVisualStatus('waiting', false, false, false)).toBe('idle');
   });
 
@@ -159,8 +136,6 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting', true, false, false)).toBe('waiting');
   });
 
-  // Changes outrank active children: the child writes its own worktree, so
-  // the parent's change is whole and Apply is offered to match (ADR 0249).
   it('waiting + active children + a proposal → changes (resolvable)', () => {
     expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
@@ -188,40 +163,40 @@ describe('visual status resolution', () => {
 
 describe('displaySection routing with children', () => {
   it('idle thread with active children goes to current section', () => {
-    expect(displaySection('archived', 'idle', false, true, false, false)).toBe('current');
+    expect(displaySection('archived', 'idle', false, true, false, false, false)).toBe('current');
   });
 
   it('idle thread with all children done goes to archive', () => {
-    expect(displaySection('archived', 'idle', false, false, false, false)).toBe('archive');
+    expect(displaySection('archived', 'idle', false, false, false, false, false)).toBe('archive');
   });
 
   it('inbox thread with active children stays in current', () => {
-    expect(displaySection('inbox', 'idle', false, true, false, false)).toBe('current');
+    expect(displaySection('inbox', 'idle', false, true, false, false, false)).toBe('current');
   });
 
   it('inbox thread with all children done goes to current', () => {
-    expect(displaySection('inbox', 'idle', false, false, false, false)).toBe('current');
+    expect(displaySection('inbox', 'idle', false, false, false, false, false)).toBe('current');
   });
 
   it('saved thread with active children goes to saved (save overrides everything)', () => {
-    expect(displaySection('inbox', 'idle', true, true, false, false)).toBe('saved');
+    expect(displaySection('inbox', 'idle', true, true, false, false, false)).toBe('saved');
   });
 
   it('saved thread with all children done goes to saved', () => {
-    expect(displaySection('inbox', 'idle', true, false, false, false)).toBe('saved');
+    expect(displaySection('inbox', 'idle', true, false, false, false, false)).toBe('saved');
   });
 
   it('running thread always goes to current regardless of children', () => {
-    expect(displaySection('archived', 'running', false, true, false, false)).toBe('current');
-    expect(displaySection('archived', 'running', false, false, false, false)).toBe('current');
+    expect(displaySection('archived', 'running', false, true, false, false, false)).toBe('current');
+    expect(displaySection('archived', 'running', false, false, false, false, false)).toBe('current');
   });
 
   it('archived thread with pending changes routes to current (no work lost behind archive)', () => {
-    expect(displaySection('archived', 'idle', false, false, true, false)).toBe('current');
+    expect(displaySection('archived', 'idle', false, false, true, false, false)).toBe('current');
   });
 
   it('saved thread with pending changes still saves (save wins over pending)', () => {
-    expect(displaySection('inbox', 'idle', true, false, true, false)).toBe('saved');
+    expect(displaySection('inbox', 'idle', true, false, true, false, false)).toBe('saved');
   });
 });
 
@@ -230,8 +205,6 @@ describe('thread title status icon', () => {
     expect(resolveVisualStatus('waiting', false, true, false)).toBe('changes');
   });
 
-  // A running child does not pulse over it: the parent's change is whole and
-  // Apply is offered, so the title reads changes (ADR 0249).
   it('changes outrank children, so the thread title stays static', () => {
     expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
@@ -243,15 +216,11 @@ describe('thread title status icon', () => {
 
 describe('family disclosure consistency across row types', () => {
   it('resolves the same parent status from threadMap or search, but only the nested list shows the control', () => {
-    // Whether the parent comes from threadMap (ThreadRow's source) or from a
-    // search result re-hydrated via ensureThreadInMap (SearchResultRow's
-    // source), the waiting/active dot resolves identically. The disclosure
-    // control is intentionally NOT shown in flat search results — only the
-    // nested ThreadList passes `collapsible`.
     const meta: ThreadMeta = {
       ...makeThread('search-thread').meta,
       messageCount: 5,
       activeChildrenCount: 1,
+      awaitedChildrenCount: 1,
       totalChildrenCount: 3,
     };
 
@@ -260,7 +229,6 @@ describe('family disclosure consistency across row types', () => {
 
     expect(threadRow.visualStatus).toBe('waiting');
     expect(searchRow.visualStatus).toBe(threadRow.visualStatus);
-    // Nested row: toggle present. Flat search row: no toggle at all.
     expect(threadRow.hasDisclosure).toBe(true);
     expect(searchRow.hasDisclosure).toBe(false);
   });

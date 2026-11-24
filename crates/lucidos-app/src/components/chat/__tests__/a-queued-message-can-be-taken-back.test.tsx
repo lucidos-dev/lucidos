@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A queued message the agent has not read offers Edit and a bin, on a Lucidos
- * Agent thread and on a Claude Code thread. A Codex follow-up redirects the
- * running turn at once, so its queued messages offer neither. See
- * docs/plans/2026-09-29-withdraw-a-queued-claude-code-message.md.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 

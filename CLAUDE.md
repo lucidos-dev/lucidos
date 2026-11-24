@@ -10,6 +10,8 @@ Working agreement for AI coding agents (Claude Code, Codex) and human contributo
 
 A plan is not actionable until it lists load-bearing invariants, explicit non-goals, phase ordering, and a verification strategy per invariant. Those invariants stay in view while you edit, rather than first appearing at `/harden`. Enforcement is a durable *plan marker* gating the first edit and Apply ([`docs/glossary.md`](docs/glossary.md) § plan marker), and the engine states the procedure to every session.
 
+**Run [update-lucidos-models](.claude/skills/update-lucidos-models/SKILL.md)** for every chat, Claude Code or Codex model addition.
+
 - **Build for users.** Fix the general cause for every affected user and workspace; the maintainer's setup is one test bench.
   Apply the [population check](.claude/rules/build-for-users.md) before editing and in every plan, review and final report.
 
@@ -53,7 +55,7 @@ A **workspace** is a user's live Lucidos instance: a workspace directory with gi
 - **KISS.** Resist special cases, flags, branches. Leave a file cleaner than you found it.
 - **Test-driven.** Write tests first. A bug fix reproduces with a failing test. Run the relevant suites before claiming done.
 - **Show rendered previews before asking about or editing a UI change that takes judgement**, even a fix adding a visual element. Use the `visual-options` skill. An exact spec or a one-answer fix skips it, and says so.
-- **Filtered Rust tests need `--lib`**: `cargo test -p lucidos-engine --lib "filter"`. Without `--lib`, runs zero tests silently. Verify `running N tests` line is > 0.
+- **Filter engine Rust tests through `./scripts/test-engine.sh -- -- "filter"`.** It searches all engine libraries. Verify the `running N tests` count is positive.
 - **Multiple test name filters need `--`**: `cargo test -p lucidos-engine --lib -- name1 name2 …`. Without the `--` separator, clap treats every name after the first as an unknown positional and fails with `error: unexpected argument 'X' found`.
 - **Integration tests for refactors.** A refactor that changes data flow MUST have integration tests: unit tests miss wiring bugs.
 - **Contract tests are sacred.** Never hand-edit `src/generated/`: generated files are build outputs, written by `./scripts/codegen.sh` (`.claude/rules/testing.md` § Contract Tests).
@@ -67,7 +69,7 @@ A **workspace** is a user's live Lucidos instance: a workspace directory with gi
     - **A narrow filter cannot certify a merge resolution.** Take one side's implementation and the other side's tests, and the contradiction lands in a file the filter excludes. The implementation's own test module passes, while the test asserting the opposite contract never runs. Any merge that mixes sides runs the FULL suite.
   - TypeScript (`.ts`, `.tsx`) → `cd crates/lucidos-app && npm run typecheck && npm test` (both regenerate first)
   - CSS (`crates/lucidos-app/src/**/*.css`) → `cd crates/lucidos-app && npx vite build`. **Not "no tests".** Nothing else in the gate parses CSS: `tsc` ignores it and Vitest never built it, so a syntax error lands on `main` clean. There it kills the shared build-watch's `vite build`, which keeps serving the previous `dist/` and republishes nothing. Every LATER frontend Apply then strands with "applied but not served yet", pointing at the build-watch rather than at the CSS. `vite build` is sub-second and is the exact command the build-watch runs, so it fails on what the watch fails on.
-  - The engine's `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`. It is `include_str!`d and served to app iframes, so it is OUTSIDE the Vite graph and `vite build` never reads it. A syntax error there ships silently rather than breaking a build. `styles/__tests__/engine-served-css-parses.test.ts` postcss-parses it under the ordinary Vitest run. Add a new engine-served stylesheet to `ENGINE_SERVED_CSS` (`styles/__tests__/css-rule-helpers.ts`) in the same change that adds the `include_str!`.
+  - The engine's `crates/lucidos-agents-api/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`. It is `include_str!`d and served to app iframes, so it is OUTSIDE the Vite graph and `vite build` never reads it. A syntax error there ships silently rather than breaking a build. `styles/__tests__/engine-served-css-parses.test.ts` postcss-parses it under the ordinary Vitest run. Add a new engine-served stylesheet to `ENGINE_SERVED_CSS` (`styles/__tests__/css-rule-helpers.ts`) in the same change that adds the `include_str!`.
   - Docs-only → no tests
   - Mixed Rust and TS → run both
 - **Test locations** — Rust unit: inline `#[cfg(test)]`. TS unit: `*.test.ts` next to source. Browser e2e: `crates/lucidos-app/e2e/*.spec.ts` (`./scripts/e2e-browser.sh`). API e2e: `crates/lucidos-e2e/tests/` (`./scripts/e2e-api.sh`). Contract tests: `crates/lucidos-app/src/contract-tests/`. See `testing.md`.
@@ -115,7 +117,7 @@ variables there.
 One rule stays resident because it is safety-critical and must hold even when the
 skill is not loaded:
 
-- `LUCIDOS_DATABASE_URL`: the workspace database, read-only by default (ADR 0481), as the *agent role*, which cannot read a secret column (ADR 0509). CC sessions, bash and python tools, and scripts get it, so run `psql "$LUCIDOS_DATABASE_URL" -c '…'`, and `BEGIN READ WRITE` for a deliberate write. **Never put the URL or password in argv**: it lands in the persisted `Bash` tool-call payload. The engine sets no `PG*` and no `DATABASE_URL`, so bare `psql` reaches nothing.
+- `LUCIDOS_DATABASE_URL`: the workspace database, read-only by default (ADR 0481), as the *agent role*, which cannot read a secret column (ADR 0509). CC sessions, bash and python tools, and scripts get it, so run `psql "$LUCIDOS_DATABASE_URL" -c '…'`. It writes no table (ADR 0760). **Never put the URL or password in argv**: it lands in the persisted `Bash` tool-call payload. The engine sets no `PG*` and no `DATABASE_URL`, so bare `psql` reaches nothing.
 
 ## Workspace Layout & Taxonomy
 

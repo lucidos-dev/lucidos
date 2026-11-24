@@ -1,0 +1,15 @@
+[package]
+name = "lucidos-event-hooks"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lucidos-core = { path = "../lucidos-core" }
+# The trigger script rules a hook script shares, and later its runner.
+lucidos-engine = { path = "../lucidos-engine" }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

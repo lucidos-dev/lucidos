@@ -1222,6 +1222,84 @@ fn parse_control_response_ignored() {
     assert!(events.is_empty());
 }
 
+#[test]
+fn billing_initialize_reads_only_its_own_effective_account() {
+    let line = serde_json::json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": BILLING_INITIALIZE_REQUEST_ID,
+            "response": {"account": {"apiProvider": "gateway", "email": "person@example.com"}}}
+    });
+    let events = parse_one_line(&line.to_string());
+    match &events[..] {
+        [AgentEvent::BillingObserved { attribution }] => {
+            assert_eq!(attribution.provider_id(), "claude-gateway");
+            assert!(!serde_json::to_string(attribution)
+                .unwrap()
+                .contains("person@"));
+        }
+        other => panic!("expected effective billing evidence, got {other:?}"),
+    }
+    let mut refused = line.clone();
+    refused["response"]["subtype"] = "error".into();
+    assert!(matches!(&parse_one_line(&refused.to_string())[..],
+        [AgentEvent::BillingObserved { attribution }] if attribution.provider_id() == "unknown"));
+    let mut unrelated = line;
+    unrelated["response"]["request_id"] = "another-control-request".into();
+    assert!(parse_one_line(&unrelated.to_string()).is_empty());
+}
+
+#[test]
+fn first_party_billing_requires_status_in_either_reply_order_and_never_crosses_streams() {
+    let initialize = serde_json::json!({"type":"control_response","response":{
+        "request_id":BILLING_INITIALIZE_REQUEST_ID,"subtype":"success",
+        "response":{"account":{"apiProvider":"firstParty","apiKeySource":"none","tokenSource":"claude-login"}}
+    }}).to_string();
+    let status = |extra: Option<serde_json::Value>| {
+        let mut rows = vec![
+            serde_json::json!({"label":"Version","value":"2.1.311"}),
+            serde_json::json!({"label":"Session ID","value":"fixture-session"}),
+            serde_json::json!({"label":"cwd","value":"/tmp/fixture"}),
+        ];
+        rows.extend(extra);
+        serde_json::json!({"type":"control_response","response":{
+            "request_id":BILLING_STATUS_REQUEST_ID,"subtype":"success",
+            "response":{"sections":[{"title":"Session","rows":rows}]}
+        }})
+        .to_string()
+    };
+    let provider = |events: Vec<AgentEvent>| match events.last().unwrap() {
+        AgentEvent::BillingObserved { attribution } => attribution.provider_id(),
+        other => panic!("expected billing, got {other:?}"),
+    };
+    for status_first in [true, false] {
+        let mut state = CcStreamState::default();
+        let (first, second) = if status_first {
+            (status(None), initialize.clone())
+        } else {
+            (initialize.clone(), status(None))
+        };
+        parse_line(&mut state, &first);
+        assert_eq!(
+            provider(parse_line(&mut state, &second)),
+            "anthropic-subscription"
+        );
+        assert_eq!(
+            provider(parse_line(
+                &mut state,
+                &status(Some(
+                    serde_json::json!({"label":"Anthropic base URL","value":"https://example.com/private"})
+                ))
+            )),
+            "unknown"
+        );
+    }
+    assert_eq!(
+        provider(parse_one_line(&initialize)),
+        "unknown",
+        "a new stream cannot inherit endpoint evidence"
+    );
+}
+
 // CC 2.1.76+ sends streaming deltas as "stream_event" wrappers. They carry no
 // content to persist (the complete text/tool call arrives later as
 // assistant/tool_result), but each one PROVES the subprocess is alive and
@@ -1449,6 +1527,7 @@ fn parse_result() {
             text,
             duration_ms,
             error,
+            ..
         } => {
             assert_eq!(text, "Done.");
             assert_eq!(*duration_ms, 1234);
@@ -1472,6 +1551,7 @@ fn parse_result_error_during_execution_carries_error() {
             text,
             duration_ms,
             error,
+            ..
         } => {
             assert_eq!(text, "");
             assert_eq!(*duration_ms, 2300);

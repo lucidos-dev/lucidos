@@ -11,39 +11,37 @@
  *  channel is shared infrastructure and the crash / error telemetry is reusable
  *  for any future client-stability issue. */
 
+import { CLIENT_BUILD_ID } from 'virtual:build-id';
+import { formatBuildId } from './buildId';
 import { focusedThreadId } from '../store/store';
 import { composeDrafts } from '../store/composeDrafts';
 import { postClientLog } from './clientLog';
 import { isIOSPwa } from './platform';
+import { onPageHide, onPageWake } from './pageVisit';
+import { noteCrashPageHide } from './crashPageHide';
+import { takeCrashRecord } from './crashStorage';
 
 const HEARTBEAT_KEY = 'lucidos-liveness-heartbeat';
 const CLEAN_CLOSE_KEY = 'lucidos-liveness-clean-close';
 const HEARTBEAT_INTERVAL_MS = 3_000;
-// 2x interval + jitter — gaps within this window mean the prior session was
-// alive within the last tick, so an interrupted close was a crash, not bg.
 const CRASH_GAP_THRESHOLD_MS = 7_000;
-// Beyond this, the prior session was idle long enough that the heartbeat
-// naturally stopped, so we can't distinguish crash from real cold start.
 const COLD_GAP_THRESHOLD_MS = 30 * 60 * 1_000;
 
 interface HeartbeatPayload {
   ts: number;
+  hiddenAt?: number;
   focusedThread: string | null;
   draftCount: number;
 }
 
 type StartupKind =
-  | 'cold'           // No prior heartbeat or > 30 min dead
-  | 'bg_resume'      // Long dead window, no clean-close marker (background timed out the heartbeat)
-  | 'reload_clean'   // Clean close marker present and nav type is reload
-  | 'nav_clean'      // Clean close marker present and nav type is navigate / back-forward
-  | 'likely_crash';  // Short dead window, no clean-close marker, iOS PWA — the bug we hunt
+  | 'cold'
+  | 'bg_resume'
+  | 'reload_clean'
+  | 'nav_clean'
+  | 'likely_crash';
 
 interface ClassifyInput {
-  /** Time the prior page was actually unresponsive: navigation-start of the
-   *  new page minus the last heartbeat ts. Subtracts out cold-reload duration
-   *  so the 7s crash window catches WKWebView kills even when the rehydrate
-   *  itself takes 10–20s on iOS PWA. */
   deadMs: number | null;
   cleanClose: boolean;
   navType: string;
@@ -84,7 +82,6 @@ function writeHeartbeat(): void {
   try {
     localStorage.setItem(HEARTBEAT_KEY, JSON.stringify(payload));
   } catch {
-    /* localStorage full / disabled — telemetry must never break the app */
   }
 }
 
@@ -98,26 +95,19 @@ function getNavType(): string {
   }
 }
 
-/** When the new page's navigation began — ~when the prior page died for a
- *  crash-reload. Falls back to Date.now() so an env without performance.timeOrigin
- *  degrades to the old wallclock-at-startup behavior instead of breaking. */
 function getNavigationStartMs(): number {
   try {
     if (typeof performance !== 'undefined' && typeof performance.timeOrigin === 'number' && performance.timeOrigin > 0) {
       return performance.timeOrigin;
     }
   } catch {
-    /* ignore */
   }
   return Date.now();
 }
 
-/** Re-exported from the leaf `utils/clientLog` so this module stays the place
- *  callers reach for breadcrumbs, while low-level utilities (utils/ipcHealth,
- *  reached from utils/tauri) can post without importing the store through here. */
 export { postClientLog };
 
-export function reportStartupKind(): void {
+export function reportStartupKind(): void | Promise<void> {
   const prior = readPriorHeartbeat();
   const cleanClose = (() => {
     try {
@@ -129,18 +119,8 @@ export function reportStartupKind(): void {
   try {
     localStorage.removeItem(CLEAN_CLOSE_KEY);
   } catch {
-    /* ignore */
   }
 
-  // gapMs = wallclock-at-mount minus last-heartbeat. Includes the cold-reload
-  // duration (~10–20s on iOS PWA), so it overshoots the 7s crash threshold even
-  // when the prior page was killed mid-use. Kept in the payload for continuity
-  // with historical log lines.
-  //
-  // deadMs = navigation-start minus last-heartbeat. Approximates the actual
-  // dead-window the user perceived: it strips out the cold-reload cost, so a
-  // WKWebView content-process kill in a fresh page surfaces as deadMs ≈ 0–3s
-  // and the classifier can correctly label it likely_crash.
   const navStart = getNavigationStartMs();
   const gapMs = prior ? Date.now() - prior.ts : null;
   const deadMs = prior ? Math.max(0, navStart - prior.ts) : null;
@@ -149,12 +129,6 @@ export function reportStartupKind(): void {
   const isPwa = isIOSPwa();
   const kind = classifyStartup({ deadMs, cleanClose, navType, isIOSPwa: isPwa });
 
-  // Capture the landing URL's deep-link channels (query + hash) so a push tap
-  // that "opens the app but doesn't navigate" is diagnosable: this is the only
-  // breadcrumb that fires on EVERY boot, including the iOS declarative-push
-  // reload. If `search`/`hash` carry `notification=…&thread=…&tap=…` the deep
-  // link reached the page (look downstream for why nav was lost); if they're
-  // empty the params were dropped before boot (scope → picker, or a redirect).
   let landingSearch = '';
   let landingHash = '';
   let landingPath = '';
@@ -163,13 +137,16 @@ export function reportStartupKind(): void {
     landingHash = window.location.hash.slice(0, 200);
     landingPath = window.location.pathname.slice(0, 80);
   } catch {
-    /* telemetry only */
   }
-  postClientLog('lifecycle', 'startup', {
+  const raw = takeCrashRecord();
+  const data = {
+    build: formatBuildId(CLIENT_BUILD_ID),
     kind,
     gap_ms: gapMs,
     dead_ms: deadMs,
     reload_ms: reloadMs,
+    prev_hidden_ms: prior?.hiddenAt !== undefined && Number.isFinite(prior.hiddenAt)
+      ? Math.max(0, navStart - prior.hiddenAt) : null,
     clean_close: cleanClose,
     nav_type: navType,
     is_ios_pwa: isPwa,
@@ -179,18 +156,16 @@ export function reportStartupKind(): void {
     landing_path: landingPath,
     landing_search: landingSearch,
     landing_hash: landingHash,
-  });
+  };
+  if (kind === 'likely_crash' && raw) {
+    return import('./crashBreadcrumbs').then(({ recoveredStartup, BreadcrumbStore }) => {
+      const store = new BreadcrumbStore({ getItem: () => raw, setItem: () => {} }, '');
+      postClientLog('lifecycle', 'startup', recoveredStartup(data, store));
+    }, () => { postClientLog('lifecycle', 'startup', data); });
+  }
+  postClientLog('lifecycle', 'startup', data);
 }
 
-// ---------------------------------------------------------------------------
-// Uncaught error / rejection breadcrumbs
-// ---------------------------------------------------------------------------
-// Same channel as startup classification: every iOS PWA black-screen recovery
-// today logs `kind:"reload_clean"` with no JS trace, so the cause is invisible.
-// Capture window-level errors and unhandled promise rejections to the engine
-// log so the next blackout leaves evidence (engine.log line tagged
-// `[Client/error]`). Throttled per error signature so a hot loop can't drown
-// out the log tail.
 
 const ERROR_THROTTLE_MS = 30_000;
 const ERROR_THROTTLE_MAX_KEYS = 100;
@@ -238,9 +213,6 @@ function installErrorBreadcrumbs(): () => void {
   function onRejection(e: PromiseRejectionEvent) {
     const reason = e.reason;
     const isError = reason instanceof Error;
-    // Always coerce to a real string — JSON.stringify returns undefined for
-    // symbol / function / undefined reasons (no throw), and the subsequent
-    // .slice would crash the rejection handler itself.
     const msg = typeof reason === 'string'
       ? reason
       : isError
@@ -278,23 +250,36 @@ export function startLivenessTracking(): () => void {
     writeHeartbeat();
   }, HEARTBEAT_INTERVAL_MS);
 
+  const stopHide = onPageHide(() => {
+    const prior = readPriorHeartbeat();
+    if (!prior) return;
+    try {
+      localStorage.setItem(HEARTBEAT_KEY, JSON.stringify({ ...prior, hiddenAt: Date.now() }));
+    } catch {  }
+  });
+  const stopWake = onPageWake(writeHeartbeat);
+  function onHide(event: PageTransitionEvent) {
+    markCleanClose();
+    noteCrashPageHide(event.persisted);
+  }
   function markCleanClose() {
     try {
       localStorage.setItem(CLEAN_CLOSE_KEY, '1');
     } catch {
-      /* ignore */
     }
   }
 
   window.addEventListener('beforeunload', markCleanClose);
-  window.addEventListener('pagehide', markCleanClose);
+  window.addEventListener('pagehide', onHide);
 
   const stopErrorBreadcrumbs = installErrorBreadcrumbs();
 
   return () => {
     clearInterval(intervalId);
     window.removeEventListener('beforeunload', markCleanClose);
-    window.removeEventListener('pagehide', markCleanClose);
+    window.removeEventListener('pagehide', onHide);
+    stopHide();
+    stopWake();
     stopErrorBreadcrumbs();
   };
 }

@@ -892,3 +892,48 @@ async fn an_option_widget_is_checked_and_lifted_on_the_hook_path() {
         .await
         .ok();
 }
+
+/// Both coding-agent backends use this endpoint. An integrated child's
+/// ordinary decision (including plan approval) belongs in its parent report.
+#[tokio::test]
+async fn integrated_sub_thread_questions_never_open_an_owner_card() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    for (session_id, tool_prefix) in [("sid-integrated", "toolu_"), ("", "codex-q-")] {
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread_summary(&pool, thread_id, "running").await;
+        sqlx::query(
+            "UPDATE thread_summaries SET coding_agent_integrated = true WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .timeout(Duration::from_secs(5))
+            .json(&json!({
+                "thread_id": thread_id,
+                "tool_use_id": format!("{tool_prefix}{thread_id}"),
+                "session_id": session_id,
+                "questions": [{
+                    "question": "Approve the plan?",
+                    "options": [{"label": "Approve"}, {"label": "Request changes"}]
+                }]
+            }))
+            .send()
+            .await
+            .expect("an integrated question must return without waiting for the owner");
+        assert_eq!(response.status().as_u16(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["answers"], json!({}));
+        let refusal = body["refusal"].as_str().expect("the tool reads a refusal");
+        assert!(refusal.contains("decision and options"), "{refusal}");
+        assert!(refusal.contains("lucidos wake-parent yes"), "{refusal}");
+        assert_eq!(
+            count_events_of_type(&pool, thread_id, "UserQuestionAsked").await,
+            0
+        );
+    }
+}

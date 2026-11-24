@@ -1,8 +1,3 @@
-/**
- * Deleting the open thread hands the focus to the next row the way a tap opens
- * it, so a Blocked row lands on its card. A plain focus opened it on its saved
- * reading position. This runs for a delete made on another device too.
- */
 import { describe, it, expect, vi } from 'vitest';
 
 const openListedThread = vi.hoisted(() => vi.fn());

@@ -4,12 +4,8 @@ import type { Page } from '@playwright/test';
 import { navigateToApp, assertHealthy } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
-/** Archived rows seeded. The initial window carries 30, so most of these are
- *  reachable only through `/threads/older` pagination. */
 const ARCHIVED_ROWS = 150;
 
-/** Rows that must be loaded before the test parks the list: well past the
- *  first window, so the saved position lies beyond what a reload loads. */
 const LOADED_BEFORE_PARKING = 100;
 
 function seedArchive(): void {
@@ -22,7 +18,6 @@ function seedArchive(): void {
     psql(inserts.join(';\n'));
 }
 
-/** Title of the first row whose top edge sits inside the list's viewport. */
 function topRowTitle(page: Page): Promise<string | null> {
     return page.evaluate(() => {
         const list = document.querySelector('.thread-drawer-list');
@@ -37,7 +32,6 @@ function topRowTitle(page: Page): Promise<string | null> {
 test.describe('Drawer scroll position across a reload', () => {
     test.beforeEach(async ({ page, context }) => {
         await assertHealthy(page);
-        // Runs on the reload too, so it leaves the saved scroll key alone.
         await context.addInitScript(() => {
             localStorage.setItem('lucidos-thread-drawer-open', 'true');
             localStorage.removeItem('lucidos-drawer-collapsed');
@@ -53,9 +47,6 @@ test.describe('Drawer scroll position across a reload', () => {
         const rows = page.locator('.thread-drawer-list .thread-row');
         await expect(rows.first()).toBeVisible();
 
-        // Page older threads in by scrolling to the bottom until enough landed.
-        // The row window mounts only the rows near the viewport, so count
-        // every row seen on the way down rather than the rows mounted now.
         await expect.poll(() => list.evaluate((el) => {
             el.scrollTop = el.scrollHeight;
             const w = window as unknown as { __rowsSeen?: Set<string> };
@@ -64,8 +55,6 @@ test.describe('Drawer scroll position across a reload', () => {
             return w.__rowsSeen.size;
         }), { timeout: 30_000 }).toBeGreaterThanOrEqual(LOADED_BEFORE_PARKING);
 
-        // Park the list deep in the loaded rows, with a real wheel so the
-        // scroll memory records it.
         await list.hover();
         await list.evaluate(el => { el.scrollTop = el.scrollHeight - el.clientHeight - 1200; });
         await page.mouse.wheel(0, 40);

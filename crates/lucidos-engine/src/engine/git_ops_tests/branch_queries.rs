@@ -566,7 +566,7 @@ fn files_have_client_update_ignores_files_outside_the_bundle() {
         "crates/lucidos-app/e2e/transcript-window-fills-the-pane.spec.ts",
         "crates/lucidos-app/e2e/fixture.html",
         "crates/lucidos-app/dev-build-watch.mjs",
-        "crates/lucidos-engine/src/api/sdk_iframe_audio.js",
+        "crates/lucidos-agents-api/src/api/sdk_iframe_audio.js",
         "packages/lucidos-sdk/tests/preferences.test.ts",
         "scripts/lib/e2e.ts",
         "crates/lucidos-engine/src/main.rs",
@@ -958,14 +958,27 @@ fn files_require_restart_detects_rust_and_migrations() {
     assert!(files_require_restart(&[
         "crates/lucidos-engine/src/main.rs".into()
     ]));
+    assert!(files_require_restart(&[
+        "crates/lucidos-core/src/core/widget.json".into()
+    ]));
     assert!(files_require_restart(&["Cargo.toml".into()]));
     assert!(files_require_restart(&["Cargo.lock".into()]));
     assert!(files_require_restart(&[
-        "crates/lucidos-engine/migrations/001.sql".into()
+        "crates/lucidos-core/migrations/001.sql".into()
     ]));
 }
 
 /// The dev window moves to its config only at a switch (ADR 0461).
+#[test]
+fn files_require_restart_for_engine_binary_inputs() {
+    assert!(files_require_restart(&[
+        "crates/lucidos-engine-bin/assets/identity.json".into()
+    ]));
+    assert!(!files_require_restart(&[
+        "crates/lucidos-engine-bin/tests/build_id.rs".into()
+    ]));
+}
+
 #[test]
 fn files_require_restart_for_the_desktop_apps_compile_inputs() {
     for input in [
@@ -1031,10 +1044,10 @@ fn files_require_restart_for_sdk_bundle_sources() {
 #[test]
 fn files_require_restart_for_engine_bundled_iframe_assets() {
     assert!(files_require_restart(&[
-        "crates/lucidos-engine/src/api/sdk_iframe.css".into()
+        "crates/lucidos-agents-api/src/api/sdk_iframe.css".into()
     ]));
     assert!(files_require_restart(&[
-        "crates/lucidos-engine/src/api/sdk_iframe_audio.js".into()
+        "crates/lucidos-agents-api/src/api/sdk_iframe_audio.js".into()
     ]));
 }
 
@@ -1055,84 +1068,6 @@ fn files_require_restart_for_the_engine_bundled_fonts() {
     assert!(!files_require_restart(&[
         "crates/lucidos-app/src/assets/fonts/LICENSE-FiraCode.txt".into()
     ]));
-}
-
-/// Every file a binary embeds needs a restart. Otherwise an Apply that edits
-/// one offers no restart, and the running process keeps the old copy.
-#[test]
-fn a_file_a_binary_embeds_requires_a_restart() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    // Built into none of the binaries an Apply rebuilds and restarts onto.
-    const NOT_IN_A_RESTARTED_BINARY: &[&str] = &["lucidos-app", "lucidos-e2e", "lucidos-eval"];
-    let include = regex::Regex::new(r#"include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)"#).unwrap();
-    let mut embedded = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).unwrap() {
-        let crate_dir = crate_dir.unwrap().path();
-        let name = crate_dir.file_name().unwrap().to_string_lossy().to_string();
-        if NOT_IN_A_RESTARTED_BINARY.contains(&name.as_str()) {
-            continue;
-        }
-        let mut dirs = vec![crate_dir.join("src")];
-        while let Some(dir) = dirs.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries {
-                let path = entry.unwrap().path();
-                let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-                // A whole file or directory of tests, mounted under `#[cfg(test)]`.
-                if file_name.ends_with("tests") || file_name.ends_with("tests.rs") {
-                    continue;
-                }
-                if path.is_dir() {
-                    dirs.push(path);
-                    continue;
-                }
-                if !file_name.ends_with(".rs") {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).unwrap();
-                for literal in include.captures_iter(&production_source(&source)) {
-                    let target = path.parent().unwrap().join(&literal[1]);
-                    let target = target
-                        .canonicalize()
-                        .unwrap_or_else(|e| panic!("{} embeds {target:?}: {e}", path.display()));
-                    let relative = target.strip_prefix(&root).unwrap();
-                    embedded.push(relative.to_string_lossy().replace('\\', "/"));
-                }
-            }
-        }
-    }
-    assert!(
-        embedded.len() > 20,
-        "the scan found only {embedded:?}, so it no longer reads the sources"
-    );
-    let missed: Vec<&String> = embedded
-        .iter()
-        .filter(|f| !files_require_restart(&[f.to_string()]))
-        .collect();
-    assert!(
-        missed.is_empty(),
-        "a binary embeds these, but an Apply that edits one offers no restart: {missed:?}. \
-         Add each to EMBEDDED_FILES in restart_detection.rs."
-    );
-    // A generated file is a build output that a clean clone lacks, so no
-    // binary may embed one. Render it at runtime instead.
-    let generated: Vec<&String> = embedded
-        .iter()
-        .filter(|f| {
-            crate::codegen::GENERATED_DIRS
-                .iter()
-                .any(|dir| f.starts_with(&format!("{dir}/")))
-        })
-        .collect();
-    assert!(
-        generated.is_empty(),
-        "a binary embeds these generated files: {generated:?}"
-    );
 }
 
 /// A Rust file's source without its inline test modules. Each one is a
@@ -1185,7 +1120,7 @@ fn production_source_drops_test_bodies_and_keeps_what_follows() {
 #[test]
 fn files_require_restart_for_embedded_data_and_the_iframe_stylesheet() {
     assert!(files_require_restart(&[
-        "crates/lucidos-engine/src/core/themes/builtin/nord.json".into()
+        "crates/lucidos-core/src/core/themes/builtin/nord.json".into()
     ]));
     assert!(files_require_restart(&[
         "crates/lucidos-app/src/styles/global/shared-components.css".into()
@@ -1472,4 +1407,86 @@ async fn a_dangling_origin_head_names_no_default() {
     }
     assert_eq!(default_local_branch(&repo).await, "main");
     assert_eq!(default_diff_base(&repo).await, "main");
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Every file a binary embeds needs a restart. Otherwise an Apply that edits
+    /// one offers no restart, and the running process keeps the old copy.
+    #[test]
+    fn a_file_a_binary_embeds_requires_a_restart() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        // Built into none of the binaries an Apply rebuilds and restarts onto.
+        const NOT_IN_A_RESTARTED_BINARY: &[&str] = &["lucidos-app", "lucidos-e2e", "lucidos-eval"];
+        let include = regex::Regex::new(r#"include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)"#).unwrap();
+        let mut embedded = Vec::new();
+        for crate_dir in std::fs::read_dir(root.join("crates")).unwrap() {
+            let crate_dir = crate_dir.unwrap().path();
+            let name = crate_dir.file_name().unwrap().to_string_lossy().to_string();
+            if NOT_IN_A_RESTARTED_BINARY.contains(&name.as_str()) {
+                continue;
+            }
+            let mut dirs = vec![crate_dir.join("src")];
+            while let Some(dir) = dirs.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries {
+                    let path = entry.unwrap().path();
+                    let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+                    // A whole file or directory of tests, mounted under `#[cfg(test)]`.
+                    if file_name.ends_with("tests") || file_name.ends_with("tests.rs") {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        dirs.push(path);
+                        continue;
+                    }
+                    if !file_name.ends_with(".rs") {
+                        continue;
+                    }
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for literal in include.captures_iter(&production_source(&source)) {
+                        let target = path.parent().unwrap().join(&literal[1]);
+                        let target = target.canonicalize().unwrap_or_else(|e| {
+                            panic!("{} embeds {target:?}: {e}", path.display())
+                        });
+                        let relative = target.strip_prefix(&root).unwrap();
+                        embedded.push(relative.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+            }
+        }
+        assert!(
+            embedded.len() > 20,
+            "the scan found only {embedded:?}, so it no longer reads the sources"
+        );
+        let missed: Vec<&String> = embedded
+            .iter()
+            .filter(|f| !files_require_restart(&[f.to_string()]))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "a binary embeds these, but an Apply that edits one offers no restart: {missed:?}. \
+         Add each to EMBEDDED_FILES in restart_detection.rs."
+        );
+        // A generated file is a build output that a clean clone lacks, so no
+        // binary may embed one. Render it at runtime instead.
+        let generated: Vec<&String> = embedded
+            .iter()
+            .filter(|f| {
+                crate::codegen_inputs::GENERATED_DIRS
+                    .iter()
+                    .any(|dir| f.starts_with(&format!("{dir}/")))
+            })
+            .collect();
+        assert!(
+            generated.is_empty(),
+            "a binary embeds these generated files: {generated:?}"
+        );
+    }
 }

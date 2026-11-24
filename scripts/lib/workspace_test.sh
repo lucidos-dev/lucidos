@@ -903,7 +903,7 @@ adopt_with() { # <http-code> <body>
     mkdir -p "$SANDBOX/ws-adopt/.lucidos"
     (
         set -e
-        WORKSPACE="$SANDBOX/ws-adopt"; ENGINE_PORT=5273; PROTO=https; GATEWAY_PORT=5251
+        WORKSPACE="$SANDBOX/ws-adopt"; ENGINE_PORT=5273; PROTO=http; GATEWAY_PORT=5251
         # shellcheck disable=SC2317 # called by adopt_into_gateway
         curl() {
             printf '%s\n' "$@" >>"$SANDBOX/adopt-args"
@@ -923,8 +923,8 @@ test_adopt_registers_the_dir_and_port_through_the_gateway() {
     else
         fail "got '$out'"
     fi
-    if grep -qx "https://localhost:5251/~/api/v1/control/workspaces/adopt" "$SANDBOX/adopt-args"; then
-        pass "posted to the adopt endpoint"
+    if grep -qx "https://127.0.0.1:5251/~/api/v1/control/workspaces/adopt" "$SANDBOX/adopt-args"; then
+        pass "posted to the adopt endpoint over https, whatever the engine serves"
     else
         fail "unexpected request: $(cat "$SANDBOX/adopt-args")"
     fi
@@ -982,6 +982,30 @@ test_interrupted_install_is_reinstalled
 test_resolves_bare_name_to_home_workspaces
 test_resolves_absolute_path_unchanged
 test_errors_on_missing_workspace
+# A directly launched engine serves plain http, even in a checkout with the
+# mkcert pair (decision 13 of the desktop-window-https plan).
+test_serve_plain_loopback_drops_the_mkcert_pair() {
+    echo "test: serve_plain_loopback drops the mkcert pair and records http"
+
+    local PROJECT_DIR="$SANDBOX/proj-plain" PROTO=""
+    mkdir -p "$PROJECT_DIR/.certs" "$HOME/workspaces/plain/.lucidos"
+    : > "$PROJECT_DIR/.certs/cert.pem"
+    : > "$PROJECT_DIR/.certs/key.pem"
+    WORKSPACE="$HOME/workspaces/plain"
+    export LUCIDOS_TLS_CERT="$PROJECT_DIR/.certs/cert.pem"
+    export LUCIDOS_TLS_KEY="$PROJECT_DIR/.certs/key.pem"
+
+    serve_plain_loopback
+
+    if [ -z "${LUCIDOS_TLS_CERT:-}" ] && [ -z "${LUCIDOS_TLS_KEY:-}" ] \
+        && [ "$PROTO" = "http" ] \
+        && grep -qx "PROTO=http" "$WORKSPACE/.lucidos/ports" 2>/dev/null; then
+        pass "the engine gets no cert and the ports file says http"
+    else
+        fail "cert=${LUCIDOS_TLS_CERT:-} key=${LUCIDOS_TLS_KEY:-} PROTO=$PROTO"
+    fi
+}
+
 test_does_not_create_directories
 test_shared_pg_sql_quoting
 test_legacy_pg_volume_layout_detects_parent_pgdata
@@ -990,6 +1014,7 @@ test_swap_ports_writes_shared_database_url
 test_swap_ports_keeps_the_proto_detect_tls_wrote
 test_relaunching_leaves_exactly_one_proto_line
 test_detect_tls_records_the_scheme_with_no_ports_file_yet
+test_serve_plain_loopback_drops_the_mkcert_pair
 test_adopt_registers_the_dir_and_port_through_the_gateway
 test_adopt_refusal_fails_the_launch
 
@@ -1181,6 +1206,38 @@ test_launch_bin_dir_is_per_profile_and_variant() {
     fi
 }
 
+test_cargo_and_launch_profiles_map_one_to_one() {
+    echo "test: cargo profiles and launch profiles map one to one"
+
+    # A launch dir holds builds of ONE cargo profile (ADR 0022). The mapping
+    # must round-trip in both directions, or two profiles share a launch dir.
+    local cargo launch back
+    for cargo in debug local-release e2e; do
+        launch="$(launch_profile_for_cargo_profile "$cargo")"
+        back="$(cargo_profile_for_launch_profile "$launch")"
+        if [ "$back" = "$cargo" ]; then
+            pass "cargo $cargo publishes to launch $launch and back"
+        else
+            fail "cargo $cargo -> launch $launch -> cargo $back"
+        fi
+    done
+    if [ "$(launch_profile_for_cargo_profile local-release)" = release ]; then
+        pass "local-release builds publish to .launch/release"
+    else
+        fail "local-release does not publish to .launch/release"
+    fi
+    if launch_profile_for_cargo_profile release >/dev/null 2>&1; then
+        fail "the shipped release profile resolved to a launch dir"
+    else
+        pass "the shipped release profile has no launch dir"
+    fi
+    if [ "$(RELEASE=1 ENGINE_CARGO_PROFILE="" engine_build_profile)" = local-release ]; then
+        pass "a release request builds local-release"
+    else
+        fail "a release request does not build local-release"
+    fi
+}
+
 test_launch_dir_is_outside_cargo_target() {
     echo "test: no launch dir is under target/, so cargo clean cannot remove it"
 
@@ -1193,7 +1250,7 @@ test_launch_dir_is_outside_cargo_target() {
     # with "No such file or directory: 'lucidos'" and `run_coding_agent` cannot
     # even spawn the child that would rebuild it. That is the 2026-08-13 outage.
     local profile variant dir
-    for profile in debug release; do
+    for profile in debug local-release e2e; do
         for variant in plain e2e-test-hooks; do
             dir="$(launch_bin_dir "$profile" "$variant")"
             case "$dir" in
@@ -1535,6 +1592,23 @@ test_published_build_state_classifies_against_head() {
     fi
 }
 
+test_locate_refuses_a_profile_with_no_launch_dir() {
+    echo "test: an unknown cargo profile fails instead of searching an empty path"
+
+    local PROJECT_DIR="$SANDBOX/proj-locate-unknown"
+    local ENGINE_BIN="" GATEWAY_BIN="" rc=0
+    mkdir -p "$PROJECT_DIR/target/debug"
+    : > "$PROJECT_DIR/target/debug/lucidos-engine"
+    : > "$PROJECT_DIR/target/debug/lucidos-gateway"
+
+    ENGINE_CARGO_PROFILE=release locate_launch_binaries >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ -z "$ENGINE_BIN" ]; then
+        pass "the shipped release profile is refused, with nothing selected"
+    else
+        fail "unknown profile was not refused (rc=$rc, ENGINE_BIN=$ENGINE_BIN)"
+    fi
+}
+
 test_locate_prefers_published_and_falls_back() {
     echo "test: the no-build path prefers the published binary, then warns"
 
@@ -1602,6 +1676,29 @@ test_locate_prefers_published_and_falls_back() {
         fail "release→debug fallback regressed: $ENGINE_BIN"
     fi
 
+    # A release request publishes to .launch/release but uplifts to
+    # target/local-release, the cargo profile it builds.
+    mkdir -p "$PROJECT_DIR/target/local-release" "$PROJECT_DIR/target/release"
+    : > "$PROJECT_DIR/target/release/lucidos-engine"
+    : > "$PROJECT_DIR/target/release/lucidos-gateway"
+    : > "$PROJECT_DIR/target/local-release/lucidos-engine"
+    : > "$PROJECT_DIR/target/local-release/lucidos-gateway"
+    if RELEASE=1 locate_launch_binaries >/dev/null 2>&1 &&
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/target/local-release/lucidos-engine" ]; then
+        pass "a release request falls back to target/local-release"
+    else
+        fail "release request uplift path: $ENGINE_BIN"
+    fi
+    mkdir -p "$PROJECT_DIR/.launch/release/plain"
+    : > "$PROJECT_DIR/.launch/release/plain/lucidos-engine"
+    : > "$PROJECT_DIR/.launch/release/plain/lucidos-gateway"
+    if RELEASE=1 locate_launch_binaries >/dev/null 2>&1 &&
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/.launch/release/plain/lucidos-engine" ]; then
+        pass "a release request prefers .launch/release/plain"
+    else
+        fail "release request launch dir: $ENGINE_BIN"
+    fi
+
     # A featured build looks in its OWN launch dir, not the plain one.
     mkdir -p "$PROJECT_DIR/.launch/debug/e2e-test-hooks"
     : > "$PROJECT_DIR/.launch/debug/e2e-test-hooks/lucidos-engine"
@@ -1651,10 +1748,11 @@ test_delivery_contract() (
     local before="$FAIL" rc out
     SCRIPT_NAME="test"
     parse_dev_args -w test --engine-build --publish-to "$PROJECT_DIR/.launch/release/plain" --fresh
-    if [ "$(engine_build_profile)" = release ]; then pass "target selects release"; else fail "wrong profile"; fi
+    if [ "$(engine_build_profile)" = local-release ]; then pass "target selects local-release"; else fail "wrong profile"; fi
+    if [ "$(launch_bin_dir)" = "$PROJECT_DIR/.launch/release/plain" ]; then pass "build publishes back to its target"; else fail "build publishes elsewhere: $(launch_bin_dir)"; fi
     if [ -n "$ENGINE_BUILD_FRESH" ]; then pass "fresh requested"; else fail "fresh lost"; fi
     parse_dev_args -w test --engine-only --publish-to "$PROJECT_DIR/.launch/release/plain" || fail "standalone switch target rejected"
-    if [ "$(engine_build_profile)" = release ]; then pass "standalone switch preserves release"; else fail "standalone switch lost profile"; fi
+    if [ "$(engine_build_profile)" = local-release ]; then pass "standalone switch preserves local-release"; else fail "standalone switch lost profile"; fi
     if parse_dev_args -w test --engine-only --fresh >/dev/null 2>&1; then
         fail "standalone switch accepted fresh clean"
     else
@@ -1686,28 +1784,32 @@ test_delivery_contract() (
 )
 test_delivery_contract || FAIL=$((FAIL+1))
 
-test_stale_publish_fails_after_one_retry() (
-    local before="$FAIL" count=0 rc=0 out
+# shellcheck disable=SC2329 # build_or_find_engine calls the stubs through run_launch_build
+test_stale_publish_compiles_once() (
+    local before="$FAIL" count=0 rc=0 out published=0
     BUILD=1
+    # PROJECT_DIR is this checkout, which must never get a launch tree here.
+    launch_tree_wanted() { return 1; }
     run_launch_cargo_builds() { count=$((count+1)); }
     prune_stale_debug_objects() { :; }
-    publish_after_preflight() { :; }
+    publish_after_preflight() { published=$((published+1)); }
     published_build_state() { echo stale; }
     build_or_find_engine > "$SANDBOX/stale-output" 2>&1 || rc=$?
     out="$(cat "$SANDBOX/stale-output")"
-    if [ "$rc" -eq 75 ]; then pass "head-moved exit is distinct"; else fail "stale result returned $rc"; fi
-    if [ "$count" -eq 2 ]; then pass "stale retry is bounded"; else fail "stale build count $count"; fi
+    if [ "$rc" -eq 0 ]; then pass "a stale publish still exits 0"; else fail "stale result returned $rc"; fi
+    if [ "$count" -eq 1 ]; then pass "a stale publish compiles once"; else fail "stale build count $count"; fi
+    if [ "$published" -eq 1 ]; then pass "a stale snapshot publishes once"; else fail "stale publish count $published"; fi
     case "$out" in
-        *"ERROR: head-moved:"*) pass "stale publish names reason" ;;
-        *) fail "stale publish omitted reason" ;;
+        *"WARNING: HEAD moved to"*) pass "stale publish prints the head-moved note" ;;
+        *) fail "stale publish omitted the note: $out" ;;
     esac
     [ "$FAIL" -eq "$before" ]
 )
-test_stale_publish_fails_after_one_retry || FAIL=$((FAIL+1))
+test_stale_publish_compiles_once || FAIL=$((FAIL+1))
 
 test_fresh_clean_uses_profile_and_slot() (
     local before="$FAIL" PROJECT_DIR="$SANDBOX/fresh-checkout" ENGINE_BUILD_FRESH=1
-    ENGINE_CARGO_PROFILE=release
+    ENGINE_CARGO_PROFILE=local-release
     mkdir -p "$PROJECT_DIR/scripts"
     cat > "$PROJECT_DIR/scripts/with-build-slot.sh" <<'SLOT'
 #!/bin/bash
@@ -1722,9 +1824,11 @@ SLOT
         *"cargo
 clean
 --profile
-release
+local-release
 -p
 lucidos-engine
+-p
+lucidos-engine-bin
 -p
 lucidos-gateway
 -p
@@ -1741,6 +1845,7 @@ test_fresh_clean_uses_profile_and_slot || FAIL=$((FAIL+1))
 test_background_publish_failure_is_fatal || FAIL=$((FAIL+1))
 
 test_launch_bin_dir_is_per_profile_and_variant
+test_cargo_and_launch_profiles_map_one_to_one
 test_launch_dir_is_outside_cargo_target
 test_worktree_refusal_still_sees_a_worktree_launch_dir
 test_publish_launch_binary_is_atomic_and_executable
@@ -1748,6 +1853,7 @@ test_publish_failure_preserves_the_previous_binary
 test_publish_prunes_only_dead_publish_temps
 test_publish_signs_the_temp_before_the_rename
 test_published_build_state_classifies_against_head
+test_locate_refuses_a_profile_with_no_launch_dir
 test_locate_prefers_published_and_falls_back
 test_worktree_predicate_classifies_paths
 test_refuses_worktree_pinned_stack
@@ -2083,14 +2189,13 @@ test_engine_gateway_port_reads_the_packaged_gateway
 test_engine_gateway_port_is_empty_without_a_gateway
 test_engine_gateway_port_never_lists_a_dead_or_absent_pid
 
-# ── gateway_stop_status: https first, then http ────────────────────────
+# ── gateway_stop_status: one https call, trusting the loopback CA ──────
 #
 # `curl` is shadowed in a subshell and answers from a queue, one status per
-# call, so the two-scheme fallback is pinned rather than assumed. No request
-# leaves this process.
+# call, and records its argv. No request leaves this process.
 
 # Run gateway_stop_status with `curl` answering the queued statuses in $1
-# (space separated). Writes the call count to $SANDBOX/curl-calls.
+# (space separated). Writes one argv line per call to $SANDBOX/curl-calls.
 #
 # The subshell runs under `set -e`, as stop.sh does, and the stub exits 7 on a
 # `000` exactly as curl does when a connection is refused. Together those pin
@@ -2104,7 +2209,7 @@ stop_status_with() {
         # shellcheck disable=SC2317 # called through gateway_curl
         curl() {
             local seq head rest
-            printf 'CALL\n' >>"$SANDBOX/curl-calls"
+            printf '%s\n' "$*" >>"$SANDBOX/curl-calls"
             seq="$(cat "$SANDBOX/curl-queue")"
             head="${seq%% *}"
             rest="${seq#* }"
@@ -2119,17 +2224,24 @@ stop_status_with() {
 
 curl_calls() { wc -l <"$SANDBOX/curl-calls" | tr -d ' '; }
 
-test_stop_status_reports_the_first_scheme_that_answers() {
+test_stop_status_reports_what_the_gateway_answered() {
     echo "test: gateway_stop_status reports what the gateway answered"
-    local got
-    got="$(stop_status_with "202 000")"
+    local got argv
+    got="$(stop_status_with "202")"
+    argv="$(cat "$SANDBOX/curl-calls")"
     if [ "$got" = "202" ] && [ "$(curl_calls)" = "1" ]; then
-        pass "https answered 202, so http is never tried"
+        pass "the gateway answered 202 in one call"
     else
         fail "want 202 in one call, got '$got' in $(curl_calls)"
     fi
+    case "$argv" in
+        *" -k "*) fail "the stop call skips verification: $argv" ;;
+        *"--cacert $(loopback_ca_cert) "*"https://127.0.0.1:5252/~/api/v1/control/workspaces/packaged/stop"*)
+            pass "it trusts the loopback CA at the loopback origin" ;;
+        *) fail "want the loopback CA and origin, got: $argv" ;;
+    esac
 
-    got="$(stop_status_with "404 000")"
+    got="$(stop_status_with "404")"
     if [ "$got" = "404" ]; then
         pass "a 404 is reported, not swallowed as a failure to reach anything"
     else
@@ -2137,27 +2249,16 @@ test_stop_status_reports_the_first_scheme_that_answers() {
     fi
 }
 
-test_stop_status_falls_back_to_http() {
-    echo "test: gateway_stop_status falls back to http when TLS refuses"
-    local got
-    # curl's own 000: no HTTP answer at all. The dev gateway serves plain http
-    # when no certs exist, so this is the ordinary local case, not an error.
-    got="$(stop_status_with "000 202")"
-    if [ "$got" = "202" ] && [ "$(curl_calls)" = "2" ]; then
-        pass "http answered after https could not connect"
-    else
-        fail "want 202 in two calls, got '$got' in $(curl_calls)"
-    fi
-}
-
 test_stop_status_says_000_when_nothing_answers() {
     echo "test: gateway_stop_status says 000 when no gateway answers"
     local got
-    got="$(stop_status_with "000 000")"
-    if [ "$got" = "000" ]; then
-        pass "no gateway on that port reads as 000, never as success"
+    # Plaintext loopback answers a hand-off page or a 301, never the control
+    # plane, so a failed https call is final.
+    got="$(stop_status_with "000 202")"
+    if [ "$got" = "000" ] && [ "$(curl_calls)" = "1" ]; then
+        pass "no gateway on that port reads as 000, with no http retry"
     else
-        fail "want 000, got '$got'"
+        fail "want 000 in one call, got '$got' in $(curl_calls)"
     fi
 
     got="$(stop_status_with " ")"
@@ -2168,8 +2269,7 @@ test_stop_status_says_000_when_nothing_answers() {
     fi
 }
 
-test_stop_status_reports_the_first_scheme_that_answers
-test_stop_status_falls_back_to_http
+test_stop_status_reports_what_the_gateway_answered
 test_stop_status_says_000_when_nothing_answers
 
 # ── desktop_window_url: the door the Tauri window loads ────────────────
@@ -2188,6 +2288,13 @@ test_gateway_mode_window_goes_through_the_gateway() {
         pass "gateway mode reaches the workspace at /<slug>/"
     else
         fail "want https://localhost:5251/dev/, got '$got'"
+    fi
+
+    got="$(desktop_window_url 1 http 5251 dev 5173)"
+    if [ "$got" = "https://localhost:5251/dev/" ]; then
+        pass "the gateway's loopback door is https whatever the engine serves"
+    else
+        fail "want https://localhost:5251/dev/ for a plain engine, got '$got'"
     fi
 
     # The trailing slash is load-bearing: the gateway resolves the first path
@@ -2652,6 +2759,53 @@ test_setup_postgres_on_an_external_port_never_calls_docker() {
 
 test_shared_pg_psql_follows_the_external_port
 test_setup_postgres_on_an_external_port_never_calls_docker
+
+# ── generate_build_outputs: never a binary from another source ─────────
+# Runs generate_build_outputs on a stub codegen.sh that logs each call's
+# arguments, one line per call. A `--cached-only` call exits CACHED_RC.
+# shellcheck disable=SC2329 # ensure_npm_deps is called by generate_build_outputs
+codegen_calls() { # <launch tree> <build> <reused bin>
+    local project="$SANDBOX/codegen-project"
+    rm -rf "$project"
+    mkdir -p "$project/scripts" "$project/target/debug"
+    # shellcheck disable=SC2016 # the stub expands these, not this shell
+    printf '#!/bin/bash\necho "[$*]" >> "%s/calls"\n[ "$*" != --cached-only ] || exit "${CACHED_RC:-0}"\n' \
+        "$project" > "$project/scripts/codegen.sh"
+    chmod +x "$project/scripts/codegen.sh"
+    touch "$project/target/debug/lucidos-codegen"
+    chmod +x "$project/target/debug/lucidos-codegen"
+    (
+        ensure_npm_deps() { :; }
+        PROJECT_DIR="$project" LAUNCH_TREE="$1" BUILD="$2" REUSED_CODEGEN_BIN="$3"
+        generate_build_outputs >/dev/null 2>&1
+    )
+    cat "$project/calls"
+}
+
+test_generate_build_outputs_picks_a_matching_source() {
+    echo "test: generate_build_outputs never renders with a binary from another source"
+    local project="$SANDBOX/codegen-project" got
+    got="$(codegen_calls "$SANDBOX/tree" 1 "")"
+    if [ "$got" = "[--cached-only]" ]; then pass "a launch tree build syncs from the cache"; else fail "launch tree: '$got'"; fi
+    got="$(CACHED_RC=1 codegen_calls "$SANDBOX/tree" 1 "")"
+    if [ "$got" = $'[--cached-only]\n[]' ]; then
+        pass "a checkout with no generated files renders in full"
+    else
+        fail "launch tree, nothing generated: '$got'"
+    fi
+    got="$(codegen_calls "" 1 "")"
+    if [ "$got" = "[--bin $project/target/debug/lucidos-codegen]" ]; then
+        pass "a live build renders with its own binary"
+    else
+        fail "live build: '$got'"
+    fi
+    got="$(codegen_calls "$SANDBOX/tree" "" "$SANDBOX/reused")"
+    if [ "$got" = "[--reused-bin $SANDBOX/reused]" ]; then pass "a reused e2e binary still renders"; else fail "reused: '$got'"; fi
+    got="$(codegen_calls "" "" "")"
+    if [ "$got" = "[]" ]; then pass "no build renders with no binary"; else fail "no build: '$got'"; fi
+}
+
+test_generate_build_outputs_picks_a_matching_source
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

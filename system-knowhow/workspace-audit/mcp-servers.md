@@ -1,7 +1,7 @@
 ---
 name: Workspace audit: MCP servers
 description: The MCP servers audit section. Registered servers whose launch line the user never approved, or whose start command the command guard's static check does not call safe.
-sources: ["system-knowhow/running-python.md", "crates/lucidos-engine/src/engine/tools/mcp.rs", "crates/lucidos-engine/src/core/mcp_servers.rs", "crates/lucidos-engine/src/engine/command_permission.rs"]
+sources: ["system-knowhow/running-python.md", "system-knowhow/running-python/*.md", "crates/lucidos-agents-api/src/engine/tools/mcp.rs", "crates/lucidos-core/src/core/mcp_servers.rs", "crates/lucidos-engine/src/engine/command_permission.rs"]
 ---
 
 # Workspace audit section: mcp-servers
@@ -12,8 +12,13 @@ the report. This file carries its scan, its checks and its fixes.
 
 An *MCP server* reruns its command line on every start. A server registered
 before the command guard read that line was never checked. This section
-finds those servers. `system-knowhow/running-python.md` § The command guard
+finds those servers. `system-knowhow/running-python/pick-the-right-tool.md` § The command guard
 owns the rule.
+
+Command permission decisions carry a trace of their deciding layer and evidence.
+The trace does not change this audit: inspect the registered launch line.
+For a trigger, check the launch command against its effective program grants. Category records confer no authority. Folder grants cover sandboxed trigger writes. MCP tool access and launch approval have separate checks.
+A launch permission card waits while its thread shows another card, so a missing card is not a missing check.
 
 ## Scan
 
@@ -31,6 +36,16 @@ a value. A server whose line reads `Launch: unknown` could not be checked.
 
 ## Checks
 
+- **Standing denies mistaken for MCP tool rules.** They apply to command
+  tools. Flag recipes using them to revoke an MCP tool grant as **broken**.
+
+Secret-read classification follows the executing sandbox policy; see
+`system-knowhow/agent-sandbox.md`. A launch approval cannot grant access to
+hidden private storage. Keep launch approval distinct from that boundary.
+
+Artifact attribution in `system-knowhow/running-python.md` describes writes after execution.
+It grants no MCP launch permission and changes none of the launch checks below.
+
 For each finding, capture: **location** (the server id), **what's wrong**,
 **which reference owns the rule** (link, don't quote), **suggested fix**.
 
@@ -39,9 +54,12 @@ For each finding, capture: **location** (the server id), **what's wrong**,
 - **Static check `may perform …`.** The command looks like an irreversible
   side effect, such as a mutating request or a cloud change. Severity:
   **smell**. Fix: ask the user to read the line and confirm they meant it.
+  If the command guard says it cannot rule out workspace deletion, cite
+  `system-knowhow/running-python/pick-the-right-tool.md` § The command guard (dangerous commands are gated).
 - **`not approved`.** Nobody approved this exact line. With the guard on, the
   default, the server does not start until someone approves it. With the guard
-  off, the catastrophic floor and secret-read gate still apply. Severity:
+  off, the catastrophic floor still applies. The secret-read gate applies only
+  where the sandbox cannot enforce. Severity:
   **smell** with the guard on, **nit** with it off. Fix: ask the user to read
   the line, then approve it by clicking Start under **Settings → MCP Servers**.
 - **Static check `needs a judgment at start`** on an approved line is not a
@@ -70,3 +88,8 @@ judgment about a command.
 - **Never edit a server's command to clear a finding.** Set it up again with
   `mcp(action="setup", ...)` only when the user asks. The guard then judges
   the new line.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

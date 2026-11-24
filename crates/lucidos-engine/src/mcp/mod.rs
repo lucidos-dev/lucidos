@@ -351,7 +351,7 @@ pub fn mcp_tool_char_ceiling(context_window: usize) -> usize {
 }
 
 /// Request-path ceiling for a model whose reply may share its input window.
-pub(crate) fn mcp_tool_char_ceiling_for(model: &str, context_window: usize) -> usize {
+pub fn mcp_tool_char_ceiling_for(model: &str, context_window: usize) -> usize {
     crate::engine::context::agent_context_char_budget_for(model, context_window)
         / MCP_BUDGET_DIVISOR
 }
@@ -604,7 +604,7 @@ impl McpManager {
             if running.get(&id).is_some_and(RunningServer::has_exited) {
                 running.remove(&id);
                 evicted = true;
-                log!(
+                log_legacy!(
                     "[MCP] Server '{}' exited on its own, dropping it from the registry",
                     id
                 );
@@ -876,7 +876,11 @@ impl McpManager {
         let env = crate::core::mcp_servers::launch_env(&self.pool, server).await?;
         // MCP servers are invoked as part of LLM tool calls today, so default to Agent.
         // If engine-internal MCP usage is added, that call site should pass ActorMode::Engine.
+        let sandbox =
+            crate::runtime::agent_sandbox::Sandbox::resolve(&self.pool, &self.workspace_root)
+                .await?;
         let client = McpClient::connect(
+            &sandbox,
             &server.id,
             &server.command,
             &server.args,
@@ -890,7 +894,7 @@ impl McpManager {
         if let Err(e) = McpServerStore::set_tools(&self.pool, &server.id, &tools).await {
             // The server IS up, so this is not a start failure. It only means
             // the page will keep quoting the previous manifest.
-            log!(
+            log_legacy!(
                 "[MCP] Failed to cache the tool manifest for '{}': {}",
                 server.id,
                 e
@@ -1318,7 +1322,7 @@ impl McpManager {
         drop(running);
 
         if !dropped.is_empty() {
-            log!(
+            log_legacy!(
                 "[MCP] Tools past the {}-char MCP tool ceiling, not offering them: {}",
                 char_ceiling,
                 describe_dropped(&dropped)
@@ -1397,7 +1401,7 @@ impl McpManager {
         let servers = match self.list_servers().await {
             Ok(servers) => servers,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[MCP] Failed to list servers for the turn's server lines: {}",
                     e
                 );
@@ -1444,7 +1448,7 @@ impl McpManager {
         {
             Ok(ids) => ids.unwrap_or_default().into_iter().collect(),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[MCP] Failed to read the enabled servers of thread {}: {}",
                     thread_id,
                     e
@@ -1491,7 +1495,7 @@ impl McpManager {
                 )
                 .await
             {
-                log!(
+                log_legacy!(
                     "[MCP] Thread {} did not inherit '{}' from its parent {}: {}",
                     child,
                     server_id,
@@ -1505,12 +1509,7 @@ impl McpManager {
     /// Parse a namespaced tool name like "mcp__blender__create_object"
     /// into (server_id, tool_name).
     pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
-        let rest = name.strip_prefix("mcp__")?;
-        let (server_id, tool_name) = rest.split_once("__")?;
-        if server_id.is_empty() || tool_name.is_empty() {
-            return None;
-        }
-        Some((server_id.to_string(), tool_name.to_string()))
+        crate::llm::tool_names::parse_mcp_tool_name(name)
     }
 }
 
@@ -1571,7 +1570,7 @@ fn offered_by_server(
             .into_iter()
             .filter_map(|offer| {
                 if offer.wire_name.is_none() {
-                    log!(
+                    log_legacy!(
                         "[MCP] Tool '{}' on server '{}' has no name that fits the tool-name limit, not offering it",
                         offer.tool.name,
                         server_id
@@ -2606,12 +2605,7 @@ done
         fn new(tools: &[McpTool]) -> Self {
             let dir = tempfile::TempDir::new().expect("tempdir");
             let script = dir.path().join("mcp-stub.sh");
-            std::fs::write(&script, STUB_SERVER).expect("write stub");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            crate::runtime::stub_executable::write_stub_executable(&script, STUB_SERVER);
             let pid_file = dir.path().join("stub.pid");
             let call_started_file = dir.path().join("call-started");
             let grandchild_pid_file = dir.path().join("grandchild.pid");
@@ -2997,13 +2991,17 @@ done
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
         let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
-        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+        for (model, cap) in [
+            ("gemini-4-argon", 32_768),
+            ("gemini-4-carbon", 32_768),
+            ("gemini-4-neon", 65_536),
+        ] {
             let report = manager.budget(model, 1_048_576).await.unwrap();
             let surface = manager
                 .tool_surface(thread, mcp_tool_char_ceiling_for(model, 1_048_576))
                 .await;
             assert_eq!(report.sent_chars, tool_definitions_chars(&surface.tools));
-            assert_eq!(report.request_chars, (1_048_576 - 32_768) * 3 / 2);
+            assert_eq!(report.request_chars, (1_048_576 - cap) * 3 / 2);
             assert_eq!(
                 report.mcp_ceiling_chars,
                 report.request_chars / MCP_BUDGET_DIVISOR
@@ -4069,9 +4067,16 @@ done
     #[tokio::test]
     async fn dropping_a_client_stops_the_processes_its_server_started() {
         let stub = StubServer::new(&[]).spawns_a_grandchild();
-        let client = McpClient::connect("stub", &stub.command, &[], &stub.env, ActorMode::Agent)
-            .await
-            .unwrap();
+        let client = McpClient::connect(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "stub",
+            &stub.command,
+            &[],
+            &stub.env,
+            ActorMode::Agent,
+        )
+        .await
+        .unwrap();
 
         drop(client);
 

@@ -1,6 +1,6 @@
 # 0218: A mute covers a sentence, and the caller's device opens the floor
 
-- **Status**: Accepted
+- **Status**: Accepted, and amended by [ADR 0666](0666-a-call-opens-listening.md)
 - **Date**: 2026-09-18
 
 Amends [ADR 0211](0211-a-call-opens-silent.md) in two places: the unit the

@@ -11,14 +11,8 @@ import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkBlock, SkText, SkeletonProvider } from '../shared/Skeleton';
 
-/** What the placeholder shows when nothing tells us the default. */
 const EXAMPLE_ORIGIN = 'https://lucidos.example.com';
 
-/** Pure: the sentence under the field, from the gateway's answer.
- *
- *  A probe verdict leads, since it answers the save the user just made. Then
- *  what the stored value means for the pairing QR. `tailnetDefault` is the
- *  origin pairing falls back to, so the empty state can say it is Tailscale. */
 export function externalAddressNote(info: ExternalAddressInfo, tailnetDefault: string | null): string {
   if (info.locked) {
     return `Set by ${info.env_var} in the gateway's environment, so it cannot be changed here.`;
@@ -35,19 +29,12 @@ export function externalAddressNote(info: ExternalAddressInfo, tailnetDefault: s
     : 'Empty, so pairing uses Tailscale once this machine is on a tailnet.';
 }
 
-/** Pure: where a tunnel or reverse proxy on this machine should point, or
- *  `null` when the gateway runs no public listener (ADR 0615). */
 export function publicListenerNote(info: ExternalAddressInfo): string | null {
   if (info.public_port === null) return null;
   return `A tunnel or reverse proxy on this machine should point at http://127.0.0.1:${info.public_port}. `
     + 'Lucidos treats everything arriving there as public, so a typed pairing code is refused and the QR or link pairs instead.';
 }
 
-/** The External address section of Settings → Access (ADR 0550).
- *
- *  The setting is the GATEWAY's, one per gateway, so this reads and writes it
- *  through the gateway's control plane. `available` is false on a page served
- *  straight off an engine port, which cannot reach that plane. */
 export function ExternalAddressSection({
   available,
   info,
@@ -60,8 +47,6 @@ export function ExternalAddressSection({
   onSaved: (info: ExternalAddressInfo) => void;
 }) {
   const showLoading = useDelayedLoading(info);
-  // The shell and its anchor render in every state, for the reason
-  // `NetworkAccessPage` gives for `access:network`.
   const shell = (body: ComponentChildren) => (
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="access:external-address">
@@ -122,9 +107,6 @@ export function ExternalAddressSection({
   );
 }
 
-/** The field, its Save button and the note. Keyed on the stored value by its
- *  caller, so a save or a CLI change redraws it from the gateway. With no
- *  `info`, inside a `SkeletonProvider`, it is the loading placeholder. */
 function ExternalAddressRow({
   info,
   tailnetDefault = null,

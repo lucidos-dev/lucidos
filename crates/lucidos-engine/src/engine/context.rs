@@ -7,45 +7,10 @@ use crate::llm::{ContentBlock, Message, MessageContent};
 use crate::memory::{EmbeddingProvider, MemoryEntry, QueryClassification};
 use uuid::Uuid;
 
-/// Default input-packing margin for models with no explicit shared-window
-/// output cap. Gemini 4 instead reserves its whole wire cap through
-/// `agent_context_char_budget_for`.
-pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
-
-/// Per-request char budget for `(system_prompt + tools + messages)`, derived
-/// from the model's resolved context window. JSON-heavy tool calls average
-/// ~1.5 chars/token (prose is ~3.5); the 3/2 multiplier picks the
-/// conservative end so the char total never under-counts the token total.
-/// A 1M-token model gets ~1.49M chars; the default 200k Claude gets ~288k
-/// chars (close to the previous hardcoded 300k); GPT-5 at 400k gets ~588k
-/// chars. Callers subtract their own prompt overhead (system prompt + tool
-/// definitions) before handing the remainder to `trim_context_if_needed`.
-///
-/// Takes the already-resolved window rather than a model string: the window
-/// now comes from the `models` registry when the row declares one, and only
-/// falls back to [`context_window_from_prefix`] when it doesn't. Resolution
-/// lives in `llm::model_registry::context_window_for`.
-///
-/// Why this exists: the old `AGENT_CONTEXT_CHAR_BUDGET = 300_000` constant
-/// was calibrated for the 200k-token default Claude and ignored the 1M
-/// window on the Opus `[1m]` build entirely, so trim pass 5 would silently
-/// drop the original user message in long tool loops even though the model
-/// could easily have held the whole thread. Per-model derivation lets us
-/// actually use the headroom we paid for.
-pub(crate) fn agent_context_char_budget(context_window: usize) -> usize {
-    let usable_tokens = context_window.saturating_sub(RESPONSE_TOKEN_RESERVE);
-    // 3/2 = 1.5 chars/token (integer math).
-    usable_tokens.saturating_mul(3) / 2
-}
-
-/// Model-aware request budget: reserve the full output cap for models with
-/// a unified input/output window. Existing models retain the 8k margin.
-pub(crate) fn agent_context_char_budget_for(model: &str, context_window: usize) -> usize {
-    match crate::llm::model_registry::unified_output_limit(model) {
-        Some(reserve) => context_window.saturating_sub(reserve).saturating_mul(3) / 2,
-        None => agent_context_char_budget(context_window),
-    }
-}
+pub(crate) use crate::llm::context_tokens::agent_context_char_budget;
+pub use crate::llm::context_tokens::agent_context_char_budget_for;
+#[cfg(test)]
+use crate::llm::context_tokens::RESPONSE_TOKEN_RESERVE;
 
 /// Exact inverse of [`agent_context_char_budget`]: how many tokens the
 /// *budget* believes a char count is worth, at its own conservative 1.5
@@ -58,53 +23,23 @@ pub(super) fn budget_tokens_from_chars(chars: usize) -> usize {
     chars.saturating_mul(2) / 3
 }
 
-/// Best estimate of the real token count behind a char count, at a measured
-/// 2.5 chars/token. Feeds `ContextCaptured.estimated_total_tokens` and the
-/// `Context: N tokens` thought-stream line, i.e. everything the user reads.
-///
-/// **Deliberately NOT the budget's ratio**, and the two must not be
-/// re-conflated. They answer different questions. The budget's 1.5 exists so
-/// the packer can never overflow the window: being conservative there is the
-/// whole point, and it stays. A number shown to the user has the opposite
-/// duty, and 1.5 made the LLM Context Viewer report a 205k prompt as 361k,
-/// contradicting the measured `usage.input_tokens` printed directly above it.
-///
-/// 2.5 is measured, not guessed. Across 12,069 `ContextCaptured` rows with
-/// real usage on `producer = main_llm`, taken after `a997aa403` started
-/// counting tool schemas in the total so estimate and actual cover the same
-/// content, the implied ratio was p01 2.28, p50 2.60, p99 2.74. Sitting just
-/// under the median keeps a small conservative lean, and the other tokenizers
-/// measured (Gemini ~3.3, GPT-5.6 ~4.0 once the schemas are corrected for) are
-/// more efficient still, so one Claude-calibrated constant errs the safe way
-/// for them too. `[Context] calibration` in `agentic_loop/run.rs` keeps
-/// logging the comparison, which is what a future per-family split would need.
-///
-/// History: this was `chars / 4` (the prose ratio) until May 25, when a
-/// `workspace-learning` trigger reported "Context: 649 K tokens" to the UI,
-/// sent 1.54 M tokens to the API past the 1 M Opus cap, and 400'd. The fix
-/// pinned it to the budget's 1.5, which cured the under-count by conflating
-/// the two jobs; splitting them is what lets this one be accurate without
-/// touching the budget's safety margin.
-pub(crate) fn estimate_tokens_from_chars(chars: usize) -> usize {
-    // 2/5 = 2.5 chars/token (integer math).
-    chars.saturating_mul(2) / 5
-}
+pub use crate::llm::context_tokens::estimate_tokens_from_chars;
 
 /// Number of tail messages to always preserve (2 assistant+user pairs).
 pub(super) const PRESERVE_RECENT_MESSAGES: usize = 4;
 
 /// Compress conversation history when more than this many messages exist.
-pub(super) const HISTORY_COMPRESS_THRESHOLD: usize = 15;
+pub const HISTORY_COMPRESS_THRESHOLD: usize = 15;
 
 /// Always keep the last N messages verbatim.
-pub(super) const HISTORY_RECENT_MESSAGES: usize = 15;
+pub const HISTORY_RECENT_MESSAGES: usize = 15;
 
 /// Hard safety-net truncation for individual messages — only catches extreme outliers
 /// (e.g., someone pasting a 50K log dump). Normal messages are never touched by this.
-pub(super) const HISTORY_MSG_TRUNCATE: usize = 15_000;
+pub const HISTORY_MSG_TRUNCATE: usize = 15_000;
 
 /// Last N messages are always kept fully verbatim (no compaction, only safety-net truncation).
-pub(super) const HISTORY_VERBATIM_TAIL: usize = 4;
+pub const HISTORY_VERBATIM_TAIL: usize = 4;
 
 /// Assistant messages outside the verbatim tail are compacted to this limit.
 /// User messages are never compacted — their exact phrasing matters for follow-ups.
@@ -120,7 +55,7 @@ pub(super) const HISTORY_ASSISTANT_COMPACT: usize = 1500;
 /// 4,051 user messages had a median of 63 chars and a mean of 446. A long
 /// thread's whole user side therefore runs to a few KB. The budget exists for
 /// the thread that pastes logs into the prompt, not for the normal case.
-pub(super) const HISTORY_OLDER_USER_BUDGET: usize = 20_000;
+pub const HISTORY_OLDER_USER_BUDGET: usize = 20_000;
 
 /// How many assistant turns may sit past the *conversation summary*'s boundary
 /// before the summary is rebuilt (ADR 0102).
@@ -132,7 +67,7 @@ pub(super) const HISTORY_OLDER_USER_BUDGET: usize = 20_000;
 /// A refresh lands one turn late, since it is detached (ADR 0102). So the gap
 /// this number allows is what a thread renders while the paragraph catches up,
 /// and 5 has not been re-derived against that.
-pub(super) const HISTORY_SUMMARY_REFRESH_AFTER: usize = 5;
+pub const HISTORY_SUMMARY_REFRESH_AFTER: usize = 5;
 
 /// How many uncovered assistant turns the *older region* renders before it
 /// elides the rest into one count line (ADR 0102).
@@ -142,7 +77,7 @@ pub(super) const HISTORY_SUMMARY_REFRESH_AFTER: usize = 5;
 /// the room a failing summariser gets before anything is elided. Without a cap
 /// a thread whose summariser never lands would render every assistant turn
 /// compacted, which is worse than the summary it replaced.
-pub(super) const HISTORY_OLDER_UNCOVERED_TURNS: usize = 8;
+pub const HISTORY_OLDER_UNCOVERED_TURNS: usize = 8;
 
 /// Max bytes for a single read_file result returned to the LLM.
 pub(super) const READ_FILE_MAX_BYTES: usize = 50_000;
@@ -179,7 +114,7 @@ pub(super) const BUDGET_CUT_NOTE: &str = "cut to fit the context budget";
 /// 2. Apply `offset` (byte index, snapped down to a char boundary) for chunked reads.
 /// 3. Truncate the returned slice to READ_FILE_MAX_BYTES; the trailing message tells the
 ///    LLM the exact `offset=` to pass on the next `read_file` call to continue.
-pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset: usize) -> String {
+pub fn sanitize_file_content_for_llm(content: String, path: &str, offset: usize) -> String {
     static DATA_URI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"data:[a-zA-Z0-9]+/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
             .expect("data URI regex must compile")
@@ -205,7 +140,7 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
         // debug/test build) and a wrapped ~18-quintillion-KB figure in the log
         // otherwise. The raw before/after byte counts below stay exact either way.
         let stripped_kb = original_len.saturating_sub(sanitized.len()) / 1024;
-        log!(
+        log_legacy!(
             "[Context] read_file '{}': stripped {}KB of base64 image data ({} → {} bytes)",
             path,
             stripped_kb,
@@ -236,7 +171,7 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
     let next_offset = start + chunk_end_rel;
     let chunk = &remaining[..chunk_end_rel];
 
-    log!(
+    log_legacy!(
         "[Context] read_file '{}': returning bytes {}–{} of {}",
         path,
         start,
@@ -263,7 +198,7 @@ const TOOL_DEF_OVERHEAD_CHARS: usize = 100;
 /// subtract them while the reported `estimated_total_tokens` ignored them
 /// entirely, so the LLM Context Viewer under-reported the real prompt and
 /// disagreed with the engine's own accounting.
-pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefinition]) -> usize {
+pub fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefinition]) -> usize {
     tools
         .iter()
         .map(|t| {
@@ -317,7 +252,7 @@ pub(super) const IMAGE_BUDGET_TOKEN_ESTIMATE: usize = 1_600;
 /// under-reports it by 640 tokens (0.6x). Bounded and well inside the ratio's
 /// own spread, so it is accepted rather than plumbed around; revisit if
 /// image-heavy turns ever dominate a capture.
-pub(super) fn estimate_message_chars(message: &Message) -> usize {
+pub fn estimate_message_chars(message: &Message) -> usize {
     match &message.content {
         MessageContent::Text(s) => s.len(),
         MessageContent::Blocks(blocks) => {
@@ -351,7 +286,7 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
 /// separate because pass 5's `messages_removed` also shifts the caller's tracked
 /// message indices, whereas truncation does not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct TrimOutcome {
+pub struct TrimOutcome {
     /// Messages evicted by pass 5.
     pub messages_removed: usize,
     /// Content cut in place by passes 1 to 4: `ToolResult` bodies replaced with
@@ -396,7 +331,7 @@ enum Arguments {
 ///
 /// One result carries none: the call whose `ToolCalled` emit failed has no
 /// event id to render. Nothing addresses it, and a stub of it is a dead end.
-pub(super) fn address_trailer(content: &str) -> Option<&str> {
+pub fn address_trailer(content: &str) -> Option<&str> {
     let line = content.lines().next_back()?.trim();
     let inner = line.strip_prefix('[')?.strip_suffix(']')?;
     crate::core::store::parse_event_address(inner)
@@ -417,7 +352,7 @@ fn stub_line(content: &str) -> Option<&str> {
 ///
 /// The context panel reports what this matches as already let go, so the model
 /// stops reasoning from bytes it can no longer inspect.
-pub(super) fn is_stub(content: &str) -> bool {
+pub fn is_stub(content: &str) -> bool {
     stub_line(content).is_some()
 }
 
@@ -437,7 +372,7 @@ pub(super) fn is_stub(content: &str) -> bool {
 /// and pass 5 cannot remove.
 ///
 /// An empty set is every workspace with the context mode off.
-pub(super) type ProtectedAddresses = std::collections::HashSet<String>;
+pub type ProtectedAddresses = std::collections::HashSet<String>;
 
 /// Whether a placeholder names the call that reads the whole body back.
 ///
@@ -446,7 +381,7 @@ pub(super) type ProtectedAddresses = std::collections::HashSet<String>;
 /// keeps it: `with_event_address` stamps both arms, and ADR 0087's baseline is
 /// the bytes the control arm shipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RecoveryClause {
+pub enum RecoveryClause {
     State,
     Omit,
 }
@@ -458,13 +393,13 @@ pub(super) enum RecoveryClause {
 /// because every pass that writes one also honours the two above it. Threading
 /// them apart is how one call site disagrees with the rest.
 #[derive(Clone, Copy)]
-pub(super) struct TrimGuards<'a> {
+pub struct TrimGuards<'a> {
     /// Never cut, whatever it costs.
-    pub(super) protected: &'a ProtectedAddresses,
+    pub protected: &'a ProtectedAddresses,
     /// Cut last, and cut when nothing else is left.
-    pub(super) held_open: &'a std::collections::HashSet<String>,
+    pub held_open: &'a std::collections::HashSet<String>,
     /// Whether a placeholder names the recovery call.
-    pub(super) recovery: RecoveryClause,
+    pub recovery: RecoveryClause,
 }
 
 impl TrimGuards<'_> {
@@ -483,7 +418,7 @@ fn is_protected(content: &str, protected: &ProtectedAddresses) -> bool {
 /// Both stub forms state the original size, and both put it immediately before
 /// the word `chars`. The panel shows it beside the stub's own size, so the
 /// model can see what a re-fetch would cost it.
-pub(super) fn stub_original_chars(content: &str) -> Option<usize> {
+pub fn stub_original_chars(content: &str) -> Option<usize> {
     let line = stub_line(content)?;
     let (before, _) = line.rsplit_once(" chars")?;
     before.rsplit(' ').next()?.parse().ok()
@@ -494,7 +429,7 @@ pub(super) fn stub_original_chars(content: &str) -> Option<usize> {
 /// It states the size, and where `recovery` says so it names the call that
 /// reads the whole thing back. The bare address line stays last, exactly as the
 /// original had it, so a later pass still finds the block.
-pub(super) fn budget_stub(content: &str, recovery: RecoveryClause) -> String {
+pub fn budget_stub(content: &str, recovery: RecoveryClause) -> String {
     let was = content.len();
     match (address_trailer(content), recovery) {
         (Some(addr), RecoveryClause::State) => format!(
@@ -763,7 +698,7 @@ fn cut_the_newest_results(
 /// pinned message can be removed, so the caller's index bookkeeping stays exact.
 ///
 /// Returns what the trim actually did — see [`TrimOutcome`].
-pub(super) fn trim_context_if_needed(
+pub fn trim_context_if_needed(
     messages: &mut Vec<Message>,
     budget: usize,
     protected_idx: Option<usize>,
@@ -788,7 +723,7 @@ pub(super) fn trim_context_if_needed(
         }
     }
     if image_bytes_stripped > 0 {
-        log!(
+        log_legacy!(
             "[Context] Context trimming: stripped {}KB of image data from older messages",
             image_bytes_stripped / 1024
         );
@@ -822,7 +757,7 @@ pub(super) fn trim_context_if_needed(
     blocks_truncated += pass_1;
     passes |= u8::from(pass_1 > 0) << 1;
     if running <= budget {
-        log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
+        log_legacy!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
             budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(running) / 1000,
             total, running, messages.len(), budget_tokens_from_chars(budget) / 1000
         );
@@ -844,7 +779,7 @@ pub(super) fn trim_context_if_needed(
     blocks_truncated += pass_2;
     passes |= u8::from(pass_2 > 0) << 2;
     if running <= budget {
-        log!(
+        log_legacy!(
             "[Context] Context trimming: pass 2 (old prose) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
             budget_tokens_from_chars(running) / 1000,
             running,
@@ -876,7 +811,7 @@ pub(super) fn trim_context_if_needed(
         blocks_truncated += pass_3;
         passes |= u8::from(pass_3 > 0) << 3;
         if running <= budget {
-            log!("[Context] Context trimming: pass 3 (tail trim) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
+            log_legacy!("[Context] Context trimming: pass 3 (tail trim) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
                 budget_tokens_from_chars(running) / 1000, running, budget_tokens_from_chars(budget) / 1000
             );
             return TrimOutcome {
@@ -905,7 +840,7 @@ pub(super) fn trim_context_if_needed(
             blocks_truncated += cut;
             passes |= u8::from(cut > 0) << 4;
             if cut > 0 {
-                log!(
+                log_legacy!(
                     "[Context] Context trimming: last resort cut {} result(s) from the newest message, which exceeded the whole budget alone ({} chars now, {} budget)",
                     cut,
                     running,
@@ -984,12 +919,12 @@ pub(super) fn trim_context_if_needed(
         }
     }
 
-    log!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
+    log_legacy!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
         budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(current_total) / 1000,
         total, current_total, removed, messages.len(), budget_tokens_from_chars(budget) / 1000
     );
     if current_total > budget {
-        log!(
+        log_legacy!(
             "[Context] Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
             budget_tokens_from_chars(current_total) / 1000,
             current_total,
@@ -1032,7 +967,7 @@ pub(super) fn truncate_large_json_strings(value: &mut serde_json::Value) -> usiz
 
 /// Truncate a string using head+tail preservation.
 /// Keeps 75% from the start and 25% from the end, with an omission marker in the middle.
-pub(super) fn truncate_head_tail(content: &str, max_chars: usize) -> String {
+pub fn truncate_head_tail(content: &str, max_chars: usize) -> String {
     // Fast path: if byte length is under limit, char count must be too
     if content.len() <= max_chars {
         return content.to_string();
@@ -1065,7 +1000,7 @@ pub(super) fn truncate_head_tail(content: &str, max_chars: usize) -> String {
 /// block produced by `core::knowhow::load_one_knowhow_section`); organic
 /// discussion of the marker that doesn't reproduce a real body survives
 /// unchanged.
-pub(super) fn format_history_content(
+pub fn format_history_content(
     content: &str,
     role: &str,
     is_verbatim: bool,
@@ -1110,7 +1045,7 @@ fn strip_loaded_knowhow_bodies(content: &str, loaded_bodies: &[&str]) -> String 
 /// `start` is the 0-based place of the first image in the thread's image walk.
 /// `None` when the walk could not place it, and then only the handles print:
 /// a guessed `thread:N` would name some other picture.
-pub(crate) fn format_image_refs(start: Option<usize>, handles: &[String]) -> String {
+pub fn format_image_refs(start: Option<usize>, handles: &[String]) -> String {
     let handles_text = handles.join(" ");
     match (start, handles.len()) {
         (None, _) => handles_text,
@@ -1132,7 +1067,7 @@ const HISTORY_STEPS_MAX_BYTES: usize = 2_000;
 /// LLM messages vec by `build_resume_tool_blocks_with_skip_ids`. Their
 /// summary lines are suppressed here so the LLM doesn't see the same tool
 /// call twice (once verbatim, once as a `[tools: ...]` summary).
-pub(crate) fn format_history_steps(
+pub fn format_history_steps(
     steps: &[Step],
     skip_tool_event_ids: &std::collections::HashSet<String>,
 ) -> Option<String> {
@@ -1162,7 +1097,7 @@ pub(crate) fn format_history_steps(
 
 /// Trim history context from the START (oldest messages) when over budget.
 /// This preserves the most recent messages, which are most relevant for follow-ups.
-pub(super) fn trim_history_from_oldest(history: &mut String, bytes_to_trim: usize) {
+pub fn trim_history_from_oldest(history: &mut String, bytes_to_trim: usize) {
     if bytes_to_trim >= history.len() {
         history.clear();
         return;
@@ -1222,7 +1157,7 @@ fn format_long_term_memory(
 }
 
 impl LucidosEngine {
-    pub(crate) async fn retrieve_context(
+    pub async fn retrieve_context(
         &self,
         query: &str,
         classification: &QueryClassification,
@@ -1237,7 +1172,7 @@ impl LucidosEngine {
 
         // Skip memory retrieval entirely if classification says it's not needed
         if !classification.needs_memory {
-            log!(@Memory, "Query classified as not needing memory — skipping retrieval");
+            log_legacy!(@Memory, "Query classified as not needing memory — skipping retrieval");
             return (String::new(), Vec::new());
         }
 
@@ -1263,7 +1198,7 @@ impl LucidosEngine {
         let embeddings = match self.embedder.embed_batch(&sub_query_strs).await {
             Ok(e) => e,
             Err(e) => {
-                log!(@Memory, "Batch embedding failed: {}", e);
+                log_legacy!(@Memory, "Batch embedding failed: {}", e);
                 return (String::new(), Vec::new());
             }
         };
@@ -1298,7 +1233,7 @@ impl LucidosEngine {
                             .or_insert((entry, score));
                     }
                 }
-                Err(e) => log!(@Memory, "Semantic search failed: {}", e),
+                Err(e) => log_legacy!(@Memory, "Semantic search failed: {}", e),
             }
         }
 
@@ -1340,7 +1275,7 @@ impl LucidosEngine {
                             });
                     }
                 }
-                Err(e) => log!(@Memory, "Keyword search failed: {}", e),
+                Err(e) => log_legacy!(@Memory, "Keyword search failed: {}", e),
             }
         }
 
@@ -1406,10 +1341,6 @@ impl LucidosEngine {
         format_long_term_memory(&sorted_topics, MAX_CONTEXT_CHARS)
     }
 }
-
-#[cfg(test)]
-#[path = "context_tests/trim.rs"]
-mod context_trim_tests;
 
 #[cfg(test)]
 #[path = "context_tests/memory.rs"]
@@ -1540,10 +1471,14 @@ mod chars_per_token_ratio_tests {
     /// chars at 1.5 chars/token, and the display ratio must not leak into it.
     #[test]
     fn gemini_four_reserves_its_wire_output_cap() {
-        for model in ["gemini-4-argon", "gemini-4-carbon"] {
+        for (model, cap) in [
+            ("gemini-4-argon", 32_768),
+            ("gemini-4-carbon", 32_768),
+            ("gemini-4-neon", 65_536),
+        ] {
             let window = 1_048_576;
             let budget = agent_context_char_budget_for(model, window);
-            assert_eq!(budget_tokens_from_chars(budget), window - 32_768);
+            assert_eq!(budget_tokens_from_chars(budget), window - cap);
             assert_eq!(
                 crate::mcp::mcp_tool_char_ceiling_for(model, window),
                 budget / 4
@@ -1626,3 +1561,7 @@ mod context_window_tests {
         assert_eq!(agent_context_char_budget(1_000_000), 1_488_000);
     }
 }
+
+#[cfg(test)]
+#[path = "context_tests/trim.rs"]
+mod context_trim_tests;

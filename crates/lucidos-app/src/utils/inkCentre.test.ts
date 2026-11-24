@@ -1,8 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { drawnInkShift, inkFont, measureInkShift } from './inkCentre';
 
-/** A canvas whose glyphs are 60 wide and paint ink over `[inkLeft, inkRight)`
- *  of their advance, wherever `fillText` puts them. */
 function stubCanvas(inkLeft: number, inkRight: number) {
   const drawn: string[] = [];
   class FakeOffscreenCanvas {
@@ -43,7 +41,6 @@ describe('drawnInkShift', () => {
   });
 
   it('moves ink drawn left of its slot to the right, in em', () => {
-    // Ink over 5..50 of a 60-wide advance: its middle is 2.5 left of 30.
     stubCanvas(5, 50);
     expect(drawnInkShift({ text: '3', font: '700 100px X', px: 100 })).toBeCloseTo(0.025);
   });

@@ -17,9 +17,6 @@ import {
 } from './perfQueue';
 
 describe('interactionSampleOf: the split that IS the diagnosis', () => {
-  // An interaction that waited 80ms before our handler even ran, spent 10ms in
-  // it, and then 60ms reaching the screen. The input share says the main thread
-  // was already busy, which points away from the handler entirely.
   const entry = {
     name: 'click',
     startTime: 1_000,
@@ -42,9 +39,6 @@ describe('interactionSampleOf: the split that IS the diagnosis', () => {
     expect(interactionSampleOf(entry).target).toBe('(no target)');
   });
 
-  /** An element as the structure reader sees it. Built by hand because
-   *  `test-setup.ts` stubs `document` without real nodes, and this function is
-   *  pure over exactly these five reads. */
   function element(f: {
     tag: string; id?: string; className?: string; role?: string; text?: string;
   }): Node {
@@ -59,9 +53,6 @@ describe('interactionSampleOf: the split that IS the diagnosis', () => {
   }
 
   it('carries the target SHAPE and never its text', () => {
-    // The uploaded line persists in engine.log. An element's text is user
-    // content: a thread title, a file name, the opening of a message. Only the
-    // structure we author ourselves may travel.
     const sample = interactionSampleOf({
       ...entry,
       target: element({
@@ -82,8 +73,6 @@ describe('interactionSampleOf: the split that IS the diagnosis', () => {
   });
 
   it('drops the element id, which is data-derived wherever the app sets one', () => {
-    // A thread drawer row carries `navKeyDomId(thread.meta.id)`, so keeping the
-    // id would put a thread id in engine.log on every tap of a row.
     const target = element({
       tag: 'button',
       id: 'nav-1f3c9a02-7b41-4e55-9d2a-6c0e8b7f1d34',
@@ -121,16 +110,13 @@ describe('startPerfProbe: what it reports about itself', () => {
     vi.restoreAllMocks();
   });
 
-  /** A PerformanceObserver that accepts only the named entry types, the way a
-   *  real engine refuses the ones it does not implement. WebKit is the case
-   *  this whole support sample exists for. */
   function stubObserver(accepts: string[]): void {
     class FakeObserver {
       observe(init: { type: string }): void {
         if (!accepts.includes(init.type)) throw new TypeError(`unsupported: ${init.type}`);
       }
 
-      disconnect(): void { /* nothing to tear down */ }
+      disconnect(): void {  }
     }
     vi.stubGlobal('PerformanceObserver', Object.assign(FakeObserver, {
       supportedEntryTypes: accepts,
@@ -144,7 +130,6 @@ describe('startPerfProbe: what it reports about itself', () => {
 
   it('records the observers a WebKit-shaped browser actually took', () => {
     _setPerfEnabledForTesting(true);
-    // Safari: Event Timing at best, and neither of the two decisive ones.
     stubObserver(['event']);
     startPerfProbe();
     const support = samples().find((s) => s.message === 'perf-probe-support');
@@ -153,9 +138,6 @@ describe('startPerfProbe: what it reports about itself', () => {
   });
 
   it('records an EMPTY armed list rather than staying silent', () => {
-    // The reading that cost a whole round: a log with no perf lines meant
-    // either "nothing was slow" or "nothing could be seen", and nothing said
-    // which. An empty list says which.
     _setPerfEnabledForTesting(true);
     stubObserver([]);
     startPerfProbe();
@@ -188,9 +170,6 @@ describe('startPerfProbe: what it reports about itself', () => {
   });
 
   it('records support when the toggle is flipped on mid-session', () => {
-    // THE supported path, and the one a startup-only sample missed entirely.
-    // The gate is off at boot for everyone, so the boot sample is dropped by
-    // the queue. The user then switches recording on and reproduces.
     _setPerfEnabledForTesting(false);
     stubObserver(['event']);
     startPerfProbe();
@@ -212,16 +191,10 @@ describe('startPerfProbe: what it reports about itself', () => {
 });
 
 describe('the probe cannot regress to console-only', () => {
-  // The regression this whole change exists to undo: findings that only ever
-  // reached `console.warn`, which an iOS PWA gives no way to read. A source
-  // scan, because the value is in the WIRING and no behaviour test sees a
-  // deleted call.
   const here: string = dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(resolve(here, 'perfProbe.ts'), 'utf-8');
 
   it('routes through the queue that reaches engine.log', () => {
-    // The import LIST is free to grow, so match the symbol and its source
-    // rather than one spelling of the line.
     expect(source).toMatch(/import \{[^}]*\brecordPerfSample\b[^}]*\} from '\.\/perfQueue'/);
   });
 
@@ -232,11 +205,6 @@ describe('the probe cannot regress to console-only', () => {
   });
 
   it('builds the uploaded target from the structure reader, not the text one', () => {
-    // The sample persists in engine.log, so it takes `targetStructure`.
-    // `describeTarget` appends the element's own text and belongs to the
-    // console line alone.
-    // Anchored on the RETURN, not the signature: the parameter's inline type
-    // is itself a brace block, so a naive end-of-function search stops inside it.
     const built = source.slice(source.indexOf('export function interactionSampleOf'));
     const body = built.slice(built.indexOf('return {'), built.indexOf('\n    };'));
     expect(body).toContain('target: targetStructure(');

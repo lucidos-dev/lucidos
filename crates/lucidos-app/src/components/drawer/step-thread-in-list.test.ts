@@ -1,8 +1,3 @@
-/**
- * `stepThreadInList` decides where the next/previous thread shortcuts land:
- * the neighbouring thread row of the drawer's open list, staying inside the
- * focused thread's lifecycle section.
- */
 
 import { describe, it, expect } from 'vitest';
 import { stepThreadInList, type DrawerNavNode } from './ThreadDrawer';

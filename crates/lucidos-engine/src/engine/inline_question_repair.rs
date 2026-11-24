@@ -25,7 +25,7 @@
 
 /// What the detector found.
 #[derive(Debug, Clone)]
-pub(crate) enum InlineQuestionLeak {
+pub enum InlineQuestionLeak {
     /// A payload that parsed AND passed the same validation
     /// `walk_question_batch` applies. The caller synthesises a real tool call
     /// from it, so the user gets the clickable card the model meant to ask for.
@@ -58,7 +58,7 @@ const CLOSE: &str = "</ask_user_question>";
 ///
 /// Returns `None` when neither matches, and the caller falls back to normal
 /// handling.
-pub(crate) fn detect_inline_ask_user_question(text: &str) -> Option<InlineQuestionLeak> {
+pub fn detect_inline_ask_user_question(text: &str) -> Option<InlineQuestionLeak> {
     match first_leaked_tag(text) {
         Some(open_at) => Some(detect_tagged(text, open_at)),
         None => detect_bare_payload(text),
@@ -182,7 +182,7 @@ fn dispatchable_questions(body: &str) -> Option<serde_json::Value> {
         _ => return None,
     };
     let parser_input = serde_json::json!({ "questions": questions });
-    let walked = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+    let walked = crate::engine::question_parsing::parse_ask_user_question_inputs(&parser_input);
     if walked.is_empty() || walked.iter().any(|q| q.question.is_empty()) {
         return None;
     }
@@ -216,7 +216,7 @@ fn splice_out(text: &str, cut_from: usize, cut_to: usize, replacement: &str) -> 
 /// Nor can it persist on the way. `should_flush` flushes only at a paragraph
 /// boundary, and a payload alone at the end has no blank line after it. So no
 /// `TextStreamed` delta ever carries one.
-pub(crate) fn buffer_contains_inline_tag(buf: &str) -> bool {
+pub fn buffer_contains_inline_tag(buf: &str) -> bool {
     buf.contains("<ask_user_question")
 }
 

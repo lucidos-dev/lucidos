@@ -18,7 +18,6 @@ import { normalizeRename, promptRenameThread } from './threadRename';
 
 const ID = 't1';
 
-/** The arguments of the last toast raised. */
 function lastToast() {
   const calls = vi.mocked(showToast).mock.calls;
   return calls[calls.length - 1];
@@ -92,7 +91,6 @@ describe('promptRenameThread', () => {
   });
 });
 
-/** The `suggest` option the rename dialog was opened with. */
 async function suggestOption() {
   await promptRenameThread(ID);
   return vi.mocked(showPrompt).mock.calls[0][1]?.suggest;

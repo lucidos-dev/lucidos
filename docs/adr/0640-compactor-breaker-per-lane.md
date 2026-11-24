@@ -53,3 +53,9 @@ the backfill reports progress, and where the user picks another model.
   and still bills a call per node per interval during a long outage.
 - **Pausing the whole compactor on the first failure.** Rejected. One bad request
   among successes would stop the backfill. Any success resets the streak instead.
+
+## Amendment, 2026-11-10: unattended writes and spend cap holds
+
+A typed spend-cap refusal does not count toward the breaker or halve its lane.
+A provider hold gates background calls until reset, while interactive turns still send.
+See [ADR 0652](0652-unattended-writes-and-spend-cap-holds.md).

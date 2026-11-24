@@ -1,8 +1,3 @@
-/**
- * A callback that arrives while the user owes the agent an answer waits behind
- * that answer (ADR 0255). Its card says so. "Requesting" claimed the agent was
- * already on it. See `docs/plans/2026-09-24-a-delivery-never-unparks-a-question.md`.
- */
 import { describe, it, expect } from 'vitest';
 import {
   exchangeStatus,
@@ -34,8 +29,6 @@ const DELIVERY_ANCHOR = {
   type: 'PromptInjected', text: 'An event you subscribed to has arrived', mode: 'agent',
 } as ThreadEvent;
 
-/** Status as the transcript renders it while the thread is parked on the
- *  question: `waiting_for_user_answer` is quiescent AND awaiting an answer. */
 function parkedStatus(exchanges: Exchange[], index: number, threadIsCC = false) {
   const isLast = index === exchanges.length - 1;
   return exchangeStatus(exchanges[index], '', isLast, false, threadIsCC, true, true);
@@ -75,7 +68,6 @@ describe('a callback under an open question', () => {
     expect(older).toBeLessThan(last);
     const behind = exchangeStatus(exchanges[older], '', false, false, false, true, true, true);
     expect(behind).toBe('held');
-    // Not behind the card, the same exchange settles as before.
     expect(exchangeStatus(exchanges[older], '', false, false, false, true, true, false)).not.toBe('held');
   });
 
@@ -102,11 +94,10 @@ describe('a callback under an open question', () => {
   });
 
   it('holds on a coding-agent thread too', () => {
-    expect(parkedStatus(exchanges, last, /* threadIsCC */ true)).toBe('held');
+    expect(parkedStatus(exchanges, last,  true)).toBe('held');
   });
 
   it('reads "Requesting" as soon as the user answers', () => {
-    // The answer is in, but the engine's `running` has not reached the client.
     const answered = exchangeStatus(exchanges[last], '', true, false, false, false, true);
     expect(answered).toBe('pending');
     const resumed = exchangeStatus(exchanges[last], '', true, false, false, false, false);

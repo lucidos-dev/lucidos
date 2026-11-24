@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
+use lucidos_agents_api::engine::turn_end::{ParentView, TurnRead};
 use lucidos_engine::engine::thread_events::ChildCompletionStatus;
-use lucidos_engine::engine::{ParentView, TurnRead};
 use lucidos_engine::llm::judgment::JudgmentProvider;
 use serde::Deserialize;
 
@@ -20,7 +20,7 @@ use crate::Fallible;
 pub(crate) const CHECK: Check = Check {
     command: "wake-decision",
     name: "wake decision",
-    chat_judge: lucidos_engine::engine::wake_decision_chat_judge,
+    chat_judge: lucidos_agents_api::engine::turn_end::wake_decision_chat_judge,
     missed: "Missed must-wake",
     noise: "Noise woken",
 };
@@ -111,7 +111,7 @@ impl Labelled for LabelledReport {
     }
 
     async fn decide(&self, provider: &dyn JudgmentProvider) -> Fallible<Answer> {
-        let d = lucidos_engine::engine::decide_wake_for_eval(
+        let d = lucidos_agents_api::engine::turn_end::decide_wake_for_eval(
             provider,
             &self.turn()?,
             judged_status(&self.status)?,

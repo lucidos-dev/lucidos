@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/** Settings → System → Backup → Backup key: the public key.
- *
- *  The panel shows the workspace's public key, so the user can set another
- *  workspace up with it. The own-key step takes only a public key: a pasted
- *  backup key is refused in the browser and never sent.
- *
- *  Plan: `docs/plans/2026-10-21-reuse-an-existing-age-backup-key.md`. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -14,7 +7,6 @@ import * as apiClient from '../../../api/client';
 import type { BackupKeys } from '../../../api/client';
 
 const NONE: BackupKeys = { recipient: null, pending: false, legacy_key: false, secs_since_verified: null };
-/** Synthetic keys: shaped like age keys, made up for this test. */
 const PUBLIC_KEY = 'age1examplepublickeyforthistestonlyqqqqqqqqqqqqqqqqqqqqqqqqqq';
 const SECRET_KEY = 'AGE-SECRET-KEY-1EXAMPLESECRETKEYFORTHISTESTONLYQQQQQQQQQQQQQQQQQQQQQQQQQQ';
 
@@ -101,8 +93,6 @@ describe('the own-key step', () => {
 
 describe('publicKeyPasteProblem', () => {
   it('names the public key for a backup key of any case, and never repeats it', () => {
-    // A key file pasted into a one-line field loses its line breaks, so the
-    // secret key comes after the comments.
     const keyFile = `# created: 2026-01-01T00:00:00Z# public key: ${PUBLIC_KEY}${SECRET_KEY}`;
     for (const pasted of [SECRET_KEY, SECRET_KEY.toLowerCase(), `\n${SECRET_KEY} `, keyFile]) {
       const problem = publicKeyPasteProblem(pasted);

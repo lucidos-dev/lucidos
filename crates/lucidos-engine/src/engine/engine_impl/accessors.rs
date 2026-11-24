@@ -4,10 +4,67 @@
 
 use super::super::*;
 use crate::core::contained_path::{join_contained, join_data_contained};
+use crate::llm::judgment::{system_one_or_default_for, JudgmentProvider, JudgmentSite};
+
+/// Release the apply claim that the session behind `claimant` took.
+///
+/// An apply task can outlive the session it claimed, and a replacement on the
+/// same thread takes its own claim. Clearing by thread id alone would release
+/// that one, and a second apply could then merge beside it. `msg_tx` is the
+/// session's identity, as in `SessionEntryGuard`.
+pub fn release_change_claim(
+    sessions: &mut std::collections::HashMap<Uuid, crate::engine::AgentSession>,
+    thread_id: Uuid,
+    claimant: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+) {
+    if let Some(s) = sessions
+        .get_mut(&thread_id)
+        .filter(|s| s.msg_tx.same_channel(claimant))
+    {
+        s.change_claim = None;
+    }
+}
 
 impl LucidosEngine {
+    /// The System One row a judgment site runs on, or `None` for its chat
+    /// model. Only the wake decision has a default row, and every site shares
+    /// one fallback (ADRs 0435, 0472).
+    pub async fn judgment_system_one(
+        &self,
+        site: JudgmentSite,
+        timeout: std::time::Duration,
+    ) -> Option<Box<dyn JudgmentProvider>> {
+        let served = self
+            .current_provider()
+            .configured_providers()
+            .unwrap_or_default();
+        system_one_or_default_for(&self.pool, site, timeout, &served).await
+    }
+
+    pub fn agent_host(&self) -> &dyn agent_host::AgentHost {
+        self.agent_host.as_ref()
+    }
+
+    /// Whether this engine remembers what the thread's latest spawn appended,
+    /// so a copy of its session would share the session's prefix.
+    pub(crate) fn remembers_cc_system_prompt(&self, thread_id: Uuid) -> bool {
+        self.cc_system_prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&thread_id)
+    }
+
+    /// Check if a coding-agent session is running for a specific thread.
+    pub async fn is_agent_running_for(&self, thread_id: Uuid) -> bool {
+        self.agent_sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .is_some_and(|s| s.is_live())
+    }
+
     /// Update a per-repo entry in cc_commands_cache and persist to disk if changed.
-    pub(crate) async fn upsert_cc_commands_cache(&self, repo_key: String, info: CcCommandsInfo) {
+    pub async fn upsert_cc_commands_cache(&self, repo_key: String, info: CcCommandsInfo) {
         let json = {
             let mut cache = self.cc_commands_cache.write().await;
             if cache.get(&repo_key) == Some(&info) {
@@ -17,7 +74,7 @@ impl LucidosEngine {
             match serde_json::to_string(&*cache) {
                 Ok(json) => Some(json),
                 Err(e) => {
-                    log!("[ClaudeCode] Failed to serialize CC commands cache: {}", e);
+                    log_legacy!("[ClaudeCode] Failed to serialize CC commands cache: {}", e);
                     None
                 }
             }
@@ -25,7 +82,7 @@ impl LucidosEngine {
         if let Some(json) = json {
             let path = self.workspace_path.join(".lucidos/cc-commands.json");
             if let Err(e) = std::fs::write(&path, &json) {
-                log!("[ClaudeCode] Failed to write CC commands cache: {}", e);
+                log_legacy!("[ClaudeCode] Failed to write CC commands cache: {}", e);
             }
         }
     }
@@ -54,7 +111,7 @@ impl LucidosEngine {
 
     /// Resolve a data-relative path, returning both the normalized data-relative path and
     /// the absolute filesystem path. Normalization rules live in [`normalize_data_path`].
-    pub(crate) fn resolve_data_path(
+    pub fn resolve_data_path(
         &self,
         relative_path: &str,
     ) -> Result<(String, std::path::PathBuf), String> {
@@ -111,7 +168,7 @@ impl LucidosEngine {
         // engines. Nothing here can recover from that, but it must not be
         // silent.
         if self.self_arc.set(Arc::downgrade(arc)).is_err() {
-            log!("[Engine] set_self_arc called twice: keeping the first Arc");
+            log_legacy!("[Engine] set_self_arc called twice: keeping the first Arc");
         }
         // The Thread Queue executes admitted entries through the engine —
         // wire it the moment the Arc exists so no submission can race a
@@ -120,7 +177,7 @@ impl LucidosEngine {
     }
 
     /// Clone the Arc<Self> for spawning background tasks.
-    pub(crate) fn clone_arc(&self) -> Arc<LucidosEngine> {
+    pub fn clone_arc(&self) -> Arc<LucidosEngine> {
         self.self_arc
             .get()
             .expect("self_arc not initialized")
@@ -133,7 +190,7 @@ impl LucidosEngine {
     /// never panics — for `&self` side effects that only make sense on a fully
     /// wired engine (the dev background rebuild) and must simply no-op in unit
     /// tests that construct a bare `LucidosEngine`.
-    pub(crate) fn try_clone_arc(&self) -> Option<Arc<LucidosEngine>> {
+    pub fn try_clone_arc(&self) -> Option<Arc<LucidosEngine>> {
         self.self_arc.get().and_then(std::sync::Weak::upgrade)
     }
 
@@ -164,7 +221,7 @@ impl LucidosEngine {
         // Fall back to the central resume resolver — works after the live
         // session has exited but before any cleanup pass removes the dir
         // (Apply leaves the worktree on disk and resets it to main).
-        let resolved = super::super::agent_session::resume::resolve_worktree_path(
+        let resolved = crate::engine::session_queries::resolve_worktree_path(
             self.pool(),
             thread_id,
             self.workspace_path(),
@@ -180,8 +237,8 @@ impl LucidosEngine {
     }
 
     /// Hold across any write+commit on the workspace repo. See
-    /// [`crate::engine::git_ops::WORKSPACE_REPO_MUTEX`] for what else holds it.
-    pub(crate) async fn lock_workspace_repo(&self) -> crate::engine::git_ops::WorkspaceRepoLock {
+    /// [`crate::core::repository_lock::WORKSPACE_REPO_MUTEX`] for what else holds it.
+    pub async fn lock_workspace_repo(&self) -> crate::engine::git_ops::WorkspaceRepoLock {
         crate::engine::git_ops::lock_workspace_repo().await
     }
 
@@ -193,14 +250,16 @@ impl LucidosEngine {
     /// Shared `script_handshake` token cache. Both the HTTP proxy and the
     /// `proxy_request` LLM tool use this so the handshake script runs once
     /// per expiry window across all callers.
-    pub fn proxy_token_cache(&self) -> &crate::api::proxy_token_cache::ProxyTokenCache {
+    pub fn proxy_token_cache(&self) -> &lucidos_core::engine::proxy_token_cache::ProxyTokenCache {
         &self.proxy_token_cache
     }
 
     /// Shared token cache as a clonable `Arc`. Used by the pipeline
     /// builder to hand `ScriptHandshakeLayer` a handle on the same cache
     /// every other caller uses.
-    pub fn proxy_token_cache_arc(&self) -> Arc<crate::api::proxy_token_cache::ProxyTokenCache> {
+    pub fn proxy_token_cache_arc(
+        &self,
+    ) -> Arc<lucidos_core::engine::proxy_token_cache::ProxyTokenCache> {
         self.proxy_token_cache.clone()
     }
 
@@ -212,7 +271,10 @@ impl LucidosEngine {
         &self,
     ) -> &Arc<
         tokio::sync::RwLock<
-            std::collections::HashMap<String, Arc<crate::api::proxy_wasm_signer::CompiledModule>>,
+            std::collections::HashMap<
+                String,
+                Arc<crate::engine::proxy_wasm_signer::CompiledModule>,
+            >,
         >,
     > {
         &self.proxy_modules
@@ -305,7 +367,7 @@ impl LucidosEngine {
     }
 
     /// The Tree memory module's compactor handle.
-    pub(crate) fn summary_tree(&self) -> &crate::engine::summary_tree::Runtime {
+    pub fn summary_tree(&self) -> &crate::engine::summary_tree::Runtime {
         &self.summary_tree
     }
 
@@ -318,7 +380,7 @@ impl LucidosEngine {
     /// data API's write and delete routes can keep it coherent: they write the
     /// file through their own `ArtifactManager`, which has no way back to the
     /// engine that serves the profile to every chat turn.
-    pub(crate) fn user_profile_cache(&self) -> &crate::engine::user_profile::UserProfileCache {
+    pub fn user_profile_cache(&self) -> &crate::engine::user_profile::UserProfileCache {
         &self.user_profile
     }
 
@@ -326,14 +388,14 @@ impl LucidosEngine {
     /// from the `timezone` preference and refreshed by the `Timezone` preference
     /// side-effect. Empty when unset. Read by the scheduler to register the
     /// backup cron in the user's timezone (the same way triggers schedule).
-    pub(crate) async fn user_timezone(&self) -> String {
+    pub async fn user_timezone(&self) -> String {
         self.user_timezone.read().await.clone()
     }
 
     /// Record that `(repo_root, branch_name)` has been hardened at `head_sha`
     /// by a run of `tier`. Called by the `/api/v1/internal/mark-hardened`
     /// endpoint that `lucidos hardened mark` hits from `/harden` Phase 5.
-    pub(crate) async fn record_hardened(
+    pub async fn record_hardened(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
@@ -344,7 +406,7 @@ impl LucidosEngine {
             .await
     }
 
-    pub(crate) async fn harden_marker(
+    pub async fn harden_marker(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
@@ -356,7 +418,7 @@ impl LucidosEngine {
     /// Called by the `/api/v1/internal/mark-planned` endpoint that the
     /// `lucidos planned mark` CLI hits.
     #[allow(clippy::too_many_arguments)] // one arg per planned_branches column
-    pub(crate) async fn record_planned(
+    pub async fn record_planned(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
@@ -379,7 +441,7 @@ impl LucidosEngine {
         .await
     }
 
-    pub(crate) async fn plan_marker_state(
+    pub async fn plan_marker_state(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
@@ -399,21 +461,40 @@ impl LucidosEngine {
         crate::engine::git_ops::plan_marker_files(&self.pool, repo_root, branch_name).await
     }
 
-    /// Approve a `Proposed` plan, flipping it to `Planned` so the gate passes.
-    /// Returns whether a proposed row was flipped, or why the user's approval
-    /// is missing. Called by the `/api/v1/internal/approve-plan` endpoint that
-    /// `lucidos planned approve` hits after the user approves the plan.
-    pub(crate) async fn approve_plan(
+    /// Approve a proposed plan for implementation or landing alone, checking the user's scope.
+    pub async fn approve_plan(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
         caller_thread: Option<&str>,
+        plan_only: bool,
     ) -> Result<
         Option<crate::engine::git_ops::ApprovedPlan>,
         crate::engine::git_ops::PlanApprovalError,
     > {
-        crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name, caller_thread)
+        if let Some(thread) = caller_thread.and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            return crate::engine::plan_lifecycle::approve(
+                &self.event_bus,
+                thread,
+                repo_root,
+                branch_name,
+                plan_only,
+            )
+            .await;
+        }
+        if plan_only {
+            crate::engine::git_ops::approve_plan_for(
+                &self.pool,
+                repo_root,
+                branch_name,
+                caller_thread,
+                true,
+            )
             .await
+        } else {
+            crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name, caller_thread)
+                .await
+        }
     }
 
     /// Borrow the event store for sharing with read-only handlers.
@@ -452,13 +533,13 @@ impl LucidosEngine {
 
     /// The hot-swapped model routing map, for a boundary that validates a
     /// provider pin against a model's routes.
-    pub(crate) fn model_registry(&self) -> &crate::llm::ModelRegistry {
+    pub fn model_registry(&self) -> &crate::llm::ModelRegistry {
         &self.model_registry
     }
 
     /// One *auxiliary model call* for `purpose`, resolved against the router
     /// installed right now, so a credential added at runtime moves it.
-    pub(crate) async fn aux_call(
+    pub async fn aux_call(
         &self,
         purpose: crate::engine::ContextPurpose,
     ) -> crate::engine::aux_purpose::AuxCall {
@@ -474,12 +555,13 @@ impl LucidosEngine {
 
     /// The model a new chat turn resolves to, and its context window: what the
     /// MCP tool ceiling and the cost reports size against.
-    pub(crate) async fn chat_model_and_window(&self) -> (String, usize) {
-        let model = crate::core::PreferenceStore::resolved_chat_model(
-            &self.pool,
-            self.current_provider().default_model(),
-        )
-        .await;
+    pub async fn chat_model_and_window(&self) -> (String, usize) {
+        let offer =
+            crate::runtime::intelligence_ladder::ChatOffer::load(&self.pool, self.model_routes())
+                .await;
+        let model = crate::runtime::intelligence_ladder::default_chat_selection(&self.pool, &offer)
+            .await
+            .model;
         let window = self.context_window_for(&model, None);
         (model, window)
     }
@@ -496,7 +578,7 @@ impl LucidosEngine {
     /// It resolves the route exactly as the router will: the turn's `chosen`
     /// provider, then the row's preference, then the first configured route.
     /// So a model served by two backends is budgeted for the one that answers.
-    pub(crate) fn context_window_for(
+    pub fn context_window_for(
         &self,
         model: &str,
         chosen: Option<crate::llm::ProviderKind>,
@@ -512,7 +594,7 @@ impl LucidosEngine {
 
     /// Input/output limits belong to the selected wire model, including a
     /// user-created alias whose registry identity has a different name.
-    pub(crate) fn request_budget_model_for(
+    pub fn request_budget_model_for(
         &self,
         model: &str,
         chosen: Option<crate::llm::ProviderKind>,
@@ -550,9 +632,7 @@ impl LucidosEngine {
 
     /// The providers this engine's router holds. A router that reports no
     /// list filters nothing, so every provider counts.
-    pub(crate) fn configured_provider_kinds(
-        &self,
-    ) -> Vec<crate::llm::model_registry::ProviderKind> {
+    pub fn configured_provider_kinds(&self) -> Vec<crate::llm::model_registry::ProviderKind> {
         self.current_provider()
             .configured_providers()
             .unwrap_or_else(|| crate::llm::model_registry::ProviderKind::ALL.to_vec())
@@ -560,10 +640,14 @@ impl LucidosEngine {
 
     /// The registry and the configured backends, which the intelligence
     /// ladders read.
-    pub(crate) fn model_routes(&self) -> crate::runtime::intelligence_ladder::ModelRoutes {
+    pub fn model_routes(&self) -> crate::runtime::intelligence_ladder::ModelRoutes {
+        let provider = self.current_provider();
         crate::runtime::intelligence_ladder::ModelRoutes {
             registry: self.model_registry().clone(),
-            configured: self.configured_provider_kinds(),
+            configured: provider
+                .configured_providers()
+                .unwrap_or_else(|| crate::llm::model_registry::ProviderKind::ALL.to_vec()),
+            provider: Some(provider),
         }
     }
 
@@ -601,7 +685,7 @@ impl LucidosEngine {
 /// The data route reads the same list, so the file tools and the HTTP API
 /// cannot disagree about where a folder's paths land.
 fn normalize_data_path(relative_path: &str) -> Result<String, String> {
-    if crate::api::is_path_traversal(relative_path) {
+    if crate::core::is_path_traversal(relative_path) {
         return Err("Path traversal not allowed".to_string());
     }
     let had_data_prefix = relative_path.starts_with("data/");
@@ -976,5 +1060,297 @@ mod normalize_data_path_tests {
                 );
             }
         }
+    }
+}
+
+impl LucidosEngine {
+    /// Which operation holds this thread's change claim right now, if any. A
+    /// Stop, Discard or Archive would be refused while one does, so a caller can
+    /// refuse before it changes anything.
+    pub async fn change_claim_holder(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<crate::engine::types::ChangeClaim> {
+        self.agent_sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .and_then(|s| s.change_claim)
+    }
+
+    /// Clear the `change_claim` claim `claimant` took. Used by the
+    /// `apply_change` Tier-1 fast path, which claims the session via
+    /// `begin_in_place_merge` then finalizes a clean fast-forward inline (no
+    /// background task to clear it). Idempotent — a missing session is a no-op.
+    pub(crate) async fn clear_change_claim(
+        &self,
+        thread_id: Uuid,
+        claimant: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    ) {
+        crate::engine::release_change_claim(
+            &mut *self.agent_sessions.lock().await,
+            thread_id,
+            claimant,
+        );
+    }
+
+    /// Read the thread's backend from `thread_summaries`. Missing rows, NULL
+    /// and DB errors default to `ClaudeCode`, which also covers sessions that
+    /// predate the column.
+    pub async fn thread_coding_agent(&self, thread_id: Uuid) -> crate::runtime::CodingAgent {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT coding_agent FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    crate::log_legacy!(
+                "[AgentSession] thread_coding_agent({}) DB error: {} — defaulting to ClaudeCode",
+                thread_id,
+                e
+            );
+                    None
+                })
+                .flatten();
+        stored
+            .map(|s| crate::runtime::CodingAgent::parse(&s))
+            .unwrap_or(crate::runtime::CodingAgent::ClaudeCode)
+    }
+
+    /// Query the latest CC settings (model, reasoning_effort) for a thread from events.
+    /// Returns (model, effort) — each is None if never changed.
+    pub async fn cc_thread_settings(&self, thread_id: Uuid) -> (Option<String>, Option<String>) {
+        self.cc_thread_settings_where(thread_id, None).await
+    }
+
+    /// [`Self::cc_thread_settings`] recorded on `coding_agent` only. A model
+    /// one backend ran says nothing about a session on the other.
+    pub async fn cc_thread_settings_on(
+        &self,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+    ) -> (Option<String>, Option<String>) {
+        self.cc_thread_settings_where(thread_id, Some(coding_agent))
+            .await
+    }
+
+    async fn cc_thread_settings_where(
+        &self,
+        thread_id: Uuid,
+        coding_agent: Option<crate::runtime::CodingAgent>,
+    ) -> (Option<String>, Option<String>) {
+        let tid = thread_id.to_string();
+        let rows: Vec<(serde_json::Value,)> = match sqlx::query_as(
+            "SELECT payload FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'CodingAgentSettingsChanged' \
+               AND ($2::text IS NULL \
+                    OR COALESCE(payload->>'coding_agent', payload->>'agent', 'claude-code') = $2) \
+             ORDER BY created DESC LIMIT 10",
+        )
+        .bind(&tid)
+        .bind(coding_agent.map(crate::runtime::CodingAgent::as_str))
+        .fetch_all(self.pool())
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                log_legacy!(
+                    "[ClaudeCode] cc_thread_settings({}) DB error: {} — falling back to no per-thread overrides",
+                    thread_id,
+                    e
+                );
+                Vec::new()
+            }
+        };
+        // Fold from newest to oldest — first non-null value wins for each field
+        let mut model: Option<String> = None;
+        let mut effort: Option<String> = None;
+        for (payload,) in &rows {
+            if model.is_none() {
+                if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
+                    model = Some(m.to_string());
+                }
+            }
+            if effort.is_none() {
+                if let Some(e) = payload.get("reasoning_effort").and_then(|v| v.as_str()) {
+                    effort = Some(e.to_string());
+                }
+            }
+            if model.is_some() && effort.is_some() {
+                break;
+            }
+        }
+        (model, effort)
+    }
+
+    /// The model and effort a coding-agent turn runs on: the request's pick,
+    /// else a pending handoff's implementer, else the thread's settings, else
+    /// the backend's default implementer (`intelligence_ladder::fill_pick`).
+    /// The spawn and the turn's `MessageReceived` both resolve through here,
+    /// so the two agree.
+    pub async fn coding_agent_rung(
+        &self,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+        requested_model: Option<String>,
+        requested_effort: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let (requested_model, requested_effort) =
+            if requested_model.is_none() && requested_effort.is_none() {
+                self.pending_handoff_rung(thread_id, coding_agent).await
+            } else {
+                (requested_model, requested_effort)
+            };
+        let (event_model, event_effort) = if requested_model.is_none() || requested_effort.is_none()
+        {
+            self.cc_thread_settings_on(thread_id, coding_agent).await
+        } else {
+            (None, None)
+        };
+        let default_implementer =
+            crate::runtime::intelligence_ladder::default_implementer(self.pool(), coding_agent)
+                .await;
+        crate::runtime::intelligence_ladder::fill_pick(
+            coding_agent,
+            requested_model.or(event_model),
+            requested_effort.or(event_effort),
+            default_implementer.as_ref(),
+            |model| {
+                crate::runtime::intelligence_ladder::model_default_effort(
+                    coding_agent,
+                    self.model_registry(),
+                    model,
+                )
+            },
+        )
+    }
+
+    /// The effort a turn records when `coding_agent` served `served` in place
+    /// of the pick (`intelligence_ladder::fallback_effort`).
+    pub async fn swap_fallback_effort(
+        &self,
+        coding_agent: crate::runtime::CodingAgent,
+        served: &str,
+    ) -> Option<String> {
+        let default_implementer =
+            crate::runtime::intelligence_ladder::default_implementer(self.pool(), coding_agent)
+                .await;
+        crate::runtime::intelligence_ladder::fallback_effort(
+            coding_agent,
+            served,
+            default_implementer.as_ref(),
+            |model| {
+                crate::runtime::intelligence_ladder::model_default_effort(
+                    coding_agent,
+                    self.model_registry(),
+                    model,
+                )
+            },
+        )
+    }
+
+    /// The model and effort a pending handoff names for `thread_id`'s
+    /// successor session, when it runs on `coding_agent`. A user's message may
+    /// start that session before the engine does.
+    async fn pending_handoff_rung(
+        &self,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+    ) -> (Option<String>, Option<String>) {
+        match crate::engine::pending_handoff::pending_handoff(self.pool(), thread_id).await {
+            Ok(Some(handoff)) if handoff.coding_agent == coding_agent => {
+                (handoff.coding_agent_model, handoff.reasoning_effort)
+            }
+            Ok(_) => (None, None),
+            Err(e) => {
+                // The thread's own settings still name a rung the backend runs.
+                log_legacy!("[ClaudeCode] pending handoff of {}: {}", thread_id, e);
+                (None, None)
+            }
+        }
+    }
+
+    /// The model and effort a coding-agent thread runs on. The model is its
+    /// latest setting. The effort is its *effort in force*, never a pick no
+    /// call ran at.
+    pub async fn cc_thread_runs_on(
+        &self,
+        thread_id: Uuid,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let (model, _) = self.cc_thread_settings(thread_id).await;
+        let effort =
+            crate::engine::handoff_estimate::thread_effort_in_force(self.pool(), thread_id).await?;
+        Ok((model, effort))
+    }
+}
+
+impl LucidosEngine {
+    /// Persist a notification and fan it out as a web push. The LLM tool and
+    /// HTTP route emit the same event and use the same fan-out.
+    ///
+    /// `link_thread_id` sets the push tap target. The LLM tool passes its
+    /// originating thread. HTTP passes the thread ID the caller supplied, if
+    /// any.
+    ///
+    /// The live PresenceCheck pong controls suppression (see
+    /// `system-knowhow/notifications/3-the-presencecheck-protocol.md` §3). Callers validate input at the
+    /// boundary. This method also rejects blank titles and messages.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_notification(
+        &self,
+        title: &str,
+        message: &str,
+        app_id: Option<&str>,
+        link_thread_id: Option<uuid::Uuid>,
+        link_event_id: Option<uuid::Uuid>,
+        mut tap: crate::scheduler::notifications::Tap,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> Result<uuid::Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        if title.trim().is_empty() {
+            return Err("title is required".into());
+        }
+        if message.trim().is_empty() {
+            return Err("message is required".into());
+        }
+        // Belt-and-braces, like the two guards above. The surfaces that take a
+        // caller-written tap already settled it. So this is a no-op for them,
+        // and for every engine-internal producer building one from typed uuids.
+        // What it buys is that a FUTURE producer cannot write a thread tap the
+        // page is unable to resolve. `None`: this is a chokepoint, not a turn,
+        // so there is no ambient thread an alias could mean here.
+        crate::scheduler::notifications::resolve_thread_tap_id(&mut tap, None)?;
+
+        let notification_id = uuid::Uuid::new_v4();
+        self.event_bus
+            .emit(crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::NotificationCreated {
+                    id: notification_id.to_string(),
+                    title: title.to_string(),
+                    message: message.to_string(),
+                    task_id: None,
+                    app_id: app_id.map(str::to_string),
+                    thread_id: link_thread_id.map(|t| t.to_string()),
+                    event_id: link_event_id.map(|e| e.to_string()),
+                    tap: tap.clone(),
+                    actor,
+                    audience: None,
+                    push_group: None,
+                },
+            ))
+            .await
+            .map_err(|e| format!("failed to create notification: {}", e))?;
+
+        crate::scheduler::push::send_push_to_all_with_app(
+            &self.clone_arc(),
+            title,
+            message,
+            Some(notification_id),
+            app_id,
+            link_thread_id,
+            link_event_id,
+            tap,
+        );
+
+        Ok(notification_id)
     }
 }

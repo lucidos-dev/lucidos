@@ -27,13 +27,10 @@ function paired(id: string, over: Partial<PairedDevice> = {}): PairedDevice {
 }
 
 const describeUa = (ua?: string) => (ua ? `parsed:${ua}` : '');
-// Fixed, so the relative times the summary prints are deterministic.
 const NOW = Date.parse('2026-08-21T00:00:00Z');
 
 describe('buildDeviceRows', () => {
   it('joins the two halves on the shared id, so one phone is one row', () => {
-    // The whole point of the change: before the ids unified, this same phone
-    // was a row in Access AND a different row in Devices.
     const rows = buildDeviceRows([device('phone')], [paired('phone')], 'laptop');
     expect(rows).toHaveLength(1);
     expect(rows[0].device?.id).toBe('phone');
@@ -41,8 +38,6 @@ describe('buildDeviceRows', () => {
   });
 
   it('keeps a paired device that has never opened this workspace', () => {
-    // The gateway list is machine-global and the engine list is per workspace,
-    // so a phone paired from another workspace belongs here with no engine row.
     const rows = buildDeviceRows([], [paired('phone')], 'laptop');
     expect(rows).toHaveLength(1);
     expect(rows[0].device).toBeUndefined();
@@ -50,7 +45,6 @@ describe('buildDeviceRows', () => {
   });
 
   it('keeps a device that never paired', () => {
-    // A client on a direct engine port never went through the gateway.
     const rows = buildDeviceRows([device('local')], [], 'laptop');
     expect(rows).toHaveLength(1);
     expect(rows[0].paired).toBeUndefined();
@@ -75,8 +69,6 @@ describe('buildDeviceRows', () => {
   });
 
   it('treats a missing gateway as no pairing information at all', () => {
-    // `null` is "nothing answered", which must not read as "nothing is paired"
-    // in a way that reorders or drops rows.
     const rows = buildDeviceRows([device('a'), device('b')], null, 'a');
     expect(rows.map((r) => r.id)).toEqual(['a', 'b']);
     expect(rows.every((r) => r.paired === undefined)).toBe(true);
@@ -105,8 +97,6 @@ describe('isUnusedDevice', () => {
 describe('deviceRowSummary', () => {
   it('says a device is paired once a gateway has answered', () => {
     const [row] = buildDeviceRows([device('a')], [paired('a')], 'a');
-    // Not just "Paired": WHEN is what tells a phone in daily use from a laptop
-    // you sold, and it is what to read before revoking.
     expect(deviceRowSummary(row, describeUa, true, NOW)).toEqual([
       'parsed:UA',
       'Paired 20 days ago',
@@ -119,17 +109,11 @@ describe('deviceRowSummary', () => {
   });
 
   it('drops the pairing clause entirely when no gateway answered', () => {
-    // With no gateway there is nothing for the clause to be true or false
-    // about, so inventing one would be a lie either way.
     const [row] = buildDeviceRows([device('a')], null, 'a');
     expect(deviceRowSummary(row, describeUa, false, NOW)).toEqual(['parsed:UA']);
   });
 
   it('says a paired device is not set up here, without claiming it never was', () => {
-    // The absence of an engine row does NOT prove the device never opened this
-    // workspace: Remove deletes that row, and the id hand-over leaves the two
-    // halves apart until the device reloads. Both would put a flat falsehood
-    // under the user's main machine.
     const [row] = buildDeviceRows([], [paired('a')], 'b');
     expect(deviceRowSummary(row, describeUa, true, NOW)).toEqual([
       'Not set up in this workspace',
@@ -176,9 +160,6 @@ describe('deviceRowName', () => {
 
 describe('submittedDeviceName', () => {
   it('writes nothing when an unnamed device is opened and blurred', () => {
-    // The regression this exists for. The field prefills with the DERIVED
-    // name. So a check against the raw id reads that prefill as a rename and
-    // stores `device-<8>` for real, which a later hand-over makes stale.
     expect(submittedDeviceName(null, 'device-0a1b2c3d', 'device-0a1b2c3d')).toBeUndefined();
   });
 
@@ -195,7 +176,6 @@ describe('submittedDeviceName', () => {
   });
 
   it('clears the stored name when the field is emptied', () => {
-    // A real edit: the row falls back to the derived name from then on.
     expect(submittedDeviceName('My MacBook', 'My MacBook', '')).toBeNull();
     expect(submittedDeviceName('My MacBook', 'My MacBook', '   ')).toBeNull();
   });

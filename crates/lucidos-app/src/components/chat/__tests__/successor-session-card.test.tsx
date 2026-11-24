@@ -8,9 +8,6 @@ import {
 } from '../../../store/thread-events';
 import type { ResponseEvent } from '../../../store/types';
 
-// A successor session starts in the same thread, behind one card: the card a
-// fresh session gets, saying where the handoff ran, with the opening folded
-// under it.
 
 const OPENING = '# Handoff\n\nPhases 0 to 3 are committed. Continue with phase 4.';
 

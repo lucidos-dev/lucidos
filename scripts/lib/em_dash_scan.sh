@@ -94,11 +94,12 @@ em_dash_added_lines() {
 # carrying a banned dash. Removed and context lines are ignored, so a file that
 # is merely touched never reports the dashes it already had.
 em_dash_filter_diff() {
-    em_dash_awk '
+    SCAN_PATH="${1:-}" em_dash_awk '
         # `+++ b/<path>` opens a file. Checked before the generic `^\+` rule,
         # which it would otherwise match.
         /^\+\+\+ / {
             p = substr($0, 5)
+            sub(/\t$/, "", p)
             if (p == "/dev/null") { path = "" } else { sub(/^b\//, "", p); path = p }
             next
         }
@@ -114,7 +115,7 @@ em_dash_filter_diff() {
         }
         /^\+/ {
             line = substr($0, 2)
-            if (path != "" && banned(line))
+            if (path != "" && (ENVIRON["SCAN_PATH"] == "" || path == ENVIRON["SCAN_PATH"]) && banned(line))
                 printf "%s:%d:%s\n", path, ln, line
             ln++
             next
@@ -122,7 +123,7 @@ em_dash_filter_diff() {
     '
 }
 
-# em_dash_scan_diff <base-commit> [repo-root]
+# em_dash_scan_diff <base-commit> [repo-root] [path]
 # Print `path:line:content` for every banned dash this branch ADDS to a
 # tracked file, comparing the base commit against the WORKING TREE (so
 # uncommitted edits count too, not just committed ones).
@@ -136,8 +137,9 @@ em_dash_filter_diff() {
 # with the prefix still attached, unresolvable for whoever has to fix it),
 # `--no-ext-diff` and `--no-color` because either one reshapes the output the
 # awk filter reads.
+# Filter after Git computes the diff so rename detection also sees other paths.
 em_dash_scan_diff() {
-    local base="$1" repo="${2:-.}" out rc
+    local base="$1" repo="${2:-.}" scope="${3:-}" out rc
     if out="$(git -C "$repo" -c core.quotePath=false diff --no-ext-diff --no-color \
         --src-prefix=a/ --dst-prefix=b/ -U0 "$base" --)"; then
         rc=0
@@ -148,10 +150,10 @@ em_dash_scan_diff() {
         echo "em_dash_scan_diff: git diff failed (status $rc) against base: $base" >&2
         return 1
     fi
-    printf '%s\n' "$out" | em_dash_filter_diff
+    printf '%s\n' "$out" | em_dash_filter_diff "$scope"
 }
 
-# em_dash_scan_untracked [repo-root]
+# em_dash_scan_untracked [repo-root] [path]
 # Print `path:line:content` for every banned dash in an untracked file.
 # Untracked files are absent from `git diff` entirely, yet every one of their
 # lines is new, so they are scanned whole. `grep` finds the candidate lines,
@@ -162,7 +164,7 @@ em_dash_scan_diff() {
 # code: the loop body would simply never run, and the function would return 0,
 # reporting a clean scan of files it never looked at.
 em_dash_scan_untracked() {
-    local repo="${1:-.}" f hits rc listing
+    local repo="${1:-.}" scope="${2:-}" f hits rc listing
     if listing="$(git -C "$repo" ls-files --others --exclude-standard)"; then
         rc=0
     else
@@ -174,6 +176,7 @@ em_dash_scan_untracked() {
     fi
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        [[ -z "$scope" || "$f" == "$scope" ]] || continue
         # Regular files only. A broken symlink or a fifo carries no prose, and
         # grep on one errors, which the fail-closed arm below would turn into a
         # refusal of the whole gate. A permission-denied REGULAR file still

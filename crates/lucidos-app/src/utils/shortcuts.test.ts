@@ -155,18 +155,12 @@ describe('SHORTCUT_DEFS registry invariants', () => {
     }
   });
   it('exposes turn-by-turn conversation shortcuts on the mod+arrow keys', () => {
-    // ⌘↑ / ⌘↓ step the transcript one turn (a .chat-exchange) at a time. Free of
-    // the mod+alt+arrow history shortcuts (alt differs) — the collision invariant
-    // above also covers this.
     expect(shortcutDef('prevTurnOrNotification').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowUp' });
     expect(shortcutDef('nextTurnOrNotification').defaultBinding).toEqual({ mod: true, shift: false, alt: false, key: 'ArrowDown' });
     expect(shortcutDef('prevTurnOrNotification').category).toBe('Navigation');
     expect(shortcutDef('nextTurnOrNotification').category).toBe('Navigation');
   });
   it('exposes the customizable "Open thread actions" shortcut', () => {
-    // The keyboard route to a thread's menu is a first-class registry entry
-    // (so it is documented + rebindable in Settings → Keyboard Shortcuts), not a
-    // hand-rolled key. The collision + bindable invariants above also cover it.
     const def = shortcutDef('openThreadActions');
     expect(def.category).toBe('Navigation');
     expect(def.defaultBinding).toEqual({ mod: true, shift: true, alt: false, key: 'm' });
@@ -202,7 +196,6 @@ describe('the toggle shortcuts', () => {
 
 describe('mnemonics', () => {
   it('name the letter the default chord actually uses', () => {
-    // "L for Live" over a default of D would teach the wrong key.
     for (const def of SHORTCUT_DEFS) {
       const letter = /^([A-Z0-9]) for /.exec(def.mnemonic ?? '')?.[1];
       if (letter) expect(def.defaultBinding.key, def.id).toBe(letter.toLowerCase());

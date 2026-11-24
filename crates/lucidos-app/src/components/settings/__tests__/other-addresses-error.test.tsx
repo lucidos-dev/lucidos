@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Access › Other addresses opens on a failed read, because Pair a
- *  device points the user at the error it holds. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

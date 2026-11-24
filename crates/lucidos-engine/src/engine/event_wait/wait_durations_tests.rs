@@ -307,13 +307,13 @@ fn the_odds_count_the_window_that_set_the_cap() {
 
 // --- The duration lists, read back from events ---
 
-async fn age(pool: &sqlx::PgPool, event_id: Uuid, secs: i64) {
-    sqlx::query("UPDATE events SET created = now() - make_interval(secs => $2) WHERE id = $1")
-        .bind(event_id)
-        .bind(secs as f64)
-        .execute(pool)
-        .await
-        .unwrap();
+async fn age(
+    pool: &sqlx::PgPool,
+    anchor: chrono::DateTime<chrono::Utc>,
+    event_id: Uuid,
+    secs: i64,
+) {
+    stamp(pool, event_id, anchor - chrono::Duration::seconds(secs)).await;
 }
 
 fn asked(tool_use_id: &str) -> ThreadEvent {
@@ -325,11 +325,13 @@ fn asked(tool_use_id: &str) -> ThreadEvent {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        permission_request: None,
     }
 }
 
 fn answered(tool_use_id: &str) -> ThreadEvent {
     ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: tool_use_id.to_string(),
         quiet: false,
         answer: AnswerKind::Selected {
@@ -365,19 +367,27 @@ fn request(purpose: ContextPurpose) -> ThreadEvent {
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }
 
 /// Seed the real request that reads the cache after a card closed, aged
 /// `secs` like the event before it.
-async fn read_after(bus: &EventBus, pool: &sqlx::PgPool, thread_id: Uuid, secs: i64) {
+async fn read_after(
+    bus: &EventBus,
+    pool: &sqlx::PgPool,
+    anchor: chrono::DateTime<chrono::Utc>,
+    thread_id: Uuid,
+    secs: i64,
+) {
     let read = seed_thread_event(bus, thread_id, request(ContextPurpose::Turn)).await;
-    age(pool, read, secs).await;
+    age(pool, anchor, read, secs).await;
 }
 
 fn wait_started(wait_id: Uuid, kinds: &[&str]) -> ThreadEvent {
     ThreadEvent::EventWaitStarted {
+        background_timing: None,
         wait_id,
         tool_use_id: "toolu_wait".to_string(),
         on: kinds
@@ -410,6 +420,7 @@ fn sorted(durations: &WaitDurations, agent: WaitAgent, wait_type: WaitType) -> V
 #[tokio::test]
 async fn a_card_runs_from_ask_to_answer() {
     let (pool, db_name) = setup_test_db().await;
+    let anchor = chrono::Utc::now();
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/cards", None).await;
@@ -417,15 +428,15 @@ async fn a_card_runs_from_ask_to_answer() {
     let ask = seed_thread_event(&bus, thread_id, asked("toolu_a")).await;
     let other = seed_thread_event(&bus, thread_id, asked("toolu_open")).await;
     let answer = seed_thread_event(&bus, thread_id, answered("toolu_a")).await;
-    age(&pool, ask, 500).await;
-    age(&pool, other, 450).await;
-    age(&pool, answer, 380).await;
-    read_after(&bus, &pool, thread_id, 380).await;
+    age(&pool, anchor, ask, 500).await;
+    age(&pool, anchor, other, 450).await;
+    age(&pool, anchor, answer, 380).await;
+    read_after(&bus, &pool, anchor, thread_id, 380).await;
 
     let old_ask = seed_thread_event(&bus, thread_id, asked("toolu_old")).await;
     let old_answer = seed_thread_event(&bus, thread_id, answered("toolu_old")).await;
-    age(&pool, old_ask, 31 * 86_400).await;
-    age(&pool, old_answer, 31 * 86_400 - 60).await;
+    age(&pool, anchor, old_ask, 31 * 86_400).await;
+    age(&pool, anchor, old_answer, 31 * 86_400 - 60).await;
 
     let permission = seed_thread_event(
         &bus,
@@ -448,12 +459,13 @@ async fn a_card_runs_from_ask_to_answer() {
             allowed: true,
             reason: None,
             persist_scope: None,
+            standing_deny: None,
         },
     )
     .await;
-    age(&pool, permission, 300).await;
-    age(&pool, resolved, 290).await;
-    read_after(&bus, &pool, thread_id, 290).await;
+    age(&pool, anchor, permission, 300).await;
+    age(&pool, anchor, resolved, 290).await;
+    read_after(&bus, &pool, anchor, thread_id, 290).await;
 
     let codex = Uuid::new_v4();
     start_cc_session(&bus, codex, "codex/cards", None).await;
@@ -526,6 +538,7 @@ async fn a_card_keeps_the_local_hour_of_its_ask() {
 
 fn canceled(tool_use_id: &str) -> ThreadEvent {
     ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: tool_use_id.to_string(),
         quiet: false,
         answer: AnswerKind::Canceled,
@@ -540,6 +553,7 @@ fn canceled(tool_use_id: &str) -> ThreadEvent {
 #[tokio::test]
 async fn a_cards_wait_ends_at_the_next_real_request() {
     let (pool, db_name) = setup_test_db().await;
+    let anchor = chrono::Utc::now();
     let (bus, _rx) = EventBus::new(pool.clone());
     let day = 86_400;
 
@@ -547,25 +561,25 @@ async fn a_cards_wait_ends_at_the_next_real_request() {
     start_cc_session(&bus, dismissed, "claude-code/dismissed", None).await;
     let ask = seed_thread_event(&bus, dismissed, asked("toolu_dismissed")).await;
     let cancel = seed_thread_event(&bus, dismissed, canceled("toolu_dismissed")).await;
-    age(&pool, ask, 1_000).await;
-    age(&pool, cancel, 990).await;
-    read_after(&bus, &pool, dismissed, 700).await;
+    age(&pool, anchor, ask, 1_000).await;
+    age(&pool, anchor, cancel, 990).await;
+    read_after(&bus, &pool, anchor, dismissed, 700).await;
 
     let gone = Uuid::new_v4();
     start_cc_session(&bus, gone, "claude-code/gone", None).await;
     let ask = seed_thread_event(&bus, gone, asked("toolu_gone")).await;
     let cancel = seed_thread_event(&bus, gone, canceled("toolu_gone")).await;
     let beat = seed_thread_event(&bus, gone, request(ContextPurpose::CacheKeepAlive)).await;
-    age(&pool, ask, 2 * day).await;
-    age(&pool, cancel, 2 * day - 10).await;
-    age(&pool, beat, 2 * day - 100).await;
+    age(&pool, anchor, ask, 2 * day).await;
+    age(&pool, anchor, cancel, 2 * day - 10).await;
+    age(&pool, anchor, beat, 2 * day - 100).await;
 
     let undecided = Uuid::new_v4();
     start_cc_session(&bus, undecided, "claude-code/undecided", None).await;
     let ask = seed_thread_event(&bus, undecided, asked("toolu_recent")).await;
     let cancel = seed_thread_event(&bus, undecided, canceled("toolu_recent")).await;
-    age(&pool, ask, 600).await;
-    age(&pool, cancel, 590).await;
+    age(&pool, anchor, ask, 600).await;
+    age(&pool, anchor, cancel, 590).await;
 
     let permission = seed_thread_event(
         &bus,
@@ -588,11 +602,12 @@ async fn a_cards_wait_ends_at_the_next_real_request() {
             allowed: false,
             reason: Some(crate::engine::cc_permission::SESSION_ENDED_REASON.to_string()),
             persist_scope: None,
+            standing_deny: None,
         },
     )
     .await;
-    age(&pool, permission, 2 * day - 200).await;
-    age(&pool, ended, 2 * day - 260).await;
+    age(&pool, anchor, permission, 2 * day - 200).await;
+    age(&pool, anchor, ended, 2 * day - 260).await;
 
     let allowed = Uuid::new_v4();
     start_cc_session(&bus, allowed, "claude-code/allowed", None).await;
@@ -617,12 +632,13 @@ async fn a_cards_wait_ends_at_the_next_real_request() {
             allowed: true,
             reason: None,
             persist_scope: None,
+            standing_deny: None,
         },
     )
     .await;
-    age(&pool, asked_to_run, 2_000).await;
-    age(&pool, allow, 1_940).await;
-    read_after(&bus, &pool, allowed, 1_340).await;
+    age(&pool, anchor, asked_to_run, 2_000).await;
+    age(&pool, anchor, allow, 1_940).await;
+    read_after(&bus, &pool, anchor, allowed, 1_340).await;
 
     let durations = read_wait_durations(&pool, Tz::UTC).await.unwrap();
     assert_eq!(
@@ -647,6 +663,7 @@ async fn a_cards_wait_ends_at_the_next_real_request() {
 #[tokio::test]
 async fn an_event_wait_runs_from_start_to_resolution() {
     let (pool, db_name) = setup_test_db().await;
+    let anchor = chrono::Utc::now();
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/waits", None).await;
@@ -670,8 +687,8 @@ async fn an_event_wait_runs_from_start_to_resolution() {
         },
     )
     .await;
-    age(&pool, started, 900).await;
-    age(&pool, delivered, 600).await;
+    age(&pool, anchor, started, 900).await;
+    age(&pool, anchor, delivered, 600).await;
 
     let started = seed_thread_event(
         &bus,
@@ -685,8 +702,8 @@ async fn an_event_wait_runs_from_start_to_resolution() {
         ThreadEvent::EventWaitExpired { wait_id: lock },
     )
     .await;
-    age(&pool, started, 500).await;
-    age(&pool, expired, 455).await;
+    age(&pool, anchor, started, 500).await;
+    age(&pool, anchor, expired, 455).await;
 
     let started = seed_thread_event(&bus, thread_id, wait_started(other, &["MailReceived"])).await;
     let expired = seed_thread_event(
@@ -695,8 +712,8 @@ async fn an_event_wait_runs_from_start_to_resolution() {
         ThreadEvent::EventWaitExpired { wait_id: other },
     )
     .await;
-    age(&pool, started, 400).await;
-    age(&pool, expired, 100).await;
+    age(&pool, anchor, started, 400).await;
+    age(&pool, anchor, expired, 100).await;
 
     let durations = read_wait_durations(&pool, Tz::UTC).await.unwrap();
     let kinds = |k: &[&str]| WaitType::Events(KeepWarmKinds::of(k.iter().copied()).unwrap());
@@ -720,13 +737,14 @@ async fn an_event_wait_runs_from_start_to_resolution() {
 #[tokio::test]
 async fn a_lucidos_agent_thread_keeps_its_own_durations() {
     let (pool, db_name) = setup_test_db().await;
+    let anchor = chrono::Utc::now();
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = crate::test_support::seed_chat_thread(&bus, "hi").await;
     let ask = seed_thread_event(&bus, thread_id, asked("toolu_la")).await;
     let answer = seed_thread_event(&bus, thread_id, answered("toolu_la")).await;
-    age(&pool, ask, 400).await;
-    age(&pool, answer, 100).await;
-    read_after(&bus, &pool, thread_id, 100).await;
+    age(&pool, anchor, ask, 400).await;
+    age(&pool, anchor, answer, 100).await;
+    read_after(&bus, &pool, anchor, thread_id, 100).await;
     let wait = Uuid::new_v4();
     let started = seed_thread_event(
         &bus,
@@ -740,8 +758,8 @@ async fn a_lucidos_agent_thread_keeps_its_own_durations() {
         ThreadEvent::EventWaitExpired { wait_id: wait },
     )
     .await;
-    age(&pool, started, 90).await;
-    age(&pool, expired, 30).await;
+    age(&pool, anchor, started, 90).await;
+    age(&pool, anchor, expired, 30).await;
 
     let durations = read_wait_durations(&pool, Tz::UTC).await.unwrap();
     let la = WaitAgent::Lucidos;

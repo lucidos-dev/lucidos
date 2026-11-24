@@ -1,27 +1,15 @@
-import { useMemo, useRef } from 'preact/hooks';
+import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import { touchActivated, type ActivationGate } from '../utils/tapGesture';
 
-/** Bind `touchActivated` to a component.
- *
- *  The handlers must be STABLE, because the helper carries per-instance press
- *  state: the twin window. Rebuilding them each render would forget the touch it
- *  just served, and a browser that dispatched the suppressed click anyway would
- *  run the action twice. The action, the enable flag, the gate and the
- *  destructive flag must NOT be stable, since all four are read off the current
- *  render. So the set is memoized once and reads the latest of each through a
- *  ref.
- *
- *  `enabled` stands the touch path down; `gate` rules on the click path and is
- *  spent by the touch path, unless `destructive` makes that path ask it too.
- *  See `touchActivated`. */
 export function useTouchActivated(
   action: () => void,
   enabled = true,
   gate?: ActivationGate,
   destructive = false,
+  shownAt?: () => number | null,
 ) {
-  const latest = useRef({ action, enabled, gate, destructive });
-  latest.current = { action, enabled, gate, destructive };
+  const latest = useRef({ action, enabled, gate, destructive, shownAt });
+  latest.current = { action, enabled, gate, destructive, shownAt };
   return useMemo(
     () => touchActivated(
       () => latest.current.action(),
@@ -33,8 +21,25 @@ export function useTouchActivated(
           spend: () => latest.current.gate?.spend(),
           aborted: () => latest.current.gate?.aborted?.() ?? false,
         },
+        ...(shownAt ? { shownAt: () => latest.current.shownAt?.() ?? null } : {}),
       },
     ),
     [],
   );
+}
+
+export function useFaceShownAt(face: string): () => number | null {
+  const shownAt = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    shownAt.current = null;
+    let task: ReturnType<typeof setTimeout> | null = null;
+    const frame = requestAnimationFrame(() => {
+      task = setTimeout(() => { shownAt.current = performance.now(); }, 0);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (task !== null) clearTimeout(task);
+    };
+  }, [face]);
+  return useMemo(() => () => shownAt.current, []);
 }

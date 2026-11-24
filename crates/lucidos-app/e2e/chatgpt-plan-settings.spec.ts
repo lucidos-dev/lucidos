@@ -1,19 +1,3 @@
-/**
- * Settings → Providers → ChatGPT plan, signed out (ADR 0636).
- *
- * The card opens on its switch and offers "Continue with ChatGPT". A start the
- * engine refuses arrives as an error toast naming Sign in with ChatGPT, and
- * opens no ChatGPT page. The sign-in itself runs against a mock auth server in
- * the engine's tests, and never spends plan usage.
- *
- * The e2e engine may run under a gateway, where a local browser's start would
- * succeed. So the test marks its sign-in request as proxied without the
- * gateway's local-browser stamp: the engine then refuses it in every mode.
- *
- * The mock model reports no provider list on `/health`, which keeps every
- * provider switch loading. The test reports an empty list instead: a
- * workspace with no provider installed, the plan's signed-out case.
- */
 import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, openSettingsView } from './helpers';
 

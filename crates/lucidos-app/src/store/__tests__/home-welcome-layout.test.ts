@@ -1,9 +1,3 @@
-/**
- * An empty Home shows the welcome in the compose layout (ADR 0411): the
- * welcome above a centred prompt, until its first message or a dismissal.
- * `homeWelcomeActive` decides it, and `composeViewActive` follows it, so the
- * prompt's slide and the layout agree by construction.
- */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   composeViewActive,
@@ -17,7 +11,6 @@ import { makeThreadState } from '../actions/threads-test-helpers';
 
 const evt = (o: Record<string, unknown>): StoredEvent => o as StoredEvent;
 
-/** A memory call no thread made, recorded on Home (ADR 0381). */
 const COST_ROW = evt({
   type: 'ContextCaptured',
   purpose: 'memory',

@@ -1,6 +1,6 @@
 # 0463: A landing lane is the only mover of main for Lucidos-source changes
 
-- **Status**: Accepted, amended by [0480](0480-apply-all-press-lands-as-one-lane-batch.md)
+- **Status**: Accepted, amended by [0480](0480-apply-all-press-lands-as-one-lane-batch.md), [0694](0694-harden-round-in-minutes.md) and [0759](0759-one-lander-per-repository.md)
 - **Date**: 2026-10-12
 - **Amends**: [0060](0060-apply-merge-ownership.md),
   [0241](0241-session-spawn-does-not-merge-main.md),
@@ -61,6 +61,7 @@ auto-apply.
 - **A closed batch's branch goes before the thread runs again.** A run on the
   lane thread first removes the integration branch the lane left. It is
   refused only while that removal fails, and each later run tries again.
+  *Amended by ADR 0662: a closed lane thread never resumes ordinary duty.*
 - **Every run carrying a batch answers the lane once.** Its completion
   reports how the turn ended. A run that never reaches it answers from
   `run_direct_agent`: a Stop during startup keeps the batch open, and a run
@@ -78,6 +79,8 @@ auto-apply.
   merges `main` in when `main` moved, then fast-forwards `main`. Each member's
   `ChangeApplied` names its own landing merge, and `LaneBatchLanded` follows
   with `main` before and after.
+  *Amended by ADR 0662: current full hardening must certify the published head;
+  a catch-up that changes it requires hardening again.*
 - **A catch-up conflict is a turn, never a failure.** Say `main` gained work
   that conflicts with the resolution. The catch-up merge is aborted, and the
   same lane thread gets a follow-up turn naming what `main` gained. Its next

@@ -16,8 +16,6 @@ import { ListSkeletonOf, SkeletonProvider, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { loadedOr } from '../../store/types';
 
-/** The tree on show (the workspace's, or the bound repo's with its changes)
- *  and the source list. A diff is pinned to its change, so it is not re-read. */
 function refreshFilesPanel(): Promise<unknown> {
   const repoId = repoSource.peek();
   return Promise.all([
@@ -30,19 +28,11 @@ export function FilesView() {
   useEffect(() => {
     if (repositories.value.status === 'not-loaded') void loadRepositories();
   }, []);
-  // A reveal belongs to this visit. Leaving before its tree drew (Back while a
-  // repo loads, or a failed load) must not scroll some later visit.
   useEffect(() => () => { revealedFolder.value = null; }, []);
   usePanelRefresh('files', refreshFilesPanel);
   const repos = loadedOr(repositories.value, []);
 
   const isRepo = repoSource.value !== null;
-  // A diff shows in the repo view even with no repo bound. App coding-agent
-  // diffs never bind one (the workspace itself is the git root), and every
-  // diff navigation stages this mode before it knows the repo. Keying on the
-  // repo alone would flash the workspace artifacts tree on the way. A failed
-  // diff with no repo falls back to the workspace view: with no repo to switch
-  // from, an error screen there would have no way out. Its toast says why.
   const showRepoView = isRepo
     || (repoViewMode.value === 'changes' && repoDiff.value.status !== 'failed');
 
@@ -70,11 +60,6 @@ export function FilesView() {
     );
   }
 
-  // Workspace (artifacts) mode. The whole area stays an import drop target, and
-  // the import control is pinned to the top-right of the switcher row — the
-  // source-switcher selector (when present) owns the top-left, the import box
-  // the top-right. The switcher row renders even without registered repos so
-  // the import box always has a top row to anchor to.
   return (
     <div class="content-view active content-view-full-bleed" data-drop-zone="import">
       <div class="workspace-files-view">
@@ -88,12 +73,6 @@ export function FilesView() {
   );
 }
 
-/** Repo / app-CC diff view: the source switcher + change selector on top and the
- *  repo files (or diff list) below. They fade IN TOGETHER once the content is
- *  ready — the switcher no longer pops in ahead of the file list (the staggered
- *  load). A latch keeps the switcher mounted through later All Files ↔ Changes
- *  reloads (RepoFilesView owns those with its own fade); only the FIRST paint
- *  waits, so subsequent mode toggles never yank the switcher back out. */
 function RepoContentView({
   hasSwitcher,
   sourceDropdown,
@@ -103,21 +82,13 @@ function RepoContentView({
   sourceDropdown: VNode | null;
   showChangeSelector: boolean;
 }) {
-  // Mirrors RepoFilesView's own readiness (changes → diff, all → tree), so the
-  // whole unit fades in exactly when RepoFilesView would first show content.
   const contentReady = repoFilesContentReady({
     filesStatus: repoFiles.value.status,
     diffStatus: repoDiff.value.status,
     mode: repoViewMode.value,
   });
-  // A failed diff/tree load never becomes "ready", so also reveal the real view
-  // on failure — otherwise RepoFilesView (which owns the actionable "Failed to
-  // load" branches) would never mount and the user would sit on the skeleton.
   const loadFailed = repoDiff.value.status === 'failed' || repoFiles.value.status === 'failed';
   const settled = contentReady || loadFailed;
-  // Latch on first-settled: a ref (not state) — the flip already re-renders, and
-  // this must never go back to false or a mid-session reload (which drops
-  // contentReady) would yank the switcher out from under the user.
   const everShown = useRef(false);
   if (settled) everShown.current = true;
   const showSkeleton = useDelayedFlag(!everShown.current);
@@ -129,11 +100,6 @@ function RepoContentView({
           <>
             {hasSwitcher && (
               <div class="files-source-switcher">
-                {/* Source switcher renders even in app-CC mode — selecting
-                    "Current Workspace" routes back through the dropdown's
-                    onChange, which leaves the diff view and drops the user back
-                    into WorkspaceFilesView. Without this, an app-CC diff has no
-                    in-pane escape control. */}
                 {sourceDropdown}
                 {showChangeSelector && <ChangeSelector />}
               </div>
@@ -146,10 +112,6 @@ function RepoContentView({
   );
 }
 
-/** Placeholder for RepoContentView: a switcher-shaped row (when a switcher will
- *  show) above the file-list skeleton, so the crossfade lands on the same
- *  layout the loaded content occupies. `fill` sizes the list run to the pane;
- *  the switcher row above it correctly shrinks the measured height. */
 function RepoViewSkeleton({ hasSwitcher }: { hasSwitcher: boolean }) {
   return (
     <SkeletonProvider>
@@ -193,9 +155,6 @@ function WorkspaceFilesView() {
     );
   }
 
-  // Crossfade the skeleton out as the artifacts area appears. The import
-  // dropzone + source switcher now live in the parent's `files-source-switcher`
-  // row (main refactor), so this only owns the artifacts list.
   return (
     <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf fill containerClass="folder-tree" row={folderTreeSkeletonRow} />}>
       {loadable.status === 'loaded' ? (

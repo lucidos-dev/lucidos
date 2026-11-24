@@ -446,5 +446,68 @@ fi
 rm -rf "$DIR"
 
 echo ""
+# Updater selection and copied bytes must belong to one manifest snapshot.
+DIR="$(new_staging)"
+SCRATCH="$(mktemp -d)"
+release_staging_write_manifest "$DIR" "$VERSION" "$COMMIT" \
+    Lucidos_0.12.2_aarch64.dmg Lucidos.app.tar.gz Lucidos.app.tar.gz.sig
+if release_staging_copy_updater "$DIR" "$SCRATCH" "$VERSION" "$COMMIT" > /dev/null \
+    && cmp "$DIR/Lucidos.app.tar.gz" "$SCRATCH/Lucidos.app.tar.gz" \
+    && cmp "$DIR/Lucidos.app.tar.gz.sig" "$SCRATCH/Lucidos.app.tar.gz.sig"; then
+    pass "copies exactly the manifest updater and signature"
+else
+    fail "valid manifest updater did not copy"
+fi
+for mode in missing-bundle missing-signature duplicate traversal wrong-version wrong-source symlink copied-bytes; do
+    rm -rf "$SCRATCH"
+    mkdir "$SCRATCH"
+    release_staging_write_manifest "$DIR" "$VERSION" "$COMMIT" \
+        Lucidos_0.12.2_aarch64.dmg Lucidos.app.tar.gz Lucidos.app.tar.gz.sig
+    python3 - "$DIR/manifest.json" "$mode" <<'PYTEST'
+import json, sys
+path, mode = sys.argv[1:]
+with open(path) as source:
+    manifest = json.load(source)
+if mode == 'missing-bundle':
+    manifest['artifacts'] = manifest['artifacts'][:1]
+elif mode == 'missing-signature':
+    manifest['artifacts'] = manifest['artifacts'][:2]
+elif mode == 'duplicate':
+    manifest['artifacts'].append(manifest['artifacts'][1])
+elif mode == 'traversal':
+    manifest['artifacts'][1]['name'] = '../Lucidos.app.tar.gz'
+elif mode == 'wrong-version':
+    manifest['version'] = '0.0.1'
+elif mode == 'wrong-source':
+    manifest['source_commit'] = 'other'
+with open(path, 'w') as destination:
+    json.dump(manifest, destination)
+PYTEST
+    if [ "$mode" = symlink ]; then
+        mv "$DIR/Lucidos.app.tar.gz" "$DIR/real-bundle"
+        ln -s real-bundle "$DIR/Lucidos.app.tar.gz"
+    fi
+    # Simulate bytes changing during copy; the destination hash must catch it.
+    if (
+        if [ "$mode" = copied-bytes ]; then
+            python3() {
+                command python3 -c 'import shutil, sys
+shutil.copyfileobj = lambda source, destination: destination.write(b"changed during copy")
+exec(sys.stdin.read())' "${@:2}"
+            }
+        fi
+        release_staging_copy_updater "$DIR" "$SCRATCH" "$VERSION" "$COMMIT"
+    ) > /dev/null 2>&1; then
+        fail "updater copy accepted $mode"
+    else
+        pass "updater copy refuses $mode"
+    fi
+    if [ "$mode" = symlink ]; then
+        rm "$DIR/Lucidos.app.tar.gz"
+        mv "$DIR/real-bundle" "$DIR/Lucidos.app.tar.gz"
+    fi
+done
+rm -rf "$DIR" "$SCRATCH"
+
 echo "release_staging: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

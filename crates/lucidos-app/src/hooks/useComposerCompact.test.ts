@@ -1,8 +1,3 @@
-/** Which face set the composer row draws, as pure math (ADR 0576).
- *
- *  The hook around it reads the DOM, which jsdom does not lay out. What is
- *  worth pinning is the decision: the phone layout is always compact, and a
- *  desktop row is compact only under the threshold. */
 import { describe, it, expect } from 'vitest';
 import { COMPOSER_COMPACT_MAX_REM, isComposerCompact } from './useComposerCompact';
 

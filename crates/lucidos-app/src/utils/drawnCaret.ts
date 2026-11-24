@@ -16,7 +16,6 @@ const SHAPE_TOKEN = '--part-composer-text-caret-shape';
 const COLOUR_TOKEN = '--part-composer-text-caret-color';
 const NATIVE_ATTR = 'data-drawn-caret';
 
-/** The properties that decide where text lands inside the box. */
 const COPIED_PROPERTIES = [
   'box-sizing', 'width', 'height',
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
@@ -27,7 +26,6 @@ const COPIED_PROPERTIES = [
   'text-transform', 'tab-size', 'direction', 'unicode-bidi',
 ];
 
-/** The shape to draw, or null to leave the caret to the browser. */
 export function drawnCaretShape(
   token: string,
   nativeCaretShape: boolean,
@@ -43,7 +41,6 @@ function browserDrawsCaretShape(): boolean {
 
 const graphemes = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter() : null;
 
-/** The whole character starting at `index`, so a block never splits an emoji. */
 function characterAt(text: string, index: number): string {
   if (index >= text.length) return '';
   const grapheme = graphemes?.segment(text).containing(index);
@@ -51,8 +48,6 @@ function characterAt(text: string, index: number): string {
   return String.fromCodePoint(text.codePointAt(index)!);
 }
 
-/** What the block covers: the character at the caret, the placeholder's first
- *  on an empty composer, and nothing at a line end. */
 function coveredText(textarea: HTMLTextAreaElement, at: number): string {
   const value = textarea.value;
   if (value === '') return characterAt(textarea.placeholder, 0);
@@ -60,11 +55,6 @@ function coveredText(textarea: HTMLTextAreaElement, at: number): string {
   return under === '\n' ? '' : under;
 }
 
-/**
- * Draw the caret shape the composer's theme asks for, where the browser
- * cannot. Returns a detach function. Where the browser draws `caret-shape`,
- * it attaches nothing at all.
- */
 export function attachDrawnCaret(
   textarea: HTMLTextAreaElement,
   { nativeCaretShape = browserDrawsCaretShape() }: { nativeCaretShape?: boolean } = {},
@@ -107,14 +97,10 @@ export function attachDrawnCaret(
     box.overlay.style.left = `${to.left - from.left - parent.clientLeft}px`;
     box.content.style.transform = `translate(${-textarea.scrollLeft}px, ${-textarea.scrollTop}px)`;
 
-    // Resolved here, not in CSS: the part tokens paint only under the
-    // textarea, and the overlay is its sibling. The native caret-color is
-    // transparent by now, so the caret colour comes from the part token.
     box.overlay.style.color = style.color;
     box.overlay.style.setProperty('--drawn-caret-color', style.getPropertyValue(COLOUR_TOKEN).trim() || style.color);
     box.overlay.style.setProperty('--drawn-caret-ink', getComputedStyle(parent.closest('.prompt-box') ?? parent).backgroundColor);
 
-    // A fresh span restarts the blink, as a native caret holds still while it moves.
     const at = textarea.selectionEnd;
     const covered = coveredText(textarea, at);
     const cursor = document.createElement('span');
@@ -134,7 +120,6 @@ export function attachDrawnCaret(
       remove();
       return;
     }
-    // During composition the browser's own caret shows where the text goes.
     textarea.toggleAttribute(NATIVE_ATTR, !composing);
     const collapsed = textarea.selectionStart === textarea.selectionEnd;
     if (document.activeElement === textarea && collapsed && !composing) draw(shape);
@@ -155,8 +140,6 @@ export function attachDrawnCaret(
     schedule();
   }
 
-  // `keydown` and `pointerup` back up `selectionchange`, which older WebKit
-  // fires late or not at all for a caret move inside a textarea.
   const textareaEvents = ['input', 'keydown', 'pointerup', 'select', 'scroll', 'focus', 'blur'];
   for (const type of textareaEvents) textarea.addEventListener(type, schedule);
   textarea.addEventListener('compositionstart', onCompositionStart);
@@ -165,7 +148,6 @@ export function attachDrawnCaret(
   document.fonts?.addEventListener('loadingdone', schedule);
   const resizes = new ResizeObserver(schedule);
   resizes.observe(textarea);
-  // A theme switch and a UI scale change both land on <html>'s attributes.
   const themes = new MutationObserver(schedule);
   themes.observe(document.documentElement, { attributes: true });
   schedule();

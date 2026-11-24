@@ -1,13 +1,4 @@
-/* The surface anatomy: the one box every toast, popover, menu and dialog is
-   built from, with an optional head, body and foot. Tone lives in the head's
-   icon, never in the frame. See docs/plans/2026-09-26-one-surface-system.md. */
 
-/* The box alone. A menu wears `.surface-box`: it shares the frame but keeps
-   its compact rows, its own line height and its own button sizes.
-   `lucidos.ui.Select`'s menu wears it too (`.lucidos-select-menu`), so an
-   app's themed dropdown gets the exact same box as the host's — this file is
-   `include_str!`'d into the served `/api/v1/sdk-iframe.css`. See
-   docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. */
 .surface,
 .surface-box,
 .lucidos-select-menu {
@@ -17,13 +8,6 @@
     box-shadow: var(--shadow-md);
 }
 
-/* The surface part (ADR 0313): a theme may draw a double frame. The :where()
-   keeps a protected dialog out at the base rule's specificity, so every rule
-   that restyles a surface's border still wins, as it does without a theme.
-   Shell-only (the catalog marks this part `frames: false`): the part token
-   is never published into an app frame, so `.lucidos-select-menu` stays out
-   of this rule — it would read nothing but its own `solid`/`1px`/
-   `var(--border-color)` fallback forever, a theme can't reach it. */
 .surface:where(:not(.protected-surface)),
 .surface-box:where(:not(.protected-surface)) {
     border-style: var(--part-surface-border-style, solid);
@@ -34,16 +18,9 @@
 .surface {
     color: var(--text-primary);
     line-height: 1.45;
-    /* Where the text starts, from the frame. The head, body and foot all read
-       it, so they share one left edge; a rule inside a surface never restates
-       the value to line up with them. */
     --surface-inset: var(--space-lg);
 }
 
-/* Centres a surface over the pane it belongs to rather than the window, from
-   the `--pane-centre-x` that `usePaneCentre` publishes. Without it, the shift
-   is zero. The clamp keeps a 1rem margin to the window edge, or half the slack
-   when there is less. `%` is the panel's own width. */
 .surface-pane-centred {
     --pane-centre-edge: calc((100vw - 100%) / 2 - min(1rem, (100vw - 100%) / 2));
     translate: clamp(
@@ -53,26 +30,20 @@
     ) 0;
 }
 
-/* A dialog over a scrim, or a menu hung from the header over both panes, sits
-   one step higher than a toast or a popover at its trigger. */
 .surface-raised {
     box-shadow: var(--shadow-lg);
 }
 
 .surface-head {
-    /* Never squeezed by a long body: the head holds its own height. */
     flex: none;
     display: flex;
     align-items: center;
     gap: var(--space-sm);
     --surface-head-height: 2.75rem;
     min-height: var(--surface-head-height);
-    /* The right side subtracts the close button's own padding, so the X glyph
-       lands on the inset too. */
     padding: var(--space-xs) calc(var(--surface-inset) - var(--space-sm)) var(--space-xs) var(--surface-inset);
 }
 
-/* A head with no close button keeps the same right inset as its body. */
 .surface-head:not(:has(.surface-close)) {
     padding-right: var(--surface-inset);
 }
@@ -99,8 +70,6 @@
     flex: 1;
     min-width: 0;
     margin: 0;
-    /* Centres one line in the head, and keeps that top gap when the title
-       wraps past the head's height. */
     padding-block: calc((var(--surface-head-height) - 2 * var(--space-xs) - 1lh) / 2);
     font-size: var(--font-size-lg);
     font-weight: 600;
@@ -118,19 +87,16 @@
 .surface-actions {
     flex: none;
     display: flex;
-    /* The growing title already places these at the head's right end. */
     justify-content: flex-end;
     align-items: center;
     gap: var(--space-sm);
 }
 
-/* A touch-sized target round the `.icon-btn` glyph. */
 .surface-close {
     padding: var(--space-sm);
     border-radius: var(--radius-control);
 }
 
-/* The drill-in's way back: it names the view it returns to. */
 .surface-back {
     display: inline-flex;
     align-items: center;
@@ -165,7 +131,6 @@
     overflow-wrap: anywhere;
 }
 
-/* The body's own padding is the gap below it, so its last child adds none. */
 .surface-body > :last-child {
     margin-bottom: 0;
 }
@@ -178,10 +143,6 @@
     padding: 0 var(--surface-inset) var(--surface-inset);
 }
 
-/* The gap above the buttons belongs to the foot, which stays put. A scrolling
-   body's own padding scrolls with its content, so mid-scroll the text ran flush
-   into the buttons. The body keeps only ring room, so a field at its end keeps
-   its focus ring when the body scrolls, and the foot gives that much back. */
 .surface-body:has(+ .surface-foot) {
     padding-bottom: var(--focus-ring-width);
 }
@@ -190,16 +151,11 @@
     padding-top: calc(var(--surface-inset) - var(--focus-ring-width));
 }
 
-/* Ring room at the top too, for a field that opens the body. The negative
-   margin takes it from the head's own padding, so the text does not move. */
 .surface-head + .surface-body {
     padding-top: var(--focus-ring-width);
     margin-top: calc(-1 * var(--focus-ring-width));
 }
 
-/* A surface button is the standard `.action-btn`, the same size as everywhere
-   else, so no size is set here. A label too long for a narrow surface ellipsizes
-   rather than overflowing the frame. */
 .surface .action-btn {
     max-width: 100%;
     overflow: hidden;

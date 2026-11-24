@@ -28,7 +28,8 @@
 //! inbound `x-lucidos-*` before doing so. Handing that hop the full-authority
 //! token would put it one forwarding bug away from the whole engine API.
 //!
-//! Both are mode 0600 and both live beside `network.toml`. The gateway and
+//! Both are mode 0600 and both live in the private subtree, which an agent's
+//! sandbox denies (ADR 0645). The gateway and
 //! the engine each read or mint both, whichever boots first
 //! (`api::local_auth::EngineAuth::resolve`). For the local token, the engine's
 //! own build-watch and release scripts have no other credential (ADR 0169).
@@ -45,6 +46,12 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "client")]
+pub mod client;
+pub mod loopback_cert;
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// Header carrying the full-authority token.
 pub const HEADER_LOCAL_TOKEN: &str = "x-lucidos-local-token";
 
@@ -57,7 +64,7 @@ pub const HEADER_LOCAL_TOKEN: &str = "x-lucidos-local-token";
 pub const HEADER_HOOK_SOCKET_TOKEN: &str = "x-lucidos-hook-socket-token";
 
 /// The full-authority credential's file name.
-pub const LOCAL_TOKEN_FILE: &str = "local-token";
+pub const LOCAL_TOKEN_FILE: &str = lucidos_home::private::LOCAL_TOKEN;
 
 /// The hook socket token's file name: the credential for webhook delivery.
 ///
@@ -65,7 +72,7 @@ pub const LOCAL_TOKEN_FILE: &str = "local-token";
 /// thing. It is handed to whatever `tailscale funnel` exposes, which is the one
 /// Lucidos surface a user may point at the open internet (ADR 0097). A process
 /// holding it must not be able to restart a workspace.
-pub const HOOK_SOCKET_TOKEN_FILE: &str = "hook-socket-token";
+pub const HOOK_SOCKET_TOKEN_FILE: &str = lucidos_home::private::HOOK_SOCKET_TOKEN;
 
 /// The file holding the password of the shared dev cluster.
 ///
@@ -73,7 +80,7 @@ pub const HOOK_SOCKET_TOKEN_FILE: &str = "hook-socket-token";
 /// cluster listens on loopback TCP, which every local user can reach, and a
 /// minted secret keeps them out. The dev scripts mint the same file under the
 /// same lock (`scripts/lib/pg_secret.sh`).
-pub const SHARED_PG_PASSWORD_FILE: &str = "pg-shared-password";
+pub const SHARED_PG_PASSWORD_FILE: &str = lucidos_home::private::SHARED_PG_PASSWORD;
 
 /// Bytes of entropy behind a token. 32 bytes is 256 bits, far past what a
 /// guessing attack could reach through an HTTP endpoint.
@@ -81,16 +88,18 @@ pub const TOKEN_BYTES: usize = 32;
 
 /// Suffix of the lock file every minter of `<name>` holds: `.<name>.lock`,
 /// beside the token. `scripts/lib/pg_secret.sh` takes the same lock.
-pub const MINT_LOCK_SUFFIX: &str = "lock";
+pub const MINT_LOCK_SUFFIX: &str = lucidos_home::private::MINT_LOCK_SUFFIX;
 
-/// `~/.lucidos/<name>`. `None` only when `HOME` is unset.
+/// The private entry `name`: `~/.lucidos/private/<name>`, or the old path in
+/// a home an older release used (`lucidos_home::private::entry_in`). `None`
+/// only when `HOME` is unset.
 ///
-/// Machine-global and outside every git tree, alongside `network.toml`.
+/// Machine-global and outside every git tree.
 pub fn path_for(name: &str) -> Option<PathBuf> {
-    Some(lucidos_home::path()?.join(name))
+    lucidos_home::private_entry(name)
 }
 
-/// `~/.lucidos/local-token`. `None` only when `HOME` is unset.
+/// The private entry `local-token`. `None` only when `HOME` is unset.
 pub fn path() -> Option<PathBuf> {
     path_for(LOCAL_TOKEN_FILE)
 }
@@ -99,6 +108,9 @@ pub fn path() -> Option<PathBuf> {
 ///
 /// A missing file is normal rather than an error. A workspace can be launched
 /// with no gateway at all, and callers treat the absence as "send no header".
+///
+/// Writes nothing. Inside an agent's sandbox the read fails, and so reads as
+/// absent.
 pub fn read_named(name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(path_for(name)?).ok()?;
     let token = raw.trim().to_string();
@@ -122,14 +134,14 @@ pub fn read() -> Option<String> {
 /// publish is a rename of a whole temp file, so a lock-free reader never sees
 /// a partial token either.
 pub fn ensure_named(name: &str) -> std::io::Result<String> {
-    let path = path_for(name)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
-    ensure_at(&path)
+    ensure_at(&lucidos_home::ensure_private_entry(name)?)
 }
 
-/// [`ensure_named`] at an explicit path, so the mint is testable without
-/// writing into the machine's own `~/.lucidos`.
-fn ensure_at(path: &Path) -> std::io::Result<String> {
+/// [`ensure_named`] at an explicit path. For a secret kept beside what it
+/// guards, such as the engine socket credential, and for tests.
+///
+/// The parent is created and made owner-only.
+pub fn ensure_at(path: &Path) -> std::io::Result<String> {
     ensure_with(path, || {})
 }
 
@@ -143,7 +155,7 @@ fn ensure_with(path: &Path, before_publish: impl FnOnce()) -> std::io::Result<St
         .write(true)
         .create(true)
         .truncate(false)
-        .open(sibling(path, MINT_LOCK_SUFFIX)?)?;
+        .open(mint_lock(path)?)?;
     mint_lock.lock()?;
     if let Some(token) = read_published(path)? {
         return Ok(token);
@@ -157,13 +169,21 @@ fn ensure_with(path: &Path, before_publish: impl FnOnce()) -> std::io::Result<St
 }
 
 /// `.<name>.<suffix>` beside `path`. Beside it, because a rename cannot cross
-/// filesystems. The mint lock is one such file: never delete it, or two
-/// minters would lock two different files.
+/// filesystems.
 fn sibling(path: &Path, suffix: &str) -> std::io::Result<PathBuf> {
-    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+    Ok(path.with_file_name(format!(".{}.{suffix}", token_name(path)?)))
+}
+
+/// The mint lock beside `path`. Never delete it, or two minters would lock two
+/// different files.
+fn mint_lock(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(path.with_file_name(lucidos_home::private::mint_lock_name(token_name(path)?)))
+}
+
+fn token_name(path: &Path) -> std::io::Result<&str> {
+    path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "token path has no name")
-    })?;
-    Ok(path.with_file_name(format!(".{name}.{suffix}")))
+    })
 }
 
 /// The token at `path`, or `None` when nothing is published yet.
@@ -314,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn a_named_path_stays_inside_the_lucidos_directory() {
+    fn a_named_path_is_its_private_entry() {
         // `HOME` is set in every environment this runs in; skip rather than
         // fail if it somehow is not, since the `None` arm is the contract.
         let Some(local) = path_for(LOCAL_TOKEN_FILE) else {
@@ -323,8 +343,13 @@ mod tests {
         let hook = path_for(HOOK_SOCKET_TOKEN_FILE).expect("HOME was readable a line ago");
         assert_ne!(local, hook);
         assert_eq!(local, path().expect("the same lookup"));
-        assert!(local.ends_with(".lucidos/local-token"), "{local:?}");
-        assert!(hook.ends_with(".lucidos/hook-socket-token"), "{hook:?}");
+        assert_eq!(
+            Some(&local),
+            lucidos_home::private_entry(LOCAL_TOKEN_FILE).as_ref()
+        );
+        let home = lucidos_home::path().expect("HOME was readable a line ago");
+        assert!(local.starts_with(&home), "{local:?}");
+        assert!(hook.ends_with(HOOK_SOCKET_TOKEN_FILE), "{hook:?}");
     }
 
     /// The engine mints when no gateway has, and finds the gateway's value
@@ -453,6 +478,20 @@ mod tests {
         ensure_at(&dir.join("local-token")).unwrap();
         let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, lucidos_home::STORAGE_ROOT_MODE);
+    }
+
+    /// An older release mints at the old path. In a home it used, a newer
+    /// minter resolves the same path, so the two never hold two tokens.
+    #[test]
+    fn an_older_and_a_newer_minter_meet_one_token_in_an_older_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".lucidos");
+        std::fs::create_dir_all(&home).unwrap();
+        let older = ensure_at(&home.join(LOCAL_TOKEN_FILE)).unwrap();
+
+        let newer = lucidos_home::private::entry_in(&home, LOCAL_TOKEN_FILE);
+        assert_eq!(ensure_at(&newer).unwrap(), older);
+        assert!(!lucidos_home::private::path_in(&home).exists());
     }
 
     #[cfg(unix)]

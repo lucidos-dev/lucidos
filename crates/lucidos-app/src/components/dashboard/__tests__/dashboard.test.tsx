@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A dashboard (ADR 0496). Its fixed square cells take their column count from
- * the dashboard's own width, and there are four size spans. Tiles take their
- * order through CSS `order` over a DOM order that never rearranges.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -16,7 +11,6 @@ type FrameProps = {
   onFrameState?: (state: FrameState) => void;
 };
 const frameProps = new Map<string, FrameProps>();
-/** What each mocked frame reports on mount. A frame not listed has revealed. */
 const mountStates = new Map<string, FrameState>();
 vi.mock('../../widgets/WidgetFrame', async () => {
   const { useLayoutEffect } = await import('preact/hooks');
@@ -119,8 +113,6 @@ describe('dashboard geometry', () => {
     expect(dashboardColumns(dashboardContentWidth(fourCells, rem), rem)).toBe(3);
   });
 
-  /** Invariant: a thread card's box takes the cell the column count gives,
-   *  from the width alone. */
   it('gives the cell edge of the column count at every width', () => {
     const rem = 16;
     const evaluate = (css: string): number => Number(new Function(`return ${css
@@ -137,7 +129,6 @@ describe('dashboard geometry', () => {
     }
   });
 
-  /** Invariant: the fit check's px cell is the cell the CSS draws, at any scale. */
   it('gives the same cell edge in px as the CSS draws', () => {
     for (const rem of [12, 16, 18, 20, 32]) {
       const evaluate = (css: string): number => Number(new Function(`return ${css
@@ -166,7 +157,6 @@ describe('dashboard geometry', () => {
     });
   });
 
-  /** Invariant: the finer grid leaves every widget box where the cell grid put it. */
   it('draws each widget size at the box n cells and their gaps make', () => {
     const edge = DASHBOARD_CELL_REM;
     const gap = DASHBOARD_GAP_REM;
@@ -208,7 +198,6 @@ describe('<Dashboard>', () => {
   });
 
   const tiles = () => [...host.querySelectorAll<HTMLElement>('[data-dashboard-tile]')];
-  /** The tile's widget, read off the mocked frame inside it. */
   const app = (t: HTMLElement) => t.querySelector('iframe')?.dataset.frame;
 
   it('draws each tile at its size, with its dashboard place as CSS order', () => {
@@ -223,9 +212,6 @@ describe('<Dashboard>', () => {
     expect(frameProps.get('inbox')).toMatchObject({ place: 'dashboard', size: 'medium', visible: true });
   });
 
-  /** Invariant: an XL tile never widens the grid. On a two-column dashboard it
-   *  spans every step, keeps its XL box in a scroller, and the widget still
-   *  hears `xl`. */
   it('clamps an XL tile to the grid and keeps its true size', () => {
     setDashboard([tile('board', 'xl', { sizes: ['medium', 'large', 'xl'] })]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
@@ -238,7 +224,6 @@ describe('<Dashboard>', () => {
     expect(canvas.style.getPropertyValue('--widget-box-true-width')).toBe(widgetBoxCss('xl').width);
   });
 
-  /** Invariant: reordering never moves an iframe in the DOM. */
   it('reorders by CSS order and keeps every frame element where it was', () => {
     setDashboard([tile('clock', 'small'), tile('inbox', 'medium'), tile('prs', 'large')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
@@ -255,8 +240,6 @@ describe('<Dashboard>', () => {
     ]);
   });
 
-  /** Invariant: the cell edge is one function of the dashboard's width, read
-   *  by the grid, the head and a thread card's widget box alike. */
   it('publishes its cell on the dashboard, for the grid and the head', () => {
     setDashboard([tile('clock', 'small')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
@@ -268,7 +251,6 @@ describe('<Dashboard>', () => {
     expect(dashboard.style.getPropertyValue('--dashboard-steps')).toBe(String(DASHBOARD_MIN_COLUMNS * DASHBOARD_STEPS_PER_CELL));
   });
 
-  /** Invariant: each dashboard draws only its own tiles (ADR 0496). */
   it('draws only the tiles of the dashboard it shows', () => {
     dashboards.value = new Map([
       ['desktop', { status: 'loaded', data: { dashboard: 'desktop', tiles: [tile('clock', 'small')] } }],
@@ -329,7 +311,6 @@ describe('<Dashboard> settling', () => {
   const hiding = () => grid().classList.contains('is-settling');
   const report = (appId: string, state: FrameState) => act(() => frameProps.get(appId)!.onFrameState!(state));
 
-  /** Invariant: the grid stays hidden while a mounted frame is still covered. */
   it('hides the grid until every frame on screen has revealed', () => {
     mountStates.set('clock', 'loading');
     mountStates.set('inbox', 'loading');
@@ -342,7 +323,6 @@ describe('<Dashboard> settling', () => {
     expect(hiding()).toBe(false);
   });
 
-  /** Invariant: an off-screen tile and an app shortcut never hold the dashboard. */
   it('is not held by an off-screen tile or an app shortcut', () => {
     mountStates.set('far', 'off-screen');
     setDashboard([tile('clock', 'small'), tile('far', 'small'), shortcut('notes')]);
@@ -350,7 +330,6 @@ describe('<Dashboard> settling', () => {
     expect(hiding()).toBe(false);
   });
 
-  /** Invariant: a tile whose place is unknown holds the dashboard. */
   it('is held by a tile the viewport observer has not reported on', () => {
     mountStates.set('clock', 'unknown');
     setDashboard([tile('clock', 'small')]);
@@ -358,7 +337,6 @@ describe('<Dashboard> settling', () => {
     expect(hiding()).toBe(true);
   });
 
-  /** Invariant: once settled, the grid never hides again. */
   it('stays shown when a tile added later is still loading', () => {
     setDashboard([tile('clock', 'small')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
@@ -370,7 +348,6 @@ describe('<Dashboard> settling', () => {
     expect(hiding()).toBe(false);
   });
 
-  /** Invariant: the fuse bounds the wait, and is cleared on unmount. */
   it('shows after the fuse while a frame is still loading', () => {
     vi.useFakeTimers();
     mountStates.set('clock', 'loading');
@@ -396,7 +373,6 @@ describe('<Dashboard> settling', () => {
     expect(vi.getTimerCount()).toBeLessThanOrEqual(pending);
   });
 
-  /** Invariant: a hidden dashboard ignores its tiles until it is shown. */
   it('does not settle while hidden, and settles once shown', () => {
     setDashboard([tile('clock', 'small')]);
     act(() => render(<Dashboard dashboard="desktop" hidden />, host));
@@ -409,7 +385,6 @@ describe('<Dashboard> settling', () => {
     expect(hiding()).toBe(false);
   });
 
-  /** Invariant: a rail sliding in reads off-screen wrongly, so it is not trusted until the slide ends. */
   it('holds an off-screen answer while a shown dashboard slides in', () => {
     vi.useFakeTimers();
     setDashboard([tile('clock', 'small')]);
@@ -421,7 +396,6 @@ describe('<Dashboard> settling', () => {
     expect(hiding()).toBe(false);
   });
 
-  /** Invariant: the loader obeys the delay gate and is opaque when shown. */
   it('draws the skeleton in the real tiles\' sizes, only past the delay gate', () => {
     vi.useFakeTimers();
     mountStates.set('clock', 'loading');
@@ -452,7 +426,6 @@ describe('<Dashboard> app shortcuts', () => {
 
   const shortcutTile = () => host.querySelector<HTMLElement>('[data-kind="app"]')!;
 
-  /** Invariant: a shortcut is an icon and a name, never a running frame (ADR 0227). */
   it('draws an app as a quarter tile with its name and no frame', () => {
     setDashboard([shortcut('notes', { name: 'Notes' }), tile('clock', 'small')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
@@ -560,8 +533,6 @@ describe('<Dashboard> in edit mode', () => {
     expect(tileOf('inbox').querySelector('.widget-size-pill')).toBeNull();
   });
 
-  /** Invariant: a widget that declares no sizes comes with all three, so it
-   *  offers the whole pill. */
   it('offers S, M and L on a widget that takes every size', () => {
     setDashboard([tile('inbox', 'medium')]);
     edit();
@@ -594,9 +565,6 @@ describe('<Dashboard> in edit mode', () => {
     expect(api.arranged).toHaveLength(1);
   });
 
-  /** Invariant: a shield on screen is a shield that can start a drag. A press
-   *  right after the shield draws, before any passive effect has run, still
-   *  grabs the tile. */
   it('a press right after edit mode draws starts a drag', async () => {
     setDashboard([tile('clock', 'small'), tile('inbox', 'medium')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
@@ -614,14 +582,10 @@ describe('<Dashboard> in edit mode', () => {
     expect(tileOf('clock').classList.contains('is-dragging')).toBe(true);
   });
 
-  /** Invariant: a swap's reflow never swaps again under a stationary pointer.
-   *  The tile the reflow slides under the pointer counts as passed, so a drop
-   *  right after a swap commits the swap, never its reversal. */
   it('a reflow that slides another tile under the pointer does not swap straight back', () => {
     setDashboard([tile('clock', 'small'), tile('inbox', 'medium'), tile('prs', 'large')]);
     edit();
     const orderNow = () => ['clock', 'inbox', 'prs'].sort((a, b) => Number(tileOf(a).style.order) - Number(tileOf(b).style.order));
-    // Over `prs` before the swap; the reflow then puts `inbox` where the pointer is.
     document.elementsFromPoint = () => [tileOf(orderNow().join() === 'clock,inbox,prs' ? 'prs' : 'inbox')];
     const shield = tileOf('clock').querySelector<HTMLElement>('.dashboard-tile-shield')!;
     const pointer = (type: string, x: number) => act(() => {
@@ -702,7 +666,6 @@ describe('<Dashboard> tile menu', () => {
 });
 
 describe('the rail toggle', () => {
-  /** It sits on the rail's head, off the header bar, so it wears no accent tint. */
   it('wears the quiet tone', () => {
     const host = document.createElement('div');
     document.body.appendChild(host);

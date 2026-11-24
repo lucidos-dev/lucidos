@@ -42,8 +42,6 @@ describe('refreshRepoView reloads file tree after changes apply', () => {
     expect(repoFiles.value).toEqual({ status: 'loaded', data: ['README.md'] });
   });
 
-  // The panel refresh contract: a pull re-reads the tree already on screen, so
-  // it must not blank to a skeleton while the new listing is in flight.
   it('keeps the tree on screen while it re-reads', async () => {
     repoFiles.value = { status: 'loaded', data: ['README.md'] };
     let release!: (files: string[]) => void;
@@ -58,8 +56,6 @@ describe('refreshRepoView reloads file tree after changes apply', () => {
   });
 
   it('defaults to "all" view when switching to a repo with pending changes', async () => {
-    // The Lucidos repo always has pending changes from Claude Code sessions; switching
-    // to it should still land on All Files, not auto-jump to the Changes tab.
     mockListRepoFiles.mockResolvedValueOnce(['foo.rs']);
     mockGetRepoChanges.mockResolvedValueOnce({ pending: [], applied: [], has_more: false });
 
@@ -69,9 +65,6 @@ describe('refreshRepoView reloads file tree after changes apply', () => {
   });
 
   it('lists files from HEAD on default load — not from a pending CC branch', async () => {
-    // Old CC branches may still track files (e.g. data/) that main has since
-    // removed. The default file tree must reflect the repo's real HEAD, not
-    // whatever pending branch happens to be open.
     mockListRepoFiles.mockResolvedValueOnce(['README.md']);
     mockGetRepoChanges.mockResolvedValueOnce({ pending: [], applied: [], has_more: false });
 

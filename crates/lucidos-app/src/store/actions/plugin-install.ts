@@ -16,33 +16,13 @@ import type { MarketplacePlugin, PluginInstallRequest } from '../types';
 import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 import { refreshApps } from './apps';
 
-/** Open the plugin install panel for the staged install in `request`. The
- *  panel takes over the content pane (same surface as the credential
- *  request panel); user stays on whatever menu item they were on, and the
- *  panel resolves via Confirm/Cancel POSTs to the engine. Reveals the content
- *  pane — this fires from an engine SSE event, so without it a mobile user (or
- *  a desktop user with a collapsed split) never sees the panel that just
- *  appeared. Same shape as `openEmailConfirmRequest`. (NOT the credential-request
- *  path: `landOnAccountsWithOverlay` additionally switches to Settings →
- *  Accounts, which is right for a credential and wrong for everything else.) */
 export function openPluginInstallRequest(request: PluginInstallRequest): void {
   panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request } };
   pushNavState();
   revealContentPane();
 }
 
-/** Stage an install (or an update) from a catalog row and open the confirm
- *  panel. Lives here rather than in `plugin-marketplaces.ts` for two reasons:
- *  it belongs beside the opener it routes through, mirroring
- *  `uninstallMarketplacePlugin` in `plugin-uninstall.ts`, and this module
- *  imports its catalog refresh from there, so the call would otherwise close
- *  an import cycle. */
 export async function installMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
-  // No pre-stage warning about local edits any more. An update used to discard
-  // them, so a blanket "this will overwrite your changes" prompt was the only
-  // warning available. The engine merges them now, and the staged panel states
-  // the real outcome per file. A prompt here would duplicate that, and claim
-  // the opposite of what happens.
   try {
     openPluginInstallRequest(await stagePluginInstall(plugin.source));
   } catch (e) {
@@ -50,27 +30,11 @@ export async function installMarketplacePlugin(plugin: MarketplacePlugin): Promi
   }
 }
 
-/** The install succeeded: turn the open panel into a read-only receipt in
- *  place, instead of closing it and revealing whatever was underneath. Same
- *  role as `markPluginUninstalled`, and the same reasons. The receipt is what
- *  makes the install a real destination in the content nav history, and
- *  `replaceNavState` keeps one install to one history row (relabelled
- *  "Installed <plugin>") while retiring the pending entry a Forward walk would
- *  otherwise re-render with a live Install button.
- *
- *  `installed_files` comes off the engine response rather than
- *  `form.request.files`, which was only what the install *would* write.
- *
- *  Returns false when `form` is no longer the active overlay, so a confirm that
- *  lands after the user dismissed the panel cannot resurrect it. */
 export function markPluginInstalled(
   form: PluginInstallForm,
   result: PluginConfirmInstallResponse,
 ): boolean {
   if (activeInlineForm.value !== form) return false;
-  // Already a receipt, and re-stamping would move the timestamp off the real
-  // install. Unreachable through the panel (the receipt has no Install button),
-  // kept so the marker can only ever be written once.
   if (form.installed) return false;
   panelOverlay.value = {
     type: 'form',
@@ -91,13 +55,6 @@ export function markPluginInstalled(
   return true;
 }
 
-/** User clicked Confirm. The engine writes files into `data/`, emits
- *  `PluginInstalled`, and auto-reloads WASM modules if `auth-modules/` was
- *  touched.
- *
- *  A failure closes the panel: the engine pops the pending entry up-front, so a
- *  failed confirm has no second chance, and leaving the panel open just wedges
- *  the user with disabled buttons. */
 export async function confirmPluginInstallAction(
   form: PluginInstallForm,
   keepLocalChanges = true,
@@ -107,13 +64,6 @@ export async function confirmPluginInstallAction(
     plugin_name: pluginName,
     plugin_version: pluginVersion,
   } = form.request;
-  // The try covers the REQUEST only. Everything after it runs with the files
-  // already on disk, so a throw there is not an install failure: inside the try
-  // it would toast "Install failed" over a stamped "Installed" receipt, and the
-  // close would silently no-op because the active form is by then the receipt
-  // rather than `form`. The focus call is the concrete hazard, not a
-  // theoretical one: it loads events and scrolls, and `focusThreadOrBootstrap`
-  // in `threads.ts` already documents that it can throw.
   let result: PluginConfirmInstallResponse;
   try {
     result = await confirmPluginInstall(installId, keepLocalChanges);
@@ -123,31 +73,9 @@ export async function confirmPluginInstallAction(
     return;
   }
   void refreshPluginCatalogAfterMutation();
-  // The receipt's Open buttons read the apps list, which must hold the new app.
   void refreshApps();
   const receipted = markPluginInstalled(form, result);
-  // When the plugin shipped NEW `setup` instructions the engine spawns a
-  // Lucidos Agent thread to walk the user through them. Drop the user straight
-  // into it so setup happens in front of them: the thread IS the feedback, so
-  // we skip the success toast in that case (the panel already showed the setup
-  // instructions; dumping them into a toast as well was the noise we removed).
-  // The engine spawns it as a SubThread, whose queue `prepare` step eager-emits
-  // MessageReceived, so on the common immediate-admit path the row exists
-  // before this response returns. It exists in the DATABASE, though. This
-  // client learns of it over SSE, which can land after the response, and a
-  // briefly queued spawn has no row at all. `focusSpawnedThread` covers both by
-  // telling ThreadView the absence is expected.
-  //
-  // The setup thread and the receipt do NOT compete: the focus reveals
-  // the THREAD pane, while the receipt sits in the CONTENT pane, so both
-  // land. Closing the panel is what used to make them look exclusive.
   if (result.setup_thread_id) {
-    // Guarded on its own, and NOT by the request's catch: a throw here is a
-    // failed navigation, not a failed install, so it must say so. Reporting it
-    // is not optional either. This action is awaited by a click handler that
-    // does not catch, so an escaping rejection would be a silent unhandled one
-    // (`.claude/rules/frontend.md` § No Hidden Errors), and the plugin IS
-    // installed, so the user is owed both halves of that sentence.
     try {
       focusSpawnedThread(result.setup_thread_id);
     } catch (e) {
@@ -157,24 +85,14 @@ export async function confirmPluginInstallAction(
       );
     }
   } else if (!receipted) {
-    // No setup thread and no receipt on screen (the user dismissed the panel
-    // mid-install), so the toast is the only place the success can land. With
-    // the receipt up it would only restate what the panel already says.
     showToast(`Installed ${pluginName} v${pluginVersion}`, 'success');
   }
 }
 
-/** User clicked Cancel — engine drops the staged temp dir + emits
- *  `PluginInstallCanceled`. Closes the panel; the LLM's tool result already
- *  said "pending in panel" so no further confirmation is needed. */
 export async function cancelPluginInstallAction(form: PluginInstallForm): Promise<void> {
   try {
     await cancelPluginInstall(form.request.install_id);
   } catch (e) {
-    // 404/410 = entry already gone (harmless race with engine cleanup or a
-    // peer device's confirm/cancel); anything else means the temp dir likely
-    // wasn't dropped and the user — who explicitly clicked Cancel — should
-    // know it didn't take.
     if (!(e instanceof ApiError) || (e.httpCode !== 404 && e.httpCode !== 410)) {
       showToast(`Cancel plugin install failed: ${errorDetail(e)}`, 'error');
     }
@@ -182,12 +100,6 @@ export async function cancelPluginInstallAction(form: PluginInstallForm): Promis
   closeInlineFormIfActive(form);
 }
 
-/** Offer the user's local patch for `pluginId` to the plugin's author.
- *
- *  The engine derives the diff, writes it under `data/artifacts/`, and spawns a
- *  thread. We drop the user into that thread, because the thread IS the work:
- *  it is where the fork, the branch and the pull request happen, and where any
- *  question about them gets asked. */
 export async function proposePluginUpstreamAction(
   pluginId: string,
   pluginName: string,
@@ -199,8 +111,6 @@ export async function proposePluginUpstreamAction(
     showToast(`Couldn't prepare a patch for ${pluginName}: ${errorDetail(e)}`, 'error');
     return;
   }
-  // Guarded separately: the patch is already written and committed, so a failed
-  // navigation is not a failed proposal and must not say it was.
   try {
     focusSpawnedThread(result.thread_id);
   } catch (e) {

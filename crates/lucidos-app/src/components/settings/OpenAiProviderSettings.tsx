@@ -1,11 +1,5 @@
 import { ApiKeyProviderSettings } from './ApiKeyProviderSettings';
 
-/** Configure the direct-OpenAI provider credential (Settings →
- *  Providers). Stores a credential named `openai`; the engine's OpenAiProvider
- *  reads it (preferring it over the OPENAI_API_KEY launch env var) and sends it
- *  as the bearer key. OpenAI authenticates with a single API key, so — unlike
- *  Anthropic — there's no auth-kind choice; the credential is stored as
- *  `api_key`. */
 export function OpenAiProviderSettings() {
   return (
     <ApiKeyProviderSettings

@@ -3,20 +3,9 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, assertHealthy, disarmFollowSeed } from './helpers';
 import { psql } from './db-helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-/** A long coding-agent thread reopens on the ROW the reader was on.
- *
- *  Reported: "its not remembering the position correctly" and "sometimes it
- *  starts at the bottom". One coding-agent turn holds hundreds of steps, and
- *  the render window draws a turn's tail first. A position that named the turn
- *  measured from the clamped top, and a window reseeded on reopen shrank under
- *  a restore that had already landed. The position now names the step row.
- *  Plan: docs/plans/2026-09-23-the-reading-position-and-the-thumb-hold-still.md */
 
-/** Steps per turn. Turn 3 is far larger than the window's row budget, and the
- *  whole thread runs past the first page of 400 events. */
 const STEPS = [30, 300, 250, 300, 40];
 
 function seed(title: string, steps: number[]): string {
@@ -50,14 +39,6 @@ function seed(title: string, steps: number[]): string {
   return threadId;
 }
 
-/** The step row resting on the transcript's top line and its offset, the same
- *  rule `readRowAnchor` uses, restated so the spec asserts the reader's view.
- *
- *  The WebKit repaint nudge moves `scrollTop` 1px for a frame and cancels it
- *  with a `translateY` on the transcript (`utils/webkitRepaint.ts`). The reader
- *  sees nothing move, but the rows sit 1px lower against the transcript's box.
- *  A row resting at a fraction above the line then flips to the row before it.
- *  The top line is therefore measured from the box without that translate. */
 async function rowAtTop(page: Page): Promise<{ label: string; relTop: number } | null> {
   return page.locator('.thread-content').first().evaluate((el) => {
     const top = el.getBoundingClientRect().top - new DOMMatrix(getComputedStyle(el).transform).m42;
@@ -73,10 +54,6 @@ async function rowAtTop(page: Page): Promise<{ label: string; relTop: number } |
   });
 }
 
-/** Where the step row named `label` sits against the transcript's top line, or
- *  null while it is not drawn. A reopen may name the row before it, because the
- *  saved anchor was read in a nudged frame. Both name the same place, so the spec
- *  asks where the PARKED row is, never which row is on the line. */
 async function rowOffset(page: Page, label: string): Promise<number | null> {
   return page.locator('.thread-content').first().evaluate(rowOffsetIn, label);
 }
@@ -92,7 +69,6 @@ function rowOffsetIn(el: HTMLElement, label: string): number | null {
   return null;
 }
 
-/** Scroll up by `px` the way a reader does: a wheel event, then the move. */
 async function scrollUp(page: Page, px: number): Promise<void> {
   await page.locator('.thread-content').first().evaluate((el, by) => {
     el.dispatchEvent(new WheelEvent('wheel', { deltaY: -by, bubbles: true }));
@@ -128,8 +104,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     const transcript = page.locator('.thread-content').first();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
 
-    // Walk up into the early rows of turn 3, the big turn the window draws
-    // with its head clamped off on every fresh open.
     for (let i = 0; i < 80; i++) {
       const at = await rowAtTop(page);
       if (at && /Run t3s([0-9]|[1-5][0-9])\b/.test(at.label)) break;
@@ -139,19 +113,14 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     const parked = await rowAtTop(page);
     expect(parked?.label, 'parked deep inside the big turn').toMatch(/Run t3s\d+/);
 
-    // Away and back, the way a reader switches threads.
     await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadB);
     await expect(transcript.getByText('Run t0s0').first()).toBeVisible();
     await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadA);
     const near = async () => Math.abs((await rowOffset(page, parked!.label) ?? Infinity) - parked!.relTop) <= 2;
     await expect.poll(near, { timeout: 10_000 }).toBe(true);
-    // And it stays there: nothing shrinks the window under a restore that landed.
     await page.waitForTimeout(1500);
     expect(await near()).toBe(true);
 
-    // A reload loads only the newest page, so the row is found by the chase.
-    // Every frame is sampled from the reload on, so a restore that lands and
-    // then moves shows up as a frame.
     await page.addInitScript(([fn, label]) => {
       const rowOffsetIn = new Function(`return ${fn}`)() as (el: HTMLElement, label: string) => number | null;
       const frames: Array<number | null> = [];
@@ -176,11 +145,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     expect(stillScrollable, 'never parked at the bottom').toBe(true);
   });
 
-  /** Reported: "I entered this thread at one spot and when I started scrolling
-   *  it was on another scroll position". A restore lands once, and turns above
-   *  the row can still grow after it: an image decodes, a row finishes drawing.
-   *  WebKit has no scroll anchoring, so nothing carried the reader with them.
-   *  The restore now takes the arrival hold. */
   test('growth above a restored row leaves the reader on it', async ({ page }) => {
     test.setTimeout(120_000);
     await page.addInitScript((tid: string) => {
@@ -194,7 +158,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     const transcript = page.locator('.thread-content').first();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
 
-    // Park a couple of screens down, so rows sit above the reader.
     await transcript.evaluate((el) => {
       el.dispatchEvent(new WheelEvent('wheel', { deltaY: 1500, bubbles: true }));
       el.scrollTop += 1500;
@@ -208,7 +171,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadA);
     await expect.poll(async () => (await rowAtTop(page))?.label, { timeout: 10_000 }).toBe(parked!.label);
 
-    // A turn above the row grows the way a decoding image grows it.
     await transcript.evaluate((el) => {
       el.querySelector<HTMLElement>('.chat-exchange')!.style.paddingTop = '900px';
     });
@@ -218,11 +180,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     expect(Math.abs(after!.relTop - parked!.relTop)).toBeLessThanOrEqual(2);
   });
 
-  /** Reported: "this thread consistently opens in one position and adjusts to
-   *  new after a sec or so". A reader who scrolled up into the first turn
-   *  holds a window that draws the whole thread, and a reopen must keep it.
-   *  Re-seeded, the thread opens on the newest turns while the restore walks
-   *  back up, and jumps when it arrives. */
   test('a reader who scrolled to the first turn reopens there without a jump', async ({ page }) => {
     test.setTimeout(180_000);
     await page.addInitScript((tid: string) => {
@@ -236,8 +193,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     const transcript = page.locator('.thread-content').first();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
 
-    // Scroll up the way a reader does until the transcript rests at the true
-    // top: every page folded in and the first turn drawn from its first row.
     const atTrueTop = () => transcript.evaluate((el) => el.scrollTop === 0
       && (el.querySelector('[data-row-event]')?.textContent ?? '').includes('Run t0s0'));
     for (let i = 0; i < 120; i++) {
@@ -248,9 +203,6 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
       await scrollUp(page, 800);
     }
     expect(await atTrueTop(), 'rests at the top of the first turn').toBe(true);
-    // Park a few rows down inside that first turn. The spec measures the
-    // distance to a row, because the chrome above the first row differs by
-    // layout. On a phone the header spacer, a banner and the sticky title sit there.
     await transcript.evaluate((el) => {
       const row = Array.from(el.querySelectorAll<HTMLElement>('[data-row-event]'))
         .find((r) => (r.textContent ?? '').includes('Run t0s5'));
@@ -262,13 +214,9 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     const parked = await rowAtTop(page);
     expect(parked?.label, 'parked inside the first turn').toMatch(/Run t0s\d+/);
 
-    // Away to the short thread. Its three turns are what prove the switch
-    // landed, since A's own DOM also holds every row B has.
     await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadB);
     await expect(transcript.locator('.chat-exchange')).toHaveCount(3);
 
-    // Watch every frame of the return. Frames before the transcript has any
-    // row on its top line are fine; a DIFFERENT row there is the jump.
     const seen = await page.evaluate(async (tid) => {
       const labels: string[] = [];
       location.hash = `#thread=${tid}`;

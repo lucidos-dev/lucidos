@@ -1,10 +1,3 @@
-/**
- * Verifies what a send does when its POST gets no answer (transport error):
- * the text stays in the thread as an unsent message, and Retry re-posts the
- * same request. HTTP refusals on a first send are covered by
- * chat-orphan-thread.test.ts. Stale `connectionStatus` must NOT short-circuit a
- * send that would have succeeded.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.hoisted(() => {
@@ -103,11 +96,8 @@ afterEach(() => {
 });
 
 const ALL_RETRIES_MS = SEND_RETRY_BACKOFF_MS.reduce((a, b) => a + b, 0);
-/** POSTs a send makes when none gets an answer. */
 const ATTEMPTS = SEND_RETRY_BACKOFF_MS.length + 1;
 
-/** Run a send through its quiet retries. Stops short of the accepted send's
- *  safety sweep, which would clear the pending row a test asserts on. */
 async function settle<T>(p: Promise<T>): Promise<T> {
   await vi.advanceTimersByTimeAsync(ALL_RETRIES_MS + 1);
   return p;
@@ -116,7 +106,6 @@ async function settle<T>(p: Promise<T>): Promise<T> {
 const send = (...args: Parameters<typeof sendMessage>) => settle(sendMessage(...args));
 const retry = (eventId: string) => settle(retryUnsentMessage(eventId));
 
-/** Every attempt of the next send, its quiet retries included, gets no answer. */
 function rejectEveryAttempt(error: unknown): void {
   for (let i = 0; i <= SEND_RETRY_BACKOFF_MS.length; i++) mockedSubmitChat.mockRejectedValueOnce(error);
 }
@@ -125,8 +114,6 @@ function exchangesOf(threadId: string) {
   return groupIntoExchanges(threadMap.value.get(threadId)!.events);
 }
 
-/** A compose draft's first message that got no answer, on thread `t-1` with a
- *  model pick. Returns the unsent event id. */
 async function sendFirstUnanswered(text: string): Promise<string> {
   threadMap.value = new Map([['t-1', makeOptimisticThreadState({ id: 't-1', title: '', channel: 'chat', initiator: 'user', eventsLoaded: true })]]);
   patchComposeSelection('t-1', { model: 'claude-sonnet-5' });
@@ -136,7 +123,6 @@ async function sendFirstUnanswered(text: string): Promise<string> {
   return eventId;
 }
 
-/** Send once with no answer, and return the thread and the unsent event id. */
 async function sendUnanswered(text: string, imageHashes?: string[]) {
   rejectEveryAttempt(new TypeError('Load failed'));
   const outcome = await send(text, imageHashes);
@@ -280,7 +266,7 @@ describe('a send that gets no answer', () => {
 });
 
 describe('Retry on an unsent message', () => {
-  it('re-posts the first request, event id included, at a fresh input sequence', async () => {
+  it('re-posts the exact first request after an uncertain outcome', async () => {
     const { eventId } = await sendUnanswered('try me again');
     mockedSubmitChat.mockResolvedValueOnce({ event_id: eventId });
 
@@ -289,9 +275,7 @@ describe('Retry on an unsent message', () => {
     expect(mockedSubmitChat).toHaveBeenCalledTimes(ATTEMPTS + 1);
     const first = mockedSubmitChat.mock.calls[0][0];
     const retried = mockedSubmitChat.mock.calls[ATTEMPTS][0];
-    // A Retry lands at the tail of this page's inputs (ADR 0449); nothing else moves.
-    expect(retried).toEqual({ ...first, input_seq: retried.input_seq });
-    expect(retried.input_seq).toBeGreaterThan(first.input_seq!);
+    expect(retried).toEqual(first);
     expect(retried.event_id).toBe(eventId);
   });
 

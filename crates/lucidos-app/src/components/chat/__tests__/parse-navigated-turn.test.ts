@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseNavigatedTurn } from '../scrollState';
 
-// Pure decode of a navigated `.chat-exchange`'s collapse identity from its data
-// attributes — no DOM, mirroring pick-turn-index.test.ts.
 
 describe('parseNavigatedTurn', () => {
   it('decodes a response-body turn', () => {

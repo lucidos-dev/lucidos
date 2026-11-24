@@ -1,22 +1,3 @@
-/**
- * Permanent guard for one definition per preference value (ADR 0368).
- *
- * A preference's default and its value list live in the engine's catalog. The
- * frontend reads the generated copy, `@lucidos/preference-catalog`. A hand copy
- * drifts once the engine's default moves. This scan fails on the two shapes
- * that reintroduce one:
- *
- *   1. A distinctive text default spelled out as a scalar string literal in
- *      the app or SDK source, tests included. The list comes from the
- *      catalog. A choice in a list is not a default: an array element, or a
- *      property value of an object that is one (`[{ value: 'x', label }]`).
- *      Comments are not literals, so prose may still name a default.
- *   2. A `currentPreference(...)` call followed by `??` or `||`. The accessor
- *      already resolves the catalog default, so a fallback after it is a
- *      second default.
- *
- * No allowlist. A legitimate second mention is removed at its source.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
@@ -43,8 +24,6 @@ function tsFiles(dir: string): string[] {
   return out;
 }
 
-/** Parsed, not pattern-matched: a regex cannot tell a literal from a quote in
- *  a comment, a regex literal or a template. */
 const SOURCES: { file: string; ast: ts.SourceFile }[] = [APP_SRC, SDK_SRC]
   .flatMap(tsFiles)
   .map((file) => ({
@@ -63,9 +42,6 @@ interface CatalogEntry {
   readonly fallback: string | null;
 }
 
-/** Text defaults distinctive enough that a literal equal to one is a copy:
- *  model ids, the region, the resident sections, the local URL. A short plain
- *  word such as `standard` is too common to scan for. */
 const DISTINCTIVE_DEFAULTS: string[] = [
   ...new Set(
     Object.values(PREFERENCE_CATALOG as Record<string, CatalogEntry>)
@@ -75,8 +51,6 @@ const DISTINCTIVE_DEFAULTS: string[] = [
   ),
 ];
 
-/** Whether a literal is one choice in a list rather than a scalar: an array
- *  element, or a property value of an object that is an array element. */
 function isListChoice(literal: ts.Node): boolean {
   const parent = literal.parent;
   if (ts.isArrayLiteralExpression(parent)) return true;
@@ -86,8 +60,6 @@ function isListChoice(literal: ts.Node): boolean {
     && ts.isArrayLiteralExpression(parent.parent.parent);
 }
 
-/** Every scalar quoted literal, backtick literal with no interpolation, and
- *  JSX attribute string, as its text. */
 function scalarStringLiterals(ast: ts.SourceFile): string[] {
   const out: string[] = [];
   walk(ast, (node) => {
@@ -98,7 +70,6 @@ function scalarStringLiterals(ast: ts.SourceFile): string[] {
   return out;
 }
 
-/** Whether a call's value goes straight into `??` or `||` as the left side. */
 function feedsAFallback(call: ts.Node): boolean {
   let node = call;
   while (ts.isParenthesizedExpression(node.parent)) node = node.parent;
@@ -111,8 +82,6 @@ function feedsAFallback(call: ts.Node): boolean {
 
 describe('no preference default is restated outside the catalog', () => {
   it('finds the distinctive defaults it scans for', () => {
-    // Guards the filter itself: a catalog shape change that empties the list
-    // would otherwise pass every file vacuously.
     expect(DISTINCTIVE_DEFAULTS).toContain(PREFERENCE_CATALOG.chat_model.fallback);
     expect(DISTINCTIVE_DEFAULTS).toContain(PREFERENCE_CATALOG.trigger_model.fallback);
     expect(DISTINCTIVE_DEFAULTS).toContain(PREFERENCE_CATALOG.voice_resident_sections.fallback);

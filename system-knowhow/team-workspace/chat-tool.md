@@ -13,7 +13,7 @@ Read `system-knowhow/team-workspace` first. This page is one source of work for 
 
 Polling needs no public address. The template reads the Web API once a minute through `lucidos proxy`, so it works on a laptop with nothing exposed. The cost is up to a minute of delay.
 
-To take Slack's Events API instead, publish the hook socket and use the issue tracker template's shape: a webhook, then a translation script on its event. A hook verifying `X-Slack-Signature` echoes Slack's `url_verification` challenge, so Slack accepts the Request URL. `system-knowhow/lucidos-cli` § `lucidos webhooks` shows the setup order.
+To take Slack's Events API instead, publish the hook socket and use the issue tracker template's shape: a webhook, then a translation script on its event. A hook verifying `X-Slack-Signature` echoes Slack's `url_verification` challenge, so Slack accepts the Request URL. `system-knowhow/lucidos-cli/subcommands-15.md` § `lucidos webhooks` shows the setup order.
 
 | Step | Piece | Does |
 |---|---|---|
@@ -65,7 +65,7 @@ lucidos triggers create --name "Chat intake" --slug chat-intake \
 
 The key starts with `source`, the literal `chat` the script wrote.
 
-Its runs start coding agents, so ask the user to tick *Allow coding agents* on it (`triggers.md` § "Coding-agent grant"). Those coding agents hold every grant the user gave coding agents. Only the listed teammates steer them, since the translate script drops strangers. Ask too for any side-effect grant the trigger's own run needs (`triggers.md` § "Side-effect grant").
+Its runs start coding agents, so ask the user to tick *Allow coding agents* on it (`system-knowhow/triggers/grouping-triggers.md` § "Coding-agent grant"). Those coding agents hold every grant the user gave coding agents. Only the listed teammates steer them, since the translate script drops strangers. If the trigger's own run needs a program grant, the failure notification opens its permission request (`system-knowhow/triggers/grouping-triggers.md` § "Program grants").
 
 ## 4. The outbound script triggers
 

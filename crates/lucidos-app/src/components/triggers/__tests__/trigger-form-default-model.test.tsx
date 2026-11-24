@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * An unpinned trigger runs on the account's trigger model, so the form's
- * Default row has to name that model and never the chat model.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 

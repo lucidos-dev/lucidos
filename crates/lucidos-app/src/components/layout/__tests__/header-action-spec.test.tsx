@@ -1,14 +1,3 @@
-/** What a `HeaderActionSpec` promises to carry into BOTH of its renderings.
- *
- *  An action folds into the ⋯ menu the moment the row runs short of room. So
- *  anything that addresses it has to survive the fold. That was already true of
- *  `extraClass`. It is now true of `data-role` too, which is how the composer's
- *  toggles are addressed by their CSS and by the e2e suite.
- *
- *  A vnode walk, not a mount: every property here is an attribute the renderer
- *  puts on the element, so the props are the whole of the answer.
- *
- *  Plan: `docs/plans/2026-09-19-composer-icon-row-overflow-menu.md`. */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChild, VNode } from 'preact';
 import {
@@ -63,7 +52,6 @@ describe('a toggle says so, on both sides', () => {
     expect(node.props.class).toBe('header-icon');
   });
 
-  /** The composer's toggles each pick the tone their look needs. */
   it('hands the tone of the spec on', () => {
     expect(propsOf(renderHeaderAction(spec({ active: true, tone: 'glyph' }))).tone).toBe('glyph');
   });
@@ -77,9 +65,6 @@ describe('a toggle says so, on both sides', () => {
     expect(propsOf(renderHeaderAction(spec()))['aria-pressed']).toBeUndefined();
   });
 
-  /** Colour is the only channel the row button has, and a menu row has none at
-   *  all. `menuitemcheckbox` is the one menu role able to hold `aria-checked`,
-   *  and `OverflowMenu` roves it like any other item. */
   it('gives the menu row a checkable role', () => {
     const on = propsOf(renderMenuAction(spec({ active: true }), ctx));
     expect(on.role).toBe('menuitemcheckbox');
@@ -93,9 +78,6 @@ describe('a toggle says so, on both sides', () => {
   });
 });
 
-/** A folded STATUS readout reports in words, and the waiting indicator's words
- *  are the model's own sentence. Left as a bare text node it had no box to clamp,
- *  so it wrapped to five lines of a three-row menu. */
 describe('a menu row keeps its words in a clamped box', () => {
   const labelOf = (node: ComponentChild): ComponentChild =>
     (propsOf(node).children as ComponentChild[])[1];
@@ -109,8 +91,6 @@ describe('a menu row keeps its words in a clamped box', () => {
   });
 });
 
-/** On iOS a mousedown on a button blurs the focused field. A press on a
- *  composer toggle then dropped the keyboard the reader was typing with. */
 describe('a press can leave focus where it is', () => {
   const mouseDownOf = (node: ComponentChild) =>
     propsOf(node).onMouseDown as ((e: Event) => void) | undefined;
@@ -129,9 +109,6 @@ describe('a press can leave focus where it is', () => {
 });
 
 describe('a menu row that OPENS something is handed the trigger', () => {
-  /** The row it was clicked on unmounts as the menu closes, so a popover
-   *  anchored to it would be positioned against nothing. The ⋯ is the only box
-   *  still standing. */
   it('runs onMenuClick against the ⋯, not the row', () => {
     let seen: HTMLElement | null | undefined;
     const row = renderMenuAction(spec({ onMenuClick: (a) => { seen = a; } }), ctx);
@@ -172,8 +149,6 @@ describe('CollapsingActions stamps its cluster attrs on every in-row member', ()
     expect(propsOf(propsOf(visible[0]).children as ComponentChild)['data-row-item']).toBe('fold');
   });
 
-  /** The trigger stands in for whatever folded, so the measurement has to see
-   *  it as a member too. Otherwise the row reads one box narrower than it is. */
   it('reaches the ⋯ trigger', () => {
     const more = childrenOf(2).find((c) => (c as VNode)?.type === OverflowMenu);
     expect(more, 'no ⋯ menu rendered for a collapsed cluster').toBeTruthy();

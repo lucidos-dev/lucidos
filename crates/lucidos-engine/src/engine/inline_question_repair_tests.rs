@@ -20,14 +20,15 @@ fn dispatched(text: &str) -> (Vec<Card>, String) {
             cleaned_text,
         }) => {
             let parser_input = serde_json::json!({ "questions": questions_json });
-            let cards = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input)
-                .into_iter()
-                .map(|q| Card {
-                    question: q.question,
-                    labels: q.options.into_iter().map(|o| o.label).collect(),
-                    multi_select: q.multi_select,
-                })
-                .collect();
+            let cards =
+                crate::engine::question_parsing::parse_ask_user_question_inputs(&parser_input)
+                    .into_iter()
+                    .map(|q| Card {
+                        question: q.question,
+                        labels: q.options.into_iter().map(|o| o.label).collect(),
+                        multi_select: q.multi_select,
+                    })
+                    .collect();
             (cards, cleaned_text)
         }
         other => panic!("expected Dispatch, got {:?}", other),

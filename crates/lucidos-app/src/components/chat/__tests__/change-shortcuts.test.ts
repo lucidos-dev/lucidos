@@ -1,9 +1,3 @@
-/** The Diff and Apply shortcuts act only where their buttons would.
- *
- *  Both read the banner's own state. So an apply already in flight, an archive
- *  under way, or a thread with no diff leaves the keystroke doing nothing.
- *
- *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../../store/actions/threads', () => ({

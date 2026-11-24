@@ -55,7 +55,9 @@ Lucidos sets no process umask. Its own temp files go through `tempfile`, and
   The dev scripts use its shell twin, `scripts/lib/storage_root.sh`.
 - **`install.sh` keeps a copy.** A piped install fetches only the libs the site
   publisher serves, so a new lib would break it. A test in `lucidos-home` pins
-  the copy's body to the lib's.
+  the copy's body to the lib's. Correction: that premise was wrong. The
+  publisher derives its lib routes from the published `install.sh`, so a new
+  lib in `LUCIDOS_LIBS` ships on the next publish.
 
 ## Consequences
 
@@ -89,4 +91,4 @@ Lucidos sets no process umask. Its own temp files go through `tempfile`, and
 | A sweep that tightens modes on a timer | The bad state would exist between sweeps, and a timer is a recovery path for a state the root makes impossible. |
 | Refusing to start on an open root | Every install from before this rule would stop working. The root is ours, so tightening it is safe. |
 | Setting `TMPDIR` to a Lucidos directory for every child | Nothing would clean it without a sweeper, and the OS cleans the macOS per-user temp dir already. |
-| A new served lib for `install.sh` | The site publisher serves a fixed route set, so the next piped install would `.`-source a web page. |
+| A new served lib for `install.sh` | Rejected on the belief that the site publisher serves a fixed route set. It does not: it reads `LUCIDOS_LIBS` from the published `install.sh`, so this option is open. |

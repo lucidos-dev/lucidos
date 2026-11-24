@@ -109,6 +109,28 @@ workflow_assertions() {
     *)         pass "'created' is absent from the release types" ;;
   esac
 
+  local job probes
+  for job in dmg-verify tarball-smoke; do
+    probes="$(job_code "$job")"
+    if printf '%s\n' "$probes" | grep -Eq 'base="(https://127[.]0[.]0[.]1:|[$][(]loopback_origin )' \
+      && printf '%s\n' "$probes" | grep -qF 'loopback_curl -fsS' \
+      && ! printf '%s\n' "$probes" | grep -Eq 'http://(localhost|127[.]0[.]0[.]1)|[$][(]curl[[:space:]]'; then
+      pass "$job uses verified HTTPS for gateway probes"
+    else
+      fail_t "$job must use verified HTTPS for gateway probes"
+    fi
+  done
+  for job in front-door front-door-macos; do
+    probes="$(job_code "$job")"
+    if printf '%s\n' "$probes" | grep -qF 'loopback-ca.pem' \
+      && printf '%s\n' "$probes" | grep -qF -- '--cacert' \
+      && ! printf '%s\n' "$probes" | grep -Eq 'curl[^"]*"http://(localhost|127[.]0[.]0[.]1)'; then
+      pass "$job trusts the loopback CA and has no hard-coded HTTP gateway probe"
+    else
+      fail_t "$job must trust the loopback CA and discover the gateway scheme"
+    fi
+  done
+
   # A gate dispatch must start dmg-verify and nothing else: every OTHER job guards
   # on the input being empty. The job keys are counted from inside the `jobs:`
   # block, since the trigger keys under `on:` share their indentation.

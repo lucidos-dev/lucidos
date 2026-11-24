@@ -116,10 +116,10 @@ async fn queued_followup_does_not_steal_the_in_flight_anchor() {
     // Pin the delta: the fallback really would pick the queued message here, so
     // this test still fails if the handle read is ever removed.
     assert_eq!(
-        crate::engine::agent_session::latest_originating_event_id(
+        crate::engine::session_queries::latest_originating_event_id(
             &pool,
             thread_id,
-            crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+            crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
         )
         .await,
         Some(queued),
@@ -130,7 +130,7 @@ async fn queued_followup_does_not_steal_the_in_flight_anchor() {
         &threads,
         &pool,
         thread_id,
-        crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+        crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
     )
     .await;
     assert_eq!(
@@ -221,7 +221,7 @@ async fn continuation_started_turn_keeps_its_own_anchor() {
         ThreadEvent::ContinuationStarted {
             branch: String::new(),
             origin: None,
-            reason: Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into()),
+            reason: Some(crate::engine::continuation_reason::USER_CLICKED_CONTINUE_REASON.into()),
             resumed_abort_id: None,
         },
         Uuid::new_v4(),
@@ -233,10 +233,10 @@ async fn continuation_started_turn_keeps_its_own_anchor() {
 
     // Pin the delta: the fallback really would pick the stale message here.
     assert_eq!(
-        crate::engine::agent_session::latest_originating_event_id(
+        crate::engine::session_queries::latest_originating_event_id(
             &pool,
             thread_id,
-            crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+            crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
         )
         .await,
         Some(stale),
@@ -248,7 +248,7 @@ async fn continuation_started_turn_keeps_its_own_anchor() {
         &threads,
         &pool,
         thread_id,
-        crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+        crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
     )
     .await;
     assert_eq!(
@@ -275,6 +275,7 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
@@ -306,7 +307,7 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
         &bus,
         thread_id,
         ThreadEvent::ContinuationRequested {
-            reason: crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into(),
+            reason: crate::engine::continuation_reason::USER_CLICKED_CONTINUE_REASON.into(),
         },
         Uuid::new_v4(),
     )
@@ -317,10 +318,10 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
 
     // Pin the delta: the fallback really would pick the stale message here.
     assert_eq!(
-        crate::engine::agent_session::latest_originating_event_id(
+        crate::engine::session_queries::latest_originating_event_id(
             &pool,
             thread_id,
-            crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
+            crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES,
         )
         .await,
         Some(stale),
@@ -331,7 +332,7 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
         &threads,
         &pool,
         thread_id,
-        crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
+        crate::engine::thread_events::CC_ORIGINATING_EVENT_TYPES,
     )
     .await;
     assert_eq!(
@@ -366,7 +367,7 @@ async fn falls_back_to_the_origin_type_query_without_a_handle() {
         &threads,
         &pool,
         thread_id,
-        crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+        crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
     )
     .await;
     assert_eq!(
@@ -396,7 +397,7 @@ async fn falls_back_when_the_handle_has_not_recorded_yet() {
         &threads,
         &pool,
         thread_id,
-        crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+        crate::engine::thread_events::CHAT_ORIGINATING_EVENT_TYPES,
     )
     .await;
     assert_eq!(resolved, Some(only));

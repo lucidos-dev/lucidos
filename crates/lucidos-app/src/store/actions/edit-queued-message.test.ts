@@ -1,21 +1,6 @@
 // @vitest-environment jsdom
-/**
- * Edit on a queued message takes it back, then puts its text and images in the
- * compose box after any draft. A refused take-back leaves compose alone, so a
- * message the agent already read never also sits in compose. See
- * docs/plans/2026-09-29-withdraw-a-queued-claude-code-message.md.
- *
- * A message a dead agent process held is removable too: the engine records
- * its tombstone from the store, so Remove answers 200 like any withdraw. See
- * docs/plans/2026-10-17-a-follow-up-a-dead-agent-never-read.md.
- */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { updateComposeSpy } = vi.hoisted(() => ({ updateComposeSpy: vi.fn() }));
-vi.mock('./compose', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./compose')>()),
-  updateCompose: updateComposeSpy,
-}));
 const { refreshThreadEvents } = vi.hoisted(() => ({ refreshThreadEvents: vi.fn(async (_id: string) => {}) }));
 vi.mock('./thread-loading', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./thread-loading')>()),
@@ -24,7 +9,7 @@ vi.mock('./thread-loading', async (importOriginal) => ({
 
 import { editQueuedMessage, removeQueuedMessage } from './chat';
 import { removingQueuedMessageIds, toasts } from '../store';
-import { setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
+import { getDraft, setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 
 const originalFetch = globalThis.fetch;
 
@@ -44,14 +29,16 @@ const message = { id: 'm2', text: 'also check the totals', imageHashes: ['hash-b
 
 describe('editQueuedMessage', () => {
   beforeEach(() => {
+    vi.useFakeTimers();
     _resetComposeDraftsForTesting();
     removingQueuedMessageIds.value = new Set();
     toasts.value = [];
-    updateComposeSpy.mockClear();
     refreshThreadEvents.mockClear();
   });
 
   afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
     globalThis.fetch = originalFetch;
     _resetComposeDraftsForTesting();
     toasts.value = [];
@@ -64,8 +51,10 @@ describe('editQueuedMessage', () => {
     await editQueuedMessage('t-1', message);
 
     expect(removed).toEqual(['m2']);
-    expect(updateComposeSpy).toHaveBeenCalledWith('t-1', { image_hashes: ['hash-a', 'hash-b'] });
-    expect(updateComposeSpy).toHaveBeenCalledWith('t-1', { text: 'half a thought\n\nalso check the totals' });
+    expect(getDraft('t-1')).toMatchObject({
+      image_hashes: ['hash-a', 'hash-b'],
+      text: 'half a thought\n\nalso check the totals',
+    });
     expect(toasts.value).toEqual([]);
   });
 
@@ -81,7 +70,7 @@ describe('editQueuedMessage', () => {
 
     await editQueuedMessage('t-1', message);
 
-    expect(updateComposeSpy).not.toHaveBeenCalled();
+    expect(getDraft('t-1')).toMatchObject({ text: 'half a thought', image_hashes: [] });
     expect(refreshThreadEvents).toHaveBeenCalledWith('t-1');
     const shown = JSON.stringify(toasts.value);
     expect(shown).toContain('Failed to edit queued message');

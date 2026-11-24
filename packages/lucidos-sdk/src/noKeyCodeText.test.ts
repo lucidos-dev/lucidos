@@ -2,8 +2,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { installNoKeyCodeText } from './noKeyCodeText';
 
-// Pins the wiring: the event the guard listens on, and the cancel it answers
-// with. The rule itself is tested in `textEntry.test.ts`.
 describe('installNoKeyCodeText', () => {
   beforeAll(() => {
     installNoKeyCodeText();

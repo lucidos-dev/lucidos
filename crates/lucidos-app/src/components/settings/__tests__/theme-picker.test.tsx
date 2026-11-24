@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** Settings › Appearance lists every theme inline, in a carousel filtered by
- *  family. A pick paints at once, and nothing folds or swallows the next tap. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -118,15 +116,12 @@ it('filters by family: All first and picked, then one chip per family', () => {
   expect(chip('Warm').getAttribute('aria-pressed')).toBe('true');
   expect(chip('All').getAttribute('aria-pressed')).toBe('false');
   expect(radios().map(r => r.querySelector('.theme-card-name')?.textContent)).toEqual(['Paper']);
-  // The chip names the family, so the strip drops its names row.
   expect(host.querySelector('.theme-family-name')).toBeNull();
   expect(card('Paper')!.style.gridRow).toBe('1');
   act(() => { chip('All').click(); });
   expect(radios()).toHaveLength(3);
 });
 
-/** Gives the strip a height layout would: taller while it draws the names row.
- *  Records each animation the strip itself runs. */
 function measureStripHeight(): () => Keyframe[][] {
   const strip = host.querySelector<HTMLElement>('.theme-carousel')!;
   strip.getBoundingClientRect = () => ({ height: host.querySelector('.theme-family-name') ? 200 : 100 }) as DOMRect;
@@ -171,8 +166,6 @@ function step(label: string): HTMLButtonElement {
   return button;
 }
 
-/** Gives the strip the box layout would: 300px wide, no padding or gap, on a
- *  16px root, with `scrollWidth` of content. jsdom lays nothing out. */
 function sizeStrip(scrollLeft: number, scrollWidth = 900) {
   document.documentElement.style.fontSize = '16px';
   const strip = host.querySelector<HTMLElement>('.theme-carousel')!;
@@ -211,7 +204,6 @@ it('turns each chevron on while there is more strip on its side', () => {
 
 it('pages by whole columns: a page is every column that fits', () => {
   showPicker();
-  // 300px holds two 9rem (144px) columns, so a page is the full 300px.
   const strip = sizeStrip(300);
   const scrolls = recordScrolls(strip);
   act(() => { step('Next themes').click(); });
@@ -230,10 +222,8 @@ it('drops to one row when every card fits in it, and back to two when not', () =
     showPicker();
     const strip = sizeStrip(0);
     const cells = () => ['Lucidos', 'Nord', 'Paper'].map(name => [card(name)!.style.gridColumn, card(name)!.style.gridRow]);
-    // 300px holds two 9rem (144px) columns, too few for three cards.
     act(() => { resized(); });
     expect(cells()).toEqual([['1', '2'], ['1', '3'], ['2', '2']]);
-    // 600px holds four, so all three sit on the row under the family names.
     Object.defineProperty(strip, 'clientWidth', { configurable: true, value: 600 });
     act(() => { resized(); });
     expect(cells()).toEqual([['1', '2'], ['2', '2'], ['3', '2']]);
@@ -244,13 +234,10 @@ it('drops to one row when every card fits in it, and back to two when not', () =
 
 it('never skips a column when the strip rests between page stops', () => {
   showPicker();
-  // Clamped at the end: 700px of strip scrolls at most 400px, a third of the
-  // way past the 300px stop. Back must land on that stop, not skip to 0.
   let strip = sizeStrip(400, 700);
   let scrolls = recordScrolls(strip);
   act(() => { step('Previous themes').click(); });
   expect(scrolls()).toEqual([300]);
-  // A swipe left it half a page in: on is the next stop, not the one after.
   strip = sizeStrip(150);
   scrolls = recordScrolls(strip);
   act(() => { step('Next themes').click(); });
@@ -263,14 +250,10 @@ it('on a phone, pages one card at a time, the first press centring the third', (
     showPicker();
     const strip = sizeStrip(0);
     expect(strip.classList.contains('theme-carousel-peek')).toBe(true);
-    // One row, and no names row above it.
     expect(card('Nord')!.style.gridRow).toBe('2');
     expect(card('Nord')!.style.gridColumn).toBe('2');
     const scrolls = recordScrolls(strip);
     act(() => { step('Next themes').click(); });
-    // A 7rem (112px) card centred in 300px stops 94px short of its column.
-    // At the start the second card is nearest the centre, so the press
-    // centres the third: 2 * 112 - 94.
     expect(scrolls()).toEqual([130]);
   } finally {
     act(() => { viewportIsMobile.value = false; });
@@ -381,7 +364,6 @@ it("names each theme in the font that theme suggests, not the page's", () => {
   const font = (meta: HTMLElement, prop: string) => meta.style.getPropertyValue(prop);
   expect(font(metas[0], '--font-ui')).toBe(FONT_STACKS.geist);
   expect(font(metas[0], '--font-features-text')).toBe(fontFeaturesFor('geist').text);
-  // A theme that suggests no font names itself in the fallback, as it would paint.
   expect(font(metas[1], '--font-ui')).toBe(FONT_STACKS[FALLBACK_FONT]);
   expect(font(metas[1], '--font-features-text')).toBe(fontFeaturesFor(FALLBACK_FONT).text);
 });
@@ -411,9 +393,7 @@ it('names a card in the workspace font its theme suggests, from the entry the th
 it('holds its box while the gallery loads, before the skeleton is due', () => {
   themeGallery.value = { status: 'loading' };
   showPicker();
-  // No loader yet: the delay gate has not fired.
   expect(host.querySelector('.loading-fade-skeleton')).toBeNull();
-  // The skeleton's own frame, drawn invisibly, so the rows below never jump.
   const reserve = host.querySelector<HTMLElement>('.loading-fade-content .theme-carousel-reserve');
   expect(reserve?.getAttribute('aria-hidden')).toBe('true');
   expect(reserve?.querySelector('.pill-bar')).not.toBeNull();

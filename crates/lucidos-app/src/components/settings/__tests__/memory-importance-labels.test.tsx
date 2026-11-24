@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-/** The importance bar's tooltips name each band's score range in words,
- *  "Low (0 to 0.3)", never with a dash. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render, type FunctionComponent } from 'preact';
 import { act } from 'preact/test-utils';

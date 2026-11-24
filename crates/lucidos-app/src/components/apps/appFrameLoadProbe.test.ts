@@ -12,7 +12,7 @@ const host = (): HostSample => ({
 const label = { app: 'thread-cost', place: 'dashboard' };
 
 let log: Mock<(category: string, message: string, data: Record<string, unknown>) => void>;
-const start = () => startFrameLoadProbe(label, () => null, host, log);
+const start = () => startFrameLoadProbe(label, () => null, 0, host, log);
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -114,10 +114,51 @@ describe('a frame still covered after the limit', () => {
   });
 });
 
+describe('the frame document timing on a line', () => {
+  const frame = document.createElement('iframe');
+  frame.setAttribute('src', '/app/x/');
+  const entry = { startTime: 40, fetchStart: 41, requestStart: 50, responseStart: 80, responseEnd: 82 };
+  const timing = { start: 40, fetchStart: 41, requestStart: 50, responseStart: 80, responseEnd: 82 };
+
+  beforeEach(() => {
+    vi.spyOn(performance, 'getEntriesByName').mockReturnValue([entry] as unknown as PerformanceEntry[]);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('is null before this element loads, since a lone load may be a sibling\'s', () => {
+    const probe = startFrameLoadProbe(label, () => frame, 0, host, log);
+    vi.advanceTimersByTime(SLOW_LOAD_MS);
+    expect(log.mock.calls[0][2]).toMatchObject({ loaded: false, frameDocument: null });
+    probe.abandon();
+    expect(log.mock.calls[1][2]).toMatchObject({ frameDocument: null });
+  });
+
+  it('is read once the element loaded, on the slow line and the ended line', () => {
+    const probe = startFrameLoadProbe(label, () => frame, 0, host, log);
+    probe.noteLoad();
+    vi.advanceTimersByTime(SLOW_LOAD_MS);
+    probe.noteRevealed(false);
+    expect(log.mock.calls.map((c) => c[2].frameDocument)).toEqual([timing, timing]);
+  });
+
+  it('reaches the ended line of a frame whose load came after the limit', () => {
+    const probe = startFrameLoadProbe(label, () => frame, 0, host, log);
+    vi.advanceTimersByTime(SLOW_LOAD_MS);
+    probe.noteRevealed(true);
+    probe.noteLoad();
+    expect(log.mock.calls.map((c) => c[2].frameDocument)).toEqual([null, timing]);
+  });
+});
+
 describe('frameDocumentTiming', () => {
-  const entry = {
-    startTime: 100.4, fetchStart: 101.2, requestStart: 110.6, responseStart: 140, responseEnd: 141.5,
-  };
+  const ATTACHED_AT = 5000;
+  const load = (startTime: number, requestStart = startTime + 10.2) => ({
+    startTime,
+    fetchStart: startTime + 0.8,
+    requestStart,
+    responseStart: startTime + 39.6,
+    responseEnd: startTime + 41.1,
+  });
 
   function frameAt(src: string): HTMLIFrameElement {
     const frame = document.createElement('iframe');
@@ -125,21 +166,51 @@ describe('frameDocumentTiming', () => {
     return frame;
   }
 
+  const entries = (...loads: ReturnType<typeof load>[]) =>
+    vi.spyOn(performance, 'getEntriesByName').mockReturnValue(loads as unknown as PerformanceEntry[]);
+
   afterEach(() => vi.restoreAllMocks());
 
-  it('reads the entry for the frame url without its fragment', () => {
-    const byName = vi.spyOn(performance, 'getEntriesByName').mockReturnValue([entry as unknown as PerformanceEntry]);
+  it('reads the load this element started, in milliseconds from its attachment', () => {
+    const byName = entries(load(ATTACHED_AT + 100.4));
     const frame = frameAt('/app/x/?a=1#top');
-    expect(frameDocumentTiming(frame)).toEqual({
+    expect(frameDocumentTiming(frame, ATTACHED_AT)).toEqual({
       start: 100, fetchStart: 101, requestStart: 111, responseStart: 140, responseEnd: 142,
     });
     expect(byName).toHaveBeenCalledWith(frame.src.split('#')[0], 'resource');
   });
 
+  it('is null when the only load of that url began before this element', () => {
+    entries(load(3574));
+    expect(frameDocumentTiming(frameAt('/app/x/'), ATTACHED_AT)).toBeNull();
+  });
+
+  it('skips the load of an earlier element and reads its own', () => {
+    entries(load(3574), load(ATTACHED_AT + 20));
+    expect(frameDocumentTiming(frameAt('/app/x/'), ATTACHED_AT)).toMatchObject({ start: 20 });
+  });
+
+  it('is null when two loads of that url began since, so neither is known to be its own', () => {
+    entries(load(ATTACHED_AT + 5), load(ATTACHED_AT + 6));
+    expect(frameDocumentTiming(frameAt('/app/x/'), ATTACHED_AT)).toBeNull();
+  });
+
+  it('reports a phase the browser hides as null, never as zero', () => {
+    entries(load(ATTACHED_AT + 100, 0));
+    expect(frameDocumentTiming(frameAt('/app/x/'), ATTACHED_AT)).toMatchObject({
+      start: 100, requestStart: null,
+    });
+  });
+
   it('is null when the browser exposes none, or the frame has no url', () => {
-    vi.spyOn(performance, 'getEntriesByName').mockReturnValue([]);
-    expect(frameDocumentTiming(frameAt('/app/x/'))).toBeNull();
-    expect(frameDocumentTiming(null)).toBeNull();
-    expect(frameDocumentTiming(document.createElement('iframe'))).toBeNull();
+    entries();
+    expect(frameDocumentTiming(frameAt('/app/x/'), ATTACHED_AT)).toBeNull();
+    expect(frameDocumentTiming(null, ATTACHED_AT)).toBeNull();
+    expect(frameDocumentTiming(document.createElement('iframe'), ATTACHED_AT)).toBeNull();
+  });
+
+  it('is null when the performance timeline throws', () => {
+    vi.spyOn(performance, 'getEntriesByName').mockImplementation(() => { throw new Error('unsupported'); });
+    expect(frameDocumentTiming(frameAt('/app/x/'), ATTACHED_AT)).toBeNull();
   });
 });

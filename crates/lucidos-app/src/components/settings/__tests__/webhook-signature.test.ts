@@ -19,13 +19,6 @@ import {
   newSignatureDraft,
 } from '../WebhookSignatureFields';
 
-/**
- * The signature half of a webhook, without rendering any of it.
- *
- * Two claims carry the feature. A scheme is data, so the three real senders
- * round-trip through the presets. And a credential the store no longer holds
- * is reported rather than linked into nothing.
- */
 
 function credential(over: Partial<CredentialInfo>): CredentialInfo {
   return {
@@ -64,8 +57,6 @@ describe('the scheme presets', () => {
     expect(stripe.template).toBe('{timestamp}.{body}');
   });
 
-  /** A signed timestamp exists only to bound replay, so every timestamped
-   *  preset names its window rather than leaving it to the engine default. */
   it('gives every timestamped scheme a replay window', () => {
     for (const preset of SCHEME_PRESETS) {
       if (!preset.hmac?.template.includes('{timestamp}')) continue;
@@ -73,8 +64,6 @@ describe('the scheme presets', () => {
     }
   });
 
-  /** Which side invents the secret is the sender's decision. Slack and Stripe
-   *  issue their own, so a secret we generated could never verify them. */
   it('offers generate only where the receiver chooses the secret', () => {
     expect(presetFor('github').secretSources).toContain('generate');
     expect(presetFor('custom').secretSources).toContain('generate');
@@ -82,7 +71,6 @@ describe('the scheme presets', () => {
     expect(presetFor('stripe').secretSources).not.toContain('generate');
   });
 
-  /** The override for a secret already sitting in a password manager. */
   it('lets every scheme name a credential that already exists', () => {
     for (const preset of SCHEME_PRESETS) {
       expect(preset.secretSources, preset.scheme).toContain('saved');
@@ -95,17 +83,10 @@ describe('the scheme presets', () => {
       if (!preset.hmac) continue;
       expect(schemeOf({ credential: 'c', ...preset.hmac })).toBe(preset.scheme);
     }
-    // A header nobody publishes is nobody's preset.
     expect(schemeOf({ credential: 'c', signature_header: 'X-Mine', template: '{body}' }))
       .toBe('custom');
   });
 
-  /** A preset scheme renders no fields and saves the preset back whole, so
-   *  claiming a config that only half matches would rewrite it on save.
-   *
-   *  The bug: a hook signing sha1 under GitHub's header read as `github`, and
-   *  one Save flipped it to sha256. It then refused every delivery, with
-   *  nothing on screen having said the digest moved. */
   it('claims a config only when every field matches', () => {
     const github = { credential: 'c', ...presetFor('github').hmac! };
     expect(schemeOf(github)).toBe('github');
@@ -120,8 +101,6 @@ describe('the scheme presets', () => {
       expect(schemeOf(differing), JSON.stringify(differing)).toBe('custom');
     }
 
-    // A field the wire omits at its default still matches the preset, which
-    // spells it out. Otherwise a CLI-made GitHub hook would read as custom.
     expect(schemeOf({
       credential: 'c',
       signature_header: 'X-Hub-Signature-256',
@@ -137,8 +116,6 @@ describe('resolveCredential', () => {
     expect(found).toEqual({ state: 'found', name: 'deploys-github', id: 'id-1' });
   });
 
-  /** The state `DeliveryRefusal::CredentialMissing` exists for. Every delivery
-   *  is refused until it is fixed, so the row says so instead of linking. */
   it('reports a name the store does not hold', () => {
     expect(resolveCredential({ credential: 'gone' }, loaded([credential({})])))
       .toEqual({ state: 'missing', name: 'gone' });
@@ -146,11 +123,6 @@ describe('resolveCredential', () => {
       .toEqual({ state: 'missing', name: 'gone' });
   });
 
-  /** A list that has not loaded holds no credentials, which is not the same
-   *  fact as a credential that is gone.
-   *
-   *  Collapsing the two accused every signed hook of refusing its deliveries,
-   *  on every cold open. A failed fetch left the accusation up for good. */
   it('says nothing about a credential it has not looked for yet', () => {
     for (const pending of [
       { status: 'not-loaded' },
@@ -163,9 +135,6 @@ describe('resolveCredential', () => {
     }
   });
 
-  /** The engine's `CredentialStore::get` excludes `oauth_client`, so a hook
-   *  naming one could never verify. Matching it here would link to a row the
-   *  delivery path cannot read. */
   it('skips an oauth_client row of the same name', () => {
     const oauth = credential({ id: 'id-2', service_name: 'dropbox', auth_type: 'oauth_client' });
     expect(resolveCredential({ credential: 'dropbox' }, loaded([oauth])).state).toBe('missing');
@@ -177,7 +146,6 @@ describe('algorithmLabel', () => {
   it('says the digest the way a reader does', () => {
     expect(algorithmLabel({ algorithm: 'sha256' })).toBe('SHA-256');
     expect(algorithmLabel({ algorithm: 'sha1' })).toBe('SHA-1');
-    // The wire default, which the engine omits from the JSON.
     expect(algorithmLabel({})).toBe('SHA-256');
   });
 });
@@ -206,13 +174,10 @@ describe('a signature draft', () => {
   it('round-trips a stored config back into the editor', () => {
     const stored: WebhookHmac = { credential: 'x', ...presetFor('stripe').hmac! };
     const draft = draftFromHmac(stored, 'stripe');
-    // A hook that already has a secret gets no proposal to replace it.
     expect(draft.source).toBe('saved');
     expect(draftToHmac(draft)).toEqual(stored);
   });
 
-  /** The invariant that makes the editor safe on a hook it did not create: a
-   *  reopened config comes back out unchanged, whatever it holds. */
   it('round-trips a config no preset claims, field for field', () => {
     const stored: WebhookHmac = {
       credential: 'relay-signing',
@@ -230,8 +195,6 @@ describe('a signature draft', () => {
   });
 
   it('sends a pasted secret verbatim', () => {
-    // The engine refuses surrounding whitespace by name. Trimming here would
-    // silently change a value the sender chose.
     const draft = {
       ...newSignatureDraft('x'),
       source: 'paste' as const,
@@ -280,7 +243,6 @@ describe('a signature draft', () => {
 });
 
 describe('secretReveal', () => {
-  /** A hook carries exactly one verifier kind, so these are never both set. */
   it('names which secret it is showing', () => {
     const secret = secretReveal({ name: 'deploys', signing_secret: 'abc' })!;
     expect(secret.value).toBe('abc');
@@ -293,9 +255,6 @@ describe('secretReveal', () => {
     expect(token.message).toContain('Bearer');
   });
 
-  /** Only the token is one-time: its digest is all that is stored. A signing
-   *  secret is a saved credential, and Accounts can copy it again. Calling it
-   *  one-time sends the user rotating a secret they could have looked up. */
   it('claims one-time only for the secret that really is', () => {
     expect(secretReveal({ name: 'd', token: 'def' })!.message).toContain('shown only now');
     const secret = secretReveal({ name: 'd', signing_secret: 'abc' })!;
@@ -303,7 +262,6 @@ describe('secretReveal', () => {
     expect(secret.message).toContain('Accounts');
   });
 
-  /** The ordinary edit. Renaming a hook hands nothing back to reveal. */
   it('reveals nothing when the response carried no secret', () => {
     expect(secretReveal({ name: 'deploys' })).toBeNull();
   });

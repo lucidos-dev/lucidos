@@ -6,20 +6,8 @@ import {
   apiRequest, ensureMobileView, gotoWithRetry, isMobileViewport, shellDeviceId, waitForPaneAtRest, waitForVisibleInput,
 } from './helpers';
 
-// Reads real motion, so it opts out of the calm default (playwright.config.ts).
 test.use({ reducedMotion: 'no-preference' });
 
-// Retro theme parts in a real browser (ADR 0313), on desktop Chromium and
-// mobile WebKit. Every test uses a fixture theme from e2e/themes/, never a
-// shipped theme.
-//
-//   - scanlines paint on the screen fill, under every protected surface;
-//   - the composer caret is a block where the browser draws one, a protected
-//     input keeps the normal caret, and reduced motion stops the blink;
-//   - floating surfaces and step cards take a double frame, and a protected
-//     dialog keeps its solid one;
-//   - theme-effects `reduce` turns the scanlines off and keeps the rest;
-//   - the default theme paints none of it.
 
 const RETRO = 'e2e-retro-phosphor';
 const here = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +15,6 @@ const fixture = readFileSync(resolve(here, 'themes', 'retro-phosphor.json'), 'ut
 const SCANLINES = '--part-screen-background-image';
 const GREEN = 'rgb(51, 255, 51)';
 
-/** The shell has booted: the splash is gone and the composer is on screen. */
 async function ready(page: Page) {
   await expect(page.locator('.boot-splash')).toHaveCount(0, { timeout: 30_000 });
   return waitForVisibleInput(page);
@@ -52,15 +39,10 @@ async function waitForScanlines(page: Page, present: boolean): Promise<void> {
   )).toEqual(present ? expect.stringMatching(/\S/) : '');
 }
 
-/** The screen fills that carry the scanlines in this layout. */
 function screens(page: Page): string[] {
   return isMobileViewport(page) ? ['.app-shell', '.mobile-swipe-pane'] : ['.app-shell'];
 }
 
-/** Protected cards and a floating surface, placed where real ones render: the
- *  content pane body, as the inline forms and the Changes panel are, or the
- *  thread pane beside the composer. The opaque card is a bare filled box, so
- *  a pixel check tells whether anything paints over it. */
 async function injectCards(page: Page, where: 'content' | 'thread' = 'content'): Promise<void> {
   await ready(page);
   if (where === 'content') {
@@ -129,15 +111,11 @@ test.describe('retro theme parts', () => {
           hit: hit === null ? 'nothing' : hit === el || el.contains(hit) ? 'the card' : hit.outerHTML.slice(0, 120),
         };
       });
-      // Under the screen fill's background, so it paints above the lines.
       expect(facts.onScreen, `${card} sits inside a screen fill`).toBe(true);
       expect(facts.image, `${card} paints no scanlines of its own`).toBe('none');
       expect(facts.hit, `${card} takes its own pointer events`).toBe('the card');
     }
 
-    // The proof of order: an opaque protected card looks the same with the
-    // scanlines on and off, while the bare gap beside it changes. Each clip
-    // stays 2px inside its box, clear of edges that blend at 3x.
     await page.locator('#rt-opaque').evaluate(el => el.scrollIntoView({ block: 'center' }));
     const inside = async (selector: string) => {
       const box = await page.locator(selector).boundingBox();
@@ -164,8 +142,6 @@ test.describe('retro theme parts', () => {
 
     const drawsShape = await page.evaluate(() => CSS.supports('caret-shape', 'block'));
     expect(drawsShape, 'Chromium draws caret-shape; WebKit does not yet').toBe(browserName === 'chromium');
-    // WebKit gets the drawn caret instead (ADR 0317, theme-caret-fallback-all.spec.ts),
-    // which hides the native one.
     await expect.poll(() => composer.evaluate(el => getComputedStyle(el).caretColor))
       .toBe(drawsShape ? GREEN : 'rgba(0, 0, 0, 0)');
     if (drawsShape) {
@@ -222,7 +198,6 @@ test.describe('retro theme parts', () => {
   test('a screenshot of the phosphor theme', async ({ page }, testInfo) => {
     await setPreference(page, 'theme', RETRO);
     await setPreference(page, 'theme-effects', 'full');
-    // A still caret, so the screenshot always shows it.
     await setPreference(page, 'motion', 'reduce');
     await waitForScanlines(page, true);
     await injectCards(page, 'thread');

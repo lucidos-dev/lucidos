@@ -10,14 +10,7 @@ import {
 } from './helpers';
 import { DASHBOARD_RAIL_SHOWN_KEY } from '../src/store/dashboardRailKeys';
 
-// Desktop-only thread-title layout tests — they depend on `page.setViewportSize()`
-// actually changing the rendered layout, which mobile-emulated projects (mobile,
-// mobile-webkit) ignore because they pin the iPhone viewport via `isMobile: true`.
-// Living in a `-desktop.spec.ts` file excludes them from those projects
-// (`testIgnore: /-desktop\.spec\.ts$/`). The rename tests that pass under mobile
-// emulation stay in thread-title.spec.ts.
 
-/** True if the visible desktop title is rendered on a single line. */
 function isTitleOneLine(page: import('@playwright/test').Page) {
   return page.evaluate(() => {
     const el = Array.from(document.querySelectorAll('.thread-view-header .thread-title'))
@@ -28,12 +21,6 @@ function isTitleOneLine(page: import('@playwright/test').Page) {
   });
 }
 
-/** How the visible desktop title truncates: whether its text overflows
- *  its OWN box (the precondition for text-overflow to fire at all) and what
- *  `text-overflow` computes to. A hard clip reads as `overflows: false` no
- *  matter how much title is missing, because the box was sized to the text and
- *  an ancestor did the cutting. The truncating box is the inner text span,
- *  whose corners must stay square so the clip never shaves the first glyph. */
 function titleTruncation(page: import('@playwright/test').Page) {
   return page.evaluate(() => {
     const el = Array.from(document.querySelectorAll('.thread-view-header .thread-title-text'))
@@ -44,7 +31,6 @@ function titleTruncation(page: import('@playwright/test').Page) {
       textOverflow: getComputedStyle(el).textOverflow,
       clipRadius: getComputedStyle(el).borderTopLeftRadius,
       visibleWidth: el.clientWidth,
-      // The row itself must never overflow: the title shrinks, it doesn't push.
       headerOverflow: header.scrollWidth - header.clientWidth,
     };
   });
@@ -56,8 +42,6 @@ test.describe('Thread title: desktop resize', () => {
   });
 
   test('title field hugs its text so the action icons sit beside it (no premature wrap)', async ({ page }) => {
-    // The title hugs its text on one line. So the pin sits right beside it,
-    // neither pushed to the row's far edge nor wrapped early.
     await page.setViewportSize({ width: 1600, height: 800 });
     await navigateToApp(page);
 
@@ -89,27 +73,17 @@ test.describe('Thread title: desktop resize', () => {
       };
     });
 
-    // One line, not wrapped.
     expect(m.displayHeight, 'title stays on one line at 1600px').toBeLessThan(m.lineHeight * 1.8);
-    // Full title shown — not clipped (no horizontal overflow of its own box).
     expect(m.displayScrollWidth, 'full title shown, not clipped')
       .toBeLessThanOrEqual(Math.ceil(m.displayWidth) + 1);
-    // Hugs its text — far narrower than the header (doesn't fill the row).
     expect(m.displayWidth, 'title field hugs its text').toBeLessThan(m.headerWidth * 0.6);
-    // Icons sit right beside the title, not at the row's far edge.
     expect(m.actionsLeft - m.displayRight, 'action icons sit just right of the title').toBeLessThan(40);
 
-    // No ellipsis on a title that fits.
     expect((await titleTruncation(page)).overflows, 'a title that fits is not truncated at all')
       .toBe(false);
   });
 
   test('long title stays on one line (truncates) at narrow widths instead of wrapping', async ({ page }) => {
-    // The title is always one line: it hugs a short title and ellipsises a
-    // too-long one at the row's edge, rather than wrapping the header to 2+ lines.
-    // The Canvas and the rail start hidden, so the Conversation is the whole
-    // window, and a narrower window is a narrower pane. Shown, both yield in a
-    // narrow window, and the Conversation grows instead.
     await page.addInitScript((railShownKey) => {
       localStorage.setItem('lucidos-split-ratio', '1');
       localStorage.setItem(railShownKey, 'false');
@@ -122,7 +96,6 @@ test.describe('Thread title: desktop resize', () => {
     await waitForResponse(page);
     await waitForThreadTitle(page);
 
-    // Longer than an 820px Conversation, the narrowest desktop pane on its own.
     const longTitle = 'A deliberately long thread title that will not fit a narrow desktop pane on one line, '
       + 'so the header has to truncate it with an ellipsis';
     await renameThreadViaMenu(page, longTitle);
@@ -134,16 +107,10 @@ test.describe('Thread title: desktop resize', () => {
 
     expect(await isTitleOneLine(page), 'one line at 1600px').toBe(true);
 
-    // Narrow the pane (stay >768px to keep the desktop layout). The long title no
-    // longer fits — it must truncate to one line, not wrap the header taller.
     await page.setViewportSize({ width: 820, height: 800 });
     await page.waitForTimeout(150);
     expect(await isTitleOneLine(page), 'still one line (truncated, not wrapped) at 820px').toBe(true);
 
-    // Regression: the overflowing title was hard-cut mid-word with no ellipsis.
-    // Its box was sized to its text, so the text never overflowed its OWN box,
-    // and text-overflow only fires on self-overflow. So the text must overflow
-    // the title's box, AND that box must be the one truncating.
     const narrow = await titleTruncation(page);
     expect(narrow.overflows, 'the title overflows its own box, so text-overflow applies').toBe(true);
     expect(narrow.textOverflow, 'the overflow renders as an ellipsis, not a hard clip').toBe('ellipsis');
@@ -151,12 +118,6 @@ test.describe('Thread title: desktop resize', () => {
     expect(narrow.headerOverflow, 'the title shrinks rather than pushing the row wider')
       .toBeLessThanOrEqual(1);
 
-    // Widen again: still one line, and more of the title is visible. Asserted as
-    // a width recovery rather than "no longer truncated" on purpose: whether an
-    // 135-char title fits the thread pane at a 1600px viewport depends on the
-    // font, so a no-ellipsis assertion here would be a coin-flip. The
-    // fits-with-no-ellipsis case is covered by the medium-title test above,
-    // which pins the title at under 60% of the row.
     await page.setViewportSize({ width: 1600, height: 800 });
     await page.waitForTimeout(150);
     expect(await isTitleOneLine(page), 'one line again at 1600px').toBe(true);
@@ -184,8 +145,6 @@ test.describe('Thread title: desktop resize', () => {
   });
 
   test('the pin centres on the title line', async ({ page }) => {
-    // The row aligns to the top. On desktop's one-line title the pin must land
-    // exactly where centring did, so it reads level with the text.
     await page.setViewportSize({ width: 1600, height: 800 });
     await navigateToApp(page);
 

@@ -1,12 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { createSwLivenessProbe, SW_PROBE_TIMEOUT_MS, SW_RECOVERY_COOLDOWN_MS } from './swLivenessProbe';
 
-/** The probe exists for Chrome's wedged service worker, which answers no
- *  message at all. Its repair unregisters the worker and resubscribes push, and
- *  it toasts "Notifications repaired". So a probe that misreads a healthy worker
- *  costs the user a push endpoint and a toast that makes no sense. An iOS PWA
- *  hit exactly that on resume: the page froze mid-probe, and on wake the
- *  overdue timeout beat the queued pong. */
 
 function setVisibility(state: DocumentVisibilityState) {
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
@@ -62,7 +56,6 @@ describe('createSwLivenessProbe', () => {
   });
 
   it('spares a worker that misses the first ping and answers the second', async () => {
-    // A worker cold-starting after an iOS wake can miss one window.
     const p = probe();
     const done = p.check();
     await vi.advanceTimersByTimeAsync(SW_PROBE_TIMEOUT_MS);
@@ -74,7 +67,6 @@ describe('createSwLivenessProbe', () => {
   });
 
   it('reads a probe the page was hidden for as no evidence', async () => {
-    // The iOS freeze: hidden mid-probe, timer overdue on wake, pong still queued.
     const p = probe();
     const done = p.check();
     setVisibility('hidden');
@@ -136,4 +128,17 @@ describe('createSwLivenessProbe', () => {
     expect(recover).not.toHaveBeenCalled();
     expect(onRecovered).not.toHaveBeenCalled();
   });
+});
+
+it('records worker restarts without adding a ping', async () => {
+  const states: number[] = [];
+  const ping = vi.fn(() => true);
+  const p = createSwLivenessProbe({ ping, recover, onRecovered, onState: state => states.push(state) });
+  const done = p.check();
+  p.notePong(10);
+  await done;
+  p.notePong(10);
+  p.notePong(11);
+  expect(states).toEqual([0, 1, 1, 2]);
+  expect(ping).toHaveBeenCalledTimes(1);
 });

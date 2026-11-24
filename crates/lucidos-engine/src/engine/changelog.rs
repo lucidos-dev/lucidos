@@ -76,7 +76,7 @@ const PUBLISHED_FAILURE_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChangelogRelease {
     /// The version with no leading `v`, e.g. `0.26.3`. Compared against
-    /// [`crate::LUCIDOS_RELEASE`] client-side to mark the running release.
+    /// the engine build identity's release client-side to mark the running release.
     pub version: String,
     /// The release date as written in the heading, or `None` when the heading
     /// carries only a version.
@@ -96,7 +96,7 @@ pub async fn changelog_releases() -> Vec<ChangelogRelease> {
     let baked = parse_changelog(CHANGELOG_MD);
     let checkout = checkout_changelog().map(|src| parse_changelog(&src));
     let published = published_releases().await;
-    select_releases(published, checkout, baked, crate::LUCIDOS_RELEASE)
+    select_releases(published, checkout, baked, crate::build_identity().release)
 }
 
 /// The first candidate that still knows `running`, else `baked`.
@@ -206,19 +206,19 @@ async fn fetch_published_changelog() -> Option<String> {
     {
         Ok(client) => client,
         Err(e) => {
-            crate::log!("[Changelog] could not build the HTTP client: {e}");
+            crate::log_legacy!("[Changelog] could not build the HTTP client: {e}");
             return None;
         }
     };
     let mut response = match client.get(PUBLISHED_CHANGELOG_URL).send().await {
         Ok(response) => response,
         Err(e) => {
-            crate::log!("[Changelog] {PUBLISHED_CHANGELOG_URL} unreachable: {e}");
+            crate::log_legacy!("[Changelog] {PUBLISHED_CHANGELOG_URL} unreachable: {e}");
             return None;
         }
     };
     if !response.status().is_success() {
-        crate::log!(
+        crate::log_legacy!(
             "[Changelog] {PUBLISHED_CHANGELOG_URL} answered {}",
             response.status()
         );
@@ -229,7 +229,9 @@ async fn fetch_published_changelog() -> Option<String> {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if body.len() + chunk.len() > PUBLISHED_MAX_BYTES {
-                    crate::log!("[Changelog] published changelog is over the size cap; ignored");
+                    crate::log_legacy!(
+                        "[Changelog] published changelog is over the size cap; ignored"
+                    );
                     return None;
                 }
                 body.extend_from_slice(&chunk);
@@ -238,7 +240,7 @@ async fn fetch_published_changelog() -> Option<String> {
             // A truncated body still parses, and its newest releases are intact,
             // so nothing downstream would notice the missing tail. Refuse here.
             Err(e) => {
-                crate::log!("[Changelog] download failed part-way through: {e}");
+                crate::log_legacy!("[Changelog] download failed part-way through: {e}");
                 return None;
             }
         }
@@ -246,7 +248,7 @@ async fn fetch_published_changelog() -> Option<String> {
     match String::from_utf8(body) {
         Ok(text) => Some(text),
         Err(_) => {
-            crate::log!("[Changelog] published changelog is not UTF-8; ignored");
+            crate::log_legacy!("[Changelog] published changelog is not UTF-8; ignored");
             None
         }
     }
@@ -347,6 +349,19 @@ mod tests {
 
     fn versions(releases: &[ChangelogRelease]) -> Vec<&str> {
         releases.iter().map(|r| r.version.as_str()).collect()
+    }
+
+    #[test]
+    fn an_rc_uses_a_changelog_that_knows_its_full_version() {
+        let checkout = parse_changelog("## v9.2.0-rc.2\n\n- Local test build\n");
+        let chosen = select_releases(
+            Some(vec![release("9.1.0")]),
+            Some(checkout),
+            vec![release("9.2.0-rc.1")],
+            "9.2.0-rc.2",
+        );
+        assert_eq!(versions(&chosen), ["9.2.0-rc.2"]);
+        assert_eq!(chosen[0].notes.trim(), "- Local test build");
     }
 
     #[test]
@@ -478,7 +493,7 @@ mod tests {
     #[test]
     fn the_newest_baked_release_is_the_one_this_binary_reports_running() {
         let releases = parse_changelog(CHANGELOG_MD);
-        assert_eq!(releases[0].version, crate::LUCIDOS_RELEASE);
+        assert_eq!(releases[0].version, crate::build_identity().release);
     }
 
     #[test]

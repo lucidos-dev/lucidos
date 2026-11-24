@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-/** A face flip changes every member's width, so the fold re-measures and never
- *  decides against a width the old face set remembered. jsdom lays nothing out,
- *  so a stub gives each member a width that depends on the row's face set. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

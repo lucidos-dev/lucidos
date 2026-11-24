@@ -13,8 +13,6 @@ import {
 
 describe('lanUrl', () => {
   it('hides the URL under the loopback bind (the packaged default)', () => {
-    // A loopback-bound gateway cannot serve a LAN address — advertising the
-    // URL anyway was the original Mobile Access bug (a dead, copyable URL).
     expect(lanUrl('loopback', '192.168.1.20', 5252)).toBeNull();
     expect(lanUrl('', '192.168.1.20', 5252)).toBeNull();
     expect(lanUrl('  loopback  ', '192.168.1.20', 5252)).toBeNull();
@@ -29,20 +27,14 @@ describe('lanUrl', () => {
   });
 
   it('shows the bound IP for a specific-IP bind, ignoring the detected LAN IP', () => {
-    // A specific-IP bind serves exactly that IP (plus loopback); the detected
-    // en0 address may be a different, unreachable interface.
     expect(lanUrl('100.64.0.7', '192.168.1.20', 5252)).toBe('http://100.64.0.7:5252');
   });
 });
 
 describe('tailnetHttpUrl', () => {
   it('stays silent when the gateway does not listen on the tailnet address', () => {
-    // Being on a tailnet says nothing about the gateway's bind. Loopback is the
-    // packaged DEFAULT, so this is the common case, and printing the URL anyway
-    // would repeat the dead-URL bug lanUrl exists to prevent.
     expect(tailnetHttpUrl('loopback', '100.64.0.7', 5252)).toBeNull();
     expect(tailnetHttpUrl('', '100.64.0.7', 5252)).toBeNull();
-    // Bound to some OTHER specific address: that one is served, not this one.
     expect(tailnetHttpUrl('192.168.1.20', '100.64.0.7', 5252)).toBeNull();
   });
 
@@ -59,10 +51,6 @@ describe('tailnetHttpUrl', () => {
 
 describe('lanUrlAvoidingTailnet', () => {
   it('never prints the same address as both Local network and Tailscale', () => {
-    // The user's own configuration: the gateway pinned to the tailnet address.
-    // lanUrl returns whatever specific address is bound, so derived
-    // separately this rendered the tailnet URL twice, once mislabelled "Local
-    // network / same Wi-Fi".
     expect(lanUrlAvoidingTailnet('100.64.0.7', '192.168.1.20', '100.64.0.7', 5252))
       .toBeNull();
   });
@@ -85,8 +73,6 @@ describe('lanUrlAvoidingTailnet', () => {
 
 describe('workspaceUrlAt', () => {
   it('lands on the workspace, not the gateway root', () => {
-    // The root 307-redirects to the sole workspace or to the picker, so on a
-    // multi-workspace install it is the wrong address to hand out.
     expect(workspaceUrlAt('http://localhost:5252', '/dev/')).toBe('http://localhost:5252/dev/');
     expect(workspaceUrlAt('https://mymac.tailnet-name.ts.net', '/dev/'))
       .toBe('https://mymac.tailnet-name.ts.net/dev/');
@@ -104,7 +90,6 @@ describe('workspaceUrlAt', () => {
 
 describe('originAtHost', () => {
   it('keeps the scheme, so a TLS gateway is not addressed over http', () => {
-    // The dev gateway speaks TLS on 5251. A composed `http://` would be dead.
     expect(originAtHost({ protocol: 'https:', port: '5251' }, '100.64.0.7'))
       .toBe('https://100.64.0.7:5251');
     expect(originAtHost({ protocol: 'http:', port: '5252' }, '100.64.0.7'))
@@ -126,8 +111,6 @@ describe('servingBind', () => {
   });
 
   it('takes the engine bind on a direct engine port', () => {
-    // The bug this replaces: reading `gateway_bind` here reports a direct-port
-    // page's reachability from a bind that governs a different process.
     expect(servingBind(config, false)).toBe('100.64.0.7');
   });
 
@@ -138,8 +121,6 @@ describe('servingBind', () => {
 
 describe('tailnetServesThisReader', () => {
   it('believes the address it was served on over the stored bind', () => {
-    // A bind change takes effect only on restart, so the config can disagree
-    // with the live socket. Arriving here IS the proof.
     expect(tailnetServesThisReader('loopback', '100.64.0.7', '100.64.0.7')).toBe(true);
     expect(tailnetServesThisReader('loopback', '100.64.0.7', 'mymac.tailnet-name.ts.net'))
       .toBe(true);
@@ -169,8 +150,6 @@ describe('tailnetConnectRows', () => {
   };
 
   it('prints the verified HTTPS URL verbatim, and nothing else', () => {
-    // The engine sets it only after a request to it came back from that same
-    // engine, so rebuilding it here would let the two disagree.
     const rows = tailnetConnectRows({
       ...base,
       workspaceServeUrl: 'https://mymac.tailnet-name.ts.net/dev/',
@@ -181,9 +160,6 @@ describe('tailnetConnectRows', () => {
   });
 
   it('publishes the HTTPS URL under the loopback default', () => {
-    // `serve` proxies from the machine to `127.0.0.1`, so it is unaffected by
-    // the bind that kills every other row here. Bind-gating it would suppress
-    // the best address on the page over an unrelated setting.
     const rows = tailnetConnectRows({
       ...base,
       bind: 'loopback',
@@ -193,8 +169,6 @@ describe('tailnetConnectRows', () => {
   });
 
   it('prefers the MagicDNS name for the plain-HTTP address', () => {
-    // It resolves to the same tailnet address for any device on the tailnet,
-    // and unlike `100.64.0.7` a person can retype it.
     const rows = tailnetConnectRows(base);
     expect(rows.map((r) => r.url)).toEqual(['http://mymac.tailnet-name.ts.net:5252/dev/']);
   });
@@ -205,7 +179,6 @@ describe('tailnetConnectRows', () => {
   });
 
   it('prints nothing when nothing is listening on the tailnet address', () => {
-    // The original bug this page was built around: a dead, copyable URL.
     expect(tailnetConnectRows({ ...base, bind: 'loopback' })).toEqual([]);
   });
 
@@ -219,8 +192,6 @@ describe('tailnetConnectRows', () => {
   });
 
   it('composes no HTTPS address that nothing verified', () => {
-    // An https reader's port speaks TLS only on its own host. Swapping in the
-    // tailnet name gives a URL no certificate is known to serve.
     const rows = tailnetConnectRows({
       ...base,
       here: { protocol: 'https:', hostname: 'localhost', port: '5251' },
@@ -235,7 +206,6 @@ describe('tailnetConnectRows', () => {
   });
 
   it('never contradicts its own URL', () => {
-    // The invariant behind the case above, over every shape this returns.
     const cases = [
       base,
       { ...base, here: { protocol: 'https:', hostname: 'localhost', port: '5251' } },
@@ -253,14 +223,8 @@ describe('tailnetConnectRows', () => {
 
 describe('tailnetAddressIsServed', () => {
   it('does NOT take a MagicDNS arrival as evidence', () => {
-    // The narrower question, and the regression this split exists for. Arriving
-    // over `serve` proves 443 is fronted, and nothing about the gateway port on
-    // the tailnet address. Borrowing the row's predicate told a phone on the
-    // recommended setup that the plain-HTTP address was live.
     expect(tailnetAddressIsServed('loopback', '100.64.0.7', 'mymac.tailnet-name.ts.net'))
       .toBe(false);
-    // The wider question answers the same reader yes, because the URL it prints
-    // is the address that reader is already on.
     expect(tailnetServesThisReader('loopback', '100.64.0.7', 'mymac.tailnet-name.ts.net'))
       .toBe(true);
   });

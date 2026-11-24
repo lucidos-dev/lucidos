@@ -36,9 +36,6 @@ describe('questionDividerResolution', () => {
     expect(questionDividerResolution(ex)).toBe('canceled');
   });
 
-  // A follow-up that could not be the answer resolves the question, which is
-  // what releases the parked agent. Its next turn belongs to the follow-up's
-  // own exchange, so this divider has no body coming either.
   it('reports superseded when a follow-up replaced the question', () => {
     const ex = makeExchange(askedEvent, [
       step(1, {
@@ -51,8 +48,6 @@ describe('questionDividerResolution', () => {
   });
 
   it('holds even when an empty CodingAgentPromptSent placeholder trails the answer', () => {
-    // Some cancel paths land the cancel-stamp alongside a stray empty marker;
-    // the divider gate must hold regardless of whether the marker shows up.
     const ex = makeExchange(askedEvent, [
       step(1, {
         type: 'UserQuestionAnswered',
@@ -106,10 +101,6 @@ describe('questionDividerResolution', () => {
   });
 });
 
-/** The suppression itself. It is `questionDividerResolution` plus one carve-out:
- *  a body carrying what Lucidos said out loud is the transcript of a call, and
- *  nothing else in the app draws one. The caller's own words are not looked
- *  for, since those open an exchange of their own. */
 describe('dividerBodyIsSuppressed', () => {
   const canceled = () =>
     makeExchange(askedEvent, [
@@ -131,9 +122,6 @@ describe('dividerBodyIsSuppressed', () => {
     expect(dividerBodyIsSuppressed(canceled(), events)).toBe(false);
   });
 
-  // The carve-out is a SPOKEN row, not renderable content. A cancel step and a
-  // step row land in every canceled divider, so the wider test would un-hide
-  // the body on every typed thread.
   it('still hides a body whose only content is an ordinary step', () => {
     const events: ResponseEvent[] = [
       { type: 'step', description: 'Ran a query', outcome: 'success' },
@@ -153,13 +141,9 @@ describe('ChatExchange wires the suppression into showResponsePanel', () => {
   });
 
   it('showResponsePanel includes !isUnansweredDivider', () => {
-    // ChatExchange is now `memo(ChatExchangeImpl, …)`; the body lives in the
-    // `function ChatExchangeImpl(...) { … }` declaration above the export.
     const fnMatch = source.match(/function ChatExchangeImpl[\s\S]*?^\}/m);
     expect(fnMatch, 'ChatExchangeImpl function not found').not.toBeNull();
     const fn = fnMatch![0];
-    // The events list, not the exchange alone: the carve-out is decided by
-    // what the body would DRAW, and only the rendered list knows that.
     expect(fn).toMatch(
       /isUnansweredDivider\s*=\s*dividerBodyIsSuppressed\(exchange,\s*events\)/,
     );

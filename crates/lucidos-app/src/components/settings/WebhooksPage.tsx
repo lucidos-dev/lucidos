@@ -43,23 +43,15 @@ import {
   type SignatureDraft,
 } from './WebhookSignatureFields';
 
-/** The event a webhook emits, as the user must type it. */
 const EVENT_TYPE_HINT =
   'PascalCase, past tense, e.g. DeployFinished. Pinned: a caller cannot change it, so one endpoint can only ever fire this event.';
 
-/** Show whatever secret a response handed back, if it handed one back.
- *
- *  It never dismisses itself, and a tap on it copies the token (its lone action
- *  is the card tap). A bearer token is the one the user cannot get again: only
- *  its digest is stored. */
 export function revealSecret(result: WebhookWithToken) {
   const reveal = secretReveal(result);
   if (!reveal) {
     showToast(`Saved ${result.name}`, 'success');
     return;
   }
-  // The Copy action is what keeps it up: an action toast waits to be answered.
-  // A delay of 0 would mean "leave at once", not "never".
   showToast(`${reveal.message} ${reveal.value}`, 'success', {
     action: {
       label: reveal.copyLabel,
@@ -72,10 +64,6 @@ function failed(e: unknown) {
   showToast(e instanceof Error ? e.message : 'That did not work', 'error');
 }
 
-/** The form for a new webhook.
- *
- *  Signing is optional and off until asked for, so the common hook is still
- *  two fields. Asking for it opens the editor an existing row also uses. */
 function AddWebhookForm({ onCreated }: { onCreated: () => void }) {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState('');
@@ -118,8 +106,6 @@ function AddWebhookForm({ onCreated }: { onCreated: () => void }) {
     }
   }
 
-  /** Enter saves from the two plain fields only. Inside the signature section
-   *  it would submit a half-filled config from under a dropdown. */
   function onFieldKey(e: KeyboardEvent) {
     if (e.key === 'Enter') void save();
     if (e.key === 'Escape') reset();
@@ -158,8 +144,6 @@ function AddWebhookForm({ onCreated }: { onCreated: () => void }) {
             </button>
           </>
         ) : (
-          // Seeds a credential name from the hook's own name, so the common
-          // case is one fewer field to fill in.
           <button class="accent-link" onClick={() => setSignature(newSignatureDraft(name))}>
             This sender signs its deliveries
           </button>
@@ -180,21 +164,10 @@ function AddWebhookForm({ onCreated }: { onCreated: () => void }) {
   );
 }
 
-/** How a webhook authenticates a delivery, in one phrase.
- *
- *  A signed hook has no token. `create` mints one only for an unsigned hook.
- *  An update that adds a signature drops any token the hook had, because
- *  `verify` requires every verifier a row carries. */
 export function verifierLabel(hook: Pick<Webhook, 'signed'>): string {
   return hook.signed ? 'signature' : 'token';
 }
 
-/** What a signed hook verifies with, as one compact row of fields.
- *
- *  The credential links into Settings > Accounts, scrolled to its own row. A
- *  name the store cannot resolve links nowhere and says so. That state is
- *  `DeliveryRefusal::CredentialMissing`, and it is the failure a user most
- *  needs to see: the hook refuses every delivery until it is fixed. */
 function SignatureRow({ hmac }: { hmac: NonNullable<Webhook['hmac']> }) {
   const link = resolveCredential(hmac, credentials.value);
 
@@ -207,13 +180,8 @@ function SignatureRow({ hmac }: { hmac: NonNullable<Webhook['hmac']> }) {
   }
   return (
     <div class="list-row-details">
-      {/* One flex item, not three: `.list-row-details` blockifies every child,
-          so an unwrapped link would strand the word before it. */}
       <span>
         Signed with{' '}
-        {/* Not a link until the credentials are loaded, since only then is
-            there an id to land on. The name still reads, so the row does not
-            reflow when the list arrives. */}
         {link.state === 'found' ? (
           <button class="accent-link" onClick={() => openCredentialSettings(link.id)}>
             {link.name}
@@ -228,11 +196,6 @@ function SignatureRow({ hmac }: { hmac: NonNullable<Webhook['hmac']> }) {
   );
 }
 
-/** Ask before the endpoint goes.
- *
- *  The delivery path carries the hook's id, so a replacement is a different
- *  URL rather than this one restored. Every sender then needs repointing,
- *  which is work outside this workspace. */
 export function confirmWebhookDeletion(hook: Pick<Webhook, 'name'>): Promise<boolean> {
   return showConfirm(
     `Delete the webhook "${hook.name}"?\n\n` +
@@ -243,14 +206,10 @@ export function confirmWebhookDeletion(hook: Pick<Webhook, 'name'>): Promise<boo
   );
 }
 
-/** One webhook. With no `hook`, inside a `SkeletonProvider`, it draws itself
- *  as the loading placeholder. */
 function WebhookRow(
   { hook, outage = null, refusal = null, now = new Date(0), onChanged = () => {} }: {
     hook?: Webhook;
     outage?: WebhookIngressOutage | null;
-    /** This hook's own standing refusal, or null. Unlike `outage`, which is
-     *  the shared path and is drawn on every enabled row. */
     refusal?: WebhookRefusal | null;
     now?: Date;
     onChanged?: () => void;
@@ -277,9 +236,6 @@ function WebhookRow(
     if (!hook || !editing) return;
     const hmac = draftToHmac(editing);
     if (!hmac) return;
-    // Signing an unsigned hook drops its bearer token, because a hook carries
-    // exactly one verifier. Only the digest was stored, so whatever presents
-    // that token stops working and it cannot be read back. Say so first.
     if (!hook.signed) {
       const go = await showConfirm(
         `${hook.name} currently authenticates with a bearer token. Signing it ` +
@@ -301,8 +257,6 @@ function WebhookRow(
     });
   }
 
-  /** Turning a signed hook unsigned mints a bearer token, shown once. A hook
-   *  always carries exactly one verifier, so it cannot just lose this one. */
   async function removeSignature() {
     if (!hook) return;
     await change(async () => {
@@ -336,8 +290,6 @@ function WebhookRow(
         </SkText>
         {delivery && <div class="list-row-details">{delivery}</div>}
         {lastRefusal && <div class="list-row-details">{lastRefusal}</div>}
-        {/* The engine's own verdict on this hook, which the line above cannot
-            give: one refusal is a fact, and a run of them is an outage. */}
         {refusal && (
           <div class="list-row-details webhook-refusal-warning">
             {webhookRefusalRowLine(refusal)}
@@ -379,8 +331,6 @@ function WebhookRow(
         )}
       </div>
       <div class="list-row-actions">
-        {/* Reopens what the hook stores, or starts a fresh draft for an
-            unsigned one. */}
         {hook && !editing && (
           <button
             class="action-btn"
@@ -424,8 +374,6 @@ export function WebhooksPage() {
   const showLoading = useDelayedLoading(loadable);
 
   function reload(): Promise<void> {
-    // A refetch keeps the visible list through the round-trip and swaps when
-    // fresh rows land, so an SSE-driven re-read never flashes a loader.
     setLoadable(loadingIfFresh);
     return fetchWebhooks()
       .then((rows) => setLoadable({ status: 'loaded', data: rows }))
@@ -434,29 +382,15 @@ export function WebhooksPage() {
 
   useEffect(() => { void reload(); }, []);
   usePanelRefresh('webhooks', reload);
-  // A signed hook names a credential, and this page says whether that
-  // credential still exists. The signal is kept fresh by the `Credential*` SSE
-  // arm, so reading it IS the subscription. This only covers a cold open.
   useEffect(() => {
     if (credentials.value.status === 'not-loaded') void loadCredentials();
   }, []);
-  // A hook created, disabled or deleted from the CLI, from a chat thread or on
-  // another device repaints this page with no reload (ADR 0118). Never paused:
-  // the row buttons disable themselves while their own call is in flight, so
-  // there is no control a reply can land under.
   useVersionedRefresh(webhooksVersion.value, false, reload);
 
   const hooks = loadable.status === 'loaded' ? loadable.data : [];
-  // One clock for the whole page. Read per row, two rows drawn either side of a
-  // second disagreed, and every elapsed-time label froze after the first paint.
   const tick = useCoarseClock();
   const now = new Date(tick);
-  // The standing outage of the path every hook shares, read through the same
-  // selector the app bar reads. Drawn on every enabled row rather than on the
-  // hook the probe happened to target: what failed sits in front of all of them.
   const outage = currentIngressOutage(tick);
-  // Per hook, unlike the outage above: the engine judges each hook's own
-  // record, so fixing one says nothing about another.
   const refusals = new Map(
     currentWebhookRefusals(tick).map((refusal) => [refusal.webhook_id, refusal]),
   );
@@ -489,7 +423,6 @@ export function WebhooksPage() {
           </div>
         )}
       </LoadingFade>
-      {/* Outside the fade, so a reload never unmounts a half-typed webhook. */}
       <div class="list-rows">
         <AddWebhookForm onCreated={reload} />
       </div>

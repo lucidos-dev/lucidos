@@ -3,8 +3,6 @@ import { activeInlineForm, panelOverlay } from '../store';
 import { ApiError } from '../../api/client/_core';
 import type { PluginUninstallRequest } from '../types';
 
-// Spy on the nav-stack writes: a confirmed uninstall mutates the panel in
-// place, so it must REPLACE the entry it already owns, never push a second one.
 const pushNavState = vi.fn();
 const replaceNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState, replaceNavState }));
@@ -12,10 +10,6 @@ vi.mock('./navigation', () => ({ pushNavState, replaceNavState }));
 const revealContentPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane }));
 
-// Only the three endpoints this module calls are stubbed; the rest of the
-// barrel stays real so `ApiError` is the same class the 404/410 guard checks
-// with `instanceof`. Arrow wrappers because `vi.mock` is hoisted above the
-// `const`s and a bare reference would read them before initialization.
 const confirmPluginUninstall = vi.fn();
 const cancelPluginUninstall = vi.fn();
 const stagePluginUninstall = vi.fn();
@@ -55,8 +49,6 @@ const request: PluginUninstallRequest = {
 
 const engineResult = {
   summary: 'Removed Habit Tracker',
-  // Deliberately NOT `request.files_present`: the receipt must show what the
-  // engine actually deleted, which can differ from what existed at prepare time.
   files_deleted: ['apps/habit-tracker/manifest.json'],
   files_missing: ['knowhow/habits.md', 'apps/habit-tracker/index.html'],
 };
@@ -86,8 +78,6 @@ describe('markPluginUninstalled', () => {
     expect(receipt.removed?.files_deleted).toEqual(engineResult.files_deleted);
     expect(receipt.removed?.files_missing).toEqual(engineResult.files_missing);
     expect(receipt.removed?.at).toBeTruthy();
-    // The request rides along so the receipt still names the plugin after a
-    // remount (a history round trip re-seeds the panel from the form alone).
     expect(receipt.request.plugin_name).toBe('Habit Tracker');
   });
 
@@ -127,8 +117,6 @@ describe('markPluginUninstalled', () => {
 
   it('no-ops when a different uninstall panel took over mid-uninstall', () => {
     const form = openPending('u-1');
-    // A second staged uninstall is also a `plugin-uninstall` form, so a type
-    // check would let this one's receipt overwrite it. The guard is identity.
     const other = openPending('u-2');
     replaceNavState.mockClear();
 
@@ -161,7 +149,6 @@ describe('confirmPluginUninstallAction', () => {
     expect(receipt?.type).toBe('plugin-uninstall');
     if (receipt?.type !== 'plugin-uninstall') return;
     expect(receipt.removed).toBeTruthy();
-    // The receipt says everything the toast would, so the toast is redundant.
     expect(showToast).not.toHaveBeenCalled();
     expect(refreshPluginCatalogAfterMutation).toHaveBeenCalled();
   });
@@ -185,8 +172,6 @@ describe('confirmPluginUninstallAction', () => {
 
     await confirmPluginUninstallAction(form);
 
-    // The engine pops the pending entry up-front, so a failed confirm has no
-    // second chance; leaving the panel open would wedge the user.
     expect(panelOverlay.value).toBeNull();
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Uninstall failed'), 'error');
   });

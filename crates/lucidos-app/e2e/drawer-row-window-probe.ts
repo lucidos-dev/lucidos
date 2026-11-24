@@ -1,23 +1,11 @@
-/**
- * Shared tools for the drawer's row window specs (`drawer-row-window*.spec.ts`).
- *
- * The probe runs in the page. Every animation frame, it looks for a gap inside
- * the list's viewport, which is a blank flash. It also records the peak number
- * of mounted rows. That runs in a MutationObserver, so a render undone before
- * paint still counts.
- */
 
 import { expect, type Page } from '@playwright/test';
 import { randomUUID } from 'crypto';
 import { psql, seedThreadRow } from './db-helpers';
 import { navigateToApp, openThreadDrawer } from './helpers';
 
-/** Rows seeded into Current: the length the iPhone lagged at. */
 export const CURRENT_ROWS = 400;
 
-/** Mounted rows allowed at once: the viewport plus two viewports either side
- *  holds about 60 to 75 rows on every project, and pinned rows add one or
- *  two. Far under the 400 a full render mounts. */
 export const MOUNTED_ROW_BOUND = 120;
 
 export interface SeededCurrent {
@@ -25,8 +13,6 @@ export interface SeededCurrent {
     titles: string[];
 }
 
-/** Seed `count` Current threads, newest first. Every third title wraps onto a
- *  second line, so rows differ in height and a wrong gap shows. */
 export function seedCurrent(count = CURRENT_ROWS): SeededCurrent {
     const stamp = Date.now();
     const ids: string[] = [];
@@ -47,7 +33,6 @@ export function seedCurrent(count = CURRENT_ROWS): SeededCurrent {
 }
 
 export interface ProbeReport {
-    /** Frames that painted a gap inside the list's viewport. */
     blanks: { gapTop: number; gapBottom: number }[];
     peakRows: number;
 }
@@ -59,10 +44,8 @@ export interface SweepReport {
     peakRows: number;
 }
 
-/** Session flag: a page that loads while it is set starts the probe at once. */
 const PROBE_AUTOSTART_KEY = 'row-window-probe-autostart';
 
-/** The in-page probe. Self-contained, so it can run as an init script too. */
 function installProbe(autostartKey: string): void {
     const w = window as unknown as { __rowWindowProbe?: unknown };
     if (w.__rowWindowProbe) return;
@@ -98,8 +81,6 @@ function installProbe(autostartKey: string): void {
             this.observer?.disconnect();
             this.observer = new MutationObserver(() => { this.peakRows = Math.max(this.peakRows, mountedRows()); });
             this.observer.observe(document.documentElement, { childList: true, subtree: true });
-            // Sampled in the task after each frame, which sees the DOM that
-            // frame painted. A rAF callback runs before the paint instead.
             const tick = () => {
                 if (!this.running) return;
                 setTimeout(() => this.blanks.push(...gapsInView()), 0);
@@ -116,8 +97,6 @@ function installProbe(autostartKey: string): void {
         visibleList,
         async sweep(stepFraction: number) {
             const list = visibleList()!;
-            // A frame takes about 16 ms. One that has not come in 5 s means the
-            // page is not painting, so the sweep names the state and stops.
             const frame = () => new Promise<void>((resolve, reject) => {
                 const stalled = setTimeout(() => reject(new Error(
                     `sweep: no frame in 5 s at scrollTop ${list.scrollTop} of ${max()} (scrollHeight ${list.scrollHeight}, ` +
@@ -143,13 +122,8 @@ function installProbe(autostartKey: string): void {
                 peakRows = Math.max(peakRows, mountedRows());
             };
             const step = list.clientHeight * stepFraction;
-            // A list with no height steps by zero and never reaches its end. A
-            // list the app replaced mid-sweep does the same. Either one hung the
-            // page for the whole test timeout, so the sweep names it instead.
             if (!(step > 0)) throw new Error(`sweep: the list has no height (clientHeight ${list.clientHeight})`);
             const max = () => list.scrollHeight - list.clientHeight;
-            // A sweep down and up takes about 2 * max / step steps. A list that
-            // keeps growing under the sweep would never end it.
             const stepLimit = Math.ceil(max() / step) * 4 + 10;
             const counted = () => {
                 if (++steps > stepLimit) throw new Error(`sweep: over ${stepLimit} steps, the list keeps growing (scrollHeight ${list.scrollHeight})`);
@@ -178,11 +152,9 @@ function installProbe(autostartKey: string): void {
         },
     };
     w.__rowWindowProbe = probe;
-    // A reload under test starts sampling before the app's first paint.
     if (sessionStorage.getItem(autostartKey)) probe.start();
 }
 
-/** Start the probe in the next page load as early as its first paint. */
 export async function autostartProbeOnNextLoad(page: Page): Promise<void> {
     await page.evaluate((key) => sessionStorage.setItem(key, '1'), PROBE_AUTOSTART_KEY);
 }
@@ -195,8 +167,6 @@ type Probe = {
     sweep(stepFraction: number): Promise<SweepReport>;
 };
 
-/** Install the probe in the current page, and in every page this context
- *  loads after it (a reload). */
 export async function installRowWindowProbe(page: Page): Promise<void> {
     await page.context().addInitScript(installProbe, PROBE_AUTOSTART_KEY);
     await page.evaluate(installProbe, PROBE_AUTOSTART_KEY);
@@ -214,13 +184,10 @@ export async function mountedRows(page: Page): Promise<number> {
     return page.evaluate(() => (window as unknown as { __rowWindowProbe: Probe }).__rowWindowProbe.mountedRows());
 }
 
-/** Scroll the list down and back up in steps of `stepFraction` of a viewport.
- *  The report names every row seen at two content offsets. */
 export async function sweepList(page: Page, stepFraction = 0.5): Promise<SweepReport> {
     return page.evaluate((f) => (window as unknown as { __rowWindowProbe: Probe }).__rowWindowProbe.sweep(f), stepFraction);
 }
 
-/** Open the drawer on the seeded list, with the probe installed. */
 export async function openSeededList(page: Page, seeded: SeededCurrent): Promise<void> {
     await navigateToApp(page);
     await openThreadDrawer(page);
@@ -228,8 +195,6 @@ export async function openSeededList(page: Page, seeded: SeededCurrent): Promise
     await installRowWindowProbe(page);
 }
 
-/** Put the list's scroll position at `fraction` of its scroll range, and wait
- *  for the window to settle there. */
 export async function parkListAt(page: Page, fraction: number): Promise<void> {
     await page.evaluate(async (f) => {
         const list = (window as unknown as { __rowWindowProbe: Probe }).__rowWindowProbe.visibleList()!;
@@ -238,8 +203,6 @@ export async function parkListAt(page: Page, fraction: number): Promise<void> {
     }, fraction);
 }
 
-/** The rows whose box lies wholly inside the list's viewport: id and top
- *  edge, relative to the list. */
 export async function visibleRows(page: Page): Promise<{ id: string; top: number }[]> {
     return page.evaluate(() => {
         const list = (window as unknown as { __rowWindowProbe: Probe }).__rowWindowProbe.visibleList()!;

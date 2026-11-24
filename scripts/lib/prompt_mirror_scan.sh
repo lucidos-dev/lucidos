@@ -8,7 +8,7 @@
 #
 # WHY A MIRROR EXISTS AT ALL. Two instruction surfaces reach a coding-agent
 # session unconditionally: the engine system prompt
-# (crates/lucidos-engine/src/engine/agent_session/prompts.rs, system-prompt
+# (crates/lucidos-agents-api/src/engine/agent_session/prompts.rs, system-prompt
 # authority) and the always-loaded set (CLAUDE.md plus the unscoped rules, a
 # user message). `docs/agent-config.md` § Which surface owns a rule splits them
 # by session truth versus repo truth, and the normal case is that a rule lands
@@ -54,7 +54,7 @@
 
 # The two surfaces, relative to the repo root.
 PROMPT_MIRROR_FILES=(
-    "crates/lucidos-engine/src/engine/agent_session/prompts.rs"
+    "crates/lucidos-agents-api/src/engine/agent_session/prompts.rs"
     "CLAUDE.md"
 )
 

@@ -1,14 +1,8 @@
-/**
- * A confirm or a prompt turns visible only once its chunk can draw it, and a
- * caller awaiting it always gets an answer (ADR 0436). `settleConfirm` and
- * `settlePrompt` are the one way each closes.
- */
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   confirmState, promptState, registerAskDialogChunk, settleConfirm, settlePrompt, showConfirm, showPrompt,
 } from '../store';
 
-/** A dialog chunk that lands when the test says. */
 function coldChunk() {
   let finish: (loaded: boolean) => void = () => {};
   let loaded = false;

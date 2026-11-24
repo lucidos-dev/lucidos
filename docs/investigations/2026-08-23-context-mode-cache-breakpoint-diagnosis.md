@@ -97,7 +97,7 @@ It is the newest position the next round leaves alone. The next round rewrites
 what is currently the tail. So the prefix ending one message earlier survives
 byte-identical and reads back. The wire places it structurally, with no
 knowledge of the mode: `apply_cache_control_to_penultimate_message` in
-`crates/lucidos-engine/src/llm/anthropic_wire.rs`.
+`crates/lucidos-core/src/llm/anthropic_wire.rs`.
 
 Two engine tests hold the invariant it rests on, in
 `engine/chat/process/context_release_tests.rs`. One asserts the anchored prefix

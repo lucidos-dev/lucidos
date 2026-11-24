@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The home thread's two entries (ADR 0362): the desktop thread header's Home
- * icon and the Lucidos menu's Home row, which only a phone draws. The Home
- * rail's toggle shares their gate (ADR 0455). No thread
- * list draws Home, so these are the way to it. Every workspace has Home
- * (ADR 0411), and both show once the thread list carries it.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { focusedThreadId, threadMap } from '../../../store/store';

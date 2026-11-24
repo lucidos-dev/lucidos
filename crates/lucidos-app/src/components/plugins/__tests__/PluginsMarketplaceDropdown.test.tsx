@@ -1,14 +1,3 @@
-/**
- * The marketplace filter is a dropdown in the Plugins filter bar, and its last
- * row adds a marketplace.
- *
- * Two things ride on that last row. Adding a marketplace used to be reachable
- * from this panel only while it was EMPTY: the catalog empty state offered the
- * official-marketplace button and a "register your own marketplace" link.
- * Register one and both leave with the empty state, so the second marketplace
- * had to be found under Settings. And the filter itself is worth nothing until
- * a second one exists, so the two belong in one control.
- */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { Dropdown } from '../../shared/Dropdown';
@@ -27,8 +16,6 @@ const TWO = [
   { id: 'mkt-z', name: 'Zulu' },
 ];
 
-/** Find the Dropdown vnode in PluginsView's tree, without invoking any nested
- *  function component (their hooks would throw outside a real render). */
 function findDropdown(node: ComponentChildren): VNode<Record<string, unknown>> | undefined {
   if (node === null || node === undefined || typeof node === 'boolean') return undefined;
   if (typeof node === 'string' || typeof node === 'number') return undefined;
@@ -40,10 +27,8 @@ function findDropdown(node: ComponentChildren): VNode<Record<string, unknown>> |
     return undefined;
   }
   const v = node as VNode<Record<string, unknown>>;
-  // Compared as unknown: the walker's node type is the generic vnode type, which
-  // TS sees as having no overlap with Dropdown's own props signature.
   if ((v.type as unknown) === (Dropdown as unknown)) return v;
-  if (typeof v.type === 'function') return undefined; // do NOT invoke
+  if (typeof v.type === 'function') return undefined;
   return findDropdown(v.props?.children as ComponentChildren);
 }
 
@@ -58,8 +43,6 @@ describe('marketplaceDropdownOptions: what the control offers', () => {
   });
 
   it('still offers Add with one marketplace, and with none', () => {
-    // The redundant filter is the price of keeping the only always-present way
-    // to register a marketplace on screen.
     expect(marketplaceDropdownOptions([{ id: 'mkt-a', name: 'Alpha' }]).map((o) => o.label)).toEqual(
       ['All marketplaces', 'Alpha', 'Add marketplace…'],
     );
@@ -70,8 +53,6 @@ describe('marketplaceDropdownOptions: what the control offers', () => {
   });
 
   it('gives the two non-marketplace rows values a real id cannot take', () => {
-    // The engine builds a marketplace id out of ASCII alphanumerics and dashes,
-    // so a colon is what keeps a sentinel from colliding with one.
     const sentinels = marketplaceDropdownOptions([])
       .map((o) => o.value)
       .filter((v) => v.includes(':'));
@@ -102,8 +83,6 @@ describe('the dropdown in the Plugins filter bar', () => {
     pluginsMarketplaceFilter.value = 'mkt-a';
     onChange()(ADD);
     expect(openSettingsSubviewMock).toHaveBeenCalledWith('marketplaces');
-    // Add navigates, it does not select. A filter replaced by a trip to
-    // Settings would silently widen the list the user was looking at.
     expect(pluginsMarketplaceFilter.value).toBe('mkt-a');
   });
 

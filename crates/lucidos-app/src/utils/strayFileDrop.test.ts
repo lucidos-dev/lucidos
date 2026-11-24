@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { dragCarriesFiles, installStrayFileDropGuard } from './strayFileDrop';
 
-/** A minimal drag-event stand-in: only `dataTransfer.types` is read. */
 const drag = (types?: readonly string[]) => ({
   dataTransfer: types ? { types } : null,
 });
@@ -26,8 +25,6 @@ describe('dragCarriesFiles', () => {
 describe('installStrayFileDropGuard', () => {
   installStrayFileDropGuard();
 
-  /** Dispatch a drag event at the document (the test stub's `dispatchEvent`
-   *  calls every registered listener) and report what the guard did to it. */
   function fire(type: 'dragover' | 'drop', types?: readonly string[]) {
     const e = new Event(type, { bubbles: true, cancelable: true });
     Object.defineProperty(e, 'dataTransfer', { value: types ? { types } : null });

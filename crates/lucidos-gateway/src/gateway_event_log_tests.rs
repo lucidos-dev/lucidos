@@ -37,9 +37,9 @@ fn replaying_the_log_gives_the_live_state() {
     record(&log, &mut live, |d| {
         d.pair("d1", "Phone", "digest-1", None).unwrap()
     });
-    let owner = live.first_operator().unwrap().id.clone();
-    record(&log, &mut live, |d| d.add_operator("Sam").unwrap());
-    let sam = live.operators[1].id.clone();
+    let owner = live.first_user().unwrap().id.clone();
+    record(&log, &mut live, |d| d.add_user("Sam").unwrap());
+    let sam = live.users[1].id.clone();
     record(&log, &mut live, |d| {
         d.pair("d2", "Laptop", "digest-2", Some(&sam)).unwrap()
     });
@@ -52,30 +52,26 @@ fn replaying_the_log_gives_the_live_state() {
             device_id: "d2".into(),
         }]
     });
-    record(&log, &mut live, |d| {
-        d.rename_operator(&owner, "Alex").unwrap()
-    });
+    record(&log, &mut live, |d| d.rename_user(&owner, "Alex").unwrap());
     record(&log, &mut live, |d| d.revoke("d2"));
 
     assert_eq!(reopen(dir.path()), live);
-    assert_eq!(live.operator_of_device("d1"), Some(sam.as_str()));
-    assert_eq!(live.operator_of_email("SAM@example.com").unwrap().id, sam);
+    assert_eq!(live.user_of_device("d1"), Some(sam.as_str()));
+    assert_eq!(live.user_of_email("SAM@example.com").unwrap().id, sam);
     assert!(live.devices.devices.iter().all(|d| d.id != "d2"));
 }
 
 #[test]
-fn a_first_pairing_creates_the_first_operator_and_later_ones_join_it() {
+fn a_first_pairing_creates_the_first_user_and_later_ones_join_it() {
     // A personal gateway never has to say whose device it is.
     let directory = Directory::default();
     let events = directory.pair("d1", "Phone", "x", None).unwrap();
-    assert!(
-        matches!(&events[0], GatewayEvent::OperatorAdded { name, .. } if name == FIRST_OPERATOR_NAME)
-    );
+    assert!(matches!(&events[0], GatewayEvent::UserAdded { name, .. } if name == FIRST_USER_NAME));
     let mut directory =
         Directory::replay(&events.into_iter().map(LoggedEvent::now).collect::<Vec<_>>());
-    let owner = directory.first_operator().unwrap().id.clone();
+    let owner = directory.first_user().unwrap().id.clone();
     let second = directory.pair("d2", "Laptop", "y", None).unwrap();
-    assert_eq!(second.len(), 1, "no second operator is created");
+    assert_eq!(second.len(), 1, "no second user is created");
     for event in second {
         directory.apply(&LoggedEvent::now(event));
     }
@@ -83,54 +79,51 @@ fn a_first_pairing_creates_the_first_operator_and_later_ones_join_it() {
 }
 
 #[test]
-fn a_pairing_for_a_removed_person_is_refused() {
+fn a_pairing_for_a_removed_user_is_refused() {
     let directory = Directory::default();
     assert!(directory.pair("d1", "Phone", "x", Some("gone")).is_err());
 }
 
 #[test]
-fn removing_an_operator_revokes_its_devices_first() {
+fn removing_a_user_revokes_its_devices_first() {
     let dir = tempfile::tempdir().unwrap();
     let (log, mut live, _) = open(dir.path(), None).unwrap();
     record(&log, &mut live, |d| {
         d.pair("d1", "Phone", "digest-1", None).unwrap()
     });
-    record(&log, &mut live, |d| d.add_operator("Sam").unwrap());
-    let sam = live.operators[1].id.clone();
+    record(&log, &mut live, |d| d.add_user("Sam").unwrap());
+    let sam = live.users[1].id.clone();
     record(&log, &mut live, |d| {
         d.pair("d2", "Laptop", "digest-2", Some(&sam)).unwrap()
     });
 
-    let events = live.remove_operator(&sam).unwrap();
+    let events = live.remove_user(&sam).unwrap();
     assert_eq!(
         events,
         vec![
             GatewayEvent::DeviceRevoked {
                 device_id: "d2".into()
             },
-            GatewayEvent::OperatorRemoved {
-                operator_id: sam.clone()
+            GatewayEvent::UserRemoved {
+                user_id: sam.clone()
             },
         ]
     );
     record(&log, &mut live, |_| events);
-    assert!(live.operator(&sam).is_none());
+    assert!(live.user(&sam).is_none());
     assert_eq!(live.devices.devices.len(), 1);
     assert_eq!(reopen(dir.path()), live);
 }
 
 #[test]
-fn an_email_belongs_to_one_operator() {
+fn an_email_belongs_to_one_user() {
     let mut directory = Directory::default();
     for name in ["Sam", "Alex"] {
-        for event in directory.add_operator(name).unwrap() {
+        for event in directory.add_user(name).unwrap() {
             directory.apply(&LoggedEvent::now(event));
         }
     }
-    let (sam, alex) = (
-        directory.operators[0].id.clone(),
-        directory.operators[1].id.clone(),
-    );
+    let (sam, alex) = (directory.users[0].id.clone(), directory.users[1].id.clone());
     for event in directory.add_email(&sam, "sam@example.com").unwrap() {
         directory.apply(&LoggedEvent::now(event));
     }
@@ -144,7 +137,7 @@ fn an_email_belongs_to_one_operator() {
 }
 
 #[test]
-fn the_device_store_migrates_once_into_one_operator() {
+fn the_device_store_migrates_once_into_one_user() {
     let dir = tempfile::tempdir().unwrap();
     let store = PairedDevices {
         devices: vec![
@@ -160,8 +153,8 @@ fn the_device_store_migrates_once_into_one_operator() {
         directory.devices, store,
         "every device and its last-seen survive"
     );
-    assert_eq!(directory.operators.len(), 1);
-    let owner = &directory.operators[0].id;
+    assert_eq!(directory.users.len(), 1);
+    let owner = &directory.users[0].id;
     assert_eq!(directory.devices_of(owner), vec!["d1", "d2"]);
 
     // The store is never read again, so a downgrade cannot revive a revoke.
@@ -276,11 +269,11 @@ fn the_log_is_owner_only() {
 }
 
 #[test]
-fn a_relayed_operator_is_recorded_only_when_it_changes() {
+fn a_relayed_user_is_recorded_only_when_it_changes() {
     let mut directory = Directory::default();
     let seen = RelayedDevice {
         device_id: "pair-1:d1".into(),
-        operator_id: "pair-1:op".into(),
+        user_id: "pair-1:op".into(),
         name: "Sam".into(),
         via: "laptop".into(),
         emails: vec!["sam@example.com".into()],
@@ -301,12 +294,12 @@ fn a_relayed_operator_is_recorded_only_when_it_changes() {
 }
 
 #[test]
-fn an_ended_pairing_takes_only_its_own_relayed_people() {
+fn an_ended_pairing_takes_only_its_own_relayed_users() {
     let mut directory = Directory::default();
     for (device, via) in [("pair-1:d1", "laptop"), ("pair-2:d1", "server")] {
         let seen = RelayedDevice {
             device_id: device.into(),
-            operator_id: format!("{via}:op"),
+            user_id: format!("{via}:op"),
             name: "Sam".into(),
             via: via.into(),
             emails: vec![],
@@ -340,4 +333,222 @@ fn only_a_seen_stamp_leaves_identity_alone() {
         device_id: "d".into()
     }
     .changes_identity());
+}
+
+/// A log as a gateway wrote it before the user rename (ADR 0655).
+const PRE_RENAME_LOG: &str = r#"
+{"at":"2026-08-17T00:00:00Z","event":{"type":"OperatorAdded","data":{"operator_id":"o1","name":"Owner"}}}
+{"at":"2026-08-17T00:00:01Z","event":{"type":"DevicePaired","data":{"device_id":"d1","label":"Phone","credential_digest":"x","operator_id":"o1"}}}
+{"at":"2026-08-17T00:00:02Z","event":{"type":"OperatorAdded","data":{"operator_id":"o2","name":"Sam"}}}
+{"at":"2026-08-17T00:00:03Z","event":{"type":"OperatorEmailAdded","data":{"operator_id":"o2","email":"sam@example.com"}}}
+{"at":"2026-08-17T00:00:04Z","event":{"type":"DeviceMoved","data":{"device_id":"d1","operator_id":"o2"}}}
+{"at":"2026-08-17T00:00:05Z","event":{"type":"OperatorRenamed","data":{"operator_id":"o2","name":"Samantha"}}}
+{"at":"2026-08-17T00:00:06Z","event":{"type":"DeviceSeen","data":{"device_id":"d1"}}}
+{"at":"2026-08-17T00:00:07Z","event":{"type":"RelayedOperatorSeen","data":{"device_id":"p:d9","operator_id":"p:o9","name":"Kim","via":"A"}}}
+{"at":"2026-08-17T00:00:08Z","event":{"type":"OperatorAdded","data":{"operator_id":"o3","name":"Gone"}}}
+{"at":"2026-08-17T00:00:09Z","event":{"type":"OperatorRemoved","data":{"operator_id":"o3"}}}
+"#;
+
+#[test]
+fn a_pre_rename_log_is_rewritten_once_and_replays_to_the_same_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LOG_FILE);
+    std::fs::write(&path, PRE_RENAME_LOG).unwrap();
+
+    let directory = reopen(dir.path());
+    let expected = Directory::replay(&[
+        LoggedEvent {
+            at: "2026-08-17T00:00:00Z".into(),
+            event: GatewayEvent::UserAdded {
+                user_id: "o1".into(),
+                name: "Owner".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:01Z".into(),
+            event: GatewayEvent::DevicePaired {
+                device_id: "d1".into(),
+                label: "Phone".into(),
+                credential_digest: "x".into(),
+                user_id: "o1".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:02Z".into(),
+            event: GatewayEvent::UserAdded {
+                user_id: "o2".into(),
+                name: "Sam".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:03Z".into(),
+            event: GatewayEvent::UserEmailAdded {
+                user_id: "o2".into(),
+                email: "sam@example.com".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:04Z".into(),
+            event: GatewayEvent::DeviceMoved {
+                device_id: "d1".into(),
+                user_id: "o2".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:05Z".into(),
+            event: GatewayEvent::UserRenamed {
+                user_id: "o2".into(),
+                name: "Samantha".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:06Z".into(),
+            event: GatewayEvent::DeviceSeen {
+                device_id: "d1".into(),
+            },
+        },
+        LoggedEvent {
+            at: "2026-08-17T00:00:07Z".into(),
+            event: GatewayEvent::RelayedUserSeen {
+                device_id: "p:d9".into(),
+                user_id: "p:o9".into(),
+                name: "Kim".into(),
+                via: "A".into(),
+                emails: Vec::new(),
+            },
+        },
+    ]);
+    assert_eq!(directory, expected);
+
+    let rewritten = std::fs::read_to_string(&path).unwrap();
+    assert!(!rewritten.contains("perator"), "{rewritten}");
+    let backup = dir
+        .path()
+        .join(format!("{LOG_FILE}.{PRE_USER_RENAME_SUFFIX}"));
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), PRE_RENAME_LOG);
+
+    // A second open finds nothing to rename and leaves the file alone.
+    assert_eq!(reopen(dir.path()), expected);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
+}
+
+#[test]
+fn the_rename_keeps_a_torn_tail_for_the_repair_to_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LOG_FILE);
+    let torn = format!("{PRE_RENAME_LOG}{{\"at\":\"2026-08-17T00:00:10Z\",\"ev");
+    std::fs::write(&path, torn).unwrap();
+    let (_, directory, opened) = open(dir.path(), None).unwrap();
+    assert_eq!(opened, Opened::RepairedTornTail);
+    assert_eq!(directory.users.len(), 2);
+}
+
+/// Does a plain device cookie carrying `credential` authorize against
+/// `directory`?
+fn authorizes(directory: &Directory, credential: &str) -> bool {
+    const NAME: &str = "lucidos_device_test";
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!("{NAME}={credential}").parse().unwrap(),
+    );
+    let (authorization, _) = auth::authorize_with_match(
+        &headers,
+        "local-token",
+        &directory.devices,
+        NAME,
+        auth::CookieForm::Plain,
+    );
+    matches!(authorization, auth::Authorization::Device { .. })
+}
+
+#[test]
+fn the_device_cut_revokes_every_device_once_and_keeps_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, mut live, _) = open(dir.path(), None).unwrap();
+    record(&log, &mut live, |d| {
+        d.pair("d1", "Phone", &auth::digest("cred-1"), None)
+            .unwrap()
+    });
+    record(&log, &mut live, |d| d.add_user("Sam").unwrap());
+    let sam = live.users[1].id.clone();
+    record(&log, &mut live, |d| {
+        d.pair("d2", "Laptop", &auth::digest("cred-2"), Some(&sam))
+            .unwrap()
+    });
+    record(&log, &mut live, |d| {
+        d.add_email(&sam, "sam@example.com").unwrap()
+    });
+    let users = live.users.clone();
+
+    let remote = crate::remote_gateways::remote_gateways_path(dir.path());
+    std::fs::write(&remote, "{\"relay\":\"pairing\"}\n").unwrap();
+    let migrated = dir.path().join(format!(
+        "{}.{MIGRATED_SUFFIX}",
+        lucidos_home::private::PAIRED_DEVICES
+    ));
+    std::fs::write(&migrated, "{}").unwrap();
+    let legacy = dir.path().join("legacy.json");
+    std::fs::write(&legacy, "{}").unwrap();
+    assert!(authorizes(&live, "cred-1"));
+
+    let cut = cut_devices_once(&log, &mut live, dir.path(), Some(&legacy)).unwrap();
+    assert_eq!(cut, Some(2));
+    assert!(live.devices.devices.is_empty());
+    assert!(
+        !authorizes(&live, "cred-1"),
+        "a pre-upgrade credential is refused"
+    );
+    assert_eq!(live.users, users, "users and their emails stay");
+    assert_eq!(reopen(dir.path()), live, "the cut is in the log");
+    assert!(!migrated.exists() && !legacy.exists());
+    assert_eq!(
+        std::fs::read_to_string(&remote).unwrap(),
+        "{\"relay\":\"pairing\"}\n",
+        "the relay store is byte-identical"
+    );
+
+    // A device paired after the cut is never cut again.
+    record(&log, &mut live, |d| {
+        d.pair("d3", "Tablet", &auth::digest("cred-3"), None)
+            .unwrap()
+    });
+    let again = cut_devices_once(&log, &mut live, dir.path(), Some(&legacy)).unwrap();
+    assert_eq!(again, None);
+    assert_eq!(live.devices.devices.len(), 1);
+}
+
+#[test]
+fn the_device_cut_revokes_what_the_same_boot_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("legacy.json");
+    PairedDevices {
+        devices: vec![device("d1", "cred-1", None)],
+    }
+    .save(&legacy)
+    .unwrap();
+    let gateway = dir.path().join("gw");
+
+    let (log, mut live, opened) = open(&gateway, Some(&legacy)).unwrap();
+    assert_eq!(opened, Opened::Migrated(1));
+    assert_eq!(
+        cut_devices_once(&log, &mut live, &gateway, Some(&legacy)).unwrap(),
+        Some(1)
+    );
+    assert!(live.devices.devices.is_empty());
+    assert!(!legacy.exists(), "the old seed is gone");
+    assert_eq!(live.users.len(), 1, "the migrated user stays");
+}
+
+#[test]
+fn the_device_cut_on_a_fresh_install_only_writes_its_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = dir.path().join("gw");
+    let (log, mut live, _) = open(&gateway, None).unwrap();
+    assert_eq!(
+        cut_devices_once(&log, &mut live, &gateway, None).unwrap(),
+        Some(0)
+    );
+    assert!(!log.path().exists());
+    assert!(gateway.join(DEVICE_CUT_MARKER).exists());
 }

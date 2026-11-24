@@ -1,5 +1,3 @@
-// Shared scaffolding for the store/actions thread tests, split across
-// threads-*.test.ts.
 import { type ThreadAggregate, type ThreadMeta, type ThreadState } from '../thread-events';
 import { setDraft, type ComposeDraft } from '../composeDrafts';
 
@@ -54,12 +52,6 @@ export function makeThreadState(id: string, overrides: MakeThreadOverrides = {})
   };
 }
 
-/** The projection snapshot the engine attaches to every persisted thread event.
- *  A fixture that omits it describes a state the engine cannot produce: the
- *  aggregate is read from `thread_summaries` inside the emitting transaction,
- *  so a persisted event without one means the row is gone. `handleThreadEvent`
- *  refuses to build a thread out of that. So any test feeding it an event for
- *  a thread not yet in the map needs this. */
 export function makeThreadAggregate(
   threadId: string,
   overrides: Partial<ThreadAggregate> = {},

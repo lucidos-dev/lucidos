@@ -5,64 +5,15 @@
 //! The decision rule lives in
 //! `docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`.
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// The env var Claude Code reads its auto-compact window from.
 pub const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 
-/// The window the trial's treatment arm runs with, in tokens.
-pub const TRIAL_WINDOW_TOKENS: u64 = 400_000;
-
-/// The values of `coding_agent_auto_compact_trial`, as the catalog lists them.
-pub const TRIAL_MODES: &[&str] = &[
-    TrialMode::Off.as_str(),
-    TrialMode::Ab.as_str(),
-    TrialMode::On.as_str(),
-];
-
-/// The `coding_agent_auto_compact_trial` preference, parsed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrialMode {
-    Off,
-    /// Half of all thread families get the window, by [`arm_for_family`].
-    Ab,
-    /// Every family gets the window.
-    On,
-}
-
-impl TrialMode {
-    const ALL: [Self; 3] = [Self::Off, Self::Ab, Self::On];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Ab => "ab",
-            Self::On => "on",
-        }
-    }
-
-    /// A value outside [`TRIAL_MODES`] reads as `off`, the catalog default.
-    pub fn parse(value: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|mode| mode.as_str() == value)
-            .unwrap_or(Self::Off)
-    }
-}
-
-/// Which arm of the trial a session ran in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoCompactArm {
-    /// The engine set no window.
-    Control,
-    /// The engine set [`TRIAL_WINDOW_TOKENS`].
-    Window,
-    /// A workspace env var set the window, so the engine left it alone.
-    Override,
-}
+pub use crate::engine::thread_events::auto_compact::{
+    AutoCompactArm, TrialMode, TRIAL_MODES, TRIAL_WINDOW_TOKENS,
+};
 
 /// What one spawn runs with. The env var and the `SessionStarted` record are
 /// both read from this one value, so they cannot disagree.
@@ -146,7 +97,7 @@ async fn first_trial_arm(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<AutoCom
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[AutoCompactTrial] first arm of {}: {}", thread_id, e);
+        crate::log_legacy!("[AutoCompactTrial] first arm of {}: {}", thread_id, e);
         None
     });
     match arm.as_deref() {
@@ -185,7 +136,7 @@ pub async fn resolve(
     let root = match super::thread_family::family_root(pool, thread_id).await {
         Ok(root) => root,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[AutoCompactTrial] could not read the family root of {}, so the spawn sits out the trial: {}",
                 thread_id,
                 e

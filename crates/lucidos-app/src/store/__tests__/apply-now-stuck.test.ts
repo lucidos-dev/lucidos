@@ -10,7 +10,7 @@ vi.mock('../../api/client', async (importOriginal) => {
 });
 
 
-import { endClaudeCodeAndApply } from '../actions/chat-claude-code';
+import { endClaudeCodeAndApply } from '../actions/codingAgentChanges';
 import { applyNow, ApiError } from '../../api/client';
 import { _holdArchiveForTesting, _resetRowIntentsForTesting } from '../rowIntents';
 
@@ -25,8 +25,6 @@ beforeEach(() => {
 });
 
 describe('endClaudeCodeAndApply refusals', () => {
-  // A running apply shows on the row (`applyInFlight`), so the click's own
-  // bridge ends with the refusal and nothing waits on a timer (ADR 0437).
   it('shows the engine\'s own words when an apply holds the session', async () => {
     const message = 'An apply is already in progress for this thread. It finishes on its own';
     mockedApplyNow.mockRejectedValueOnce(
@@ -36,7 +34,6 @@ describe('endClaudeCodeAndApply refusals', () => {
 
     const toast = toasts.value.find((t) => t.key === 'applying-thread-1');
     expect(toast?.message).toContain(message);
-    // Its progress is the activity group's to show, so the notice does not spin.
     expect(toast?.spinning).toBeFalsy();
     expect(applyNowRequests.value.has('thread-1')).toBe(false);
   });
@@ -72,22 +69,18 @@ describe('endClaudeCodeAndApply refusals', () => {
   });
 
   it('silently returns when already tracked (no API call)', async () => {
-    // Pre-set the thread as applying
     applyNowRequests.value = new Map([['thread-1', null]]);
 
     await endClaudeCodeAndApply('thread-1');
 
-    // Should not have called the API — early return
     expect(mockedApplyNow).not.toHaveBeenCalled();
   });
 
   it('refuses to apply while dismiss is in progress — states are mutually exclusive', async () => {
-    // Scenario: user clicked Archive (dismiss in progress), apply must not start.
     _holdArchiveForTesting(['thread-1']);
 
     await endClaudeCodeAndApply('thread-1');
 
-    // Should not have called the API or set applying state
     expect(mockedApplyNow).not.toHaveBeenCalled();
     expect(applyingNowThreadIds.value.has('thread-1')).toBe(false);
   });

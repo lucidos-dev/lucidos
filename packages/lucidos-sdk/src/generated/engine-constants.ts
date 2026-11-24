@@ -4,6 +4,9 @@
 // Source of truth: the engine constant each export names, under
 // crates/lucidos-engine/src.
 
+/** `VERSION` in `../../lucidos-gateway-stamp/src/workspace_client.rs`. */
+export const WORKSPACE_CLIENT_VERSION = 1;
+
 /** `CLIENT_LOG_MAX_BATCH` in `api/internal.rs`. */
 export const CLIENT_LOG_MAX_BATCH = 100;
 
@@ -18,6 +21,9 @@ export const WIDGET_PARAMS_MAX_BYTES = 2048;
 
 /** `WidgetSize::ALL` in `core/apps.rs`. */
 export const WIDGET_SIZES = ["small", "medium", "large", "xl"] as const;
+
+/** `LivenessState::ALL` in `engine/thread_liveness.rs`. */
+export const LIVENESS_STATES = ["working", "quiet", "waiting_for_user_answer", "paused", "failed", "queued", "held", "stalled", "waiting", "idle"] as const;
 
 /** `MAX_IDS` in `api/threads/archive_all.rs`. */
 export const ARCHIVE_ALL_MAX_IDS = 2000;
@@ -79,6 +85,18 @@ export const ENGINE_RESTART_INTERRUPT_REASON = "engine_restart_interrupt";
 /** `HARDEN_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const HARDEN_REQUESTED_REASON = "harden_requested";
 
+/** `PLAN_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const PLAN_REQUESTED_REASON = "plan_requested";
+
+/** `BUILD_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const BUILD_REQUESTED_REASON = "build_requested";
+
+/** `HANDOFF_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const HANDOFF_REQUESTED_REASON = "handoff_requested";
+
+/** `REPORTS_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const REPORTS_REQUESTED_REASON = "reports_requested";
+
 /** `EFFORT_RESTART_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const EFFORT_RESTART_REASON = "effort_restart";
 
@@ -87,6 +105,15 @@ export const KEEP_ALIVE_IDLE_REASON = "cache_keep_alive";
 
 /** `KEEP_ALIVE_ENDING_EVENT_TYPES` in `engine/thread_events/event_impl.rs`. */
 export const KEEP_ALIVE_ENDING_EVENT_TYPES = ["UserQuestionAsked", "CodingAgentPermissionRequest"] as const;
+
+/** `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` in `engine/thread_events/event_impl.rs`. */
+export const QUESTION_OVERTAKEN_EVENT_TYPES = ["ResponseAborted", "ResponseCanceled", "ResponseFailed", "CodingAgentIdled", "CodingAgentTextStreamed", "CodingAgentToolCalled", "CodingAgentPromptSent", "TextStreamed", "ThoughtStreamed", "ToolCalled", "ToolResult"] as const;
+
+/** `Action::ENGINE_STEPS` in `../../lucidos-core/src/engine/thread_events/permission/action.rs`. */
+export const ENGINE_STEP_ACTIONS = ["harden","set-plan-marker","build-approved-plan","hand-off","read-waiting-reports"] as const;
+
+/** `ROOT_THREAD_ROLE_ALIASES` in `../../lucidos-core/src/core/event_subscription/mod.rs`. */
+export const ROOT_THREAD_ROLE_ALIASES = [["WorkItemDriverTaken","RootThreadDriverTaken"],["WorkItemDriverReleased","RootThreadDriverReleased"],["WorkItemGateEscalated","RootThreadGateEscalated"],["WorkItemWatched","RootThreadWatched"],["WorkItemUnwatched","RootThreadUnwatched"]] as const;
 
 /** `TYPESAFE_API_KEY_ENV` in `llm/judgment/endpoint.rs`. */
 export const TYPESAFE_API_KEY_ENV = "TYPESAFE_API_KEY";

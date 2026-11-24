@@ -14,6 +14,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
+use super::consumption_claim::{
+    held_message_at_receipt, held_message_receipt_target, HELD_MESSAGE_RECEIPT_TYPES,
+};
 use super::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope, SystemEvent};
 use super::thread_events::{EventChannel, ThreadEvent};
 use super::LucidosEngine;
@@ -35,6 +38,11 @@ pub(crate) enum MemoryJob {
 fn memory_event_types() -> Vec<&'static str> {
     ThreadEvent::INDEXABLE_EVENT_TYPES
         .iter()
+        .chain(
+            HELD_MESSAGE_RECEIPT_TYPES
+                .iter()
+                .filter(|kind| !ThreadEvent::INDEXABLE_EVENT_TYPES.contains(kind)),
+        )
         .copied()
         .chain(["ArtifactCreated", "ArtifactUpdated", "ArtifactImported"])
         .collect()
@@ -54,7 +62,7 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
                 run(&engine, job).await;
             }
         }
-        log!(@Memory, "Memory indexer stream ended");
+        log_legacy!(@Memory, "Memory indexer stream ended");
     })
 }
 
@@ -65,7 +73,40 @@ pub(crate) async fn jobs_after(
     pool: &sqlx::PgPool,
 ) -> Option<Vec<MemoryJob>> {
     let frames = replay.read(received, pool).await?;
-    Some(frames.iter().filter_map(job).collect())
+    let mut jobs = Vec::new();
+    for frame in &frames {
+        if let Some(job) = job(frame) {
+            jobs.push(job);
+        } else if let Some(job) = held_delivery_job(frame, pool).await {
+            jobs.push(job);
+        }
+    }
+    Some(jobs)
+}
+
+async fn held_delivery_job(emitted: &EmittedEvent, pool: &sqlx::PgPool) -> Option<MemoryJob> {
+    let BusEvent::Thread {
+        thread_id,
+        event,
+        meta,
+    } = &emitted.typed
+    else {
+        return None;
+    };
+    let message = held_message_receipt_target(event, meta)?;
+    let row = match held_message_at_receipt(pool, *thread_id, message, emitted.seq?).await {
+        Ok(row) => row?,
+        Err(error) => {
+            log_legacy!(@Memory, "Could not load the source for a held message receipt: {error}");
+            return None;
+        }
+    };
+    let text = LucidosEngine::memory_content_for_event(&row)?;
+    (!text.trim().is_empty()).then_some(MemoryJob::Text {
+        thread_id: *thread_id,
+        event_id: row.id,
+        text,
+    })
 }
 
 /// The job a frame carries, if any. Only a stored thread event is indexed,
@@ -79,7 +120,7 @@ fn job(emitted: &EmittedEvent) -> Option<MemoryJob> {
             meta,
         } => {
             emitted.seq?;
-            if meta.channel == Some(EventChannel::Trigger) {
+            if meta.channel == Some(EventChannel::Trigger) || meta.queued_for_permission {
                 return None;
             }
             let text = event.indexable_text()?;
@@ -206,6 +247,7 @@ mod tests {
             commit: "abc123".into(),
             source: None,
             writer_thread_id: None,
+            writer: None, // Legacy event fixture.
         }))
         .await
         .unwrap();
@@ -243,6 +285,147 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    #[tokio::test]
+    async fn held_delivery_vectors_use_the_original_event_only_after_the_receipt() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callbacks) = EventBus::new(pool.clone());
+        for (lagged, coding_agent) in [(false, false), (true, false), (false, true), (true, true)] {
+            let thread_id = Uuid::new_v4();
+            let card = Uuid::new_v4().to_string();
+            let request = if coding_agent {
+                sqlx::query("INSERT INTO thread_summaries (thread_id, source) VALUES ($1, $2)")
+                    .bind(thread_id)
+                    .bind(crate::engine::thread_lifecycle::CODING_AGENT_SOURCE)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                ThreadEvent::CodingAgentPermissionRequest {
+                    request_id: card.clone(),
+                    tool_use_id: "permission-tool".into(),
+                    tool_name: "bash".into(),
+                    input: serde_json::json!({"command": "pwd"}),
+                    summary: "Read the working directory".into(),
+                    grant_offer: None,
+                }
+            } else {
+                ThreadEvent::CommandPermissionRequested {
+                    request_id: card.clone(),
+                    tool_use_id: "permission-tool".into(),
+                    tool_name: "bash".into(),
+                    command: "pwd".into(),
+                    summary: "Read the working directory".into(),
+                    decision_trace: None,
+                    grant_head: None,
+                    grant_offer: None,
+                }
+            };
+            seed_thread_event(&bus, thread_id, request).await;
+            let (mut rx, mut replay) =
+                LagReplay::subscribe(&bus, ReplayScope::Workspace, Some(memory_event_types()));
+            let held = bus
+                .emit(BusEvent::Thread {
+                    thread_id,
+                    event: message_received("held text"),
+                    meta: EventMeta {
+                        queued_for_permission: true,
+                        ..EventMeta::NONE
+                    },
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .event_id;
+
+            let pending = jobs_after(rx.recv().await, &mut replay, &pool)
+                .await
+                .unwrap();
+            assert!(pending.is_empty(), "{pending:?}");
+
+            let answer = if coding_agent {
+                ThreadEvent::CodingAgentPermissionResolved {
+                    request_id: card,
+                    allowed: false,
+                    reason: None,
+                    persist_scope: None,
+                    standing_deny: None,
+                }
+            } else {
+                ThreadEvent::CommandPermissionResolved {
+                    request_id: card,
+                    allowed: false,
+                    reason: None,
+                    persist_scope: None,
+                    standing_deny: None,
+                }
+            };
+            seed_thread_event(&bus, thread_id, answer).await;
+            let closing = jobs_after(rx.recv().await, &mut replay, &pool)
+                .await
+                .unwrap();
+            assert!(closing.is_empty(), "{closing:?}");
+
+            let (event, meta) = if coding_agent {
+                seed_thread_event(
+                    &bus,
+                    thread_id,
+                    ThreadEvent::CodingAgentPromptSent {
+                        text: "held text".into(),
+                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                        origin: None,
+                        input_event_id: Some(held),
+                    },
+                )
+                .await;
+                let forwarded = jobs_after(rx.recv().await, &mut replay, &pool)
+                    .await
+                    .unwrap();
+                assert!(forwarded.is_empty(), "{forwarded:?}");
+                (
+                    ThreadEvent::CodingAgentInputRead {
+                        input_event_id: held,
+                        started_turn: false,
+                        verbatim: false,
+                    },
+                    EventMeta::NONE,
+                )
+            } else {
+                (
+                    ThreadEvent::ChatTurnSettingsResolved {
+                        model: "test".into(),
+                        reasoning_effort: None,
+                        provider: None,
+                    },
+                    EventMeta {
+                        request_event_id: Some(held),
+                        ..EventMeta::NONE
+                    },
+                )
+            };
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            })
+            .await
+            .unwrap();
+            if lagged {
+                flood_past_bus_capacity(&bus);
+            }
+            let delivered = jobs_after(rx.recv().await, &mut replay, &pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                delivered,
+                [MemoryJob::Text {
+                    thread_id,
+                    event_id: held,
+                    text: "held text".into(),
+                }]
+            );
+        }
+        teardown_test_db(&db).await;
+    }
+
     /// The replay list gates live frames too, so an artifact event the
     /// indexer acts on but the list omits would never be indexed.
     #[test]
@@ -253,12 +436,14 @@ mod tests {
                 commit: "abc123".into(),
                 source: None,
                 writer_thread_id: None,
+                writer: None, // Legacy event fixture.
             },
             SystemEvent::ArtifactUpdated {
                 artifact_path: "notes.md".into(),
                 commit: "abc123".into(),
                 source: None,
                 writer_thread_id: None,
+                writer: None, // Legacy event fixture.
             },
             SystemEvent::ArtifactImported {
                 artifact_path: "notes.md".into(),
@@ -267,6 +452,7 @@ mod tests {
                 commit_hash: "abc123".into(),
                 summary: None,
                 writer_thread_id: None,
+                writer: None, // Legacy event fixture.
             },
         ];
         for write in writes {

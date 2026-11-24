@@ -4,10 +4,11 @@
 #   ./scripts/main-check.sh <sha>
 #   ./scripts/main-check.sh <sha> --attach <run-url> <branch>
 #
-# The engine's one entry point, run after a landing moves main. It runs the
-# engine suite and every e2e suite on GitHub against a stripped copy of
-# <sha>, through `e2e-github.sh main-check`. Nothing runs on this host and
-# nothing falls back to it. --attach picks up the run an engine left going
+# The engine calls this after a landing moves main. It runs every e2e suite
+# and the main-check suites through `e2e-github.sh main-check`.
+# GitHub runs the engine, crates and script suites on Linux and macOS.
+# Frontend typecheck and Vitest run on Linux. Every job uses a stripped copy of <sha>.
+# Nothing runs on this host and nothing falls back to it. --attach picks up the run an engine left going
 # when it restarted, and pushes nothing.
 #
 # Stdout carries only the protocol the engine reads (scripts/lib/main_check.sh):

@@ -1,9 +1,3 @@
-/**
- * A coding agent holds an agent-sent message while the user owes it a reply
- * (ADR 0256). The transcript shows the message as held under the open
- * question, keeps the question answerable, and marks the message delivered once
- * the engine releases it.
- */
 import { describe, it, expect } from 'vitest';
 import {
   exchangeResponseEvents,

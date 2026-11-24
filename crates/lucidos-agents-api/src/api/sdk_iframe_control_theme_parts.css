@@ -1,0 +1,14 @@
+body {
+    text-shadow: var(--part-app-text-text-shadow, none);
+    letter-spacing: var(--part-app-text-letter-spacing, normal);
+}
+
+a {
+    text-decoration-color: var(--part-app-link-text-decoration-color, currentcolor);
+    text-shadow: var(--part-app-link-text-shadow, var(--part-app-text-text-shadow, none));
+}
+
+input, textarea, select, button, .lucidos-select-trigger, .text-input {
+    border-color: var(--part-app-control-border-color, var(--border-color));
+    box-shadow: var(--part-app-control-box-shadow, none);
+}

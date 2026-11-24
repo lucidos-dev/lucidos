@@ -1,16 +1,3 @@
-/**
- * A tap inside the left edge strip opens the thread row beneath it.
- *
- * Reported as a first tap that does nothing, with a second tap that works.
- * `.edge-swipe-left` is a transparent strip over the pane's left 2.5rem. A tap
- * there lands on the strip, and `gateStripTouch` cancels its touchstart to
- * suppress the iOS back swipe. The cancel also drops the click, so the row
- * never hears the tap. `replayEdgeTap` gives the click back.
- *
- * Tapped at a point the strip covers, never at the row's centre: Playwright's
- * `tap()` drives the centre, which sits clear of the strip and passes with or
- * without the fix.
- */
 import { test, expect } from './fixtures';
 import {
   assertHealthy,
@@ -48,7 +35,6 @@ test.describe('Edge tap reaches its row', () => {
     const box = (await row.boundingBox())!;
     const y = box.y + box.height / 2;
 
-    // The precondition the bug needs: the strip, not the row, is hit here.
     const hit = await page.evaluate(([x, py]) => {
       const el = document.elementFromPoint(x, py);
       return el?.classList.contains('edge-swipe-zone') ? 'strip' : (el?.tagName ?? 'nothing');

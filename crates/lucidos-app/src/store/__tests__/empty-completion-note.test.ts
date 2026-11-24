@@ -6,10 +6,6 @@ function msg(text = 'play tåpelig'): StoredEvent {
   return { type: 'MessageReceived', text };
 }
 
-// A benign empty completion (the model ended its turn cleanly with no text) is
-// emitted as an empty ResponseGenerated. The renderer must state that plainly
-// with a neutral `empty` note — NOT a red error — while a real ResponseFailed
-// and the [ENGINE-LIMIT] cap must keep their existing rendering.
 describe('benign empty completion → neutral note', () => {
   it('pushes an empty note when ResponseGenerated has no text after tool calls', () => {
     const exchange = makeExchange(msg(), [
@@ -19,7 +15,6 @@ describe('benign empty completion → neutral note', () => {
     ]);
     const events = exchangeResponseEvents(exchange, true, false);
     expect(events.some(e => e.type === 'empty')).toBe(true);
-    // The turn completed — not an error.
     expect(exchangeStatus(exchange, '', true)).toBe('done');
   });
 
@@ -58,8 +53,6 @@ describe('benign empty completion → neutral note', () => {
     expect(hasNote(false)).toBe(true);
   });
 
-  // The engine ends a quiet pick on its quiet reply as ResponseGenerated.text,
-  // with no streamed chunk before it, on every agent.
   describe('a quiet reply renders as the turn\'s text', () => {
     const answered = (quiet: boolean) => step(2, {
       type: 'UserQuestionAnswered',

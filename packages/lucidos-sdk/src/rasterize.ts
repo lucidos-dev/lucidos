@@ -1,16 +1,3 @@
-/**
- * Draw this document's viewport to an image, with no iframe.
- *
- * An app frame is sandboxed at an opaque origin (ADR 0227), and every child
- * frame it makes gets an opaque origin of its own. So this never renders
- * through a child frame: it could not read it back.
- *
- * It hands the browser an SVG image instead: a `<foreignObject>` holding a copy
- * of the page with every element's computed style inlined. The browser renders
- * it, so any CSS it can paint comes out right. An SVG image loads no
- * subresource, so fonts and images ride inside as `data:` URLs
- * (`captureResources.ts`).
- */
 
 import {
   EMBED_BUDGET_MS, createInliner, embeddedFontFaces, fontFamilies, inlineCssUrls, type Inliner,
@@ -19,27 +6,20 @@ import {
 const XHTML = 'http://www.w3.org/1999/xhtml';
 const SVG = 'http://www.w3.org/2000/svg';
 
-/** Elements that paint nothing, or whose job the inlined styles already did. */
 const SKIPPED = new Set([
   'head', 'script', 'style', 'link', 'meta', 'title', 'base', 'noscript', 'template', 'source', 'track',
 ]);
 
-/** Elements whose content this document cannot copy. Each keeps its box. */
 const OPAQUE = new Set(['iframe', 'video', 'audio', 'object', 'embed']);
 
 const SCROLLS = /^(auto|scroll)$/;
 
-/** The snapshot is a still, so nothing in it may animate. An animation would
- *  restart at its first frame, and a fade-in rasterizes invisible. */
 const STILL = '*,*::before,*::after{animation:none!important;transition:none!important}';
 
-/** Computed properties left out of the copy: custom properties are already
- *  substituted, and motion is stopped by {@link STILL}. */
 function isCopied(name: string): boolean {
   return !name.startsWith('--') && !name.startsWith('animation') && !name.startsWith('transition');
 }
 
-/** An element's computed style as declarations, in the order the browser lists them. */
 export function declarations(style: CSSStyleDeclaration): string {
   let out = '';
   for (let i = 0; i < style.length; i++) {
@@ -51,12 +31,10 @@ export function declarations(style: CSSStyleDeclaration): string {
   return out;
 }
 
-/** One class per distinct declaration block, so siblings that look alike share a rule. */
 export class StyleSheetBuilder {
   private readonly classes = new Map<string, string>();
   private readonly rules: string[] = [];
 
-  /** The class carrying `body`, as `selectorSuffix` (`''` or a pseudo-element). */
   classFor(body: string, selectorSuffix = ''): string {
     const key = `${selectorSuffix}{${body}`;
     let name = this.classes.get(key);
@@ -73,7 +51,6 @@ export class StyleSheetBuilder {
   }
 }
 
-/** The page scroll and size the snapshot shows. */
 interface Viewport {
   width: number;
   height: number;
@@ -85,9 +62,7 @@ class Cloner {
   readonly styles = new StyleSheetBuilder();
   readonly families = new Set<string>();
   readonly pending: Promise<void>[] = [];
-  /** Fixed and sticky elements, lifted to the root at the place they paint now. */
   readonly lifted: Element[] = [];
-  /** Each copy's computed transform, where it has one. */
   private readonly transforms = new WeakMap<Element, string>();
 
   constructor(
@@ -104,12 +79,10 @@ class Cloner {
     const style = this.computed(el, pseudo);
     const content = style.getPropertyValue('content');
     if (!content || content === 'none' || content === 'normal') return null;
-    // An icon font usually lives here and nowhere else, so its face is used.
     for (const family of fontFamilies(style.fontFamily)) this.families.add(family);
     return this.styles.classFor(declarations(style), pseudo);
   }
 
-  /** A shallow copy carrying no script, no stylesheet hook and no lazy source. */
   private shell(source: Element, tag: string): Element {
     const copy = OPAQUE.has(tag) ? this.doc.createElementNS(XHTML, 'div') : source.cloneNode(false) as Element;
     for (const attr of Array.from(copy.attributes)) {
@@ -121,7 +94,6 @@ class Cloner {
     return copy;
   }
 
-  /** Carry what the user typed or picked, which lives in properties, not attributes. */
   private copyState(source: Element, copy: Element): void {
     if (source instanceof HTMLInputElement) {
       if (source.type === 'checkbox' || source.type === 'radio') {
@@ -144,7 +116,6 @@ class Cloner {
     }
   }
 
-  /** Point `attr` at `url`'s bytes once read, or at nothing if unreadable. */
   private embed(copy: Element, attr: string, url: string): void {
     copy.removeAttribute(attr);
     if (!url) return;
@@ -153,19 +124,15 @@ class Cloner {
     }));
   }
 
-  /** A canvas is pixels, not DOM, so it travels as a picture of itself. */
   private canvasImage(source: HTMLCanvasElement): Element {
     const img = this.doc.createElementNS(XHTML, 'img');
     try {
       img.setAttribute('src', source.toDataURL());
     } catch {
-      // A canvas holding another origin's pixels refuses to export. Its box stays.
     }
     return img;
   }
 
-  /** Offset a scrolled box's children, since the copy has no scroll position.
-   *  The offset goes in front of a child's own transform, never over it. */
   private applyScroll(source: Element, copy: Element): void {
     const isRoot = source === this.doc.documentElement;
     const left = isRoot ? this.viewport.scrollX : source.scrollLeft;
@@ -177,7 +144,6 @@ class Cloner {
     }
   }
 
-  /** Pin a sticky element where its box is now, ready to lift to the root. */
   private pinned(source: Element, copy: HTMLElement): HTMLElement {
     const rect = source.getBoundingClientRect();
     copy.style.position = 'absolute';
@@ -194,7 +160,6 @@ class Cloner {
     const inSvg = source.namespaceURI === SVG;
     if (!inSvg && SKIPPED.has(tag)) return null;
     const style = this.computed(source);
-    // Inside an SVG a hidden `<symbol>` or `<defs>` is still what a `<use>` draws.
     if (!inSvg && style.display === 'none') return null;
 
     const copy = source instanceof HTMLCanvasElement ? this.canvasImage(source) : this.shell(source, tag);
@@ -218,24 +183,15 @@ class Cloner {
     }
     if (style.transform && style.transform !== 'none') this.transforms.set(copy, style.transform);
     this.applyScroll(source, copy);
-    // The copy fakes scrolling with offsets, so a scroll box only clips. Left
-    // scrollable, it would draw scrollbars the page does not show.
     if (copy instanceof HTMLElement && (SCROLLS.test(style.overflowX) || SCROLLS.test(style.overflowY))) {
       copy.style.overflow = 'hidden';
     }
 
-    // The root copy is exactly the viewport, so a fixed element lifted to it
-    // keeps its own geometry. Left in place, a scrolled ancestor's offset would
-    // carry it away.
     if (style.position === 'fixed') {
       this.lifted.push(copy);
       return null;
     }
     if (style.position === 'sticky') {
-      // Whether stuck or not, it paints where its box is now. It still holds
-      // its place in the flow, so a hidden copy stays behind and what follows
-      // does not move up. Opacity, because every descendant's class sets its
-      // own `visibility`.
       const placeholder = copy.cloneNode(true) as HTMLElement;
       placeholder.style.opacity = '0';
       this.lifted.push(this.pinned(source, copy as HTMLElement));
@@ -245,7 +201,6 @@ class Cloner {
   }
 }
 
-/** The colour the page paints behind everything, for a JPEG that has no alpha. */
 function backdrop(doc: Document): string {
   const view = doc.defaultView as Window;
   for (const el of [doc.documentElement, doc.body]) {
@@ -262,27 +217,18 @@ function decode(src: string): Promise<HTMLImageElement> {
   return img.decode().then(() => img);
 }
 
-/** The largest picture a capture for the agent's eyes produces, in CSS pixels
- *  after scaling. */
 export const CAPTURE_MAX_WIDTH = 1024;
 export const CAPTURE_MAX_HEIGHT = 1200;
 
-/** A saved capture renders at the device pixel ratio up to this, and its long
- *  edge stays within {@link SAVED_MAX_EDGE} canvas pixels. */
 export const SAVED_MAX_PIXEL_RATIO = 2;
 export const SAVED_MAX_EDGE = 2048;
 
-/** Encoder quality for the agent's JPEG and for a saved JPEG or WebP. PNG
- *  ignores it. */
 export const CAPTURE_QUALITY = 0.65;
 export const SAVED_QUALITY = 0.92;
 
-/** The agent's picture is always a JPEG. */
 export const CAPTURE_TYPE = 'image/jpeg';
 
-/** The canvas a capture draws to and how it is encoded. */
 export interface Rendering {
-  /** Canvas pixels per CSS pixel. */
   scale: number;
   width: number;
   height: number;
@@ -290,11 +236,6 @@ export interface Rendering {
   quality: number;
 }
 
-/**
- * How to render a viewport. With no `format` it is the picture the agent sees:
- * small, 1x, JPEG. With one, it is a file: the device pixel ratio, in
- * `image/<format>`. The engine names the format by its MIME subtype.
- */
 export function renderingFor(
   width: number, height: number, pixelRatio: number, format?: string,
 ): Rendering {
@@ -319,7 +260,6 @@ export function renderingFor(
   };
 }
 
-/** The viewport as a base64 image, sized and encoded by {@link renderingFor}. */
 export async function rasterize(doc: Document, format?: string): Promise<string> {
   const until = performance.now() + EMBED_BUDGET_MS;
   const inline = createInliner(until);
@@ -337,8 +277,6 @@ export async function rasterize(doc: Document, format?: string): Promise<string>
   page.style.width = `${viewport.width}px`;
   page.style.height = `${viewport.height}px`;
   for (const lifted of cloner.lifted) page.appendChild(lifted);
-  // Every resource read shares one deadline, so a slow one costs its own
-  // picture and never the capture.
   const [css, fonts] = await Promise.all([
     inlineCssUrls(cloner.styles.css(), doc.baseURI, inline),
     embeddedFontFaces(cloner.families, inline, until),

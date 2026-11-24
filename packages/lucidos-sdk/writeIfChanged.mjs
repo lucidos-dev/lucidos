@@ -1,8 +1,3 @@
-/**
- * Write a build output only when its bytes changed, so an unchanged file keeps
- * its mtime. Vite watches what it imports, and a rewrite of identical bytes
- * would rebuild or reload for nothing.
- */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 

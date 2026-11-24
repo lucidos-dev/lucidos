@@ -1,10 +1,3 @@
-/**
- * An apps panel row acts like a thread drawer row. A pin toggle is always
- * drawn, and a press on it pins in place without opening the app. Edit and
- * Delete sit in the row's menu. On desktop the row draws its ⋯, which the
- * keyboard reaches, and a right-click opens the menu too. On a phone the row
- * draws no ⋯ and a long press opens the menu.
- */
 import { test, expect, type Page } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
@@ -29,7 +22,6 @@ const menu = (page: Page) => page.getByRole('menu');
 const appFrame = (page: Page) => page.locator(`[data-role="app-ui-frame"][src*="/app/${APP_ID}/"]:visible`);
 const MENU_ITEMS = ['Edit', /^Add to dashboard/, 'Delete'];
 
-/** Leaves the fixture unpinned, whatever the test before it did. */
 async function unpin(page: Page): Promise<void> {
   if ((await pin(page).getAttribute('aria-pressed')) === 'true') {
     await pin(page).click();
@@ -37,12 +29,6 @@ async function unpin(page: Page): Promise<void> {
   }
 }
 
-/** Holds the row's description past the long-press threshold with the pointer
- *  still. Playwright cannot hold a touchscreen tap. `useLongPress` reads no
- *  `pointerType`, so a real mouse press runs the same path. It also goes
- *  through real hit-testing, and the browser pairs its own click with the lift.
- *  A phone slides the content pane in, so a box read at once can sit off
- *  screen. `hover()` waits until the row is still and takes the hit there. */
 async function longPressRow(page: Page): Promise<void> {
   await row(page).locator('.app-row-description').hover();
   await page.mouse.down();
@@ -88,7 +74,6 @@ test.describe('the apps panel row actions', () => {
     await expect(pin(page)).toHaveAttribute('aria-pressed', 'true');
     await expect(pin(page)).toHaveAccessibleName(`Unpin ${APP_NAME}`);
     await expect(pin(page).locator('svg')).toHaveAttribute('fill', 'currentColor');
-    // The button's colour transitions, so wait for it to settle on the accent.
     await expect.poll(() => page.evaluate(() => {
       const probe = document.createElement('span');
       probe.style.color = 'var(--accent)';
@@ -147,8 +132,6 @@ test.describe('the apps panel row actions', () => {
 
   test('the keyboard toggles the pin, opens the menu from the ⋯, and Escape hands focus back', async ({ page }) => {
     test.skip(isMobileViewport(page), 'a phone has no keyboard focus to rove');
-    // Leave the focused pane on the thread, then move focus with no pointer, as
-    // a screen reader does. The pane's Tab trap must follow focus.
     await page.locator('[data-role="prompt-input"]:visible').first().click();
     await pin(page).focus();
     await page.keyboard.press('Space');

@@ -1,13 +1,3 @@
-// The oldest turn on screen draws its TAIL, and its head arrives by scrolling.
-//
-// `threadWindow.test.ts` owns the arithmetic. This owns the two halves that
-// live outside it: the memo has to answer to the clamp, and the head must have
-// no control of its own.
-//
-// The second is not a style preference. A per-turn "Show earlier steps"
-// expander shipped twice and was removed twice, the second time because the
-// user disliked it from the first message. See
-// docs/plans/2026-06-26-perf-instrumentation-remove-step-cap.md.
 
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -33,9 +23,6 @@ const props = (rowsHidden: number) => ({ exchange: exchange(), revision: 0, rows
 
 describe('the memo answers to the row clamp', () => {
   it('re-renders when a scroll-up round uncovers part of the head', () => {
-    // Nothing else about the floor turn changes on a round: same events, same
-    // revision, same status. Without this the head never draws and the reader
-    // scrolls into a turn that will not open.
     expect(chatExchangePropsEqual(props(200), props(120))).toBe(false);
   });
 
@@ -48,16 +35,11 @@ describe('the memo answers to the row clamp', () => {
   });
 });
 
-/** The render window budgets by what the clamped slice DRAWS
- *  (`rowsDrawnByClamp`). So the slice has to be chosen by the same two
- *  questions, or the window counts rows this component never renders. */
 describe('the body is chosen by the questions the window asks', () => {
   const source: string = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), '..', 'ChatExchange.tsx'), 'utf8');
 
   it('hands the clamp to the body, which picks its path by the shared predicate', () => {
-    // `responseBody` asks `headClampApplies`, the question `rowsDrawnByClamp`
-    // asks. Its tests pin that the clamp applies only on that path.
     expect(source).toContain('responseBody(events, { showSteps, showDetails, rowsHidden })');
   });
 
@@ -76,7 +58,6 @@ describe('the body is chosen by the questions the window asks', () => {
 
 describe('the clamped head has no control of its own', () => {
   const CHAT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
-  /** The shapes the twice-removed expander took, by class and by copy. */
   const BANNED = [
     'step-window-expander',
     'renderStepExpander',
@@ -90,8 +71,6 @@ describe('the clamped head has no control of its own', () => {
     .filter((name: string) => (name.endsWith('.tsx') || name.endsWith('.ts')) && !name.includes('.test.'));
 
   it('scans a real set of transcript sources', () => {
-    // A directory read that matched nothing would pass the sweep below in
-    // silence, and so would a hardcoded filename that has since been renamed.
     expect(sources).toContain('ChatExchange.tsx');
     expect(sources).toContain('chat-exchange-parts.tsx');
     expect(sources).toContain('threadWindow.ts');
@@ -102,7 +81,6 @@ describe('the clamped head has no control of its own', () => {
   it('reveals the head by scrolling, not by a button', () => {
     for (const name of sources) {
       const source = readFileSync(join(CHAT_DIR, name), 'utf8');
-      // The comments that record the ban have to name it, so only CODE counts.
       const code = source.split('\n')
         .filter((line: string) => !/^\s*(\/\/|\*|\/\*)/.test(line))
         .join('\n');

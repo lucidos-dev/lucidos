@@ -1,18 +1,3 @@
-// The HTML artifact preview frame, and the message bridge that crosses it.
-//
-// A previewed artifact is untrusted: an upload, an agent's web or email fetch,
-// or a file an app wrote. So its frame runs at an OPAQUE origin (ADR 0322).
-// Its scripts still run, but it cannot read the shell's DOM or storage, and
-// the engine refuses its requests to `/api/v1` as cross-site.
-//
-// The host cannot reach into an opaque frame's `contentDocument`. So a small
-// script is stamped into the document, ahead of the artifact's own. It carries
-// link clicks, downloads, shell shortcuts, fragment scrolls and pane swipes. It
-// cancels what the browser must not do, and posts the rest up. Every routing
-// DECISION stays on the host.
-//
-// The UI-scale zoom needs no bridge: `withPreviewSizing` stamps it into the
-// document text. The zoom SHORTCUTS ride the chord bridge like every other.
 
 import type { Binding } from '../../utils/shortcuts';
 import { isMac } from '../../utils/platform';
@@ -38,68 +23,23 @@ import {
   runPreviewLinkAction,
 } from './previewIframeLinks';
 
-/**
- * What a preview frame may do.
- *
- * `allow-same-origin` is absent, and that is the fix: with it the artifact
- * would run as the shell. `allow-top-navigation` is absent, so it cannot move
- * the shell. `allow-popups-to-escape-sandbox` is absent, so a window it opens
- * stays sandboxed. The engine serves a data file under the same set
- * (`file_response::DOCUMENT_SANDBOX_CSP`).
- */
 export const ARTIFACT_PREVIEW_SANDBOX =
   'allow-scripts allow-forms allow-modals allow-popups allow-downloads';
 
-/**
- * What the shell delegates to a preview frame, as a permissions policy.
- *
- * The opaque origin is not `self`, so every feature is denied unless listed.
- * `autoplay` and `fullscreen` keep a report's media playing and its video's
- * fullscreen button working. `clipboard-write` keeps its Copy buttons working.
- * The same calls the app frame makes (`appFrameSandbox.ts`), minus
- * `encrypted-media`, which no report needs. `fullscreen *` names every origin
- * for the reason given there: WebKit denies a bare one to an opaque frame.
- */
 export const ARTIFACT_PREVIEW_ALLOW = 'autoplay; fullscreen *; clipboard-write';
 
-/**
- * A fresh per-render nonce. The host drops a message that does not carry it.
- *
- * `getRandomValues` rather than `randomUUID`: the second exists only in a
- * secure context, and a phone may reach a dev workspace over plain http.
- */
 export function newBridgeNonce(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** What the host stamps into the bridge script. */
 export interface PreviewBridgeConfig {
   nonce: string;
   bindings: readonly Binding[];
   hostSchemes: readonly string[];
-  /** Whether sideways drags swipe the phone's panes. Off away from the phone, which
-   *  has no pane swipe, and in the modal, which floats over the panes. */
   paneSwipe: boolean;
 }
 
-/**
- * The script that runs inside the preview frame, as source. Plain ES5 over its
- * arguments, with no outer name, so a test can run it against a fake window.
- *
- * What it cancels, it decides synchronously, from two stamped lists: the schemes
- * the host routes, and the current shortcut bindings. The click rule mirrors
- * `handlePreviewLinkClick`, and the chord matcher mirrors `matchesEvent`. A
- * sibling `download` is claimed too: across origins the browser would ignore
- * `download` and navigate the frame. Listeners sit on `document` in the capture
- * phase, after the artifact's own window-capture handlers.
- *
- * The nonce is what the host trusts, so the artifact must never learn it:
- *  - the script runs first, then removes its own element, so the nonce lives
- *    only in this closure;
- *  - each message is an object literal, which no prototype setter intercepts;
- *  - it posts only for a trusted event, never for a scripted `click()`.
- */
 export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc, finder, swiper) {
   var self = doc.currentScript;
   if (self && self.parentNode) self.parentNode.removeChild(self);
@@ -216,15 +156,9 @@ export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc, finder,
   }
 }`;
 
-/** The names the preview bundles give their results (`PREVIEW_BUNDLES` in
- *  `packages/lucidos-sdk/previewBundles.build.mjs`). The bundles run inside the
- *  bridge's own function, so these are locals there, never window globals.
- *  Pinned against the bundle text in the bridge tests. */
 export const PREVIEW_FIND_LOCAL = '__lucidosPreviewFind';
 export const PREVIEW_SWIPE_LOCAL = '__lucidosPreviewSwipe';
 
-/** The `<script>` tag that installs the bridge. JSON cannot close a script
- *  element once every `<` is escaped, so no artifact byte is needed. */
 export function previewBridgeScript(cfg: PreviewBridgeConfig): string {
   const json = JSON.stringify({
     nonce: cfg.nonce,
@@ -239,23 +173,16 @@ export function previewBridgeScript(cfg: PreviewBridgeConfig): string {
     + `(${PREVIEW_BRIDGE_SOURCE})(${json}, window, document, ${PREVIEW_FIND_LOCAL}, ${PREVIEW_SWIPE_LOCAL});})();</script>`;
 }
 
-/** Stamp the bridge in as the very first thing the document parses, after a
- *  doctype only. Not merely first in `<head>`. An artifact can put a script
- *  before its head, or a `<head>` inside a comment. Either would then run ahead
- *  of the bridge and watch it arrive. */
 export function withPreviewBridge(html: string, cfg: PreviewBridgeConfig): string {
-  // Comments may precede the doctype and still keep standards mode.
   const doctype = /^(?:\s|<!--[\s\S]*?-->)*<!doctype[^>]*>/i.exec(html);
   const at = doctype ? doctype[0].length : 0;
   return html.slice(0, at) + previewBridgeScript(cfg) + html.slice(at);
 }
 
-/** The bridge config for one render: a fresh nonce and today's lists. */
 export function previewBridgeConfig(bindings: readonly Binding[], paneSwipe: boolean): PreviewBridgeConfig {
   return { nonce: newBridgeNonce(), bindings, hostSchemes: PREVIEW_HOST_SCHEMES, paneSwipe };
 }
 
-/** A message from a preview frame, once it has passed every check. */
 export type PreviewFrameMessage =
   | { kind: 'link'; href: string; baseUri: string | null }
   | { kind: 'download'; href: string; name: string; baseUri: string | null }
@@ -266,30 +193,14 @@ export type PreviewFrameMessage =
   | { kind: 'fragment-missing'; id: string }
   | { kind: 'swipe'; dx: number }
   | { kind: 'swipe-end'; paneDelta: -1 | 0 | 1 }
-  /** The frame's raw count, or null when its finder failed. Unchecked here:
-   *  the find bar validates a count from any frame the same way. */
   | { kind: 'find-result'; id: string; reply: unknown };
 
-/** Longest href or anchor id the host will route. A real link is far shorter;
- *  the cap keeps a hostile frame from handing the router megabytes. */
 const MAX_TEXT = 8192;
 
 function boundedString(value: unknown): value is string {
   return typeof value === 'string' && value.length <= MAX_TEXT;
 }
 
-/**
- * Accept a message only when it provably came from THIS preview's document.
- *
- * Four checks, all required:
- *  - `source` is this frame's own window. Origin alone proves nothing: every
- *    opaque frame on the page, an app's included, reports `"null"`.
- *  - `origin` is `"null"`. The frame is sandboxed, so anything else means the
- *    sandbox is gone, and the bridge refuses to work rather than trust it.
- *  - `nonce` is the one stamped into this render. A message left over from the
- *    document the frame showed before is dropped.
- *  - the body has the exact shape of its kind.
- */
 export function readPreviewFrameMessage(
   e: Pick<MessageEvent, 'source' | 'origin' | 'data'>,
   frameWindow: Window | null,
@@ -334,7 +245,6 @@ export function readPreviewFrameMessage(
       if (typeof data.dx !== 'number' || !Number.isFinite(data.dx)) return null;
       return { kind: 'swipe', dx: data.dx };
     case 'swipe-end':
-      // Any other delta still ends the drag, as a snap back.
       return { kind: 'swipe-end', paneDelta: data.paneDelta === 1 || data.paneDelta === -1 ? data.paneDelta : 0 };
     case 'find-result':
       if (!boundedString(data.id)) return null;
@@ -348,35 +258,21 @@ export function readPreviewFrameMessage(
   }
 }
 
-/** What the host knows about the preview a message came from. */
 export interface PreviewFrameContext {
   artifactPath: string;
-  /** Whether the artifact declares its own `<base href>`. Only then does the
-   *  frame's reported base decide where a relative link points. */
   declaresOwnBase: boolean;
   frameWindow: Window | null;
 }
 
-/** Does the shell hold transient user activation right now?
- *
- *  A click inside the preview activates its ancestors too. So the shell reads
- *  true for a real click, and false for a message script sent on its own. A
- *  browser without the API answers `null`: unknown, not yes. */
 function shellHasUserActivation(): boolean | null {
   const activation = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
   return activation ? activation.isActive : null;
 }
 
-/** May a message from the preview carry out a navigation?
- *
- *  Only while the shell holds activation from a click. The bridge already posts
- *  only for a trusted event, under a nonce the artifact cannot read. This is
- *  the second lock: a browser that cannot tell answers `null` and passes. */
 export function previewMayNavigate(activation: boolean | null): boolean {
   return activation !== false;
 }
 
-/** Act on a checked message from a preview frame. */
 export function routePreviewFrameMessage(msg: PreviewFrameMessage, ctx: PreviewFrameContext): void {
   switch (msg.kind) {
     case 'link': {
@@ -429,9 +325,6 @@ export function routePreviewFrameMessage(msg: PreviewFrameMessage, ctx: PreviewF
   }
 }
 
-/** Where a download link points. A workspace file, normally. An artifact
- *  that declares its own `<base href>` may point it elsewhere, and then the
- *  link goes where that base says, as a link would. */
 function downloadTarget(
   msg: Extract<PreviewFrameMessage, { kind: 'download' }>,
   ctx: PreviewFrameContext,
@@ -444,13 +337,6 @@ function downloadTarget(
   return { kind: 'file', path: decodeSegments(resolvePreviewRelativePath(ctx.artifactPath, msg.href)) };
 }
 
-/** An href is percent-encoded and `lucidos.data.url` encodes again, so a
- *  `Q3%20summary.csv` would be fetched as `Q3%2520summary.csv`. A malformed
- *  escape is kept as written.
- *
- *  The path's dot segments were already collapsed, so a segment that decodes
- *  to `.`, `..` or a separator is kept as written too. Decoded, `%2e%2e` would
- *  walk the shell's credentialed download out of `/data/`. */
 function decodeSegments(path: string): string {
   return path.split('/').map((segment) => {
     let decoded: string;
@@ -467,8 +353,6 @@ function refuseUnclicked(what: string, artifactPath: string): void {
   showToast(`The preview of ${artifactPath} tried to ${what} without a click. Nothing was opened.`, 'error');
 }
 
-/** Download a workspace file from the shell's own origin, where the browser
- *  honours `download`. `name` is the link's own suggestion, when it made one. */
 function downloadDataFile(path: string, name: string): void {
   const anchor = document.createElement('a');
   anchor.href = lucidos.data.url(path);

@@ -3,8 +3,6 @@ import { instantMicros } from './isoInstant';
 
 describe('instantMicros', () => {
   it('orders a whole second against its own sub-second neighbours', () => {
-    // The exact wire payload that misordered a thread's events. A lexical sort
-    // puts `...:21Z` last, because `.` sorts before `Z`.
     const wire = [
       '2026-08-28T07:19:20.980Z',
       '2026-08-28T07:19:20.990Z',
@@ -18,8 +16,6 @@ describe('instantMicros', () => {
   });
 
   it('orders across producers writing different sub-second widths', () => {
-    // Postgres keeps microseconds, so the engine can emit 6 digits; the
-    // frontend's own `toISOString` always emits 3.
     expect(instantMicros('2026-08-28T07:19:21.010500Z')!).toBeGreaterThan(
       instantMicros('2026-08-28T07:19:21.010Z')!,
     );

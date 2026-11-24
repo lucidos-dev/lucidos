@@ -51,6 +51,94 @@ pub(crate) async fn fetch_origin_main(repo_root: &Path) -> Result<Option<String>
         .ok_or_else(|| format!("could not read {ORIGIN_MAIN} after the fetch"))
 }
 
+/// Verify receive-pack can create and delete queue refs. Use an object origin
+/// already holds and a reserved, non-change ref that intake will ignore.
+pub(crate) async fn probe_origin_landing_queue(repo_root: &Path) -> Result<(), String> {
+    let tip = fetch_origin_main(repo_root)
+        .await
+        .map_err(|e| format!("Could not read origin/main for the landing queue probe: {e}"))?
+        .ok_or("The landing queue needs an origin with a main branch.")?;
+    let probe = format!("refs/lucidos/queue/probe-{}", uuid::Uuid::new_v4());
+    push_origin_refs(repo_root, &[&format!("{tip}:{probe}")])
+        .await
+        .map_err(|e| format!("Could not verify origin accepts landing queue refs: {e}"))?;
+    let visible = list_origin_refs(repo_root, &probe).await;
+    push_origin_refs(repo_root, &[&format!(":{probe}")])
+        .await
+        .map_err(|e| format!("Could not remove the landing queue probe: {e}"))?;
+    if !visible?
+        .iter()
+        .any(|(name, oid)| name == &probe && oid == &tip)
+    {
+        return Err("The ref written to origin is not visible when reading origin.".into());
+    }
+    Ok(())
+}
+
+/// Publish one transaction on origin. The caller supplies the refspecs and
+/// any compare-and-swap leases.
+pub(crate) async fn push_origin_refs(repo_root: &Path, updates: &[&str]) -> Result<(), String> {
+    let mut args = vec![
+        "push",
+        "--atomic",
+        "--no-follow-tags",
+        "--porcelain",
+        "origin",
+    ];
+    args.extend(updates);
+    let output = run_remote(&args, repo_root, PUSH_TIMEOUT).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(push_refusal(
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
+/// Read exact refs advertised by origin. Transport errors are distinct from
+/// a successful listing with no matching refs.
+pub(crate) async fn list_origin_refs(
+    repo_root: &Path,
+    pattern: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let output = run_remote(
+        &["ls-remote", "--refs", "origin", pattern],
+        repo_root,
+        FETCH_TIMEOUT,
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    std::str::from_utf8(&output.stdout)
+        .map_err(|e| e.to_string())?
+        .lines()
+        .map(|line| {
+            let (oid, name) = line
+                .split_once('\t')
+                .ok_or("Malformed origin ref listing")?;
+            Ok((name.to_string(), oid.to_string()))
+        })
+        .collect()
+}
+
+/// Fetch exactly the advertised object, without moving local refs or
+/// FETCH_HEAD. A withdrawn advertisement is retryable.
+pub(crate) async fn fetch_origin_object(repo_root: &Path, oid: &str) -> Result<(), String> {
+    let output = run_remote(
+        &["fetch", "--no-tags", "--no-write-fetch-head", "origin", oid],
+        repo_root,
+        FETCH_TIMEOUT,
+    )
+    .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// How a push to `origin`'s `main` went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PushOutcome {
@@ -75,7 +163,9 @@ pub(crate) async fn push_to_origin_main(repo_root: &Path, sha: &str) -> PushOutc
     let _push_guard = ORIGIN_PUSH_MUTEX.lock().await;
     match push_sha(repo_root, sha).await {
         PushOutcome::Rejected(reason) if origin_holds(repo_root, sha).await => {
-            log!("[Changes] origin's main already holds {sha}, so nothing to push ({reason})");
+            log_legacy!(
+                "[Changes] origin's main already holds {sha}, so nothing to push ({reason})"
+            );
             PushOutcome::Pushed
         }
         outcome => outcome,
@@ -146,7 +236,7 @@ pub(super) fn push_was_rejected(stdout: &str, stderr: &str) -> bool {
 /// Whether a landing goes to `origin` before local `main` (ADR 0589). Only a
 /// gateway that holds a pairing lands origin-first (`landing_gateway`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LandingOrder {
+pub enum LandingOrder {
     OriginFirst,
     /// Land locally, then push in the background.
     LocalFirst,
@@ -279,7 +369,7 @@ pub(crate) async fn ls_remote_main(repo_root: &Path) -> Result<Option<String>, S
 
 /// How following `origin`'s `main` went (ADR 0589).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FollowOutcome {
+pub enum FollowOutcome {
     /// The repository has no `origin`, so there is nothing to follow.
     NoOrigin,
     /// `origin` did not answer.

@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * Entering or leaving an app's native fullscreen moves the host's overlays into
- * and out of the fullscreen panel. It must MOVE them, never remount them: a
- * remount resets every overlay's own state, so Search Everywhere lost its query
- * and a prompt lost what the reader had typed (ADR 0437).
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { useState } from 'preact/hooks';
@@ -15,7 +9,6 @@ import { UiBlockingOverlay } from '../UiBlockingOverlay';
 import { appFullscreenHost } from '../../../store/appFullscreenHost';
 import { clientRefreshing } from '../../../hooks/sw-update';
 
-/** An overlay with state of its own, as Search Everywhere keeps its query. */
 function StatefulOverlay() {
   const [query, setQuery] = useState('');
   return (
@@ -47,7 +40,6 @@ describe('the overlay layer keeps its overlays mounted', () => {
     clientRefreshing.value = false;
     root = document.createElement('div');
     document.body.appendChild(root);
-    // The fullscreen app panel and its empty mount, as AppUiInline renders them.
     panel = document.createElement('div');
     mount = document.createElement('div');
     mount.setAttribute('data-overlay-layer', '');
@@ -92,8 +84,6 @@ describe('the overlay layer keeps its overlays mounted', () => {
     await act(() => { appFullscreenHost.value = mount; });
     const before = probe();
 
-    // AppUiInline clears the host in its unmount cleanup, which runs before
-    // Preact removes the panel's DOM. The overlays must already be home then.
     appFullscreenHost.value = null;
     panel.remove();
 

@@ -1,16 +1,60 @@
 # System events: behaviour notes
 
-`SystemEvent` (`crates/lucidos-engine/src/engine/event_bus_system_event.rs`) is the catalog of event variants. Its doc comments describe each variant. This page holds what those comments do not: projection effects, emit order and contracts a reader must not break. [`.claude/rules/db.md`](../.claude/rules/db.md) holds the conventions that apply to every event.
+`SystemEvent` (`crates/lucidos-core/src/engine/event_bus_system_event.rs`) is the catalog of event variants. Its doc comments describe each variant. This page holds what those comments do not: projection effects, emit order and contracts a reader must not break. [`.claude/rules/db.md`](../.claude/rules/db.md) holds the conventions that apply to every event.
+
+## SSE envelope identity
+
+Every SSE envelope carries the emitted event's `event_id`, for thread and system events alike.
+Thread data also retains its existing `event_id` field.
+Payload identities keep their own meaning: a notification's `data.event_id` names its tap target.
+Clients use the envelope identity to coordinate interactive presentation across windows (ADR 0721).
+Repeated delivery preserves that identity; distinct emissions retain distinct identities even when their payloads match.
+
+## Diagnostic inbox
+
+`DiagnosticBundleReceived` is committed in the same transaction as the private
+`diagnostic_bundles` payload, before broadcast or trigger matching. Its aggregate
+is `diagnostic_bundle` and its aggregate id is the receipt id. The event records
+origin, canonical content digest and stored compressed size, never log text.
+Concurrent deliveries with the same authenticated origin and delivery key share
+one receipt; conflicting content is refused. The immutable event retains that
+identity after the payload's 90-day expiry, so re-fetch cannot resurrect it.
+An arrival is ingress, including fetch by a cron trigger: it carries no emitting
+trigger id and can wake the receiving workspace's own trigger.
+
+## Live transaction mutations
+
+Thread plan lifecycle commands use `EventBus::emit_with_mutation` to commit
+marker changes with validated event appends. A rejected event cannot write a
+marker; a failed marker mutation rolls back its event.
+Replay applies projections without running these live callbacks, so historical
+approval never restores consumed edit permission. System event dispatch remains
+unchanged.
 
 ## Thread status and permissions
 
+- **Input release wakes the Thread Queue directly.** Routing and recording barriers share one logical input identity.
+  Releasing either barrier wakes the drain only when another input waits; the wake adds no system event or projection.
+- **A human Stop holds automatic wakes across sessions.** A device's `ResponseCanceled` with `user_stop` starts the hold.
+  Only a device resume ends it; parent messages may run without releasing held waits and child reports.
+  See `system-knowhow/glossary/core-terms-9.md` § Stopped thread.
+
+- **Sandbox mode belongs to the session event.** `SessionStarted.sandbox` records the resolved spawn choice without adding a system event or changing permission projections.
+  See `system-knowhow/thread-events.md` for the generated wire values; legacy events omit the field.
+- **Billing observations are passive thread metadata.** `CodingAgentBillingObserved` records runtime evidence without changing status, recency or section.
+  Usage stays on `ContextCaptured`; an observation must never create another metered call.
+- **Direct-port device sessions keep the existing event contract.** Each mint records `PermissionSpent` for an Allow once on its exact workspace, device and lifetime. A valid session supplies the device actor for ordinary input; registration alone supplies no attestation. Targeted widget fit reports require that same device, resolve an in-memory answer, and emit no system event.
 - **Permission resolution never resurrects a thread.** `CodingAgentPermissionResolved`, `CommandPermissionResolved` and `McpPermissionResolved` share one projection arm in `event_bus_projection_thread.rs`. It flips status to `running` only from `waiting_for_user_answer`. A stale click on an idle or terminal thread changes nothing.
 - **A question answer is the exception.** `UserQuestionAnswered` keeps its own unconditional move to `running`. An answer can resume an idled thread through `--resume`. A permission resolution never does.
 - **A finished session leaves no dangling card.** `CodingAgentIdled` clears any pending `CodingAgentPermissionRequest` through `resolve_pending_permissions_as_session_ended`.
 - **Request events flip status to `waiting_for_user_answer`.** That covers `CommandPermissionRequested` and `McpPermissionRequested`. Both are persisted, chat-channel only, and resolved through `POST /api/v1/command-permission/consent` and `POST /api/v1/mcp-permission/consent`.
-- **Persist scope.** `Resolved` carries `allowed`, an optional `reason` and an optional `persist_scope`. `narrow` stores `Mcp(server:tool)`, `broad` stores `Mcp(server:*)` in the workspace `mcp-allowed-tools`, and `session` stays in memory.
+- **Persist scope.** `Resolved` carries `allowed`, an optional `reason` and an optional `persist_scope`. `narrow` stores `Mcp(server:tool)`, `broad` stores `Mcp(server:*)` as standing grants in the workspace MCP lane, and `session` stores a grant held by the thread.
 - **No card for MCP calls in a non-interactive trigger thread**, or when the server's `auto_approve` flag is set.
 - **Message events exist on chat and coding-agent threads.** `MessageReceived` is the user typing, whichever agent answers. To filter chat threads only, join `thread_summaries` on `source = 'chat' AND is_coding_agent = false`. Use `source IN ('chat','trigger')` to include triggers.
+- **A thread holds one open card** (ADR 0755). Under the append lock, Validate records a `UserQuestionAsked` on a thread with an open card as `UserQuestionQueued`. It refuses an agent permission prompt there with the typed `CardSlotTaken`, and the prompt's site waits and emits again. `engine/card_queue.rs` posts the oldest queued card once the slot frees.
+- **A seeded `ThreadStarted` lands once.** A start carrying `recovered_compose` or `agent_draft` creates its thread under the append lock. When the thread already exists, the append drops the start, so a retry writes no event. A start carrying both seeds is refused.
+- **A background wait can update its timing in place.** `EventWaitTimingUpdated` preserves the original subscription, watermark, and wait ID.
+- **An unchanged integrated report files on the parent.** The fan-in compares the latest child report with the current payload and confirms the reply came from this turn. A match can emit `ChildReportFiled` instead of `ChildThreadCompleted` (ADR 0742). It owes no parent turn. A held parent files every report this way and raises no card.
 - **`ChildThreadDetached` is the only parent-and-child event that writes the child's row.** It cuts the edge (ADR 0278). The other three land on the parent only.
 - **Serde aliases.** `ThoughtStreamed` also reads `Thinking`, and the `CodingAgent*` variants also read the old `ClaudeCode*` names. Write new code against the current names.
 
@@ -61,12 +105,29 @@ interrupted jobs and announces their failure under both archive locks before
 HTTP admission. A never-used snapshot store creates neither directories nor
 MAC keys at boot.
 
+## Artifact provenance and provider holds
+
+`ArtifactCreated`, `ArtifactUpdated` and `ArtifactImported` carry an optional `writer` resolved when the write occurs.
+Only a `trigger` writer excludes a new artifact leaf from workspace memory and its estimate.
+App writes and legacy events without a writer remain eligible. Existing leaves are not rebuilt or reclassified.
+An unattended trigger without its trigger id fails provenance resolution rather than becoming an ordinary thread writer.
+After an already-merged change, a failed resolution raises a notification and preserves unrelated app and artifact-deletion events.
+
+`ModelSpendCapReached` announces one provider's hold on background model calls.
+It carries `provider`, the optional provider-supplied `resets_at`, and the engine's `held_until` retry boundary.
+`ModelSpendCapHoldEnded` announces reset, a successful call, or an explicit clear; a user clear also carries its actor.
+These events persist, but hold state belongs to the current engine run and is not reconstructed after a restart.
+
+The first event creates one notification. Further blocked calls do not create another hold notification.
+Interactive calls can still try the provider, and success ends that provider's hold.
+A coding-agent billing notice describes its failed turn without starting an engine provider hold.
+
 ## Memory events
 
 Aggregate `memory`, `aggregate_id` `global`.
 
 - **`MemoryCorrected` is the checkpoint.** The `memory` tool's `correct` and `correct_by_id` actions emit it before they delete anything. It is the only durable record of a correction. Rebuild phase 3 (`engine::memory::correction::replay_corrections`) replays each one, oldest first.
-- **A replay is conservative.** It deletes the closest same-source copy and what extraction folded in. It touches only rows written after `recorded_at`, from sources older than the event. The payload carries `search_query`, `wrong_fact`, `removed`, an optional `correction` and `recorded_at`. Flat rows from the retired factory carry only `deleted_summaries`, which the replay matches on text alone.
+- **A replay is conservative.** It deletes the closest same-source copy and what extraction folded in. It touches only rows written after `recorded_at`, from sources older than the event. The payload carries `search_query`, `wrong_fact`, `removed`, an optional `correction` and `recorded_at`. A correction through `POST /api/v1/memory/correct-by-id` also carries its caller as `actor`. Flat rows from the retired factory carry only `deleted_summaries`, which the replay matches on text alone.
 - **A tree backfill episode runs from `TreeBackfillStarted` to `TreeBackfillEnded` or `TreeBackfillReset`.** `TreeBackfillProgressed` is transient. `Started`, `Completed`, `CapReached`, `CapRaised`, `Ended` and `Reset` are persisted. `summary_tree/spend.rs` reads the cap and spend back from these rows at every seed. Spend is the `summary_compaction` captures since `Started`, priced by `COMPACTOR_MODELS`.
 - **Progress counts scopes.** Each in-scope thread plus the workspace is one scope, and `done_milli` adds the built share of each scope under way. The compactor emits `Progressed` at seed, per completed scope, per owed node, and when a scope starts failing or the model wait changes.
 - **`TreeBackfillCompleted` follows `mark_ready`.** It fires once the workspace tree and the threads active in the last 7 days are built. Older threads fill in after (`ready: true`).
@@ -76,17 +137,26 @@ Aggregate `memory`, `aggregate_id` `global`.
 ## Notifications and presence (all transient)
 
 - **Presence.** `DeviceVisible` and `DeviceHidden` use aggregate `device_presence`. `PresenceCheck` uses aggregate `presence`. None is persisted. `PresenceCheck` is the fan-out check at `NotificationCreated` time and carries the toast content.
-  - Every connected page acts on it and POSTs `/api/v1/presence-pong` with its presence outcome. Only an outcome other than `not_shown` withholds the OS push (`system-knowhow/notifications.md` §3, ADR 0440).
+  - Every connected page acts on it and POSTs `/api/v1/presence-pong` with its presence outcome. Only an outcome other than `not_shown` withholds the OS push (`system-knowhow/notifications/3-the-presencecheck-protocol.md` §3, ADR 0440).
 - **`NativePushRequested`** uses aggregate `notification`, `aggregate_id` the notification id. The `NotificationCreated` fan-out emits it only on the push-allowed branch, when no page reported handling the check. A connected Tauri app shows a native macOS banner through `show_native_notification`, which needs a packaged `.app`. A desktop window brought forward since it answered shows the in-app toast instead.
   - A tap routes through `dispatchDeepLink`, as a web-push tap does. Browser and PWA pages ignore the frame and get the real web push. The decision runs whenever any client is on SSE, even with zero web-push subscriptions.
 - **`NativePushDismissRequested`** is the cross-device counterpart of a read. `mark_notification_read` and `mark_all_notifications_read` emit it inside the same `success` and `count > 0` guards as `NotificationRead` and `NotificationsAllRead`, so a no-op POST emits neither. `aggregate_id` is the notification id, or `all` when `notification_id` is `None`. Only a Tauri desktop app acts on it (`handleNativePushDismiss` gates on `isTauri()`). The open web cannot silently remove a Web Push banner, and Safari revokes a subscription after 3 silent pushes.
 - **`NativePushDismissRequested.audience`** names the reader's person's devices on a team gateway, so one person's read leaves everyone else's banners (ADR 0623).
 - **`NotificationCreated.audience`** lists the devices a notification is for (ADR 0623). A producer may name them. Otherwise `EventBus::with_notification_audience` fills them in from the root thread of the thread it opens. That runs before the append transaction, so a replay agrees. Absent means everyone.
-- **`OperatorsChanged`** is transient, aggregate `operator`, id `all`. The engine emits it after a gateway `POST /api/v1/operators/changed` once the new operator list differs. Pages reload `GET /api/v1/operators/me`, which decides their Review group on a team gateway. They also reload `GET /api/v1/operators/people`, the people they can mention.
-  - `sent_at_ms` drives a page-side freshness gate that drops a late SSE-queue flush. See `system-knowhow/notifications.md` §4.
+- **`PairingRequestsChanged`** is transient, aggregate `pairing`, id `all`. The engine emits it after a gateway `POST /api/v1/pairing-requests/changed`: a pairing started waiting for a paired device's Allow, or one was answered. A body naming a `raised` request also writes a notification that opens Settings → Access. Pages re-read the gateway's `/~/api/v1/auth/pairing-requests`.
+- **`UsersChanged`** is transient, aggregate `user`, id `all`. The engine emits it after a gateway `POST /api/v1/users/changed` once the new user list differs. Pages reload `GET /api/v1/users/me`, which decides their Review group on a team gateway. They also reload `GET /api/v1/users`, the users they can mention.
+  - `sent_at_ms` drives a page-side freshness gate that drops a late SSE-queue flush. See `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4.
 
 ## Thread Queue and capacity
 
+The engine owns queue events and their projection. The queue executor starts
+admitted work through the agent host.
+
+- **Stop compose restoration** is stored on `QueuedMessageRemoved` with `restore_to_compose: true` and its exact `compose` report. The removal and restoration share a transaction; the postcommit `ThreadComposeChanged` and HTTP response carry that report. Replay applies it only to an older compose epoch. The report includes exact restoration additions keyed by epoch; compose PUTs retain them and consumption clears them. Pending clients rebase those additions once and keep that edit pending across older acknowledgements. Normal trash markers do not restore compose (ADR 0710).
+- **`OrdinarySubmissionAccepted`** records a resolved composer request and its compose acknowledgement, keyed by the target thread. Its event identity differs from the execution message identity. Atomic acceptance joins input order and consumes compose on the transaction that persists this event and projects recoverable queue membership. Receipt replay checks the immutable wire intent and authenticated actor before resolving current settings or applying any current fence. The separately retained resolved payload fixes execution settings. Compose consumption announces only after commit, and replay emits nothing.
+
+  Ordinary HTTP sends use this acceptance and recover through the user-priority gate.
+- **`DraftSubmissionAccepted`** persists the exact saved snapshot, prepared queue request, retry receipt, submitting agent and owner-authority evidence (ADR 0651). Its aggregate is `thread`, keyed by the destination thread. Its projection consumes the draft at the checked *draft revision* and records receipt and recoverable queue membership in one transaction. A replay returns the receipt without consuming later edits. Agents reach it over `POST /api/v1/threads/:thread_id/submit-draft`, the `threads` tool and the CLI. Each needs a standing instruction or a live once `submit-draft` *permission*, which acceptance spends in its own transaction (ADR 0688).
 - **The Thread Queue events are persisted** and drive the `thread_queue` projection. Aggregate `thread_queue`, `aggregate_id` the entry id. Every background spawn emits them, so they double as the audit trail of background work. An immediately admitted entry gets `ThreadQueued` and `ThreadQueueAdmitted` back to back.
 - **`ThreadQueued.requeued = true`** marks the boot sweep re-queuing an admitted entry that bound no thread.
 - **A trigger fire emits `ThreadQueueAdmitted` twice.** The second carries the `thread_id` the fire minted (`ThreadQueue::record_entry_thread`). The projection COALESCEs the id onto the row and keeps the first `admitted_at`. That lets the boot sweep tell a fire that started from one that never did (ADR 0133).
@@ -109,6 +179,7 @@ Aggregate `memory`, `aggregate_id` `global`.
 - **`PluginLocalChangesMerged` follows `PluginInstalled`** when the install met a locally edited file. It is persisted because nothing on disk records which files merged. Paths in `conflicted`, `replaced` and `removed` have a copy in `saved_paths`, under `data/artifacts/plugin-local-changes/` with a `.patch` sibling. Paths in `restored` do not, since a deletion has no content.
 - **Marketplace events use aggregate `plugin_marketplace`**, `aggregate_id` the `marketplace_id`. `PluginMarketplaceRegistered` is an upsert: the id hashes the canonical source, so a re-registration rewrites `name` and `source`. It fires on every registration call, as `McpServerRegistered` does. Only `engine::tools::plugins::marketplaces` emits it, as the single write path of `data/config/plugin-marketplaces.json`.
 - **`PluginCatalogScanStarted` and `PluginCatalogScanned` are transient.** They bookend the scan in `scheduler::plugin_updates` and move the Plugins panel's scanning state. A scan runs at startup, every five minutes, on registration and on a stale page open. Persisting them would add a heartbeat row.
+- **Event hook arming (ADR 0746).** `EventHookArmed`, `EventHookDisarmed` and `EventHookRemoved` are persisted, aggregate `event_hook`, `aggregate_id` the hook's slug, and carry `actor`. No table holds the arming: the latest of the three per slug is it (`core::event_hooks::armed_hooks`). `EventHookArmed` names the `content_hash` it binds, so an edited hook reads as changed, not armed. The `/api/v1/hooks` routes emit them with `bus.emit`, because the event is the act, and an agent's act spends the owner's once permission first. No hook may name one of the three.
 - **Dashboards (ADR 0496).** `DashboardTileAdded`, `DashboardTileRemoved` and `DashboardArranged` are persisted, aggregate `dashboard`, `aggregate_id` `phone` or `desktop`. No projection table exists: `engine/dashboard.rs` folds them on every read, over a seed from the home thread's legacy `WidgetPinned`, `WidgetUnpinned` and `HomeBoardArranged` rows. Nothing writes those rows now.
 
 ## Apps, artifacts and knowhow
@@ -127,7 +198,7 @@ Aggregate `memory`, `aggregate_id` `global`.
 
 Persisted, and carrying `actor` unless noted. The payload shapes are in the `SystemEvent` doc comments.
 
-- **The emit lives in the store's write path, not at the call site.** `RepositoryStore::{register,unregister}`, `WebhookStore::{create,update,delete}`, `McpServerStore::set_tool_disabled` and `ModelStore` emit by construction, so every surface announces. `crates/lucidos-engine/src/core/announced_surfaces.rs` lists which surface is announced and which is deliberately silent, with the reason.
+- **The emit lives in the store's write path, not at the call site.** `RepositoryStore::{register,unregister}`, `WebhookStore::{create,update,delete}`, `McpServerStore::set_tool_disabled` and `ModelStore` emit by construction, so every surface announces. `crates/lucidos-core/src/core/announced_surfaces.rs` lists which surface is announced and which is deliberately silent, with the reason.
 - **`Credential*` events never carry the secret**, only the service name and type. `CredentialRevealed` and `BackupKeyRevealed` follow the same contract. Each is written when the plaintext or key leaves the engine, behind a one-shot 30-second reveal token and an app-`Referer` refusal (ADR 0117). That makes an unexpected reveal findable afterwards.
 - **Environment variables carry their `value`**, the inverse of `Credential*`, because they are non-secret. The startup `data/.env` migration writes rows directly and emits nothing.
 - **`RepositoryAdded` also feeds the `repo_names` projection.** `actor` is the device for the HTTP CRUD, the acting thread for the tool, and absent for the startup registration.
@@ -141,9 +212,10 @@ Persisted, and carrying `actor` unless noted. The payload shapes are in the `Sys
 - **Webhook refusals (ADR 0235)** are the verification-layer sibling of the ingress pair, which reads a 401 as healthy. `cause` is `disabled` or `verification`. `resolution` is `accepted`, `reconfigured`, `quiet` or `removed`, exhaustive so a declaration cannot strand. They are per hook and edge-triggered, and `declared_refusals` takes the newest event per `aggregate_id`.
 - **`McpServerStopped` removes the id from every `thread_summaries.enabled_mcp_servers`**, as `McpServerRemoved` does (ADR 0430). Engine shutdown emits none, so threads keep their enabled servers across a restart.
 - **`McpLaunchApproved` fires once per new *launch approval***, from `McpServerStore::approve_launch`. Re-approving a pair it already holds is silent. The payload names the server and the actor, never the fingerprint or the line, since the real line holds sealed env values. The frontend bumps `mcpServersVersion` on it.
-- **`McpServerDisabledToolsChanged` and `PermissionGrantsChanged` carry the resulting set in full**, never a delta, so a reader needs no folding. The grant event matters most for auditing a widened grant. Both emit only when the set moved. `McpServerStore::set_tools`, a cache refresh, emits nothing.
+- **`McpServerDisabledToolsChanged` and `PermissionGrantsChanged` carry the resulting set in full**, never a delta, so a reader needs no folding. Settings emits only when the set changes. `McpServerStore::set_tools`, a cache refresh, emits nothing.
 - **Config events carry what Undo needs** (ADR 0623, `engine/config_change.rs`). `McpServerDisabledToolsChanged` adds `previous`, `McpServerRegistered` adds `created`, `RepositoryRemoved` adds `name`, `root_path` and `description` (none on an identity collapse), and `CredentialDeleted` adds `metadata`, never the value. `TriggerUpdated` and `TriggerDeleted` payloads carry `previous`, the config before, as a created payload. A trigger's own actor field rides as `actor_field`.
-- **All three grant editors emit through `api::settings::write_grant_file`.** `grant_file` is a typed `core::GrantFile` whose wire value is its file name. The "Always allow" buttons add no event, since their `*PermissionResolved` event names the pattern.
+- **Standing tool grant changes emit `PermissionGrantsChanged`** (ADR 0677). Settings edits, remembered card picks and revocations use `tool_grants::change_standing`. `grant_file` is a typed `core::GrantFile` whose wire value is its file name. `source` says which path changed it, and `granted_in_thread_id` names the thread a card click came from.
+- **Legacy grant files** are imported at boot and removed after commit. A unique index stamps the import per lane, even for an absent file. After that, the engine removes any leftover files without changing grants.
 - **`ModelCreated`, `ModelUpdated` and `ModelDeleted`** make `spawn_models_registry_subscriber` reload the in-memory `ModelRegistry`, so `RoutingProvider` picks up a re-routed model without a restart.
 - **Data file events.** `PUT`, `DELETE` and `POST /api/v1/data/*` emit `DataFileWritten`, `DataFileDeleted` and `DataFileEdited`. The agent file tools emit them too, with no actor, for paths outside `artifacts/` (`data_file_event` in `engine/tools/files.rs`). `Artifact*` covers `artifacts/`.
 - **Device events.** `DeviceHandedOver` is one event for a whole-row move across `devices`, `preferences`, `pinned_apps`, `device_presence` and `push_subscriptions`. The per-row writes stay silent. The daily device sweep emits `DevicePushChanged` and `DeviceDeleted` with no actor.
@@ -155,18 +227,26 @@ Persisted, and carrying `actor` unless noted. The payload shapes are in the `Sys
 
 ## Landing lane and main check
 
-- **Landing lane (ADR 0463).** Aggregate `landing_lane`, `aggregate_id` the `batch_id`. Only `engine::landing_lane` emits `LaneBatchStarted`, `LaneBatchLanded` and `LaneBatchFailed`. The lane keeps no table. Recovery folds these with `ChangeQueued`, `ChangeUnqueued` and each member's `ChangeApplied`.
+- **Landing lane (ADR 0463).** Aggregate `landing_lane`, `aggregate_id` the `batch_id`. Only `engine::landing_lane` emits `LaneBatchStarted`, `LaneBatchLanded`, `LaneBatchFailed`, `LaneArrivalsHeld` and `LaneArrivalsReleased`. The lane keeps no table. Recovery folds these with `ChangeQueued`, `ChangeUnqueued` and each member's `ChangeApplied`.
 - **`LaneBatchStarted`** carries `members`, `base_sha` and `lane_thread_id`. `base_sha` is `main` when the batch formed, where the integration branch `lane/<batch_id>` starts. Any run on the lane thread while the batch is open carries the batch (`landing_lane::lane_duty_for_run`).
-- **`LaneBatchLanded`** follows every member's `ChangeApplied`. After a crash between the two, recovery reads `pre_sha` from the reflog of `main`.
-- **`LaneBatchFailed`** carries `actor` only for a Cancel (`POST /api/v1/changes/lane/cancel`). Every member gets `ChangeUnqueued { reason: batch_failed }` and stays pending.
+- **`LaneBatchLanded`** follows each local member's `ChangeApplied`. A remote member's source records `ChangeApplied` once it observes the landing. After a crash between the two, recovery reads `pre_sha` from the reflog of `main`.
+- **`LaneBatchFailed`** carries `actor` only for a Cancel (`POST /api/v1/changes/lane/cancel`). Local members get `ChangeUnqueued { reason: batch_failed }`. The source of each remote member reads its result ref and records `ChangeUnqueued`.
+- **`LaneBatchFailureRequested`** stores a remote batch's failure intent before publishing result refs. Recovery retries publication until it can close the batch.
+- **`HardenCertificateCarried`** records the previous and new heads when a disjoint catch-up inherits a full certificate. The event and marker update commit together.
+- **`RemoteChangesLanded`** reports the previous and new main heads for an origin landing that includes a remote member. The main check reads it as a landing.
+- **`LaneArrivalsHeld`** opens the *arrival hold* (ADR 0694). The batch's catch-up changed its hardened head, so it hardens again. Until it ends, the lane queues each clean arrival without a pass, so `main` holds still. Recovery reads every `ChangeQueued` inside an open hold as a held arrival.
+- **`LaneArrivalsReleased`** ends it, with `cause` (`batch_landed`, `batch_failed` or `cap_reached`) and the held `arrivals` in arrival order. The cap is `ARRIVAL_HOLD_CAP`, 15 minutes from the `LaneArrivalsHeld`, restart included. A batch end with no release written also closes the hold on recovery.
 - **Origin-first landing (ADR 0589).** While the gateway holds a pairing, a landing pushes before `main` moves and before `ChangeApplied`. An unreachable `origin` emits nothing: the members stay queued, and the lane snapshot's `waiting_for_origin` says why. Unpaired, the lane lands locally and pushes after.
 - **`MainPushFailed`** (aggregate `main_push`, `aggregate_id` the repository root) reports a failed push after an Apply outside the lane, or after a local-first lane landing. `main` stays moved locally, and the client raises an error toast.
 - **`MainFollowRefused`** (aggregate `main_follow`, `aggregate_id` the repository root) reports that local `main` could not fast-forward to a newer `origin/main`: the two diverged, or an uncommitted edit stood in the way. `main` stays where it was. The follow task sends it once per distinct reason, and the client raises an error toast.
-- **Main check (ADR 0464).** Aggregate `main_check`, `aggregate_id` the `check_id`. Only `engine::main_check` emits `MainCheckStarted`, `RunLinked`, `Passed`, `Failed`, `Abandoned` and `RedClosed`. It keeps no table. Recovery folds them with every `ChangeApplied` that carries a `landing_merge_sha`.
+- **`MainFollowed`** (aggregate `main_follow`, `aggregate_id` the repository root) records that local `main` fast-forwarded from `from_sha` to a newer `origin/main` at `to_sha`, because another gateway landed. The main check reads it as a landing, live and after a restart (ADR 0694).
+- **`MainCheckSuperseded`** (aggregate `main_check`, `aggregate_id` the check id) records that a newer `main` at `to_sha` cancelled the running main check before its first test job started. It is no verdict: the next check starts on the newer `main` at once, from the same base. A check whose tests started always runs to its verdict (ADR 0694).
+- **Main check (ADR 0464).** Aggregate `main_check`, `aggregate_id` the `check_id`. Only `engine::main_check` emits `MainCheckStarted`, `RunLinked`, `Passed`, `Failed`, `Abandoned`, `RedClosed` and `RepairStarted`. It keeps no table. Recovery folds them with every `ChangeApplied` that carries a `landing_merge_sha`.
 - **`MainCheckStarted`** runs `scripts/main-check.sh <to_sha>`. `from_sha` is `main` as the last check with a verdict saw it.
 - **`MainCheckRunLinked`** records the workflow run. Engine shutdown then detaches, and the next start reattaches with `main-check.sh <to_sha> --attach <run_url> <branch>`.
-- **`MainCheckPassed` records flaky tests** that failed once and passed a retry, and the one flaky fix thread it opened. Nothing records that thread's close. Recovery derives it from a landing by that thread, or from its archive or delete.
-- **`MainCheckFailed` opens one fix thread.** Main stays red until a `MainCheckRedClosed`, whose `reason` is `fix_landed` or `closed`.
+- **`MainCheckPassed` records flaky tests** that failed once and passed a retry, and the repair owner its findings attach to. Nothing records that thread's close. Recovery derives it from a landing by that thread, or from its archive or delete.
+- **`MainCheckFailed` schedules or updates one repair.** Checks continue while red. `MainCheckRedClosed.reason` is `fix_landed`, `closed`, or `passed_on_newer_main`.
+- **`fix_thread_id` on `MainCheckFailed`, `MainCheckPassed` and `MainCheckRedClosed`** names the repair each one reports to. A working repair arms one event wait on all three, filtered on `fix_thread_id`. Each later finding and the close then reach it while it works (ADR 0694). Rows written before the field have none.
 - **`MainCheckAbandoned` is no verdict.** It covers GitHub down, a refused push, or a restart before the run was linked. It starts nothing by itself.
 
 ## Other engine and security events
@@ -186,6 +266,27 @@ Unless noted, these are dev-only by construction (`refresh_served_frontend_after
 - **`FrontendUpdateStranded`** fires when the post-Apply rebuild wait expires (`REBUILD_WAIT_TIMEOUT`, 60 s): the change built, but the `dist/` this engine serves is not the one republished. It stays distinct from `Deferred`, which means "arrives on Switch". Reusing it would say something false.
 - **`FrontendUpdateStranded` fields.** `served_in_worktree` marks a stack pinned to a coding-agent worktree, whose `dist/` freezes while the shared checkout rebuilds elsewhere. `build_error` is what `.build-watch/status.json` last reported. `build_watch_stopped` reads the pidfile beside it, because a status records only the last completed build. `true` outranks `build_error`, since a stopped watch never retries. `false` also means "could not tell".
 - **`ServedFrontendAdvanced`** fires on every swap of this engine's boot-pinned snapshot to the shared `dist/` (`advance_served_snapshot`). Two paths swap: the applying engine after its own frontend-only Apply, and `sync_served_frontend_if_safe` (about every 10 s) after another workspace's. The second is gated by `peer_advance_is_safe`: disk and build state, plus git-confirmed engine-source parity with HEAD (`engine_source_matches_head`). A mixed change mid-rebuild defers to the Switch flow. The frontend handler re-runs `syncClientUpdateFromBuild`, which is idempotent. An SSE reconnect re-runs the check, since nothing replays the event.
-- **`EngineBuildStateChanged`** carries `state` (`idle`, `building`, `ready`, `failed`) and fires from `engine::background_build` on each background-rebuild transition, latest generation only. It exists because iOS suspends the throttled `checkEngineVersion` poll on a backgrounded PWA, so the build window went unobserved. The handler re-runs the authoritative GET and never trusts `state`. A PWA suspended for the whole build reconciles in `onResume`.
+- **`EngineBuildStateChanged`** carries `state` (`idle`, `building`, `ready`, `failed`) and fires from `engine::background_build` on each background-rebuild transition, latest generation only. It prompts connected clients to re-read without a periodic client check. The handler re-runs the authoritative GET and never trusts `state`. A PWA suspended for the whole build reconciles in `onResume`.
+- **`EngineVersionStatusChanged`** fires when the source engine observes a semantic status change, or first observes a connected page. Elapsed counters are excluded. Clients re-read the authoritative snapshot. The watcher idles without pages and exits for packaged installs.
 - **`FrontendRefreshStateChanged`** fires when the applying engine starts waiting for the build-watch after a frontend-only Apply, and when the wait ends. A peer-sync takeover sends the end poke itself, since it aborts the task. The "Building frontend" activity follows `frontend_refresh_elapsed_ms` from the re-read, never the poke.
-- **`FrontendPreviewStarted` and `FrontendPreviewStopped`** use `aggregate_id` the thread id (ADR 0055). The one preview slot per workspace is identified by the thread whose worktree it serves. `Started` carries the port and never a URL, because the same workspace is `localhost` on the laptop and a Tailscale name on the phone. Only the page builds the href (`previewHref`). Moving the slot emits a stop for the old thread and a start for the new one, in no fixed order. So the stop handler keys on `thread_id`.
+- **`FrontendPreviewStarted` and `FrontendPreviewStopped`** use `aggregate_id` the thread id (ADR 0055): the workspace's one preview slot is named by the thread whose worktree it serves. `Started` carries the port and never a URL, because the same workspace is `localhost` on the laptop and a Tailscale name on the phone. Only the page builds the href (`previewHref`). `loopback_only` says Vite serves this machine alone, so a page on another device shows why instead of a link. Moving the slot emits a stop for the old thread and a start for the new one, in no fixed order. So the stop handler keys on `thread_id`.
+
+### Main repair admission (ADR 0682)
+
+`MainCheckRepairStarted` is a persisted `main_check` event keyed by `check_id`.
+It carries `fix_thread_id`, `started_by` (`auto` or `fix-now`), and the owner's actor for Fix now.
+It has no thread projection effect. A successful emit authorizes the first repair prompt.
+
+Checks continue while red. Continued failures keep their repair owner.
+A later pass closes red with `passed_on_newer_main`; failed verdicts remain failed.
+`MainCheckFailed.superseded_by_fix` optionally records a fix that landed during an older check.
+Such a failure cannot reopen red. Old payloads still require `fix_thread_id`.
+
+
+### Memory extraction failures
+
+`MemoryExtractionFailed` records one exhausted extraction operation, rather than each attempt.
+It carries the memory `source`, selected `model` and final `reason`.
+Reasons are `call_failed`, `unreadable_reply` and `timed_out`.
+An empty facts array is a successful answer and emits no failure.
+Non-artifact sources keep the existing raw-text fallback; artifacts skip it.

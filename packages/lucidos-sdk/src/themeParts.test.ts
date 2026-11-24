@@ -1,7 +1,3 @@
-/**
- * The part grammar twin agrees with the engine, case for case, and every apply
- * site runs it on part tokens (ADR 0307).
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -18,12 +14,11 @@ const cases: {
   valid: { token: string; value: string; canonical: string }[];
   invalid: { token: string; value: string; error: string }[];
 } = JSON.parse(readFileSync(
-  resolve(here, '../../../crates/lucidos-engine/src/core/themes/theme-part-cases.json'),
+  resolve(here, '../../../crates/lucidos-core/src/core/themes/theme-part-cases.json'),
   'utf-8',
 ));
 
 describe('the part grammar agrees with the engine', () => {
-  // The engine's `parts_tests.rs` reads the same fixture.
   it.each(cases.valid)('accepts $token = $value', ({ token, value, canonical }) => {
     expect(checkPartToken(token, value)).toEqual({ ok: canonical });
   });

@@ -1,11 +1,3 @@
-/**
- * A whole call driven through fake devices.
- *
- * The point is the terminal paths: every way a call can end must release the
- * microphone exactly once. A held `MediaStream` keeps the recording indicator
- * lit long after the call is gone. No test with a real `AudioContext` could run
- * here at all.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SPEECH_GATE_DEFAULTS } from './speechGate';
 import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
@@ -33,12 +25,6 @@ import {
 
 const THREAD = 'thread-1';
 
-/**
- * Quiet frames enough that the caller's next word takes the floor back.
- *
- * Derived rather than written out, so the two numbers behind it cannot drift
- * apart. Below this a word is somebody finishing their sentence.
- */
 const GAVE_UP_THE_FLOOR = Math.ceil(BARGE_IN_QUIET_MS / CAPTURE_FRAME_MS);
 
 interface Harness {
@@ -47,40 +33,26 @@ interface Harness {
   states: CallState[];
   problems: string[];
   last(): CallState;
-  /** Devices handed out, newest last. */
   devices: FakeDevice[];
   sockets: FakeSocket[];
   socket(): FakeSocket;
   device(): FakeDevice;
-  /** The device id each `openAudio` was asked for, newest last. */
   askedFor: (string | null)[];
-  /** Push captured microphone frames at the runner. */
   capture(rms: number, frames?: number): void;
-  /** Speak loudly enough to open the gate, for a whole run by default. */
   speak(frames?: number): void;
-  /** Go quiet for long enough to shut it, for a whole run by default. */
   hush(frames?: number): void;
-  /** How many times a woken audio device was handed back untaken. */
   releases(): number;
-  /** Resolve a deferred `openAudio`, when one was armed. */
   releaseAudio(): Promise<void>;
   armSlowAudio(): void;
   armAudioFailure(error: unknown): void;
-  /** Make every device handed out from here refuse to close. */
   armCloseFailure(error: unknown): void;
   armSocketFailure(error: unknown): void;
-  /** Make the next ticket mint refuse. */
   armMintFailure(error: unknown): void;
-  /** Hold every ticket mint until {@link releaseMint}. */
   armSlowMint(): void;
   releaseMint(): Promise<void>;
-  /** The thread each ticket was minted for, newest last. */
   minted: string[];
-  /** Make the echo report that no hop carries an upgrade. */
   armBlockedUpgrade(): void;
-  /** Make the probe itself fail, so it answers nothing either way. */
   armProbeFailure(error: unknown): void;
-  /** Let a pending refusal probe answer. */
   settleProbe(): Promise<void>;
 }
 
@@ -91,7 +63,6 @@ class FakeDevice implements AudioDevice {
   closeError: unknown = null;
   note: string | null = null;
 
-  /** Whether the talker's audio is still sounding. Tests set it. */
   playing = false;
 
   play(pcm: ArrayBuffer): void {
@@ -141,7 +112,6 @@ class FakeSocket {
     this.forgotten = true;
   }
 
-  /** What the engine says, ignored once the runner has closed us. */
   say(frame: object): void {
     if (!this.forgotten) this.handlers.onText(JSON.stringify(frame));
   }
@@ -150,13 +120,6 @@ class FakeSocket {
     return this.texts.map((t) => JSON.parse(t).type as string);
   }
 
-  /**
-   * The controls a barge-in case is about, which is the cut and not the floor.
-   *
-   * `caller_started_speaking` rides every opening edge, so it lands in most of
-   * these cases and says nothing about whether the talker was cut off. Cases
-   * about the opener itself read {@link controls} whole.
-   */
   cuts(): string[] {
     return this.controls().filter((type) => type !== 'caller_started_speaking');
   }
@@ -293,7 +256,6 @@ const STARTED = {
   audio: { sample_rate_hz: 24_000, channels: 1, encoding: 'pcm_s16le' },
 };
 
-/** Press, let the microphone arrive, shake hands, and take the call live. */
 async function liveCall(): Promise<Harness> {
   const h = harness();
   h.runner.press(THREAD);
@@ -347,8 +309,6 @@ describe('placing a call', () => {
     h.armSlowAudio();
     h.runner.press(THREAD);
     await Promise.resolve();
-    // A first-use permission prompt can sit here for a long time. A ticket
-    // minted before it could expire before the caller ever answered.
     expect(h.minted).toHaveLength(0);
     await h.releaseAudio();
     await Promise.resolve();
@@ -363,8 +323,6 @@ describe('placing a call', () => {
 });
 
 describe('which microphone a call opens', () => {
-  /** A workspace that never picked one asks for nothing in particular, which
-   *  is how every call worked before the picker existed. */
   it('names none until the reader picks one', async () => {
     const h = harness();
     h.runner.press(THREAD);
@@ -381,8 +339,6 @@ describe('which microphone a call opens', () => {
     expect(h.askedFor).toEqual(['headset']);
   });
 
-  /** The call still goes up, so the note is the only way anybody learns they
-   *  are not on the microphone they chose. */
   it('says out loud when the port had to settle for another device', async () => {
     const h = harness({ microphone: 'headset', note: 'the headset is gone' });
     h.runner.press(THREAD);
@@ -451,8 +407,6 @@ describe('barge-in', () => {
     expect(h.socket().cuts()).toEqual([]);
   });
 
-  /** Stopping playback must not shut the gate. The caller is mid-word, and the
-   *  rest of that word is one utterance, not a second one. */
   it('leaves the gate open across the cut it makes', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
@@ -461,13 +415,6 @@ describe('barge-in', () => {
     expect(h.last().utteranceCount).toBe(1);
   });
 
-  /** **The caller never stopped, so they cut nobody off.** The talker took the
-   *  floor over the top of them, which is the provider endpointing on a
-   *  breath. Their next words finish the sentence it talked over.
-   *
-   *  Cut here, the client throws the speaker's queue away while the talker
-   *  carries on, and the caller hears the reply resume as a fragment. Their
-   *  utterance still opens: only the CUT is withheld. */
   it('stays quiet for a caller who never stopped talking', async () => {
     const h = await liveCall();
     h.speak();
@@ -479,9 +426,6 @@ describe('barge-in', () => {
     expect(h.last().phase).toBe('speaking');
   });
 
-  /** The breath before a trailing "please" is longer than the gate's own
-   *  hangover and shorter than handing the floor over. It is the exact gap the
-   *  reported call was chopped at. */
   it('stays quiet for a caller drawing breath mid-sentence', async () => {
     const h = await liveCall();
     h.speak();
@@ -492,8 +436,6 @@ describe('barge-in', () => {
     expect(h.device().stops).toBe(0);
   });
 
-  /** Every delta of the reply arrives as one of these. Measuring afresh on
-   *  each would shut the gate under a caller who IS cutting in. */
   it('measures afresh only on the first delta of a reply', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'here ' });
@@ -504,8 +446,6 @@ describe('barge-in', () => {
     expect(h.socket().cuts()).toEqual(['barge_in']);
   });
 
-  /** One interruption is one cut, whatever the gate does after it. A caller
-   *  talking through a reply raises an edge per breath they take. */
   it('cuts once however many breaths the caller takes over it', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
@@ -518,12 +458,6 @@ describe('barge-in', () => {
   });
 });
 
-/**
- * The caller's own voice, as the transcript reads it.
- *
- * The row it draws is the only sign a caller has that anything heard them
- * start. So what matters is that it appears on speech, and never outlives it.
- */
 describe('a live utterance', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -556,8 +490,6 @@ describe('a live utterance', () => {
     expect(h.last().utterance).toBe('none');
   });
 
-  /** Every delta of the talker's reply is an input. A bound re-armed by each
-   *  would outlive the answer it is waiting behind. */
   it('is withdrawn on time however much else the call is doing', async () => {
     const h = await liveCall();
     h.speak();
@@ -597,15 +529,6 @@ describe('a live utterance', () => {
   });
 });
 
-/**
- * The talker's tail.
- *
- * `talker_turn_ended` says the provider finished generating, and the speaker
- * can still be playing what it generated. So the floor flips to the caller with
- * audio in the air. Echo cancellation and the run-of-frames rule are what cover
- * it. That is the same pair keeping such audio from firing a barge-in while the
- * talker holds the floor.
- */
 describe('audio still leaving the speaker as the floor flips', () => {
   it('draws no utterance from echo the gate never hears', async () => {
     const h = await liveCall();
@@ -628,8 +551,6 @@ describe('audio still leaving the speaker as the floor flips', () => {
     expect(h.last().utterance).toBe('live');
   });
 
-  /** The caller cut in, and the engine reports the turn over a moment later.
-   *  They are still mid-sentence, so that is one utterance and one row. */
   it('keeps an open gate open, so a barge-in stays one utterance', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
@@ -641,13 +562,6 @@ describe('audio still leaving the speaker as the floor flips', () => {
   });
 });
 
-/**
- * What goes up to the provider while the talker speaks.
- *
- * Echo cancellation leaves a residue of the talker's own voice, and the
- * provider's VAD hears it as the caller. Answered, it is the talker replying to
- * itself. So over the talker only the caller's own speech goes up.
- */
 describe('audio sent over the talker', () => {
   const { threshold, framesToOpen } = SPEECH_GATE_DEFAULTS;
   const loud = threshold * 2;
@@ -669,8 +583,6 @@ describe('audio sent over the talker', () => {
     expect(h.socket().audio).toHaveLength(0);
   });
 
-  /** The loud frames before the gate opens are held too. The bound keeps the
-   *  newest frames, so the oldest quiet ones are the ones that go. */
   it('sends the held onset first, oldest first, when the caller cuts in', async () => {
     const h = await talkerSpeaking();
     h.hush(GAVE_UP_THE_FLOOR);
@@ -694,8 +606,6 @@ describe('audio sent over the talker', () => {
     expect(h.socket().audio).toHaveLength(1);
   });
 
-  /** The turn ends when the words are generated. Seconds of them can still be
-   *  queued in the speaker, and their echo is just as much echo. */
   it('holds echo until the reply has finished playing', async () => {
     const h = await talkerSpeaking();
     h.device().playing = true;
@@ -751,8 +661,6 @@ describe('every way a call ends releases the microphone', () => {
     expect(h.sockets).toHaveLength(0);
     expect(h.last().phase).toBe('idle');
     expect(h.last().note).toBe('No microphone was found on this device.');
-    // No device opened, so teardown has nothing to close. The audio context the
-    // press woke goes back here or it runs for the rest of the page's life.
     expect(h.releases()).toBe(1);
   });
 
@@ -762,7 +670,6 @@ describe('every way a call ends releases the microphone', () => {
     await Promise.resolve();
     await Promise.resolve();
     h.socket().handlers.onClose();
-    // The microphone goes back at once, without waiting on the probe below.
     expect(h.device().closes).toBe(1);
     expect(h.last().phase).toBe('idle');
   });
@@ -773,8 +680,6 @@ describe('every way a call ends releases the microphone', () => {
     h.runner.press(THREAD);
     await Promise.resolve();
     await Promise.resolve();
-    // The microphone was already open at the throw. The whole point is that it
-    // is released, rather than left listening on a call that never began.
     expect(h.device().closes).toBe(1);
     expect(h.last().phase).toBe('idle');
     expect(h.last().note).toBe(UNEXPECTED_SETUP_FAILURE);
@@ -788,8 +693,6 @@ describe('every way a call ends releases the microphone', () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    // A `fetch` shows the engine's words where a handshake hides them, so the
-    // reader gets the real reason rather than the generic refusal.
     expect(h.last().phase).toBe('idle');
     expect(h.last().note).toBe(reason);
     expect(h.last().note).not.toBe(CALL_REFUSED);
@@ -819,15 +722,7 @@ describe('every way a call ends releases the microphone', () => {
   });
 });
 
-/**
- * The cause of a refused handshake is measured, never guessed.
- *
- * Guessing shipped once and misdiagnosed the first real call anybody placed:
- * the message named a busy thread and an unreachable engine, and the truth was
- * a gateway too old to carry the upgrade at all.
- */
 describe('why a handshake was refused', () => {
-  /** Press, let the microphone arrive, then have the socket close unopened. */
   async function refused(block: boolean): Promise<Harness> {
     const h = harness();
     if (block) h.armBlockedUpgrade();
@@ -858,8 +753,6 @@ describe('why a handshake was refused', () => {
     expect(h.problems).toEqual([]);
   });
 
-  /** No evidence about the hops means the engine-side reason stands. Blaming
-   *  the route on a probe that never ran is the worse wrong answer. */
   it('keeps the engine-side reason when the probe itself cannot run', async () => {
     const h = harness();
     h.armProbeFailure(new Error('no socket here'));
@@ -871,7 +764,6 @@ describe('why a handshake was refused', () => {
     expect(h.problems).toEqual([CALL_REFUSED]);
   });
 
-  /** A reason for a call the reader has already replaced is noise. */
   it('drops an answer that a newer call has overtaken', async () => {
     const h = harness();
     h.runner.press(THREAD);
@@ -900,14 +792,12 @@ describe('a microphone that arrives after its call ended', () => {
     const h = harness();
     h.armSlowAudio();
     h.runner.press(THREAD);
-    h.runner.press(THREAD); // rings off while still connecting
+    h.runner.press(THREAD);
     expect(h.last().phase).toBe('idle');
     await h.releaseAudio();
     expect(h.devices).toHaveLength(1);
     expect(h.device().closes).toBe(1);
     expect(h.sockets).toHaveLength(0);
-    // Closing the device it opened IS handing the context back, so nothing
-    // hands it back twice.
     expect(h.releases()).toBe(0);
   });
 });
@@ -922,15 +812,12 @@ describe('a microphone that will not close', () => {
     expect(h.problems.join(' ')).toContain('microphone could not be released');
   });
 
-  /** The other release, and it owes the same report. A rejection dropped here
-   *  is an unhandled one, and the reader is left with a lit indicator and no
-   *  reason for it. */
   it('says so for a microphone that arrived after its call ended', async () => {
     const h = harness();
     h.armSlowAudio();
     h.armCloseFailure(new Error('device busy'));
     h.runner.press(THREAD);
-    h.runner.press(THREAD); // rings off while still connecting
+    h.runner.press(THREAD);
     await h.releaseAudio();
     await Promise.resolve();
     await Promise.resolve();
@@ -951,13 +838,6 @@ describe('the frames a call sends', () => {
     );
   });
 
-  /**
-   * The floor opener rides every opening edge, cut or no cut.
-   *
-   * It is what the engine's floor opens on, and the Live provider states no
-   * such frame of its own (ADR 0211). A caller speaking on their own floor
-   * interrupts nobody, so the cut is withheld and this is not.
-   */
   it('tell the engine the caller opened their mouth, cut or no cut', async () => {
     const h = await liveCall();
     h.speak();
@@ -965,7 +845,6 @@ describe('the frames a call sends', () => {
     expect(h.device().stops).toBe(0);
   });
 
-  /** Their FIRST word is the one the floor most needs, and it beats the socket. */
   it('tell it about a caller who started before the session was up', async () => {
     const h = harness();
     h.runner.press(THREAD);
@@ -978,16 +857,7 @@ describe('the frames a call sends', () => {
   });
 });
 
-/**
- * The caller starts talking before the socket is up.
- *
- * The microphone opens ahead of the dial, and the engine sends
- * `session_started` only once the PROVIDER session is up. Every frame captured
- * in that window used to be dropped, so their opening words were never
- * transcribed and no bubble was drawn for them.
- */
 describe('audio captured before the handshake', () => {
-  /** Pressed, microphone open, socket dialled, handshake not yet answered. */
   async function connecting(): Promise<Harness> {
     const h = harness();
     h.runner.press(THREAD);
@@ -1013,7 +883,6 @@ describe('audio captured before the handshake', () => {
     expect(h.socket().audio).toHaveLength(SPEECH_GATE_DEFAULTS.framesToOpen);
   });
 
-  /** Reordering would put the end of a sentence before its start. */
   it('goes up in the order it was spoken, ahead of what follows', async () => {
     const h = await connecting();
     const loud = SPEECH_GATE_DEFAULTS.threshold * 2;
@@ -1028,7 +897,6 @@ describe('audio captured before the handshake', () => {
     expect(sent).toHaveLength(3);
   });
 
-  /** A dial that never lands must not grow for the life of the page. */
   it('drops the oldest frames past its bound', async () => {
     const h = await connecting();
     h.capture(SPEECH_GATE_DEFAULTS.threshold / 2, PREROLL_FRAMES_MAX + 40);
@@ -1038,9 +906,6 @@ describe('audio captured before the handshake', () => {
     expect(h.socket().audio.length).toBeGreaterThan(0);
   });
 
-  /** Both bounds wait on the PROVIDER, and a connecting call has none. Running
-   *  the clock there withdraws the bubble of somebody who spoke into a slow
-   *  connect, before their held audio has even been sent. */
   it('runs no withdrawal clock while the call is still connecting', async () => {
     vi.useFakeTimers();
     try {
@@ -1052,7 +917,6 @@ describe('audio captured before the handshake', () => {
       vi.advanceTimersByTime(LANDING_BOUND_MS * 3);
       expect(h.last().utterance).toBe('landing');
 
-      // The clock arms once there is a provider to wait on.
       h.socket().handlers.onOpen();
       h.socket().say(STARTED);
       vi.advanceTimersByTime(LANDING_BOUND_MS);

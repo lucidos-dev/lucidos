@@ -5,13 +5,8 @@ import {
   splitRungValue, codingAgentCommandsReady, composerControl,
 } from './helpers';
 
-// `sw.js` serves the commands and estimate GETs. Once the worker controls the
-// page, those fetches run in the worker, where `page.route` cannot see them.
-// The mocks below then lapse.
 test.use({ serviceWorkers: 'block' });
 
-/** Send a CC message and wait for session to go idle (Done).
- * Commands are cached after this, so the rung control has its rungs. */
 async function setupIdleCCThread(page: Page) {
   await navigateToApp(page);
   await newThread(page);
@@ -21,11 +16,6 @@ async function setupIdleCCThread(page: Page) {
   await waitForActionPanel(page, 'Archive', 120_000);
 }
 
-/** Install API route handlers that record control requests and answer success.
- * The commands read then reports the recorded pair, as the engine does. Call
- * it BEFORE the thread is set up: the app reads the commands again only on a
- * session event.
- * Returns the control requests the app sent, in order. */
 async function mockRungPicks(page: Page) {
   let modelOverride: string | null = null;
   let effortOverride: string | null = null;
@@ -43,7 +33,6 @@ async function mockRungPicks(page: Page) {
     });
   });
 
-  // A pick on a started thread asks what it costs first. This one is free.
   await page.route(/\/api\/v1\/threads\/[^/]+\/switch-estimate/, async (route) => {
     await route.fulfill({
       status: 200,
@@ -52,12 +41,11 @@ async function mockRungPicks(page: Page) {
     });
   });
 
-  // The request event is the record of what the app sent.
   page.on('request', (req) => {
     if (req.method() !== 'POST' || !req.url().endsWith('/api/v1/claude-code/control')) return;
     try {
       controls.push(req.postDataJSON()?.request ?? {});
-    } catch { /* a body that is not JSON is no control request */ }
+    } catch {  }
   });
 
   await page.route('**/api/v1/claude-code/control', async (route) => {
@@ -79,15 +67,11 @@ test.describe('Model switching', () => {
     await assertHealthy(page);
   });
 
-  // A refetch can still be in flight when the test ends. Playwright then
-  // disposes its response while the context closes, before `page.isClosed()`
-  // turns true. Dropping the routes first ignores that handler's error.
   test.afterEach(async ({ page }) => {
     if (!page.isClosed()) await page.unrouteAll({ behavior: 'ignoreErrors' });
   });
 
   test('CC control menu opens and shows options', async ({ page }) => {
-    // This test only needs the dropdown visible — idle session is fine
     await setupIdleCCThread(page);
 
     await expect.poll(() => codingAgentCommandsReady(page), { timeout: 10_000 }).toBe(true);
@@ -96,7 +80,6 @@ test.describe('Model switching', () => {
     const dropdown = page.locator('.control-dropdown:visible').first();
     await expect(dropdown).toBeVisible({ timeout: 5_000 });
 
-    // Top-level items use .control-item class
     const optionCount = await page.locator('.control-item:visible').count();
     expect(optionCount).toBeGreaterThan(0);
   });
@@ -107,12 +90,10 @@ test.describe('Model switching', () => {
 
     const dropdown = await openRungList(page);
 
-    // One row is checked: a rung, or the thread's own pair.
     const currentModel = dropdown.locator('.control-option-current:visible');
     await expect(currentModel).toHaveCount(1);
     expect((await currentModel.textContent())?.trim()).toBeTruthy();
 
-    // The list carries rungs and the ladder link. No rung opens a tier step.
     expect((await readRungRows(page)).length).toBeGreaterThan(0);
     await expect(dropdown.locator('.control-option[data-value="ladder-link"]:visible')).toBeVisible();
     await expect(dropdown.locator('.control-option:not([data-value="ladder-link"]) .control-option-more')).toHaveCount(0);
@@ -124,7 +105,6 @@ test.describe('Model switching', () => {
     await mockRungPicks(page);
     await navigateToApp(page);
 
-    // Leave a commands fetch in flight and end the test under it.
     await page.evaluate(() => { void fetch('/api/v1/claude-code/commands').catch(() => {}); });
   });
 
@@ -143,7 +123,6 @@ test.describe('Model switching', () => {
 
     await openRungList(page);
 
-    // Pick a rung that is not the checked one. One tap commits both halves.
     const rungs = await readRungRows(page);
     expect(rungs.length).toBeGreaterThanOrEqual(2);
     const target = rungs.find((r) => !r.current);
@@ -155,7 +134,6 @@ test.describe('Model switching', () => {
     expect(modelPick?.model).toBe(target!.model);
     expect(modelPick?.effort).toBe(target!.effort || undefined);
 
-    // Re-open to verify selection changed
     await openRungList(page);
     const checked = await currentRungValue(page);
     expect(splitRungValue(checked)).toEqual({ model: target!.model, effort: target!.effort });

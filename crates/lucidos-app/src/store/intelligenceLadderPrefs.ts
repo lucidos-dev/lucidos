@@ -12,8 +12,6 @@ import {
 } from '@lucidos/preference-catalog';
 import type { CodingAgent } from '../api/types';
 
-/** The preferences one backend's intelligence ladder reads and its editor
- *  writes in Settings → Intelligence. */
 export const LADDER_PREFS: Record<CodingAgent, { ladder: string; model: string; effort: string }> = {
   'claude-code': {
     ladder: PREF_INTELLIGENCE_LADDER_CLAUDE_CODE.key,
@@ -27,11 +25,8 @@ export const LADDER_PREFS: Record<CodingAgent, { ladder: string; model: string; 
   },
 };
 
-/** The chat ladder's override, which decides what the chat picker lists. */
 export const CHAT_LADDER_PREF = PREF_INTELLIGENCE_LADDER_CHAT.key;
 
-/** The preferences the chat ladder's default rung reads. */
 export const CHAT_DEFAULT_PREFS = [PREF_CHAT_MODEL.key, PREF_CHAT_REASONING_EFFORTS.key] as const;
 
-/** The share of long-prompt calls, which every cost band reads. */
 export const LONG_PROMPT_SHARE_PREF = PREF_LONG_PROMPT_SHARE.key;

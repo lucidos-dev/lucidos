@@ -1,19 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The event-type picker on an open trigger detail page must recover from a
- * transport failure.
- *
- * Reported as "Failed to load event types". The engine had answered every
- * request it ever saw, so the failure was transport-side. A reopen already
- * retried. The panel the user was looking at did not, and it offered one
- * empty-valued option that cleared the field.
- *
- * The verdict lives in a module-level cache, so each case starts from a fresh
- * module graph. `vi.resetModules()` plus dynamic imports is what gives one:
- * preact, the store and the component must come from the same graph.
- *
- * See docs/plans/2026-08-24-trigger-event-type-picker-recovers-from-a-transport-failure.md
- */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { TriggerInfo } from '../../../store/types';
 
@@ -46,8 +31,6 @@ function trigger(): TriggerInfo {
   };
 }
 
-/** Mount the trigger form on `host`, from one module graph. Returns its
- *  unmount. */
 async function mountForm(host: HTMLElement): Promise<() => void> {
   const { h, render } = await import('preact');
   const store = await import('../../../store/store');
@@ -62,8 +45,6 @@ async function mountForm(host: HTMLElement): Promise<() => void> {
   return () => render(null, host);
 }
 
-/** Preact runs effects off the render, so poll rather than wait a fixed span:
- *  a loaded parallel run stretches the frames they ride on. */
 async function waitFor(done: () => boolean, budgetMs = 1000): Promise<void> {
   for (let waited = 0; waited < budgetMs; waited += 10) {
     if (done()) return;
@@ -85,8 +66,6 @@ function eventTypeInput(host: HTMLElement): HTMLInputElement {
   return el;
 }
 
-/** The labels the picker currently offers. Focus is what opens a `freeText`
- *  dropdown, and the menu is portaled, so read it off the document. */
 async function openOptionLabels(host: HTMLElement): Promise<string[]> {
   const input = eventTypeInput(host);
   input.blur();
@@ -101,9 +80,6 @@ describe('the trigger event-type picker recovers from a transport failure', () =
   let host: HTMLElement;
   let unmount: (() => void) | null;
 
-  // Pays the cold transform of the form's module graph under the hook
-  // timeout. `vi.resetModules()` re-evaluates modules but keeps their
-  // transforms, so no case's own timeout pays it on a loaded host.
   beforeAll(async () => {
     await import('../TriggerDetails');
   });
@@ -149,8 +125,6 @@ describe('the trigger event-type picker recovers from a transport failure', () =
     unmount = await mountForm(host);
     await waitFor(() => errorRow(host) !== null);
 
-    // The reported shape: one option labelled "Failed to load event types"
-    // whose value was '', so picking it cleared the field.
     expect(await openOptionLabels(host)).toEqual([]);
     expect(document.querySelector('.dropdown-no-results')).not.toBeNull();
     expect(eventTypeInput(host).value).toBe('DeployFinished');
@@ -184,7 +158,6 @@ describe('the trigger event-type picker recovers from a transport failure', () =
     input.focus();
     await waitFor(() => errorRow(host) === null);
 
-    // A second open finds the cache loaded, so it must not fetch again.
     expect(await openOptionLabels(host)).toEqual(['DeployFinished']);
     expect(fetchEventTypes).toHaveBeenCalledTimes(1);
   });
@@ -203,7 +176,6 @@ describe('the trigger event-type picker recovers from a transport failure', () =
   });
 
   it('shares one request across concurrent mounts', async () => {
-    // Never settles, so both mounts must join this one request.
     fetchEventTypes.mockImplementation(() => new Promise<string[]>(() => {}));
 
     const second = document.createElement('div');
@@ -224,7 +196,6 @@ describe('the trigger event-type picker recovers from a transport failure', () =
     unmount();
 
     unmount = await mountForm(host);
-    // Nothing to wait FOR here, so give a second fetch time to appear.
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(fetchEventTypes).toHaveBeenCalledTimes(1);

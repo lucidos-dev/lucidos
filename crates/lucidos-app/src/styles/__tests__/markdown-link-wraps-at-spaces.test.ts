@@ -1,15 +1,3 @@
-/**
- * A markdown link wraps at its spaces, never mid-word beside a free one.
- *
- * The regression: `.markdown-content a` set `word-break: break-all`, which
- * allows a break between any two letters. A thread link titled "Continue the
- * Loop" rendered as "Continue t" over "he Loop". The space before "the" was
- * free.
- *
- * The container's `word-break: break-word` already breaks a long URL where it
- * cannot fit, and a link inherits it. So the link sets no `word-break` of its
- * own.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { getSummaryTree, getSummaryTreeThreads, getRecallZoom, getRecallDate } from '../../api/client';
 import { summaryTreesVersion } from '../../store/store';
-import { operatorName, operators } from '../../store/actions/operators';
+import { gatewayUserName, gatewayUsers } from '../../store/actions/gatewayUsers';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
@@ -26,8 +26,6 @@ import type {
 
 export const THREADS_PAGE_SIZE = 50;
 
-/** A read held in component state. Only the newest read lands, and a re-read
- *  keeps what is shown until it answers. */
 function useLatestRead<T>(): [Loadable<T>, (read: () => Promise<T>, reread?: boolean) => Promise<void>] {
   const [loadable, setLoadable] = useState<Loadable<T>>({ status: 'not-loaded' });
   const request = useRef(0);
@@ -46,8 +44,6 @@ function useLatestRead<T>(): [Loadable<T>, (read: () => Promise<T>, reread?: boo
 
 interface Opened {
   lines: RecallLine[];
-  /** The line's time range, or why it has none. A leaf whose source events
-   *  are gone still opens; only its date is missing. */
   date: RecallDateResponse | { error: string };
 }
 
@@ -56,15 +52,10 @@ function DateLabel({ date }: { date: Opened['date'] }) {
   return <span class="tree-line-date">{dateRangeLabel(date.from, date.to)}</span>;
 }
 
-/** Reports a view's count label to the browser's head row, which stays
- *  mounted across views so its tabs keep focus. */
 function useCountLabel(label: string | null, onCount: (label: string | null) => void) {
   useEffect(() => { onCount(label); }, [label]);
 }
 
-/** One summary line. It opens one zoom level in place: into finer lines, or
- *  for a leaf into its source. With no `line`, inside a `SkeletonProvider`,
- *  it draws itself as a loading placeholder. */
 function TreeLineRow({ line }: { line?: RecallLine }) {
   const sk = useSkeleton();
   const [expanded, setExpanded] = useState(false);
@@ -73,7 +64,7 @@ function TreeLineRow({ line }: { line?: RecallLine }) {
   const span = line ? lineSpan(line.id) : null;
   const kinded = line ? entryKindOf(line.text) : null;
   const sender = kinded?.kind === 'prompt (human)' && line?.sender_device_id
-    ? operatorName(operators.value, line.sender_device_id)
+    ? gatewayUserName(gatewayUsers.value, line.sender_device_id)
     : null;
 
   const read = useCallback(async (): Promise<Opened> => {
@@ -151,7 +142,6 @@ function OpenedLines({ id, lines }: { id: string; lines: RecallLine[] }) {
   );
 }
 
-/** The top of one tree: the workspace's, or a thread's. */
 function TreeTop({ threadId, onCount }: { threadId?: string; onCount: (label: string | null) => void }) {
   const [top, readTop] = useLatestRead<SummaryTreeTop>();
   const showLoading = useDelayedLoading(top);
@@ -178,8 +168,6 @@ function TreeTop({ threadId, onCount }: { threadId?: string; onCount: (label: st
   );
 }
 
-/** A thread with a tree. With no `thread`, inside a `SkeletonProvider`, it
- *  draws itself as a loading placeholder. */
 function TreeThreadRow({ thread, onOpen }: { thread?: SummaryTreeThread; onOpen?: () => void }) {
   const sk = useSkeleton();
   return (
@@ -221,7 +209,6 @@ function TreeThreadList({ offset, onOffset, onCount, onOpen }: {
     ? `${page.data.total.toLocaleString()} ${page.data.total === 1 ? 'thread' : 'threads'}`
     : null, onCount);
 
-  // A delete can empty the page shown. Step back to the last page that holds threads.
   const strandedPage = page.status === 'loaded' && page.data.threads.length === 0 && offset > 0;
   useEffect(() => {
     if (strandedPage && page.status === 'loaded') {
@@ -259,9 +246,6 @@ const TABS: { value: Tab; label: string }[] = [
   { value: 'threads', label: 'Threads' },
 ];
 
-/** Settings → System → Memory on the Tree module: the summary trees, opened
- *  line by line down to the exact message, through the recall tool's own
- *  zoom (ADR 0362). The workspace tree, or any thread's. */
 export function SummaryTreeBrowser() {
   const [tab, setTab] = useState<Tab>('workspace');
   const [thread, setThread] = useState<SummaryTreeThread | null>(null);

@@ -2,21 +2,12 @@ import { test, expect } from './fixtures';
 import { appPath, createIframeAppFixture, psql } from './db-helpers';
 import { gotoWithRetry, hideDashboardRail } from './helpers';
 
-// Verifies that an app iframe receives live theme updates via the SDK's
-// `lucidos.ui.watchPreferences()` SSE subscription.
-//
-// The bug we're guarding against: PreferencesChanged events were broadcast
-// engine-side but the iframe SDK either never connected its EventSource or
-// never dispatched the event to the watchPreferences callback, so the iframe's
-// data-theme-mode stayed stale until reload.
 
 const APP_ID = 'e2e-sdk-theme-test';
 let fixture: { cleanup: () => void };
 
 test.describe('SDK iframe theme — live PreferencesChanged update', () => {
   test.beforeAll(() => {
-    // Minimal app: load SDK, apply current prefs, watch for changes.
-    // No app code beyond the two SDK calls — this is the contract every app uses.
     fixture = createIframeAppFixture(APP_ID, {
       manifest: { id: APP_ID, name: 'SDK theme test', description: 'e2e fixture' },
       html: `<!DOCTYPE html>
@@ -55,8 +46,6 @@ waitForLucidos();
   });
 
   test('app inside Lucidos iframe receives live PreferencesChanged via SSE', async ({ page, request }) => {
-    // Establish a known device id and seed initial theme (matches the parent's
-    // localStorage; iframe shares same origin so it reads the same id).
     await gotoWithRetry(page, '/');
     const deviceId = 'e2e-device-' + Date.now();
     await page.evaluate((id) => localStorage.setItem('lucidos-device-id', id), deviceId);
@@ -64,9 +53,6 @@ waitForLucidos();
       data: { value: 'dark', device_id: deviceId },
     });
 
-    // Embed the test app inside an iframe sandbox identical to AppUiInline.tsx.
-    // The parent page also opens its own SSE listener (matches the real app
-    // where Lucidos UI subscribes to the same /api/v1/events).
     await page.setContent(`<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
@@ -88,32 +74,21 @@ waitForLucidos();
     await expect(appFrame.locator('#status')).toHaveText('applied');
     await expect(appFrame.locator('html')).toHaveAttribute('data-theme-mode', 'dark');
 
-    // Toggle to light — SSE event broadcast to all subscribers including the iframe.
     await request.put(`/api/v1/preferences?key=theme-mode`, {
       data: { value: 'light', device_id: deviceId },
     });
 
-    // Live update inside the iframe — should land within seconds.
     await expect(appFrame.locator('html')).toHaveAttribute('data-theme-mode', 'light', { timeout: 5000 });
   });
 
   test('opt-in /api/v1/sdk-prefs.js serves the boot script, and seeds it per device', async ({ request }) => {
-    // With no `?device=`, the body is the shared bundle and stays cacheable.
-    // An app frame is isolated and reads none of the shell's storage, so the
-    // engine resolves that device's appearance and prepends it (ADR 0227).
     const res = await request.get('/api/v1/sdk-prefs.js');
     expect(res.status()).toBe(200);
     expect(res.headers()['content-type']).toContain('application/javascript');
 
     const js = await res.text();
-    // The served script is BUILT from packages/lucidos-sdk/src/boot/, the same
-    // source the app shell inlines into its own <head>, so the two documents
-    // cannot drift. It is bundled to a self-contained IIFE with no imports.
     expect(js).toContain('GENERATED from packages/lucidos-sdk/src/boot/');
     expect(js).toContain('(() => {');
-    // Two sources in order: the engine's seed, then storage. The storage keys
-    // are workspace-scoped through the SDK's _storage helper (mirrors
-    // workspaceStorage.ts); the guard in sdk_prefs.rs forbids raw access.
     expect(js).toContain('THEME_MODE_KEY = PREF_THEME_MODE.key');
     expect(js).toContain('THEME_MODE_STORAGE_KEY = "lucidos-theme-mode"');
     expect(js).toContain('seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY)');
@@ -121,13 +96,8 @@ waitForLucidos();
     expect(js).toContain('wsLocalGet("lucidos-ui-scale")');
     expect(js).toContain('globalThis.__lucidosPrefs');
     expect(js).not.toContain('localStorage.getItem("lucidos-theme-mode")');
-    // No device named, so nothing is prepended and the body stays shared.
     expect(js).not.toContain('window.__lucidosPrefs=');
-    // `system` defers to matchMedia at execution time so light-OS browsers
-    // don't FOUC dark-then-light.
     expect(js).toContain('matchMedia("(prefers-color-scheme: light)")');
-    // Sets the parent-shell-shared CSS contract: data-theme-mode + --bg-primary
-    // + --font-ui (and --user-ui-scale when set).
     expect(js).toContain('THEME_MODE_ATTRIBUTE = "data-theme-mode"');
     expect(js).toContain('setAttribute(THEME_MODE_ATTRIBUTE, resolved)');
     expect(js).toContain('setProperty("--bg-primary"');
@@ -135,15 +105,6 @@ waitForLucidos();
   });
 });
 
-// Cold-load regression: simulates a returning user whose `lucidos-theme-mode` is
-// already persisted in localStorage. The parent shell's inline FOUC IIFE
-// (in `crates/lucidos-app/index.html`) and the iframe's `/api/v1/sdk-prefs.js`
-// must both read the same localStorage and paint `data-theme-mode="light"` from
-// frame zero — no flash to dark and back.
-//
-// localStorage seeding uses `addInitScript`, not `page.evaluate` after goto:
-// the parent shell's inline IIFE reads localStorage during the very first
-// `<head>` evaluation, so any post-goto seed is too late.
 
 const COLD_APP_ID = 'e2e-sdk-cold-load';
 let coldFixture: { cleanup: () => void };
@@ -152,10 +113,6 @@ test.describe('SDK iframe theme — cold reload (full Lucidos bootstrap)', () =>
   test.beforeAll(() => {
     coldFixture = createIframeAppFixture(COLD_APP_ID, {
       manifest: { id: COLD_APP_ID, name: 'SDK cold-load test', description: 'e2e fixture' },
-      // Mirrors the standard app boilerplate: opt-in script first, then
-      // shared stylesheet, then sdk.js. The body holds a `#ready` marker
-      // and a script that calls `applyPreferences` + `watchPreferences` —
-      // exactly the contract every real app follows.
       html: `<!DOCTYPE html>
 <html>
 <head>
@@ -193,46 +150,25 @@ waitForLucidos();
   test('parent and iframe paint data-theme-mode="light" from frame zero, driven by localStorage', async ({ page, request, context }) => {
     const deviceId = 'e2e-cold-' + Date.now();
 
-    // Seed the user's persisted state BEFORE the parent's first paint:
-    //   - localStorage device id (so getDeviceId() picks it up; also drives
-    //     the per-device API calls preferences.ts makes after mount)
-    //   - localStorage lucidos-theme-mode=light (this is what the inline FOUC IIFE
-    //     in index.html reads on the very first <head> tick)
-    //   - app-window-open (so loadApps() restores the test app on reload —
-    //     mirrors the real "last app stays open across reloads" UX)
     await context.addInitScript(([id, appId]) => {
       localStorage.setItem('lucidos-device-id', id);
       localStorage.setItem('lucidos-theme-mode', 'light');
       localStorage.setItem('app-window-open', appId);
     }, [deviceId, COLD_APP_ID]);
 
-    // Persist theme=light for that device so the post-load `applyPreferences()`
-    // SSE round-trip agrees with the localStorage cache. (Without this, the
-    // backend would return its default and the iframe's SDK applyPreferences
-    // call would later flip the theme back, masking a real FOUC.)
     await request.put(`/api/v1/preferences?key=theme-mode`, {
       data: { value: 'light', device_id: deviceId },
     });
 
-    // Cold reload — the auto-restore path mounts the iframe via
-    // panelOverlay → AppUiInline. No `?app=` deep-link (its 500ms timeout
-    // hides the bug behind a delay).
     await gotoWithRetry(page, '/');
 
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10_000 });
 
-    // The iframe element's background follows the parent's --bg-primary,
-    // which depends on the parent's data-theme-mode. With localStorage-driven
-    // FOUC, the parent's first paint is light from frame zero.
     const iframeBg = await page.evaluate(() =>
       getComputedStyle(document.querySelector('iframe[data-role="app-ui-frame"]')!).backgroundColor);
     expect(iframeBg, `iframe element bg must be white, not dark (got ${iframeBg})`).toMatch(/^rgba?\(\s*255\s*,\s*255\s*,\s*255/);
 
-    // Pins the inline value separately from the iframeBg check above:
-    // by query time CSS modules have hydrated, so iframeBg can pass on
-    // luck while the user still saw `var(--bg-primary, #07172e)` fall
-    // back to dark for the first ~50–200ms.
     const inlinedBgPrimary = await page.evaluate(() =>
       document.documentElement.style.getPropertyValue('--bg-primary'));
     expect(
@@ -243,10 +179,6 @@ waitForLucidos();
     const appFrame = page.frameLocator('iframe[data-role="app-ui-frame"]:visible');
     await expect(appFrame.locator('#ready')).toBeVisible({ timeout: 10_000 });
 
-    // Capture every data-theme-mode transition inside the iframe. A FOUC
-    // manifests as `dark → light` even when the steady state is "light";
-    // a single assertion on the post-load attribute can't see the brief
-    // dark frame.
     const iframeTransitions = await appFrame.locator('html').evaluate((html) => {
       return new Promise<string[]>((resolve) => {
         const seen: string[] = [html.getAttribute('data-theme-mode') ?? '<unset>'];
@@ -263,10 +195,6 @@ waitForLucidos();
   });
 });
 
-// Regression: theme integration is opt-in. An app served without the
-// `<script src="/api/v1/sdk-prefs.js">` tag must NOT have `data-theme-mode`
-// injected on its <html>. The engine returns app HTML untouched — no
-// auto-injection of script or stylesheet tags.
 
 const NO_OPT_IN_APP_ID = 'e2e-sdk-no-opt-in';
 let noOptInFixture: { cleanup: () => void };
@@ -275,9 +203,6 @@ test.describe('SDK iframe theme — opt-in only', () => {
   test.beforeAll(() => {
     noOptInFixture = createIframeAppFixture(NO_OPT_IN_APP_ID, {
       manifest: { id: NO_OPT_IN_APP_ID, name: 'No opt-in', description: 'e2e fixture' },
-      // Plain HTML: no sdk-prefs.js script, no sdk-iframe.css link, nothing
-      // that would pull in theme integration. The app's own styles must be
-      // the only thing shaping its appearance.
       html: `<!DOCTYPE html>
 <html>
 <head>
@@ -298,7 +223,6 @@ test.describe('SDK iframe theme — opt-in only', () => {
   });
 
   test('app served without sdk-prefs.js does NOT receive data-theme-mode on <html>', async ({ page, request }) => {
-    // Origin matters — the iframe URL is path-relative.
     await gotoWithRetry(page, '/');
     await page.setContent(`<!DOCTYPE html>
 <html>
@@ -314,11 +238,8 @@ test.describe('SDK iframe theme — opt-in only', () => {
     await expect(appFrame.locator('#ready')).toBeVisible({ timeout: 5000 });
     await page.waitForTimeout(200);
 
-    // The contract: opt-out apps see no engine-driven theme injection.
     await expect(appFrame.locator('html')).not.toHaveAttribute('data-theme-mode', /.*/);
 
-    // And the engine must NOT have rewritten the served HTML to include
-    // the prefs script or theme stylesheet on this app's behalf.
     const res = await request.get(appPath(NO_OPT_IN_APP_ID));
     const html = await res.text();
     expect(html).not.toContain('/api/v1/sdk-prefs.js');
@@ -326,14 +247,6 @@ test.describe('SDK iframe theme — opt-in only', () => {
   });
 });
 
-// Systemic regression: an app iframe rendered DARK even when the device was
-// Light, for EVERY app, because `applyPreferences()` ran after sdk-prefs.js and
-// resolved theme as `prefs['theme-mode'] || 'dark'`. When the active device has no
-// server-scoped `theme-mode` (the reported iPhone-PWA case stores only `ui-scale`),
-// that returned 'dark' and clobbered the correct Light value sdk-prefs.js had
-// already applied from localStorage. The fix makes applyPreferences prefer the
-// client value (localStorage / data-theme-mode) over the hard default, so a missing
-// server theme never flips the iframe to dark.
 
 const NO_SERVER_THEME_APP_ID = 'e2e-sdk-no-server-theme';
 let noServerThemeFixture: { cleanup: () => void };
@@ -342,8 +255,6 @@ test.describe('SDK iframe theme — localStorage wins when the server has no dev
   test.beforeAll(() => {
     noServerThemeFixture = createIframeAppFixture(NO_SERVER_THEME_APP_ID, {
       manifest: { id: NO_SERVER_THEME_APP_ID, name: 'SDK no-server-theme test', description: 'e2e fixture' },
-      // Standard app boilerplate: opt-in prefs script, shared stylesheet, SDK,
-      // then applyPreferences + watchPreferences — the contract every app uses.
       html: `<!DOCTYPE html>
 <html>
 <head>
@@ -381,11 +292,6 @@ waitForLucidos();
   test('iframe stays light from localStorage even though only ui-scale is stored server-side', async ({ page, request, context }) => {
     const deviceId = 'e2e-no-theme-' + Date.now();
 
-    // Seed the user's persisted client state BEFORE first paint: device id,
-    // a Light theme in localStorage (what sdk-prefs.js + the parent FOUC read),
-    // and the open app so the auto-restore mounts the iframe on reload. At
-    // 125%, the Canvas holding the app cannot fit beside the dashboard rail and
-    // yields (ADR 0495), so the rail is hidden.
     await hideDashboardRail(page);
     await context.addInitScript(([id, appId]) => {
       localStorage.setItem('lucidos-device-id', id);
@@ -393,8 +299,6 @@ waitForLucidos();
       localStorage.setItem('app-window-open', appId);
     }, [deviceId, NO_SERVER_THEME_APP_ID]);
 
-    // The exact reported shape: the device has ONLY a server-scoped ui-scale —
-    // no `theme` row. (A fresh device id guarantees no pre-existing theme row.)
     await request.put(`/api/v1/preferences?key=ui-scale`, {
       data: { value: '125', device_id: deviceId },
     });
@@ -407,10 +311,6 @@ waitForLucidos();
     const appFrame = page.frameLocator('iframe[data-role="app-ui-frame"]:visible');
     await expect(appFrame.locator('#ready')).toBeVisible({ timeout: 10_000 });
 
-    // Capture every data-theme-mode transition inside the iframe. The bug manifested
-    // as a flip to `dark` AFTER applyPreferences ran (the async prefs fetch
-    // resolved with no theme and overwrote the localStorage-light value). A
-    // single post-load assertion can miss the brief dark frame.
     const transitions = await appFrame.locator('html').evaluate((html) => {
       return new Promise<string[]>((resolve) => {
         const seen: string[] = [html.getAttribute('data-theme-mode') ?? '<unset>'];

@@ -17,7 +17,7 @@ const RETIRED_SWITCH: &str = "home_thread_enabled";
 
 /// The migration that retires the switch, run against a seeded workspace.
 const RETIRE_SWITCH_MIGRATION: &str =
-    include_str!("../../migrations/20261010082810_retire_home_thread_switch.sql");
+    include_str!("../../../lucidos-core/migrations/20261010082810_retire_home_thread_switch.sql");
 
 /// What boot does in a fresh workspace: one Home, and the lookup finds it.
 #[tokio::test]

@@ -3,9 +3,6 @@ import { appUrl, fetchEventTypes, pinAppApi, unpinAppApi } from './apps';
 import { parseWidgetParams } from '../../../../../packages/lucidos-sdk/src/params';
 import { engineRestarting } from '../../store/store';
 
-// The trigger event-type picker caches whatever verdict this read produces. So
-// one dropped fetch used to paint "Failed to load event types" until the panel
-// was reopened. `retryTransient` is what stops a blip becoming a verdict.
 
 const originalFetch = globalThis.fetch;
 
@@ -17,9 +14,6 @@ function okJson(body: unknown): Response {
 }
 
 describe('appUrl', () => {
-  // All four combinations of the two optional parts. The fragment must land
-  // AFTER the query. A query parameter would not survive the engine's
-  // WIP-preview rewrite, which rebuilds the query and keeps only `thread_id`.
   it('builds the bare app URL', () => {
     expect(appUrl('pr-understanding')).toMatch(/\/app\/pr-understanding\/$/);
   });
@@ -40,22 +34,15 @@ describe('appUrl', () => {
   });
 
   it('keeps a `?` inside the fragment out of the query', () => {
-    // Everything after the `#` is the fragment, so this stays one hash rather
-    // than becoming a second query the WIP-preview rewrite would drop.
     const url = appUrl('viewer', undefined, 'report?tab=files');
     expect(url).toMatch(/\/app\/viewer\/#report\?tab=files$/);
     expect(url.indexOf('#')).toBeLessThan(url.indexOf('?'));
   });
 
   it('adds no empty fragment for an empty target', () => {
-    // A bare `#` is a target: it means the top of the document. An app opened
-    // with no target must keep whatever the reader was looking at.
     expect(appUrl('pr-understanding', undefined, '')).not.toContain('#');
   });
 
-  // The device says whose appearance the app's first paint carries. An isolated
-  // frame cannot read that out of the shell's storage. So it rides the URL, and
-  // the engine stamps it onto the app's own `sdk-prefs.js` reference.
   describe('with a device minted', () => {
     beforeEach(() => localStorage.setItem('lucidos-device-id', 'cfdb4cbfe6044f8b'));
     afterEach(() => localStorage.removeItem('lucidos-device-id'));
@@ -70,8 +57,6 @@ describe('appUrl', () => {
       expect(url).toContain('device=cfdb4cbfe6044f8b');
     });
 
-    // ADR 0415: params ride one SDK-owned key, so the host keys survive and
-    // `lucidos.params()` reads back exactly what the host wrote.
     it('carries widget params beside the host keys, and the SDK reads both back', () => {
       const params = { clip: 'artifacts/voices/marin.mp3', thread_id: 'not-a-host-key' };
       const url = new URL(appUrl('lucidos-sound-player', 'thread-7', undefined, params), 'http://h');
@@ -97,8 +82,6 @@ describe('appUrl', () => {
   });
 
   it('carries no device before one is minted', () => {
-    // A surface with no id sends nothing rather than inventing one, the same
-    // rule `deviceIdHeader` follows. The global preferences then answer.
     expect(appUrl('pr-understanding')).not.toContain('device=');
   });
 });
@@ -161,9 +144,6 @@ describe('fetchEventTypes', () => {
   });
 });
 
-// The engine answers a failed pin with `200 {success: false}`. `pinApp` pins
-// optimistically and reverts only on a rejection. A resolved refusal therefore
-// left the tile pinned on screen and in the offline cache.
 describe('pinAppApi and unpinAppApi', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
 

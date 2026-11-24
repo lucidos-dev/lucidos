@@ -1,20 +1,8 @@
-/** An effort pick mid-turn is one turn, not two.
- *
- *  Claude Code takes effort only at spawn. So the engine cancels the turn as a
- *  redirect (`effort_restart`), idles the session, and resumes it at the new
- *  effort under a `ContinuationStarted`. That resume used to open a turn of its
- *  own. The interrupted turn then read "Done" under its own resume card, which
- *  read as the explanation of the effort change.
- *
- *  Now the resume folds into the turn it interrupted, as a restart row. The
- *  turn keeps reading Working through the gap before the resume lands.
- */
 import { describe, expect, it } from 'vitest';
 import { exchangeResponseEvents, exchangeStatus, groupIntoExchanges, type StoredEvent } from '../thread-events';
 
 const DEVICE = { kind: 'device', device_id: 'my-mac' } as const;
 
-/** The reported order: a turn working, the effort pick, the resume. */
 function restartedThread(until: 'canceled' | 'idled' | 'resumed' | 'working'): Map<number, StoredEvent> {
   const events: [number, StoredEvent][] = [
     [1, { type: 'MessageReceived', text: 'run the suites', mode: 'human', _eventId: 'msg-1' }],
@@ -66,7 +54,6 @@ describe('an effort restart is one turn', () => {
     expect(exchangeStatus(turn, '', true, false, true, true)).toBe('done');
   });
 
-  // A follow-up drives the thread instead, and the engine owes no resume.
   it('owes nothing once a follow-up takes over', () => {
     const events = restartedThread('idled');
     events.set(6, { type: 'MessageReceived', text: 'do this instead', mode: 'human', _eventId: 'msg-2' });
@@ -74,8 +61,6 @@ describe('an effort restart is one turn', () => {
     expect(exchangeStatus(exchanges[0], '', false, false, true, true)).toBe('done');
   });
 
-  // The cancel and idle before the resume ended the replaced run, not the
-  // turn. A message sent now waits for the resumed agent to read it.
   it('queues a follow-up behind the resumed turn', () => {
     const events = restartedThread('working');
     events.set(2, { type: 'CodingAgentInputRead', input_event_id: 'msg-1' } as StoredEvent);
@@ -87,8 +72,6 @@ describe('an effort restart is one turn', () => {
     expect(turn.steps[turn.steps.length - 1].event.type).toBe('CodingAgentTextStreamed');
   });
 
-  // An abort after the cancel ends the turn some other way. A resume that
-  // still lands draws below the abort, where it happened.
   it('owes nothing once an abort ends the turn', () => {
     const events = restartedThread('working');
     events.set(6, { type: 'ResponseAborted', cause: 'engine_shutdown', actor: DEVICE } as StoredEvent);
@@ -96,7 +79,6 @@ describe('an effort restart is one turn', () => {
     expect(types).toEqual(['MessageReceived', 'ResponseAborted', 'ContinuationStarted']);
   });
 
-  // A child's report holds no turn, so the resume still folds in.
   it('folds the resume past a turnless boundary', () => {
     const events = restartedThread('working');
     events.set(6, { type: 'ChildReportFiled', child_thread_id: 'child-1', summary: 'done' } as StoredEvent);
@@ -104,7 +86,6 @@ describe('an effort restart is one turn', () => {
     expect(types).not.toContain('ContinuationStarted');
   });
 
-  // Any other resume still opens its own turn.
   it('leaves a resume for another reason as its own turn', () => {
     const events = restartedThread('working');
     events.set(4, { type: 'ResponseAborted', cause: 'engine_shutdown', actor: DEVICE } as StoredEvent);

@@ -1,23 +1,17 @@
-import type { LadderSurface, ServedIntelligenceRung, IntelligenceRung } from '../../api/types';
+import type { IntelligenceLadder, LadderSurface, ServedIntelligenceRung, IntelligenceRung } from '../../api/types';
 
-/** The ladders Settings → Intelligence draws, in order. The chat surface is
- *  the Lucidos Agent's. */
 export const LADDER_SURFACES: readonly { surface: LadderSurface; name: string }[] = [
   { surface: 'chat', name: 'Lucidos Agent' },
   { surface: 'claude-code', name: 'Claude Code' },
   { surface: 'codex', name: 'Codex' },
 ];
 
-/** Where Search everywhere lands for `surface`'s ladder. */
 export function ladderAnchor(surface: LadderSurface): string {
   return `intelligence:ladder-${surface}`;
 }
 
-/** The slug of the trigger Keep prices current creates. The page finds it by
- *  this, so a renamed trigger still counts. */
 export const KEEP_PRICES_CURRENT_SLUG = 'keep-prices-current';
 
-/** The schedules Keep prices current offers: 09:00 daily, or Mondays. */
 export const KEEP_PRICES_CURRENT_CRON = {
   daily: '0 0 9 * * *',
   weekly: '0 0 9 * * 1',
@@ -25,8 +19,6 @@ export const KEEP_PRICES_CURRENT_CRON = {
 
 export type PriceCheckCadence = keyof typeof KEEP_PRICES_CURRENT_CRON;
 
-/** The trigger Keep prices current creates for `cadence`. Its intent says
- *  what the user wants; the price-check knowhow says how. */
 export function keepPricesCurrentTrigger(cadence: PriceCheckCadence) {
   return {
     name: 'Keep prices current',
@@ -43,17 +35,11 @@ function pairValue(pairs: readonly IntelligenceRung[]): string {
   return pairs.map((p) => `${p.model}=${p.effort}`).join(', ');
 }
 
-/** What to store for `rungs`: the rungs that are on, in order. `null` when
- *  that restates the shipped ladder, so the preference stays unset and a
- *  later refresh still reaches this workspace. */
 export function ladderOverride(rungs: readonly ServedIntelligenceRung[], shipped: readonly IntelligenceRung[]): string | null {
   const value = pairValue(rungs.filter((r) => r.on));
   return value === pairValue(shipped) ? null : value;
 }
 
-/** `rungs` with the rung at `index` swapped past the next rung that is on in
- *  `step`'s direction. Off rungs keep their shipped place, so moving one past
- *  them only would save nothing. `null` when there is nowhere to go. */
 export function movedRung(rungs: readonly ServedIntelligenceRung[], index: number, step: -1 | 1): ServedIntelligenceRung[] | null {
   let target = index + step;
   while (target >= 0 && target < rungs.length && !rungs[target].on) target += step;
@@ -63,9 +49,6 @@ export function movedRung(rungs: readonly ServedIntelligenceRung[], index: numbe
   return next;
 }
 
-/** `rungs` with the rung at `from` carried to the rung at `to`, one `movedRung`
- *  step at a time. A drag so ends where the arrows would have taken it. A `to`
- *  that is off leaves the rung just past it. `null` when nothing moves. */
 export function draggedRung(rungs: readonly ServedIntelligenceRung[], from: number, to: number): ServedIntelligenceRung[] | null {
   const step = to > from ? 1 : -1;
   let current: ServedIntelligenceRung[] | null = null;
@@ -79,12 +62,22 @@ export function draggedRung(rungs: readonly ServedIntelligenceRung[], from: numb
   return current;
 }
 
-/** `rungs` with the rung at `index` switched on or off. */
 export function toggledRung(rungs: readonly ServedIntelligenceRung[], index: number): ServedIntelligenceRung[] {
-  return rungs.map((r, i) => (i === index ? { ...r, on: !r.on } : r));
+  return rungs.map((r, i) => (i === index && !r.is_default ? { ...r, on: !r.on } : r));
 }
 
-/** A share from 0 to 1 as a whole percentage. */
 export function percent(share: number): number {
   return Math.round(share * 100);
+}
+
+export function starredLadder(ladder: IntelligenceLadder, pick: ServedIntelligenceRung): IntelligenceLadder {
+  const { model, effort } = pick;
+  return {
+    ...ladder,
+    default_rung: { model, effort },
+    rungs: ladder.rungs.map((rung) => {
+      const is_default = rung.model === model && rung.effort === effort;
+      return { ...rung, is_default, on: rung.on || is_default };
+    }),
+  };
 }

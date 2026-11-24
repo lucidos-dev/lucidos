@@ -13,14 +13,13 @@
 //! workspaces, and a proxy hop would do that for every link. A paired remote
 //! gateway is the one proxied hop, and only by a deliberate grant (ADR 0591).
 //!
-//! **The scheme is measured.** The packaged gateway serves plain http and a dev
-//! checkout serves https, and TLS comes from launch environment recorded nowhere
-//! on disk. Asking the peer also means no peer-side code is needed, so this
-//! reaches a gateway many releases old (ADR 0105).
+//! **Every peer answers https on loopback**, with a leaf from the per-user
+//! loopback CA that every install on the machine shares. So one client reaches
+//! every peer (`lucidos_local_token::client::origin`).
 //!
-//! Plan: `docs/plans/2026-09-16-cross-gateway-thread-links.md`.
+//! Plans: `docs/plans/2026-09-16-cross-gateway-thread-links.md`,
+//! `docs/plans/2026-11-19-desktop-window-https.md`.
 
-use crate::net_config::{SCHEME_HTTP, SCHEME_HTTPS};
 use crate::registry::{self, Registry};
 use lucidos_installs::{Install, Inventory};
 use std::path::Path;
@@ -36,8 +35,8 @@ pub(crate) use lucidos_gateway_constants::GATEWAY_HEALTH_PATH;
 /// What `/~/api/v1/health` calls a gateway, as opposed to an engine.
 pub(crate) const GATEWAY_ROLE: &str = "gateway";
 
-/// How long one probe may take. Two schemes are tried, so this is half the
-/// worst case a user waits on their click.
+/// How long one probe may take, which is the worst case a user waits on
+/// their click.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// A workspace found on an install that is not ours.
@@ -161,28 +160,19 @@ fn workspace_in(install: &Install, name: &str) -> Option<PeerWorkspace> {
     })
 }
 
-/// Which scheme a gateway on `port` answered on, or `None` when none did.
+/// Did a Lucidos gateway answer on `port`? The port alone proves nothing: it
+/// is a well-known number and anything may hold it.
 ///
 /// Loopback is the right address to ask whatever the machine's bind says. Every
 /// `BindChoice` reaches it: `Loopback` is it, `All` contains it, and an explicit
 /// `Address` binds loopback beside itself (`net_config::bind_socket_addrs`).
 ///
-/// `None` means the install is registered but its gateway is down, which the
+/// `false` means the install is registered but its gateway is down, which the
 /// caller reports rather than fixing. Another install's launch agent is not
 /// ours to run.
-pub async fn probe_scheme(client: &reqwest::Client, port: u16) -> Option<&'static str> {
-    for scheme in [SCHEME_HTTPS, SCHEME_HTTP] {
-        if answered_as_gateway(client, scheme, port).await {
-            return Some(scheme);
-        }
-    }
-    None
-}
-
-/// Did a Lucidos gateway answer here? The port alone proves nothing: it is a
-/// well-known number and anything may hold it.
-async fn answered_as_gateway(client: &reqwest::Client, scheme: &str, port: u16) -> bool {
-    let url = format!("{scheme}://127.0.0.1:{port}{GATEWAY_HEALTH_PATH}");
+pub async fn answers_as_gateway(client: &reqwest::Client, port: u16) -> bool {
+    let origin = lucidos_local_token::client::origin(port);
+    let url = format!("{origin}{GATEWAY_HEALTH_PATH}");
     let Ok(res) = client.get(&url).timeout(PROBE_TIMEOUT).send().await else {
         return false;
     };
@@ -195,10 +185,6 @@ async fn answered_as_gateway(client: &reqwest::Client, scheme: &str, port: u16) 
     body.get("role").and_then(|v| v.as_str()) == Some(GATEWAY_ROLE)
 }
 
-/// How long a peer gateway may take to answer a handed-off OAuth callback,
-/// its own engine hop included.
-const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Hand an OAuth callback to the peer gateway on `port`, as its status and page.
 ///
 /// `query` holds only the fields a browser's callback carries
@@ -210,12 +196,15 @@ pub async fn hand_off_oauth_callback(
     port: u16,
     query: &str,
 ) -> Option<(u16, String)> {
-    let scheme = probe_scheme(client, port).await?;
+    if !answers_as_gateway(client, port).await {
+        return None;
+    }
+    let origin = lucidos_local_token::client::origin(port);
     let handoff = crate::oauth_callback::HANDOFF_PATH;
-    let url = format!("{scheme}://127.0.0.1:{port}{handoff}?{query}");
+    let url = format!("{origin}{handoff}?{query}");
     let res = client
         .get(&url)
-        .timeout(HANDOFF_TIMEOUT)
+        .timeout(crate::oauth_callback::HANDOFF_TIMEOUT)
         .send()
         .await
         .ok()?;
@@ -236,13 +225,9 @@ pub async fn hand_off_oauth_callback(
 /// no overall timeout, and its pool is for a destination we own. This one speaks
 /// to another install once per click and keeps nothing open afterwards.
 ///
-/// Invalid certs are accepted because a dev gateway serves its own. The probe
-/// reads one field off a public route, so a loopback impostor learns nothing
-/// and gives nothing away.
+/// The peer is on loopback, so it is the loopback client.
 pub fn probe_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
+    lucidos_local_token::client::client_builder()
         .pool_max_idle_per_host(0)
         .connect_timeout(PROBE_TIMEOUT)
         .build()

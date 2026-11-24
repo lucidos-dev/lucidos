@@ -1,12 +1,9 @@
-// Throwaway git repositories for tests that need real history. Plain JS, so a
-// test reaches git and the file system through typed helpers (gitSandbox.d.mts).
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-/** A fresh repository on `main`, with an identity and `.lucidos/` ignored. */
 export function makeRepo() {
   const root = mkdtempSync(join(tmpdir(), 'git-sandbox-'));
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -43,7 +40,6 @@ export function removeDir(path) {
   rmSync(path, { recursive: true, force: true });
 }
 
-/** This process's environment with `overrides` on top, for a child process. */
 export function envWith(overrides) {
   return { ...process.env, ...overrides };
 }

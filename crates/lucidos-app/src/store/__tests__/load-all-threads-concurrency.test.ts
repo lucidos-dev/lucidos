@@ -1,15 +1,3 @@
-/**
- * `loadAllThreads` declines a call when another load is in flight, or when the
- * engine is mid-restart. It used to resolve indistinguishably from a landed
- * load, and `refreshThreadList` reads that resolve as "the list is fresh" and
- * retracts its stale-list card: an overlapping resume and SSE resync therefore
- * cleared a warning that was still true, and hid the real load's failure while
- * doing it. Flagged independently by two reviewers on 2026-08-07.
- *
- * It now reports whether THIS call performed a load. These pin both halves: the
- * mutual exclusion (unchanged, and load-bearing so an older response cannot land
- * last and write stale `meta`) and the honest verdict.
- */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../../api/threads', () => ({
@@ -37,8 +25,6 @@ function emptyResponse(): ThreadsResponse {
   };
 }
 
-/** A response the test settles by hand, so a second caller can arrive while the
- *  first is still open. */
 function deferredResponse(): { promise: Promise<ThreadsResponse>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<ThreadsResponse>((res) => {
@@ -60,14 +46,9 @@ describe('loadAllThreads reports whether it actually loaded', () => {
     fetchThreadsMock.mockReturnValue(gate.promise);
 
     const first = loadAllThreads();
-    // Declines immediately rather than awaiting the open one: WebKit leaves a
-    // fetch hanging across an iOS suspension, and joining would block every
-    // later caller for the length of it.
     expect(await loadAllThreads()).toBe(false);
     expect(fetchThreadsMock).toHaveBeenCalledTimes(1);
 
-    // The open read may predate whatever made the second caller ask, such as
-    // an event gap. So one more read starts after it.
     gate.resolve();
     expect(await first).toBe(true);
     expect(fetchThreadsMock).toHaveBeenCalledTimes(2);
@@ -97,7 +78,6 @@ describe('loadAllThreads reports whether it actually loaded', () => {
     fetchThreadsMock.mockRejectedValueOnce(new Error('boom'));
     await expect(loadAllThreads()).rejects.toThrow('boom');
 
-    // A failed load must not wedge the guard: the next attempt has to run.
     fetchThreadsMock.mockResolvedValue(emptyResponse());
     expect(await loadAllThreads()).toBe(true);
   });

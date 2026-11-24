@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-pub use lucidos_gateway_constants::SIGIL;
+pub use lucidos_gateway_constants::{slugify, SIGIL};
 
 /// Legacy entries stay protected until a user classifies them.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,8 +34,39 @@ pub enum WorkspaceOrigin {
     Demo,
     Eval,
     E2e,
+    /// Made through the workspace broker by an agent thread.
+    Agent,
     #[default]
     Unknown,
+}
+
+impl WorkspaceOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Demo => "demo",
+            Self::Eval => "eval",
+            Self::E2e => "e2e",
+            Self::Agent => "agent",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// A machine-made workspace is one an agent may delete, restore from Trash
+    /// or snapshot-restore into. The single definition of that split.
+    pub fn is_machine_made(self) -> bool {
+        match self {
+            Self::Agent | Self::Demo | Self::Eval | Self::E2e => true,
+            Self::User | Self::Unknown => false,
+        }
+    }
+}
+
+/// The agent thread that made a workspace through the broker.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CreatedBy {
+    pub workspace_id: String,
+    pub thread_id: String,
 }
 
 /// Cleanup authority is persisted with the entry, never inferred from its name.
@@ -51,6 +82,8 @@ pub struct WorkspaceCleanup {
     pub owner_token_digest: Option<String>,
     #[serde(default)]
     pub last_opened_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<CreatedBy>,
 }
 
 /// Optional registration changes. Omitting them preserves an existing entry.
@@ -62,12 +95,13 @@ pub struct CleanupRegistration {
 }
 
 impl WorkspaceCleanup {
+    pub(crate) fn backs_up_database_on_delete(&self) -> bool {
+        !self.origin.is_machine_made()
+    }
+
     pub fn permits_owner(&self, token: &str) -> bool {
         self.ephemeral
-            && matches!(
-                self.origin,
-                WorkspaceOrigin::Eval | WorkspaceOrigin::E2e | WorkspaceOrigin::Demo
-            )
+            && self.origin.is_machine_made()
             && !token.is_empty()
             && self
                 .owner_token_digest
@@ -151,6 +185,22 @@ impl Workspace {
                 ..Default::default()
             },
             autostart: true,
+        }
+    }
+
+    /// Stamp a provisioned entry as made by an agent through the workspace
+    /// broker. Autostart is the caller's explicit choice, so a rig cannot
+    /// fill the next boot by default.
+    pub fn agent_made(self, autostart: bool, created_by: CreatedBy) -> Self {
+        Self {
+            autostart,
+            cleanup: WorkspaceCleanup {
+                origin: WorkspaceOrigin::Agent,
+                ephemeral: true,
+                created_by: Some(created_by),
+                ..Default::default()
+            },
+            ..self
         }
     }
 
@@ -277,10 +327,10 @@ impl Registry {
     /// stay tellable apart until the user renames one. Nothing is renamed for
     /// them.
     pub fn find_by_display_name(&self, name: &str, except_id: Option<&str>) -> Option<&Workspace> {
-        let wanted = name.trim().to_lowercase();
-        self.workspaces
-            .iter()
-            .find(|w| Some(w.id.as_str()) != except_id && w.name.trim().to_lowercase() == wanted)
+        self.workspaces.iter().find(|w| {
+            Some(w.id.as_str()) != except_id
+                && lucidos_gateway_constants::display_names_match(&w.name, name)
+        })
     }
 
     /// Add a workspace. Errors if the id already exists.
@@ -314,32 +364,6 @@ impl Registry {
             }
         }
         Err("could not allocate a free loopback port after 50 attempts".into())
-    }
-}
-
-/// Derive a stable, filesystem- and URL-safe slug from a display name:
-/// lowercase, non-alphanumerics collapsed to single `-`, leading/trailing `-`
-/// trimmed. Empty input (or all-punctuation) falls back to `workspace`. The
-/// output is always `[a-z0-9-]`, so it can never start with the gateway sigil.
-pub fn slugify(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut prev_dash = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "workspace".to_string()
-    } else {
-        out
     }
 }
 
@@ -432,6 +456,59 @@ mod tests {
         let roundtrip: Workspace =
             serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
         assert_eq!(legacy, roundtrip);
+    }
+
+    #[test]
+    fn a_legacy_registry_loads_unknown_and_saves_back_without_created_by() {
+        let legacy = r#"{"version":1,"workspaces":[
+            {"id":"old","name":"Old","dir":"workspaces/old","port":5001,"autostart":true,
+             "origin":"demo","ephemeral":true},
+            {"id":"bare","name":"Bare","dir":"workspaces/bare","port":5002}
+        ]}"#;
+        let reg: Registry = serde_json::from_str(legacy).unwrap();
+        let bare = reg.get("bare").unwrap();
+        assert_eq!(bare.cleanup.origin, WorkspaceOrigin::Unknown);
+        assert!(bare.cleanup.created_by.is_none());
+        assert_eq!(
+            reg.get("old").unwrap().cleanup.origin,
+            WorkspaceOrigin::Demo
+        );
+
+        let saved = serde_json::to_value(&reg).unwrap();
+        for ws in saved["workspaces"].as_array().unwrap() {
+            assert!(ws.get("created_by").is_none(), "{ws}");
+        }
+        let reloaded: Registry = serde_json::from_value(saved).unwrap();
+        assert_eq!(reloaded.workspaces, reg.workspaces);
+    }
+
+    #[test]
+    fn an_agent_made_entry_round_trips_its_creator() {
+        let ws = Workspace::gateway_provisioned("fixture".into(), "Fixture".into(), 5003)
+            .agent_made(
+                false,
+                CreatedBy {
+                    workspace_id: "dev".into(),
+                    thread_id: "thread-1".into(),
+                },
+            );
+        let json = serde_json::to_value(&ws).unwrap();
+        assert_eq!(json["origin"], "agent");
+        assert_eq!(json["ephemeral"], true);
+        assert_eq!(json["autostart"], false);
+        assert_eq!(json["created_by"]["thread_id"], "thread-1");
+        assert_eq!(serde_json::from_value::<Workspace>(json).unwrap(), ws);
+    }
+
+    #[test]
+    fn only_agent_demo_eval_and_e2e_are_machine_made() {
+        use WorkspaceOrigin::*;
+        for origin in [Agent, Demo, Eval, E2e] {
+            assert!(origin.is_machine_made(), "{origin:?}");
+        }
+        for origin in [User, Unknown] {
+            assert!(!origin.is_machine_made(), "{origin:?}");
+        }
     }
 
     #[test]

@@ -18,6 +18,8 @@ mod bundle_location;
 /// launched app a sink that discards both, so without this the client's
 /// diagnostics do not exist.
 mod client_log;
+pub use client_log::capture_relaunch as capture_client_relaunch_log;
+pub use client_log::record_relaunch as record_client_relaunch;
 mod client_owner_lock;
 mod config_scalar;
 mod crash_watchdog;
@@ -26,8 +28,10 @@ mod dev_window;
 mod device_id_store;
 mod install_preflight;
 mod launch_role;
+mod loopback_trust;
 mod mobile;
 mod notifications;
+mod outbox_handoff;
 mod pairing;
 mod panel_preview;
 mod preview_undo;
@@ -51,7 +55,7 @@ mod window_target;
 
 /// The Lucidos release this app was built as (e.g. "0.46.0"), from the
 /// repo-root `RELEASE` file. `build-dmg.sh` stamps the same file into the
-/// bundle version. Mirrors `lucidos_engine::LUCIDOS_RELEASE` (duplicated, not
+/// bundle version. Mirrors the engine executable's release (duplicated, not
 /// shared, per ADR 0014).
 ///
 /// Compare THIS against an engine's or a gateway's release, never
@@ -74,8 +78,10 @@ pub fn run_service() -> i32 {
     desktop::run_service()
 }
 
+pub use desktop::run_disposable_service;
+
 pub use client_owner_lock::claim_client_owner_lock;
-pub use launch_role::{launch_role, version_line, LaunchRole};
+pub use launch_role::{launch_role, version_line, LaunchRole, RelaunchOutcome};
 
 /// Hand `url` to the OS default handler.
 ///
@@ -678,8 +684,9 @@ fn restart_process(exe: &std::path::Path, args: &[std::ffi::OsString]) -> Result
 /// (`desktop::startup_label`) rather than assembled here or in the page, so the
 /// wording has one home and is unit-tested.
 #[tauri::command]
-fn startup_status(app: tauri::AppHandle) -> String {
-    app.state::<desktop::StartupStatus>().label()
+fn startup_status(app: tauri::AppHandle) -> desktop::StartupReport {
+    app.state::<desktop::StartupStatus>()
+        .report(&app.state::<loopback_trust::LoopbackTrust>())
 }
 
 /// Show a native macOS notification and route a tap to the page.
@@ -691,11 +698,17 @@ fn startup_status(app: tauri::AppHandle) -> String {
 /// `native-notification-tapped`, and the page routes it through the same
 /// `dispatchDeepLink` the web-push tap uses.
 ///
-/// No-op in the dev window and off macOS. See `notifications.rs` and
-/// `system-knowhow/notifications.md` §4.
+/// No-op in development; otherwise waits for OS acceptance. Unavailable off
+/// macOS. See `notifications.rs` and `system-knowhow/notifications/3-the-presencecheck-protocol.md` §4.
 #[tauri::command]
-fn show_native_notification(title: String, body: String, link: serde_json::Value) {
-    notifications::show(&title, &body, link);
+async fn show_native_notification(
+    title: String,
+    body: String,
+    link: serde_json::Value,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || notifications::show(&title, &body, link))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Remove an already-delivered native banner, the cross-device dismiss
@@ -716,7 +729,7 @@ fn dismiss_native_notification(workspace: Option<String>, id: Option<String>) {
 /// Wake the unread-indicator loop for an immediate recompute, so the macOS
 /// count updates the instant a notification is read rather than on the next
 /// poll. Best-effort: a send failure with no receiver is ignored. The recompute
-/// reads the gateway's fresh `unread-total` aggregate.
+/// reads the gateway's `unread-total`, which its row subscriptions keep current.
 #[tauri::command]
 fn nudge_dock_badge(state: tauri::State<'_, DockBadgeNudge>) {
     let _ = state.0.lock().unwrap().send(());
@@ -907,7 +920,7 @@ fn startup_clamp_and_show(app: &tauri::AppHandle) {
                     // Only a window that actually reached the screen latches the
                     // gate, the same rule `front_window` follows.
                     Ok(()) => {
-                        window_screen::note_shown(app_window::MAIN_WINDOW_LABEL);
+                        app_window::note_window_shown(app, app_window::MAIN_WINDOW_LABEL, true);
                         window_persist::note_presented();
                     }
                     Err(e) => eprintln!("[Tauri] Failed to show the main window: {e}"),
@@ -992,16 +1005,12 @@ pub fn run() {
     // Created here so both ends are in scope: `nudge_dock_badge` holds the
     // sender as managed state, and `desktop::launch` takes the receiver.
     let (dock_badge_nudge_tx, dock_badge_nudge_rx) = std::sync::mpsc::channel::<()>();
-    tauri::Builder::default()
-        .plugin(
-            tauri_plugin_window_state::Builder::new()
-                .with_state_flags(window_persist::window_state_flags())
-                // `main` only. Every other label is a per-process counter, so
-                // the plugin would restore one window's geometry onto an
-                // unrelated one. See `window_persist::plugin_tracks`.
-                .with_filter(window_persist::plugin_tracks)
-                .build(),
-        )
+    let builder = tauri::Builder::default();
+    let builder = match window_persist::window_state_plugin() {
+        Some(plugin) => builder.plugin(plugin),
+        None => builder,
+    };
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(boot_splash_guard::plugin())
@@ -1015,6 +1024,8 @@ pub fn run() {
         .manage(desktop::StartupStatus::default())
         .manage(DockBadgeNudge(Mutex::new(dock_badge_nudge_tx)))
         .manage(view_menu::ViewMenu::default())
+        .manage(outbox_handoff::OutboxHandoffStore::default())
+        .manage(loopback_trust::LoopbackTrust::default())
         .invoke_handler(tauri::generate_handler![
             panel_preview::create_panel_webview,
             panel_preview::navigate_panel_webview,
@@ -1042,6 +1053,7 @@ pub fn run() {
             app_window::focus_calling_window,
             nudge_dock_badge,
             app_window::get_native_window_active,
+            app_window::get_native_window_shown,
             take_pending_native_taps,
             updater::check_app_update,
             updater::install_app_update_and_restart,
@@ -1063,18 +1075,16 @@ pub fn run() {
             device_id_store::previous_device_id,
             device_id_store::remember_device_id,
             pairing::mint_pairing_code,
+            outbox_handoff::store_outbox_handoff,
+            outbox_handoff::take_outbox_handoff,
+            outbox_handoff::acknowledge_outbox_handoff,
+            loopback_trust::trust_loopback_ca,
         ])
         .on_window_event(|window, event| {
             let app = window.app_handle();
             match event {
-                // Packaged: closing a window must NOT quit the client or stop
-                // the always-on service, so the main window is hidden rather
-                // than closed. Secondary windows close normally, and dev keeps
-                // the default close-quits behavior.
-                //
-                // Geometry is flushed synchronously here on every platform. The
-                // plugin's own disk write is unreachable in the packaged client,
-                // and this close is when the user expects it remembered.
+                // Flush geometry before a close or hide. Packaged app windows
+                // retain their pages unless deliberate teardown has begun.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     window_persist::persist_window_state_only(app);
                     // The SESSION only when this close is the user's own. A
@@ -1084,34 +1094,22 @@ pub fn run() {
                     if !window_persist::tearing_down() {
                         window_persist::persist_window_session(app);
                     }
-                    if !tauri::is_dev() && window.label() == "main" {
-                        // Keep the client resident: HIDE, for a fast reopen with
-                        // page state preserved, then drop to the tray if this was
-                        // the last visible window.
+                    if app_window::should_retain_on_close(
+                        window.label(),
+                        tauri::is_dev(),
+                        window_persist::tearing_down(),
+                    ) {
                         api.prevent_close();
-                        let _ = window.hide();
-                        // Off screen by our own hand. The watchdog reads this
-                        // rather than `[NSWindow isVisible]`, so a parked page
-                        // is left alone instead of reloaded.
-                        window_screen::note_hidden(window.label());
-                        // The WKWebView cannot report an `orderOut:`, and
-                        // `Focused(false)` may not fire on one. This is the
-                        // load-bearing signal that the page is inactive. It is
-                        // what lets the engine send the OS banner rather than a
-                        // suppressed in-app toast.
-                        app_window::emit_window_active(app, window.label(), false);
-                        app_window::enter_menu_bar_only_if_no_windows(app, Some(window.label()));
+                        app_window::hide_app_window(window);
                     }
                 }
-                // A secondary window closed. Drop its traffic-light resize
-                // observer, then re-evaluate the tray. The tray half is
-                // packaged-only; the observer half is not, because a leaked
-                // registration is keyed on the dead window's address in both
-                // builds. `main` never reaches here: its close is prevented.
+                // Destruction during teardown or development releases observers
+                // and updates the session only when its write gates allow it.
                 tauri::WindowEvent::Destroyed if app_window::is_app_window(window.label()) => {
                     traffic_lights::unwatch(window.label());
                     window_screen::forget(window.label());
                     app_window::forget_window_fullscreen(window.label());
+                    app_window::forget_window_focus(window.label());
                     view_menu::forget(app, window.label());
                     // The SLOT is what this clears. The child webview itself
                     // dies with its host, which is now this window, and tauri
@@ -1139,6 +1137,7 @@ pub fn run() {
                 {
                     app_window::emit_window_active(app, window.label(), *focused);
                     if *focused {
+                        app_window::record_window_focus(window.label());
                         view_menu::apply_for(app, window.label());
                     }
                 }
@@ -1355,6 +1354,7 @@ pub fn run() {
             // click on the windowless client re-shows one. `quit_lucidos` sets
             // `QUITTING` so its own exit passes the guard.
             match event {
+                tauri::RunEvent::Exit => client_log::flush(),
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     if !tauri::is_dev() && !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();
@@ -1970,7 +1970,7 @@ mod tests {
 ///
 /// What they cannot prove is the origin STRING the OS produces, which tauri
 /// derives from the `Origin` header WebKit puts on the `ipc://` request. That
-/// the header really is `http://localhost:<port>` rests on code inspection and
+/// the header really is `https://localhost:<port>` rests on code inspection and
 /// field evidence, not on these tests.
 #[cfg(test)]
 mod acl_tests {
@@ -2013,26 +2013,54 @@ mod acl_tests {
     /// The runtime capability `desktop::launch` registers, as a plain
     /// [`Capability`] the resolver can consume.
     fn gateway_capability(port: u16) -> Capability {
-        match desktop::gateway_capability(&desktop::gateway_url(port)).build() {
+        only_capability(desktop::gateway_capability(&desktop::gateway_url(port)))
+    }
+
+    /// The runtime capability of the outbox hand-off page.
+    fn handoff_capability(port: u16) -> Capability {
+        only_capability(desktop::handoff_capability(&desktop::handoff_origin(port)))
+    }
+
+    fn only_capability(builder: tauri::ipc::CapabilityBuilder) -> Capability {
+        match builder.build() {
             CapabilityFile::Capability(c) => c,
-            _ => panic!("gateway_capability must build exactly one capability"),
+            _ => panic!("a runtime capability must build exactly one capability"),
         }
     }
 
     /// Build the authority the packaged client runs with: the static
-    /// capabilities, plus the runtime one `desktop::launch` registers before
-    /// navigating. Passing `None` leaves the runtime capability out.
+    /// capabilities, plus the runtime ones `desktop::launch` registers before
+    /// navigating. Passing `None` leaves the runtime capabilities out.
     fn authority(gateway_port: Option<u16>) -> tauri::ipc::RuntimeAuthority {
+        let runtime = gateway_port
+            .map(|port| vec![gateway_capability(port), handoff_capability(port)])
+            .unwrap_or_default();
+        authority_with(runtime)
+    }
+
+    /// The static capabilities plus exactly `runtime`.
+    fn authority_with(runtime: Vec<Capability>) -> tauri::ipc::RuntimeAuthority {
         let acl = acl_manifests();
         let mut capabilities = static_capabilities();
-        if let Some(port) = gateway_port {
-            let capability = gateway_capability(port);
+        for capability in runtime {
             capabilities.insert(capability.identifier.clone(), capability);
         }
         let resolved = Resolved::resolve(&acl, capabilities, Target::current())
             .expect("capabilities must resolve against the app's ACL manifests");
         tauri::runtime_authority!(acl, resolved)
     }
+
+    /// The commands our own frontend calls. The panel reports come from a
+    /// previewed page and the outbox store from the hand-off page, and each
+    /// has its own tests below.
+    fn frontend_commands() -> BTreeSet<String> {
+        invoke_handler_commands()
+            .into_iter()
+            .filter(|c| !c.starts_with("__panel_") && c != HANDOFF_STORE)
+            .collect()
+    }
+
+    const HANDOFF_STORE: &str = "store_outbox_handoff";
 
     /// Command names registered in `tauri::generate_handler!`, read out of this
     /// very file so the list can never be a stale copy. Module qualifiers are
@@ -2111,12 +2139,7 @@ mod acl_tests {
         let origin = Origin::Remote {
             url: gateway_origin(),
         };
-        for command in invoke_handler_commands() {
-            // The panel reports are invoked from the previewed page, never from
-            // our own frontend, and are covered by their own test below.
-            if command.starts_with("__panel_") {
-                continue;
-            }
+        for command in frontend_commands() {
             assert!(
                 authority
                     .resolve_access(&command, "main", "main", &origin)
@@ -2196,11 +2219,11 @@ mod acl_tests {
         // A different local port, a foreign host, and a different scheme must
         // all stay out. Remote content cannot reach custom commands.
         for url in [
-            "http://localhost:9999",
-            "http://127.0.0.1:5252",
-            "http://evil.example",
-            "http://localhost.evil.example:5252",
-            "https://localhost:5252",
+            "https://localhost:9999",
+            "https://127.0.0.1:5252",
+            "https://evil.example",
+            "https://localhost.evil.example:5252",
+            "http://localhost:5252",
         ] {
             assert!(
                 authority
@@ -2298,10 +2321,7 @@ mod acl_tests {
         // bundled splash included. Without `allow-app-ipc` in the default
         // capability that breaks the dev window and the splash's own heartbeat.
         let authority = authority(None);
-        for command in invoke_handler_commands() {
-            if command.starts_with("__panel_") {
-                continue;
-            }
+        for command in frontend_commands() {
             assert!(
                 authority
                     .resolve_access(&command, "main", "main", &Origin::Local)
@@ -2325,10 +2345,14 @@ mod acl_tests {
         // `generate_handler!` but absent from `permissions/app-ipc.json` is
         // denied on EVERY origin, dev included.
         let registered = invoke_handler_commands();
-        let permitted: BTreeSet<String> = permission_commands("allow-app-ipc")
-            .union(&permission_commands("allow-panel-report"))
-            .cloned()
-            .collect();
+        let permitted: BTreeSet<String> = [
+            "allow-app-ipc",
+            "allow-panel-report",
+            "allow-outbox-handoff-store",
+        ]
+        .into_iter()
+        .flat_map(permission_commands)
+        .collect();
         let unpermitted: Vec<_> = registered.difference(&permitted).collect();
         assert!(
             unpermitted.is_empty(),
@@ -2350,6 +2374,82 @@ mod acl_tests {
                 "__panel_content_report".to_string(),
             ]),
             "allow-panel-report is granted to ANY remote origin — keep it to the three reports"
+        );
+        assert_eq!(
+            permission_commands("allow-outbox-handoff-store"),
+            BTreeSet::from([HANDOFF_STORE.to_string()]),
+            "the hand-off page's permission must stay the one store command"
+        );
+    }
+
+    #[test]
+    fn the_handoff_origin_reaches_only_the_outbox_store() {
+        let authority = authority_with(vec![handoff_capability(PORT)]);
+        let origin = remote(&desktop::handoff_origin(PORT));
+        assert!(
+            authority
+                .resolve_access(HANDOFF_STORE, "main", "main", &origin)
+                .is_some(),
+            "the hand-off page cannot store the outbox, so the window would strand it"
+        );
+        let others = invoke_handler_commands()
+            .into_iter()
+            .filter(|c| c != HANDOFF_STORE)
+            .chain(PLUGIN_COMMANDS.iter().map(|c| c.to_string()));
+        for command in others {
+            assert!(
+                authority
+                    .resolve_access(&command, "main", "main", &origin)
+                    .is_none(),
+                "`{command}` is reachable from the hand-off origin"
+            );
+        }
+    }
+
+    #[test]
+    fn the_outbox_store_is_scoped_to_the_handoff_page() {
+        let authority = authority_with(vec![gateway_capability(PORT), handoff_capability(PORT)]);
+        let handoff = desktop::handoff_origin(PORT);
+        for (window, webview, url) in [
+            ("main", "main", "http://localhost:9999"),
+            ("main", "main", "http://127.0.0.1:5252"),
+            ("main", "main", "https://evil.example"),
+            ("window-1", "window-1", handoff.as_str()),
+        ] {
+            assert!(
+                authority
+                    .resolve_access(HANDOFF_STORE, window, webview, &remote(url))
+                    .is_none(),
+                "the outbox store is reachable from {webview} on {url}"
+            );
+        }
+        for host in PREVIEW_HOSTS {
+            assert!(
+                authority
+                    .resolve_access(HANDOFF_STORE, host, &preview_label(1), &remote(&handoff))
+                    .is_none(),
+                "a preview hosted on {host} reaches the outbox store"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gateway_capability_does_not_grant_the_outbox_store() {
+        let authority = authority_with(vec![gateway_capability(PORT)]);
+        let origin = Origin::Remote {
+            url: gateway_origin(),
+        };
+        assert!(
+            authority
+                .resolve_access(HANDOFF_STORE, "main", "main", &origin)
+                .is_none(),
+            "the gateway origin reaches the hand-off page's store command"
+        );
+        assert!(
+            authority
+                .resolve_access(HANDOFF_STORE, "main", "main", &Origin::Local)
+                .is_none(),
+            "the bundled app URL reaches the hand-off page's store command"
         );
     }
 
@@ -2378,8 +2478,9 @@ mod acl_tests {
         // the main window. Combined with a remote context that would hand our IPC
         // surface to previewed content. Webview scoping is the only safe form.
         let mut capabilities = static_capabilities();
-        let capability = gateway_capability(PORT);
-        capabilities.insert(capability.identifier.clone(), capability);
+        for capability in [gateway_capability(PORT), handoff_capability(PORT)] {
+            capabilities.insert(capability.identifier.clone(), capability);
+        }
         for (identifier, capability) in &capabilities {
             if capability.remote.is_some() {
                 assert!(
@@ -2393,5 +2494,74 @@ mod acl_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod close_guard_tests {
+    #[test]
+    fn native_close_and_park_share_the_retention_operation() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split_once("tauri::WindowEvent::CloseRequested { api, .. } => {")
+            .unwrap()
+            .1
+            .split_once("tauri::WindowEvent::Destroyed")
+            .unwrap()
+            .0;
+        assert!(handler.contains("app_window::should_retain_on_close("));
+        assert!(handler.contains("window_persist::tearing_down()"));
+        assert!(handler.contains("tauri::is_dev()"));
+        assert!(handler.contains("api.prevent_close()"));
+        assert!(handler.contains("app_window::hide_app_window(window)"));
+        assert!(!handler.contains("window.label() =="));
+
+        let windows = include_str!("app_window.rs");
+        let park = windows
+            .split_once("pub(crate) fn close_all_to_tray(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn show_main_window(")
+            .unwrap()
+            .0;
+        assert!(park.contains("hide_app_window(&window)"));
+        let hide = windows
+            .split_once("pub(crate) fn hide_app_window(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn close_all_to_tray(")
+            .unwrap()
+            .0;
+        for effect in [
+            "window.hide()",
+            "note_window_shown(app, window.label(), false)",
+            "emit_window_active(app, window.label(), false)",
+            "enter_menu_bar_only_if_no_windows(app, None)",
+        ] {
+            assert!(hide.contains(effect), "missing hide effect: {effect}");
+        }
+        assert!(!hide.contains("get_webview_window"));
+    }
+    #[test]
+    fn shown_bridge_uses_calling_window_and_targeted_transitions() {
+        let source = include_str!("app_window.rs");
+        let seed = source
+            .split_once("fn get_native_window_shown(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn note_window_shown(")
+            .unwrap()
+            .0;
+        assert!(seed.contains("window_screen::shown_by_client(window.label())"));
+        assert!(!seed.contains("is_focused"));
+        assert!(source.contains(r#"app.emit_to(label, "native-window-shown", shown)"#));
+        let hide = source
+            .split_once("fn hide_app_window(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn close_all_to_tray(")
+            .unwrap()
+            .0;
+        assert!(hide.find("return;").unwrap() < hide.find("note_window_shown").unwrap());
     }
 }

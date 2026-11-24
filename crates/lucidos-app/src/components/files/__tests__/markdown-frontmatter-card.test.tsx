@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A markdown preview draws the file's frontmatter as a properties card. Left to
- * marked, the raw block renders as a horizontal rule over one big heading.
- */
 import { describe, it, expect, afterEach } from 'vitest';
 import { render } from 'preact';
 import { MarkdownDocument } from '../MarkdownDocument';

@@ -1,5 +1,3 @@
-/** A turn's body rows carry the seq of the event behind them. That is how a
- *  side question sits between the rows written before and after it. */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getExchanges, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeResponseEvents } from '../thread-events';

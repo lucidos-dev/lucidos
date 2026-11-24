@@ -3,12 +3,6 @@ import { locateReadingTarget, readingTargetOf } from '../ThreadView';
 import { makeThreadState } from '../../../store/__tests__/thread-events-helpers';
 import { computeExchanges, type StoredEvent, type ThreadState } from '../../../store/thread-events';
 
-/** Where the window must walk to put a reader back on their row.
- *
- *  A row is found by the event id of its tool call, among a turn's events.
- *  That id survives what the turn's own id does not: a page boundary that cuts
- *  the turn into a *continuation fragment*, which carries no turn id at all.
- *  Plan: docs/plans/2026-09-23-the-reading-position-and-the-thumb-hold-still.md */
 
 const T0 = Date.UTC(2026, 8, 23, 12, 0, 0);
 const at = (i: number) => new Date(T0 + i * 1000).toISOString();
@@ -64,8 +58,6 @@ describe('locateReadingTarget', () => {
   });
 
   it('finds a row inside a continuation fragment, which has no turn id', () => {
-    // The page starts mid-turn: the fragment holds evt-1..evt-3 and no opening
-    // message. A turn anchor could not name it. Its rows are still found.
     const exchanges = exchangesOf(whole.slice(1), true);
     expect(exchanges[0].continuationFragment).toBe(true);
     expect(locateReadingTarget(exchanges, { kind: 'row', id: 'evt-2' })).toEqual({ index: 0, row: 1 });

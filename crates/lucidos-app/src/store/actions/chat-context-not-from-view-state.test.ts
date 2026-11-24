@@ -1,6 +1,3 @@
-// Contract: sendMessage must take ChatContext explicitly via options.context
-// rather than reading currentApp / previewFile / selectedLines back from
-// view-state signals (frontend.md — Frontend Sends Intent).
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { panelOverlay, threadMap, setFocusedThread } from '../store';
 import type { App } from '../types';

@@ -1,14 +1,7 @@
 // @vitest-environment jsdom
-/**
- * `--app-height` follows every correction iOS makes to the layout viewport.
- *
- * Replays a phone's own log. It went to the background in landscape and came
- * back in portrait. At the wake iOS reported the landscape height (402) at the
- * portrait width, with a visual viewport of 0. A window `resize` then brought
- * the height back to 874, and no visual-viewport resize followed. The shell
- * stayed 402 tall, under half the screen, until the keyboard next moved.
- */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { enginePackaged } from '../../../store/enginePackaging';
+import { PERF_FLAG_KEY, perfRecordingOn, setPerfEnabled } from '../../../utils/perfQueue';
 import { trackAppHeight } from '../MobileSwipeContainer';
 import { resetKeyboardCloseState } from '../keyboardCloseRelayout';
 
@@ -75,6 +68,52 @@ describe('trackAppHeight', () => {
 
     window.dispatchEvent(new Event('resize'));
     expect(band()).toBe(reserved);
+  });
+
+  it('starts from-source sampling without polling until the device opts in', () => {
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    const clear = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      expect(perfRecordingOn()).toBe(false);
+      enginePackaged.value = false;
+      expect(perfRecordingOn()).toBe(true);
+      expect(interval).not.toHaveBeenCalled();
+
+      localStorage.setItem(PERF_FLAG_KEY, '1');
+      window.dispatchEvent(Object.assign(new Event('storage'), {
+        key: PERF_FLAG_KEY, newValue: '1', storageArea: window.localStorage,
+      }));
+      expect(interval).toHaveBeenCalledExactlyOnceWith(expect.any(Function), 3000);
+
+      localStorage.removeItem(PERF_FLAG_KEY);
+      window.dispatchEvent(Object.assign(new Event('storage'), {
+        key: PERF_FLAG_KEY, oldValue: '1', storageArea: window.localStorage,
+      }));
+      expect(clear).toHaveBeenCalledExactlyOnceWith(interval.mock.results[0].value);
+      expect(perfRecordingOn()).toBe(true);
+    } finally {
+      enginePackaged.value = null;
+      localStorage.removeItem(PERF_FLAG_KEY);
+      interval.mockRestore();
+      clear.mockRestore();
+    }
+  });
+
+  it('starts and stops polling from the packaged switch in the same tab', () => {
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    const clear = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      enginePackaged.value = true;
+      setPerfEnabled(true);
+      expect(interval).toHaveBeenCalledExactlyOnceWith(expect.any(Function), 3000);
+      setPerfEnabled(false);
+      expect(clear).toHaveBeenCalledExactlyOnceWith(interval.mock.results[0].value);
+    } finally {
+      setPerfEnabled(false);
+      enginePackaged.value = null;
+      interval.mockRestore();
+      clear.mockRestore();
+    }
   });
 
   it('stops listening on teardown', () => {

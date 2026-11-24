@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-/**
- * The Successor card on top of the composer, offering a *successor session* to a
- * large coding-agent thread. It shows only at a clean idle, and only where the
- * engine's verdict for the current cache state says a handoff pays. It also
- * waits for the user to start writing in the composer.
- */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -35,7 +29,6 @@ import type { StoredEvent } from '../../../store/thread-events';
 
 type MetaOverrides = NonNullable<NonNullable<Parameters<typeof makeThreadState>[1]>['meta']>;
 
-/** An hour on, as far as a prompt cache's warmth reaches. */
 const LATER = new Date(Date.now() + 3_600_000).toISOString();
 
 function reading(card: Partial<NonNullable<ThreadContext['card']>> | null): ThreadContext {
@@ -134,7 +127,6 @@ describe('SuccessorCard', () => {
   const hosts: HTMLElement[] = [];
 
   afterEach(() => {
-    // Clearing the body leaves a Preact tree subscribed, so unmount each one.
     for (const host of hosts.splice(0)) render(null, host);
     document.body.innerHTML = '';
     threadMap.value = new Map();
@@ -166,13 +158,12 @@ describe('SuccessorCard', () => {
     Array.from(host.querySelectorAll<HTMLButtonElement>('.successor-card .question-option'))
       .find((b) => b.querySelector('.question-option-label')?.textContent === label)!;
 
-  it('asks the question with three options, each with its explanation', async () => {
+  it('offers only Continue with context and Stay here', async () => {
     const host = await mount();
     expect(host.querySelector('.question-text')?.textContent).toContain('This thread holds 412k tokens');
-    expect(host.querySelector('.question-text p:last-child')?.textContent).toBe('Carry on in a fresh session?');
+    expect(host.querySelector('.question-text p:last-child')?.textContent).toBe('Continue in a fresh session or stay here?');
     const labels = Array.from(host.querySelectorAll('.successor-card .question-option-label')).map((e) => e.textContent);
-    expect(labels).toEqual(['Continue with context', 'Start fresh', 'Stay here']);
-    expect(option(host, 'Start fresh').textContent).toContain('no carry-over');
+    expect(labels).toEqual(['Continue with context', 'Stay here']);
     expect(successorCardThreadId.value).toBe('t1');
   });
 
@@ -211,9 +202,9 @@ describe('SuccessorCard', () => {
     const picked = option(host, 'Continue with context');
     expect(picked.querySelector('.mini-spinner')).not.toBeNull();
     expect(picked.textContent).toContain('Writing the handoff…');
-    expect(option(host, 'Start fresh').disabled).toBe(true);
+    expect(option(host, 'Stay here').disabled).toBe(true);
     await act(async () => { finish(); await Promise.resolve(); });
-    expect(option(host, 'Start fresh').disabled).toBe(false);
+    expect(option(host, 'Stay here').disabled).toBe(false);
   });
 
   it('says Starting the fresh session on a cold cache', async () => {
@@ -222,14 +213,6 @@ describe('SuccessorCard', () => {
     const host = await mount();
     await act(async () => { option(host, 'Continue with context').click(); });
     expect(option(host, 'Continue with context').textContent).toContain('Starting the fresh session…');
-  });
-
-  it('starts fresh through the draft action and calls no engine route', async () => {
-    const host = await mount();
-    await act(async () => { option(host, 'Start fresh').click(); });
-    expect(startFreshDraft).toHaveBeenCalledWith(threadMap.value.get('t1')!.meta);
-    expect(continueInSuccessor).not.toHaveBeenCalled();
-    expect(declineSuccessorOffer).not.toHaveBeenCalled();
   });
 
   it('records Stay here with the engine', async () => {

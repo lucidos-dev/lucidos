@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/** Settings → Keyboard Shortcuts → Composer: the Enter key switch.
- *
- *  It shows the stored mode, and a press writes `composer_enter_key`.
- *
- *  Plan: `docs/plans/2026-10-16-composer-enter-key-setting.md`. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-// The Thread queue's Running and Queued sections collapse from their headers,
-// and the Capacity policy button sits beside the Running toggle.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';

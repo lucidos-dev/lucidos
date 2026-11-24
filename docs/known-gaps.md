@@ -178,13 +178,13 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 ## Notifications & push
 
 ### iOS web push requires an installed (home-screen) PWA
-- **Where:** `crates/lucidos-app/src/store/actions/push.ts` (`isIOS() && !isStandalone()` guard), `system-knowhow/notifications.md` §1
+- **Where:** `crates/lucidos-app/src/store/actions/push.ts` (`isIOS() && !isStandalone()` guard), `system-knowhow/notifications/1-conceptual-model.md` §1
 - **Gap:** A user browsing Lucidos in an iOS Safari *tab* cannot enable push notifications — the enable flow refuses with "On iOS, add Lucidos to your home screen first to enable push notifications".
 - **Why:** iOS Safari only exposes the Service Worker / Web Push APIs to a PWA installed to the home screen (standalone display mode); a plain browser tab has no service worker to subscribe with.
 - **Status:** Open — user must "Add to Home Screen" first. Structural iOS/WebKit limitation, no engine-side fix.
 
 ### An iOS home-screen app pairs separately from Safari
-- **Where:** `crates/lucidos-gateway/src/auth.rs` (`COOKIE_DEVICE_CREDENTIAL`), `crates/lucidos-app/src/components/picker/PairingGate.tsx` (`pairingScreenBranch`), `system-knowhow/remote-access.md` § A phone installs before it pairs
+- **Where:** `crates/lucidos-gateway/src/auth.rs` (`COOKIE_DEVICE_CREDENTIAL`), `crates/lucidos-app/src/components/picker/PairingGate.tsx` (`pairingScreenBranch`), `system-knowhow/remote-access/settings-access.md` § A phone installs before it pairs
 - **Gap:** Pairing in an iOS Safari tab does not let the installed home-screen app in. Scanning the Access-page QR with the Camera app always opens Safari, never the app.
 - **Why:** iOS gives a home-screen web app its own WebKit storage container. Cookies, localStorage, IndexedDB and the Cache API all live inside it, so nothing web-storage-shaped crosses from Safari. iOS also offers no way to route a scanned link into an installed web app, which is what Android's PWA scope capture does.
 - **Status:** Worked around, not closed. Three paths carry a code across. The manifest's `start_url` pairs a fresh install. The shared pasteboard covers an install that already exists. The app's own camera reads the QR. The storage boundary itself is a WebKit platform rule with no engine-side fix.
@@ -204,7 +204,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Status:** Open — test native notifications only in a packaged `.app`. Platform requirement.
 
 ### The desktop app gets no native notifications off macOS
-- **Where:** `crates/lucidos-app/src/notifications.rs` (`#[cfg(not(target_os = "macos"))]` no-ops for `setup`/`show`/`dismiss`/`set_dock_badge`/`set_tray_title`), `system-knowhow/notifications.md` §1/§4
+- **Where:** `crates/lucidos-app/src/notifications.rs` (`#[cfg(not(target_os = "macos"))]` no-ops for `setup`/`show`/`dismiss`/`set_dock_badge`/`set_tray_title`), `system-knowhow/notifications/1-conceptual-model.md` §1/§4
 - **Gap:** On a Linux/Windows desktop build the app surfaces no native banners, dock badge, or tray-title unread count.
 - **Why:** The embedded WKWebView can't subscribe to Web Push (no service worker), so the engine reaches the desktop app over SSE and renders banners through Apple's macOS-only `UserNotifications` framework — there is no cross-platform native notification path wired. Browser/PWA clients on those platforms still get web push server-side.
 - **Status:** Open — only the macOS desktop app has a native path; other desktops rely on a browser/PWA client for notifications.
@@ -283,7 +283,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Status:** Open — mitigated via preflight health check, retry, and reaper; not deterministically fixed (browser-side).
 
 ### `bash_background` unit tests are load-sensitive and flake under host contention
-- **Where:** `crates/lucidos-engine/src/engine/tools/bash_background.rs` `#[cfg(test)] mod tests` — notably `killed_task_preserves_output_written_before_kill` (:547), `drain_returns_only_new_output_each_call` (:446), `wait_zero_matches_legacy_non_blocking_drain` (:870).
+- **Where:** `crates/lucidos-engine/src/engine/bash_background.rs` `#[cfg(test)] mod tests` — notably `killed_task_preserves_output_written_before_kill` (:547), `drain_returns_only_new_output_each_call` (:446), `wait_zero_matches_legacy_non_blocking_drain` (:870).
 - **Gap:** These spawn real subprocesses and poll for their output within fixed windows (e.g. "task did not finish within 8s after kill"). On a saturated host they intermittently fail with `first stdout: ""` / `stdout: ""` / the 8s timeout, and *which* test fails varies per run. Observed 2026-07-26 while the machine was running continuous cargo + vite builds: 1 failure in a full-suite run, then across three consecutive module-only runs — ok, 2 failures (a different pair), ok. The same test passes reliably when run alone.
 - **Why:** The assertions are wall-clock races against real process scheduling, not logic. Under contention the child simply hasn't been scheduled to write before the deadline. Making them deterministic means restructuring around a readiness signal rather than a sleep/poll window — a change to the tested module's test harness, not to any caller.
 - **Status:** Open — unrelated to any feature work that trips it, so don't chase it from an unrelated diff. Re-run the module (or the single test) to confirm a failure is this flake before treating it as a regression; a genuine regression fails deterministically and names the same test every time.
@@ -375,19 +375,19 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 ## LLM providers & models
 
 ### Vertex ADC: only `authorized_user` credentials work in-engine
-- **Where:** `crates/lucidos-engine/src/llm/vertex/adc.rs` (module header), CLAUDE.md § Environment Variables (other types "fall back to the `gcloud` subprocess (dev only)")
+- **Where:** `crates/lucidos-core/src/llm/vertex/adc.rs` (module header), CLAUDE.md § Environment Variables (other types "fall back to the `gcloud` subprocess (dev only)")
 - **Gap:** Vertex authentication with `service_account`, `external_account`, or `impersonated_service_account` ADC credential types doesn't work in a packaged/headless engine.
 - **Why:** Only the `authorized_user` ADC type is parsed and refreshed in-engine; other types return `None` and require falling back to the `gcloud` CLI subprocess, which a packaged build doesn't ship.
 - **Status:** Open — packaged/headless Vertex needs an `authorized_user` ADC (`gcloud auth application-default login`); other types are dev-only via the `gcloud` binary.
 
 ### Responses-API models drop image content
-- **Where:** `crates/lucidos-engine/src/llm/openai/responses.rs` (`ContentBlock::Image { .. } =>` "Responses API (codex models) doesn't support images — skip")
+- **Where:** `crates/lucidos-core/src/llm/openai/responses.rs` (`ContentBlock::Image { .. } =>` "Responses API (codex models) doesn't support images — skip")
 - **Gap:** Sending an image to a model that uses OpenAI's Responses API (GPT-5+ / Codex) silently omits the image.
 - **Why:** The Responses API wire format the engine emits has no image support, so image blocks are skipped when building the request.
 - **Status:** **Closed (2026-10-17)** by "fix(llm): the Responses API sends images as input_image parts". The builder sends each image as an `input_image` data URL part, in block order. A tool's image follows its function call output, and a cache-marked message keeps its images too. The wire no longer decides which models see images.
 
 ### OpenRouter and local providers are Chat-Completions-only, with no routing heuristic
-- **Where:** `crates/lucidos-engine/src/llm/openai/mod.rs` (`force_chat_completions` for OpenRouter/local), `crates/lucidos-engine/src/llm/model_registry.rs` ("no rule for these shapes, so it falls back to Vertex (documented limitation)")
+- **Where:** `crates/lucidos-core/src/llm/openai/mod.rs` (`force_chat_completions` for OpenRouter/local), `crates/lucidos-core/src/llm/model_registry.rs` ("no rule for these shapes, so it falls back to Vertex (documented limitation)")
 - **Gap:** A GPT-5+/Codex-class model served via OpenRouter or a local OpenAI-compatible server is pinned to the Chat Completions API (never the Responses API); and if such a model id is missing from the `models` table, provider routing falls back to Vertex rather than the intended backend.
 - **Why:** OpenRouter/local backends implement only Chat Completions, so `force_chat_completions` is set; and the prefix routing heuristic recognizes only `gpt-`/`claude-` shapes — OpenRouter (`z-ai/*`) and local ids have no prefix rule, so an exact registry hit is required.
 - **Status:** Open — keep OpenRouter/local models present in the registry; Responses-API-only features are unavailable through them.
@@ -407,25 +407,25 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 ## Coding agents
 
 ### A coding-agent thread's backend is locked at first session
-- **Where:** `crates/lucidos-engine/src/api/chat.rs` (`validate_thread_continuity` → `StatusCode::CONFLICT`), `docs/adr/0004-codex-as-second-coding-agent.md`
+- **Where:** `crates/lucidos-agents-api/src/api/chat.rs` (`validate_thread_continuity` → `StatusCode::CONFLICT`), `docs/adr/0004-codex-as-second-coding-agent.md`
 - **Gap:** You cannot switch a thread between Claude Code and Codex after it starts — a follow-up requesting the other backend is rejected with HTTP 409.
 - **Why:** The backend is chosen at first send and locked; the other backend has no session to resume, so a mid-thread flip would silently lose the conversation context.
 - **Status:** Open by design — start a new thread to use the other backend.
 
 ### The Codex `exec` protocol lacks cards, streaming, and graceful interrupt
-- **Where:** `crates/lucidos-engine/src/runtime/codex.rs` (module header), `docs/adr/0005-codex-app-server-protocol.md`, `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs` (`INTERRUPT_ESCALATE_AFTER`)
+- **Where:** `crates/lucidos-engine/src/runtime/codex.rs` (module header), `docs/adr/0005-codex-app-server-protocol.md`, `crates/lucidos-agents-api/src/engine/agent_session/run_session/run.rs` (`INTERRUPT_ESCALATE_AFTER`)
 - **Gap:** Running Codex under `LUCIDOS_CODEX_PROTOCOL=exec` (the escape hatch) gives no permission cards (sandbox escalations fail instead of asking), no per-token streaming (items arrive whole), and no graceful interrupt (cancel kills the child, losing partial work).
 - **Why:** `codex exec` runs exactly one turn per process with no protocol for permission requests or a graceful wind-down; the OS sandbox is the only guard. It's kept wired only as a rollback lever because the app-server protocol is upstream-experimental. (Even app-server's graceful `turn/interrupt` hard-kills after an 8s escalation.)
 - **Status:** Open by design — default `app-server` protocol carries these; `exec` is a deliberately reduced fallback.
 
 ### Cross-workspace coding-agent spawns can't be child threads
-- **Where:** `crates/lucidos-engine/src/llm/tools/threads.rs` (`run_coding_agent` — "child-thread auto-resume callbacks across workspaces are unsupported; the tool refuses child + cross-workspace with an error")
+- **Where:** `crates/lucidos-core/src/llm/tools/threads.rs` (`run_coding_agent` — "child-thread auto-resume callbacks across workspaces are unsupported; the tool refuses child + cross-workspace with an error")
 - **Gap:** Spawning a coding agent into a *different* workspace must be `relation="top"`; you can't get the automatic callback-resume of a child thread across workspaces.
 - **Why:** The auto-resume callback that a child thread relies on isn't wired to cross a workspace boundary.
 - **Status:** Open — cross-workspace work runs as an independent top-level thread; sequential dependencies need manual follow-up.
 
 ### `run_coding_agent` can't target unregistered or non-git folders
-- **Where:** `crates/lucidos-engine/src/llm/tools/threads.rs` (`run_coding_agent` description — unregistered git folder / non-git directory "not supported in v1; refused with a clear error")
+- **Where:** `crates/lucidos-core/src/llm/tools/threads.rs` (`run_coding_agent` description — unregistered git folder / non-git directory "not supported in v1; refused with a clear error")
 - **Gap:** You can't point a coding-agent session at an arbitrary directory — only Lucidos itself, an installed app's `data/apps/<id>/`, or a registered external repo.
 - **Why:** v1 resolves targets via the repo registry / app layout; an unregistered or non-git path is refused rather than silently handled.
 - **Status:** Open — register the repo first (`manage_repositories action='add'`), or use the chat file tools for `data/` subtrees.
@@ -437,7 +437,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Status:** Resolved. A card pick now lives in its own `successorCardPick` signal, never in a pair a send carries, and the card drops it when it closes. A send while the card holds it asks first, and *Switch* records it on the engine. The redesign still stands as the cleaner shape: the successor's model is chosen in one place on the card, and the prompt box's rung control only ever applies to the current thread.
 
 ### A failed warm Continue leaves its successor request open
-- **Where:** `crates/lucidos-engine/src/api/threads/successor.rs` (`request_narrative`), `crates/lucidos-engine/src/engine/successor.rs` (`pending_successor_request`)
+- **Where:** `crates/lucidos-agents-api/src/api/threads/successor.rs` (`request_narrative`), `crates/lucidos-agents-api/src/engine/successor.rs` (`pending_successor_request`)
 - **Gap:** A warm Continue records `SuccessorRequested` before it submits the handoff request. The submit can fail, for example when the thread turned busy. The UI then reports a failure, but the event stays open until the thread next idles. An agent handoff in that window picks up the message and implementer of the failed Continue.
 - **Why:** Recording and submitting are two steps with no rollback, and no event withdraws a request.
 - **Status:** Open, deferred to the same Successor card redesign as the gap above.
@@ -498,31 +498,31 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
   - **A Python destruction on a variable path checkpoints.** `shutil.rmtree(os.environ['HOME'])` resolves no literal outside, so `python_destruction_scope` reads it as in-workspace and the checkpoint cannot restore it. This predates the fix, and only the judge catches it.
 
 ### AskUserQuestion is capped at 4 options and 4 questions
-- **Where:** `docs/adr/0017-ask-user-question-four-option-cap.md`, `crates/lucidos-engine/src/llm/tools/misc.rs` (`maxItems: 4`)
+- **Where:** `docs/adr/0017-ask-user-question-four-option-cap.md`, `crates/lucidos-core/src/llm/tools/misc.rs` (`maxItems: 4`)
 - **Gap:** A question asked via the agent's `ask_user_question` tool (and Claude Code's `AskUserQuestion`) can present at most 4 tappable options, and at most 4 questions per call.
 - **Why:** Inherited from Claude Code's native `AskUserQuestion` schema (`maxItems: 4`); the mobile-first card fits ~4 buttons without scrolling.
 - **Status:** Open — for more than 4 choices, enumerate the overflow in prose and take a free-text answer.
 
 ### Archive and cancel carry no parent-child check, so any thread can reach any thread
-- **Where:** `crates/lucidos-engine/src/api/thread_reach.rs` (the gate), `crates/lucidos-engine/src/api/threads/archive.rs` (`archive_thread`), `crates/lucidos-engine/src/api/chat.rs` (`cancel_chat`); contrast `docs/adr/0043-parent-to-child-privileged-write.md` and `docs/adr/0083-sibling-threads-observe-never-direct.md`
+- **Where:** `crates/lucidos-agents-api/src/api/thread_reach.rs` (the gate), `crates/lucidos-agents-api/src/api/threads/archive.rs` (`archive_thread`), `crates/lucidos-agents-api/src/api/chat.rs` (`cancel_chat`); contrast `docs/adr/0043-parent-to-child-privileged-write.md` and `docs/adr/0083-sibling-threads-observe-never-direct.md`
 - **Gap:** `POST /api/v1/threads/archive` and `POST /api/v1/chat/cancel` accept any thread id in the workspace and run no authorization ladder. The actor resolved from headers is display attribution only (ADR 0050). So a coding-agent subprocess reaching the loopback API can archive or cancel a sibling thread, or its own parent.
 - **Why:** Both predate the thread-bound origin token. The messaging edge got the ladder when it shipped (`follow_up_child_thread` refuses unless `row.parent_thread_id == caller`), and the two older destructive verbs were never revisited. No LLM tool exposes either, so no agent reaches them by accident, which is why this went unnoticed.
 - **Status:** **Closed (2026-08-17)** by `docs/plans/2026-08-17-archive-and-cancel-reach-self-and-descendants.md`. Both routes now run the ladder in `api::thread_reach`: a token-bearing caller reaches itself and its own descendants, and nothing further, with a 403 otherwise. A caller with no token is untouched: the user's device, the local API surface, the e2e suites. A threadless subprocess is refused rather than handed every thread, and a thread-bound caller cannot cancel everything by omitting `thread_id`. **One residual, and it belongs to the whole surface:** `/api/v1` has no authentication (*unattributed caller* in `docs/glossary.md`). So a subprocess that drops its token keeps full reach, and closing that is owed its own ADR.
 
 ### Three tool sources sit outside the gated registry tables
-- **Where:** `crates/lucidos-engine/src/llm/tools/mod.rs` (`FAMILIES`, `CHAT_TAIL`), against the splice in `crates/lucidos-engine/src/engine/chat/process/run.rs`; `docs/adr/0088-tool-schemas-are-gated-by-capability-not-trimmed.md` Consequences.
+- **Where:** `crates/lucidos-core/src/llm/tools/mod.rs` (`FAMILIES`, `CHAT_TAIL`), against the splice in `crates/lucidos-agents-api/src/engine/chat/process/run.rs`; `docs/adr/0088-tool-schemas-are-gated-by-capability-not-trimmed.md` Consequences.
 - **Gap:** ADR 0088 rules that a new tool family must state its gate, or state that it has none. The *type* enforces it for the two registry tables: a row cannot be written without a `Gate`. Three sources are spliced outside them and can still arrive resident by omission. `send_notification` is a bare `push` between the two tables. `capability_manifest::llm_tools()` contributes 14 grouped schemas with no gate concept at all. MCP-discovered tools come from running servers.
 - **Why:** The wire ORDER is the first cache segment's prefix, and reordering it rewrites the tools tier for every workspace. `send_notification` sits between the two tables and the manifest set sits after it, so folding either into a table would move schemas. The manifest is also a different owner (`crate::capability_manifest`), whose declared-parity model has no gate field; adding one is its own change. MCP tools are a workspace's own configuration already, so they are gated in the only sense that applies.
 - **Status:** Open, and narrowed rather than closed. Every hand-written flat family is in a table, pinned by `every_offered_schema_comes_from_a_gated_registry_row`. So the omission cannot happen where new families are actually added. Closing the rest means giving `capability_manifest` a gate field, which is worth doing when a grouped domain first turns out to be unusable somewhere.
 
 ### The always-loaded meter bills two of the three turn-tail blocks
-- **Where:** `always_loaded_areas` in `crates/lucidos-engine/src/engine/chat/process/system_prompt.rs`, against `chat::process::turn_clock::current_time_block`.
+- **Where:** `always_loaded_areas` in `crates/lucidos-agents-api/src/engine/chat/process/system_prompt.rs`, against `chat::process::turn_clock::current_time_block`.
 - **Gap:** The meter behind `always_loaded_context_stays_under_budget` bills the `[ENGINE BUILD]` and `[CLIENT URL]` blocks, both halves each, but not `[CURRENT TIME]`. So roughly 60 characters of engine-authored labels and scaffolding ship on every turn outside the only meter that watches always-loaded text.
 - **Why:** The clock moved to the tail under ADR 0084 and was never added to the meter; the other two were added when they moved. Adding the clock now would move the ratchet for an unrelated reason. That attribution is exactly what the ceiling's doc comment exists to keep honest.
 - **Status:** Open, and small. Fold it in on the next deliberate move of `ALWAYS_LOADED_BUDGET_CHARS`, billing the labels rather than the reading. The timezone name and the timestamp are workspace and per-turn values, not engine-authored text.
 
 ### Not every HTTP route is agent-callable
-- **Where:** `docs/adr/0018-capability-parity-manifest.md` (declared parity, not blanket parity), `crates/lucidos-engine/src/capability_manifest/`
+- **Where:** `docs/adr/0018-capability-parity-manifest.md` (declared parity, not blanket parity), `crates/lucidos-core/src/capability_manifest/`
 - **Gap:** Only capabilities declared in the capability-parity manifest are surfaced as LLM tools / CLI commands / SDK methods; many HTTP routes (backup schedules, disk usage, device registration, blobs, compose drafts, …) are UI/infra-only and not agent-reachable.
 - **Why:** A blanket "every route everywhere" rule would generate nonsense tools; the manifest declares per-capability which surfaces get it, enforced by codegen (build fails on drift).
 - **Status:** Open by design — add a capability to the manifest to expose it across surfaces.

@@ -267,6 +267,9 @@ Pass `wake_mode` to `run_thread` or `run_coding_agent`, or `--wake-mode` to
 - **A filed report is not lost.** A chat parent reads it as a
   `[CHILD THREAD REPORT FILED]` block on its next turn. A coding-agent parent
   reads it at the front of its next prompt.
+- **An identical integrated report files.** The same hardened head and report
+  content can be filed on a follow-up turn. An explicit wake request and the
+  final wake for a batch take precedence.
 - **A coding-agent parent mid-turn reads a report through its own calls.** A
   report that wakes you while your turn runs waits for the turn to end. Most
   `lucidos` calls note it on stderr, `lucidos background-task wait` returns
@@ -280,6 +283,16 @@ Pass `wake_mode` to `run_thread` or `run_coding_agent`, or `--wake-mode` to
   decision* instead: the child says, with `wake_parent` or
   `lucidos wake-parent yes|no`, or one background call decides. Any doubt
   wakes you.
+
+## Reading a child's current state
+
+The `[CHILD THREADS]` block gives each listed child's state at the start of the
+turn and the age of its latest report. The line names its event waits and time
+left, the children it awaits, and any hold or current expected wake. Long
+reasons and awaited-child titles appear as previews. Read
+`liveness.state` on a `threads` search or list row when you need a fresh read
+or a child outside the block. Those rows carry the full wait details. An
+earlier completion report tells you how that turn ended.
 
 ## Reaching a child that already finished
 
@@ -355,10 +368,11 @@ preferred:
 
 - *Report and stop.* End your turn with the question in your final text.
   Under `wake`, or as the last of a batch, your terminal re-opens the parent,
-  and its follow-up revives you. Under `no-wake` it does not: ask the user on
-  your own card instead. A child with no wake mode says its parent must act
-  (`wake_parent` true, or `lucidos wake-parent yes`). It uses only the
-  designed edges and costs a turn boundary each way.
+  and its follow-up revives you. Under `no-wake` your report is filed for the
+  parent's next turn. An independent child can ask the user on its own card.
+  An integrated sub-thread reports its ordinary questions to its parent.
+  A child with no wake mode says its parent must act (`wake_parent` true,
+  or `lucidos wake-parent yes`).
 - *Emit and park.* Emit a domain event naming what you need, arm `await_event`
   for the answer, then end the turn. It is faster (a measured handoff ran in
   15 ms) but needs the parent already subscribed.
@@ -383,19 +397,24 @@ Say what is true, and do not lean on what is not.
   check is unforgeable and no surface skips it.
 - **Convention.** That a payload states a fact rather than an order. Nothing
   inspects payloads: you are the check, and so is your parent.
-- **Enforced.** Six verbs reach yourself and the sub-threads below you, at any
-  depth, on your own authority: Apply, Discard, answering a question card,
-  restarting a turn, archiving and cancelling. A sibling or your own parent
-  comes back refused. The user still does all six from their own device. So
-  none of them is a supervision tool you can point sideways.
+- **Enforced.** Five verbs reach yourself and the sub-threads below you, at
+  any depth, on your own authority: Apply, Discard, restarting a turn,
+  archiving and cancelling. A sibling or your own parent comes back refused.
+  The user still does all five from their own device. So none of them is a
+  supervision tool you can point sideways.
+- **Enforced.** No thread answers a card: a question card, a permission card
+  or a plan approval, its own or a sub-thread's. A turn the owner opened does
+  not change that. To answer for the owner, raise a *batch* naming the exact
+  picks (`lucidos permissions batch`, `system-knowhow/lucidos-cli.md`). It
+  runs once the owner confirms it.
 - **Enforced.** Anything wider than your own subtree is the workspace owner's
   to press. You may press it while carrying their standing instruction: a turn
   they opened, or a trigger firing they authorized. Creating a top-thread is
   not in that group: any thread may create one, in any turn (ADR 0475). Do not
   tell a sibling's problem to your parent, which most threads here do not
   have. Report what you found, and let the owner decide.
-  Without a standing instruction, a coding agent may ask for one act with
-  `lucidos ask-owner-approval` (`system-knowhow/lucidos-cli.md`). The owner's
-  **Allow once** on the card Lucidos writes lets your thread do that act, at
-  that thread, once. A card you word yourself grants nothing, whatever the
-  owner answers.
+  Without a standing instruction, a coding agent may ask for a permission with
+  `lucidos ask-permission` (`system-knowhow/lucidos-cli.md`). The owner's pick
+  on the card Lucidos writes lets your thread do that act: once, for this
+  thread, or always, as the act allows. A card you word yourself grants
+  nothing, whatever the owner answers.

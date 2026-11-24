@@ -12,7 +12,6 @@ import type {
 } from '../../store/types';
 import type { AgentBinariesResponse, ApiResult, CodingAgent, CodingAgentLadder, IntelligenceLadder, IntelligenceRung, LadderSurface, BackgroundModels, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, RecallDateResponse, RecallZoomResponse, SummaryTreeThreadsResponse, SummaryTreeTop, TreeBackfill, TreeBackfillEstimate, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse, TailnetStatusResponse } from '../types';
 
-// --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
   limit?: number;
   before?: number;
@@ -33,20 +32,16 @@ export function markAllNotificationsRead(): Promise<void> {
   return lucidos.notifications.markAllRead();
 }
 
-// --- Credentials ---
 export function listCredentials(): Promise<CredentialsListResponse> {
   return json(`${API}/credentials`);
 }
 
 export function createCredential(body: {
   service_name: string;
-  /** The *credential scope*: every base URL the credential may be sent to. */
   base_urls: string[];
   auth_type: AuthType;
   auth_value: string;
-  /** Override the default `CRED_<NAME>` env var name. */
   env_var_name?: string;
-  /** The credential *form request* this save answers. */
   form_request_id?: string;
 }): Promise<ApiResult> {
   return json(`${API}/credentials`, {
@@ -56,10 +51,7 @@ export function createCredential(body: {
   });
 }
 
-// --- Form requests (engine::form_requests) ---
 
-/** One open *form request*, as `GET /api/v1/form-requests/pending` serves it.
- *  `event` is the request exactly as the stream frame carried it. */
 export interface PendingFormRequest {
   thread_id: string;
   request_id: string;
@@ -70,15 +62,21 @@ export function listPendingFormRequests(): Promise<PendingFormRequest[]> {
   return json(`${API}/form-requests/pending`);
 }
 
-/** The Cancel of a credential or email form. `resolved: false` means another
- *  device answered it first, which closes it just the same. */
+export async function listResolvedFormRequests(ids: string[]): Promise<string[]> {
+  const resolved: string[] = [];
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const query = new URLSearchParams({ request_ids: ids.slice(offset, offset + 100).join(',') });
+    resolved.push(...await json<string[]>(`${API}/form-requests/resolved?${query}`));
+  }
+  return resolved;
+}
+
 export function cancelFormRequest(requestId: string): Promise<{ resolved: boolean }> {
   return json(`${API}/form-requests/${encodeURIComponent(requestId)}/cancel`, {
     method: 'POST',
   });
 }
 
-// --- Environment variables (Settings → Environment Variables) ---
 export function listEnvVars(): Promise<EnvVarsListResponse> {
   return json(`${API}/env-vars`);
 }
@@ -105,7 +103,6 @@ export function deleteEnvVarApi(name: string): Promise<ApiResult> {
   });
 }
 
-// --- Coding agent binaries (Settings → Coding Agents) ---
 export function getCodingAgentBinaries(): Promise<AgentBinariesResponse> {
   return json(`${API}/coding-agents/binaries`);
 }
@@ -118,8 +115,6 @@ export function getChatLadder(): Promise<IntelligenceLadder> {
   return json(`${API}/intelligence-ladder?surface=chat`);
 }
 
-/** Copy from Lucidos Agent: write the chat rungs `surface` runs into its
- *  override. Answers the rungs now on. */
 export function copyLadderFromChat(surface: CodingAgent): Promise<{ rungs: IntelligenceRung[] }> {
   return json(`${API}/intelligence-ladder/copy-from-chat`, {
     method: 'POST',
@@ -128,13 +123,19 @@ export function copyLadderFromChat(surface: CodingAgent): Promise<{ rungs: Intel
   });
 }
 
-/** Sort by intelligence: restate `surface`'s rungs from least to most intelligent,
- *  keeping what is on. Answers the rungs now on. */
 export function sortLadder(surface: LadderSurface): Promise<{ rungs: IntelligenceRung[] }> {
   return json(`${API}/intelligence-ladder/sort`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ surface } satisfies { surface: LadderSurface }),
+  });
+}
+
+export function setLadderDefault(surface: LadderSurface, { model, effort }: IntelligenceRung): Promise<ApiResult> {
+  return json(`${API}/intelligence-ladder/default`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ surface, model, effort }),
   });
 }
 
@@ -146,7 +147,6 @@ export function deletePreference(key: string): Promise<ApiResult> {
   return json(`${API}/preferences?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
 }
 
-// --- Network access (per-workspace engine bind; Settings → Access) ---
 export function getNetworkConfig(): Promise<NetworkConfigResponse> {
   return json(`${API}/network-config`);
 }
@@ -159,10 +159,6 @@ export function setNetworkConfig(body: { engine_bind: string }): Promise<ApiResu
   });
 }
 
-/** The MagicDNS name and this workspace's verified HTTPS URL (Settings →
- *  Access → Other addresses). Separate from `getNetworkConfig` because it probes:
- *  a reverse lookup and a round trip through the tailnet, which the bind editor
- *  must not pay for. */
 export function getTailnetStatus(): Promise<TailnetStatusResponse> {
   return json(`${API}/tailnet-status`);
 }
@@ -179,27 +175,15 @@ export interface EmailAccountSettings {
 }
 
 export interface UpdateCredentialBody {
-  /** The *credential scope*: every base URL the credential may be sent to. */
   base_urls: string[];
   auth_type: AuthType;
   auth_header: string;
-  /** Omitted / empty keeps the currently-stored secret. */
   auth_value?: string;
-  /** Present only when editing an `email_password` credential. */
   email?: EmailAccountSettings;
-  /** Override the default `CRED_<NAME>` env var name. */
   env_var_name?: string;
-  /** The credential *form request* this save answers (a widening or a repair). */
   form_request_id?: string;
 }
 
-// The three verbs that act on an EXISTING credential take its `id`, not its
-// service name. A name stopped being a unique handle when `auth_type` became
-// the discriminator: an OAuth app registration may share a name with an API key
-// for the same provider. Editing needs the id for a sharper reason still, since
-// the form can change `auth_type`, so even name-plus-type cannot identify the
-// row being edited. `createCredential` stays name-keyed because it is an upsert
-// and the row has no id yet.
 
 export function updateCredential(
   id: string,
@@ -220,18 +204,6 @@ export function deleteCredentialApi(
   });
 }
 
-/** A credential's plaintext, for the Copy buttons and the edit form's prefill.
- *
- *  Two steps: mint a one-shot reveal token for this row, then spend it. The
- *  token lives 30 seconds and dies on use, so the plaintext is never one bare
- *  GET away. See ADR 0117 for what that does and does not close.
- *
- *  Retried once on a 403, because a spent token is a state only this function
- *  can recover from. The service worker re-issues a `GET` whose response was
- *  lost (`fetchWithRetry` in `public/sw.js`), and the server already redeemed
- *  the token on the attempt that vanished. So the retry that exists to rescue a
- *  flaky connection would otherwise turn one into a hard failure. Re-minting is
- *  exactly what a second click would do. */
 export async function getCredentialValue(
   id: string
 ): Promise<{ auth_type: string; auth_value: string }> {
@@ -243,13 +215,8 @@ export async function getCredentialValue(
   }
 }
 
-/** The reads a credential form waits on before it can render: the reveal and
- *  the email settings. Longer than the default. On a machine under heavy
- *  memory pressure these sequential reads run past it, and the form a request
- *  opened then showed only an error. */
 const CREDENTIAL_FORM_READ_TIMEOUT_MS = 30_000;
 
-/** One mint-then-spend round trip. */
 async function revealCredentialOnce(
   id: string
 ): Promise<{ auth_type: string; auth_value: string }> {
@@ -273,16 +240,10 @@ export function getEmailAccount(name: string): Promise<EmailAccountInfo> {
   );
 }
 
-// --- OAuth Accounts ---
 export function listOAuthAccounts(): Promise<{ accounts: OAuthAccountInfo[] }> {
   return json(`${API}/oauth/accounts`);
 }
 
-/** The *OAuth provider registry* plus the redirect URI a flow will send.
- *
- *  Non-secret provider metadata, so it needs no gating. An engine with no
- *  staged system-knowhow answers an empty `providers` list rather than failing,
- *  and the Accounts page falls back to its typed-name path. */
 export function listKnownOAuthProviders(): Promise<KnownOAuthProviders> {
   return json(`${API}/oauth/known-providers`);
 }
@@ -293,11 +254,15 @@ export function deleteOAuthAccountApi(id: string): Promise<ApiResult> {
   });
 }
 
-export function reauthorizeOAuth(provider: string, scopes: string): Promise<ApiResult> {
+export function reauthorizeOAuth(
+  provider: string,
+  scopes: string,
+  signIn = false,
+): Promise<ApiResult> {
   return json(`${API}/oauth/reauthorize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider, scopes }),
+    body: JSON.stringify({ provider, scopes, sign_in: signIn }),
   });
 }
 
@@ -307,29 +272,11 @@ export function completeOAuth(provider: string): Promise<ApiResult> {
   }, 130000);
 }
 
-// --- Preferences (SDK delegation) ---
 export async function getPreferences(deviceId?: string): Promise<{ preferences: Record<string, string> }> {
   const preferences = await lucidos.preferences.get(deviceId);
   return { preferences };
 }
 
-/** Write one preference. A REFUSAL THROWS.
- *
- *  It does not delegate to `lucidos.preferences.set`, and that is the point.
- *  The engine answers a refused write with `200 {success: false, error}` rather
- *  than a 4xx, and the SDK's `set` discards the body. So every refusal this
- *  endpoint issues read as a save that worked: a malformed timezone, a bad
- *  backup cron, an over-long response style.
- *
- *  It throws rather than returning the flag so that the shape every caller
- *  already has is the correct one. A `.catch()`, a `Promise.all` rejection, a
- *  try/catch: each now sees the refusal it was written for. Returning `false`
- *  instead would need a new branch at all six call sites. The ones that forgot
- *  it would keep reporting a refused write as saved.
- *
- *  `isTransientFetchError` wants a `TypeError` for transport, so it reads this
- *  throw as a VERDICT rather than a dropped connection. `deliverNow` therefore
- *  stops retrying and says why. */
 export async function setPreference(
   key: string,
   value: string,
@@ -343,7 +290,6 @@ export async function setPreference(
   return throwIfRefused(result, `the engine refused the '${key}' preference`);
 }
 
-// --- Devices ---
 export function registerDevice(deviceId: string, userAgent: string): Promise<ApiResult> {
   return json(`${API}/devices/register`, {
     method: 'POST',
@@ -352,26 +298,8 @@ export function registerDevice(deviceId: string, userAgent: string): Promise<Api
   });
 }
 
-/** What the engine did with a hand-over claim. Every value is an ordinary
- *  answer: `already-done` and `no-such-device` both mean "stop asking". */
 export type HandOverOutcome = 'moved' | 'already-done' | 'no-such-device';
 
-/**
- * Move this device's row from the id it used to report to the one it reports
- * now, keeping its push subscription and its device-scoped preferences.
- *
- * Called once, early in boot, and only when the two differ. See
- * `docs/plans/2026-08-22-one-device-identity-minted-at-the-gateway.md`.
- *
- * **It asserts the id being adopted, overriding the default stamp.** This is
- * the one request whose subject is a change of identity, and `localStorage`
- * still holds the OLD id here by design: nothing is written until the row has
- * moved. `fetchWithDefaults` would therefore claim the identity being left.
- * The engine refuses that (`claims_another_device` in `api/settings.rs`) whenever
- * the gateway is not the one asserting the header. Behind an up-to-date
- * gateway this value is replaced by the authenticated id, which is the same
- * id. `docs/plans/2026-08-22-device-hand-over-must-not-need-a-fresh-gateway.md`
- */
 export function handOverDevice(
   oldDeviceId: string,
   deviceId: string,
@@ -383,7 +311,6 @@ export function handOverDevice(
   });
 }
 
-/** The device id the gateway asserts for this request, or null with no gateway in front. */
 export function getCallerDevice(): Promise<{ device_id: string | null }> {
   return json(`${API}/devices/caller`);
 }
@@ -412,7 +339,6 @@ export function deleteDevice(deviceId: string): Promise<ApiResult> {
   return json(`${API}/devices/${deviceId}`, { method: 'DELETE' });
 }
 
-// --- Memory Inspector ---
 export function getMemoryStats(): Promise<MemoryStatsResponse> {
   return json(`${API}/memory/stats`);
 }
@@ -457,21 +383,14 @@ export async function cancelMemoryRebuild(): Promise<void> {
   await json(`${API}/memory/rebuild`, { method: 'DELETE' });
 }
 
-/** Snapshot of the background embedding-model load. The live signal is the
- *  `EmbeddingModelStatusChanged` SSE frame; this is how a client that connected
- *  mid-download catches up, and it returns the identical shape. */
 export function getEmbeddingModelStatus(): Promise<EmbeddingModelStatus> {
   return json(`${API}/memory/embedding-model-status`);
 }
 
-/** Where the Tree memory module's backfill has got. The `TreeBackfill*` SSE
- *  frames move it after this. */
 export function getTreeBackfill(): Promise<TreeBackfill> {
   return json(`${API}/memory/tree-backfill`);
 }
 
-/** Continue a backfill held at `fromCap`, the cap the user saw. The engine
- *  sets the new cap and answers with it, or refuses a cap that has moved. */
 export function raiseTreeBackfillCap(fromCap: number): Promise<{ cap_usd: number }> {
   return json(`${API}/memory/tree-backfill/cap`, {
     method: 'POST',
@@ -480,56 +399,34 @@ export function raiseTreeBackfillCap(fromCap: number): Promise<{ cap_usd: number
   });
 }
 
-/** The estimate scans a workspace's whole history. It answers in about a
- *  second on millions of events. A cold database cache or a busy host can
- *  stretch that past `json()`'s 10s default, and a deliberate one-off read
- *  can afford to wait. */
 const TREE_BACKFILL_ESTIMATE_TIMEOUT_MS = 60_000;
 
-/** What a Tree backfill of this workspace would cost, read before the user
- *  confirms Tree. */
 export function getTreeBackfillEstimate(): Promise<TreeBackfillEstimate> {
   return json(`${API}/memory/tree-backfill/estimate`, undefined, TREE_BACKFILL_ESTIMATE_TIMEOUT_MS);
 }
 
-/** The top of a summary tree: the workspace's, or `threadId`'s. */
 export function getSummaryTree(threadId?: string): Promise<SummaryTreeTop> {
   const q = threadId ? `?thread=${encodeURIComponent(threadId)}` : '';
   return json(`${API}/memory/tree${q}`);
 }
 
-/** The threads with summary trees, the most recently active first. */
 export function getSummaryTreeThreads(params: { limit: number; offset: number }): Promise<SummaryTreeThreadsResponse> {
   return json(`${API}/memory/tree/threads?limit=${params.limit}&offset=${params.offset}`);
 }
 
-/** A summary tree line opened one level: its halves, or for a leaf its source. */
 export function getRecallZoom(id: string): Promise<RecallZoomResponse> {
   return json(`${API}/recall/zoom?id=${encodeURIComponent(id)}&n=1`);
 }
 
-/** When the entries under a summary tree line happened. */
 export function getRecallDate(id: string): Promise<RecallDateResponse> {
   return json(`${API}/recall/date?id=${encodeURIComponent(id)}`);
 }
 
-/** The model each background task runs on, resolved against the configured
- *  providers. Settings shows it while a row is unset. */
 export function getBackgroundModels(): Promise<BackgroundModels> {
   return json(`${API}/models/background`);
 }
 
-// --- Email ---
 
-/** The engine's worst-case send path is the 30s-bounded OAuth token refresh
- *  (`bounded_http_client` in `core/oauth.rs`) followed by the 80s-bounded SMTP
- *  send (`SMTP_SEND_TIMEOUT` in `core/email_client.rs`) = 110s. This request
- *  timeout must stay ABOVE that sum so the engine's specific failure ("SMTP
- *  send via host:port timed out", auth errors, no-route) reaches the toast:
- *  `json()`'s 10s default aborted first, surfaced only a misleading generic
- *  "request timed out" while the backend kept sending, and users retrying the
- *  still-open modal double-sent.
- *  Exported for the contract pin in email-send-pending.test.ts. */
 export const EMAIL_SEND_TIMEOUT_MS = 120_000;
 
 export function sendEmailConfirmed(draft: {
@@ -541,7 +438,6 @@ export function sendEmailConfirmed(draft: {
   reply_to_message_id?: string;
   account: string;
   attachments?: string[];
-  /** The confirm *form request* this send answers. */
   form_request_id?: string;
 }): Promise<ApiResult> {
   return json(`${API}/email/send`, {
@@ -551,7 +447,6 @@ export function sendEmailConfirmed(draft: {
   }, EMAIL_SEND_TIMEOUT_MS);
 }
 
-// --- Backup ---
 export interface BackupEntry {
   id: string;
   filename: string;
@@ -559,20 +454,14 @@ export interface BackupEntry {
   created_at: string;
 }
 
-/** The legacy backup key, revealed for the `.enc` archives it sealed. */
 export interface BackupKeyResponse {
   key: string;
 }
 
-/** What seals this workspace's backups. Reveals no key. */
 export interface BackupKeys {
-  /** The age public key new archives are sealed to, or null before setup. */
   recipient: string | null;
-  /** A minted backup key waits to be pasted back. */
   pending: boolean;
-  /** A legacy key exists. Until the switch, it seals backups. */
   legacy_key: boolean;
-  /** Seconds since the user last proved they hold the backup key. */
   secs_since_verified: number | null;
 }
 
@@ -581,12 +470,7 @@ export interface BackupProviderInfo {
   name: string;
   connected: boolean;
   ready: boolean;
-  /** Which required scopes a CONNECTED account is missing, in the provider's
-   *  declared order. Empty for a ready provider and for one with no account.
-   *  Named on the page: "access not granted" alone cannot tell a grant that
-   *  never happened from one that came back a scope short. */
   missing_scopes: string[];
-  /** Web URL to this provider's backups folder ("View backups folder" link), or null. */
   folder_url: string | null;
 }
 
@@ -594,11 +478,6 @@ export async function getBackupProviders(): Promise<BackupProviderInfo[]> {
   return json(`${API}/backup/providers`);
 }
 
-/** Mint a one-shot token for the legacy key reveal below. Step one of two.
- *
- *  The backup key takes the same shape as a credential reveal (ADR 0117): the
- *  token lives 30 seconds, dies on use, and is bound to this one secret. It
- *  takes no id, because a workspace has exactly one backup key. */
 async function mintBackupKeyRevealToken(): Promise<string> {
   const { token } = await json<{ token: string; expires_in_secs: number }>(
     `${API}/backup/key/reveal-token`,
@@ -607,14 +486,6 @@ async function mintBackupKeyRevealToken(): Promise<string> {
   return token;
 }
 
-/** Run one mint-then-spend round trip, retrying the pair once on a 403.
- *
- *  A spent token is a state only this function can recover from. The service
- *  worker re-issues a request whose response was lost (`fetchWithRetry` in
- *  `public/sw.js`), and the server already redeemed the token on the attempt
- *  that vanished. So the retry that exists to rescue a flaky connection would
- *  otherwise turn one into a hard failure. Re-minting is exactly what a second
- *  click would do, and one retry means a real refusal still surfaces. */
 async function withBackupKeyToken(
   spend: (token: string) => Promise<BackupKeyResponse>
 ): Promise<BackupKeyResponse> {
@@ -627,8 +498,6 @@ async function withBackupKeyToken(
   }
 }
 
-/** Reveal the legacy backup key, so the user keeps it for old `.enc`
- *  archives. Throws `ApiError` 404 when the workspace holds none. */
 export async function getBackupKey(): Promise<BackupKeyResponse> {
   return withBackupKeyToken((token) =>
     json(`${API}/backup/key?token=${encodeURIComponent(token)}`));
@@ -638,16 +507,12 @@ export async function getBackupKeys(): Promise<BackupKeys> {
   return json(`${API}/backup/recipient`);
 }
 
-/** Mint a key pair and return its backup key, shown once. Backups keep their
- *  current key until {@link confirmBackupKey} accepts the paste-back. */
 export async function startBackupKeySetup(): Promise<string> {
   const { backup_key } = await json<{ backup_key: string }>(
     `${API}/backup/recipient/setup`, { method: 'POST' });
   return backup_key;
 }
 
-/** The paste-back gate. Throws `ApiError` with reason `key-mismatch`,
- *  `not-a-backup-key` or `nothing-pending`. */
 export async function confirmBackupKey(backupKey: string): Promise<BackupKeys> {
   return json(`${API}/backup/recipient/confirm`, {
     method: 'POST',
@@ -656,7 +521,6 @@ export async function confirmBackupKey(backupKey: string): Promise<BackupKeys> {
   });
 }
 
-/** Seal backups to an age public key the user made themselves. */
 export async function setOwnBackupRecipient(recipient: string): Promise<BackupKeys> {
   return json(`${API}/backup/recipient`, {
     method: 'PUT',
@@ -665,7 +529,6 @@ export async function setOwnBackupRecipient(recipient: string): Promise<BackupKe
   });
 }
 
-/** Whether a pasted backup key opens this workspace's backups. */
 export async function verifyBackupKey(backupKey: string): Promise<boolean> {
   const { matches } = await json<{ matches: boolean }>(`${API}/backup/recipient/verify`, {
     method: 'POST',
@@ -675,15 +538,12 @@ export async function verifyBackupKey(backupKey: string): Promise<boolean> {
   return matches;
 }
 
-/** What Settings, 1Password shows about the service account. Never the token. */
 export interface OnepasswordStatus {
   saved: boolean;
   cli_path: string | null;
 }
 
-/** What a working service account reaches. */
 export interface OnepasswordVaultCheck {
-  /** The `op` binary that ran. */
   cli: string;
   vaults: string[];
 }
@@ -692,8 +552,6 @@ export async function getOnepasswordStatus(): Promise<OnepasswordStatus> {
   return json(`${API}/onepassword`);
 }
 
-/** Save the service account. A blank `token` keeps the stored one, so the
- *  `op` path can change without pasting the token again. */
 export async function saveOnepassword(token: string, cliPath: string): Promise<void> {
   await text(`${API}/onepassword`, {
     method: 'PUT',
@@ -706,16 +564,12 @@ export async function deleteOnepassword(): Promise<void> {
   await text(`${API}/onepassword`, { method: 'DELETE' });
 }
 
-/** How long the Test may take: the engine gives `op` 20 seconds. */
 const ONEPASSWORD_TEST_TIMEOUT_MS = 30_000;
 
-/** Run `op` with the saved service account and list the vaults it reaches. */
 export async function testOnepassword(): Promise<OnepasswordVaultCheck> {
   return json(`${API}/onepassword/test`, { method: 'POST' }, ONEPASSWORD_TEST_TIMEOUT_MS);
 }
 
-/** Returns when the backup is queued — completion arrives via SSE
- *  (`BackupCompleted` / `BackupFailed`), not by awaiting this promise. */
 export async function createBackup(provider: string): Promise<void> {
   await json(`${API}/backup`, {
     method: 'POST',
@@ -724,31 +578,21 @@ export async function createBackup(provider: string): Promise<void> {
   });
 }
 
-/** Persisted outcome of the last backup run — survives engine restarts. */
 export interface BackupLastRun {
   status: 'success' | 'failure';
   at: string;
-  /** When the run started (RFC 3339); null for records predating duration
-   *  tracking. Duration = `at - started_at`. */
   started_at: string | null;
   filename: string | null;
   size_bytes: number | null;
   error: string | null;
 }
 
-/** Aggregated backup health for the Settings → Backup page. */
 export interface BackupStatus {
-  /** A backup is in progress right now. */
   running: boolean;
-  /** Outcome of the last run, or null if never recorded. */
   last_run: BackupLastRun | null;
-  /** Newest cloud backup, or null if none / provider unreachable. */
   latest_backup: BackupEntry | null;
-  /** Age of `latest_backup` in seconds, or null if none. */
   age_seconds: number | null;
-  /** No recent good backup (none, or older than 24h). */
   stale: boolean;
-  /** Set when the provider couldn't be listed (cloud unreachable). */
   list_error: string | null;
 }
 
@@ -756,9 +600,18 @@ export async function getBackupStatus(provider: string): Promise<BackupStatus> {
   return json(`${API}/backup/status?provider=${encodeURIComponent(provider)}`);
 }
 
-// Restore lives in the workspace picker (gateway control plane), not here — see
-// `api/client/control.ts` (`restoreBackup` / `getRestoreStatus`). Settings keeps
-// only backup *creation* + scheduling.
+export interface LastSuccessfulBackupResponse {
+  at: string | null;
+  stale: boolean;
+  configured: boolean;
+  overdue: boolean;
+  overdue_at: string | null;
+}
+
+export async function getLastSuccessfulBackup(): Promise<LastSuccessfulBackupResponse> {
+  return json(`${API}/backup/last-successful`);
+}
+
 
 export interface BackupSchedule {
   schedule: string | null;
@@ -793,7 +646,6 @@ export async function setBackupRetention(keep: number): Promise<void> {
   });
 }
 
-// --- Repo File Explorer ---
 
 export async function listRepoFiles(repoId: string, gitRef?: string): Promise<string[]> {
   const params = gitRef ? `?ref=${encodeURIComponent(gitRef)}` : '';
@@ -804,7 +656,6 @@ export async function getRepoFileContent(repoId: string, path: string, gitRef?: 
   return text(repoFileUrl(repoId, path, gitRef));
 }
 
-// --- Browse Directories ---
 export interface BrowseResult {
   path: string;
   directories: string[];
@@ -816,8 +667,6 @@ export async function browseDirectories(path?: string): Promise<BrowseResult> {
   return json(`${API}/browse-directories${params}`);
 }
 
-// --- Workspace prompt footprint (ADR 0413) ---
-// Mirrors `engine::prompt_footprint::WorkspacePromptFootprint`.
 
 export type FootprintVerdict = 'used' | 'unused' | 'not-yet-judged' | 'not-loaded-by-name';
 
@@ -829,18 +678,13 @@ export interface FootprintItem {
   chars: number;
   clipped_chars: number;
   usage?: { last_used_days_ago: number | null; verdict: FootprintVerdict };
-  /** A knowhow doc's file, relative to `data/`. */
   path?: string;
-  /** An MCP server's schemas only: threads that enabled it, and threads that
-   *  called one of its tools, over the unused window (ADR 0430). */
   mcp_threads?: { enabled: number; called: number };
 }
 
 export interface FootprintSection {
   id: string;
   title: string;
-  /** `mcp-enabled` rides only threads that enable an MCP server, so it is not
-   *  in `total_chars`. */
   when: 'every-turn' | 'gated' | 'open-app' | 'tools-dropped' | 'mcp-enabled';
   chars: number;
   over_ceiling: boolean;

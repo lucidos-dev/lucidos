@@ -26,7 +26,7 @@ A comment on the issue arrives through steps 1 to 3 again. Its key matches the o
 
 Create a bot account for the factory, never a person's account. On GitHub that is a GitHub App installed on the chosen repositories only, or a machine user with access to them alone. Give it issue read and write, contents write and pull requests write, and nothing more.
 
-Save its token as a workspace credential named `issue-tracker-bot`, scoped to the API's base URL (`lucidos-cli.md` § `lucidos credentials`). Then add the entry the scripts call to `data/config/apis.json`:
+Save its token as a workspace credential named `issue-tracker-bot`, scoped to the API's base URL (`system-knowhow/lucidos-cli/subcommands-13.md` § `lucidos credentials`). Then add the entry the scripts call to `data/config/apis.json`:
 
 ```json
 {
@@ -53,7 +53,7 @@ lucidos webhooks create --name issue-tracker --event-type IssueTrackerDelivered 
   --dedupe '{"header":"X-GitHub-Delivery","window_secs":3600}'
 ```
 
-Check the flags against `lucidos-cli.md` § `lucidos webhooks`, which is the authority. Paste the printed secret into the tracker's webhook form. Send only the `Issues` and `Issue comments` events, as JSON. Expose the hook socket as `remote-access.md` § "The one exception: a webhook's own socket" says.
+Check the flags against `system-knowhow/lucidos-cli/subcommands-15.md` § `lucidos webhooks`, which is the authority. Paste the printed secret into the tracker's webhook form. Send only the `Issues` and `Issue comments` events, as JSON. Expose the hook socket as `system-knowhow/remote-access/diagnose-first-never-assume.md` § "The one exception: a webhook's own socket" says.
 
 ## 3. The translation script trigger
 
@@ -79,8 +79,8 @@ lucidos triggers create --name "Issue tracker intake" --slug issue-tracker-intak
 
 - The key starts with `source`, the literal `issue-tracker` the script wrote. The outbound scripts read it to know the root thread is theirs.
 - `actor` credits the teammate whose email it is. An answer from the issue sets them as driver.
-- Its runs start coding agents, so ask the user to tick *Allow coding agents* on it (`triggers.md` § "Coding-agent grant"). Only the listed teammates steer those agents, since the translate script drops strangers.
-- The coding agent pushes and opens pull requests under the workspace's grants, not the trigger's side-effect grant. A push those grants do not cover shows a card and waits for a human.
+- Its runs start coding agents, so ask the user to tick *Allow coding agents* on it (`system-knowhow/triggers/grouping-triggers.md` § "Coding-agent grant"). Only the listed teammates steer those agents, since the translate script drops strangers.
+- The coding agent pushes and opens pull requests under the workspace's coding-agent grants. A push those grants do not cover shows a card and waits for a human.
 
 ## 5. The outbound script triggers
 

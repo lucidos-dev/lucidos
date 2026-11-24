@@ -7,25 +7,10 @@ import {
   type HeaderCollapseInput,
 } from './useHeaderActionCollapse';
 
-// Pins the progressive-collapse math for the DESKTOP content-pane header's
-// right icon cluster, plus the one rule its mobile counterpart has. Mobile
-// measures nothing (see the hook, and the reason in ContentHeaderActions), so
-// its whole decision is the count function at the bottom of this file.
-//
-// Real-ish numbers at the default 16px root: every header action is a
-// 2.25rem (36px) .icon-btn.header-icon (so is the ⋯ trigger and the bell) and
-// the flex gap is 0.25rem (4px).
-//
-// Most cases below feed `computeHeaderCollapse` a fixed leading width, which
-// exercises the linear fit on its own terms. Real callers never pass a measured
-// one: the centre box is CENTRED on the row, so they pass half of what it
-// leaves. The geometry that follows from that is what the non-overlap invariant
-// further down walks, clamp arm by clamp arm.
 const ICON = 36;
 const GAP = 4;
 const NAV = 116;
 
-/** App-UI mode: refresh, open-in-tab, fullscreen (nearest-title first) + bell. */
 function appUiInput(overrides: Partial<HeaderCollapseInput>): HeaderCollapseInput {
   return {
     containerWidth: 800,
@@ -39,8 +24,6 @@ function appUiInput(overrides: Partial<HeaderCollapseInput>): HeaderCollapseInpu
   };
 }
 
-/** Container width that exactly hosts nav + gaps + the title + a given icon
- *  row — the boundary every scenario is phrased around. */
 function exactWidth(input: HeaderCollapseInput, collapsed: number): number {
   return input.leadingWidth + input.gapPx + input.centreWidth + input.gapPx + iconsRowWidth(input, collapsed);
 }
@@ -53,9 +36,6 @@ describe('computeHeaderCollapse', () => {
 
   it('first squeeze collapses the TWO icons nearest the title (never exactly one)', () => {
     const input = appUiInput({});
-    // One px too narrow for the full row → the first collapse step. Icons at
-    // c=2: ⋯ + fullscreen + bell (3 items) vs 4 items at c=0 — one icon+gap
-    // narrower, so the same width fits.
     const width = exactWidth(input, 0) - 1;
     const r = computeHeaderCollapse({ ...input, containerWidth: width });
     expect(r).toEqual({ collapsed: 2, titleEllipsized: false });
@@ -77,9 +57,7 @@ describe('computeHeaderCollapse', () => {
 
   it('the anchor is never part of the collapse: the minimal row still pays for ⋯ + bell', () => {
     const input = appUiInput({});
-    // ⋯ + bell + 1 gap.
     expect(iconsRowWidth(input, 3)).toBe(ICON + GAP + ICON);
-    // Full row: 3 actions + bell + 3 gaps.
     expect(iconsRowWidth(input, 0)).toBe(4 * ICON + 3 * GAP);
   });
 
@@ -111,8 +89,6 @@ describe('computeHeaderCollapse', () => {
     expect(computeHeaderCollapse({ ...input, containerWidth: exactWidth(input, 0) - 0.6 }).collapsed).toBe(2);
   });
 
-  // File-preview diff mode carries 4 context actions (refresh, whole-file,
-  // source-toggle, edit): the steps walk 0 → 2 → 3 → 4, one per squeeze.
   it('a 4-action list walks 0 → 2 → 3 → 4 as the container narrows', () => {
     const input = appUiInput({ actionWidths: [ICON, ICON, ICON, ICON] });
     const seen: number[] = [];
@@ -123,41 +99,24 @@ describe('computeHeaderCollapse', () => {
     expect(seen).toEqual([0, 2, 3, 4]);
   });
 
-  // ── The structural invariant the centred box enforces, mirrored in math ──
-  // The title cluster is a fixed span centred on the row, its width the CSS
-  // clamp below (`.pane-header-content-title` in styles/panels/shell.css), and
-  // the actions are right-aligned at the row's trailing edge. So the box's
-  // right edge must stay at least a gap left of the cluster, at every container
-  // width and through all three arms of the clamp.
-  //
-  // The reserve holds overflow and bell. Optional actions fold on the middle
-  // arm before entering the fixed title span.
-  const SPAN = 320;                    // --desktop-nav-span, 20rem
-  const SPAN_MAX = 576;                // --desktop-content-title-span-max, 36rem
-  const MIN_SPAN = 2 * ICON + 2.1 * 16; // two chevrons and the mark tap target
-  const RESERVE = 2 * ICON + 3 * GAP;  // --content-side-reserve
-  const UNFOLDED = 7 * ICON + 8 * GAP; // --content-unfolded-reserve
+  const SPAN = 320;
+  const SPAN_MAX = 576;
+  const MIN_SPAN = 2 * ICON + 2.1 * 16;
+  const RESERVE = 2 * ICON + 3 * GAP;
+  const UNFOLDED = 7 * ICON + 8 * GAP;
 
   const clamp = (min: number, value: number, max: number) => Math.max(min, Math.min(value, max));
 
-  /** The rendered width of the centred box at a given container width: the CSS
-   *  clamp, in JS. Its cap is itself a clamp, which grows past SPAN only out
-   *  of room beyond UNFOLDED at each end. */
   function boxWidth(container: number): number {
     return clamp(MIN_SPAN, container - 2 * RESERVE, clamp(SPAN, container - 2 * UNFOLDED, SPAN_MAX));
   }
 
-  /** The same box before it could grow: capped at SPAN. */
   function fixedSpanBoxWidth(container: number): number {
     return clamp(MIN_SPAN, container - 2 * RESERVE, SPAN);
   }
 
   it('non-overlap invariant: the centred box\'s right edge never reaches the icon row', () => {
     const base = appUiInput({});
-    // Down to where even ⋯ + the bell cannot fit beside a box already on its
-    // min-span floor. That is ~296px here, well under the Canvas pane's own
-    // 360px floor (MIN_CONTENT_PANE_REM), so no reachable pane width is left
-    // out; below it nothing can hold the two apart and the box is clipped.
     for (let w = 2000; w >= 300; w -= 1) {
       const centreWidth = boxWidth(w);
       const input = {
@@ -173,7 +132,6 @@ describe('computeHeaderCollapse', () => {
       const boxRight = (w + centreWidth) / 2;
       expect(boxRight, `container ${w}`).toBeLessThanOrEqual(iconsLeft - input.gapPx + 0.6);
 
-      // Nothing is clipped while the reserve still holds.
       expect(titleEllipsized, `container ${w}`).toBe(false);
     }
   });
@@ -190,9 +148,6 @@ describe('computeHeaderCollapse', () => {
   });
 
   it('a third icon rides only where the box leaves more than the reserve', () => {
-    // Room alone decides. On the middle arm a third icon would cross the
-    // reserve, so all three fold into ⋯ and the cluster is two boxes again. Where
-    // the box sits at its span cap, the row has room and nothing folds.
     const three = appUiInput({ actionWidths: [ICON, ICON, ICON] });
     for (const w of [400, 450, 500, 550]) {
       const centreWidth = boxWidth(w);
@@ -215,8 +170,6 @@ describe('computeHeaderCollapse', () => {
   });
 
   it('growing never folds an action the fixed span let ride, up to six', () => {
-    // The title takes only room past UNFOLDED, and UNFOLDED holds six actions
-    // and the bell. So no set of up to six folds where it rode before.
     for (let count = 0; count <= 6; count++) {
       const actions = appUiInput({ actionWidths: Array.from({ length: count }, () => ICON) });
       for (let w = 2000; w >= 360; w -= 1) {
@@ -229,9 +182,6 @@ describe('computeHeaderCollapse', () => {
   });
 
   it('folds on the min-span arm, where the box stops giving way', () => {
-    // A hypothetical row below the Canvas floor with two actions: the box is
-    // pinned at MIN_SPAN, so the cluster would reach it and the icons go into ⋯
-    // instead. This is the whole reason the measurement survives the centring.
     const w = 260;
     const centreWidth = boxWidth(w);
     expect(centreWidth).toBe(MIN_SPAN);
@@ -242,19 +192,14 @@ describe('computeHeaderCollapse', () => {
       leadingWidth: (w - centreWidth) / 2,
     };
     expect(computeHeaderCollapse(input).collapsed).toBe(2);
-    // Unfolded it really would have reached the box: that is what it dodged.
     const unfoldedClearance = (w - iconsRowWidth(input, 0)) - (w + centreWidth) / 2;
     expect(unfoldedClearance).toBeLessThan(GAP);
   });
 
-  // The thread pane's cluster has no permanent anchor: nothing after the
-  // actions, so the minimal state is the ⋯ trigger alone and the anchor costs
-  // neither its own width nor a gap to it.
   it('a cluster with no anchor pays for neither the anchor nor a gap to it', () => {
     const input = appUiInput({ anchorWidth: 0 });
     expect(iconsRowWidth(input, 0)).toBe(3 * ICON + 2 * GAP);
     expect(iconsRowWidth(input, 3)).toBe(ICON);
-    // ...and it still walks the same steps as it narrows.
     const seen: number[] = [];
     for (let w = exactWidth(input, 0) + 10; w >= exactWidth(input, 3) - 10; w -= 1) {
       const { collapsed } = computeHeaderCollapse({ ...input, containerWidth: w });
@@ -274,10 +219,7 @@ describe('computeHeaderCollapse', () => {
   });
 });
 
-// Mobile's whole decision, which reads no box at all.
 describe('measuredCollapseInput', () => {
-  // A row whose two actions and bell just fit beside a 320px centred title:
-  // (570 - 320) / 2 leaves 125px, and the cluster plus its two gaps is 124.
   const row = { clientWidth: 570, titleWidth: 320, iconWidth: ICON, actionCount: 2, anchorWidth: ICON, gapPx: GAP };
 
   it('keeps every action riding when nothing holds the trailing padding', () => {
@@ -286,7 +228,6 @@ describe('measuredCollapseInput', () => {
 
   it('folds sooner while the docked dashboard rail toggle holds the trailing padding', () => {
     const docked = measuredCollapseInput({ ...row, trailingPadding: ICON + GAP });
-    // The centred box still sits on the whole row, so only the actions give way.
     expect(docked.leadingWidth).toBe((570 - 320) / 2);
     expect(computeHeaderCollapse(docked).collapsed).toBe(2);
   });
@@ -308,9 +249,6 @@ describe('mobileCollapseCount', () => {
   });
 
   it('never leaves more than one control before the bell', () => {
-    // The bound the centred cluster's edge reserve is sized against: whatever
-    // the count, the trailing cluster is the ⋯ trigger or one action, plus the
-    // bell. Two icon boxes, never three.
     for (let n = 0; n <= 6; n++) {
       const collapsed = mobileCollapseCount(n);
       const standing = n - collapsed + (collapsed > 0 ? 1 : 0);

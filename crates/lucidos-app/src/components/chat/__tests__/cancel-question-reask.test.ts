@@ -1,21 +1,3 @@
-/**
- * Regression: the morph Send→Cancel button stuck disabled ("Cancel...") after
- * a question was canceled and the agent answered the cancel by RE-ASKING.
- *
- * Repro the user hit: a chat thread asks an AskUserQuestion (Q1). The user
- * clicks the morph "Cancel". `handleCancelExchange` sets the optimistic
- * `cancelingThreadIds` flag and resolves Q1 as Canceled — but the agent then
- * asks Q2. Throughout, the thread never leaves a mid-turn status
- * (waiting_for_user_answer → running → waiting_for_user_answer), so the OLD
- * cleanup effect — which only released the flag once the thread was no longer
- * mid-turn — never fired. The button sat in the disabled "Cancel..." state for
- * Q2 with no way to cancel it; only a reload (which drops the in-memory flag)
- * restored it.
- *
- * The fix tracks WHICH question the cancel targeted and releases the flag once
- * that question is no longer the thread's latest pending one — i.e. it resolved
- * (as Canceled) and the agent either idled or asked a fresh question.
- */
 import { describe, it, expect } from 'vitest';
 import {
   findLatestPendingQuestion,
@@ -109,8 +91,8 @@ describe('findLatestPendingQuestion', () => {
     const thread = buildThreadState([
       { type: 'MessageReceived', text: 'go', channel: 'chat' } as ThreadEvent,
       ask('tu_q1'),
-      answer('tu_q1'), // Q1 canceled
-      ask('tu_q2'), // agent re-asked
+      answer('tu_q1'),
+      ask('tu_q2'),
     ]);
     expect(findLatestPendingQuestion(thread)).toEqual({ toolUseId: 'tu_q2', multiSelect: false });
   });
@@ -127,15 +109,10 @@ describe('shouldClearCanceling', () => {
   });
 
   it('keeps the flag while still waiting on the SAME question that was canceled', () => {
-    // Brief click→SSE gap: the morph must read "Cancel..." (disabled) so a
-    // double-tap can't re-fire the cancel.
     expect(shouldClearCanceling('waiting_for_user_answer', 'tu_q1', 'tu_q1')).toBe(false);
   });
 
   it('clears when the canceled question is replaced by a re-asked one', () => {
-    // The bug: status stays mid-turn through waiting → running → waiting, so
-    // the not-mid-turn check never fires. The question-identity change is what
-    // releases the flag so Q2 gets a fresh, enabled Cancel button.
     expect(shouldClearCanceling('waiting_for_user_answer', 'tu_q1', 'tu_q2')).toBe(true);
   });
 
@@ -144,31 +121,14 @@ describe('shouldClearCanceling', () => {
   });
 
   it('keeps the flag for a running-turn cancel (no question targeted) while still running', () => {
-    // Canceling a plain running turn must keep "Cancel..." while the turn is
-    // still running — there is no question to key the release off.
     expect(shouldClearCanceling('running', undefined, undefined)).toBe(false);
   });
 
   it('releases a running-turn cancel the moment the turn pauses on a NEW card it never targeted', () => {
-    // Regression (Codex, 2026-07-03): the user clicked the
-    // generic Stop on a running Codex turn, but a follow-up redirect superseded
-    // the cancel so no terminal ever fired. The turn kept going and paused on a
-    // permission card (waiting_for_user_answer) the cancel never targeted. The
-    // OLD logic treated waiting_for_user_answer as still-mid-turn with no
-    // canceledQuestionId to key off, so the flag wedged "Canceling" forever.
-    // A running-turn cancel (canceledWhileAwaiting=false) must release the
-    // instant the turn is no longer `running`.
     expect(shouldClearCanceling('waiting_for_user_answer', undefined, undefined, false)).toBe(true);
   });
 
   it('keeps a card cancel (permission/question) bridged through waiting_for_user_answer', () => {
-    // A cancel clicked while a card was ON SCREEN (canceledWhileAwaiting=true)
-    // must bridge the click→terminal gap so the button reads "Canceling…"
-    // (disabled) and a double-tap can't re-fire — until the turn actually
-    // leaves every mid-turn state. This is the permission-card path, which
-    // records no canceledQuestionId (permission cards are not
-    // UserQuestionAsked), so without the awaiting bit it would wrongly fall to
-    // the running-turn release above.
     expect(shouldClearCanceling('waiting_for_user_answer', undefined, undefined, true)).toBe(false);
   });
 
@@ -183,8 +143,8 @@ describe('integration: cancel a question, agent re-asks', () => {
     const thread = buildThreadState([
       { type: 'MessageReceived', text: 'go', channel: 'chat' } as ThreadEvent,
       ask('tu_q1'),
-      answer('tu_q1'), // user clicked Cancel → Q1 resolved as Canceled
-      ask('tu_q2'), // agent re-asked the same question
+      answer('tu_q1'),
+      ask('tu_q2'),
     ]);
     const canceledQuestionId = 'tu_q1';
     const latestPending = findLatestPendingQuestion(thread)?.toolUseId;

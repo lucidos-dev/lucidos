@@ -1,15 +1,3 @@
-/**
- * The follow toggle's glyph paints 0.667 of its viewBox on both axes.
- *
- * It floats in a circle under the down chevron. The composer row's 0.750 read
- * too heavy beside that chevron, so the user picked 0.667 from rendered sizes.
- *
- * **0.667 is the GEOMETRIC extent, stroke excluded.** A check that includes
- * the stroke measures a different number. Deriving it by hand off the path
- * data is what this file does, deliberately. The shape is axis-aligned
- * segments plus semicircles on horizontal chords, and their extremes are all
- * on-path, so the bbox is exact.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -21,11 +9,6 @@ import { dirname, resolve } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const icons = readFileSync(resolve(here, '../../components/shared/icons.tsx'), 'utf8');
 
-/** Geometric bbox of one path, stroke excluded.
- *
- *  Handles only the commands this glyph uses. An arc must be a semicircle on a
- *  horizontal chord, and that is asserted rather than assumed. A redraw
- *  reaching for a general ellipse fails here instead of being mismeasured. */
 function bounds(d: string): { xs: number[]; ys: number[] } {
   const xs: number[] = [];
   const ys: number[] = [];
@@ -61,8 +44,6 @@ function bounds(d: string): { xs: number[]; ys: number[] } {
         expect(dy, 'arc chord is not horizontal').toBe(0);
         expect(rx, 'arc is not circular').toBe(ry);
         expect(Math.abs(dx) / 2, 'arc is not a semicircle').toBeCloseTo(rx, 6);
-        // Sweep 1 left to right bulges up in SVG's y-down space, and each
-        // reversal flips it. The apex is the only extreme off the endpoints.
         ys.push((sweep === 1) === dx > 0 ? y - rx : y + rx);
         x += dx;
         break;
@@ -81,7 +62,6 @@ function bounds(d: string): { xs: number[]; ys: number[] } {
   return { xs, ys };
 }
 
-/** A glyph's painted fraction of its own box, per axis. */
 function inkFraction(ds: string[], side: number): { x: number; y: number } {
   const xs: number[] = [];
   const ys: number[] = [];
@@ -96,7 +76,6 @@ function inkFraction(ds: string[], side: number): { x: number; y: number } {
   };
 }
 
-/** The `d` of every path the named icon draws, plus its square viewBox side. */
 function glyph(name: string): { ds: string[]; side: number } {
   const body = new RegExp(`export function ${name}\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}`).exec(icons);
   expect(body, `icons.tsx no longer exports ${name}()`).not.toBeNull();
@@ -115,8 +94,6 @@ describe('the ink measurement itself', () => {
   });
 
   it('puts a semicircle\'s apex above the chord when it bulges up', () => {
-    // From (4,12) rightwards, sweep 1: apex at y=4, so the height is 8 and the
-    // width is the 16 chord.
     const ink = inkFraction(['M4 12a8 8 0 0 1 16 0'], 24);
     expect(ink.x).toBeCloseTo(16 / 24, 6);
     expect(ink.y).toBeCloseTo(8 / 24, 6);

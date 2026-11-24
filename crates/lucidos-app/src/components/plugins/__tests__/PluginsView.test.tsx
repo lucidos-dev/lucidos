@@ -11,10 +11,6 @@ import {
 
 const STORAGE_KEY = 'lucidos-plugins-installed-only';
 
-// Walk a vnode tree WITHOUT invoking function components — their hooks would
-// throw outside a real render. Record which function-component types are reached
-// (by reference) and every segmented toggle <button>. PluginsView itself has no
-// top-level hooks, so calling it as a plain function is safe.
 function inspect(
   node: ComponentChildren,
   acc: { types: Set<unknown>; buttons: VNode<Record<string, unknown>>[] },
@@ -27,7 +23,7 @@ function inspect(
   }
   const v = node as VNode<Record<string, unknown>>;
   if (typeof v.type === 'function') {
-    acc.types.add(v.type); // record but do NOT recurse/invoke
+    acc.types.add(v.type);
     return;
   }
   if (
@@ -63,7 +59,6 @@ function isActive(button: VNode<Record<string, unknown>> | undefined): boolean {
 describe('PluginsView — All | Installed toggle over one unified list', () => {
   beforeEach(() => {
     appSearchOpen.value = false;
-    // Reset to the All (default) state between cases.
     setPluginsInstalledOnly(false);
   });
 

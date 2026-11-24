@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * WebKit shares one in-flight fetch of a subresource between frames. It fails
- * that fetch for all of them when the frame that started it goes away. Every
- * app frame loads the SDK script and stylesheet, so a frame that leaves
- * mid-load can strand a sibling with neither. So the host reloads every frame
- * still loading when one leaves before its `load` (appFrameSharedLoads.ts).
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -96,7 +89,6 @@ describe('a frame that leaves while loading', () => {
     expect(firstReloaded).not.toBe(firstBefore);
     expect(secondReloaded).not.toBe(secondBefore);
 
-    // Once a reloaded frame loads, a later leave reloads only the one still loading.
     fireLoad(first);
     const third = mount('/app/sound/?a=4');
     unmount(third);

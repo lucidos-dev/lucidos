@@ -18,8 +18,6 @@ const rungs: CodingAgentLadderRung[] = [
   { model: 'claude-opus-5-6', effort: 'high', label: 'Opus 5.6', intelligence: null, cost: null, time: null, estimated: true },
 ];
 
-/** The picker as the engine serves it: Claude Code also lists old models and
- *  the 1M twin, and none of them may reach the rung list. */
 const options = [
   { value: 'default', label: 'Default (recommended)', description: '', resolved_model: 'claude-opus-5-6[1m]' },
   { value: 'opus', label: 'Opus', description: '', resolved_model: 'claude-opus-5-6[1m]' },

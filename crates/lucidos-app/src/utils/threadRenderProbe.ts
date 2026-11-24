@@ -35,6 +35,8 @@
 
 import { postClientLog } from './liveness';
 import { isWebKit } from './platform';
+import { restoreAdmissionPhase } from './restoreAdmission';
+import { requestsInFlight } from '../api/client/requestsInFlight';
 
 export type ThreadRenderClass =
   | 'genuinely-empty'
@@ -47,58 +49,28 @@ export interface ThreadRenderProbe {
   threadId: string;
   channel: string;
   isCodingAgent: boolean;
-  /** exchanges.length the LAST time ThreadView rendered this thread's body. */
   renderedExchangesLen: number;
-  /** exchanges.length recomputed from the CURRENT store at probe time — a fresh
-   *  fold, so a value that diverges from `renderedExchangesLen` proves the view
-   *  is showing a stale render. */
   freshExchangesLen: number;
   eventCount: number;
   eventsLoaded: boolean;
-  /** Whether the store holds any non-metadata (content) event — i.e. the thread
-   *  SHOULD show a body. */
   hasContentEvents: boolean;
-  /** `promptAnimating` — the compose→thread FLIP gate. On mobile this is always
-   *  false (the FLIP is desktop-only); captured so a stuck-true value on any
-   *  surface is visible. */
   animating: boolean;
-  /** Child element count of the `.thread-content` scroll container, or null when
-   *  the ref isn't mounted. Zero-with-exchanges = a commit/mount gap. */
   contentChildCount: number | null;
-  /** Rendered height of the content container, or null when unmounted. Non-zero
-   *  with content present rules out a collapsed/zero-size layout. */
   contentScrollHeight: number | null;
 }
 
-/** Classify a render probe into one of the discriminating buckets. Pure — no
- *  signal reads, no DOM, no I/O — so it is fully unit-testable. The order of the
- *  checks is the priority: a missed re-render is reported even when content events
- *  exist, because it is the more specific (and more actionable) diagnosis. */
 export function classifyThreadRender(p: ThreadRenderProbe): ThreadRenderClass {
-  // A thread with no content events is legitimately bodyless (fresh draft, a
-  // thread carrying only ThreadStarted/metadata) — not the bug we hunt.
   if (!p.hasContentEvents) return 'genuinely-empty';
 
-  // The store has exchanges now but the last render showed none → the view never
-  // re-rendered to reflect the post-load store write. This is the "recovers on
-  // scroll" stale-render mechanism.
   if (p.renderedExchangesLen === 0 && p.freshExchangesLen > 0) return 'missed-rerender';
 
-  // Content events exist, yet a FRESH recompute still folds to zero exchanges →
-  // a grouping / corrupted-Map gap (handled by rebuildCorruptedThreadEvents).
   if (p.renderedExchangesLen === 0) return 'empty-render';
 
-  // Exchanges rendered, but the content area has no DOM children → Preact has the
-  // memo result yet the subtree isn't mounted.
   if (p.contentChildCount === 0) return 'dom-missing';
 
-  // Exchanges rendered and the DOM is built. Healthy to JS — a blank report here
-  // is compositor paint loss, not a data/render fault.
   return 'content-present';
 }
 
-/** Whether a probe is worth a breadcrumb. Skip the legit-empty case so the log
- *  only carries threads that SHOULD show a body. Pure. */
 export function shouldReportThreadRender(cls: ThreadRenderClass): boolean {
   return cls !== 'genuinely-empty';
 }
@@ -129,5 +101,22 @@ export function reportThreadRenderProbe(probe: ThreadRenderProbe): void {
     animating: probe.animating,
     content_child_count: probe.contentChildCount,
     content_scroll_height: probe.contentScrollHeight,
+  });
+}
+
+/** The probe for a focused thread the store does not hold yet, such as a cold
+ *  notification open still on its skeleton. Restore admission and the shell's
+ *  requests are the two owners that can hold it, so it names both. Counts and
+ *  ages only, never request paths. A temporary measure: see
+ *  docs/temporary-measures.md § The render probe's absent-target report. */
+export function reportAbsentThreadRender(threadId: string): void {
+  if (!isWebKit()) return;
+  const requests = requestsInFlight();
+  postClientLog('render', 'thread_render_probe', {
+    class: 'target-absent',
+    thread_id: threadId,
+    admission_phase: restoreAdmissionPhase(),
+    requests_in_flight: requests.count,
+    oldest_request_ms: requests.oldestMs,
   });
 }

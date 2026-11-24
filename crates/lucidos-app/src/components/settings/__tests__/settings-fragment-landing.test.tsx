@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A `settings:<view>#<row>` link scrolls to its row, waiting for one that
- * renders late. A row the page never draws is reported, where every other
- * scroll target stays silent.
- */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
@@ -75,9 +70,34 @@ describe('SettingsView fragment landing', () => {
     expect(settingsLinkedFragment.value).toBeNull();
   });
 
+  it('scrolls to and marks the colon-anchored sandbox row without a toast', async () => {
+    settingsSubview.value = 'permissions';
+    await link('agent-sandbox:unsandboxed');
+    const row = host.querySelector<HTMLElement>('[data-search-anchor="agent-sandbox:unsandboxed"]')!;
+    expect(row).not.toBeNull();
+    expect(scrolled).toEqual([row]);
+    expect(row.classList.contains('nav-focus-stuck')).toBe(true);
+    await waitOut();
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('lands a retired full anchor on its current row', async () => {
+    await link('models:vertex-ai');
+    expect(scrolled.map(el => el.dataset.searchAnchor)).toEqual([providerAnchor('vertex')]);
+    await waitOut();
+    expect(toasts.value).toEqual([]);
+  });
+
   it('lands a row inside a fold on the block its search entry names', async () => {
     await link('vertex-region');
     expect(scrolled.map((el) => el.dataset.searchAnchor)).toEqual([providerAnchor('vertex')]);
+  });
+
+  it('lands a retired row inside a fold on its current ancestor', async () => {
+    await link('models:region');
+    expect(scrolled.map(el => el.dataset.searchAnchor)).toEqual([providerAnchor('vertex')]);
+    await waitOut();
+    expect(toasts.value).toEqual([]);
   });
 
   it('waits for a row that renders after the page', async () => {

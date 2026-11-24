@@ -22,7 +22,6 @@ let held: ShellSnapBack | null = null;
 let suppressed = 0;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-/** Reset the rate limit. Test seam only. */
 export function resetShellScrollProbe(): void {
   if (flushTimer) clearTimeout(flushTimer);
   flushTimer = null;
@@ -60,7 +59,6 @@ function logSnapBack(snap: ShellSnapBack): void {
   suppressed = 0;
 }
 
-/** A tag and its classes: enough to find the control, and no content. */
 function describeElement(el: Element | null): string {
   if (!el || el === document.body) return 'body';
   const classes = typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 3).join('.') : '';

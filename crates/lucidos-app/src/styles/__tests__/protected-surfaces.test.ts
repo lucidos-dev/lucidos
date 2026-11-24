@@ -1,17 +1,3 @@
-/**
- * Protected surfaces: no theme and no style override can make an approval
- * unreadable or misleading (ADR 0309).
- *
- * The engine derives and clamps the `--protected-*` palette
- * (`core/themes/protected.rs`, with its own tests). This suite pins the shell's
- * half of the promise:
- *
- *   - `.protected-surface` maps every catalog paint token to that palette, so
- *     no theme value reaches inside;
- *   - every protected surface carries the class;
- *   - the CSS those surfaces use reads its colours only through mapped tokens;
- *   - `base.css` carries a literal default for every protected token.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -29,15 +15,11 @@ const read = (path: string): string => readFileSync(resolve(src, path), 'utf-8')
 const protectedCss = read('styles/global/protected-surface.css');
 const baseCss = read('styles/global/base.css');
 const catalog: { tokens: { name: string; kind: string }[] } = JSON.parse(
-  read('../../lucidos-engine/src/core/themes/theme-tokens.json'),
+  read('../../lucidos-core/src/core/themes/theme-tokens.json'),
 );
 
 const PROTECTED_CLASS = 'protected-surface';
 
-/** Catalog kinds that cannot hide or recolour content, so the map may leave
- *  them to the theme. A radius rounds a corner, and every surface pads its
- *  content away from its corners. A new kind is not in this list, so the guard
- *  fails until someone decides. */
 const HARMLESS_KINDS = new Set(['length']);
 
 function declarations(css: string, selector: string): Map<string, string> {
@@ -99,8 +81,6 @@ describe('the protected palette defaults', () => {
   });
 });
 
-/** Root classes only a protected surface wears. Every class list naming one,
- *  in any component, must also name `protected-surface`. */
 const APPROVAL_ROOTS = [
   'permission-body',
   'question-body',
@@ -110,8 +90,6 @@ const APPROVAL_ROOTS = [
   'split-button-menu',
 ];
 
-/** Surfaces whose root class is shared with ordinary views, so they are named
- *  by file. */
 const SURFACES: { file: string; root: string }[] = [
   { file: 'components/credentials/CredentialModal.tsx', root: 'inline-form' },
   { file: 'components/plugins/PluginInstallPanel.tsx', root: 'inline-form' },
@@ -156,7 +134,6 @@ describe('every protected surface carries the class', () => {
   it('builds the action slot, alone or split, as one', () => {
     const slot = read('components/chat/ActionSlot.tsx');
     expect(slot).toContain('class={`${classOf(action)} action-slot ${PROTECTED_SURFACE}`}');
-    // A split face, caret, whole face and menu each take the class there.
     expect(read('components/shared/SplitButton.tsx').match(/protected-surface/g)?.length).toBeGreaterThanOrEqual(4);
     expect(read('components/chat/WaitingBanner.tsx')).not.toMatch(/class=\{?['"`]action-btn action-btn-(confirm|danger)['"`]/);
   });
@@ -167,8 +144,6 @@ describe('every protected surface carries the class', () => {
   });
 });
 
-/** Stylesheets that style the surfaces above, and the selectors that mark a
- *  rule as theirs. */
 const SURFACE_SHEETS = [
   'styles/chat/response.css',
   'styles/pages.css',
@@ -191,15 +166,12 @@ describe('the CSS a protected surface uses', () => {
       for (const rule of cssRules(read(sheet))) {
         if (!SURFACE_SELECTOR.test(rule.selector)) continue;
         for (const [prop, value] of rule.props) {
-          // A local token is followed through its own value, like a colour.
           if (prop.startsWith('--')) local.add(prop);
           if (!prop.startsWith('--') && !COLOUR_PROPS.test(prop)) continue;
           for (const name of varNames(value)) reads.push({ where: `${sheet} ${rule.selector} { ${prop} }`, name });
         }
       }
     }
-    // A part token needs no remap: the generated reset sets every one to
-    // initial on the surface, which the next block pins.
     const unmapped = reads
       .filter(({ name }) => !name.startsWith('--protected-') && !name.startsWith('--part-')
         && !remap.has(name) && !local.has(name))
@@ -209,8 +181,6 @@ describe('the CSS a protected surface uses', () => {
 
   it('paints no literal colour, which the clamp could not see', () => {
     const literal = /#[0-9a-f]{3,8}\b|\b(?:rgba?|hsla?|oklch|oklab)\(/i;
-    // A hover rule that protected-surface.css restates for the same classes
-    // is overridden inside every protected surface.
     const classesOf = (selector: string) =>
       new Set([...selector.matchAll(/\.([a-z0-9-]+)/g)].map(m => m[1]).filter(c => c !== PROTECTED_CLASS));
     const restatedHover = cssRules(protectedCss)
@@ -238,7 +208,7 @@ describe('theme parts never reach a protected surface (ADR 0307)', () => {
   const partsCatalog: {
     properties: Record<string, { inherits: boolean }>;
     parts: { properties: { token: string }[] }[];
-  } = JSON.parse(read('../../lucidos-engine/src/core/themes/theme-parts.json'));
+  } = JSON.parse(read('../../lucidos-core/src/core/themes/theme-parts.json'));
   const generated = read('styles/generated/theme-parts.css');
 
   it('resets every part token on the surface', () => {

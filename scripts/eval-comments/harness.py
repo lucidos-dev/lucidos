@@ -10,8 +10,9 @@ Driven by eval-comments.sh. Subcommands:
   run [--tasks ...] [--arms A,C] [--runs 2] [--seed 7] [--runs-dir runs]
       Run the sessions, at most SLOTS at a time, then grade each one.
   grade --run r01 [--runs-dir runs]      (re)grade one finished run
-  report [--runs-dir runs]               per-run table and per-arm summary
+  report [--runs-dir runs]               per-run table, per-arm summary, pass rule
   status [--runs-dir runs]
+  judge-check                            one tiny judge call, to prove model access
 
 Layout. Everything the agents never see lives under DATA_ROOT
 (~/.lucidos/data/comment-ablation): task clones, transcripts, diffs, grades.
@@ -31,6 +32,7 @@ Spending. Every session is a real model run. Nothing here is reachable from
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
@@ -44,11 +46,11 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "comment-strip"))
 import strip_comments  # noqa: E402
 
 REPO = Path(subprocess.check_output(["git", "-C", str(HERE), "rev-parse", "--show-toplevel"], text=True).strip())
@@ -58,6 +60,8 @@ TASKS_DIR = HERE / "tasks"
 
 MODEL = "claude-opus-5-5[1m]"
 EFFORT = "high"
+# The judge must not share the agents' model (the pilot's measurement problem 3).
+JUDGE_MODEL = "claude-sonnet-5-5"
 # claude-opus-5 (the bare id) and every Fable model are refused outright.
 REFUSED_MODEL_RE = re.compile(r"^claude-opus-5($|@|\[)|fable", re.IGNORECASE)
 
@@ -76,7 +80,9 @@ LAUNCH_STAGGER_SECS = 45
 
 STRIP_ROOTS = ("crates/", "packages/")
 # Bump when stripping changes what an arm tree contains. v2: rustfmt after stripping.
-STRIP_VERSION = 2
+# v3: the stripper under scripts/comment-strip, with its kept classes.
+# v4: a gate a stripped arm fails gets the flagged files back whole.
+STRIP_VERSION = 4
 # The `#[ignore]`d tests that rewrite the generated files on a commit that has
 # them. Their names follow `generate_*_file`, and the set differs by commit. A
 # commit with none has scripts/codegen.sh instead.
@@ -119,6 +125,7 @@ ENV_PASSTHROUGH = ("HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL
 VERTEX_DEFAULTS = {
     "CLOUD_ML_REGION": "europe-west1",
     "VERTEX_REGION_CLAUDE_5_5_OPUS": "eu",
+    "VERTEX_REGION_CLAUDE_5_5_SONNET": "eu",
     "VERTEX_REGION_CLAUDE_5_SONNET": "eu",
 }
 MODEL_ENV_FIXED = {
@@ -367,11 +374,18 @@ def ensure_clone(task: dict) -> Path:
 
 
 def worktree(clone: Path, path: Path, rev: str) -> Path:
+    """A fresh worktree at `rev`. An existing target/ survives, so a rebuilt arm compiles incrementally."""
+    kept_target = path.parent / f".{path.name}-target"
+    shutil.rmtree(kept_target, ignore_errors=True)
     if path.exists():
+        if (path / "target").is_dir():
+            (path / "target").rename(kept_target)
         git("worktree", "remove", "--force", str(path), cwd=clone, check=False)
         shutil.rmtree(path, ignore_errors=True)
     git("worktree", "prune", cwd=clone)
     git("worktree", "add", "-q", "--detach", str(path), rev, cwd=clone)
+    if kept_target.is_dir():
+        kept_target.rename(path / "target")
     return path
 
 
@@ -389,7 +403,7 @@ def strip_tree(tree: Path, mode: str) -> dict:
     summary = {}
     for rel in files:
         path = tree / rel
-        src = path.read_text(encoding="utf-8")
+        src = strip_comments.read_source(path)
         lang = strip_comments.language_of(rel)
         out, removed = strip_comments.strip(src, lang, mode)
         if not removed:
@@ -397,7 +411,7 @@ def strip_tree(tree: Path, mode: str) -> dict:
         # I3: only comments changed.
         if strip_comments.tokens_without_comments(src, lang) != strip_comments.tokens_without_comments(out, lang):
             sys.exit(f"stripping changed a code token in {rel}")
-        path.write_text(out, encoding="utf-8")
+        path.write_bytes(out.encode("utf-8"))
         summary[rel] = removed
     format_stripped(tree, summary)
     return summary
@@ -440,7 +454,8 @@ class WindowEnded(Exception):
 class Window:
     """A wall-clock budget for one invocation.
 
-    The engine kills a background task after an hour, so a long run is a chain
+    The engine kills a background task at its timeout, an hour by default and
+    4 h at most. So a long run is a chain
     of windows. Each step asks whether it fits before it starts, and every
     subprocess timeout is clamped to the window, so nothing outlives it.
     """
@@ -511,6 +526,13 @@ def prepare_task(task: dict, arms: list[str], verify: bool) -> None:
     if info.get("strip_version") != STRIP_VERSION or not all(f"arm_{a}" in info for a in arms):
         WINDOW.need(STEP_SECS["build"], "building the arms")
         info = build_arms(task, arms)
+        verified = read_json(root / "verify.json", {})
+        # A rebuild can come with a new SUITE_ARGV, so arm A's suite baseline goes too.
+        verified.pop("suite_A", None)
+        for arm in arms:
+            if ARMS[arm] is not None:
+                forget_arm_results(verified, arm)
+        write_json(root / "verify.json", verified)
     if verify:
         verify_task(task, arms, info, root / "prepare.log")
 
@@ -540,27 +562,102 @@ def build_arms(task: dict, arms: list[str]) -> dict:
         wt = worktree(clone, root / f"prep-{arm}", arm_a)
         summary = strip_tree(wt, mode)
         write_json(root / f"strip-{arm}.json", summary)
-        generators = sorted(set(GENERATOR_RE.findall(
-            git("grep", "-h", "-E", r"fn generate_[a-z0-9_]+_file", "--", "crates/lucidos-engine/src", cwd=wt)
-        )))
-        info[f"generators_{arm}"] = generators
-        for gen in generators:
-            code, out = cargo(["cargo", "test", "-p", "lucidos-engine", "--lib", gen, "--", "--include-ignored"], wt, prep_log)
-            if code != 0 or re.search(r"running [1-9]\d* tests?", out) is None:
-                sys.exit(f"{task['id']}: generator {gen} failed, see {prep_log}")
-        if not generators and (wt / "scripts/codegen.sh").exists():
-            code, _ = cargo(["bash", "scripts/codegen.sh"], wt, prep_log)
-            if code != 0:
-                sys.exit(f"{task['id']}: scripts/codegen.sh failed, see {prep_log}")
-        git("add", "-A", cwd=wt)
-        sha = commit_like(wt, parent, git("write-tree", cwd=wt).strip())
-        git("update-ref", f"refs/heads/arm-{arm}", sha, cwd=clone)
-        git("reset", "-q", "--soft", sha, cwd=wt)
-        info[f"arm_{arm}"] = sha
+        info[f"generators_{arm}"] = commit_arm(task, arm, wt, info)
         info[f"strip_{arm}"] = {"files": len(summary), "blocks": sum(len(v) for v in summary.values())}
         log(f"{task['id']}: arm {arm} strips {info[f'strip_{arm}']['blocks']} blocks in {len(summary)} files")
     write_json(root / "prepare.json", info)
     return info
+
+
+def generators_in(tree: Path) -> list[str]:
+    """The engine's generated-file tests. Newer trees have none and use scripts/codegen.sh."""
+    found = git("grep", "-h", "-E", r"fn generate_[a-z0-9_]+_file", "--", "crates/lucidos-engine/src", cwd=tree, check=False)
+    return sorted(set(GENERATOR_RE.findall(found)))
+
+
+def commit_arm(task: dict, arm: str, wt: Path, info: dict) -> list[str]:
+    """Regenerate the generated files, then commit `wt` as the arm's base. Returns the generators run."""
+    prep_log = task_root(task) / "prepare.log"
+    generators = generators_in(wt)
+    for gen in generators:
+        code, out = cargo(["cargo", "test", "-p", "lucidos-engine", "--lib", gen, "--", "--include-ignored"], wt, prep_log)
+        if code != 0 or re.search(r"running [1-9]\d* tests?", out) is None:
+            sys.exit(f"{task['id']}: generator {gen} failed, see {prep_log}")
+    if not generators and (wt / "scripts/codegen.sh").exists():
+        with linked_node_modules(wt):
+            code, _ = cargo(["bash", "scripts/codegen.sh"], wt, prep_log)
+        if code != 0:
+            sys.exit(f"{task['id']}: scripts/codegen.sh failed, see {prep_log}")
+    git("add", "-A", cwd=wt)
+    sha = commit_like(wt, info["parent"], git("write-tree", cwd=wt).strip())
+    git("update-ref", f"refs/heads/arm-{arm}", sha, cwd=task_root(task) / "src.git")
+    git("reset", "-q", "--soft", sha, cwd=wt)
+    info[f"arm_{arm}"] = sha
+    return generators
+
+
+# A stripped arm must pass every gate arm A passes. A gate that fails only
+# because comments are gone (a clippy lint a comment held back, a file rustfmt
+# would reorder, a test that reads source text) gets those files back whole.
+RESTORE_ROUNDS = 3
+# Real-Chrome tests hang in task trees from before main marked them #[ignore]
+# for the confinement suite. Every arm skips them, so the comparison holds.
+SUITE_SKIP = ("runtime::browser::session::tests::the_agent_browser_",)
+SUITE_ARGV = ["./scripts/test-engine.sh", "--", "--", *itertools.chain.from_iterable(("--skip", s) for s in SUITE_SKIP)]
+ARM_RESULT_KEYS = ("clippy", "suite", "tsc", "fmt")
+
+
+def forget_arm_results(result: dict, arm: str) -> None:
+    for key in [k for k in result if any(k.startswith(f"{g}_{arm}") for g in ARM_RESULT_KEYS)]:
+        del result[key]
+
+
+def files_flagged_by_clippy(output: str) -> set[str]:
+    """The file of each clippy error, read from the `--> path:line:col` under it."""
+    files, pending = set(), False
+    for line in output.splitlines():
+        if line.startswith("error"):
+            pending = not line.startswith(("error: could not compile", "error: aborting"))
+        elif pending and (m := re.match(r"\s*--> ([^:\s]+):\d+:\d+", line)):
+            files.add(m.group(1))
+            pending = False
+    return files
+
+
+def files_flagged_by_fmt(output: str, tree: Path) -> set[str]:
+    return set(re.findall(rf"^Diff in {re.escape(str(tree))}/(.+?):\d+:", output, re.M))
+
+
+def tsc_errors(output: str) -> set[str]:
+    """Each tsc error as `path: message`, without its position, which a strip moves."""
+    return {f"{m.group(1)}: {m.group(2)}" for m in re.finditer(r"^(\S[^\n(]*)\(\d+,\d+\): (error TS\d+:[^\n]*)", output, re.M)}
+
+
+def files_read_by_tests(tests: list[str], tree: Path) -> set[str]:
+    """The file defining each test, and every file it names by include_str! or src_root().join."""
+    files = set()
+    for name in tests:
+        defined = git("grep", "-l", "-w", f"fn {name.rsplit('::', 1)[-1]}", "--", "crates", cwd=tree, check=False).split()
+        for rel in defined:
+            files.add(rel)
+            src = (tree / rel).read_text(encoding="utf-8")
+            for target in re.findall(r'include_str!\(\s*"([^"]+)"\s*\)', src):
+                files.add(os.path.normpath(os.path.join(os.path.dirname(rel), target)))
+            crate_src = rel.split("/src/", 1)[0] + "/src/"
+            for target in re.findall(r'src_root\(\)\s*\.join\(\s*"([^"]+)"\s*\)', src):
+                files.add(crate_src + target)
+    return files
+
+
+def restore_files(task: dict, arm: str, info: dict, files: dict[str, str]) -> None:
+    """Put the original of each stripped file back into `arm`, keyed by the gate that flagged it."""
+    wt = reset_prep(task, arm, info)
+    for rel in sorted(files):
+        git("checkout", "-q", info["arm_A"], "--", rel, cwd=wt)
+    commit_arm(task, arm, wt, info)
+    info.setdefault(f"restored_{arm}", {}).update(files)
+    write_json(task_root(task) / "prepare.json", info)
+    log(f"{task['id']}: arm {arm} restored {len(files)} file(s): {', '.join(sorted(files))}")
 
 
 def failing_tests(output: str) -> set[str]:
@@ -603,82 +700,133 @@ def verify_task(task: dict, arms: list[str], info: dict, prep_log: Path) -> None
     if result["base"] != "fail" or result["fix"] != "pass":
         sys.exit(f"{task['id']}: the withheld test does not discriminate")
 
-    # I3: every stripped arm still lints clean, passes the engine suite and type-checks.
+    # I3: every stripped arm passes every gate arm A passes.
     for arm in arms:
         if ARMS[arm] is None:
             continue
-        if f"clippy_{arm}" not in result:
-            WINDOW.need(STEP_SECS["clippy"], f"clippy on arm {arm}")
-            clippy = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
-            code, out = cargo(clippy, reset_prep(task, arm, info), prep_log)
-            if code != 0:
-                # One retry: a lint failure repeats, a flaky build step does not.
-                code, out = cargo(clippy, reset_prep(task, arm, info), prep_log)
-            result[f"clippy_{arm}"] = code
-            if code != 0:
-                result[f"clippy_{arm}_tail"] = out[-2000:]
+        # One more verify than restores, so the last restore is checked too.
+        for round_ in range(RESTORE_ROUNDS + 1):
+            broken, flagged = verify_arm(task, arm, info, result, save, prep_log)
+            if not broken or round_ == RESTORE_ROUNDS:
+                break
+            stripped = read_json(root / f"strip-{arm}.json", {})
+            restorable = {rel: gate for rel, gate in flagged.items() if rel in stripped and rel not in info.get(f"restored_{arm}", {})}
+            if not restorable:
+                break
+            restore_files(task, arm, info, restorable)
+            forget_arm_results(result, arm)
             save()
-        if f"suite_{arm}" not in result:
-            WINDOW.need(STEP_SECS["suite"], f"the engine suite on arm {arm}")
-            code, out = cargo(["./scripts/test-engine.sh"], reset_prep(task, arm, info), prep_log, timeout=STEP_SECS["suite"])
-            result[f"suite_{arm}"] = {"exit": code, "failed": sorted(failing_tests(out))}
-            save()
-        if result[f"suite_{arm}"]["exit"] != 0 and "suite_A" not in result:
-            WINDOW.need(STEP_SECS["suite"], "the engine suite on arm A, for comparison")
-            code, out = cargo(["./scripts/test-engine.sh"], reset_prep(task, "A", info), prep_log, timeout=STEP_SECS["suite"])
-            result["suite_A"] = {"exit": code, "failed": sorted(failing_tests(out))}
-            save()
-        if f"tsc_{arm}" not in result:
-            WINDOW.need(STEP_SECS["tsc"], f"tsc on arm {arm}")
-            result[f"tsc_{arm}"] = tsc_check(reset_prep(task, arm, info), prep_log)
-            save()
-        if f"fmt_{arm}" not in result:
-            WINDOW.need(STEP_SECS["fmt"], f"rustfmt on arm {arm}")
-            result[f"fmt_{arm}"], _ = cargo(["cargo", "fmt", "--all", "--check"], reset_prep(task, arm, info), prep_log)
-            save()
-        new_failures = sorted(set(result[f"suite_{arm}"]["failed"]) - set(result.get("suite_A", {}).get("failed", [])))
-        if new_failures and f"suite_{arm}_rerun" not in result:
-            # A test arm A passes may only be flaky under full-suite load.
-            WINDOW.need(STEP_SECS["withheld"], f"an isolated rerun of arm {arm}'s new failures")
-            code, _ = cargo(["./scripts/test-engine.sh", "--", "--", "--exact", *new_failures], reset_prep(task, arm, info), prep_log)
-            result[f"suite_{arm}_rerun"] = {"tests": new_failures, "exit": code}
-            save()
-        log(f"{task['id']}: arm {arm} clippy={result[f'clippy_{arm}']} suite={result[f'suite_{arm}']} "
-            f"tsc={result[f'tsc_{arm}']} fmt={result[f'fmt_{arm}']}")
-        broken = [k for k in (f"clippy_{arm}", f"tsc_{arm}", f"fmt_{arm}") if result[k] != 0]
-        if new_failures and result[f"suite_{arm}_rerun"]["exit"] != 0:
-            broken.append(f"suite_{arm}: {new_failures}")
-        if result[f"suite_{arm}"]["exit"] != 0 and not result[f"suite_{arm}"]["failed"]:
-            broken.append(f"suite_{arm} exited {result[f'suite_{arm}']['exit']} without a test summary")
         if broken:
             sys.exit(f"{task['id']}: arm {arm} is not green ({', '.join(broken)}); see {prep_log}")
     for arm in ("A", *arms):
         drop_target(root / f"prep-{arm}")
 
 
-def tsc_check(tree: Path, prep_log: Path) -> int:
+def verify_arm(task: dict, arm: str, info: dict, result: dict, save, prep_log: Path) -> tuple[list[str], dict[str, str]]:
+    """Run each gate on a stripped arm once. Returns what is broken, and the files each failure points at."""
+    tree = task_root(task) / f"prep-{arm}"
+    if f"clippy_{arm}" not in result:
+        WINDOW.need(STEP_SECS["clippy"], f"clippy on arm {arm}")
+        clippy = ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
+        code, out = cargo(clippy, reset_prep(task, arm, info), prep_log)
+        if code != 0:
+            # One retry: a lint failure repeats, a flaky build step does not.
+            code, out = cargo(clippy, reset_prep(task, arm, info), prep_log)
+        result[f"clippy_{arm}"] = code
+        result[f"clippy_{arm}_files"] = sorted(files_flagged_by_clippy(out)) if code else []
+        save()
+    if f"suite_{arm}" not in result:
+        WINDOW.need(STEP_SECS["suite"], f"the engine suite on arm {arm}")
+        code, out = cargo(SUITE_ARGV, reset_prep(task, arm, info), prep_log, timeout=STEP_SECS["suite"])
+        result[f"suite_{arm}"] = {"exit": code, "failed": sorted(failing_tests(out))}
+        save()
+    if result[f"suite_{arm}"]["exit"] != 0 and "suite_A" not in result:
+        WINDOW.need(STEP_SECS["suite"], "the engine suite on arm A, for comparison")
+        code, out = cargo(SUITE_ARGV, reset_prep(task, "A", info), prep_log, timeout=STEP_SECS["suite"])
+        result["suite_A"] = {"exit": code, "failed": sorted(failing_tests(out))}
+        save()
+    # A tsc failure without a diagnostic, such as a timeout, runs again next time.
+    if f"tsc_{arm}" not in result or result.get(f"tsc_{arm}_exit"):
+        WINDOW.need(STEP_SECS["tsc"], f"tsc on arm {arm}")
+        code, out = tsc_check(reset_prep(task, arm, info), prep_log)
+        errors = tsc_errors(out) if code else set()
+        result[f"tsc_{arm}_exit"] = code if code and not errors else 0
+        if errors and "tsc_A" not in result:
+            # The arms link one node_modules, which may postdate the task, so judge against arm A.
+            WINDOW.need(STEP_SECS["tsc"], "tsc on arm A, for comparison")
+            result["tsc_A"] = sorted(tsc_errors(tsc_check(reset_prep(task, "A", info), prep_log)[1]))
+        result[f"tsc_{arm}"] = sorted(errors - set(result.get("tsc_A", [])))
+        save()
+    if f"fmt_{arm}" not in result:
+        WINDOW.need(STEP_SECS["fmt"], f"rustfmt on arm {arm}")
+        code, out = cargo(["cargo", "fmt", "--all", "--check"], reset_prep(task, arm, info), prep_log)
+        result[f"fmt_{arm}"] = code
+        result[f"fmt_{arm}_files"] = sorted(files_flagged_by_fmt(out, tree)) if code else []
+        save()
+    new_failures = sorted(set(result[f"suite_{arm}"]["failed"]) - set(result.get("suite_A", {}).get("failed", [])))
+    if new_failures and f"suite_{arm}_rerun" not in result:
+        # A test arm A passes may only be flaky under full-suite load.
+        WINDOW.need(STEP_SECS["withheld"], f"an isolated rerun of arm {arm}'s new failures")
+        code, _ = cargo(["./scripts/test-engine.sh", "--", "--", "--exact", *new_failures], reset_prep(task, arm, info), prep_log)
+        result[f"suite_{arm}_rerun"] = {"tests": new_failures, "exit": code}
+        save()
+    log(f"{task['id']}: arm {arm} clippy={result[f'clippy_{arm}']} suite={result[f'suite_{arm}']} "
+        f"tsc={len(result[f'tsc_{arm}'])} new errors fmt={result[f'fmt_{arm}']}")
+
+    broken, flagged = [], {}
+    if result[f"clippy_{arm}"] != 0:
+        broken.append(f"clippy_{arm}")
+        flagged.update(dict.fromkeys(result[f"clippy_{arm}_files"], "clippy"))
+    if result[f"fmt_{arm}"] != 0:
+        broken.append(f"fmt_{arm}")
+        flagged.update(dict.fromkeys(result[f"fmt_{arm}_files"], "rustfmt"))
+    if result[f"tsc_{arm}"]:
+        broken.append(f"tsc_{arm}: {result[f'tsc_{arm}']}")
+        flagged.update({e.split(": ", 1)[0]: "tsc" for e in result[f"tsc_{arm}"] if not e.startswith("..")})
+    if result.get(f"tsc_{arm}_exit"):
+        broken.append(f"tsc_{arm} exited {result[f'tsc_{arm}_exit']} without a diagnostic")
+    if new_failures and result[f"suite_{arm}_rerun"]["exit"] != 0:
+        broken.append(f"suite_{arm}: {new_failures}")
+        flagged.update(dict.fromkeys(files_read_by_tests(new_failures, reset_prep(task, arm, info)), "test reads source"))
+    if result[f"suite_{arm}"]["exit"] != 0 and not result[f"suite_{arm}"]["failed"]:
+        broken.append(f"suite_{arm} exited {result[f'suite_{arm}']['exit']} without a test summary")
+    return broken, flagged
+
+
+@contextlib.contextmanager
+def linked_node_modules(tree: Path):
+    """The main checkout's node_modules, linked into `tree` and gone again before any commit."""
     main_checkout = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=REPO).strip()).parent
-    # Older commits keep the only tsconfig in the app crate.
-    project = "." if (tree / "tsconfig.json").exists() else "crates/lucidos-app"
     link = tree / "node_modules"
     if not link.exists():
         link.symlink_to(main_checkout / "node_modules")
     try:
+        yield
+    finally:
+        if link.is_symlink():
+            link.unlink()
+
+
+def tsc_check(tree: Path, prep_log: Path) -> tuple[int, str]:
+    """Type-check `tree`. Returns the exit code and what tsc printed."""
+    # Older commits keep the only tsconfig in the app crate.
+    project = "." if (tree / "tsconfig.json").exists() else "crates/lucidos-app"
+    header = f"$ npx tsc --noEmit -p {project}"
+    with linked_node_modules(tree):
         with open(prep_log, "a") as f:
-            f.write(f"\n$ npx tsc --noEmit -p {project}\n")
+            f.write(f"\n{header}\n")
             f.flush()
             p = subprocess.Popen(["npx", "tsc", "--noEmit", "-p", project], cwd=tree, stdout=f, stderr=subprocess.STDOUT)
             budget = WINDOW.clamp(STEP_SECS["tsc"])
             try:
-                return p.wait(timeout=budget)
+                code = p.wait(timeout=budget)
             except subprocess.TimeoutExpired:
                 kill_group(p)
                 if budget < STEP_SECS["tsc"]:
                     raise WindowEnded("tsc")
-                return 124
-    finally:
-        if link.is_symlink():
-            link.unlink()
+                code = 124
+    text = prep_log.read_text()
+    return code, text[text.rfind(header):]
 
 
 # ---------------------------------------------------------------- withheld test
@@ -1191,6 +1339,60 @@ def lock_wait(path: Path) -> float:
     return round(sum(float(line.split("\t")[1]) for line in path.read_text().splitlines() if line.count("\t") >= 2), 1)
 
 
+def shares_agent_model(models: list[str]) -> bool:
+    """True when a reported model id is the agents' model, with any Vertex suffix."""
+    agent = MODEL.split("[")[0]
+    return any(m.split("[")[0].split("@")[0] == agent for m in models)
+
+
+def judge_argv() -> list[str]:
+    check_model(JUDGE_MODEL)
+    return [claude_bin(), "-p", "--model", JUDGE_MODEL, "--effort", EFFORT, "--output-format", "json",
+            "--no-session-persistence", "--setting-sources", "project", "--tools", ""]
+
+
+class JudgeCallFailed(Exception):
+    """The judge call returned an error (a quota, an outage) instead of a reply."""
+
+
+JUDGE_RETRY_SECS = 90
+
+
+def parse_judge_output(stdout: str) -> dict:
+    """The verdict JSON from the judge's reply, with the models that answered.
+
+    Raises JudgeCallFailed, JSONDecodeError or AttributeError on a reply with no
+    verdict, so the caller can retry.
+    """
+    outer = json.loads(stdout)
+    if outer.get("is_error"):
+        # An API error's text carries JSON of its own, which must never pass for a verdict.
+        raise JudgeCallFailed(outer.get("result", "")[:500])
+    models = sorted(outer.get("modelUsage", {}))
+    refused = [m for m in models if REFUSED_MODEL_RE.search(m)]
+    if refused:
+        return {"error": f"judge ran on a refused model {refused}"}
+    verdict = json.loads(re.search(r"\{.*\}", outer.get("result", ""), re.S).group(0))
+    verdict["judge_cost_usd"] = outer.get("total_cost_usd")
+    verdict["judge_models"] = models
+    return verdict
+
+
+def judge_check(args) -> None:
+    """One tiny judge call: proves Vertex serves JUDGE_MODEL with the grading environment."""
+    cwd = DATA_ROOT / "judge-cwd"
+    cwd.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run(judge_argv(), cwd=cwd, env=model_env(), input='Reply with exactly {"ok": true}',
+                       text=True, capture_output=True, timeout=600)
+    try:
+        verdict = parse_judge_output(p.stdout)
+    except (JudgeCallFailed, json.JSONDecodeError, AttributeError):
+        sys.exit(f"judge-check failed (exit {p.returncode}): {p.stdout[-500:]}{p.stderr[-500:]}")
+    print(json.dumps(verdict))
+    if "error" in verdict or shares_agent_model(verdict["judge_models"]):
+        sys.exit("judge-check: the judge ran on a refused model or the agents' model")
+
+
 def judge(template: str, fields: dict, out_path: Path) -> dict:
     prompt = (HERE / template).read_text()
     for k, v in fields.items():
@@ -1206,8 +1408,7 @@ def judge(template: str, fields: dict, out_path: Path) -> dict:
     out_path.with_suffix(".prompt.md").write_text(prompt)
     cwd = DATA_ROOT / "judge-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
-    argv = [claude_bin(), "-p", "--model", MODEL, "--effort", EFFORT, "--output-format", "json",
-            "--no-session-persistence", "--setting-sources", "project", "--tools", ""]
+    argv = judge_argv()
     last = ""
     for _ in range(2):
         try:
@@ -1215,19 +1416,18 @@ def judge(template: str, fields: dict, out_path: Path) -> dict:
             p = subprocess.run(argv, cwd=cwd, env=model_env(), input=prompt, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=budget)
             last = p.stdout[-500:] + p.stderr[-500:]
-            outer = json.loads(p.stdout)
-            refused = [m for m in outer.get("modelUsage", {}) if REFUSED_MODEL_RE.search(m)]
-            if refused:
-                return {"error": f"judge ran on a refused model {refused}"}
-            text = outer.get("result", "")
-            verdict = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
-            verdict["judge_cost_usd"] = outer.get("total_cost_usd")
+            verdict = parse_judge_output(p.stdout)
+            if "error" in verdict:
+                return verdict
             write_json(out_path, verdict)
             return verdict
         except subprocess.TimeoutExpired as e:
             if budget < 1200:
                 raise WindowEnded("a judge call") from e
             last = f"{e}: {last}"
+        except JudgeCallFailed as e:
+            last = str(e)
+            time.sleep(WINDOW.clamp(JUDGE_RETRY_SECS))
         except (json.JSONDecodeError, AttributeError) as e:
             last = f"{e}: {last}"
     write_json(out_path, {"error": last})
@@ -1331,13 +1531,15 @@ def collect(root: Path) -> list[dict]:
             "out_tok": mt.get("output_tokens"),
             "tot_tok": sum(mt.get(k) or 0 for k in ("input_tokens", "cache_creation_tokens", "cache_read_tokens", "output_tokens")),
             "cost": mt.get("cost_usd"), "turns": mt.get("turns"),
+            "agent_models": mt.get("models") or [],
+            "judge_models": sorted({m for k in ("judge_fix", "judge_cite") for m in g[k].get("judge_models", [])}),
             "argv": json.dumps(m.get("argv")), "env_keys": json.dumps(m.get("env_keys")),
         })
     return rows
 
 
-def permutation_p(rows: list[dict], key, arms=("A", "C")) -> float | None:
-    """Exact p-value for |mean(C) - mean(A)|, shuffling arm labels within each task."""
+def permutation_p(rows: list[dict], key, arms: tuple[str, str]) -> float | None:
+    """Exact p-value for the gap between the two arms' means, shuffling arm labels within each task."""
     by_task: dict[str, list[tuple[str, float]]] = {}
     for r in rows:
         v = key(r)
@@ -1365,6 +1567,39 @@ def permutation_p(rows: list[dict], key, arms=("A", "C")) -> float | None:
         total += 1
         hits += diff(combo) >= observed - 1e-12
     return hits / total if total else None
+
+
+# The small check's pass rule (docs/plans/2026-11-22-comment-strip-small-check.md),
+# fixed before any session ran. Arm B fails on either drop.
+PASS_DROP_MAX = 3
+JUDGE_DROP_MAX = 1.0
+PASS_RULE_RUNS = 8
+
+
+def pass_rule(rows: list[dict], base: str = "A", arm: str = "B") -> str:
+    def side(name):
+        rs = [r for r in rows if r["arm"] == name]
+        return sum(r["pass"] for r in rs), len(rs), mean([r["score"] for r in rs])
+
+    base_pass, base_n, base_mean = side(base)
+    arm_pass, arm_n, arm_mean = side(arm)
+    reasons = [f"arm {name} has {n} of {PASS_RULE_RUNS} graded runs"
+               for name, n in ((base, base_n), (arm, arm_n)) if n != PASS_RULE_RUNS]
+    tasks = {name: Counter(r["task"] for r in rows if r["arm"] == name) for name in (base, arm)}
+    reasons += [f"arm {name} ran {t} {k} times" for name in (base, arm) for t, k in sorted(tasks[name].items()) if k > 1]
+    if tasks[base].keys() != tasks[arm].keys():
+        reasons.append(f"arms {base} and {arm} cover different tasks")
+    reasons += [f"arm {name} has {k} runs without a judge score" for name in (base, arm)
+                if (k := sum(r["score"] is None for r in rows if r["arm"] == name))]
+    if base_pass - arm_pass >= PASS_DROP_MAX:
+        reasons.append(f"withheld passes {base_pass - arm_pass} below arm {base}")
+    if base_mean is None or arm_mean is None:
+        reasons.append("a judge mean is missing")
+    elif base_mean - arm_mean >= JUDGE_DROP_MAX:
+        reasons.append(f"judge mean {base_mean - arm_mean:.2f} below arm {base}")
+    head = (f"Pass rule: arm {base} {base_pass}/{base_n} passes, judge mean {fmt(base_mean, 2)}; "
+            f"arm {arm} {arm_pass}/{arm_n}, judge mean {fmt(arm_mean, 2)}.")
+    return f"{head} Verdict: arm {arm} {'FAILS (' + '; '.join(reasons) + ')' if reasons else 'PASSES'}."
 
 
 def report(args) -> None:
@@ -1395,10 +1630,12 @@ def report(args) -> None:
             rs = [r for r in rows if r["task"] == task and r["arm"] == arm]
             if rs:
                 lines.append(f"| {task} | {arm} | {sum(r['pass'] for r in rs)}/{len(rs)} | {[r['score'] for r in rs]} | {[r['src_lines'] for r in rs]} |")
-    lines += ["", "Exact permutation test, arm labels shuffled within each task (two-sided):", ""]
-    for label, key in (("judge score", lambda r: r["score"]), ("withheld pass", lambda r: 1.0 if r["pass"] else 0.0),
-                       ("src lines", lambda r: r["src_lines"]), ("output tokens", lambda r: r["out_tok"])):
-        lines.append(f"- {label}: p = {fmt(permutation_p(rows, key), 3)}")
+    arms = tuple(sorted({r["arm"] for r in rows}))
+    if len(arms) == 2:
+        lines += ["", f"Exact permutation test, {arms[0]} against {arms[1]}, arm labels shuffled within each task (two-sided):", ""]
+        for label, key in (("judge score", lambda r: r["score"]), ("withheld pass", lambda r: 1.0 if r["pass"] else 0.0),
+                           ("src lines", lambda r: r["src_lines"]), ("output tokens", lambda r: r["out_tok"])):
+            lines.append(f"- {label}: p = {fmt(permutation_p(rows, key, arms), 3)}")
 
     # I4: the arms ran the same command line and environment.
     mismatches = []
@@ -1407,6 +1644,13 @@ def report(args) -> None:
         if len({r["argv"] for r in rs}) > 1 or len({r["env_keys"] for r in rs}) > 1:
             mismatches.append(task)
     lines += ["", f"Settings identical across arms: {'yes' if not mismatches else 'NO for ' + ', '.join(mismatches)}"]
+    agent_models = sorted({m for r in rows for m in r["agent_models"]})
+    judge_models = sorted({m for r in rows for m in r["judge_models"]})
+    lines += [f"Agent models: {', '.join(agent_models) or '-'}", f"Judge models: {', '.join(judge_models) or '-'}"]
+    if shares_agent_model(judge_models):
+        lines.append("WARNING: the judge shared a model with the agents")
+    if "A" in arms and "B" in arms:
+        lines += ["", pass_rule(rows)]
     text = "\n".join(lines)
     (root / "report.md").write_text(text + "\n")
     print(text)
@@ -1442,11 +1686,15 @@ def main() -> None:
     for name in ("report", "status"):
         p = sub.add_parser(name)
         p.add_argument("--runs-dir", default="runs")
+    sub.add_parser("judge-check")
     args = ap.parse_args()
     check_model(MODEL)
+    check_model(JUDGE_MODEL)
     global WINDOW
     WINDOW = Window(getattr(args, "window_mins", None))
-    {"prepare": prepare, "run": run_cmd, "grade": grade_cmd, "report": report, "status": status}[args.cmd](args)
+    commands = {"prepare": prepare, "run": run_cmd, "grade": grade_cmd, "report": report, "status": status,
+                "judge-check": judge_check}
+    commands[args.cmd](args)
 
 
 if __name__ == "__main__":

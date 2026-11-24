@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-/**
- * A menu opened inside a backdrop modal mounts in that modal's panel.
- *
- * A portaled menu mounted in `<body>` sits below `--z-modal`. Inside a modal it
- * opened behind the dialog, and a tap on it dismissed the modal. The Tree
- * memory confirm's model picker was the first menu inside a modal.
- */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
 

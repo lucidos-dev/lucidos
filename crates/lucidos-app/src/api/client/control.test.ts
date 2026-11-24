@@ -13,8 +13,7 @@ import {
   reloadGateway,
   openWorkspace,
   parseWorkspaceNameFromArchive,
-  getCleanupReview,
-  freezeCleanup,
+  freezeWorkspaceDeletion,
   confirmCleanup,
   listTrash,
   restoreTrash,
@@ -25,10 +24,6 @@ import {
 import { slugifyWorkspaceName } from '../../utils/slug';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 
-// The control plane lives under the reserved sigil namespace
-// `/~/api/v1/control/*` (ADR 0014 §2) — an absolute path that can never collide
-// with a workspace slug. These pin that the client targets the sigil path so a
-// rename of the namespace can't silently break the picker.
 
 const originalFetch = globalThis.fetch;
 
@@ -49,22 +44,28 @@ function headersOf(mock: ReturnType<typeof vi.fn>, call = 0): Record<string, str
 }
 
 describe('control client', () => {
-  it('reads cleanup and Trash projections without masking errors', async () => {
+  it('reads Trash without masking errors', async () => {
     const mock = withFetch(() => Promise.resolve(new Response('{"error":"peer inventory unavailable"}', { status: 503 })));
-    await expect(getCleanupReview()).rejects.toThrow('peer inventory unavailable');
     await expect(listTrash()).rejects.toThrow('peer inventory unavailable');
     expect(mock.mock.calls.map((call) => call[0])).toEqual([
-      '/~/api/v1/control/cleanup', '/~/api/v1/control/trash',
+      '/~/api/v1/control/trash',
     ]);
   });
 
-  it('freezes exact fingerprints and confirms the server phrase with the device identity', async () => {
+  it('freezes exact workspace IDs and confirms the server phrase with the device identity', async () => {
     localStorage.setItem(DEVICE_ID_KEY, 'paired-device');
-    const batch = { id: 'batch-test', phrase: 'Delete 1 workspaces', members: [], results: [] };
+    const batch = {
+      id: 'batch-test',
+      phrase: 'Delete Sample',
+      members: [{ id: 'sample', name: 'Sample', database_backup: false }],
+    };
+    const receipt = { results: [{ id: 'sample', status: 'deleted', detail: null }] };
     const mock = withFetch(() => Promise.resolve(Response.json(batch)));
-    expect(await freezeCleanup([{ id: 'sample', fingerprint: 'observed' }])).toEqual(batch);
-    expect(await confirmCleanup(batch.id, batch.phrase)).toEqual(batch);
-    expect(JSON.parse(mock.mock.calls[0][1].body)).toEqual({ members: [{ id: 'sample', fingerprint: 'observed' }] });
+    mock.mockResolvedValueOnce(Response.json(batch)).mockResolvedValueOnce(Response.json(receipt));
+    expect(await freezeWorkspaceDeletion(['sample'])).toEqual(batch);
+    expect(await confirmCleanup(batch.id, batch.phrase)).toEqual(receipt);
+    expect(mock.mock.calls[0][0]).toBe('/~/api/v1/control/workspace-delete-batches');
+    expect(JSON.parse(mock.mock.calls[0][1].body)).toEqual({ workspaces: ['sample'] });
     expect(JSON.parse(mock.mock.calls[1][1].body)).toEqual({ confirm: batch.phrase });
     expect(mock.mock.calls[1][0]).toBe('/~/api/v1/control/cleanup/batches/batch-test/confirm');
     for (let i = 0; i < 2; i++) {
@@ -139,7 +140,6 @@ describe('control client', () => {
     const started = await restoreBackup(file, 'a-key', 'myws');
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/restore');
     expect(mock.mock.calls[0][1]?.method).toBe('POST');
-    // Multipart: the body is FormData (browser sets the boundary), not JSON.
     expect(mock.mock.calls[0][1]?.body).toBeInstanceOf(FormData);
     expect(started.id).toBe('myws');
   });
@@ -154,7 +154,6 @@ describe('control client', () => {
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/gateway/status');
     expect(status.update_available).toBe(true);
     expect(status.build_id).toBe('abc123');
-    // `packaged` drives the picker's dev-only self-reload control gating.
     expect(status.packaged).toBe(false);
   });
 
@@ -175,12 +174,6 @@ describe('control client', () => {
     expect(mock.mock.calls[0][1]?.method).toBe('POST');
   });
 
-  // Restart and Stop are the two control calls a PERSON makes about a running
-  // engine, so they are the two that must say which device made them. The
-  // gateway forwards the id to that engine right before it signals it, and it is
-  // the only thing that tells the engine apart from a crash: without it the
-  // interrupted threads settle at `failed` with "Response interrupted" and no
-  // auto-resume instead of `paused` with "Paused by restart".
   it('sends the device-id header on restart so the engine can attribute the teardown', async () => {
     localStorage.setItem(DEVICE_ID_KEY, 'device-abc');
     const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
@@ -205,9 +198,6 @@ describe('control client', () => {
     expect(headersOf(mock)['x-lucidos-device-id']).toBe('device-abc');
   });
 
-  // A browser that has never opened a workspace has no id to send. It must not
-  // mint one here (that would register a device nobody named); the restart just
-  // goes through unattributed, exactly as it did before.
   it('omits the header entirely when this browser has no device id yet', async () => {
     const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
     await restartWorkspace('dev');
@@ -228,9 +218,6 @@ describe('control client', () => {
   });
 });
 
-// These two helpers let the picker prefill a default restore name and predict a
-// slug collision before uploading. They mirror the gateway's `registry::slugify`
-// and `parse_workspace_name_from_archive` — keep them in lockstep.
 describe('restore name helpers', () => {
   it('slugifyWorkspaceName mirrors the registry slug rules', () => {
     expect(slugifyWorkspaceName('Default')).toBe('default');
@@ -250,15 +237,11 @@ describe('restore name helpers', () => {
   });
 });
 
-// Locating a workspace on another Lucidos install (ADR 0196). The load-bearing
-// case is the last one: the install this feature reaches for is the one running
-// an old gateway, so the old gateway's answer has to degrade rather than throw.
 describe('locateWorkspace', () => {
   const PEER = {
     status: 'reachable',
     install: 'Lucidos.app in /Applications',
     gateway_port: 5252,
-    scheme: 'http',
     slug: 'work',
   };
 
@@ -277,9 +260,6 @@ describe('locateWorkspace', () => {
     await expect(locateWorkspace('ghost')).resolves.toBeNull();
   });
 
-  // An unmatched `/~/…` path falls through to the picker's SPA shell, so a
-  // gateway with no such route answers 200 and HTML. Parsing it would report a
-  // syntax error over a workspace that is merely out of this gateway's view.
   it('reads an older gateway\'s picker shell as "cannot say"', async () => {
     withFetch(() =>
       Promise.resolve(
@@ -298,13 +278,7 @@ describe('locateWorkspace', () => {
   });
 });
 
-// Regression pin for the reported bug: on the iOS PWA, a pane swipe fired
-// WebKit's native back gesture and landed the user in the workspace they had
-// switched away from. The switch had PUSHED a history entry, so back had
-// somewhere to go. See `utils/documentNavigation.ts`.
 describe('workspace navigation leaves nothing on the back stack', () => {
-  // The node test env has no window.location (test-setup.ts aliases window to
-  // globalThis), so it is installed as a global, as openExternalUrl.test.ts does.
   const CURRENT = 'https://gateway.example.com/dev/';
   let fakeLocation: { href: string; replace: ReturnType<typeof vi.fn> };
 

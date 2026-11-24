@@ -40,9 +40,6 @@ export interface ThemeFamilyGroup {
   themes: Theme[];
 }
 
-/** Splits themes into one section per family, in family order, keeping each
- *  theme's listed order. Every other theme, with no family or one this bundle
- *  does not know, comes last as "Other", so no theme drops out of the picker. */
 export function groupThemesByFamily(themes: Theme[]): ThemeFamilyGroup[] {
   const groups: ThemeFamilyGroup[] = THEME_FAMILIES.map(family => ({
     name: FAMILY_NAMES[family],
@@ -53,8 +50,6 @@ export function groupThemesByFamily(themes: Theme[]): ThemeFamilyGroup[] {
   return groups.filter(group => group.themes.length > 0);
 }
 
-/** The font the theme would paint if the user followed it, as the two custom
- *  properties the card's name reads. */
 function themeFontStyle(theme: Theme): Record<string, string> {
   const known = theme.resolved.workspace_fonts;
   const font = resolveFontKey(FOLLOW_THEME, theme.resolved.fonts, known);
@@ -64,18 +59,12 @@ function themeFontStyle(theme: Theme): Record<string, string> {
   };
 }
 
-/** The narrowest a card may get before the strip drops a column. */
 const THEME_CARD_MIN_REM = 9;
 
-/** A phone card previews a portrait phone screen, so it is narrower than a
- *  desktop card. */
 const PEEK_CARD_REM = 7;
 
-/** On a phone, the centred card's widest share of the strip. Even a narrow
- *  strip then leaves its neighbours room to peek in at both sides. */
 const PEEK_CARD_MAX_SHARE = 0.62;
 
-/** Marks a phone's strip, the skeleton's included. */
 const PEEK_CLASS = 'theme-carousel-peek';
 
 function peekCardWidth(el: HTMLElement): number {
@@ -85,17 +74,10 @@ function peekCardWidth(el: HTMLElement): number {
 
 interface StripGeometry {
   columns: number;
-  /** How far one page moves the strip, its gap included. */
   page: number;
-  /** How far left of a page's start the strip stops, so a phone's card sits
-   *  centred. The browser clamps the first and last stop to the strip's ends,
-   *  so the end cards sit at the edges and leave no side empty. */
   offset: number;
 }
 
-/** The strip's layout from its own box. A PEEK_CLASS strip (a phone) centres
- *  one card with its neighbours peeking in. Any other fits as many whole
- *  columns as it can, and a page is all of them. */
 function stripGeometry(el: HTMLElement): StripGeometry {
   const style = getComputedStyle(el);
   const gap = parseFloat(style.columnGap) || 0;
@@ -111,8 +93,6 @@ function stripGeometry(el: HTMLElement): StripGeometry {
   return { columns, page, offset: 0 };
 }
 
-/** Sizes the columns to the strip: whole columns filling it exactly, or on a
- *  phone a card narrow enough for its neighbours to peek in. */
 function fitColumns(el: HTMLElement): void {
   if (el.classList.contains(PEEK_CLASS)) {
     el.style.setProperty('--theme-card-width', `${peekCardWidth(el)}px`);
@@ -123,13 +103,10 @@ function fitColumns(el: HTMLElement): void {
 
 interface FamilyPlacement {
   group: ThemeFamilyGroup;
-  /** First grid column, 1-based. */
   column: number;
   span: number;
 }
 
-/** Lays families side by side, each starting on a fresh column and filling
- *  `rows` rows, so a page boundary always falls between whole cards. */
 function placeFamilies(groups: ThemeFamilyGroup[], rows: number): FamilyPlacement[] {
   let column = 1;
   return groups.map(group => {
@@ -140,20 +117,6 @@ function placeFamilies(groups: ThemeFamilyGroup[], rows: number): FamilyPlacemen
   });
 }
 
-/**
- * Every theme as a radio card in a strip that scrolls sideways, a page of
- * whole columns at a time. A chevron floats over each side and pages it, and
- * the cards fade out at a side with more past it. The strip is two cards
- * tall, or one when every card shown fits in a single row. On a phone it is
- * one row that centres a card at a time, with its neighbours peeking in. Above it, filter chips pick All or one family. All
- * names each family above its first card.
- *
- * A pick paints at once and the strip stays, so themes can be compared.
- * Each card previews itself: it sets every catalog token at its default, then
- * the theme's own resolved map, as custom properties on the preview element.
- * So the preview resolves each `var()` against that theme alone and never
- * inherits the page's active theme.
- */
 export function ThemePicker() {
   useEffect(() => {
     if (themeGallery.value.status === 'not-loaded') void loadThemeGallery();
@@ -163,22 +126,16 @@ export function ThemePicker() {
   const strip = useRef<HTMLDivElement>(null);
   const phone = viewportIsMobile.value;
   const maxRows = phone ? 1 : 2;
-  // How many whole columns the strip fits, 0 until it is measured.
   const [columns, setColumns] = useState(0);
-  // The family chip picked, or null for All.
   const [filter, setFilter] = useState<string | null>(null);
   const groups = gallery.status === 'loaded' ? groupThemesByFamily(gallery.data.themes) : [];
-  // A family a reload dropped falls back to All rather than an empty strip.
   const picked = groups.some(group => group.name === filter) ? filter : null;
   const shown = picked === null ? groups : groups.filter(group => group.name === picked);
   const cardCount = shown.reduce((count, group) => count + group.themes.length, 0);
   const rows = cardCount <= columns ? 1 : maxRows;
-  // All names each family above its first card, on a row of its own.
   const labelRows = picked === null ? 1 : 0;
   const families = placeFamilies(shown, rows);
   const [ends, setEnds] = useState<StripEnds>({ atStart: true, atEnd: true });
-  // Runs on every scroll, so it keeps the old state when neither end moved:
-  // a fresh object would re-render every card each frame.
   const measure = () => {
     if (!strip.current) return;
     const next = stripEnds(strip.current);
@@ -194,9 +151,6 @@ export function ThemePicker() {
     fit();
     measure();
   }, [loaded, phone]);
-  // Opens on the page holding the active theme, once the gallery and the
-  // preference naming the active theme are both in. Earlier would open on the
-  // default, and a later pick must not move the strip under the reader.
   const ready = loaded && preferences.value.status === 'loaded';
   useLayoutEffect(() => {
     if (!ready) return;
@@ -208,8 +162,6 @@ export function ThemePicker() {
     scroller.scrollLeft = Math.max(0, Math.floor(column / columns) * page - offset);
     measure();
   }, [ready]);
-  // A wider or narrower column changes how many cards fit, and moves the ends
-  // without a scroll event.
   useEffect(() => {
     const scroller = strip.current;
     if (!scroller || typeof ResizeObserver === 'undefined') return;
@@ -223,11 +175,6 @@ export function ThemePicker() {
   const scrollTo = (left: number) => {
     strip.current?.scrollTo({ left: Math.max(0, left), behavior: isReducedMotion() ? 'auto' : 'smooth' });
   };
-  // Moves one page on, so every stop shows whole pages. Whole columns round
-  // toward the direction of travel: after a clamp at an end or a swipe the
-  // strip rests between stops, and rounding to the nearest would skip cards.
-  // A phone steps on from the card nearest the centre instead: at an end that
-  // is the second card, so a press centres the third.
   const pageBy = (direction: 1 | -1) => {
     const scroller = strip.current;
     if (!scroller) return;
@@ -236,11 +183,7 @@ export function ThemePicker() {
     const from = offset !== 0 ? Math.round(at) : direction > 0 ? Math.floor(at + 0.01) : Math.ceil(at - 0.01);
     scrollTo((from + direction) * page - offset);
   };
-  // A new filter or row count lays the cards out anew, so the ends move with
-  // no scroll.
   useLayoutEffect(measure, [picked, rows]);
-  // A chip re-lays the strip out, so it plays the move from the layout it
-  // showed before the pick. The ends are read again once it settles.
   const beforePick = useRef<StripSnapshot | null>(null);
   const cancelMove = useRef<(() => void) | null>(null);
   useLayoutEffect(() => {
@@ -253,8 +196,6 @@ export function ThemePicker() {
     const scroller = strip.current;
     if (!scroller) return setFilter(name);
     if (name !== picked) {
-      // Taken mid-move too, so a second pick carries on from what shows. The
-      // old move then goes before anything measures the new layout.
       beforePick.current = snapshotStrip(scroller);
       cancelMove.current?.();
       cancelMove.current = null;
@@ -268,10 +209,7 @@ export function ThemePicker() {
   const stripClass = phone ? `theme-carousel ${PEEK_CLASS}` : 'theme-carousel';
   const active = currentThemeId();
   const themes = gallery.status === 'loaded' ? gallery.data.themes : null;
-  // A preference naming a theme that is gone paints the default
-  // (refreshActiveTheme), so the picker checks the default too.
   const painted = themes?.find(theme => theme.id === active) ?? themes?.find(theme => theme.id === DEFAULT_THEME_ID);
-  // The loaded frame's rows: a chip line, the names row, then the cards.
   const skeletonFrame = () => (
     <div class="theme-carousel-frame">
       <div class="pill-bar" aria-hidden="true">
@@ -292,8 +230,6 @@ export function ThemePicker() {
   return (
     <LoadingFade showSkeleton={showSkeleton} skeleton={skeletonFrame()}>
       {gallery.status !== 'loaded' && (
-        // Holds the picker's box before the skeleton is due, so the rows below
-        // it do not jump when the skeleton or the cards arrive.
         <div class="theme-carousel-reserve" aria-hidden="true">{skeletonFrame()}</div>
       )}
       {gallery.status === 'loaded' && (
@@ -338,8 +274,6 @@ export function ThemePicker() {
                   )}
                   {group.themes.map((theme, i) => {
                     const selected = theme.id === painted?.id;
-                    // The active theme needs no pick, unless it lacks this mode:
-                    // then pickTheme offers the mode switch.
                     const settled = selected && theme.modes.includes(mode);
                     return (
                       <ThemeCard
@@ -367,7 +301,6 @@ export function ThemePicker() {
   );
 }
 
-/** One theme's radio in the carousel, at its grid cell. */
 function ThemeCard({ theme, defaults, mode, selected = false, column, row, onClick }: {
   theme?: Theme;
   defaults?: ThemeModeMaps;
@@ -381,9 +314,7 @@ function ThemeCard({ theme, defaults, mode, selected = false, column, row, onCli
   useEffect(() => {
     for (const font of theme?.resolved.workspace_fonts ?? []) registerWorkspaceFont(font, dataMountUrl);
   }, [theme]);
-  // A single-mode theme previews the mode it has, so Paper never shows as navy.
   const previewMode = theme?.modes.length === 1 ? theme.modes[0] : mode;
-  // The gallery sanitised these maps when it loaded (store/actions/themes.ts).
   const tokens = theme ? theme.resolved[previewMode] : {};
   const style = defaults ? { ...defaults[previewMode], ...tokens } : undefined;
   const label = theme ? modesLabel(theme) : null;
@@ -401,7 +332,6 @@ function ThemeCard({ theme, defaults, mode, selected = false, column, row, onCli
       disabled={sk}
       onClick={onClick}
     >
-      {/* The preview's height in themes.css: portrait on a phone. */}
       <SkBlock w="100%" h={viewportIsMobile.value ? '11rem' : '5rem'} round>
         <div class="theme-preview" style={style} aria-hidden="true">
           <div class="theme-preview-header">

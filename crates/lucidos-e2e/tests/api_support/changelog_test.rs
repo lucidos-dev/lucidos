@@ -38,10 +38,11 @@ async fn changelog_returns_every_release_newest_first() {
         .iter()
         .filter_map(|r| r["version"].as_str())
         .collect();
+    let release = include_str!("../../../../RELEASE").trim_ascii_end();
     assert!(
-        versions.contains(&lucidos_engine::LUCIDOS_RELEASE),
+        versions.contains(&release),
         "the release this engine reports running ({}) should have notes; got {versions:?}",
-        lucidos_engine::LUCIDOS_RELEASE
+        release
     );
 
     for release in releases {

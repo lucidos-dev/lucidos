@@ -2,8 +2,6 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { activeInlineForm, panelOverlay } from '../store';
 import type { PluginInstallRequest } from '../types';
 
-// Spy on the nav-stack writes: a confirmed install mutates the panel in place,
-// so it must REPLACE the entry it already owns, never push a second one.
 const pushNavState = vi.fn();
 const replaceNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState, replaceNavState }));
@@ -11,14 +9,9 @@ vi.mock('./navigation', () => ({ pushNavState, replaceNavState }));
 const revealContentPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane }));
 
-// The setup thread and the receipt live in DIFFERENT panes, so both are
-// expected to happen; this spy is what proves the receipt did not cost us the
-// jump into setup.
 const focusSpawnedThread = vi.fn();
 vi.mock('./threads', () => ({ focusSpawnedThread }));
 
-// Arrow wrappers because `vi.mock` is hoisted above the `const`s; the rest of
-// the barrel stays real.
 const confirmPluginInstall = vi.fn();
 const cancelPluginInstall = vi.fn();
 const stagePluginInstall = vi.fn();
@@ -60,8 +53,6 @@ const request: PluginInstallRequest = {
 
 const engineResult = {
   summary: 'Installed Habit Tracker',
-  // Deliberately NOT `request.files`: the receipt must show what the engine
-  // actually wrote, which can differ from what the staged install would write.
   installed_files: ['apps/habit-tracker/manifest.json'],
 };
 
@@ -171,13 +162,6 @@ describe('confirmPluginInstallAction', () => {
 
     await confirmPluginInstallAction(form);
 
-    // The focus reveals the THREAD pane and the receipt sits in the CONTENT
-    // pane, so they do not compete: both must land.
-    //
-    // `focusSpawnedThread`, never a plain `focusThread`. The setup thread's
-    // row reaches this client over SSE, which can land after this response.
-    // ThreadView unfocuses a thread it cannot find in the map, which is what
-    // dropped the user on the compose view after an update.
     expect(focusSpawnedThread).toHaveBeenCalledWith('t-9');
     const receipt = activeInlineForm.value;
     expect(receipt?.type).toBe('plugin-install');
@@ -189,19 +173,14 @@ describe('confirmPluginInstallAction', () => {
   it('reports a failed jump to the setup thread as a navigation failure, not an install failure', async () => {
     const form = openPending();
     confirmPluginInstall.mockResolvedValue({ ...engineResult, setup_thread_id: 't-9' });
-    // The focus call loads events and scrolls; `focusThreadOrBootstrap` in
-    // threads.ts documents that it can throw. The click handler awaiting this
-    // action does not catch, so an escaping rejection would be silent.
     focusSpawnedThread.mockImplementation(() => { throw new Error('boom'); });
 
     await expect(confirmPluginInstallAction(form)).resolves.toBeUndefined();
 
-    // The plugin IS installed, so the message must not read as a failed install.
     expect(showToast).toHaveBeenCalledWith(
       expect.stringContaining("Installed Habit Tracker v0.3.0, but couldn't open its setup thread"),
       'error',
     );
-    // …and the receipt stands, because the install genuinely succeeded.
     const receipt = activeInlineForm.value;
     expect(receipt?.type).toBe('plugin-install');
     if (receipt?.type !== 'plugin-install') return;

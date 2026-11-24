@@ -6,15 +6,23 @@
 //! process of another local user can bind the freed port. The gateway's next
 //! request would hand it the local token, a device cookie and the body.
 //!
-//! # Two layers, and no secret
+//! # Three layers
 //!
-//! Every socket lives in `~/.lucidos/run`, which [`bind`] keeps 0700, so
+//! Every socket lives in the run directory ([`run_dir`]), which [`bind`] keeps 0700, so
 //! another user cannot create one there. [`connect`] then asks the kernel for
 //! the peer's uid, and hands back a stream only when it is this user's.
 //! Nothing is written before that.
 //!
-//! No key is involved, so nothing is handed out or pinned. An engine the
-//! gateway did not start binds the same path from its workspace alone.
+//! A uid does not tell the gateway from an agent's subprocess, which runs as
+//! the same user. So every request also carries the socket credential, read
+//! from beside the sockets ([`credential_for`]), in [`CREDENTIAL_HEADER`]. An
+//! agent's sandbox denies the private subtree, so it cannot read it (ADR 0645).
+//! The engine refuses a request without it before routing it.
+//!
+//! Whichever side needs the credential first mints it. So an engine the
+//! gateway did not start still binds and checks from its workspace alone. An
+//! engine from an older release ignores the header, so a gateway re-adopting
+//! one after a switch still reaches it.
 //!
 //! # A socket another program binds
 //!
@@ -34,21 +42,35 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 
-/// The directory under `~/.lucidos` that holds every engine socket, and the
-/// directories [`owner_only_subdir`] hands out.
-const RUN_DIR: &str = "run";
+/// The directory under the private subtree that holds every engine socket,
+/// and the directories [`owner_only_subdir`] hands out.
+const RUN_DIR: &str = lucidos_home::private::RUN_DIR;
+
+/// How long the gateway waits for an engine to take a forwarded OAuth callback.
+/// The engine answers the browser's request within this, so its own wait for the
+/// flow's outcome is shorter: `lucidos-engine` derives it from this value.
+pub const OAUTH_CALLBACK_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The header every request on an engine socket carries the credential in.
+pub const CREDENTIAL_HEADER: &str = "x-lucidos-engine-socket-token";
+
+/// The socket credential's file, in the directory of the sockets it guards.
+/// Its name is no hex digest, so it never collides with a socket.
+const CREDENTIAL_FILE: &str = "socket-token";
 
 /// Hex digits of the workspace digest that name a socket. 64 bits puts a
 /// collision out of reach for one user's workspaces, and keeps the path short.
 const NAME_HEX_DIGITS: usize = 16;
 
-/// `~/.lucidos/run`. An error only when `HOME` is unset.
+/// The run directory, a private entry: `~/.lucidos/private/run`, or
+/// `~/.lucidos/run` in a home an older release used. An error only when
+/// `HOME` is unset.
 pub fn run_dir() -> io::Result<PathBuf> {
     lucidos_local_token::path_for(RUN_DIR)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
 }
 
-/// The engine socket for `workspace`: `~/.lucidos/run/<digest>`.
+/// The engine socket for `workspace`: `<run directory>/<digest>`.
 ///
 /// A pure function of `HOME` and the canonical workspace path. An engine and
 /// the gateway therefore agree on it unprompted, which is what lets the
@@ -65,7 +87,7 @@ fn path_in(run_dir: &Path, workspace: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// An owner-only directory in `~/.lucidos/run`, for a socket that another
+/// An owner-only directory in the run directory, for a socket that another
 /// program binds, as Postgres binds `.s.PGSQL.<port>`.
 ///
 /// Named `<prefix>-<digest of key>`, so it is a pure function of `HOME` and
@@ -76,8 +98,8 @@ fn path_in(run_dir: &Path, workspace: &Path) -> io::Result<PathBuf> {
 /// `socket_name` is the file the other program will bind inside. The whole
 /// path is checked against the kernel limit here, so the refusal names it.
 pub fn owner_only_subdir(prefix: &str, key: &Path, socket_name: &str) -> io::Result<PathBuf> {
-    lucidos_home::ensure()?;
-    owner_only_subdir_in(&run_dir()?, prefix, key, socket_name)
+    let run_dir = lucidos_home::ensure_private_entry(RUN_DIR)?;
+    owner_only_subdir_in(&run_dir, prefix, key, socket_name)
 }
 
 /// [`owner_only_subdir`] under an explicit run directory.
@@ -211,6 +233,38 @@ fn require_owner_only_dir_of(dir: &Path, owner: libc::uid_t) -> io::Result<()> {
     Ok(())
 }
 
+/// The credential guarding the engine socket at `socket`, minted on first use.
+///
+/// Read on every call, never cached, so a gateway and an engine always agree
+/// on it. An unreadable file is an error, never a reason to mint over it.
+pub fn credential_for(socket: &Path) -> io::Result<String> {
+    let dir = socket.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("engine socket {} has no directory", socket.display()),
+        )
+    })?;
+    let file = dir.join(CREDENTIAL_FILE);
+    match std::fs::read_to_string(&file) {
+        Ok(raw) if !raw.trim().is_empty() => return Ok(raw.trim().to_string()),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("engine socket credential {}: {e}", file.display()),
+            ))
+        }
+    }
+    ensure_owner_only_dir(dir)?;
+    lucidos_local_token::ensure_at(&file)
+}
+
+/// Whether a request's [`CREDENTIAL_HEADER`] value matches `credential`.
+pub fn presents_credential(header: Option<&str>, credential: &str) -> bool {
+    header.is_some_and(|value| lucidos_local_token::ct_eq(value, credential))
+}
+
 /// Connect to the engine socket at `path`, and prove the listener is ours.
 ///
 /// The only way to an [`OwnedEngineStream`]. The peer check runs before the
@@ -237,7 +291,11 @@ async fn connect_expecting(
             own_uid: expected,
         });
     }
-    Ok(OwnedEngineStream(stream))
+    let credential = credential_for(path).map_err(|source| ConnectError::NoCredential {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(OwnedEngineStream { stream, credential })
 }
 
 /// Whether an accepted connection comes from this user.
@@ -265,6 +323,9 @@ pub enum ConnectError {
         peer_uid: Option<libc::uid_t>,
         own_uid: libc::uid_t,
     },
+    /// The listener is ours, and the socket credential could not be read or
+    /// minted, so no request could carry it.
+    NoCredential { path: PathBuf, source: io::Error },
 }
 
 impl fmt::Display for ConnectError {
@@ -292,6 +353,11 @@ impl fmt::Display for ConnectError {
                 "engine socket {} has a peer the kernel would not name, so nothing was sent",
                 path.display()
             ),
+            ConnectError::NoCredential { path, source } => write!(
+                f,
+                "engine socket {} has no usable credential, so nothing was sent: {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -299,17 +365,29 @@ impl fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ConnectError::Unreachable { source, .. } => Some(source),
+            ConnectError::Unreachable { source, .. }
+            | ConnectError::NoCredential { source, .. } => Some(source),
             ConnectError::NotOwner { .. } => None,
         }
     }
 }
 
-/// A connection to an engine socket whose peer is this user.
+/// A connection to an engine socket whose peer is this user, with the
+/// credential its requests must carry.
 ///
 /// [`connect`] is its only constructor, so holding one is the proof.
 #[derive(Debug)]
-pub struct OwnedEngineStream(UnixStream);
+pub struct OwnedEngineStream {
+    stream: UnixStream,
+    credential: String,
+}
+
+impl OwnedEngineStream {
+    /// The value every request on this stream sends in [`CREDENTIAL_HEADER`].
+    pub fn credential(&self) -> &str {
+        &self.credential
+    }
+}
 
 impl AsyncRead for OwnedEngineStream {
     fn poll_read(
@@ -317,7 +395,7 @@ impl AsyncRead for OwnedEngineStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 
@@ -327,15 +405,15 @@ impl AsyncWrite for OwnedEngineStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -343,11 +421,11 @@ impl AsyncWrite for OwnedEngineStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.0.is_write_vectored()
+        self.stream.is_write_vectored()
     }
 }
 
@@ -362,12 +440,12 @@ pub mod test_support {
         super::own_uid()
     }
 
-    /// [`super::path_for`] under `run_dir` rather than `~/.lucidos/run`.
+    /// [`super::path_for`] under `run_dir` rather than the real run directory.
     pub fn path_in(run_dir: &Path, workspace: &Path) -> std::io::Result<std::path::PathBuf> {
         super::path_in(run_dir, workspace)
     }
 
-    /// [`super::owner_only_subdir`] under `run_dir` rather than `~/.lucidos/run`.
+    /// [`super::owner_only_subdir`] under `run_dir` rather than the real run directory.
     pub fn owner_only_subdir_in(
         run_dir: &Path,
         prefix: &str,
@@ -692,5 +770,52 @@ mod tests {
             connect(&missing).await,
             Err(ConnectError::Unreachable { .. })
         ));
+    }
+
+    // ── The socket credential ──────────────────────────────────────────────
+
+    /// The engine reads it at accept and the gateway at connect. Whichever
+    /// comes first mints it, and the other reads the same value.
+    #[tokio::test]
+    async fn both_sides_hold_one_credential_minted_once() {
+        let root = scratch();
+        let path = root.path().join("run").join("sock");
+        let listener = bind(&path).expect("bind");
+        let engine_side = credential_for(&path).expect("mint");
+        let _accepted = tokio::spawn(async move { listener.accept().await });
+        let stream = connect(&path).await.expect("connect");
+        assert_eq!(stream.credential(), engine_side);
+        assert_eq!(engine_side.len(), lucidos_local_token::TOKEN_BYTES * 2);
+        let file = root.path().join("run").join(CREDENTIAL_FILE);
+        let mode = std::fs::metadata(&file).expect("credential file").mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// An unreadable credential is not a missing one. Minting over it would
+    /// lock out every engine still checking the old value.
+    #[test]
+    fn an_unreadable_credential_is_an_error_and_is_kept() {
+        let root = scratch();
+        let path = root.path().join("run").join("sock");
+        let first = credential_for(&path).expect("mint");
+        let file = root.path().join("run").join(CREDENTIAL_FILE);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let outcome = credential_for(&path);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        // Root reads a mode 000 file anyway, so only a refusal is checked.
+        if let Err(e) = outcome {
+            assert!(e.to_string().contains(CREDENTIAL_FILE), "{e}");
+        }
+        assert_eq!(credential_for(&path).expect("read"), first);
+    }
+
+    #[test]
+    fn only_the_exact_credential_is_presented() {
+        let credential = "a".repeat(64);
+        assert!(presents_credential(Some(&credential), &credential));
+        assert!(!presents_credential(None, &credential));
+        assert!(!presents_credential(Some(""), &credential));
+        assert!(!presents_credential(Some(&"b".repeat(64)), &credential));
+        assert!(!presents_credential(Some(&credential[..63]), &credential));
     }
 }

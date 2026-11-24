@@ -50,7 +50,6 @@
 //! expected wake: ADR 0603. Why a parked wait learns its cap: ADR 0606.
 
 use std::collections::HashMap;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -62,7 +61,7 @@ use super::wait_durations::{HourWindow, LearnedCap, WaitDurations};
 use super::LiveWait;
 use crate::engine::cache_ttl::{CacheLifetime, CacheTtl, WriteSplit};
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::successor::{
+use crate::engine::session_capture_sql::{
     last_cache_refresh_started_sql, last_real_request_started_sql, last_turn_started_sql,
 };
 use crate::engine::thread_events::{
@@ -102,82 +101,11 @@ pub(crate) const KEEP_WARM_EVENT_TYPES: [&str; 7] = [
     "ChangeProposed",
 ];
 
-/// How a beat's request reaches the provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BeatStart {
-    /// A Claude Code session restarts first.
-    Cold,
-    /// A prefill goes straight out.
-    Direct,
-}
+pub(super) use crate::llm::cache_lifetime::BeatStart;
 
-impl CacheLifetime {
-    /// When the beat fires, in seconds since the last request started. The
-    /// tick runs every 10 s. A cold beat's request lands a median 16 s and a
-    /// p95 30 s later. So the 5-minute beat's lands by 270 s at p95, inside
-    /// the 300 s lifetime (ADR 0492). A direct beat lands in seconds, so it
-    /// fires later (ADR 0556).
-    pub(super) fn beat_window(self, start: BeatStart) -> RangeInclusive<f64> {
-        match (self, start) {
-            (Self::FiveMinutes, BeatStart::Cold) => 230.0..=260.0,
-            (Self::FiveMinutes, BeatStart::Direct) => 260.0..=280.0,
-            (Self::ThirtyMinutes, BeatStart::Cold) => 1500.0..=1560.0,
-            (Self::ThirtyMinutes, BeatStart::Direct) => 1560.0..=1620.0,
-            (Self::OneHour, BeatStart::Cold) => 3300.0..=3360.0,
-            (Self::OneHour, BeatStart::Direct) => 3500.0..=3540.0,
-            (Self::TwelveHours, BeatStart::Cold) => 42_600.0..=42_660.0,
-            (Self::TwelveHours, BeatStart::Direct) => 42_900.0..=42_960.0,
-        }
-    }
-
-    /// How many beats cost as much as one rewrite at this TTL: the write rate
-    /// over the read rate. A beat is a full-context read, and a wake after
-    /// the cache expired is a full-context write.
-    pub(super) fn rewrite_in_beats(self, cache: CacheShares) -> f64 {
-        self.write_share(cache) / cache.read
-    }
-
-    /// The seconds between two beats.
-    pub(super) fn beat_every_secs(self, start: BeatStart) -> f64 {
-        *self.beat_window(start).start()
-    }
-}
-
-/// The values of `cache_keep_alive_mode`, as the catalog lists them.
-pub const CACHE_KEEP_ALIVE_MODES: &[&str] = &[
-    CacheKeepAliveMode::On.as_str(),
-    CacheKeepAliveMode::Off.as_str(),
-];
-
-/// The `cache_keep_alive_mode` preference, parsed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheKeepAliveMode {
-    /// Beats until the ping plan ends, never past the reread cap. A parked
-    /// wait's plan ends at its learned cap, or half the reread cap.
-    On,
-    /// No beats.
-    Off,
-}
-
-impl CacheKeepAliveMode {
-    const ALL: [Self; 2] = [Self::On, Self::Off];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-
-    /// A value outside [`CACHE_KEEP_ALIVE_MODES`] reads as `off`, the catalog
-    /// default.
-    pub fn parse(value: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|mode| mode.as_str() == value)
-            .unwrap_or(Self::Off)
-    }
-}
+pub use crate::engine::thread_events::keep_alive_status::CacheKeepAliveMode;
+#[cfg(test)]
+use crate::engine::thread_events::keep_alive_status::CACHE_KEEP_ALIVE_MODES;
 
 /// The kinds a keep-warm wait watches, one bit per [`KEEP_WARM_EVENT_TYPES`]
 /// entry. Two waits on the same kinds are the same wait type.
@@ -231,7 +159,7 @@ impl ParkedCard {
 
 /// Which agent a wait belongs to. Each keeps its own wait durations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum WaitAgent {
+pub enum WaitAgent {
     ClaudeCode,
     Lucidos,
 }
@@ -1161,7 +1089,7 @@ struct MissedBeat {
 }
 
 fn log_missed_beat(thread_id: Uuid, route: &str, model: Option<&str>, read: u64, input: u64) {
-    crate::log!(
+    crate::log_legacy!(
         "[KeepAlive] Missed cache: thread={thread_id} route={route} model={} read={read} input={input}",
         model.unwrap_or("unknown")
     );
@@ -1304,10 +1232,10 @@ fn candidates_sql() -> String {
         "e.payload->'usage'->>'input_tokens'",
     );
     let beat_purpose = crate::engine::ContextPurpose::CacheKeepAlive.wire();
-    let capture_started = crate::engine::successor::CAPTURE_STARTED;
+    let capture_started = crate::engine::session_capture_sql::CAPTURE_STARTED;
     // A handed-off session is ending, so there is no cache worth keeping. The
     // `handed_off` CTE computes that set once per query.
-    let handed_off = crate::engine::successor::pending_handoff_threads_sql();
+    let handed_off = crate::engine::handoff_sql::pending_handoff_threads_sql();
     let handoff_pending = "ts.thread_id IN (SELECT thread_id FROM handed_off)";
     let in_session =
         crate::engine::session_scope::in_current_session_sql("ts.thread_id", "e.sequence");
@@ -1579,7 +1507,7 @@ async fn read_status_spent(
             read_run_spent(pool, thread_id, c, since).await?
         }
         None if c.turned_off_at.is_some() => Spent {
-            context_tokens: crate::engine::successor::thread_context(pool, thread_id)
+            context_tokens: crate::engine::handoff_state::thread_context(pool, thread_id)
                 .await?
                 .input_tokens
                 .unwrap_or(0),
@@ -1601,7 +1529,7 @@ async fn read_spent(
         .bind(CACHE_KEEP_ALIVE_REASON_KIND)
         .fetch_one(pool)
         .await?;
-    let context = crate::engine::successor::thread_context(pool, thread_id).await?;
+    let context = crate::engine::handoff_state::thread_context(pool, thread_id).await?;
     Ok(Spent {
         beats: u32::try_from(beats).unwrap_or(u32::MAX),
         cost_usd: price_calls(&calls.0),
@@ -1658,7 +1586,7 @@ async fn read_capture_spent(
         .bind(crate::engine::ContextPurpose::CacheKeepAlive.wire())
         .fetch_one(pool)
         .await?;
-    let context = crate::engine::successor::thread_context(pool, thread_id).await?;
+    let context = crate::engine::handoff_state::thread_context(pool, thread_id).await?;
     Ok(Spent {
         beats: u32::try_from(calls.0.len()).unwrap_or(u32::MAX),
         cost_usd: price_calls(&calls.0),
@@ -1694,7 +1622,7 @@ async fn sync_status(
     let spent = match read_status_spent(bus.pool(), thread_id, candidate, anchors).await {
         Ok(spent) => spent,
         Err(e) => {
-            crate::log!("[KeepAlive] Could not read the pings of thread {thread_id}: {e}");
+            crate::log_legacy!("[KeepAlive] Could not read the pings of thread {thread_id}: {e}");
             return;
         }
     };
@@ -1717,7 +1645,7 @@ async fn sync_status(
             }
             Ok(RunClose::NotARun | RunClose::WakeInFlight) => {}
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[KeepAlive] Could not read how the run of thread {thread_id} ended: {e}"
                 );
                 return;
@@ -1741,7 +1669,7 @@ async fn close_stale_statuses(bus: &EventBus, candidates: &[Uuid]) {
         {
             Ok(stale) => stale,
             Err(e) => {
-                crate::log!("[KeepAlive] Could not read the stale statuses: {e}");
+                crate::log_legacy!("[KeepAlive] Could not read the stale statuses: {e}");
                 return;
             }
         };
@@ -1751,7 +1679,7 @@ async fn close_stale_statuses(bus: &EventBus, candidates: &[Uuid]) {
             Ok(RunClose::NotARun) => None,
             Ok(RunClose::WakeInFlight) => continue,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[KeepAlive] Could not read how the run of thread {thread_id} ended: {e}"
                 );
                 continue;
@@ -1767,6 +1695,7 @@ struct RunEnd {
     /// `None` when no real request followed the run.
     at: Option<DateTime<Utc>>,
     /// Set only when that request began while the cache was still warm (I7).
+    /// Zero when the last real request alone would have kept it warm.
     saved_usd: Option<f64>,
 }
 
@@ -1774,18 +1703,20 @@ struct RunEnd {
 struct RunWake {
     started: DateTime<Utc>,
     gap_secs: Option<f64>,
+    real_gap_secs: Option<f64>,
     usage: Option<sqlx::types::Json<crate::engine::ApiUsage>>,
 }
 
 /// The run's first ping, then the first real request that began after it.
 /// Also the gap between that request and the cache's last refresh before it,
-/// and what that request read from the cache. A resume beat's turn is no real
-/// request, and a copy beat or a prefill is no turn. The refresh never counts
-/// another frame of the request's own call. `$1` is the thread, `$2` the run's
-/// start, `$3` the beat purpose and `$4` the anchor reason kind.
+/// the gap to the last real request before it, and what it read from the
+/// cache. A resume beat's turn is no real request, and a copy beat or a
+/// prefill is no turn. Neither gap counts another frame of the request's own
+/// call. `$1` is the thread, `$2` the run's start, `$3` the beat purpose and
+/// `$4` the anchor reason kind.
 fn run_end_sql() -> String {
-    use crate::engine::successor::MAIN_SESSION_CAPTURE;
-    let started = crate::engine::successor::CAPTURE_STARTED;
+    use crate::engine::session_capture_sql::MAIN_SESSION_CAPTURE;
+    let started = crate::engine::session_capture_sql::CAPTURE_STARTED;
     let call = BEAT_CALL;
     format!(
         r#"
@@ -1795,16 +1726,18 @@ WITH first_ping AS (
       WHERE e.thread_id = $1 AND e.created >= $2
         AND ((e.event_type = 'PromptInjected' AND e.payload->'origin'->'reason'->>'kind' = $4)
           OR (e.event_type = 'ContextCaptured' AND e.payload->>'purpose' = $3))),
+     real_request AS (
+     SELECT e.sequence, {started} AS started, {call} AS call_id
+       FROM events e
+      WHERE e.thread_id = $1 AND {MAIN_SESSION_CAPTURE}
+        AND NOT EXISTS (
+            SELECT 1 FROM events a
+             WHERE a.id::text = e.payload->>'request_event_id'
+               AND a.event_type = 'PromptInjected'
+               AND a.payload->'origin'->'reason'->>'kind' = $4)),
      wake AS (
      SELECT s.started, s.call_id
-       FROM (SELECT e.sequence, {started} AS started, {call} AS call_id
-               FROM events e
-              WHERE e.thread_id = $1 AND {MAIN_SESSION_CAPTURE}
-                AND NOT EXISTS (
-                    SELECT 1 FROM events a
-                     WHERE a.id::text = e.payload->>'request_event_id'
-                       AND a.event_type = 'PromptInjected'
-                       AND a.payload->'origin'->'reason'->>'kind' = $4)) s
+       FROM real_request s
       WHERE s.started > (SELECT at FROM first_ping)
       ORDER BY s.sequence LIMIT 1)
 SELECT w.started,
@@ -1815,6 +1748,9 @@ SELECT w.started,
                   WHERE e.thread_id = $1 AND e.event_type = 'ContextCaptured'
                     AND (({MAIN_SESSION_CAPTURE}) OR e.payload->>'purpose' = $3)) r
            WHERE r.started < w.started AND r.call_id <> w.call_id))::float8 AS gap_secs,
+       EXTRACT(EPOCH FROM w.started - (
+         SELECT max(r.started) FROM real_request r
+          WHERE r.started < w.started AND r.call_id <> w.call_id))::float8 AS real_gap_secs,
        (SELECT e.payload->'usage'
           FROM events e
          WHERE e.thread_id = $1 AND e.event_type = 'ContextCaptured' AND {call} = w.call_id
@@ -1827,7 +1763,8 @@ SELECT w.started,
 /// Read how a run that began at `since` ended. The saving is the reread price
 /// of the run's `context_tokens`. It is claimed only when the next real request
 /// began while the cache was warm and read from it: a request that wrote the
-/// cache afresh, after a model switch or a new session, saved nothing.
+/// cache afresh, after a model switch or a new session, saved nothing. A warm
+/// wake the cache would have met warm without any ping claims zero.
 async fn read_run_end(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -1844,6 +1781,7 @@ async fn read_run_end(
     let Some(RunWake {
         started: at,
         gap_secs,
+        real_gap_secs,
         usage,
     }) = wake
     else {
@@ -1864,9 +1802,15 @@ async fn read_run_end(
                     u64::from(usage.input_tokens),
                 )
             });
-        (warm && context_tokens > 0)
-            .then(|| reread_usd(context_tokens, write.model.as_deref()?, lifetime))
-            .flatten()
+        if !warm || context_tokens == 0 {
+            return None;
+        }
+        // A wake inside the last real request's lifetime was warm without the
+        // pings: it read a warm cache, but they saved it nothing.
+        if !real_gap_secs.is_some_and(|gap| gap > lifetime.lifetime_secs()) {
+            return Some(0.0);
+        }
+        reread_usd(context_tokens, write.model.as_deref()?, lifetime)
     });
     Ok(RunEnd {
         at: Some(at),
@@ -1983,13 +1927,14 @@ async fn emit_status(bus: &EventBus, thread_id: Uuid, status: Option<CacheKeepAl
         })
         .await
     {
-        crate::log!("[KeepAlive] Could not write the status of thread {thread_id}: {e}");
+        crate::log_legacy!("[KeepAlive] Could not write the status of thread {thread_id}: {e}");
     }
 }
 
 /// The candidates: `waiting` threads, every parent with active children, and
 /// every thread parked on the user. A session past its *context ceiling* owes
-/// a handoff, so no beat may resume it, as with a pending handoff.
+/// a handoff, so no beat may resume it, as with a pending handoff. A thread
+/// on *hold* gets no beat either: a beat is no work.
 async fn read_candidates(
     pool: &sqlx::PgPool,
     waiting: &[Uuid],
@@ -2012,6 +1957,11 @@ async fn read_candidates(
     tx.commit().await?;
     let mut kept = Vec::with_capacity(rows.len());
     for row in rows {
+        if crate::engine::thread_stop::thread_is_stopped(pool, row.thread_id).await
+            || crate::engine::thread_hold::thread_is_held(pool, row.thread_id).await
+        {
+            continue;
+        }
         if !row.is_coding_agent
             || crate::engine::context_ceiling::past_ceiling(pool, row.thread_id)
                 .await?
@@ -2026,7 +1976,7 @@ async fn read_candidates(
 /// The user's per-thread keep-alive switch, as a request names it (ADR 0554).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum KeepAliveSwitch {
+pub enum KeepAliveSwitch {
     Off,
     On,
 }
@@ -2045,7 +1995,7 @@ impl LucidosEngine {
     /// tick picks, and that no turn holds, gets its new status before this
     /// returns, so the card answers the click. The next tick reads the
     /// projected column, so pings stop or resume there.
-    pub(crate) async fn switch_cache_keep_alive(
+    pub async fn switch_cache_keep_alive(
         &self,
         thread_id: Uuid,
         switch: KeepAliveSwitch,
@@ -2072,7 +2022,9 @@ impl LucidosEngine {
             Ok(Some(picked)) => picked,
             Ok(None) => return Ok(()),
             Err(e) => {
-                crate::log!("[KeepAlive] Could not read thread {thread_id} after its switch: {e}");
+                crate::log_legacy!(
+                    "[KeepAlive] Could not read thread {thread_id} after its switch: {e}"
+                );
                 return Ok(());
             }
         };
@@ -2110,7 +2062,7 @@ impl LucidosEngine {
         let rows = match read_candidates(&self.pool, &waiting).await {
             Ok(rows) => rows,
             Err(e) => {
-                crate::log!("[KeepAlive] Could not read the waiting threads: {e}");
+                crate::log_legacy!("[KeepAlive] Could not read the waiting threads: {e}");
                 return;
             }
         };
@@ -2290,7 +2242,7 @@ impl LucidosEngine {
     /// What the keep-alive does for `thread_id`: the status the tick would
     /// record, or the reason it records none, for the cache-warm line. Only a
     /// thread that does not exist has no candidate row.
-    pub(crate) async fn warm_line_keep_alive(
+    pub async fn warm_line_keep_alive(
         &self,
         thread_id: Uuid,
     ) -> Result<CacheKeepAliveStatus, sqlx::Error> {
@@ -2316,7 +2268,7 @@ impl LucidosEngine {
             .lock()
             .await
             .get(&thread_id)
-            .is_some_and(crate::engine::agent_session::spawn_claim::holds_thread);
+            .is_some_and(crate::engine::session_claim::holds_thread);
         let turning = self.active_threads.lock().unwrap().contains_key(&thread_id);
         if held || turning {
             ThreadClaim::Busy
@@ -2351,7 +2303,10 @@ impl LucidosEngine {
         }
         let engine = Arc::clone(self);
         tokio::spawn(async move {
-            engine.re_estimate_expected_wake(thread_id).await;
+            engine
+                .agent_host()
+                .re_estimate_expected_wake(&engine, thread_id)
+                .await;
             engine.keep_alive_re_estimates.finish(thread_id, stated_at);
         });
     }
@@ -2395,15 +2350,19 @@ impl LucidosEngine {
             Ok(Some(result)) => result.event_id,
             Ok(None) => return,
             Err(e) => {
-                crate::log!("[KeepAlive] Could not write the anchor for thread {thread_id}: {e}");
+                crate::log_legacy!(
+                    "[KeepAlive] Could not write the anchor for thread {thread_id}: {e}"
+                );
                 return;
             }
         };
-        crate::log!("[KeepAlive] Resuming thread {thread_id} to keep its prompt cache warm");
+        crate::log_legacy!("[KeepAlive] Resuming thread {thread_id} to keep its prompt cache warm");
         let engine = self.clone();
         tokio::spawn(async move {
             if let Err(e) = engine
+                .agent_host()
                 .process_message_with_steps(
+                    &engine,
                     KEEP_ALIVE_PROMPT,
                     None,
                     None,
@@ -2433,7 +2392,9 @@ impl LucidosEngine {
                 )
                 .await
             {
-                crate::log!("[KeepAlive] Keep-alive turn failed for thread {thread_id}: {e}");
+                crate::log_legacy!(
+                    "[KeepAlive] Keep-alive turn failed for thread {thread_id}: {e}"
+                );
             }
         });
     }
@@ -2445,7 +2406,7 @@ impl LucidosEngine {
             .lock()
             .unwrap()
             .insert(thread_id, std::time::Instant::now());
-        crate::log!(
+        crate::log_legacy!(
             "[KeepAlive] Asking a copy of parked thread {thread_id} to keep its prompt cache warm"
         );
         let engine = self.clone();
@@ -2455,17 +2416,19 @@ impl LucidosEngine {
     /// Ask the copy, then record what it cost. The capture's `duration_ms`
     /// dates the copy's launch, which the next beat's timing reads.
     async fn ask_keep_alive_copy(&self, thread_id: Uuid, candidate: &Candidate) {
-        let copy = match self.session_copy(thread_id).await {
+        let copy = match self.agent_host().session_copy(self, thread_id).await {
             Ok(copy) => copy,
             Err(e) => {
-                crate::log!("[KeepAlive] No session copy for thread {thread_id}: {e:?}");
+                crate::log_legacy!("[KeepAlive] No session copy for thread {thread_id}: {e:?}");
                 return;
             }
         };
         // Checked at the tick too. An eviction since then would cost a full
         // rewrite for nothing.
         if !copy.shares_the_prefix() {
-            crate::log!("[KeepAlive] Thread {thread_id} lost its appended prompt; no copy beat");
+            crate::log_legacy!(
+                "[KeepAlive] Thread {thread_id} lost its appended prompt; no copy beat"
+            );
             return;
         }
         let launched = std::time::Instant::now();
@@ -2487,7 +2450,7 @@ impl LucidosEngine {
             {
                 Ok(reply) => reply,
                 Err(e) => {
-                    crate::log!("[KeepAlive] Copy beat failed for thread {thread_id}: {e}");
+                    crate::log_legacy!("[KeepAlive] Copy beat failed for thread {thread_id}: {e}");
                     return;
                 }
             };
@@ -2505,25 +2468,19 @@ impl LucidosEngine {
                 u64::from(usage.input_tokens),
             );
         }
-        let detail = crate::engine::model_call::CallDetail {
-            reasoning_effort: copy.effort().map(str::to_string),
-            duration_ms: u64::try_from(launched.elapsed().as_millis()).ok(),
-            ..Default::default()
-        };
-        crate::engine::AuxCapture::new(
+        record_copy_usage(
             &self.event_bus,
             thread_id,
-            crate::engine::ContextPurpose::CacheKeepAlive,
-        )
-        .record_usage_detailed(
             &copy.model_of(&reply),
-            KEEP_ALIVE_PROMPT.chars().count(),
-            reply.usage,
-            detail,
+            copy.effort(),
+            &reply,
+            launched.elapsed(),
         )
         .await;
         if let Err(e) = reply.answer {
-            crate::log!("[KeepAlive] Copy beat for thread {thread_id} ended without a word: {e}");
+            crate::log_legacy!(
+                "[KeepAlive] Copy beat for thread {thread_id} ended without a word: {e}"
+            );
         }
     }
 
@@ -2618,7 +2575,7 @@ pub(super) async fn beat_once(
             outcome
         }
         Err(e) if first && e.is::<crate::llm::prefill::PrefillRefused>() => {
-            crate::log!(
+            crate::log_legacy!(
                 "[KeepAlive] {} refused its first prefill beat, so it beats no more \
                  until a restart: {e}",
                 provider.as_str()
@@ -2627,7 +2584,7 @@ pub(super) async fn beat_once(
             return;
         }
         Err(e) => {
-            crate::log!("[KeepAlive] Prefill beat failed for thread {thread_id}: {e}");
+            crate::log_legacy!("[KeepAlive] Prefill beat failed for thread {thread_id}: {e}");
             return;
         }
     };
@@ -2637,7 +2594,7 @@ pub(super) async fn beat_once(
             store.refreshed(thread_id, pair, started);
         }
         BeatOutcome::Talkative => {
-            crate::log!(
+            crate::log_legacy!(
                 "[KeepAlive] A prefill beat on {} wrote output, so it beats no more \
                  until a restart",
                 provider.as_str()
@@ -2646,12 +2603,12 @@ pub(super) async fn beat_once(
             store.end_run(thread_id, pair);
         }
         BeatOutcome::Missed | BeatOutcome::Wrote => {
-            crate::log!(
+            crate::log_legacy!(
                 "[KeepAlive] A prefill beat for thread {thread_id} missed the cache, \
                  so its run ends"
             );
             if let Some(until) = store.mark_missed(thread_id, pair, provider, Utc::now()) {
-                crate::log!(
+                crate::log_legacy!(
                     "[KeepAlive] {} missed {} beats in a row, so its beats pause until {until}",
                     provider.as_str(),
                     super::remembered_requests::MISSES_TO_PAUSE
@@ -2695,6 +2652,36 @@ pub(super) fn judge_beat(usage: &crate::engine::ApiUsage, output_cap: Option<u32
     } else {
         BeatOutcome::Read
     }
+}
+
+/// Record a copy's spend even when it returned no usable answer.
+async fn record_copy_usage(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    model: &str,
+    effort: Option<&str>,
+    reply: &crate::runtime::claude_code::SessionCopyReply,
+    elapsed: std::time::Duration,
+) {
+    let detail = crate::engine::model_call::CallDetail {
+        provider: Some(reply.billing.provider_id().to_string()),
+        telemetry_owned_by_cli: true,
+        reasoning_effort: effort.map(str::to_string),
+        duration_ms: u64::try_from(elapsed.as_millis()).ok(),
+        ..Default::default()
+    };
+    crate::engine::AuxCapture::new(
+        bus,
+        thread_id,
+        crate::engine::ContextPurpose::CacheKeepAlive,
+    )
+    .record_usage_detailed(
+        model,
+        KEEP_ALIVE_PROMPT.chars().count(),
+        reply.usage,
+        detail,
+    )
+    .await;
 }
 
 #[cfg(test)]

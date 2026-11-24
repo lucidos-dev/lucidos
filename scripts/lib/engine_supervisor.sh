@@ -20,6 +20,9 @@
 
 # Usage: run_supervised <state_dir> <logfile> <cmd...>
 #
+# Each spawn reads stdin from SUPERVISED_STDIN when it names a file, else
+# /dev/null. A starter's stamp key arrives that way, so a respawn gets it too.
+#
 # Writes no pidfile. The engine publishes `engine.pid` itself once it holds
 # the workspace's owner lock, so the file never names a successor still
 # waiting for its predecessor to exit (ADR 0438). <state_dir> receives the
@@ -72,7 +75,7 @@ run_supervised() {
             fi
         fi
 
-        "$@" >> "$logfile" 2>&1 &
+        "$@" < "${SUPERVISED_STDIN:-/dev/null}" >> "$logfile" 2>&1 &
         local child_pid=$!
         # Log every spawn so a respawn cycle reads as a continuous
         # supervisor narrative even when the child crashes before

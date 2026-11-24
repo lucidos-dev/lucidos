@@ -2,13 +2,6 @@ import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { DropdownChevron, DropdownSkeleton } from '../Dropdown';
 
-/** The one property that makes this skeleton worth having: it wears the REAL
- *  trigger's box, so its height comes from the same CSS rule as the control that
- *  replaces it and the row cannot jump on settle. A hand-sized `SkBlock` would
- *  pass an eyeball review and drift the next time anyone re-pads the trigger,
- *  which is exactly what this pins. No jsdom in the test infra, so this walks
- *  the returned vnode tree rather than rendering it.
- */
 function collectClasses(node: ComponentChildren, out: string[] = []): string[] {
   if (node === null || node === undefined || typeof node !== 'object') return out;
   if (Array.isArray(node)) {
@@ -49,9 +42,6 @@ describe('DropdownSkeleton', () => {
   });
 
   it('carries the chevron, so the skeleton is not narrower than the control by one', () => {
-    // The trigger is a flex row of label + chevron with a gap between them.
-    // Drop the chevron and every slow-loading dropdown grows on settle, which
-    // is the exact layout shift the skeleton exists to prevent.
     expect(containsType(tree, DropdownChevron)).toBe(true);
   });
 

@@ -1,18 +1,3 @@
-/**
- * A model is identified by its name AND its id, so a Settings → Models row that
- * clips either one identifies nothing.
- *
- * Both lines used to be `white-space: nowrap` with an ellipsis, against a row
- * where the info column was the only flexible child: beside it sit a provider
- * chip, an optional "not set up" chip, and the builtin marker or a Delete
- * button. At phone width that column got about a third of the row. So
- * "Nemotron 3.5 Lightning (free)" read as "Nemotron 3.5…" and its id as
- * "nemotron-3.5-l…". The row wraps now instead of squeezing its text.
- *
- * A source scan rather than a browser test, and `rulesTargeting` rather than
- * `block`: the assertion is that NOTHING anywhere in the sheet re-clips these
- * two, which a first-textual-match reader cannot answer.
- */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -26,7 +11,6 @@ import { rulesTargeting } from './css-rule-helpers';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const settingsCss = readFileSync(resolve(here, '../settings/base.css'), 'utf-8');
 
-/** The values that stop a line wrapping. `pre-wrap` and `pre-line` do wrap. */
 const NON_WRAPPING = ['nowrap', 'pre'];
 
 describe('Settings → Models row legibility', () => {
@@ -47,8 +31,6 @@ describe('Settings → Models row legibility', () => {
   it('the id can break mid-token, since it is one unbroken word', () => {
     const rules = rulesTargeting(settingsCss, 'model-manager-id');
     const wrap = rules.map(r => r.props.get('overflow-wrap')).filter(Boolean);
-    // `break-word` would not do: it breaks the token but is not counted when
-    // the flex line is measured, so the row still overflows its pane.
     expect(wrap).toContain('anywhere');
   });
 

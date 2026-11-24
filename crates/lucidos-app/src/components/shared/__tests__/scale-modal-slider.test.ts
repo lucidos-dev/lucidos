@@ -18,10 +18,6 @@ import {
   _resetScaleTimersForTesting,
 } from '../scaleModalState';
 
-// setPreference would otherwise POST to the API; just confirm the call goes
-// out, swallow the network round trip. `isTransientFetchError` is real logic
-// savePreference classifies rejections with, so give it the honest shape rather
-// than a stub that would misroute a failure.
 vi.mock('../../../api/client', () => ({
   getPreferences: vi.fn(),
   setPreference: vi.fn().mockResolvedValue(undefined),
@@ -32,16 +28,6 @@ vi.mock('../../../api/client', () => ({
 
 const setPreferenceMock = vi.mocked(setPreference);
 
-/**
- * Regression: ScaleModal's onChange handler used to call
- * `scaleModalOpen.value = false` after persisting. On macOS Chrome (and every
- * other browser) the `change` event on `<input type="range">` fires on
- * mouse-up after the drag commits — so the modal popped closed the instant
- * the user finished any drag, before they could read the picked value.
- *
- * The modal must now only close via Escape, backdrop click, or
- * dismissScaleModal() (Cmd/Ctrl release). The slider commit just persists.
- */
 describe('scale modal slider drag', () => {
   beforeEach(() => {
     _resetScaleTimersForTesting();
@@ -94,19 +80,7 @@ describe('scale modal slider drag', () => {
   });
 });
 
-/**
- * Regression: `commitSliderValue` used to fire an immediate, un-debounced
- * `PUT /preferences` per `change` event, with no coalescing of in-flight
- * requests. WebKit is generous with `change` during a range drag, so on an iOS
- * PWA one drag queued several concurrent writes, and one page suspend then
- * failed all of them at once. That is the three stacked "Failed to save
- * ui-scale preference: request cancelled" cards this suite now pins shut.
- */
 describe('scale write coalescing', () => {
-  // Deliveries are serialized on a per-key promise chain (see
-  // `store/actions/preferences.ts`), so the request goes out a microtask after
-  // the debounce fires rather than inside `advanceTimersByTime`. Drain them, or
-  // every assertion below reads the mock before the write was ever attempted.
   const settle = () => Promise.resolve().then(() => {}).then(() => {});
 
   beforeEach(() => {
@@ -136,10 +110,6 @@ describe('scale write coalescing', () => {
     expect(setPreferenceMock).toHaveBeenCalledWith('ui-scale', '137.5', expect.any(String));
   });
 
-  // `applyUiScale` is the local half: the CSS var plus the localStorage cache
-  // the FOUC script reads. It must stay instant, so the debounce delays only
-  // the network write. (The test env stubs `documentElement.style` to a no-op,
-  // so localStorage is the observable half here.)
   it('applies each commit locally at once, without waiting out the debounce', async () => {
     commitSliderValue(125);
     await settle();
@@ -163,7 +133,6 @@ describe('scale write coalescing', () => {
     expect(scaleModalOpen.value).toBe(false);
     expect(setPreferenceMock).toHaveBeenCalledTimes(1);
     expect(setPreferenceMock).toHaveBeenCalledWith('ui-scale', '125', expect.any(String));
-    // The flush disarmed the timer; nothing fires a second write later.
     vi.advanceTimersByTime(1000);
     await settle();
     expect(setPreferenceMock).toHaveBeenCalledTimes(1);
@@ -209,13 +178,6 @@ describe('scale write coalescing', () => {
   });
 });
 
-/**
- * Regression: a zoom step forwarded out of an app frame snapped back, then
- * reached its scale 500 ms later. The panel took focus from the frame, and the
- * window `focus` ran the resume sync. Its `loadPreferences` painted the engine's
- * scale over the one the debounced save had not sent yet. Any refetch in that
- * window did the same.
- */
 describe('a preferences refetch keeps the scale on screen', () => {
   const settle = () => Promise.resolve().then(() => {}).then(() => {});
   const getPreferencesMock = vi.mocked(getPreferences);
@@ -256,8 +218,6 @@ describe('a preferences refetch keeps the scale on screen', () => {
     await loadPreferences();
     expect(localStorage.getItem('lucidos-ui-scale')).toBe('112.5');
 
-    // Accepted, so the engine's answer is the truth again: another device may
-    // change the scale after this one.
     accept();
     await settle();
     await loadPreferences();
@@ -272,17 +232,6 @@ describe('a preferences refetch keeps the scale on screen', () => {
   });
 });
 
-/**
- * Regression: the panel's only way out was a `keyup` on Meta/Control, and that
- * event is not guaranteed to arrive. The packaged macOS app is the reported
- * case: zoom with the shortcut there and the panel stayed on screen for the
- * rest of the session. It now counts itself out after `SHORTCUT_LINGER_MS` of
- * no change, with the release kept as the fast path.
- *
- * The countdown belongs to the shortcut, not to the panel. Settings opens the
- * same component as a real modal, and one that dissolved while the user reached
- * for its slider would be a second bug.
- */
 describe('scale panel linger dismiss', () => {
   const settle = () => Promise.resolve().then(() => {}).then(() => {});
 
@@ -291,7 +240,6 @@ describe('scale panel linger dismiss', () => {
     setPreferenceMock.mockClear();
     vi.useFakeTimers();
     preferences.value = { status: 'loaded', data: { 'ui-scale': '100' } };
-    // Closed, so a zoom step exercises the open-and-arm path the shortcut takes.
     scaleModalOpen.value = false;
     previewScale.value = 100;
   });
@@ -311,7 +259,6 @@ describe('scale panel linger dismiss', () => {
     vi.advanceTimersByTime(200);
     await settle();
     expect(scaleModalOpen.value).toBe(false);
-    // The debounce already delivered it, so lingering out adds no second write.
     expect(setPreferenceMock).toHaveBeenCalledTimes(1);
     expect(setPreferenceMock).toHaveBeenCalledWith('ui-scale', '112.5', expect.any(String));
   });
@@ -329,8 +276,6 @@ describe('scale panel linger dismiss', () => {
   });
 
   it('a step that is already at the clamp keeps the panel up', () => {
-    // Walk to the ceiling, then keep pressing: the value stops moving but the
-    // user has not stopped asking.
     for (let i = 0; i < 10; i++) adjustUiScale(UI_SCALE_STEP);
     expect(previewScale.value).toBe(UI_SCALE_MAX);
 
@@ -340,9 +285,6 @@ describe('scale panel linger dismiss', () => {
     expect(scaleModalOpen.value).toBe(true);
   });
 
-  // Renewing on each `input` was the first shape, and it dissolved the panel
-  // under a thumb held still mid-drag: renewing measures idleness, and a
-  // stationary thumb is idle. Reaching for the slider settles it instead.
   it('grabbing the slider settles the panel, so a held thumb cannot dissolve it', () => {
     adjustUiScale(UI_SCALE_STEP);
     previewSliderValue(150);
@@ -369,10 +311,6 @@ describe('scale panel linger dismiss', () => {
     expect(scaleModalOpen.value).toBe(false);
   });
 
-  // A pinch banks distance and spends it a notch at a time, so it can steer the
-  // panel for several frames without changing the value. Only `adjustUiScale`
-  // renewed the countdown, so those frames read as idleness: the panel
-  // dissolved mid-gesture and took its wheel listener with it.
   it('a gesture that has not yet earned a step still keeps the panel up', () => {
     adjustUiScale(UI_SCALE_STEP);
     for (let i = 0; i < 4; i++) {

@@ -1,23 +1,8 @@
-/**
- * Settings, System, Overview: what the Installs list says, and when it warns.
- *
- * The two rules are the ones a user feels. Every install is listed, always, so
- * "why am I on an old engine" is answerable from this one screen. And only a
- * contended port earns a warning. A developer running a source checkout beside
- * the app is never nagged about a setup that works.
- *
- * Pure builders rather than a mounted render, the shape
- * `backup-health-card.test.tsx` uses: the page pulls in the whole store.
- */
 import { describe, it, expect } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { installRow, installConflictNotice } from '../InstallsSection';
 import type { InstallRecord } from '../../../api/client/control';
 
-/** Flatten a vnode tree to a string, keeping `class` so a per-state rule can be
- *  asserted. Mirrors the helper in `backup-health-card.test.tsx`. Component
- *  vnodes keep their tag, since the row draws most of its text through
- *  `<SkText>` and invoking that here would throw on its hook. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -55,8 +40,6 @@ describe('installRow', () => {
     expect(text).toContain('/Applications/Lucidos.app');
   });
 
-  // The whole point of the screen is that every number on it can be trusted.
-  // A blank would read as zero, and a plausible default would be a lie.
   it('says "unknown" rather than guessing a version or a port', () => {
     const text = vnodeToText(installRow(record({ version: null, port: null })));
 
@@ -71,8 +54,6 @@ describe('installRow', () => {
     expect(vnodeToText(installRow(record()))).not.toContain('serving this workspace');
   });
 
-  // A registered job is how a forgotten install keeps coming back after a
-  // reboot, so the row names every one of them.
   it('names each job that can start the install on its own', () => {
     const text = vnodeToText(
       installRow(
@@ -95,7 +76,6 @@ describe('installRow', () => {
     expect(text).toContain('com.lucidos.gateway.default');
   });
 
-  // Removal steps are noise unless the install shares a port with another.
   it('says how to remove it only when its port is contended', () => {
     expect(vnodeToText(installRow(record()))).not.toContain('To remove');
 
@@ -104,7 +84,6 @@ describe('installRow', () => {
     expect(text).toContain('Uninstall Lucidos from the Lucidos menu');
   });
 
-  // Only a shell command is worth copying. Steps to follow are plain prose.
   it('offers Copy only for a removal that is a shell command', () => {
     expect(vnodeToText(installRow(record(), false, true))).not.toContain('Copy');
 
@@ -116,8 +95,6 @@ describe('installRow', () => {
     expect(text).toContain('Copy');
   });
 
-  // The placeholder is the same markup, so it cannot drift from the row. It
-  // must not render an install's fields, having none.
   it('draws a placeholder from its own markup', () => {
     const text = vnodeToText(installRow(undefined, true));
 
