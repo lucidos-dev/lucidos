@@ -33,6 +33,18 @@ describe('the modal backdrop', () => {
     expect(copies.map((r) => r.selector)).toEqual([]);
   });
 
+  it('lets a phone prompt reach the layout viewport only to sit on the keyboard band', () => {
+    const rebounds = rulesSetting('prompt-dialog-overlay', ['height', 'bottom', 'padding-bottom']);
+    expect(rebounds.map((r) => [r.selector, r.atRules]))
+      .toEqual([['.prompt-dialog-overlay', '@media (--phone-layout)']]);
+    const [prompt] = rebounds;
+    expect(prompt.props.get('bottom')).toBe('0');
+    expect(prompt.props.get('align-items'), 'centred, it jumps high once iOS reports the keys')
+      .toBe('flex-end');
+    expect(prompt.props.get('padding-bottom'), 'the band is set on focus, before iOS reports the keys')
+      .toContain('var(--keyboard-band');
+  });
+
   it('keeps its top edge where file search clears the mobile header', () => {
     expect(rulesSetting('file-search-overlay', ['top', 'inset']).map((r) => r.selector))
       .toEqual([]);

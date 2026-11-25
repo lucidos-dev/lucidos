@@ -127,15 +127,19 @@ impl SlotClass {
             Self::Background => "background",
         }
     }
+
+    /// The class `as_str` names, or `None` for any other value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::Ordinary, Self::Priority, Self::Background]
+            .into_iter()
+            .find(|class| class.as_str() == raw.trim())
+    }
 }
 
 /// Unknown values keep the ordinary class.
 pub fn resolve_class(raw: Option<&str>) -> SlotClass {
-    match raw.map(str::trim) {
-        Some("priority") => SlotClass::Priority,
-        Some("background") => SlotClass::Background,
-        _ => SlotClass::Ordinary,
-    }
+    raw.and_then(SlotClass::parse)
+        .unwrap_or(SlotClass::Ordinary)
 }
 
 /// Older engines can still ask for Apply priority when the new class is unset.

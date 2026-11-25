@@ -40,6 +40,10 @@ function rootAncestorId(start: ThreadState, byId: ReadonlyMap<string, ThreadStat
     return current.meta.id;
 }
 
+export function isFamilyRoot(thread: ThreadState, byId: ReadonlyMap<string, ThreadState>): boolean {
+    return rootAncestorId(thread, byId) === thread.meta.id;
+}
+
 function isHoldRoot(thread: ThreadState): boolean {
     return thread.meta.hold?.root_thread_id === thread.meta.id;
 }

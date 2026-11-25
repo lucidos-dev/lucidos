@@ -73,6 +73,7 @@ pub mod system_widgets;
 pub mod technical_literacy;
 pub use lucidos_agent_sandbox::temp_dirs;
 pub mod themes;
+pub mod thread_folders;
 pub mod trigger_folder_grant;
 pub mod url_scope;
 pub mod user_dir;

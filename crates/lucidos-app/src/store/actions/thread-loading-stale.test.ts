@@ -405,3 +405,93 @@ describe('threadLoadInFlightMs', () => {
     expect(threadLoadInFlightMs('t1')).toBeNull();
   });
 });
+
+describe('refreshThreadEvents: its claim, coalescing and verdicts', () => {
+  it('a foreground refresh is never satisfied by a refresh already in flight', async () => {
+    putThreads([['t1', loaded('t1')]]);
+    let release!: (v: unknown) => void;
+    fetchEvents.mockReturnValueOnce(new Promise(r => { release = r; }));
+    void refreshThreadEvents('t1');
+    void refreshThreadEvents('t1');
+    await settle();
+
+    expect(fetchEvents).toHaveBeenCalledTimes(2);
+    release({ events: [], currentAggregate: null });
+    await settle();
+  });
+
+  it('a declined background refresh reports that nothing landed', async () => {
+    putThreads([['t1', loaded('t1')]]);
+    markLoadedThreadsStale();
+    let release!: (v: unknown) => void;
+    fetchEvents.mockReturnValueOnce(new Promise(r => { release = r; }));
+    void refreshThreadEvents('t1');
+    await settle();
+
+    expect(await refreshThreadEvents('t1', { coalesce: true })).toBe(false);
+    expect(fetchEvents).toHaveBeenCalledTimes(1);
+    release({ events: [], currentAggregate: null });
+    await settle();
+  });
+
+  it('a transient failure stays silent and reports that nothing landed', async () => {
+    putThreads([['t1', loaded('t1')]]);
+    fetchEvents.mockRejectedValue(new TypeError('Load failed'));
+
+    expect(await refreshThreadEvents('t1')).toBe(false);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('applies what it fetched to the thread the map holds after the fetch, not the one it started with', async () => {
+    putThreads([['t1', loaded('t1')]]);
+    const replacement = loaded('t1');
+    fetchEvents.mockImplementationOnce(async () => {
+      threadMap.value = new Map([['t1', replacement]]);
+      return {
+        events: [{ sequence: 8, event_type: 'TextStreamed', payload: { text: 'x' }, created: '2026-06-01T00:00:00Z', event_id: 'evt-8' }],
+        currentAggregate: null,
+      };
+    });
+
+    await refreshThreadEvents('t1');
+
+    expect(replacement.lastDbSeq).toBe(8);
+  });
+
+  it('a refresh that fails after a newer one landed raises no card, even across a guard reset', async () => {
+    putThreads([['t1', loaded('t1')]]);
+    let failOld!: (e: unknown) => void;
+    fetchEvents.mockReturnValueOnce(new Promise((_, reject) => { failOld = reject; }));
+    const old = refreshThreadEvents('t1');
+    await settle();
+    await refreshThreadEvents('t1');
+    clearThreadFetchGuards();
+
+    failOld(new Error('boom'));
+    await old;
+
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('a superseded refresh settling does not release the claim a newer refresh holds', async () => {
+    putThreads([['t1', loaded('t1')]]);
+    markLoadedThreadsStale();
+    let releaseOld!: (v: unknown) => void;
+    fetchEvents.mockReturnValueOnce(new Promise(r => { releaseOld = r; }));
+    const old = refreshThreadEvents('t1');
+    clearThreadFetchGuards();
+    markLoadedThreadsStale();
+    let releaseNew!: (v: unknown) => void;
+    fetchEvents.mockReturnValueOnce(new Promise(r => { releaseNew = r; }));
+    const fresh = refreshThreadEvents('t1');
+    await settle();
+
+    releaseOld({ events: [], currentAggregate: null });
+    await old;
+
+    expect(await refreshThreadEvents('t1', { coalesce: true })).toBe(false);
+    expect(fetchEvents).toHaveBeenCalledTimes(2);
+    releaseNew({ events: [], currentAggregate: null });
+    await fresh;
+  });
+});

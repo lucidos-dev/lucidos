@@ -66,6 +66,17 @@ Perf instrumentation** shows **Always on**.
 Packaged installs keep recording off by default. Use that setting on the
 device that lags to turn recording on. It takes effect at once.
 
+A device that turned the switch on earlier keeps the stored choice when it
+opens a from-source workspace. **Clear stored opt-in** in the same row removes
+it. Recording stays on from source. The phone viewport poll, which only the
+stored choice starts, stops.
+
+`./scripts/scoreboard.sh` rolls the samples up: median and 90th percentile per
+sample kind and device class, for the reporting window, up to 7 days. It pages
+back through the diagnostic log and lists every limit it hit under the table.
+The device class comes from the user agent alone. An iPad on default Safari
+settings sends a Mac user agent, so it counts as desktop.
+
 The perf channel flushes queued samples every 10 s, when the queue reaches
 20 samples, or when the page is hidden. **A `[Client/perf]` line's time is
 the flush time**, so events up to 10 s apart share one timestamp.

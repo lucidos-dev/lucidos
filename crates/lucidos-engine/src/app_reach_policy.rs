@@ -407,6 +407,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/threads/suggest-title", Host, &[]),
     ("/threads/unarchive", Host, &[]),
     ("/threads/unsave", Host, &[]),
+    ("/threads/move-to-folder", Host, &[]),
     ("/trigger-groups", App, &["GET"]),
     ("/trigger-groups/reorder", Host, &[]),
     ("/triggers", App, &["GET", "POST", "PUT", "DELETE"]),

@@ -8,6 +8,7 @@ import {
   applyAllInProgress,
   standingApplyThreadIds,
   toasts,
+  updateAvailable,
 } from '../store';
 
 const mockGetChangeById = vi.fn();
@@ -202,6 +203,15 @@ describe('applyAllChanges', () => {
 
     expect(mockApplyAll).toHaveBeenCalledTimes(1);
   });
+
+  it('raises no toast when the batch is accepted', async () => {
+    toasts.value = [];
+    mockApplyAll.mockResolvedValueOnce({ batch_size: 2 });
+
+    await applyAllChanges();
+
+    expect(toasts.value).toHaveLength(0);
+  });
 });
 
 describe('ensureChangeLoaded', () => {
@@ -297,6 +307,19 @@ describe('refreshChangesState', () => {
     land({ pending: [fresh], applied: [], has_more_applied: false });
     await refresh;
     expect(changes.value).toEqual({ status: 'loaded', data: [fresh] });
+  });
+
+  it('does not light the client update badge from an applied change', async () => {
+    updateAvailable.value = false;
+    mockFetchChanges.mockResolvedValueOnce({
+      pending: [],
+      applied: [makeChange('applied-frontend', { status: 'applied' })],
+      has_more_applied: false,
+    });
+
+    await refreshChangesState();
+
+    expect(updateAvailable.value).toBe(false);
   });
 });
 

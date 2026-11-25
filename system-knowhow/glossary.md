@@ -217,6 +217,7 @@ Core terms (continued).
 - Part token
 - Thread pause
 - Pinned thread
+- Custom folder
 - Plugin
 - Plugin category
 - Plugin manifest
@@ -359,6 +360,7 @@ Core terms (continued).
 - Trigger group
 - Event hook
 - Hook definition
+- Hook answer
 - Typed answer
 - Unattested caller
 - Unsent message

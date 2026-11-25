@@ -13,7 +13,7 @@ import { joinSliceLoadsDuring } from '../bootstrapSliceLoads';
 
 const read = json as unknown as Mock;
 
-describe('loadRepositories — transient failures retry, real ones surface', () => {
+describe('loadRepositories: transient failures retry, real ones surface', () => {
   beforeEach(() => {
     read.mockReset();
     repositories.value = { status: 'not-loaded' };
@@ -54,7 +54,7 @@ describe('loadRepositories — transient failures retry, real ones surface', () 
     });
   });
 
-  it('parks on failed with a readable reason — never the raw WebKit abort string', async () => {
+  it('parks on failed with a readable reason, never the raw WebKit abort string', async () => {
     read.mockRejectedValue(new DOMException('Fetch is aborted', 'AbortError'));
 
     await loadRepositories();
@@ -84,6 +84,20 @@ describe('refreshRepositories answers with a request sent after the call', () =>
 
     expect(read).toHaveBeenCalledTimes(2);
     expect(repositories.value).toMatchObject({ status: 'loaded', data: [{ id: 'r2' }] });
+  });
+
+  it('concurrent loads share one request, and each resolves once the list is in', async () => {
+    let answer: (repos: unknown) => void = () => {};
+    read.mockImplementationOnce(() => new Promise(resolve => { answer = resolve; }));
+    const first = loadRepositories();
+    const second = loadRepositories();
+
+    expect(read).toHaveBeenCalledTimes(1);
+    answer([]);
+    await second;
+
+    expect(repositories.value).toEqual({ status: 'loaded', data: [] });
+    await first;
   });
 
   it('sends one request when nothing is in flight', async () => {

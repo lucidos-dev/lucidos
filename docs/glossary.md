@@ -1421,6 +1421,11 @@ Named for the thing it protects, which is that something will wake the thread. I
 ### attention_descendant_count
 `thread_summaries` column (`INT`, default `0`) holding the rolled-up count of a thread's *attention-needing descendants* (transitive). Maintained by EventBus alongside `blocking_descendant_count`; consumed by `display_section(..., has_attention_descendants: bool)` via `count > 0` to bubble the ancestor chain to the *Current* section when any descendant needs user attention, even if sibling descendants are still running.
 
+### archivable sub-thread count
+`thread_summaries.archivable_sub_thread_count` (`INTEGER`, default `0`): how many of a thread's sub-threads, at any depth, "Archive completed sub-threads" would archive now. It equals `safe_thread_count` from `completed_preflight` over the thread's descendants scope, so the rule lives only in `refuse_completed`. The wire carries it as `archivable_sub_thread_count`, and TS as `archivableSubThreadCount`.
+
+A full recount per ancestor, never a delta: a sub-thread counts only when its whole subtree is clear. The EventBus samples the archive inputs around each projection update (`ArchiveInputSample`). A flip asks `ArchivableCountWorker` to recount the parent and every ancestor after commit, off the hot path. The worker also backfills every family on boot, without blocking it. A moved row rebroadcasts its aggregate, so the overflow menu draws the count on its first frame. The press still reads the preflight for the id list.
+
 ### available_thread_actions
 The DB-derivable per-thread action-availability core in `engine/thread_lifecycle.rs` (renamed from `resolve_actions`). Pure function over `thread_summaries` facts (`thread_type`, `status`, `stored_section`, `has_pending_changes`, `descendants_block_archive`, `has_live_event_waits`, `has_unsent_draft`, `is_saved`), returning the available `ThreadAction`s in cascade order: `[DiscardDraft?, Discard?, Apply?, Archive?, Unsave|Save]`. `has_live_event_waits` is the *parked* fact: a delivery will wake the thread on its own branch, so `Apply` and `Discard` are withheld (ADR 0106). An active sub-thread is deliberately not an input, because the child writes its own worktree (ADR 0249). `Archive` is unaffected, having never been offered beside a pending change.
 
@@ -3101,7 +3106,7 @@ A check that a stripped file differs from its original only in comments. Each fi
 The regression test from a task's real fix, kept out of the agent's tree and installed only at grading. It calls only code that existed before the fix, so it grades behaviour, not the shipped fix's names. `prepare --verify` proves each one fails on the buggy base and passes on the fix.
 
 ### Context-handling benchmark
-What the ADR 0087 *context-mode eval* became under ADR 0110. It measures one *configuration* doing fourteen tasks in a seeded workspace, and reports five absolute axes: task quality, cost, rounds, wall time and *context utilisation*. It is a binary in `crates/lucidos-eval`, run by hand through `scripts/eval-context-mode.sh`, never a test and never in CI. Its fixture is `eval/context-mode/`.
+What the ADR 0087 *context-mode eval* became under ADR 0110. It measures one *configuration* doing fourteen tasks in a seeded workspace, and reports five absolute axes: task quality, cost, rounds, wall time and *context utilisation*. It is a feature-gated binary in `lucidos-engine-bin`, run by hand through `scripts/eval-context-mode.sh`, never a test and never in CI. Its fixture is `eval/context-mode/`.
 
 No criterion may name an internal of the *self-curated context mode*, and `Fixture::validate` refuses one that does. What replaced the old graduation and kill bars is nothing: a human reads the axes.
 
@@ -6929,6 +6934,9 @@ The ordered stages of a repository's delivery, plus the rules naming the events 
 
 ### Scoreboard
 The report of delivery measures that a loop run reads: *lead time* per change, stage times, waits and *unit costs*. `./scripts/scoreboard.sh` prints it as text, or JSON with `--json`.
+
+### Improvement loop
+A scheduled coding-agent run that reads the *scoreboard*, writes a report, and starts at most its **allowance** of planning threads, each proposing one improvement. It never edits source or applies a change. The procedure is the `improvement-loop` skill. A workspace trigger holds the schedule and the proposal limits, and computes the allowance.
 
 ## When to add a term
 

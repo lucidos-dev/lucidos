@@ -49,7 +49,7 @@ import {
   getPendingUploads,
   _resetPendingUploadsForTesting,
 } from '../pendingUploads';
-import { connectionStatus, threadMap, toasts } from '../store';
+import { connectionStatus, threadListFetched, threadMap, toasts } from '../store';
 import { getDraft, setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 import { _resetSessionBlobUrlsForTesting } from '../../components/chat/pastedImages';
 import {
@@ -379,4 +379,33 @@ it('rechecks origin after a draft lookup crosses a restore', async () => {
   expect(outcome.gone + outcome.expired + outcome.restored).toBe(0);
   expect(await storedIds()).toEqual(['lookup-race']);
   expect(uploadThreadBlob).not.toHaveBeenCalled();
+});
+
+describe('a failed read never reads as an empty store', () => {
+  it('fails the pass when the unsent sends cannot be read, and deletes no bytes', async () => {
+    await seed(record('u-1', { landedHash: 'h1', createdAt: NOW - PENDING_UPLOAD_MAX_AGE_MS - 1 }));
+    _resetUnsentMessageRecordsForTesting({ ...messages, list: async () => { throw new Error('db locked'); } });
+
+    await expect(restorePendingUploads(NOW)).rejects.toThrow('db locked');
+    expect(await storedIds()).toEqual(['u-1']);
+    expect(chipIds()).toEqual([]);
+  });
+});
+
+describe('the restore waits for the first thread list', () => {
+  it('restores nothing until the engine serves the thread list that stages the drafts', async () => {
+    threadListFetched.value = false;
+    await seed(record('u-1', { createdAt: Date.now() - 60_000 }));
+    const stop = installPendingUploadRestore();
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(chipIds()).toEqual([]);
+
+      threadListFetched.value = true;
+      await vi.waitFor(() => expect(chipIds()).toEqual(['u-1']));
+    } finally {
+      stop();
+      threadListFetched.value = false;
+    }
+  });
 });

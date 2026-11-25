@@ -433,6 +433,20 @@ fn the_slot_class_comes_from_the_environment_value() {
 }
 
 #[test]
+fn a_slot_class_parses_back_from_its_own_name_only() {
+    for class in [
+        SlotClass::Ordinary,
+        SlotClass::Priority,
+        SlotClass::Background,
+    ] {
+        assert_eq!(SlotClass::parse(class.as_str()), Some(class));
+    }
+    for other in ["", "normal", "1", "Priority"] {
+        assert_eq!(SlotClass::parse(other), None, "{other:?}");
+    }
+}
+
+#[test]
 fn a_priority_build_runs_un_niced_unless_told_otherwise() {
     assert_eq!(resolve_nice(None, SlotClass::Priority), 0);
     assert_eq!(resolve_nice(None, SlotClass::Ordinary), DEFAULT_NICE);

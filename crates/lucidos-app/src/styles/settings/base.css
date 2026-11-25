@@ -502,3 +502,20 @@
 .remote-gateway-state-unreachable {
     color: var(--accent-yellow);
 }
+
+.remote-gateway-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: 0;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+}
+
+.remote-gateway-toggle:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: calc(var(--radius-control) * 0.5);
+}

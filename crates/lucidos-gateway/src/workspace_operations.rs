@@ -240,9 +240,8 @@ fn no_single_route(selector: &str, matching_routes: usize) -> ApiError {
     ApiError::conflict(format!(
         "{selector} gives this gateway no agent return access. \
          On {selector}, open Settings → Access → Remote gateways. \
-         Pair this gateway there if it is not listed, then turn on its \
-         \"Allow agents on <this gateway> to read and start threads through this gateway\" switch. \
-         Then retry."
+         Pair this gateway there if it is not listed, then open its fold \
+         and turn on \"Agent return access\". Then retry."
     ))
 }
 

@@ -366,6 +366,7 @@ function summary(threadId: string, state: 'composing' | 'active', composeText: s
     total_children_count: 0,
     blocking_descendant_count: 0,
     attention_descendant_count: 0,
+    archivable_sub_thread_count: 0,
     live_event_wait_count: 0,
     status: 'idle',
     summary_version: 0,

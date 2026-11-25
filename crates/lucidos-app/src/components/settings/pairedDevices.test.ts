@@ -101,12 +101,9 @@ describe('where the list sits', () => {
     expect(page).not.toMatch(/listPairedDevices/);
   });
 
-  it('still points Access at where Revoke went', () => {
-    expect(page).toMatch(/openSettingsSubview\('devices'\)/);
-    const add = page.indexOf('<PairDeviceSection');
-    const pointer = page.indexOf("openSettingsSubview('devices')");
-    expect(add).toBeGreaterThan(-1);
-    expect(pointer).toBeGreaterThan(add);
+  it('still points Access at where Revoke went, from the pairing card', () => {
+    const pairCard: string = readFileSync(resolve(here, './PairDeviceSection.tsx'), 'utf8');
+    expect(pairCard).toMatch(/openSettingsSubview\('devices'\)/);
   });
 
   it('carries the anchor Search Everywhere scrolls to', () => {

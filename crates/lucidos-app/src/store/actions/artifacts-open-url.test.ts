@@ -117,6 +117,15 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
     expect(window.location.href).toBe(APP_URL);
   });
 
+  it('openUrlOutsideApp, Tauri + toggle off: lowercases the scheme and host before the OS opener gets it', () => {
+    platformMocks.isTauri = true;
+    preferences.value = { status: 'loaded', data: {} };
+
+    openUrlOutsideApp('HTTPS://EXAMPLE.com');
+
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/');
+  });
+
   it('Tauri + toggle on: opens the in-app webview panel, never the system browser', () => {
     platformMocks.isTauri = true;
     preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };

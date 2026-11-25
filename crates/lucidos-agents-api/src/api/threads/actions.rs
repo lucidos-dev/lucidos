@@ -1,4 +1,4 @@
-//! Thread mutation handlers — answer-question, save/unsave, rename, suggest
+//! Thread mutation handlers — answer-question, save/unsave, move to folder, rename, suggest
 //! title, continue — and the message-history fetch.
 
 use crate::engine::agent_recovery::orphaned_branch_work::OrphanedBranchWorkExt;
@@ -185,64 +185,164 @@ fn emitted_version(
     })
 }
 
-/// POST /api/v1/threads/save — save a thread
+/// The custom folder a pin or move names, checked against the
+/// `thread_folders` list. A missing or null `folder` is plain Pinned.
+async fn requested_folder(
+    state: &AppState,
+    request: &serde_json::Value,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let folder = match request.get("folder") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(id)) => id.clone(),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "folder must be a folder id or null".to_string(),
+            ))
+        }
+    };
+    let known = crate::core::thread_folders::list(&state.pool)
+        .await
+        .iter()
+        .any(|f| f.id == folder);
+    if !known {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("No custom folder has the id '{folder}'"),
+        ));
+    }
+    Ok(Some(folder))
+}
+
+async fn emit_pin_event(
+    state: &AppState,
+    thread_id: Uuid,
+    event: crate::engine::thread_events::ThreadEvent,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<i64, (StatusCode, String)> {
+    let name = event.event_type();
+    let emitted = state
+        .engine
+        .event_bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event,
+            meta: crate::engine::thread_events::EventMeta::with_actor(actor),
+        })
+        .await
+        .map_err(|e| {
+            log_legacy!("[API] Failed to emit {}: {}", name, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to emit {name}: {e}"),
+            )
+        })?;
+    emitted_version(emitted)
+}
+
+/// POST /api/v1/threads/save — pin a thread, into the custom folder `folder`
+/// names when the body carries one. Pinning a pinned thread with a folder
+/// moves it there; without one it changes nothing.
 pub(in crate::api) async fn save_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = extract_thread_uuid(&request)?;
+    let folder = requested_folder(&state, &request).await?;
+    let already_saved = match thread_is_saved(&state, thread_uuid).await? {
+        None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
+        Some((true, version)) if folder.is_none() => return Ok(summary_version_body(version)),
+        Some((saved, _)) => saved,
+    };
+    let actor = crate::api::actor::user_actor(&headers, None);
+    let mut version = None;
+    if !already_saved {
+        // The home thread sits in no drawer section, so a pin would move it
+        // nowhere (ADR 0362).
+        let is_home = crate::engine::home_thread::is_home_thread(&state.pool, thread_uuid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if is_home {
+            return Err((
+                StatusCode::CONFLICT,
+                "The home thread opens from Home rather than the thread list, so it is never pinned."
+                    .to_string(),
+            ));
+        }
+        version = Some(
+            emit_pin_event(
+                &state,
+                thread_uuid,
+                crate::engine::thread_events::ThreadEvent::ThreadSaved,
+                actor.clone(),
+            )
+            .await?,
+        );
+
+        // Generate title in background — don't block the save response
+        let engine = state.engine.clone();
+        let tid = thread_uuid.to_string();
+        tokio::spawn(async move {
+            let has_title = engine
+                .event_store()
+                .thread_has_title(&tid)
+                .await
+                .unwrap_or(true);
+            if !has_title {
+                engine.spawn_title_generation(&tid).await;
+            }
+        });
+    }
+    if folder.is_some() {
+        version = Some(
+            emit_pin_event(
+                &state,
+                thread_uuid,
+                crate::engine::thread_events::ThreadEvent::ThreadMovedToFolder { folder },
+                actor,
+            )
+            .await?,
+        );
+    }
+    // The early return above leaves a pin, a move, or both to emit.
+    version.map(summary_version_body).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Neither a pin nor a move was written".to_string(),
+        )
+    })
+}
+
+/// POST /api/v1/threads/move-to-folder — file a pinned thread in the custom
+/// folder `folder` names, or back in plain Pinned when it is null. Refuses an
+/// unpinned thread with 409, since a folder only files a pin.
+pub(in crate::api) async fn move_thread_to_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let thread_uuid = extract_thread_uuid(&request)?;
+    let folder = requested_folder(&state, &request).await?;
     match thread_is_saved(&state, thread_uuid).await? {
         None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
-        Some((true, version)) => return Ok(summary_version_body(version)),
-        Some((false, _)) => {}
-    }
-    // The home thread sits in no drawer section, so a pin would move it
-    // nowhere (ADR 0362).
-    let is_home = crate::engine::home_thread::is_home_thread(&state.pool, thread_uuid)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if is_home {
-        return Err((
-            StatusCode::CONFLICT,
-            "The home thread opens from Home rather than the thread list, so it is never pinned."
-                .to_string(),
-        ));
+        Some((false, _)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Only a pinned thread sits in a folder. Pin it with a folder instead.".to_string(),
+            ))
+        }
+        Some((true, _)) => {}
     }
     let actor = crate::api::actor::user_actor(&headers, None);
-
-    let emitted = state
-        .engine
-        .event_bus
-        .emit(crate::engine::event_bus::BusEvent::Thread {
-            thread_id: thread_uuid,
-            event: crate::engine::thread_events::ThreadEvent::ThreadSaved,
-            meta: crate::engine::thread_events::EventMeta::with_actor(actor),
-        })
-        .await
-        .map_err(|e| {
-            log_legacy!("[API] Failed to save thread: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save thread: {}", e),
-            )
-        })?;
-
-    // Generate title in background — don't block the save response
-    let engine = state.engine.clone();
-    let tid = thread_uuid.to_string();
-    tokio::spawn(async move {
-        let has_title = engine
-            .event_store()
-            .thread_has_title(&tid)
-            .await
-            .unwrap_or(true);
-        if !has_title {
-            engine.spawn_title_generation(&tid).await;
-        }
-    });
-
-    Ok(summary_version_body(emitted_version(emitted)?))
+    let version = emit_pin_event(
+        &state,
+        thread_uuid,
+        crate::engine::thread_events::ThreadEvent::ThreadMovedToFolder { folder },
+        actor,
+    )
+    .await?;
+    Ok(summary_version_body(version))
 }
 
 /// POST /api/v1/threads/unsave — unsave a thread
@@ -260,25 +360,14 @@ pub(in crate::api) async fn unsave_thread(
         Some((true, _)) => {}
     }
     let actor = crate::api::actor::user_actor(&headers, None);
-
-    let emitted = state
-        .engine
-        .event_bus
-        .emit(crate::engine::event_bus::BusEvent::Thread {
-            thread_id: thread_uuid,
-            event: crate::engine::thread_events::ThreadEvent::ThreadUnsaved,
-            meta: crate::engine::thread_events::EventMeta::with_actor(actor),
-        })
-        .await
-        .map_err(|e| {
-            log_legacy!("[API] Failed to unsave thread: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to unsave thread: {}", e),
-            )
-        })?;
-
-    Ok(summary_version_body(emitted_version(emitted)?))
+    let version = emit_pin_event(
+        &state,
+        thread_uuid,
+        crate::engine::thread_events::ThreadEvent::ThreadUnsaved,
+        actor,
+    )
+    .await?;
+    Ok(summary_version_body(version))
 }
 
 /// POST /api/v1/threads/rename — rename a thread (user-initiated)

@@ -66,7 +66,7 @@ describe('handleSaveThread — pin error handling', () => {
 
     await handleSaveThread('t1');
 
-    expect(mockSave).toHaveBeenCalledWith('t1');
+    expect(mockSave).toHaveBeenCalledWith('t1', undefined);
     expect(threadMap.value.get('t1')!.meta.saved).toBe(true);
     expect(toasts.value).toHaveLength(0);
   });

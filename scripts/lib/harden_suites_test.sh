@@ -160,7 +160,7 @@ printf '%s\n' crates/lucidos-agents-api/src/api \
     crates/lucidos-core/src/engine/event_bus_system_event.rs .claude/rules/frontend.md > "$TMP/vitest-inputs"
 # A workspace graph shaped like the real one, as `start` records it: the engine
 # has three dependents, and the gateway, app and CLI have none.
-printf 'lucidos-agent-sandbox\tcrates/lucidos-agent-sandbox\t\nlucidos-app\tcrates/lucidos-app\tlucidos-home\nlucidos-capabilities\tcrates/lucidos-capabilities\t\nlucidos-cli\tcrates/lucidos-cli\tlucidos-capabilities lucidos-home\nlucidos-agents-api\tcrates/lucidos-agents-api\tlucidos-engine\nlucidos-e2e\tcrates/lucidos-e2e\tlucidos-agents-api lucidos-engine lucidos-local-token\nlucidos-core\tcrates/lucidos-core\tlucidos-agent-sandbox lucidos-home lucidos-local-token\nlucidos-engine\tcrates/lucidos-engine\tlucidos-core\nlucidos-engine-bin\tcrates/lucidos-engine-bin\tlucidos-agents-api lucidos-engine\nlucidos-eval\tcrates/lucidos-eval\tlucidos-agents-api lucidos-engine lucidos-local-token\nlucidos-gateway\tcrates/lucidos-gateway\tlucidos-home\nlucidos-home\tcrates/lucidos-home\t\nlucidos-local-token\tcrates/lucidos-local-token\tlucidos-home\n' > "$TMP/sel-graph"
+printf 'lucidos-agent-sandbox\tcrates/lucidos-agent-sandbox\t\nlucidos-app\tcrates/lucidos-app\tlucidos-home\nlucidos-capabilities\tcrates/lucidos-capabilities\t\nlucidos-cli\tcrates/lucidos-cli\tlucidos-capabilities lucidos-home\nlucidos-agents-api\tcrates/lucidos-agents-api\tlucidos-engine\nlucidos-e2e\tcrates/lucidos-e2e\tlucidos-agents-api lucidos-engine lucidos-local-token\nlucidos-core\tcrates/lucidos-core\tlucidos-agent-sandbox lucidos-home lucidos-local-token\nlucidos-engine\tcrates/lucidos-engine\tlucidos-core\nlucidos-engine-bin\tcrates/lucidos-engine-bin\tlucidos-agents-api lucidos-engine lucidos-local-token\nlucidos-gateway\tcrates/lucidos-gateway\tlucidos-home\nlucidos-home\tcrates/lucidos-home\t\nlucidos-local-token\tcrates/lucidos-local-token\tlucidos-home\n' > "$TMP/sel-graph"
 printf 'CHANGELOG.md\tcrates/lucidos-engine\n' > "$TMP/sel-owners"
 ALL_SUITES="lint-static lint-rust crates gateway cli app-lib eval core engine agents confinement"
 select_cfg() { # [drift-file] [tier]
@@ -169,7 +169,7 @@ select_cfg() { # [drift-file] [tier]
 select_for() { printf '%s\n' "$@" | select_cfg; }
 expect_eq "an agent edit skips the lower engine suite" "lint-static lint-rust crates eval agents" \
     "$(select_for crates/lucidos-agents-api/src/engine/chat/mod.rs)"
-expect_eq "a binary crate edit runs its tests" "lint-static lint-rust crates" "$(select_for crates/lucidos-engine-bin/src/main.rs)"
+expect_eq "a root package edit runs both binary suites" "lint-static lint-rust crates eval" "$(select_for crates/lucidos-engine-bin/src/main.rs)"
 expect_eq "an engine edit" "lint-static lint-rust crates eval engine agents" "$(select_for crates/lucidos-engine/src/a.rs)"
 expect_eq "a core edit runs all three libraries" "lint-static lint-rust crates eval core engine agents" \
     "$(select_for crates/lucidos-core/src/a.rs)"
@@ -189,7 +189,7 @@ expect_eq "a gateway edit skips the engine and every other crate" "lint-static l
 expect_eq "a small crate edit tests the small crates and the CLI above it" "lint-static lint-rust crates cli" "$(select_for crates/lucidos-capabilities/Cargo.toml)"
 expect_eq "a shared crate reaches every crate that depends on it" "lint-static lint-rust crates gateway cli app-lib eval core engine agents" \
     "$(select_for crates/lucidos-home/src/a.rs)"
-expect_eq "an eval edit tests the eval crate alone" "lint-static lint-rust eval" "$(select_for crates/lucidos-eval/src/a.rs)"
+expect_eq "an eval source edit runs the root binary suites" "lint-static lint-rust crates eval" "$(select_for crates/lucidos-engine-bin/src/bin/lucidos-eval/a.rs)"
 expect_eq "an e2e edit lints and runs no suite" "lint-static lint-rust" "$(select_for crates/lucidos-e2e/tests/a.rs)"
 expect_eq "ORT download policy" "$ALL_SUITES ort-download" "$(select_for crates/vendor/ort-sys/build.rs)"
 expect_eq "ORT mirror tests" "lint-static ort-download" "$(select_for scripts/lib/onnxruntime_mirror_test.sh)"
@@ -348,7 +348,7 @@ expect_eq "covered: the confinement suite stays" \
 
 # I2: whatever a covered round drops, the main check runs.
 for p in crates/lucidos-engine/src/a.rs crates/lucidos-gateway/src/a.rs crates/lucidos-capabilities/src/lib.rs \
-    crates/lucidos-cli/src/main.rs crates/lucidos-app/src/lib.rs crates/lucidos-eval/src/a.rs Cargo.lock \
+    crates/lucidos-cli/src/main.rs crates/lucidos-app/src/lib.rs crates/lucidos-engine-bin/src/bin/lucidos-eval/a.rs Cargo.lock \
     crates/lucidos-app/src/a.ts system-knowhow/a.md scripts/status.sh scripts/lib/flock.sh scripts/release.sh \
     install.sh crates/lucidos-engine/src/runtime/python.rs docs/a.md; do
     lost=""
@@ -750,7 +750,7 @@ paths_are() { printf '%s\n' "$@" > "$CMD_STATE/paths"; }
 paths_are crates/lucidos-gateway/src/a.rs
 expect_eq "a gateway edit lints the gateway alone" "make lint-rust CLIPPY_SCOPE='-p lucidos-gateway'" "$(command_for lint-rust normal)"
 paths_are crates/lucidos-engine/src/a.rs
-expect_eq "an engine edit lints its dependents too" "make lint-rust CLIPPY_SCOPE='-p lucidos-agents-api -p lucidos-e2e -p lucidos-engine -p lucidos-engine-bin -p lucidos-eval'" "$(command_for lint-rust normal)"
+expect_eq "an engine edit lints its dependents too" "make lint-rust CLIPPY_SCOPE='-p lucidos-agents-api -p lucidos-e2e -p lucidos-engine -p lucidos-engine-bin'" "$(command_for lint-rust normal)"
 expect_eq "an orchestration edit compiles only its test binary" \
     "./scripts/test-engine.sh --package lucidos-engine -- -- guard_tests a" "$(command_for engine-touched normal)"
 paths_are crates/lucidos-core/src/b.rs
@@ -781,7 +781,7 @@ expect_eq "an explicit filter keeps all libraries alongside a module filter" \
     "$(command_for engine-touched normal)"
 paths_are crates/lucidos-home/src/a.rs
 expect_eq "a leaf-dependency edit lints each crate that reaches it" \
-    "make lint-rust CLIPPY_SCOPE='-p lucidos-agents-api -p lucidos-app -p lucidos-cli -p lucidos-core -p lucidos-e2e -p lucidos-engine -p lucidos-engine-bin -p lucidos-eval -p lucidos-gateway -p lucidos-home -p lucidos-local-token'" "$(command_for lint-rust normal)"
+    "make lint-rust CLIPPY_SCOPE='-p lucidos-agents-api -p lucidos-app -p lucidos-cli -p lucidos-core -p lucidos-e2e -p lucidos-engine -p lucidos-engine-bin -p lucidos-gateway -p lucidos-home -p lucidos-local-token'" "$(command_for lint-rust normal)"
 paths_are crates/lucidos-home/src/a.rs crates/lucidos-capabilities/src/a.rs crates/lucidos-agent-sandbox/src/a.rs
 expect_eq "reaching every member lints the workspace" "make lint-rust" "$(command_for lint-rust normal)"
 for p in Cargo.lock Cargo.toml .cargo/config.toml rust-toolchain.toml clippy.toml Makefile crates/vendor/x/src/lib.rs; do
@@ -808,7 +808,7 @@ expect_eq "the agents suite runs only the agents library" "./scripts/test-engine
         "$(module_filters crates/lucidos-future-leaf/src/example.rs)"
 )
 expect_eq "the engine suite runs only the lower library" "./scripts/test-engine.sh --engine" "$(command_for engine normal)"
-expect_eq "the eval suite runs the eval crate" "cargo test --locked -p lucidos-eval" "$(command_for eval normal)"
+expect_eq "the eval suite runs the gated eval target" "cargo test --locked -p lucidos-engine-bin --features eval --bin lucidos-eval" "$(command_for eval normal)"
 expect_eq "a shell-only diff runs the static linters" "make lint-static" "$(command_for lint-static normal)"
 # /harden runs make lint as its two halves, so a check added to `lint` alone
 # would never run in a round.
@@ -1361,7 +1361,8 @@ for barrier_mode in normal early; do
         "$(cat "$REPO/.lucidos/harden-suites/old-evidence" 2>/dev/null)"
     expect_eq "$barrier_mode preserves retry obligations" 'ts whole' \
         "$(cat "$REPO/.lucidos/harden-retry" 2>/dev/null)"
-    expect_eq "$barrier_mode admits no suite or codegen" "" "$(cat "$STUB_DIR/events" 2>/dev/null)"
+    expect_eq "$barrier_mode runs selected static lint" ran "$(cat "$STUB_DIR/lint-static.ran" 2>/dev/null)"
+    expect_eq "$barrier_mode starts no codegen" "" "$(cat "$STUB_DIR/codegen-step.ran" 2>/dev/null)"
     expect_eq "$barrier_mode requests no memory admission" "" "$(cat "$STUB_DIR/gate.calls" 2>/dev/null)"
 done
 rm -f "$STUB_DIR/cheap.rc"
@@ -1373,10 +1374,28 @@ echo 1 > "$STUB_DIR/prerequisites.rc"
 hs start --include-suite ts > "$TMP/prerequisites.out" 2>&1
 expect_eq "missing host prerequisites refuse start" 1 "$?"
 expect_has "the included suite is preflighted" ts "$(cat "$STUB_DIR/prerequisites.args")"
+expect_eq "prerequisite refusal cannot emit previous timings" '{}' "$(hs timings)"
 expect_eq "prerequisite refusal records refused" refused "$(cat "$REPO/.lucidos/harden-start.status")"
 expect_eq "prerequisite refusal preserves evidence" preserved "$(cat "$REPO/.lucidos/harden-suites/old-evidence")"
-expect_eq "prerequisite refusal starts neither codegen nor suites" "" "$(cat "$STUB_DIR/events" 2>/dev/null)"
+expect_eq "prerequisite refusal starts no codegen" "" "$(cat "$STUB_DIR/codegen-step.ran" 2>/dev/null)"
 rm -f "$STUB_DIR/prerequisites.rc"
+reset_stub
+
+cat > "$STUB_DIR/build-prerequisites.sh" <<'BUILD_PRECHECK'
+#!/bin/bash
+printf 'fixture native prerequisite failure: %s\n' "$*" >&2
+exit 72
+BUILD_PRECHECK
+chmod +x "$STUB_DIR/build-prerequisites.sh"
+echo 1 > "$STUB_DIR/cheap.rc"
+echo 2 > "$STUB_DIR/lint-static.rc"
+HS_BUILD_PREREQUISITES_CMD="$STUB_DIR/build-prerequisites.sh" hs start \
+    --include-suite app-lib > "$TMP/build-precheck.out" 2>&1
+expect_eq "combined startup failure refuses start" 1 "$?"
+expect_has "combined startup reports cheap failure" "Independent hardening gates failed" "$(cat "$TMP/build-precheck.out")"
+expect_has "combined startup reports desktop scope" "-p lucidos-app" "$(cat "$TMP/build-precheck.out")"
+expect_has "combined startup reports selected lint failure" "lint-static failed during startup" "$(cat "$TMP/build-precheck.out")"
+expect_eq "combined startup requests no build slot" "" "$(cat "$STUB_DIR/gate.calls" 2>/dev/null)"
 reset_stub
 
 echo "selected independent suites collect failures before codegen or Cargo"
@@ -1420,7 +1439,7 @@ exit 1
 STATIC_MAKE
 chmod +x "$TMP/static-bin/make"
 export STATIC_CALLS="$TMP/static-calls"
-HS_STUB_CMD='' PATH="$TMP/static-bin:$PATH" hs start > "$TMP/static.out" 2>&1
+HS_STUB_CMD='' HS_BUILD_PREREQUISITES_CMD=/usr/bin/true PATH="$TMP/static-bin:$PATH" hs start > "$TMP/static.out" 2>&1
 expect_eq "a real static command failure refuses startup" 1 "$?"
 expect_lacks "runner retains knowhow coverage" "LINT_STATIC_TARGETS=" "$(cat "$STATIC_CALLS" 2>/dev/null)"
 reset_stub
@@ -2066,7 +2085,19 @@ echo 'test("t", async ({ page }) => { await page.getByText("Open board").click()
 echo "fn a() {}" > "$REPO2/crates/lucidos-engine/src/a.rs"
 git -C "$REPO2" add -A && git -C "$REPO2" commit -qm base
 git -C "$REPO2" checkout -q -b feature
-hs2() { (cd "$REPO2" && HS_CODEGEN=/usr/bin/true bash "$CLI" "$@"); }
+# Browser fixtures have no generation step. Model the fingerprint and make
+# a render attempt observable without ever invoking the real generator.
+cat > "$STUB_DIR/browser-codegen.sh" <<'CODEGEN'
+#!/bin/sh
+if [ "${1:-}" = --fingerprint ]; then
+    printf '%s\n' "${HS_BROWSER_CODEGEN_FP:-fixture-fingerprint}"
+    exit 0
+fi
+touch "$(dirname "$0")/browser-codegen.ran"
+exit 1
+CODEGEN
+chmod +x "$STUB_DIR/browser-codegen.sh"
+hs2() { (cd "$REPO2" && HS_CODEGEN="$STUB_DIR/browser-codegen.sh" bash "$CLI" "$@"); }
 echo "fn a() { 1; }" > "$REPO2/crates/lucidos-engine/src/a.rs"
 git -C "$REPO2" commit -qam backend
 reset_stub
@@ -2090,6 +2121,10 @@ hs2 start > /dev/null 2>&1
 out="$(hs2 wait --budget 20)"
 expect_eq "a passing touched spec passes" 0 "$?"
 expect_has "the row passes" "e2e-touched PASS" "$out"
+out="$(HS_BROWSER_CODEGEN_FP=changed hs2 verdict)"
+expect_eq "changed codegen inputs require a new startup" 2 "$?"
+expect_has "the verdict asks for startup checks" "reselect generated outputs under the startup checks" "$out"
+if [ -f "$STUB_DIR/browser-codegen.ran" ]; then fail "the verdict invoked codegen"; else pass "the verdict invoked no codegen"; fi
 reset_stub
 echo "$E2E_LOCK_BUSY_EXIT" > "$STUB_DIR/e2e-touched.rc"
 hs2 start > /dev/null 2>&1
@@ -2135,7 +2170,7 @@ echo board.spec.ts > "$STUB_DIR/select.out"
 touch "$STUB_DIR/select.hold"
 hs2 start --include-suite gateway --include-suite e2e-touched > "$TMP/out" 2>&1 &
 BG=$!
-for _ in $(seq 1 50); do [ -f "$STUB_DIR/engine.ran" ] && break; sleep 0.1; done
+for _ in $(seq 1 300); do [ -f "$STUB_DIR/engine.ran" ] && break; sleep 0.1; done
 if [ -f "$STUB_DIR/engine.ran" ]; then pass "a cargo suite starts while the selection runs"; else fail "a cargo suite starts while the selection runs"; fi
 if [ -f "$STUB_DIR/e2e-touched.ran" ]; then fail "e2e-touched waits for the selection"; else pass "e2e-touched waits for the selection"; fi
 if [ -f "$STATE2/suites" ]; then fail "the suites file waits for the selection"; else pass "the suites file waits for the selection"; fi

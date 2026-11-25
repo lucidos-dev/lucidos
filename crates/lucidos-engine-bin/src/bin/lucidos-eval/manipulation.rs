@@ -476,13 +476,9 @@ mod tests {
     /// rather than measure.
     #[test]
     fn the_engine_in_this_checkout_declares_the_context_mode_flag() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the crate sits two levels below the repository root")
-            .to_path_buf();
+        let repo_root = crate::repository_root();
         assert_eq!(
-            flag_availability_in_checkout(&repo_root).unwrap(),
+            flag_availability_in_checkout(repo_root).unwrap(),
             FlagAvailability::Present,
             "the engine's catalog no longer declares ADR 0085's `{}` in the `key: \"…\"` \
              form this preflight scans for, so every lean run would refuse.",

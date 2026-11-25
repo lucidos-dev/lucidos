@@ -1,7 +1,17 @@
-//! Event hooks (ADR 0746): the loader for `data/hooks/<slug>/hook.toml`.
+//! Event hooks (ADR 0746): the loader for `data/hooks/<slug>/hook.toml`, and
+//! the runner that asks one hook about one pending event.
 //!
 //! A leaf crate (ADR 0738). It implements the [`EventHooks`] interface from
 //! `lucidos-core`, and the engine executable hands it to the router.
+
+mod answer;
+mod input;
+mod json_strings;
+mod runner;
+
+pub use answer::{HookAnswer, Refusal, RefusalCause, ReturnedEvent};
+pub use input::{HookInput, PendingEvent};
+pub use runner::{effective_timeout, run_hook, Confinement};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -181,7 +191,9 @@ fn hooked_event_kind(event_type: &str) -> Result<HookedEventKind, String> {
     }
 }
 
-fn check_script(hook_dir: &Path, script: &str) -> Result<(), String> {
+/// The path of `script` in `hook_dir`, once it names a file there that a
+/// trigger runtime can run.
+fn check_script(hook_dir: &Path, script: &str) -> Result<PathBuf, String> {
     if script.is_empty() || is_path_traversal(script) {
         return Err(format!(
             "script: '{script}' must be a path inside the hook's folder."
@@ -195,7 +207,7 @@ fn check_script(hook_dir: &Path, script: &str) -> Result<(), String> {
             "script: '{script}' is not a file in the hook's folder."
         ));
     }
-    Ok(())
+    Ok(path)
 }
 
 fn check_timeout(timeout_secs: Option<u64>) -> Result<(), String> {
@@ -206,6 +218,12 @@ fn check_timeout(timeout_secs: Option<u64>) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+/// The script file of the hook `slug`, checked again at run time, since the
+/// tree may have changed since it was listed.
+fn hook_script_path(workspace: &Path, slug: &str, script: &str) -> Result<PathBuf, String> {
+    check_script(&contained(&hooks_root(workspace)?, slug)?, script)
 }
 
 /// `root.join(rel)`, refused when a symlink carries it out of `root`.

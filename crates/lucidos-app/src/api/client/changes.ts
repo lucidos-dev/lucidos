@@ -276,6 +276,7 @@ export interface EngineVersionStatus {
   build_queued?: QueuedBuild;
   pending_commits?: PendingCommits;
   frontend_refresh_elapsed_ms?: number;
+  frontend_build_watch_stopped?: { since_ms: number; cause: string | null };
 }
 
 export interface QueuedBuild {

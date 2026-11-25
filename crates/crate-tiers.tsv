@@ -15,7 +15,6 @@ lucidos-engine	4	engine
 lucidos-engine-bin	8	engine
 lucidos-engine-boot	7	leaf
 lucidos-engine-socket	-1
-lucidos-eval	8
 lucidos-event-hooks	7	leaf
 lucidos-file-backup-exclusion	-3
 lucidos-frame-capability	-1

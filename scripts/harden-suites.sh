@@ -248,7 +248,17 @@ run_step() { # <name> <command> [<gate label>]
     fi
     if [ "$rc" = 0 ]; then
         date +%s > "$STATE/$name.start"
-        (cd "$ROOT" && LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$passed_at" bash -c "$cmd") >> "$STATE/$name.log" 2>&1
+        (
+            cd "$ROOT" || exit 1
+            if [ -n "${3:-}" ] && [ -z "${HS_STUB_CMD:-}" ]; then
+                export LUCIDOS_SLOT_RECHECK_MEMORY=1 LUCIDOS_HARDEN_BUILD_CHECKED=1
+                case "$cmd" in
+                    "cargo "* | "make test-crates")
+                        exec "$SCRIPT_DIR/with-build-slot.sh" --label "$3" -- bash -c "$cmd" ;;
+                esac
+            fi
+            LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$passed_at" exec bash -c "$cmd"
+        ) >> "$STATE/$name.log" 2>&1
         rc=$?
     fi
     date +%s > "$STATE/$name.end"
@@ -270,9 +280,9 @@ run_codegen_step() {
 
 # A suite that waits for the codegen step takes a failed step's exit code as
 # its own, so a refused gate (72) voids it and any other failure fails it.
-run_suite() { # <suite>
+run_suite() { # <suite> [checked-knowhow]
     local suite=$1 cmd gate="" codegen_rc
-    if ! cmd="$(hs_suite_command "$suite" "$(cat "$STATE/mode")" "$STATE")"; then
+    if ! cmd="$(hs_suite_command "$suite" "$(cat "$STATE/mode")" "$STATE" "${2:-}")"; then
         echo 1 > "$STATE/$suite.exit"
         return
     fi
@@ -294,14 +304,43 @@ run_suite() { # <suite>
     run_step "$suite" "$cmd" "$gate"
 }
 
+# Resolve the same Clippy scope used by the suite. Other Cargo suites are
+# headless except app-lib. Codegen can compile on a cache miss.
+check_build_prerequisites() { # <selected suites> <staged state>
+    local suites=$1 state=$2 suite scope compile=""
+    local check=${HS_BUILD_PREREQUISITES_CMD:-$SCRIPT_DIR/build-prerequisites.sh}
+    local suite_words
+    suite_words="$(printf '%s' "$suites" | tr '\n' ' ')"
+    if [ -n "${HS_STUB_CMD:-}" ] && [ -z "${HS_BUILD_PREREQUISITES_CMD:-}" ]; then return 0; fi
+    for suite in $suites; do
+        if [ "$suite" = lint-rust ]; then
+            scope="$(hs_lint_scope "$state")"
+            case " $suite_words " in
+                *" app-lib "*)
+                    if [ "$scope" != --workspace ]; then scope="$scope -p lucidos-app"; fi ;;
+            esac
+            # shellcheck disable=SC2086 # package flags emitted by hs_lint_scope
+            "$check" -- $scope --all-features
+            return
+        fi
+        hs_is_cargo_suite "$suite" && compile=1
+    done
+    if printf '%s\n' "$suites" | grep -qx app-lib; then
+        "$check" --selection desktop
+    elif [ -n "$compile" ] || ! hs_codegen_fingerprint_matches "$ROOT" ||
+        { hs_needs_codegen "$suites" && ! "${HS_CODEGEN:-$SCRIPT_DIR/codegen.sh}" --cache-dir >/dev/null; }; then
+        "$check" --selection headless
+    fi
+}
+
 # Complete all selected independent work before any generated-surface discovery
 # or build launch. Keep ordinary suite timings and exits, including each failure.
-run_independent_suites() { # <newline-separated suites>
+run_independent_suites() { # <newline-separated suites> <checked-knowhow>
     local s failed=0
     for s in $1; do
         hs_is_independent_suite "$s" || continue
         date +%s > "$STATE/$s.queued"
-        run_suite "$s"
+        run_suite "$s" "$2"
         [ "$(cat "$STATE/$s.exit" 2>/dev/null)" = 0 ] || failed=1
     done
     return "$failed"
@@ -380,12 +419,11 @@ cmd_start() {
     # Run independent gates before generated drift (which may compile) and
     # before replacing any evidence, retries or durable include obligations.
     # Fixtures replace the checks while exercising real suite selection.
-    local gated_sha planned retry_plan=""
+    local gated_sha planned retry_plan="" startup_failed=0 independent_failed=0
     gated_sha="$(git -C "$ROOT" rev-parse HEAD)"
     if ! (cd "$ROOT" && "${HS_GATES_CMD:-$SCRIPT_DIR/harden-gates.sh}"); then
-        echo refused > "$START_RECORD.status"
-        echo "Independent hardening gates failed; existing suite evidence is unchanged." >&2
-        return 1
+        startup_failed=1
+        echo "Independent hardening gates failed." >&2
     fi
 
     # Stage selection inputs so prerequisite failures preserve the old run.
@@ -404,6 +442,8 @@ cmd_start() {
     hs_test_inputs "$ROOT" > "$startup_state/test-inputs"
     hs_vitest_inputs "$ROOT" > "$startup_state/vitest-inputs"
     : > "$startup_state/generated-drift"
+    local codegen=${HS_CODEGEN:-$SCRIPT_DIR/codegen.sh}
+    "$codegen" --fingerprint > "$startup_state/codegen-fingerprint"
     # Metadata enumerates manifests without compiling.
     hs_crate_graph "$ROOT" > "$startup_state/crate-graph"
     hs_compile_owners "$ROOT" "$startup_state/crate-graph" > "$startup_state/compile-owners"
@@ -447,8 +487,29 @@ cmd_start() {
         prerequisite_suites="$(printf '%s\n' "$planned" | awk '$0 != "engine-touched" && $0 != "engine-filtered"')"
     fi
     if [ -n "$prerequisite_suites" ] && ! (cd "$ROOT" && "${HS_PREREQUISITES_CMD:-$SCRIPT_DIR/dev-prerequisites.sh}" --for "$(printf '%s\n' "$prerequisite_suites" | paste -sd , -)"); then
+        startup_failed=1
+        echo "Development prerequisites failed." >&2
+    fi
+    if ! (cd "$ROOT" && check_build_prerequisites "$planned" "$startup_state"); then
+        startup_failed=1
+        echo "Build prerequisites failed." >&2
+    fi
+
+    printf '%s\n' "$mode" > "$startup_state/mode"
+    local checked_knowhow=""
+    [ -n "${HS_GATES_CMD:-}" ] || checked_knowhow=1
+    if ! STATE="$startup_state" run_independent_suites "$planned" "$checked_knowhow"; then
+        independent_failed=1
+        for s in $planned; do
+            if [ -f "$startup_state/$s.exit" ] && [ "$(cat "$startup_state/$s.exit")" != 0 ]; then
+                printf '\n%s failed during startup\n' "$s" >&2
+                cat "$startup_state/$s.log" >&2
+            fi
+        done
+    fi
+    if [ "$startup_failed" = 1 ]; then
         echo refused > "$START_RECORD.status"
-        echo "Host prerequisites failed; existing suite evidence is unchanged." >&2
+        echo "Startup checks failed; existing suite evidence is unchanged." >&2
         return 1
     fi
 
@@ -489,11 +550,11 @@ cmd_start() {
         if [ -n "$suites" ]; then
             cp "$RETRY_FILE" "$STATE/retry"
             cp "$RETRY_BASE" "$STATE/full-start-sha" 2>/dev/null || :
-            if ! run_independent_suites "$suites"; then
+            if [ "$independent_failed" = 1 ]; then
                 printf '%s\n' "$suites" > "$STATE/suites"
                 return 1
             fi
-            hs_generated_drift "$ROOT" > "$STATE/generated-drift"
+            LUCIDOS_SLOT_RECHECK_MEMORY=1 hs_generated_drift "$ROOT" > "$STATE/generated-drift"
             printf '%s\n' "$suites" > "$STATE/suites"
             echo "Suites ($label, a retry of what failed): $(tr '\n' ' ' < "$STATE/suites")"
             # A failed driver run reruns alone, once `wait` has joined the other-model review.
@@ -510,11 +571,11 @@ cmd_start() {
     # Independent suite selection does not depend on generated drift or browser
     # specs. Record the provisional obligations even if the barrier refuses.
     early="$(select_with_includes "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" /dev/null "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths")"
-    if ! run_independent_suites "$early"; then
+    if [ "$independent_failed" = 1 ]; then
         printf '%s\n' "$early" > "$STATE/suites"
         return 1
     fi
-    hs_generated_drift "$ROOT" > "$STATE/generated-drift"
+    LUCIDOS_SLOT_RECHECK_MEMORY=1 hs_generated_drift "$ROOT" > "$STATE/generated-drift"
 
     # Only e2e-touched reads the specs, and it is no cargo suite, so the cargo
     # lane starts once, before the slow selection.
@@ -819,7 +880,14 @@ cmd_verdict() {
     # A recorded failure skips it: drift discovery may compile.
     if ! retry_round && ! any_failed; then
         use_main_check_setting "$STATE"
-        hs_generated_drift "$ROOT" > "$STATE/generated-drift-now"
+        local codegen=${HS_CODEGEN:-$SCRIPT_DIR/codegen.sh} fingerprint
+        if fingerprint="$("$codegen" --fingerprint)" && [ -n "$fingerprint" ] &&
+            [ "$fingerprint" = "$(cat "$STATE/codegen-fingerprint" 2>/dev/null)" ]; then
+            cp "$STATE/generated-drift" "$STATE/generated-drift-now"
+        else
+            echo "RERUN: reselect generated outputs under the startup checks"
+            return 2
+        fi
         branch_paths | sort -u > "$STATE/paths-now"
         select_touched_specs "$STATE/paths-now" "$STATE/touched-specs-now" \
             || echo "(the touched specs could not be selected)" > "$STATE/touched-specs-now"
@@ -921,7 +989,7 @@ step_timings() { # <name>
 # or the codegen step.
 cmd_timings() {
     local s first=1 round=full codegen=null
-    if [ ! -f "$STATE/suites" ]; then
+    if startup_pending || startup_refused || [ ! -f "$STATE/suites" ]; then
         echo '{}'
         return 0
     fi

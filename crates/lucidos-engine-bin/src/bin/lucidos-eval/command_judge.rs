@@ -158,8 +158,7 @@ mod tests {
     /// the irreversible lane carries a category.
     #[test]
     fn the_labelled_set_is_well_formed() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/command-guard/cases.toml");
+        let path = crate::eval_fixture_root().join("command-guard/cases.toml");
         let set: LabelledSet = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let categories = [
             "email",

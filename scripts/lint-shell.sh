@@ -125,6 +125,58 @@ key_section() { # <label> <nul-separated-path-list>
     xargs -0 git hash-object --no-filters -- < "$2"
 }
 
+# Reuse only the repository's source search rule. Alternate search paths
+# and explicit external source names can reach files outside the inventory.
+cacheable_sources() {
+    local file dir
+    while IFS= read -r -d '' file; do
+        [ -f "$file" ] && [ ! -L "$file" ] || return 1
+        dir=$file
+        while [[ "$dir" = */* ]]; do
+            dir=${dir%/*}
+            [ ! -L "$dir" ] || return 1
+        done
+        printf './%s\0' "$file" || return 1
+    done < "$1" > "$WORK/key.scan"
+    # shellcheck disable=SC2016 # xargs passes this program to awk
+    [ ! -s "$WORK/key.scan" ] || xargs -0 awk '
+        function outside(path, depth, dirs) {
+            if (path ~ /^\//) return 1
+            depth = split(substr(FILENAME, 3), dirs, "/") - 1
+            while (sub(/^\.\.\//, "", path)) {
+                if (--depth < 0) return 1
+            }
+            return path ~ /(^|\/)\.\.\//
+        }
+        /(^|[[:space:]])source-path[[:space:]]*=/ &&
+            $0 !~ /^[[:space:]]*source-path[[:space:]]*=[[:space:]]*SCRIPTDIR[[:space:]]*$/ {
+            if ($0 !~ /^[[:space:]]*#/) exit 1
+            if ($0 ~ /^[[:space:]]*#[[:space:]]*shellcheck[[:space:]]/) exit 1
+        }
+        /^[[:space:]]*#[[:space:]]*shellcheck[[:space:]].*source=/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i !~ /^source=/ || $i == "source=/dev/null") continue
+                if ($i !~ /^source=[[:alnum:]_.\/-]+\.sh$/ ||
+                    outside(substr($i, 8))) exit 1
+            }
+        }
+        !/^[[:space:]]*#/ {
+            absolute = $0
+            gsub(/(^|[[:space:];&|(!])(source|\.)[[:space:]]+["\047]?\/dev\/null(["\047[:space:];&|()]|$)/, " ", absolute)
+            if (absolute ~ /(^|[[:space:];&|(!])(source|\.)[[:space:]]+["\047]?\//) exit 1
+            line = $0
+            while (match(line, /(^|[;&|(])[[:space:]]*((then|do|else|elif|if|while|until|!)[[:space:]]+)?(source|\.)[[:space:]]+["\047]?[[:alnum:]_.\/-]+["\047]?([[:space:];&|()]|$)/)) {
+                call = substr(line, RSTART, RLENGTH)
+                line = substr(line, RSTART + RLENGTH - 1)
+                sub(/^[[:space:];&|()]*((then|do|else|elif|if|while|until|!)[[:space:]]+)?(source|\.)[[:space:]]+["\047]?/, "", call)
+                sub(/["\047[:space:];&|()]$/, "", call)
+                sub(/["\047]$/, "", call)
+                if (call != "/dev/null" && (call !~ /\.sh$/ || outside(call))) exit 1
+            }
+        }
+    ' < "$WORK/key.scan"
+}
+
 # Print the key of every input ShellCheck reads now, or fail. The checked
 # section is the discovery list itself, so a key never covers a script this
 # run did not check. An untracked script, ignored or not, is only read, when
@@ -136,10 +188,17 @@ key_section() { # <label> <nul-separated-path-list>
 pass_key() {
     local config="$WORK/key.config" untracked="$WORK/key.untracked" material="$WORK/key.material"
     [ -z "${SHELLCHECK_OPTS:-}" ] || return 1
+    git ls-files -z -- '*.sh' > "$WORK/key.inventory" || return 1
+    cmp -s "$INVENTORY" "$WORK/key.inventory" || return 1
     git ls-files -z --cached -- '*shellcheckrc' > "$config" || return 1
     git ls-files -z --others -- '*.sh' '*shellcheckrc' > "$untracked" || return 1
+    cat "$INVENTORY" "$config" "$untracked" > "$WORK/key.inputs" || return 1
+    cacheable_sources "$WORK/key.inputs" || return 1
     {
+        printf '%s\n' "$SHELLCHECK" "$SHELLCHECK_BATCH_SIZE" "${C_GREEN:+--color=always}"
+        git hash-object --no-filters -- "$SHELLCHECK" || return 1
         "$SHELLCHECK" --version || return 1
+        git ls-files -s -z -- '*.sh' '*shellcheckrc' || return 1
         key_section checked "$INVENTORY" || return 1
         key_section config "$config" || return 1
         key_section untracked "$untracked" || return 1

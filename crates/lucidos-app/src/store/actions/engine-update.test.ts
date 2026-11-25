@@ -61,6 +61,7 @@ function status(over: Partial<{
   build_failure: BuildFailure;
   build_queued: QueuedBuild;
   frontend_refresh_elapsed_ms: number;
+  frontend_build_watch_stopped: EngineVersionStatus['frontend_build_watch_stopped'];
 }> = {}) {
   return {
     build_id: 'eng123',
@@ -328,6 +329,23 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     mockStatus.mockResolvedValue(status());
     await checkEngineVersion();
     expect(enginePendingCommits.value).toBeNull();
+  });
+
+  it('clears the pending range on a packaged engine, which never reports one', async () => {
+    enginePendingCommits.value = { total: 4, groups: [] };
+    mockStatus.mockResolvedValue(status({ packaged: true }));
+    await checkEngineVersion();
+    expect(enginePendingCommits.value).toBeNull();
+  });
+
+  it('hides a superseded version toast without recording it as a user dismissal', async () => {
+    mockStatus.mockResolvedValue(status({ update_available: true }));
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(true);
+    mockStatus.mockResolvedValue(status());
+    await checkEngineVersion();
+    expect(hasSwitchToast()).toBe(false);
+    expect(mockMarkDismissed).not.toHaveBeenCalled();
   });
 
   it('drops a pre-grouping payload rather than reading `groups` off it', async () => {
@@ -617,6 +635,12 @@ describe('the build-failed toast says what broke, and what to do', () => {
     await checkEngineVersion();
     expect(failedToast()?.action?.label).toBe('Retry build');
   });
+
+  it.each(['not-delivered', 'unsupported-launch'] as const)('keeps Retry for a %s failure', async (kind) => {
+    mockStatus.mockResolvedValue(failedWith({ kind, summary: 'Publish failed', repeatable: false }));
+    await checkEngineVersion();
+    expect(failedToast()?.action?.label).toBe('Retry build');
+  });
 });
 
 describe('checkEngineVersion: the pending version is dismissable, and the badge is the way back', () => {
@@ -818,6 +842,16 @@ describe('checkEngineVersion: the build narration cannot outlive the build', () 
     expect(engineBuildDetail.value?.anchoredAt).toBeLessThanOrEqual(Date.now());
   });
 
+  it('anchors the build clock to the client clock when the status lands', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-25T10:00:00Z'));
+      mockStatus.mockResolvedValue(status({ build_state: 'building', source_behind_head: true, build_elapsed_ms: 42_000 }));
+      await checkEngineVersion();
+      expect(engineBuildDetail.value?.anchoredAt).toBe(Date.parse('2026-11-25T10:00:00Z'));
+    } finally { vi.useRealTimers(); }
+  });
+
   it('survives an engine that predates the grouped commit shape', async () => {
     mockStatus.mockResolvedValue(status({
       build_state: 'building',
@@ -1000,6 +1034,53 @@ describe('frontend refresh after a frontend-only Apply', () => {
     await Promise.resolve();
     expect(mockStatus).toHaveBeenCalled();
     expect(frontendRefreshDetail.value?.elapsedMs).toBe(1_000);
+  });
+});
+
+describe('stopped frontend build-watch', () => {
+  const stopped = { since_ms: 1_000, cause: 'SIGTERM' };
+
+  function warning() {
+    return toasts.value.find((toast) => toast.key === 'engine-frontend-build-watch-stopped');
+  }
+
+  beforeEach(() => {
+    mockStatus.mockReset();
+    resetEngineVersionToastForTest();
+    toasts.value = [];
+    engineRestarting.value = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('shows the warning from the initial version status alone', async () => {
+    await bootstrapSnapshot(status({ frontend_build_watch_stopped: stopped }));
+    expect(warning()?.type).toBe('warning');
+    expect(warning()?.message).toContain('SIGTERM');
+    expect(warning()?.message).toContain('./scripts/web-dev.sh -w <workspace>');
+  });
+
+  it('clears the warning when a refreshed status omits the outage', async () => {
+    await bootstrapSnapshot(status({ frontend_build_watch_stopped: { ...stopped, cause: null } }));
+    expect(warning()?.message).toContain('cause unknown');
+    mockStatus.mockResolvedValue(status());
+    await checkEngineVersion();
+    expect(warning()).toBeUndefined();
+  });
+
+  it('keeps an acknowledged outage dismissed until its start time changes', async () => {
+    mockStatus.mockResolvedValue(status({ frontend_build_watch_stopped: stopped }));
+    await checkEngineVersion();
+    expect(warning()?.action?.label).toBe('OK');
+    warning()?.action?.onClick();
+    expect(warning()).toBeUndefined();
+    await checkEngineVersion();
+    expect(warning()).toBeUndefined();
+
+    mockStatus.mockResolvedValue(status({
+      frontend_build_watch_stopped: { ...stopped, since_ms: 2_000 },
+    }));
+    await checkEngineVersion();
+    expect(warning()).toBeDefined();
   });
 });
 

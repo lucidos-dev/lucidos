@@ -124,6 +124,11 @@ pub struct ThreadSummary {
     /// `false` or re-fetch the whole grouped payload. Both sources read this same
     /// column, so they cannot disagree.
     pub saved: bool,
+    /// The custom folder this pinned thread is filed in, an id from the
+    /// `thread_folders` preference. `None` lists it in plain Pinned, and so
+    /// does an id the list no longer holds. Always `None` while unpinned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_folder: Option<String>,
     /// Whether this is the workspace's *home thread* (ADR 0362). Omitted when
     /// false, so every other thread's wire bytes are unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -178,6 +183,11 @@ pub struct ThreadSummary {
     /// Consumed by `display_section` via `count > 0` to bubble Current to the
     /// ancestor chain even when sibling descendants are still running.
     pub attention_descendant_count: i64,
+    /// The *archivable sub-thread count*: how many sub-threads, at any depth,
+    /// the overflow menu's "Archive N completed sub-threads" would put away.
+    /// Exactly the press preflight's `safe_thread_count`. The engine recounts
+    /// it after commit (`thread_triage::archivable_count`).
+    pub archivable_sub_thread_count: i64,
     /// Whether this thread is a *stopped child*: a user Stop ended its turn,
     /// and its parent is still owed the card that settles it (ADR 0252).
     /// Counts toward attention and never toward blocking.
@@ -433,6 +443,7 @@ struct ThreadRow {
     total_children_count: i64,
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
+    archivable_sub_thread_count: i64,
     is_stopped_child: bool,
     hold: Option<sqlx::types::Json<ThreadHoldSummary>>,
     read_requested: bool,
@@ -452,6 +463,7 @@ struct ThreadRow {
     coding_agent_is_external_repo: bool,
     last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     is_saved: bool,
+    pin_folder: Option<String>,
     is_home: bool,
     has_response: bool,
     parent_thread_id: Option<String>,
@@ -526,6 +538,9 @@ pub struct ThreadAggregate {
     /// per-event SSE aggregate alongside `blocking_descendant_count` so the
     /// frontend can recompute section without a refetch.
     pub attention_descendant_count: i64,
+    /// See `ThreadSummary::archivable_sub_thread_count`. Carried on the
+    /// rebroadcast aggregate so the overflow menu's count follows the family.
+    pub archivable_sub_thread_count: i64,
     /// See `ThreadSummary::is_stopped_child`. Carried on the per-event SSE
     /// aggregate so the stopped-child notice and the attention badge appear
     /// and clear live.
@@ -563,6 +578,10 @@ pub struct ThreadAggregate {
     pub coding_agent_change_state: CodingAgentChangeState,
     pub coding_agent_is_external_repo: bool,
     pub is_saved: bool,
+    /// See `ThreadSummary::pin_folder`. Carried on the per-event SSE aggregate
+    /// so a move between folders shows on every device live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_folder: Option<String>,
     /// See `ThreadSummary::home`. An SSE event can be the first a client hears
     /// of the home thread, and it must not draw that thread in a section.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -678,6 +697,7 @@ fn row_to_thread_aggregate(
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
+        archivable_sub_thread_count: r.archivable_sub_thread_count,
         is_stopped_child: r.is_stopped_child,
         hold: r.hold.map(|hold| hold.0),
         read_requested: r.read_requested,
@@ -693,6 +713,7 @@ fn row_to_thread_aggregate(
         ),
         coding_agent_is_external_repo: r.coding_agent_is_external_repo,
         is_saved: r.is_saved,
+        pin_folder: r.pin_folder,
         home: r.is_home,
         has_response: r.has_response,
         last_revived_at: r.last_revived_at,
@@ -746,11 +767,11 @@ fn thread_cols(alias: &str) -> String {
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.awaited_children_count::bigint, {a}.awaited_by_parent, {a}.total_children_count::bigint, \
-        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.hold, {a}.read_requested, {a}.reply_seen_devices, {a}.apply_in_flight, \
+        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.archivable_sub_thread_count::bigint, {a}.is_stopped_child, {a}.hold, {a}.read_requested, {a}.reply_seen_devices, {a}.apply_in_flight, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, {a}.cache_keep_alive_status, \
         {a}.status, {a}.summary_version, {a}.coding_agent_change_state, {a}.coding_agent_unproposed_reason, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
-        {a}.is_saved, {a}.is_home, {a}.has_response, \
+        {a}.is_saved, {a}.pin_folder, {a}.is_home, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
         (SELECT p.title FROM thread_summaries p WHERE p.thread_id = {a}.parent_thread_id) AS parent_thread_title, \
         {a}.successor_thread_id::text AS successor_thread_id, \
@@ -832,6 +853,7 @@ fn row_to_thread_summary(
         last_agent_action: r.last_agent_action,
         message_count: r.message_count,
         saved: r.is_saved,
+        pin_folder: r.pin_folder,
         home: r.is_home,
         section: r.section,
         active_children_count: r.active_children_count,
@@ -840,6 +862,7 @@ fn row_to_thread_summary(
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
+        archivable_sub_thread_count: r.archivable_sub_thread_count,
         is_stopped_child: r.is_stopped_child,
         hold: r.hold.map(|hold| hold.0),
         read_requested: r.read_requested,

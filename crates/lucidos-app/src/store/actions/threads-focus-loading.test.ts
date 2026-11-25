@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { effect } from '@preact/signals';
 
 vi.hoisted(() => {
   const storage = new Map<string, string>();
@@ -37,7 +38,7 @@ import { archiveThreadCount, focusedPane, focusedThreadId, generatedTitleIds, mo
 import { _resetThreadOpenMarksForTesting, takeThreadOpenStart } from '../../utils/threadOpenMarks';
 import { closeDashboardPanel, dashboardPanelOpen, openDashboardPanel } from '../dashboards';
 import { loadAllThreads, loadThreadEvents } from './thread-loading';
-import { focusThread, handleSaveThread, unfocusThread } from './threads';
+import { focusThread, focusThreadOrBootstrapResult, handleSaveThread, unfocusThread } from './threads';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 import { _resetComposeSyncForTesting } from '../composeSync';
 
@@ -174,6 +175,31 @@ describe('focusThread', () => {
         setFollowLiveEdge(true);
 
         unfocusThread();
+        expect(classifyScroll(el).followSurvives).toBe(false);
+      });
+    });
+
+    it('retires it before the focus moves, so no subscriber sees the old follow still armed', () => {
+      withTranscript((el) => {
+        focusThread('t1');
+        setFollowLiveEdge(true);
+        const seen: boolean[] = [];
+        const stop = effect(() => {
+          if (focusedThreadId.value === 't2' && seen.length === 0) seen.push(classifyScroll(el).followSurvives);
+        });
+
+        focusThread('t2');
+        stop();
+        expect(seen).toEqual([false]);
+      });
+    });
+
+    it('retires it at the optimistic focus when a bootstrap opens a thread outside the loaded list', () => {
+      withTranscript((el) => {
+        focusThread('t1');
+        setFollowLiveEdge(true);
+
+        void focusThreadOrBootstrapResult('t2').catch(() => {});
         expect(classifyScroll(el).followSurvives).toBe(false);
       });
     });

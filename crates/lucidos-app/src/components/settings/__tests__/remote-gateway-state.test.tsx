@@ -6,6 +6,7 @@ import { act } from 'preact/test-utils';
 import { RemoteGatewaysSection, remoteGatewayState } from '../GatewayPairingSections';
 import * as control from '../../../api/client/control';
 import type { Loadable } from '../../../store/types';
+import { openFold } from './openFold';
 
 vi.mock('../../../api/client/control', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client/control')>()),
@@ -53,6 +54,7 @@ describe('RemoteGatewaysSection', () => {
     document.body.append(host);
     await act(async () => { render(<RemoteGatewaysSection available />, host); });
     await act(async () => { await Promise.resolve(); });
+    await act(() => { openFold(host, 'cloud'); });
   }
 
   const buttons = () => [...host.querySelectorAll('button')].map(b => b.textContent);
@@ -64,8 +66,8 @@ describe('RemoteGatewaysSection', () => {
     expect(host.textContent).toContain('Access revoked');
     expect(host.querySelector('input[aria-label="New gateway pairing secret from cloud"]')).not.toBeNull();
     expect(buttons()).toContain('Re-pair');
-    expect(buttons()).toContain('Remove');
-    expect(buttons()).not.toContain('Rotate credential');
+    expect(buttons()).toContain('Remove cloud');
+    expect(buttons()).not.toContain('Rotate');
   });
 
   it('draws the rows while the listing is still pending', async () => {
@@ -73,8 +75,21 @@ describe('RemoteGatewaysSection', () => {
     vi.mocked(control.listRemoteWorkspaces).mockReturnValue(new Promise(() => {}));
     await mount();
     expect(host.textContent).toContain('https://cloud.example.com');
-    expect(buttons()).toContain('Rotate credential');
+    expect(buttons()).toContain('Rotate');
     expect(host.textContent).not.toContain('Access revoked');
+  });
+
+  it('keeps an open header draft across collapsing the gateway fold', async () => {
+    vi.mocked(control.listRemoteGateways).mockResolvedValue([cloud]);
+    vi.mocked(control.listRemoteWorkspaces).mockResolvedValue([]);
+    await mount();
+    await act(() => { openFold(host, 'Edit'); });
+    expect(buttons()).toContain('Save headers');
+    const toggle = host.querySelector<HTMLButtonElement>('.remote-gateway-toggle')!;
+    await act(() => { toggle.click(); });
+    expect(buttons()).not.toContain('Save headers');
+    await act(() => { toggle.click(); });
+    expect(buttons()).toContain('Save headers');
   });
 
   it('shows a failed listing as an error beside the rows', async () => {

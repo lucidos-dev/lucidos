@@ -27,10 +27,6 @@ pub(crate) fn lookup_repo_commands_in_cache(
     cache.get(repo_path).cloned().unwrap_or_default()
 }
 
-/// Tools every Claude Code session may run without a permission card. The
-/// engine itself asks for each: `request-read` at every turn end, and
-/// `expect-wake` in an `await-event` result. A card would stall those turns
-/// in a workspace that has granted nothing yet.
 pub(crate) const ENGINE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(lucidos request-read:*)",
     "Bash(lucidos expect-wake:*)",

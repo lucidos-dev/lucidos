@@ -6,7 +6,7 @@ vi.mock('../../api/client/control', () => ({ getGatewayStatus: mocks.getGatewayS
 
 const { relayedUpdate } = await import('../store');
 const { resumeRelayedUpdate, watchRelayedUpdate } = await import('./update-relay');
-const { loadRelayedUpdate, saveRelayedUpdate } = await import('../updateRelay');
+const { loadRelayedUpdate, saveRelayedUpdate, RELAY_GIVE_UP_MS } = await import('../updateRelay');
 
 const MARKER = { id: 'r-1', version: '1.3.0', fromVersion: '1.2.0', since: Date.now() };
 
@@ -61,6 +61,16 @@ describe('watching a relayed update', () => {
     expect(loadRelayedUpdate()).toBeNull();
     await vi.advanceTimersByTimeAsync(10_000);
     expect(mocks.getGatewayStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it('reports did-not-run once a gateway outage outlasts the give-up window', async () => {
+    mocks.getGatewayStatus.mockRejectedValue(new Error('the service is restarting'));
+    const news = vi.fn();
+    watchRelayedUpdate({ ...MARKER, since: Date.now() }, news);
+    await vi.advanceTimersByTimeAsync(RELAY_GIVE_UP_MS + 2_000);
+    expect(news).toHaveBeenCalledTimes(1);
+    expect(news).toHaveBeenCalledWith({ kind: 'did-not-run' });
+    expect(relayedUpdate.value).toBeNull();
   });
 
   it('picks a request back up after a reload, and looks at once', async () => {

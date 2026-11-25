@@ -15,11 +15,13 @@ vi.mock('./threads', () => ({ focusSpawnedThread }));
 const confirmPluginInstall = vi.fn();
 const cancelPluginInstall = vi.fn();
 const stagePluginInstall = vi.fn();
+const proposePluginUpstream = vi.fn();
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   confirmPluginInstall: (...a: unknown[]) => confirmPluginInstall(...a),
   cancelPluginInstall: (...a: unknown[]) => cancelPluginInstall(...a),
   stagePluginInstall: (...a: unknown[]) => stagePluginInstall(...a),
+  proposePluginUpstream: (...a: unknown[]) => proposePluginUpstream(...a),
 }));
 
 const refreshPluginCatalogAfterMutation = vi.fn();
@@ -37,6 +39,7 @@ const {
   openPluginInstallRequest,
   markPluginInstalled,
   confirmPluginInstallAction,
+  proposePluginUpstreamAction,
 } = await import('./plugin-install');
 
 const request: PluginInstallRequest = {
@@ -218,5 +221,20 @@ describe('confirmPluginInstallAction', () => {
     await confirmPluginInstallAction(form);
 
     expect(activeInlineForm.value).toBe(other);
+  });
+});
+
+describe('proposePluginUpstreamAction', () => {
+  it('reports a failed jump to the new thread as a navigation failure, not a failed proposal', async () => {
+    proposePluginUpstream.mockResolvedValue({ thread_id: 't-7', patch_path: 'patches/habit-tracker.patch' });
+    focusSpawnedThread.mockImplementationOnce(() => { throw new Error('boom'); });
+
+    await proposePluginUpstreamAction('habit-tracker', 'Habit Tracker');
+
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Saved your Habit Tracker patch to data/patches/habit-tracker.patch'),
+      'error',
+    );
+    expect(showToast).not.toHaveBeenCalledWith(expect.stringContaining("Couldn't prepare a patch"), 'error');
   });
 });

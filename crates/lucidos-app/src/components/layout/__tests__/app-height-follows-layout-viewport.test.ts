@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { enginePackaged } from '../../../store/enginePackaging';
-import { PERF_FLAG_KEY, perfRecordingOn, setPerfEnabled } from '../../../utils/perfQueue';
+import { PERF_FLAG_KEY, clearPerfOptIn, perfRecordingOn, setPerfEnabled } from '../../../utils/perfQueue';
 import { trackAppHeight } from '../MobileSwipeContainer';
 import { resetKeyboardCloseState } from '../keyboardCloseRelayout';
 
@@ -90,6 +90,30 @@ describe('trackAppHeight', () => {
         key: PERF_FLAG_KEY, oldValue: '1', storageArea: window.localStorage,
       }));
       expect(clear).toHaveBeenCalledExactlyOnceWith(interval.mock.results[0].value);
+      expect(perfRecordingOn()).toBe(true);
+    } finally {
+      enginePackaged.value = null;
+      localStorage.removeItem(PERF_FLAG_KEY);
+      interval.mockRestore();
+      clear.mockRestore();
+    }
+  });
+
+  it('stops polling when a from-source device clears its old opt-in in the same tab', () => {
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    const clear = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      enginePackaged.value = false;
+      localStorage.setItem(PERF_FLAG_KEY, '1');
+      window.dispatchEvent(Object.assign(new Event('storage'), {
+        key: PERF_FLAG_KEY, newValue: '1', storageArea: window.localStorage,
+      }));
+      expect(interval).toHaveBeenCalledExactlyOnceWith(expect.any(Function), 3000);
+
+      clearPerfOptIn();
+
+      expect(clear).toHaveBeenCalledExactlyOnceWith(interval.mock.results[0].value);
+      expect(localStorage.getItem(PERF_FLAG_KEY)).toBeNull();
       expect(perfRecordingOn()).toBe(true);
     } finally {
       enginePackaged.value = null;

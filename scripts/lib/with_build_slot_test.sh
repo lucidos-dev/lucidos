@@ -51,6 +51,7 @@ chmod +x "$TMP/bin/fake-build"
 SAFE_PATH="$TMP/bin:/usr/bin:/bin"
 run_slot() { # <label>
     (cd "$TMP" && env -i HOME="$TMP" PATH="$SAFE_PATH" \
+        LUCIDOS_SLOT_RECHECK_MEMORY="${LUCIDOS_SLOT_RECHECK_MEMORY:-}" \
         bash "$TMP/scripts/with-build-slot.sh" --label "$1" -- fake-build)
 }
 
@@ -127,6 +128,7 @@ if [ "$4" = --lease ]; then
 fi
 while [ "$1" != -- ]; do shift; done
 shift
+touch "$(dirname "$0")/../broker-admitted"
 exec "$@"
 EOF
 chmod +x "$TMP/bin/lucidos"
@@ -165,5 +167,19 @@ test_no_broker_runs_the_body_unleased
 test_lease_runs_the_memory_gate_once
 
 echo ""
+cat > "$TMP/scripts/build-prerequisites.sh" <<'CHECK'
+#!/bin/bash
+d="$(dirname "$0")/.."
+[ -f "$d/broker-admitted" ] || exit 1
+echo "$*" > "$d/strict-memory.calls"
+exit 72
+CHECK
+chmod +x "$TMP/scripts/build-prerequisites.sh"
+rm -f "$TMP/build.ran" "$TMP/broker-admitted"
+LUCIDOS_SLOT_RECHECK_MEMORY=1 run_slot "strict memory recheck"
+expect_eq "strict memory refusal preserves exit 72" 72 "$?"
+expect_eq "strict memory is probed without a prior receipt" --memory "$(cat "$TMP/strict-memory.calls")"
+expect_eq "strict memory refusal prevents execution" missing "$(cat "$TMP/build.ran" 2>/dev/null || echo missing)"
+
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

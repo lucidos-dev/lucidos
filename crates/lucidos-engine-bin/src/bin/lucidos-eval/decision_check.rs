@@ -45,8 +45,9 @@ pub(crate) struct Check {
 impl Check {
     /// The shipped labelled set, `eval/<command>/turns.toml`.
     pub(crate) fn shipped_set(&self) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../../eval/{}/turns.toml", self.command))
+        crate::eval_fixture_root()
+            .join(self.command)
+            .join("turns.toml")
     }
 
     /// Where a run appends its decisions unless told otherwise.

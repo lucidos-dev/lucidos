@@ -115,6 +115,7 @@ pub(super) fn version_status(update_available: bool, source_behind_head: bool) -
         build_queued: None,
         pending_commits: None,
         frontend_refresh_elapsed_ms: None,
+        frontend_build_watch_stopped: None,
     }
 }
 

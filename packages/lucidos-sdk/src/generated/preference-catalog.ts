@@ -69,6 +69,13 @@ export const PREF_RESPONSE_STYLES = {
   fallback: null,
 } as const;
 
+export const PREF_THREAD_FOLDERS = {
+  key: "thread_folders",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
 export const PREF_TITLE_STYLE = {
   key: "title_style",
   scope: "global",
@@ -1071,6 +1078,7 @@ export const PREFERENCE_CATALOG = {
   "chat_reasoning_efforts": PREF_CHAT_REASONING_EFFORTS,
   "response_style": PREF_RESPONSE_STYLE,
   "response_styles": PREF_RESPONSE_STYLES,
+  "thread_folders": PREF_THREAD_FOLDERS,
   "title_style": PREF_TITLE_STYLE,
   "technical_literacy": PREF_TECHNICAL_LITERACY,
   "image_model": PREF_IMAGE_MODEL,

@@ -267,8 +267,8 @@ pub(in crate::api) async fn delete_thread_family(
     drop_live_subscriptions(&state, &ids).await;
     let worktrees_removed = reclaim_worktrees(&state, &coding_agents).await;
     let widgets_removed = remove_owned_widgets(&state, &ids, &actor).await;
-    if surviving_parent.is_some() {
-        repair_ancestor_counts(&state).await;
+    if let Some(parent) = surviving_parent {
+        repair_ancestor_counts(&state, parent).await;
     }
     if let Some(card) = owed_card {
         state.engine.event_bus.deliver_owed_child_card(card).await;
@@ -861,7 +861,7 @@ async fn parent_outside_family(
     )
 }
 
-async fn repair_ancestor_counts(state: &AppState) {
+async fn repair_ancestor_counts(state: &AppState, surviving_parent: Uuid) {
     // The child-count rebuild includes `total_children_count`. A count of one
     // with no child left draws a chevron that expands to nothing.
     use crate::engine::event_bus::EventBus;
@@ -871,6 +871,10 @@ async fn repair_ancestor_counts(state: &AppState) {
     if let Err(e) = EventBus::rebuild_blocking_descendant_count(&state.pool).await {
         log_legacy!("[Delete] Could not rebuild the descendant counts: {}", e);
     }
+    state
+        .engine
+        .event_bus
+        .request_archive_recount(surviving_parent);
 }
 
 #[cfg(test)]

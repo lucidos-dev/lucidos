@@ -21,6 +21,16 @@ it('keeps early progress and terminal frames until the presenter is available', 
   events.stopAppUpdateProgress();
 });
 
+it('retries the subscription on the next start after a failed listen', async () => {
+  m.listen.mockRejectedValueOnce(new Error('denied'));
+  const events = await import('./appUpdateProgressEvents');
+  events.startAppUpdateProgress();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  events.startAppUpdateProgress();
+  expect(m.listen).toHaveBeenCalledTimes(2);
+  events.stopAppUpdateProgress();
+});
+
 it('clears queued frames and closes a subscription that finishes after teardown', async () => {
   let subscribed!: (stop: () => void) => void;
   m.listen.mockReturnValue(new Promise<() => void>((resolve) => { subscribed = resolve; }));

@@ -38,6 +38,7 @@ function makeThread(totalChildrenCount: number): ThreadState {
     totalChildrenCount,
     blockingDescendantCount: 0,
     attentionDescendantCount: 0,
+    archivableSubThreadCount: 0,
     codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false,
     lastRevivedAt: '',

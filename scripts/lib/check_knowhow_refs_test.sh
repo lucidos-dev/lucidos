@@ -23,6 +23,8 @@ class References(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name)
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        self.put('mkdocs.yml', 'docs_dir: docs/site\n')
+        self.put('docs/site/index.md', '# Site\n')
         for i in range(20):
             self.put(f'system-knowhow/doc-{i}.md', '# Reference\n')
         self.put('system-knowhow/workspace-audit.md', '| **high** | Meaning |\n')
@@ -252,6 +254,40 @@ class References(unittest.TestCase):
         self.check(f'See `{part_a}` \u00a7 Alpha for the permission request on this machine, and \u00a7 Gamma below.', 0)
         self.put('docs/caf\u00e9.md', f'See `{part_a}` \u00a7 Gamma.')
         self.check(f'See `{part_a}` \u00a7 Alpha.', 1)
+
+    def test_site_includes_resolve_relative_paths_and_marker_ranges(self):
+        page = 'docs/site/nested/page.markdown'
+        target = '../../../system-knowhow/part.md'
+        source = 'system-knowhow/part.md'
+        self.put(source, '<!--start-->\nGlossary text.\n<!--end-->\n')
+        self.put(page, f'{{% include-markdown "{target}" %}}')
+        self.check('# Reference', 0)
+        self.put(page, f'{{% include-markdown {target} %}}')
+        self.assertIn('quoted source', self.check('# Reference', 1))
+        self.put(page, f'{{%\n include-markdown "{target}"\n start="<!--start-->"\n end="<!--end-->"\n%}}')
+        self.check('# Reference', 0)
+        for content, diagnostic in (
+            ('<!--end-->\nText.\n<!--start-->', 'end'),
+            ('<!--start-->\nText.', 'end'),
+            ('Text.\n<!--end-->', 'start'),
+        ):
+            with self.subTest(content=content):
+                self.put(source, content)
+                output = self.check('# Reference', 1)
+                self.assertIn(f'{page}:1:', output)
+                self.assertIn(f'<!--{diagnostic}-->', output)
+        self.put(source, '<!--start-->\n<!--end-->')
+        self.assertIn('empty range', self.check('# Reference', 1))
+        (self.root / source).unlink()
+        self.assertIn(target, self.check('# Reference', 1))
+
+    def test_site_includes_follow_mkdocs_docs_dir_and_check_plain_includes(self):
+        self.put('mkdocs.yml', 'docs_dir: "docs/moved site" # source pages\n')
+        self.assertIn('docs/moved site', self.check('# Reference', 1))
+        self.put('docs/moved site/index.md', '{% include "diagram.svg" %}')
+        self.assertIn('diagram.svg', self.check('# Reference', 1))
+        self.put('docs/moved site/diagram.svg', '<svg/>')
+        self.check('# Reference', 0)
 
     def test_missing_or_empty_inputs(self):
         for name in (self.manifest, self.settings, 'crates/demo/src/lib.rs'):

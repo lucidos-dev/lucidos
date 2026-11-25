@@ -5,7 +5,8 @@
 This pass covers every shipped client: iOS Safari/PWA, macOS WKWebView,
 desktop browsers and SDK frames. It inspects the tree and recorded registry
 findings, without reading workspace user data. No probe has affirmative evidence
-that its full removal condition is met. No source or scroll file changes.
+that its full removal condition is met. The failed lazy-chunk refetch gains a
+registry entry and a source pointer.
 
 Costs below are source-level counts and cadence, not CPU, memory or latency
 benchmarks. Device verification, fresh diagnostic audits and release-counter
@@ -24,6 +25,7 @@ All rows are **kept**. The registry preserves their individual removal steps.
 | Crash resources: `utils/crashMonitor.ts`, `crashBreadcrumbs.ts`, `crashStorage.ts`, `pageResources.ts` | Shared page-health row still active; death classes lack recorded closure. | Resource observer and load listener; visible sampling normally 10 s, 2 s for 20 s after thread open, 500 ms for 15 s after wake; bounded persisted samples/marks. |
 | SDK frame resources: `packages/lucidos-sdk/src/widgetResources.ts`, host `utils/frameResources.ts` | Already registered under Page health log; shared crash investigation remains open. | Resource-change media/image counting, messages to host and mounted-frame aggregation; no resource paths. |
 | App frame load: `components/apps/appFrameLoadProbe.ts` | Six recorded desktop episodes; admission stage unidentified, no phone fix verification. | One 3 s timer per mounted frame; slow frames log start and end/abandon, fast frames silent. Shared request/queue snapshots add bookkeeping. |
+| Failed lazy-chunk refetch: `utils/lazyComponent.tsx::probeFailedChunk` | The [inline-small-chunks plan](../plans/2026-11-17-inline-small-lazy-chunks.md) leaves failures of larger imports unresolved. No recorded device audit closes them. | After an identified import fails and recovery declines to reload, one extra asset fetch, one full response-body read on a response, and one log. |
 | Shell snap-back: `utils/shellScrollProbe.ts` | No recorded source-trigger fix and packaged-macOS verification. | Geometry/focus payload on guard correction; at most one log per second, one coalescing timer. Permanent guard stays. |
 | Safe-area: `utils/safeAreaProbe.ts` | ADRs 0551/0553/0610 describe fixes and confirmation goals, not a recorded audit closing both goals. | Geometry/style/layout reads on changed inset state; deferred log; 3 s settle timer retries at most 20 times. |
 | Toast press: `components/shared/toastPressProbe.ts` | No recorded first-tap cause and verified fix. | Five passive document listeners; per-press mutation observer and deadline/grace timers, verdict log. |
@@ -45,14 +47,15 @@ All rows are **kept**. The registry preserves their individual removal steps.
 | `utils/swLivenessProbe.ts`, `swFetchPathProbe.ts`, `store/actions/send-probe.ts` | Health checks drive recovery, rather than collecting evidence alone. | Worker ping deadlines; paired health fetches; accepted-send 4 s confirmation timeout, conditional refetch/restart. |
 | `store/restoreAdmissionWatchdog.ts` | Admission recovery is product behavior. | Admission deadline and conditional recovery/logging. |
 | `utils/safeAreaFloor.ts`, `scrollbarGutter.ts`, SDK `tooltip.ts` | Hidden measurement elements supply layout values to product behavior. | Layout reads and resize observation; not diagnostic candidates. |
+| SDK `fullScreenTrace.ts` | The resolved Video full screen trace row records the decision to retain SDK-wide tracing after the player-specific trace retired. | Per-frame full-screen request hooks and event listeners. Each traced request arms one timeout per element. |
 | `window_probe.rs` | Feature-gated standalone AppKit reproduction and regression tooling; header explicitly excludes shipped builds. | Zero in shipped clients; only runs when explicitly built and invoked. |
 
 The producer and temporary-marker scan also covered native client diagnostics,
 SDK sources, client-log callers, shell install sites and investigation references.
 Native relaunch/crash diagnostics, IPC health and ordinary error breadcrumbs are
-product recovery or permanent tooling. No additional unregistered temporary
-probe was identified. Shared helper deletion must follow current callers:
-request snapshots also feed render and crash diagnostics.
+product recovery or permanent tooling. The failed lazy-chunk refetch was the
+only unregistered temporary probe found. Shared helper deletion must follow
+current callers: request snapshots also feed render and crash diagnostics.
 
 ## Condition changes
 

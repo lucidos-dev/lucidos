@@ -279,7 +279,7 @@ where
 /// workspaces routinely disagree on `needs_memory`. The context-mode eval runs
 /// exactly that shape, and a disagreement voids the whole task pair
 /// (`lucidos_eval::analyse::retrieval_disagreed`). Pinning both arms removes
-/// the confound. See `crates/lucidos-eval/src/workspace.rs`.
+/// the confound. See `crates/lucidos-engine-bin/src/bin/lucidos-eval/workspace.rs`.
 pub(super) const FORCE_QUERY_CLASSIFICATION_ENV: &str = "LUCIDOS_FORCE_QUERY_CLASSIFICATION";
 
 /// Read one raw env value into a pinned classification.

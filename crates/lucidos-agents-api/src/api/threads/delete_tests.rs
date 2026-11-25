@@ -781,7 +781,7 @@ fn the_audit_frame_is_the_last_thing_the_handler_does() {
         "drop_live_subscriptions(&state, &ids)",
         "reclaim_worktrees(&state, &coding_agents)",
         "remove_owned_widgets(&state, &ids, &actor)",
-        "repair_ancestor_counts(&state)",
+        "repair_ancestor_counts(&state, parent)",
     ] {
         let at = SRC
             .find(earlier)
@@ -984,6 +984,7 @@ fn the_reclaim_detaches_before_it_removes_and_the_repair_runs_both_rebuilds() {
     let repair = function_body(SRC, "async fn repair_ancestor_counts(");
     assert!(repair.contains("rebuild_children_counts("));
     assert!(repair.contains("rebuild_blocking_descendant_count("));
+    assert!(repair.contains("request_archive_recount(surviving_parent)"));
 }
 
 #[tokio::test]

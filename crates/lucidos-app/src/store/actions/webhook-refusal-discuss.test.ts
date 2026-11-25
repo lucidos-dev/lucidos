@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { webhookRefusalNotice } from '../../utils/webhookRefusalNotice';
 import type { WebhookRefusal } from '../../api/client';
+import { webhookRefusals } from '../store';
+import { currentWebhookRefusals } from './webhookRefusals';
 
 const sendSeededPrompt = vi.fn(async () => true);
 vi.mock('./compose', () => ({ sendSeededPrompt }));
@@ -135,6 +137,13 @@ describe('discussWebhookRefusal', () => {
   it('swallows nothing on a declined or failed send: the seam toasts', async () => {
     sendSeededPrompt.mockResolvedValue(false);
     await expect(discussWebhookRefusal(refusal(), null)).resolves.toBeUndefined();
+  });
+
+  it('leaves the standing refusal on the bar, since a discussion measures no recovery', async () => {
+    const r = refusal();
+    webhookRefusals.value = { status: 'loaded', data: { refusals: { refusing: [r] }, receivedAt: Date.now() } };
+    await discussWebhookRefusal(r, null);
+    expect(currentWebhookRefusals(Date.now()).map((x) => x.webhook_id)).toEqual([r.webhook_id]);
   });
 
   it('is reachable: the bar wires a button to this action', () => {

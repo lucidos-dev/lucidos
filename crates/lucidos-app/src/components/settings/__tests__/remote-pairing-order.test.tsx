@@ -9,6 +9,7 @@ import { pickerFooter, type PickerFooterProps } from '../../picker/PickerFooter'
 import { EMPTY_RESTORE_DRAFT } from '../../picker/workspaceForms';
 import { HTTPS_ONLY_NOTE } from '../remoteGatewayForm';
 import * as control from '../../../api/client/control';
+import { openFold } from './openFold';
 
 vi.mock('../../../api/client/control', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client/control')>()),
@@ -55,6 +56,7 @@ for (const surface of ['Settings', 'picker'] as const) {
           ? <RemoteGatewaysSection available />
           : <PickerForm />, host);
       });
+      if (surface === 'Settings') await act(() => { openFold(host, 'Add a remote gateway'); });
     }
 
     function controls() {
@@ -119,6 +121,7 @@ it('shows stored return access until the owner change completes and reloads', as
   document.body.append(host);
   await act(async () => { render(<RemoteGatewaysSection available />, host); });
   await act(async () => { await Promise.resolve(); });
+  await act(() => { openFold(host, 'cloud'); });
   const input = host.querySelector<HTMLInputElement>('input[aria-label="Allow agents on cloud to read and start threads through this gateway"]');
   expect(input, host.textContent ?? '').not.toBeNull();
   await act(async () => { input!.click(); });

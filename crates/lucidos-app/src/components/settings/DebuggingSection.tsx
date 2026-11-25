@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import { currentAutocorrect, currentCaptureContext, setAutocorrect, setCaptureContext } from '../../store/actions/preferences';
-import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
+import { clearPerfOptIn, isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
 import { isIOS } from '../../utils/platform';
 import { animationSpeed, enginePackaged, preferences, speedMultiplier } from '../../store/store';
 import { reducedMotion } from '../../utils/motion';
@@ -53,9 +53,31 @@ export function DebuggingSection() {
               From-source installs record automatically. Packaged installs start
               with recording off. The switch applies to this device immediately.
             </p>
+            <p>
+              A device that turned the switch on earlier keeps that stored choice
+              when it opens a from-source workspace. Clear it here. Recording
+              stays on from source, and the phone's viewport poll, which only
+              the stored choice turns on, stops.
+            </p>
           </Explainer>
         </span>
-        {packaged === false && <span>Always on</span>}
+        {packaged === false && (
+          <div class="settings-row-options" style="gap: 0.5rem; align-items: center">
+            <span>Always on</span>
+            {perfOn && (
+              <button
+                class="action-btn"
+                aria-label="Clear stored perf opt-in"
+                onClick={() => {
+                  clearPerfOptIn();
+                  setPerfOn(isPerfEnabled());
+                }}
+              >
+                Clear stored opt-in
+              </button>
+            )}
+          </div>
+        )}
         {packaged === true && (
           <label class="toggle-switch">
             <input

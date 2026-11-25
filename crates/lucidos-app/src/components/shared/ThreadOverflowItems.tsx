@@ -1,12 +1,10 @@
-import { useEffect, useState } from 'preact/hooks';
-import { archiveAllPreflight, type ArchiveAllPreflight } from '../../api/threads';
-import { type Loadable, loadingIfFresh, failedIfFresh } from '../../store/types';
+import { useState } from 'preact/hooks';
 import { archivingCompleted, handleArchiveCompleted } from '../../store/actions/archive-completed';
-import { LoadableError } from './LoadableError';
 import { Disclosure } from './Disclosure';
 import type { ComponentChildren } from 'preact';
 import type { OverflowMenuContext } from './OverflowMenu';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, HoldIcon, StandingApplyIcon, TrashIcon } from './icons';
+import { FolderPinItems } from './FolderPinItems';
+import { ChevronRightIcon, FolderIcon, CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, HoldIcon, StandingApplyIcon, TrashIcon } from './icons';
 import { canRenameThread, promptRenameThread } from '../../store/actions/threadRename';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
@@ -19,6 +17,7 @@ import { exitItems } from '../../store/actions/threadBlockers';
 import { canHoldThread, HOLD_TOOLTIP, promptAndHoldThread } from '../../store/actions/threadHold';
 import { SUB_THREAD_STATE, moreSubThreads } from '../../store/actions/blockerCopy';
 import { threadMap, standingApplyThreadIds } from '../../store/store';
+import { isFamilyRoot } from '../drawer/family-graph';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 
 export const LISTED_SUB_THREADS = 3;
@@ -72,6 +71,9 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
             <PinIcon filled={saved} />
             {saved ? 'Unpin thread' : 'Pin thread'}
           </button>
+          {liveThread && isFamilyRoot(liveThread, threadMap.value) && (
+            <PinToFolderItem threadId={threadId} saved={saved} run={run} />
+          )}
           <div class="thread-overflow-divider" role="separator" />
         </>
       )}
@@ -132,7 +134,7 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
           Move to top level
         </button>
       )}
-      <ArchiveCompletedItem threadId={threadId} run={run} />
+      <ArchiveCompletedItem threadId={threadId} count={liveThread?.meta.archivableSubThreadCount ?? 0} run={run} />
       {exits.archive === 'enabled' && (
         <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleArchiveThread(threadId); })}>
           <ArchiveIcon />
@@ -172,6 +174,27 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
   );
 }
 
+function PinToFolderItem({ threadId, saved, run }: {
+  threadId: string;
+  saved: boolean;
+  run: OverflowMenuContext['run'];
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" class="thread-overflow-item" role="menuitem" aria-expanded={open}
+        onClick={() => setOpen(o => !o)}>
+        <FolderIcon />
+        {saved ? 'Move to folder' : 'Pin to folder'}
+        <span class={`thread-overflow-chevron${open ? ' open' : ''}`} aria-hidden="true"><ChevronRightIcon size="1em" /></span>
+      </button>
+      <Disclosure open={open} bodyClass="thread-overflow-submenu">
+        <FolderPinItems threadId={threadId} run={run} includePinned={saved} />
+      </Disclosure>
+    </>
+  );
+}
+
 function BlockedExit({ icon, label, reason, danger }: {
   icon: ComponentChildren;
   label: string;
@@ -188,55 +211,17 @@ function BlockedExit({ icon, label, reason, danger }: {
   );
 }
 
-function ArchiveCompletedItem({ threadId, run }: {
+function ArchiveCompletedItem({ threadId, count, run }: {
   threadId: string;
+  count: number;
   run: OverflowMenuContext['run'];
 }) {
-  const summaries = threadMap.value;
-  const children = new Map<string, string[]>();
-  for (const [id, thread] of summaries) {
-    const parent = thread.meta.parentThreadId;
-    if (!parent) continue;
-    const siblings = children.get(parent) ?? [];
-    siblings.push(id);
-    children.set(parent, siblings);
-  }
-  const related = new Set<string>();
-  const pending = [threadId];
-  while (pending.length) {
-    const id = pending.pop()!;
-    if (related.has(id)) continue;
-    related.add(id);
-    pending.push(...(children.get(id) ?? []));
-  }
-  let ancestor = summaries.get(threadId)?.meta.parentThreadId;
-  while (ancestor && !related.has(ancestor)) {
-    related.add(ancestor);
-    ancestor = summaries.get(ancestor)?.meta.parentThreadId;
-  }
-  const version = [...related].sort().map(id => `${id}:${summaries.get(id)?.meta.summaryVersion}`).join(',');
   const busy = archivingCompleted.value.has(threadId);
-  const [preflight, setPreflight] = useState<Loadable<ArchiveAllPreflight>>({ status: 'not-loaded' });
-  const [retry, setRetry] = useState(0);
-  useEffect(() => {
-    let current = true;
-    setPreflight(loadingIfFresh);
-    archiveAllPreflight(threadId).then(data => {
-      if (current) setPreflight({ status: 'loaded', data });
-    }).catch(error => { if (current) setPreflight(prev => failedIfFresh(prev, error)); });
-    return () => { current = false; };
-  }, [threadId, version, retry]);
-  switch (preflight.status) {
-    case 'not-loaded':
-    case 'loading': return null;
-    case 'failed': return <LoadableError noun="completed sub-threads" error={preflight.error} onRetry={() => setRetry(n => n + 1)} />;
-    case 'loaded': {
-      const { data } = preflight;
-      return <Disclosure open={data.safe_thread_count > 0} appear><button type="button" class="thread-overflow-item" role="menuitem" disabled={busy}
-        onClick={run(() => { void handleArchiveCompleted(threadId, data); })}>
-        <ArchiveIcon />
-        Archive {data.safe_thread_count} completed sub-threads
-      </button></Disclosure>;
-    }
-  }
+  return <Disclosure open={count > 0}>
+    <button type="button" class="thread-overflow-item" role="menuitem" disabled={busy}
+      onClick={run(() => { void handleArchiveCompleted(threadId); })}>
+      <ArchiveIcon />
+      Archive {count} completed sub-threads
+    </button>
+  </Disclosure>;
 }

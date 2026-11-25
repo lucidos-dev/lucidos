@@ -23,6 +23,10 @@ function close(value: string | null) {
   settlePrompt(value);
 }
 
+function keepFieldFocused(e: MouseEvent) {
+  e.preventDefault();
+}
+
 export function PromptDialog() {
   const state = promptState.value;
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -94,7 +98,7 @@ export function PromptDialog() {
     <Overlay
       open
       onClose={() => close(null)}
-      overlayClass="protected-surface"
+      overlayClass="protected-surface prompt-dialog-overlay"
       panelClass="surface surface-raised confirm-dialog protected-surface"
       panelRole="dialog"
       ariaModal
@@ -116,7 +120,7 @@ export function PromptDialog() {
           <input type="text" class="prompt-input" placeholder={state.placeholder} readOnly={suggesting} aria-busy={suggesting} {...PROSE_TEXT_ATTRS} />
         )}
       </div>
-      <div class="surface-foot">
+      <div class="surface-foot" onMouseDown={keepFieldFocused}>
         <button class="action-btn action-btn-secondary" data-role="prompt-cancel" onClick={() => close(null)}>
           {cancelLabel}
         </button>
@@ -131,7 +135,7 @@ export function PromptDialog() {
 function SuggestLink({ suggesting, onClick }: { suggesting: boolean; onClick: () => void }) {
   return (
     <button type="button" class="accent-link prompt-suggest" data-role="prompt-suggest"
-      aria-disabled={suggesting} aria-busy={suggesting}
+      aria-disabled={suggesting} aria-busy={suggesting} onMouseDown={keepFieldFocused}
       onClick={() => { if (!suggesting) onClick(); }}>
       {suggesting && <span class="mini-spinner" aria-hidden="true" />}
       Suggest

@@ -50,6 +50,7 @@ function composingThread(id: string): ThreadState {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
+      archivableSubThreadCount: 0,
       state: 'composing',
       latestTodoList: null,
       liveEventWaitCount: 0,

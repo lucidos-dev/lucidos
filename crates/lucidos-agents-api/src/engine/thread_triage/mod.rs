@@ -5,6 +5,7 @@
 //! action proposes an action per thread, and Archive all puts away only what
 //! this module calls safe. A thread is judged from facts, never its title.
 
+pub(crate) mod archivable_count;
 pub(crate) mod archive_all;
 pub(crate) mod facts;
 pub(crate) mod proposal;

@@ -10,26 +10,16 @@
 # engine suite, so an eval reachable from `cargo test` would spend four figures
 # on a lint fix. The eval is a binary, driven by scripts/eval-context-mode.sh.
 #
-# WHAT IS CHECKED, and why it is not the plan's literal rule. The plan writes I4
-# as "no #[test] and no tests/ directory in the crate", and then verifies five
-# other invariants with unit tests in that same crate. Both cannot hold. What
-# I4 is actually protecting is that nothing `cargo test` reaches can boot a
-# workspace, drive a thread, drop a database or call a model provider. So:
+# The eval target requires the opt-in eval feature. Its unit tests may check
+# free arithmetic and fixture handling. None may boot a workspace, drive a
+# thread, drop a database or call a model provider. Other targets in the root
+# package have their own tests.
 #
-#   1. No tests/ directory, and no [lib] / [[test]] / [[bench]] in Cargo.toml.
-#      `cargo test -p lucidos-eval` then has exactly one target, the binary's
-#      own unit tests.
-#   2. No #[cfg(test)] in main.rs, which is where the run loop lives.
-#   3. At most one #[cfg(test)] per file, so "from the marker to end of file"
-#      is exactly the test region and rule 4 can read it.
-#   4. No test region names a spending entrypoint. A test that cannot name one
-#      cannot call one.
+# Each eval source file may have one #[cfg(test)] region, at the end. The check
+# rejects all spending entry points in that region and keeps tests out of the
+# main run loop.
 #
-# That is stronger than the literal rule in one direction (it also catches a
-# tests/ file) and weaker in another (free arithmetic may be tested). The
-# weakening is the point: I1, I3, I5, I8 and I10 are unit tests.
-#
-# Exit status: 0 when clean, non-zero otherwise, including when the crate is
+# Exit status: 0 when clean, non-zero otherwise, including when the target is
 # missing. A gate that cannot run must never read as clean.
 
 set -uo pipefail
@@ -38,7 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR" || exit 1
 
-CRATE="crates/lucidos-eval"
+PACKAGE="crates/lucidos-engine-bin"
+EVAL="src/bin/lucidos-eval"
 
 # Every function that spends money, boots an engine, drops a database or clears
 # a data tree. Reached only from main.rs's command dispatch, never from a test.
@@ -63,23 +54,52 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-if [ ! -d "$CRATE" ]; then
-    echo "ERROR: $CRATE is missing, so I4 cannot be checked." >&2
+if [ ! -f "$PACKAGE/$EVAL/main.rs" ]; then
+    echo "ERROR: $PACKAGE/$EVAL/main.rs is missing, so I4 cannot be checked." >&2
     exit 1
 fi
 
-if [ -d "$CRATE/tests" ]; then
-    fail "$CRATE/tests/ exists. An integration-test target runs under \`cargo test\`."
+# Inspect the eval target only. The root package can declare other binaries,
+# integration tests and benchmarks.
+if ! awk -v eval_path="$EVAL/" '
+    function finish() {
+        if (name == "lucidos-eval" || index(path, eval_path) == 1) {
+            if (table != "[[bin]]" || name != "lucidos-eval" ||
+                path != eval_path "main.rs" || features != "[\"eval\"]") invalid = 1
+            else found++
+        }
+    }
+    /^[[:space:]]*\[/ {
+        finish()
+        table = $1
+        name = path = features = ""
+    }
+    /^[[:space:]]*(name|path)[[:space:]]*=/ {
+        value = $0
+        sub(/^[^=]+=[[:space:]]*"/, "", value)
+        sub(/".*$/, "", value)
+        if ($0 ~ /^[[:space:]]*name/) name = value
+        else path = value
+    }
+    /^[[:space:]]*required-features[[:space:]]*=/ {
+        features = $0
+        sub(/^[^=]+=[[:space:]]*/, "", features)
+        sub(/[[:space:]]*(#.*)?$/, "", features)
+    }
+    END { finish(); exit (invalid || found != 1) }
+' "$PACKAGE/Cargo.toml"; then
+    fail "$PACKAGE/Cargo.toml must declare one feature-gated lucidos-eval binary for $EVAL."
 fi
 
-for forbidden in '\[lib\]' '\[\[test\]\]' '\[\[bench\]\]'; do
-    if grep -qE "^$forbidden" "$CRATE/Cargo.toml"; then
-        fail "$CRATE/Cargo.toml declares $forbidden. The crate is a bin and nothing else."
-    fi
-done
+# A default feature list could enable eval, directly or through another feature.
+if awk '/^[[:space:]]*\[/ { in_features = ($1 == "[features]") }
+    in_features && /^[[:space:]]*default[[:space:]]*=/ { found = 1 }
+    END { exit !found }' "$PACKAGE/Cargo.toml"; then
+    fail "$PACKAGE/Cargo.toml declares default features. The eval feature must stay opt-in."
+fi
 
-if grep -q '#\[cfg(test)\]' "$CRATE/src/main.rs"; then
-    fail "$CRATE/src/main.rs has a #[cfg(test)] module. The run loop lives there."
+if grep -q '#\[cfg(test)\]' "$PACKAGE/$EVAL/main.rs"; then
+    fail "$PACKAGE/$EVAL/main.rs has a #[cfg(test)] module. The run loop lives there."
 fi
 
 while IFS= read -r file; do
@@ -98,7 +118,7 @@ so the test region is unambiguous."
 workspace. A test must not be able to reach it."
         fi
     done
-done < <(find "$CRATE/src" -name '*.rs' | sort)
+done < <(find "$PACKAGE/$EVAL" -name '*.rs' | sort)
 
 if [ "$FAILURES" -gt 0 ]; then
     echo "" >&2
@@ -107,4 +127,4 @@ a binary, never a test." >&2
     exit 1
 fi
 
-echo "OK: $CRATE cannot run the eval under \`cargo test\`."
+echo "OK: $PACKAGE/$EVAL cannot run the eval under \`cargo test\`."

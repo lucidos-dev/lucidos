@@ -12,7 +12,9 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use uuid::Uuid;
 
 use lucidos_build_slot::{
     host_ncpu, inherited_slot, resolve_class_with_legacy, BuildLimits, BuildSlotGuard,
@@ -37,6 +39,10 @@ const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest label recorded in slot metadata and carried on an event.
 const LABEL_CHARS: usize = 120;
+
+const ENV_REQUEST_ID: &str = "LUCIDOS_BUILD_SLOT_REQUEST_ID";
+const ENV_LEASE_RECORDS: &str = "LUCIDOS_BUILD_SLOT_LEASE_RECORDS";
+const ENV_GRANTED_CLASS: &str = "LUCIDOS_BUILD_SLOT_GRANTED_CLASS";
 
 pub(crate) struct BuildSlotArgs {
     pub status: bool,
@@ -134,19 +140,45 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     if let Some(index) = inherited_slot() {
         let limits = BuildLimits::nested(std::env::var(ENV_LEASE_NICE).ok().as_deref());
         lower_own_priority(limits.nice);
-        return spawn_child(&args.command, Some(&index), limits);
+        let request_id = std::env::var(ENV_REQUEST_ID)
+            .ok()
+            .and_then(|id| Uuid::parse_str(&id).ok());
+        let class = granted_class();
+        let started = Instant::now();
+        let code = spawn_child(&args.command, Some(&index), limits, request_id, class);
+        let exit_code = code.as_ref().ok().copied();
+        announce(
+            "BuildSlotStepCompleted",
+            &format!("A step under a build slot completed: `{label}`"),
+            serde_json::json!({
+                "label": label,
+                "slot": index,
+                "request_id": request_id.map(|id| id.to_string()),
+                "class": class.map(SlotClass::as_str),
+                "duration_ms": started.elapsed().as_millis(),
+                "exit_code": exit_code,
+                "outcome": command_outcome(exit_code),
+            }),
+        );
+        return code;
     }
 
     let Some(pool) = open_pool() else {
-        return spawn_child(&args.command, None, BuildLimits::NONE);
+        return spawn_child(&args.command, None, BuildLimits::NONE, None, None);
     };
-    let Some((guard, limits)) = acquire(&pool, &label, args.max_wait_secs, None) else {
+    let Some((hold, limits)) = acquire(&pool, &label, args.max_wait_secs, None) else {
         return Ok(WAIT_TIMEOUT_EXIT);
     };
-    let index = guard.index().to_string();
+    let index = hold.guard.index().to_string();
     lower_own_priority(limits.nice);
-    let code = spawn_child(&args.command, Some(&index), limits);
-    release(guard, &label);
+    let code = spawn_child(
+        &args.command,
+        Some(&index),
+        limits,
+        Some(hold.request_id),
+        Some(hold.class),
+    );
+    hold.release(&label, code.as_ref().ok().copied());
     code
 }
 
@@ -168,22 +200,33 @@ fn cmd_lease(args: BuildSlotArgs) -> Result<u8, BoxError> {
         return Ok(0);
     };
     let label = default_label(Some(args.label.as_deref().unwrap_or("build lease")), &[]);
-    let Some((guard, limits)) = acquire(&pool, &label, args.max_wait_secs, Some(parent)) else {
+    let Some((hold, limits)) = acquire(&pool, &label, args.max_wait_secs, Some(parent)) else {
         println!("error");
         return Ok(WAIT_TIMEOUT_EXIT);
     };
-    let result = (|| -> io::Result<()> {
+    let result = (|| -> io::Result<Option<u8>> {
         let jobs = limits
             .jobs
             .map_or_else(|| "-".into(), |jobs| jobs.to_string());
         {
             let mut stdout = io::stdout().lock();
-            writeln!(stdout, "granted {} {jobs} {}", guard.index(), limits.nice)?;
+            let index = hold.guard.index();
+            let nice = limits.nice;
+            if std::env::var_os(ENV_LEASE_RECORDS).is_some() {
+                writeln!(
+                    stdout,
+                    "granted {index} {jobs} {nice} {} {}",
+                    hold.request_id,
+                    hold.class.as_str()
+                )?;
+            } else {
+                writeln!(stdout, "granted {index} {jobs} {nice}")?;
+            }
             stdout.flush()?;
         }
         wait_for_lease_release(parent)
     })();
-    release(guard, &label);
+    hold.release(&label, result.as_ref().ok().copied().flatten());
     result?;
     Ok(0)
 }
@@ -199,22 +242,30 @@ fn parent_pid() -> u32 {
     0
 }
 
-fn wait_for_lease_release(parent: u32) -> io::Result<()> {
+fn wait_for_lease_release(parent: u32) -> io::Result<Option<u8>> {
     // The shell opens the FIFO read-write. Its death may leave inherited
     // writers open, so stdin alone cannot tell us when to release.
     let (done, release) = std::sync::mpsc::channel();
     std::thread::Builder::new().spawn(move || {
         let mut line = Vec::new();
-        let _ = done.send(io::stdin().lock().read_until(b'\n', &mut line));
+        let result = io::stdin().lock().read_until(b'\n', &mut line).map(|_| {
+            std::str::from_utf8(&line)
+                .ok()?
+                .trim_end()
+                .strip_prefix("release ")?
+                .parse::<u8>()
+                .ok()
+        });
+        let _ = done.send(result);
     })?;
     while parent_pid() == parent {
         match release.recv_timeout(Duration::from_secs(1)) {
-            Ok(result) => return result.map(|_| ()),
+            Ok(result) => return result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn open_pool() -> Option<BuildSlotPool> {
@@ -232,15 +283,25 @@ fn acquire(
     label: &str,
     max_wait_secs: Option<u64>,
     lease_parent: Option<u32>,
-) -> Option<(BuildSlotGuard, BuildLimits)> {
+) -> Option<(SlotHold, BuildLimits)> {
+    let request_id = Uuid::new_v4();
+    let requested_at = Instant::now();
     let class = resolve_class_with_legacy(
         std::env::var(ENV_CLASS).ok().as_deref(),
         std::env::var(ENV_LEGACY_PRIORITY).ok().as_deref(),
     );
-    let guard = pool
+    let (guard, acquired_at) = pool
         .try_acquire_as(label, class)
-        .or_else(|| wait_for_slot(pool, label, class, max_wait_secs, lease_parent))?;
-    let index = guard.index().to_string();
+        .map(|guard| (guard, Instant::now()))
+        .or_else(|| wait_for_slot(pool, label, class, max_wait_secs, lease_parent, request_id))?;
+    let hold = SlotHold {
+        guard,
+        request_id,
+        class,
+        wait: acquired_at.duration_since(requested_at),
+        acquired_at,
+    };
+    let index = hold.guard.index().to_string();
     // Decided with the slot already in hand, so the share counts this holder.
     let caller_jobs = std::env::var(ENV_CARGO_JOBS).ok();
     let nice_raw = std::env::var(ENV_NICE).ok();
@@ -254,25 +315,54 @@ fn acquire(
         "{}",
         describe_limits(&index, pool.capacity().value, &limits)
     );
-    Some((guard, limits))
+    Some((hold, limits))
 }
 
-fn release(guard: BuildSlotGuard, label: &str) {
-    let index = guard.index().to_string();
-    // Free the slot BEFORE announcing, so a waiter woken by the event finds it
-    // already available rather than racing the drop.
-    drop(guard);
-    // UNCONDITIONAL, and it must stay that way. Gating this on "is anyone
-    // waiting right now?" looks like a saving and is a trap: the subscriber
-    // this event exists for has ALREADY given up and exited, which is why it
-    // subscribed. Its flag went with it, so the probe says nobody is waiting
-    // and the sleeper is never woken. One row per build is the price of the
-    // `--max-wait` recovery path being real (ADR 0070).
-    announce(
-        "BuildSlotReleased",
-        &format!("A build slot freed up after `{label}`"),
-        serde_json::json!({ "label": label, "slot": index }),
-    );
+struct SlotHold {
+    guard: BuildSlotGuard,
+    request_id: Uuid,
+    class: SlotClass,
+    wait: Duration,
+    acquired_at: Instant,
+}
+
+impl SlotHold {
+    fn release(self, label: &str, exit_code: Option<u8>) {
+        let index = self.guard.index().to_string();
+        let hold_ms = self.acquired_at.elapsed().as_millis();
+        // Free the slot before announcing so a woken waiter finds it free.
+        drop(self.guard);
+        // Unconditional: the subscriber this event wakes has already given up
+        // and exited, so its waiting flag is gone (ADR 0070).
+        announce(
+            "BuildSlotReleased",
+            &format!("A build slot freed up after `{label}`"),
+            serde_json::json!({
+                "label": label,
+                "slot": index,
+                "request_id": self.request_id.to_string(),
+                "class": self.class.as_str(),
+                "wait_ms": self.wait.as_millis(),
+                "hold_ms": hold_ms,
+                "exit_code": exit_code,
+                "outcome": command_outcome(exit_code),
+            }),
+        );
+    }
+}
+
+/// The class the enclosing acquisition was granted, as that acquisition
+/// reported it. Unknown or missing values stay unknown, never a guess.
+fn granted_class() -> Option<SlotClass> {
+    SlotClass::parse(&std::env::var(ENV_GRANTED_CLASS).ok()?)
+}
+
+fn command_outcome(exit_code: Option<u8>) -> &'static str {
+    match exit_code {
+        Some(0) => "succeeded",
+        Some(_) => "failed",
+        None => "unknown",
+    }
 }
 
 /// The slot label: `--label` when given, else the program's file name alone.
@@ -305,7 +395,8 @@ fn wait_for_slot(
     class: SlotClass,
     max_wait_secs: Option<u64>,
     lease_parent: Option<u32>,
-) -> Option<BuildSlotGuard> {
+    request_id: Uuid,
+) -> Option<(BuildSlotGuard, Instant)> {
     let capacity = pool.capacity().value;
     let turn = match class {
         SlotClass::Priority => "as a priority build, so the next free one is ours",
@@ -340,7 +431,12 @@ fn wait_for_slot(
             announce(
                 "BuildSlotWaiting",
                 &format!("A build is waiting for one of {capacity} build slots: `{label}`"),
-                serde_json::json!({ "label": label, "slot_count": capacity }),
+                serde_json::json!({
+                    "label": label,
+                    "slot_count": capacity,
+                    "request_id": request_id.to_string(),
+                    "class": class.as_str(),
+                }),
             );
         }
         if waited >= next_progress {
@@ -356,12 +452,18 @@ fn wait_for_slot(
 
     match guard {
         Some(guard) => {
+            let acquired_at = Instant::now();
             announce(
                 "BuildSlotAcquired",
                 &format!("A waiting build took a build slot: `{label}`"),
-                serde_json::json!({ "label": label, "slot": guard.index() }),
+                serde_json::json!({
+                    "label": label,
+                    "slot": guard.index(),
+                    "request_id": request_id.to_string(),
+                    "class": class.as_str(),
+                }),
             );
-            Some(guard)
+            Some((guard, acquired_at))
         }
         None => {
             let secs = max_wait_secs.unwrap_or_default();
@@ -434,6 +536,8 @@ fn spawn_child(
     command: &[String],
     slot: Option<&str>,
     limits: BuildLimits,
+    request_id: Option<Uuid>,
+    granted_class: Option<SlotClass>,
 ) -> Result<u8, BoxError> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
@@ -443,7 +547,17 @@ fn spawn_child(
     if let Some(index) = slot {
         cmd.env(ENV_HELD, index);
     }
-    // The class belongs to this acquisition, not to the tree it admits.
+    if let Some(id) = request_id {
+        cmd.env(ENV_REQUEST_ID, id.to_string());
+    } else {
+        cmd.env_remove(ENV_REQUEST_ID);
+    }
+    // The class that governs admission belongs to this acquisition, not to the
+    // tree it admits. The tree only learns which class was granted.
+    match granted_class {
+        Some(class) => cmd.env(ENV_GRANTED_CLASS, class.as_str()),
+        None => cmd.env_remove(ENV_GRANTED_CLASS),
+    };
     cmd.env_remove(ENV_LEASE_NICE);
     cmd.env_remove(ENV_CLASS);
     cmd.env_remove(ENV_LEGACY_PRIORITY);
@@ -477,9 +591,8 @@ fn exit_code(status: std::process::ExitStatus) -> u8 {
 
 /// Emit a domain event, best effort.
 ///
-/// Silent on every failure, because announcing must never block, slow or fail
-/// a build. An engine that is down simply means nobody is told, and a waiter
-/// recovers through its own polling.
+/// Post failures never affect the build's result. The HTTP timeout caps the
+/// wait when an engine accepts the request but does not answer.
 fn announce(event_type: &str, summary: &str, mut payload: serde_json::Value) {
     let Ok(ws) = resolve_from_env() else {
         return;

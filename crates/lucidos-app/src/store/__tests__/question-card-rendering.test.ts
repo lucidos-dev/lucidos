@@ -46,7 +46,7 @@ function buildThreadState(events: ThreadEvent[]): ThreadState {
     section: 'archived',
     activeChildrenCount: 0,
     totalChildrenCount: 0,
-    blockingDescendantCount: 0, attentionDescendantCount: 0,
+    blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
     state: 'active',
     latestTodoList: null,
     liveEventWaitCount: 0,

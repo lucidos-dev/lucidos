@@ -811,3 +811,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0805: Hold replaces the automation pause: a thread and its sub-threads run nothing by themselves until Resume, with no cards](0805-hold-replaces-the-automation-pause.md)
 - [0806: Agents query sanitized gateway and desktop client logs through the local gateway.](0806-query-gateway-and-client-diagnostic-logs.md)
 - [0807: A per-pairing trusted pairing toggle on A, off by default, lets A serve B's own client for B's workspaces at A's origin; supersedes 0723's "Trust B like A: rejected".](0807-trusted-pairing-serves-the-peer-client.md)
+- [0808: Custom folders: the folder list is a preference, membership is a thread event](0808-custom-folders-preference-plus-event.md)

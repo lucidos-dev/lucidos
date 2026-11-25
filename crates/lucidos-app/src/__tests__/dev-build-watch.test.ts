@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 // @ts-expect-error: dev tooling, JS with no type declarations
 import * as watcher from '../../dev-build-watch.mjs';
 import {
@@ -15,6 +15,8 @@ const {
   DEV_BUILD_WATCH_ENV: WATCHER_ENV,
   BROKEN_ALERT_GRACE_MS,
   alertTransition,
+  handleBuildSpawnError,
+  handleWatchError,
   createBuildAlerts,
   budgetAlert,
   budgetAlerts,
@@ -296,5 +298,24 @@ describe('the committed inputs the poll asks git about', () => {
     expect(paths).toContain('crates/lucidos-app/src');
     expect(paths).toContain('package-lock.json');
     expect(paths).toContain('packages/lucidos-sdk/src');
+  });
+});
+
+describe('watcher recovery', () => {
+  it('resets a failed build, records the error, and drains queued work', () => {
+    const calls: string[] = [];
+    handleBuildSpawnError(new Error('EAGAIN'), 'install skipped', {
+      reset: () => calls.push('reset'),
+      record: (ok: boolean, error: string, skipped: string) => calls.push(`${ok}: ${error} (${skipped})`),
+      drain: () => calls.push('drain'),
+    });
+    expect(calls).toEqual(['reset', 'false: could not start vite build: EAGAIN (install skipped)', 'drain']);
+  });
+
+  it('closes failed watches and schedules a build before the poll retries them', () => {
+    const stop = vi.fn();
+    const schedule = vi.fn();
+    handleWatchError(new Error('watch lost'), { stop, schedule });
+    expect(stop).toHaveBeenCalledBefore(schedule);
   });
 });

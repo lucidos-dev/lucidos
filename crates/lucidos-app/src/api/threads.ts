@@ -33,6 +33,7 @@ export interface ThreadSummary {
   last_agent_action?: string;
   message_count: number;
   saved?: boolean;
+  pin_folder?: string;
   home?: boolean;
   section: ThreadSection;
   active_children_count: number;
@@ -41,6 +42,7 @@ export interface ThreadSummary {
   total_children_count: number;
   blocking_descendant_count: number;
   attention_descendant_count: number;
+  archivable_sub_thread_count: number;
   is_stopped_child?: boolean;
   hold?: ThreadHoldSummary;
   read_requested?: boolean;
@@ -120,8 +122,13 @@ async function rowWriteAck(res: Response): Promise<RowWriteAck> {
     return body ? JSON.parse(body) as RowWriteAck : {};
 }
 
-export async function saveThread(threadId: string): Promise<RowWriteAck> {
-    return rowWriteAck(await postThreadAction('save', { thread_id: threadId }));
+export async function saveThread(threadId: string, folder?: string): Promise<RowWriteAck> {
+    const body = folder === undefined ? { thread_id: threadId } : { thread_id: threadId, folder };
+    return rowWriteAck(await postThreadAction('save', body));
+}
+
+export async function moveThreadToFolder(threadId: string, folder: string | null): Promise<RowWriteAck> {
+    return rowWriteAck(await postThreadAction('move-to-folder', { thread_id: threadId, folder }));
 }
 
 export async function unsaveThread(threadId: string): Promise<RowWriteAck> {

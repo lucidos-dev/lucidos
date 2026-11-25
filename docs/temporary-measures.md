@@ -554,9 +554,8 @@ outside the retired probe.
 - **Removal / resolution condition:** when the **keyboard-reveal placement
   investigation** (`ios-keyboard-reveal-placement`) is closed, that is, the
   reveal is confirmed stable on-device over a representative run of forms.
-  Verify by confirming no open work reads the `[Client/mobile] focus-reveal`
-  line, then delete `reportEpisode`, its `lastSeen` bookkeeping and the two
-  imports it needs.
+  Record a passing device audit as described above. Then delete
+  `reportEpisode`, its `lastSeen` bookkeeping and its diagnostic imports.
 - **Status:** active
 - **Investigation:** `ios-keyboard-reveal-placement`
 
@@ -608,7 +607,7 @@ outside the retired probe.
   Resolve both the editing degradation and crash-reload investigations before removing their shared reporter. For editing,
   the trend across a degraded session
   names the cause and that cause is fixed in a recorded audit.
-  Verify by confirming no open work reads the line. Then delete both modules,
+  Record the editing and crash-reload audit verdicts. Then delete both modules,
   the test, the install file, its import in `main.tsx`, and the call in
   `shellStartup.ts`. Remove the resource/crash utilities and tests, and
   unwrap `recoveredStartup` in `liveness.ts`, retaining its startup fields.
@@ -637,13 +636,48 @@ outside the retired probe.
   when caller searches prove they have no remaining consumers. Remove only
   retired helpers’ tests and wiring in `AppFrame.tsx`, `_core.ts`,
   `app-bridge.ts` and `shellStartup.ts`.
-- **Evidence so far:** six desktop WebKit episodes and none from a phone. The
-  four with engine records reached their workspace through the gateway relay,
-  and the frame's requests queued behind the shell's reads. The stage that
-  admits one request at a time is not identified. Frame timing from an
-  older build is unreliable, and `docs/client-logs.md` says how to tell.
+- **Evidence so far:** the historical sample recorded six desktop WebKit
+  episodes. In four relayed episodes, shell reads spent most of their time
+  outside the engine. Gateway arrivals suggest a queue shared with the
+  frame's requests. The original 2362 ms gap remains unverified.
+  The corrected probe limits timing to entries since the current attachment
+  and samples only after that frame loads. See `docs/client-logs.md` for
+  attribution limits.
+- **Controlled check (2026-11-25):** on a disposable HTTP/1.1 origin, six
+  open streams delayed a same-origin iframe request until the streams closed
+  in macOS WebKit and Chromium. Each browser measured a fetch-to-send gap
+  of at least 2 s in 100 of 100 saturated opens and 0 of 100 idle opens.
+  All 400 opens had document timing. The fixture exercised one frame at a time
+  on a warm page, without a service worker, Lucidos shell or gateway relay.
+- **Missing evidence:** capture a slow document's browser send and connection
+  timing alongside the sending gateway's request log. That can distinguish
+  origin connection saturation from work inside the relay. Two adjacent
+  24-hour queries returned zero frame records with no client coverage.
+  Shipped direct and relayed paths and real iPhone Safari and installed PWA
+  resume remain unmeasured.
+- **Owner / review:** rank 16 investigator, 2026-12-02. Recheck for a matched
+  browser and gateway trace and a recorded iPhone resume audit.
 - **Status:** active
 - **Investigation:** none.
+
+### Failed lazy-chunk refetch
+
+- **Added:** 2026-10-17. Registered 2026-11-24.
+- **Lives in:** `probeFailedChunk` in `crates/lucidos-app/src/utils/lazyComponent.tsx`.
+- **Impermanent because:** after a lazy import fails and stale-chunk recovery
+  declines to reload, the probe refetches the identified top-level asset once.
+  It logs the response status, type and byte count, or the fetch error. The
+  result helps distinguish a failed asset fetch from an import failure with
+  a reachable asset. It cannot test the module's static dependencies.
+- **Removal / resolution condition:** record the cause and fix for the
+  remaining lazy-import failures with a matching-build audit. Exercise the
+  formerly failing iOS PWA import and the larger module graph, including its
+  dependencies. Then remove `probeFailedChunk` and its call. Update the two
+  refetch cases in `lazyComponent.test.ts` to keep coverage of the
+  `load_failed` log and stale-chunk recovery. Keep the user toast.
+- **Status:** active. The inline-small-chunks work covers selected imports.
+  It does not establish a fix for remaining larger imports.
+- **Investigation:** [Inline small lazy chunks](plans/2026-11-17-inline-small-lazy-chunks.md).
 
 ### Shell snap-back log
 
@@ -1718,8 +1752,8 @@ outside the retired probe.
   every WebKit client, to catch it there too. The price is one engine.log line
   per thread open on such a client, which buys a diagnosis and nothing else.
 - **Removal / resolution condition:** when `webkit-desktop-blank-thread` closes,
-  narrow the gate back to `isIOSPwa()`. Verify by confirming no open work reads
-  a `[Client/render] thread_render_probe` line from a desktop client.
+  narrow the gate back to `isIOSPwa()`. Record a packaged macOS audit of
+  the fix and verify the narrowed gate still covers the iOS PWA.
 - **Status:** open
 - **Investigation:** `webkit-desktop-blank-thread`
 
@@ -1737,8 +1771,8 @@ outside the retired probe.
   held it. It costs one line per such open on a WebKit client.
 - **Removal / resolution condition:** when `notification-cold-open-loading`
   closes, delete `reportAbsentThreadRender` and its tests, and restore the
-  settle probe's silent return. Verify no open work reads a
-  `class=target-absent` line.
+  settle probe's silent return. Record the fix and a passing iOS PWA audit
+  of cold notification opens that wait for restore admission.
 - **Status:** open
 - **Investigation:** `notification-cold-open-loading`
 
@@ -1756,8 +1790,9 @@ outside the retired probe.
 - **Removal / resolution condition:** the next iPhone stall incident has a
   `[Client/device-database] released_on_hide` line from the old page, or shows
   that none was written. Record the verdict under
-  `notification-cold-open-loading`, then delete the `postClientLog` call and
-  its test. Verify no open work reads the line.
+  `notification-cold-open-loading`, including whether the old page reached
+  the release hook and whether it held a transaction that blocked admission.
+  Then delete the `postClientLog` call and its test.
 - **Status:** active
 - **Investigation:** `notification-cold-open-loading`
 
@@ -2323,7 +2358,8 @@ outside the retired probe.
 - **Removal / resolution condition:** when the **ride lands short**
   investigation (`follow-ride-lands-short`) is closed. That means the cause of
   the short landing is identified, and either fixed or attributed to WebKit.
-  Verify no open work still needs the `[Client/follow]` lines. Then delete
+  Record a device audit that exercises ride landings and verifies the fix,
+  or a WebKit reproduction that establishes the attribution. Then delete
   `reportRideLandedShort`, its flag, its clear in `armFollowOn`, its call in
   `settleTheRide`, and the three tests. `grep -rn 'rideShortReported' crates/lucidos-app/src`
   must come back empty. The correction itself STAYS: it is the fix, not the

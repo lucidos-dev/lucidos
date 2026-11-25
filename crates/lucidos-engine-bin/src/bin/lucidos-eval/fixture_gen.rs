@@ -61,7 +61,7 @@ pub fn generate(fixture_dir: &Path) -> Fallible<()> {
     let mut block = String::new();
     block.push_str(BEGIN_MARKER);
     block.push_str(
-        "\n-- Written by `cargo run -p lucidos-eval --features fixture-gen -- \
+        "\n-- Written by `cargo run -p lucidos-engine-bin --features fixture-gen --bin lucidos-eval -- \
          generate-memory-fixture`\n-- from fixtures/memory-seed.toml. Never edit by hand: the \
          vectors are model\n-- output and the digest depends on them byte for byte.\n",
     );

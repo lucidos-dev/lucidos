@@ -23,8 +23,8 @@ build_slot_leased() { # <label> <cmd...>
         "$@"
         return
     fi
-    local holder state="" slot="" jobs="" nice="" rc=0
-    LUCIDOS_BUILD_SLOT_LEASE_OWNER="$owner" \
+    local holder state="" slot="" jobs="" nice="" request_id="" class="" rc=0
+    LUCIDOS_BUILD_SLOT_LEASE_OWNER="$owner" LUCIDOS_BUILD_SLOT_LEASE_RECORDS=1 \
         "$PROJECT_DIR/scripts/with-build-slot.sh" --label "$label" --lease \
         >&3 <&4 3>&- 4>&- &
     holder=$!
@@ -33,13 +33,15 @@ build_slot_leased() { # <label> <cmd...>
     {
         exec 3>&-
         rm -rf "$scratch"
-        IFS=' ' read -r state slot jobs nice || state=""
+        IFS=' ' read -r state slot jobs nice request_id class || state=""
     } <"$scratch/ready"
 
     case "$state" in
         granted)
             local -x LUCIDOS_BUILD_SLOT_HELD="$slot"
             local -x LUCIDOS_BUILD_SLOT_LEASE_NICE="$nice"
+            local -x LUCIDOS_BUILD_SLOT_REQUEST_ID="$request_id"
+            local -x LUCIDOS_BUILD_SLOT_GRANTED_CLASS="$class"
             local -x LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT
             LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$(date +%s)"
             if [ -z "${CARGO_BUILD_JOBS:-}" ] && [ "$jobs" != "-" ]; then
@@ -47,7 +49,7 @@ build_slot_leased() { # <label> <cmd...>
             fi
             local -x LUCIDOS_BUILD_SLOT_CLASS="" LUCIDOS_BUILD_SLOT_PRIORITY=""
             "$@" 4>&- || rc=$?
-            printf 'release\n' >&4
+            printf 'release %s\n' "$rc" >&4
             ;;
         refused)
             rc="$slot"

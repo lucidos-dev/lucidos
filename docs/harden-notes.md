@@ -112,6 +112,25 @@ Lucidos is not PR-based, so `/harden` is the only stage between a change and
 weeks. `make lint` is the same compile plus clippy with `CLIPPY_FLAGS`, ShellCheck
 over every tracked `*.sh`, and a rustfmt-clean tree. Never restate its flags.
 
+## Build prerequisites
+
+The runner collects startup gates, selected independent suites and host preflight
+failures before it queues a build. A failed startup preflight keeps prior suite
+evidence and retry obligations. A selected independent suite records its own
+timing and result when startup prerequisites pass.
+
+Native checks follow the selected targets. Linux desktop builds need the
+pkg-config modules used by the locked Tauri dependencies. Headless Linux
+builds skip those modules. macOS checks the SDK and compiler path. The memory
+check reads host pressure on macOS and usable RAM plus cgroup limits on Linux.
+
+Slot-backed hardening and Clippy commands recheck memory after admission.
+Exit 72 means the memory check refused the build. Retry once the host recovers.
+
+ShellCheck reuses a checkout-local successful pass when its tool, invocation,
+configuration and input key match. Set `LINT_SHELL_NO_CACHE=1` to force analysis.
+Alternate source search paths bypass reuse.
+
 ## Timeouts under load are contention, not findings
 
 - **The Codex driver tests run alone.** Both modules spawn a `/bin/sh` stub with

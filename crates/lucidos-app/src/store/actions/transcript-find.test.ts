@@ -5,16 +5,17 @@ vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../utils/elementVisibility')>()),
   isElementVisible: () => true,
 }));
-vi.mock('../../components/chat/scrollState', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../components/chat/scrollState')>()),
-  stopFollowingBottom: vi.fn(),
-}));
+vi.mock('../../components/chat/scrollState', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../components/chat/scrollState')>();
+  return { ...actual, stopFollowingBottom: vi.fn(), markRevealScroll: vi.fn(actual.markRevealScroll) };
+});
 vi.mock('./thread-loading', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./thread-loading')>()),
   ensureWholeThreadLoaded: vi.fn(async () => true),
 }));
 
 import { createPainter, type FindPainter } from '@lucidos/find';
+import { markRevealScroll } from '../../components/chat/scrollState';
 import { clearBand, transcriptTarget } from './transcript-find';
 import { freshText, markdownText, transcriptPassages } from './transcript-passages';
 import { transcriptRenderRequest } from './transcriptRenderRequest';
@@ -131,10 +132,45 @@ describe('the transcript target', () => {
     const step = target.run('apple', 1).then(() => { stepped = true; });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(stepped, 'the fold would put a scrolled step back').toBe(false);
+    expect(transcriptRenderRequest.value, 'the step has not asked for its turn while the fold runs').toBeNull();
     land(false);
     await step;
     expect(stepped).toBe(true);
     expect(ensureWholeThreadLoaded).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks the scroll a step makes, so the transcript does not undo it as the reader scrolling', async () => {
+    thread(conversation);
+    drawTurns();
+    vi.mocked(markRevealScroll).mockClear();
+    const target = transcriptTarget(ID, recordingPainter());
+    await target.run('apple');
+    await target.run('apple', 1);
+    expect(markRevealScroll).toHaveBeenCalledWith(document.querySelector('.thread-content'));
+  });
+
+  it('lets an unfolding roll finish before it measures the match', async () => {
+    thread(conversation);
+    drawTurns();
+    const turn = document.querySelector<HTMLElement>('.chat-exchange[data-user-seq="1"]')!;
+    let rolled = false;
+    const roll = new Promise<void>((resolve) => setTimeout(() => { rolled = true; resolve(); }, 30));
+    Object.assign(turn, { getAnimations: () => [{ finished: roll }] });
+    const measured: boolean[] = [];
+    const plain = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      measured.push(rolled);
+      return plain.call(this);
+    };
+    try {
+      const target = transcriptTarget(ID, recordingPainter());
+      await target.run('apple');
+      await target.run('apple', 1);
+    } finally {
+      Range.prototype.getBoundingClientRect = plain;
+    }
+    expect(measured.length).toBeGreaterThan(0);
+    expect(measured.every(Boolean)).toBe(true);
   });
 
   it('highlights the drawn matches as the reader types', async () => {

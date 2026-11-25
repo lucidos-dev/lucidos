@@ -14,7 +14,7 @@
 # something else entirely.
 #
 # **The vectors are generated, never written by hand.** Run
-# `cargo run -p lucidos-eval --features fixture-gen -- generate-memory-fixture`
+# `cargo run -p lucidos-engine-bin --features fixture-gen --bin lucidos-eval -- generate-memory-fixture`
 # to embed these summaries with the pinned embedding model and rewrite the
 # generated block in `seed.sql`. Commit the result. The vectors are checked in
 # so the digest is reproducible and no run re-embeds anything.

@@ -24,14 +24,15 @@ vi.hoisted(() => {
   }
 });
 
-import { makeThreadState } from './threads-test-helpers';
-import { threadMap, toasts } from '../store';
+import { makeThreadAggregate, makeThreadState } from './threads-test-helpers';
+import { connectionStatus, engineRestarting, threadMap, toasts } from '../store';
 import {
   clearThreadFetchGuards,
   ensureWholeThreadLoaded,
   loadOlderThreadEvents,
   _resetHistoryReadsForTesting,
   loadThreadEvents,
+  refreshThreadEvents,
   THREAD_EVENTS_PAGE_SIZE,
   _resetThreadEventsFailuresForTesting,
 } from './thread-loading';
@@ -396,5 +397,172 @@ describe('a whole-thread surface loads the whole thread', () => {
     fetchEvents.mockClear();
     await ensureWholeThreadLoaded(THREAD);
     expect(fetchEvents).not.toHaveBeenCalled();
+  });
+});
+
+describe('a cold load lands on the thread the map holds, under the rules a restart and a retry set', () => {
+  it('applies a landed page to the state the map holds after the fetch, not the one it started with', async () => {
+    threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+    const replacement = makeThreadState(THREAD, { eventsLoaded: false });
+    fetchEvents.mockImplementationOnce(async () => {
+      threadMap.value = new Map([[THREAD, replacement]]);
+      return { events: page(100, 2), currentAggregate: null, hasMore: false };
+    });
+
+    await loadThreadEvents(THREAD);
+    await settle();
+
+    expect(replacement.eventsLoaded).toBe(true);
+    expect(threadMap.value.get(THREAD)).toBe(replacement);
+  });
+
+  it('a load that lands clears a failure another attempt set while it was in flight', async () => {
+    threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+    fetchEvents.mockImplementationOnce(async () => {
+      threadMap.value.get(THREAD)!.eventsLoadFailed = true;
+      return { events: page(100, 2), currentAggregate: null, hasMore: false };
+    });
+
+    await loadThreadEvents(THREAD);
+    await settle();
+
+    const thread = threadMap.value.get(THREAD)!;
+    expect(thread.eventsLoaded).toBe(true);
+    expect(thread.eventsLoadFailed).toBe(false);
+  });
+
+  it('an engine restart mid-load leaves the thread flagged failed, so the resume sync still finds it', async () => {
+    vi.useFakeTimers();
+    try {
+      threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+      fetchEvents.mockImplementation(async () => {
+        engineRestarting.value = true;
+        throw new Error('engine down');
+      });
+
+      const load = loadThreadEvents(THREAD);
+      await vi.runAllTimersAsync();
+      await load;
+
+      expect(threadMap.value.get(THREAD)!.eventsLoadFailed).toBe(true);
+      expect(toasts.value).toEqual([]);
+    } finally {
+      engineRestarting.value = false;
+      vi.useRealTimers();
+    }
+  });
+
+  it('a transient abort during a load is retried, and the reader is not told', async () => {
+    vi.useFakeTimers();
+    try {
+      threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+      const aborted = Object.assign(new Error('aborted'), { name: 'AbortError' });
+      fetchEvents
+        .mockRejectedValueOnce(aborted)
+        .mockResolvedValue({ events: page(100, 2), currentAggregate: null, hasMore: false });
+
+      const load = loadThreadEvents(THREAD);
+      await vi.runAllTimersAsync();
+      await load;
+
+      expect(threadMap.value.get(THREAD)!.eventsLoaded).toBe(true);
+      expect(toasts.value).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('a refresh failure card names the thread that failed last', () => {
+  beforeEach(() => {
+    connectionStatus.value = 'connected';
+    threadMap.value = new Map([
+      ['a', makeThreadState('a', { eventsLoaded: true })],
+      ['b', makeThreadState('b', { eventsLoaded: true })],
+    ]);
+  });
+
+  it('shows the newest reason when one thread fails again after another failed', async () => {
+    fetchEvents
+      .mockRejectedValueOnce(new Error('reason 1'))
+      .mockRejectedValueOnce(new Error('reason 2'))
+      .mockRejectedValueOnce(new Error('reason 3'));
+
+    await refreshThreadEvents('a');
+    await refreshThreadEvents('b');
+    await refreshThreadEvents('a');
+
+    const text = toasts.value.map(t => t.message).join(' | ');
+    expect(text).toContain('reason 3');
+    expect(text).not.toContain('reason 2');
+  });
+
+  it('a recovery does not re-raise a card the reader dismissed', async () => {
+    fetchEvents
+      .mockRejectedValueOnce(new Error('a broke'))
+      .mockRejectedValueOnce(new Error('b broke'));
+    await refreshThreadEvents('a');
+    await refreshThreadEvents('b');
+    expect(toasts.value.length).toBeGreaterThan(0);
+
+    toasts.value = [];
+    fetchEvents.mockResolvedValueOnce({ events: [], currentAggregate: null });
+    await refreshThreadEvents('a');
+
+    expect(toasts.value).toEqual([]);
+  });
+});
+
+describe('a cold load folds its snapshot in the order the thread meta needs', () => {
+  it('the snapshot aggregate has the last word on the thread meta, over whatever the replayed rows moved', async () => {
+    threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+    fetchEvents.mockResolvedValueOnce({
+      events: [{ sequence: 1, event_type: 'TextStreamed', payload: { text: 'x' }, created: '2026-06-02T00:00:00Z', event_id: 'evt-1' }],
+      currentAggregate: makeThreadAggregate(THREAD, { lastActivity: '2026-06-01T00:00:00Z' }),
+      hasMore: false,
+    });
+
+    await loadThreadEvents(THREAD);
+    await settle();
+
+    expect(threadMap.value.get(THREAD)!.meta.updatedAt).toBe('2026-06-01T00:00:00Z');
+  });
+
+  it('replaying a past call leaves the live call rows standing as they were', async () => {
+    const live = { eventId: 'live-1', count: 1, created: '2026-06-01T00:00:00Z', text: 'current words' };
+    const thread = makeThreadState(THREAD, { eventsLoaded: false });
+    thread.liveUtterances = [live];
+    threadMap.value = new Map([[THREAD, thread]]);
+    fetchEvents.mockResolvedValueOnce({
+      events: [{ sequence: 1, event_type: 'VoiceSessionEnded', payload: { voice_session_id: 'old-call' }, created: '2026-05-01T00:00:00Z', event_id: 'evt-old' }],
+      currentAggregate: null,
+      hasMore: false,
+    });
+
+    await loadThreadEvents(THREAD);
+    await settle();
+
+    expect(threadMap.value.get(THREAD)!.liveUtterances).toEqual([live]);
+  });
+});
+
+describe('a cold load that fails after the thread has landed', () => {
+  it('raises no card, since the thread already has its history', async () => {
+    vi.useFakeTimers();
+    try {
+      threadMap.value = new Map([[THREAD, makeThreadState(THREAD, { eventsLoaded: false })]]);
+      fetchEvents.mockImplementation(async () => {
+        threadMap.value.get(THREAD)!.eventsLoaded = true;
+        throw new Error('boom');
+      });
+
+      const load = loadThreadEvents(THREAD);
+      await vi.runAllTimersAsync();
+      await load;
+
+      expect(toasts.value).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -14,6 +14,16 @@ fn allowed_tools_flag_allows_only_engine_tools_with_no_grants() {
     );
 }
 
+#[test]
+fn engine_allowed_tools_keep_the_lines_the_engine_asks_for() {
+    for line in [
+        "Bash(lucidos request-read:*)",
+        "Bash(lucidos expect-wake:*)",
+    ] {
+        assert!(ENGINE_ALLOWED_TOOLS.contains(&line), "{line}");
+    }
+}
+
 fn lines(body: &str) -> Vec<String> {
     crate::core::grants::parse_patterns(body)
 }

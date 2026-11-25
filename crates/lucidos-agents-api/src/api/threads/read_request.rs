@@ -93,24 +93,13 @@ pub(in crate::api) struct ReplySeenBody {
     summary_version: i64,
 }
 
-/// POST /api/v1/threads/:thread_id/read-request/seen: the user saw the reply
-/// a read request points at. `seen` says whether a request was pending. A
-/// 409 means the thread changed since the client saw it, so it asks again.
-///
-/// A sighting is the user's alone, so an agent subprocess is refused: its
-/// token would otherwise pass as a caller and clear any thread's request.
 pub(in crate::api) async fn mark_thread_reply_seen(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<ReplySeenBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if matches!(
-        crate::core::subprocess_origin::subprocess_origin(&headers),
-        crate::core::subprocess_origin::SubprocessOrigin::Subprocess { .. }
-    ) {
-        return Err(ApiError::new(StatusCode::FORBIDDEN, SEEN_IS_THE_USERS));
-    }
+    refuse_an_agent_sighting(&headers)?;
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
     let thread_uuid =
         parse_thread_id(&thread_id).map_err(|(status, msg)| ApiError::new(status, msg))?;
@@ -135,5 +124,39 @@ pub(in crate::api) async fn mark_thread_reply_seen(
             StatusCode::NOT_FOUND,
             format!("No thread {thread_id} in this workspace."),
         )),
+    }
+}
+
+fn refuse_an_agent_sighting(headers: &HeaderMap) -> Result<(), ApiError> {
+    if matches!(
+        crate::core::subprocess_origin::subprocess_origin(headers),
+        crate::core::subprocess_origin::SubprocessOrigin::Subprocess { .. }
+    ) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, SEEN_IS_THE_USERS));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sighting_is_refused_to_an_agent_subprocess() {
+        crate::core::subprocess_origin::init_agent_origin_secret(
+            "subprocess-test-secret".to_string(),
+        );
+        let token = crate::core::subprocess_origin::mint_agent_origin_token(None, 0, None)
+            .expect("secret installed");
+        let mut agent = HeaderMap::new();
+        agent.insert(
+            crate::core::subprocess_origin::HEADER_AGENT_ORIGIN_TOKEN,
+            token.parse().unwrap(),
+        );
+        let refusal =
+            refuse_an_agent_sighting(&agent).expect_err("an agent cannot clear a request");
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert_eq!(refusal.message, SEEN_IS_THE_USERS);
+        assert!(refuse_an_agent_sighting(&HeaderMap::new()).is_ok());
     }
 }

@@ -2309,6 +2309,53 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
     teardown_test_db(&db_name).await;
 }
 
+/// A tick that read a parked card opens no run once the card is answered.
+/// No warming status lands under the turn that resumed.
+#[tokio::test]
+async fn an_answered_card_opens_no_run() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/answered", None).await;
+    let candidate = parked();
+    let anchors = anchors_of(&candidate);
+    let durations = WaitDurations::default();
+    let sync = || {
+        sync_status(
+            &bus,
+            thread_id,
+            &candidate,
+            GiveUpRule::PingPlan,
+            &durations,
+            &anchors,
+            None,
+        )
+    };
+
+    set_status(&pool, thread_id, ThreadStatus::Running).await;
+    sync().await;
+    assert_eq!(
+        status_events(&pool, thread_id).await,
+        0,
+        "the card was answered after the tick read it"
+    );
+
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
+    sync().await;
+    assert_eq!(
+        kind_of(
+            stored_status(&pool, thread_id)
+                .await
+                .as_ref()
+                .expect("a parked card opens a run")
+        ),
+        StatusKind::Warming
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 // --- How a run ends (I6, I7) ---
 
 /// A run that pinged ends with its span and its price. A run that never pinged
@@ -3568,6 +3615,7 @@ async fn a_parked_session_writes_its_status() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/parked-status", None).await;
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
     let parked = parked();
     sync_status(
         &bus,

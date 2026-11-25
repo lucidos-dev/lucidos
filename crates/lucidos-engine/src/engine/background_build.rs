@@ -35,7 +35,7 @@ pub(crate) trait BuildHost: Send + Sync + 'static {
     async fn deferred_build_needed(&self) -> bool;
 }
 
-/// One completed build: the state it settles to, and the HEAD it started at.
+/// One completed build and the checkout HEAD it last tried to cover.
 #[derive(Debug, Clone)]
 pub(crate) struct FinishedBuild {
     pub(crate) state: BuildState,

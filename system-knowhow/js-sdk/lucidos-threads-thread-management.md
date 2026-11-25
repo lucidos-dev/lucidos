@@ -126,6 +126,9 @@ interface ThreadSummary {
    *  descendants needing *user attention* (WaitingForUserAnswer, or pending
    *  changes). Drives REVIEW bubbling up the ancestor chain. */
   attention_descendant_count: number;
+  /** Sub-threads, at any depth, that "Archive completed sub-threads" would
+   *  archive now: finished, unblocked, with every descendant clear. */
+  archivable_sub_thread_count: number;
   /** Pending changes held by this thread's sub-threads, at any depth, not
    *  counting its own. Present on `lucidos.threads.list` rows only; absent on
    *  every other read, so an absent field never means zero. */

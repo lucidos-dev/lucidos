@@ -1692,7 +1692,10 @@ mod tests {
     /// either one there fails here, rather than turning re-posts off silently.
     #[test]
     fn the_refusal_prefix_is_the_text_the_engine_writes() {
-        let run = include_str!("../../lucidos-agents-api/src/engine/agentic_loop/run.rs");
+        let run = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lucidos-agents-api/src/engine/agentic_loop/run.rs"
+        ));
         let failure = r#""Model returned no response ({}).""#;
         let diagnostic = r#""stop_reason: {}, output_tokens: {}"#;
         for fragment in [failure, diagnostic] {

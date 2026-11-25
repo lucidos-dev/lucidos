@@ -138,8 +138,8 @@ The *thread drawer* header button that swaps between the *Folders grouping* and 
 See also: *thread drawer*.
 
 ### Folders grouping
-The *thread drawer*'s default grouping: the Pinned, *Current* and Archive sections. Each section collapses on its own, and the thread filter shapes what they list. Reached with the drawer header's *grouping button*, which shows a folder while the Ongoing grouping is on screen.
-See also: *Ongoing grouping*, *thread drawer*.
+The *thread drawer*'s default grouping: any *custom folders*, then the Pinned, *Current* and Archive sections. Each section collapses on its own, and the thread filter shapes what they list. Reached with the drawer header's *grouping button*, which shows a folder while the Ongoing grouping is on screen.
+See also: *custom folder*, *Ongoing grouping*, *thread drawer*.
 
 ### Ongoing grouping
 The *thread drawer* grouping by what is still going on with each *thread*: *Blocked*, *Review*, **Drafts** and *In flight*. Each group is a tile at the top showing its count, always all four and always in that order. One tile is selected, and only its threads are listed below the tiles. Tapping a tile only selects it: the open thread stays where it is, and a tap on a row opens that row. An empty tile is dimmed but can still be selected, and then the list says it is empty. A thread that matches no group is not listed here: find it under the *Folders grouping*.

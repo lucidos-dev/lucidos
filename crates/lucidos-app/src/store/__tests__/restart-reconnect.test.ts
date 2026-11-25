@@ -275,6 +275,21 @@ describe('restart state survives network reconnect', () => {
     expect(latestEngineVersion.value).toBe('2026.04.13.1');
   });
 
+  it('a newer engine asks for a restart but never raises the web update prompt', async () => {
+    await establishConnection();
+    restartRequired.value = false;
+    updateAvailable.value = false;
+
+    mockCheckHealth.mockResolvedValueOnce(loadedHealth({
+      engine_version: '2026.04.01.1',
+      latest_engine_version: '2026.04.13.1',
+    }));
+    await checkConnection();
+
+    expect(restartRequired.value).toBe(true);
+    expect(updateAvailable.value).toBe(false);
+  });
+
   it('does not set restartRequired when engine version is current', async () => {
     await establishConnection();
     restartRequired.value = false;

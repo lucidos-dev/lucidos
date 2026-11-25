@@ -8,7 +8,24 @@ default-run = "lucidos-engine"
 name = "lucidos-engine"
 path = "src/main.rs"
 
+# ADR 0087: running the eval is explicit. Its tests are offline.
+[[bin]]
+name = "lucidos-eval"
+path = "src/bin/lucidos-eval/main.rs"
+required-features = ["eval"]
+
 [features]
+eval = [
+    "dep:clap",
+    "dep:lucidos-local-token",
+    "dep:lucidos-pg-url",
+    "dep:regex",
+    "dep:reqwest",
+    "dep:sha2",
+    "dep:tempfile",
+    "dep:toml",
+]
+fixture-gen = ["eval", "dep:fastembed"]
 e2e-test-hooks = ["lucidos-agents-api/e2e-test-hooks"]
 real-embedder-tests = ["lucidos-agents-api/real-embedder-tests"]
 
@@ -30,5 +47,16 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 dotenvy = "0.15"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 
+clap = { version = "4", features = ["derive"], optional = true }
+fastembed = { version = "4", optional = true }
+lucidos-local-token = { path = "../lucidos-local-token", features = ["client"], optional = true }
+lucidos-pg-url = { path = "../lucidos-pg-url", optional = true }
+regex = { version = "1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
+toml = { version = "0.8", optional = true }
+
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"

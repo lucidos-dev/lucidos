@@ -14,6 +14,7 @@ export function importedChunkOf(load: () => unknown): string | null {
   return /import\(\s*["'`]([^"'`]+)["'`]\s*\)/.exec(String(load))?.[1] ?? null;
 }
 
+// Temporary diagnostic. See docs/temporary-measures.md, Failed lazy-chunk refetch.
 export async function probeFailedChunk(file: string): Promise<void> {
   const controlled = typeof navigator !== 'undefined' && !!navigator.serviceWorker?.controller;
   const base = { importedChunk: file, build: CLIENT_BUILD_ID, controlled };

@@ -4564,7 +4564,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if the harness runs `psql` through an agent tool, or if the base
   starts holding a credential that is not a local dev one.
-  (`crates/lucidos-eval/src/workspace.rs`.)
+  (`crates/lucidos-engine-bin/src/bin/lucidos-eval/workspace.rs`.)
 
 - **A `CodingAgentToolResult` clears the event-wait park unconditionally, with
   no `tool_use_id` match** (2026-08-19). Reads as too broad, because an
@@ -4627,7 +4627,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if the gateway gains a path that spawns an arm engine on a healthy
   run, or if the harness stops booting its arms itself.
-  (`crates/lucidos-eval/src/workspace.rs`, `crates/lucidos-gateway/src/stack.rs`.)
+  (`crates/lucidos-engine-bin/src/bin/lucidos-eval/workspace.rs`, `crates/lucidos-gateway/src/stack.rs`.)
 
 - **`DEVICE_ID_KEY` looks origin-global and is not.** A reviewer reads
   `localStorage.getItem('lucidos-device-id')` and notes that the gateway serves
@@ -4999,7 +4999,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Inferring absence during resume would silently replace the run's authority.
   The approved cleanup contract preserves resources and reports the refusal.
   Re-flag only if a resume refreshes authority or deletes without a validated original pin.
-  (`crates/lucidos-eval/src/gateway.rs`, `pin_run_owner`.)
+  (`crates/lucidos-engine-bin/src/bin/lucidos-eval/gateway.rs`, `pin_run_owner`.)
 
 - **A batch format introduced in the current branch has no legacy production batches.**
   Cleanup batches first land with this branch; main has no cleanup_actions module.

@@ -55,6 +55,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ThreadTitleRenamed: 'metadata',
   ThreadSaved: 'metadata',
   ThreadUnsaved: 'metadata',
+  ThreadMovedToFolder: 'metadata',
   ThreadArchived: 'terminal',
   ThreadArchiveRequested: 'metadata',
   ThreadUnarchived: 'metadata',

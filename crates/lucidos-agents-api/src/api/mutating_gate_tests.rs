@@ -219,6 +219,7 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/suggest-title",
     "/threads/unarchive",
     "/threads/unsave",
+    "/threads/move-to-folder",
     "/trigger-groups",
     "/trigger-groups/reorder",
     "/triggers",

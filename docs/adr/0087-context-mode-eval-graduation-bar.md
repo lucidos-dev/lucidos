@@ -429,7 +429,7 @@ The second was wrong and the engine never emitted it for that block.
 `Conversation History` is the cross-turn history the flag reorders.
 `Conversation` is the within-turn delta the agentic loop appends, which the
 flag has never touched. The names are corrected above and in
-`crates/lucidos-eval/src/manipulation.rs`, which is where they are read.
+`crates/lucidos-engine-bin/src/bin/lucidos-eval/manipulation.rs`, which is where they are read.
 
 ### What it does not change
 
@@ -1296,7 +1296,7 @@ between the arms on run 6 is about $3, not $7. Read this as a correction to the
 instrument, not as a reprieve for the mode.
 
 ADR 0110 supersedes this document and carries the fix. `InputSplit` in
-`crates/lucidos-eval/src/metrics.rs` is now the only way a price reaches a token
+`crates/lucidos-engine-bin/src/bin/lucidos-eval/metrics.rs` is now the only way a price reaches a token
 count, and it takes the cached parts out of the total first.
 
 ## Amendment, 2026-08-24: and the Anthropic price row was 3x too high on top of that

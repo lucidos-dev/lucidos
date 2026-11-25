@@ -2808,5 +2808,42 @@ test_generate_build_outputs_picks_a_matching_source() {
 test_generate_build_outputs_picks_a_matching_source
 
 echo ""
+test_build_watch_exec_detaches() {
+    echo "test: the build-watch wrapper creates a session without changing pid"
+    if python3 - "$SCRIPT_DIR/build_watch_exec.pl" "$SANDBOX" <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, sandbox = sys.argv[1:]
+app = Path(sandbox) / "watch-session"
+app.mkdir()
+pidfile = app / "pid"
+record = app / "exit.json"
+record.write_text('{"cause":"stale"}')
+with (app / "start.lock").open("w") as start:
+    with subprocess.Popen(
+        ["perl", wrapper, str(app), str(app / "watch.lock"), str(pidfile),
+         str(start.fileno()), sys.executable, "-c",
+         "import os, sys; assert not os.path.exists(sys.argv[1]); print(os.getpid(), os.getsid(0))",
+         str(record)],
+        pass_fds=(start.fileno(),), stdout=subprocess.PIPE, text=True,
+    ) as child:
+        stdout, _ = child.communicate(timeout=10)
+        assert child.returncode == 0
+        pid, session = map(int, stdout.split())
+        assert child.pid == pid == int(pidfile.read_text()) == session
+        assert session != os.getsid(0)
+PY
+    then
+        pass "the exec detaches in place and clears the old exit record"
+    else
+        fail "the exec did not detach in place"
+    fi
+}
+
+test_build_watch_exec_detaches
+echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

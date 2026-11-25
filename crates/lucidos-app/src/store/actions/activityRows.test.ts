@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { effect } from '@preact/signals';
 import type { ApplyEstimates, Change, LandingLane } from '../../api/client';
-import { EMPTY_LANDING_LANE, IDLE_MAIN_CHECK, NO_APPLY_ESTIMATES, threadMap, type ApplyPhaseReading } from '../store';
+import { changes, EMPTY_LANDING_LANE, IDLE_MAIN_CHECK, NO_APPLY_ESTIMATES, threadMap, type ApplyPhaseReading } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
 import type { BackgroundActivity } from '../backgroundActivity';
-import { activityRows, type ActivityRowsInput } from './activityRows';
+import { activityRows, liveActivityRows, type ActivityRowsInput } from './activityRows';
 
 function change(id: string, threadId: string, overrides: Partial<Change> = {}): Change {
   return {
@@ -70,6 +71,17 @@ beforeEach(() => {
 describe('activityRows', () => {
   it('has no row when nothing runs', () => {
     expect(activityRows(IDLE)).toEqual([]);
+  });
+
+  it('re-runs an effect that reads the live rows when the changes signal moves', () => {
+    changes.value = { status: 'loaded', data: [] };
+    const runs = vi.fn();
+    const dispose = effect(() => { runs(liveActivityRows(NOW)); });
+    const before = runs.mock.calls.length;
+    changes.value = { status: 'loaded', data: [change('c-1', 't-1')] };
+    expect(runs.mock.calls.length).toBeGreaterThan(before);
+    dispose();
+    changes.value = { status: 'not-loaded' };
   });
 
   it('gives each background activity one row that unfolds to it', () => {

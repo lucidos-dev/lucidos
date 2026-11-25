@@ -107,6 +107,15 @@ describe('the Tree backfill store', () => {
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: at(3, 2) } });
   });
 
+  it('never steps the bar back to an older frame than the count shown', async () => {
+    const at = (seq: number, done: number) => ({ ...ZERO, done, total: 2, done_milli: done * 1_000, seq });
+    mockGet.mockResolvedValue({ state: 'running', progress: at(2, 1) });
+    await loadTreeBackfill();
+
+    handleGlobalEvent('TreeBackfillProgressed', { progress: at(1, 0) });
+    expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: at(2, 1) } });
+  });
+
   it('takes no order from a snapshot read that started before the reset', async () => {
     let resolve: (v: TreeBackfill) => void = () => {};
     mockGet.mockReturnValue(new Promise<TreeBackfill>((r) => { resolve = r; }));

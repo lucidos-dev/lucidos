@@ -46,6 +46,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         totalChildrenCount: Math.max(opts.activeChildrenCount ?? 0, opts.awaitedChildrenCount ?? 0),
         blockingDescendantCount: 0,
         attentionDescendantCount: 0,
+        archivableSubThreadCount: 0,
         codingAgentChangeState: opts.codingAgentChangeState ?? { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',

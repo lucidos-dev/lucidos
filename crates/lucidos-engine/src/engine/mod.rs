@@ -651,19 +651,19 @@ pub struct LucidosEngine {
     /// Published only while the build's `BuildProcessGroupGuard` is armed, so
     /// it never names a group whose leader has been reaped.
     build_process_group: std::sync::atomic::AtomicU32,
-    /// Dev-only: swappable served-frontend dir. `api::serve_frontend` reads the
-    /// current snapshot path per request; a *frontend-only* Apply re-snapshots
-    /// `dist/` and swaps this so the served client advances WITHOUT an engine
-    /// respawn (INV-A: only when the engine binary is unchanged — a mixed change
-    /// still advances only via a Switch). `None` in packaged / headless (no
-    /// `LUCIDOS_STATIC_DIR`). Set once by `api::create_router` via
-    /// `init_served_frontend`. See `engine::frontend_refresh`.
+    /// The router shares this path with `api::serve_frontend`.
+    /// In dev, frontend-only Apply swaps it without switching the engine.
+    /// A mixed change still requires a Switch (INV-A).
     served_frontend: std::sync::OnceLock<Arc<std::sync::RwLock<PathBuf>>>,
     /// The built `/api/v1` router, with every layer a live request passes.
     /// See `engine::api_router`.
     api_router: std::sync::OnceLock<axum::Router>,
-    /// The source dir (`LUCIDOS_STATIC_DIR` = live `dist/`) that served-frontend
-    /// snapshots are taken from. Set alongside `served_frontend`.
+    /// Commit captured at registration or swap, before a live dist can change.
+    activated_frontend_commit: std::sync::Mutex<Option<String>>,
+    /// Resolves when the latest `ServedFrontendCommitChanged` write lands.
+    /// The next write waits on it, so records keep swap order.
+    served_commit_write_done: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// The live frontend dir (`LUCIDOS_STATIC_DIR`) used to pin snapshots.
     served_frontend_source: std::sync::OnceLock<PathBuf>,
     /// Monotonic generation for served-frontend re-snapshots: coalesces rapid
     /// frontend-only Applies (only the latest generation swaps) AND names the
@@ -677,6 +677,8 @@ pub struct LucidosEngine {
     /// a task the peer sync aborted cannot leave the indicator on. See
     /// `engine::frontend_refresh::live_refresh_elapsed`.
     frontend_refresh_started: std::sync::Mutex<Option<(u64, std::time::Instant)>>,
+    frontend_build_watch_stopped:
+        std::sync::Mutex<Option<engine_version::FrontendBuildWatchStopped>>,
     /// Has the worktree-pinned-frontend warning already fired this process? The
     /// check runs on the ~10s peer-sync tick, so without this it would log every
     /// tick forever. A field rather than a `static` so tests that build several

@@ -51,8 +51,12 @@ pub async fn restored_recovery_branches(
 /// * **`SessionEnded`** is listed, but only for the reasons that really end a
 ///   turn. The mid-turn ones are subtracted separately by
 ///   [`SESSION_ENDED_MID_TURN_REASONS_SQL`].
+///
+/// **`ThreadArchived`** is listed because the thread lifecycle classes it
+/// `Terminal` and settles the thread `Idle`. `archive_family` emits it as the
+/// terminator of a turn it ends, such as one parked on a card it cancels.
 const TURN_ENDED_EVENT_TYPES_SQL: &str = "'CodingAgentIdled','ResponseGenerated',\
-    'ResponseCanceled','ResponseFailed','SessionEnded'";
+    'ResponseCanceled','ResponseFailed','SessionEnded','ThreadArchived'";
 
 /// [`crate::engine::thread_events::SessionEndReason`] values that do NOT end the
 /// turn. A `SessionEnded` carrying one is dropped from the lifecycle scan, so

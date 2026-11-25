@@ -186,9 +186,6 @@ pub(super) async fn store_inline_images(
     Ok(hashes)
 }
 
-/// Stream `path` with the given `mime` and the immutable cache header
-/// shared by both blob endpoints. Content-addressed = the bytes never
-/// change for a hash, so once fetched the browser never re-requests.
 async fn stream_immutable(path: std::path::PathBuf, mime: String) -> Result<Response, ApiError> {
     let file = tokio::fs::File::open(&path)
         .await
@@ -326,5 +323,22 @@ mod tests {
             .expect_err("undecodable input is refused");
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_blob_is_served_immutable_so_the_browser_never_revalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, png()).unwrap();
+
+        let response = stream_immutable(path, "image/png".to_string())
+            .await
+            .expect("the file streams");
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
     }
 }

@@ -45,7 +45,7 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
       section: 'inbox',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',

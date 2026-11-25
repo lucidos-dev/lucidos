@@ -301,6 +301,15 @@ describe('update progress narration', () => {
     expect(dialog.progress).toBeNull();
   });
 
+  it('clears the run before the failure toast is shown', () => {
+    const seen: unknown[] = [];
+    mocks.showToast.mockImplementation(() => { seen.push(storeSignals.appUpdateProgress.value); });
+    startAppUpdateProgress();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
+    emitProgress({ version: '2026.7.30', phase: 'failed', message: 'signature mismatch' });
+    expect(seen).toEqual([null]);
+  });
+
   it('reports a failure with its reason and leaves nothing spinning', () => {
     startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
@@ -365,6 +374,23 @@ describe('update progress narration', () => {
     expect(storeSignals.appUpdateProgress.value).toBeNull();
   });
 
+  it('clears a run the install left behind once it resolves without restarting', async () => {
+    storeSignals.latestTauriAppVersion.value = '2026.7.30';
+    mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
+    startAppUpdateProgress();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
+    await installAppUpdate();
+    expect(storeSignals.appUpdateProgress.value).toBeNull();
+    expect(mocks.removeToast).toHaveBeenCalledWith('app-update-available');
+  });
+
+  it('lets a second install run after the first resolves without restarting', async () => {
+    mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
+    await installAppUpdate();
+    await installAppUpdate();
+    expect(mocks.installAppUpdateAndRestart).toHaveBeenCalledTimes(2);
+  });
+
   it('does not let the periodic check clobber a live run', async () => {
     storeSignals.appUpdateProgress.value = { version: '2026.7.30', phase: 'installing' };
     await checkAppUpdateViaClient();
@@ -404,6 +430,13 @@ describe('checkAppUpdateViaClient', () => {
     expect(type).toBe('info');
     expect(opts.key).toBe('app-update-available');
     expect(opts.action.label).toBe('Update & restart');
+  });
+
+  it('offers the in-app update as a confirm action, never a neutral one', async () => {
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
+    await checkAppUpdateViaClient();
+    const [, , opts] = mocks.showToast.mock.calls[0];
+    expect(opts.action.variant).toBe('confirm');
   });
 
   it('clicking the toast action installs the update + restarts the stack', async () => {
@@ -552,6 +585,15 @@ describe('refreshReleaseCheck', () => {
     expect(opts.action.label).toBe('Update & restart');
     opts.action.onClick();
     expect(mocks.installAppUpdateAndRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the attached relay before it words the offer in a browser session', async () => {
+    mocks.isTauri.mockReturnValue(false);
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf({ version: '9.50.0', install: 'desktop-app' }));
+    mocks.getGatewayStatus.mockResolvedValue({ build_id: 'b', update_available: false, update_relay: attachedClient() });
+    await refreshReleaseCheck();
+    const opts = lastToastOpts() as { action: { label: string } };
+    expect(opts.action.label).toBe('Update desktop app');
   });
 
   it('routes a browser or PWA session instead of offering an install', async () => {
@@ -860,6 +902,13 @@ describe('reportUpdateCheck', () => {
       message: "Couldn't check for updates: connection refused",
       type: 'error',
     });
+  });
+
+  it('states the shadowed fact in exactly the current wording', () => {
+    reportUpdateCheck({ kind: 'shadowed', engine: '0.26.2', client: '0.36.0' });
+    expect(lastToast().message).toBe(
+      'This workspace is served by Lucidos 0.26.2, but this app is 0.36.0. See System > Overview.',
+    );
   });
 
   it('names both versions when another install is answering', () => {
@@ -1207,6 +1256,11 @@ describe('canInstallUpdateHere', () => {
       version: '9.11.0',
       install: 'desktop-app',
     });
+    expect(canInstallUpdateHere()).toBe(true);
+  });
+
+  it('is true for a Tauri client whose release names no install shape', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf({ version: '9.11.0', install: null });
     expect(canInstallUpdateHere()).toBe(true);
   });
 

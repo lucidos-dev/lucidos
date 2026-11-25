@@ -132,7 +132,7 @@ export LUCIDOS_EVAL_ROOT="${LUCIDOS_EVAL_ROOT:-$HOME/workspaces}"
 LUCIDOS_EVAL_PG_BASE="${LUCIDOS_EVAL_PG_BASE:-postgres://$PG_USER:$(shared_pg_password)@localhost:5435}"
 export LUCIDOS_EVAL_PG_BASE
 # The model, its label and provider, and the reasoning effort default in the
-# harness itself (`seed_pins` in crates/lucidos-eval/src/main.rs).
+# harness itself (`seed_pins` in crates/lucidos-engine-bin/src/bin/lucidos-eval/main.rs).
 
 # The seeded memory vectors were produced by the model the fixture names, and
 # recall compares them against whatever the engine loads. A different one here
@@ -162,7 +162,7 @@ mkdir -p "$LUCIDOS_EVAL_ROOT"
 
 if [ -z "${LUCIDOS_EVAL_SKIP_BUILD:-}" ]; then
     echo "[eval] building the engine and the harness"
-    cargo build --locked --release -p lucidos-engine-bin -p lucidos-eval
+    cargo build --locked --release -p lucidos-engine-bin --features eval
 fi
 
 export LUCIDOS_EVAL_ENGINE_BIN="${LUCIDOS_EVAL_ENGINE_BIN:-$PROJECT_DIR/target/release/lucidos-engine}"

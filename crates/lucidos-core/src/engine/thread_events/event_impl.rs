@@ -221,6 +221,7 @@ impl ThreadEvent {
             Self::ThreadTitleRenamed { .. } => "ThreadTitleRenamed",
             Self::ThreadSaved => "ThreadSaved",
             Self::ThreadUnsaved => "ThreadUnsaved",
+            Self::ThreadMovedToFolder { .. } => "ThreadMovedToFolder",
             Self::ThreadArchived => "ThreadArchived",
             Self::ThreadArchiveRequested => "ThreadArchiveRequested",
             Self::ThreadUnarchived => "ThreadUnarchived",
@@ -417,6 +418,7 @@ impl ThreadEvent {
         "ThreadTitleRenamed",
         "ThreadSaved",
         "ThreadUnsaved",
+        "ThreadMovedToFolder",
         "ThreadArchived",
         "ThreadArchiveRequested",
         "ThreadUnarchived",
@@ -662,6 +664,25 @@ impl ThreadEvent {
                 | Self::ThoughtStreamed { .. }
                 | Self::CodingAgentTextStreamed { .. }
                 | Self::CodingAgentThoughtStreamed { .. }
+        )
+    }
+
+    /// Whether this variant moves an input of the completed-sub-thread archive
+    /// rule that its summary row does not hold: a question card (the orphaned
+    /// question scan) or a `changes` row. The projection then recounts the
+    /// ancestors' archivable counts even when the row's own sample is unchanged.
+    pub fn moves_archive_input_off_summary(&self) -> bool {
+        matches!(
+            self,
+            Self::UserQuestionAsked { .. }
+                | Self::UserQuestionAnswered { .. }
+                | Self::ChangeProposed { .. }
+                | Self::ChangeApplied { .. }
+                | Self::ChangeDiscarded { .. }
+                | Self::ChangeSetAside { .. }
+                | Self::ChangeBroughtBack { .. }
+                | Self::ChangeWithdrawn { .. }
+                | Self::ChangeReverted { .. }
         )
     }
 

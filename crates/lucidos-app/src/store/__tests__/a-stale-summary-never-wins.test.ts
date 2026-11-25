@@ -22,7 +22,7 @@ function aggregate(summaryVersion: number, status: ThreadAggregate['status']): T
     threadId: T, title: 'Fix the bug', channel: 'claude_code', initiator: 'user',
     createdAt: AT, lastActivity: AT, messageCount: 1, section: 'inbox', status, summaryVersion,
     activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0,
-    attentionDescendantCount: 0, liveEventWaitCount: 0, codingAgentChangeState: { kind: 'none' },
+    attentionDescendantCount: 0, archivableSubThreadCount: 0, liveEventWaitCount: 0, codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false, isSaved: false, hasResponse: true, lastRevivedAt: null,
     parentThreadId: null, parentThreadTitle: null, state: 'active',
   };
@@ -33,7 +33,7 @@ function summary(summaryVersion: number, status: ThreadSummary['status']): Threa
     thread_id: T, title: 'Fix the bug', channel: 'claude_code', initiator: 'user',
     created_at: AT, last_activity: AT, message_count: 1, section: 'inbox',
     active_children_count: 0, total_children_count: 0, blocking_descendant_count: 0,
-    attention_descendant_count: 0, live_event_wait_count: 0, status, summary_version: summaryVersion,
+    attention_descendant_count: 0, archivable_sub_thread_count: 0, live_event_wait_count: 0, status, summary_version: summaryVersion,
     coding_agent_change_state: { kind: 'none' },
     coding_agent_is_external_repo: false,
     last_revived_at: null, state: 'active', compose_text: '', compose_images: [],

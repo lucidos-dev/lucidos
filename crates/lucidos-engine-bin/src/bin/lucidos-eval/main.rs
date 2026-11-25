@@ -209,6 +209,17 @@ impl DecisionCheckArgs {
     }
 }
 
+fn repository_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the root package sits two levels below the repository root")
+}
+
+fn eval_fixture_root() -> PathBuf {
+    repository_root().join("eval")
+}
+
 /// Everything the harness resolves from its environment, in one place.
 struct Paths {
     repo_root: PathBuf,
@@ -221,12 +232,8 @@ struct Paths {
 
 impl Paths {
     fn resolve() -> Fallible<Paths> {
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .ok_or("the crate must sit two levels below the repository root")?
-            .to_path_buf();
-        let fixture_root = repo_root.join("eval/context-mode");
+        let repo_root = repository_root().to_path_buf();
+        let fixture_root = eval_fixture_root().join("context-mode");
         Ok(Paths {
             results_dir: fixture_root.join("results"),
             eval_root: PathBuf::from(required_env(
@@ -354,8 +361,7 @@ async fn dispatch() -> Fallible<()> {
             .await
         }
         Command::JudgeCheck { models, out } => {
-            let set = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../eval/command-guard/cases.toml");
+            let set = eval_fixture_root().join("command-guard/cases.toml");
             command_judge::run(&set, &models, &out).await
         }
         Command::ReadDecisionCheck(args) => {

@@ -558,6 +558,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       handleEngineBuildStateChanged();
       break;
 
+    case 'FrontendBuildWatchStateChanged':
     case 'FrontendRefreshStateChanged':
       handleFrontendRefreshStateChanged();
       break;

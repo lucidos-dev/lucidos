@@ -41,8 +41,8 @@ mod wake_decision;
 
 // Handler functions consumed by the router and the SearchEverywhere endpoint.
 pub(super) use actions::{
-    answer_thread_question, continue_thread, get_thread_messages, harden_thread, rename_thread,
-    save_thread, suggest_title, unsave_thread,
+    answer_thread_question, continue_thread, get_thread_messages, harden_thread,
+    move_thread_to_folder, rename_thread, save_thread, suggest_title, unsave_thread,
 };
 pub(super) use archive::archive_thread;
 pub(super) use events_snapshot::{
@@ -165,6 +165,7 @@ pub(super) fn router() -> Router<super::AppState> {
         .route("/threads/search", get(search_threads))
         .route("/threads/save", post(save_thread))
         .route("/threads/unsave", post(unsave_thread))
+        .route("/threads/move-to-folder", post(move_thread_to_folder))
         .route("/threads/rename", post(rename_thread))
         .route("/threads/archive", post(archive_thread))
         .route(

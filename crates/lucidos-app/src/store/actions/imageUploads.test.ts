@@ -54,7 +54,7 @@ const pendingUploadsMap = () => pendingUploads.value;
 import { connectionStatus, threadMap, toasts } from '../store';
 import { getDraft, patchDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 import { noteImageLanded, _resetLandedImagesForTesting } from '../landedImages';
-import { _resetSessionBlobUrlsForTesting } from '../../components/chat/pastedImages';
+import { _resetSessionBlobUrlsForTesting, getSessionBlobUrlForHash } from '../../components/chat/pastedImages';
 import { makeOptimisticThreadState, type ThreadState } from '../thread-events';
 
 const THREAD = 't-1';
@@ -159,6 +159,12 @@ describe('runPendingUpload', () => {
     expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
   });
 
+  it('keeps an upload whose thread this page never saw live', () => {
+    threadMap.value = new Map();
+    addEntry();
+    expect(getPendingUpload(THREAD, 'u-1')).toBeDefined();
+  });
+
   it('shows the wait for the draft thread while its start is pending', async () => {
     vi.mocked(isThreadStartPending).mockReturnValue(true);
     let release!: () => void;
@@ -171,6 +177,44 @@ describe('runPendingUpload', () => {
     release();
     await run;
     expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
+  });
+
+  it('does not post the blob until the draft thread exists', async () => {
+    vi.mocked(isThreadStartPending).mockReturnValue(true);
+    let release!: () => void;
+    vi.mocked(awaitThreadStarted).mockImplementation(() => new Promise<void>((r) => { release = r; }));
+    vi.mocked(uploadThreadBlob).mockResolvedValue({ hash: 'h1', mime: 'image/png', byte_size: 3 });
+    addEntry();
+    const run = runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(uploadThreadBlob).not.toHaveBeenCalled();
+    release();
+    await run;
+    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
+  });
+
+  it('a second run of an upload already in flight starts no parallel request', async () => {
+    let answer!: (v: { hash: string; mime: string; byte_size: number }) => void;
+    vi.mocked(uploadThreadBlob).mockImplementation(() => new Promise((r) => { answer = r; }));
+    addEntry();
+    const first = runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+    const second = runPendingUpload(THREAD, 'u-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
+    answer({ hash: 'h1', mime: 'image/png', byte_size: 3 });
+    await Promise.all([first, second]);
+    expect(getDraft(THREAD).image_hashes).toEqual(['h1']);
+  });
+
+  it('landing keeps the preview URL alive for the session map', async () => {
+    const revoke = vi.spyOn(URL, 'revokeObjectURL');
+    vi.mocked(uploadThreadBlob).mockResolvedValue({ hash: 'h1', mime: 'image/png', byte_size: 3 });
+    addEntry();
+    await runPendingUpload(THREAD, 'u-1');
+    expect(getSessionBlobUrlForHash('h1')).toBe('blob:u-1');
+    expect(revoke).not.toHaveBeenCalledWith('blob:u-1');
+    revoke.mockRestore();
   });
 
   it('retries transient failures on its own, then lands', async () => {

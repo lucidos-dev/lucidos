@@ -1257,6 +1257,29 @@ fn a_boolean_filter_arg_refuses_what_is_not_a_boolean() {
     }
 }
 
+#[test]
+fn a_date_only_time_bound_is_refused_not_dropped() {
+    let args = serde_json::json!({ "since": "2026-07-01", "until": "2026-07-02T00:00:00Z" });
+    let err = super::parse_time_filter(&args, "since").expect_err("a bare date is not RFC3339");
+    assert!(err.contains("since"), "{err}");
+    assert!(super::parse_time_filter(&args, "until")
+        .expect("an RFC3339 bound parses")
+        .is_some());
+    for bound in [
+        serde_json::json!(1719792000),
+        serde_json::json!(["2026-07-01T00:00:00Z"]),
+    ] {
+        let args = serde_json::json!({ "since": bound });
+        let err = super::parse_time_filter(&args, "since").expect_err("a non-string bound");
+        assert!(err.contains("since"), "{err}");
+    }
+    assert!(
+        super::parse_time_filter(&serde_json::json!({ "since": null }), "since")
+            .expect("null is no bound")
+            .is_none()
+    );
+}
+
 /// A model that still calls the retired `execute_intent` learns the
 /// replacement, with its intent id, rather than "Unknown tool".
 #[test]

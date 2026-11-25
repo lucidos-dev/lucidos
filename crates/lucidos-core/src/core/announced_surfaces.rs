@@ -751,7 +751,9 @@ pub const TABLES: &[TableRule] = &[
                  anchor to its keep-alive CodingAgentIdled. \
                  cache_keep_alive_status projects CacheKeepAliveStatusChanged, \
                  and cache_keep_alive_off_at the CacheKeepAliveTurnedOff and \
-                 CacheKeepAliveTurnedOn pair.",
+                 CacheKeepAliveTurnedOn pair. archivable_sub_thread_count \
+                 is recounted after commit from the descendants' columns \
+                 those events wrote, and each moved row is rebroadcast.",
         },
     },
     TableRule {

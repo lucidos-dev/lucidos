@@ -1062,6 +1062,117 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
     teardown_test_db(&db_name).await;
 }
 
+/// Regression: archiving a turn parked on a question ends that turn, so the
+/// next restart must not offer Continue on the archived thread.
+///
+/// The archive cancel-stamps the card and emits `ThreadArchived` as the turn's
+/// terminator (`archive_family`). The classifier missed that terminator, read
+/// the newest lifecycle event as the turn's `SessionStarted`, and classified the
+/// branch `running`. Recovery then recreated the reclaimed worktree and offered
+/// Continue, and Continue revived the archived thread.
+#[tokio::test]
+async fn archived_question_park_classifies_idle_so_restart_does_not_revive_it() {
+    use crate::engine::agent_question::aq_test_helpers::emit_user_question;
+    use crate::engine::agent_recovery::BRANCH_CLASSIFICATION_SQL;
+    use crate::engine::thread_events::AnswerKind;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    let emit = |thread_id: Uuid, event: ThreadEvent| {
+        let bus = bus.clone();
+        let meta = cc_meta.clone();
+        async move {
+            let label = event.event_type();
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{label} emit: {e}"))
+            .unwrap_or_else(|| panic!("{label} persisted"));
+        }
+    };
+    let session_started = |branch: &str| ThreadEvent::SessionStarted {
+        sandbox: None,
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        session_id: "sid-test".into(),
+        branch: branch.into(),
+        repo_id: None,
+        coding_agent_kind: Default::default(),
+        coding_agent_folder: String::new(),
+        app_id: None,
+        integrated: false,
+        auto_compact_window: None,
+        auto_compact_arm: None,
+        continuity: None,
+    };
+    let archive_parked = |branch: &'static str| {
+        let emit = &emit;
+        let bus = &bus;
+        let session_started = &session_started;
+        async move {
+            let thread_id = Uuid::new_v4();
+            emit(thread_id, session_started(branch)).await;
+            emit_user_question(bus, thread_id, "toolu_park").await;
+            emit(
+                thread_id,
+                ThreadEvent::UserQuestionAnswered {
+                    compose: None,
+                    tool_use_id: "toolu_park".into(),
+                    quiet: false,
+                    answer: AnswerKind::Canceled,
+                },
+            )
+            .await;
+            emit(thread_id, ThreadEvent::ThreadArchived).await;
+            thread_id
+        }
+    };
+
+    archive_parked("claude-code/archived-parked").await;
+
+    let revived = archive_parked("claude-code/unarchived-then-new-turn").await;
+    emit(revived, ThreadEvent::ThreadUnarchived).await;
+    emit(
+        revived,
+        ThreadEvent::CodingAgentUserMessageSent {
+            text: "pick it back up".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+    )
+    .await;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
+        .fetch_all(&pool)
+        .await
+        .expect("branch classification query runs");
+    let status: std::collections::HashMap<String, String> = rows.into_iter().collect();
+
+    assert_eq!(
+        status
+            .get("claude-code/archived-parked")
+            .map(String::as_str),
+        Some("idle"),
+        "the archive ended the parked turn, so a restart must not reopen it"
+    );
+    assert_eq!(
+        status
+            .get("claude-code/unarchived-then-new-turn")
+            .map(String::as_str),
+        Some("running"),
+        "a turn started after unarchiving was in flight; the archive ends only \
+         the turn before it"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// A *Switch to new version* promises the interrupted thread a resume, and the
 /// UI withholds its Continue button on the strength of that promise. So a
 /// promise the boot cannot keep has to be WITHDRAWN before the API server opens,

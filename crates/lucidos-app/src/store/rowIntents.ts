@@ -1,10 +1,10 @@
 import { signal } from '@preact/signals';
 import type { ThreadMeta } from './thread-events';
 
-export type RowFields = Partial<Pick<ThreadMeta, 'section' | 'saved' | 'codingAgentChangeState' | 'state'>>;
+export type RowFields = Partial<Pick<ThreadMeta, 'section' | 'saved' | 'pinFolder' | 'codingAgentChangeState' | 'state'>>;
 
 export interface RowIntent {
-  kind: 'archive' | 'pin' | 'unpin' | 'discard';
+  kind: 'archive' | 'pin' | 'unpin' | 'move' | 'discard';
   fields: RowFields;
   beneath: RowFields;
   ackVersion: number | null;

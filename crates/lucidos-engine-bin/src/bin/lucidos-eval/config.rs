@@ -1109,11 +1109,7 @@ mod tests {
 
     /// The checked-in fixture's directory, which several tests load.
     fn fixture_root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the crate sits two levels below the repository root")
-            .join("eval/context-mode")
+        crate::eval_fixture_root().join("context-mode")
     }
 
     /// The row the price table is missing would otherwise surface from

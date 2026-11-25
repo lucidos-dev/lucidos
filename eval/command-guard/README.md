@@ -16,7 +16,7 @@ These classifier tests do not replace the real confinement suite.
 The model tier runs on demand:
 
 ```sh
-cargo run --locked -p lucidos-eval -- command-judge --models MODEL --out results.jsonl
+cargo run --locked -p lucidos-engine-bin --features eval --bin lucidos-eval -- command-judge --models MODEL --out results.jsonl
 ```
 
 It computes each marker with the real static pass under a synthetic `/workspace` root.

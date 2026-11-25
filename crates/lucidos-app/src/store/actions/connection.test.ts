@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, activeInlineForm, connectionStatus, focusedThreadId, threadMap, threadsLoaded, toasts, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
+import { panelOverlay, activeInlineForm, connectionStatus, engineRestarting, focusedThreadId, threadMap, threadsLoaded, toasts, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
 import type { CredentialRequest, EmailConfirmRequest } from '../types';
 import { makeThreadState } from './threads-test-helpers';
 import { ApiError } from '../../api/client';
@@ -12,6 +12,10 @@ vi.mock('../../api/client', async (importActual) => ({
     data: { workspace: 'test', workspace_path: '/tmp/test' },
   }),
   API_BASE: 'http://localhost:3000',
+}));
+vi.mock('./compose', async (importActual) => ({
+  ...(await importActual<typeof import('./compose')>()),
+  flushUndeliveredComposeDrafts: vi.fn(),
 }));
 vi.mock('./thread-stream', () => ({
   connectThreadEvents: vi.fn(),
@@ -43,7 +47,9 @@ vi.mock('./whatsNew', () => ({
   reloadChangelogIfRead: vi.fn(),
 }));
 
-const { handleResume } = await import('./connection');
+const { handleResume, handleRestartTimeout, checkConnection } = await import('./connection');
+const { checkHealth } = await import('../../api/client');
+const { flushUndeliveredComposeDrafts } = await import('./compose');
 const { reviveThreadEvents } = await import('./thread-stream');
 const { loadPreferences } = await import('./preferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
@@ -195,6 +201,26 @@ describe('handleResume thread-events refresh', () => {
     expect(mark).toHaveBeenCalled();
   });
 
+  it('marks the loaded threads stale before the focused refresh starts', async () => {
+    loadedThreads(['focused', 'bg-1']);
+    focusedThreadId.value = 'focused';
+    const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
+    const refresh = refreshThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const mark = markLoadedThreadsStale as unknown as ReturnType<typeof vi.fn>;
+    refresh.mockClear();
+    mark.mockClear();
+    const marksAtRefresh: number[] = [];
+    refresh.mockImplementation(async () => {
+      marksAtRefresh.push(mark.mock.calls.length);
+      return true;
+    });
+
+    await handleResume();
+    refresh.mockResolvedValue(true);
+
+    expect(marksAtRefresh[marksAtRefresh.length - 1]).toBe(1);
+  });
+
   it('issues no request at all when the user is on the compose view', async () => {
     loadedThreads(Array.from({ length: 20 }, (_, i) => `t${i}`));
     const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
@@ -265,5 +291,75 @@ describe('handleResume thread-list refresh', () => {
     const card = toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY);
     expect(card).toBeDefined();
     expect(card!.message).toContain('Failed to get saved threads');
+  });
+});
+
+describe('handleResume resets the per-thread fetch guards', () => {
+  it('clears the retry caps so a long-lived iOS page can retry a stuck thread', async () => {
+    const { clearThreadFetchGuards } = await import('./thread-loading');
+    const clear = clearThreadFetchGuards as unknown as ReturnType<typeof vi.fn>;
+    clear.mockClear();
+
+    await handleResume();
+
+    expect(clear).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('overlapping handleResume calls run one resume sync', () => {
+  it('runs the sync once for a burst of resumes', async () => {
+    vi.mocked(loadPreferences).mockClear();
+
+    await Promise.all([handleResume(), handleResume(), handleResume()]);
+
+    expect(loadPreferences).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handleResume flushes undelivered compose drafts', () => {
+  it('re-sends any draft the engine never received on a reconnect', async () => {
+    vi.mocked(flushUndeliveredComposeDrafts).mockClear();
+
+    await handleResume();
+
+    expect(flushUndeliveredComposeDrafts).toHaveBeenCalled();
+  });
+});
+
+describe('a restart timeout keeps the restart flag up while it probes', () => {
+  it('still reads the restart as in progress when the health probe runs', async () => {
+    engineRestarting.value = true;
+    let flagDuringProbe: boolean | null = null;
+    vi.mocked(checkHealth).mockImplementationOnce(async () => {
+      flagDuringProbe = engineRestarting.value;
+      return { status: 'failed', error: 'unreachable' } as never;
+    });
+
+    await handleRestartTimeout();
+
+    expect(flagDuringProbe).toBe(true);
+    expect(engineRestarting.value).toBe(false);
+  });
+});
+
+describe('the poll does not raise the thread-list card on a failed load', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    toasts.value = [];
+    connectionStatus.value = 'connected';
+    threadsLoaded.value = false;
+    engineRestarting.value = false;
+  });
+
+  it('stays silent when the thread list load rejects on a poll tick', async () => {
+    const { loadAllThreads } = await import('./thread-loading');
+    const load = loadAllThreads as unknown as ReturnType<typeof vi.fn>;
+    load.mockRejectedValueOnce(new ApiError(500, 'Failed to get saved threads'));
+
+    await checkConnection();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    expect(toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY)).toBeUndefined();
   });
 });

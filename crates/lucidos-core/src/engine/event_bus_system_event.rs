@@ -761,6 +761,31 @@ pub enum SystemEvent {
         thread_id: uuid::Uuid,
         sent_at_ms: i64,
     },
+    /// The engine executable and initial frontend this workspace activated on
+    /// boot. Persisted once after the router selects the initial snapshot.
+    EngineVersionActivated {
+        build_id: String,
+        engine_version: String,
+        release: String,
+        release_dirty: bool,
+        frontend_source_commit: Option<String>,
+    },
+    /// A snapshot swap started serving a different known frontend source SHA.
+    /// Persisted from the shared Apply and peer-sync swap path.
+    ServedFrontendCommitChanged {
+        previous_source_commit: Option<String>,
+        source_commit: String,
+    },
+    /// A source rebuild attempt ended, including delivery verification and any
+    /// internal retries. Persisted independently of the transient build state.
+    EngineBuildCompleted {
+        /// `succeeded`, `failed`, or `skipped-locked`.
+        outcome: String,
+        duration_ms: u64,
+        /// Checkout HEAD targeted by the final delivery check or attempt.
+        /// It can differ from the executable's stamp and is null for a lock skip.
+        built_head: Option<String>,
+    },
     /// The engine's dev background-rebuild `build_state` transitioned
     /// (`idle`|`building`|`ready`|`failed`), emitted by `engine::background_build`
     /// at build start (`building`) and completion (`ready`/`failed`, latest
@@ -783,6 +808,10 @@ pub enum SystemEvent {
     /// This engine's served-frontend refresh started or ended. Transient poke;
     /// clients re-read version-status for the authoritative snapshot.
     FrontendRefreshStateChanged {
+        sent_at_ms: i64,
+    },
+    /// The reported build-watch downtime changed. Transient poke to re-read version-status.
+    FrontendBuildWatchStateChanged {
         sent_at_ms: i64,
     },
     ArtifactCreated {
@@ -2187,6 +2216,9 @@ impl SystemEvent {
     /// `DomainEvent` is deliberately absent. It is a transport variant, and its
     /// row is stored under the inner event type, never that literal name.
     pub const PERSISTED_TYPE_NAMES: &'static [&'static str] = &[
+        "EngineBuildCompleted",
+        "EngineVersionActivated",
+        "ServedFrontendCommitChanged",
         "NotificationCreated",
         "PreferencesChanged",
         "ReleaseNoticeResolved",
@@ -2434,9 +2466,13 @@ impl SystemEvent {
             Self::ServedFrontendAdvanced { .. } => "ServedFrontendAdvanced",
             Self::FrontendPreviewStarted { .. } => "FrontendPreviewStarted",
             Self::FrontendPreviewStopped { .. } => "FrontendPreviewStopped",
+            Self::EngineBuildCompleted { .. } => "EngineBuildCompleted",
+            Self::EngineVersionActivated { .. } => "EngineVersionActivated",
+            Self::ServedFrontendCommitChanged { .. } => "ServedFrontendCommitChanged",
             Self::EngineBuildStateChanged { .. } => "EngineBuildStateChanged",
             Self::EngineVersionStatusChanged { .. } => "EngineVersionStatusChanged",
             Self::FrontendRefreshStateChanged { .. } => "FrontendRefreshStateChanged",
+            Self::FrontendBuildWatchStateChanged { .. } => "FrontendBuildWatchStateChanged",
             Self::DomainEvent { .. } => "DomainEvent",
             Self::ArtifactCreated { .. } => "ArtifactCreated",
             Self::ArtifactUpdated { .. } => "ArtifactUpdated",
@@ -2653,9 +2689,13 @@ impl SystemEvent {
         "ServedFrontendAdvanced",
         "FrontendPreviewStarted",
         "FrontendPreviewStopped",
+        "EngineBuildCompleted",
+        "EngineVersionActivated",
+        "ServedFrontendCommitChanged",
         "EngineBuildStateChanged",
         "EngineVersionStatusChanged",
         "FrontendRefreshStateChanged",
+        "FrontendBuildWatchStateChanged",
         "DomainEvent",
         "ArtifactCreated",
         "ArtifactUpdated",
@@ -2967,9 +3007,13 @@ impl SystemEvent {
             | Self::ServedFrontendAdvanced { .. }
             | Self::FrontendPreviewStarted { .. }
             | Self::FrontendPreviewStopped { .. }
+            | Self::EngineBuildCompleted { .. }
+            | Self::EngineVersionActivated { .. }
+            | Self::ServedFrontendCommitChanged { .. }
             | Self::EngineBuildStateChanged { .. }
             | Self::EngineVersionStatusChanged { .. }
-            | Self::FrontendRefreshStateChanged { .. } => "engine",
+            | Self::FrontendRefreshStateChanged { .. }
+            | Self::FrontendBuildWatchStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
             Self::HandshakeScriptApproved { .. }

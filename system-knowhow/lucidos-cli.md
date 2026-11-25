@@ -10,6 +10,7 @@ description: The `lucidos` shell command, on PATH in every subprocess Lucidos sp
 <!-- domain-event: OuraSleepImported: Example domain event emitted by a wearable sleep-data import. -->
 
 <!-- domain-event: BuildSlotReleased: The CLI emits this domain event when a host build slot is released. -->
+<!-- domain-event: BuildSlotStepCompleted: The CLI emits this domain event after a wrapped command exits under an inherited slot. -->
 <!-- domain-event: AnalysisCompleted: Example domain event emitted by an analysis script. -->
 <!-- domain-event: DataImported: Example domain event emitted by a data-import script. -->
 

@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import type { WebhookIngressOutage } from '../../api/client';
+import { webhookIngress } from '../store';
+import { currentIngressOutage } from './webhookIngress';
 
 const sendSeededPrompt = vi.fn(async () => true);
 vi.mock('./compose', () => ({ sendSeededPrompt }));
@@ -91,6 +93,13 @@ describe('discussWebhookIngress', () => {
   it('swallows nothing on a declined or failed send: the seam toasts', async () => {
     sendSeededPrompt.mockResolvedValue(false);
     await expect(discussWebhookIngress(outage())).resolves.toBeUndefined();
+  });
+
+  it('leaves the standing outage on the bar, since a discussion measures no recovery', async () => {
+    const o = outage();
+    webhookIngress.value = { status: 'loaded', data: { ingress: { degraded: o }, receivedAt: Date.now() } };
+    await discussWebhookIngress(o);
+    expect(currentIngressOutage(Date.now())?.webhook_name).toBe('github-ci');
   });
 
   it('is reachable: the bar wires a button to this action', () => {

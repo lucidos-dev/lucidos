@@ -8,13 +8,15 @@
 # <start-fd>, and this process inherits that descriptor. In order, it:
 #
 #   1. takes <watch-lock> exclusively, waiting out a dying watcher;
-#   2. removes dist/, dist.staging/ and dist.prev/, which only the owner may do;
+#   2. removes the previous exit record and dist directories under the owner lock;
 #   3. publishes its pid to <pidfile>, by rename;
 #   4. closes its copy of start.lock, so the next launcher sees the watch held;
 #   5. execs <command> with watch.lock still open, so the watcher holds it for
 #      its whole life and the kernel drops it when the watcher dies.
 use strict;
 use warnings;
+use Errno qw(ENOENT);
+use File::Basename qw(dirname);
 use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
 use File::Path qw(remove_tree);
 use POSIX ();
@@ -23,9 +25,14 @@ my ($app, $lock, $pidfile, $start_fd, @cmd) = @ARGV;
 die "usage: build_watch_exec.pl <app-dir> <watch-lock> <pidfile> <start-fd> <command> [args...]\n"
     unless defined $start_fd && @cmd;
 
+my $session = POSIX::setsid();
+warn "build-watch: setsid: $!\n" if !defined($session) || $session < 0;
+
 open(my $watch, '>>', $lock) or die "build-watch: open $lock: $!\n";
 flock($watch, LOCK_EX) or die "build-watch: lock $lock: $!\n";
 
+my $exit_record = dirname($lock) . '/exit.json';
+unlink($exit_record) or $! == ENOENT or die "build-watch: remove $exit_record: $!\n";
 remove_tree("$app/dist", "$app/dist.staging", "$app/dist.prev");
 
 my $tmp = "$pidfile.$$.tmp";

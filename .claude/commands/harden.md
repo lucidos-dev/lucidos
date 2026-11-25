@@ -378,6 +378,16 @@ came after it (ADR 0476). Phases 0 to 0.6 do not run again.
 
 ## Phase 1: Run /code-review
 
+At the start of each iteration, before review or suites, run the following
+with the current iteration (starting at 1) and resolved tier:
+
+```bash
+./scripts/harden-gates.sh round-start <iteration> <full|fast>
+```
+
+Repeat this on a return to Phase 1. Phase 4.5 suite retries within a round
+retain the original start.
+
 **Docs-only:** if Phase 0.5 flagged this diff as docs-only, skip the early
 suite run. The other-model kickoff runs only its `decide`, with `--docs-only`,
 and notes the skipped line it prints. Run the review inline, with the angles
@@ -388,6 +398,9 @@ Phase 0.5 names.
 The Phase 4.5 test suites start now and run alongside the review phases
 (ADR 0292). `start` owns the cheap-gate barrier and reports every failure
 before launching compilation. Do not run the barrier separately before it.
+
+Complete the manual private-data, compliance, glossary and buried-finding
+checks on the intended start commit before launching the early suite run.
 Format first, so the start commit is the one the suites test:
 
 ```bash
@@ -806,9 +819,10 @@ spec whose record is valid, and prints `PASS carried from <commit>` when no
 spec is left. A source edit since that commit voids the carry. A retry round
 carries nothing.
 
-**A startup refusal reports FAIL.** After cheap gates, start checks host
-prerequisites for the selected suites before generation or suite execution.
-Follow the install commands in its output and rerun start.
+**A startup refusal reports FAIL.** Start collects cheap-gate, independent
+suite and selected host prerequisite failures before generation or compilation.
+Native package checks follow the selected build scope. The build slot rechecks
+memory when it starts a command. Retry after resolving the reported deficiency.
 Previous evidence stays intact, but
 `wait` and `verdict` report the refusal rather than an older verdict.
 Read `.lucidos/harden-suites-start.log` before starting again.

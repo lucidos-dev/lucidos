@@ -307,6 +307,12 @@ fn thread_event_type_name_extraction() {
         ),
         (ThreadEvent::ThreadSaved, "ThreadSaved"),
         (ThreadEvent::ThreadUnsaved, "ThreadUnsaved"),
+        (
+            ThreadEvent::ThreadMovedToFolder {
+                folder: Some("w48".into()),
+            },
+            "ThreadMovedToFolder",
+        ),
         (ThreadEvent::ThreadArchived, "ThreadArchived"),
         (
             ThreadEvent::TriggerStarted {

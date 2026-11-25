@@ -3,6 +3,7 @@
 # harden-gates.sh: run `/harden`'s cheap gates, the checks every diff runs.
 #
 #   ./scripts/harden-gates.sh
+#   ./scripts/harden-gates.sh round-start <iteration> <full|fast>
 #
 # Each gate takes seconds, so `/harden` runs them before it starts the test
 # suites and again at Phase 4.5. A failure caught first costs no suite run
@@ -24,9 +25,12 @@ LOGS="$ROOT/.lucidos/harden-gates"
 GATES='em-dash ./scripts/check-em-dashes.sh
 prose ./scripts/check-prose.sh
 comments ./scripts/check-comments.sh
-crate-tiers ./scripts/check-crate-tiers.sh && ./scripts/lib/check_crate_tiers_test.sh
-crate-size ./scripts/check-crate-size.sh && ./scripts/lib/check_crate_size_test.sh
-crate-graph ./scripts/check-crate-graph.sh && ./scripts/lib/check_crate_graph_test.sh
+crate-tiers ./scripts/check-crate-tiers.sh
+crate-tiers-fixtures ./scripts/lib/check_crate_tiers_test.sh
+crate-size ./scripts/check-crate-size.sh
+crate-size-fixtures ./scripts/lib/check_crate_size_test.sh
+crate-graph ./scripts/check-crate-graph.sh
+crate-graph-fixtures ./scripts/lib/check_crate_graph_test.sh
 codegen-inputs ./scripts/check-codegen-inputs.sh
 adr ./scripts/check-adrs.sh
 context-budget ./scripts/check-context-budget.sh
@@ -44,21 +48,50 @@ audit-fixtures ./scripts/lib/check_audit_scans_test.sh
 knowhow-refs-fixtures ./scripts/lib/check_knowhow_refs_test.sh
 knowhow-generated-fixtures ./scripts/lib/check_knowhow_generated_test.sh
 default-flows ./scripts/check-default-flows.sh
-workspace-client-contract ./scripts/check-workspace-client-contract.sh && ./scripts/lib/check_workspace_client_contract_test.sh
+workspace-client-contract ./scripts/check-workspace-client-contract.sh
+workspace-client-contract-fixtures ./scripts/lib/check_workspace_client_contract_test.sh
 retired-terms-fixtures ./scripts/lib/check_retired_terms_test.sh
 hooks-registered ./scripts/lib/hooks_registered_test.sh
 stage-rules node --test scripts/scoreboard/*.test.mjs
 comment-strip ./scripts/comment-strip/run-tests.sh
 eval-comments-harness ./scripts/eval-comments/run-tests.sh'
 
+record_round_start() {
+    local iteration="${1:-}" tier="${2:-}" branch head payload
+    if [[ ! "$iteration" =~ ^[1-9][0-9]*$ ]] || [[ "$tier" != full && "$tier" != fast ]]; then
+        echo "harden-gates: round-start needs an iteration and tier (full or fast)." >&2
+        return 1
+    fi
+    [ -n "${LUCIDOS_THREAD_ID:-}" ] || return 0
+    branch="$(git -C "$ROOT" branch --show-current)" || return 0
+    head="$(git -C "$ROOT" rev-parse HEAD)" || return 0
+    payload="$(python3 - "$LUCIDOS_THREAD_ID" "$branch" "$head" "$iteration" "$tier" <<'PYTHON'
+import json
+import sys
+
+thread_id, branch, head, iteration, tier = sys.argv[1:]
+print(json.dumps(dict(thread_id=thread_id, branch=branch or None, head_sha=head,
+                      iteration=int(iteration), tier=tier)))
+PYTHON
+    )" || return 0
+    lucidos events emit HardeningStarted --summary "harden iteration $iteration started" \
+        --payload "$payload" >/dev/null ||
+        echo "harden-gates: could not record round start." >&2
+}
+
 case "${1:-}" in
+    round-start)
+        shift
+        record_round_start "$@"
+        exit $?
+        ;;
     "") ;;
     -h | --help)
         awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
         exit 0
         ;;
     *)
-        echo "harden-gates: takes no arguments." >&2
+        echo "harden-gates: use round-start <iteration> <full|fast> or run with no arguments." >&2
         exit 1
         ;;
 esac

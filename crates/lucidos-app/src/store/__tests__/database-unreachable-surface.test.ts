@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { effect } from '@preact/signals';
 import { connectionStatus, databaseReachable, engineRestarting, engineStartedAt, showToast, toasts, workspaceUnavailable } from '../store';
 import type { HealthInfo } from '../../api/client';
 
@@ -169,6 +170,66 @@ describe('a database claim never outlives the engine that made it', () => {
     syncDatabaseReachability(health({ database_reachable: false }));
     expect(databaseReachable.value).toBe(false);
     expect(toasts.value.filter((t) => t.key === DATABASE_UNREACHABLE_TOAST_KEY)).toHaveLength(1);
+  });
+});
+
+describe('the outage signal and its toast change in the order suppression needs', () => {
+  it('raises the outage signal before the toast appears', () => {
+    const seen: boolean[] = [];
+    const dispose = effect(() => {
+      if (toasts.value.some(t => t.key === DATABASE_UNREACHABLE_TOAST_KEY)) seen.push(databaseReachable.peek());
+    });
+    syncDatabaseReachability(health({ database_reachable: false }));
+    dispose();
+    expect(seen).toEqual([false]);
+  });
+
+  it('retracts the toast before the outage signal clears', () => {
+    syncDatabaseReachability(health({ database_reachable: false }));
+    const seen: boolean[] = [];
+    const dispose = effect(() => {
+      if (databaseReachable.value) seen.push(toasts.value.some(t => t.key === DATABASE_UNREACHABLE_TOAST_KEY));
+    });
+    syncDatabaseReachability(health({ database_reachable: true }));
+    dispose();
+    expect(seen).toEqual([false]);
+  });
+
+  it('does not churn the outage signal while a reconnect is still in hysteresis', async () => {
+    mockCheckHealth.mockResolvedValue({ status: 'loaded', data: health() });
+    await checkConnection();
+    syncDatabaseReachability(health({ database_reachable: false }));
+    connectionStatus.value = 'disconnected';
+    const seen: boolean[] = [];
+    const dispose = effect(() => {
+      seen.push(databaseReachable.value);
+    });
+    mockCheckHealth.mockResolvedValue({ status: 'loaded', data: health({ database_reachable: false }) });
+    await checkConnection();
+    dispose();
+    expect(seen.every(v => v === false)).toBe(true);
+  });
+
+  it('raises no engine-restarted toast on a tick that also reports an outage', async () => {
+    engineStartedAt.value = '2026-08-03T00:00:00Z';
+    engineRestarting.value = true;
+    mockCheckHealth.mockResolvedValue({
+      status: 'loaded',
+      data: health({ database_reachable: false, started_at: '2026-08-04T12:00:00Z' }),
+    });
+    await checkConnection();
+    expect(toasts.value.some(t => t.message === 'Engine restarted')).toBe(false);
+  });
+
+  it('keeps the outage toast up past any auto-dismiss window', () => {
+    vi.useFakeTimers();
+    try {
+      syncDatabaseReachability(health({ database_reachable: false }));
+      vi.advanceTimersByTime(10 * 60_000);
+      expect(toasts.value.some(t => t.key === DATABASE_UNREACHABLE_TOAST_KEY)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

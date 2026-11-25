@@ -27,6 +27,7 @@ import { showConfirm, showToast } from '../../store/store';
 import { loadingIfFresh, toFailed, type Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { Disclosure } from '../shared/Disclosure';
+import { DisclosureChevron } from '../shared/DisclosureChevron';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { LoadableError } from '../shared/LoadableError';
@@ -82,7 +83,7 @@ function GatewayRow({
   detail,
   action,
 }: {
-  title?: string;
+  title?: preact.ComponentChildren;
   detail?: preact.ComponentChildren;
   action?: preact.ComponentChildren;
 }) {
@@ -109,7 +110,7 @@ function GatewayList<T>({
 }: {
   list: Loadable<T[]>;
   noun: string;
-  empty: string;
+  empty?: string;
   row: (item: T) => preact.VNode;
 }) {
   const showLoading = useDelayedLoading(list);
@@ -121,7 +122,7 @@ function GatewayList<T>({
     >
       {list.status === 'loaded' && (
         list.data.length === 0
-          ? <div class="settings-section-desc">{empty}</div>
+          ? empty && <div class="settings-section-desc">{empty}</div>
           : list.data.map(row)
       )}
     </LoadingFade>
@@ -236,8 +237,9 @@ export function PairGatewaySection({
           <div class="list-row-info">
             <div class="title">Let another gateway in</div>
             <div class="list-row-details list-row-details-prose">
-              Creates a one-time secret. The other gateway pastes it under Remote gateways, and needs
-              this version of Lucidos or newer.
+              {paired.status === 'loaded' && paired.data.length === 0
+                ? "No other gateway can open this gateway's workspaces yet."
+                : 'Creates a one-time secret for the other gateway to paste.'}
             </div>
           </div>
           <div class="list-row-actions">
@@ -294,7 +296,8 @@ export function PairGatewaySection({
         <Explainer title="Pair a gateway">
           <p>
             Lets another Lucidos gateway open this gateway's workspaces, for every device
-            paired with it. The other gateway pastes the secret under Remote gateways.
+            paired with it. The other gateway pastes the secret under Remote gateways, and
+            needs this version of Lucidos or newer.
           </p>
           <p>
             It is one-way: this gateway gains nothing on the other one. Unpair ends it on
@@ -312,7 +315,6 @@ export function PairGatewaySection({
           <GatewayList
             list={paired}
             noun="paired gateways"
-            empty="No other gateway can open this gateway's workspaces."
             row={(gateway) => (
               <GatewayRow
                 key={gateway.id}
@@ -451,9 +453,25 @@ function RepairRemoteGateway({ gateway, reload }: { gateway: RemoteGateway; relo
   );
 }
 
-function RemoteGatewaySettings({ gateway, reload }: { gateway: RemoteGateway; reload: () => Promise<unknown> }) {
-  const [editing, setEditing] = useState(false);
-  const [rows, setRows] = useState<HeaderDraft[]>([]);
+interface HeadersDraft {
+  editing: boolean;
+  rows: HeaderDraft[];
+}
+
+const CLOSED_HEADERS_DRAFT: HeadersDraft = { editing: false, rows: [] };
+
+function RemoteGatewaySettings({
+  gateway,
+  reload,
+  headers,
+  setHeaders,
+}: {
+  gateway: RemoteGateway;
+  reload: () => Promise<unknown>;
+  headers: HeadersDraft;
+  setHeaders: (draft: HeadersDraft) => void;
+}) {
+  const { editing, rows } = headers;
   const [saving, setSaving] = useState(false);
   const returnLabel = `Allow agents on ${gateway.name} to read and start threads through this gateway`;
   const setReturnAccess = async (enabled: boolean) => {
@@ -501,16 +519,21 @@ function RemoteGatewaySettings({ gateway, reload }: { gateway: RemoteGateway; re
     setSaving(true);
     try {
       await updateRemoteGatewayHeaders(gateway.name, headersFromDraft(rows));
-      setRows([]);
-      setEditing(false);
+      setHeaders(CLOSED_HEADERS_DRAFT);
       await reload();
     } catch (e) {
       showToast(`Couldn't update headers for ${gateway.name}: ${errorDetail(e)}`, 'error');
     } finally { setSaving(false); }
   };
-  return <div>
+  return <>
     <div class="settings-row">
-      <span class="settings-row-label">{returnLabel}</span>
+      <span class="settings-row-label">
+        Agent return access
+        <Explainer title="Agent return access">
+          On: agents on {gateway.name} may read and start threads through this gateway. Off: they cannot reach
+          back here at all.
+        </Explainer>
+      </span>
       <label class="toggle-switch" data-tooltip={returnLabel}>
         <input type="checkbox" aria-label={returnLabel} checked={gateway.return_access ?? false}
           disabled={saving || gateway.return_access === undefined}
@@ -526,7 +549,7 @@ function RemoteGatewaySettings({ gateway, reload }: { gateway: RemoteGateway; re
     {gateway.return_access === undefined && <div class="settings-row-note">Update this gateway to manage agent return access.</div>}
     <div class="settings-row">
       <span class="settings-row-label">
-        {trustedLabel}
+        Use its own app
         <Explainer title="Trusted pairing">
           Off: this gateway's app opens {gateway.name}'s workspaces. On: {gateway.name} serves its own app, so you
           get its version and features. Its code then runs with this gateway's access. Turn it on only for a gateway you own.
@@ -544,18 +567,81 @@ function RemoteGatewaySettings({ gateway, reload }: { gateway: RemoteGateway; re
         <span class="toggle-slider" />
       </label>
     </div>
-    <div class="settings-row-note">{gateway.last_rotated_at ? `Credential rotated ${timeAgo(gateway.last_rotated_at, Date.now())}` : 'Credential rotates automatically every 30 days'}</div>
-    {gateway.rotation_error && <div class="settings-row-note" role="status">{gateway.rotation_error} · Retries automatically.</div>}
-    {!gateway.rotation_error && gateway.gateway_protocol < 2 && <div class="settings-row-note">Update the remote gateway to support credential rotation.</div>}
-    <button class="action-btn" disabled={saving} onClick={() => void rotate()}>Rotate credential</button>
-    <div class="settings-row-note">{gateway.header_names.length ? gateway.header_names.map(n => `${n}: set`).join(' · ') : 'No extra headers'}</div>
-    <button class="action-btn" aria-expanded={editing} disabled={saving} onClick={() => { setRows([]); setEditing(!editing); }}>Edit headers</button>
+    <div class="settings-row">
+      <div class="settings-row-label">
+        Credential
+        <div class="settings-row-note">{gateway.last_rotated_at ? `Rotated ${timeAgo(gateway.last_rotated_at, Date.now())}` : 'Rotates automatically every 30 days'}</div>
+        {gateway.rotation_error && <div class="settings-row-note" role="status">{gateway.rotation_error} · Retries automatically.</div>}
+        {!gateway.rotation_error && gateway.gateway_protocol < 2 && <div class="settings-row-note">Update the remote gateway to support credential rotation.</div>}
+      </div>
+      <button class="action-btn" disabled={saving} onClick={() => void rotate()}>Rotate</button>
+    </div>
+    <div class="settings-row">
+      <div class="settings-row-label">
+        Headers
+        <div class="settings-row-note">{gateway.header_names.length ? gateway.header_names.map(n => `${n}: set`).join(' · ') : 'None'}</div>
+      </div>
+      <button class="action-btn" aria-expanded={editing} disabled={saving} onClick={() => setHeaders({ editing: !editing, rows: [] })}>Edit</button>
+    </div>
     <Disclosure open={editing}>
       <p class="settings-row-note">Re-enter every header you want to keep. Saving replaces the entire set; an empty set clears it.</p>
-      <RemoteHeadersEditor rows={rows} onChange={setRows} disabled={saving} />
-      <button class="action-btn" disabled={saving} onClick={() => void save()}>Save headers</button>
+      <RemoteHeadersEditor rows={rows} onChange={next => setHeaders({ editing, rows: next })} disabled={saving} />
+      <div class="settings-row">
+        <button class="action-btn" disabled={saving} onClick={() => void save()}>Save headers</button>
+      </div>
     </Disclosure>
-  </div>;
+  </>;
+}
+
+function RemoteGatewayItem({
+  gateway,
+  state,
+  reload,
+  remove,
+}: {
+  gateway: RemoteGateway;
+  state: RemoteGatewayState;
+  reload: () => Promise<unknown>;
+  remove: (gateway: RemoteGateway) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [headers, setHeaders] = useState<HeadersDraft>(CLOSED_HEADERS_DRAFT);
+  return (
+    <div>
+      <GatewayRow
+        title={
+          <button
+            type="button"
+            class="remote-gateway-toggle"
+            aria-expanded={open}
+            onClick={() => setOpen(!open)}
+          >
+            <DisclosureChevron open={open} />
+            {gateway.name}
+          </button>
+        }
+        detail={<RemoteGatewayDetail gateway={gateway} state={state} />}
+      />
+      <Disclosure open={state.kind === 'unreachable'}>
+        {state.kind === 'unreachable' && <div class="settings-row-note" role="status">{state.reason}</div>}
+      </Disclosure>
+      <Disclosure open={state.kind === 'revoked'}>
+        <RepairRemoteGateway gateway={gateway} reload={reload} />
+      </Disclosure>
+      <Disclosure open={open}>
+        <div class="settings-row-child">
+          <Disclosure open={state.kind !== 'revoked'}>
+            <RemoteGatewaySettings gateway={gateway} reload={reload} headers={headers} setHeaders={setHeaders} />
+          </Disclosure>
+          <div class="settings-row">
+            <button class="action-btn action-btn-danger" onClick={() => void remove(gateway)}>
+              Remove {gateway.name}
+            </button>
+          </div>
+        </div>
+      </Disclosure>
+    </div>
+  );
 }
 
 export function RemoteGatewaysSection({ available }: { available: boolean }) {
@@ -567,6 +653,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
   );
   usePanelRefresh('remote gateways', reload);
   const [draft, setDraft] = useState<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
+  const [adding, setAdding] = useState(false);
   const [pairing, setPairing] = useState(false);
   const [awaitingOwner, setAwaitingOwner] = useState(false);
   const blocker = remoteGatewayBlocker(draft);
@@ -578,6 +665,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
     try {
       const added = await submitRemoteGateway(draft, () => setAwaitingOwner(true));
       setDraft(EMPTY_REMOTE_GATEWAY_DRAFT);
+      setAdding(false);
       showToast(`Paired with ${added.name}`, 'success');
       await reload();
     } catch (e) {
@@ -649,12 +737,12 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
             The other gateway needs an https address. The short name is how its
             workspaces are named here, as <code>name@short-name</code>.
           </p>
+          <p>
+            It is one-way: they cannot open yours, and their agents reach back here only
+            where you turn that on. Each one can revoke your access by unpairing this
+            gateway on its own Access page.
+          </p>
         </Explainer>
-      </div>
-      <div class="settings-section-desc">
-        These gateways let this one open their workspaces. They cannot open yours,
-        and their agents reach back here only where you turn that on. Each one can
-        revoke your access by unpairing this gateway on its own Access page.
       </div>
       {available ? (
         <>
@@ -663,55 +751,50 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
               list={remotes}
               noun="remote gateways"
               empty="No remote gateways yet."
-              row={(gateway) => {
-                const state = remoteGatewayState(listings, gateway);
-                return (
-                  <div key={gateway.name}>
-                    <GatewayRow
-                      title={gateway.name}
-                      detail={<RemoteGatewayDetail gateway={gateway} state={state} />}
-                      action={
-                        <button class="action-btn action-btn-danger" onClick={() => void remove(gateway)}>
-                          Remove
-                        </button>
-                      }
-                    />
-                    <Disclosure open={state.kind === 'unreachable'}>
-                      {state.kind === 'unreachable' && <div class="settings-row-note" role="status">{state.reason}</div>}
-                    </Disclosure>
-                    <Disclosure open={state.kind === 'revoked'}>
-                      <RepairRemoteGateway gateway={gateway} reload={reload} />
-                    </Disclosure>
-                    <Disclosure open={state.kind !== 'revoked'}>
-                      <RemoteGatewaySettings gateway={gateway} reload={reload} />
-                    </Disclosure>
-                  </div>
-                );
-              }}
+              row={(gateway) => (
+                <RemoteGatewayItem
+                  key={gateway.name}
+                  gateway={gateway}
+                  state={remoteGatewayState(listings, gateway)}
+                  reload={reload}
+                  remove={remove}
+                />
+              )}
             />
           </div>
           {listings.status === 'failed' && (
             <LoadableError noun="whether remote gateways still answer" error={listings.error} />
           )}
-          <div class="settings-row-note" data-role="remote-gateway-trust">{TRUST_NOTE}</div>
-          {field('Short name', 'name', 'cloud')}
-          {field('Gateway pairing secret', 'code', 'lgp_…')}
-          <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
-          {field(
-            'Address',
-            'address',
-            'https://lucidos.example.com',
-            <button
-              class="action-btn action-btn-confirm"
-              disabled={blocker !== null || pairing}
-              onClick={() => void pair()}
-            >
-              {awaitingOwner ? 'Waiting…' : pairing ? 'Pairing…' : 'Pair'}
-            </button>,
-          )}
-          {blocker?.kind === 'plain-http' && <div class="settings-row-note">{HTTPS_ONLY_NOTE}</div>}
-          <Disclosure open={awaitingOwner}>
-            <div class="settings-row-note" role="status">{AWAITING_OWNER_NOTE}</div>
+          <button
+            type="button"
+            class="settings-disclosure-toggle"
+            aria-expanded={adding}
+            onClick={() => setAdding(!adding)}
+          >
+            <DisclosureChevron open={adding} />
+            Add a remote gateway
+          </button>
+          <Disclosure open={adding}>
+            <div class="settings-row-note" data-role="remote-gateway-trust">{TRUST_NOTE}</div>
+            {field('Short name', 'name', 'cloud')}
+            {field('Gateway pairing secret', 'code', 'lgp_…')}
+            <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
+            {field(
+              'Address',
+              'address',
+              'https://lucidos.example.com',
+              <button
+                class="action-btn action-btn-confirm"
+                disabled={blocker !== null || pairing}
+                onClick={() => void pair()}
+              >
+                {awaitingOwner ? 'Waiting…' : pairing ? 'Pairing…' : 'Pair'}
+              </button>,
+            )}
+            {blocker?.kind === 'plain-http' && <div class="settings-row-note">{HTTPS_ONLY_NOTE}</div>}
+            <Disclosure open={awaitingOwner}>
+              <div class="settings-row-note" role="status">{AWAITING_OWNER_NOTE}</div>
+            </Disclosure>
           </Disclosure>
         </>
       ) : (

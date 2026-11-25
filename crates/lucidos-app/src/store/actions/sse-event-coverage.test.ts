@@ -22,6 +22,12 @@ const DISPATCHER_FILES = DISPATCHERS.map((d) => d.file).join(' or ');
 const NO_UI_STATE: Record<string, string> = {
   HardenCertificateCarried:
     'The lander updates the lane certificate for a disjoint catch-up. The UI reads the lane snapshot in ChangesUpdated.',
+  EngineBuildCompleted:
+    'a durable rebuild result for event queries; EngineBuildStateChanged drives the live build state',
+  EngineVersionActivated:
+    'a boot record emitted before serving SSE; clients read the current version from the version status endpoint',
+  ServedFrontendCommitChanged:
+    'a durable record of the served commit; ServedFrontendAdvanced prompts the client to check for an update',
   LaneArrivalsHeld:
     'the lane snapshot names the hold, and rides the ChangesUpdated the lane sends beside it',
   LaneArrivalsReleased:

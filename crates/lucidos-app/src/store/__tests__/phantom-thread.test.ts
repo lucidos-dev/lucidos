@@ -23,7 +23,7 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       section: 'archived',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',
@@ -166,7 +166,7 @@ describe('Phantom thread prevention', () => {
       updatedAt: ancestorOwnLastActivity,
       activeChildrenCount: 3,
       totalChildrenCount: 5,
-      blockingDescendantCount: 1, attentionDescendantCount: 1,
+      blockingDescendantCount: 1, attentionDescendantCount: 1, archivableSubThreadCount: 0,
     }));
     threadMap.value = new Map(map);
 
@@ -179,7 +179,7 @@ describe('Phantom thread prevention', () => {
         section: 'archived',
         activeChildrenCount: 3,
         totalChildrenCount: 5,
-        blockingDescendantCount: 2, attentionDescendantCount: 2,
+        blockingDescendantCount: 2, attentionDescendantCount: 2, archivableSubThreadCount: 0,
       }),
     });
 

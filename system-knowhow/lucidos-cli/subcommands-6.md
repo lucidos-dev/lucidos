@@ -6,6 +6,7 @@ description: Part of Lucidos CLI (lucidos). Its index lists the sections it cove
 <!-- domain-event: BuildSlotAcquired: The CLI emits this domain event when a contended host build acquires a slot. -->
 <!-- domain-event: BuildSlotWaiting: The CLI emits this domain event when a host build must wait for a slot. -->
 <!-- domain-event: BuildSlotReleased: The CLI emits this domain event when a host build slot is released. -->
+<!-- domain-event: BuildSlotStepCompleted: The CLI emits this domain event after a wrapped command exits under an inherited slot. -->
 
 One part of `system-knowhow/lucidos-cli`, which lists every part.
 
@@ -229,16 +230,32 @@ $ lucidos await-event --on BuildSlotReleased --timeout-secs 3600 \
   cargo's own default.
 - **The exit code is the command's**, and a signalled command reports
   `128 + signal`, so a killed build never reads as a pass.
-- **Every release is announced.** `BuildSlotReleased` fires whenever a slot
-  frees, so a session that gave up on `--max-wait` and subscribed is always
-  woken. `BuildSlotWaiting` and `BuildSlotAcquired` fire only under contention.
+- **Every release attempts a best-effort post.** `BuildSlotReleased` is
+  posted after the slot frees, including when a session has already given up on
+  `--max-wait` and subscribed. `BuildSlotWaiting` and `BuildSlotAcquired` are
+  posted only under contention. The three events share a `request_id` and a
+  `class`: the slot class the acquisition resolved (`priority`, `ordinary` or
+  `background`). Each release includes `wait_ms`, `hold_ms`, `outcome` and
+  `exit_code`.
+- **Nested steps have their own timing.** `BuildSlotStepCompleted` carries
+  `duration_ms`, `exit_code`, and the inherited `request_id` and `class` if
+  available. The class is the one the enclosing hold was granted, so a step
+  proves its class without joining another event.
+  A command that cannot start still posts one, with a `null` exit code and
+  outcome `unknown`. This post happens after the command exits. Each best-effort post has a
+  five-second HTTP timeout and preserves the command's exit code.
 
 ### Hidden: `lucidos build-slot --lease`
 
 The launch build wrapper uses this mode to hold one slot across its full body.
 It accepts `--label` and `--max-wait`. After acquiring a slot, it prints
 `granted <index> <jobs> <nice>` to stdout, with `-` when the grant supplies no
-job count.
+job count. Launch wrappers that set `LUCIDOS_BUILD_SLOT_LEASE_RECORDS` also
+receive the request ID and the granted class as fifth and sixth fields.
+They pass these to nested steps through `LUCIDOS_BUILD_SLOT_REQUEST_ID` and
+`LUCIDOS_BUILD_SLOT_GRANTED_CLASS`. The launch wrapper sends
+`release <exit_code>` to report its body's exit status. EOF or owner death
+leaves the status unknown.
 
 The helper holds until it reads a line or EOF on stdin, or detects
 that its parent shell died. The wrapper passes the original shell PID in

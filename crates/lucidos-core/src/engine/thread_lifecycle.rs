@@ -287,7 +287,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
     Some(match event_type {
         // Metadata
         "ThreadTitleGenerated" | "ThreadTitleRenamed" => EventClass::Metadata,
-        "ThreadSaved" | "ThreadUnsaved" => EventClass::Metadata,
+        "ThreadSaved" | "ThreadUnsaved" | "ThreadMovedToFolder" => EventClass::Metadata,
         // Boot reports the cut fire without starting or completing another turn.
         "TriggerRunInterrupted" => EventClass::Metadata,
         // A request, not the archive: the resolver's `ThreadArchived` moves
@@ -598,6 +598,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadTitleRenamed",
         "ThreadSaved",
         "ThreadUnsaved",
+        "ThreadMovedToFolder",
         "ThreadArchived",
         "ThreadArchiveRequested",
         "ThreadUnarchived",
@@ -1008,6 +1009,7 @@ pub fn resolve_transition(
         | "ThreadTitleGenerated"
         | "ThreadTitleRenamed"
         | "ThreadUnsaved"
+        | "ThreadMovedToFolder"
         | "ThreadArchiveRequested"
         | "ThreadReadRequested"
         | "ThreadReadNotRequested"

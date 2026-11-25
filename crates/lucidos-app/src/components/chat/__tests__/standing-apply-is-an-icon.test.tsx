@@ -75,6 +75,7 @@ function makeThread(): ThreadState {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
+      archivableSubThreadCount: 0,
       codingAgentChangeState: { kind: 'proposed', requires_restart: false },
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',

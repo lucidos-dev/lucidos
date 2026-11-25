@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.60.0 — 2026-11-25
+
+### Added
+
+- Custom folders for pinned threads. Pin a thread to a folder from its ⋯ menu, and each folder shows as its own section in the drawer. Archiving a folder keeps its threads.
+
+### Changed
+
+- Settings > Access is tidier, and each paired remote gateway folds into its own section. A header you are typing survives opening or closing the fold.
+
+### Fixed
+
+- After a restart, an archived thread no longer offers Continue.
+- A running turn keeps its working state when a background status or a child report lands mid-turn. It no longer reads Done while it still works.
+- Answering a question card on a busy engine no longer starts a stray keep-alive run under the resumed turn.
+- An agent event query with a malformed time bound now fails with an error. It no longer runs over all time.
+- The thread menu opens with the "Archive completed sub-threads" count already loaded, so the menu no longer changes size while it opens.
+- On a phone, the prompt stays above the keyboard and its buttons stay visible.
+- On a phone, pressing a prompt button or Suggest keeps the prompt field focused, so the dialog stays under your tap.
+- Folder sections show a folder icon, and On hold shows a pause icon in a ring.
 ## v0.59.1 — 2026-11-24
 
 ### Added

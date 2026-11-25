@@ -1210,6 +1210,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     shared_engine.start_spawn_request_consumer(spawn_request_rx);
 
+    // Keeps each summary's archivable sub-thread count current. Its first
+    // full recount runs on its own task, so boot does not wait for it.
+    lucidos_agents_api::engine::agent_recovery::ArchivableCountWorker::spawn(
+        shared_engine.pool().clone(),
+        std::sync::Arc::new(shared_engine.event_bus.clone()),
+    );
+
     // Auto-resume the coding-agent threads recovery flagged for a user-initiated
     // Switch to new version.
     //
@@ -1311,6 +1318,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &bind_choice,
         Arc::new(lucidos_event_hooks::WorkspaceHooks),
     );
+    shared_engine.record_engine_version_activated().await;
     // Dev-only: advance this engine's served-frontend snapshot to the
     // checkout-shared `dist/` when that is safe. A PEER workspace then picks up
     // another workspace's frontend-only Apply without a manual restart.

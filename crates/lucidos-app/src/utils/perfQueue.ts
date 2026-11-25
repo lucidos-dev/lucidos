@@ -39,8 +39,7 @@ export function onPerfOptInChange(listener: (on: boolean) => void): () => void {
   return () => { optInListeners.delete(listener); };
 }
 
-export function setPerfEnabled(on: boolean): void {
-  if (enginePackaged.peek() !== true) return;
+function storeOptIn(on: boolean): void {
   const previous = isPerfEnabled();
   try {
     if (typeof localStorage !== 'undefined') {
@@ -52,6 +51,15 @@ export function setPerfEnabled(on: boolean): void {
   perfRecordingOn();
   const current = isPerfEnabled();
   if (current !== previous) notifyListeners(optInListeners, current);
+}
+
+export function setPerfEnabled(on: boolean): void {
+  if (enginePackaged.peek() !== true) return;
+  storeOptIn(on);
+}
+
+export function clearPerfOptIn(): void {
+  storeOptIn(false);
 }
 
 function notifyListeners(listeners: Set<(on: boolean) => void>, on: boolean): void {

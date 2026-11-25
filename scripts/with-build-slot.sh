@@ -151,6 +151,13 @@ if [ -r "$SCRIPT_DIR/lib/stale_incremental.sh" ]; then
     ) >&"$LOG_FD" || echo "with-build-slot.sh: the stale incremental prune failed, building anyway" >&2
 fi
 
+# The broker starts this command after admission. A refusal releases the slot
+# without waiting while holding it. Ordinary build callers retain their policy.
+if [ -z "$LEASE" ] && [ "${LUCIDOS_SLOT_RECHECK_MEMORY:-}" = 1 ]; then
+    # shellcheck disable=SC2016 # the broker starts this bash after admission
+    set -- bash -c '"$0" --memory && exec "$@"' "$SCRIPT_DIR/build-prerequisites.sh" "$@"
+fi
+
 if ! BROKER="$(_resolve_broker)"; then
     echo "with-build-slot.sh: no \`lucidos\` that knows \`build-slot\`, running the build unrestricted" >&2
     if [ -n "$LEASE" ]; then echo unleased; exit 0; fi

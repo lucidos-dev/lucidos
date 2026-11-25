@@ -10,9 +10,9 @@ vi.mock('../../api/threads', () => ({
 }));
 vi.mock('../../utils/liveness', () => ({ postClientLog: vi.fn() }));
 
-import { fetchOlderThreads, fetchArchivedCount } from '../../api/threads';
-import { loadAllThreads, loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, filterChangedSinceLoad, _clearFamilyExtensionIdsForTest, _clearLoadedFilterSelectionForTest, _clearOlderThreadsCursorForTest } from '../actions/thread-loading';
-import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, archiveThreadCount, ALL_CHANNELS } from '../store';
+import { fetchOlderThreads, fetchArchivedCount, fetchThreads } from '../../api/threads';
+import { loadAllThreads, loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, filterChangedSinceLoad, noteThreadDeleted, _clearFamilyExtensionIdsForTest, _clearLoadedFilterSelectionForTest, _clearOlderThreadsCursorForTest } from '../actions/thread-loading';
+import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, archiveThreadCount, ALL_CHANNELS, awaitedThreadId, focusedThreadId, codingAgentSessionVersion, CODING_AGENT_CHANNEL } from '../store';
 import { closeThreadFilterPanel, openThreadFilterPanel } from '../threadFilterPanel';
 import { applySummaryVersion, makeOptimisticThreadState } from '../thread-events';
 import type { ThreadState } from '../thread-events';
@@ -33,6 +33,7 @@ function summary(over: Partial<ThreadSummary> & { thread_id: string; created_at:
     total_children_count: 0,
     blocking_descendant_count: 0,
     attention_descendant_count: 0,
+    archivable_sub_thread_count: 0,
     live_event_wait_count: 0,
     status: 'idle',
     summary_version: 0,
@@ -572,5 +573,157 @@ describe('filterChangedSinceLoad', () => {
       move();
       expect(filterChangedSinceLoad()).toBe(true);
     }
+  });
+});
+
+describe('loadOlderThreads: the answers the drawer and the filter rely on', () => {
+  beforeEach(() => {
+    fetchMock.mockClear();
+    fetchMock.mockResolvedValue({ threads: [], family_threads: [], has_more: false });
+    threadMap.value = new Map();
+    threadHasMore.value = true;
+    threadLoadingMore.value = false;
+    threadChannelFilter.value = new Set(ALL_CHANNELS);
+    selectedTriggerIds.value = new Set();
+    selectedRepoIds.value = new Set();
+    selectedAppIds.value = new Set();
+    _clearFamilyExtensionIdsForTest();
+    _clearOlderThreadsCursorForTest();
+    _clearLoadedFilterSelectionForTest();
+  });
+
+  function archivedWindow(): void {
+    const arch = loaded(makeOptimisticThreadState({
+      id: 'arch', title: 'Oldest loaded archived', channel: 'chat', initiator: 'user', eventsLoaded: false,
+    }), '2026-06-01T00:00:00Z');
+    threadMap.value = new Map([['arch', arch]]);
+  }
+
+  it('an empty landed page answers true, so the fill loop reads the server as having answered', async () => {
+    archivedWindow();
+    fetchMock.mockResolvedValueOnce({ threads: [], family_threads: [], has_more: false });
+
+    expect(await loadOlderThreads()).toBe(true);
+    expect(threadHasMore.value).toBe(false);
+  });
+
+  it('a page fetched for a selection the reader has since left cannot disarm pagination for the new one', async () => {
+    threadChannelFilter.value = new Set(['chat']);
+    let landPage!: (v: unknown) => void;
+    fetchMock.mockReturnValueOnce(new Promise((resolve) => { landPage = resolve as (v: unknown) => void; }));
+
+    const inFlight = loadOlderThreads();
+    selectedRepoIds.value = new Set(['repo-b']);
+    landPage({
+      threads: [summary({ thread_id: 'old-1', created_at: '2026-05-01T00:00:00Z' })],
+      family_threads: [],
+      has_more: false,
+    });
+    await inFlight;
+
+    expect(threadHasMore.value).toBe(true);
+  });
+
+  it('a selection is not settled while its page is still in flight', async () => {
+    threadChannelFilter.value = new Set(['chat']);
+    let landPage!: (v: unknown) => void;
+    fetchMock.mockReturnValueOnce(new Promise((resolve) => { landPage = resolve as (v: unknown) => void; }));
+
+    const inFlight = loadOlderThreads();
+    expect(filterChangedSinceLoad(), 'nothing has settled the selection yet').toBe(true);
+    landPage({ threads: [], family_threads: [], has_more: false });
+    await inFlight;
+
+    expect(filterChangedSinceLoad()).toBe(false);
+  });
+});
+
+describe('loadAllThreads: what a sync keeps and what it refreshes', () => {
+  const EMPTY_LIST = { saved: [], archive: [], active: [], active_threads: [], composing: [], family_threads: [] };
+
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    awaitedThreadId.value = null;
+    vi.mocked(fetchThreads).mockReset();
+    vi.mocked(fetchThreads).mockResolvedValue(EMPTY_LIST as never);
+  });
+
+  it('does not resurrect a thread deleted this session when a list read that predates the delete lands', async () => {
+    noteThreadDeleted('gone-1');
+    vi.mocked(fetchThreads).mockResolvedValueOnce({
+      ...EMPTY_LIST,
+      active_threads: [summary({ thread_id: 'gone-1', created_at: '2026-06-01T00:00:00Z', section: 'inbox' })],
+    } as never);
+
+    await loadAllThreads();
+
+    expect(threadMap.value.has('gone-1')).toBe(false);
+  });
+
+  it('keeps a queued spawn the reader is awaiting focused while the list has no row for it yet', async () => {
+    awaitedThreadId.value = 'queued-1';
+    focusedThreadId.value = 'queued-1';
+
+    await loadAllThreads();
+
+    expect(focusedThreadId.value).toBe('queued-1');
+    awaitedThreadId.value = null;
+  });
+
+  it('bumps the coding-agent session version after a reload, since the menu refetches only on the bump', async () => {
+    focusedThreadId.value = 'cc-1';
+    vi.mocked(fetchThreads).mockResolvedValueOnce({
+      ...EMPTY_LIST,
+      active_threads: [summary({ thread_id: 'cc-1', created_at: '2026-06-01T00:00:00Z', section: 'inbox', channel: CODING_AGENT_CHANNEL })],
+    } as never);
+    const before = codingAgentSessionVersion.value;
+
+    await loadAllThreads();
+
+    expect(codingAgentSessionVersion.value).toBe(before + 1);
+  });
+
+  it('keeps the coding agents a thread already holds when an older engine omits them from its summary', async () => {
+    const agents = [{ id: 'cc-a' }] as unknown as NonNullable<ThreadState['meta']['codingAgents']>;
+    const existing = makeOptimisticThreadState({
+      id: 'cc-2', title: 'Held', channel: 'chat', initiator: 'user', eventsLoaded: false,
+    });
+    existing.meta.codingAgents = agents;
+    threadMap.value = new Map([['cc-2', existing]]);
+    vi.mocked(fetchThreads).mockResolvedValueOnce({
+      ...EMPTY_LIST,
+      active_threads: [summary({ thread_id: 'cc-2', created_at: '2026-06-01T00:00:00Z', section: 'inbox' })],
+    } as never);
+
+    await loadAllThreads();
+
+    expect(threadMap.value.get('cc-2')!.meta.codingAgents).toEqual(agents);
+  });
+});
+
+describe('loadAllThreads: a first send the engine has not recorded keeps its local state', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    vi.mocked(fetchThreads).mockReset();
+    vi.mocked(fetchThreads).mockResolvedValue({ saved: [], archive: [], active: [], active_threads: [], composing: [], family_threads: [] } as never);
+  });
+
+  it('does not let a list read flip an unsent first message back to the compose view', async () => {
+    const pending = makeOptimisticThreadState({
+      id: 'first-1', title: 'Unsent', channel: 'chat', initiator: 'user', eventsLoaded: false,
+    });
+    pending.meta.state = 'active';
+    pending.pendingUserMessages = [{ text: 'hello' } as unknown as ThreadState['pendingUserMessages'][number]];
+    threadMap.value = new Map([['first-1', pending]]);
+    vi.mocked(fetchThreads).mockResolvedValueOnce({
+      saved: [], archive: [], active: [], composing: [], family_threads: [],
+      active_threads: [summary({ thread_id: 'first-1', created_at: '2026-06-01T00:00:00Z', section: 'inbox', state: 'composing' })],
+    } as never);
+
+    await loadAllThreads();
+
+    expect(threadMap.value.get('first-1')!.meta.state).toBe('active');
   });
 });

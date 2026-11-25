@@ -269,7 +269,7 @@ Workspace crates:
 | `lucidos-gateway` | Multi-workspace gateway and routing |
 | `lucidos-gateway-tls` | What each gateway connection is served over, and its certificates |
 | `lucidos-app` | Tauri desktop shell, plus the frontend under `src/` |
-| `lucidos-eval` | Evaluation harness |
+| `lucidos-engine-bin` | Engine executable and feature-gated evaluation harness |
 | `lucidos-cli` | The `lucidos` command-line tool |
 | `lucidos-installs` | Install discovery and update checks |
 | `lucidos-build-slot` | Build-slot arbitration between concurrent builds |

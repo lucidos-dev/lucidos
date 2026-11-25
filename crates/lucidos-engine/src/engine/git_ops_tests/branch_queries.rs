@@ -1421,7 +1421,7 @@ mod guard_tests {
             .canonicalize()
             .unwrap();
         // Built into none of the binaries an Apply rebuilds and restarts onto.
-        const NOT_IN_A_RESTARTED_BINARY: &[&str] = &["lucidos-app", "lucidos-e2e", "lucidos-eval"];
+        const NOT_IN_A_RESTARTED_BINARY: &[&str] = &["lucidos-app", "lucidos-e2e"];
         let include = regex::Regex::new(r#"include_(?:str|bytes)!\(\s*"([^"]+)"\s*\)"#).unwrap();
         let mut embedded = Vec::new();
         for crate_dir in std::fs::read_dir(root.join("crates")).unwrap() {

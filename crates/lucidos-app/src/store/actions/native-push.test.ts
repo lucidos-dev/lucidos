@@ -294,6 +294,33 @@ describe('setupNativePushTapRouting → drain → dispatchDeepLink', () => {
     }
   });
 
+  it('runs the startup drain only after the live listener is wired', async () => {
+    let listenerWiredAtDrain = false;
+    takePendingNativeTaps.mockImplementationOnce(() => {
+      listenerWiredAtDrain = listenHandler !== null;
+      return Promise.resolve([]);
+    });
+    await setupNativePushTapRouting();
+    await flush();
+    expect(listenerWiredAtDrain).toBe(true);
+  });
+
+  it('takes the tap from the stash, never from the live signal payload', async () => {
+    await setupNativePushTapRouting();
+    await flush();
+    dispatchDeepLink.mockClear();
+
+    takePendingNativeTaps.mockResolvedValueOnce([
+      { notification_id: 'n-stashed', tap: { kind: 'modal' } },
+    ]);
+    listenHandler!({ payload: { notification_id: 'n-from-payload', tap: { kind: 'modal' } } });
+    await flush();
+    expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
+    expect(dispatchDeepLink).toHaveBeenCalledWith(
+      expect.objectContaining({ notification: 'n-stashed' }),
+    );
+  });
+
   it('an empty drain dispatches nothing', async () => {
     await setupNativePushTapRouting();
     await flush();
@@ -342,6 +369,21 @@ describe('NativePushDismissRequested → remove native desktop banner', () => {
     emitDismiss({ audience: ['this-mac', 'my-phone'] });
     await flush();
     expect(dismissNativeNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes a banner while the window is in front (no active gate, unlike show)', async () => {
+    const prev = document.visibilityState;
+    try {
+      (document as unknown as { visibilityState: string }).visibilityState = 'visible';
+      emitDismiss({ notification_id: 'n-front' });
+      await flush();
+      expect(dismissNativeNotification).toHaveBeenCalledWith({
+        workspace: 'myws',
+        notificationId: 'n-front',
+      });
+    } finally {
+      (document as unknown as { visibilityState: string }).visibilityState = prev;
+    }
   });
 
   it('scopes a mark-all-read dismiss to this workspace', async () => {

@@ -30,6 +30,7 @@ import { archiveThread, deletePreflight, deleteThreadFamily } from '../../api/th
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
 import { confirmState, focusedThreadId, threadMap } from '../store';
 import { handleDeleteThread } from './threads-delete';
+import { ARCHIVE_PINNED_CONFIRM } from './threads';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 
 vi.mock('../../api/threads', async (importOriginal) => ({
@@ -93,6 +94,24 @@ describe('handleDeleteThread offers Archive', () => {
     expect(dialog.message).toContain('Archive keeps it instead');
 
     chooseExtraAction();
+    await running;
+
+    expect(archiveThread).toHaveBeenCalledWith('t1');
+    expect(deleteThreadFamily).not.toHaveBeenCalled();
+  });
+
+  it('asks about a pinned thread only after the delete dialog closes, so that dialog cannot close it', async () => {
+    threadMap.value = new Map([
+      ['t1', makeThreadState('t1', { meta: { section: 'inbox', saved: true } })],
+    ]);
+
+    const running = handleDeleteThread('t1');
+    await openedDialog();
+    chooseExtraAction();
+
+    const archiveDialog = await openedDialog();
+    expect(archiveDialog.message).toBe(ARCHIVE_PINNED_CONFIRM);
+    archiveDialog.resolve?.(true);
     await running;
 
     expect(archiveThread).toHaveBeenCalledWith('t1');

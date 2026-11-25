@@ -50,9 +50,11 @@ import { clearStackedMark, placeStackedMark } from './agentMarkLift';
 import { isMobile } from '../../utils/viewport';
 import { scrollBehavior } from '../../utils/motion';
 import type { ThreadSearchResult } from '../../api/threads';
-import { PinIcon, CurrentIcon, HoldIcon, ArchiveIcon, DraftsIcon, BlockedIcon, ReviewIcon, InFlightIcon, SearchIcon, ChevronRightIcon, ClaudeIcon, CodexIcon, LucidosMarkIcon } from '../shared/icons';
+import { FolderIcon, PinIcon, CurrentIcon, HoldIcon, ArchiveIcon, DraftsIcon, BlockedIcon, ReviewIcon, InFlightIcon, SearchIcon, ChevronRightIcon, ClaudeIcon, CodexIcon, LucidosMarkIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import type { ComponentType, VNode } from 'preact';
+import { customFolderSectionKey, knownFolderOf, splitByCustomFolder, threadFolders, type CustomFolderSectionKey, type ThreadFolder } from '../../store/threadFolders';
+import { CustomFolderMenu, NewFolderButton } from './CustomFolderControls';
 
 export { threadPassesChannelFilter };
 
@@ -69,12 +71,27 @@ function SectionPinIcon({ size }: { size?: string }) {
     return <PinIcon size={size} className="section-icon-pin" />;
 }
 
-const SECTION_META: Record<DisplaySection, { title: string; Icon: ComponentType<{ size?: string }> }> = {
+export const SECTION_META: Record<DisplaySection, { title: string; Icon: ComponentType<{ size?: string }> }> = {
     saved: { title: 'Pinned', Icon: SectionPinIcon },
     on_hold: { title: 'On hold', Icon: HoldIcon },
     current: { title: 'Current', Icon: CurrentIcon },
     archive: { title: 'Archive', Icon: ArchiveIcon },
 };
+
+type DrawerSectionRows = {
+    name: DrawerSectionKey;
+    folder?: ThreadFolder;
+    count: number;
+    threads: NestedThread[];
+    hasRunning: boolean;
+};
+
+function sectionAction(s: DrawerSectionRows): ComponentChildren {
+    if (s.folder) return <CustomFolderMenu folder={s.folder} />;
+    if (s.name === 'saved') return <NewFolderButton />;
+    if (s.name === 'current' && s.count > 0) return <ArchiveAllButton />;
+    return undefined;
+}
 
 export function isThreadRowTarget(target: EventTarget | null): boolean {
     return !!(target as Element | null)?.closest?.('[data-thread-nav]');
@@ -85,8 +102,10 @@ export function handleDrawerPointerDown(target: EventTarget | null): void {
     focusPane('drawer');
 }
 
+export type DrawerSectionKey = DisplaySection | CustomFolderSectionKey;
+
 export type DrawerNavNode =
-    | { kind: 'section'; sectionKey: DisplaySection }
+    | { kind: 'section'; sectionKey: DrawerSectionKey }
     | { kind: 'tile'; group: OngoingGroup; selected: boolean }
     | {
           kind: 'thread';
@@ -95,7 +114,7 @@ export type DrawerNavNode =
           parentId: string | null;
           hasChildren: boolean;
           hiddenArchivedCount?: number;
-          sectionKey: DisplaySection | null;
+          sectionKey: DrawerSectionKey | null;
           group?: OngoingGroup;
       };
 
@@ -395,7 +414,7 @@ export function seedDrawerHighlight(): void {
 }
 
 export type FoldersReveal =
-    | { kind: 'reveal'; section: DisplaySection; collapsedAncestors: string[]; archivedAncestorsToReveal: string[] }
+    | { kind: 'reveal'; section: DrawerSectionKey; collapsedAncestors: string[]; archivedAncestorsToReveal: string[] }
     | { kind: 'hidden-by-filter' }
     | { kind: 'not-listed' };
 
@@ -410,7 +429,15 @@ function routeInList(threadId: string, threads: ThreadState[], filter: ThreadFil
     const { decorations, familyGraph } = computeDrawerCategorization(
         threads, filter.channels, filter.triggerIds, filter.repoIds, filter.appIds,
     );
-    return { section: decorations.routedByThread.get(threadId), familyGraph, decorations };
+    const routed = decorations.routedByThread.get(threadId);
+    const section = routed === 'saved' ? savedSectionKey(threadId, familyGraph, threadFolders.value) : routed;
+    return { section, familyGraph, decorations };
+}
+
+function savedSectionKey(threadId: string, graph: FamilyGraph, folders: readonly ThreadFolder[]): DrawerSectionKey {
+    const root = graph.byId.get(graph.rootByThread.get(threadId) ?? threadId);
+    const folder = knownFolderOf(root, folders);
+    return folder ? customFolderSectionKey(folder.id) : 'saved';
 }
 
 function hiddenArchivedRevealChain(
@@ -669,8 +696,23 @@ function ThreadList({ frozen }: { frozen: boolean }) {
     const archiveCount = archiveThreadCount.value;
     const sectionHasRunning = (threads: ThreadState[]) =>
         threads.some(t => statusMap.get(t.meta.id) === 'running');
-    const sectionByName: Record<DisplaySection, { name: DisplaySection; count: number; threads: NestedThread[]; hasRunning: boolean }> = {
-        saved: { name: 'saved', count: inboxThreadCount(saved), threads: familyRows(visibleSaved), hasRunning: sectionHasRunning(saved) },
+    const folders = threadFolders.value;
+    const savedSplit = splitByCustomFolder(saved, familyGraph.rootByThread, familyGraph.byId, folders);
+    const visibleSavedSplit = splitByCustomFolder(visibleSaved, familyGraph.rootByThread, familyGraph.byId, folders);
+    const folderSections: DrawerSectionRows[] = savedSplit.folders.map(({ folder, threads }, i) => ({
+        name: customFolderSectionKey(folder.id),
+        folder,
+        count: inboxThreadCount(threads),
+        threads: familyRows(visibleSavedSplit.folders[i].threads),
+        hasRunning: sectionHasRunning(threads),
+    }));
+    const sectionByName: Record<DisplaySection, DrawerSectionRows> = {
+        saved: {
+            name: 'saved',
+            count: inboxThreadCount(savedSplit.pinned),
+            threads: familyRows(visibleSavedSplit.pinned),
+            hasRunning: sectionHasRunning(savedSplit.pinned),
+        },
         on_hold: { name: 'on_hold', count: holdRootCount(onHold), threads: familyRows(visibleOnHold), hasRunning: sectionHasRunning(onHold) },
         current: {
             name: 'current',
@@ -680,11 +722,12 @@ function ThreadList({ frozen }: { frozen: boolean }) {
         },
         archive: { name: 'archive', count: archiveCount, threads: familyRows(archive), hasRunning: sectionHasRunning(archive) },
     };
-    const sections = THREAD_DRAWER_SECTION_ORDER.map(name => sectionByName[name]);
+    const sections = [...folderSections, ...THREAD_DRAWER_SECTION_ORDER.map(name => sectionByName[name])];
+    const listed = (s: DrawerSectionRows) => s.threads.length > 0 || s.folder !== undefined;
 
     const collapsed = collapsedSections.value;
     const sectionDefs: FlipSection[] = sections
-        .filter(s => s.threads.length > 0)
+        .filter(listed)
         .map(s => ({
             name: s.name,
             ids: [sectionNavKey(s.name), ...(collapsed.has(s.name) ? [] : s.threads.map(n => n.thread.meta.id))],
@@ -692,7 +735,7 @@ function ThreadList({ frozen }: { frozen: boolean }) {
 
     const navList: DrawerNavNode[] = [];
     for (const s of sections) {
-        if (s.threads.length === 0) continue;
+        if (!listed(s)) continue;
         navList.push({ kind: 'section', sectionKey: s.name });
         if (collapsed.has(s.name)) continue;
         for (const n of s.threads) {
@@ -825,16 +868,18 @@ function ThreadList({ frozen }: { frozen: boolean }) {
             {!hydrated ? <div ref={containerRef} /> : (
                 <div ref={containerRef} class="thread-drawer-rows">
                     {sections.map(s => {
-                        if (s.threads.length === 0) return null;
-                        const { title, Icon } = SECTION_META[s.name];
+                        if (!listed(s)) return null;
+                        const { title, Icon } = s.folder
+                            ? { title: s.folder.name, Icon: FolderIcon }
+                            : SECTION_META[s.name as DisplaySection];
                         return (
                             <DrawerSection key={s.name} sectionKey={s.name} title={title} Icon={Icon} count={s.count} hasRunning={s.hasRunning}
-                                action={s.name === 'current' && s.count > 0 ? <ArchiveAllButton /> : undefined}>
-                                {windowedRows(s)}
+                                action={sectionAction(s)}>
+                                {s.threads.length > 0 && windowedRows(s)}
                             </DrawerSection>
                         );
                     })}
-                    {sections.every(s => s.threads.length === 0) && (
+                    {sections.every(s => !listed(s)) && (
                         <div class="empty-state">No threads</div>
                     )}
                     <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <ThreadRowContent />} />}>

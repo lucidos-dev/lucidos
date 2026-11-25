@@ -11,6 +11,7 @@ import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { useCodeCountdown } from './useCodeCountdown';
 import { Dropdown } from '../shared/Dropdown';
+import { openSettingsSubview } from '../../store/actions/menu';
 import { isTeamGateway, gatewayUserRows, gatewayUsers } from '../../store/actions/gatewayUsers';
 
 export interface MintedCode {
@@ -110,7 +111,11 @@ export function PairDeviceSection({
           <div class="list-row-info">
             <div class="title">Pair a phone or another computer</div>
             <div class="list-row-details list-row-details-prose">
-              {targetSentence(target)}
+              {targetSentence(target)} Paired devices live under{' '}
+              <button class="accent-link" onClick={() => openSettingsSubview('devices')}>
+                Settings → Devices
+              </button>
+              .
             </div>
           </div>
           <div class="list-row-actions">

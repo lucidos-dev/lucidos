@@ -3,13 +3,19 @@ import { chatLadder, chatModels, configuredProviders } from '../store';
 import type { IntelligenceLadder } from '../../api/types';
 
 const getChatLadder = vi.hoisted(() => vi.fn<() => Promise<IntelligenceLadder>>());
+const updateModel = vi.hoisted(() => vi.fn<(id: string, body: Record<string, unknown>) => Promise<{ success: boolean }>>(async () => ({ success: true })));
+const listModels = vi.hoisted(() => vi.fn(async () => ({ models: [] })));
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   getChatLadder,
+  updateModel: (id: string, body: Record<string, unknown>) => updateModel(id, body),
+  listModels: () => listModels(),
 }));
 import {
   chatModelOptions,
   loadChatLadder,
+  rememberProvider,
+  saveModelRoutes,
   clampEffortFor,
   isProviderConfigured,
   modelReasoningEfforts,
@@ -463,6 +469,26 @@ describe('the route editor', () => {
       { provider: 'vertex', id: '', contextWindow: '' },
       { provider: 'anthropic', id: '', contextWindow: '' },
     ]);
+  });
+
+  it('a route save with no picked provider leaves the stored one alone, and null clears it', async () => {
+    updateModel.mockClear();
+    const drafts = [{ provider: 'vertex', id: '', contextWindow: '' }];
+    await saveModelRoutes('claude-opus-5-6', drafts, undefined);
+    expect(updateModel.mock.calls[0][1]).not.toHaveProperty('preferred_provider');
+    await saveModelRoutes('claude-opus-5-6', drafts, null);
+    expect(updateModel.mock.calls[1][1]).toHaveProperty('preferred_provider', null);
+  });
+
+  it('remembers a picked backend on the model row, and writes nothing when it already does', async () => {
+    updateModel.mockClear();
+    chatModels.value = { status: 'loaded', data: [dualRouted('claude-opus-5-6', 'Opus 5.6', ['vertex', 'anthropic'])] };
+    await rememberProvider('claude-opus-5-6', 'anthropic');
+    expect(updateModel).toHaveBeenCalledWith('claude-opus-5-6', { preferred_provider: 'anthropic' });
+    updateModel.mockClear();
+    chatModels.value = { status: 'loaded', data: [dualRouted('claude-opus-5-6', 'Opus 5.6', ['vertex', 'anthropic'], 'anthropic')] };
+    await rememberProvider('claude-opus-5-6', 'anthropic');
+    expect(updateModel).not.toHaveBeenCalled();
   });
 
   it('sends only what differs from the defaults', () => {

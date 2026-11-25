@@ -351,6 +351,17 @@
         height: var(--app-height, 100dvh);
     }
 
+    .prompt-dialog-overlay {
+        bottom: 0;
+        height: auto;
+        align-items: flex-end;
+        padding-bottom: calc(max(var(--keyboard-band, 0px), var(--safe-area-bottom, 0px)) + var(--space-md));
+    }
+
+    .prompt-dialog-overlay > .confirm-dialog {
+        max-height: 100%;
+    }
+
 
     :root[data-mobile-dynamic-bars] {
         --bars-glide-duration: var(--duration-slow);

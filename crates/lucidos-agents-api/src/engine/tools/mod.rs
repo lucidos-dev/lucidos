@@ -1391,12 +1391,6 @@ pub(crate) fn set_aside_refusal_message(
     }
 }
 
-/// The `changes` tool's wording for a refused Apply. Pure, so every branch is
-/// asserted without booting an engine.
-///
-/// It names `apply_when_settled` for ONE refusal, the settling thread. A
-/// standing apply drops at once on a parked one. Naming it there would swap
-/// a refusal the caller can act on for one it cannot.
 pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRefusal) -> String {
     use crate::api::changes::ChangeActionRefusal as R;
     match refusal {
@@ -1412,10 +1406,6 @@ pub(crate) fn apply_refusal_message(refusal: crate::api::changes::ChangeActionRe
              finishes."
                 .to_string()
         }
-        // Deliberately never spells the standing-apply action, not even to
-        // forbid it. A named tool in a negative instruction is still a named
-        // tool. The test beside this asserts the bare absence, rather than
-        // trusting the model to read the "not".
         R::ThreadParked => {
             "Error: the thread that proposed this change is parked: it is waiting on a question, \
              or its turn failed. It may commit again once it moves on, so Apply is withheld. \
@@ -1463,25 +1453,19 @@ pub(crate) fn parse_optional_uuid(
     }
 }
 
-/// Parse an optional RFC3339 time filter (`since` / `until`) for the event
-/// query tools.
-///
-/// A present-but-unparseable value is a hard error, never a silent `None`:
-/// dropping the bound turns a windowed query into an all-time one, which the
-/// model then reports to the user as the window. `2026-07-01` (no time, no
-/// offset) is a very common model shape and does NOT parse as RFC3339, so this
-/// path is hit routinely rather than exotically.
 pub(crate) fn parse_time_filter(
     args: &serde_json::Value,
     key: &str,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-    let Some(raw) = args
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
+    let raw = match args.get(key) {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.trim(),
+        Some(other) => {
+            return Err(format!(
+                "Error: `{key}` must be an RFC3339 timestamp string (e.g. 2026-07-01T00:00:00Z), got {other}"
+            ))
+        }
     };
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
@@ -1635,10 +1619,6 @@ const QUERY_EVENTS_TRUNCATION_HINT: &str =
      before drilling. Do not retry with a larger byte_limit unless you have \
      already narrowed the query.";
 
-/// A three-way boolean filter arg, such as `has_draft`. Absent or null
-/// is no filter, and `"true"` / `"false"` spelled as strings are read as
-/// booleans. Anything else is refused: ignoring it would answer with the whole
-/// workspace, a question the model did not ask.
 fn bool_arg(args: &serde_json::Value, name: &str) -> Result<Option<bool>, String> {
     match args.get(name) {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -1974,19 +1954,6 @@ pub(crate) async fn emit_event_impl(
     Ok(text)
 }
 
-/// The `thread_id` argument of `query_events` and `count_events`.
-///
-/// Refused rather than ignored. This is the read half of "we talked about
-/// this": the model finds a thread with `threads` 'search', then asks for its
-/// events here. Widening a malformed id to EVERY thread silently would hand it
-/// another conversation, or the workspace total under a thread's name.
-///
-/// Matched on the VALUE, not on `as_str()`. Filtering to strings first would
-/// send a `thread_id` of `["<uuid>"]` or `{...}` down the absent arm, which
-/// widens the query to every thread. The alias is the one string that is not
-/// an id, and it resolves to the caller's own thread. Anything else still has
-/// to parse as a uuid. Shared with every other thread-id slot an agent can
-/// write, so the vocabulary cannot drift between them.
 fn events_thread_id_arg(
     args: &serde_json::Value,
     caller_thread_id: uuid::Uuid,

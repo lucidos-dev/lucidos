@@ -28,7 +28,7 @@ vi.mock('./menu', () => ({ landOnAccountsWithOverlay: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
 
 import { grantOAuthScope, cancelPendingOAuthConnect } from './oauth';
-import { submitRequestedCredential } from './credentials';
+import { closeCredentialForm, submitRequestedCredential } from './credentials';
 import type { CredentialRequest } from '../types';
 
 function needsCredentials(over: Partial<CredentialRequest> = {}) {
@@ -129,6 +129,23 @@ describe('a saved registration continues the connection it was blocking', () => 
       ['https://jira.test'],
       'api_key',
       'secret',
+    );
+
+    expect(openUrlOutsideApp).not.toHaveBeenCalled();
+  });
+
+  it('abandons the pending connect when the registration form is closed', async () => {
+    reauthorizeOAuth.mockResolvedValueOnce(needsCredentials());
+    await grantOAuthScope('dropbox', 'files.content.write');
+
+    closeCredentialForm();
+    reauthorizeOAuth.mockResolvedValue(AUTHORIZES);
+    await submitRequestedCredential(
+      { service: 'dropbox' },
+      'dropbox',
+      ['https://api.dropboxapi.test'],
+      'oauth_client',
+      '{"client_id":"abc"}',
     );
 
     expect(openUrlOutsideApp).not.toHaveBeenCalled();

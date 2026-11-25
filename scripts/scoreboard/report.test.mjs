@@ -69,8 +69,10 @@ test('the text report shows the count behind every aggregate', () => {
     main_check_seconds: {},
     lane_batches: {},
     github_build_seconds: { unavailable: 'no timings log path' },
+    perf_samples: { unavailable: 'the lucidos command is not on PATH', notes: [] },
   };
   const text = formatText(report);
+  assert.match(text, /App speed samples[^\n]*\nunavailable: the lucidos command is not on PATH/);
   assert.match(text, /lead time\s+too few \(n=2\)/);
   assert.match(text, /changes 2, lead time known for 2/);
   assert.match(text, /reverted 1, apply failed 0, main check failed 0/);

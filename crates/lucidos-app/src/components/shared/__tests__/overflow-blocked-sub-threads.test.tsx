@@ -20,12 +20,15 @@ beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 let host: HTMLElement | null = null;
 
-function openMenu(): HTMLElement {
+async function openMenu(): Promise<HTMLElement> {
     host = document.createElement('div');
     document.body.appendChild(host);
     act(() => { render(<ThreadOverflowMenu threadId="t" title="T" />, host!); });
     const trigger = host.querySelector<HTMLElement>('button[aria-haspopup="menu"]');
-    act(() => { trigger?.click(); });
+    await act(async () => { trigger?.click(); });
+    await vi.waitFor(() => act(() => {
+        if (!document.querySelector('.thread-overflow-menu')) throw new Error('menu not open yet');
+    }));
     return document.querySelector<HTMLElement>('.thread-overflow-menu')!;
 }
 
@@ -39,17 +42,18 @@ afterEach(() => {
     if (host) { render(null, host); host.remove(); host = null; }
     document.querySelectorAll('.thread-overflow-menu').forEach(el => el.remove());
     threadMap.value = new Map();
+    vi.restoreAllMocks();
     vi.clearAllMocks();
 });
 
 describe('Blocking sub-threads in the thread overflow menu', () => {
-    it('lists each blocking sub-thread with its state, strongest first, and opens it on a tap', () => {
+    it('lists each blocking sub-thread with its state, strongest first, and opens it on a tap', async () => {
         threadMap.value = new Map([
             ['t', makeThreadState('t', { meta: { section: 'inbox' } })],
             ['c1', sub('c1', 'Bump the SDK', pending)],
             ['c2', sub('c2', 'Fix login redirect', { status: 'running' })],
         ]);
-        const menu = openMenu();
+        const menu = await openMenu();
 
         expect(menu.querySelector('.thread-overflow-note')?.textContent).toBe(blockedBySubThreads(2));
         const rows = [...menu.querySelectorAll<HTMLElement>('.thread-overflow-sub-thread')].map(r => r.closest('button')!);
@@ -65,26 +69,26 @@ describe('Blocking sub-threads in the thread overflow menu', () => {
         expect(focusThread).toHaveBeenCalledWith('c1');
     });
 
-    it('names the first few and counts the rest', () => {
+    it('names the first few and counts the rest', async () => {
         const total = LISTED_SUB_THREADS + 2;
         const ids = Array.from({ length: total }, (_, i) => `c${i}`);
         threadMap.value = new Map([
             ['t', makeThreadState('t', { meta: { section: 'inbox' } })],
             ...ids.map(id => [id, sub(id, `Sub ${id}`, pending)] as const),
         ]);
-        const menu = openMenu();
+        const menu = await openMenu();
 
         expect(menu.querySelectorAll('.thread-overflow-sub-thread')).toHaveLength(LISTED_SUB_THREADS);
         const notes = [...menu.querySelectorAll('.thread-overflow-note')].map(n => n.textContent);
         expect(notes).toEqual([blockedBySubThreads(total), moreSubThreads(2)]);
     });
 
-    it("shows the thread's own reason with no sub-thread rows", () => {
+    it("shows the thread's own reason with no sub-thread rows", async () => {
         threadMap.value = new Map([
             ['t', makeThreadState('t', { meta: { section: 'inbox', status: 'running' } })],
             ['c', sub('c', 'Child', pending)],
         ]);
-        const menu = openMenu();
+        const menu = await openMenu();
 
         expect(menu.querySelector('.thread-overflow-note')?.textContent).toBe(BLOCKER_REASON.running);
         expect(menu.querySelectorAll('.thread-overflow-sub-thread')).toHaveLength(0);

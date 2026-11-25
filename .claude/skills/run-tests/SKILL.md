@@ -17,12 +17,11 @@ Run both phases. If either fails, the whole skill FAILED.
    1. **Build:** `cargo build -p lucidos-engine-bin --release` — verifies the engine
       compiles in the profile it ships in (a separate compilation from the test
       build below, which is debug + `cfg(test)`).
-   2. **Eval crate:** `cargo test --locked -p lucidos-eval`, run before the
-      engine suite because it needs no Postgres and takes under a second.
+   2. **Eval binary:** `make test-eval`. It needs no Postgres and runs before the
+      engine suite.
       **`./scripts/test-engine.sh --full` is NOT equivalent to `make
       test-full`**: only the make target carries the `test-eval` prerequisite,
-      so the script alone drops this phase and its ~270 tests silently.
-      The crate is bin-only, so this runs the binary's own unit tests.
+      so the script alone omits the eval binary's unit tests.
       `scripts/check-eval-not-a-test.sh` (in `make lint`) keeps those tests
       unable to reach anything that spends money or boots a workspace
       (ADR 0087).

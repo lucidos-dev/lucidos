@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { signal } from '@preact/signals';
+import { effect, signal } from '@preact/signals';
 import { focusedThreadId, setDrawerGrouping, setSelectedOngoingGroup, threadMap, threadSearchQuery, toasts } from '../store';
 import { ApiError } from '../../api/client';
 import type { ThreadState } from '../thread-events';
@@ -270,6 +270,47 @@ describe('showEventWhereItLives', () => {
     expect(toastMessages()[0]).toContain('Could not open that event');
     expect(eventHasTarget('idle-1')).toBe(true);
   });
+
+  it('does not navigate by raw id to a loaded thread that draws nothing for the event', async () => {
+    fetchEventLocation.mockResolvedValue({ thread_id: 'other' });
+    threadMap.value = new Map([
+      ['other', { events: new Map(), pendingUserMessages: [], eventsLoaded: false } as unknown as ThreadState],
+    ]);
+
+    const navigation = showEventWhereItLives('bash-1');
+    await settle();
+    threadMap.value = new Map([
+      ['other', threadWith('starter-1', [['BackgroundBashCompleted', 'bash-1']])],
+    ]);
+    await navigation;
+
+    expect(focusThread).not.toHaveBeenCalled();
+    expect(toastMessages()[0]).toContain('not drawn anywhere');
+  });
+
+  it('settles the wait the moment a load releases its claim, not at the deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      let claimHeld = true;
+      threadEventsStillArriving.mockImplementation(() => claimHeld);
+      fetchEventLocation.mockResolvedValue({ thread_id: 'other' });
+      threadMap.value = new Map([
+        ['other', { events: new Map(), pendingUserMessages: [], eventsLoaded: false } as unknown as ThreadState],
+      ]);
+
+      void showEventWhereItLives('idle-1');
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+      threadMap.value = new Map([
+        ['other', threadWith('starter-1', [['CodingAgentIdled', 'idle-1']])],
+      ]);
+      claimHeld = false;
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+
+      expect(focusThread).toHaveBeenCalledWith('other', { targetEventId: 'starter-1' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('resolveEventTarget', () => {
@@ -326,6 +367,15 @@ describe('resolveEventTarget', () => {
     threadMap.value = new Map([['other', threadWith('starter-1', [])]]);
 
     expect(await resolveEventTarget('just-landed')).toEqual({ kind: 'unloaded', threadId: 'other' });
+  });
+
+  it('does not refuse an event a paged thread has not drawn on the page it holds', async () => {
+    fetchEventLocation.mockResolvedValue({ thread_id: 'other' });
+    const paged = threadWith('starter-1', [['BackgroundBashCompleted', 'bash-1']]);
+    paged.hasOlderEvents = true;
+    threadMap.value = new Map([['other', paged]]);
+
+    expect(await resolveEventTarget('bash-1')).toEqual({ kind: 'unloaded', threadId: 'other' });
   });
 
   it('asks the engine once however many rows ask', async () => {
@@ -389,6 +439,18 @@ describe('eventHasTarget', () => {
     ensureEventTargetResolved('bash-1');
     await vi.waitFor(() => expect(eventHasTarget('bash-1')).toBe(false));
     expect(fetchEventLocation).not.toHaveBeenCalled();
+  });
+
+  it('does not subscribe a row to the thread map', () => {
+    let runs = 0;
+    const stop = effect(() => {
+      runs += 1;
+      eventHasTarget('idle-1');
+    });
+    threadMap.value = new Map();
+    stop();
+
+    expect(runs).toBe(1);
   });
 
   it('settles false on a 404', async () => {

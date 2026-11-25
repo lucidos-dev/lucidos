@@ -49,7 +49,6 @@ crates/lucidos-agents-api/src/api/backup.rs	f6b794236adfafaa	keep	Picker and thi
 crates/lucidos-agents-api/src/api/backup.rs	f86b036ab525af70	adr	Notes the pure-function design for testing; a module-level structure rationale.
 crates/lucidos-agents-api/src/api/blobs.rs	0b100bd6b1f9874b	adr	Rejected bulk-upload alternative; design choice, not a line constraint.
 crates/lucidos-agents-api/src/api/blobs.rs	11431e5e362bee8e	adr	Explains the state-machine guard and the idempotent write design.
-crates/lucidos-agents-api/src/api/blobs.rs	60e4db6283609840	keep	Immutable caching breaks if blob bytes ever change for a hash.
 crates/lucidos-agents-api/src/api/blobs.rs	6cdb312e241a852f	keep	Preview downscale prevents iOS Safari black images; removing it breaks silently.
 crates/lucidos-agents-api/src/api/blobs.rs	a7a03bc7ad7848a8	keep	Lazy preview generation makes iOS Safari abort; nothing else warns against awaiting it.
 crates/lucidos-agents-api/src/api/bootstrap.rs	0b603ff8a8caea5d	adr	Separate tables so the split moves rows without touching the route.
@@ -66,7 +65,6 @@ crates/lucidos-agents-api/src/api/changes.rs	6f5c06b5055b6ea8	keep	Skipping thre
 crates/lucidos-agents-api/src/api/changes.rs	8a3ef60092eb26c1	adr	Records why the thread-state variants stay separate; rejects collapsing them.
 crates/lucidos-agents-api/src/api/changes.rs	adac20d4fc19c6a2	adr	Explains route grouping and layout rationale at module level.
 crates/lucidos-agents-api/src/api/changes.rs	b9e6065d72e901ab	keep	Discarding unsettled change deletes branch and worktree under live session; nothing else flags it.
-crates/lucidos-agents-api/src/api/changes.rs	d0d833fb79f98496	keep	Selector can grant while a question is open; check looks redundant.
 crates/lucidos-agents-api/src/api/changes.rs	dd0db8d19ca028c2	keep	Mirror row lifecycle drives the reload toast; SSE events are not replayed.
 crates/lucidos-agents-api/src/api/changes.rs	ed0c7a20e36a9e48	keep	Per-member authorization must run before batch fails; nothing else flags omission.
 crates/lucidos-agents-api/src/api/changes.rs	f0e2187ff955efba	keep	Cancel's authorization gate must precede batch changes so refusal stops nothing.
@@ -220,7 +218,6 @@ crates/lucidos-agents-api/src/api/mod.rs	0a81590fdaa0e746	adr	Rejects whole-row 
 crates/lucidos-agents-api/src/api/mod.rs	11c14a761fc385bf	keep	Take-back must persist before canceling; reordering races the live turn.
 crates/lucidos-agents-api/src/api/mod.rs	1e0afe10ebeb8c59	keep	Flatten would silently emit a duplicate key; nothing flags it.
 crates/lucidos-agents-api/src/api/mod.rs	2ce04aef83d3b562	adr	Design note on ephemeral tokens, pointing elsewhere.
-crates/lucidos-agents-api/src/api/mod.rs	3367033a7868732a	keep	Metachar checks guard a future shell layer; they look redundant under argv.
 crates/lucidos-agents-api/src/api/mod.rs	33887fe784dc9cf3	keep	Absent must stay None; an empty set silently clears credentials.
 crates/lucidos-agents-api/src/api/mod.rs	3cd49092f9470dbb	keep	Must follow merges; earlier placement lets mis-aimed writes skip the workspace check.
 crates/lucidos-agents-api/src/api/mod.rs	45058af921a4ad9b	keep	Refusing builtin writes would leave seeded models stuck on one backend.
@@ -241,7 +238,6 @@ crates/lucidos-agents-api/src/api/mod.rs	afed9de368b9e4dc	keep	Unknown thread id
 crates/lucidos-agents-api/src/api/mod.rs	b2d5e67ca944f847	keep	Serving live dist after rebuild risks incompatible client; snapshot prevents it.
 crates/lucidos-agents-api/src/api/mod.rs	b499c092f73cc665	keep	Tiers must match the TypeScript matchRepository or links and navigates diverge.
 crates/lucidos-agents-api/src/api/mod.rs	b51b3f905bec76e8	keep	Proxied requests must be refused before credential read; reordering silently breaks it.
-crates/lucidos-agents-api/src/api/mod.rs	ca90541d0e2286b8	keep	Without the helper, malformed ids silently become cancel-all; unflagged.
 crates/lucidos-agents-api/src/api/mod.rs	cf56132600d16d7e	adr	Design rationale: one constructor so warnings aren't dropped on update.
 crates/lucidos-agents-api/src/api/mod.rs	d64decd46b541727	keep	Workspace check must follow domain merges or mis-aimed writes slip through.
 crates/lucidos-agents-api/src/api/mod.rs	e1889444f044c757	keep	Writes must go through preferences, or bounds checks get bypassed silently.
@@ -367,7 +363,6 @@ crates/lucidos-agents-api/src/api/threads/mod.rs	4aa927017defa542	adr	Cause foll
 crates/lucidos-agents-api/src/api/threads/mod.rs	71fa1de275b27db0	keep	Server guard stops stale frontends and raw API callers; removing it is silent.
 crates/lucidos-agents-api/src/api/threads/mod.rs	755eb0be94904ca9	adr	Explains route grouping by path; a module-level organizational decision.
 crates/lucidos-agents-api/src/api/threads/mod.rs	f0ec556a6c43c69a	adr	Explains module split and re-export surface; module-level design rationale.
-crates/lucidos-agents-api/src/api/threads/read_request.rs	2271b32c17479c0f	keep	Agent tokens would pass as callers and clear read requests.
 crates/lucidos-agents-api/src/api/threads/read_request.rs	a8aa8ce099f3bb8e	keep	Guard must run before body read so other-thread decisions get refused.
 crates/lucidos-agents-api/src/api/threads/search.rs	3f454dd9582adab1	adr	Explains logic living in engine, shared with the tool.
 crates/lucidos-agents-api/src/api/threads/search.rs	746d208504e7b65d	keep	Final truncate must follow the sort; arms alone exceed the limit.
@@ -701,7 +696,6 @@ crates/lucidos-agents-api/src/engine/claude_code/control.rs	d18807999c3f88ac	kee
 crates/lucidos-agents-api/src/engine/claude_code/merge_session.rs	9a8021aad4b22ff8	adr	Rejects the unified router: it lacks worktree-bound sessions and resume tokens.
 crates/lucidos-agents-api/src/engine/claude_code/merge_session.rs	aa500107c4f10668	keep	Switching to process_message_with_steps silently double-emits MR and title, re-registers queue.
 crates/lucidos-agents-api/src/engine/claude_code/mod.rs	0a5b6da6e49283bb	keep	Automatic callers must pass system origin; recovery gate needs a device actor.
-crates/lucidos-agents-api/src/engine/claude_code/mod.rs	226f7f20ceb1668a	keep	Pruning these entries as unused would stall turns behind a permission card.
 crates/lucidos-agents-api/src/engine/claude_code/mod.rs	5db83898082dc7d6	keep	Failed status read must stay logged; treating it as settled silently drops the failure.
 crates/lucidos-agents-api/src/engine/claude_code/mod.rs	a906c47660cc7699	keep	Treating a failed check as no would let apply silently pass open questions.
 crates/lucidos-agents-api/src/engine/claude_code/mod.rs	bcc61cf305b3d7a6	keep	Resetting a branch the worktree no longer has checked out would destroy work.
@@ -787,9 +781,7 @@ crates/lucidos-agents-api/src/engine/tools/memory.rs	082e01036b4cd10f	adr	Explai
 crates/lucidos-agents-api/src/engine/tools/memory.rs	6be7effc2e68e419	keep	Raw search result would leak drafts silently; projection must stay.
 crates/lucidos-agents-api/src/engine/tools/memory.rs	979e0c981ab6ac8a	keep	Correction must still be recorded when delete no-ops; early return loses it.
 crates/lucidos-agents-api/src/engine/tools/memory.rs	996822038d42d957	keep	Search must rank via same relevance_score as injection, or orders diverge silently.
-crates/lucidos-agents-api/src/engine/tools/mod.rs	0b78d03a19759280	keep	Warns that naming apply_when_settled on a parked thread swaps an actionable refusal for an unactionable one; wording-only, nothing flags it.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	1e8e255bcbb10b1a	keep	Arming a standing apply must pass the same authority gate as immediate apply; the refusal call shows it, but dropping it silently bypasses authorization.
-crates/lucidos-agents-api/src/engine/tools/mod.rs	255f2af41c51abdf	keep	Forbids naming the standing-apply action even negatively; a later edit adding it would pass compile and tests unless the absence test catches it.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	3ce898a46a0222a8	keep	Legacy rows can hold raw credentials; read-side masking is not redundant.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	405d5210a52f6f0f	adr	Typed Err chosen over prefix inference, which mislabels failed tools as success.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	484fa81c19756bea	adr	Explains the ambient-caller design choice versus a parent uuid; a module-level decision, not a line constraint.
@@ -803,11 +795,8 @@ crates/lucidos-agents-api/src/engine/tools/mod.rs	aca4e481f8eacc7f	keep	Refusals
 crates/lucidos-agents-api/src/engine/tools/mod.rs	ae0f6bdf1adf9b65	keep	Silent fallback if fire_matching_triggers stops setting the task-local.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	b7b502b35d449321	keep	Without this gate a merge can reset a running worktree; nothing else prevents it.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	b930fc2fb2533174	keep	Caller thread must stay ambient so my_children cannot be set by the model.
-crates/lucidos-agents-api/src/engine/tools/mod.rs	be43ae3f579113ce	keep	Refusing non-boolean values prevents silently widening the query to the whole workspace; nothing else flags it.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	c9382923f86ff805	keep	Caller identity must stay ambient, not an argument, or authorization becomes fake.
-crates/lucidos-agents-api/src/engine/tools/mod.rs	d4d7e325ae1839a8	keep	Silently dropping an unparseable time bound widens the query to all-time; plausible edit to Option would go unflagged.
 crates/lucidos-agents-api/src/engine/tools/mod.rs	d811f2580e9029f0	keep	Auto-stamping app_id would break the popover's deep-link; nothing flags it.
-crates/lucidos-agents-api/src/engine/tools/mod.rs	e81a275d940af749	keep	Matching on value, not as_str, prevents widening a malformed id to every thread.
 crates/lucidos-agents-api/src/engine/tools/navigate.rs	34a19fc6fe3d8188	keep	Actor stamp decides routing; thread-sync.ts drop rule must stay in step.
 crates/lucidos-agents-api/src/engine/tools/navigate.rs	dfb7027e1edd0658	keep	OAuth page must stay persisted; routing it here hangs the waiting flow.
 crates/lucidos-agents-api/src/engine/tools/notifications.rs	4720ec7d39761578	adr	Module design: grouped handler, separate send tool, legacy alias.
@@ -3233,29 +3222,13 @@ crates/lucidos-app/src/store/actions/activityRows.ts	7f36c8598ff42124	keep	Reads
 crates/lucidos-app/src/store/actions/activityRows.ts	c6e3c2e5f1b99ddd	adr	One shared derivation for badge and menu; a module-level design choice.
 crates/lucidos-app/src/store/actions/app-appearance.ts	04e9fa003b7d0b06	keep	Must read mirrors, not debounced save, or the app lags the shell.
 crates/lucidos-app/src/store/actions/app-appearance.ts	3ab86b4903972dd9	keep	Push must follow frame load; early pushes reach nobody, silently.
-crates/lucidos-app/src/store/actions/app-badge.ts	14e0ef2b34820e67	keep	Must not gate on Tauri; page needs these rows, unlike the icon write.
-crates/lucidos-app/src/store/actions/app-badge.ts	6afae17a8e5d99b8	keep	Own row read back is stale after mark-read; icon would disagree with bell.
-crates/lucidos-app/src/store/actions/app-badge.ts	6f7cdf88d178eb5f	keep	Must stay a signal: effects.ts subscribes to it to re-assert the icon.
-crates/lucidos-app/src/store/actions/app-badge.ts	af2ce6b8553962b2	keep	Icon total must stay cross-workspace; gateway manifest scope couples it.
-crates/lucidos-app/src/store/actions/app-badge.ts	bbff4e674bc6e8e2	keep	Icon is externally written; equal computed won't notify, so the write must be unconditional.
 crates/lucidos-app/src/store/actions/app-badge.ts	d34f2ba6d4447b65	adr	Views versus bare rows is a design choice.
-crates/lucidos-app/src/store/actions/app-badge.ts	f231ecf86b384b2f	keep	Stale-response race; the seq guard is unflagged if removed.
 crates/lucidos-app/src/store/actions/app-badge.ts	f57155f7b3e3df22	adr	Records best-effort design and why only other workspaces are counted.
 crates/lucidos-app/src/store/actions/app-bridge.ts	0b0c2fbaf0a5bc45	adr	Explains one-snapshot design over per-key async reads.
-crates/lucidos-app/src/store/actions/app-bridge.ts	575ef90c0014aadd	keep	Default arm must stay; unmatched wire ops would otherwise never be answered.
-crates/lucidos-app/src/store/actions/app-bridge.ts	577b5c39f3a16c65	keep	Origin checks would reject opaque origins; the identity check must stay.
-crates/lucidos-app/src/store/actions/app-bridge.ts	8353b2c5f0589658	keep	Engine rejects over 4 KB UTF-8 and drops the line; byte limit must stay.
-crates/lucidos-app/src/store/actions/app-bridge.ts	a50ae93db803aebc	keep	Security: frames must not supply x-lucidos headers, or they could name any device.
-crates/lucidos-app/src/store/actions/app-bridge.ts	a96810107dc45560	keep	Key walks skip the wrapper; the raw prefix must stay or keys vanish silently.
-crates/lucidos-app/src/store/actions/app-bridge.ts	aceb0bb50404bbee	keep	Frame is untrusted; the SDK check does not cover this path, so keep it.
-crates/lucidos-app/src/store/actions/app-bridge.ts	d6c3c4da70f26f1a	keep	Security: device id must stay limited to /preferences; widening leaks it.
 crates/lucidos-app/src/store/actions/app-bridge.ts	e80c3e2ceb50ecb4	adr	Module overview: why isolated frames need a host-side bridge.
 crates/lucidos-app/src/store/actions/app-external-links.ts	1d7dd6bf91f6fe2a	keep	Platform quirks: desktop drops window.open, iOS PWA needs a tap.
 crates/lucidos-app/src/store/actions/app-external-links.ts	4da52893cd67eb6c	keep	Pushes before the frame loads reach no listener; call order matters.
-crates/lucidos-app/src/store/actions/app-frame-channel.ts	3d925abba2820029	keep	Opaque origin: only '*' delivers; a specific origin fails silently.
-crates/lucidos-app/src/store/actions/app-frame-channel.ts	61a263a4585c81fa	keep	Late subscribers get a synthetic open only if the stream is open now; a stale flag stalls apps.
 crates/lucidos-app/src/store/actions/app-frame-channel.ts	950417cc4678c7ae	adr	Explains why per-frame capability bypasses the subscriber map.
-crates/lucidos-app/src/store/actions/app-frame-channel.ts	9546c8c3c309c965	keep	Apps re-read on open; dropping open events loses data silently.
 crates/lucidos-app/src/store/actions/app-frame-channel.ts	9e30c888eec31c60	adr	Design: frame navigates itself; comment mentions a stale timeoutMs parameter.
 crates/lucidos-app/src/store/actions/app-frame-channel.ts	f5e8beca6dc543b3	adr	Rationale for one shared upstream connection across frames.
 crates/lucidos-app/src/store/actions/app-frame-messages.ts	13783290c308622f	keep	Reply must fire on decision; deferring to dismissal hangs the SDK promise.
@@ -3266,256 +3239,84 @@ crates/lucidos-app/src/store/actions/app-keybindings.ts	9813766abd28fde5	keep	Mu
 crates/lucidos-app/src/store/actions/app-media-bridge.ts	1e8ab459fd5a09a1	adr	Design choice: serial queue lets stale frames fail before decoder allocation.
 crates/lucidos-app/src/store/actions/app-media-bridge.ts	6596317c6909fe5f	keep	Decoder must release before the queue advances; nothing enforces it.
 crates/lucidos-app/src/store/actions/app-media-bridge.ts	b502837b8cf9ac68	keep	Security: URL must stay credential-less and frame-loadable; nothing enforces it here.
-crates/lucidos-app/src/store/actions/app-ready-bridge.ts	75272c0b82765c7b	keep	Element-keyed dispatch avoids stale ready revealing replacement frame; window dispatch reintroduces bug.
-crates/lucidos-app/src/store/actions/app-toast-bridge.ts	040f1e3389b3a8de	keep	Caller order matters: authenticity check first, and this before the message guard.
-crates/lucidos-app/src/store/actions/app-toast-bridge.ts	1c0e000f4496b7d3	keep	Must use removeToast; dismissToast records user dismissal, silently suppressing host update prompts.
-crates/lucidos-app/src/store/actions/app-update.ts	02d3777f8752f591	keep	Route refresh must precede the offer; reordering shows the wrong update action.
 crates/lucidos-app/src/store/actions/app-update.ts	0710d523bf492006	adr	Explains why relay news shares the local progress handler.
-crates/lucidos-app/src/store/actions/app-update.ts	08c681a644ef2aa5	keep	Guide must open the page key, not system; the anchor silently scrolls to nothing.
-crates/lucidos-app/src/store/actions/app-update.ts	1c8b88ab1e7a41c9	keep	Looks redundant with Rust's failed frames; removing it strands the spinner on rejected invokes.
 crates/lucidos-app/src/store/actions/app-update.ts	1fc5303baa542451	adr	Module-wide rule: every release announcement carries an action route.
 crates/lucidos-app/src/store/actions/app-update.ts	2725abef68bbf095	keep	Verdict must not be re-read from poll-written signals; race shows false up-to-date.
 crates/lucidos-app/src/store/actions/app-update.ts	2c3816f8021e43ef	adr	Single label source for all update surfaces; design rationale, not a line constraint.
 crates/lucidos-app/src/store/actions/app-update.ts	311c030838ac3478	keep	Neutral variant would make a stray card tap restart the app; keep confirm.
-crates/lucidos-app/src/store/actions/app-update.ts	38ef03430e888341	keep	Installing flag must reset on non-restart return or retries are silently blocked.
-crates/lucidos-app/src/store/actions/app-update.ts	5a1447062c25384c	keep	Asymmetry is deliberate; requiring desktop-app would silently hide a working button.
-crates/lucidos-app/src/store/actions/app-update.ts	7e89db1a0128f00a	keep	Shadow check must precede the client fallback, or stale engines report up-to-date.
-crates/lucidos-app/src/store/actions/app-update.ts	851a2b1cbbc649b0	keep	Message must state only the fact; a cause guess sends users to the wrong fix.
 crates/lucidos-app/src/store/actions/app-update.ts	904882c6eddce4f4	adr	One wording for all update checks; silent states are a design choice.
-crates/lucidos-app/src/store/actions/app-update.ts	9526e354ef5ca2fb	keep	Mapping shadowed to up-to-date would be silently false; nothing flags it.
 crates/lucidos-app/src/store/actions/app-update.ts	99fd07bd9809989a	adr	Module boundary: the update read lives a layer up to avoid imports.
-crates/lucidos-app/src/store/actions/app-update.ts	9c00431aa18bdc6c	keep	Looks redundant, but events and command replies race; this clear prevents a stuck spinner.
 crates/lucidos-app/src/store/actions/app-update.ts	df3ac5bf19f8c92e	keep	Clear run before toasting, or the error toast is silently suppressed.
-crates/lucidos-app/src/store/actions/app-update.ts	e90779c25218b8f0	keep	Depends on engine /health reporting release; dropping it silently disables shadow detection.
-crates/lucidos-app/src/store/actions/app-update.ts	f731648eb7862de7	keep	Without the force bypass, re-asking after dismissal silently does nothing.
-crates/lucidos-app/src/store/actions/app-update.ts	f8f47c090fc543da	keep	Do not re-offer after bundle loss; copying the cancel path reintroduces the bug.
-crates/lucidos-app/src/store/actions/app-update.ts	fd061f1f397dba9b	keep	Running progress must stay a dialog; the gateway dies during install.
-crates/lucidos-app/src/store/actions/appUpdateProgressEvents.ts	5a88f36d6e437b22	keep	Failed subscribe must stay retryable; a flag-on-failure would block retries.
-crates/lucidos-app/src/store/actions/appUpdateProgressEvents.ts	6abbcef9ff320ef8	keep	Frames can arrive before presenter; dropping the buffer loses them silently.
-crates/lucidos-app/src/store/actions/applyProgress.ts	634b5810b2c883a5	keep	Discards never fire events; event-only resolution would show them unresolved forever.
-crates/lucidos-app/src/store/actions/applyProgress.ts	b174d9f64faf4fcb	keep	Failed applies stay pending on idle threads; phase must clear.
-crates/lucidos-app/src/store/actions/apps.ts	030047cb47859716	keep	Fullscreen on the iframe hides modals; the obvious fix breaks overlays.
 crates/lucidos-app/src/store/actions/apps.ts	1a07382f3ec35941	adr	Explains why the asked path skips the retry loop; a design choice.
-crates/lucidos-app/src/store/actions/apps.ts	1d50192f7519261a	keep	Element fullscreen fails from shortcuts and moves the web view out.
 crates/lucidos-app/src/store/actions/apps.ts	2275a7fd390e6134	adr	Explains single-signal design for fullscreen sync
-crates/lucidos-app/src/store/actions/apps.ts	31a67c102bcc9560	keep	Calling openApp here would switch mobileView, yanking users on reload.
 crates/lucidos-app/src/store/actions/apps.ts	3c04592097c34a2d	keep	Frontend deadline must stay under backend's 10s timeout; unflagged coupling.
 crates/lucidos-app/src/store/actions/apps.ts	3e8adb61ce7364fd	keep	Gate stops SSE refreshes reopening the app and yanking the content pane.
-crates/lucidos-app/src/store/actions/apps.ts	4b4546246c07ea9e	keep	Re-clicking same link after self-navigation needs direct hash write; src unchanged.
-crates/lucidos-app/src/store/actions/apps.ts	567555a81f0bd8ee	keep	Shell's echo of our own exit must not read as a macOS exit.
 crates/lucidos-app/src/store/actions/apps.ts	68016e54fb175aa7	keep	Cache miss must re-scan disk; the cached list lags hint-less writers.
-crates/lucidos-app/src/store/actions/apps.ts	8420d42b1af6ae4f	keep	Downstream sendMessage falls back to focused thread; clearing it first is required.
 crates/lucidos-app/src/store/actions/apps.ts	b0415a9fdfaf4a76	adr	Records why one shared exit definition serves both callers.
-crates/lucidos-app/src/store/actions/apps.ts	bdbc43695329c1bf	keep	Panel, not iframe, must be the fullscreen target; an iframe hides host overlays silently.
-crates/lucidos-app/src/store/actions/apps.ts	ccabc6cf110885ec	keep	Packaged-client click dies silently; anchor or openUrl reintroduces the bug.
 crates/lucidos-app/src/store/actions/apps.ts	cd62d70994370c51	adr	Explains the shared leave-fullscreen definition across callers.
 crates/lucidos-app/src/store/actions/apps.ts	d01d29fc32c941b3	keep	Promise.resolve guards prefixed webkit, which returns void; .then would throw and break the fallback.
-crates/lucidos-app/src/store/actions/apps.ts	d55de708ed7d8cf3	keep	Quick toggle pairs race unless window commands stay serialized.
 crates/lucidos-app/src/store/actions/apps.ts	dedbc7853123ffaf	adr	Module-scoped debounce because only one app iframe is open at a time.
 crates/lucidos-app/src/store/actions/apps.ts	f73c497616a3c63d	keep	WIP cleanup must precede the early return, or stale preview survives when app closed.
-crates/lucidos-app/src/store/actions/appsById.ts	426d4c4fd6963690	keep	Stale write-back after a forget; the identity check guards against it.
-crates/lucidos-app/src/store/actions/appsById.ts	bb1b9b2fab42ca5c	keep	Only a 404 may mark an app gone; transient errors must not, and nothing below shows it.
-crates/lucidos-app/src/store/actions/archive-completed.ts	68a2f30ee9fb8925	keep	Module-level state; local state would allow a double submit.
-crates/lucidos-app/src/store/actions/artifacts.ts	0b3bbcc1ee7fbe18	keep	Serialises listings so an older, out-of-order answer cannot land last.
-crates/lucidos-app/src/store/actions/artifacts.ts	315ea4c6404b1f41	keep	Adding file: lets local files reach the model via in-app page text.
-crates/lucidos-app/src/store/actions/artifacts.ts	3c2c26f0f72d4182	keep	One-shot restore gate; later refreshes would reopen the file and clobber the content pane.
-crates/lucidos-app/src/store/actions/artifacts.ts	6def95399453fb51	keep	Caller must prefix paths; server no-cache header is what prevents stale bytes.
-crates/lucidos-app/src/store/actions/artifacts.ts	99ffcc19328e9866	keep	Must not route through openUrl; bare paths would navigate to the gateway origin.
 crates/lucidos-app/src/store/actions/artifacts.ts	a80588c608202ea6	keep	Non-web schemes let the OS opener launch arbitrary programs; keep allowlist web-only.
-crates/lucidos-app/src/store/actions/artifacts.ts	a983d96c88bd9e5d	keep	Replacing the timer must keep inherited settles, or refreshes hang forever.
 crates/lucidos-app/src/store/actions/artifacts.ts	c1ce55037023c862	keep	Testing for 'loaded' instead of not-loaded would stop failed refreshes from latching stale.
-crates/lucidos-app/src/store/actions/artifacts.ts	c7a1a42716b63c9e	keep	OAuth pages fail in embedded webviews; callers must use this, not openUrl.
 crates/lucidos-app/src/store/actions/artifacts.ts	e1eb61d5b972765e	keep	Single slot assumes one open preview; a second path would drop refreshes.
-crates/lucidos-app/src/store/actions/artifacts.ts	f000b10f64ff4cb4	keep	Must match Rust url::Url normalization or frontend and backend URL comparisons diverge.
-crates/lucidos-app/src/store/actions/artifacts.ts	fd07c096c43c00ae	keep	Router must set range and find after this call; openRepoFilePreview must clear too.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	1d510e7d2dfea81d	keep	Stale write is uncorrectable after terminal frame; guard required.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	3b6324ce7a9fba22	keep	Startup must not throw; guard must reset so next mount retries.
 crates/lucidos-app/src/store/actions/backgroundActivity.ts	5d3bfa17c0afa0e2	keep	Bypassing this entry point silently breaks the freshness counter.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	6b24ae741b41e368	keep	Rejected invoke emits no frame; clearing run would falsely claim cancel.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	75229e384c429eee	keep	Tauri bridge throws synchronously off Tauri; branch required.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	80533b80c3eda3c1	keep	Remount during pending listen would register duplicate listeners; nothing flags it.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	82f07051bc8e972f	keep	Stale snapshot write overwrites live state; no later frame corrects it.
 crates/lucidos-app/src/store/actions/backgroundActivity.ts	b9430f0c8e953c82	adr	Architecture rationale for single action-performing unit.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	ef7cf68bb08c6c91	keep	Merging outcome into the narration toast would let a closed toast swallow failures silently.
-crates/lucidos-app/src/store/actions/backgroundActivity.ts	f827b06b7ce6fcbc	keep	Dropped toast would silently lose outcome; keep assignment conditional.
 crates/lucidos-app/src/store/actions/backup.ts	068de2dff8f7f078	keep	Only newest read may write; stale overdue would silently return.
 crates/lucidos-app/src/store/actions/backup.ts	395f64a51ce95249	adr	Records a single start path so failure toasts have one copy.
-crates/lucidos-app/src/store/actions/blockerCopy.ts	f69c4acc597a4dc7	keep	Unknown reasons must block; a silent default would let delete proceed.
 crates/lucidos-app/src/store/actions/bridgedFetchLanes.ts	01d22f523376fb9a	keep	Round-robin fairness depends on Map insertion order; reordering silently degrades it.
 crates/lucidos-app/src/store/actions/bridgedFetchLanes.ts	4e9ff19ee0e9e0ce	adr	Explains why lanes are capped rather than unlimited.
 crates/lucidos-app/src/store/actions/bridgedFetchLanes.ts	805deda39c0aaccd	keep	Raising the slot count starves the shell; nothing flags it.
-crates/lucidos-app/src/store/actions/bridgedFetchLanes.ts	b9182637163ba950	keep	Silent hazard: a write told failed must not land.
 crates/lucidos-app/src/store/actions/changeToast.ts	df2b193da63549e0	adr	Module placement avoids an import cycle; design rationale.
 crates/lucidos-app/src/store/actions/chat-changes.ts	0de7993966dd42c2	keep	Title must be set before the flag, or the reloaded page briefly shows the wrong title.
 crates/lucidos-app/src/store/actions/chat-changes.ts	1d9f0bb4fef3c6b0	keep	Missing clear leaves a restored progress dialog hanging forever.
-crates/lucidos-app/src/store/actions/chat-changes.ts	25e8fc3a0b5345cb	keep	In-flight restore must take precedence over pending restore, or the reload re-shows a stale warning.
-crates/lucidos-app/src/store/actions/chat-changes.ts	299d3ef935ffca1d	keep	Disarm must await in-flight arms or a tap on pending thread is dropped.
 crates/lucidos-app/src/store/actions/chat-changes.ts	314af9a238a329a8	keep	dismissToast would wrongly suppress the toast after a failed switch.
 crates/lucidos-app/src/store/actions/chat-changes.ts	46009f15106fd058	keep	Toast here would outlive step; editors adding one would show stale messages.
-crates/lucidos-app/src/store/actions/chat-changes.ts	546aaa0a40118a6c	keep	Seeding startedAt is what keeps completion detection working across dev builds; omitting it hangs the flag.
-crates/lucidos-app/src/store/actions/chat-changes.ts	606336efd4c1e0ac	keep	Restore and reconnect gate depend on this marker in connection.ts.
 crates/lucidos-app/src/store/actions/chat-changes.ts	67203d992fd8b1c4	keep	Stale page append would drop just-applied change; the drop-and-retry guard is not obvious.
-crates/lucidos-app/src/store/actions/chat-changes.ts	935787153d383759	keep	Set before await to prevent double-click batch in click-to-SSE gap.
-crates/lucidos-app/src/store/actions/chat-changes.ts	a1740995289ea7b2	keep	Must not touch engineRestarting, or re-sync closes the in-flight restart dialog mid-restart.
 crates/lucidos-app/src/store/actions/chat-changes.ts	a1b6fdd22d392a78	keep	started_at must stay pre-restart or completion detection breaks.
 crates/lucidos-app/src/store/actions/chat-changes.ts	b71fcdc643160cf6	keep	Dialog derives from engineRestarting; an explicit raise or close could hang.
-crates/lucidos-app/src/store/actions/chat-changes.ts	c21f3338f316eed0	keep	Leaving engineRestarting set is required; clearing it breaks restart completion detection on reconnect.
-crates/lucidos-app/src/store/actions/chat-changes.ts	c8c3122b9fa65647	keep	String rejections need the revert too, or the dialog hangs forever.
-crates/lucidos-app/src/store/actions/chat-changes.ts	d5607cc70c494cc6	keep	Retry and swallow rules are deliberate; a per-fetch toast on transient failures is noise and easily reintroduced.
 crates/lucidos-app/src/store/actions/chat-changes.ts	dc6538047d29cfc0	keep	Lighting the badge from applied-list reintroduces a bug; the build-id check must stay the sole source.
-crates/lucidos-app/src/store/actions/chat-changes.ts	e34f67cb5f0f2b57	keep	Omitting changeId lets the arm reach a later, unreviewed proposal.
-crates/lucidos-app/src/store/actions/chat-changes.ts	f3d26a281311beca	keep	Must match Rust DISARMED_BY_OWNER string; test catches drift, but toast logic depends on it.
-crates/lucidos-app/src/store/actions/chat-claude-code.ts	0a0d29959d9a3c7a	keep	409 after a dropped attempt usually means it landed; treating it as failure misreports.
-crates/lucidos-app/src/store/actions/chat-claude-code.ts	1f483f5fd254bfe3	keep	Cleared by distant PromptInput effect; quiet picks must not mark, retries must hold it.
 crates/lucidos-app/src/store/actions/chat-claude-code.ts	83305002d73bd934	keep	Send chain stops a typed message being taken as the answer; retries reuse id.
-crates/lucidos-app/src/store/actions/chat-claude-code.ts	dfec7d9a3728e773	keep	Caller-added toasts would duplicate the failure message; coupling unstated.
-crates/lucidos-app/src/store/actions/chat.ts	0314b81ca1763194	keep	Uncertain send must replay exact request, or retry duplicates the message.
 crates/lucidos-app/src/store/actions/chat.ts	0d07257945a0608e	keep	A default reasoning effort would silently re-break per-thread memory.
 crates/lucidos-app/src/store/actions/chat.ts	0fb47b9215a2175e	adr	Module-level decision: loader isolated to avoid transitive import tree.
 crates/lucidos-app/src/store/actions/chat.ts	1464f6cddfcbce4f	keep	Cancel must target the thread clicked, not current focus after await.
 crates/lucidos-app/src/store/actions/chat.ts	16546a89130a576d	keep	Dropping eventId leaves the optimistic row stuck; no error flags it.
 crates/lucidos-app/src/store/actions/chat.ts	224fa42e6021a64c	keep	threadStarted must be awaited before POST or compose sends 404.
-crates/lucidos-app/src/store/actions/chat.ts	2a1989b35d86bed1	keep	Noop must release flag and re-sync, or Cancel stays disabled forever.
 crates/lucidos-app/src/store/actions/chat.ts	2ad7a0cc266b1729	keep	Must capture message before awaits; a restore during waits loses it.
-crates/lucidos-app/src/store/actions/chat.ts	3a4e0d6f0d3e1867	keep	Landed send must not retry or show unsent; otherwise duplicate messages.
-crates/lucidos-app/src/store/actions/chat.ts	3f994e65bb60e928	keep	Slot must be claimed before any await to keep send order; nothing enforces it.
 crates/lucidos-app/src/store/actions/chat.ts	839d24b5064a2c5f	keep	Read must precede the push, which flips thread state; silent otherwise.
 crates/lucidos-app/src/store/actions/chat.ts	86f42e18365dbf40	keep	Workspace-relative folder form must stay or classifier misroutes silently.
-crates/lucidos-app/src/store/actions/chat.ts	87d6cfd748faafbb	keep	Clearing on a failed refetch force-drops persisted messages; only success proves absence.
 crates/lucidos-app/src/store/actions/chat.ts	9470e2de4f3e1c14	keep	Persist final body before first POST; later edits break retries and reloads.
 crates/lucidos-app/src/store/actions/chat.ts	b53aea791976850e	keep	Follow-ups must omit model or per-thread memory silently breaks.
 crates/lucidos-app/src/store/actions/chat.ts	bb553d0c8b384e0e	keep	Clock-derived seqs collide for close sends; counting down prevents overlap.
 crates/lucidos-app/src/store/actions/chat.ts	c43ce9e564c730dd	keep	Bump is required; computeds don't subscribe to threadMap, so rows stay stale.
 crates/lucidos-app/src/store/actions/chat.ts	cfc4f2f0ae64eef8	keep	activeExchanges reads via peek, so bump is needed or the stale row stays.
-crates/lucidos-app/src/store/actions/chat.ts	d8fe8d19400f5081	keep	Answer must be read before POST, since arrival clears the pending row.
-crates/lucidos-app/src/store/actions/chat.ts	deefecd435add551	keep	Retry must reuse the original event id, or the engine runs it twice.
 crates/lucidos-app/src/store/actions/chat.ts	e2b14ed605b8c174	keep	Reordering after the POST loses the message on reload.
-crates/lucidos-app/src/store/actions/chat.ts	e8c81348f043f603	keep	Snapshot must precede insert or raw-new detection silently breaks.
 crates/lucidos-app/src/store/actions/chat.ts	eae57ddbfb43834e	keep	Dropping the row loses a persisted message; leaving it counted pins thread running.
 crates/lucidos-app/src/store/actions/chatgptPlan.ts	00fce562345cb5b5	adr	Engine owns sign-in; this module reads status and sends intent.
 crates/lucidos-app/src/store/actions/chatgptPlan.ts	3c87a855ee1c5827	keep	External rule: welcome shown once, in OpenAI's own wording.
 crates/lucidos-app/src/store/actions/claudeGateway.ts	f9e8b16985fcebc5	adr	Engine owns sign-in; this module reads status and sends intent.
 crates/lucidos-app/src/store/actions/client-update.ts	06d4076e83a8c5bf	keep	User-dismiss here silently pins build as dismissed, suppressing future toasts.
-crates/lucidos-app/src/store/actions/client-update.ts	24374341b239190f	keep	Gate avoids flashing a dismissed toast; startClient must re-run this after loadPreferences.
-crates/lucidos-app/src/store/actions/client-update.ts	266d70b1c948ec35	keep	Bare reload keeps the old service worker; refreshClient must swap it.
-crates/lucidos-app/src/store/actions/client-update.ts	4a0f489d9b0ef381	keep	dismissToast here would suppress refresh on other devices; keep removeToast.
 crates/lucidos-app/src/store/actions/client-update.ts	54eab3846839b9ff	adr	Design rationale: compare loaded bundle, not the controlling worker id.
-crates/lucidos-app/src/store/actions/client-update.ts	d52085c31c8c4e0b	keep	Key-only dismiss reads this recorded id; without it, the wrong build gets pinned.
 crates/lucidos-app/src/store/actions/codingAgentChanges.ts	7f5f75391ad61aca	keep	Engine slug names must match this set, or refusals misreport silently.
-crates/lucidos-app/src/store/actions/codingAgentChanges.ts	bbb8d574c8975cca	keep	Read legacy version before the request: SSE frame can beat the response.
-crates/lucidos-app/src/store/actions/compose.ts	09dcea660a4d4fb7	keep	Scope edit must be a pending write, or a server report could revert it.
-crates/lucidos-app/src/store/actions/compose.ts	1151b74e4836f1ac	keep	Patch-before-discard ordering; reversing it silently restores stale text on rollback.
-crates/lucidos-app/src/store/actions/compose.ts	162b1f2b883d9780	keep	Pending-edit guard stops in-flight writes resurrecting the discarded draft.
-crates/lucidos-app/src/store/actions/compose.ts	16a924239d10519e	keep	Filtering undefined out of the spread silently stops field clearing.
 crates/lucidos-app/src/store/actions/compose.ts	24775e7661684239	adr	Design decision: step off the draft, not confirm-overwrite; code shows it.
-crates/lucidos-app/src/store/actions/compose.ts	28d32476552bd69b	keep	Removing the explicit mode silently routes drafts to the coding agent; nothing flags it.
-crates/lucidos-app/src/store/actions/compose.ts	33c766d4ad7b41d9	keep	Ordering requirement: markHashesAsSent must precede draft clear; nothing flags it.
-crates/lucidos-app/src/store/actions/compose.ts	360a94e57c1de210	keep	Callers must drop non-composing focus first, or the text lands in a sent thread.
 crates/lucidos-app/src/store/actions/compose.ts	39ca9b40a6da4c5b	keep	Must mirror sendMessage rollback cleanup or stale verdicts persist silently.
-crates/lucidos-app/src/store/actions/compose.ts	4024c6a489182e84	keep	Must set destination before prefill; reorder silently misroutes the new draft.
-crates/lucidos-app/src/store/actions/compose.ts	45aa55850d3b6c04	keep	setFocusedThread(null) would skip the pane reveal mobile users need.
-crates/lucidos-app/src/store/actions/compose.ts	4924eef61dec8304	keep	Thread row must exist before chat POST; fire-and-forget start race is unflagged.
-crates/lucidos-app/src/store/actions/compose.ts	4bae818d3ba037c9	keep	Stale meta.channel would misroute sends; channel must come from opts, unflagged.
-crates/lucidos-app/src/store/actions/compose.ts	52341e0032a33bc3	keep	Dropping either refused text or typed copy loses unsent work silently.
-crates/lucidos-app/src/store/actions/compose.ts	5338b3946cac17c1	keep	Clearing the pending edit on refusal would silently lose the user's text.
 crates/lucidos-app/src/store/actions/compose.ts	53878f777688bfe8	keep	Set must hold only ids; storing snapshots would silently send stale drafts.
 crates/lucidos-app/src/store/actions/compose.ts	55fb7fc5b1df4dc9	keep	iOS WebKit aborts fetches on suspend; retry logic silently depends on it, mirrors preferences.ts.
-crates/lucidos-app/src/store/actions/compose.ts	578489a1a2eb6440	keep	Nav-entry removal pairs with a distant push; 404s on back/forward.
-crates/lucidos-app/src/store/actions/compose.ts	648d041c3795527c	keep	Stale-report recovery must not let the report replace a pending edit.
-crates/lucidos-app/src/store/actions/compose.ts	658af3b04d1928ef	keep	Dropping targets from a stale cache wipes valid drafts on every synced device.
-crates/lucidos-app/src/store/actions/compose.ts	6bb3137da6f729df	keep	Unconditional settle relies on per-thread write serialization; concurrent writes would clear newer undelivered drafts.
-crates/lucidos-app/src/store/actions/compose.ts	72aca39847807998	keep	Sending a mode the engine already holds would trip the server mode lock.
 crates/lucidos-app/src/store/actions/compose.ts	833dbf10f14bd15e	keep	Copies snapshot; aliasing would let later picks mutate rollback state.
-crates/lucidos-app/src/store/actions/compose.ts	88ec58af4305a445	keep	Moving teardown inside the timer branch silently resurrects failed-push drafts.
-crates/lucidos-app/src/store/actions/compose.ts	960e632a018697b1	keep	Else branch keeps engine's stale draft in sync; removal goes unnoticed.
 crates/lucidos-app/src/store/actions/compose.ts	981ca19d8b9da550	adr	Rejected alternative: fallback must not re-aim coding prompts at another codebase.
-crates/lucidos-app/src/store/actions/compose.ts	9f04e3bd946fff2a	keep	Testing composing instead of live would silently drop owed sent drafts.
-crates/lucidos-app/src/store/actions/compose.ts	ad45d82b2b7b4bcf	keep	Swapping in focusThread silently fires event loads and mobile navigation.
-crates/lucidos-app/src/store/actions/compose.ts	b1a4b38f128a7e65	keep	Silent cross-draft leak if resolveScope reads selectedScope; coupling not visible here.
-crates/lucidos-app/src/store/actions/compose.ts	b42e4fdd185def72	keep	updatedAt must stay untouched; the backend allowlist must agree or drafts surface as activity.
-crates/lucidos-app/src/store/actions/compose.ts	b87d3204a4512bf3	keep	Queued owed pushes must flush, not only timers; silent data-loss hazard.
-crates/lucidos-app/src/store/actions/compose.ts	bc39906e62139d1d	keep	Overlapping writes apply out of order, restoring stale drafts; nothing flags parallelizing.
-crates/lucidos-app/src/store/actions/compose.ts	bddf15974e17a7b3	keep	Callers fire void; removing the toast makes failed sends silent.
-crates/lucidos-app/src/store/actions/compose.ts	be6710bebbca994d	keep	Keepalive edits must stay pending; marking them delivered silently loses text.
 crates/lucidos-app/src/store/actions/compose.ts	be805cd941bd6040	keep	Null relies on server COALESCE preserving images; a server change silently wipes them.
-crates/lucidos-app/src/store/actions/compose.ts	c1df4127ed39a191	keep	Pending-edit guard stops pre-send report restoring sent text; unflagged race.
 crates/lucidos-app/src/store/actions/compose.ts	c4158748aeaec0e2	keep	Must stay on debounced path; a direct write races or drops new typed text.
-crates/lucidos-app/src/store/actions/compose.ts	c84f6436081a71b9	keep	Without noteLocalComposeEdit, a start report silently wipes seeded picks.
 crates/lucidos-app/src/store/actions/compose.ts	ca68f4b7437ccf66	keep	Image upload callers must await start; the race is unflagged at the call site.
-crates/lucidos-app/src/store/actions/compose.ts	d12ae1064b0e5689	keep	Forbids adding an admission gate that would drop text on tab close.
-crates/lucidos-app/src/store/actions/compose.ts	da0a0af1d51e5986	keep	Send dropped the last write; removing the push silently reloads older text.
-crates/lucidos-app/src/store/actions/compose.ts	eb84add57871e0df	keep	Without seeding destination, Send targets Lucidos instead of the chosen repo.
-crates/lucidos-app/src/store/actions/compose.ts	fda1d5c3dba3b0dc	keep	Sending mode on every keystroke caused a send race; keep it null when known.
-crates/lucidos-app/src/store/actions/connection.ts	00157b0be808ba32	keep	Settled disconnect must retire the outage claim, or engine toasts stay suppressed
-crates/lucidos-app/src/store/actions/connection.ts	0418ac5187794b9c	keep	Mark must precede loads and clearThreadFetchGuards must not reset it.
-crates/lucidos-app/src/store/actions/connection.ts	0f9d9f1a6ab20bbb	keep	Signal before toast, retraction before clearing; wrong order gets suppressed silently
 crates/lucidos-app/src/store/actions/connection.ts	22880ecab878e2c0	keep	Raw unnamespaced storage must stay so the guard survives the picker hop.
-crates/lucidos-app/src/store/actions/connection.ts	281163656dac61c8	keep	Dropping engineRestarting from the gate strands restart detection after a mid-restart reload.
-crates/lucidos-app/src/store/actions/connection.ts	2813a6b801bf5ab5	keep	Restore reads this marker on reload; skipping the clear shows a stale restart dialog.
-crates/lucidos-app/src/store/actions/connection.ts	38d57d3e3d4f2b59	keep	Stream replacement skips gap reconcile; repair must run here.
 crates/lucidos-app/src/store/actions/connection.ts	432423155219ade1	adr	Why one shared wrapper rather than per-site catch blocks
-crates/lucidos-app/src/store/actions/connection.ts	48ace7bf3415266a	keep	Using refreshThreadList here would repeat error cards every tick.
-crates/lucidos-app/src/store/actions/connection.ts	54247960bdb29a06	keep	Reconnect path must not retire claim: probe can still read disconnected during hysteresis.
-crates/lucidos-app/src/store/actions/connection.ts	6325ee8aae50b58d	keep	Suppression window must open before any toast this tick; nothing else enforces order.
-crates/lucidos-app/src/store/actions/connection.ts	6a9b8618e80097d4	keep	A refresh prompt here nags; the staleness check owns it.
-crates/lucidos-app/src/store/actions/connection.ts	7800706445390113	keep	Gate and flag cover different windows; removing either reopens concurrent SSE reconnect cycles
-crates/lucidos-app/src/store/actions/connection.ts	7fa511a39be77a54	keep	Removing this reset leaves release notice permanently shut for the page's life.
-crates/lucidos-app/src/store/actions/connection.ts	95cb1f705f034040	keep	Concurrent probes double-count failures; shared promise must stay, not placeholder
-crates/lucidos-app/src/store/actions/connection.ts	a1136343c808636c	keep	iOS timer fires late, so probe health first; clearing restart flag early leaks toasts
-crates/lucidos-app/src/store/actions/connection.ts	a6bd2a2d7ae750c5	keep	Retract before clearing signal; removeToast not dismissToast or retraction is suppressed
-crates/lucidos-app/src/store/actions/connection.ts	b080488ec07fc57b	keep	Retries must stay eager: lazy like refresh leaves failure card standing
-crates/lucidos-app/src/store/actions/connection.ts	b7b32c834b169720	keep	Retry stale focused thread every tick; iOS wake drops catch-up silently, leaving transcript behind.
-crates/lucidos-app/src/store/actions/connection.ts	b871384c990e5089	keep	Keep healthOk separate or failure cap never fires while showing connected
-crates/lucidos-app/src/store/actions/connection.ts	bac04977665a3348	keep	WebKit hung-fetch quirk; retry guards must reset on iOS resume.
-crates/lucidos-app/src/store/actions/connection.ts	c419e496f418aeee	keep	Draft flush needed separately on reconnect; no resume event fires, silent loss otherwise
-crates/lucidos-app/src/store/actions/connection.ts	d15fd2fd5504be60	keep	Forms must not be cleared here; data loss would be silent.
 crates/lucidos-app/src/store/actions/connection.ts	d1c28da8480d318d	keep	Picker href's ?pick must stand down redirect or bounce loops.
-crates/lucidos-app/src/store/actions/connection.ts	d403f5b164246d35	keep	Web must not compare engine version: bundles diverge in dev, causing phantom update prompts.
 crates/lucidos-app/src/store/actions/connection.ts	d70fb7fbb1098700	keep	Client timeout must match the gateway's boot budget in another file.
-crates/lucidos-app/src/store/actions/connection.ts	da626c0e4ebe6aa4	keep	Outage toast must not auto-dismiss or other failures go silently suppressed
-crates/lucidos-app/src/store/actions/connection.ts	ee0fce59be352f53	keep	No event fires when a notice arrives; resume is the only refresh.
-crates/lucidos-app/src/store/actions/credentials.ts	150c26b8e26bbde5	keep	Skipping the OAuth cancel later opens a browser for an abandoned provider.
-crates/lucidos-app/src/store/actions/credentials.ts	38c175b2e3455280	keep	Stored header must pass through; hardcoding default silently breaks X-Api-Key credentials
-crates/lucidos-app/src/store/actions/credentials.ts	4b5602e7196750a5	keep	Successful save must not close via closeCredentialForm; that abandons the unblocked authorization
-crates/lucidos-app/src/store/actions/credentials.ts	aba6cb62448e97a2	keep	Repair must update, not create: creating silently duplicates the oauth_client identity
-crates/lucidos-app/src/store/actions/cross-workspace.ts	05dfcdef7fc4452f	keep	iOS window.open pushes a stale history entry; same-origin hops must replace the page
-crates/lucidos-app/src/store/actions/cross-workspace.ts	206549d3cf9ca7e5	keep	Port swap behind tailscale or ssh forward targets an unanswered address; the check is needed.
-crates/lucidos-app/src/store/actions/cross-workspace.ts	6b0fee03bf4eb78d	keep	Passive fetch must not boot stopped workspaces; lazyStart false is load-bearing.
-crates/lucidos-app/src/store/actions/cross-workspace.ts	aa49025ebf15fbe5	keep	Tab key must include the port; slug alone reuses the wrong install's tab.
 crates/lucidos-app/src/store/actions/cross-workspace.ts	f8976956b591425f	adr	Explains native-window routing and why other installs keep openUrl.
-crates/lucidos-app/src/store/actions/dashboards.ts	5c6a95e7425d277d	keep	Stale late read could overwrite newer tile state; guard is silent and intermittent.
-crates/lucidos-app/src/store/actions/dashboards.ts	92c6b52fbd81e1d5	keep	Reconnect may drop events; without re-read, dashboards go stale silently.
-crates/lucidos-app/src/store/actions/device-presence.ts	0df5310b89bcb974	keep	sendBeacon drops generation and device headers; engine refuses, presence never clears.
-crates/lucidos-app/src/store/actions/device-presence.ts	162b1937a68effb4	keep	iOS resume skips dedupe; forceRefresh needed or presence goes stale silently.
-crates/lucidos-app/src/store/actions/device-presence.ts	63a2888df4820ba3	keep	iOS resume skips hidden; forceRefresh bypass keeps presence from aging out.
 crates/lucidos-app/src/store/actions/device-presence.ts	b9d16f2dc4f96086	keep	macOS hides tray state from webview; native bridge must update cache first.
 crates/lucidos-app/src/store/actions/device-presence.ts	e7a659e413a99b6c	keep	Read generation before registration and admission waits, or it goes stale.
-crates/lucidos-app/src/store/actions/devices.ts	071160acd1484a3a	keep	Reverting on partial failure would show untrue state; the obvious fix reintroduces it.
 crates/lucidos-app/src/store/actions/devices.ts	52b956a5611f3ec0	keep	Promise.all would reload mid-batch and flip a device back on.
-crates/lucidos-app/src/store/actions/devices.ts	73f8e490a4cc774a	keep	Gateway adoption overwrites bare id, so it must follow relayed hand-over.
-crates/lucidos-app/src/store/actions/devices.ts	8ac85690d228f4ef	keep	Attempt must never reject; mutations await it via registrationToAwait.
-crates/lucidos-app/src/store/actions/devices.ts	abfe30b1abb2f114	keep	Writes must follow handOver, and handOver must reject; engine returns 500 on failure.
-crates/lucidos-app/src/store/actions/devices.ts	c3885a264b823b39	keep	Hand-over must finish before the id override and key are set; silent split otherwise.
-crates/lucidos-app/src/store/actions/devices.ts	d90f4b0848f60300	keep	Seed before await; else a concurrent getDeviceId mints a spurious UUID.
 crates/lucidos-app/src/store/actions/devices.ts	e6d6aa5ecf86b7c1	keep	Must run before the first API call, or a spurious device registers.
-crates/lucidos-app/src/store/actions/email-confirm.ts	51db1a9410fefbae	keep	Do not reuse credential helper; it teleports user and strands them.
-crates/lucidos-app/src/store/actions/email-confirm.ts	c4c69b72ea953371	keep	replaceNavState not push, else Forward re-renders a live Send button.
 crates/lucidos-app/src/store/actions/engine-update.ts	0894a5911c254fee	adr	Records why both toast shapes share one key; a design choice.
-crates/lucidos-app/src/store/actions/engine-update.ts	15be2d0e6ce3fecb	keep	Worktree case is permanent; other timeouts recoverable, must not claim change is lost.
-crates/lucidos-app/src/store/actions/engine-update.ts	43d0d4e3d254e1e0	keep	Counting build_state ready alone reintroduces the endless toast loop bug.
-crates/lucidos-app/src/store/actions/engine-update.ts	5727a31df1ee2c81	keep	Anchoring must use the client clock; re-derived commits drift; nothing flags it.
-crates/lucidos-app/src/store/actions/engine-update.ts	5b39780946cf58de	keep	removeToast not dismissToast; cross-device preference must close toast; building clears it.
-crates/lucidos-app/src/store/actions/engine-update.ts	5f4807d78700f104	keep	Type says groups always exists; old engines omit it, so the guard looks redundant.
-crates/lucidos-app/src/store/actions/engine-update.ts	6340757c34da72c0	keep	Lost-lock peer build must show spinner, not Rebuild toast; hidden shared-lock coupling.
-crates/lucidos-app/src/store/actions/engine-update.ts	89c8ddc421e23fa0	keep	Delivery failures must keep manual retry; filtering by kind breaks it silently.
-crates/lucidos-app/src/store/actions/engine-update.ts	8d60afa5f53693d4	keep	Pending-range write must precede all exits; a THREW read must not clear it.
-crates/lucidos-app/src/store/actions/engine-update.ts	982a48cb4e1839c3	keep	Pending must use not-building, not idle, or stuck-ready state goes silent.
-crates/lucidos-app/src/store/actions/engine-update.ts	a135a2dc117787d2	keep	Exemption must stay per-device; inferring it from an open toast breaks global dismissal.
-crates/lucidos-app/src/store/actions/engine-update.ts	ac8928f180b0c62a	keep	Frontend refresh must be set before the build-failed return or it is skipped.
-crates/lucidos-app/src/store/actions/engine-update.ts	c3e2e116b33f6951	keep	iOS PWA suspended SSE queue can flush stale hints; gate prevents false message.
-crates/lucidos-app/src/store/actions/engine-update.ts	c99d974718b520fa	keep	Gate relies on a distant subscription requesting a read; removal silently hides toast.
-crates/lucidos-app/src/store/actions/engine-update.ts	cb7cb3488ccd07e1	keep	No Switch here: switching mid-build respawns onto a half-written binary.
-crates/lucidos-app/src/store/actions/engine-update.ts	d7e4e620bd28fc12	keep	Branch order matters; stopped watch must never promise automatic arrival.
 crates/lucidos-app/src/store/actions/engine-update.ts	f1d9dd91c167bfae	keep	Using dismissToast would silently hide future retry failures; removeToast is required.
 crates/lucidos-app/src/store/actions/entityReferences.ts	29131638e666080f	keep	Engine must emit from RepositoryStore write path; a direct write goes unseen.
 crates/lucidos-app/src/store/actions/entityReferences.ts	2c104a72b7afd597	keep	Closing on the frame beats markPluginInstalled; exempt by actor, not receipt.
@@ -3528,36 +3329,18 @@ crates/lucidos-app/src/store/actions/entityReferences.ts	c3ed1dca6e41edd9	keep	D
 crates/lucidos-app/src/store/actions/entityReferences.ts	c68e86c5305db9d8	keep	Mirrors engine's provider list; drift leaves stale provider options.
 crates/lucidos-app/src/store/actions/entityReferences.ts	d0bb13bd450e2870	adr	Explains why ingress events cannot cover refusals.
 crates/lucidos-app/src/store/actions/entityReferences.ts	f6f8ba707be2efc2	keep	Gate must not swallow preview invalidation; list refresh and preview are independent.
-crates/lucidos-app/src/store/actions/event-navigation.ts	08999a16dd8608ce	keep	Landing before the catch-up picks an older turn; nothing flags that.
 crates/lucidos-app/src/store/actions/event-navigation.ts	0eae755b87aef5b1	keep	Must not be called during render; store reads would subscribe the row.
-crates/lucidos-app/src/store/actions/event-navigation.ts	21bd5df1b49c94b3	keep	Microtask deferral after map write is needed so the claim-release ordering is observed correctly.
 crates/lucidos-app/src/store/actions/event-navigation.ts	27e2b400447f6dd8	adr	Records two-tier split and render-time cost rationale.
-crates/lucidos-app/src/store/actions/event-navigation.ts	4fc9da8caefd88b9	keep	Must not read threadMap during render; every row would re-render.
-crates/lucidos-app/src/store/actions/event-navigation.ts	61d5ea901635ba94	keep	Fetch whole history only as fallback; falling through to raw id fails silently for exchange-anchored events.
 crates/lucidos-app/src/store/actions/event-navigation.ts	760dd2e0465d83a7	keep	Every opening must route here, or hand-off landing silently never happens.
-crates/lucidos-app/src/store/actions/event-navigation.ts	7b3fc318be002eb6	keep	Transport failures must not cache as no-target; only 404 may. Silent affordance loss.
-crates/lucidos-app/src/store/actions/event-navigation.ts	a677e4ba9c58c4cc	keep	Failed requests must not be cached, or a dropped connection sticks permanently.
-crates/lucidos-app/src/store/actions/event-navigation.ts	ac39cae342602d95	keep	Awaiting loadThreadEvents alone returns instantly during in-flight load; nothing else flags this race.
 crates/lucidos-app/src/store/actions/event-navigation.ts	c2c4daffa685eafe	adr	Records why cheap and expensive resolution are split; rejects full-resolve alternative.
-crates/lucidos-app/src/store/actions/event-navigation.ts	cd33854297d9b613	keep	Early return on unknown target is the only guard against landing on an older turn.
-crates/lucidos-app/src/store/actions/event-navigation.ts	d80ed196e3432475	keep	Race: loaded thread may lack an event the engine knows; must not refuse.
-crates/lucidos-app/src/store/actions/event-navigation.ts	e1ccfb0b1068b0da	keep	Paged continuation fragments give null anchors; treating as nowhere refuses jumps.
-crates/lucidos-app/src/store/actions/event-navigation.ts	ee6622580a22b8fd	keep	Raw-id fallback would waste full resolve deadline on element that cannot exist; must not fall through.
 crates/lucidos-app/src/store/actions/event-navigation.ts	f02ede52c24686e1	adr	Explains sharing resolveEventTarget with the render path.
 crates/lucidos-app/src/store/actions/event-navigation.ts	f6de95c28af977e1	adr	Justifies unbounded cache; bounding it costs memory, not correctness.
 crates/lucidos-app/src/store/actions/event-stream.ts	9ea0d3071739d42b	adr	Module boundary rationale for keeping transport independent of deferred handlers.
 crates/lucidos-app/src/store/actions/event-stream.ts	ed6f6f2fa4c7a948	keep	Restart must emit a drop, or thread-stream never resyncs missed frames.
 crates/lucidos-app/src/store/actions/event-stream.ts	f85608c1f2ad96bd	keep	Shared transport must send one pong per workspace or engine expected_pong_count breaks silently.
-crates/lucidos-app/src/store/actions/filePreviewModal.ts	2b1ffcdbbd07ce1e	keep	Source view forced per line presence; dropping it leaves readers stuck on raw markdown with no toggle.
-crates/lucidos-app/src/store/actions/filePreviewModal.ts	371a382e3eea15ad	keep	Diff locator must preview the file, not load diff, or it rebinds the Files panel behind the modal.
-crates/lucidos-app/src/store/actions/filePreviewModal.ts	f6aab2e45c071b0b	keep	Refusing under foreign native fullscreen prevents silent invisible modal; nothing else would flag it.
-crates/lucidos-app/src/store/actions/fileTarget.ts	185d654ed440887d	keep	Invisible range would attach to next chat message silently.
 crates/lucidos-app/src/store/actions/fileTarget.ts	1988bf28336216a8	adr	Explains why all surfaces share one resolver.
 crates/lucidos-app/src/store/actions/fileTarget.ts	521cc4c883d11ca3	adr	Explains why file view takes an input rather than a rewritten locator.
 crates/lucidos-app/src/store/actions/fileTarget.ts	beb3e6aaf9858f48	keep	Modal must not diverge from navigate; a second implementation would silently drift.
-crates/lucidos-app/src/store/actions/find-bar.ts	2966d45c027ee167	keep	Sync call from tap keeps mobile keyboard; async would silently break it.
-crates/lucidos-app/src/store/actions/find-bar.ts	67e4b3f703b9b2bc	keep	Stale async answers overwrite newer results; nothing else guards it.
-crates/lucidos-app/src/store/actions/find-bar.ts	960af627b488adf1	keep	Coupling to LineNumberedCode consumption; silent hang if changed.
 crates/lucidos-app/src/store/actions/find-bar.ts	c9909977dbb66b00	keep	Effect disposal must happen outside its own run; nothing flags inlining.
 crates/lucidos-app/src/store/actions/find-request.ts	42873fb2d5d09596	keep	Importing the bar here silently regresses first paint; nothing flags it.
 crates/lucidos-app/src/store/actions/find-request.ts	c4da52551b2e8f0f	keep	Lowering to one letter silently freezes phones; no error flags it.
@@ -3566,388 +3349,123 @@ crates/lucidos-app/src/store/actions/form-requests.ts	0c3ae702a0ed241b	keep	Sync
 crates/lucidos-app/src/store/actions/form-requests.ts	114ac2e12e55ab18	keep	Acting device must stay exempt by actor, or it races its own receipt; nothing flags it.
 crates/lucidos-app/src/store/actions/form-requests.ts	308950b88d68b9d4	keep	Sync must follow stream open, or requests emitted in between are missed.
 crates/lucidos-app/src/store/actions/frame-capability.ts	236090cfb723747f	adr	Records the one-timer-for-all-frames design choice.
-crates/lucidos-app/src/store/actions/frame-capability.ts	be773a6ffecf500e	keep	Running flag must stay; in-flight round would re-arm timer after teardown.
-crates/lucidos-app/src/store/actions/frame-capability.ts	deed6d0fe11d59bd	keep	Cache lifetime must not outlast renewal half-life, or previews get expired passes.
 crates/lucidos-app/src/store/actions/frame-swipe-bridge.ts	0e7370f596f3c0e9	keep	Caller must pre-validate frame, origin, nonce; nothing enforces it.
-crates/lucidos-app/src/store/actions/frame-swipe-bridge.ts	da17f84c35300ba9	keep	Snap-back for impossible release deltas stops a stuck drag; nothing flags its removal.
 crates/lucidos-app/src/store/actions/frontend-preview.ts	260ab1d09d5902e1	adr	Module design: one slot, one signal, kept live by SSE.
-crates/lucidos-app/src/store/actions/frontend-preview.ts	4b9c80edfe31d673	keep	Coupled to deviceIdSeed; dropping the id param silently loses device preferences.
 crates/lucidos-app/src/store/actions/frontend-preview.ts	5f19f8a4bbc270d5	keep	Engine url follows the last request's Host; using it gives phones wrong links silently.
-crates/lucidos-app/src/store/actions/frontend-preview.ts	6d97baf4722bc973	keep	SSE frames arrive unordered; removing the thread check lets late stops erase new previews.
-crates/lucidos-app/src/store/actions/frontend-preview.ts	d447753625a9b5a2	keep	Fragment must survive deviceIdSeed's URL strip, or thread landing silently breaks.
-crates/lucidos-app/src/store/actions/gatewayUsers.ts	8b5e5138c64bda56	keep	Relayed users must stay keyed per gateway or merge silently.
-crates/lucidos-app/src/store/actions/gatewayUsers.ts	ccae53712eb0f7ee	keep	Must stay in step with engine's local_of_relayed; nothing checks drift.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	17b917340e6db326	keep	Hash must be stripped only after landing; stripping first silently loses retries.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	26ac05608001366d	keep	Strip before opening so a mid-load resume cannot open twice.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	2cc85ad527618ae4	keep	iOS PWA misses hashchange after push tap; resume listeners required.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	3679e6fdad12bc6f	keep	Guard prevents competing landings; the guard's purpose is not visible here.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	5e9f3dd93254fe44	keep	Retry window covers lazy-starting engine; shortening it reintroduces lost landings.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	6c0fd6b8dece0438	keep	Focus can fire on hidden tab; dispatch then loses the hash silently.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	720147a7586b4651	keep	Stale landings must not focus or strip a newer hash; failure is silent.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	de0593f4f971e157	keep	Resume wiring is required for iOS push taps; without it they silently no-op.
-crates/lucidos-app/src/store/actions/hash-deeplink-router.ts	f5c33bd2dd1b438e	keep	Anchoring stops loose match swallowing push-tap notification hash.
-crates/lucidos-app/src/store/actions/imageUploads.ts	41d81301c96552ea	keep	Detach must not revoke the URL the session map now holds; not visible.
-crates/lucidos-app/src/store/actions/imageUploads.ts	555e6642276b6b1b	keep	Server blob guard needs the thread row; this wait also retries thread creation.
-crates/lucidos-app/src/store/actions/imageUploads.ts	5e201a1a47fb7680	keep	Resume depends on isConnected flipping for every reconnect path; nothing flags a new one.
 crates/lucidos-app/src/store/actions/imageUploads.ts	8a071cda09f56821	keep	iOS PWA re-fetch from server URL causes black flash.
-crates/lucidos-app/src/store/actions/imageUploads.ts	c36132d9f7abd83d	keep	Without this check, unseen threads' pending images would be wiped on load.
-crates/lucidos-app/src/store/actions/imageUploads.ts	d9e8cc96cfd7f513	keep	Second landing signal relies on detach aborting the run; silent if removed.
-crates/lucidos-app/src/store/actions/imageUploads.ts	f6fd016f1224e992	keep	Map is the only guard against parallel upload runs; removal aborts.
 crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	1a25eb7f89dfd33a	adr	Projections-of-one-set rationale, plus pointer to NotificationRead arm.
 crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	3b60e369e4e4d53d	adr	Rejects counting rendered text; ids are the chosen structure.
-crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	4dbb19a8c6f93cb1	keep	Optimistic read-mark invalidates in-flight reload; removing it resurfaces the badge bump.
 crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	616286e841867853	keep	Importing via thread-sync recreates a module cycle causing undefined bindings.
-crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	7491b076874e50e9	keep	Dismiss-first ordering and acted guard stop double-tap re-running open or navigate.
 crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	96abf7ffbd39d515	keep	Firing from NotificationCreated would leak a duplicate toast after iOS push taps.
-crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	b005013b26836cec	keep	Silenced check must stay below Row 1 so reading still marks read.
-crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	cc2d4fc35ce08a2e	keep	Decrementing when overflow hidden would re-raise it; showToast raises absent keys.
 crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	d4561d00ff38512c	adr	Records why fullscreen and popped-out windows must classify the same.
-crates/lucidos-app/src/store/actions/in-app-notification-toast.ts	e64589a89467b1f7	keep	Repaint must follow navigation on WebKit; exhaustiveness depends on calling from each arm.
-crates/lucidos-app/src/store/actions/interactive-delivery.ts	4bf1b759dc7d3193	keep	Closing forms must trigger pending-work retry; the effect reads are the subscription and look removable.
-crates/lucidos-app/src/store/actions/interactive-delivery.ts	780961dcece4b82b	keep	Permission request must follow claim release; opening must stay synchronous.
-crates/lucidos-app/src/store/actions/keybindings.ts	1465a63dc0aacee2	keep	Two-pass precedence: a new default must not steal a user's chord. Merging loops silently breaks it.
 crates/lucidos-app/src/store/actions/keybindings.ts	1cfb61949d2da4f4	adr	Module split: pure registry math in utils, stateful access here.
 crates/lucidos-app/src/store/actions/laneControls.ts	4c03a52e5974a6b7	adr	Module split: stream half loads eagerly, controls lazily.
-crates/lucidos-app/src/store/actions/mainCheck.ts	95a2484ef47dff9b	keep	Start frames must skip the check-id filter; nothing else flags a break.
 crates/lucidos-app/src/store/actions/menu.ts	63ef6b3641bfb294	keep	Warns against re-adding pane navigation here; the old gate silently dropped swipes.
 crates/lucidos-app/src/store/actions/menu.ts	c31cd899686613ca	keep	Scopes must reach the Connect prefill or user faces a second consent screen.
 crates/lucidos-app/src/store/actions/menu.ts	de48cf0e2b116211	keep	Pass a credential id, never a name; both are strings, so nothing flags it.
 crates/lucidos-app/src/store/actions/menu.ts	f9afa9584d147fe0	adr	Records the navigation-unit decision and the rejected double-push pairing.
-crates/lucidos-app/src/store/actions/models.ts	05d9a498552f8449	keep	Parked preferred-route models must stay listed; hiding them is a silent regression.
-crates/lucidos-app/src/store/actions/models.ts	093e7bbcfff2301b	keep	Compose pick must still write preference despite per-draft rule; unflagged.
 crates/lucidos-app/src/store/actions/models.ts	756542afd67df8e7	adr	Explains shared adapter shape across pickers; the append reason is plain.
 crates/lucidos-app/src/store/actions/models.ts	7d45293be48e0e14	keep	Stale slow read overwrites newer; seq guard's purpose is not stated in code.
-crates/lucidos-app/src/store/actions/models.ts	9657a1820489463b	keep	Undefined versus null protects a chat-picker choice; lost silently otherwise.
-crates/lucidos-app/src/store/actions/models.ts	b78fbf8c1eea866f	keep	Preferred route must not be skipped when unconfigured; nothing else flags it.
-crates/lucidos-app/src/store/actions/native-push.ts	577671a313f23255	keep	Startup drain must follow trigger wiring, or mid-setup taps wait for the next trigger.
-crates/lucidos-app/src/store/actions/native-push.ts	60576757a8cfb8d0	keep	Deliberately no active gate; copying show's gate silently breaks dismissal.
-crates/lucidos-app/src/store/actions/native-push.ts	786dd0cfb29d764a	keep	Legacy binaries return null; removing the null check silently breaks them.
-crates/lucidos-app/src/store/actions/native-push.ts	826348332c558401	keep	Must match the workspace showNativeBanner stamped; a silent coupling.
 crates/lucidos-app/src/store/actions/native-push.ts	885f38cb306a4bee	keep	Window must cover the engine's 2s deadline; a coupled number nothing checks.
 crates/lucidos-app/src/store/actions/native-push.ts	9996b667fee77bf7	adr	Explains why native push uses SSE; a subsystem-level design choice.
-crates/lucidos-app/src/store/actions/native-push.ts	cc3670fb0afe44af	keep	WebKit focus and visibility are the reliable drains; removing them reintroduces lost taps.
-crates/lucidos-app/src/store/actions/native-push.ts	fc671defe5305d64	keep	Taps must drain from the stash, not the event payload; otherwise taps are lost.
-crates/lucidos-app/src/store/actions/navigation-request.ts	08e0cb944aae1b0a	keep	Pre-checking cached list misreports live apps as missing; delegation avoids it.
-crates/lucidos-app/src/store/actions/navigation-request.ts	10b002b6374f2be6	keep	Switching to switchMenuItem strands Back; revealContentPane is silently required.
-crates/lucidos-app/src/store/actions/navigation-request.ts	5eba92c8554e59cc	keep	Range set after open, since openers clear selection; markdown needs source view forced.
-crates/lucidos-app/src/store/actions/navigation-request.ts	6741a54aa1b1bfb2	keep	Pre-check on stale trigger list misreports live triggers; delegate instead.
-crates/lucidos-app/src/store/actions/navigation-request.ts	7baba9eeeed3090f	keep	Direct navigation from other threads would hijack the user's page silently.
-crates/lucidos-app/src/store/actions/navigation-request.ts	86f8df31e4ebf1c5	keep	Closing the app on tap would lose reader context; nothing flags it.
-crates/lucidos-app/src/store/actions/navigation-request.ts	96dc155d6a1e7187	keep	Stored notifications and old events still carry app-ui; alias must remain.
 crates/lucidos-app/src/store/actions/navigation-request.ts	9bf905f8618c7964	adr	Explains that two callers share one router; architecture-level choice.
-crates/lucidos-app/src/store/actions/navigation-request.ts	a8ec2660358bad97	keep	Absent fragment must not become empty, or open app loses its position.
-crates/lucidos-app/src/store/actions/navigation-request.ts	b1e83e1082d9bc6b	keep	Engine still emits thread-queue; removing case silently breaks notification taps.
-crates/lucidos-app/src/store/actions/navigation-request.ts	e3e3a76aec475b67	keep	Separate switchMenuItem call adds extra nav-history entry; Back misroutes silently.
-crates/lucidos-app/src/store/actions/navigation-request.ts	e5281ab99c70c261	keep	Constant must match the engine and SDK nil UUID; nothing checks it.
-crates/lucidos-app/src/store/actions/navigation-request.ts	fa94faa81358ea64	keep	Stored notifications deep-link via app-store; removing case breaks them silently.
-crates/lucidos-app/src/store/actions/navigation.ts	1bab60da4823809f	keep	WIP must restore last or effect prematurely clears WIP.
-crates/lucidos-app/src/store/actions/navigation.ts	4075540e3753ee24	keep	Restoring must not force reveal on page load; it would override reloaded pane state.
-crates/lucidos-app/src/store/actions/navigation.ts	7261b1e313b48752	keep	Early-return path needs migration; raw restore yields silent blank panel.
-crates/lucidos-app/src/store/actions/navigation.ts	807faa0bcb78df1b	keep	Push must share the state change's task; microtask deferral prevents folding half-written state.
-crates/lucidos-app/src/store/actions/navigationDirect.ts	3cc500b8c3a6e71c	keep	Awaiting a cold chunk before opening loses browser user activation, so popups get blocked.
-crates/lucidos-app/src/store/actions/navigationDirect.ts	adeb62828797bb42	keep	Sync focus before Preact commits hits stale DOM and fails silently; rAF is required.
-crates/lucidos-app/src/store/actions/navigationDirect.ts	d9f23bf74467b4d2	keep	OAuth must open in OS browser, and recording it drives handleOAuthAccountConnected fronting.
-crates/lucidos-app/src/store/actions/newChatPrefill.ts	e5f00ec1130f77ab	keep	Focus check stops shared-channel destination leaking onto whichever thread the reader moved to.
 crates/lucidos-app/src/store/actions/notification-deeplink.ts	1f2fccc1d0bd43e8	adr	Design rationale for one router across four surfaces.
 crates/lucidos-app/src/store/actions/notification-deeplink.ts	5735e66a36b34327	keep	Hash avoids reload and Chrome toast; service worker coupling nothing else flags.
-crates/lucidos-app/src/store/actions/notification-deeplink.ts	713950fd692748b8	keep	Attacker-reachable URL; removing scheme check opens script injection, nothing flags it.
-crates/lucidos-app/src/store/actions/notification-deeplink.ts	76c887381c6b8b95	keep	Retired none kind via untyped data must still open; removing fallback silently breaks notifications.
-crates/lucidos-app/src/store/actions/notification-deeplink.ts	91cf9a07d15cf7ab	keep	Bare thread/event URLs silently lose navigation if the gate accepts them.
 crates/lucidos-app/src/store/actions/notification-discuss.ts	f63f7595b4201691	adr	Explains why no panelOverlay write; rationale only, code visible.
 crates/lucidos-app/src/store/actions/notifications.ts	027aa6783770c44e	adr	Shared helper keeps both tab-refresh routes sourcing identically.
-crates/lucidos-app/src/store/actions/notifications.ts	1389ec94d97910e4	keep	Discarding stale loads prevents old lists overwriting newer ones; unflagged.
 crates/lucidos-app/src/store/actions/notifications.ts	1e1ea40104ad63bd	keep	List and single-row queries must select identical columns, silently.
 crates/lucidos-app/src/store/actions/notifications.ts	2eadc0137b8a9092	adr	Explains why two lookups stay separate; rationale for chevron list choice.
-crates/lucidos-app/src/store/actions/notifications.ts	3af426c019da8f71	keep	Simpler retries wedge infinite scroll or drop rows; nothing flags it.
 crates/lucidos-app/src/store/actions/notifications.ts	61ebab672f722a8f	adr	Design choice: content pane rather than modal, with nav entry for Back.
-crates/lucidos-app/src/store/actions/notifications.ts	6ad8168866d6c9d8	keep	Epoch must be taken at load start, or read masks silently fail.
-crates/lucidos-app/src/store/actions/notifications.ts	7537f3faabd8fa49	keep	Pending reads must stay ahead of server ack or rows reappear on reload.
-crates/lucidos-app/src/store/actions/notifications.ts	7d0bff174e11f8f5	keep	Loads must stay in the set until done, or masks drop silently.
-crates/lucidos-app/src/store/actions/notifications.ts	8810de6658be0b4a	keep	Badge sync must stay unconditional; a gate would silently go stale.
-crates/lucidos-app/src/store/actions/notifications.ts	969ddc81c04ae7e3	keep	Failed loads must still prune, or stale read masks silently persist.
-crates/lucidos-app/src/store/actions/notifications.ts	a351499cb8e8ff78	keep	Gating icon sync on count change leaves stale badge on resume.
-crates/lucidos-app/src/store/actions/notifications.ts	a978d7791e5d98bf	keep	Stamping after the await races; failed fetch must clear guard.
-crates/lucidos-app/src/store/actions/notifications.ts	be7417a8b7cd3a7f	keep	Loading after marking read drops the row from unread filter; chevrons break silently.
 crates/lucidos-app/src/store/actions/notifications.ts	cbad98ebd65f4759	keep	Inbox list and detail GET must select identical columns or rendering silently breaks.
-crates/lucidos-app/src/store/actions/notifications.ts	cd40cb9b82b1c265	keep	Detail skips fetch only if list rows carry full notification bodies.
-crates/lucidos-app/src/store/actions/notifications.ts	d09af4a63d7fc13a	keep	iOS wake transients falsely trip stale toast if counted; Safari quirk.
-crates/lucidos-app/src/store/actions/notifications.ts	e3364db82be76709	keep	Dropping reachability gate double-reports and miscounts tunnel timeouts.
-crates/lucidos-app/src/store/actions/notifications.ts	eb6dd5ee692371a0	keep	Nudge must follow the engine commit; optimistic drop races
-crates/lucidos-app/src/store/actions/oauth.ts	61cca21d496faae7	keep	Fallback success toast is needed when the device-scoped handler stays silent.
-crates/lucidos-app/src/store/actions/oauth.ts	65bb4a83f17a8b34	keep	Toast must show regardless of focus authorization; gating it hides success.
-crates/lucidos-app/src/store/actions/oauth.ts	7a8656aa7a113aab	keep	Handler must keep clearing oauthAuthFlow, or the fallback toast double-fires or goes silent.
 crates/lucidos-app/src/store/actions/oauth.ts	8efefec6f3cd3db6	adr	Single-slot, module-scoped continuation rationale; clear-before-resume is visible.
 crates/lucidos-app/src/store/actions/oauth.ts	8f90aae02bc40590	adr	Single slot mirrors engine's one live callback flow; design coupling.
-crates/lucidos-app/src/store/actions/oauth.ts	dfb7d53865a43aa7	keep	Device id is per-app; dropping the per-page flow check fronts every window.
-crates/lucidos-app/src/store/actions/oauth.ts	e413583402f7c2c4	keep	Desktop needs OS opener; provider string must match the engine's echo.
-crates/lucidos-app/src/store/actions/pane.ts	3bd2a53a35689054	keep	Direct threadDrawerOpen writes on mobile desync the dot indicator; nothing enforces this.
-crates/lucidos-app/src/store/actions/pane.ts	4deb9742be99b513	keep	Marker left on collapsed pane kills Tab; not enforced here.
-crates/lucidos-app/src/store/actions/pane.ts	64446394b69498ed	keep	Desktop stamp would leave a stale mark, corrupting a later span.
-crates/lucidos-app/src/store/actions/pane.ts	8b02d4b8d170d24d	keep	Deliberate no-stamp; adding one leaves stale perf marks.
 crates/lucidos-app/src/store/actions/pane.ts	a8ba4236ba622b1c	keep	Focus must be set after panelOverlay, or content clicks get absorbed.
-crates/lucidos-app/src/store/actions/pane.ts	b12655e143de75ef	keep	Pushing history entries breaks iOS Safari back-swipe with blank snapshot; keep it out.
 crates/lucidos-app/src/store/actions/pane.ts	ed7db4f18a561199	keep	Stamp must precede the signal write, or the measured span misses the render.
-crates/lucidos-app/src/store/actions/pane.ts	ee990e17eab27c4a	keep	Moving marker alone splits it from focus; next Tab leaves the prompt.
 crates/lucidos-app/src/store/actions/pane.ts	fd9ad8b619f97082	keep	Focusing on click, not pointerdown, stops window drags from changing focused pane.
-crates/lucidos-app/src/store/actions/pendingUploadRestore.ts	1b9500a905bf3f72	keep	The skip prevents re-sending images and early draft cleanup; nothing flags it.
-crates/lucidos-app/src/store/actions/pendingUploadRestore.ts	2af5aa0ee4d6036a	keep	A read failure must not become empty sends; it would silently delete bytes.
-crates/lucidos-app/src/store/actions/pendingUploadRestore.ts	b1c64a8582e2e489	keep	A lookup failure must not count as gone; it would silently delete records.
-crates/lucidos-app/src/store/actions/pendingUploadRestore.ts	e5b03b1a75a1a7f2	keep	Restore must wait for thread-list-staged drafts; the ordering is not flagged.
-crates/lucidos-app/src/store/actions/pinnedApps.ts	79d4d5c469fd6774	keep	Snapshot revert would resurrect entries an interleaved SSE deleted; nothing flags it.
 crates/lucidos-app/src/store/actions/pinnedApps.ts	ba827b72133fa46a	keep	Literal avoids TDZ in the store.ts/pinnedApps.ts cycle; a const breaks it.
-crates/lucidos-app/src/store/actions/plugin-install.ts	1f144cb64aa6bdd7	keep	Focus call inside the try would toast a false failure over a real install.
 crates/lucidos-app/src/store/actions/plugin-install.ts	4ef59c13dbb53083	adr	Explains why staging lives here, avoiding an import cycle.
 crates/lucidos-app/src/store/actions/plugin-install.ts	5b1a4e088a994a42	keep	Re-adding an overwrite warning would falsely claim what the engine does.
 crates/lucidos-app/src/store/actions/plugin-install.ts	92b75b0d4a3b0b20	adr	Design of receipt-in-place and a single nav history row.
 crates/lucidos-app/src/store/actions/plugin-install.ts	cb724b85557ef327	keep	Thread row may not exist yet; plain focus races and fails intermittently.
-crates/lucidos-app/src/store/actions/plugin-install.ts	de027157bcc9ef36	keep	Merging into the outer catch falsely reports a committed patch as failed.
-crates/lucidos-app/src/store/actions/plugin-install.ts	f5422104e62ebe7f	keep	Folding into the outer catch reports a successful install as failed.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	002814bdd6b46952	keep	id is a source hash; an id-only key silently hides renames.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	019df092cec24bef	keep	Caller may not queue the re-scan; a dropped result leaves the panel stale.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	0a1fde3edd925874	keep	Joining an in-flight scan silently lands pre-change data; the rename bug.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	0bb6d7f1bb35f88c	keep	Says settle on trailing scan, but code awaits the pre-change read.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	1d7d2683ecfbfe07	keep	A changed source creates a duplicate row; normalizing it fails silently.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	5ee301b453abb07a	keep	A plain re-read returns the cached scan; swapping it in freezes the list.
 crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	79fdc45800a4aed5	keep	Engine-owned flag; SSE arms elsewhere must keep it in step.
 crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	7bf4ba0664cfbde0	adr	Rejected split of one unit; module-level design rationale.
 crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	86f85823bafab46a	adr	Explains why one POST serves both add and rename.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	88a5671ee37003a7	keep	Safari transport quirk; dropping it silently breaks iOS retry.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	9183ecd39216a442	keep	Early-landed scan must never settle a waiter; nothing enforces it.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	97ab895e435298a8	keep	SSE and HTTP arrive unordered; a scan frame may predate the request.
-crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	a35e618861d1bf11	keep	Must use the after-mutation read; reconnect must call it since SSE replays no scan.
 crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	baa5cdafc9e60c70	keep	Single flag must stay; a queue or late clear risks backlog or spin.
 crates/lucidos-app/src/store/actions/plugin-marketplaces.ts	ffc3f0ecf4fbd325	adr	Rejected location to avoid an import cycle; module-level.
-crates/lucidos-app/src/store/actions/plugin-uninstall.ts	5e763cf9bafff971	keep	Widening the try would report a success as an uninstall failure.
-crates/lucidos-app/src/store/actions/plugin-uninstall.ts	c04bb3eebf440ae1	keep	Receipt needs replaceNavState, baked partition, identity compare; each silently breaks.
-crates/lucidos-app/src/store/actions/plugins.ts	a874cec750772367	keep	Joining an in-flight load would let a stale read win.
-crates/lucidos-app/src/store/actions/preferences.ts	040752c0cf74bc3b	keep	Resolving the default would make clears re-save empty on every blur.
-crates/lucidos-app/src/store/actions/preferences.ts	0452d240bc2cb818	keep	Enter-to-send must not show before load; a sent message cannot be undone.
-crates/lucidos-app/src/store/actions/preferences.ts	09a5707e0bd5e134	keep	Writing the whole list unread would silently drop other models' tiers.
-crates/lucidos-app/src/store/actions/preferences.ts	0fb8ed686fb3d1d9	keep	UI must not show values the engine would reject; rule is mirrored here.
 crates/lucidos-app/src/store/actions/preferences.ts	0ff7893d9a1be26e	keep	Inline writers that skip reapply silently revert tuned overrides.
-crates/lucidos-app/src/store/actions/preferences.ts	0ffa307e4ec2681b	keep	Sync rAF in tests silently drops every later measurement pass.
-crates/lucidos-app/src/store/actions/preferences.ts	12db57d29cd1c4b1	keep	Must span two frames; a single rAF lets transitions ease.
 crates/lucidos-app/src/store/actions/preferences.ts	1c710a7c61e785be	adr	Rejects a queue; last-write-wins per key by design.
-crates/lucidos-app/src/store/actions/preferences.ts	1fe0b74fad34611b	keep	Long-open tab needs overdue_at; dropping it leaves stale verdict unflagged.
-crates/lucidos-app/src/store/actions/preferences.ts	26280afb1dc6da09	keep	Snapshot must precede the read, or writes made during it are dropped silently.
-crates/lucidos-app/src/store/actions/preferences.ts	31475b7439d7a604	keep	Removing this read silently misses a flip that happened before attaching.
 crates/lucidos-app/src/store/actions/preferences.ts	31f87625403324a0	keep	then(run, run) stops a rejected link wedging the key's chain forever.
 crates/lucidos-app/src/store/actions/preferences.ts	3de3782093615c21	keep	Routing must not depend on this helper; an editor could wire it in and break routing silently.
 crates/lucidos-app/src/store/actions/preferences.ts	4839cbd1abf42a5b	keep	Four mirrored defaults must agree or the paint visibly flashes.
-crates/lucidos-app/src/store/actions/preferences.ts	4b282c096ee7f32d	keep	Dropping unknown ids silently turns off sections a newer engine defines.
-crates/lucidos-app/src/store/actions/preferences.ts	4c65437a9cefed13	keep	Theme-style localStorage caching would echo a stale font default.
-crates/lucidos-app/src/store/actions/preferences.ts	505e6d20a3e650dc	keep	Removing the once-only guard causes an endless reset loop; unflagged.
-crates/lucidos-app/src/store/actions/preferences.ts	54a2db9bfe4d6e95	keep	Sharing the in-flight promise would hang resume after iOS suspension.
 crates/lucidos-app/src/store/actions/preferences.ts	5818b169188f406e	keep	Setting the seq after queueing lets superseded writes still deliver late.
-crates/lucidos-app/src/store/actions/preferences.ts	59429cf8c9508d66	keep	Shell hides window until this runs; moving it shows wrong appearance.
-crates/lucidos-app/src/store/actions/preferences.ts	5cacd6c6a7c7106e	keep	Separate key: merging lets draining clear the rejection toast silently.
-crates/lucidos-app/src/store/actions/preferences.ts	5e9157312a6d1b6b	keep	Per-key ordering; any direct engine call bypassing this queue reorders writes silently.
-crates/lucidos-app/src/store/actions/preferences.ts	5ec92f37e2b85117	keep	Distant loadPreferences skip path needs this module-init install.
-crates/lucidos-app/src/store/actions/preferences.ts	5f70d6859fd6a670	keep	Reading the signal directly would toast users who turned toasts off before load.
-crates/lucidos-app/src/store/actions/preferences.ts	68398110a56db15e	keep	Must mirror index.html FOUC script or cold reloads flash.
 crates/lucidos-app/src/store/actions/preferences.ts	6b3de5975c04e82e	adr	Records the design choice to track applied names for removal.
-crates/lucidos-app/src/store/actions/preferences.ts	6bbce638bc70bc4b	keep	Deliberately unvalidated; allow-list would silently reject user-added models.
-crates/lucidos-app/src/store/actions/preferences.ts	6e625d4aad55ac6f	keep	Open style set; validating against a list drops user-added styles.
-crates/lucidos-app/src/store/actions/preferences.ts	7002524b04f4e452	keep	Couples to base.css attribute; renaming it makes swap colours ease.
 crates/lucidos-app/src/store/actions/preferences.ts	720fcfe8202f700b	adr	Shared settle helper for both answers; code already routes them.
-crates/lucidos-app/src/store/actions/preferences.ts	747a50d88a2838f3	keep	Boot script reads this mirror; key drift causes theme first-paint mismatch.
 crates/lucidos-app/src/store/actions/preferences.ts	75729ad9f83a230a	keep	Resume handler must call this, or parked writes never send silently.
-crates/lucidos-app/src/store/actions/preferences.ts	78e63ff78aaddbcb	keep	Hoisting this check out of the loop lets a stale write overwrite a newer one.
-crates/lucidos-app/src/store/actions/preferences.ts	7a3a3a3ef95ff525	keep	Never-forever policy for overdue snooze; copying setup would reintroduce it silently.
 crates/lucidos-app/src/store/actions/preferences.ts	7edad31eb5cdb1f9	adr	Why both measurements belong in one unit.
 crates/lucidos-app/src/store/actions/preferences.ts	7f8914aedee88d70	adr	Records a deliberate choice to withhold four permission modes.
 crates/lucidos-app/src/store/actions/preferences.ts	8080b5f8080f60d8	keep	Stale-token clearing must precede the inline background write, unflagged.
-crates/lucidos-app/src/store/actions/preferences.ts	86a808e693e5a2e2	keep	Schedule trap: setup check must use backup_provider, not schedule; nothing flags it.
-crates/lucidos-app/src/store/actions/preferences.ts	897370cffefe65e0	keep	Repaint cuts running transitions silently; the comparison guard is needed.
-crates/lucidos-app/src/store/actions/preferences.ts	89c67ed0cc548741	keep	Same-key writes must never overlap; engine applies in arrival order.
 crates/lucidos-app/src/store/actions/preferences.ts	8d310ad7220ebacd	adr	Threshold and reset design; the counter already shows the behaviour.
-crates/lucidos-app/src/store/actions/preferences.ts	8d7a86afe26326bf	keep	Omitting id reads stale signal; ordering hazard is not flagged.
-crates/lucidos-app/src/store/actions/preferences.ts	8f7cdba03a314d8c	keep	Cache must populate before reads; reversed order silently returns stale defaults.
 crates/lucidos-app/src/store/actions/preferences.ts	94a55dd7f0dfe7f1	keep	Reordering silently overwrites remote overrides with defaults; nothing else guards it.
-crates/lucidos-app/src/store/actions/preferences.ts	98830db2c45249bb	keep	Null and empty mean different things; collapsing them re-enables defaults silently.
-crates/lucidos-app/src/store/actions/preferences.ts	9c8098a4caf90de8	keep	A cap of 0 silently ends turns before any LLM call.
 crates/lucidos-app/src/store/actions/preferences.ts	abe15216593e52d7	keep	Removing by incoming map leaves stale values stuck; not flagged.
-crates/lucidos-app/src/store/actions/preferences.ts	b83ff5263e0fad04	keep	Refused writes resurrect on refetch without the drop.
 crates/lucidos-app/src/store/actions/preferences.ts	c31b7f38b1a914e8	keep	Obvious onPageWake substitute misses the Mac sleep wake.
 crates/lucidos-app/src/store/actions/preferences.ts	c49bde915f82ff0e	keep	Handle is browser-local; workspace-wide storage breaks other devices silently.
-crates/lucidos-app/src/store/actions/preferences.ts	c703c066728f07a7	keep	Default-off guards against silently sending prompts to a third-party relay.
-crates/lucidos-app/src/store/actions/preferences.ts	c77d61c77b8efd95	keep	Failed refetch must keep data; SSE never re-fires failed loads, so it would stick.
-crates/lucidos-app/src/store/actions/preferences.ts	c97fd795837f6de6	keep	Mirror must match the boot script's read, or first paint disagrees.
 crates/lucidos-app/src/store/actions/preferences.ts	cbfb7f010b0d329f	keep	Bookkeeping assumes it runs inside the key's delivery chain; moving it breaks that.
-crates/lucidos-app/src/store/actions/preferences.ts	d3f530982a1896b1	keep	The bump is the only signal the shell's titlebar observer gets; removing it breaks traffic lights.
 crates/lucidos-app/src/store/actions/preferences.ts	d5f1e768725fad60	keep	Synchronous layout reads per input event wedge the tab; obvious fix reintroduces it.
 crates/lucidos-app/src/store/actions/preferences.ts	d724b2152b954f6a	keep	Pair must agree across three surfaces; editing one silently drifts without any type or compiler signal.
 crates/lucidos-app/src/store/actions/preferences.ts	de487998080a6343	keep	Names iOS flip hazards; resolving from the media query change breaks.
 crates/lucidos-app/src/store/actions/preferences.ts	dec8272e0684f78c	adr	Records why the voice model is not a chat registry row.
-crates/lucidos-app/src/store/actions/preferences.ts	e35a3f6b95319482	keep	Refetch overwrites pending writes unless overlay is applied.
-crates/lucidos-app/src/store/actions/preferences.ts	e50dbece8310f5a4	keep	WebKit aborts in-flight fetches on suspend; retry and optimistic apply must stay.
-crates/lucidos-app/src/store/actions/preferences.ts	ee5e7426bd02d6f8	keep	Skipping removal lets stale mirror survive reset; nothing flags.
 crates/lucidos-app/src/store/actions/preferences.ts	f38d34e57cddd238	adr	Explains module split between appearance package and this store.
-crates/lucidos-app/src/store/actions/preferences.ts	f39dfad75e4c9d06	keep	Every paint must bump after writing mirror, or app frames go stale silently.
-crates/lucidos-app/src/store/actions/preferences.ts	f635ce1518c9cd0c	keep	iOS reads autocorrect at focus, before load; the mirror must stay.
 crates/lucidos-app/src/store/actions/preferences.ts	f77092a11916e51a	keep	Awaiting would block local reset on an unreachable engine; nothing flags it.
-crates/lucidos-app/src/store/actions/preferences.ts	fa61652314736124	keep	Retry is the only guard: failure is terminal, since SSE never re-fires failed loads.
 crates/lucidos-app/src/store/actions/preferences.ts	ff901a1489f09bb1	adr	Records observing the band rather than notifying from writers.
-crates/lucidos-app/src/store/actions/presence-pong.ts	0e775d3b3d0e42b1	keep	iOS PWA late toast duplicates the push; the deadline check prevents it.
-crates/lucidos-app/src/store/actions/presence-pong.ts	d6356a75ea22f109	keep	Bypassing transport skips worker merge; engine misses the one pong it awaits.
-crates/lucidos-app/src/store/actions/presence-pong.ts	e62aa9f26d1ea8b9	keep	Pong must report what was shown, or engine suppresses or sends wrong push.
-crates/lucidos-app/src/store/actions/push.ts	1aa9156b79f4f510	keep	Failed enable would still silence other phones, leaving no device receiving push.
-crates/lucidos-app/src/store/actions/push.ts	2c0cf547104e1db4	keep	Stale subscription on a recreated slug breaks push; reconciliation must stay.
 crates/lucidos-app/src/store/actions/push.ts	3b382190d1093f9c	adr	Single entry point design; handshake-before-flag is visible in code.
-crates/lucidos-app/src/store/actions/push.ts	62c8a291c6d4c172	keep	Null must not count as mismatch; obvious fix causes resubscribe churn.
-crates/lucidos-app/src/store/actions/push.ts	63100d923b8b38e1	keep	Register's returned registration may be installing; subscribe fails; use ready.
-crates/lucidos-app/src/store/actions/push.ts	76b53e5e401d5608	keep	Skipping resend when subscription is unchanged silently stops device_id refresh.
 crates/lucidos-app/src/store/actions/push.ts	976ebce49f1cf3ed	adr	Single entry point keeps three toggles from disagreeing.
-crates/lucidos-app/src/store/actions/push.ts	fc20f26ffc7940a1	keep	Browser routes clicks of orphaned notifications to dead registration; cleanup looks optional.
-crates/lucidos-app/src/store/actions/push.ts	ff6239eb9b8cd805	keep	Register's return may be installing; subscribe needs active, so keep ready.
 crates/lucidos-app/src/store/actions/releaseNotices.ts	150a027a72bfcae5	keep	Editor adding acknowledge here would stop notices reappearing silently.
 crates/lucidos-app/src/store/actions/releaseNotices.ts	222cb4d4c29cd951	keep	Treating a failed answer as settled would lose the one notice the reader gets.
 crates/lucidos-app/src/store/actions/releaseNotices.ts	4e89a24203437d7e	adr	Module-level design: modal, panel, and page-lifetime dismissal rationale.
 crates/lucidos-app/src/store/actions/releaseNotices.ts	59a0ba1a8f5769ed	keep	Re-resolving an answered notice appends a duplicate event; nothing flags it.
 crates/lucidos-app/src/store/actions/remoteGatewayManage.ts	e9a3bd98a1461bd9	keep	Refusal kinds must mirror Rust enum; TypeScript won't flag drift.
-crates/lucidos-app/src/store/actions/repoFileLink.ts	7bc8ac969ae160b6	keep	Fresh request needed; cached list may miss new registration.
-crates/lucidos-app/src/store/actions/repoFileLink.ts	bc54685d08c324a3	keep	Cache-hit open must stay synchronous, before any await, within click.
-crates/lucidos-app/src/store/actions/repoSelectionRestore.ts	07f3a47e2f293452	keep	Only 404 drops the saved id; transient errors must keep it.
 crates/lucidos-app/src/store/actions/repositories.ts	3698e7de7b253f43	adr	Records a rejected alternative: single-file opening is deliberately not used.
-crates/lucidos-app/src/store/actions/repositories.ts	435cd6ca4add0d45	keep	Binding must precede folder opens; binding resets expanded folders.
-crates/lucidos-app/src/store/actions/repositories.ts	46431e4d7ee51dcf	keep	Switching repo must wipe the diff before overlay opens, or sidebar shows wrong repo's files.
-crates/lucidos-app/src/store/actions/repositories.ts	5cce2d1c6bc85334	keep	Pending info must be set before loadRepoFiles or the tree loads at the wrong ref.
-crates/lucidos-app/src/store/actions/repositories.ts	5d8d622d34c89cc8	keep	Pending branch must be set before loadRepoFiles reads the tree.
-crates/lucidos-app/src/store/actions/repositories.ts	665f4ca99420ffc3	keep	Snapshot must precede the panelOverlay mutation or replace decision breaks.
-crates/lucidos-app/src/store/actions/repositories.ts	675aeece748d22e0	keep	Unbind must come first or lingering signals see stale paths
-crates/lucidos-app/src/store/actions/repositories.ts	785e5032cf5ae558	keep	Stale diff writes if post-await navigation checks are removed.
-crates/lucidos-app/src/store/actions/repositories.ts	84e95b417b9ebb4b	keep	Must call before first await or stale diff shows during load.
-crates/lucidos-app/src/store/actions/repositories.ts	8e107890d3e6a1ee	keep	setActiveMenu's hidden side effect keeps reload on Files.
-crates/lucidos-app/src/store/actions/repositories.ts	9e96771f68342ec1	keep	Snapshot restore on failed re-read protects the shared registry for all surfaces.
-crates/lucidos-app/src/store/actions/repositories.ts	a928a8294e84a962	keep	Unbind must come first or lingering signals see stale paths
-crates/lucidos-app/src/store/actions/repositories.ts	c8215b822fd66a1a	keep	Stale-snapshot append silently drops a just-applied change; nothing flags it.
-crates/lucidos-app/src/store/actions/repositories.ts	ffd7b6bde3730b25	keep	Failure path must keep loaded list, matching setLoadingIfFresh.
 crates/lucidos-app/src/store/actions/repositoriesLoader.ts	604281f6d57c6db8	adr	Module split avoids a heavy chat.ts import chain; design rationale
-crates/lucidos-app/src/store/actions/repositoriesLoader.ts	d6f4c405142c6743	keep	Awaiting callers would read a still-loading state if the dedupe returned early.
 crates/lucidos-app/src/store/actions/responseStyles.ts	3c9a3a7a0e7c717e	adr	Rejects deriving the library from the preference map; the engine holds shipped styles.
-crates/lucidos-app/src/store/actions/responseStyles.ts	3e66113f7f3ad5b4	keep	toFailed would unmount the editor and lose the user's typed paragraph.
-crates/lucidos-app/src/store/actions/responseStyles.ts	a2c03037c9b92e78	keep	Keep the direct API call: the queued savePreference path resolves even on refusal.
 crates/lucidos-app/src/store/actions/restore-snapshot.ts	187d5ab53fc6dbcd	keep	Only user taps may call this; the engine would accept an event-triggered restore.
 crates/lucidos-app/src/store/actions/restore-snapshot.ts	1dbf5f3af3769130	keep	No await may sit between the generation check and the fetch call.
-crates/lucidos-app/src/store/actions/restore-snapshot.ts	3998bc13f40b0d04	keep	Some restore failures still started; must not claim nothing changed.
-crates/lucidos-app/src/store/actions/seen-target.ts	0aabb7061c86bd48	keep	Dropping waits, not pausing, stops background time from completing dwells.
-crates/lucidos-app/src/store/actions/seen-target.ts	0b7ee73271f2744c	keep	Blur and focus must stand down directly, not through the throttled coalescer.
 crates/lucidos-app/src/store/actions/seen-target.ts	28f7183e61faa668	adr	Explains why a canceller is held rather than an id.
 crates/lucidos-app/src/store/actions/seen-target.ts	39264728234d12db	keep	iOS PWA flush needs this release, or the hold lingers silently.
-crates/lucidos-app/src/store/actions/seen-target.ts	3d085a938627ce67	keep	Accumulating dwell time across passes would let glimpses clear notifications.
-crates/lucidos-app/src/store/actions/seen-target.ts	4151c7d18e808505	keep	Lowering the dwell lets glimpses and fast passes clear notifications as reads.
 crates/lucidos-app/src/store/actions/seen-target.ts	48157be3d1088680	keep	Re-arm tears down observers, so the render watch must be armed after it.
-crates/lucidos-app/src/store/actions/seen-target.ts	4d72604b8c713abe	keep	Unknown unread set must not be treated as empty on cold open.
-crates/lucidos-app/src/store/actions/seen-target.ts	5023ffba8a49171f	keep	Without the threadMap read, cards entering the band without scroll go unmarked.
-crates/lucidos-app/src/store/actions/seen-target.ts	800de4430fd55ed0	keep	Unbounded watch would run a whole-body observer on every token.
-crates/lucidos-app/src/store/actions/seen-target.ts	9284e9ade73e07c0	keep	Without this call, the retry the dropped mark allows never fires.
-crates/lucidos-app/src/store/actions/seen-target.ts	92963c52aeb575f7	keep	Bare read looks dead; removing it silently drops the reactive subscription.
 crates/lucidos-app/src/store/actions/seen-target.ts	b743bc16bb817bae	keep	Hold must precede dwell; places must be captured before reload.
-crates/lucidos-app/src/store/actions/seen-target.ts	c47a3ca1321a23c1	keep	Sampling before commit races; the render watch is the only guard.
 crates/lucidos-app/src/store/actions/seen-target.ts	d620469bd74d4b94	adr	Rejects sharing contentViewKey; app visit identity differs from navigation identity.
-crates/lucidos-app/src/store/actions/seen-target.ts	d6a319943d2b25a4	keep	Arrival narrowing must run before the early return.
 crates/lucidos-app/src/store/actions/seen-target.ts	e098369ea81f838f	keep	Scroll must use document capture; an element listener would silently miss scroll.
 crates/lucidos-app/src/store/actions/seen-target.ts	edaf5f6c399c909d	adr	Record instead of signal reads, so the seen rules are testable without a DOM.
-crates/lucidos-app/src/store/actions/seen-target.ts	ef13a0bdb4a5f2b7	keep	Observer must not decide the verdict; unchanged-set return prevents a loop.
 crates/lucidos-app/src/store/actions/seen-target.ts	fa2de2cf253d030d	keep	Must match Review's turn-ended rule; a distant coupling.
 crates/lucidos-app/src/store/actions/send-probe.ts	0310f848e87b1a63	keep	The probe must never retry the send or drop its row.
-crates/lucidos-app/src/store/actions/sendChain.ts	0675c76bc58d3b73	keep	Claiming must stay synchronous, or sends number out of call order.
-crates/lucidos-app/src/store/actions/sendChain.ts	6a5de4b1ba77f0a1	keep	Resetting the per-thread sequence map would break engine input ordering.
-crates/lucidos-app/src/store/actions/sendChain.ts	f5cdb3634df52d1c	keep	Identity-guarded delete; an unconditional delete drops a successor's slot.
-crates/lucidos-app/src/store/actions/sendRetry.ts	0c2352eadc673fff	keep	Throttled timers fire late; a deadline check must not rely on timer delay.
-crates/lucidos-app/src/store/actions/sendRetry.ts	3fd19df26ece893e	keep	Only explicit 409 refusals may allow fresh intent; widening it duplicates sends silently.
-crates/lucidos-app/src/store/actions/sendRetry.ts	518e02b3e278408b	keep	Deadline vs per-attempt timeout: editor raising retries could exceed deadline unnoticed.
-crates/lucidos-app/src/store/actions/sendRetry.ts	e3a809759a3693a3	keep	Synchronous first attempt matters for user-gesture timing; a refactor could defer it unnoticed.
 crates/lucidos-app/src/store/actions/sendSettlement.ts	77546b72630429a9	adr	Explains why settlement is data and shared across paths; a design rationale.
 crates/lucidos-app/src/store/actions/settingsReads.ts	716715ae2ef94727	keep	Deep link must start reads too; removing the SettingsView call breaks it silently.
 crates/lucidos-app/src/store/actions/slowness.ts	651dcb0821ee3e0d	adr	Explains per-workspace scoping of episodes; a design choice, not a line constraint.
 crates/lucidos-app/src/store/actions/slowness.ts	e0692131199a28af	adr	Module-level design rationale for the slowness poll and storage choice.
-crates/lucidos-app/src/store/actions/successor.ts	5b916e8679e5b98c	keep	Merging drafts could exceed engine compose limits; unloaded drafts unseen.
-crates/lucidos-app/src/store/actions/themes.ts	07ff37b1333c9fd0	keep	Workspace theme files are untrusted; removing sanitisation opens style injection silently.
-crates/lucidos-app/src/store/actions/thread-event-repair.ts	6bc8634ea37a0b55	keep	iOS Safari corrupts Map internals; Map copy looks like a no-op.
 crates/lucidos-app/src/store/actions/thread-label.ts	35b165a881fb5430	adr	Explains file placement for test imports, not a line constraint.
-crates/lucidos-app/src/store/actions/thread-list-refresh.ts	8590d5fe9645f6e7	keep	A resolved promise alone reads as fresh; declined loads would retract a true card.
 crates/lucidos-app/src/store/actions/thread-list-refresh.ts	aae9e2ac0376c3d6	adr	Module-level design: one wrapper owns both callers' outcomes.
-crates/lucidos-app/src/store/actions/thread-list-refresh.ts	c5d1d898aaad6428	keep	Narrowing the predicate blames the engine for link outages, silently.
-crates/lucidos-app/src/store/actions/thread-loading.ts	09bd51ac1f2dd8c0	keep	Menu won't refetch after reload because SSE doesn't replay; bump is the only signal.
-crates/lucidos-app/src/store/actions/thread-loading.ts	0c4c15b97081210c	keep	Family members in the cursor would skip threads on pagination; nothing flags it.
 crates/lucidos-app/src/store/actions/thread-loading.ts	0e9092d9c8f4c134	keep	String comparison relies on the backend's fixed-width UTC timestamp format.
 crates/lucidos-app/src/store/actions/thread-loading.ts	0f9e295b8c28a08c	adr	Rejects folding into loadThreadEvents, which would restore the fan-out.
-crates/lucidos-app/src/store/actions/thread-loading.ts	143dcb1255738132	keep	Caller's fill loop depends on this true/false; an empty landed page must return true.
 crates/lucidos-app/src/store/actions/thread-loading.ts	1582f24ea2b6214a	keep	Gating on the live claim silently drops verdicts or shows stale failures.
 crates/lucidos-app/src/store/actions/thread-loading.ts	1ecc909a72b6cd6f	keep	Identity comparison relies on appliedThreadFilter keeping its object when contents match.
-crates/lucidos-app/src/store/actions/thread-loading.ts	392956b10a6b407b	keep	Retry press must not be blocked by the watchdog's forced-retry cap
-crates/lucidos-app/src/store/actions/thread-loading.ts	394975f2ed671cb0	keep	Claim must happen for every proceeding attempt, or ownership silently breaks.
-crates/lucidos-app/src/store/actions/thread-loading.ts	39879eca9784b18c	keep	Eager family threads with old dates would silently skip pagination if counted.
 crates/lucidos-app/src/store/actions/thread-loading.ts	3a9d5028416f3edd	keep	Marker must stay store-level; a per-mount version silently misses filter changes.
-crates/lucidos-app/src/store/actions/thread-loading.ts	3de684bd7f7fca89	keep	Must wait for in-flight backfill; skipping would drop the deep link target.
-crates/lucidos-app/src/store/actions/thread-loading.ts	3e288570a38c1ff3	keep	A busy-flag skip would leave deep links unfetched; queued reads are required.
 crates/lucidos-app/src/store/actions/thread-loading.ts	3ee6816f877d7d46	keep	Duplicate refetch needs applyEventRows idempotent; iOS timers can hang fetches.
-crates/lucidos-app/src/store/actions/thread-loading.ts	40a2978ab2802a8c	keep	Defaulting to null or empty would wipe lists from older engines; nothing flags it.
-crates/lucidos-app/src/store/actions/thread-loading.ts	428ffaf08c63c64c	keep	Boolean return drives pending message drop; declined refreshes must return false.
 crates/lucidos-app/src/store/actions/thread-loading.ts	431884eba4453ee5	adr	Rejects grouped endpoint for cost; contract otherwise, not a line constraint.
-crates/lucidos-app/src/store/actions/thread-loading.ts	43fefdfbc012b063	keep	iOS wake aborts and hung tunnels must not toast; the health poll covers them.
-crates/lucidos-app/src/store/actions/thread-loading.ts	525c0a44f08b957f	keep	Clear failure flag again; else loaded thread paints failed state.
-crates/lucidos-app/src/store/actions/thread-loading.ts	52a427321a200544	keep	Replacing not inserting avoids stale memoised exchanges; applyEventRows would regress state.
-crates/lucidos-app/src/store/actions/thread-loading.ts	53d45ea2269fb692	keep	Chain before awaiting; awaiting first lets queued callers fetch history twice.
-crates/lucidos-app/src/store/actions/thread-loading.ts	595c64ce95530eea	keep	Overlay must run last; earlier replay mutations would leak into thread.meta.
-crates/lucidos-app/src/store/actions/thread-loading.ts	5a2318b12e3a2e57	keep	Map-derived cursor stalls on duplicate-only pages; must track server position.
 crates/lucidos-app/src/store/actions/thread-loading.ts	5e009779281cb404	keep	Must match recencyKey's fallback or Saved sort silently drifts.
-crates/lucidos-app/src/store/actions/thread-loading.ts	5ef584fb35d000bf	keep	Focused thread must stay marked, or a failed refresh leaves no retry path.
-crates/lucidos-app/src/store/actions/thread-loading.ts	630b9667754be7a1	keep	Coalescing foreground callers breaks read-after-write proof silently; only newest reports.
-crates/lucidos-app/src/store/actions/thread-loading.ts	67195e31000c4ab9	keep	Coalescing into a pre-gap refresh leaves the thread stale with nothing in flight.
-crates/lucidos-app/src/store/actions/thread-loading.ts	676b5f17fb2773a4	keep	Merge, don't replace: replacing would drop SSE events arriving mid-request.
 crates/lucidos-app/src/store/actions/thread-loading.ts	6e841bd1bb626312	adr	Transient failures stay silent; verdicts surface as a card.
 crates/lucidos-app/src/store/actions/thread-loading.ts	6ff595135e2d385c	adr	Per-thread serialisation rationale; design choice, not a line constraint.
-crates/lucidos-app/src/store/actions/thread-loading.ts	70f66e6af6f3b66a	keep	Engine-restart check must precede the retry spend and flag clearing.
 crates/lucidos-app/src/store/actions/thread-loading.ts	7c947d5e44b226da	adr	Map chosen over Set so the card tracks current failures.
-crates/lucidos-app/src/store/actions/thread-loading.ts	824ae70b1e22bea5	keep	Pre-gap fetches must not clear the stale mark; ordering check depends on it.
-crates/lucidos-app/src/store/actions/thread-loading.ts	8797625b9830f70f	keep	Clearing an awaited queued spawn as ghost would break spawn; nothing flags it.
 crates/lucidos-app/src/store/actions/thread-loading.ts	8880fb3cf32a96ad	keep	Cursor must be stored before the loop, guaranteeing caller loop termination.
-crates/lucidos-app/src/store/actions/thread-loading.ts	898871807a94550f	keep	A stale-selection answer would disarm pagination with no re-arm path.
 crates/lucidos-app/src/store/actions/thread-loading.ts	94795fcdf63641ad	keep	Trimming terms makes deep links report a missing thread while events still arrive.
-crates/lucidos-app/src/store/actions/thread-loading.ts	9a0e450dc90ca3a6	keep	Adding this mark to the fetch-guard reset silently disables stale-event catch-up.
-crates/lucidos-app/src/store/actions/thread-loading.ts	9d0ceab3ef24b0a6	keep	Releasing another attempt's slot silently corrupts coalescing; per-attempt ownership is required.
 crates/lucidos-app/src/store/actions/thread-loading.ts	9ea56c19880f9caf	keep	Offer current-call rows only; remembering them leaks old words into bubbles.
-crates/lucidos-app/src/store/actions/thread-loading.ts	a4cd757bad0311c3	keep	Merging focused load into shared pool reintroduces latency; nothing flags it.
-crates/lucidos-app/src/store/actions/thread-loading.ts	a55893a018290be6	keep	Empty landed page must not end pagination; a stop check would stall it silently.
-crates/lucidos-app/src/store/actions/thread-loading.ts	b5b7da54f13f5bd8	keep	Cold mark must stay under eventsLoaded return or telemetry misfires.
-crates/lucidos-app/src/store/actions/thread-loading.ts	b78a7dd486e1c577	keep	Success-keyed check; attempt order would raise a false card.
-crates/lucidos-app/src/store/actions/thread-loading.ts	b8233f627e7ddb02	keep	Pruning deleted ids lets a stale list read resurrect a thread.
-crates/lucidos-app/src/store/actions/thread-loading.ts	b85b01b1e245638b	keep	Unguarded state write re-shows compose view over an unsent first message.
 crates/lucidos-app/src/store/actions/thread-loading.ts	bbeb3ccc41566e51	keep	Awaiting the in-flight load or releasing the guard early causes blocking or stale writes.
-crates/lucidos-app/src/store/actions/thread-loading.ts	bf0507d58aba8906	keep	Map reference can change during await; a hoisted read would use a stale thread.
-crates/lucidos-app/src/store/actions/thread-loading.ts	bf6e5c678f975f21	keep	Restoring the failed flag keeps the thread visible to resume and SSE hooks.
 crates/lucidos-app/src/store/actions/thread-loading.ts	c122277ae7357a0e	adr	Map chosen over Set so the card re-renders current failures.
-crates/lucidos-app/src/store/actions/thread-loading.ts	c3a412ee897e40eb	keep	Stamping the intent before the await silently suppresses a needed reload.
-crates/lucidos-app/src/store/actions/thread-loading.ts	c5a275a71a83bd33	keep	iOS Safari transient aborts; retrying only non-abort errors breaks it.
-crates/lucidos-app/src/store/actions/thread-loading.ts	cc83e43c2a218ab4	keep	Must never reset; reset would let superseded attempts report
-crates/lucidos-app/src/store/actions/thread-loading.ts	cea1f4ba8822e194	keep	Post-await map read; a pre-fetch snapshot silently reverts concurrent Map installs.
-crates/lucidos-app/src/store/actions/thread-loading.ts	d0d0e9abfab5cda9	keep	Resetting threadHasMore is silently required, or loadOlderThreads early-returns.
 crates/lucidos-app/src/store/actions/thread-loading.ts	d1afa87689346da8	adr	Backstop design: reconcile on read, alongside direct removal calls.
-crates/lucidos-app/src/store/actions/thread-loading.ts	e432f4163551701f	keep	Past call's live rows must not replay into live state; would sweep current bubble.
-crates/lucidos-app/src/store/actions/thread-loading.ts	e66a70fbd522ca32	keep	Unconditional stamping lets RESYNC swallow filter changes; no signal.
 crates/lucidos-app/src/store/actions/thread-loading.ts	e6e2cfe8d2dba06a	keep	WebKit can hang fetches across suspension; without reset, threads block forever.
-crates/lucidos-app/src/store/actions/thread-loading.ts	ef2199204c57d7c5	keep	Applying to a detached ThreadState silently drops the snapshot's meta overlay.
-crates/lucidos-app/src/store/actions/thread-loading.ts	f0cb2f427700a39c	keep	Page max under-reports watermark; server maxSequence must be used.
 crates/lucidos-app/src/store/actions/thread-loading.ts	f25c6a4d4e5625dd	keep	Math.max must not become set, or a stale refresh re-raises the card.
 crates/lucidos-app/src/store/actions/thread-loading.ts	f31b2c40c8b33126	keep	Four removal and recovery sites must call this or the card sticks.
-crates/lucidos-app/src/store/actions/thread-loading.ts	f63d2a01b5193bec	keep	Delete-then-set keeps newest reason; set alone shows a stale reason.
 crates/lucidos-app/src/store/actions/thread-loading.ts	f7c74706323886d4	adr	Refusal and failure look identical; callers should check first.
-crates/lucidos-app/src/store/actions/thread-loading.ts	f8f8c47f26234b90	keep	Stamping the live signal at settle marks a selection fetched that was not.
-crates/lucidos-app/src/store/actions/thread-loading.ts	fa6ef92e3e5ff591	keep	Recovery path must not raise; would emit a stale sticky card.
 crates/lucidos-app/src/store/actions/thread-loading.ts	fbdc7d3e2ff449e6	adr	Silent during outage; the connection dot already reports it.
-crates/lucidos-app/src/store/actions/thread-stream.ts	071999b2e533102e	keep	Only a new connection resends hello; without disconnect, gated requests hang forever.
-crates/lucidos-app/src/store/actions/thread-stream.ts	2307d8907644eed0	keep	Restarted engine's backfill order resets; without the forget, frames get dropped silently.
-crates/lucidos-app/src/store/actions/thread-stream.ts	292612c0deb3dab6	keep	Generation must bump before close so the queued onerror sees it stale.
-crates/lucidos-app/src/store/actions/thread-stream.ts	4ce9f779fb63958d	keep	Closing our port drops the shared upstream for every other document.
-crates/lucidos-app/src/store/actions/thread-stream.ts	586264fc5bb44b4a	keep	Remote engine bytes must stay data, not code; pongs option keeps presence checks working.
-crates/lucidos-app/src/store/actions/thread-stream.ts	640d8ec88e87f154	keep	Without the guard, a stale handler closes the new connection, causing an iOS PWA SSE gap.
-crates/lucidos-app/src/store/actions/thread-stream.ts	6ddb3254e11166b4	keep	Admitted work must survive transport retries; clearing it silently drops frames.
-crates/lucidos-app/src/store/actions/thread-stream.ts	a7a80648cc18e168	keep	First open must not resync, or every page load double-fetches silently.
-crates/lucidos-app/src/store/actions/thread-stream.ts	a96e40b60e2f4452	keep	Phase must be logged before disconnect resets it.
-crates/lucidos-app/src/store/actions/thread-stream.ts	cc2e956c3b50a49a	keep	Unconditional reconnect on focus would drop a navigate click's frame during teardown.
-crates/lucidos-app/src/store/actions/thread-stream.ts	cfba46f33ef17213	keep	Resync flag must be set after disconnect, which clears it, or the gap is missed.
 crates/lucidos-app/src/store/actions/thread-stream.ts	f96a963cb26f9016	adr	Module-level design: eager admission before delayed dispatch.
 crates/lucidos-app/src/store/actions/thread-sync.ts	017f588751135040	keep	Gate prevents per-token recomputation; a missed meta flag goes silent.
 crates/lucidos-app/src/store/actions/thread-sync.ts	0c48bfe779a9ffe9	keep	Canceled queued members never emit events; without this clear, they stick at Applying.
@@ -3989,95 +3507,34 @@ crates/lucidos-app/src/store/actions/thread-sync.ts	e24f3659cae7e519	keep	Only o
 crates/lucidos-app/src/store/actions/thread-sync.ts	e4ba6a54579a629e	keep	Event may not be thread's first; deriving skeleton from event breaks silently.
 crates/lucidos-app/src/store/actions/thread-sync.ts	e549eefa5de11277	keep	Refresh must follow metadata read; reordering silently serves stale state.
 crates/lucidos-app/src/store/actions/thread-sync.ts	fbb8581bd74230af	keep	Same-theme writes must repaint (agent republish); dedupe breaks it. Ordering after loadPreferences matters.
-crates/lucidos-app/src/store/actions/threadActions.ts	2660928074e5d97b	keep	Reading ccInfo gives null while running or idle, silently disabling the external-repo check.
-crates/lucidos-app/src/store/actions/threadActions.ts	2a1617af8962540e	keep	Cascade and delete dialog await archive; a void wrapper would silently break it.
-crates/lucidos-app/src/store/actions/threadActions.ts	674755e67a7c01bc	keep	Armed flag must track the current change; otherwise an unreviewed later change auto-applies.
-crates/lucidos-app/src/store/actions/threadActions.ts	71a238dfb6f917e9	keep	Must mirror the Rust is_blocking carve-out; ChangeApplied must precede archive.
 crates/lucidos-app/src/store/actions/threadActions.ts	80fd6e6da2c42df9	adr	Module design: enrichment prevents drift between buttons and shortcuts.
-crates/lucidos-app/src/store/actions/threadActions.ts	b847873069dd5288	keep	Stateless selector can't see in-flight work; removing gate double-applies or skips layers.
-crates/lucidos-app/src/store/actions/threadActions.ts	fe07c7f04e667c42	keep	Active threads must clear via updateCompose; deleting 409s; drafts sync server-side.
-crates/lucidos-app/src/store/actions/threadBlockers.ts	4024ef589ecff420	keep	Stored-archived threads must keep Archive offered, or the drifted-count heal silently stops.
-crates/lucidos-app/src/store/actions/threadFamily.ts	3c2a3cd29304040b	keep	Must mirror backend cascade scope; drift silently misaligns optimistic archive and delete.
 crates/lucidos-app/src/store/actions/threadHash.ts	4fb107b05afc172a	keep	Startup strips the query param; a ?thread= link silently breaks deep linking.
-crates/lucidos-app/src/store/actions/threadQueue.ts	7042a10db163827d	keep	Throw is the only guard; a catch returning false makes callers mistake it for not queued.
 crates/lucidos-app/src/store/actions/threads-delete.ts	68b7f8132b926dbf	adr	Client-side family walk design; rows drop before the frame arrives.
 crates/lucidos-app/src/store/actions/threads-delete.ts	80f3dff365d399d1	adr	Design choice: preflight before dialog; types already require preflight.
-crates/lucidos-app/src/store/actions/threads-delete.ts	91b1f0997e552f44	keep	Archive opening its own confirm would be closed by ConfirmDialog; nothing flags it.
 crates/lucidos-app/src/store/actions/threads-drop.ts	4faf43b366a77dd0	adr	Explains why two callers exist and why it is idempotent; design rationale.
-crates/lucidos-app/src/store/actions/threads-drop.ts	6f647a9cfb35e560	keep	Anchor must be snapshotted before rows leave the map or position is lost silently.
-crates/lucidos-app/src/store/actions/threads-drop.ts	9086e11477c29f0e	keep	Each per-thread cleanup must run or nothing flags a dangling pointer to the deleted thread.
 crates/lucidos-app/src/store/actions/threads-test-helpers.ts	114b15a6b4b2428e	keep	Fixtures missing the aggregate pass tests silently; the engine never produces such events.
 crates/lucidos-app/src/store/actions/threads.ts	0697a35c9bc46a25	adr	Rejects holding focus across retries; releases must stay conditional and per-attempt.
-crates/lucidos-app/src/store/actions/threads.ts	0f64d782433a2eda	keep	Sync points only mark threads; this refresh pays the mark, easily mistaken for redundant.
 crates/lucidos-app/src/store/actions/threads.ts	356320ba5dcab91f	keep	stillArriving check stops false not-in-thread toast during load; wording must not claim source.
 crates/lucidos-app/src/store/actions/threads.ts	3e308180d271f3d8	keep	Stale-pointer cleanup from background-mounted ThreadView must pass revealPane false, else yanks mobile pane.
-crates/lucidos-app/src/store/actions/threads.ts	4595f4569dab2aa9	keep	Drafts must be discarded only after archive succeeds; otherwise silent loss
 crates/lucidos-app/src/store/actions/threads.ts	4a21d6b75d48cfb1	keep	Plain focusThread unfocuses via ThreadView stale-pointer cleanup; coupling is distant.
-crates/lucidos-app/src/store/actions/threads.ts	5296046142398db6	keep	Snapshot must precede the optimistic flip or the anchor silently breaks
-crates/lucidos-app/src/store/actions/threads.ts	5e3d6f62d442bf6a	keep	Clear exemption before focus; otherwise stale pointer stays exempt later.
-crates/lucidos-app/src/store/actions/threads.ts	6cfaa64369d4680b	keep	Awaited id must be set before focus or move-away clear drops it.
-crates/lucidos-app/src/store/actions/threads.ts	72240e5f48f095b9	keep	404 is not proof of gone; keep queue check and re-read for spawn race.
-crates/lucidos-app/src/store/actions/threads.ts	8670eeb56685cf3d	keep	awaitedThreadId must be set or ThreadView unfocuses the optimistic thread immediately.
-crates/lucidos-app/src/store/actions/threads.ts	8b870253f12298f2	keep	Revealing the pane on archive breaks mobile; the flag must stay false.
-crates/lucidos-app/src/store/actions/threads.ts	9130af97ec37efcf	keep	A manual notAtTop reset hides the chevron silently; syncNotAtTop owns it.
 crates/lucidos-app/src/store/actions/threads.ts	929bba2fef958442	adr	Design rationale for dialog sources; no constraint on these lines
-crates/lucidos-app/src/store/actions/threads.ts	b9182b41877d11af	keep	Retire must run before focus moves, or subscribers see the stale armed ride.
-crates/lucidos-app/src/store/actions/threads.ts	bbabe014a2f6d612	keep	Discard must follow successful archive; moving it earlier silently loses drafts.
-crates/lucidos-app/src/store/actions/threads.ts	becfe42c5ee9db28	keep	stopFollowingBottom must run before the final focus or the old follow stays armed.
-crates/lucidos-app/src/store/actions/threads.ts	cda13be2598388f6	keep	Armed follow would ride compose view growth; retire it here
-crates/lucidos-app/src/store/actions/threads.ts	d35ef52a0a9a7d8c	keep	Anchor must be read before the optimistic flip, or it fails silently.
-crates/lucidos-app/src/store/actions/threads.ts	d664d0018c6cbdaa	keep	All three fields required for display; archive net and ThreadArchived depend on it.
-crates/lucidos-app/src/store/actions/threads.ts	e9c5d68630242ae6	keep	Versions must be read before request; frames can beat the response
 crates/lucidos-app/src/store/actions/trafficLights.ts	33618a69c25d8ff1	adr	Module design: one band-tracking mechanism, not per-site measurements.
 crates/lucidos-app/src/store/actions/trafficLights.ts	3478dcc594b8fdd6	adr	Rejects a class-name selector; the picker needs its own declared band.
-crates/lucidos-app/src/store/actions/trafficLights.ts	39dad6e119bf7973	keep	Computed custom property returns a string; rect must be checked against offsetHeight.
-crates/lucidos-app/src/store/actions/trafficLights.ts	54e18195bd418fe2	keep	Without reset, one failed push sticks for the session; nothing flags it later.
-crates/lucidos-app/src/store/actions/trafficLights.ts	d7f1e97ed8e528e7	keep	Gating on the late attribute would never re-arm the watch; resize covers breakpoint moves.
-crates/lucidos-app/src/store/actions/transcript-find.ts	9bb1a770c4010e00	keep	Scroll-hold wait is non-obvious; removing it undoes the reader's step.
-crates/lucidos-app/src/store/actions/transcript-find.ts	cc283a8585791e57	keep	Transcript silently undoes unmarked reveal scrolls; distant coupling nothing flags.
 crates/lucidos-app/src/store/actions/transcript-find.ts	da6906c7a6ffa5d8	adr	Module-scope design choice; also describes session and cache fields.
-crates/lucidos-app/src/store/actions/transcript-find.ts	e174ec092dd4f211	keep	Roll must finish before measuring; removing frames misreads match position silently.
-crates/lucidos-app/src/store/actions/transcript-passages.ts	7cb9562fd07d64d1	keep	Cache key must separate pre-engine plain text from markdown, or results go stale silently.
 crates/lucidos-app/src/store/actions/transcript-passages.ts	d5a703a1adb56924	adr	Module purpose: counts reuse the drawing code; design unit choice.
 crates/lucidos-app/src/store/actions/transcript-passages.ts	e19aa0727fd6af15	keep	Rendering a component with effects would mutate the live document; a silent break.
 crates/lucidos-app/src/store/actions/transcriptRenderRequest.ts	ada7c8db9f804c52	adr	Explains module placement to avoid loading find targets; a design choice.
-crates/lucidos-app/src/store/actions/treeBackfill.ts	0edc076a52dba72b	keep	Stale snapshot after engine restart could set wrong order; silent bug.
-crates/lucidos-app/src/store/actions/treeBackfill.ts	2694f4c1c20685cd	keep	Snapshot read must not overwrite newer live SSE state; silent bug.
-crates/lucidos-app/src/store/actions/treeBackfill.ts	2f52377a913b84a3	keep	Out-of-order SSE frames could step the bar back; a silent visible regression.
-crates/lucidos-app/src/store/actions/treeBackfill.ts	399ab3c184485bb3	keep	Reconnect after restart needs order reset; stale order would drop frames silently.
-crates/lucidos-app/src/store/actions/treeBackfill.ts	dcf4eac502b3d987	keep	Gap-lost frames can hide the ending; the version bump must not be removed.
-crates/lucidos-app/src/store/actions/treeBackfill.ts	dd071f75685beaa5	keep	Snapshot reads started before a frame must not overwrite it; nothing else guards this.
 crates/lucidos-app/src/store/actions/treeBackfill.ts	f197914ee8eb9747	keep	Dispatcher must use only these entry points to keep freshness counter intact.
 crates/lucidos-app/src/store/actions/triggerGroups.ts	5422bb90e991a4ec	keep	SSE group events must not upsert; they must re-fetch, or member counts go stale.
-crates/lucidos-app/src/store/actions/triggers.ts	04c890ec3236429a	keep	Stale cache pre-check would falsely report live trigger missing; re-fetch needed.
-crates/lucidos-app/src/store/actions/triggers.ts	18a1b3280d3f4ef2	keep	Omitting model/reasoning fields on update would leave stale pins; silent, no type error catches it.
-crates/lucidos-app/src/store/actions/triggers.ts	1fe138434dbb631f	keep	Engine refuses provider without model; no compiler flags a violation here.
-crates/lucidos-app/src/store/actions/triggers.ts	40c6036ee8abb3b5	keep	Omitting grant on update would silently keep access; security-relevant, unflagged.
-crates/lucidos-app/src/store/actions/triggers.ts	480253343daf6c4b	keep	Omitting nulls on update leaves stale pin; the engine accepts it silently, nothing flags the bug.
 crates/lucidos-app/src/store/actions/unsentMessageRestore.ts	43e545a201ac5d1b	adr	Module-level purpose and plan reference; a subsystem description, not a line constraint.
 crates/lucidos-app/src/store/actions/unsentMessageRestore.ts	832152b4d3151595	adr	Explains the thread creation mirrors sendMessage; design rationale for a subsystem.
-crates/lucidos-app/src/store/actions/unsentMessageRestore.ts	dcf002775e9aadce	keep	Only this send could create thread; wrong verdict discards delivered messages.
-crates/lucidos-app/src/store/actions/update-relay.ts	388782b79e8d43e7	keep	Removing settleRelay's bound means an endless outage never reports.
 crates/lucidos-app/src/store/actions/view-menu.ts	830ceaac07dc4535	adr	Explains the menu's role across pages; subsystem-level design, not a line constraint.
-crates/lucidos-app/src/store/actions/view-menu.ts	f42e8e53f0a8e80f	keep	Stop before setup resolves must still end the effect; otherwise leaks silently.
-crates/lucidos-app/src/store/actions/visitKeys.ts	3ae61c6432f108ea	keep	Router reroutes thread-queue; a panel key would silently stop notifications clearing.
 crates/lucidos-app/src/store/actions/visitKeys.ts	79b7ad53b49f8cbd	keep	Keying on thread_id clears trigger summaries early; only this comment guards it.
-crates/lucidos-app/src/store/actions/visitKeys.ts	a0384aacb307aabf	keep	Removing app-ui case silently breaks old notification rows.
 crates/lucidos-app/src/store/actions/visitKeys.ts	a6db70116b5a0766	adr	Module design: one shared constructor set keeps both sides agreeing.
-crates/lucidos-app/src/store/actions/visitKeys.ts	e741736187eb4644	keep	Unresolved path silently mismatches the overlay's stored locator; nothing flags it.
-crates/lucidos-app/src/store/actions/webhook-ingress-discuss.ts	bcfa1fe8f7555302	keep	Hiding the bar on discuss falsely claims recovery; nothing measured it.
-crates/lucidos-app/src/store/actions/webhook-refusal-discuss.ts	c14f89d694f61a4a	keep	Hiding the bar on discuss falsely claims recovery; nothing measured it.
 crates/lucidos-app/src/store/actions/webhookIngress.ts	c7f0223730c945d8	adr	One route defines live outage; frames re-read rather than carry state.
 crates/lucidos-app/src/store/actions/webhookRefusals.ts	49bcaf58e270846a	adr	Module's role in the webhook subsystem; points to ADR 0235.
 crates/lucidos-app/src/store/actions/whatsNew.ts	2e42295f7a70affe	adr	Design choice: unread dot is per-client, not per-account.
-crates/lucidos-app/src/store/actions/whatsNew.ts	d7e4181c18ddabc8	keep	Reconnect re-read is the only recovery; no event corrects stale changelog.
-crates/lucidos-app/src/store/actions/widget-frame-bridge.ts	f522d8983090b69d	keep	Must dispatch on frame element; detached-frame resize hazard is unflagged.
 crates/lucidos-app/src/store/actions/wipPreview.ts	0750eead2ecc7004	adr	Rejects threading another signal; lists callers of an imperative API.
-crates/lucidos-app/src/store/actions/wipPreview.ts	093bd37ae90e2f2a	keep	Don't infer worktree removal from diff or status; caused undo-on-click bug.
-crates/lucidos-app/src/store/actions/wipPreview.ts	c348d08dcaf82e03	keep	Empty map is unknown until loaded; clearing early loses restored WIP.
-crates/lucidos-app/src/store/actions/workspaceFonts.ts	18d35df835d892ec	keep	Compound weight spellings must precede plain ones; first match wins.
-crates/lucidos-app/src/store/actions/workspaceFonts.ts	f7cb74d28287f4a7	keep	Taken set must include broken fonts; else installs overwrite and cleanup deletes.
-crates/lucidos-app/src/store/actions/workspaceFonts.ts	f873def3988a1e03	keep	Raw directory names must never feed a glob; wrong matches delete other fonts.
 crates/lucidos-app/src/store/appFullscreenHost.ts	28f59f9da518d090	keep	Detached fullscreen element must not block; removing the isConnected check rejects visible previews.
 crates/lucidos-app/src/store/appFullscreenHost.ts	83ba05bce1a91a4c	keep	Native fullscreen paints only its subtree; overlays must move into the mount or vanish.
 crates/lucidos-app/src/store/appFullscreenHost.ts	b36e1edb7a0f783c	keep	Must re-read DOM each call; a cached element silently refuses valid previews.
@@ -4440,15 +3897,10 @@ crates/lucidos-app/src/store/store.ts	fef7f53fa6ad79a8	keep	Using dismissToast f
 crates/lucidos-app/src/store/systemAttentionBadge.ts	277c8eea7674fec0	adr	Module design: why badge covers updates and owed notices, not unread notes
 crates/lucidos-app/src/store/systemAttentionBadge.ts	51c4f2c31dbc1bab	adr	Why labels are centralised rather than per-surface.
 crates/lucidos-app/src/store/systemAttentionBadge.ts	93764a1dd39227b5	adr	Why the two halves each read only their own source
-crates/lucidos-app/src/store/thread-events/event-waits.ts	129a2bfdab88c950	keep	Matches engine's frozen wording; editing these strings silently breaks legacy re-entry rows.
 crates/lucidos-app/src/store/thread-events/event-waits.ts	8c647e97b9a95f67	adr	Joined string would drop buttons on pressable surfaces; each group labels itself.
-crates/lucidos-app/src/store/thread-events/event-waits.ts	ba8f98460b49cfb5	keep	Replay must match live fold; nothing flags a non-idempotent or impure change
 crates/lucidos-app/src/store/thread-events/event-waits.ts	f0dbc032c50a9d77	adr	Why grouping exists: repeated type names read poorly
 crates/lucidos-app/src/store/thread-events/exchange-anchors.ts	09a0c4dd4e4578fb	adr	Single rule: inline steps stay unstamped; a tripwire test enforces declarations.
 crates/lucidos-app/src/store/thread-events/exchange-anchors.ts	1efc417801a5a4f4	adr	Every event deep link routes here, since the engine checks only thread membership.
-crates/lucidos-app/src/store/thread-events/exchange-anchors.ts	342ccc70e4ce5e46	keep	Must match findExchangeByAnchorId backward scan; collision picks wrong turn.
-crates/lucidos-app/src/store/thread-events/exchange-anchors.ts	99a44116f8a1425b	keep	Window must draw the whole turn or deep links silently fail; nothing flags it.
-crates/lucidos-app/src/store/thread-events/exchange-anchors.ts	c89a1c7eedb64440	keep	Stamping a fragment's first step duplicates ids and collides with the failure card.
 crates/lucidos-app/src/store/thread-events/exchange-grouping.ts	088ae84c033caea9	adr	Spoken boundary owns no turn unless a running turn continued into it.
 crates/lucidos-app/src/store/thread-events/exchange-grouping.ts	0c269ec827ff603c	keep	Default paged=false silently drops steps of paged sets.
 crates/lucidos-app/src/store/thread-events/exchange-grouping.ts	0ec34988ff04a001	keep	Identity memo misses in-place mutation; dropping revision bump freezes rendering silently.
@@ -4531,71 +3983,29 @@ crates/lucidos-app/src/store/thread-events/exchange-queue.ts	0757659031bdfcd0	ke
 crates/lucidos-app/src/store/thread-events/exchange-queue.ts	3b273a957082c191	keep	Fold absorbs injected anchors; removing a case queues turns wrongly.
 crates/lucidos-app/src/store/thread-events/exchange-queue.ts	e8d7a60a8903aa20	keep	Using candidates instead of awaiting makes the live stream show the wrong message silently.
 crates/lucidos-app/src/store/thread-events/exchange-queue.ts	fd8af925d5c0ced2	keep	Dividers can interleave queued indices; a contiguous-run assumption breaks.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	14013c74954d2590	keep	Dropping the same-exchange id check silently hides orphan-resubmitted turns behind a placeholder.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	14d8adedc52551de	keep	Parser depends on the rerun.rs format; changing it silently zeroes the tool count.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	16f48324c53665b5	keep	Must run after all steps arrive, or snapshots bind to wrong rows.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	1759ea9acea7d02a	keep	Predicate mirrors backend paused status; editing one side splits the dot and button.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	175fc3756a03ffa0	keep	Overtaken-set must match engine's list or dead-button card reads Needs your answer.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	1a6d8809430c0573	keep	Historical rows carry the retired name; the case must remain.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	27a87d7b5cc43c85	keep	Ordering before !isLast arm stops later delivery retroactively marking park abandoned.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	3032ef02fe9fd30f	keep	Unnarrowed walk resolves the wrong step: a newer call's row gets ticked off.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	32527d3ac7c2a91a	keep	Queued check must precede !isLast fallthrough or shows wrong 'No response' text.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	38eb2f94962eccef	keep	Labels must match Rust replay strings; drift silently changes recalled-memory wording.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	3df848d6488979d7	keep	Relies on request_event_id serialization invariant; threadIdle guard prevents premature done.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	462ddc11c3e47ca0	keep	Placeholder must not read as crash; isStale excludes it, so reordering would break.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	46f83f8ab2c053c2	keep	Sub-agent calls must never name the session's Thinking row.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	48c9ad3cdc08c98a	keep	Reverse scan on last session event; a plain any-end search breaks second calls.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	50bf082e44ed9975	keep	Engine-down keyed on abort cause, not actor; teardown window otherwise shows Working.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	51d437ca268ca504	keep	CodingAgentIdled can be skipped; SessionEnded must stay terminal.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	52c4ca449b4a10c2	keep	Sweeps must stay pending-only; reusing isLiveStep silently finalizes held permission rows.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	576d9fe7db7331d1	keep	Raising the legacy default to 1M would silently overstate headroom.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	5772c877494767c2	keep	Fallback must be unknown; total_chars would overstate tokens about 2.5x.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	5a4400aa86a6bc1b	keep	isLast guard prevents follow-up after cancel from wrongly resuming engine.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	5f6514351d3a185a	keep	Clearing the park alone; merging into the isCCWaiting group revives finished turns.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	6239f5cf9715c694	keep	Live last-exchange must fall through, else completion card shows Done before reentry.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	6f06849eababffc4	adr	Design choice: replace the pending step rather than queue under it.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	706aee8caeb053a1	keep	EventWaitCanceled must stay out of the clear list; else reads Done not Aborted.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	74757d489d00cacf	keep	Id pairing and isNotThinking guard stop AskUserQuestion spinner bugs.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	764fb4fe3a2cf40d	keep	Spoken rows must count on every banner; no audio is kept, so loss is permanent.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	793a4d4fd880bdc2	adr	Contrasts with a sibling predicate; the names already show the difference.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	7bcba828fade54d5	keep	Folding this into the work-event group silently mislabels crashes after follow-ups as done.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	7d7af7ae8ec0e27d	keep	Last-terminator-wins rule decides superseded abort rendering; nothing else flags reversal.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	83763a6512ed2fec	keep	Scan must continue past resolved aborts; an older unresolved abort stays continuable.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	85a7f691762554b9	keep	Denied step must be found by this lookup or refusal explanation silently vanishes.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	88e9cf5c9124996e	keep	Pending steps must not resolve on !isLast alone; mid-flight injection still runs.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	8b6be86eb7e5d5e0	keep	Non-last stepped exchanges rely on injection routing; reordering breaks Working display.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	92de135af77088e4	keep	Window clamp and exchange must count the same rows; silent off-by-one otherwise.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	936560bcee4440d8	keep	Must check the event's own text; a stream-presence check misclassifies ENGINE-LIMIT.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	97dda093bc92b6d2	keep	Legacy end reasons must stay, or old exchanges render as interruptions.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	98ab69b3e12bcf64	keep	Spoken-row test is deliberate; hasRenderableResponseContent would unhide typed threads' canceled questions.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	9c05978ce1ecae60	keep	Engine idles between effort restart and resume; idle must not read done.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	aef9069bb72177b9	adr	Rejected alternative: caller's own words are not a row.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	b9f84b285b3a2a46	keep	Stops must not rewrite the arming row; the obvious fix loses history.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	bf635de338045092	keep	Omitted terminator is deliberate; adding one silently breaks exchange status.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	c824a37b68b22167	keep	Stale must settle done, not aborted; client status copy lags events.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	e01316a6dddc5e35	adr	Subsystem binding rules shared by both projections; mostly behaviour description.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	e2b62fecc68c0b39	keep	Never resolve on !isLast; mid-flight injection would strand live spinners.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	f0a3930175159ee5	keep	Engine must emit ThoughtStreamed, ContextCaptured, ToolCalled in order or snapshot is lost.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	f6097622fcc0226a	keep	Skipped non-last CC exchange must stay done; removing it causes spinner or wrong state.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	f6f54e231a3304ea	adr	Rejected field: a character count is not a token total.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	f72e98a1648ee162	keep	Without isStale gate, dead coding-agent turn spins Working forever.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	f78e6de105105ead	keep	Stop boundary must stay terminal; otherwise unrelated running turn spins Requesting forever.
 crates/lucidos-app/src/store/thread-events/exchange-render.ts	fbfa48f1d3d85499	adr	Contrasts with a narrower helper; the function body already encodes it.
-crates/lucidos-app/src/store/thread-events/exchange-render.ts	fc06a70edea0e1f8	keep	Per-chunk match before merge; exact equality only, or prose gets hidden or duplicates.
 crates/lucidos-app/src/store/thread-events/exchange.ts	02070a9fd154def9	adr	Explains the blockedStepSeqs and deniedStepSeqs design across fold and renderer layers.
 crates/lucidos-app/src/store/thread-events/exchange.ts	093f8709880bc481	adr	Explains why fragments and resumes skip the initiator panel; design rationale.
-crates/lucidos-app/src/store/thread-events/exchange.ts	0d18dcdbfa24cde4	keep	Keying by userSeq remounts DOM on optimistic swap; event_id must stay the key.
-crates/lucidos-app/src/store/thread-events/exchange.ts	15ea40d3518e0129	keep	Cap text is emitted with no TextStreamed; side channel needed for banner.
-crates/lucidos-app/src/store/thread-events/exchange.ts	1b94c6f21cae2645	keep	Stale Thinking must be finalized here; cleared-on-takeback rule must hold or shimmer persists.
 crates/lucidos-app/src/store/thread-events/exchange.ts	4443f386f7c10ffa	adr	Explains why these fields live on the Exchange.
-crates/lucidos-app/src/store/thread-events/exchange.ts	6473c2ef7382d86a	keep	Mutated-in-place exchanges break memo if revision captured as primitive; silent stale renders otherwise.
-crates/lucidos-app/src/store/thread-events/exchange.ts	7ef0189d5ffb5e21	keep	Fragment must open only when older events are unloaded, or corrupt threads get hidden.
-crates/lucidos-app/src/store/thread-events/exchange.ts	bbcdbba9e1018739	keep	Older threads store this id; dropping the entry loses their label.
 crates/lucidos-app/src/store/thread-events/exchange.ts	c2a0a9ba8b69c1fb	adr	Version-free aliases go stale when Anthropic repoints them; labels shouldn't name versions.
-crates/lucidos-app/src/store/thread-events/exchange.ts	cfcc55bf4297763a	keep	Editors must keep these as steps; exchangeStatus reads SessionEnded.
 crates/lucidos-app/src/store/thread-events/exchange.ts	ed0d64542b7c455d	adr	Explains why two event types share bubble rendering; design rationale.
 crates/lucidos-app/src/store/thread-events/render-order.ts	cb840956d8ae3570	adr	Per-frame use would be slow; the check belongs only in tests.
-crates/lucidos-app/src/store/thread-events/spokenMerge.ts	dd45a997984f463a	keep	Caller must pass adjacent rows; nothing flags cross-speaker merges.
 crates/lucidos-app/src/store/thread-events/thread-event-types.ts	0d268f71a7728682	adr	Held in meta, not derived per render, to avoid per-keystroke scans.
 crates/lucidos-app/src/store/thread-events/thread-event-types.ts	3d1371b120de4c27	keep	Mirrors Rust is_redirect; tsc catches missing keys, not wrong values.
 crates/lucidos-app/src/store/thread-events/thread-event-types.ts	3f8ff4254ecf6c37	keep	Widening to any abort marks live turns dead; only engine shutdown counts.
@@ -4610,33 +4020,17 @@ crates/lucidos-app/src/store/thread-events/thread-event-types.ts	c7c98d04f5b045e
 crates/lucidos-app/src/store/thread-events/thread-event-types.ts	d538c7805b926d50	keep	Both halves required; dropping either misreports pause and resume.
 crates/lucidos-app/src/store/thread-events/thread-event-types.ts	ff3e81e1aa1ad1f5	keep	Reason must be checked before actor, or hang resumes claim engine restart.
 crates/lucidos-app/src/store/thread-events/thread-flag-sensitivity.ts	4ecd9c7d0cb39a7d	keep	Key assumes exchangeStatus reads only stream presence; drift goes unnoticed.
-crates/lucidos-app/src/store/thread-events/thread-flag-sensitivity.ts	52fe4c2a0c011266	keep	In-place folds must bump revision or the cached verdict goes stale silently.
-crates/lucidos-app/src/store/thread-events/thread-flag-sensitivity.ts	c088592770dfd1f7	keep	Queued turns must stay sensitive; ChatExchange's panelHold lives elsewhere, unflagged.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	015f34c9215dadff	adr	Slot not list: engine allows only one live reply at a time.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	06ea34dccac2ee4a	keep	Overlay must run before the seq-dedup guard or stranded waits never repair.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	07427ac3c72cf7d8	keep	Marking changed defeats fan-out gate; silent performance regression.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	1f29cb8c3d3fbf37	keep	Failed-load flag must be cleared by runResumeSync retry or threads stick.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	32dd8e1a2ac13c91	keep	Out-of-order SSE on reconnect; separate max sequence prevents skipping gap events.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	3cd3cf1f27ff5826	keep	JSON identity holds only for flat objects; Map or Set fields break silently.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	4bdb94b9758375b9	keep	loadOlderThreads pages by this key; a change skips or repeats Archive rows.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	505c95e14f2e3386	keep	Fold and server reconcile must both stay; missed events strand waits silently.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	751a2fa7f26d847f	keep	Non-obvious comparison; plain >= refuses versionless summaries forever.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	8fa858b6a0c3b6fc	adr	Explains projecting the todo list rather than deriving it per render.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	95f01760d4b6ad6d	keep	Drafts must stay off ThreadMeta or every subscriber re-renders per keystroke.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	9ca5ed2ac8c86dc2	keep	Unifying with threadIsBlocked lights the Blocked badge on paused threads.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	9ee69aa5526b1ebb	keep	Counting instead of words mispairs rows for the rest of the call.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	9f18717ebae09d49	keep	SSE may deliver Home first; dropping the key leaks it into drawer sections.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	a6c41c510d5a3743	adr	Stable drawer order by creation time, not attention or churn.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	a8ad19f8d0adc775	keep	lastAgentAction must stay unmarked; lastUserAction must be marked for re-sort.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	be5bbf53b7fa019e	keep	Dropping the union with pendingChange makes the banner flash between SSE broadcasts.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	cf91afb76366177a	keep	Keep-alive turns must not bump recency; the set is the only way to tell.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	d36322fd2a034583	adr	Rejects deriving the field from the array to keep drift visible.
-crates/lucidos-app/src/store/thread-events/thread-meta.ts	d78073e1999b2888	keep	Excluding updatedAt from changed is required; including it defeats fan-out gate.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	d9c7ce4236d3644a	keep	Archived would drop stopped threads from Current before any summary lands.
 crates/lucidos-app/src/store/thread-events/thread-meta.ts	ec1e59e039a8077b	keep	Adding compose fields to the aggregate would silently clobber local typing.
-crates/lucidos-app/src/store/thread-events/tool-descriptions.ts	39edf7073f9af495	keep	Partial write list would mislead; filtering unnamed entries reintroduces that silently.
-crates/lucidos-app/src/store/thread-events/tool-descriptions.ts	3aee5aba32798893	keep	Removing the single-word check shows commands that never ran; POSIX $0 behavior.
-crates/lucidos-app/src/store/thread-events/tool-descriptions.ts	41dd30a6da9beb42	keep	Unwrapping a literal bash -lc from Claude Code would mislabel the user's invocation.
 crates/lucidos-app/src/store/thread-events/tool-descriptions.ts	661e7ca84056f9d2	adr	Shared label design across backends; cosmetic mismatch only.
 crates/lucidos-app/src/store/threadActivity.ts	0a040a564a33be3e	adr	Per-thread signal design rationale for the whole module.
 crates/lucidos-app/src/store/threadFilter.ts	e993326e583dcead	adr	Shared-helper rationale; the helper itself enforces it.
@@ -5424,10 +4818,6 @@ crates/lucidos-app/src/utils/lastWorkspace.ts	8059a38431dd478e	keep	Raw key must
 crates/lucidos-app/src/utils/lastWorkspace.ts	e7222d2853926399	keep	Raw key needed; scoped key would read unset on peer tap.
 crates/lucidos-app/src/utils/layoutMedia.ts	a6a16b21ea45365a	adr	Module design rationale; cites an ADR for the landscape choice.
 crates/lucidos-app/src/utils/layoutMedia.ts	c2ce6d11f5a90959	keep	Avoids nested not for browser support; simplifying breaks old browsers silently.
-crates/lucidos-app/src/utils/lazyComponent.tsx	2c597346c3623561	keep	Regex depends on Vite's emitted import form; silent if changed.
-crates/lucidos-app/src/utils/lazyComponent.tsx	41fc4a0ed2b05dac	keep	Cancel-on-any-press rule prevents late open landing on wrong surface.
-crates/lucidos-app/src/utils/lazyComponent.tsx	befba7462681825a	keep	h() avoids JSX typing with unconstrained P; a JSX change would break typing.
-crates/lucidos-app/src/utils/lazyComponent.tsx	db254ebd967c1d22	keep	Reload-then-probe ordering; probe after reload would be cut short.
 crates/lucidos-app/src/utils/leadingEdgeGate.ts	a52c4969792854f2	keep	Leading-edge, not trailing or promise guard; iOS burst would repeat work.
 crates/lucidos-app/src/utils/linkifyPaths.ts	07d95997eea27855	keep	Adding the cached-registry check would make new triggers render as dead links.
 crates/lucidos-app/src/utils/linkifyPaths.ts	11c7a0a63f7fa303	keep	Broader matching silently hijacks sub-file previews; data.list() coupling is distant.

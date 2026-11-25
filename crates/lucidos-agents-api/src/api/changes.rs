@@ -282,10 +282,6 @@ pub(crate) async fn change_action_refusal(
     if status != ChangeStatus::Pending && !set_aside_discard {
         return Ok(None);
     }
-    // Asked even when the selector grants the action. The selector reads the
-    // status alone, and a thread can read `idle` with its question still open
-    // (see `unsettled_thread_ids`). They otherwise agree, so this adds no
-    // refusal beyond that one.
     let unsettled = crate::core::changes::unsettled_thread_ids(pool, std::iter::once(thread_id))
         .await?
         .contains(&thread_id);
@@ -1299,6 +1295,35 @@ mod tests {
                 .await
                 .expect("ask the gate"),
             Some(ChangeActionRefusal::ActionUnavailable),
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn an_idle_thread_with_an_open_question_is_refused_apply() {
+        use crate::engine::thread_lifecycle::ThreadAction;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        seed_cc_thread(&pool, thread_id, "idle", 0, 0).await;
+        seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id)
+             VALUES ($1, 'thread', $2, 'UserQuestionAsked', '{}'::jsonb, NOW(), $2::uuid)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("record an open question");
+
+        assert_eq!(
+            change_action_refusal(&pool, change_id, ThreadAction::Apply)
+                .await
+                .expect("ask the gate"),
+            Some(ChangeActionRefusal::ThreadParked),
         );
         teardown_test_db(&db_name).await;
     }

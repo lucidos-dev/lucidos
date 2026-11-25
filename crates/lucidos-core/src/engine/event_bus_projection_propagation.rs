@@ -98,6 +98,62 @@ pub(crate) async fn load_blocking_sample(
     ))
 }
 
+/// Sample of the `thread_summaries` columns the completed-sub-thread archive
+/// rule reads (`refuse_completed`). The projection loads it before and after
+/// an event. A change asks the engine to recount every ancestor's
+/// `archivable_sub_thread_count`, since this row counts toward each of them.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(crate) struct ArchiveInputSample {
+    parent_thread_id: Option<Uuid>,
+    status: String,
+    archive_state: String,
+    state: String,
+    is_saved: bool,
+    change_state: String,
+    has_output: bool,
+    waits_on_event: bool,
+    has_draft: bool,
+}
+
+impl ArchiveInputSample {
+    /// The rows whose archivable count may have moved between `prev` and
+    /// `curr`: the parent before and after. Empty when nothing the rule reads
+    /// changed, unless `forced`, for an input stored outside the row.
+    pub(crate) fn recount_anchors(
+        prev: Option<&Self>,
+        curr: Option<&Self>,
+        forced: bool,
+    ) -> Vec<Uuid> {
+        if prev == curr && !forced {
+            return Vec::new();
+        }
+        let mut anchors: Vec<Uuid> = [prev, curr]
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parent_thread_id)
+            .collect();
+        anchors.dedup();
+        anchors
+    }
+}
+
+/// Read `thread_id`'s [`ArchiveInputSample`], or `None` before its row exists.
+pub(crate) async fn load_archive_input_sample(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    thread_id: Uuid,
+) -> Result<Option<ArchiveInputSample>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT t.parent_thread_id, t.status, t.archive_state, t.state, t.is_saved, \
+                t.coding_agent_change_state AS change_state, t.has_response AS has_output, \
+                t.live_event_wait_count > 0 AS waits_on_event, {draft} AS has_draft \
+         FROM thread_summaries t WHERE t.thread_id = $1",
+        draft = crate::core::store::HAS_DRAFT_SQL,
+    ))
+    .bind(thread_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// Recompute the direct parent's `active_children_count` from children
 /// still in flight, per the shared `active_thread_statuses()` predicate.
 /// Returns the parent's `thread_id` when one exists (so the caller can
@@ -748,6 +804,43 @@ impl EventBus {
         Ok(())
     }
 
+    /// Store each thread's `archivable_sub_thread_count`, then broadcast every
+    /// row that moved, as an event's ancestors are. The engine-tier recount
+    /// worker computes the counts, because the archive rule lives above this
+    /// crate. Returns the rows that moved.
+    pub async fn store_archivable_sub_thread_counts(
+        &self,
+        counts: &[(Uuid, i64)],
+    ) -> Result<Vec<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
+        if counts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (ids, values): (Vec<Uuid>, Vec<i64>) = counts.iter().copied().unzip();
+        let mut tx = self.pool.begin().await?;
+        let moved: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE thread_summaries t SET archivable_sub_thread_count = c.n::int \
+             FROM UNNEST($1::uuid[], $2::bigint[]) AS c(id, n) \
+             WHERE t.thread_id = c.id AND t.archivable_sub_thread_count <> c.n::int \
+             RETURNING t.thread_id",
+        )
+        .bind(&ids)
+        .bind(&values)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut aggregates = Vec::with_capacity(moved.len());
+        for id in &moved {
+            if let Some(agg) = crate::core::store::fetch_thread_aggregate(&mut *tx, *id).await? {
+                aggregates.push((*id, agg));
+            }
+        }
+        tx.commit().await?;
+        for (id, agg) in aggregates {
+            let (active, total) = (agg.active_children_count, agg.total_children_count);
+            self.send_children_count_event(id, active, total, Some(agg));
+        }
+        Ok(moved)
+    }
+
     /// Recompute every parent's `active_children_count`,
     /// `awaited_children_count` and `total_children_count` from ground truth,
     /// and every `awaited_by_parent`.
@@ -1218,5 +1311,65 @@ mod tests {
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod archive_input_sample_tests {
+    use super::ArchiveInputSample;
+    use uuid::Uuid;
+
+    fn sample(parent: Option<Uuid>, status: &str) -> ArchiveInputSample {
+        ArchiveInputSample {
+            parent_thread_id: parent,
+            status: status.into(),
+            archive_state: "inbox".into(),
+            state: "active".into(),
+            is_saved: false,
+            change_state: "none".into(),
+            has_output: true,
+            waits_on_event: false,
+            has_draft: false,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_sample_names_no_anchor() {
+        let parent = Some(Uuid::new_v4());
+        let s = sample(parent, "idle");
+        assert!(ArchiveInputSample::recount_anchors(Some(&s), Some(&s), false).is_empty());
+    }
+
+    #[test]
+    fn a_flip_or_an_off_row_input_names_the_parent() {
+        let parent = Uuid::new_v4();
+        let (idle, running) = (
+            sample(Some(parent), "idle"),
+            sample(Some(parent), "running"),
+        );
+        assert_eq!(
+            ArchiveInputSample::recount_anchors(Some(&idle), Some(&running), false),
+            vec![parent]
+        );
+        assert_eq!(
+            ArchiveInputSample::recount_anchors(Some(&idle), Some(&idle), true),
+            vec![parent]
+        );
+    }
+
+    #[test]
+    fn a_detach_names_the_former_parent() {
+        let former = Uuid::new_v4();
+        let (before, after) = (sample(Some(former), "idle"), sample(None, "idle"));
+        assert_eq!(
+            ArchiveInputSample::recount_anchors(Some(&before), Some(&after), false),
+            vec![former]
+        );
+    }
+
+    #[test]
+    fn a_top_thread_names_no_anchor() {
+        let (idle, running) = (sample(None, "idle"), sample(None, "running"));
+        assert!(ArchiveInputSample::recount_anchors(Some(&idle), Some(&running), false).is_empty());
     }
 }

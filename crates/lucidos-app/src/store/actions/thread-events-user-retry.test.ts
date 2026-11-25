@@ -25,7 +25,7 @@ vi.hoisted(() => {
 });
 
 import { makeThreadState } from './threads-test-helpers';
-import { connectionStatus, threadMap, toasts } from '../store';
+import { connectionStatus, engineRestarting, threadMap, toasts } from '../store';
 import {
   _resetThreadEventsFailuresForTesting,
   clearThreadFetchGuards,
@@ -84,5 +84,19 @@ describe('the Retry button on a thread that failed to load', () => {
     retryThreadEvents('t1');
     await settle();
     expect(fetchEvents).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('a watchdog retry that lands during an engine restart', () => {
+  it('does not spend the one forced retry, so the first retry after the restart still runs', async () => {
+    engineRestarting.value = true;
+    forceRetryThreadEvents('t1');
+    await settle();
+    expect(fetchEvents).toHaveBeenCalledTimes(0);
+
+    engineRestarting.value = false;
+    forceRetryThreadEvents('t1');
+    await settle();
+    expect(fetchEvents).toHaveBeenCalledTimes(1);
   });
 });

@@ -540,8 +540,7 @@ mod tests {
         struct PinnedJudge {
             model: String,
         }
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../eval/context-mode/probes.toml");
+        let path = crate::eval_fixture_root().join("context-mode/probes.toml");
         let text = std::fs::read_to_string(&path).expect("the checked-in probes.toml");
         toml::from_str::<ProbesJudge>(&text)
             .expect("probes.toml has a [judge] model")

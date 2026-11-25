@@ -73,7 +73,7 @@ VALUES (:'model', :'model_label',
 DELETE FROM memory_entries;
 
 -- BEGIN GENERATED memory_entries
--- Written by `cargo run -p lucidos-eval --features fixture-gen -- generate-memory-fixture`
+-- Written by `cargo run -p lucidos-engine-bin --features fixture-gen --bin lucidos-eval -- generate-memory-fixture`
 -- from fixtures/memory-seed.toml. Never edit by hand: the vectors are model
 -- output and the digest depends on them byte for byte.
 INSERT INTO memory_entries (id, source, topic, summary, importance, entities, embedding, embedding_model, src_created_at, created_at, extractor_version) VALUES

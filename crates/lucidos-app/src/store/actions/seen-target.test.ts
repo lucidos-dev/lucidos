@@ -199,6 +199,12 @@ describe('the dwell', () => {
     expect(nextDwellDueIn(waits, 1400)).toBe(SEEN_DWELL_MS - 400);
     expect(nextDwellDueIn(waits, 9999)).toBe(0);
   });
+
+  it('reports nothing for a glimpse of half a second', () => {
+    const waits = emptySeenWaits();
+    sampleSeen(waits, 0, ['a']);
+    expect(sampleSeen(waits, 500, ['a'])).toEqual([]);
+  });
 });
 
 
@@ -590,6 +596,34 @@ describe('the watch', () => {
       resampleSeenTargets();
     }
     expect(markReadOptimistic).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a dwell in flight while the unread set is not yet known', () => {
+    focusedThreadId.value = 't-1';
+    isInViewport.mockReturnValue(true);
+    const data = [unread('n-1', threadTap('t-1', 'e-1'))];
+    servedUnreadNotifications.value = { status: 'loaded', data };
+    resampleSeenTargets();
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+    vi.setSystemTime(500);
+    servedUnreadNotifications.value = { status: 'loaded', data };
+    vi.setSystemTime(SEEN_DWELL_MS);
+    resampleSeenTargets();
+    expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+  });
+
+  it('keeps one card observer while the watched card holds still', () => {
+    const observers = installObserverFakes();
+    const card = {};
+    stubQuerySelectorAll(() => [card]);
+
+    focusedThreadId.value = 't-1';
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    resampleSeenTargets();
+    resampleSeenTargets();
+    resampleSeenTargets();
+
+    expect(observers.intersection).toHaveLength(1);
   });
 
   const A_FRAME = 50;

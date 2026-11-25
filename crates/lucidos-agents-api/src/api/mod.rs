@@ -191,11 +191,6 @@ pub(super) fn sanitize_leaf_filename(name: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Parse an optional UUID query/body string, mapping malformed input to `BAD_REQUEST`.
-///
-/// Without this, handlers fall back to silently treating malformed ids as `None`
-/// (e.g. "cancel one" becomes "cancel all"). See `.claude/rules/frontend.md`
-/// § No Silent Defaults.
 pub(super) fn parse_optional_uuid(opt: Option<&str>) -> Result<Option<Uuid>, StatusCode> {
     opt.map(Uuid::parse_str)
         .transpose()
@@ -341,10 +336,6 @@ fn split_repo_locator(file_path: &str) -> Option<(&str, &str, &str)> {
     well_formed.then_some((repo, mode, path))
 }
 
-/// Reject refs/commits that git would parse as a flag, traverse with `..`, or contain
-/// shell metacharacters. The git invocations themselves use argv (no shell), so these
-/// checks defend against ref-as-flag injection and against passing the value through
-/// any future shell-quoting layer.
 pub(super) fn is_dangerous_git_ref(s: &str) -> bool {
     s.is_empty() || s.starts_with('-') || s.contains("..") || s.contains(';') || s.contains('|')
 }
@@ -2359,5 +2350,36 @@ mod tests {
         let mut settings = serde_json::json!({ "target": "settings", "settings_view": "models" });
         super::resolve_thread_id_in_nav_payload(&mut settings, None).unwrap();
         assert_eq!(settings["settings_view"], serde_json::json!("models"));
+    }
+
+    #[test]
+    fn a_malformed_optional_uuid_is_refused_not_read_as_absent() {
+        assert_eq!(parse_optional_uuid(None), Ok(None));
+        let id = Uuid::new_v4();
+        assert_eq!(parse_optional_uuid(Some(&id.to_string())), Ok(Some(id)));
+        assert_eq!(
+            parse_optional_uuid(Some("cancel-one")),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn a_git_ref_git_reads_as_a_flag_or_a_shell_token_is_refused() {
+        for dangerous in [
+            "",
+            "--upload-pack=evil",
+            "-f",
+            "main..feature",
+            "a;rm",
+            "a|b",
+        ] {
+            assert!(
+                is_dangerous_git_ref(dangerous),
+                "{dangerous:?} must be refused"
+            );
+        }
+        for safe in ["main", "feature/x", "v1.2.3"] {
+            assert!(!is_dangerous_git_ref(safe), "{safe} must pass");
+        }
     }
 }

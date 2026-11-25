@@ -5,6 +5,7 @@
 #
 #   ./scripts/check-knowhow-refs.sh
 # Checks references and reverse event, CLI and SDK documentation coverage.
+# Checks local MkDocs include sources and delimiters.
 # Reads docs/generated/agent-surface.json without Cargo. Missing inputs fail.
 # Domain examples declare `<!-- domain-event: Name: reason -->` in their file.
 # A `system-knowhow/<file>.md` followed by `§ <section>` must name a file that
@@ -593,16 +594,79 @@ for path in tracked:
                 if not section_resolves(file, citation):
                     problems.append("%s:%d: %s has no section `%s`" % (path, number, file, anchor_text(citation)[:50]))
 
+# --- public docs transclusions ---------------------------------------------
+
+include_directive = re.compile(r"\{%\s*(include(?:-markdown)?)\s+(.*?)%\}", re.DOTALL)
+markdown_extensions = {".markdown", ".mdown", ".mkdn", ".mkd", ".md"}
+repo_root = pathlib.Path.cwd()
+
+def site_pages():
+    # This config declares docs_dir as a top-level, single-line path.
+    setting = re.search(r"^docs_dir:[ \t]*(.*)", read("mkdocs.yml"), re.MULTILINE)
+    try:
+        directory, = shlex.split(setting[1], comments=True) if setting else ["docs"]
+    except ValueError:
+        fatal("mkdocs.yml docs_dir is not a single path")
+    root = pathlib.Path(directory).resolve()
+    if not directory or not root.is_relative_to(repo_root):
+        fatal(f"mkdocs.yml docs_dir {directory!r} is not a local directory")
+    pages = sorted(
+        page for page in root.relative_to(repo_root).rglob("*")
+        if page.suffix in markdown_extensions and page.is_file()
+    )
+    if not pages:
+        fatal(f"mkdocs.yml docs_dir {directory!r} has no Markdown pages")
+    return pages
+
+
+for page in site_pages():
+    markdown = read(page)
+    for directive in include_directive.finditer(markdown):
+        line = markdown.count("\n", 0, directive.start()) + 1
+        location = f"{page}:{line}: {directive[1]}"
+        body = directive[2].strip()
+        try:
+            source, *arguments = shlex.split(body)
+        except ValueError:
+            problems.append(f"{location}: expected a local source and valid arguments")
+            continue
+        if body[0] not in "\"'" or not source:
+            problems.append(f"{location}: expected a nonempty quoted source")
+            continue
+        target = (page.parent / source).resolve()
+        if (pathlib.Path(source).is_absolute() or not target.is_relative_to(repo_root)
+                or "://" in source or glob.has_magic(source)):
+            problems.append(f"{location}: expected one repository-local source, got {source!r}")
+            continue
+        if not target.is_file():
+            problems.append(f"{location}: source {source!r} does not exist")
+            continue
+        options = dict(argument.split("=", 1) for argument in arguments if "=" in argument)
+        content = target.read_text(encoding=options.get("encoding", "utf-8"))
+        offset = 0
+        for delimiter in ("start", "end"):
+            if delimiter not in options:
+                continue
+            marker = options[delimiter]
+            index = content.find(marker, offset)
+            if not marker or index < 0:
+                position = " after the start marker" if offset else ""
+                problems.append(f"{location}: {delimiter} marker {marker!r} missing{position} in {source!r}")
+                break
+            if delimiter == "end" and offset and not content[offset:index].strip():
+                problems.append(f"{location}: empty range between markers in {source!r}")
+            offset = index + len(marker)
+
 # --- report ----------------------------------------------------------------
 
 if not problems:
     print(
-        "✓ %d system-knowhow files: references resolve and public surfaces have documentation"
+        "✓ %d system-knowhow files: references and site includes resolve, and public surfaces have documentation"
         % len(knowhow_files)
     )
     sys.exit(0)
 
-sys.stderr.write("\n✗ BLOCKED: %d problem(s) in system-knowhow/.\n\n" % len(problems))
+sys.stderr.write("\n✗ BLOCKED: %d knowhow and docs reference problem(s).\n\n" % len(problems))
 for problem in problems:
     sys.stderr.write("  %s\n" % problem)
 sys.stderr.write(

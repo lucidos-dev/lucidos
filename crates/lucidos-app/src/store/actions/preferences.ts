@@ -211,9 +211,9 @@ function writeValues(writes: Iterable<[string, PendingPreferenceWrite]>): Record
   return Object.fromEntries([...writes].map(([key, write]) => [key, write.value]));
 }
 
-const deliveryChains = new Map<string, Promise<void>>();
+const deliveryChains = new Map<string, Promise<unknown>>();
 
-function enqueueDelivery(key: string, run: () => Promise<void>): Promise<void> {
+function enqueueDelivery<T>(key: string, run: () => Promise<T>): Promise<T> {
   const prior = deliveryChains.get(key) ?? Promise.resolve();
   const next = prior.then(run, run);
   deliveryChains.set(key, next);
@@ -242,13 +242,13 @@ function settleDelivered(key: string, write: PendingPreferenceWrite): void {
   if (pendingPreferenceWrites.size === 0) removeToast(PREFERENCE_UNREACHABLE_TOAST);
 }
 
-function deliverOrPark(key: string, write: PendingPreferenceWrite): Promise<void> {
+function deliverOrPark(key: string, write: PendingPreferenceWrite): Promise<boolean> {
   return enqueueDelivery(key, () => deliverNow(key, write));
 }
 
-async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<void> {
+async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<boolean> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    if ((latestWriteSeq.get(key) ?? write.seq) > write.seq) return;
+    if ((latestWriteSeq.get(key) ?? write.seq) > write.seq) return false;
     try {
       await setPreference(key, write.value, write.deviceScoped ? getDeviceId() : undefined);
     } catch (e) {
@@ -258,13 +258,14 @@ async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<v
       showToast(`Failed to save ${key} preference: ${errorDetail(e)}`, 'error', {
         key: PREFERENCE_REJECTED_TOAST,
       });
-      return;
+      return false;
     }
     settleDelivered(key, write);
-    return;
+    return true;
   }
   pendingPreferenceWrites.set(key, write);
   writeFailures.recordFailure();
+  return false;
 }
 
 export async function flushPendingPreferenceWrites(): Promise<void> {
@@ -292,6 +293,15 @@ export async function savePreference(
   applySideEffect?: () => void,
   deviceScoped = false,
 ): Promise<void> {
+  await savePreferenceAccepted(key, value, applySideEffect, deviceScoped);
+}
+
+export async function savePreferenceAccepted(
+  key: string,
+  value: string,
+  applySideEffect?: () => void,
+  deviceScoped = false,
+): Promise<boolean> {
   applySideEffect?.();
   if (preferences.value.status === 'loaded') {
     preferences.value = {
@@ -302,7 +312,7 @@ export async function savePreference(
   const write = { value, deviceScoped, seq: ++writeSeq };
   latestWriteSeq.set(key, write.seq);
   unansweredWrites.set(key, write);
-  await deliverOrPark(key, write);
+  return deliverOrPark(key, write);
 }
 
 

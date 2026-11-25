@@ -12,6 +12,7 @@
 //! release updater, `updater.rs`.
 
 use super::background_build::{BackgroundBuild, BuildHost, FinishedBuild};
+use super::event_bus::{BusEvent, EventBus, SystemEvent};
 use super::LucidosEngine;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -672,6 +673,12 @@ impl SelfHealState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FrontendBuildWatchStopped {
+    pub since_ms: i64,
+    pub cause: Option<String>,
+}
+
 /// Wire shape of `GET /api/v1/engine/version-status`.
 #[derive(Serialize)]
 pub struct VersionStatus {
@@ -757,6 +764,9 @@ pub struct VersionStatus {
     /// Always absent packaged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontend_refresh_elapsed_ms: Option<u64>,
+    /// Sustained build-watch downtime in the checkout this engine serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_build_watch_stopped: Option<FrontendBuildWatchStopped>,
 }
 
 /// One observation per engine, independent of the number of connected clients.
@@ -770,6 +780,7 @@ impl VersionStatus {
     fn fingerprint(mut self) -> serde_json::Value {
         self.build_elapsed_ms = None;
         self.frontend_refresh_elapsed_ms = None;
+        self.frontend_build_watch_stopped = None;
         if let Some(deferred) = &mut self.build_deferred {
             deferred.deferred_ms = 0;
         }
@@ -1391,6 +1402,7 @@ impl LucidosEngine {
             build_queued: self.build_queued(),
             build_deferred,
             pending_commits,
+            frontend_build_watch_stopped: self.frontend_build_watch_stopped.lock().unwrap().clone(),
             frontend_refresh_elapsed_ms: self
                 .frontend_refresh_elapsed()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
@@ -1573,6 +1585,25 @@ impl LucidosEngine {
         crate::engine::background_build::restart(self);
     }
 
+    /// Record the running executable and the router's initial frontend once
+    /// per process boot, before any peer refresh can replace that snapshot.
+    pub async fn record_engine_version_activated(&self) {
+        let identity = crate::build_identity();
+        let frontend_source_commit = self.activated_frontend_commit.lock().unwrap().clone();
+        self.event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::EngineVersionActivated {
+                    build_id: identity.id.into(),
+                    engine_version: identity.engine_version.into(),
+                    release: identity.release.into(),
+                    release_dirty: identity.release_dirty,
+                    frontend_source_commit,
+                }),
+                "[Engine] EngineVersionActivated",
+            )
+            .await;
+    }
+
     /// Emit the transient `EngineBuildStateChanged` UI poke. A connected client
     /// then learns of a background-rebuild transition over the live SSE stream.
     /// The frontend handler re-runs the
@@ -1710,6 +1741,39 @@ async fn build_and_verify(
     }
 }
 
+async fn run_recorded_build(
+    host: &impl DeliveryHost,
+    bus: &EventBus,
+    previous_failure: Option<&str>,
+    generation: u64,
+) -> FinishedBuild {
+    let started = Instant::now();
+    let finished = build_and_verify(host, previous_failure, generation).await;
+    let outcome = match &finished.state {
+        BuildState::Ready { .. } => "succeeded",
+        BuildState::Failed { .. } => "failed",
+        BuildState::Idle => "skipped-locked",
+        _ => unreachable!("build_and_verify returns a terminal state"),
+    };
+    let event = SystemEvent::EngineBuildCompleted {
+        outcome: outcome.into(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        built_head: match finished.state {
+            BuildState::Idle => None,
+            _ => finished.built_head.clone(),
+        },
+    };
+    // A manual restart can abort the build task at an await. Once verification
+    // finishes, the event write must survive cancellation of that task.
+    let bus = bus.clone();
+    let _ = tokio::spawn(async move {
+        bus.emit_or_log(BusEvent::System(event), "[Rebuild] EngineBuildCompleted")
+            .await;
+    })
+    .await;
+    finished
+}
+
 #[async_trait::async_trait]
 impl DeliveryHost for LucidosEngine {
     async fn head(&self) -> Option<String> {
@@ -1822,7 +1886,8 @@ impl BuildHost for LucidosEngine {
     }
 
     async fn run_build(&self, previous_failure: Option<&str>, generation: u64) -> FinishedBuild {
-        let finished = build_and_verify(self, previous_failure, generation).await;
+        let finished =
+            run_recorded_build(self, &self.event_bus, previous_failure, generation).await;
         if matches!(finished.state, BuildState::Failed { .. }) {
             let _ = super::background_build::with_current_build(self, generation, || {
                 let mut sh = self.self_heal_state.lock().unwrap();
@@ -2676,6 +2741,23 @@ mod tests {
         assert_eq!(cache.checked_at, Some(third));
     }
 
+    #[test]
+    fn stopped_build_watch_status_is_omitted_until_reported() {
+        let mut status = watched_status();
+        let wire = serde_json::to_value(&status).unwrap();
+        assert!(wire.get("frontend_build_watch_stopped").is_none());
+
+        status.frontend_build_watch_stopped = Some(super::FrontendBuildWatchStopped {
+            since_ms: 123_000,
+            cause: Some("SIGTERM".to_owned()),
+        });
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["frontend_build_watch_stopped"],
+            serde_json::json!({"since_ms": 123_000, "cause": "SIGTERM"})
+        );
+    }
+
     fn watched_status() -> super::VersionStatus {
         super::VersionStatus {
             build_id: "running".into(),
@@ -2696,6 +2778,7 @@ mod tests {
             }),
             pending_commits: None,
             frontend_refresh_elapsed_ms: None,
+            frontend_build_watch_stopped: None,
         }
     }
 
@@ -2884,6 +2967,7 @@ mod tests {
                 build_deferred: Some(deferred.clone()),
                 pending_commits: None,
                 frontend_refresh_elapsed_ms: None,
+                frontend_build_watch_stopped: None,
             };
             let wire = serde_json::to_value(&status).unwrap();
             assert_eq!(wire["build_state"], state);
@@ -3563,6 +3647,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         fresh: std::sync::Mutex<Vec<bool>>,
         delivered: bool,
         probe_failure: bool,
+        skip_locked: bool,
         delivered_head: Option<String>,
         published_since: Option<String>,
         heads: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
@@ -3610,6 +3695,9 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         }
         async fn build(&self, _: Option<&str>, fresh: bool) -> super::EngineBuildOutcome {
             self.fresh.lock().unwrap().push(fresh);
+            if self.skip_locked {
+                return super::EngineBuildOutcome::SkippedLocked;
+            }
             // A real successful process that publishes nothing, the original
             // false-success contract. It must never be enough to report Ready.
             let mut cmd = tokio::process::Command::new("sh");
@@ -3645,12 +3733,50 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     }
 
     #[tokio::test]
+    async fn engine_build_fact_records_lock_skip_without_a_head() {
+        assert_engine_build_fact(
+            &DeliveryStub {
+                skip_locked: true,
+                ..Default::default()
+            },
+            "skipped-locked",
+            None,
+        )
+        .await;
+    }
+
+    async fn assert_engine_build_fact(
+        host: &DeliveryStub,
+        outcome: &str,
+        built_head: Option<&str>,
+    ) -> super::FinishedBuild {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db) = setup_test_db().await;
+        let (bus, _) = super::EventBus::new(pool.clone());
+        let finished = super::run_recorded_build(host, &bus, None, 0).await;
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload->'data' FROM events WHERE event_type = 'EngineBuildCompleted'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["outcome"], outcome);
+        assert_eq!(rows[0]["built_head"], serde_json::json!(built_head));
+        assert!(rows[0]["duration_ms"].is_u64());
+        drop(bus);
+        teardown_test_db(&db).await;
+        finished
+    }
+
+    #[tokio::test]
     async fn unavailable_delivery_probe_fails_without_cleaning_or_claiming_non_delivery() {
         let host = DeliveryStub {
             probe_failure: true,
             ..Default::default()
         };
-        let finished = super::build_and_verify(&host, None, 0).await;
+        let finished = assert_engine_build_fact(&host, "failed", Some("head1")).await;
         let failure = finished.state.failure().unwrap();
         assert_eq!(failure.kind, None);
         assert!(failure.summary.contains("probe unavailable"));
@@ -3766,7 +3892,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             delivered: true,
             ..Default::default()
         };
-        let finished = super::build_and_verify(&host, None, 0).await;
+        let finished = assert_engine_build_fact(&host, "succeeded", Some("head1")).await;
         assert!(matches!(finished.state, BuildState::Ready { .. }));
         assert_eq!(*host.fresh.lock().unwrap(), [false]);
     }

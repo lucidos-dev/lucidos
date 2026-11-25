@@ -31,6 +31,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       channel: info.channel as ThreadMeta['channel'],
       initiator: info.initiator,
       saved,
+      pinFolder: info.pin_folder ?? null,
       ...(info.home ? { home: true as const } : {}),
       createdAt: info.created_at || new Date().toISOString(),
       updatedAt: info.last_activity || info.created_at || new Date().toISOString(),
@@ -46,6 +47,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       totalChildrenCount: info.total_children_count || 0,
       blockingDescendantCount: info.blocking_descendant_count || 0,
       attentionDescendantCount: info.attention_descendant_count || 0,
+      archivableSubThreadCount: info.archivable_sub_thread_count || 0,
       isStoppedChild: info.is_stopped_child === true,
       hold: info.hold ?? null,
       readRequested: info.read_requested === true,
@@ -126,6 +128,7 @@ export function upsertThread(
       if (info.message_count) existing.meta.messageCount = info.message_count;
       if (info.saved !== undefined) existing.meta.saved = info.saved;
       else if (saved) existing.meta.saved = true;
+      existing.meta.pinFolder = info.pin_folder ?? null;
       if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
       existing.meta.codingAgentChangeState = info.coding_agent_change_state;
       existing.meta.activeChildrenCount = info.active_children_count || 0;
@@ -134,6 +137,7 @@ export function upsertThread(
       existing.meta.totalChildrenCount = info.total_children_count || 0;
       existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
       existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
+      existing.meta.archivableSubThreadCount = info.archivable_sub_thread_count || 0;
       existing.meta.isStoppedChild = info.is_stopped_child === true;
       existing.meta.hold = info.hold ?? null;
       existing.meta.readRequested = info.read_requested === true;

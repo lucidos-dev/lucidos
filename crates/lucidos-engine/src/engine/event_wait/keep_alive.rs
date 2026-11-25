@@ -1652,7 +1652,29 @@ async fn sync_status(
             }
         }
     }
+    if next.is_some() && candidate.awaiting_user {
+        match still_awaits_user(bus.pool(), thread_id).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                crate::log_legacy!("[KeepAlive] Could not re-read thread {thread_id}: {e}");
+                return;
+            }
+        }
+    }
     emit_status(bus, thread_id, next).await;
+}
+
+/// Whether the thread still waits on the user. The tick reads every candidate
+/// before it writes, so a slow tick can reach a card the user has already
+/// answered. A run it opened then would sit under the turn that resumed.
+async fn still_awaits_user(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT status = $2 FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .bind(ThreadStatus::WaitingForUserAnswer.as_str())
+        .fetch_optional(pool)
+        .await
+        .map(|awaits| awaits.unwrap_or(false))
 }
 
 /// Close the status of every thread that stopped being a candidate, so a

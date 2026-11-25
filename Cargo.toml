@@ -18,7 +18,6 @@ members = [
     "crates/lucidos-cli",
     "crates/lucidos-e2e",
     "crates/lucidos-engine-socket",
-    "crates/lucidos-eval",
     "crates/lucidos-file-backup-exclusion",
     "crates/lucidos-frame-capability",
     "crates/lucidos-gateway-constants",

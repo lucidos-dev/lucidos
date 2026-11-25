@@ -16,13 +16,13 @@ connects your accounts to the assistant, your apps and your scripts. A
 **Artifacts** are your durable, git-tracked files.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-3.md"
    start="<!--gloss-event-start-->"
    end="<!--gloss-event-end-->"
 %}
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms.md"
    start="<!--gloss-artifact-start-->"
    end="<!--gloss-artifact-end-->"
 %}
@@ -60,13 +60,13 @@ An **app** is a UI you open repeatedly. A **trigger** runs work on a schedule or
 in response to an event.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms.md"
    start="<!--gloss-app-start-->"
    end="<!--gloss-app-end-->"
 %}
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-12.md"
    start="<!--gloss-trigger-start-->"
    end="<!--gloss-trigger-end-->"
 %}
@@ -81,7 +81,7 @@ A **webhook** receives events from an outside service, and a trigger can react t
 them. It is the one surface a stranger can reach.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-13.md"
    start="<!--gloss-webhook-start-->"
    end="<!--gloss-webhook-end-->"
 %}
@@ -96,7 +96,7 @@ Codex). The coding agent works in its own git worktree and proposes a change for
 you to review and Apply.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-9.md"
    start="<!--gloss-sub-thread-start-->"
    end="<!--gloss-sub-thread-end-->"
 %}
@@ -108,7 +108,7 @@ and your triggers all call it through the **proxy**. The engine adds the key to
 each request, so an app never sees it.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-8.md"
    start="<!--gloss-proxy-start-->"
    end="<!--gloss-proxy-end-->"
 %}
@@ -120,7 +120,7 @@ You install one from any git repo: a public GitHub repo to share with everyone,
 or a company repo to share with your coworkers.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-7.md"
    start="<!--gloss-plugin-start-->"
    end="<!--gloss-plugin-end-->"
 %}
@@ -131,7 +131,7 @@ The prompt is the primary interface. You describe what you want, and Lucidos
 builds the data and the presentation together, live.
 
 {%
-   include-markdown "../../system-knowhow/glossary.md"
+   include-markdown "../../system-knowhow/glossary/core-terms-4.md"
    start="<!--gloss-live-cocreation-start-->"
    end="<!--gloss-live-cocreation-end-->"
 %}

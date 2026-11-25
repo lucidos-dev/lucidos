@@ -267,4 +267,19 @@ describe('Undo restore toast intent', () => {
     toast!.onClick!();
     expect(confirmSnapshotRestore).toHaveBeenCalledExactlyOnceWith(tap);
   });
+
+  it('dismisses the toast before the action runs, so the action never finds it still up', () => {
+    vi.mocked(confirmSnapshotRestore).mockClear();
+    let toastWhenActed: unknown = 'not-called';
+    vi.mocked(confirmSnapshotRestore).mockImplementationOnce(async () => {
+      toastWhenActed = toastFor('undo');
+    });
+    const tap = { kind: 'restore-snapshot' as const, workspace_id: 'demo', handle: 'snap_00000000000000000000000000' };
+    presentInAppNotification({
+      title: 'Workspace restored', body: 'Recovery snapshot retained',
+      target: { notification: 'undo', tap },
+    });
+    toastFor('undo')!.onClick!();
+    expect(toastWhenActed).toBeUndefined();
+  });
 });

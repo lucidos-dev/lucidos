@@ -467,6 +467,17 @@ pub const RESPONSE_STYLES: Pref<Optional> = Pref::optional(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const THREAD_FOLDERS: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "thread_folders",
+    label: "Custom folders",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("no custom folders"),
+    description: "The user's custom folders, the named sections that split Pinned in the thread drawer, as a JSON array of {id, name} objects in display order. A new folder needs a fresh id of lowercase letters, digits and hyphens. THIS KEY REPLACES THE WHOLE ARRAY, so read the current value first and send it back with your edit applied. Removing a folder never unpins its threads: they list in Pinned again. Bounds, all refused rather than trimmed: 40 chars of id, 40 of name, 20 folders.",
+    side_effect: PrefSideEffect::None,
+});
+
 /// The longest title style, in chars.
 pub const TITLE_STYLE_MAX_CHARS: usize = 500;
 
@@ -2223,6 +2234,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CHAT_REASONING_EFFORTS.spec,
     &RESPONSE_STYLE.spec,
     &RESPONSE_STYLES.spec,
+    &THREAD_FOLDERS.spec,
     &TITLE_STYLE.spec,
     &TECHNICAL_LITERACY.spec,
     &IMAGE_MODEL.spec,

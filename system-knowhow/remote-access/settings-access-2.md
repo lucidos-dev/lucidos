@@ -16,7 +16,7 @@ carry it, right under **Pair a device**:
 | Section | On which gateway | What it does |
 |---|---|---|
 | **Pair a gateway** | B, the one being opened | Mints a *gateway pairing secret* and shows the `https` address to use with it. Lists the gateways that may open this one, each with its *remote start setting* and **Unpair**. |
-| **Remote gateways** | A, the one opening | Takes a short name, the pasted secret, optional extra request headers, then B's address, with **Pair** last. Lists the remote gateways, with **Remove**. A row says **Access revoked** or **Not reachable** when B's own check says so. |
+| **Remote gateways** | A, the one opening | Lists the remote gateways, each folded under its name. Open a gateway's fold for its settings and **Remove**. **Add a remote gateway** opens the form: a short name, the pasted secret, optional extra request headers, then B's address, with **Pair** last. A row says **Access revoked** or **Not reachable** when B's own check says so. |
 
 `lucidos pair --gateway` on B mints the same secret from a terminal. The
 Workspaces picker also has **Add a remote gateway**, with the same form.
@@ -109,7 +109,8 @@ workspace and retry. Reads to that engine still work.
 
 If A pairs to B, A's own agents may use A's outgoing pairings.
 For B's agents, A's owner opens **Settings → Access → Remote gateways**.
-Enable **Allow agents on B to read and start threads through this gateway** there. The label uses B's registered name.
+There they open B's fold and enable **Agent return access**.
+Its tooltip names B by its registered name.
 The switch is off for every new and existing pairing. An agent, local token,
 or device paired only with B cannot enable it.
 
@@ -164,15 +165,16 @@ and `CF-Access-Client-Secret`; obtain both from the proxy administrator.
 Lucidos's transport is provider-independent. A sign-in page means the proxy
 has not admitted the request: supply its headers or use the tailnet address.
 
-In **Settings → Access → Remote gateways**, **Edit headers** replaces the
+In **Settings → Access → Remote gateways**, open the gateway's fold. There
+**Edit** on the **Headers** row replaces the
 whole header set without pairing again. Re-enter every value you want to keep;
 emptying the set clears it. Values are write-only: the list shows names and
 “set”. The packaged macOS app seals values with Keychain; other installs use
 an owner-only key file. Keep the original sealing key with a backup. Anyone
 who can read both key and ciphertext can decrypt file-backed values.
 
-Gateway credentials rotate automatically every 30 days. **Rotate credential**
-starts one immediately or retries a pending attempt. Errors and unsupported
+Gateway credentials rotate automatically every 30 days. **Rotate** on the
+fold's **Credential** row starts one immediately or retries a pending attempt. Errors and unsupported
 peers appear on the remote row; update an older remote to enable rotation.
 The pairing stays usable while retries run hourly. A durable sealed candidate
 allows recovery after restarts and lost responses.

@@ -570,6 +570,16 @@ pub(super) async fn put_compose(
     crate::core::preferences::lock_compose_agent_seed(&mut tx, false)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    // A draft is an archive input, so a sub-thread's draft appearing or
+    // clearing moves its ancestors' archivable sub-thread counts.
+    let before: Option<(Option<Uuid>, bool)> = sqlx::query_as(&format!(
+        "SELECT t.parent_thread_id, {} FROM thread_summaries t WHERE t.thread_id = $1",
+        crate::core::store::HAS_DRAFT_SQL,
+    ))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
     let row: Option<ComposeReportRow> = sqlx::query_as(&compose_update_sql())
         .bind(id)
         .bind(&body.text)
@@ -589,6 +599,12 @@ pub(super) async fn put_compose(
         return refuse_unapplied_compose(&state, id, body.compose_epoch, mode).await;
     };
     let report = ComposeReport::from(row);
+    if let Some((Some(parent), had_draft)) = before {
+        let images = serde_json::json!(report.image_hashes);
+        if had_draft != crate::core::store::has_draft(&report.text, &images) {
+            state.engine.event_bus.request_archive_recount(parent);
+        }
+    }
 
     let device_id = headers
         .get(crate::core::subprocess_origin::HEADER_DEVICE_ID)

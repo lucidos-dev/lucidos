@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { enginePackaged } from '../store/enginePackaging';
-import { perfRecordingOn, trimToCap, recordPerfSample, flushPerfQueue, _resetPerfQueueForTesting, _setPerfEnabledForTesting, isPerfEnabled, setPerfEnabled, PERF_FLAG_KEY } from './perfQueue';
+import { perfRecordingOn, trimToCap, recordPerfSample, flushPerfQueue, _resetPerfQueueForTesting, _setPerfEnabledForTesting, isPerfEnabled, setPerfEnabled, clearPerfOptIn, onPerfOptInChange, PERF_FLAG_KEY } from './perfQueue';
 
 describe('perf flag accessors', () => {
   beforeEach(() => { enginePackaged.value = true; });
@@ -50,6 +50,30 @@ describe('perf flag accessors', () => {
     expect(perfRecordingOn()).toBe(true);
   });
 
+  it('clears a stored opt-in from source while recording stays on, and tells opt-in listeners', () => {
+    const store: Record<string, string> = { [PERF_FLAG_KEY]: '1' };
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => (k in store ? store[k] : null),
+      setItem: (k: string, v: string) => { store[k] = v; },
+      removeItem: (k: string) => { delete store[k]; },
+    });
+    const seen: boolean[] = [];
+    const unsubscribe = onPerfOptInChange((on) => seen.push(on));
+    enginePackaged.value = false;
+    expect(isPerfEnabled()).toBe(true);
+    expect(perfRecordingOn()).toBe(true);
+
+    clearPerfOptIn();
+
+    expect(PERF_FLAG_KEY in store).toBe(false);
+    expect(isPerfEnabled()).toBe(false);
+    expect(perfRecordingOn()).toBe(true);
+    expect(seen).toEqual([false]);
+    clearPerfOptIn();
+    expect(seen).toEqual([false]);
+    unsubscribe();
+  });
+
   it('never throws and reads false where storage throws', () => {
     vi.stubGlobal('localStorage', {
       getItem: () => { throw new Error('storage blocked'); },
@@ -57,6 +81,7 @@ describe('perf flag accessors', () => {
       removeItem: () => { throw new Error('storage blocked'); },
     });
     expect(() => setPerfEnabled(true)).not.toThrow();
+    expect(() => clearPerfOptIn()).not.toThrow();
     expect(isPerfEnabled()).toBe(false);
   });
 });

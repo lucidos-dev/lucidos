@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
-import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest, focusedThreadId, settingsLinkedFragment } from '../store';
+import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest, focusedThreadId, settingsLinkedFragment, triggers, appsList } from '../store';
 
 const { showToast, setPluginsInstalledOnly } = vi.hoisted(() => ({
   showToast: vi.fn(),
@@ -188,6 +188,33 @@ describe('handleNavigationRequest — new-chat destination prefill', () => {
     expect(updateCompose).toHaveBeenCalledWith('new-thread-id', { text: 'Work on PR #123' });
     expect(applyDestination).not.toHaveBeenCalled();
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('requested by an app'), 'error');
+  });
+});
+
+describe('handleNavigationRequest: live lists are delegated, never pre-checked', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('hands a trigger to navigateToTrigger even when the cached list does not hold it', () => {
+    triggers.value = { status: 'loaded', data: [] };
+    handleNavigationRequest({ target: 'trigger', id: 'tr-new' }, { source: 'a thread' });
+    expect(navigateToTrigger).toHaveBeenCalledWith('tr-new', 'a thread');
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('hands an app to openAppById even when the cached list does not hold it', () => {
+    appsList.value = { status: 'loaded', data: [] };
+    handleNavigationRequest({ target: 'app', app_id: 'habit-tracker' }, { source: 'a thread' });
+    expect(openAppById).toHaveBeenCalledWith('habit-tracker', 'a thread', undefined);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('lands an old app-store deep link on Plugins with the whole catalog showing', () => {
+    handleNavigationRequest({ target: 'app-store' });
+    expect(setPluginsInstalledOnly).toHaveBeenCalledWith(false);
+    expect(switchMenuItem).toHaveBeenCalledWith('plugins');
+    expect(showToast).not.toHaveBeenCalled();
   });
 });
 
@@ -399,6 +426,17 @@ describe('handleNavigationRequest: file target at a line', () => {
     handleNavigationRequest({ target: 'file', file_path: 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:src/main.rs', line: 5 });
 
     expect(selectedLines.value).toEqual({ start: 5, end: 5 });
+  });
+
+  it('keeps the cited line when the opener clears the selection it was given', () => {
+    openFilePreview.mockImplementationOnce(() => {
+      selectedLines.value = null;
+      filePreviewSource.value = false;
+    });
+    handleNavigationRequest({ target: 'file', file_path: 'artifacts/notes.md', line: 10, line_end: 20 });
+
+    expect(selectedLines.value).toEqual({ start: 10, end: 20 });
+    expect(filePreviewSource.value).toBe(true);
   });
 
   it('selects in an extensionless file, which is textual by default', () => {

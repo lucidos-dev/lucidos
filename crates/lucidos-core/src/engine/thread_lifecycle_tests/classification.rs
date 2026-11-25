@@ -44,6 +44,7 @@ fn metadata_events_are_correct() {
         "ThreadTitleRenamed",
         "ThreadSaved",
         "ThreadUnsaved",
+        "ThreadMovedToFolder",
     ];
     for event_type in &metadata_events {
         assert_eq!(

@@ -2,7 +2,7 @@
 //!
 //! What these tests reach is what the turn builds: the mode read, the sweep,
 //! and the guidance the prompt carries. The end-to-end half belongs to
-//! `crates/lucidos-eval`'s manipulation check, which reads the panel's section
+//! the `lucidos-eval` binary's manipulation check, which reads the panel's section
 //! name off real `ContextCaptured` rows.
 
 use super::*;

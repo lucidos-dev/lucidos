@@ -101,7 +101,10 @@ lint-fmt:
 # compiles alongside the e2e push-log stub, so --all-features lints both.
 # lint-shell and lint-fmt stay outside the slot so they never queue for Clippy.
 lint-rust: lint-fmt
-	@$(BUILD_SLOT) --label "make lint" -- $(MAKE) --no-print-directory lint-rust-clippy
+	@if [ -z "$$LUCIDOS_HARDEN_BUILD_CHECKED" ]; then \
+		./scripts/build-prerequisites.sh -- $(CLIPPY_SCOPE) --all-features; \
+	fi
+	@LUCIDOS_SLOT_RECHECK_MEMORY=1 $(BUILD_SLOT) --label "make lint" -- $(MAKE) --no-print-directory lint-rust-clippy
 
 # Reached through lint-rust, which holds the build slot.
 lint-rust-clippy:
@@ -150,17 +153,17 @@ test-full: test-eval test-gateway test-crates
 test-scripts:
 	./scripts/test-scripts.sh
 
-# The context-mode eval crate's own unit tests. Needs no Postgres and runs in
+# The context-mode eval binary's own unit tests. Needs no Postgres and runs in
 # well under a second, so it goes first: a broken invariant should surface
 # before the engine suite's two minutes, not after.
 #
-# Running the eval crate under `cargo test` is safe BY CONSTRUCTION, and this
+# Running the eval binary's unit tests under `cargo test` is safe BY CONSTRUCTION, and this
 # is not in tension with I4. `lint-eval` proves nothing a test can reach boots
 # a workspace, drives a thread, drops a database or calls a provider. Without
-# this line the crate's invariant tests would never run in the gate, which is
+# this line the eval's invariant tests would never run in the gate, which is
 # the same as not having written them.
 test-eval:
-	cargo test --locked -p lucidos-eval
+	cargo test --locked -p lucidos-engine-bin --features eval --bin lucidos-eval
 
 # The gateway crate's own unit tests. No Postgres, no Docker, half a second.
 #
@@ -178,7 +181,7 @@ test-gateway:
 # second; `lucidos-diagnostic-log`'s trybuild cases compile crates and take
 # longer on a cold cache. `make lint` compiles them under `--all-targets` and runs none, so
 # without this target a broken token check or capability check still passes.
-TEST_CRATES = $(shell awk '/^lucidos-/ && $$1 != "lucidos-app" && $$1 != "lucidos-cli" && $$1 != "lucidos-e2e" && $$1 != "lucidos-eval" && $$1 != "lucidos-gateway" && (NF == 2 || $$1 == "lucidos-engine-bin") {print $$1}' crates/crate-tiers.tsv)
+TEST_CRATES = $(shell awk '/^lucidos-/ && $$1 != "lucidos-app" && $$1 != "lucidos-cli" && $$1 != "lucidos-e2e" && $$1 != "lucidos-gateway" && (NF == 2 || $$1 == "lucidos-engine-bin") {print $$1}' crates/crate-tiers.tsv)
 test-crates:
 	cargo test --locked $(addprefix -p ,$(TEST_CRATES))
 

@@ -1152,7 +1152,7 @@ impl EventBus {
                      skipping wake-up kick — see notify_parent_if_child error path.",
                     parent_id
                 );
-                Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+                self.roll_back_parent_wake(parent_id, wake.as_ref()).await;
                 return;
             }
             Err(e) => {
@@ -1165,7 +1165,7 @@ impl EventBus {
                     parent_id,
                     e
                 );
-                Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+                self.roll_back_parent_wake(parent_id, wake.as_ref()).await;
                 return;
             }
         };
@@ -1205,7 +1205,7 @@ impl EventBus {
                     e
                 );
             }
-            Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+            self.roll_back_parent_wake(parent_id, wake.as_ref()).await;
             return;
         };
         // The wake promised a turn. If the channel is gone (its receiver dies
@@ -1220,7 +1220,7 @@ impl EventBus {
             terminal_event_id,
             parent_is_cc,
         ) {
-            Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+            self.roll_back_parent_wake(parent_id, wake.as_ref()).await;
         }
     }
 
@@ -1468,6 +1468,7 @@ impl EventBus {
         // `None` here is the missing-parent-row case: nothing was written, so
         // there is no wake to report and nothing for a caller to undo.
         let (active, total, prev_status, prev_revived_at, revived_at) = row?;
+        self.request_archive_recount(parent_id);
         let aggregate =
             match crate::core::store::fetch_thread_aggregate(&self.pool, parent_id).await {
                 Ok(agg) => agg,
@@ -1533,6 +1534,17 @@ impl EventBus {
                 e
             );
         }
+    }
+
+    /// [`undo_parent_wake`](Self::undo_parent_wake), then recount the archive
+    /// counts the restored status feeds. The undo writes no event, so the
+    /// projection never samples it.
+    async fn roll_back_parent_wake(&self, parent_id: Uuid, wake: Option<&ParentWake>) {
+        if wake.is_none() {
+            return;
+        }
+        Self::undo_parent_wake(&self.pool, parent_id, wake).await;
+        self.request_archive_recount(parent_id);
     }
 
     /// Settle the child's `parent_callback_pending` marker on a coding-agent
@@ -1695,7 +1707,7 @@ impl EventBus {
                 None,
                 parent_is_coding_agent,
             ) {
-                Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+                self.roll_back_parent_wake(parent_id, wake.as_ref()).await;
                 continue;
             }
             refired += 1;

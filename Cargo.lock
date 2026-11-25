@@ -4921,7 +4921,9 @@ version = "0.1.0"
 dependencies = [
  "axum-server",
  "chrono",
+ "clap",
  "dotenvy",
+ "fastembed",
  "futures",
  "lucidos-agents-api",
  "lucidos-engine",
@@ -4929,12 +4931,18 @@ dependencies = [
  "lucidos-engine-socket",
  "lucidos-event-hooks",
  "lucidos-home",
+ "lucidos-local-token",
  "lucidos-owner-lock",
+ "lucidos-pg-url",
+ "regex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "uuid",
 ]
 
@@ -4972,18 +4980,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "lucidos-eval"
+name = "lucidos-event-hooks"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "clap",
- "fastembed",
- "lucidos-agents-api",
+ "lucidos-core",
  "lucidos-engine",
- "lucidos-local-token",
- "lucidos-pg-url",
- "regex",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4992,18 +4993,6 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "uuid",
-]
-
-[[package]]
-name = "lucidos-event-hooks"
-version = "0.1.0"
-dependencies = [
- "lucidos-core",
- "lucidos-engine",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "toml 0.8.23",
 ]
 
 [[package]]

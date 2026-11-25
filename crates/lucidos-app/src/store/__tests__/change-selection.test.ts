@@ -100,6 +100,16 @@ describe('selectRepoChange', () => {
     });
   });
 
+  it('lists the files at the change branch, so the tree matches its diff', async () => {
+    repoSource.value = 'repo-1';
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
+    (listRepoFiles as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    await selectRepoChange(mockChange);
+
+    expect(listRepoFiles).toHaveBeenCalledWith('repo-1', 'claude-code/test-branch');
+  });
+
   it('sets selectedChangeId and clears repoPending for applied change', async () => {
     repoSource.value = 'repo-1';
     (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
@@ -157,6 +167,17 @@ describe('loadRepoChanges', () => {
 
     expect(repoChanges.value.status).toBe('failed');
   });
+
+  it('a failed refetch keeps the last-good change list on screen', async () => {
+    const data: RepoChangesState = { pending: [mockChange], applied: [mockAppliedChange], has_more: false };
+    repoChanges.value = { status: 'loaded', data };
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('DB error'));
+    repoSource.value = 'repo-1';
+
+    await loadRepoChanges('repo-1');
+
+    expect(repoChanges.value).toEqual({ status: 'loaded', data });
+  });
 });
 
 describe('viewChangeDiff', () => {
@@ -211,6 +232,35 @@ describe('viewChangeDiff', () => {
     expect(repoViewMode.value).toBe('changes');
     expect(repoDiff.value.status).toBe('loaded');
     expect(repoPending.value?.description).toBe('Fix the widget');
+  });
+
+  it('lists the files at the change branch when it binds the repo', async () => {
+    repositories.value = {
+      status: 'loaded',
+      data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
+    };
+    repoSource.value = 'repo-other';
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
+    (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
+    (listRepoFiles as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    await viewChangeDiff(mockChange);
+
+    expect(listRepoFiles).toHaveBeenCalledWith('repo-1', 'claude-code/test-branch');
+  });
+
+  it('unbinds the prior repo before the inline diff is requested', async () => {
+    repositories.value = { status: 'loaded', data: [] };
+    repoSource.value = 'repo-1';
+    let release!: (v: unknown) => void;
+    (getChangeDiff as ReturnType<typeof vi.fn>).mockReturnValue(new Promise((r) => { release = r; }));
+
+    const pending = viewChangeDiff(mockChange);
+    await vi.waitFor(() => expect(getChangeDiff).toHaveBeenCalled());
+
+    expect(repoSource.value).toBeNull();
+    release({ files: [] });
+    await pending;
   });
 
   it('appends the app id to the description for an app coding-agent change', async () => {
@@ -366,6 +416,27 @@ describe('viewChangeDiff', () => {
 });
 
 describe('viewThreadCcDiff', () => {
+  it('unbinds the prior repo before an app thread diff is staged', async () => {
+    repositories.value = { status: 'loaded', data: [] };
+    repoSource.value = 'repo-1';
+    threadMap.value = new Map([
+      ['thread-1', { meta: { codingAgentKind: 'app', codingAgentFolder: '/ws/data/apps/widget/' } } as never],
+    ]);
+    (getThreadCcDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      repo_root: '/ws',
+      branch_name: 'claude-code/feat',
+      base_ref: 'main',
+      files: [{ path: 'data/apps/widget/index.html', status: 'modified', hunks: [] }],
+    });
+    const sourcesSeen: Array<string | null> = [];
+    const stop = effect(() => { if (repoPending.value) sourcesSeen.push(repoSource.value); });
+
+    await viewThreadCcDiff('thread-1');
+    stop();
+
+    expect(sourcesSeen).toEqual([null]);
+  });
+
   it('lands on the file list even for a single-file branch diff', async () => {
     repositories.value = {
       status: 'loaded',

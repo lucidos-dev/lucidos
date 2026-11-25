@@ -25,6 +25,7 @@ import {
   refreshPluginCatalog,
   refreshPluginCatalogAfterMutation,
   removePluginMarketplaceAction,
+  renamePluginMarketplaceAction,
   rescanPluginCatalogAndSettle,
   resyncPluginCatalog,
 } from './plugin-marketplaces';
@@ -407,6 +408,28 @@ describe('a marketplace mutation shows its own result', () => {
     expect(seen.every((ids) => ids.includes(NEW_MARKETPLACE.id))).toBe(true);
   });
 
+  it('re-scans when a scan predating a registration lands behind it', async () => {
+    loadedWith([OTHER_MARKETPLACE]);
+    const stale = deferredCatalog([OTHER_MARKETPLACE]);
+    mockFetchPluginCatalog
+      .mockImplementationOnce(stale.scan)
+      .mockResolvedValue(catalogOf({ marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE] }));
+    void refreshPluginCatalog();
+
+    mockAddPluginMarketplace.mockResolvedValue({
+      marketplace: NEW_MARKETPLACE,
+      marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE],
+      created: true,
+      commit: 'abc123',
+    });
+    await addPluginMarketplaceAction(NEW_MARKETPLACE.source);
+
+    stale.release();
+    await vi.runAllTimersAsync();
+
+    expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(2);
+  });
+
   it('discards a scan carrying the pre-rename name', async () => {
     const renamed = { ...OTHER_MARKETPLACE, name: 'Renamed plugins' };
     loadedWith([OTHER_MARKETPLACE]);
@@ -460,6 +483,22 @@ describe('a marketplace mutation shows its own result', () => {
       status: 'loaded',
       data: { marketplaces: [NEW_MARKETPLACE, OTHER_MARKETPLACE] },
     });
+  });
+
+  it('renames by re-posting the stored source exactly as it is', async () => {
+    const stored = 'https://github.com/example-org/example-repo/';
+    loadedWith([NEW_MARKETPLACE]);
+    mockAddPluginMarketplace.mockResolvedValue({
+      marketplace: NEW_MARKETPLACE,
+      marketplaces: [NEW_MARKETPLACE],
+      created: false,
+      commit: 'abc123',
+    });
+    mockFetchPluginCatalog.mockImplementation(scanStillCloning());
+
+    await renamePluginMarketplaceAction(stored, 'Example plugins');
+
+    expect(mockAddPluginMarketplace).toHaveBeenCalledWith(stored, 'Example plugins');
   });
 
   it('does not fabricate a catalog when none has loaded yet', async () => {
@@ -565,6 +604,31 @@ describe('a scan landing', () => {
     expect(marketplaceCatalog.value).toMatchObject({ status: 'loaded', data: { scanned_at: '2026-09-22T10:05:00Z' } });
   });
 
+  it('does not settle on a read that began before the scan request returned', async () => {
+    marketplaceScanning.value = false;
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    let respond!: () => void;
+    mockRescanPluginCatalog.mockReturnValue(new Promise((resolve) => { respond = () => resolve({ queued: true }); }));
+    const early = deferredCatalog([]);
+    const trailing = deferredCatalog([], false);
+    mockFetchPluginCatalog
+      .mockImplementationOnce(early.scan)
+      .mockImplementationOnce(trailing.scan);
+
+    void refreshPluginCatalog();
+    let settled = false;
+    const refresh = rescanPluginCatalogAndSettle().then(() => { settled = true; });
+    respond();
+    await vi.runAllTimersAsync();
+    early.release();
+    await vi.runAllTimersAsync();
+    expect(settled).toBe(false);
+
+    trailing.release();
+    await refresh;
+    expect(settled).toBe(true);
+  });
+
   it('does not settle on a frame whose re-read still finds a scan running', async () => {
     marketplaceScanning.value = false;
     marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
@@ -608,6 +672,19 @@ describe('a scan landing', () => {
     resyncPluginCatalog();
     await vi.runAllTimersAsync();
     expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-reads again after an in-flight read when a resync lands mid-read', async () => {
+    marketplaceCatalog.value = { status: 'loaded', data: catalogOf() };
+    const inFlight = deferredCatalog([]);
+    mockFetchPluginCatalog.mockImplementationOnce(inFlight.scan);
+
+    void refreshPluginCatalog();
+    resyncPluginCatalog();
+    inFlight.release();
+    await vi.runAllTimersAsync();
+
+    expect(mockFetchPluginCatalog).toHaveBeenCalledTimes(2);
   });
 
   it('fails a refresh whose scan request fails, and lowers the cue', async () => {

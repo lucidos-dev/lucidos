@@ -39,6 +39,7 @@ function makeThread(totalChildrenCount: number, overrides: Partial<ThreadMeta> =
     totalChildrenCount,
     blockingDescendantCount: 0,
     attentionDescendantCount: 0,
+    archivableSubThreadCount: 0,
     codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false,
     lastRevivedAt: '',

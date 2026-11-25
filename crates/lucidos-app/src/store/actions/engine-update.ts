@@ -107,11 +107,35 @@ function renderBuildFailedToast(status: EngineVersionStatus): void {
   });
 }
 
+const BUILD_WATCH_STOPPED_TOAST_KEY = 'engine-frontend-build-watch-stopped';
+let dismissedBuildWatchStop: number | undefined;
+
+function renderBuildWatchStoppedToast(stopped: EngineVersionStatus['frontend_build_watch_stopped']): void {
+  if (!stopped || stopped.since_ms === dismissedBuildWatchStop) {
+    removeToast(BUILD_WATCH_STOPPED_TOAST_KEY);
+    return;
+  }
+  const cause = stopped.cause ?? 'cause unknown';
+  showToast(`Run ./scripts/web-dev.sh -w <workspace> to start the build-watch again. Exit: ${cause}`, 'warning', {
+    key: BUILD_WATCH_STOPPED_TOAST_KEY,
+    title: 'Frontend build-watch stopped',
+    dismissable: false,
+    action: {
+      label: 'OK',
+      onClick: () => {
+        dismissedBuildWatchStop = stopped.since_ms;
+        dismissToast(BUILD_WATCH_STOPPED_TOAST_KEY);
+      },
+    },
+  });
+}
+
 let lastAnnouncedId: string | undefined;
 
 let reopenedVersionId: string | undefined;
 
 export function resetEngineVersionToastForTest(): void {
+  dismissedBuildWatchStop = undefined;
   lastAnnouncedId = undefined;
   reopenedVersionId = undefined;
 }
@@ -206,6 +230,7 @@ const narrowVersionSlice: SliceOf<'engine_version_status'> = {
 };
 
 function applyEngineVersionStatus(status: EngineVersionStatus): void {
+  renderBuildWatchStoppedToast(status.packaged ? undefined : status.frontend_build_watch_stopped);
   const pendingCommits = groupedCommits(status.pending_commits);
   enginePendingCommits.value = pendingCommits;
   engineBuildDeferred.value = !status.packaged && status.build_deferred

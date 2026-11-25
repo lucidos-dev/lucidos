@@ -173,6 +173,36 @@ describe('setDevicePushEnabled', () => {
     );
   });
 
+  it('reconciles a partial failure against the server without reverting the devices that switched off', async () => {
+    const rows = installFakeServer([
+      makeDevice(THIS_DEVICE, UA.iphone, false),
+      makeDevice('dev-fails', UA.iphone, true),
+      makeDevice('dev-ok', UA.android, true),
+    ]);
+    setDevicePush.mockImplementation(async (id: string, enabled: boolean) => {
+      if (id === 'dev-fails' && !enabled) throw new Error('engine down');
+      const row = rows.find((d) => d.id === id);
+      if (row) row.push_enabled = enabled;
+      return { success: true };
+    });
+    showConfirm.mockResolvedValue(true);
+
+    const { setDevicePushEnabled } = await import('./push');
+    const { devices } = await import('./devices');
+    devices.value = { status: 'loaded', data: rows.map((d) => ({ ...d })) };
+    let okSeenByReload: boolean | undefined;
+    listDevices.mockImplementation(async () => {
+      okSeenByReload = devices.value.status === 'loaded'
+        ? devices.value.data.find((d) => d.id === 'dev-ok')?.push_enabled
+        : undefined;
+      return { devices: rows.map((d) => ({ ...d })) };
+    });
+
+    await setDevicePushEnabled(THIS_DEVICE, true);
+
+    expect(okSeenByReload, 'the reload must not read the switched-off device back on').toBe(false);
+  });
+
   it('changes nothing on the other devices when the user declines', async () => {
     const rows = installFakeServer([
       makeDevice(THIS_DEVICE, UA.iphone, false),

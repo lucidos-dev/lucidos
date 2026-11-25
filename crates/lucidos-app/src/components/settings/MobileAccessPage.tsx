@@ -39,7 +39,6 @@ import { loadingIfFresh, toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
-import { openSettingsSubview } from '../../store/actions/menu';
 import { isLoopbackHostname } from '../../utils/loopbackHostname';
 
 const gatewayIsOurOrigin = WORKSPACE_ID !== null;
@@ -602,9 +601,6 @@ export function MobileAccessPage() {
           <DisclosureChevron open={addressesOpen} />
           Other addresses
         </button>
-        <div class="settings-section-desc">
-          Tailscale and your own route, to bookmark on a device that is already paired.
-        </div>
         <Disclosure open={addressesOpen}>{body}</Disclosure>
       </div>
     );
@@ -747,16 +743,6 @@ export function MobileAccessPage() {
       <PairingRequestsSection available={gatewayIsOurOrigin} />
 
       <PairDeviceSection canMint={gatewayIsOurOrigin} target={pairTarget()} />
-
-      <div class="settings-section">
-        <p class="settings-section-desc">
-          Devices already paired are listed under{' '}
-          <button class="accent-link" onClick={() => openSettingsSubview('devices')}>
-            Settings → Devices
-          </button>
-          , where you can revoke one.
-        </p>
-      </div>
 
       {otherAddressesSection()}
 

@@ -1,5 +1,16 @@
-import { describe, it, expect } from 'vitest';
-import { guessFace, safeFileName, slugFromLabel } from './workspaceFonts';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+const api = vi.hoisted(() => ({
+  listFonts: vi.fn(),
+  listFontFiles: vi.fn(),
+  writeFontFile: vi.fn(),
+  deleteFontFile: vi.fn(),
+}));
+vi.mock('../../api/client', () => api);
+
+import {
+  guessFace, installWorkspaceFont, removeWorkspaceFont, safeFileName, slugFromLabel,
+} from './workspaceFonts';
 
 describe('slugFromLabel', () => {
   it('makes a directory name the engine accepts', () => {
@@ -38,5 +49,52 @@ describe('guessFace', () => {
     expect(guessFace('Brand-Light.otf').weight).toBe('300');
     expect(guessFace('Brand[wght].woff2').weight).toBe('100 900');
     expect(guessFace('Brand-VF.woff2').weight).toBe('100 900');
+  });
+});
+
+describe('installWorkspaceFont', () => {
+  const install = {
+    label: 'Brand Sans',
+    group: 'sans' as const,
+    ligatures: false,
+    files: [{ file: new File(['x'], 'Brand.woff2'), weight: '400', style: 'normal' as const }],
+  };
+
+  beforeEach(() => {
+    api.listFonts.mockReset().mockResolvedValue({ fonts: [], invalid: [] });
+    api.listFontFiles.mockReset().mockResolvedValue([]);
+    api.writeFontFile.mockReset().mockResolvedValue(undefined);
+    api.deleteFontFile.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('picks a directory a broken font already holds, so its writes cannot overwrite that font', async () => {
+    api.listFonts.mockResolvedValue({ fonts: [], invalid: [{ id: 'ws-brand-sans', reason: 'no manifest' }] });
+
+    const id = await installWorkspaceFont(install);
+
+    expect(id).toBe('ws-brand-sans-2');
+    expect(api.writeFontFile.mock.calls.map((c) => c[0])).toContain('fonts/brand-sans-2/font.json');
+  });
+});
+
+describe('removeWorkspaceFont', () => {
+  beforeEach(() => {
+    api.listFonts.mockReset().mockResolvedValue({ fonts: [], invalid: [] });
+    api.listFontFiles.mockReset();
+    api.deleteFontFile.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('deletes only the broken font named, even when its raw name holds regex characters', async () => {
+    api.listFontFiles.mockResolvedValue([
+      'fonts/my.font/font.json',
+      'fonts/my.font/a.woff2',
+      'fonts/myxfont/font.json',
+      'fonts/myxfont/b.woff2',
+    ]);
+
+    await removeWorkspaceFont('ws-my.font');
+
+    expect(api.deleteFontFile.mock.calls.map((c) => c[0]).sort())
+      .toEqual(['fonts/my.font/a.woff2', 'fonts/my.font/font.json']);
   });
 });

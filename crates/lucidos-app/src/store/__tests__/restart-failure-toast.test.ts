@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { engineRestarting, engineRestartNewVersion, activeProgressDialog, toasts, showToast, NEW_VERSION_TOAST_KEY, restartRequired, engineVersionReady, enginePackaged } from '../store';
+import { engineRestarting, engineRestartNewVersion, activeProgressDialog, toasts, showToast, NEW_VERSION_TOAST_KEY, restartRequired, engineVersionReady, enginePackaged, engineStartedAt } from '../store';
 import { ApiError } from '../../api/client';
 
 const RESTART_FAILURE_TOAST_KEY = 'restart-required';
@@ -13,7 +13,7 @@ vi.mock('../../api/client', async () => {
   };
 });
 
-const { initiateEngineRestart } = await import('../actions/chat-changes');
+const { initiateEngineRestart, RESTART_IN_FLIGHT_LS_KEY } = await import('../actions/chat-changes');
 
 beforeEach(() => {
   engineRestarting.value = false;
@@ -76,6 +76,42 @@ describe('initiateEngineRestart surfaces spawn failures', () => {
     expect(dialog.progress).toBeNull();
     expect(dialog.cancel).toBeUndefined();
     expect(toasts.value).toHaveLength(0);
+  });
+
+  it('clears the in-flight restart marker when the restart API rejects with ApiError', async () => {
+    mockRestartEngine.mockRejectedValueOnce(new ApiError(500, 'boom'));
+
+    await initiateEngineRestart();
+
+    expect(localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY)).toBeNull();
+  });
+
+  it('records the in-flight restart marker with the pre-restart started_at and newVersion false', async () => {
+    engineStartedAt.value = '2026-01-01T00:00:00Z';
+    mockRestartEngine.mockResolvedValueOnce(undefined);
+
+    await initiateEngineRestart();
+
+    expect(JSON.parse(localStorage.getItem(RESTART_IN_FLIGHT_LS_KEY)!)).toEqual({
+      startedAt: '2026-01-01T00:00:00Z',
+      newVersion: false,
+    });
+  });
+
+  it('reverts the restarting flag and shows the failure toast when the Tauri restart rejects with a plain string', async () => {
+    enginePackaged.value = true;
+    const tauriInvoke = vi.fn().mockRejectedValueOnce('spawn failed: port busy');
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = { invoke: tauriInvoke };
+    try {
+      await initiateEngineRestart();
+    } finally {
+      delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
+
+    expect(engineRestarting.value).toBe(false);
+    const toast = toasts.value.find(t => t.key === RESTART_FAILURE_TOAST_KEY);
+    expect(toast).toBeTruthy();
+    expect(toast!.message).toBe('Restart failed: spawn failed: port busy');
   });
 
   it('keeps restarting flag set on non-ApiError rejection (engine being killed)', async () => {

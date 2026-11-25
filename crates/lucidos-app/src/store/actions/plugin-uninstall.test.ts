@@ -153,6 +153,16 @@ describe('confirmPluginUninstallAction', () => {
     expect(refreshPluginCatalogAfterMutation).toHaveBeenCalled();
   });
 
+  it('does not report a failure after the uninstall landed as an uninstall failure', async () => {
+    const form = openPending();
+    confirmPluginUninstall.mockResolvedValue(engineResult);
+    refreshPluginCatalogAfterMutation.mockImplementationOnce(() => { throw new Error('refresh boom'); });
+
+    await confirmPluginUninstallAction(form).catch(() => undefined);
+
+    expect(showToast).not.toHaveBeenCalledWith(expect.stringContaining('Uninstall failed'), 'error');
+  });
+
   it('falls back to a toast when the panel was dismissed mid-uninstall', async () => {
     const form = openPending();
     confirmPluginUninstall.mockImplementation(async () => {

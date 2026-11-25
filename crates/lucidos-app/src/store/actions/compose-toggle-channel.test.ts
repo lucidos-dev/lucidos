@@ -111,6 +111,7 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     totalChildrenCount: 0,
     blockingDescendantCount: 0,
     attentionDescendantCount: 0,
+    archivableSubThreadCount: 0,
     codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false,
     lastRevivedAt: '',

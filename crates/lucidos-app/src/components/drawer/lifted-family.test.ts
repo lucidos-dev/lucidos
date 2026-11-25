@@ -29,7 +29,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         section: opts.section ?? 'inbox',
         activeChildrenCount: opts.activeChildrenCount ?? 0,
         totalChildrenCount: 0,
-        blockingDescendantCount: 0, attentionDescendantCount: 0,
+        blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
         codingAgentChangeState: opts.codingAgentChangeState ?? { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',

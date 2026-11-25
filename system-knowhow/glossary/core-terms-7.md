@@ -91,7 +91,7 @@ See also: *gateway pairing*, `system-knowhow/remote-access/settings-access-2.md`
 ### Return access grant
 An optional grant on an existing *gateway pairing*, controlled by the gateway that holds the outgoing pairing. If A pairs to B, B gets no access back to A or A's other pairings. Only A's owner may enable return access so B's agents can read and start threads through A. Preserve the originating gateway, workspace, thread and source authorization. Off by default, one grant per source gateway.
 
-Under **Settings → Access → Remote gateways**, enable **Allow agents on B to read and start threads through this gateway**. B means its registered name. `lucidos workspaces targets --via <gateway>` discovers routes; `--via` and `--to` select the routing gateway and workspace while keeping the caller's source-engine environment.
+Under **Settings → Access → Remote gateways**, open B's fold and enable **Agent return access**. Its tooltip names B by its registered name. `lucidos workspaces targets --via <gateway>` discovers routes; `--via` and `--to` select the routing gateway and workspace while keeping the caller's source-engine environment.
 
 It creates no reciprocal pairing, device identity or *manage grant*. Revoking it or unpairing cuts the next incoming operation. Agents hosted by A need no return grant to use A's outgoing pairings (ADR 0725).
 See also: *gateway pairing*, *remote workspace*.
@@ -142,10 +142,20 @@ Paused is a *verdict* about the interrupted turn, not a resting state, so events
 **A pending change does not change the verdict.** A thread interrupted mid-turn reads Paused (or *failed*) whether or not it carries a *change*. Nothing writes `waiting` for that now: the thread's change state carries the change, not its status. The change stays in the thread and the review list.
 
 ### Pinned thread
-A *thread* the user pinned to keep at hand, in the Pinned section of the *thread drawer*. A pinned thread is never archived: pinning an archived thread brings it back, and archiving a pinned thread unpins it. So a settled pinned thread offers Archive beside Unpin. Only the user's own Archive unpins. Automatic archiving (a finished, unwatched trigger run) and an agent's archive leave a pinned thread alone.
+A *thread* the user pinned to keep at hand, in the Pinned section of the *thread drawer* or in a *custom folder*. A pinned thread is never archived: pinning an archived thread brings it back, and archiving a pinned thread unpins it. So a settled pinned thread offers Archive beside Unpin. Only the user's own Archive unpins. Automatic archiving (a finished, unwatched trigger run) and an agent's archive leave a pinned thread alone.
 
 Internally the pin is still called "saved": the `saved` section key, `is_saved`, and the `ThreadSaved` / `ThreadUnsaved` events.
-See also: *Current section*, *thread drawer*.
+See also: *Current section*, *custom folder*, *thread drawer*.
+
+### Custom folder
+A section of the *Folders grouping* that the user names, to group *pinned threads*. Custom folders show above Pinned, in the order of the `thread_folders` *preference*. A thread in a custom folder is still a pinned thread, and every pin rule holds. A thread's whole family shows in its *root thread*'s folder.
+
+With no custom folder, Pin pins in one tap. Once one exists, Pin asks for Pinned or a folder. The thread's ⋯ menu offers **Pin to folder** or **Move to folder**, and the Pinned header offers **New folder**.
+
+A folder header offers Rename, Delete and **Archive folder**. Delete never unpins: the folder's threads go back to Pinned. Archive folder archives what the user's own Archive allows, and removes the folder once it is empty. An archived thread loses its folder.
+
+Internally the folder of a thread is `pin_folder`, set by the `ThreadMovedToFolder` event. Distinct from the *Folders grouping* itself, and from a *folder grant*.
+See also: *pinned thread*, *Folders grouping*.
 
 <!--gloss-plugin-start-->
 ### Plugin

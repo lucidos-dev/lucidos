@@ -15,6 +15,21 @@ import {
   _resetOverlayStackForTesting,
 } from '../overlayStack';
 import { _resetRowIntentsForTesting } from '../rowIntents';
+import { armStandingApply } from './chat-changes';
+import { discardCompose, updateCompose } from './compose';
+
+vi.mock('./chat-changes', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat-changes')>()),
+  armStandingApply: vi.fn(async () => {}),
+}));
+vi.mock('./compose', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./compose')>();
+  return {
+    ...actual,
+    discardCompose: vi.fn(actual.discardCompose),
+    updateCompose: vi.fn(actual.updateCompose),
+  };
+});
 
 function setThread(state: ThreadState): void {
   threadMap.value = new Map([[state.meta.id, state]]);
@@ -376,6 +391,39 @@ describe('runCloseCascade no-op gates', () => {
     expect(confirmState.value.okLabel).toBe('Apply');
     expect(confirmState.value.extraAction?.label).toBe('Discard');
     confirmState.value.resolve?.(false);
+  });
+});
+
+describe('the standing apply and the draft clear act on the thread they name', () => {
+  it('arms the standing apply against the change the thread shows, not a later one', async () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, liveEventWaitCount: 1 },
+    }));
+    changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
+
+    const standing = resolveThreadActions('t1').find((a) => a.kind === 'apply_when_settled');
+    await standing?.invoke();
+
+    expect(armStandingApply).toHaveBeenCalledWith('t1', 'change-t1');
+  });
+
+  it('clears an active thread draft through updateCompose, never discarding its compose state', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(discardCompose).mockClear();
+      vi.mocked(updateCompose).mockClear();
+      setThread(makeThreadState('t1', { meta: { state: 'active', section: 'inbox', status: 'idle', composeText: 'drop me' } }));
+      const p = discardDraft('t1');
+      await Promise.resolve();
+      confirmState.value.resolve?.(true);
+      expect(await p).toBe(true);
+
+      expect(discardCompose).not.toHaveBeenCalled();
+      expect(updateCompose).toHaveBeenCalledWith('t1', { text: '', image_hashes: [] });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });
 

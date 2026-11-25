@@ -365,14 +365,17 @@ event system DomainEvent
 event system DraftSubmissionAccepted
 event system EmailSent
 event system EmbeddingModelStatusChanged
+event system EngineBuildCompleted
 event system EngineBuildStateChanged
 event system EngineSupervisorRespawned
+event system EngineVersionActivated
 event system EngineVersionStatusChanged
 event system EnvironmentVariableDeleted
 event system EnvironmentVariableSet
 event system EventHookArmed
 event system EventHookDisarmed
 event system EventHookRemoved
+event system FrontendBuildWatchStateChanged
 event system FrontendPreviewStarted
 event system FrontendPreviewStopped
 event system FrontendRefreshStateChanged
@@ -453,6 +456,7 @@ event system RepositoryAdded
 event system RepositoryImported
 event system RepositoryRemoved
 event system ServedFrontendAdvanced
+event system ServedFrontendCommitChanged
 event system SnapshotCaptureFailed
 event system SnapshotChecked
 event system SnapshotCreated
@@ -649,6 +653,7 @@ event thread ThreadHoldLifted
 event thread ThreadHoldPlaced
 event thread ThreadMcpServerDisabled
 event thread ThreadMcpServerEnabled
+event thread ThreadMovedToFolder
 event thread ThreadReadNotRequested
 event thread ThreadReadRequested
 event thread ThreadReplySeen
@@ -679,5 +684,5 @@ event thread WidgetUnpinned
 event thread WorkDelegated
 event thread WorkingUnderstandingWritten
 event thread WorktreeCleaned
-wire crates/lucidos-app/src/generated/thread-event-wire.ts c2f9fb64c597176e568700912b0c26561627d9b4b6e57837dbf61940886daa54
-wire crates/lucidos-app/src/generated/thread-lifecycle.ts f7f62da7035c26286ac840a9dfa13a4869c7f6d02ea536a1c6f3643cfff9bf35
+wire crates/lucidos-app/src/generated/thread-event-wire.ts c3ab3b1bbc6248108c754711d0846d49b919378ba6bc6058b94729d229181950
+wire crates/lucidos-app/src/generated/thread-lifecycle.ts 9d7dc4ed9ab2c0adc6db14ccfe01640f94ee97fb4613af469b73a59262034840

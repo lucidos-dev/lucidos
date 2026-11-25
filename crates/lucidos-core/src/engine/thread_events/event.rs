@@ -1047,6 +1047,13 @@ pub enum ThreadEvent {
     },
     ThreadSaved,
     ThreadUnsaved,
+    /// The user filed a pinned thread in a custom folder, an id from the
+    /// `thread_folders` preference. `None` moves it back to plain Pinned.
+    /// Projects to `thread_summaries.pin_folder`.
+    ThreadMovedToFolder {
+        #[serde(default)]
+        folder: Option<String>,
+    },
     ThreadArchived,
     /// The thread's own agent asked to be archived once its turn ends (ADR 0310).
     /// The actor names the agent thread. The archive request resolver runs the

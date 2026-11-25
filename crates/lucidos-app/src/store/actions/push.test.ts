@@ -447,6 +447,57 @@ describe('stale applicationServerKey reconciliation', () => {
     ).toBe(true);
     expect(subscribedEndpoint(seen)).toBe('https://fcm.googleapis.com/fcm/send/fresh-1');
   });
+
+  it('recovery re-subscribes on the active worker, not the one register() returns', async () => {
+    const seen = installFetch(CURRENT_KEY);
+    const installing = {
+      pushManager: {
+        getSubscription: async () => null,
+        subscribe: async () => {
+          const err = new Error('Subscription failed - no active Service Worker');
+          err.name = 'InvalidStateError';
+          throw err;
+        },
+      },
+    };
+    const { registration: active } = makeRegistration();
+    Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+      value: {
+        getRegistration: async () => null,
+        register: async () => installing,
+        ready: Promise.resolve(active),
+      },
+      configurable: true,
+    });
+
+    const { recoverServiceWorker } = await import('./push');
+    await recoverServiceWorker();
+
+    expect(
+      subscribedEndpoint(seen),
+      'the recovered subscription must be made on the active worker',
+    ).toBe('https://fcm.googleapis.com/fcm/send/fresh-1');
+  });
+
+  it('unregistering closes the notifications the old registration orphaned', async () => {
+    const close = vi.fn();
+    const unregister = vi.fn(async () => true);
+    Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+      value: {
+        getRegistration: async () => ({
+          getNotifications: async () => [{ close }, { close }],
+          unregister,
+        }),
+      },
+      configurable: true,
+    });
+
+    const { unregisterServiceWorker } = await import('./push');
+    await unregisterServiceWorker();
+
+    expect(close, 'every orphaned notification must be dismissed').toHaveBeenCalledTimes(2);
+    expect(unregister).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('pushUnsupportedReason', () => {

@@ -122,7 +122,7 @@ A hook is asked only where the act has not happened yet, so a refusal can stop i
 A hook runs only once the owner **arms** it, in Settings > Event Hooks or with `lucidos hooks arm`. Arming binds the hook's current definition and script. An edit leaves it **changed**: its events are refused until the owner arms the new content or disarms it. An agent arms, disarms or removes a hook only with the owner's Allow once.
 
 **Today no hook can be armed yet,** because Lucidos asks hooks about no event so far. A definition changes nothing yet.
-See also: *hook definition*, *trigger*, `system-knowhow/lucidos-cli/subcommands-9.md` § `lucidos hooks list | arm | disarm | remove`.
+See also: *hook definition*, *hook answer*, *trigger*, `system-knowhow/lucidos-cli/subcommands-9.md` § `lucidos hooks list | arm | disarm | remove`.
 
 ### Hook definition
 The file `data/hooks/<slug>/hook.toml` that declares an *event hook*. You write it, and Lucidos never rewrites it, unlike a *trigger definition*. Its keys:
@@ -135,6 +135,16 @@ The file `data/hooks/<slug>/hook.toml` that declares an *event hook*. You write 
 
 `lucidos hooks list` shows every definition, valid or not, with its problems. An unknown key, an event no hook can name, a bad condition or a missing script each make it invalid.
 See also: *event hook*, *field path*.
+
+### Hook answer
+What an *event hook*'s script decides about one pending event. The script runs as a trigger script does. It reads the hook's slug and the event on stdin, with every stored secret masked out. It prints one JSON object, and its `answer` key names the answer:
+
+- `allow`, with an optional `events` list of domain events to record beside the event;
+- `needs-input`, naming the `argument` it needs;
+- `refuse`, with a `reason`.
+
+A hook fails closed. A crash, a run past its `timeout_secs`, or output that is no answer each count as a refusal. An event Lucidos records itself is no answer, so a hook returns domain events only. Nothing asks a hook yet, so no script runs.
+See also: *event hook*, *hook definition*.
 
 ### Typed answer
 What you type into the composer while a *question card* waits. It is that card's answer, so it shows on the card under **Your answer**, never as a message below. While sending, the card's header reads **Sending**. If Lucidos does not answer, it reads **Not sent**, with a retry icon under your answer and the options live again. Tapping an option or typing a new answer replaces it.

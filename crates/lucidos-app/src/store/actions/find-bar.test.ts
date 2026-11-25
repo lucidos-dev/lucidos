@@ -322,6 +322,18 @@ describe('a find a navigation asked for', () => {
     expect(findFocusRequest.value).toBe(focusRequest + 1);
   });
 
+  it('holds the keyboard inside the tap that opens the bar, before any load', () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({ matches: query === '(pointer: coarse)' }));
+    try {
+      showSource(['apple']);
+      openFind('content');
+      expect(document.querySelector('[data-keyboard-proxy]')).not.toBeNull();
+    } finally {
+      document.querySelectorAll('[data-keyboard-proxy]').forEach((el) => el.remove());
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('takes no focus with a finger, so a phone keeps its keyboard down', () => {
     vi.stubGlobal('matchMedia', (query: string) => ({ matches: query === '(pointer: coarse)' }));
     try {

@@ -26,6 +26,7 @@ function makeThread(id = 'thread-1', status: ThreadStatus = 'idle'): ThreadState
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
+      archivableSubThreadCount: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',

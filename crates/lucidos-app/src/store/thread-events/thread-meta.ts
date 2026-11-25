@@ -23,6 +23,7 @@ export type ThreadAggregate = {
   totalChildrenCount: number;
   blockingDescendantCount: number;
   attentionDescendantCount: number;
+  archivableSubThreadCount: number;
   isStoppedChild?: boolean;
   hold?: ThreadHoldSummary;
   readRequested?: boolean;
@@ -34,6 +35,7 @@ export type ThreadAggregate = {
   codingAgentChangeState: CodingAgentChangeState;
   codingAgentIsExternalRepo: boolean;
   isSaved: boolean;
+  pinFolder?: string;
   home?: true;
   hasResponse: boolean;
   lastRevivedAt: string | null;
@@ -111,6 +113,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
+  if (meta.archivableSubThreadCount !== agg.archivableSubThreadCount) { meta.archivableSubThreadCount = agg.archivableSubThreadCount; changed = true; }
   if (!!meta.isStoppedChild !== !!agg.isStoppedChild) { meta.isStoppedChild = !!agg.isStoppedChild; changed = true; }
   if (!sameHold(meta.hold, agg.hold)) { meta.hold = agg.hold ?? null; changed = true; }
   if (!!meta.readRequested !== !!agg.readRequested) { meta.readRequested = !!agg.readRequested; changed = true; }
@@ -122,6 +125,8 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (!sameChangeState(meta.codingAgentChangeState, agg.codingAgentChangeState)) { meta.codingAgentChangeState = agg.codingAgentChangeState; changed = true; }
   if (meta.codingAgentIsExternalRepo !== agg.codingAgentIsExternalRepo) { meta.codingAgentIsExternalRepo = agg.codingAgentIsExternalRepo; changed = true; }
   if (meta.saved !== agg.isSaved) { meta.saved = agg.isSaved; changed = true; }
+  const nextPinFolder = agg.pinFolder ?? null;
+  if ((meta.pinFolder ?? null) !== nextPinFolder) { meta.pinFolder = nextPinFolder; changed = true; }
   if (agg.home && !meta.home) { meta.home = true; changed = true; }
   meta.messageCount = agg.messageCount;
   meta.updatedAt = agg.lastActivity;
@@ -178,6 +183,7 @@ export type ThreadMeta = {
   channel: EventChannel | 'error_unknown_channel';
   initiator: ThreadInitiator;
   saved: boolean;
+  pinFolder?: string | null;
   home?: true;
   createdAt: string;
   updatedAt: string;
@@ -193,6 +199,7 @@ export type ThreadMeta = {
   totalChildrenCount: number;
   blockingDescendantCount: number;
   attentionDescendantCount: number;
+  archivableSubThreadCount: number;
   isStoppedChild?: boolean;
   hold?: ThreadHoldSummary | null;
   readRequested?: boolean;
@@ -304,6 +311,7 @@ export function makeOptimisticThreadState(opts: {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
+      archivableSubThreadCount: 0,
       liveEventWaitCount: 0,
       codingAgentChangeState: NO_CHANGE,
       codingAgentIsExternalRepo: false,

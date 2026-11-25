@@ -31,7 +31,7 @@ describe('SSE routing: skeleton thread creation', () => {
 describe('SSE skeleton must not prevent DB backfill', () => {
   it('SSE skeleton with eventsLoaded=true causes missed events (reproduces bug)', () => {
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: true,
@@ -52,7 +52,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
 
   it('SSE skeleton with eventsLoaded=false allows DB backfill to fill gaps', () => {
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: false,
@@ -428,7 +428,7 @@ describe('Focused thread preserved across reload', () => {
       section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, archivable_sub_thread_count: 0, live_event_wait_count: 0,
       status: 'idle',
       summary_version: 0,
       coding_agent_change_state: { kind: 'none' },
@@ -465,7 +465,7 @@ describe('Focused thread preserved across reload', () => {
       section: 'inbox',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, archivable_sub_thread_count: 0, live_event_wait_count: 0,
       status: 'waiting',
       summary_version: 0,
       coding_agent_change_state: { kind: 'proposed', requires_restart: false },

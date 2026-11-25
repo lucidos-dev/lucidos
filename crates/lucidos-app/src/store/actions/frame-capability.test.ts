@@ -4,6 +4,7 @@ import {
   artifactPreviewCapability,
   renewEveryOpenFrame,
   resetArtifactPreviewCapability,
+  startFrameCapabilityRenewal,
   stopFrameCapabilityRenewal,
   withPreviewCapability,
 } from './frame-capability';
@@ -115,6 +116,23 @@ describe('renewEveryOpenFrame', () => {
     await renewEveryOpenFrame();
 
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not re-arm the renewal timer when a stop lands during a round in flight', async () => {
+    mountAppFrame('/app/site-publisher/');
+    let answer: (value: unknown) => void = () => {};
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => { answer = resolve; })));
+    startFrameCapabilityRenewal();
+
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    stopFrameCapabilityRenewal();
+    answer({ ok: true, json: async () => ({ capability: 'fresh', renew_after_secs: 1800 }) });
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    const mintsBeforeStop = vi.mocked(fetch).mock.calls.length;
+
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+    expect(vi.mocked(fetch).mock.calls.length).toBe(mintsBeforeStop);
   });
 });
 

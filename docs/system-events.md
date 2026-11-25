@@ -249,6 +249,20 @@ Persisted, and carrying `actor` unless noted. The payload shapes are in the `Sys
 - **`fix_thread_id` on `MainCheckFailed`, `MainCheckPassed` and `MainCheckRedClosed`** names the repair each one reports to. A working repair arms one event wait on all three, filtered on `fix_thread_id`. Each later finding and the close then reach it while it works (ADR 0694). Rows written before the field have none.
 - **`MainCheckAbandoned` is no verdict.** It covers GitHub down, a refused push, or a restart before the run was linked. It starts nothing by itself.
 
+## Build and version facts
+
+These events are persisted with aggregate `engine` and aggregate ID `global`.
+Their stored payload uses the standard system event envelope, with fields under `data`.
+
+- **`EngineBuildCompleted`** records one source rebuild attempt after delivery verification, including internal retries. Its payload has `outcome` (`succeeded`, `failed`, or `skipped-locked`), `duration_ms`, and `built_head`. The head is the checkout commit targeted by the final attempt or delivery check and can differ from the executable stamp. A lock skip has a null head. An aborted attempt that never reached completion has no record.
+- **`EngineVersionActivated`** records the running executable once per boot on packaged and source installs. It carries `build_id`, `engine_version`, `release`, `release_dirty`, and `frontend_source_commit`. The frontend commit is null when the engine serves no frontend or its initial snapshot has no valid stamp. The build ID is the executable's embedded identity, including a dirty-diff suffix when present.
+- **`ServedFrontendCommitChanged`** records a runtime snapshot swap to a different known `source_commit`. It carries the `previous_source_commit`, which is null if the old snapshot's commit was unknown. It covers both the applying workspace and peer sync on source installs. Unstamped and same-commit swaps still send the transient frontend signal.
+
+Source build tools also emit these domain events:
+
+- **`HardeningStarted`** is emitted by the repository hardening flow once per review round, with `thread_id`, `branch`, `head_sha`, `iteration`, and `tier`. `branch` is `null` on a detached HEAD.
+- **`BuildSlotWaiting`**, **`BuildSlotAcquired`**, **`BuildSlotReleased`**, and **`BuildSlotStepCompleted`** record slot holds and nested commands. Each carries `class`, the slot class the acquisition resolved: `priority`, `ordinary` or `background`. A nested step reports the class its enclosing hold was granted, or `null` when it cannot know. The CLI's [build slot reference](../system-knowhow/lucidos-cli.md) documents the timing and delivery behavior.
+
 ## Other engine and security events
 
 - **`EngineSupervisorRespawned`** has aggregate `engine`, `aggregate_id` the `supervisor_pid`, and no `actor`. The bash supervisor (`scripts/lib/engine_supervisor.sh`) writes `<workspace>/.lucidos/engine.last-death.json` when its child dies with an exit code other than 0, 130 or 138. The next engine emits it and deletes the sidecar at startup (`engine::supervisor_respawn_sidecar::emit_if_present`).
@@ -269,6 +283,7 @@ Unless noted, these are dev-only by construction (`refresh_served_frontend_after
 - **`EngineBuildStateChanged`** carries `state` (`idle`, `building`, `ready`, `failed`) and fires from `engine::background_build` on each background-rebuild transition, latest generation only. It prompts connected clients to re-read without a periodic client check. The handler re-runs the authoritative GET and never trusts `state`. A PWA suspended for the whole build reconciles in `onResume`.
 - **`EngineVersionStatusChanged`** fires when the source engine observes a semantic status change, or first observes a connected page. Elapsed counters are excluded. Clients re-read the authoritative snapshot. The watcher idles without pages and exits for packaged installs.
 - **`FrontendRefreshStateChanged`** fires when the applying engine starts waiting for the build-watch after a frontend-only Apply, and when the wait ends. A peer-sync takeover sends the end poke itself, since it aborts the task. The "Building frontend" activity follows `frontend_refresh_elapsed_ms` from the re-read, never the poke.
+- **`FrontendBuildWatchStateChanged`** fires when sustained build-watch downtime appears, changes, or clears. Clients re-read `frontend_build_watch_stopped` from version status to update the warning.
 - **`FrontendPreviewStarted` and `FrontendPreviewStopped`** use `aggregate_id` the thread id (ADR 0055): the workspace's one preview slot is named by the thread whose worktree it serves. `Started` carries the port and never a URL, because the same workspace is `localhost` on the laptop and a Tailscale name on the phone. Only the page builds the href (`previewHref`). `loopback_only` says Vite serves this machine alone, so a page on another device shows why instead of a link. Moving the slot emits a stop for the old thread and a start for the new one, in no fixed order. So the stop handler keys on `thread_id`.
 
 ### Main repair admission (ADR 0682)

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { collectPageText } from '@lucidos/find';
@@ -183,5 +183,20 @@ describe('thread find passages', () => {
     expect(unfoldOf('Plan review')).not.toHaveProperty('subAgent');
     expect(unfoldOf('approve')).toMatchObject({ steps: true, subAgent: 'ag' });
     expect(unfoldOf('Because it approves.')).toEqual({ sideQuestion: 'sq1' });
+  });
+});
+
+describe('cached passage text', () => {
+  it('reads a markdown text afresh once the engine lands, never serving the plain read', async () => {
+    vi.resetModules();
+    const passages = await import('./transcript-passages');
+    const { provideMarkdownEngine } = await import('../../utils/renderMarkdown');
+    const read = passages.cachedText(new Map<string, string>());
+    const words = (text: string) => text.split('\u0000').map((b) => b.trim()).filter(Boolean);
+    expect(words(read.markdown('**bold**'))).toEqual(['**bold**']);
+    const engine = await import('../../utils/markdownEngine');
+    await engine.loadMarkdownLibraries();
+    provideMarkdownEngine(engine);
+    expect(words(read.markdown('**bold**'))).toEqual(['bold']);
   });
 });

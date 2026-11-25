@@ -66,7 +66,6 @@ describe('drawer status mark starts the title line', () => {
   });
 
   it('centers the row actions on the same cap height as the mark', () => {
-    capCentringRule();
     const offenders = rulesTargeting(drawerCss, 'thread-row-actions')
       .filter(r => ['display', 'height', 'margin-bottom', 'margin-top', 'position'].some(p => r.props.has(p)))
       .filter(r => !selectorList(r.selector).includes(MARK));

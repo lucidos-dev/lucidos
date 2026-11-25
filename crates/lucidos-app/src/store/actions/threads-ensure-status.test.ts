@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { effect } from '@preact/signals';
 
 vi.hoisted(() => {
   const storage = new Map<string, string>();
@@ -103,7 +104,7 @@ describe('ensureThreadInMap', () => {
       active_children_count: 0,
       awaited_children_count: 2,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, archivable_sub_thread_count: 0, live_event_wait_count: 0,
       status: 'idle',
       summary_version: 0,
       coding_agent_change_state: { kind: 'none' },
@@ -142,7 +143,7 @@ describe('ensureThreadInMap', () => {
       section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, archivable_sub_thread_count: 0, live_event_wait_count: 0,
       status: 'idle',
       summary_version: 0,
       coding_agent_change_state: { kind: 'none' },
@@ -444,6 +445,16 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     expect(threadsLoaded.value && awaitedThreadId.value !== 'spawned').toBe(false);
   });
 
+  it('claims the await before the focus moves, so the move itself sees the claim', () => {
+    const seen: Array<string | null> = [];
+    const stop = effect(() => {
+      if (focusedThreadId.value === 'spawned') seen.push(awaitedThreadId.peek());
+    });
+    focusSpawnedThread('spawned');
+    stop();
+    expect(seen).toEqual(['spawned']);
+  });
+
   it('moving the focus off an awaited thread releases the await', () => {
     focusSpawnedThread('spawned');
     threadMap.value = new Map([['elsewhere', makeThreadState('elsewhere')]]);
@@ -617,7 +628,7 @@ describe('event replay must not override API status', () => {
       summaryVersion: 0,
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
       isSaved: false,
@@ -668,7 +679,7 @@ describe('event replay must not override API status', () => {
       summaryVersion: 0,
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
       codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
       isSaved: false,

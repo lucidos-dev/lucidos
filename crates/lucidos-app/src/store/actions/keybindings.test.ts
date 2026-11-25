@@ -93,6 +93,11 @@ describe('matchShortcut', () => {
     expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }))).toBe('newThread');
   });
 
+  it('lets a chord the user bound beat an earlier default on the same chord', () => {
+    setPrefs({ searchFiles: 'mod+k' });
+    expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }))).toBe('searchFiles');
+  });
+
   it('can exclude one id (the one being rebound)', () => {
     setPrefs({});
     expect(matchShortcut(evt({ ctrlKey: true, key: 'k' }), 'searchEverywhere')).toBeNull();

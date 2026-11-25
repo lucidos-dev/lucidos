@@ -25,7 +25,7 @@
 //! (`emit_frontend_update_deferred`); the frontend renders a keyed hint toast.
 
 use super::LucidosEngine;
-use crate::engine::engine_version::BuildState;
+use crate::engine::engine_version::{BuildState, FrontendBuildWatchStopped};
 use crate::engine::frontend_snapshot;
 use chrono::{DateTime, Utc};
 use lucidos_owner_lock::{build_watch, ConsumerLock};
@@ -159,6 +159,38 @@ fn read_build_watch_state(served_dir: &Path) -> BuildWatchState {
     }
 }
 
+const BUILD_WATCH_STOPPED_GRACE: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct BuildWatchTracker {
+    stopped_since: Option<(Instant, i64)>,
+}
+
+impl BuildWatchTracker {
+    fn observe(
+        &mut self,
+        state: BuildWatchState,
+        now: Instant,
+        now_ms: i64,
+        cause: Option<String>,
+    ) -> Option<FrontendBuildWatchStopped> {
+        if state != BuildWatchState::Stopped {
+            self.stopped_since = None;
+            return None;
+        }
+        let (since, since_ms) = *self.stopped_since.get_or_insert((now, now_ms));
+        (now.duration_since(since) >= BUILD_WATCH_STOPPED_GRACE)
+            .then_some(FrontendBuildWatchStopped { since_ms, cause })
+    }
+}
+
+fn read_build_watch_exit_cause(source: &Path) -> Option<String> {
+    let record = std::fs::read_to_string(build_watch_dir(source)?.join("exit.json")).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&record).ok()?;
+    let cause = record.get("cause")?.as_str()?.trim();
+    (!cause.is_empty()).then(|| cause.to_owned())
+}
+
 /// Where this engine registers as a consumer of its checkout's build-watch, or
 /// `None` when `source` is not a dev checkout's `dist/` (packaged, headless).
 fn build_watch_consumer_lock(source: &Path) -> Option<PathBuf> {
@@ -269,12 +301,14 @@ fn applying_git_gate(engine_source_matches_head: Option<bool>) -> bool {
 }
 
 impl LucidosEngine {
-    /// Register the swappable served-frontend handle + its source dir. Called once
-    /// by `api::create_router` when `LUCIDOS_STATIC_DIR` is set. A second call
-    /// (e.g. a second router in a test) is ignored: the first registration wins.
+    /// Register the first router's served path and its live source dir.
     pub fn init_served_frontend(&self, handle: Arc<RwLock<PathBuf>>, source: PathBuf) {
-        let _ = self.served_frontend.set(handle);
-        let _ = self.served_frontend_source.set(source);
+        self.served_frontend.get_or_init(|| {
+            *self.activated_frontend_commit.lock().unwrap() =
+                frontend_snapshot::read_source_commit(&handle.read().unwrap());
+            let _ = self.served_frontend_source.set(source);
+            handle
+        });
     }
 
     /// The commit the served snapshot was built from, read from its stamp, or
@@ -608,14 +642,8 @@ impl LucidosEngine {
             .await;
     }
 
-    /// Pin a fresh snapshot of `source`, atomically swap the served handle to it,
-    /// and announce the swap with `ServedFrontendAdvanced`. Grace-cleans the
-    /// previous snapshot. Shared by the applying-engine refresh
-    /// ([`run_served_frontend_refresh`]) and the periodic peer sync
-    /// ([`sync_served_frontend_if_safe`]); both honor the generation guard (a newer
-    /// refresh supersedes this one) and the cleanup guard (only ever removes a dir
-    /// UNDER the snapshot parent, never the live `dist/`). The caller is
-    /// responsible for the INV-A gate before calling.
+    /// Swap the served snapshot for Apply or peer sync. Callers enforce INV-A.
+    /// A newer generation supersedes the swap. Cleanup retains live `dist/`.
     ///
     /// The announcement is the client's only prompt signal that a newer client
     /// is served. Every swap must emit it, or the Refresh toast waits for the
@@ -634,9 +662,23 @@ impl LucidosEngine {
                     frontend_snapshot::remove_snapshot_dir(&new_dir);
                     return;
                 }
-                let prev = {
+                let source_commit = frontend_snapshot::read_source_commit(&new_dir);
+                let (prev, commit_write) = {
                     let mut guard = handle.write().unwrap();
-                    std::mem::replace(&mut *guard, new_dir.clone())
+                    let prev = std::mem::replace(&mut *guard, new_dir.clone());
+                    let previous_source_commit = std::mem::replace(
+                        &mut *self.activated_frontend_commit.lock().unwrap(),
+                        source_commit.clone(),
+                    );
+                    // Schedule the durable write before yielding, inside the
+                    // swap guard. A newer Apply can abort this task after the
+                    // swap, and records must land in swap order.
+                    let commit_write = source_commit
+                        .filter(|commit| previous_source_commit.as_ref() != Some(commit))
+                        .map(|source_commit| {
+                            self.spawn_served_commit_write(previous_source_commit, source_commit)
+                        });
+                    (prev, commit_write)
                 };
                 crate::log_legacy!(
                     "[Frontend] serving re-snapshotted dist at {}",
@@ -653,6 +695,9 @@ impl LucidosEngine {
                     });
                 }
                 self.emit_served_frontend_advanced().await;
+                if let Some(write) = commit_write {
+                    let _ = write.await;
+                }
             }
             Err(e) => {
                 // Fail-safe: leave the current served dir in place (never a 404).
@@ -661,6 +706,52 @@ impl LucidosEngine {
                 );
             }
         }
+    }
+
+    /// Write one `ServedFrontendCommitChanged` after the previous one lands.
+    /// Call it inside the swap guard, so the chain follows swap order.
+    fn spawn_served_commit_write(
+        &self,
+        previous_source_commit: Option<String>,
+        source_commit: String,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::engine::event_bus::{BusEvent, SystemEvent};
+        let (written, next_waits_on) = tokio::sync::oneshot::channel();
+        let earlier = self
+            .served_commit_write_done
+            .lock()
+            .unwrap()
+            .replace(next_waits_on);
+        let bus = self.event_bus.clone();
+        tokio::spawn(async move {
+            if let Some(earlier) = earlier {
+                let _ = earlier.await;
+            }
+            bus.emit_or_log(
+                BusEvent::System(SystemEvent::ServedFrontendCommitChanged {
+                    previous_source_commit,
+                    source_commit,
+                }),
+                "[Frontend] ServedFrontendCommitChanged",
+            )
+            .await;
+            let _ = written.send(());
+        })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn advance_served_snapshot_for_test(&self, source: &Path) {
+        let generation = self
+            .frontend_refresh_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let handle = self
+            .served_frontend
+            .get()
+            .expect("register the served frontend first");
+        self.advance_served_snapshot(handle, source, self.workspace_path(), generation)
+            .await;
     }
 
     /// Emit the transient `ServedFrontendAdvanced` UI signal: this engine just
@@ -773,8 +864,38 @@ impl LucidosEngine {
             .await;
     }
 
+    async fn track_frontend_build_watch(&self, tracker: &mut BuildWatchTracker) {
+        if !self.newer_version_visible() {
+            return;
+        }
+        let Some(source) = self.served_frontend_source.get() else {
+            return;
+        };
+        let state = read_build_watch_state(source);
+        let cause = (state == BuildWatchState::Stopped)
+            .then(|| read_build_watch_exit_cause(source))
+            .flatten();
+        let sent_at_ms = crate::engine::now_epoch_millis();
+        let next = tracker.observe(state, Instant::now(), sent_at_ms, cause);
+        {
+            let mut reported = self.frontend_build_watch_stopped.lock().unwrap();
+            if *reported == next {
+                return;
+            }
+            *reported = next;
+        }
+
+        use crate::engine::event_bus::{BusEvent, SystemEvent};
+        self.event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::FrontendBuildWatchStateChanged { sent_at_ms }),
+                "[Frontend] FrontendBuildWatchStateChanged",
+            )
+            .await;
+    }
+
     /// Dev-only: spawn the periodic dev-maintenance loop (every
-    /// [`SERVED_FRONTEND_SYNC_INTERVAL`]). Two responsibilities per tick:
+    /// [`SERVED_FRONTEND_SYNC_INTERVAL`]). Three responsibilities per tick:
     /// 1. **Served-frontend peer sync** (`sync_served_frontend_if_safe`) — a peer
     ///    workspace picks up another workspace's frontend-only Apply without a
     ///    manual restart. See `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
@@ -785,6 +906,8 @@ impl LucidosEngine {
     ///    chose manual source builds. See
     ///    `docs/plans/2026-07-03-engine-version-switch-selfheal.md`.
     ///
+    /// 3. **Build-watch liveness** publishes a warning after sustained downtime.
+    ///
     /// Packaged returns immediately (no source rebuild); a headless engine (no
     /// served handle yet) ticks harmlessly — each step early-returns per tick, so
     /// this is robust to being spawned before the router registers the handle.
@@ -794,10 +917,12 @@ impl LucidosEngine {
             if crate::runtime::is_packaged() {
                 return;
             }
+            let mut build_watch = BuildWatchTracker::default();
             let mut ticker = tokio::time::interval(SERVED_FRONTEND_SYNC_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                engine.track_frontend_build_watch(&mut build_watch).await;
                 engine.sync_served_frontend_if_safe().await;
                 // Same dev-only cadence drives engine-version self-heal: if the
                 // engine SOURCE is behind HEAD with a stale on-disk binary
@@ -1043,6 +1168,59 @@ mod tests {
             &bare.path().join("dist"),
             applied
         ));
+    }
+
+    #[test]
+    fn stopped_watch_requires_a_continuous_grace_period() {
+        use super::BuildWatchTracker;
+        let mut tracker = BuildWatchTracker::default();
+        let start = Instant::now();
+        let mut sample = |state, seconds| {
+            tracker.observe(
+                state,
+                start + Duration::from_secs(seconds),
+                1_000 + seconds as i64 * 1_000,
+                Some("SIGTERM".to_owned()),
+            )
+        };
+        assert!(sample(BuildWatchState::Stopped, 0).is_none());
+        assert!(sample(BuildWatchState::Stopped, 59).is_none());
+        assert!(sample(BuildWatchState::Unknown, 60).is_none());
+        assert!(sample(BuildWatchState::Stopped, 70).is_none());
+        let report = sample(BuildWatchState::Stopped, 130).unwrap();
+        assert_eq!(report.since_ms, 71_000);
+        assert_eq!(report.cause.as_deref(), Some("SIGTERM"));
+        assert_eq!(sample(BuildWatchState::Stopped, 140), Some(report));
+        assert!(sample(BuildWatchState::Running, 150).is_none());
+        assert!(sample(BuildWatchState::Stopped, 160).is_none());
+        assert_eq!(
+            sample(BuildWatchState::Stopped, 220).unwrap().since_ms,
+            161_000
+        );
+        assert!(sample(BuildWatchState::Unknown, 230).is_none());
+    }
+
+    #[test]
+    fn stopped_watch_cause_comes_from_its_exit_record() {
+        use super::read_build_watch_exit_cause;
+        let app = tempfile::tempdir().unwrap();
+        let source = app.path().join("dist");
+        let state_dir = build_watch::dir(app.path());
+        std::fs::create_dir_all(&state_dir).unwrap();
+        assert_eq!(read_build_watch_exit_cause(&source), None);
+
+        let record = state_dir.join("exit.json");
+        std::fs::write(
+            &record,
+            r#"{"at":"2026-01-01T00:00:00Z","cause":"SIGTERM"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_build_watch_exit_cause(&source).as_deref(),
+            Some("SIGTERM")
+        );
+        std::fs::write(record, "incomplete").unwrap();
+        assert_eq!(read_build_watch_exit_cause(&source), None);
     }
 
     #[test]

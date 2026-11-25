@@ -349,24 +349,27 @@ assert_command() {
 assert_command 2
 assert_command 2 --host
 assert_command 2 --unknown
-assert_command 72 --host fixture-host --target fixture-target --selection headless --memory
+assert_command 72 --host fixture-host --target aarch64-fixture-linux-gnu --selection headless --memory
 grep -qx '<fixture-host>' "$fixture/output"
-grep -qx '<fixture-target>' "$fixture/output"
+grep -qx '<aarch64-fixture-linux-gnu>' "$fixture/output"
 grep -qx '<headless>' "$fixture/output"
 grep -qx '<memory>' "$fixture/output"
 grep -qx '<5>' "$fixture/output"
 export BP_FIXTURE_CARGO_ARGS="$fixture/cli-cargo-args"
-assert_command 72 --host fixture-host --target fixture-target -- --workspace --all-features
+assert_command 72 --host fixture-host --target aarch64-fixture-linux-gnu -- --workspace --all-features
 grep -qx '<desktop>' "$fixture/output"
 grep -qx -- '--all-features' "$fixture/cli-cargo-args"
-assert_command 2 --host fixture-host --target fixture-target --selection headless -- --workspace
-assert_command 2 --host fixture-host --target fixture-target --memory -- --workspace
-assert_command 72 --host fixture-host --target fixture-target --
+assert_command 2 --host fixture-host --target aarch64-fixture-linux-gnu --selection headless -- --workspace
+assert_command 2 --host fixture-host --target aarch64-fixture-linux-gnu --memory -- --workspace
+assert_command 72 --host fixture-host --target aarch64-fixture-linux-gnu --
 grep -qx '<desktop>' "$fixture/output"
+assert_command 72 --host fixture-host -- --target aarch64-fixture-linux-gnu -p lucidos-app
+grep -qx 'aarch64-fixture-linux-gnu' "$fixture/cli-cargo-args"
+grep -qx -- '-p' "$fixture/cli-cargo-args"
 export BP_FIXTURE_CARGO_FAIL=1
-assert_command 1 --host fixture-host --target fixture-target -- --workspace
+assert_command 1 --host fixture-host --target aarch64-fixture-linux-gnu -- --workspace
 unset BP_FIXTURE_CARGO_FAIL BP_FIXTURE_CARGO_ARGS
-echo 'build_prerequisites_test: PASS (9 CLI parser cases)'
+echo 'build_prerequisites_test: PASS (10 CLI parser cases)'
 
 # Selection reads Cargo's target-filtered dependency graph, never installed
 # native packages or a textual scan of optional manifest dependencies.
@@ -379,24 +382,24 @@ echo 'build_prerequisites_test: PASS (9 CLI parser cases)'
     fixture_cargo_rc=0
     fixture_graph='lucidos-engine v1.0.0
 libc v0.2.0'
-    [ "$(bp_cargo_selection fixture-target -p lucidos-engine --all-features)" = headless ]
+    [ "$(bp_cargo_selection aarch64-fixture-linux-gnu -p lucidos-engine --all-features)" = headless ]
     grep -qx -- '--offline' "$fixture/cargo-args"
     grep -qx -- '--locked' "$fixture/cargo-args"
-    grep -qx -- 'fixture-target' "$fixture/cargo-args"
+    grep -qx -- 'aarch64-fixture-linux-gnu' "$fixture/cargo-args"
     grep -qx -- '--all-features' "$fixture/cargo-args"
     fixture_graph='lucidos-app v1.0.0
 gtk-sys v0.18.0 (*)'
-    [ "$(bp_cargo_selection fixture-target --workspace --all-features)" = desktop ]
+    [ "$(bp_cargo_selection aarch64-fixture-linux-gnu --workspace --all-features)" = desktop ]
     fixture_graph='webkit2gtk-sys v2.0.0'
-    [ "$(bp_cargo_selection fixture-target -p lucidos-app)" = desktop ]
+    [ "$(bp_cargo_selection aarch64-fixture-linux-gnu -p lucidos-app)" = desktop ]
     fixture_cargo_rc=1
     rc=0
-    bp_cargo_selection fixture-target --workspace > "$fixture/output" 2>&1 || rc=$?
+    bp_cargo_selection aarch64-fixture-linux-gnu --workspace > "$fixture/output" 2>&1 || rc=$?
     [ "$rc" -eq 1 ]
     grep -q 'cannot resolve' "$fixture/output"
     fixture_cargo_rc=0 fixture_graph=''
     rc=0
-    bp_cargo_selection fixture-target --workspace > "$fixture/output" 2>&1 || rc=$?
+    bp_cargo_selection aarch64-fixture-linux-gnu --workspace > "$fixture/output" 2>&1 || rc=$?
     [ "$rc" -eq 1 ]
 )
 echo 'build_prerequisites_test: PASS (5 synthetic Cargo selection cases)'

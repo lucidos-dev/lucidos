@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { perfSamplesSection } from './perf-samples.mjs';
 import { buildScoreboard, crateGraph, SCOREBOARD_EVIDENCE, suiteTimings, summarize } from './unit-costs.mjs';
 
 export const PAGE_SIZE = 10_000;
@@ -180,6 +181,7 @@ function main() {
     main_check_seconds: groupSummaries(psqlJson(mainCheckSql(since), env), 'outcome', 'seconds'),
     lane_batches: laneBatches(psqlJson(laneBatchSql(since), env)),
     github_build_seconds: githubSection(args.timingsLog, { observedMs, days: args.days }),
+    perf_samples: perfSamplesSection({ days: args.days, observedMs }),
   };
   console.log(args.json ? JSON.stringify(report, null, 2) : formatText(report));
 }
@@ -210,6 +212,7 @@ function githubSection(path, window) {
 
 const minutes = (ms) => (ms / 60_000).toFixed(1);
 const fromSeconds = (s) => (s / 60).toFixed(1);
+const whole = (ms) => String(Math.round(ms));
 const count = (n) => String(Number(n.toFixed(1)));
 const TEXT_ROWS = 15;
 
@@ -295,6 +298,12 @@ export function formatText(r) {
   section('GitHub build jobs on this host (minutes)');
   if (r.github_build_seconds.unavailable) out.push(r.github_build_seconds.unavailable);
   else out.push(table(['job', 'time'], Object.entries(r.github_build_seconds).map(([j, s]) => [j, cell(s, fromSeconds)])));
+
+  const p = r.perf_samples;
+  section('App speed samples from the diagnostic log (milliseconds per sample kind and device class)');
+  if (p.unavailable) out.push(`unavailable: ${p.unavailable}`);
+  else if (p.rollup.length) out.push(table(['kind', 'device', 'samples'], p.rollup.map((s) => [s.kind, s.device, cell(s, whole)])));
+  for (const note of p.notes) out.push(`note: ${note}`);
   return out.join('\n').trimStart();
 }
 

@@ -53,6 +53,7 @@ function summary(overrides: Partial<ThreadSummary>): ThreadSummary {
     total_children_count: 0,
     blocking_descendant_count: 0,
     attention_descendant_count: 0,
+    archivable_sub_thread_count: 0,
     live_event_wait_count: 0,
     live_event_waits: [],
     status: 'idle',

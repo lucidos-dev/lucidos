@@ -31,6 +31,7 @@ pub use super::chat::recovery::{
     recover_orphan_tool_calls, recover_orphaned_threads, resume_pending_chat_switches,
 };
 pub use super::claude_code::start_cc_model_discovery;
+pub use super::thread_triage::archivable_count::ArchivableCountWorker;
 pub use has_diff::*;
 pub use helpers::*;
 pub use orphaned_branch_work::{set_aside_archived_branch_work_on_startup, spawn_branch_work_net};

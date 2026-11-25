@@ -128,7 +128,10 @@ describe('every protected surface carries the class', () => {
     'components/shared/ProgressDialog.tsx',
   ])(
     '%s puts its backdrop inside it too, so the scrim is protected',
-    file => expect(read(file)).toContain(`overlayClass="${PROTECTED_CLASS}"`),
+    file => {
+      const overlayClass = /overlayClass="([^"]*)"/.exec(read(file))?.[1] ?? '';
+      expect(overlayClass.split(/\s+/)).toContain(PROTECTED_CLASS);
+    },
   );
 
   it('builds the action slot, alone or split, as one', () => {

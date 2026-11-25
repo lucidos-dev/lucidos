@@ -45,7 +45,7 @@ engine, and for an eval arm that corrupts the measurement it exists to produce.
 
 The eval harness states the expectation from the other side: autostart stays
 off, so "the gateway never spawns an arm engine of its own accord"
-(`crates/lucidos-eval/src/gateway.rs`). Respawning a dead arm engine would break
+(`crates/lucidos-engine-bin/src/bin/lucidos-eval/gateway.rs`). Respawning a dead arm engine would break
 that promise once per run, and leave a stray engine behind every time.
 
 Releasing is also the honest report. The engine is gone, so "stopped" is what is

@@ -3,12 +3,13 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { planFoldersReveal, revealThreadInFolders, setFamilyCollapsed, setSectionCollapsed } from './ThreadDrawer';
 import { computeFamilyGraph, collapsedAncestorIds } from './family-graph';
 import {
-    ALL_CHANNELS, drawerGrouping, selectedOngoingGroup, setDrawerGrouping, setSelectedOngoingGroup,
+    ALL_CHANNELS, preferences, drawerGrouping, selectedOngoingGroup, setDrawerGrouping, setSelectedOngoingGroup,
     setThreadChannelFilter, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, toasts,
 } from '../../store/store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import type { ThreadState, ThreadMeta } from '../../store/thread-events';
 import type { ArchiveState, EventChannel } from '../../generated/thread-lifecycle';
+import { PREF_THREAD_FOLDERS } from '@lucidos/preference-catalog';
 
 type ThreadOpts = { parentId?: string; section?: ArchiveState; channel?: EventChannel; state?: ThreadMeta['state'] };
 
@@ -27,7 +28,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         section: opts.section ?? 'inbox',
         activeChildrenCount: 0,
         totalChildrenCount: 0,
-        blockingDescendantCount: 0, attentionDescendantCount: 0,
+        blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
         codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
@@ -217,5 +218,28 @@ describe('revealThreadInFolders', () => {
 
         expect(appliedThreadFilter.value.channels.size).toBe(ALL_CHANNELS.length);
         expect(drawerGrouping.value).toBe('folders');
+    });
+});
+
+describe('planFoldersReveal with custom folders', () => {
+    beforeEach(() => {
+        preferences.value = { status: 'loaded', data: { [PREF_THREAD_FOLDERS.key]: '[{"id":"w48","name":"W48"}]' } };
+    });
+
+    function pinnedIn(id: string, folder: string, parentId?: string): ThreadState {
+        const thread = makeThread(id, { parentId });
+        thread.meta.saved = true;
+        thread.meta.pinFolder = folder;
+        return thread;
+    }
+
+    it('names the folder section of a pin in a listed folder, and of its sub-thread', () => {
+        const threads = [pinnedIn('root', 'w48'), makeThread('child', { parentId: 'root' })];
+        expect(planFoldersReveal('root', threads, ALL, new Set())).toMatchObject({ section: 'folder:w48' });
+        expect(planFoldersReveal('child', threads, ALL, new Set())).toMatchObject({ section: 'folder:w48' });
+    });
+
+    it('names Pinned for a pin whose folder was deleted', () => {
+        expect(planFoldersReveal('t', [pinnedIn('t', 'gone')], ALL, new Set())).toMatchObject({ section: 'saved' });
     });
 });

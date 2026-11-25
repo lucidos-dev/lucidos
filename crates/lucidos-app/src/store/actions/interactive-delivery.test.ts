@@ -24,9 +24,33 @@ vi.mock('./navigation-request', () => ({ presentThreadNavigation: vi.fn() }));
 vi.mock('./oauth', () => ({ presentOAuthAccountConnected: vi.fn() }));
 vi.mock('./devices', () => ({ getDeviceId: () => 'test-device' }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
-import { installInteractiveDelivery } from './interactive-delivery';
+import { installInteractiveDelivery, presentInteractiveRequest } from './interactive-delivery';
 
 beforeEach(() => { vi.clearAllMocks(); });
+
+it('closing a form or confirm publishes again, so pending work retries without a new connection', async () => {
+  const activeInlineForm = (await import('../store')).activeInlineForm as unknown as { value: unknown };
+  const stop = installInteractiveDelivery();
+  try {
+    await vi.waitFor(() => expect(mocks.coordinator.publish).toHaveBeenCalled());
+    mocks.coordinator.publish.mockClear();
+    activeInlineForm.value = { id: 'form' } as never;
+    activeInlineForm.value = null;
+    await vi.waitFor(() => expect(mocks.coordinator.publish).toHaveBeenCalledTimes(2));
+  } finally { stop(); await vi.waitFor(() => expect(mocks.coordinator.stop).toHaveBeenCalledOnce()); }
+});
+
+it('opens the push prompt at once, and asks for the permission only after the answer', async () => {
+  const { showConfirm } = await import('../store');
+  const { setDevicePushEnabled } = await import('./push');
+  let answer!: (ok: boolean) => void;
+  vi.mocked(showConfirm).mockReturnValueOnce(new Promise<boolean>((resolve) => { answer = resolve; }) as never);
+  expect(presentInteractiveRequest({ id: 'push', kind: 'push-enable', payload: {}, preference: { threadId: 'thread' } })).toBe(true);
+  expect(showConfirm).toHaveBeenCalledTimes(1);
+  expect(setDevicePushEnabled).not.toHaveBeenCalled();
+  answer(true);
+  await vi.waitFor(() => expect(setDevicePushEnabled).toHaveBeenCalledWith('test-device', true));
+});
 
 it('installs the service synchronously and waits for the adapter before submitting', async () => {
   const stop = installInteractiveDelivery();

@@ -4,10 +4,12 @@ import { makeThreadState } from './threads-test-helpers';
 import { getComposeSelectionOverride, resolveCodingAgent, _resetComposeSelectionsForTesting } from '../composeSelections';
 import { preferencesSlice, currentAgentBrandColours, setAgentBrandColours, applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
 import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, backupIsConfigured, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupBanner, backupBannerIn, backupOverdueHiddenByDismissal, dismissBackupOverdueReminder, BACKUP_OVERDUE_SNOOZE_MS, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, backupIsConfigured, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupBanner, backupBannerIn, backupOverdueHiddenByDismissal, dismissBackupOverdueReminder, BACKUP_OVERDUE_SNOOZE_MS, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule, appearanceVersion, currentResponseStyle, currentChatModel, currentOpenCodeFreeEnabled, storedVoiceTalkerModel } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
 import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_HEADER_TOP } from '@lucidos/appearance';
+import { AUTOCORRECT_STORAGE_KEY } from '@lucidos/text-entry';
+import { STYLE_OVERRIDES_KEY } from '../../utils/styleOverrides';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -2255,5 +2257,163 @@ describe('agent brand colours', () => {
     await setAgentBrandColours(false);
     expect(currentAgentBrandColours()).toBe(false);
     expect(save).toHaveBeenCalledWith('agent-brand-colours', 'false', expect.any(String));
+  });
+});
+
+describe('preference enforcement under the rules the store relies on', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+  });
+
+  it('a failed refetch keeps the loaded preferences rather than blanking them', async () => {
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
+    vi.spyOn(apiClient, 'getPreferences').mockRejectedValueOnce(new ApiError(500, 'engine down'));
+
+    await loadPreferences();
+
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'dark' } });
+  });
+
+  it('a write made while a refetch is out survives the refetch answering with the older value', async () => {
+    preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
+    let answerRead: () => void = () => {};
+    vi.spyOn(apiClient, 'getPreferences').mockImplementationOnce(() => new Promise((resolve) => {
+      answerRead = () => resolve({ preferences: { 'theme-mode': 'dark' } });
+    }));
+    let answerWrite: () => void = () => {};
+    vi.spyOn(apiClient, 'setPreference').mockImplementation(() => new Promise((resolve) => {
+      answerWrite = () => resolve({ success: true } as ApiResult);
+    }));
+
+    const loaded = loadPreferences();
+    const saved = savePreference('theme-mode', 'light');
+    await vi.waitFor(() => expect(apiClient.setPreference).toHaveBeenCalled());
+    answerRead();
+    await loaded;
+
+    expect(preferences.value).toEqual({ status: 'loaded', data: { 'theme-mode': 'light' } });
+    answerWrite();
+    await saved;
+  });
+
+  it('a synchronous animation frame does not stop the next UI-scale measurement pass being scheduled', () => {
+    const frame = vi.fn((cb: FrameRequestCallback) => { cb(0); return 0; });
+    vi.stubGlobal('requestAnimationFrame', frame);
+
+    applyUiScale(100);
+    applyUiScale(110);
+
+    expect(frame).toHaveBeenCalledTimes(2);
+  });
+
+  it('a theme paint bumps appearanceVersion so shared surfaces repaint', () => {
+    const before = appearanceVersion.value;
+    applyThemeMode('light');
+    expect(appearanceVersion.value).toBeGreaterThan(before);
+  });
+
+  it('a UI-scale paint bumps appearanceVersion so shared surfaces repaint', () => {
+    const before = appearanceVersion.value;
+    applyUiScale(105);
+    expect(appearanceVersion.value).toBeGreaterThan(before);
+  });
+
+  it('the shell is told the window may show only after the mode is on the document', () => {
+    platformMocks.isTauri = false;
+    applyThemeMode('dark');
+    platformMocks.isTauri = true;
+    let painted: string | null = null;
+    windowReadyToShowMock.mockImplementationOnce(() => {
+      painted = document.documentElement.style.colorScheme;
+    });
+
+    try {
+      applyThemeMode('light');
+      expect(painted).toBe('light');
+    } finally {
+      platformMocks.isTauri = false;
+    }
+  });
+
+  it('a stored style override paints on a fresh load', async () => {
+    preferences.value = { status: 'not-loaded' };
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
+      preferences: { [STYLE_OVERRIDES_KEY]: JSON.stringify({ '--accent': '#ff0000' }) },
+    });
+    const paint = vi.spyOn(document.documentElement.style, 'setProperty');
+
+    await loadPreferences();
+
+    expect(paint).toHaveBeenCalledWith('--accent', '#ff0000');
+  });
+
+  it('a font mirror in this device never answers for the font preference while loading', () => {
+    localStorage.setItem('lucidos-font-family', 'ibm-plex-mono');
+    preferences.value = { status: 'loading' };
+
+    expect(currentFontFamily()).toBe('theme');
+  });
+
+  it('a response style id the catalog does not list reads back as stored', () => {
+    preferences.value = { status: 'loaded', data: { response_style: 'my-custom-style' } };
+    expect(currentResponseStyle()).toBe('my-custom-style');
+  });
+
+  it('a chat model id outside the catalog reads back as stored', () => {
+    preferences.value = { status: 'loaded', data: { chat_model: 'custom-provider/model-x' } };
+    expect(currentChatModel()).toBe('custom-provider/model-x');
+  });
+
+  it('OpenCode Free is off on a loaded workspace that stores nothing', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    expect(currentOpenCodeFreeEnabled()).toBe(false);
+  });
+
+  it('an unset voice talker reads as empty, so a clear saves nothing', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    expect(storedVoiceTalkerModel()).toBe('');
+  });
+
+  it('a served absence clears the autocorrect mirror before the reads take it', async () => {
+    localStorage.setItem(AUTOCORRECT_STORAGE_KEY, 'false');
+    preferences.value = { status: 'loaded', data: {} };
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+    setProseAutocorrectMock.mockClear();
+
+    await loadPreferences();
+
+    expect(setProseAutocorrectMock).toHaveBeenLastCalledWith(true);
+  });
+
+  it('the style reset is written once per page load, however often preferences reload', async () => {
+    vi.resetModules();
+    const store = await import('../store');
+    const client = await import('../../api/client');
+    const fresh = await import('./preferences');
+    const realLocation = Object.getOwnPropertyDescriptor(window, 'location');
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { href: 'http://localhost/?style-reset', search: '?style-reset', pathname: '/', hash: '' },
+    });
+    const replace = vi.spyOn(window.history, 'replaceState').mockImplementation(() => {});
+    const setPref = vi.spyOn(client, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    vi.spyOn(client, 'getPreferences').mockResolvedValue({ preferences: {} });
+    store.preferences.value = { status: 'loaded', data: {} };
+
+    await fresh.loadPreferences();
+    await fresh.loadPreferences();
+    expect(setPref.mock.calls.filter(([key]) => key === STYLE_OVERRIDES_KEY)).toHaveLength(1);
+    replace.mockRestore();
+    if (realLocation) Object.defineProperty(window, 'location', realLocation);
+    else Reflect.deleteProperty(window, 'location');
   });
 });

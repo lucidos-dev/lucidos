@@ -433,9 +433,9 @@ fn a_padded_or_shouted_pin_is_still_a_pin() {
 }
 
 /// The eval harness exports this name and this value from its own copies of
-/// both strings, in `crates/lucidos-eval/src/workspace.rs`. That crate does not
-/// depend on the engine (ADR 0087 decision 15), so nothing but a literal joins
-/// the two sides. Rename or re-spell either and the harness keeps exporting the
+/// both strings, in `crates/lucidos-engine-bin/src/bin/lucidos-eval/workspace.rs`.
+/// Nothing but a literal joins the two sides.
+/// Rename or re-spell either and the harness keeps exporting the
 /// old one: nothing fails to compile, the pin silently stops working, and the
 /// run goes back to voiding the pairs it exists to save. This is the tripwire.
 #[test]

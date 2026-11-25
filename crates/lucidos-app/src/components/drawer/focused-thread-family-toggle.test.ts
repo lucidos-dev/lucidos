@@ -21,7 +21,7 @@ function makeThread(id: string, totalChildrenCount: number): ThreadState {
         section: 'archived',
         activeChildrenCount: 0,
         totalChildrenCount,
-        blockingDescendantCount: 0, attentionDescendantCount: 0,
+        blockingDescendantCount: 0, attentionDescendantCount: 0, archivableSubThreadCount: 0,
         codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',

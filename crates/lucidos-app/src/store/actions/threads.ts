@@ -229,38 +229,44 @@ function holdRows(threadIds: Iterable<string>, kind: RowIntent['kind'], fields: 
   });
 }
 
-const ROW_WRITE_VERBS: Record<RowIntent['kind'], string> = { archive: 'archiving', discard: 'discarding', pin: 'pinning', unpin: 'unpinning' };
+const ROW_WRITE_VERBS: Record<RowIntent['kind'], string> = { archive: 'archiving', discard: 'discarding', pin: 'pinning', unpin: 'unpinning', move: 'moving' };
 
-function refuseWhileRowWriteInFlight(threadId: string): boolean {
+export function refuseWhileRowWriteInFlight(threadId: string): boolean {
   const inFlight = rowRequestInFlight(threadId);
   if (inFlight) showToast(`Still ${ROW_WRITE_VERBS[inFlight]} this thread. Try again in a moment.`, 'info');
   return inFlight !== null;
 }
 
-async function writePin(
+type PinWriteKind = 'pin' | 'unpin' | 'move';
+
+export async function writePin(
   threadId: string,
-  kind: 'pin' | 'unpin',
-  write: (threadId: string) => Promise<{ summary_version?: number }>,
-): Promise<void> {
-  if (refuseWhileRowWriteInFlight(threadId)) return;
+  kind: PinWriteKind,
+  fields: RowFields,
+  write: () => Promise<{ summary_version?: number }>,
+): Promise<boolean> {
+  if (refuseWhileRowWriteInFlight(threadId)) return false;
   const legacyVersion = versionsBeyondCurrent([threadId]).get(threadId);
-  holdRows([threadId], kind, kind === 'pin' ? { saved: true, section: 'inbox' } : { saved: false });
+  holdRows([threadId], kind, fields);
   try {
-    const { summary_version } = await write(threadId);
+    const { summary_version } = await write();
     const version = summary_version ?? legacyVersion;
     changeRows([threadId], (meta) => version === undefined
       ? abandonRowIntent(meta, kind)
       : acknowledgeRowIntent(meta, kind, version));
+    return true;
   } catch (e) {
     changeRows([threadId], (meta) => abandonRowIntent(meta, kind));
     showToast(`Failed to ${kind} thread: ${errorDetail(e)}`, 'error');
+    return false;
   }
 }
 
-export async function handleSaveThread(threadId: string): Promise<void> {
+export async function handleSaveThread(threadId: string, folder?: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread || thread.meta.saved) return;
-  await writePin(threadId, 'pin', saveThread);
+  await writePin(threadId, 'pin', { saved: true, section: 'inbox', pinFolder: folder ?? null },
+    () => saveThread(threadId, folder));
 }
 
 export async function handleUnsaveThread(threadId: string): Promise<void> {
@@ -270,7 +276,7 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
   if (!await showConfirm('Remove this thread from the Pinned section?', 'Remove', { variant: 'default' })) {
     return;
   }
-  await writePin(threadId, 'unpin', unsaveThread);
+  await writePin(threadId, 'unpin', { saved: false, pinFolder: null }, () => unsaveThread(threadId));
 }
 
 
@@ -368,7 +374,44 @@ export async function handleUnarchiveThread(threadId: string): Promise<void> {
   }
 }
 
-export const ARCHIVE_PINNED_CONFIRM = 'Archiving unpins this thread. Move it to the archive?';
+export const ARCHIVED_ROW_FIELDS: RowFields = { section: 'archived', saved: false, pinFolder: null, codingAgentChangeState: NO_CHANGE };
+
+export function holdArchivedRows(cascade: Iterable<string>): void {
+  holdRows(cascade, 'archive', ARCHIVED_ROW_FIELDS);
+}
+
+export function settleArchive(
+  cascade: Iterable<string>,
+  result: Awaited<ReturnType<typeof archiveThread>>,
+  legacyVersions: ReadonlyMap<string, number>,
+): { skipped: ArchiveSkippedMember[]; skippedIds: Set<string> } {
+  const { skipped = [], summary_versions: versions } = result;
+  const skippedIds = new Set(skipped.map((m) => m.thread_id));
+  changeRows(cascade, (meta) => {
+    const version = versions ? versions[meta.id] : legacyVersions.get(meta.id);
+    return skippedIds.has(meta.id) || version === undefined
+      ? abandonRowIntent(meta, 'archive')
+      : acknowledgeRowIntent(meta, 'archive', version);
+  });
+  return { skipped, skippedIds };
+}
+
+export function focusOffCascade(candidates: readonly string[], cascade: ReadonlySet<string>): string | null {
+  const nextId = candidates.find(id => !cascade.has(id)) ?? null;
+  if (nextId) {
+    revealOnFocus.value = true;
+    openListedThread(nextId, { revealPane: false });
+  } else {
+    unfocusThread({ revealPane: false });
+  }
+  return nextId;
+}
+
+export function abandonArchive(cascade: Iterable<string>): void {
+  changeRows(cascade, (meta) => abandonRowIntent(meta, 'archive'));
+}
+
+export const ARCHIVE_PINNED_CONFIRM ='Archiving unpins this thread. Move it to the archive?';
 
 export async function handleArchiveThread(threadId: string): Promise<void> {
   if (archiveRequestInFlight(threadId)) return;
@@ -429,25 +472,11 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   const candidates = visibleCandidatesAround(threadId);
 
   const legacyVersions = versionsBeyondCurrent(cascade);
-  holdRows(cascade, 'archive', { section: 'archived', saved: false, codingAgentChangeState: NO_CHANGE });
-
-  const nextId = candidates.find(id => !cascade.has(id)) ?? null;
-  if (nextId) {
-    revealOnFocus.value = true;
-    openListedThread(nextId, { revealPane: false });
-  } else {
-    unfocusThread({ revealPane: false });
-  }
+  holdArchivedRows(cascade);
+  const nextId = focusOffCascade(candidates, cascade);
 
   try {
-    const { skipped = [], summary_versions: versions } = await archiveThread(threadId);
-    const skippedIds = new Set(skipped.map((m) => m.thread_id));
-    changeRows(cascade, (meta) => {
-      const version = versions ? versions[meta.id] : legacyVersions.get(meta.id);
-      return skippedIds.has(meta.id) || version === undefined
-        ? abandonRowIntent(meta, 'archive')
-        : acknowledgeRowIntent(meta, 'archive', version);
-    });
+    const { skipped, skippedIds } = settleArchive(cascade, await archiveThread(threadId), legacyVersions);
     if (skipped.length > 0) {
       if (skippedIds.has(threadId) && focusedThreadId.value === nextId) {
         focusThread(threadId, { revealPane: false });
@@ -460,7 +489,7 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
       }
     }
   } catch (e) {
-    changeRows(cascade, (meta) => abandonRowIntent(meta, 'archive'));
+    abandonArchive(cascade);
     const stillOnAutoFocus = focusedThreadId.value === nextId;
     if (stillOnAutoFocus && threadMap.value.has(threadId)) {
       focusThread(threadId, { revealPane: false });

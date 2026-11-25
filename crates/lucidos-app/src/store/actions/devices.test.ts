@@ -702,6 +702,19 @@ describe('boot order', () => {
   });
 });
 
+describe('registerCurrentDevice', () => {
+  it('resolves even when the register call fails, so every mutation awaiting it proceeds', async () => {
+    const { registerCurrentDevice } = await import('./devices');
+    const { registerDevice } = await import('../../api/client');
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      vi.mocked(registerDevice).mockRejectedValueOnce(new Error('engine down'));
+      await expect(registerCurrentDevice()).resolves.toBeUndefined();
+      expect(warning).toHaveBeenCalled();
+    } finally { warning.mockRestore(); }
+  });
+});
+
 describe('turnDeviceName', () => {
   beforeEach(() => vi.resetModules());
 

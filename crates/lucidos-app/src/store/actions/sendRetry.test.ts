@@ -4,7 +4,7 @@ vi.mock('../../utils/clientLog', () => ({ postClientLog: vi.fn() }));
 
 import { ApiError } from '../../api/client';
 import { postClientLog } from '../../utils/clientLog';
-import { SEND_RETRY_BACKOFF_MS, SEND_RETRY_DEADLINE_MS, withQuietRetries } from './sendRetry';
+import { SEND_RETRY_BACKOFF_MS, SEND_RETRY_DEADLINE_MS, inputRefusalOf, withQuietRetries } from './sendRetry';
 import { _resetPageVisitForTesting } from '../../utils/pageVisit';
 
 const dropped = () => new TypeError('Load failed');
@@ -172,5 +172,19 @@ describe('withQuietRetries', () => {
     doc.dispatchEvent(new Event('visibilitychange'));
     await vi.advanceTimersByTimeAsync(0);
     expect(attempt).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('inputRefusalOf', () => {
+  it('reads only an explicit ordering refusal as a refusal', () => {
+    expect(inputRefusalOf(new ApiError(409, 'overtaken', { reason: 'overtaken' }))).toMatchObject({ reason: 'overtaken' });
+    expect(inputRefusalOf(new ApiError(409, 'stale', { reason: 'compose_snapshot_stale' }))).toMatchObject({ reason: 'compose_snapshot_stale' });
+    expect(inputRefusalOf(new ApiError(409, 'fence', { reason: 'compose_fence_required' }))).toMatchObject({ reason: 'compose_fence_required' });
+  });
+
+  it('does not read other conflicts, other statuses or transport failures as a refusal', () => {
+    expect(inputRefusalOf(new ApiError(409, 'busy', { reason: 'thread_busy' }))).toBeUndefined();
+    expect(inputRefusalOf(new ApiError(500, 'overtaken', { reason: 'overtaken' }))).toBeUndefined();
+    expect(inputRefusalOf(new TypeError('Load failed'))).toBeUndefined();
   });
 });

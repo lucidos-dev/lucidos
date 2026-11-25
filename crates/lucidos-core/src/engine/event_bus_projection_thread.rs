@@ -1019,9 +1019,24 @@ impl EventBus {
             }
             ThreadEvent::ThreadUnsaved => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET is_saved = FALSE WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET is_saved = FALSE, pin_folder = NULL \
+                     WHERE thread_id = $1",
                 )
                 .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            // A folder only files a pin: the API refuses an unpinned thread,
+            // and the `thread_summaries_folder_is_pinned` CHECK backs that.
+            // The `is_saved` guard keeps a stale replay from tripping it.
+            ThreadEvent::ThreadMovedToFolder { folder } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET pin_folder = $2 \
+                     WHERE thread_id = $1 AND is_saved",
+                )
+                .bind(thread_id)
+                .bind(folder.as_deref())
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -1049,7 +1064,8 @@ impl EventBus {
                 // starts a fresh thread (ADR 0623).
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET status = {IDLE}, \
-                     is_saved = FALSE, is_stopped_child = FALSE, read_requested = FALSE, \
+                     is_saved = FALSE, pin_folder = NULL, \
+                     is_stopped_child = FALSE, read_requested = FALSE, \
                      continue_key = NULL, \
                      {clear} \
                      WHERE thread_id = $1",
@@ -1135,7 +1151,7 @@ impl EventBus {
                 // because a pinned thread is never archived (ADR 0312).
                 sqlx::query(
                     "UPDATE thread_summaries SET state = 'discarded', \
-                     archive_state = 'archived', is_saved = FALSE, \
+                     archive_state = 'archived', is_saved = FALSE, pin_folder = NULL, \
                      compose_text = '', compose_images = '[]'::jsonb, compose_mode = NULL, \
                      compose_selection = NULL \
                      WHERE thread_id = $1 AND state = 'composing'",

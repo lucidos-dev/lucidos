@@ -2821,6 +2821,19 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The user filed a pinned thread in a custom folder, an id from the
+   *  `thread_folders` preference. `None` moves it back to plain Pinned.
+   *  Projects to `thread_summaries.pin_folder`. */
+  | {
+      type: 'ThreadMovedToFolder';
+      folder?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   | {
       type: 'ThreadArchived';
       /** Links this event back to the request that opened the turn. */
@@ -4978,6 +4991,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ThreadTitleRenamed: true,
   ThreadSaved: true,
   ThreadUnsaved: true,
+  ThreadMovedToFolder: true,
   ThreadArchived: true,
   ThreadArchiveRequested: true,
   ThreadUnarchived: true,

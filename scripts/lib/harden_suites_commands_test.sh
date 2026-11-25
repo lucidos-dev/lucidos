@@ -7,6 +7,11 @@ source "$SCRIPT_DIR/harden_suites.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 unset HS_STUB_CMD
+
+[ "$(hs_suite_command lint-static normal "$TMP" 1)" = "make lint-static LINT_STATIC_TARGETS='lint-shell lint-eval'" ]
+[ "$(hs_suite_command lint-static normal "$TMP")" = "make lint-static" ]
+echo "PASS: only static lint with completed knowhow checks omits them"
+
 for suite in release harden-suites codegen; do
     cmd=$(hs_suite_command "$suite" normal "$TMP")
     mkdir -p "$TMP/$suite"

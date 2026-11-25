@@ -213,6 +213,9 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
     if key == prefs::RESPONSE_STYLES.key() {
         crate::core::response_style::validate_document(value)?;
     }
+    if key == prefs::THREAD_FOLDERS.key() {
+        crate::core::thread_folders::validate_document(value)?;
+    }
 
     // Any app can write the style remote, so part tokens in it pass the
     // part grammar here, where every writer arrives (ADR 0307).

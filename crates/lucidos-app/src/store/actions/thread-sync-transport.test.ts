@@ -22,14 +22,18 @@ vi.mock('../../utils/clientLog', () => ({ postClientLog }));
 
 const ERROR: StreamDrop = { reason: 'error' };
 let restoreRuntimeActive = false;
+let clearPhaseOnRestoreBegin = false;
 let restoreEpoch = 0;
 const acceptRestoreHello = vi.fn(async (_epoch: number, _generation: string | null) => true);
 vi.mock('../restoreRuntime', () => ({
   hasRestoreRuntime: () => restoreRuntimeActive,
-  beginRestoreConnection: () => ++restoreEpoch,
+  beginRestoreConnection: () => {
+    if (clearPhaseOnRestoreBegin) admissionPhase = 'admitted';
+    return ++restoreEpoch;
+  },
   acceptRestoreHello,
 }));
-afterEach(() => { restoreRuntimeActive = false; });
+afterEach(() => { restoreRuntimeActive = false; clearPhaseOnRestoreBegin = false; });
 
 let admissionPhase: RestoreAdmissionPhase = 'admitted';
 vi.mock('../../utils/restoreAdmission', async (importOriginal) => ({
@@ -375,6 +379,19 @@ describe('a stalled restore admission', () => {
       { phase: 'journal', error: 'storage stalled' }]]);
   });
 
+  it('logs the step a failed hello stopped in before the disconnect resets it', async () => {
+    connectThreadEvents();
+    const first = opened!;
+    first.handlers.onOpen();
+    admissionPhase = 'journal';
+    clearPhaseOnRestoreBegin = true;
+    acceptRestoreHello.mockRejectedValueOnce(new Error('storage stalled'));
+    first.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(first.stream.close).toHaveBeenCalled());
+    expect(restoreLogs()).toEqual([['restore-admission', 'failed',
+      { phase: 'journal', error: 'storage stalled' }]]);
+  });
+
   async function failHello(error: Error) {
     acceptRestoreHello.mockRejectedValueOnce(error);
     if (!opened || opened.stream.close.mock.calls.length > 0) await vi.advanceTimersByTimeAsync(10_000);
@@ -604,6 +621,29 @@ describe('the shell attaching to a transport', () => {
       first.handlers.onFrame('{"type":"NotificationCreated","data":{"id":"n-3"}}');
       expect(processSSEForReferences).not.toHaveBeenCalledWith('NotificationCreated', { id: 'n-3' }, undefined);
     });
+  });
+
+  it('leaves a replaced transport error alone, so the new connection stays open', () => {
+    connectThreadEvents();
+    const stale = opened!;
+    disconnectThreadEvents();
+    connectThreadEvents();
+    const current = opened!;
+
+    stale.handlers.onError(ERROR);
+
+    expect(current.stream.close).not.toHaveBeenCalled();
+    expect(openEventStream).toHaveBeenCalledTimes(2);
+  });
+
+  it('repairs nothing on the first open, which startup already loads', async () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    await vi.runAllTimersAsync();
+
+    expect(refreshThreadList).not.toHaveBeenCalled();
+    expect(refreshChangesState).not.toHaveBeenCalled();
+    expect(loadThreadQueue).not.toHaveBeenCalled();
   });
 
   it('reconciles on the open that follows an error, not on the first one', async () => {
@@ -945,6 +985,18 @@ describe('a stalled stream', () => {
       ['event-stream', 'worker-restarted', {}],
       ['event-stream', 'worker-unresponsive', {}],
     ]);
+  });
+
+  it('ignores an error the old transport raises while it is being closed', () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    const first = opened!;
+    first.stream.close.mockImplementation(() => first.handlers.onError(stalled));
+
+    disconnectThreadEvents();
+
+    expect(postClientLog).not.toHaveBeenCalled();
+    expect(status()).toBe('disconnected');
   });
 
   it('posts nothing from a handler a newer connection replaced', () => {

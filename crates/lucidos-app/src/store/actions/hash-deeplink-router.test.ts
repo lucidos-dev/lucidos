@@ -210,6 +210,18 @@ describe('hash-deeplink-router', () => {
       expect(replaceNavState, 'the history row must match the live app').toHaveBeenCalledTimes(1);
     });
 
+    it('consumes the app hash before the app opens, so a mid-load resume cannot open it twice', async () => {
+      let hashWhenOpened: string | undefined;
+      openAppById.mockImplementationOnce((id: string) => {
+        hashWhenOpened = window.location.hash;
+        return Promise.resolve(id === INSTALLED_APP);
+      });
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      await flush();
+      expect(hashWhenOpened).toBe('');
+    });
+
     it('carries the app fragment through, escapes and all', async () => {
       const fragment = 'week=3&view=list';
       setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP, fragment })}`);
@@ -285,6 +297,13 @@ describe('hash-deeplink-router', () => {
       expect(dispatchDeepLink).not.toHaveBeenCalled();
     });
 
+    it('a push-tap hash that carries a thread id is dispatched, never landed as a thread', () => {
+      setUrl(`http://localhost/${buildNavigateHash()}`);
+      handleHashLocation();
+      expect(focusThreadOrBootstrapResult).not.toHaveBeenCalled();
+      expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
+    });
+
     it('s4_5_handle_hash_location_noops_on_unrecognized_hash_anchor', () => {
       setUrl('http://localhost/#some-other-anchor');
       handleHashLocation();
@@ -349,6 +368,40 @@ describe('hash-deeplink-router', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it('keeps retrying long enough to outlast a lazily started engine', async () => {
+      vi.useFakeTimers();
+      try {
+        for (let i = 0; i < 6; i++) {
+          focusThreadOrBootstrapResult.mockResolvedValueOnce({ kind: 'failed', error: new Error('engine starting') });
+        }
+        setUrl(`http://localhost/#thread=${THREAD_ID}`);
+        handleHashLocation();
+
+        await vi.advanceTimersByTimeAsync(12_000);
+        expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(7);
+        expect(window.location.hash).toBe('');
+        expect(showToast).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a superseded landing neither focuses nor strips the newer hash', async () => {
+      const OTHER_THREAD_ID = '1f0e9a4c-5b2d-4e7a-8c3f-9d6b2a1e0c57';
+      let resolveFirst!: (outcome: Outcome) => void;
+      focusThreadOrBootstrapResult
+        .mockImplementationOnce(() => new Promise<Outcome>((r) => { resolveFirst = r; }))
+        .mockImplementationOnce(() => new Promise<Outcome>(() => {}));
+      setUrl(`http://localhost/#thread=${THREAD_ID}`);
+      handleHashLocation();
+      setUrl(`http://localhost/#thread=${OTHER_THREAD_ID}`);
+      handleHashLocation();
+
+      resolveFirst({ kind: 'focused' });
+      await flush();
+      expect(window.location.hash).toBe(`#thread=${OTHER_THREAD_ID}`);
     });
 
     it('does not start a second landing while one is in flight for the same thread', async () => {

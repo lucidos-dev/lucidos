@@ -37,6 +37,7 @@ mod initiator_actor;
 mod parked_question_delivery;
 mod parked_thread_archive;
 mod per_thread_commit_order;
+mod pin_folder;
 mod pinned_is_never_archived;
 mod proposal_follows_changes;
 mod read_request;

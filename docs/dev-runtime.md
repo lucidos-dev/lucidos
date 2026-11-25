@@ -41,7 +41,7 @@ response carries the entry's `port`: boot an engine there and the gateway adopts
 it instead of spawning a second one on the same database.
 
 Callers are `adopt_into_gateway` (`scripts/lib/workspace.sh`) and
-`crates/lucidos-eval/src/gateway.rs`, which logs every failure as one line.
+`crates/lucidos-engine-bin/src/bin/lucidos-eval/gateway.rs`, which logs every failure as one line.
 
 ### Disposable harness workspaces
 

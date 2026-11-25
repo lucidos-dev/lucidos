@@ -162,6 +162,20 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     expect(setAppBadge).toHaveBeenLastCalledWith(6);
   });
 
+  it('re-runs an effect reading the total when a refresh moves it', async () => {
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
+    const runs = vi.fn();
+    const dispose = effect(() => { runs(crossWorkspaceUnreadTotal.value); });
+    expect(runs).toHaveBeenLastCalledWith(0);
+    mocks.listWorkspaces.mockResolvedValue([workspace('other', 1)]);
+    await refreshOtherWorkspacesUnread();
+    expect(runs).toHaveBeenLastCalledWith(1);
+    mocks.listWorkspaces.mockResolvedValue([workspace('other', 3)]);
+    await refreshOtherWorkspacesUnread();
+    expect(runs).toHaveBeenLastCalledWith(3);
+    dispose();
+  });
+
   it('counts a workspace with no reported count as 0 (stopped, so no engine to poll)', async () => {
     mocks.listWorkspaces.mockResolvedValue([workspace('other'), workspace('notes', 2)]);
     servedUnreadNotifications.value = { status: 'loaded', data: [] };

@@ -32,6 +32,7 @@ function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
     totalChildrenCount: meta.totalChildrenCount,
     blockingDescendantCount: meta.blockingDescendantCount,
     attentionDescendantCount: meta.attentionDescendantCount,
+    archivableSubThreadCount: meta.archivableSubThreadCount,
     liveEventWaitCount: meta.liveEventWaitCount,
     codingAgentChangeState: meta.codingAgentChangeState,
     codingAgentIsExternalRepo: meta.codingAgentIsExternalRepo,

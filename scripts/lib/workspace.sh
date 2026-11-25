@@ -3215,6 +3215,11 @@ start_frontend_built() {
             # when a build fails. Absolute, the convention `desktop.rs`
             # `spawn_gateway` uses. LUCIDOS_WORKSPACE is already exported by
             # `resolve_workspace`, and the CLI needs both.
+            if [[ -f "$bw_log" ]] && ! mv -f "$bw_log" "$bw_log.prev"; then
+                flock_close "$BUILD_WATCH_START_FD"
+                flock_close "$BUILD_WATCH_CONSUMERS_FD"
+                exit 1
+            fi
             local cli_bin="${ENGINE_BIN:+${ENGINE_BIN%/*}/lucidos}"
             # The watcher must not inherit this launch's consumer lock, or it
             # would count itself as a consumer for its whole life.

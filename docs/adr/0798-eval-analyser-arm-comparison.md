@@ -11,7 +11,7 @@ arms, and a sweep pools several runs. The comments record the rules that keep
 those comparisons honest.
 
 This record restates the design comments of
-`crates/lucidos-eval/src/analyse.rs`, written before the comment strip removes
+`crates/lucidos-engine-bin/src/bin/lucidos-eval/analyse.rs`, written before the comment strip removes
 them. Nobody checked it line by line against the code.
 
 ## Decision

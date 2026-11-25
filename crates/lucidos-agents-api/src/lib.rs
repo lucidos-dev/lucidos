@@ -32,6 +32,9 @@ pub mod test_support {
 }
 
 #[cfg(test)]
+mod engine_version_facts_tests;
+
+#[cfg(test)]
 mod guard_tests;
 
 #[cfg(test)]

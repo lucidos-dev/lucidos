@@ -70,6 +70,13 @@ With `defer_version_builds=while-coding`, a held Apply still returns `status: "a
 
 A source build watches its own version status while a page is connected, and emits `EngineVersionStatusChanged` when it changes. Clients re-read the endpoint on that event instead of polling. The endpoint then serves at least what the event announced, including the pending commits. Packaged builds run no watcher.
 
+After 60 seconds of observed frontend build-watch downtime, version status includes
+`frontend_build_watch_stopped: { since_ms, cause }`. `since_ms` marks the first
+stopped observation in epoch milliseconds. `cause` is the recorded exit cause or
+`null`. The field is omitted when the watch is running or its state is unknown,
+and for packaged or pinned engines. `FrontendBuildWatchStateChanged` tells
+connected clients to re-read the endpoint when the report changes.
+
 ### Status values
 
 | Status | Meaning |

@@ -20,7 +20,7 @@
 #[path = "event_bus_projection_keep_alive.rs"]
 pub(crate) mod keep_alive;
 #[path = "event_bus_projection_propagation.rs"]
-mod propagation;
+pub(super) mod propagation;
 #[path = "event_bus_projection_system.rs"]
 mod system;
 #[path = "event_bus_projection_thread.rs"]

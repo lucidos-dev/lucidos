@@ -30,6 +30,7 @@ fn fixture_row() -> ThreadRow {
         total_children_count: 4,
         blocking_descendant_count: 5,
         attention_descendant_count: 6,
+        archivable_sub_thread_count: 7,
         is_stopped_child: true,
         hold: None,
         read_requested: true,
@@ -52,6 +53,7 @@ fn fixture_row() -> ThreadRow {
         coding_agent_is_external_repo: false,
         last_revived_at: Some(at("2026-01-02T03:04:09Z")),
         is_saved: true,
+        pin_folder: None,
         is_home: false,
         has_response: true,
         parent_thread_id: Some("00000000-0000-0000-0000-000000000002".into()),
@@ -86,6 +88,7 @@ fn full_thread_summary_fixture(
         .unwrap()
         .remove(0);
     summary.home = true;
+    summary.pin_folder = Some("w48".into());
     summary.cache_keep_alive_status = Some(CacheKeepAliveStatus::Stopped {
         at: at("2026-01-02T05:00:00Z"),
         beats: 25,
@@ -131,7 +134,7 @@ fn thread_summary_serializes_to_the_pinned_bytes() {
             r#""section":"inbox","active_children_count":1,"awaited_children_count":2,"#,
             r#""awaited_by_parent":true,"#,
             r#""total_children_count":4,"live_event_wait_count":1,"live_event_waits":{waits},"#,
-            r#""blocking_descendant_count":5,"attention_descendant_count":6,"is_stopped_child":true,"read_requested":true,"reply_seen_devices":["d1"],"apply_in_flight":true,"#,
+            r#""blocking_descendant_count":5,"attention_descendant_count":6,"archivable_sub_thread_count":7,"is_stopped_child":true,"read_requested":true,"reply_seen_devices":["d1"],"apply_in_flight":true,"#,
             r#""status":"waiting_for_user_answer","summary_version":42,"#,
             r#""coding_agent_change_state":{{"kind":"proposed","requires_restart":true}},"#,
             r#""coding_agent_is_external_repo":false,"#,
@@ -161,7 +164,7 @@ fn thread_aggregate_serializes_to_the_pinned_bytes() {
             r#""lastAgentAction":"2026-01-02T03:04:08Z","messageCount":3,"section":"inbox","#,
             r#""status":"waiting_for_user_answer","summaryVersion":42,"activeChildrenCount":1,"#,
             r#""awaitedChildrenCount":2,"awaitedByParent":true,"#,
-            r#""totalChildrenCount":4,"blockingDescendantCount":5,"attentionDescendantCount":6,"#,
+            r#""totalChildrenCount":4,"blockingDescendantCount":5,"attentionDescendantCount":6,"archivableSubThreadCount":7,"#,
             r#""isStoppedChild":true,"readRequested":true,"replySeenDevices":["d1"],"applyInFlight":true,"liveEventWaitCount":1,"liveEventWaits":{waits},"#,
             r#""cacheKeepAliveStatus":null,"#,
             r#""codingAgentChangeState":{{"kind":"proposed","requires_restart":true}},"#,
@@ -331,6 +334,27 @@ fn a_hold_serializes_on_both_wires() {
     assert!(aggregate.contains(expected), "{aggregate}");
 }
 
+/// The folder rides both wires, and an unfiled pin sends
+/// no key, so every other thread's wire bytes are unchanged.
+#[test]
+fn a_pin_folder_serializes_on_both_wires_and_is_omitted_when_unset() {
+    let filed = || ThreadRow {
+        pin_folder: Some("w48".into()),
+        ..fixture_row()
+    };
+    let expected = r#""pin_folder":"w48""#;
+    let summary = EventStore::rows_to_thread_summaries(vec![filed()])
+        .unwrap()
+        .remove(0);
+    let summary = serde_json::to_string(&summary).unwrap();
+    assert!(summary.contains(expected), "{summary}");
+    let aggregate = serde_json::to_string(&row_to_thread_aggregate(filed()).unwrap()).unwrap();
+    assert!(aggregate.contains(r#""pinFolder":"w48""#), "{aggregate}");
+
+    let unfiled = serde_json::to_string(&row_to_thread_aggregate(fixture_row()).unwrap()).unwrap();
+    assert!(!unfiled.contains("pinFolder"), "{unfiled}");
+}
+
 mod guard_tests {
     use super::*;
     use crate::engine::thread_events::liveness::{LivenessState, ThreadLiveness};
@@ -369,6 +393,7 @@ mod guard_tests {
             last_agent_action => "Agent action history",
             message_count => "Conversation size",
             saved => "Drawer organization",
+            pin_folder => "Drawer organization",
             home => "Workspace role",
             section => "Drawer organization",
             active_children_count => "Drawer rollup, includes children this thread does not await",
@@ -380,6 +405,7 @@ mod guard_tests {
             cache_keep_alive_status => "Cache maintenance, independent of thread liveness",
             blocking_descendant_count => "Archive eligibility rollup for descendants",
             attention_descendant_count => "Drawer attention rollup for descendants",
+            archivable_sub_thread_count => "Overflow menu count for archiving completed sub-threads",
             is_stopped_child => "Unsettled card owed to the parent for a past Stop",
             hold => "The hold the drawer section and composer strip draw; liveness carries its own",
             read_requested => "Reply review request",

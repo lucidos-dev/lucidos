@@ -724,9 +724,9 @@ export function PauseIcon() {
   );
 }
 
-export function HoldIcon() {
+export function HoldIcon({ size }: { size?: string } = {}) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <circle cx="12" cy="12" r="9" />
       <path d="M10 9v6" />
       <path d="M14 9v6" />
@@ -771,9 +771,9 @@ export function ApiPlugIcon() {
   );
 }
 
-export function FolderIcon() {
+export function FolderIcon({ size }: { size?: string } = {}) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M3 7a2 2 0 0 1 2-2h4l2.25 2.75H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
     </svg>
   );

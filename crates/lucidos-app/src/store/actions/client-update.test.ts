@@ -12,7 +12,7 @@ vi.mock('../../hooks/sw-update', () => ({
 
 import { syncClientUpdateFromBuild } from './client-update';
 import { updateAvailable, toasts, showToast, engineRestarting, dismissToast, preferences } from '../store';
-import { getServedBuildId, wasSwUpdateDismissed, noteUpdateBuildId, markSwUpdateDismissed } from '../../hooks/sw-update';
+import { getServedBuildId, refreshClient, wasSwUpdateDismissed, noteUpdateBuildId, markSwUpdateDismissed } from '../../hooks/sw-update';
 
 const mockGetServedBuildId = vi.mocked(getServedBuildId);
 const mockWasDismissed = vi.mocked(wasSwUpdateDismissed);
@@ -136,5 +136,28 @@ describe('syncClientUpdateFromBuild — badge ⟺ toast (arrival coupled; dismis
     await syncClientUpdateFromBuild();
     expect(hasUpdateToast()).toBe(true);
     expect(updateAvailable.value).toBe(true);
+  });
+});
+
+describe('syncClientUpdateFromBuild: Refresh action', () => {
+  beforeEach(() => {
+    reset();
+    vi.mocked(refreshClient).mockClear();
+  });
+
+  it('routes Refresh through refreshClient so the service worker is swapped', async () => {
+    mockGetServedBuildId.mockResolvedValue('server999');
+    await syncClientUpdateFromBuild();
+    toasts.value.find((t) => t.key === UPDATE_KEY)?.action?.onClick?.();
+    expect(refreshClient).toHaveBeenCalledTimes(1);
+  });
+
+  it('collapses the toast on Refresh without recording a deferral for the build', async () => {
+    mockGetServedBuildId.mockResolvedValue('server999');
+    await syncClientUpdateFromBuild();
+    expect(hasUpdateToast()).toBe(true);
+    toasts.value.find((t) => t.key === UPDATE_KEY)?.action?.onClick?.();
+    expect(hasUpdateToast()).toBe(false);
+    expect(mockMarkDismissed).not.toHaveBeenCalled();
   });
 });

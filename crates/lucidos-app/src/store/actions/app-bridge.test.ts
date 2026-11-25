@@ -201,6 +201,15 @@ describe('the installed router', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('answers an op no arm names, so the frame is never left waiting', async () => {
+    const post = vi.spyOn(frame.contentWindow as Window, 'postMessage').mockImplementation(() => {});
+    deliver(frame.contentWindow, { type: 'lucidos:bridge', id: 'u1', op: 'no.such.op', args: {} });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: BRIDGE_REPLY_TYPE, id: 'u1', ok: false }),
+      '*',
+    ));
+  });
+
   it('makes no call for a route the engine keeps away from apps', async () => {
     deliver(frame.contentWindow, call('/credentials'));
     await new Promise((r) => setTimeout(r, 0));

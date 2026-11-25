@@ -34,7 +34,7 @@ import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '
 import { ALL_CHANNELS, confirmState, setDrawerGrouping, setSelectedOngoingGroup, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
-import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
+import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive, unfocusThread } from './threads';
 import { _resetRowIntentsForTesting, archiveRequestInFlight } from '../rowIntents';
 import * as drawerOrder from '../../components/drawer/drawerOrder';
 import { provideDrawerOrder } from '../drawerOrderHandle';
@@ -187,6 +187,21 @@ describe('handleArchiveThread', () => {
     }));
     threadMap.value = map;
     focusThread('t2');
+
+    await handleArchiveThread('t2');
+
+    expect(focusedThreadId.value).toBe('t3');
+  });
+
+  it('picks the next focus from the rows as they stood before the archive flipped the row out', async () => {
+    const meta = (id: string, updatedAt: string) => ({ id, title: `Thread ${id}`, channel: 'claude_code' as const, saved: false, createdAt: '', updatedAt, status: 'waiting' as const, codingAgentChangeState: { kind: 'none' as const }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox' as const, activeChildrenCount: 0 });
+    threadMap.value = new Map([
+      ['t1', makeThreadState('t1', { meta: meta('t1', '2026-01-01T00:00:02Z') })],
+      ['t2', makeThreadState('t2', { meta: meta('t2', '2026-01-01T00:00:01Z') })],
+      ['t3', makeThreadState('t3', { meta: meta('t3', '2026-01-01T00:00:00Z') })],
+    ]);
+    unfocusThread({ revealPane: false });
+    focusedThreadId.value = 't2';
 
     await handleArchiveThread('t2');
 

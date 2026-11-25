@@ -1207,3 +1207,201 @@ describe('notification read source generation', () => {
     } finally { observeSourceGeneration(null); }
   });
 });
+
+describe('a list load that lands late never overwrites a newer one', () => {
+  beforeEach(() => {
+    notificationsFilter.value = 'all';
+    seedUnread([]);
+    servedNotifications.value = { status: 'not-loaded' };
+    (getNotifications as Mock).mockReset();
+  });
+
+  it('discards an older browse load that resolves after a newer one', async () => {
+    const older = deferred<NotifResponse>();
+    (getNotifications as Mock)
+      .mockReturnValueOnce(older.promise)
+      .mockResolvedValueOnce({ notifications: [makeNotification('y', false)], unread_count: 1, has_more: false });
+
+    const olderLoad = loadNotifications();
+    await loadNotifications();
+    older.resolve({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false });
+    await olderLoad;
+
+    expect(loadedRows(notifications.value).map((n) => n.id)).toEqual(['y']);
+  });
+
+  it('discards an older unread apply that lands after a newer one', () => {
+    const older = unreadNotificationsSlice.begin();
+    const newer = unreadNotificationsSlice.begin();
+    unreadNotificationsSlice.apply({ notifications: [makeNotification('y', false)], unread_count: 1, has_more: false }, newer);
+    unreadNotificationsSlice.apply({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false }, older);
+
+    expect(loadedRows(unreadNotifications.value).map((n) => n.id)).toEqual(['y']);
+  });
+});
+
+describe('a read ack is not carried by a load that started before it', () => {
+  beforeEach(() => {
+    notificationsFilter.value = 'all';
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false), makeNotification('y', false)] };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+    (getNotifications as Mock).mockReset();
+    (markNotificationRead as Mock).mockReset();
+    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+  });
+
+  it('a browse load started before the ack keeps the row read when a later unread load lands first', async () => {
+    const browse = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(browse.promise);
+    const browseLoad = loadNotifications();
+
+    markReadOptimistic('x');
+    await vi.waitFor(() => expect(pendingNotificationReads.value.get('x')?.ackedAt ?? null).not.toBeNull());
+    (getNotifications as Mock).mockResolvedValueOnce({
+      notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false,
+    });
+    await loadUnreadNotifications();
+
+    browse.resolve({
+      notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false,
+    });
+    await browseLoad;
+
+    expect(loadedRows(notifications.value).find((n) => n.id === 'x')?.read).toBe(true);
+  });
+});
+
+describe('a failed list load releases the reads it owed', () => {
+  beforeEach(() => {
+    notificationsFilter.value = 'all';
+    seedUnread([]);
+    servedNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+    (getNotifications as Mock).mockReset();
+    (markNotificationRead as Mock).mockReset();
+    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+  });
+
+  it('a failed browse load drops the acknowledged read it was still holding', async () => {
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+    markReadOptimistic('x');
+    await vi.waitFor(() => expect(pendingNotificationReads.value.get('x')?.ackedAt ?? null).not.toBeNull());
+    expect(pendingNotificationReads.value.has('x')).toBe(true);
+
+    (getNotifications as Mock).mockRejectedValueOnce(new Error('engine down'));
+    await loadNotifications();
+
+    expect(pendingNotificationReads.value.has('x')).toBe(false);
+  });
+
+  it('a failed unread load drops the acknowledged read it was still owing', async () => {
+    let rejectLoad!: (e: Error) => void;
+    const failing = new Promise<NotifResponse>((_, reject) => { rejectLoad = reject; });
+    (getNotifications as Mock).mockReturnValueOnce(failing);
+    const unreadLoad = loadUnreadNotifications();
+
+    markReadOptimistic('x');
+    await vi.waitFor(() => expect(pendingNotificationReads.value.get('x')?.ackedAt ?? null).not.toBeNull());
+    expect(pendingNotificationReads.value.has('x')).toBe(true);
+
+    rejectLoad(new Error('engine down'));
+    await unreadLoad;
+
+    expect(pendingNotificationReads.value.has('x')).toBe(false);
+  });
+});
+
+describe('viewNotification dedup stamp', () => {
+  beforeEach(() => {
+    resetViewDedup();
+    panelOverlay.value = null;
+    servedNotifications.value = { status: 'not-loaded' };
+    seedUnread([]);
+    (getNotifications as Mock).mockReset();
+    (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
+    (getNotification as Mock).mockReset();
+    (markNotificationRead as Mock).mockReset();
+    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+    notificationDetailPending.value = null;
+    toasts.value = [];
+  });
+
+  it('a second fire of one tap while the detail is still fetching does not fetch again', async () => {
+    const pending = deferred<Notification>();
+    (getNotification as Mock).mockReturnValueOnce(pending.promise);
+
+    const first = viewNotification('z');
+    const second = viewNotification('z');
+    pending.resolve(makeNotification('z', true));
+    await Promise.all([first, second]);
+
+    expect(getNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed detail fetch clears the stamp, so a re-tap fetches again', async () => {
+    (getNotification as Mock)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(makeNotification('z', true));
+
+    await viewNotification('z');
+    await viewNotification('z');
+
+    expect(getNotification).toHaveBeenCalledTimes(2);
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail' });
+  });
+});
+
+describe('a deep-link open marks read after the inbox load', () => {
+  it('the unread-filtered inbox load still returns the row, because the read has not committed yet', async () => {
+    notificationsFilter.value = 'unread';
+    servedNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+    panelOverlay.value = null;
+    const committed = new Set<string>();
+    (markNotificationRead as Mock).mockReset();
+    (markNotificationRead as Mock).mockImplementation(async (id: string) => {
+      committed.add(id);
+      return { success: true };
+    });
+    (getNotifications as Mock).mockReset();
+    (getNotifications as Mock).mockImplementation(async (params: { filter: string }) => ({
+      notifications: params.filter === 'unread' && committed.has('x') ? [] : [makeNotification('x', false)],
+      unread_count: 0,
+      has_more: false,
+    }));
+    (getNotification as Mock).mockReset();
+    (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
+    resetViewDedup();
+
+    await viewNotification('x');
+
+    expect(loadedRows(notifications.value).map((n) => n.id)).toEqual(['x']);
+    notificationsFilter.value = 'all';
+  });
+});
+
+describe('the dock badge nudge follows the engine commit, not the tap', () => {
+  it('a read tapped on this device does not nudge the dock badge; the engine SSE after the commit does', async () => {
+    (getNotifications as Mock).mockReset();
+    (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
+    (markNotificationRead as Mock).mockReset();
+    const post = deferred<{ success: boolean }>();
+    (markNotificationRead as Mock).mockReturnValueOnce(post.promise);
+    (nudgeDockBadge as Mock).mockClear();
+    (isTauri as Mock).mockReturnValue(true);
+    try {
+      markReadOptimistic('x');
+      expect(nudgeDockBadge).not.toHaveBeenCalled();
+
+      post.resolve({ success: true });
+      await post.promise;
+      await Promise.resolve();
+      expect(nudgeDockBadge).not.toHaveBeenCalled();
+
+      handleNotificationSSE();
+      expect(nudgeDockBadge).toHaveBeenCalledTimes(1);
+    } finally {
+      (isTauri as Mock).mockReturnValue(false);
+    }
+  });
+});

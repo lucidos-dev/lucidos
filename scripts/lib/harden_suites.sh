@@ -655,7 +655,7 @@ hs_extra_engine_libraries() { # <reach>
 }
 
 # Workspace crates that already have a suite. e2e needs a running engine.
-HS_SUITE_CRATES="lucidos-eval lucidos-gateway lucidos-app lucidos-cli lucidos-e2e"
+HS_SUITE_CRATES="lucidos-gateway lucidos-app lucidos-cli lucidos-e2e"
 hs_has_own_suite() {
     hs_is_listed "$1" "$HS_SUITE_CRATES $(hs_engine_libraries | paste -sd " " -)"
 }
@@ -734,6 +734,7 @@ hs_script_lib_tests() { # changed paths on stdin
         case "$p" in
             scripts/harden-gates.sh) t=scripts/lib/harden_gates_test.sh ;;
             scripts/lint-shell.sh) t=scripts/lib/lint_shell_test.sh ;;
+            scripts/with-build-slot.sh) t=scripts/lib/with_build_slot_test.sh ;;
             scripts/build-prerequisites.sh) t=scripts/lib/build_prerequisites_test.sh ;;
             scripts/dev-prerequisites.sh | scripts/lib/dev_prerequisites.sh) t=scripts/lib/dev_prerequisites_test.sh ;;
             scripts/lib/*_test.sh) t=$p ;;
@@ -859,7 +860,7 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         [ -n "$gateway" ] && echo gateway
         [ -n "$cli" ] && echo cli
         [ -n "$app" ] && echo app-lib
-        hs_reach_has "$reach" lucidos-eval && echo eval
+        hs_reach_has "$reach" lucidos-engine-bin && echo eval
         hs_reach_has "$reach" lucidos-core && echo core
         if hs_reach_has "$reach" lucidos-engine; then
             echo engine
@@ -1036,16 +1037,26 @@ hs_names_engine_tests() {
 
 # The lint command: clippy scoped to the crates the diff reaches. A diff that
 # reaches every crate, or one the state cannot attribute, lints the workspace.
-hs_lint_command() { # <state-dir>
+hs_lint_scope() { # <state-dir>
     local reach crates="" c
     reach="$(hs_state_reach "$1" 2> /dev/null)"
     if [ -z "$reach" ] || [ "$reach" = '*' ] \
         || [ "$(printf '%s\n' "$reach" | wc -l)" -ge "$(wc -l < "$1/crate-graph")" ]; then
-        echo "make lint-rust"
+        echo "--workspace"
         return 0
     fi
     for c in $reach; do crates="$crates -p $c"; done
-    echo "make lint-rust CLIPPY_SCOPE='${crates# }'"
+    echo "${crates# }"
+}
+
+hs_lint_command() { # <state-dir>
+    local scope
+    scope="$(hs_lint_scope "$1")"
+    if [ "$scope" = --workspace ]; then
+        echo "make lint-rust"
+    else
+        echo "make lint-rust CLIPPY_SCOPE='$scope'"
+    fi
 }
 
 # The engine's guard tests, plus the tests of each touched engine module and
@@ -1119,7 +1130,7 @@ hs_crates_command() { # <state-dir>
 # (e2e_github_handoff), which sends a busy host's run to GitHub (ADR 0584).
 # e2e-touched-webkit sends the mobile-webkit specs to GitHub as the run starts
 # on every host, pinned to its start commit.
-hs_suite_command() { # <suite> <early|normal> <state-dir>
+hs_suite_command() { # <suite> <early|normal> <state-dir> [checked-knowhow]
     local suite=$1 mode=$2 state=$3 skips="" m
     if hs_is_e2e_suite "$suite"; then
         hs_prepare_touched "$suite" "$state" 2> /dev/null
@@ -1137,11 +1148,16 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
         return 0
     fi
     case "$suite" in
-        lint-static) echo "make lint-static" ;;
+        lint-static)
+            if [ "${4:-}" = 1 ]; then
+                echo "make lint-static LINT_STATIC_TARGETS='lint-shell lint-eval'"
+            else
+                echo "make lint-static"
+            fi ;;
         lint-rust) hs_lint_command "$state" ;;
         ort-download) echo "./scripts/lib/onnxruntime_mirror_test.sh" ;;
         crates) hs_crates_command "$state" ;;
-        eval) echo "cargo test --locked -p lucidos-eval" ;;
+        eval) echo "cargo test --locked -p lucidos-engine-bin --features eval --bin lucidos-eval" ;;
         engine)
             if [ "$mode" = early ]; then
                 for m in $HS_DRIVER_MODULES; do skips="$skips --skip $m"; done

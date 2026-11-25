@@ -6,6 +6,7 @@ import { act } from 'preact/test-utils';
 import { RemoteGatewaysSection } from '../GatewayPairingSections';
 import * as control from '../../../api/client/control';
 import * as store from '../../../store/store';
+import { openFold } from './openFold';
 
 vi.mock('../../../api/client/control', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client/control')>()),
@@ -45,6 +46,7 @@ describe('trusted pairing toggle', () => {
     document.body.append(host);
     await act(async () => { render(<RemoteGatewaysSection available />, host); });
     await act(async () => { await Promise.resolve(); });
+    await act(() => { openFold(host, 'cloud'); });
     const input = host.querySelector<HTMLInputElement>(`input[aria-label="${LABEL}"]`)!;
     expect(input.checked).toBe(gateway.trusted_pairing);
     await act(async () => { input.click(); });

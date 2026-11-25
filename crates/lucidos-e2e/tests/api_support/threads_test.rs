@@ -290,6 +290,131 @@ async fn thread_save_and_unsave() {
     );
 }
 
+/// A custom folder files a pin. Pinning with a folder lands the thread in it.
+/// A move needs a pinned thread and a folder the list holds. Unpinning drops
+/// the folder.
+#[tokio::test]
+async fn test_pin_into_a_custom_folder() {
+    let client = user_client().await;
+    let marker = unique_marker("api-folder");
+    client
+        .post(format!("{}/api/v1/chat/stream", base_url()))
+        .json(&serde_json::json!({
+            "message": format!("Say exactly: \"folder-api {marker}\""),
+            "mode": "human",
+        }))
+        .send()
+        .await
+        .expect("Chat request failed");
+    let threads = poll_threads_until_archive(&client, 30).await;
+    let thread_id = threads["archive"].as_array().unwrap()[0]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prefs_url = format!("{}/api/v1/preferences?key=thread_folders", base_url());
+    let put = client
+        .put(&prefs_url)
+        .json(&serde_json::json!({ "value": r#"[{"id":"w48","name":"W48"}]"# }))
+        .send()
+        .await
+        .expect("preference write failed");
+    assert_eq!(put.status(), 200);
+
+    let post = |path: &'static str, body: serde_json::Value| {
+        let client = client.clone();
+        async move {
+            client
+                .post(format!("{}/api/v1/threads/{path}", base_url()))
+                .json(&body)
+                .send()
+                .await
+                .expect("request failed")
+                .status()
+        }
+    };
+    let folder_of = || {
+        let client = client.clone();
+        let thread_id = thread_id.clone();
+        async move {
+            let threads: serde_json::Value = client
+                .get(format!("{}/api/v1/threads", base_url()))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            threads["saved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(&thread_id))
+                .map(|t| t["pin_folder"].clone())
+        }
+    };
+
+    assert_eq!(
+        post(
+            "move-to-folder",
+            serde_json::json!({ "thread_id": thread_id, "folder": "w48" })
+        )
+        .await,
+        409,
+        "an unpinned thread cannot sit in a folder"
+    );
+    assert_eq!(
+        post(
+            "save",
+            serde_json::json!({ "thread_id": thread_id, "folder": "nope" })
+        )
+        .await,
+        400,
+        "an unknown folder is refused"
+    );
+    assert_eq!(
+        post(
+            "save",
+            serde_json::json!({ "thread_id": thread_id, "folder": "w48" })
+        )
+        .await,
+        200
+    );
+    assert_eq!(folder_of().await, Some(serde_json::json!("w48")));
+
+    assert_eq!(
+        post(
+            "move-to-folder",
+            serde_json::json!({ "thread_id": thread_id, "folder": null })
+        )
+        .await,
+        200
+    );
+    assert_eq!(folder_of().await, Some(serde_json::Value::Null));
+
+    post(
+        "move-to-folder",
+        serde_json::json!({ "thread_id": thread_id, "folder": "w48" }),
+    )
+    .await;
+    assert_eq!(
+        post("unsave", serde_json::json!({ "thread_id": thread_id })).await,
+        200
+    );
+    assert_eq!(folder_of().await, None, "an unpinned thread leaves Pinned");
+    assert_eq!(
+        post("save", serde_json::json!({ "thread_id": thread_id })).await,
+        200
+    );
+    assert_eq!(
+        folder_of().await,
+        Some(serde_json::Value::Null),
+        "a pin after an unpin starts in plain Pinned"
+    );
+
+    client.delete(&prefs_url).send().await.ok();
+}
+
 /// Only a thread's own agent takes its child reports. A device caller, which
 /// holds no thread-bound origin token, is refused before anything is taken.
 #[tokio::test]

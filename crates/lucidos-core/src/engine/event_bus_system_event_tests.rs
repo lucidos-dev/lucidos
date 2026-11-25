@@ -373,6 +373,21 @@ fn frontend_refresh_state_changed_is_transient_on_engine_aggregate() {
 }
 
 #[test]
+fn frontend_build_watch_state_changed_is_transient_on_engine_aggregate() {
+    let event = SystemEvent::FrontendBuildWatchStateChanged {
+        sent_at_ms: 123_000,
+    };
+    assert!(!event.is_persisted());
+    assert_eq!(event.aggregate(), "engine");
+    assert_eq!(event.event_type(), "FrontendBuildWatchStateChanged");
+    assert_eq!(event.aggregate_id(), "global");
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        serde_json::json!({"type": "FrontendBuildWatchStateChanged", "data": {"sent_at_ms": 123_000}})
+    );
+}
+
+#[test]
 fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     // Transient cross-device dismiss signal — broadcast to SSE, never written to
     // events. `Some(id)` removes one delivered native banner on connected Tauri

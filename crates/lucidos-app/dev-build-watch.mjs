@@ -10,6 +10,7 @@ export const PROJECT_DIR = resolve(APP_DIR, '../..');
 const DEPS_STATE = resolve(PROJECT_DIR, 'scripts/deps-state.sh');
 const STATE_DIR = resolve(APP_DIR, '.build-watch');
 const STATUS_FILE = resolve(STATE_DIR, 'status.json');
+const EXIT_FILE = resolve(STATE_DIR, 'exit.json');
 const DEBOUNCE_MS = 200;
 const POLL_MS = 10_000;
 const PROBE_TIMEOUT_MS = 5_000;
@@ -266,6 +267,30 @@ function viteBin() {
 let builtFingerprint = null;
 let eventSinceBuild = false;
 
+function resetBuild() {
+  child = null;
+  building = false;
+}
+
+function drainPendingBuild() {
+  if (pending) {
+    pending = false;
+    runBuild();
+  }
+}
+
+export function handleBuildSpawnError(err, skippedInstall, {
+  reset = resetBuild,
+  record = recordOutcome,
+  drain = drainPendingBuild,
+} = {}) {
+  reset();
+  const error = `could not start vite build: ${err.message}`;
+  log(error);
+  record(false, error, skippedInstall, {});
+  drain();
+}
+
 function runBuild() {
   if (building) { pending = true; return; }
   building = true;
@@ -285,11 +310,17 @@ function runBuild() {
     return;
   }
 
-  child = spawn(process.execPath, [bin, 'build'], {
-    cwd: APP_DIR,
-    env: buildChildEnv(process.env, process.pid),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  try {
+    child = spawn(process.execPath, [bin, 'build'], {
+      cwd: APP_DIR,
+      env: buildChildEnv(process.env, process.pid),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    handleBuildSpawnError(err, skippedInstall);
+    return;
+  }
+  child.once('error', (err) => handleBuildSpawnError(err, skippedInstall));
   let tail = '';
   let partialLine = '';
   const chunkBudgets = {};
@@ -307,18 +338,17 @@ function runBuild() {
     partialLine = lines.pop() ?? '';
     for (const line of lines) measure(line);
   };
-  child.stdout.on('data', keepStdout);
-  child.stderr.on('data', keep);
+  child.stdout?.on('data', keepStdout);
+  child.stderr?.on('data', keep);
 
   child.on('exit', (code) => {
-    child = null;
-    building = false;
+    resetBuild();
     measure(partialLine);
     const ms = Date.now() - started;
     const ok = code === 0;
     log(`vite build ${ok ? 'ok' : `FAILED (exit ${code})`} in ${ms}ms`);
     recordOutcome(ok, ok ? null : firstErrorLine(tail), skippedInstall, chunkBudgets);
-    if (pending) { pending = false; runBuild(); }
+    drainPendingBuild();
   });
 }
 
@@ -331,17 +361,33 @@ function schedule() {
 
 const watchers = [];
 
+export function handleWatchError(err, {
+  stop = stopWatching,
+  schedule: rebuild = schedule,
+} = {}) {
+  log(`watch failed: ${err.message}. Building now and re-creating the watch on the next poll`);
+  stop();
+  rebuild();
+}
+
+function keepWatcher(handle) {
+  handle.on('error', (err) => {
+    if (watchers.includes(handle)) handleWatchError(err);
+  });
+  watchers.push(handle);
+}
+
 function startWatching() {
   for (const dir of watchDirs) {
     try {
-      watchers.push(watch(dir, { recursive: true }, schedule));
+      keepWatcher(watch(dir, { recursive: true }, schedule));
     } catch (err) {
       console.warn(`[dev-build-watch] cannot watch ${dir}: ${err.message}`);
     }
   }
   for (const file of watchFiles) {
     try {
-      watchers.push(watch(file, schedule));
+      keepWatcher(watch(file, schedule));
     } catch (err) {
       console.warn(`[dev-build-watch] cannot watch ${file}: ${err.message}`);
     }
@@ -355,6 +401,10 @@ function stopWatching() {
 
 let probeFailing = false;
 function pollInputs() {
+  if (watchers.length === 0) {
+    startWatching();
+    if (watchers.length > 0) schedule();
+  }
   const current = inputsFingerprint();
   if (current === null) {
     if (!probeFailing) log('cannot read the committed inputs from git, so a deaf watch would go unnoticed');
@@ -373,18 +423,34 @@ function pollInputs() {
   schedule();
 }
 
-function shutdown() {
+function recordExit(cause) {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(EXIT_FILE, `${JSON.stringify({ at: new Date().toISOString(), cause })}\n`);
+  } catch (err) {
+    log(`could not record exit: ${err.message}`);
+  }
+}
+
+function shutdown(cause, code) {
+  log(`stopping: ${cause}`);
+  recordExit(cause);
   stopWatching();
   if (child) child.kill('SIGTERM');
-  process.exit(0);
+  process.exit(code);
 }
 
 const invokedDirectly = process.argv[1]
   && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) {
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+    process.on(signal, () => shutdown(signal, 0));
+  }
+  process.on('uncaughtException', (err) => {
+    console.error(err?.stack ?? String(err));
+    shutdown(String(err?.message ?? err), 1);
+  });
   runBuild();
   startWatching();
-  setInterval(pollInputs, POLL_MS).unref();
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  setInterval(pollInputs, POLL_MS);
 }

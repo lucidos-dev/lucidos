@@ -549,6 +549,8 @@ struct StagedThreadEvent {
     aggregate: Option<crate::core::store::ThreadAggregate>,
     ancestor_aggregates: Vec<crate::core::store::ThreadAggregate>,
     side_effects: Vec<BusEvent>,
+    /// See [`projection::propagation::ArchiveInputSample`].
+    archive_recount_anchors: Vec<Uuid>,
 }
 
 /// Wake-up signal the child→parent fan-in fires when a child thread reaches
@@ -702,6 +704,11 @@ pub struct EventBus {
     /// takes it. Shared so every clone of the bus hands out the same one.
     spawn_request_rx:
         std::sync::Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<SpawnRequest>>>>,
+    /// Rows whose `archivable_sub_thread_count`, and every ancestor's, a
+    /// committed event may have moved. Sent after commit. The engine-tier
+    /// recount worker that took [`EventBus::take_archive_recounts`] drains it.
+    archive_recount_tx: mpsc::UnboundedSender<Uuid>,
+    archive_recount_rx: std::sync::Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<Uuid>>>>,
     changes_projection: crate::core::changes_projection::ChangesProjection,
     /// Children the engine is about to auto-resume, so `notify_parent_if_child`
     /// withholds their completion card. See [`AutoResumeHolds`].
@@ -757,6 +764,7 @@ impl EventBus {
         let (event_tx, _) = broadcast::channel(BUS_CAPACITY);
         let (parent_callback_tx, parent_callback_rx) = mpsc::unbounded_channel();
         let (spawn_request_tx, spawn_request_rx) = mpsc::unbounded_channel();
+        let (archive_recount_tx, archive_recount_rx) = mpsc::unbounded_channel();
         let changes_projection =
             crate::core::changes_projection::ChangesProjection::new(pool.clone());
         (
@@ -770,6 +778,10 @@ impl EventBus {
                 spawn_request_tx,
                 spawn_request_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(
                     spawn_request_rx,
+                ))),
+                archive_recount_tx,
+                archive_recount_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(
+                    archive_recount_rx,
                 ))),
                 changes_projection,
                 auto_resume_holds: AutoResumeHolds::default(),
@@ -918,6 +930,24 @@ impl EventBus {
             .take()
     }
 
+    /// The receiver every archivable-count recount request is sent to. `None`
+    /// once taken: the recount worker is its one consumer.
+    pub fn take_archive_recounts(&self) -> Option<mpsc::UnboundedReceiver<Uuid>> {
+        self.archive_recount_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Ask the recount worker to recount `thread_id`'s archivable sub-thread
+    /// count and every ancestor's. Call it only after the write it follows
+    /// has committed, so the recount reads it.
+    pub fn request_archive_recount(&self, thread_id: Uuid) {
+        if let Err(e) = self.archive_recount_tx.send(thread_id) {
+            crate::log_legacy!("[EventBus] Archive recount has no consumer: {}", e.0);
+        }
+    }
+
     fn send_spawn_request(&self, request: SpawnRequest) {
         if let Err(e) = self.spawn_request_tx.send(request) {
             crate::log_legacy!("[EventBus] Spawn request has no consumer: {:?}", e.0);
@@ -1018,6 +1048,7 @@ impl EventBus {
 
         let aggregate = crate::core::store::fetch_thread_aggregate(&mut *tx, thread_id).await?;
         tx.commit().await?;
+        self.request_archive_recount(thread_id);
 
         if let Some(aggregate) = aggregate {
             let _ = self.event_tx.send(EmittedEvent {
@@ -2071,9 +2102,32 @@ impl EventBus {
             // CaptureAggregate read their own write. Returns the side-effect
             // events for PostCommit, and the ancestors whose
             // `blocking_descendant_count` changed.
+            use projection::propagation::{load_archive_input_sample, ArchiveInputSample};
+            let streaming = te.is_per_token_streaming();
+            let prev_archive = if streaming {
+                None
+            } else {
+                load_archive_input_sample(&mut tx, thread_id).await?
+            };
             let (side_effects, affected_ancestors) = self
                 .update_thread_projection(&mut tx, thread_id, &te, &meta)
                 .await?;
+            let archive_recount_anchors = if streaming {
+                Vec::new()
+            } else {
+                let curr_archive = load_archive_input_sample(&mut tx, thread_id).await?;
+                let mut anchors = ArchiveInputSample::recount_anchors(
+                    prev_archive.as_ref(),
+                    curr_archive.as_ref(),
+                    te.moves_archive_input_off_summary(),
+                );
+                // A detach cuts the edge on the child's row, inside the
+                // former parent's event, so this row's own count moves.
+                if matches!(te, ThreadEvent::ChildThreadDetached { .. }) {
+                    anchors.push(thread_id);
+                }
+                anchors
+            };
 
             // === Phase: CaptureAggregate ===
             // Snapshot this thread and each affected ancestor inside the tx, so
@@ -2114,6 +2168,7 @@ impl EventBus {
                 aggregate,
                 ancestor_aggregates,
                 side_effects,
+                archive_recount_anchors,
             });
         }
 
@@ -2177,6 +2232,9 @@ impl EventBus {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .retain(|_, input| input.thread != thread_id || input.message != message);
+            }
+            for anchor in &s.archive_recount_anchors {
+                self.request_archive_recount(*anchor);
             }
             fan_outs.push((
                 s.event_id,

@@ -1,6 +1,7 @@
 import { exchangeUserImageHashes, exchangeUserMessage } from './exchange';
 import { TERMINAL_EVENT_TYPES, exchangeHoldsNoTurn, isLiveCallRow, isUnsentExchange, isUningestedMessage, isWaitingTypedMessage, latestRunSteps } from './exchange-grouping';
 import type { Exchange } from './exchange';
+import { isTurnlessBoundary } from './thread-event-types';
 
 function exchangeHasTerminalStep(exchange: Exchange): boolean {
   return latestRunSteps(exchange).some(({ event }) =>
@@ -37,9 +38,13 @@ export interface QueuedFollowupRun {
   queuedIndices: Set<number>;
 }
 
+function bearsTurn(exchange: Exchange): boolean {
+  return !isLiveCallRow(exchange.userEvent) && !isUnsentExchange(exchange) && !isTurnlessBoundary(exchange.userEvent);
+}
+
 function lastTurnBearingIndex(exchanges: Exchange[]): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
-    if (!isLiveCallRow(exchanges[i].userEvent) && !isUnsentExchange(exchanges[i])) return i;
+    if (bearsTurn(exchanges[i])) return i;
   }
   return -1;
 }
@@ -49,7 +54,7 @@ function codingAgentQueue(exchanges: Exchange[]): QueuedFollowupRun {
   let activeIndex = -1;
   for (let i = 0; i < exchanges.length; i++) {
     if (exchanges[i].awaitingRead) queuedOrder.push(i);
-    else if (!isLiveCallRow(exchanges[i].userEvent) && !isUnsentExchange(exchanges[i])) activeIndex = i;
+    else if (bearsTurn(exchanges[i])) activeIndex = i;
   }
   if (activeIndex === -1) activeIndex = lastTurnBearingIndex(exchanges);
   return { activeIndex, queuedOrder, queuedIndices: new Set(queuedOrder) };
@@ -81,7 +86,7 @@ export function queuedFollowupRun(
   let activeIndex = -1;
   for (let i = exchanges.length - 1; i >= 0; i--) {
     if (isUningestedMessage(exchanges[i])) continue;
-    if (exchangeHoldsNoTurn(exchanges[i]) || isUnsentExchange(exchanges[i])) continue;
+    if (exchangeHoldsNoTurn(exchanges[i]) || isUnsentExchange(exchanges[i]) || isTurnlessBoundary(exchanges[i].userEvent)) continue;
     if (canQueueBehind(exchanges[i])) activeIndex = i;
     break;
   }

@@ -20,7 +20,7 @@ function aggregate(summaryVersion: number, change: CodingAgentChangeState): Thre
     threadId: T, title: 'Plan the fix', channel: 'claude_code', initiator: 'user',
     createdAt: AT, lastActivity: AT, messageCount: 1, section: 'inbox', status: 'idle', summaryVersion,
     activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0,
-    attentionDescendantCount: 0, liveEventWaitCount: 0, codingAgentChangeState: change,
+    attentionDescendantCount: 0, archivableSubThreadCount: 0, liveEventWaitCount: 0, codingAgentChangeState: change,
     codingAgentIsExternalRepo: false, isSaved: false, hasResponse: true, lastRevivedAt: null,
     parentThreadId: null, parentThreadTitle: null, state: 'active',
   };
@@ -31,7 +31,7 @@ function summary(summaryVersion: number, change: CodingAgentChangeState): Thread
     thread_id: T, title: 'Plan the fix', channel: 'claude_code', initiator: 'user',
     created_at: AT, last_activity: AT, message_count: 1, section: 'inbox',
     active_children_count: 0, total_children_count: 0, blocking_descendant_count: 0,
-    attention_descendant_count: 0, live_event_wait_count: 0, status: 'idle',
+    attention_descendant_count: 0, archivable_sub_thread_count: 0, live_event_wait_count: 0, status: 'idle',
     summary_version: summaryVersion, coding_agent_change_state: change,
     coding_agent_is_external_repo: false,
     last_revived_at: null, state: 'active', compose_text: '', compose_images: [],

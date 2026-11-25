@@ -189,6 +189,18 @@ describe('users', () => {
     });
   });
   describe('relayed names', () => {
+    it('keeps one user id on two gateways as two people', async () => {
+      const { senderName } = await import('./gatewayUsers');
+      const data: GatewayUsersResponse = {
+        users: [user('Alex', ['alexs'])],
+        relayed: [
+          { device_id: 'reader-phone', user_id: 'o9', name: 'Pat', via: 'A', emails: [] },
+          { device_id: 'other-phone', user_id: 'o9', name: 'Pat', via: 'B', emails: [] },
+        ],
+      };
+      expect(senderName({ status: 'loaded', data }, 'reader-phone', 'other-phone')).toBe('Pat');
+    });
+
     it('follow the fixture the engine tests read too', async () => {
       const { gatewayUserName } = await import('./gatewayUsers');
       const path = resolve(REPO_ROOT, 'crates/lucidos-core/src/gateway_user_names.json');

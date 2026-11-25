@@ -441,6 +441,26 @@ test_a_pass_is_reused_only_for_identical_inputs() {
     expect_rerun "SHELLCHECK_OPTS, which can name files the key cannot see" SHELLCHECK_OPTS=--severity=error
     expect_rerun "the same SHELLCHECK_OPTS again" SHELLCHECK_OPTS=--severity=error
     expect_reuse "the first version again"
+    printf '\n# replacement with the same version\n' >> "$SANDBOX/bin/shellcheck"
+    expect_rerun "a replaced ShellCheck executable reporting the same version"
+    expect_reuse "the same replacement"
+    echo 'source-path=/outside' >> "$REPO/.shellcheckrc"
+    expect_rerun "a source search outside the checkout"
+    expect_rerun "an unchanged source search outside the checkout"
+    sed '/source-path=\/outside/d' "$REPO/.shellcheckrc" > "$REPO/.shellcheckrc.tmp"
+    mv "$REPO/.shellcheckrc.tmp" "$REPO/.shellcheckrc"
+    expect_reuse "the original source search"
+
+    printf '#!/bin/bash\n' > "$SANDBOX/external.sh"
+    printf ':; source "%s/external.sh"\n' "$SANDBOX" >> "$REPO/clean003.sh"
+    expect_rerun "an external source after a command separator"
+    expect_rerun "an unchanged script sourcing outside the checkout"
+    printf 'if true; then source "%s/external.sh"; fi\n' "$SANDBOX" > "$REPO/clean003.sh"
+    expect_rerun "an external source after then"
+    expect_rerun "an unchanged conditional sourcing outside the checkout"
+    sed '$d' "$REPO/clean003.sh" > "$REPO/clean003.sh.tmp"
+    mv "$REPO/clean003.sh.tmp" "$REPO/clean003.sh"
+
     echo 'echo edited again' >> "$REPO/clean003.sh"
     expect_rerun "an edited script under SHELLCHECK_OPTS" SHELLCHECK_OPTS=--severity=error
     expect_rerun "that tree without SHELLCHECK_OPTS, since the run under it recorded nothing"
